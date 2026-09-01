@@ -5,6 +5,7 @@
 
 using System;
 using System.IO;
+using System.Threading.Tasks;
 using AiDotNet.Tensors.Licensing;
 using AiDotNet.Tensors.NumericOperations;
 using Xunit;
@@ -303,6 +304,33 @@ public class PersistenceGuardTests
         Assert.False(LicenseValidator.ValidateKeyFormat("not-a-valid-key"));
         Assert.False(LicenseValidator.ValidateKeyFormat(""));
         Assert.False(LicenseValidator.ValidateKeyFormat("aidn..."));  // empty id+sig
+    }
+
+    [Fact]
+    public async Task SetTestTrialFilePathOverride_IgnoresAmbientKeyAndExercisesTrial()
+    {
+        await Task.Yield();
+
+        string savedKey = Environment.GetEnvironmentVariable("AIDOTNET_LICENSE_KEY");
+        try
+        {
+            Environment.SetEnvironmentVariable("AIDOTNET_LICENSE_KEY", "aidn.test.ambient.AAAAAAAA");
+            PersistenceGuard.ClearValidatorCacheForTesting();
+
+            using var trial = IsolatedTrial(out var path);
+
+            PersistenceGuard.EnforceBeforeLoad();
+
+            var state = TrialState.Load(path);
+            Assert.Equal(1, state.OperationsConsumed);
+            Assert.Equal("aidn.test.ambient.AAAAAAAA",
+                Environment.GetEnvironmentVariable("AIDOTNET_LICENSE_KEY"));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("AIDOTNET_LICENSE_KEY", savedKey);
+            PersistenceGuard.ClearValidatorCacheForTesting();
+        }
     }
 
     [Fact]

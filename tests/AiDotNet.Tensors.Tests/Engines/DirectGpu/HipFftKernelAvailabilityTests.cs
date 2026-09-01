@@ -84,7 +84,11 @@ public sealed class HipFftKernelAvailabilityTests
         }
 
         SetField(backend, "_kernelCache", kernels);
-        SetField(backend, "<IsAvailable>k__BackingField", true);
+        // IsAvailable is no longer an auto-property: it now reads `_isAvailable && !_disposed`,
+        // so that a disposed backend stops reporting itself as usable and DirectGpuBackendFactory
+        // rebuilds instead of handing out a dead cached instance. This hook follows that rename;
+        // the simulated state it sets up is identical.
+        SetField(backend, "_isAvailable", true);
         SetField(backend, "<DeviceName>k__BackingField", "Mock AMD GPU");
         return backend;
     }

@@ -14,6 +14,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
     {
         private IntPtr _kernel;
         private readonly DirectOpenClContext _context;
+        private readonly string _kernelName;
         private bool _disposed;
 
         public IntPtr Handle => _kernel;
@@ -21,6 +22,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public DirectOpenClKernel(DirectOpenClContext context, DirectOpenClProgram program, string kernelName)
         {
             _context = context;
+            _kernelName = kernelName;
 
             _kernel = OpenClNativeBindings.CreateKernel(program.Handle, kernelName, out int err);
             if (err != OpenClNativeBindings.CL_SUCCESS || _kernel == IntPtr.Zero)
@@ -51,6 +53,18 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         // args at Execute time; Execute clears it.
         [ThreadStatic] private static System.Collections.Generic.List<PendingArg>? _pendingArgs;
 
+        /// <summary>Which kernel the thread's staged args belong to.</summary>
+        /// <remarks>
+        /// The pending list is per-thread but shared across every kernel, and it was cleared only on
+        /// the success path of Execute. So any throw between SetArg and Execute -- a guard rejecting
+        /// an argument, an enqueue failure, an abandoned call -- left those args staged, and the NEXT
+        /// kernel this thread executed applied them: another kernel's signature, at another kernel's
+        /// arg indices, carrying buffer handles that may since have been disposed. Passing a released
+        /// cl_mem to clSetKernelArg faults inside the driver, which is what an 0xC0000005 in
+        /// SetKernelArg looks like from managed code.
+        /// </remarks>
+        [ThreadStatic] private static DirectOpenClKernel? _pendingOwner;
+
         // Serializes the apply-args + enqueue critical section across ALL kernels
         // (the shared cl_kernel arg state and the shared command queue both require it).
         private static readonly object _submitLock = new object();
@@ -58,32 +72,68 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         private static System.Collections.Generic.List<PendingArg> Pending
             => _pendingArgs ??= new System.Collections.Generic.List<PendingArg>(8);
 
+        /// <summary>Begins (or continues) staging for <paramref name="owner"/>, dropping any args
+        /// abandoned by a previous kernel on this thread.</summary>
+        private static System.Collections.Generic.List<PendingArg> Stage(DirectOpenClKernel owner, uint index)
+        {
+            var pending = Pending;
+
+            // Index 0 starts a launch sequence -- every launcher sets its arguments from 0 upwards
+            // -- so this is where a previous sequence's leftovers are dropped. That makes each
+            // launch self-cleaning even when the last one threw between SetArg and Execute, without
+            // depending on the clear at the end of Execute having been reached.
+            if (index == 0 || !ReferenceEquals(_pendingOwner, owner))
+            {
+                pending.Clear();
+                _pendingOwner = owner;
+            }
+
+            return pending;
+        }
+
+        /// <summary>Drops the thread's staged args; safe to call from a finally.</summary>
+        private static void DiscardPendingArgs()
+        {
+            _pendingArgs?.Clear();
+            _pendingOwner = null;
+        }
+
         #region SetArg Overloads
 
         public void SetArg(uint index, IntPtr bufferHandle)
-            => Pending.Add(new PendingArg(index, ArgKind.Buffer, (long)bufferHandle));
+            => Stage(this, index).Add(new PendingArg(index, ArgKind.Buffer, (long)bufferHandle));
 
         public void SetArg(uint index, int value)
-            => Pending.Add(new PendingArg(index, ArgKind.Int32, value));
+            => Stage(this, index).Add(new PendingArg(index, ArgKind.Int32, value));
 
         public void SetArg(uint index, float value)
-            => Pending.Add(new PendingArg(index, ArgKind.Float, BitConverter.ToInt32(BitConverter.GetBytes(value), 0)));
+            => Stage(this, index).Add(new PendingArg(index, ArgKind.Float, BitConverter.ToInt32(BitConverter.GetBytes(value), 0)));
 
         public void SetArg(uint index, ulong value)
-            => Pending.Add(new PendingArg(index, ArgKind.UInt64, unchecked((long)value)));
+            => Stage(this, index).Add(new PendingArg(index, ArgKind.UInt64, unchecked((long)value)));
 
         /// <summary>
         /// Sets a local memory argument (for shared memory allocation).
         /// </summary>
         public void SetLocalArg(uint index, int sizeInBytes)
-            => Pending.Add(new PendingArg(index, ArgKind.Local, sizeInBytes));
+            => Stage(this, index).Add(new PendingArg(index, ArgKind.Local, sizeInBytes));
 
         // Applies the per-thread pending args to the shared kernel. MUST be called
         // while holding _submitLock and immediately before the matching enqueue.
         private void ApplyPendingArgsLocked()
         {
+            ThrowIfUnusable();
+
             var pending = _pendingArgs;
             if (pending == null) return;
+
+            // Never apply args staged for a different kernel. Indices and sizes belong to that
+            // kernel's signature, not this one.
+            if (!ReferenceEquals(_pendingOwner, this))
+            {
+                pending.Clear();
+                return;
+            }
             for (int i = 0; i < pending.Count; i++)
             {
                 var a = pending[i];
@@ -139,12 +189,15 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         /// </summary>
         public void Execute1D(int globalSize, int localSize)
         {
+            ThrowIfUnusable();
             GpuLaunchProbe.OnLaunch();
             // Round up global size to multiple of local size
             int alignedGlobal = ((globalSize + localSize - 1) / localSize) * localSize;
 
             var globalSizes = new UIntPtr[] { (UIntPtr)alignedGlobal };
             var localSizes = new UIntPtr[] { (UIntPtr)localSize };
+
+            BeginLaunch(TotalOf(globalSizes), TotalOf(localSizes));
 
             int err;
             lock (_submitLock)
@@ -160,11 +213,17 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     0,
                     IntPtr.Zero,
                     IntPtr.Zero);
-                _pendingArgs?.Clear();
+                DiscardPendingArgs();
             }
 
             if (err != OpenClNativeBindings.CL_SUCCESS)
-                throw new InvalidOperationException($"Failed to enqueue kernel: {err}");
+            {
+                throw new InvalidOperationException(
+                    $"Failed to enqueue kernel '{_kernelName}': {err}. Recent launches, most recent "
+                        + "last: " + Environment.NewLine + GpuKernelDiagnostics.DescribeRecentLaunches());
+            }
+
+            EndLaunch();
         }
 
         /// <summary>
@@ -172,6 +231,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         /// </summary>
         public void Execute2D(int globalSizeX, int globalSizeY, int localSizeX, int localSizeY)
         {
+            ThrowIfUnusable();
             GpuLaunchProbe.OnLaunch();
             // Round up global sizes to multiples of local sizes
             int alignedGlobalX = ((globalSizeX + localSizeX - 1) / localSizeX) * localSizeX;
@@ -179,6 +239,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
             var globalSizes = new UIntPtr[] { (UIntPtr)alignedGlobalX, (UIntPtr)alignedGlobalY };
             var localSizes = new UIntPtr[] { (UIntPtr)localSizeX, (UIntPtr)localSizeY };
+
+            BeginLaunch(TotalOf(globalSizes), TotalOf(localSizes));
 
             int err;
             lock (_submitLock)
@@ -194,11 +256,17 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     0,
                     IntPtr.Zero,
                     IntPtr.Zero);
-                _pendingArgs?.Clear();
+                DiscardPendingArgs();
             }
 
             if (err != OpenClNativeBindings.CL_SUCCESS)
-                throw new InvalidOperationException($"Failed to enqueue kernel: {err}");
+            {
+                throw new InvalidOperationException(
+                    $"Failed to enqueue kernel '{_kernelName}': {err}. Recent launches, most recent "
+                        + "last: " + Environment.NewLine + GpuKernelDiagnostics.DescribeRecentLaunches());
+            }
+
+            EndLaunch();
         }
 
         /// <summary>
@@ -206,6 +274,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         /// </summary>
         public void Execute3D(int globalSizeX, int globalSizeY, int globalSizeZ, int localSizeX, int localSizeY, int localSizeZ)
         {
+            ThrowIfUnusable();
             GpuLaunchProbe.OnLaunch();
             // Round up global sizes to multiples of local sizes
             int alignedGlobalX = ((globalSizeX + localSizeX - 1) / localSizeX) * localSizeX;
@@ -214,6 +283,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
             var globalSizes = new UIntPtr[] { (UIntPtr)alignedGlobalX, (UIntPtr)alignedGlobalY, (UIntPtr)alignedGlobalZ };
             var localSizes = new UIntPtr[] { (UIntPtr)localSizeX, (UIntPtr)localSizeY, (UIntPtr)localSizeZ };
+
+            BeginLaunch(TotalOf(globalSizes), TotalOf(localSizes));
 
             int err;
             lock (_submitLock)
@@ -229,11 +300,17 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     0,
                     IntPtr.Zero,
                     IntPtr.Zero);
-                _pendingArgs?.Clear();
+                DiscardPendingArgs();
             }
 
             if (err != OpenClNativeBindings.CL_SUCCESS)
-                throw new InvalidOperationException($"Failed to enqueue kernel: {err}");
+            {
+                throw new InvalidOperationException(
+                    $"Failed to enqueue kernel '{_kernelName}': {err}. Recent launches, most recent "
+                        + "last: " + Environment.NewLine + GpuKernelDiagnostics.DescribeRecentLaunches());
+            }
+
+            EndLaunch();
         }
 
         #endregion
@@ -248,12 +325,15 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         /// <param name="localSize">The local work size.</param>
         public void Execute1DOnQueue(IntPtr commandQueue, int globalSize, int localSize)
         {
+            ThrowIfUnusable();
             GpuLaunchProbe.OnLaunch();
             // Round up global size to multiple of local size
             int alignedGlobal = ((globalSize + localSize - 1) / localSize) * localSize;
 
             var globalSizes = new UIntPtr[] { (UIntPtr)alignedGlobal };
             var localSizes = new UIntPtr[] { (UIntPtr)localSize };
+
+            BeginLaunch(TotalOf(globalSizes), TotalOf(localSizes));
 
             int err;
             lock (_submitLock)
@@ -269,11 +349,17 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     0,
                     IntPtr.Zero,
                     IntPtr.Zero);
-                _pendingArgs?.Clear();
+                DiscardPendingArgs();
             }
 
             if (err != OpenClNativeBindings.CL_SUCCESS)
                 throw new InvalidOperationException($"Failed to enqueue kernel on queue: {err}");
+
+            // Finish THIS queue, not the default one. Under AIDOTNET_GPU_SYNC_LAUNCHES the whole
+            // point is that a device fault is attributed to the launch that caused it; a path that
+            // enqueues and returns without finishing leaves its faults asynchronous and blames
+            // whatever synchronises next, which is the behaviour the flag exists to remove.
+            EndLaunch(commandQueue);
         }
 
         /// <summary>
@@ -286,6 +372,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         /// <param name="localSizeY">The local work size in Y dimension.</param>
         public void Execute2DOnQueue(IntPtr commandQueue, int globalSizeX, int globalSizeY, int localSizeX, int localSizeY)
         {
+            ThrowIfUnusable();
             GpuLaunchProbe.OnLaunch();
             // Round up global sizes to multiples of local sizes
             int alignedGlobalX = ((globalSizeX + localSizeX - 1) / localSizeX) * localSizeX;
@@ -293,6 +380,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
             var globalSizes = new UIntPtr[] { (UIntPtr)alignedGlobalX, (UIntPtr)alignedGlobalY };
             var localSizes = new UIntPtr[] { (UIntPtr)localSizeX, (UIntPtr)localSizeY };
+
+            BeginLaunch(TotalOf(globalSizes), TotalOf(localSizes));
 
             int err;
             lock (_submitLock)
@@ -308,11 +397,17 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     0,
                     IntPtr.Zero,
                     IntPtr.Zero);
-                _pendingArgs?.Clear();
+                DiscardPendingArgs();
             }
 
             if (err != OpenClNativeBindings.CL_SUCCESS)
                 throw new InvalidOperationException($"Failed to enqueue kernel on queue: {err}");
+
+            // Finish THIS queue, not the default one. Under AIDOTNET_GPU_SYNC_LAUNCHES the whole
+            // point is that a device fault is attributed to the launch that caused it; a path that
+            // enqueues and returns without finishing leaves its faults asynchronous and blames
+            // whatever synchronises next, which is the behaviour the flag exists to remove.
+            EndLaunch(commandQueue);
         }
 
         /// <summary>
@@ -328,6 +423,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public void Execute3DOnQueue(IntPtr commandQueue, int globalSizeX, int globalSizeY, int globalSizeZ,
             int localSizeX, int localSizeY, int localSizeZ)
         {
+            ThrowIfUnusable();
             GpuLaunchProbe.OnLaunch();
             // Round up global sizes to multiples of local sizes
             int alignedGlobalX = ((globalSizeX + localSizeX - 1) / localSizeX) * localSizeX;
@@ -336,6 +432,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
             var globalSizes = new UIntPtr[] { (UIntPtr)alignedGlobalX, (UIntPtr)alignedGlobalY, (UIntPtr)alignedGlobalZ };
             var localSizes = new UIntPtr[] { (UIntPtr)localSizeX, (UIntPtr)localSizeY, (UIntPtr)localSizeZ };
+
+            BeginLaunch(TotalOf(globalSizes), TotalOf(localSizes));
 
             int err;
             lock (_submitLock)
@@ -351,11 +449,17 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     0,
                     IntPtr.Zero,
                     IntPtr.Zero);
-                _pendingArgs?.Clear();
+                DiscardPendingArgs();
             }
 
             if (err != OpenClNativeBindings.CL_SUCCESS)
                 throw new InvalidOperationException($"Failed to enqueue kernel on queue: {err}");
+
+            // Finish THIS queue, not the default one. Under AIDOTNET_GPU_SYNC_LAUNCHES the whole
+            // point is that a device fault is attributed to the launch that caused it; a path that
+            // enqueues and returns without finishing leaves its faults asynchronous and blames
+            // whatever synchronises next, which is the behaviour the flag exists to remove.
+            EndLaunch(commandQueue);
         }
 
         #endregion
@@ -383,6 +487,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             var globalSizes = new UIntPtr[] { (UIntPtr)alignedGlobalX, (UIntPtr)alignedGlobalY };
             var localSizes = new UIntPtr[] { (UIntPtr)localSizeX, (UIntPtr)localSizeY };
 
+            BeginLaunch(TotalOf(globalSizes), TotalOf(localSizes));
+
             // Allocate event handle
             IntPtr eventHandle = Marshal.AllocHGlobal(IntPtr.Size);
             try
@@ -401,11 +507,26 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                         0,
                         IntPtr.Zero,
                         eventHandle);
-                    _pendingArgs?.Clear();
+                    DiscardPendingArgs();
                 }
 
                 if (err != OpenClNativeBindings.CL_SUCCESS)
                     throw new InvalidOperationException($"Failed to enqueue kernel: {err}");
+
+                // The enqueue created the event, so from here on WE own it. If the synchronise
+                // throws -- which is exactly what sync-launch mode exists to make happen at the
+                // faulting launch -- we never return, so the caller never receives the handle and
+                // can never release it. Release it before the exception leaves.
+                try
+                {
+                    EndLaunch(_context.ProfilingCommandQueue);
+                }
+                catch
+                {
+                    IntPtr orphaned = Marshal.ReadIntPtr(eventHandle);
+                    if (orphaned != IntPtr.Zero) OpenClNativeBindings.ReleaseEvent(orphaned);
+                    throw;
+                }
 
                 // Read the event pointer from the allocated memory
                 IntPtr eventPtr = Marshal.ReadIntPtr(eventHandle);
@@ -433,6 +554,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             var globalSizes = new UIntPtr[] { (UIntPtr)alignedGlobal };
             var localSizes = new UIntPtr[] { (UIntPtr)localSize };
 
+            BeginLaunch(TotalOf(globalSizes), TotalOf(localSizes));
+
             IntPtr eventHandle = Marshal.AllocHGlobal(IntPtr.Size);
             try
             {
@@ -450,11 +573,26 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                         0,
                         IntPtr.Zero,
                         eventHandle);
-                    _pendingArgs?.Clear();
+                    DiscardPendingArgs();
                 }
 
                 if (err != OpenClNativeBindings.CL_SUCCESS)
                     throw new InvalidOperationException($"Failed to enqueue kernel: {err}");
+
+                // The enqueue created the event, so from here on WE own it. If the synchronise
+                // throws -- which is exactly what sync-launch mode exists to make happen at the
+                // faulting launch -- we never return, so the caller never receives the handle and
+                // can never release it. Release it before the exception leaves.
+                try
+                {
+                    EndLaunch(_context.ProfilingCommandQueue);
+                }
+                catch
+                {
+                    IntPtr orphaned = Marshal.ReadIntPtr(eventHandle);
+                    if (orphaned != IntPtr.Zero) OpenClNativeBindings.ReleaseEvent(orphaned);
+                    throw;
+                }
 
                 return Marshal.ReadIntPtr(eventHandle);
             }
@@ -466,7 +604,110 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         #endregion
 
+        /// <summary>The kernel's own argument count, queried once. -1 when unavailable.</summary>
+        private int _declaredArgCount = -2;   // -2 = not yet queried, -1 = device would not say
+
+        private int DeclaredArgCount
+        {
+            get
+            {
+                if (_declaredArgCount == -2)
+                {
+                    _declaredArgCount = OpenClNativeBindings.GetKernelNumArgs(_kernel);
+                }
+
+                return _declaredArgCount;
+            }
+        }
+
+        /// <summary>
+        /// Validates the launch, records it in the diagnostics journal, and -- under
+        /// AIDOTNET_GPU_SYNC_LAUNCHES -- finishes the queue so an asynchronous fault is attributed
+        /// to THIS launch rather than to whatever synchronises next.
+        /// </summary>
+        private void BeginLaunch(long globalSize, long localSize)
+        {
+            int staged = _pendingArgs is null || !ReferenceEquals(_pendingOwner, this)
+                ? 0
+                : _pendingArgs.Count;
+
+            GpuKernelDiagnostics.ValidateLaunch(
+                _kernelName,
+                handleIsValid: !_disposed && _kernel != IntPtr.Zero,
+                stagedArgCount: staged,
+                declaredArgCount: DeclaredArgCount,
+                globalSize: globalSize,
+                localSize: localSize);
+
+            GpuKernelDiagnostics.RecordLaunch(_kernelName, globalSize, localSize, staged);
+        }
+
+        /// <summary>Finishes the queue when synchronous diagnostics are on, so a device fault is
+        /// reported against the launch that caused it.</summary>
+        /// <summary>Work-item count across however many dimensions the launch uses.</summary>
+        private static long TotalOf(UIntPtr[] sizes)
+        {
+            long total = 1;
+            foreach (var size in sizes) total *= (long)(ulong)size;
+            return total;
+        }
+
+        private void EndLaunch() => EndLaunch(_context.CommandQueue);
+
+        /// <summary>
+        /// Finishes THE QUEUE THIS LAUNCH USED. The OnQueue and profiled paths submit to a different
+        /// queue than <c>_context.CommandQueue</c>, so finishing the default one would attribute a
+        /// fault to the wrong work — or miss it entirely.
+        /// </summary>
+        private void EndLaunch(IntPtr commandQueue)
+        {
+            if (!GpuKernelDiagnostics.SynchronousLaunches) return;
+
+            int err = OpenClNativeBindings.Finish(commandQueue);
+            if (err != OpenClNativeBindings.CL_SUCCESS)
+            {
+                throw new InvalidOperationException(
+                    $"GPU fault after launching '{_kernelName}' (clFinish returned {err}). Recent "
+                        + "launches, most recent last: " + Environment.NewLine
+                        + GpuKernelDiagnostics.DescribeRecentLaunches());
+            }
+        }
+
+        /// <summary>Refuses to launch a kernel whose handle has been released.</summary>
+        /// <remarks>
+        /// Dispose sets _kernel to IntPtr.Zero, and nothing on the launch path checked it, so a
+        /// kernel used after its backend was disposed handed NULL to clSetKernelArg. The OpenCL spec
+        /// says that returns CL_INVALID_KERNEL; drivers are not obliged to be careful about it, and
+        /// a dereference inside the runtime surfaces as an 0xC0000005 that kills the process with no
+        /// managed frame to blame. This turns that into a named, catchable failure that says which
+        /// kernel and can be attributed to a test.
+        /// </remarks>
+        private void ThrowIfUnusable()
+        {
+            if (_disposed || _kernel == IntPtr.Zero)
+            {
+                throw new ObjectDisposedException(
+                    nameof(DirectOpenClKernel),
+                    $"OpenCL kernel '{_kernelName}' was used after its handle was released. The "
+                        + "backend that owns it has been disposed while something still held a "
+                        + "reference to this kernel.");
+            }
+        }
+
         public void Dispose()
+        {
+            // Released under the SUBMIT LOCK. ThrowIfUnusable is otherwise a time-of-check to
+            // time-of-use window: a launch validates the handle, Dispose calls clReleaseKernel, and
+            // the launch then hands the released handle to clSetKernelArg. Taking the same lock the
+            // apply-and-enqueue critical section holds makes release and submission mutually
+            // exclusive, so a validated handle stays valid until its enqueue completes.
+            lock (_submitLock)
+            {
+                DisposeLocked();
+            }
+        }
+
+        private void DisposeLocked()
         {
             if (_disposed) return;
 

@@ -94,7 +94,54 @@ public sealed class TensorArena : IDisposable
     // a model with many distinct shapes can't grow the pool without bound.
     // ---------------------------------------------------------------------
     [ThreadStatic]
-    private static Dictionary<(Type, int), Stack<Array>>? _persistent;
+    private static Dictionary<(Type, int), Bucket>? _persistent;
+
+    /// <summary>
+    /// One (type, size) bucket plus the arena generation that last touched it.
+    /// </summary>
+    /// <remarks>
+    /// The generation stamp is what makes retention self-limiting ACROSS models.
+    /// <see cref="MaxPersistPerSize"/> bounds a single bucket, but nothing bounded the NUMBER of
+    /// buckets, and the bucket key is an EXACT (type, element-count) pair — so a process that runs
+    /// many distinct shapes accumulated one bucket per shape and released none of them until
+    /// <see cref="ClearPersistentPool"/> was called by hand. Every retained buffer is at least
+    /// <see cref="PersistThresholdElems"/> elements (256 KB at float, 512 KB at double) and there
+    /// can be up to <see cref="MaxPersistPerSize"/> of them per bucket, so the ceiling was
+    /// shapes × 64 × 256 KB — hundreds of MB of Gen2 for a few dozen shapes.
+    /// Measured on AiDotNet's RecurrentGemma finite-difference gradcheck: 11-13 s in a clean
+    /// process, past its entire 120 s budget once 29 sibling model tests had filled the pool on the
+    /// same thread. Nothing was wrong with the gradcheck; it was paying for buffers no one would
+    /// ever rent again.
+    /// </remarks>
+    private sealed class Bucket
+    {
+        internal readonly Stack<Array> Arrays = new Stack<Array>(MaxPersistPerSize);
+
+        internal long LastTouchedGeneration;
+    }
+
+    /// <summary>
+    /// Completed top-level arena lifetimes on this thread. Buckets are stamped with it on every
+    /// rent and return, and <see cref="PruneStaleCrossArenaBuckets"/> drops those that have gone
+    /// <see cref="MaxIdleGenerations"/> lifetimes without a touch.
+    /// </summary>
+    [ThreadStatic]
+    private static long _arenaGeneration;
+
+    /// <summary>
+    /// How many arena lifetimes a bucket may sit untouched before it is dropped.
+    /// </summary>
+    /// <remarks>
+    /// The pool's stated purpose is that "the NEXT arena on the same thread reuses the buffers", so
+    /// a bucket untouched for several lifetimes is not serving that purpose — it is holding a
+    /// previous model's working set resident. Two preserves steady-state reuse for a train loop that
+    /// rents the same shapes every step (touched every generation, so never stale) while releasing a
+    /// different model's shapes within two lifetimes. This is deliberately a generation policy and
+    /// not a byte budget: a byte cap cannot tell "one paper-scale model's ~1 GB working set, which
+    /// the next step genuinely wants" apart from "twenty models' leftovers", and picking a number
+    /// low enough to bound the second would evict the first every step and undo issue #478.
+    /// </remarks>
+    private const long MaxIdleGenerations = 2;
 
     // Test/diagnostic: counts how many times a large buffer was served from the
     // cross-arena persistent pool (a reuse hit) rather than freshly allocated.
@@ -134,9 +181,10 @@ public sealed class TensorArena : IDisposable
         if (elementCount < PersistThresholdElems) return null;
         var pool = _persistent;
         if (pool is null) return null;
-        if (pool.TryGetValue((type, elementCount), out var stack) && stack.Count > 0)
+        if (pool.TryGetValue((type, elementCount), out var bucket) && bucket.Arrays.Count > 0)
         {
-            var arr = stack.Pop();
+            var arr = bucket.Arrays.Pop();
+            bucket.LastTouchedGeneration = _arenaGeneration;
             _persistentReuseHits++;
             // Zero the recycled buffer. The arena's previous behaviour allocated
             // every first-use-per-arena buffer via `new T[]`, which the CLR
@@ -157,15 +205,16 @@ public sealed class TensorArena : IDisposable
     private static void ReturnPersistent(Type type, int elementCount, Array arr)
     {
         if (elementCount < PersistThresholdElems) return; // let small buffers GC
-        var pool = _persistent ??= new Dictionary<(Type, int), Stack<Array>>();
+        var pool = _persistent ??= new Dictionary<(Type, int), Bucket>();
         var key = (type, elementCount);
-        if (!pool.TryGetValue(key, out var stack))
+        if (!pool.TryGetValue(key, out var bucket))
         {
-            stack = new Stack<Array>(MaxPersistPerSize);
-            pool[key] = stack;
+            bucket = new Bucket();
+            pool[key] = bucket;
         }
-        if (stack.Count < MaxPersistPerSize)
-            stack.Push(arr);
+        bucket.LastTouchedGeneration = _arenaGeneration;
+        if (bucket.Arrays.Count < MaxPersistPerSize)
+            bucket.Arrays.Push(arr);
         // else: at cap — drop the reference, let GC reclaim (don't hoard).
     }
 
@@ -215,15 +264,16 @@ public sealed class TensorArena : IDisposable
     // staying bounded. Thread-static, matching the [ThreadStatic] pool contract.
     // ---------------------------------------------------------------------
     [ThreadStatic]
-    private static Dictionary<(Type, int), Stack<Array>>? _carryPool;
+    private static Dictionary<(Type, int), Bucket>? _carryPool;
 
     private static Array? RentCarry(Type type, int elementCount)
     {
         var pool = _carryPool;
         if (pool is null) return null;
-        if (pool.TryGetValue((type, elementCount), out var stack) && stack.Count > 0)
+        if (pool.TryGetValue((type, elementCount), out var bucket) && bucket.Arrays.Count > 0)
         {
-            var arr = stack.Pop();
+            var arr = bucket.Arrays.Pop();
+            bucket.LastTouchedGeneration = _arenaGeneration;
             _persistentReuseHits++;
             return arr; // caller overwrites every element from the boundary — no clear needed
         }
@@ -232,22 +282,81 @@ public sealed class TensorArena : IDisposable
 
     private static void ReturnCarry(Type type, int elementCount, Array arr)
     {
-        var pool = _carryPool ??= new Dictionary<(Type, int), Stack<Array>>();
+        var pool = _carryPool ??= new Dictionary<(Type, int), Bucket>();
         var key = (type, elementCount);
-        if (!pool.TryGetValue(key, out var stack))
+        if (!pool.TryGetValue(key, out var bucket))
         {
-            stack = new Stack<Array>(MaxPersistPerSize);
-            pool[key] = stack;
+            bucket = new Bucket();
+            pool[key] = bucket;
         }
-        if (stack.Count < MaxPersistPerSize)
-            stack.Push(arr);
+        bucket.LastTouchedGeneration = _arenaGeneration;
+        if (bucket.Arrays.Count < MaxPersistPerSize)
+            bucket.Arrays.Push(arr);
     }
 
     /// <summary>
-    /// Drops every buffer held in the calling thread's cross-arena persistent
-    /// pool. For tests / explicit memory-pressure handling; production code
-    /// never needs this (the pool is bounded by <see cref="MaxPersistPerSize"/>).
+    /// Drops cross-arena buckets that have gone <see cref="MaxIdleGenerations"/> arena lifetimes
+    /// without a rent or a return. Called once per top-level <see cref="Dispose"/>, after the
+    /// generation counter advances, so the cost is one dictionary walk per arena rather than per
+    /// buffer.
     /// </summary>
+    private static void PruneStaleCrossArenaBuckets()
+    {
+        Prune(_persistent);
+        Prune(_carryPool);
+
+        static void Prune(Dictionary<(Type, int), Bucket>? pool)
+        {
+            if (pool is null || pool.Count == 0) return;
+
+            List<(Type, int)>? stale = null;
+            foreach (var kvp in pool)
+            {
+                if (kvp.Value.LastTouchedGeneration + MaxIdleGenerations >= _arenaGeneration) continue;
+                (stale ??= new List<(Type, int)>()).Add(kvp.Key);
+            }
+
+            if (stale is null) return;
+            for (int i = 0; i < stale.Count; i++) pool.Remove(stale[i]);
+        }
+    }
+
+    /// <summary>
+    /// Buckets currently held across the two cross-arena pools on this thread. Diagnostic: lets a
+    /// test assert that retention stays bounded as distinct shapes keep arriving, which is the
+    /// property <see cref="MaxPersistPerSize"/> alone does not give.
+    /// </summary>
+    internal static int CrossArenaBucketCount =>
+        (_persistent?.Count ?? 0) + (_carryPool?.Count ?? 0);
+
+    /// <summary>
+    /// Arrays currently retained across the two cross-arena pools on this thread. Diagnostic.
+    /// </summary>
+    internal static int CrossArenaRetainedArrayCount
+    {
+        get
+        {
+            int total = 0;
+            if (_persistent is not null)
+                foreach (var kvp in _persistent) total += kvp.Value.Arrays.Count;
+            if (_carryPool is not null)
+                foreach (var kvp in _carryPool) total += kvp.Value.Arrays.Count;
+            return total;
+        }
+    }
+
+    /// <summary>
+    /// Drops every buffer held in the calling thread's cross-arena pools.
+    /// </summary>
+    /// <remarks>
+    /// This used to say production code never needs it "(the pool is bounded by
+    /// <see cref="MaxPersistPerSize"/>)". That was not true: MaxPersistPerSize bounds one bucket,
+    /// and nothing bounded how many buckets a thread accumulated, so the only thing keeping the pool
+    /// from growing with the number of distinct shapes a process saw was a caller remembering to
+    /// come here. Retention is now genuinely bounded by <see cref="MaxIdleGenerations"/>, so this is
+    /// once again what it claims to be: a hard reset for tests and for explicit memory-pressure
+    /// handling, not a leak valve.
+    /// </remarks>
     public static void ClearPersistentPool()
     {
         _persistent?.Clear();
@@ -751,9 +860,9 @@ public sealed class TensorArena : IDisposable
     {
         if (TensorAllocator.AllocDiag)
         {
-            System.Console.Error.WriteLine($"[ALLOC-DIAG] arenaHit={TensorAllocator.ArenaHit}({TensorAllocator.ArenaHitBytes / BytesPerMiB:F0}MB) arenaMiss={TensorAllocator.ArenaMiss}({TensorAllocator.ArenaMissBytes / BytesPerMiB:F0}MB) arenaNull={TensorAllocator.ArenaNull}({TensorAllocator.ArenaNullBytes / BytesPerMiB:F0}MB)");
-            TensorAllocator.ArenaHit = 0; TensorAllocator.ArenaMiss = 0; TensorAllocator.ArenaNull = 0;
-            TensorAllocator.ArenaHitBytes = 0; TensorAllocator.ArenaMissBytes = 0; TensorAllocator.ArenaNullBytes = 0;
+            var diag = TensorAllocator.Counters.Snapshot();
+            System.Console.Error.WriteLine($"[ALLOC-DIAG] arenaHit={diag.Hit}({diag.HitBytes / BytesPerMiB:F0}MB) arenaMiss={diag.Miss}({diag.MissBytes / BytesPerMiB:F0}MB) arenaNull={diag.Null}({diag.NullBytes / BytesPerMiB:F0}MB)");
+            TensorAllocator.Counters.Reset();
         }
         // Rewind all cursors to 0 — arrays and tensors stay pooled.
         // NOTE: must snapshot the keys before mutating. On .NET Framework
@@ -862,6 +971,16 @@ public sealed class TensorArena : IDisposable
         {
             Array.Clear(_tensorRing, 0, _tensorRingCount);
             _tensorRingCount = 0;
+        }
+
+        // One arena lifetime has ended: advance the generation and drop whatever has not been
+        // touched for MaxIdleGenerations of them. Only a TOP-LEVEL arena counts as a lifetime — a
+        // nested arena disposing back into a live outer scope is part of the OUTER lifetime, and
+        // counting it would age the outer scope's own buckets out from under it.
+        if (_previous is null)
+        {
+            _arenaGeneration++;
+            PruneStaleCrossArenaBuckets();
         }
     }
 

@@ -1,4 +1,5 @@
 using System;
+using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -12,6 +13,7 @@ namespace AiDotNet.Tensors.Tests.Engines;
 // they produce numerically equivalent output. Shapes cover DCGAN's
 // generator stack (4×4 stride 2 padding 1, channels 512→256→128→64→3) and a
 // few small shapes to catch indexing edge cases.
+[Collection("BlasManaged-Perf-Serial")]
 public class ConvTranspose2DGemmCorrectnessTests
 {
     private static Tensor<double> MakeRandomTensor(int[] shape, int seed)
@@ -155,8 +157,10 @@ public class ConvTranspose2DGemmCorrectnessTests
     // tests in this same file (maxDiff < 1e-9); this test only asserts latency.
     [Trait("Category", "Performance")]
     [Fact]
-    public void DcganL2Shape_FatASmallNFastPath_BeatsOpenBlasBudget()
+    public async Task DcganL2Shape_FatASmallNFastPath_BeatsOpenBlasBudget()
     {
+        await Task.Yield();
+
         // Issue #358 phase-2 perf gate: the DCGAN L2 ConvTranspose2D shape
         // [B=1, Cin=512, 4, 4] → [Co=256, 8, 8] hits a documented MKL/OpenBLAS
         // perf cliff at M=4096, N=16, K=512, transA=true (215 ms OpenBLAS /

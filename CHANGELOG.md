@@ -1,5 +1,73 @@
 # Changelog
 
+## [0.129.8](https://github.com/ooples/AiDotNet.Tensors/compare/v0.129.7...v0.129.8) (2026-08-30)
+
+
+### Bug Fixes
+
+* **cpu:** preserve Conv2D parity without Windows regression ([#998](https://github.com/ooples/AiDotNet.Tensors/issues/998)) ([37260c3](https://github.com/ooples/AiDotNet.Tensors/commit/37260c33a1c5bcaa35d823dbc42396c3c3afecc8))
+* register the crash diagnostics dump at assembly load, not first use ([#999](https://github.com/ooples/AiDotNet.Tensors/issues/999)) ([b21aab5](https://github.com/ooples/AiDotNet.Tensors/commit/b21aab57a341d9f877383844102ee6f14b6558b1))
+
+## [0.129.7](https://github.com/ooples/AiDotNet.Tensors/compare/v0.129.6...v0.129.7) (2026-08-30)
+
+
+### Bug Fixes
+
+* gpu tape gaps, categorical residency, and non-power-of-two reductions ([#995](https://github.com/ooples/AiDotNet.Tensors/issues/995)) ([28a42f5](https://github.com/ooples/AiDotNet.Tensors/commit/28a42f5e901084dd5a48db0c17bf202c20e4dcf8))
+* mask the b loads in the n-tail direct gemm kernels ([#991](https://github.com/ooples/AiDotNet.Tensors/issues/991)) ([44c1ac1](https://github.com/ooples/AiDotNet.Tensors/commit/44c1ac147f2865c7242d4ac66503f1d75273ae7e))
+* mask the column tail in the 4-row block gemm kernels ([#993](https://github.com/ooples/AiDotNet.Tensors/issues/993)) ([4faaa5d](https://github.com/ooples/AiDotNet.Tensors/commit/4faaa5d9a0204647f552b46904d91bdaa358d9a4))
+* upload the sequence file crash evidence actually writes ([#997](https://github.com/ooples/AiDotNet.Tensors/issues/997)) ([a378851](https://github.com/ooples/AiDotNet.Tensors/commit/a3788514152fcfd742860392f7793b1fb3eb9fe5))
+
+## [0.129.6](https://github.com/ooples/AiDotNet.Tensors/compare/v0.129.5...v0.129.6) (2026-08-29)
+
+
+### Bug Fixes
+
+* reject gemm operands too small for their own strides ([#989](https://github.com/ooples/AiDotNet.Tensors/issues/989)) ([70bf7e2](https://github.com/ooples/AiDotNet.Tensors/commit/70bf7e2a3fac8717e617813a9b051dd0b54c1016))
+
+## [0.129.5](https://github.com/ooples/AiDotNet.Tensors/compare/v0.129.4...v0.129.5) (2026-08-28)
+
+
+### Bug Fixes
+
+* cut lossless streaming-encode peak from ~3.7n to ~1.7n ([#986](https://github.com/ooples/AiDotNet.Tensors/issues/986)) ([5101076](https://github.com/ooples/AiDotNet.Tensors/commit/510107653c027c4dec00b3f33d6b121b5855596f))
+* make conv2d and conv2dinto compute the same function for float ([#988](https://github.com/ooples/AiDotNet.Tensors/issues/988)) ([459539d](https://github.com/ooples/AiDotNet.Tensors/commit/459539da0adb60118fb0b49fb000db305b2cc014))
+
+## [0.129.4](https://github.com/ooples/AiDotNet.Tensors/compare/v0.129.3...v0.129.4) (2026-08-26)
+
+
+### Bug Fixes
+
+* make the arena allocation counters impossible to misread ([#984](https://github.com/ooples/AiDotNet.Tensors/issues/984)) ([4f71f71](https://github.com/ooples/AiDotNet.Tensors/commit/4f71f71f2ba707283ceb5f200515876093717547))
+
+
+### Performance
+
+* stop CloneDeepCopy staging through a full intermediate array ([#983](https://github.com/ooples/AiDotNet.Tensors/issues/983)) ([96e88a3](https://github.com/ooples/AiDotNet.Tensors/commit/96e88a3ab8d2c8f5e65d9fbf7f47cae26f928b85))
+
+## [0.129.3](https://github.com/ooples/AiDotNet.Tensors/compare/v0.129.2...v0.129.3) (2026-08-26)
+
+
+### Performance
+
+* **gpu:** stop uploading a tensor to the GPU just because it was registered ([#981](https://github.com/ooples/AiDotNet.Tensors/issues/981)) ([34a45d5](https://github.com/ooples/AiDotNet.Tensors/commit/34a45d5c578d198250eb184cc90d4bf37c1fbab0))
+
+## [0.129.2](https://github.com/ooples/AiDotNet.Tensors/compare/v0.129.1...v0.129.2) (2026-08-22)
+
+
+### Bug Fixes
+
+* **perf:** bound the buffer caches in aggregate, not just per bucket ([#979](https://github.com/ooples/AiDotNet.Tensors/issues/979)) ([0ce3bb7](https://github.com/ooples/AiDotNet.Tensors/commit/0ce3bb7d53a052a699b7130f68cb7a555488f940))
+
+## [0.129.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.129.0...v0.129.1) (2026-08-22)
+
+
+### Bug Fixes
+
+* **compilation:** capture custom fused training kernels ([#978](https://github.com/ooples/AiDotNet.Tensors/issues/978)) ([b761bdd](https://github.com/ooples/AiDotNet.Tensors/commit/b761bdd88734ed74a10dc232431b6f4e659599b0))
+* **compilation:** record RoPE dependencies in fused training ([#975](https://github.com/ooples/AiDotNet.Tensors/issues/975)) ([f592c46](https://github.com/ooples/AiDotNet.Tensors/commit/f592c46a9b6ea84571d1f865ed2eac74b5bd7094))
+* **directgpu:** break the infinite recursion in the TensorTanh CPU fallback ([#977](https://github.com/ooples/AiDotNet.Tensors/issues/977)) ([d40cfb5](https://github.com/ooples/AiDotNet.Tensors/commit/d40cfb5de5dd2f67e7fb8981fb435155a44a567a))
+
 ## [0.129.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.128.0...v0.129.0) (2026-08-21)
 
 

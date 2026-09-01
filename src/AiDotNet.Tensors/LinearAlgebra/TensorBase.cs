@@ -2658,10 +2658,25 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
         {
             _numOps.Copy(_data.AsSpan(), result._data.AsWritableSpan());
         }
+        else if (IsContiguous)
+        {
+            // Contiguous, but either offset into its storage or backed by a pool block longer than
+            // the logical length. Slice straight into the destination. This used to go through
+            // ToArray(), which allocates a SECOND full-length array purely to copy out of it again,
+            // so a deep clone cost 2x the tensor's own bytes. Pooled weights hit this path routinely
+            // (CloneShared already refuses to share them for the same _storage.Length != Length
+            // reason), which made it the common case rather than the exotic one.
+            _data.AsSpan().Slice(_storageOffset, Length)
+                 .CopyTo(result._data.AsWritableSpan().Slice(0, Length));
+        }
         else
         {
-            var srcArray = ToArray();
-            srcArray.AsSpan().CopyTo(result._data.AsWritableSpan());
+            // Genuinely strided view: walk the mapping into the destination, still without
+            // materialising an intermediate array.
+            var srcData = _data.AsSpan();
+            var dst = result._data.AsWritableSpan();
+            for (int i = 0; i < Length; i++)
+                dst[i] = srcData[FlatIndexToStorageIndex(i)];
         }
         return result;
     }

@@ -102,6 +102,66 @@ public class TensorArenaPersistentPoolTests
     /// sees exactly `cap` reuse hits (not all 65). Pins MaxPersistPerSize as the
     /// sole guard against unbounded per-size pool growth (CodeRabbit #767).
     /// </summary>
+    /// <summary>
+    /// MaxPersistPerSize bounds ONE bucket; it never bounded how many buckets a thread kept. The
+    /// key is an exact (type, element-count) pair, so a process that keeps meeting new shapes — a
+    /// model-family test class, a service hosting several models — accumulated a bucket per shape
+    /// and freed none of it until someone called ClearPersistentPool by hand. At up to 64 buffers of
+    /// >= PersistThresholdElems each, that is ~16 MB per shape held in Gen2.
+    ///
+    /// Observed downstream in AiDotNet: RecurrentGemma's finite-difference gradcheck runs in 11-13 s
+    /// in a clean process and blew its entire 120 s budget once 29 sibling model tests had filled
+    /// this pool on the same thread.
+    ///
+    /// Retention is now bounded by MaxIdleGenerations instead: a bucket nothing has rented or
+    /// returned for that many arena lifetimes is dropped.
+    /// </summary>
+    [Fact]
+    public void ManyDistinctShapes_RetentionStaysBounded()
+    {
+        TensorArena.ClearPersistentPool();
+
+        const int shapes = 40;
+        // Distinct element counts, each above PersistThresholdElems (64Ki) so every one is retained.
+        for (int i = 0; i < shapes; i++)
+        {
+            int[] shape = { (64 * 1024) + (i * 4096) };
+            using var arena = TensorArena.Create();
+            TensorAllocator.RentUninitialized<float>(shape).AsWritableSpan()[0] = i;
+        }
+
+        // Before the generation policy this was `shapes` buckets, all still resident. Each arena
+        // above is its own lifetime and never revisits an earlier shape, so every bucket goes stale
+        // within MaxIdleGenerations and only the most recent handful can survive.
+        Assert.InRange(TensorArena.CrossArenaBucketCount, 0, 4);
+        Assert.InRange(TensorArena.CrossArenaRetainedArrayCount, 0, 4);
+    }
+
+    /// <summary>
+    /// The other half of the contract: bounding retention must not cost the issue #478 win. A train
+    /// loop that rents the SAME shapes every step touches its bucket every generation, so it never
+    /// goes stale however long the loop runs, and reuse keeps hitting.
+    /// </summary>
+    [Fact]
+    public void SteadyStateSameShape_StillReusedAfterManyLifetimes()
+    {
+        TensorArena.ClearPersistentPool();
+        int[] shape = { 128 * 1024 };
+
+        // Cycle 1 populates the pool; cycles 2..N must each rent it straight back.
+        const int steps = 12;
+        for (int i = 0; i < steps; i++)
+        {
+            using var arena = TensorArena.Create();
+            TensorAllocator.RentUninitialized<float>(shape).AsWritableSpan()[0] = i;
+        }
+
+        // One hit per step after the first — the bucket is touched every generation, so
+        // MaxIdleGenerations never elapses for it.
+        Assert.Equal(steps - 1, TensorArena.PersistentReuseHits);
+        Assert.Equal(1, TensorArena.CrossArenaBucketCount);
+    }
+
     [Fact]
     public void SameSizeBuffers_BeyondCap_RetentionIsCapped()
     {

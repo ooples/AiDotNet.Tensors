@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -60,6 +61,28 @@ public partial class CpuEngine
         EnsureSameShape(value, inpGate, nameof(inpGate));
         if (decay.Length != recDim)
             throw new ArgumentException($"decay length ({decay.Length}) must equal recDim ({recDim}).", nameof(decay));
+
+        if (GraphMode.IsActive && GraphMode.Current is { } scope)
+        {
+            scope.BindEngineIfUnset(this);
+            var capturedValue = value;
+            var capturedRecGate = recGate;
+            var capturedInpGate = inpGate;
+            var capturedDecay = decay;
+            return scope.RecordVariadic(
+                LazyNodeType.Custom,
+                "RgLruScan",
+                new[] { value, recGate, inpGate, decay },
+                new[] { batch, seqLen, recDim },
+                (eng, output) =>
+                {
+                    var result = eng.RgLruScanForward(
+                        capturedValue, capturedRecGate, capturedInpGate, capturedDecay);
+                    DirectGpuTensorEngine.CopyResultInto(eng, result, output);
+                },
+                RgLruScanBackward<T>,
+                null);
+        }
 
         var output = new Tensor<T>(new[] { batch, seqLen, recDim });
 

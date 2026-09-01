@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 
@@ -19,6 +20,31 @@ public partial class CpuEngine
     {
         ValidateMesaScan(q, k, v, initialWeights, regularization, numHeads,
             out int batch, out int time, out int model, out int headDim);
+
+        if (GraphMode.IsActive && GraphMode.Current is { } scope)
+        {
+            scope.BindEngineIfUnset(this);
+            var capturedQ = q;
+            var capturedK = k;
+            var capturedV = v;
+            var capturedInitialWeights = initialWeights;
+            T capturedRegularization = regularization;
+            int capturedNumHeads = numHeads;
+            return scope.RecordVariadic(
+                LazyNodeType.Custom,
+                "MesaScanForward",
+                new[] { q, k, v, initialWeights },
+                new[] { batch, time, model },
+                (eng, output) =>
+                {
+                    var result = eng.MesaScanForward(
+                        capturedQ, capturedK, capturedV, capturedInitialWeights,
+                        capturedRegularization, capturedNumHeads);
+                    DirectGpuTensorEngine.CopyResultInto(eng, result, output);
+                },
+                MesaScanBackward<T>,
+                new object[] { regularization!, numHeads });
+        }
 
         var output = new Tensor<T>(new[] { batch, time, model });
         if (typeof(T) == typeof(float))

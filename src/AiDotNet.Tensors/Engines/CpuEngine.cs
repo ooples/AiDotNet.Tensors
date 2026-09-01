@@ -1,4 +1,4 @@
-#pragma warning disable CS0618 // SimdGemm.Sgemm/Dgemm (no-trans shims) are [Obsolete] — internal call sites pending migration to BlasManaged.Gemm<T> in later K tasks.
+﻿#pragma warning disable CS0618 // SimdGemm.Sgemm/Dgemm (no-trans shims) are [Obsolete] — internal call sites pending migration to BlasManaged.Gemm<T> in later K tasks.
 using System;
 using System.Buffers;
 using System.Runtime.CompilerServices;
@@ -9495,16 +9495,23 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var result = TensorAllocator.Rent<T>(new[] { batch, outChannels, outputHeight, outputWidth });
 
-        // Use im2col + GEMM for float (significantly faster)
+        // Every float/NCHW entry point must select the same numeric kernel for a given
+        // platform and geometry. Overload choice and gradient recording are deliberately
+        // absent from the selector because neither may change the computed function.
         if (typeof(T) == typeof(float))
         {
-            Conv2DWithIm2ColFloat(
-                input as Tensor<float> ?? throw new InvalidCastException(),
-                kernel as Tensor<float> ?? throw new InvalidCastException(),
-                result as Tensor<float> ?? throw new InvalidCastException(),
+            // The dispatcher obtains backing arrays only if it selects im2col-GEMM. Keeping that
+            // lookup lazy matters for offset views on the Windows adaptive route: a read-only array
+            // request would materialize an otherwise-unneeded full copy. When arrays are needed,
+            // GetReadOnlyDataArray preserves COW sharing for both inputs.
+            DispatchFloatConv2D(
+                (Tensor<float>)(object)input,
+                (Tensor<float>)(object)kernel,
+                (Tensor<float>)(object)result,
+                null, null, null,
                 batch, inChannels, height, width,
                 outChannels, kernelHeight, kernelWidth,
-                stride, padding, dilation,
+                stride, stride, padding, padding, dilation, dilation,
                 outputHeight, outputWidth);
             DifferentiableOps.RecordBinary("Conv2D", result, inputOrig, kernel,
                 BackwardFunctions<T>.Conv2DBackward, new object[] { new[] { stride, stride }, new[] { padding, padding }, new[] { dilation, dilation } });
@@ -9723,25 +9730,19 @@ public partial class CpuEngine : ITensorLevelEngine
                 $"Output tensor shape [{string.Join(", ", output._shape)}] doesn't match expected shape [{batch}, {outChannels}, {outputHeight}, {outputWidth}].");
         }
 
-        // Use im2col + GEMM for float. Route through Conv2DIm2colGemm — the same
-        // maintained fast path the int[] Conv2DInto / allocating Conv2D(int[])
-        // overloads use — rather than Conv2DWithIm2ColFloat (the SIMD-direct /
-        // Winograd cascade). For the small 3×3 stride-1 convs that dominate CNN
-        // inference the direct cascade is ~15× slower than im2col-GEMM (measured:
-        // a 16→32 @14×14 conv at 1967 µs via this overload vs 117 µs via the int[]
-        // overload), so the int and int[] overloads were silently making opposite
-        // kernel choices. Output is numerically equivalent (im2col-GEMM vs direct
-        // differ only by FP summation order).
+        // Use the same platform/geometry dispatcher as both allocating overloads so
+        // a preallocated destination changes allocation behavior only, never arithmetic.
         if (typeof(T) == typeof(float))
         {
-            Conv2DIm2colGemm(
-                (float[])(object)input.GetDataArray(),
-                (float[])(object)kernel.GetDataArray(),
-                (float[])(object)output.GetDataArray(),
+            DispatchFloatConv2D(
+                (Tensor<float>)(object)input,
+                (Tensor<float>)(object)kernel,
+                (Tensor<float>)(object)output,
+                null, null, null,
                 batch, inChannels, height, width,
                 outChannels, kernelHeight, kernelWidth,
-                outputHeight, outputWidth,
-                stride, stride, padding, padding, dilation, dilation);
+                stride, stride, padding, padding, dilation, dilation,
+                outputHeight, outputWidth);
             return;
         }
 
@@ -9823,6 +9824,100 @@ public partial class CpuEngine : ITensorLevelEngine
             outChannels, kernelHeight, kernelWidth,
             stride, padding, dilation,
             outputHeight, outputWidth);
+    }
+
+    private static readonly bool IsWindowsPlatform =
+        System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
+            System.Runtime.InteropServices.OSPlatform.Windows);
+
+    /// <summary>
+    /// Selects one float convolution family for every public CPU entry point.
+    /// The adaptive cascade is materially faster on Windows, while im2col-GEMM is the
+    /// measured winner on Linux. Geometry and layout, never overload or gradient mode,
+    /// determine the family so equivalent calls remain bit-identical.
+    /// </summary>
+    private static bool ShouldUseAdaptiveFloatConv2D(
+        LinearAlgebra.TensorLayout inputLayout,
+        int strideH,
+        int strideW,
+        int padH,
+        int padW,
+        int dilationH,
+        int dilationW)
+    {
+        return ShouldUseAdaptiveFloatConv2DForPlatform(
+            IsWindowsPlatform, inputLayout, strideH, strideW, padH, padW, dilationH, dilationW);
+    }
+
+    /// <summary>
+    /// Applies the platform and geometry policy separately from runtime OS detection so every
+    /// decision branch can be tested deterministically on every CI host.
+    /// </summary>
+    internal static bool ShouldUseAdaptiveFloatConv2DForPlatform(
+        bool isWindows,
+        LinearAlgebra.TensorLayout inputLayout,
+        int strideH,
+        int strideW,
+        int padH,
+        int padW,
+        int dilationH,
+        int dilationW)
+    {
+        return isWindows
+            && inputLayout == LinearAlgebra.TensorLayout.Nchw
+            && strideH == strideW
+            && padH == padW
+            && dilationH == dilationW;
+    }
+
+    /// <summary>
+    /// Dispatches every float Conv2D entry point through the same platform/geometry policy.
+    /// The supplied arrays may already be unpacked for a packed-layout fallback.
+    /// </summary>
+    private void DispatchFloatConv2D(
+        Tensor<float> input,
+        Tensor<float> kernel,
+        Tensor<float> output,
+        float[]? inputData,
+        float[]? kernelData,
+        float[]? outputData,
+        int batch,
+        int inChannels,
+        int height,
+        int width,
+        int outChannels,
+        int kernelHeight,
+        int kernelWidth,
+        int strideH,
+        int strideW,
+        int padH,
+        int padW,
+        int dilationH,
+        int dilationW,
+        int outputHeight,
+        int outputWidth)
+    {
+        if (ShouldUseAdaptiveFloatConv2D(
+            input.Layout, strideH, strideW, padH, padW, dilationH, dilationW))
+        {
+            Conv2DWithIm2ColFloat(
+                input, kernel, output,
+                batch, inChannels, height, width,
+                outChannels, kernelHeight, kernelWidth,
+                strideH, padH, dilationH,
+                outputHeight, outputWidth);
+            return;
+        }
+
+        inputData ??= input.GetReadOnlyDataArray();
+        kernelData ??= kernel.GetReadOnlyDataArray();
+        outputData ??= output.GetDataArray();
+        Conv2DIm2colGemm(
+            inputData, kernelData, outputData,
+            batch, inChannels, height, width,
+            outChannels, kernelHeight, kernelWidth,
+            outputHeight, outputWidth,
+            strideH, strideW, padH, padW, dilationH, dilationW);
     }
 
     /// <summary>
@@ -13762,14 +13857,17 @@ public partial class CpuEngine : ITensorLevelEngine
                     batch, inChannels, height, width, cBlock);
                 inputData = (T[])(object)unpackedData;
             }
-            Conv2DIm2colGemm(
+            DispatchFloatConv2D(
+                (Tensor<float>)(object)input,
+                (Tensor<float>)(object)kernel,
+                (Tensor<float>)(object)result,
                 (float[])(object)inputData,
                 (float[])(object)kernelData,
                 (float[])(object)outputData,
                 batch, inChannels, height, width,
                 outChannels, kernelHeight, kernelWidth,
-                outputHeight, outputWidth,
-                strideH, strideW, padH, padW, dilationH, dilationW);
+                strideH, strideW, padH, padW, dilationH, dilationW,
+                outputHeight, outputWidth);
         }
         else if (typeof(T) == typeof(double))
         {
@@ -15522,6 +15620,12 @@ public partial class CpuEngine : ITensorLevelEngine
         if (gradOutput._shape[1] != kernelShape[0]) throw new ArgumentException($"gradOutput outChannels ({gradOutput._shape[1]}) must match kernelShape outChannels ({kernelShape[0]})");
         if (input._shape[1] != kernelShape[1]) throw new ArgumentException($"input inChannels ({input._shape[1]}) must match kernelShape inChannels ({kernelShape[1]})");
 
+        // gradOutput's spatial size is a function of the forward geometry, not a free
+        // parameter. Without this the op accepted an impossible request and returned garbage.
+        ConvBackwardShapeGuard.ValidateGradOutputSpatial(
+            "Conv2DBackwardKernel", gradOutput._shape, input._shape, kernelShape,
+            stride, padding, dilation, spatialRank: 2);
+
         var numOps = MathHelper.GetNumericOperations<T>();
 
         int batch = input._shape[0];
@@ -16559,6 +16663,15 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
 
+        // gradOutput's spatial size is a FUNCTION of inputShape, poolSize and stride, and
+        // was previously read straight off gradOutput and trusted. An inconsistent one made
+        // the window walk `oh * stride + ph` past the end of the input and throw
+        // IndexOutOfRangeException from inside a parallel loop -- an unvalidated precondition
+        // reported as an internal error instead of a bad argument.
+        ConvBackwardShapeGuard.ValidateGradOutputSpatial(
+            "MaxPool2DBackward", gradOutput._shape, inputShape, poolSize,
+            stride, null, null, spatialRank: 2);
+
         var numOps = MathHelper.GetNumericOperations<T>();
 
         int batch = inputShape[0];
@@ -16781,6 +16894,15 @@ public partial class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> AvgPool2DBackward<T>(Tensor<T> gradOutput, int[] inputShape, int[] poolSize, int[] stride)
     {
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
+
+        // gradOutput's spatial size is a FUNCTION of inputShape, poolSize and stride, and
+        // was previously read straight off gradOutput and trusted. An inconsistent one made
+        // the window walk `oh * stride + ph` past the end of the input and throw
+        // IndexOutOfRangeException from inside a parallel loop -- an unvalidated precondition
+        // reported as an internal error instead of a bad argument.
+        ConvBackwardShapeGuard.ValidateGradOutputSpatial(
+            "AvgPool2DBackward", gradOutput._shape, inputShape, poolSize,
+            stride, null, null, spatialRank: 2);
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
@@ -17765,6 +17887,62 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> ConvTranspose2DBackwardInput<T>(Tensor<T> gradOutput, Tensor<T> kernel, int[] inputShape, int[] stride, int[] padding)
     {
+        if (gradOutput is null) throw new ArgumentNullException(nameof(gradOutput));
+        if (kernel is null) throw new ArgumentNullException(nameof(kernel));
+
+        // CHECKED UP FRONT, AND AS AN ARGUMENT ERROR. This used to run the whole Conv2D and only
+        // then compare shapes, throwing InvalidOperationException — which reports a caller's bad
+        // argument as an internal fault, after paying for the convolution to discover it. The
+        // relation is the standard one read backwards: ConvTranspose's forward makes gradOutput from
+        // inputShape, so a Conv2D over gradOutput must land back on inputShape.
+        if (stride is null) throw new ArgumentNullException(nameof(stride));
+        if (padding is null) throw new ArgumentNullException(nameof(padding));
+        if (inputShape is null) throw new ArgumentNullException(nameof(inputShape));
+
+        if (stride.Length >= 2 && padding.Length >= 2
+            && gradOutput.Rank == 4 && kernel.Rank == 4 && inputShape.Length == 4)
+        {
+            for (int axis = 0; axis < 2; axis++)
+            {
+                if (stride[axis] <= 0) break;
+
+                // THE DIVISION MUST BE EXACT HERE, unlike the forward direction. A forward
+                // convolution genuinely floors — several input extents map to the same output — but
+                // this runs the relation BACKWARDS to recover the transposed input, and floor
+                // division silently accepts a gradOutput that no forward pass could have produced.
+                // Concretely: gradOutput 6, kernel 3, stride 2, padding 0 truncates to 2 and matches
+                // an inputShape of 2, yet the transposed forward for input 2 produces 5, not 6. The
+                // convolution downstream then drops the trailing gradient position and returns a
+                // wrong input gradient — which is exactly the silent-garbage outcome this check
+                // exists to prevent.
+                int numerator =
+                    gradOutput._shape[2 + axis] + 2 * padding[axis] - kernel._shape[2 + axis];
+
+                if (numerator < 0 || numerator % stride[axis] != 0)
+                {
+                    throw new ArgumentException(
+                        $"ConvTranspose2DBackwardInput: gradOutput spatial axis {axis} is "
+                            + $"{gradOutput._shape[2 + axis]}, which does not invert to a whole input "
+                            + $"extent for kernel {kernel._shape[2 + axis]}, stride {stride[axis]} and "
+                            + $"padding {padding[axis]} (leftover {numerator} over stride "
+                            + $"{stride[axis]}). No transposed forward pass produces that size.",
+                        nameof(gradOutput));
+                }
+
+                int expected = numerator / stride[axis] + 1;
+
+                if (expected != inputShape[2 + axis])
+                {
+                    throw new ArgumentException(
+                        $"ConvTranspose2DBackwardInput: gradOutput spatial axis {axis} is "
+                            + $"{gradOutput._shape[2 + axis]}, which convolves back to {expected}, "
+                            + $"but inputShape says {inputShape[2 + axis]}. gradOutput's spatial size "
+                            + "is fixed by inputShape, the kernel, the stride and the padding.",
+                        nameof(gradOutput));
+                }
+            }
+        }
+
         // ConvTranspose2D backward w.r.t. input is equivalent to Conv2D forward
         // Note: This implementation assumes unit dilation. For non-unit dilation, the gradient requires
         // more complex handling (e.g., dilated convolution with flipped kernel).
@@ -18297,6 +18475,17 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (groups == 1 && deformGroups == 1)
             return DeformableConv2DBackwardInput(gradOutput, input, kernel, offset, mask, inputShape, stride, padding, dilation);
+        // gradOutput's spatial size is determined by the forward geometry; reading it off
+        // gradOutput and trusting it let the sampling loop index past the input.
+        // Null-checked BEFORE the shape guard, which dereferences these. Without it a null
+        // operand produced NullReferenceException instead of the documented argument error.
+        if (gradOutput is null) throw new ArgumentNullException(nameof(gradOutput));
+        if (kernel is null) throw new ArgumentNullException(nameof(kernel));
+
+        ConvBackwardShapeGuard.ValidateGradOutputSpatial(
+            "DeformableConv2DGroupedBackwardInput", gradOutput._shape, inputShape, kernel._shape,
+            stride, padding, dilation, spatialRank: 2);
+
         var numOps = MathHelper.GetNumericOperations<T>();
         int batch = inputShape[0], inChannels = inputShape[1], height = inputShape[2], width = inputShape[3];
         int outChannels = kernel._shape[0], kernelHeight = kernel._shape[2], kernelWidth = kernel._shape[3];
@@ -18446,6 +18635,18 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (groups == 1 && deformGroups == 1)
             return DeformableConv2DBackwardOffset(gradOutput, input, kernel, offset, mask, stride, padding, dilation);
+        // gradOutput's spatial size is determined by the forward geometry; reading it off
+        // gradOutput and trusting it let the sampling loop index past the input.
+        // Null-checked BEFORE the shape guard, which dereferences these. Without it a null
+        // operand produced NullReferenceException instead of the documented argument error.
+        if (gradOutput is null) throw new ArgumentNullException(nameof(gradOutput));
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (kernel is null) throw new ArgumentNullException(nameof(kernel));
+
+        ConvBackwardShapeGuard.ValidateGradOutputSpatial(
+            "DeformableConv2DGroupedBackwardOffset", gradOutput._shape, input._shape, kernel._shape,
+            stride, padding, dilation, spatialRank: 2);
+
         var numOps = MathHelper.GetNumericOperations<T>();
         int batch = input._shape[0], inChannels = input._shape[1], height = input._shape[2], width = input._shape[3];
         int outChannels = kernel._shape[0], kernelHeight = kernel._shape[2], kernelWidth = kernel._shape[3];
@@ -18525,6 +18726,18 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (groups == 1 && deformGroups == 1)
             return DeformableConv2DBackwardMask(gradOutput, input, kernel, offset, mask, stride, padding, dilation);
+        // gradOutput's spatial size is determined by the forward geometry; reading it off
+        // gradOutput and trusting it let the sampling loop index past the input.
+        // Null-checked BEFORE the shape guard, which dereferences these. Without it a null
+        // operand produced NullReferenceException instead of the documented argument error.
+        if (gradOutput is null) throw new ArgumentNullException(nameof(gradOutput));
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (kernel is null) throw new ArgumentNullException(nameof(kernel));
+
+        ConvBackwardShapeGuard.ValidateGradOutputSpatial(
+            "DeformableConv2DGroupedBackwardMask", gradOutput._shape, input._shape, kernel._shape,
+            stride, padding, dilation, spatialRank: 2);
+
         var numOps = MathHelper.GetNumericOperations<T>();
         int batch = input._shape[0], inChannels = input._shape[1], height = input._shape[2], width = input._shape[3];
         int outChannels = kernel._shape[0], kernelHeight = kernel._shape[2], kernelWidth = kernel._shape[3];
@@ -18718,6 +18931,19 @@ public partial class CpuEngine : ITensorLevelEngine
         int[] dilation)
     {
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
+
+        // gradOutput's spatial size is determined by input/kernel/stride/padding/dilation.
+        // Without this the sampling loop indexed the input at a position the geometry never
+        // produces and threw IndexOutOfRangeException -- an unvalidated precondition surfacing
+        // as an internal error rather than a bad argument.
+        // Null-checked BEFORE the shape guard, which dereferences these. Without it a null
+        // operand produced NullReferenceException instead of the documented argument error.
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (kernel is null) throw new ArgumentNullException(nameof(kernel));
+
+        ConvBackwardShapeGuard.ValidateGradOutputSpatial(
+            "DeformableConv2DBackwardInput", gradOutput._shape, input._shape, kernel._shape,
+            stride, padding, dilation, spatialRank: 2);
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (kernel == null) throw new ArgumentNullException(nameof(kernel));
         if (offset == null) throw new ArgumentNullException(nameof(offset));
@@ -19103,6 +19329,19 @@ public partial class CpuEngine : ITensorLevelEngine
         int[] dilation)
     {
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
+
+        // gradOutput's spatial size is determined by input/kernel/stride/padding/dilation.
+        // Without this the sampling loop indexed the input at a position the geometry never
+        // produces and threw IndexOutOfRangeException -- an unvalidated precondition surfacing
+        // as an internal error rather than a bad argument.
+        // Null-checked BEFORE the shape guard, which dereferences these. Without it a null
+        // operand produced NullReferenceException instead of the documented argument error.
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (kernel is null) throw new ArgumentNullException(nameof(kernel));
+
+        ConvBackwardShapeGuard.ValidateGradOutputSpatial(
+            "DeformableConv2DBackwardOffset", gradOutput._shape, input._shape, kernel._shape,
+            stride, padding, dilation, spatialRank: 2);
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (kernel == null) throw new ArgumentNullException(nameof(kernel));
         if (offset == null) throw new ArgumentNullException(nameof(offset));
@@ -19528,6 +19767,19 @@ public partial class CpuEngine : ITensorLevelEngine
         int[] dilation)
     {
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
+
+        // gradOutput's spatial size is determined by input/kernel/stride/padding/dilation.
+        // Without this the sampling loop indexed the input at a position the geometry never
+        // produces and threw IndexOutOfRangeException -- an unvalidated precondition surfacing
+        // as an internal error rather than a bad argument.
+        // Null-checked BEFORE the shape guard, which dereferences these. Without it a null
+        // operand produced NullReferenceException instead of the documented argument error.
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (kernel is null) throw new ArgumentNullException(nameof(kernel));
+
+        ConvBackwardShapeGuard.ValidateGradOutputSpatial(
+            "DeformableConv2DBackwardMask", gradOutput._shape, input._shape, kernel._shape,
+            stride, padding, dilation, spatialRank: 2);
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (kernel == null) throw new ArgumentNullException(nameof(kernel));
         if (offset == null) throw new ArgumentNullException(nameof(offset));
@@ -21170,6 +21422,15 @@ public partial class CpuEngine : ITensorLevelEngine
     public Tensor<T> MaxPool3DBackward<T>(Tensor<T> gradOutput, int[,,,,,] maxIndices, int[] inputShape, int[] poolSize, int[] stride)
     {
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
+
+        // gradOutput's spatial size is a FUNCTION of inputShape, poolSize and stride, and
+        // was previously read straight off gradOutput and trusted. An inconsistent one made
+        // the window walk `oh * stride + ph` past the end of the input and throw
+        // IndexOutOfRangeException from inside a parallel loop -- an unvalidated precondition
+        // reported as an internal error instead of a bad argument.
+        ConvBackwardShapeGuard.ValidateGradOutputSpatial(
+            "MaxPool3DBackward", gradOutput._shape, inputShape, poolSize,
+            stride, null, null, spatialRank: 3);
         if (maxIndices == null) throw new ArgumentNullException(nameof(maxIndices));
         if (inputShape == null || inputShape.Length != 5) throw new ArgumentException("Input shape must be array of 5 elements [batch, channels, depth, height, width].", nameof(inputShape));
 
@@ -21408,6 +21669,15 @@ public partial class CpuEngine : ITensorLevelEngine
     public Tensor<T> AvgPool3DBackward<T>(Tensor<T> gradOutput, int[] inputShape, int[] poolSize, int[] stride, int[] padding)
     {
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
+
+        // gradOutput's spatial size is a FUNCTION of inputShape, poolSize and stride, and
+        // was previously read straight off gradOutput and trusted. An inconsistent one made
+        // the window walk `oh * stride + ph` past the end of the input and throw
+        // IndexOutOfRangeException from inside a parallel loop -- an unvalidated precondition
+        // reported as an internal error instead of a bad argument.
+        ConvBackwardShapeGuard.ValidateGradOutputSpatial(
+            "AvgPool3DBackward", gradOutput._shape, inputShape, poolSize,
+            stride, padding, null, spatialRank: 3);
         if (inputShape == null || inputShape.Length != 5) throw new ArgumentException("Input shape must be array of 5 elements [batch, channels, depth, height, width].", nameof(inputShape));
         if (poolSize == null || poolSize.Length != 3) throw new ArgumentException("Pool size must be array of 3 elements.", nameof(poolSize));
         if (stride == null || stride.Length != 3) throw new ArgumentException("Stride must be array of 3 elements.", nameof(stride));
@@ -22903,7 +23173,20 @@ public partial class CpuEngine : ITensorLevelEngine
         int innerSize = 1;
         for (int i = 0; i < normalizedAxis; i++) outerSize = checked(outerSize * probabilities.Shape[i]);
         for (int i = normalizedAxis + 1; i < rank; i++) innerSize = checked(innerSize * probabilities.Shape[i]);
-        Random random = seed.HasValue ? new Random(seed.Value) : RandomHelper.ThreadSafeRandom;
+        // SEEDED DRAWS COME FROM THE SHARED STATELESS RNG, not System.Random. Every other seeded
+        // random op here keys StatelessRandom on (seed, element index) -- a counter-based PCG hash
+        // that the CUDA, Metal and OpenCL kernels reproduce constant-for-constant, which is what
+        // lets those ops run on the device AND still match the CPU bit for bit.
+        //
+        // System.Random cannot be reproduced in a kernel, so this op alone had no device-side
+        // implementation available to it: every GPU backend without a bespoke categorical kernel
+        // fell back to the CPU, silently, after the caller had selected the GPU engine. Keying the
+        // draw on the ROW index rather than on draw order is the part that matters -- a parallel
+        // kernel computes any row's uniform without replaying the ones before it.
+        //
+        // The seeded sequence changes as a result. The contract is reproducibility, which is kept:
+        // the same seed still yields the same sample, and the existing tests assert that plus
+        // one-hot-ness rather than any particular draw.
 
         for (int outer = 0; outer < outerSize; outer++)
         {
@@ -22922,7 +23205,11 @@ public partial class CpuEngine : ITensorLevelEngine
                 if (!(sum > 0d) || double.IsNaN(sum) || double.IsInfinity(sum))
                     throw new ArgumentException(
                         "Every categorical slice must have a finite positive sum.", nameof(probabilities));
-                double target = random.NextDouble() * sum;
+                int row = outer * innerSize + inner;
+                double uniform = seed.HasValue
+                    ? StatelessRandom.Uniform01(unchecked((uint)seed.Value), unchecked((uint)row))
+                    : RandomHelper.ThreadSafeRandom.NextDouble();
+                double target = uniform * sum;
                 double cumulative = 0d;
                 int selected = classes - 1;
                 for (int category = 0; category < classes; category++)
@@ -30607,6 +30894,21 @@ public partial class CpuEngine : ITensorLevelEngine
         bool concatenate,
         out Tensor<T> attentionCoeffs)
     {
+        if (nodeFeatures is null) throw new ArgumentNullException(nameof(nodeFeatures));
+        if (edgeSourceIndices is null) throw new ArgumentNullException(nameof(edgeSourceIndices));
+        if (edgeTargetIndices is null) throw new ArgumentNullException(nameof(edgeTargetIndices));
+        if (headWeights is null) throw new ArgumentNullException(nameof(headWeights));
+        if (attentionWeightsSource is null) throw new ArgumentNullException(nameof(attentionWeightsSource));
+        if (attentionWeightsTarget is null) throw new ArgumentNullException(nameof(attentionWeightsTarget));
+        if (nodeFeatures.Rank != 3)
+            throw new ArgumentException(
+                $"MultiHeadGraphAttention requires 3-D nodeFeatures [batch, nodes, features]. Got rank {nodeFeatures.Rank}.",
+                nameof(nodeFeatures));
+        if (headWeights.Rank != 3)
+            throw new ArgumentException(
+                $"MultiHeadGraphAttention requires 3-D headWeights [heads, inFeatures, headDim]. Got rank {headWeights.Rank}.",
+                nameof(headWeights));
+
         var numOps = MathHelper.GetNumericOperations<T>();
 
         int batchSize = nodeFeatures._shape[0];
@@ -30615,6 +30917,43 @@ public partial class CpuEngine : ITensorLevelEngine
         int numHeads = headWeights._shape[0];
         int headDim = headWeights._shape[2];
         int numEdges = edgeSourceIndices._shape[0];
+
+        // The projection reads headWeights as [head, inFeature, headDim] while walking node features
+        // by inFeatures, so a headWeights whose middle axis disagrees indexes past the weight span —
+        // reported as IndexOutOfRangeException from deep inside the loop rather than as the shape
+        // mismatch it is. None of these agreements was checked.
+        if (headWeights._shape[1] != inFeatures)
+        {
+            throw new ArgumentException(
+                $"MultiHeadGraphAttention: headWeights has {headWeights._shape[1]} input features but "
+                    + $"nodeFeatures has {inFeatures}. The projection contracts one against the other.",
+                nameof(headWeights));
+        }
+
+        long attentionPerHead = (long)numHeads * headDim;
+        if (attentionWeightsSource.Length < attentionPerHead)
+        {
+            throw new ArgumentException(
+                $"MultiHeadGraphAttention: attentionWeightsSource has {attentionWeightsSource.Length} "
+                    + $"elements but {attentionPerHead} are addressed ({numHeads} heads x {headDim}).",
+                nameof(attentionWeightsSource));
+        }
+
+        if (attentionWeightsTarget.Length < attentionPerHead)
+        {
+            throw new ArgumentException(
+                $"MultiHeadGraphAttention: attentionWeightsTarget has {attentionWeightsTarget.Length} "
+                    + $"elements but {attentionPerHead} are addressed ({numHeads} heads x {headDim}).",
+                nameof(attentionWeightsTarget));
+        }
+
+        if (edgeTargetIndices.Length != edgeSourceIndices.Length)
+        {
+            throw new ArgumentException(
+                $"MultiHeadGraphAttention: {edgeSourceIndices.Length} source indices against "
+                    + $"{edgeTargetIndices.Length} target indices. Edges are pairs.",
+                nameof(edgeTargetIndices));
+        }
 
         var nodeData = nodeFeatures.AsSpan();
         var weightData = headWeights.AsSpan();
@@ -30841,6 +31180,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         int srcDimSize = sourceShape[actualDim];
         int outDimSize = gradOutput._shape[actualDim];
+
 
         // Gather gradients back
         for (int outer = 0; outer < outerSize; outer++)
@@ -31082,6 +31422,7 @@ public partial class CpuEngine : ITensorLevelEngine
         int srcDimSize = sourceShape[actualDim];
         int outDimSize = gradOutput._shape[actualDim];
 
+
         for (int outer = 0; outer < outerSize; outer++)
         {
             for (int d = 0; d < srcDimSize; d++)
@@ -31213,6 +31554,29 @@ public partial class CpuEngine : ITensorLevelEngine
 
         int srcDimSize = sourceShape[actualDim];
         int outDimSize = gradOutput._shape[actualDim];
+
+        // dstIdx below is built from sourceShape's outer/inner extents and gradOutput's scattered
+        // dimension, then used to index BOTH the index tensor and gradOutput. Neither was checked to
+        // cover it, so a gradOutput disagreeing with sourceShape walked off the end of one of them
+        // and threw IndexOutOfRangeException instead of reporting a bad argument.
+        long addressed = (long)outerSize * outDimSize * innerSize;
+        if (gradOutput.Length < addressed)
+        {
+            throw new ArgumentException(
+                $"ScatterMaxBackward: gradOutput has {gradOutput.Length} elements but the scatter addresses "
+                    + $"{addressed} (outer {outerSize} x dim {outDimSize} x inner {innerSize}, from "
+                    + "sourceShape). gradOutput must agree with sourceShape on every axis except the "
+                    + "scattered one.",
+                nameof(gradOutput));
+        }
+
+        if (argmax.Length < addressed)
+        {
+            throw new ArgumentException(
+                $"ScatterMaxBackward: argmax has {argmax.Length} entries but {addressed} are addressed; it carries one "
+                    + "source index per gradOutput element.",
+                nameof(argmax));
+        }
 
         // Route gradients to argmax positions
         for (int outer = 0; outer < outerSize; outer++)
@@ -42899,6 +43263,22 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> DropoutBackward<T>(Tensor<T> gradOutput, Tensor<T> mask, double dropoutRate)
     {
+        if (gradOutput is null) throw new ArgumentNullException(nameof(gradOutput));
+        if (mask is null) throw new ArgumentNullException(nameof(mask));
+
+        // The loop below walks gradOutput.Length and indexes maskData with the same counter, so a
+        // shorter mask reads past its end and throws IndexOutOfRangeException from inside the
+        // multiply. The mask is the dropout pattern for THIS gradient: equal element count is not an
+        // optimisation detail, it is what makes the operation meaningful. There were no argument
+        // checks here at all.
+        if (mask.Length != gradOutput.Length)
+        {
+            throw new ArgumentException(
+                $"DropoutBackward: mask has {mask.Length} elements but gradOutput has "
+                    + $"{gradOutput.Length}. The mask must cover exactly the gradient it gates.",
+                nameof(mask));
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradData = gradOutput.GetFlattenedData();
         var maskData = mask.GetDataArray();

@@ -17,6 +17,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 /// </summary>
 internal sealed class PtxSplitComplexPhaseF32Kernel : IDisposable
 {
+    private const int MaxRegistersPerThreadLimit = 24;
+
     internal const int DefaultBlockThreads = 256;
     internal const string EntryPoint = "aidotnet_split_complex_phase_f32";
 
@@ -105,55 +107,60 @@ internal sealed class PtxSplitComplexPhaseF32Kernel : IDisposable
         ptx.AppendLine("    .param .u64 out_ptr");
         ptx.AppendLine(")");
         ptx.AppendLine($".maxntid {blockThreads}, 1, 1");
+        ptx.AppendLine($".maxnreg {MaxRegistersPerThreadLimit}");
         ptx.AppendLine("{");
-        ptx.AppendLine("    .reg .pred %p<6>;");
-        ptx.AppendLine("    .reg .b32 %r<3>;");
-        ptx.AppendLine("    .reg .b64 %rd<10>;");
-        ptx.AppendLine("    .reg .f32 %f<24>;");
-        ptx.AppendLine("    ld.param.u64 %rd0, [in_real_ptr];");
-        ptx.AppendLine("    ld.param.u64 %rd1, [in_imag_ptr];");
-        ptx.AppendLine("    ld.param.u64 %rd2, [out_ptr];");
+        ptx.AppendLine("    .reg .pred %p<3>;");
+        ptx.AppendLine("    .reg .b32 %r<2>;");
+        ptx.AppendLine("    .reg .b64 %rd<2>;");
+        ptx.AppendLine("    .reg .f32 %f<6>;");
         ptx.AppendLine("    mov.u32 %r0, %tid.x;");
         ptx.AppendLine("    mov.u32 %r1, %ctaid.x;");
-        ptx.AppendLine($"    mad.lo.u32 %r2, %r1, {blockThreads}, %r0;");
-        ptx.AppendLine("    mul.wide.u32 %rd3, %r2, 4;");
-        ptx.AppendLine("    add.u64 %rd4, %rd0, %rd3;");
-        ptx.AppendLine("    add.u64 %rd5, %rd1, %rd3;");
-        ptx.AppendLine("    ld.global.nc.f32 %f0, [%rd4];");   // re
-        ptx.AppendLine("    ld.global.nc.f32 %f1, [%rd5];");   // im
+        ptx.AppendLine($"    mad.lo.u32 %r0, %r1, {blockThreads}, %r0;");
+        ptx.AppendLine("    mul.wide.u32 %rd1, %r0, 4;");
+        // Load each pointer only when it is needed and reuse the address
+        // register. Keeping three pointers plus three derived addresses live
+        // made the SM86 JIT allocate 26 registers/thread for a 24-register
+        // design budget.
+        ptx.AppendLine("    ld.param.u64 %rd0, [in_real_ptr];");
+        ptx.AppendLine("    add.u64 %rd0, %rd0, %rd1;");
+        ptx.AppendLine("    ld.global.nc.f32 %f0, [%rd0];");    // re
+        ptx.AppendLine("    ld.param.u64 %rd0, [in_imag_ptr];");
+        ptx.AppendLine("    add.u64 %rd0, %rd0, %rd1;");
+        ptx.AppendLine("    ld.global.nc.f32 %f1, [%rd0];");    // im
         ptx.AppendLine("    abs.f32 %f2, %f0;");               // ax
         ptx.AppendLine("    abs.f32 %f3, %f1;");               // ay
         ptx.AppendLine("    max.f32 %f4, %f2, %f3;");          // mx
         ptx.AppendLine("    min.f32 %f5, %f2, %f3;");          // mn
         ptx.AppendLine($"    setp.lt.f32 %p0, %f4, {tiny};");
-        ptx.AppendLine("    rcp.rn.f32 %f6, %f4;");
-        ptx.AppendLine("    mul.rn.f32 %f7, %f5, %f6;");        // a = mn/mx
-        ptx.AppendLine("    mul.rn.f32 %f8, %f7, %f7;");        // t = a^2
-        ptx.AppendLine($"    mov.f32 %f9, {c4};");
-        ptx.AppendLine($"    fma.rn.f32 %f9, %f9, %f8, {c3};");
-        ptx.AppendLine($"    fma.rn.f32 %f9, %f9, %f8, {c2};");
-        ptx.AppendLine($"    fma.rn.f32 %f9, %f9, %f8, {c1};");
-        ptx.AppendLine($"    fma.rn.f32 %f9, %f9, %f8, {c0};");
-        ptx.AppendLine("    mul.rn.f32 %f10, %f7, %f9;");       // r = atan(a) in [0,pi/4]
-        ptx.AppendLine($"    mul.rn.f32 %f11, %f10, {negOne};");
-        ptx.AppendLine($"    add.rn.f32 %f11, %f11, {halfPi};");
-        ptx.AppendLine("    setp.gt.f32 %p1, %f3, %f2;");        // ay > ax
-        ptx.AppendLine("    selp.f32 %f12, %f11, %f10, %p1;");
-        ptx.AppendLine($"    mul.rn.f32 %f13, %f12, {negOne};");
-        ptx.AppendLine($"    add.rn.f32 %f13, %f13, {pi};");
+        ptx.AppendLine("    setp.gt.f32 %p1, %f3, %f2;");       // ay > ax
+        ptx.AppendLine("    rcp.rn.f32 %f4, %f4;");
+        ptx.AppendLine("    mul.rn.f32 %f5, %f5, %f4;");        // a = mn/mx
+        ptx.AppendLine("    mul.rn.f32 %f2, %f5, %f5;");        // t = a^2
+        ptx.AppendLine($"    mov.f32 %f3, {c4};");
+        ptx.AppendLine($"    fma.rn.f32 %f3, %f3, %f2, {c3};");
+        ptx.AppendLine($"    fma.rn.f32 %f3, %f3, %f2, {c2};");
+        ptx.AppendLine($"    fma.rn.f32 %f3, %f3, %f2, {c1};");
+        ptx.AppendLine($"    fma.rn.f32 %f3, %f3, %f2, {c0};");
+        ptx.AppendLine("    mul.rn.f32 %f5, %f5, %f3;");        // r = atan(a) in [0,pi/4]
+        ptx.AppendLine($"    mul.rn.f32 %f2, %f5, {negOne};");
+        ptx.AppendLine($"    add.rn.f32 %f2, %f2, {halfPi};");
+        ptx.AppendLine("    selp.f32 %f5, %f2, %f5, %p1;");
+        ptx.AppendLine($"    mul.rn.f32 %f2, %f5, {negOne};");
+        ptx.AppendLine($"    add.rn.f32 %f2, %f2, {pi};");
         ptx.AppendLine("    setp.lt.f32 %p2, %f0, 0f00000000;");  // re < 0
-        ptx.AppendLine("    selp.f32 %f14, %f13, %f12, %p2;");
-        ptx.AppendLine("    neg.f32 %f15, %f14;");
-        ptx.AppendLine("    setp.lt.f32 %p3, %f1, 0f00000000;");  // im < 0
-        ptx.AppendLine("    selp.f32 %f14, %f15, %f14, %p3;");
+        ptx.AppendLine("    selp.f32 %f5, %f2, %f5, %p2;");
+        ptx.AppendLine("    neg.f32 %f2, %f5;");
+        ptx.AppendLine("    setp.lt.f32 %p1, %f1, 0f00000000;");  // im < 0
+        ptx.AppendLine("    selp.f32 %f5, %f2, %f5, %p1;");
         // Degenerate magnitude. atan2f(+-0, re) is pi for a negative real and 0
         // otherwise, so the guard cannot force 0 unconditionally: it also fires
         // for a small-but-nonzero negative real, where the reference returns pi.
         // %p2 already holds re < 0.
-        ptx.AppendLine($"    selp.f32 %f16, {pi}, 0f00000000, %p2;");
-        ptx.AppendLine("    selp.f32 %f14, %f16, %f14, %p0;");
-        ptx.AppendLine("    add.u64 %rd6, %rd2, %rd3;");
-        ptx.AppendLine("    st.global.f32 [%rd6], %f14;");
+        ptx.AppendLine($"    selp.f32 %f2, {pi}, 0f00000000, %p2;");
+        ptx.AppendLine("    selp.f32 %f5, %f2, %f5, %p0;");
+        ptx.AppendLine("    ld.param.u64 %rd0, [out_ptr];");
+        ptx.AppendLine("    add.u64 %rd0, %rd0, %rd1;");
+        ptx.AppendLine("    st.global.f32 [%rd0], %f5;");
         ptx.AppendLine("    ret;");
         ptx.AppendLine("}");
         return ptx.ToString();
@@ -178,7 +185,7 @@ internal sealed class PtxSplitComplexPhaseF32Kernel : IDisposable
                     extent, extent, 16, DirectPtxTensorAccess.Write, DirectPtxExtentMode.Exact)
             ],
             ResourceBudget: new DirectPtxResourceBudget(
-                MaxRegistersPerThread: 24,
+                MaxRegistersPerThread: MaxRegistersPerThreadLimit,
                 MaxStaticSharedBytes: 0,
                 MaxLocalBytesPerThread: 0,
                 MinBlocksPerMultiprocessor: 1536 / blockThreads),

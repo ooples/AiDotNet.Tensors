@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -63,6 +64,29 @@ public partial class CpuEngine
             throw new ArgumentException($"timeDecay length ({timeDecay.Length}) must equal modelDim ({modelDim}).", nameof(timeDecay));
         if (timeFirst.Length != modelDim)
             throw new ArgumentException($"timeFirst length ({timeFirst.Length}) must equal modelDim ({modelDim}).", nameof(timeFirst));
+
+        if (GraphMode.IsActive && GraphMode.Current is { } scope)
+        {
+            scope.BindEngineIfUnset(this);
+            var capturedR = rProj;
+            var capturedK = kProj;
+            var capturedV = vProj;
+            var capturedTimeDecay = timeDecay;
+            var capturedTimeFirst = timeFirst;
+            return scope.RecordVariadic(
+                LazyNodeType.Custom,
+                "Rwkv4Wkv",
+                new[] { rProj, kProj, vProj, timeDecay, timeFirst },
+                new[] { batch, seqLen, modelDim },
+                (eng, output) =>
+                {
+                    var result = eng.Rwkv4WkvForward(
+                        capturedR, capturedK, capturedV, capturedTimeDecay, capturedTimeFirst);
+                    DirectGpuTensorEngine.CopyResultInto(eng, result, output);
+                },
+                Rwkv4WkvBackward<T>,
+                null);
+        }
 
         var output = new Tensor<T>(new[] { batch, seqLen, modelDim });
 
