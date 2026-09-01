@@ -12115,7 +12115,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend))
             return;
 
-        object key = tensor.GetDataArray();
+        // Invalidation reads host data and cache identity; it must not request writable storage.
+        // A real host mutation has already passed through a write gate and detached its COW family.
+        var key = tensor.GetBackingArrayForCacheLookupUnsafe();
+        if (key is null)
+            return;
 
         if (!_persistentBufferCache.TryGetValue(key, out var entry))
             return;
@@ -12126,7 +12130,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             entry.Buffer.Dispose();
 
             // Upload new data
-            float[] floatData = DirectGpuEngine.ToFloatArray(tensor.GetDataArray());
+            float[] floatData = DirectGpuEngine.ToFloatArray(key);
             IGpuBuffer newBuffer = backend.AllocateBuffer(floatData);
             backend.Synchronize();
 

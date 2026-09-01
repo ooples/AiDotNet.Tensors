@@ -48,6 +48,35 @@ public class PersistentTensorRegistrationTests
     }
 
     [Fact]
+    public void InvalidatePersistentTensor_DoesNotDetachCopyOnWriteAlias()
+    {
+        using var engine = new DirectGpuTensorEngine();
+        if (!engine.IsGpuAvailable)
+            return;
+
+        using var source = new Tensor<float>(new[] { 1_048_576 });
+        source[0] = -8.5f;
+        using var clone = (Tensor<float>)source.CloneShared();
+
+        engine.RegisterPersistentTensor(source, PersistentTensorRole.Weights);
+        engine.RegisterPersistentTensor(clone, PersistentTensorRole.Weights);
+
+        long before = System.GC.GetAllocatedBytesForCurrentThread();
+        engine.InvalidatePersistentTensor(clone);
+        long allocated = System.GC.GetAllocatedBytesForCurrentThread() - before;
+
+        Assert.True(
+            allocated < 256 * 1024,
+            $"Invalidating a COW alias allocated {allocated:N0} bytes; cache maintenance must not detach " +
+            $"the {clone.Length * sizeof(float):N0}-byte tensor.");
+        Assert.Equal(-8.5f, source[0]);
+        Assert.Equal(-8.5f, clone[0]);
+
+        engine.UnregisterPersistentTensor(clone);
+        engine.UnregisterPersistentTensor(source);
+    }
+
+    [Fact]
     public void RegisterPersistentTensor_DoesNotMaterialiseTheTensor()
     {
         // The engine under test must be the GPU one. AiDotNetEngine.Current starts as CpuEngine and
