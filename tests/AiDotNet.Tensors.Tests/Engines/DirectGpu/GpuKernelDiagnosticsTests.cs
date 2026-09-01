@@ -144,6 +144,49 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu
             GpuKernelDiagnostics.DumpTo(string.Empty);
         }
 
+        /// <summary>
+        /// The dump must land even when its directory does not exist yet. Callers build the path from a
+        /// results folder that a fresh CI runner has never created, and the process does not run with
+        /// the workspace as its working directory. Before this was fixed the write threw
+        /// DirectoryNotFoundException -- an IOException -- straight into the swallow-everything catch:
+        /// the env var was set on every shard of a full matrix and not one file was produced.
+        /// </summary>
+        [Fact]
+        public void DumpTo_CreatesTheMissingDirectory_ForAbsoluteAndRelativePaths()
+        {
+            string absoluteRoot = Path.Combine(Path.GetTempPath(), "aidotnet-dump-abs-" + Guid.NewGuid().ToString("N"));
+            string relativeRoot = "aidotnet-dump-rel-" + Guid.NewGuid().ToString("N");
+            try
+            {
+                string nested = Path.Combine(absoluteRoot, "results", "gpu", "gpu-diagnostics.txt");
+                Assert.False(Directory.Exists(absoluteRoot), "precondition: the target directory must not exist yet");
+
+                GpuKernelDiagnostics.DumpTo(nested);
+
+                Assert.True(File.Exists(nested), "an absolute path into a directory that does not exist yet must still be written");
+                Assert.Contains("# GPU launch journal", File.ReadAllText(nested), StringComparison.Ordinal);
+
+                // A RELATIVE path resolves against the process working directory -- which is where a
+                // test host's CI step will NOT find it, but that is the caller's problem (pass an
+                // absolute path); this method's promise is that the file exists at the resolved location.
+                string relative = Path.Combine(relativeRoot, "sub", "gpu-diagnostics.txt");
+                string resolved = Path.GetFullPath(relative);
+
+                GpuKernelDiagnostics.DumpTo(relative);
+
+                Assert.True(File.Exists(resolved), $"a relative path must be written at its resolved location {resolved}");
+            }
+            finally
+            {
+                foreach (string root in new[] { absoluteRoot, Path.GetFullPath(relativeRoot) })
+                {
+                    try { if (Directory.Exists(root)) Directory.Delete(root, recursive: true); }
+                    catch (IOException) { }
+                    catch (UnauthorizedAccessException) { }
+                }
+            }
+        }
+
         [Fact]
         public void CapacityCheckIsOptIn_AndReportsTheOverrun()
         {

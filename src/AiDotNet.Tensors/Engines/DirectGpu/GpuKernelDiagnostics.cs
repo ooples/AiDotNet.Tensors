@@ -129,6 +129,18 @@ namespace AiDotNet.Tensors.Engines.DirectGpu
             var path = Environment.GetEnvironmentVariable("AIDOTNET_GPU_DIAGNOSTICS_DUMP");
             if (string.IsNullOrEmpty(path)) return;
 
+            // Pin the location NOW. A relative dump path resolves against the working directory at the
+            // time of each write, and this process may change directory later (test hosts do). The
+            // periodic flush, both exit hooks and the immediate write must all target the one file the
+            // operator named, not wherever the process happens to be standing when each fires.
+            try
+            {
+                path = Path.GetFullPath(path);
+            }
+            catch (ArgumentException) { return; }        // an unusable path: the diagnostic is best-effort
+            catch (IOException) { return; }              // PathTooLongException
+            catch (NotSupportedException) { return; }
+
             try
             {
                 // EXIT HOOKS ARE NOT ENOUGH, AND THIS IS THE WHOLE POINT OF THE DIAGNOSTIC.
@@ -336,7 +348,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu
                 // DirectoryNotFoundException, which is an IOException, which the catch below
                 // swallows. The result was a diagnostic that failed in total silence: the env var
                 // set on every shard of a full CI matrix, and not one file produced anywhere.
-                var directory = Path.GetDirectoryName(Path.GetFullPath(path));
+                //
+                // Resolve the path ONCE and use that same absolute path for both the directory and the
+                // write. Path.GetFullPath resolves a relative path against the working directory at the
+                // moment it is called; letting File.WriteAllText re-resolve the original relative path
+                // would let a chdir in between send the write to a directory this method never created,
+                // and the IOException handler below would swallow that too.
+                string fullPath = Path.GetFullPath(path);
+                var directory = Path.GetDirectoryName(fullPath);
                 if (!string.IsNullOrEmpty(directory) && !Directory.Exists(directory))
                     Directory.CreateDirectory(directory);
 
@@ -346,7 +365,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu
                 // usually the story, and it is invisible in a managed heap dump.
                 text.AppendLine("# buffers: " + DescribeBufferResidency());
                 foreach (var line in RecentLaunches()) text.AppendLine(line);
-                File.WriteAllText(path, text.ToString());
+                File.WriteAllText(fullPath, text.ToString());
             }
             catch (IOException) { }
             catch (UnauthorizedAccessException) { }
