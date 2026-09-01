@@ -23,6 +23,31 @@ public class PersistentTensorRegistrationTests
 {
 #if NET6_0_OR_GREATER   // GetAllocatedBytesForCurrentThread is .NET Core 3.0+; this project also targets net471.
     [Fact]
+    public void UnregisterPersistentTensor_DoesNotDetachCopyOnWriteAlias()
+    {
+        using var engine = new DirectGpuTensorEngine();
+        using var source = new Tensor<float>(new[] { 1_048_576 });
+        source[0] = 17.25f;
+        using var clone = (Tensor<float>)source.CloneShared();
+
+        engine.RegisterPersistentTensor(source, PersistentTensorRole.Weights);
+        engine.RegisterPersistentTensor(clone, PersistentTensorRole.Weights);
+
+        long before = System.GC.GetAllocatedBytesForCurrentThread();
+        engine.UnregisterPersistentTensor(clone);
+        long allocated = System.GC.GetAllocatedBytesForCurrentThread() - before;
+
+        Assert.True(
+            allocated < 256 * 1024,
+            $"Unregistering a COW alias allocated {allocated:N0} bytes; cleanup must not detach " +
+            $"the {clone.Length * sizeof(float):N0}-byte tensor.");
+        Assert.Equal(17.25f, source[0]);
+        Assert.Equal(17.25f, clone[0]);
+
+        engine.UnregisterPersistentTensor(source);
+    }
+
+    [Fact]
     public void RegisterPersistentTensor_DoesNotMaterialiseTheTensor()
     {
         // The engine under test must be the GPU one. AiDotNetEngine.Current starts as CpuEngine and

@@ -12079,7 +12079,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         base.UnregisterPersistentTensor(tensor);
 
-        object key = tensor.GetDataArray();
+        // Cache identity is a read-only concern. GetDataArray() advertises writable access and
+        // therefore detaches copy-on-write aliases, turning cleanup into an O(tensor size)
+        // allocation. The cache itself is keyed by the same backing-array identity accessor.
+        object? key = tensor.GetBackingArrayForCacheLookupUnsafe();
+        if (key is null)
+            return;
 
         lock (_persistentBufferLock)
         {
