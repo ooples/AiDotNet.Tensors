@@ -2,6 +2,7 @@
 
 using System;
 using System.IO;
+using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -656,8 +657,9 @@ public class SparseCompletenessTests
     }
 
     [Fact]
-    public void Safetensors_RoundtripSparseTensor_PreservesValues()
+    public async Task Safetensors_RoundtripSparseTensor_PreservesValues()
     {
+        await Task.Yield();
         using var trial = IsolateTrial();
         var a = SmallA(); // CSR-form COO; round-trip through CSR for storage compactness.
         var path = Path.GetTempFileName();
@@ -680,8 +682,9 @@ public class SparseCompletenessTests
     }
 
     [Fact]
-    public void Safetensors_RoundtripBsrTensor_PreservesBlockShape()
+    public async Task Safetensors_RoundtripBsrTensor_PreservesBlockShape()
     {
+        await Task.Yield();
         using var trial = IsolateTrial();
         var a = SmallA().ToBsr(2, 2);
         var path = Path.GetTempFileName();
@@ -708,10 +711,10 @@ public class SparseCompletenessTests
     private static System.IDisposable IsolateTrial()
     {
         var trialPath = Path.Combine(Path.GetTempPath(), "aidotnet-test-trial-" + System.Guid.NewGuid().ToString("N") + ".json");
-        var scope = PersistenceGuard.SetTestTrialFilePathOverride(trialPath);
+        var trialScope = PersistenceGuard.SetTestTrialFilePathOverride(trialPath);
         return new ActionDisposable(() =>
         {
-            scope.Dispose();
+            trialScope.Dispose();
             try { if (File.Exists(trialPath)) File.Delete(trialPath); } catch { }
         });
     }

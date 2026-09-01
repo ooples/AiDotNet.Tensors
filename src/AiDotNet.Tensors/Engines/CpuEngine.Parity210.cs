@@ -1087,6 +1087,38 @@ public partial class CpuEngine
             (outShape[0], outShape[1]) = (outShape[1], outShape[0]);
         }
 
+        // WHEN THE TAPE IS RECORDING, BUILD THE GRIDS FROM DIFFERENTIABLE OPS. The element loop
+        // below writes into a rented buffer directly, which produces correct VALUES and no gradient
+        // whatsoever: the outputs are new tensors with nothing linking them to the inputs they were
+        // copied from. Measured: TensorMeshgrid[3;4;xy] recorded ZERO differentiable leaves on CPU
+        // against two on GPU, so a model that differentiated through a meshgrid got silent zeros
+        // from the CPU engine and real gradients from the GPU one.
+        //
+        // torch.meshgrid is differentiable, and each output is just the input broadcast along its
+        // own axis, so composing reshape + broadcast is both the correct gradient and the same
+        // construction the GPU engine already uses for its tape-active path — which is why the two
+        // engines now agree by construction rather than by coincidence.
+        if (DifferentiableOps.IsTapeActiveForThread<T>() || GraphMode.IsActive)
+        {
+            var taped = new Tensor<T>[d];
+            for (int k = 0; k < d; k++)
+            {
+                int axis = k;
+                if (indexing == "xy" && d >= 2)
+                {
+                    if (k == 0) axis = 1;
+                    else if (k == 1) axis = 0;
+                }
+
+                var rshape = new int[d];
+                for (int i = 0; i < d; i++) rshape[i] = 1;
+                rshape[axis] = tensors[k]._shape[0];
+                taped[k] = TensorBroadcastTo(tensors[k].Reshape(rshape), outShape);
+            }
+
+            return taped;
+        }
+
         var results = new Tensor<T>[d];
         var strides = ComputeRowMajorStrides(outShape);
         int total = 1; foreach (var s in outShape) total *= s;

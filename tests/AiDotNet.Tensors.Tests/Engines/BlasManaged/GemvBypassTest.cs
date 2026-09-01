@@ -1,6 +1,8 @@
 using System;
+using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines.BlasManaged;
 using Xunit;
+using Xunit.Abstractions;
 using BlasManagedLib = AiDotNet.Tensors.Engines.BlasManaged.BlasManaged;
 #if NET6_0_OR_GREATER
 using System.Runtime.Intrinsics.X86;
@@ -12,8 +14,13 @@ namespace AiDotNet.Tensors.Tests.Engines.BlasManaged;
 /// Sub-R (#408): verify the GEMV bypass produces correct output for the M=1,
 /// N=1, and K=1 cases, and matches the scalar reference within FP32/FP64 bounds.
 /// </summary>
+[Collection("BlasManaged-Perf-Serial")]
 public class GemvBypassTest
 {
+    private readonly ITestOutputHelper _output;
+
+    public GemvBypassTest(ITestOutputHelper output) => _output = output;
+
     private static void NaiveGemmFp32(
         ReadOnlySpan<float> a, int lda, bool transA,
         ReadOnlySpan<float> b, int ldb, bool transB,
@@ -196,8 +203,11 @@ public class GemvBypassTest
     }
 
     [SkippableFact]
-    public void N1_AVX2_Path_Beats_Scalar_Reference_BySignificantMargin()
+    [Trait("Category", "Performance")]
+    public async Task N1_AVX2_Path_Beats_Scalar_Reference_BySignificantMargin()
     {
+        await Task.Yield();
+
         // Sub-R (#408) perf gate: the N=1 case used to be scalar-only —
         // single-multiply-per-cycle for the dot product. The new AVX2 FMA
         // path does 8 multiplies per cycle, so on long-K shapes
@@ -260,6 +270,9 @@ public class GemvBypassTest
         swScalar.Stop();
 
         double speedup = swScalar.Elapsed.TotalMilliseconds / swAvx2.Elapsed.TotalMilliseconds;
+        _output.WriteLine(
+            $"N=1 AVX2 speedup: {speedup:F2}× (AVX2 {swAvx2.Elapsed.TotalMilliseconds:F1} ms; " +
+            $"scalar {swScalar.Elapsed.TotalMilliseconds:F1} ms; required ≥3.0×).");
         Assert.True(speedup >= 3.0,
             $"N=1 AVX2 speedup over scalar reference is {speedup:F2}× — expected ≥3.0×. " +
             $"AVX2: {swAvx2.Elapsed.TotalMilliseconds:F1} ms, scalar: {swScalar.Elapsed.TotalMilliseconds:F1} ms.");

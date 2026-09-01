@@ -48,6 +48,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // AIDOTNET_FP16_GPU_CACHE=1). Lazily constructed on first hetero forward.
     private MixedPrecisionCompiledPlan? _fp16PagedPlan;
     private readonly IEngine _engine;
+    // Every replay mutates plan-owned forward buffers, gradient buffers, saved-state holders,
+    // optimizer moments, and (on CUDA) graph-lifetime state. A compiled plan is therefore one
+    // state machine, not a bag of independent delegates. Serialize Step so two callers cannot let
+    // one forward overwrite saved state while the other caller's backward is consuming it.
+    private readonly object _stepSync = new();
 
     // ---- CUDA-graph capture of the whole compiled training step (opt-in, default OFF) ----
     // When AIDOTNET_CUDA_GRAPH_STEP=1 on a CUDA float plan, the fixed forward+grad-zero+
@@ -1551,6 +1556,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Tensor<T> Step()
+    {
+        lock (_stepSync)
+            return StepCore();
+    }
+
+    private Tensor<T> StepCore()
     {
         using var graphModeSuspension = GraphMode.SuspendRecording();
 

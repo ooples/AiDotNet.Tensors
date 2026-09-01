@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 
@@ -23,6 +24,38 @@ public partial class CpuEngine
             input, transitionReal, transitionImag, inputMapReal, inputMapImag,
             outputMapReal, outputMapImag, skip,
             out int batch, out int time, out int groups, out int width, out int state);
+
+        if (GraphMode.IsActive && GraphMode.Current is { } scope)
+        {
+            scope.BindEngineIfUnset(this);
+            var capturedInput = input;
+            var capturedTransitionReal = transitionReal;
+            var capturedTransitionImag = transitionImag;
+            var capturedInputMapReal = inputMapReal;
+            var capturedInputMapImag = inputMapImag;
+            var capturedOutputMapReal = outputMapReal;
+            var capturedOutputMapImag = outputMapImag;
+            var capturedSkip = skip;
+            return scope.RecordVariadic(
+                LazyNodeType.Custom,
+                "ComplexDiagonalSsmScan",
+                new[]
+                {
+                    input, transitionReal, transitionImag, inputMapReal, inputMapImag,
+                    outputMapReal, outputMapImag, skip
+                },
+                new[] { batch, time, groups, width },
+                (eng, output) =>
+                {
+                    var result = eng.ComplexDiagonalSsmScanForward(
+                        capturedInput, capturedTransitionReal, capturedTransitionImag,
+                        capturedInputMapReal, capturedInputMapImag, capturedOutputMapReal,
+                        capturedOutputMapImag, capturedSkip);
+                    DirectGpuTensorEngine.CopyResultInto(eng, result, output);
+                },
+                ComplexDiagonalSsmScanBackward<T>,
+                savedState: null);
+        }
 
         var output = new Tensor<T>(new[] { batch, time, groups, width });
         ComplexDiagonalSsmScanForwardCore(

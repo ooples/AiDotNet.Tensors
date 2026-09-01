@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) AiDotNet. All rights reserved.
 // OpenCL backend using pure P/Invoke - no managed GPU runtime dependency.
 // Works on ALL .NET versions including .NET Framework 4.6.2.
 
@@ -109,7 +109,21 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         private ClBlastXgemmDirectParameters _clblastDirectParams;
         private int _clblastMinIndirectSize;
 
-        public bool IsAvailable { get; }
+        private bool _isAvailable;
+
+        /// <summary>
+        /// Whether this backend can serve work. FALSE ONCE DISPOSED, which is load-bearing:
+        /// DirectGpuBackendFactory caches one backend per process and hands the cached instance back
+        /// while it reports available. Dispose() clears the kernel cache, so a disposed-but-still-cached
+        /// backend answers every later kernel lookup with KeyNotFoundException ("add_vectors") on a
+        /// completely unrelated caller. Reporting unavailable makes the factory build a fresh backend
+        /// instead. VulkanBackend and MetalBackend already did this; these three did not.
+        /// </summary>
+        public bool IsAvailable
+        {
+            get => _isAvailable && !_disposed;
+            private set => _isAvailable = value;
+        }
         public string? InitializationError { get; private set; }
         public string BackendName => "OpenCL";
         public TensorDevice DeviceType => TensorDevice.OpenCL;
@@ -551,6 +565,36 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 foreach (var name in new[] { "GenerateRandomUniform", "GenerateRandomNormal" })
                 {
                     _kernelCache[name] = new DirectOpenClKernel(_context, randomProgram, name);
+                }
+
+                // Compile categorical sampling. Isolated in its own program because it needs fp64 for
+                // exact CPU parity: a device without fp64 fails HERE, leaving _categoricalKernelReady
+                // false so the engine keeps using the managed reference, rather than failing the
+                // whole random program and taking GenerateRandomUniform down with it.
+                try
+                {
+                    // SafeMathFlags, NOT optimizationFlags. The latter enables
+                    // -cl-fast-relaxed-math / -cl-unsafe-math-optimizations, which permit the
+                    // compiler to reassociate floating-point arithmetic. This kernel's whole point is
+                    // an ORDERED double accumulation that reproduces the CPU's inverse-CDF walk
+                    // exactly; reassociating `sum` or `cumulative` moves the boundary and selects a
+                    // different category, which the exact-parity test reads as a hard mismatch.
+                    var categoricalProgram = CompileOrLoadCached(
+                        Kernels.CategoricalKernels.GetSource(),
+                        OpenClBuildOptions.SafeMathFlags,
+                        "Categorical sampling kernels");
+                    _programs.Add(categoricalProgram);
+                    foreach (var name in Kernels.CategoricalKernels.GetKernelNames())
+                    {
+                        _kernelCache[name] = new DirectOpenClKernel(_context, categoricalProgram, name);
+                    }
+
+                    _categoricalKernelReady = true;
+                }
+                catch (Exception)
+                {
+                    // No fp64 (or the device rejected the program): stay on the CPU reference.
+                    _categoricalKernelReady = false;
                 }
 
                 // Compile specialized kernels (hyperbolic geometry, octonion algebra, quantum computing)
@@ -4019,7 +4063,17 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 writeA = !writeA;
             }
 
-            var result = new float[1];
+            // Sized to the BUFFER, not to the one value being read. The final buffer is whichever
+            // scratch the last pass wrote, and its capacity is the first pass's partial count -- not
+            // one. CopyToHost validates the destination against the whole buffer, so downloading
+            // into float[1] threw "Destination array too small" for any input needing more than one
+            // partial (1025 elements at a local size of 256 gives 5). That was unreachable until the
+            // reductions started returning the right answer for shorter inputs, so it sat behind the
+            // non-power-of-two tail bug rather than beside it.
+            int downloadLength = current is DirectOpenClGpuBuffer resultBuffer
+                ? Math.Max(1, resultBuffer.Buffer.Length)
+                : 1;
+            var result = new float[downloadLength];
             DownloadBuffer(current, result);
             return result[0];
         }
@@ -13552,6 +13606,14 @@ KERNEL VARIANTS (A/B testing):
         {
             if (_disposed) return;
 
+            // FAIL CLOSED FIRST. IsAvailable reads !_disposed, and teardown below disposes the
+            // dynamic GEMM, the buffer pool, every cached kernel and program, and the context. Set
+            // last, this flag would leave a window -- one that grows with the number of compiled
+            // kernels -- where a concurrent caller holding the process-wide cached backend still
+            // sees IsAvailable == true while _kernelCache is being cleared, and hits exactly the
+            // KeyNotFoundException this guard exists to prevent.
+            _disposed = true;
+
             _dynamicGemm?.Dispose();
             _bufferPool.Dispose();
 
@@ -13577,7 +13639,6 @@ KERNEL VARIANTS (A/B testing):
             _programs.Clear();
 
             _context?.Dispose();
-            _disposed = true;
         }
 
     public void ReduceMean(IGpuBuffer i, IGpuBuffer o, int sz) { ExecuteActivation("reduce_mean", i, o, sz); }

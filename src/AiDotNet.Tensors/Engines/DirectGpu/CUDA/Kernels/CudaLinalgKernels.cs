@@ -243,8 +243,8 @@ extern ""C"" __global__ void parity211_qr_reduced(
                 partial += Qb[i * k + p] * Qb[i * k + j];
             partials[tid] = partial;
             __syncthreads();
-            for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-                if (tid < s) partials[tid] += partials[tid + s];
+            for (int s_active = blockDim.x, s = (blockDim.x + 1) / 2; s > 0; s_active = s, s = (s > 1) ? (s + 1) / 2 : 0) {
+                if (tid < s && tid + s < s_active) partials[tid] += partials[tid + s];
                 __syncthreads();
             }
             if (tid == 0) { sScalar = partials[0]; Rb[p * n + j] = sScalar; }
@@ -264,8 +264,8 @@ extern ""C"" __global__ void parity211_qr_reduced(
         }
         partials[tid] = partialN;
         __syncthreads();
-        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-            if (tid < s) partials[tid] += partials[tid + s];
+        for (int s_active = blockDim.x, s = (blockDim.x + 1) / 2; s > 0; s_active = s, s = (s > 1) ? (s + 1) / 2 : 0) {
+            if (tid < s && tid + s < s_active) partials[tid] += partials[tid + s];
             __syncthreads();
         }
         if (tid == 0) { sScalar = sqrtf(partials[0]); Rb[j * n + j] = sScalar; }
@@ -291,8 +291,8 @@ extern ""C"" __global__ void parity211_qr_reduced(
                 partial += Qb[i * k + p] * Ab[i * n + c];
             partials[tid] = partial;
             __syncthreads();
-            for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-                if (tid < s) partials[tid] += partials[tid + s];
+            for (int s_active = blockDim.x, s = (blockDim.x + 1) / 2; s > 0; s_active = s, s = (s > 1) ? (s + 1) / 2 : 0) {
+                if (tid < s && tid + s < s_active) partials[tid] += partials[tid + s];
                 __syncthreads();
             }
             if (tid == 0) Rb[p * n + c] = partials[0];

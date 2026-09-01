@@ -1959,6 +1959,54 @@ void main() {
     for (uint j = 0; j < innerSize; j++) b[base_idx + j] /= (sum_exp + 1e-10);
 }";
 
+    /// <summary>
+    /// Categorical sampling — the Vulkan twin of the OpenCL <c>categorical_sample</c> kernel and of
+    /// <c>CpuEngine.TensorCategoricalSample</c>.
+    /// </summary>
+    /// <remarks>
+    /// Accumulates in <c>double</c>, exactly as the CPU reference and the OpenCL kernel do. In float
+    /// the running total drifts and a target sitting near a bucket edge selects the neighbouring
+    /// category, which the exact-parity test treats as a hard mismatch. This requires the device to
+    /// support <c>shaderFloat64</c>; where it does not, pipeline creation fails and the backend keeps
+    /// using the managed reference rather than silently sampling at lower precision.
+    /// </remarks>
+    public static string CategoricalSampleGlsl => Header + TwoBufferLayout + @"
+layout(push_constant) uniform Params { uint rows; uint classes; uint seedLo; uint seedHi; };
+
+// StatelessRandom.Uniform01(seed, index) - identical constants to the managed helper, to the
+// OpenCL kernel and to the CUDA/HIP twins. Keying on the ROW index lets each invocation compute
+// its own uniform without replaying the rows before it.
+// NOTE: 'sample' is a reserved word in GLSL 4.x, hence 'draw'.
+float stateless_uniform01(uint seed32, uint index) {
+    uint state = index * 747796405u + seed32 + 2891336453u;
+    uint word = ((state >> ((state >> 28) + 4u)) ^ state) * 277803737u;
+    uint draw = (word >> 22) ^ word;
+    return float(draw >> 8) * (1.0 / 16777216.0);
+}
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= rows) return;
+
+    uint seed32 = seedLo ^ seedHi;
+    float u = stateless_uniform01(seed32, row);
+    uint offset = row * classes;
+
+    double sum = 0.0lf;
+    for (uint c = 0u; c < classes; c++) sum += double(a[offset + c]);
+
+    double target = double(u) * sum;
+    double cumulative = 0.0lf;
+    uint selected = classes - 1u;
+    for (uint c = 0u; c < classes; c++) {
+        cumulative += double(a[offset + c]);
+        if (target < cumulative) { selected = c; break; }
+    }
+
+    for (uint c = 0u; c < classes; c++) b[offset + c] = 0.0;
+    b[offset + selected] = 1.0;
+}";
+
     public static string SparsemaxGlsl => Header + TwoBufferLayout + @"
 layout(push_constant) uniform Params { uint outerSize; uint innerSize; };
 void main() {

@@ -1,17 +1,22 @@
 // Copyright (c) AiDotNet. All rights reserved.
 
 using System.Diagnostics;
+using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Compilation;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 
+[Collection("BlasManaged-Perf-Serial")]
 public sealed class LazyGraphCompilerPerformanceTests
 {
     [Fact]
-    public void Compile_WideFanInGraph_StaysBelowQuadraticRuntime()
+    [Trait("Category", "Performance")]
+    public async Task Compile_WideFanInGraph_StaysBelowQuadraticRuntime()
     {
+        await Task.Yield();
+
         const int producerCount = 50_000;
         var producers = new StubLazyNode[producerCount];
         var rawNodes = new List<ILazyNode>(producerCount + 1);

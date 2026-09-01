@@ -1,6 +1,7 @@
 // Copyright (c) AiDotNet. All rights reserved.
 
 using System;
+using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 using AiDotNet.Tensors.Engines.DirectGpu.HIP;
@@ -35,6 +36,75 @@ public class OffloadAllocatorTests
         new VulkanOffloadAllocator(),
         new WebGpuOffloadAllocator(),
     };
+
+    [Theory]
+    [InlineData(false, false, false)]
+    [InlineData(false, true, false)]
+    [InlineData(true, false, true)]
+    [InlineData(true, true, false)]
+    public async Task CudaAvailability_FailsClosedAfterCircuitBreaker(
+        bool driverAvailable, bool circuitBroken, bool expected)
+    {
+        await Task.Yield();
+
+        Assert.Equal(expected, CudaOffloadAllocator.IsCudaUsable(driverAvailable, circuitBroken));
+    }
+
+    [Theory]
+    [InlineData(false, false, false)]
+    [InlineData(false, true, false)]
+    [InlineData(true, false, true)]
+    [InlineData(true, true, false)]
+    public async Task CudaContextCleanup_NeverPopsAfterCircuitBreaker(
+        bool pushed, bool circuitBroken, bool expected)
+    {
+        await Task.Yield();
+
+        Assert.Equal(expected, CudaOffloadAllocator.ShouldPopContext(pushed, circuitBroken));
+    }
+
+    [SkippableFact]
+    public async Task SharedCudaAllocator_FailsClosedAfterBackendDestroysContext()
+    {
+        await Task.Yield();
+
+        Skip.IfNot(CudaNativeBindings.IsAvailable, "CUDA driver is unavailable.");
+        using var backend = new CudaBackend();
+        Skip.IfNot(backend.IsAvailable, "CUDA backend failed to initialize.");
+        using var allocator = new CudaOffloadAllocator(backend.CudaContextHandle);
+
+        Assert.True(allocator.IsAvailable);
+        backend.Dispose();
+
+        Assert.False(allocator.IsAvailable);
+        var error = Assert.Throws<NotSupportedException>(
+            () => allocator.Allocate(1024, OffloadScheme.Pinned));
+        Assert.Contains("no longer live", error.Message, StringComparison.Ordinal);
+    }
+
+    [SkippableFact]
+    public async Task SharedCudaAllocator_DisposeWithLiveBackend_FreesOutstandingAllocations()
+    {
+        await Task.Yield();
+
+        Skip.IfNot(CudaNativeBindings.IsAvailable, "CUDA driver is unavailable.");
+        using var backend = new CudaBackend();
+        Skip.IfNot(backend.IsAvailable, "CUDA backend failed to initialize.");
+        using var allocator = new CudaOffloadAllocator(backend.CudaContextHandle);
+
+        var pinned = allocator.Allocate(1024, OffloadScheme.Pinned);
+        var managed = allocator.Allocate(1024, OffloadScheme.Managed);
+        Assert.NotEqual(IntPtr.Zero, pinned.HostPointer);
+        Assert.NotEqual(IntPtr.Zero, managed.DevicePointer);
+
+        // Dispose owns both outstanding handles. Checked native frees make either cleanup failure
+        // surface here, while the probe below proves a shared allocator never tears down its owner.
+        allocator.Dispose();
+        Assert.False(allocator.IsAvailable);
+
+        using var probe = backend.AllocateBuffer(new[] { 1.25f, -2.5f, 4.75f });
+        Assert.Equal(new[] { 1.25f, -2.5f, 4.75f }, backend.DownloadBuffer(probe));
+    }
 
     [Fact]
     public void IsAvailable_ProbeNeverThrows_OnAnyBackend()

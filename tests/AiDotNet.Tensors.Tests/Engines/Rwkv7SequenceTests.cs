@@ -1,7 +1,9 @@
 using System;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.LinearAlgebra;
+using AiDotNet.Tensors.Tests.TestHelpers;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines;
@@ -168,6 +170,80 @@ public class Rwkv7SequenceTests
         var dst = new float[src.Length];
         for (int i = 0; i < src.Length; i++) dst[i] = (float)src[i];
         return new Tensor<float>(dst, t.Shape.ToArray());
+    }
+
+    [Fact]
+    public void CompiledTraining_CapturesForwardAndBackwardDependencies()
+    {
+        var engine = new CpuEngine();
+        const int batch = 1, seqLen = 4, modelDim = 4, numHeads = 2;
+        var source = MakeInputs(batch, seqLen, modelDim, 37);
+        var parameters = new[]
+        {
+            ToFloat(source.R),
+            ToFloat(source.Kappa),
+            ToFloat(source.KTilde),
+            ToFloat(source.V),
+            ToFloat(source.Decay),
+            ToFloat(source.Icl)
+        };
+
+        Dictionary<Tensor<float>, Tensor<float>> eagerGradients;
+        float eagerLoss;
+        using (var tape = new GradientTape<float>())
+        {
+            var eagerOutput = engine.Rwkv7SequenceForward(
+                parameters[0], parameters[1], parameters[2], parameters[3],
+                parameters[4], parameters[5], numHeads);
+            var eagerLossTensor = engine.ReduceSum(eagerOutput, null);
+            eagerLoss = eagerLossTensor[0];
+            eagerGradients = tape.ComputeGradients(eagerLossTensor, parameters);
+        }
+
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.EnableTraining(parameters))
+        {
+            var compiledOutput = engine.Rwkv7SequenceForward(
+                parameters[0], parameters[1], parameters[2], parameters[3],
+                parameters[4], parameters[5], numHeads);
+            var compiledLossTensor = engine.ReduceSum(compiledOutput, null);
+            plan = scope.CompileTraining(parameters, compiledLossTensor);
+        }
+
+        using (plan)
+        {
+            var replayedLoss = plan.Step()[0];
+            Assert.True(MathCompat.IsFinite(replayedLoss));
+            Assert.InRange(Math.Abs(replayedLoss - eagerLoss), 0f, 2e-5f);
+
+            var compiled = Assert.IsType<CompiledTrainingPlan<float>>(plan);
+            for (int parameterIndex = 0; parameterIndex < parameters.Length; parameterIndex++)
+            {
+                Assert.True(eagerGradients.ContainsKey(parameters[parameterIndex]),
+                    $"Eager backward omitted parameter {parameterIndex}.");
+                var expected = eagerGradients[parameters[parameterIndex]].ToArray();
+                var actual = compiled.Gradients[parameterIndex].ToArray();
+                Assert.Equal(expected.Length, actual.Length);
+                for (int element = 0; element < expected.Length; element++)
+                {
+                    Assert.True(MathCompat.IsFinite(actual[element]),
+                        $"Compiled gradient {parameterIndex}[{element}] is not finite.");
+                    Assert.InRange(Math.Abs(actual[element] - expected[element]), 0f, 3e-4f);
+                }
+            }
+
+            // The recurrence used to execute eagerly DURING tracing and enter the graph as a frozen leaf.
+            // A first replay could therefore look plausible, but changing an upstream tensor had no effect.
+            parameters[0][0] += 0.25f;
+            float expectedUpdatedLoss = engine.ReduceSum(
+                engine.Rwkv7SequenceForward(
+                    parameters[0], parameters[1], parameters[2], parameters[3],
+                    parameters[4], parameters[5], numHeads),
+                null)[0];
+            float replayedUpdatedLoss = plan.Step()[0];
+            Assert.InRange(Math.Abs(replayedUpdatedLoss - expectedUpdatedLoss), 0f, 2e-5f);
+            Assert.NotEqual(replayedLoss, replayedUpdatedLoss);
+        }
     }
 
     [Fact]

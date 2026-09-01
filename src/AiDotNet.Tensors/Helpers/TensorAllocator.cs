@@ -15,9 +15,138 @@ namespace AiDotNet.Tensors.Helpers;
 public static class TensorAllocator
 {
     // Diagnostic counters (AIDOTNET_ALLOC_DIAG=1): where RentUninitialized's arena tier lands.
+    //
+    // Deliberately `static readonly` rather than a settable property: the JIT folds a readonly
+    // static bool into a constant and eliminates the branch entirely, so the counters cost nothing
+    // when they are off. A mutable switch would put a real branch on every Rent.
     internal static readonly bool AllocDiag =
         System.Environment.GetEnvironmentVariable("AIDOTNET_ALLOC_DIAG") == "1";
-    internal static long ArenaHit, ArenaMiss, ArenaNull, ArenaHitBytes, ArenaMissBytes, ArenaNullBytes;
+    internal static readonly ArenaAllocationCounters Counters = new ArenaAllocationCounters();
+
+    /// <summary>
+    /// The arena hit/miss/null tallies. An instance rather than static fields so the record,
+    /// snapshot and reset semantics can be unit-tested directly, in every test run, without
+    /// depending on how AIDOTNET_ALLOC_DIAG happens to be set for the process.
+    /// </summary>
+    internal sealed class ArenaAllocationCounters
+    {
+        private long _hit, _miss, _null, _hitBytes, _missBytes, _nullBytes;
+
+        internal void RecordHit(long bytes)
+        {
+            System.Threading.Interlocked.Increment(ref _hit);
+            System.Threading.Interlocked.Add(ref _hitBytes, bytes);
+        }
+
+        internal void RecordMiss(long bytes)
+        {
+            System.Threading.Interlocked.Increment(ref _miss);
+            System.Threading.Interlocked.Add(ref _missBytes, bytes);
+        }
+
+        internal void RecordNull(long bytes)
+        {
+            System.Threading.Interlocked.Increment(ref _null);
+            System.Threading.Interlocked.Add(ref _nullBytes, bytes);
+        }
+
+        internal ArenaAllocationDiagnostics Snapshot() => new ArenaAllocationDiagnostics(
+            System.Threading.Interlocked.Read(ref _hit),
+            System.Threading.Interlocked.Read(ref _miss),
+            System.Threading.Interlocked.Read(ref _null),
+            System.Threading.Interlocked.Read(ref _hitBytes),
+            System.Threading.Interlocked.Read(ref _missBytes),
+            System.Threading.Interlocked.Read(ref _nullBytes));
+
+        internal void Reset()
+        {
+            System.Threading.Interlocked.Exchange(ref _hit, 0);
+            System.Threading.Interlocked.Exchange(ref _miss, 0);
+            System.Threading.Interlocked.Exchange(ref _null, 0);
+            System.Threading.Interlocked.Exchange(ref _hitBytes, 0);
+            System.Threading.Interlocked.Exchange(ref _missBytes, 0);
+            System.Threading.Interlocked.Exchange(ref _nullBytes, 0);
+        }
+    }
+
+    /// <summary>
+    /// Whether the arena allocation counters are recording. Off unless AIDOTNET_ALLOC_DIAG=1.
+    /// </summary>
+    /// <remarks>
+    /// Read this before reading the counters. When recording is off every counter reads zero, which
+    /// is indistinguishable from "no allocations happened" — a zero that has been misread as
+    /// evidence that the arena was never consulted. <see cref="TryGetArenaDiagnostics"/> exists so
+    /// that mistake is not possible: it returns false rather than handing back meaningless zeros.
+    /// </remarks>
+    public static bool ArenaDiagnosticsEnabled => AllocDiag;
+
+    /// <summary>
+    /// A snapshot of where <c>RentUninitialized</c>'s arena tier landed.
+    /// </summary>
+    /// <param name="Hit">Rents served from the current <see cref="TensorArena"/>.</param>
+    /// <param name="Miss">Rents that found an arena but no reusable block in it.</param>
+    /// <param name="Null">Rents taken with no arena active on the thread.</param>
+    /// <param name="HitBytes">Bytes served from the arena.</param>
+    /// <param name="MissBytes">Bytes requested when an arena was active but could not serve them.</param>
+    /// <param name="NullBytes">Bytes requested with no arena active.</param>
+    public readonly struct ArenaAllocationDiagnostics
+    {
+        internal ArenaAllocationDiagnostics(long hit, long miss, long nul, long hitBytes, long missBytes, long nullBytes)
+        {
+            Hit = hit; Miss = miss; Null = nul;
+            HitBytes = hitBytes; MissBytes = missBytes; NullBytes = nullBytes;
+        }
+
+        /// <summary>Rents served from the current arena.</summary>
+        public long Hit { get; }
+
+        /// <summary>Rents that found an arena but no reusable block in it.</summary>
+        public long Miss { get; }
+
+        /// <summary>Rents taken with no arena active on the thread.</summary>
+        public long Null { get; }
+
+        /// <summary>Bytes served from the arena.</summary>
+        public long HitBytes { get; }
+
+        /// <summary>Bytes requested when an arena was active but could not serve them.</summary>
+        public long MissBytes { get; }
+
+        /// <summary>Bytes requested with no arena active.</summary>
+        public long NullBytes { get; }
+    }
+
+    /// <summary>
+    /// Reads the arena allocation counters, or returns false when they are not recording.
+    /// </summary>
+    /// <param name="diagnostics">The snapshot; <c>default</c> when recording is off.</param>
+    /// <returns><see langword="true"/> when the returned numbers mean something.</returns>
+    /// <remarks>
+    /// Returning false instead of zeros is the point of this method. Set AIDOTNET_ALLOC_DIAG=1
+    /// before the process starts to record.
+    /// </remarks>
+    public static bool TryGetArenaDiagnostics(out ArenaAllocationDiagnostics diagnostics)
+    {
+        if (!AllocDiag)
+        {
+            diagnostics = default;
+            return false;
+        }
+
+        diagnostics = Counters.Snapshot();
+        return true;
+    }
+
+    /// <summary>
+    /// Zeroes the arena allocation counters so a measurement can be scoped to one operation.
+    /// </summary>
+    /// <returns><see langword="true"/> when recording is on and the counters were reset.</returns>
+    public static bool TryResetArenaDiagnostics()
+    {
+        if (!AllocDiag) return false;
+        Counters.Reset();
+        return true;
+    }
 
     /// <summary>
     /// Threshold above which ArrayPool is used instead of standard allocation.
@@ -381,10 +510,10 @@ public static class TensorAllocator
         if (arena != null)
         {
             var pooledTensor = arena.TryRentTensor<T>(totalSize, shape);
-            if (pooledTensor != null) { if (AllocDiag) { System.Threading.Interlocked.Increment(ref ArenaHit); System.Threading.Interlocked.Add(ref ArenaHitBytes, (long)totalSize * System.Runtime.CompilerServices.Unsafe.SizeOf<T>()); } return pooledTensor; }
-            if (AllocDiag) { System.Threading.Interlocked.Increment(ref ArenaMiss); System.Threading.Interlocked.Add(ref ArenaMissBytes, (long)totalSize * System.Runtime.CompilerServices.Unsafe.SizeOf<T>()); }
+            if (pooledTensor != null) { if (AllocDiag) Counters.RecordHit((long)totalSize * System.Runtime.CompilerServices.Unsafe.SizeOf<T>()); return pooledTensor; }
+            if (AllocDiag) Counters.RecordMiss((long)totalSize * System.Runtime.CompilerServices.Unsafe.SizeOf<T>());
         }
-        else if (AllocDiag) { System.Threading.Interlocked.Increment(ref ArenaNull); System.Threading.Interlocked.Add(ref ArenaNullBytes, (long)totalSize * System.Runtime.CompilerServices.Unsafe.SizeOf<T>()); }
+        else if (AllocDiag) Counters.RecordNull((long)totalSize * System.Runtime.CompilerServices.Unsafe.SizeOf<T>());
 
 #if NET5_0_OR_GREATER
         // Thread-local cache: skip Array.Clear

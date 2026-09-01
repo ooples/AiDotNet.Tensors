@@ -15,6 +15,11 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> Interpolate<T>(Tensor<T> input, int[] sizes, InterpolateMode mode, bool alignCorners = false)
     {
+        // Capture the differentiable node before native dispatch. During compiled replay GraphMode
+        // is inactive, so the same node still executes the backend's resident interpolation kernel.
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive)
+            return base.Interpolate(input, sizes, mode, alignCorners);
+
         // GPU surface: T=float, 4D NCHW, modes Nearest/Bilinear/Bicubic/Area.
         if (typeof(T) == typeof(float)
             && input.Rank == 4

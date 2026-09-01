@@ -1846,7 +1846,20 @@ public partial class DirectGpuTensorEngine
     {
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
         axes ??= new[] { 0, 1 };
-        if (axes.Length != 2 || axes[0] == axes[1] || !TryGetBackend(out var backend))
+
+        // WHEN THE TAPE IS RECORDING, TAKE THE BASE PATH. The GPU rotation below is built from
+        // PermuteResidentGpu, which materializes a fresh device buffer through DeferTensorResult
+        // and wires no gradient, so the chain from output back to input is cut. The op then looks
+        // correct — the values are right — while contributing NOTHING to a backward pass, which is
+        // the worst way for an autodiff bug to present. Measured: TensorRot90[4,8] recorded one
+        // differentiable leaf on CPU and zero on GPU.
+        //
+        // This is the same guard the other ops in this file use for the same reason (see
+        // TensorCTCLoss and its neighbours): the GPU fast path is an optimization, and an
+        // optimization that silently drops gradients is not one.
+        if (axes.Length != 2 || axes[0] == axes[1]
+            || IsTapeActive<T>() || Compilation.GraphMode.IsActive
+            || !TryGetBackend(out var backend))
             return base.TensorRot90(tensor, k, axes);
 
         int steps = ((k % 4) + 4) % 4;

@@ -234,7 +234,21 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     [ThreadStatic]
     private static IntPtr _threadCurrentContext;
 
-    public bool IsAvailable { get; }
+    private bool _isAvailable;
+
+    /// <summary>
+    /// Whether this backend can serve work. FALSE ONCE DISPOSED, which is load-bearing:
+    /// DirectGpuBackendFactory caches one backend per process and hands the cached instance back
+    /// while it reports available. Dispose() clears the kernel cache, so a disposed-but-still-cached
+    /// backend answers every later kernel lookup with KeyNotFoundException ("add_vectors") on a
+    /// completely unrelated caller. Reporting unavailable makes the factory build a fresh backend
+    /// instead. VulkanBackend and MetalBackend already did this; these three did not.
+    /// </summary>
+    public bool IsAvailable
+    {
+        get => _isAvailable && !_disposed;
+        private set => _isAvailable = value;
+    }
     public string BackendName => "CUDA";
     public TensorDevice DeviceType => TensorDevice.CUDA;
     public string DeviceName { get; }
@@ -721,6 +735,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                             CudaNativeBindings.cuModuleGetFunction(out IntPtr kernel, cachedModule, kernelName),
                             $"cuModuleGetFunction({kernelName})");
                         _kernelCache[kernelName] = kernel;
+                        GpuKernelDiagnostics.RegisterKernelName(kernel, kernelName);
                     }
 
                     return cachedModule;
@@ -827,6 +842,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                 CudaNativeBindings.cuModuleGetFunction(out IntPtr kernel, module, kernelName),
                 $"cuModuleGetFunction({kernelName})");
             _kernelCache[kernelName] = kernel;
+            // Lets the native-launch choke point journal this kernel BY NAME (Issue #996).
+            GpuKernelDiagnostics.RegisterKernelName(kernel, kernelName);
         }
 
         return module;
@@ -16728,6 +16745,12 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             return;
 
         _disposed = true;
+
+        // Drop the diagnostics registrations for these handles. The registry is process-lifetime but
+        // kernel handles are not, and a driver may reuse a freed handle address -- a stale entry
+        // would then name a later kernel wrongly, which in crash forensics is worse than no name.
+        foreach (var handle in _kernelCache.Values) GpuKernelDiagnostics.UnregisterKernelName(handle);
+
         // Finalizer path (disposing == false) or any process/domain teardown:
         //   - The managed members (GpuBufferPool's ConcurrentBag/ThreadLocal, the cuDNN
         //     helpers) may already have been finalized by the runtime — touching them

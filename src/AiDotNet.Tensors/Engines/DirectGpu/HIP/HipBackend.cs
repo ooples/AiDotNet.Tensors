@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) AiDotNet. All rights reserved.
 // HIP backend for AMD GPU with real MFMA (Matrix Fused Multiply-Add) support.
 // Target: 25,000+ GFLOPS on MI200, 15,000+ GFLOPS on RX 7900.
 
@@ -60,6 +60,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     // Additional kernel modules
     private IntPtr _activationModule;
     private IntPtr _neuralNetModule;
+    private IntPtr _categoricalModule;
     private IntPtr _convolutionModule;
     private IntPtr _fusedConvolutionModule;
     private IntPtr _poolingModule;
@@ -123,7 +124,21 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     private const string GemmVendorThresholdEnvVar = "AIDOTNET_GPU_GEMM_VENDOR_THRESHOLD";
     private const long DefaultVendorGemmThreshold = 128L * 128L * 128L;
 
-    public bool IsAvailable { get; }
+    private bool _isAvailable;
+
+    /// <summary>
+    /// Whether this backend can serve work. FALSE ONCE DISPOSED, which is load-bearing:
+    /// DirectGpuBackendFactory caches one backend per process and hands the cached instance back
+    /// while it reports available. Dispose() clears the kernel cache, so a disposed-but-still-cached
+    /// backend answers every later kernel lookup with KeyNotFoundException ("add_vectors") on a
+    /// completely unrelated caller. Reporting unavailable makes the factory build a fresh backend
+    /// instead. VulkanBackend and MetalBackend already did this; these three did not.
+    /// </summary>
+    public bool IsAvailable
+    {
+        get => _isAvailable && !_disposed;
+        private set => _isAvailable = value;
+    }
     public string BackendName => $"HIP ({GetKernelTypeName()})";
     public TensorDevice DeviceType => TensorDevice.HIP;
     public string DeviceName { get; }
@@ -477,6 +492,32 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             CompileKernelModule(HipNeuralNetKernels.GetSource(), "neural_net", ref _neuralNetModule,
                 HipNeuralNetKernels.GetKernelNames());
 
+            // Categorical sampling: its own module, and NOT fast-math. Sharing the neural-net
+            // module would make every kernel in it hostage to this one compiling, and fast math
+            // permits reassociating the ordered double accumulation this kernel needs to reproduce
+            // the CPU sampler exactly. A failure here leaves the engine on its CPU reference instead
+            // of taking generate_random_uniform and the rest down with it.
+            try
+            {
+                CompileKernelModule(HipCategoricalKernels.GetSource(), "categorical",
+                    ref _categoricalModule, HipCategoricalKernels.GetKernelNames(), useFastMath: false);
+            }
+            catch (OutOfMemoryException)
+            {
+                // Process-level resource problem; do NOT silently downgrade. Matches the
+                // fused-advanced compilation path: a failed allocation is not a statement about
+                // this device's capability, and turning it into a quiet CPU fallback hides a
+                // condition the caller has to know about.
+                throw;
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"[HipBackend] Categorical kernel compile failed: {ex.GetType().Name}: {ex.Message}. "
+                    + "Falling back to the managed categorical sampler.");
+                _categoricalModule = IntPtr.Zero;
+            }
+
             // Compile Convolution kernels
             CompileKernelModule(HipConvolutionKernels.GetSource(), "convolution", ref _convolutionModule,
                 HipConvolutionKernels.GetKernelNames());
@@ -808,7 +849,13 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             IntPtr func = IntPtr.Zero;
             hipResult = HipNativeBindings.hipModuleGetFunction(ref func, module, kernelName);
             if (hipResult == HipError.Success)
+            {
                 _kernelCache[kernelName] = func;
+                // Lets the native-launch choke point journal this kernel BY NAME (Issue #996).
+                // INSIDE the guard: registering on a failed lookup would map IntPtr.Zero to this
+                // name and misattribute a later fault to a kernel that never resolved.
+                GpuKernelDiagnostics.RegisterKernelName(func, kernelName);
+            }
         }
     }
 
@@ -11161,6 +11208,12 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             HipNativeBindings.hipModuleUnload(_activationModule);
             _activationModule = IntPtr.Zero;
         }
+        if (_categoricalModule != IntPtr.Zero)
+        {
+            HipNativeBindings.hipModuleUnload(_categoricalModule);
+            _categoricalModule = IntPtr.Zero;
+        }
+
         if (_neuralNetModule != IntPtr.Zero)
         {
             HipNativeBindings.hipModuleUnload(_neuralNetModule);
@@ -11365,6 +11418,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             _stream = IntPtr.Zero;
         }
 
+        // Drop the diagnostics registrations for these handles. A driver may reuse a freed
+        // handle address, so a stale entry would name a later kernel wrongly (Issue #996).
+        foreach (var handle in _kernelCache.Values) GpuKernelDiagnostics.UnregisterKernelName(handle);
         _kernelCache.Clear();
     }
 

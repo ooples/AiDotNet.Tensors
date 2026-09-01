@@ -488,6 +488,17 @@ internal static partial class SimdGemm
         System.Span<float> c,
         int m, int k, int n)
     {
+        // Public entry into the pointer kernels: it does not pass through
+        // SgemmAddInternal, so it carries its own precondition. Strides are implicit in
+        // this overload's contract -- A is [m,k] at lda=k, B is [k,n] at ldb=n.
+        if (m > 0 && n > 0 && k > 0)
+        {
+            ValidateGemmOperands(
+                a.Length, k, false,
+                b.Length, n, false,
+                c.Length, m, k, n);
+        }
+
 #if !NET471
         // Our JIT'd AVX2 kernel first (opt-in). This is the entry the MLP's
         // MlpForward path and FusedLinear's tier-3 fallback use — without this
@@ -805,6 +816,17 @@ internal static partial class SimdGemm
         System.Span<float> c,
         int m, int k, int n)
     {
+        // Public entry into the pointer kernels: it does not pass through
+        // SgemmAddInternal, so it carries its own precondition. Strides are implicit in
+        // this overload's contract -- A is [m,k] at lda=k, B is [k,n] at ldb=n.
+        if (m > 0 && n > 0 && k > 0)
+        {
+            ValidateGemmOperands(
+                a.Length, k, false,
+                b.Length, n, false,
+                c.Length, m, k, n);
+        }
+
         c.Clear();
 
         if (n > Nc || Avx512Sgemm.CanUse)
@@ -1164,6 +1186,20 @@ internal static partial class SimdGemm
         System.ReadOnlySpan<float> a, float[] b, System.Span<float> c,
         int m, int k, int n)
     {
+        // The SAME precondition as the net5+ definition above. This overload has a twin, and
+        // guarding only the one visible on the framework you happen to build locally leaves the
+        // other route unprotected: it delegates to the obsolete no-trans shim, which forwards to
+        // BlasManaged rather than through any of the guarded paths, so an undersized b arrived at
+        // the kernel as an IndexOutOfRangeException instead of a named ArgumentException. Caught by
+        // SgemmWithCachedB_ValidatesItsOperands running on the net471 leg.
+        if (m > 0 && n > 0 && k > 0)
+        {
+            ValidateGemmOperands(
+                a.Length, k, false,
+                b.Length, n, false,
+                c.Length, m, k, n);
+        }
+
 #pragma warning disable CS0618 // Self-call to the [Obsolete] no-trans shim — SgemmWithCachedB is a net471 wrapper that legitimately delegates here.
         Sgemm(a, b.AsSpan(), c, m, k, n);
 #pragma warning restore CS0618
@@ -1365,6 +1401,16 @@ internal static partial class SimdGemm
         Span<float> c,
         int m, int k, int n)
     {
+        // Before the JIT / oneDNN fast paths below, which take fixed pointers of their own and
+        // would therefore bypass the check in SgemmAddInternal.
+        if (m > 0 && n > 0 && k > 0)
+        {
+            ValidateGemmOperands(
+                a.Length, lda, transA,
+                b.Length, ldb, transB,
+                c.Length, m, k, n);
+        }
+
 #if !NET471
         // Our JIT'd AVX2 kernel first (opt-in): no transpose, row-major contiguous
         // (lda==k, ldb==n). Beats managed + oneDNN on small-K/N, on our own pool.
@@ -1537,6 +1583,84 @@ internal static partial class SimdGemm
     /// across multiple Kc-tiles into the same C location.
     /// </summary>
     [MethodImpl(Hot)]
+
+    /// <summary>
+    /// Rejects operand spans that are too small for the requested shape and strides.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// THE KERNELS WALK RAW POINTERS. <see cref="SgemmDirect"/> and the packed paths take
+    /// <c>fixed</c> pointers into <paramref name="a"/>, <paramref name="b"/> and
+    /// <paramref name="c"/> and index them with lda / ldb / n. Nothing checked those spans were
+    /// large enough, so a caller that got a stride wrong did not get an exception - it read and
+    /// wrote past the end of the buffer. Observed as
+    /// <c>System.AccessViolationException: Attempted to read or write protected memory</c> raised
+    /// inside <c>SgemmDirect</c> on a backward pass, which kills the process outright: no catch
+    /// block runs, no shapes are reported, and a test host dies with "Test host process crashed".
+    /// </para>
+    /// <para>
+    /// The check is integer arithmetic on values already in registers, once per GEMM, against
+    /// kernels that then do m*n*k FMAs - it is not measurable. What it buys is that an undersized
+    /// operand becomes an <see cref="ArgumentException"/> naming the operand, its shape, its
+    /// stride and the length it needed, at the boundary where the caller is still on the stack.
+    /// </para>
+    /// <para>
+    /// Row-major minimums, transpose-aware. A is [m,k] read with row stride lda, or [k,m] when
+    /// <paramref name="transA"/>; B is [k,n] with row stride ldb, or [n,k] when
+    /// <paramref name="transB"/>; C is [m,n] with row stride n. The last row needs only its own
+    /// columns, hence (rows-1)*stride + cols rather than rows*stride - a caller passing an exactly
+    /// sized final row is legal and must not be rejected.
+    /// </para>
+    /// </remarks>
+    private static void ValidateGemmOperands(
+        int aLength, int lda, bool transA,
+        int bLength, int ldb, bool transB,
+        int cLength,
+        int m, int k, int n)
+    {
+        int aRows = transA ? k : m;
+        int aCols = transA ? m : k;
+        int bRows = transB ? n : k;
+        int bCols = transB ? k : n;
+
+        if (lda < aCols)
+        {
+            throw new ArgumentException(
+                $"GEMM operand A has row stride lda={lda} but {aCols} columns; the stride must be "
+                    + "at least the column count.", nameof(lda));
+        }
+
+        if (ldb < bCols)
+        {
+            throw new ArgumentException(
+                $"GEMM operand B has row stride ldb={ldb} but {bCols} columns; the stride must be "
+                    + "at least the column count.", nameof(ldb));
+        }
+
+        long needA = (long)(aRows - 1) * lda + aCols;
+        if (aLength < needA)
+        {
+            throw new ArgumentException(
+                $"GEMM operand A is {aLength} elements but [{aRows}x{aCols}] at lda={lda} needs "
+                    + $"{needA} (m={m}, k={k}, n={n}, transA={transA}).", "a");
+        }
+
+        long needB = (long)(bRows - 1) * ldb + bCols;
+        if (bLength < needB)
+        {
+            throw new ArgumentException(
+                $"GEMM operand B is {bLength} elements but [{bRows}x{bCols}] at ldb={ldb} needs "
+                    + $"{needB} (m={m}, k={k}, n={n}, transB={transB}).", "b");
+        }
+
+        long needC = (long)m * n;
+        if (cLength < needC)
+        {
+            throw new ArgumentException(
+                $"GEMM output C is {cLength} elements but [{m}x{n}] needs {needC}.", "c");
+        }
+    }
+
     internal static void SgemmAddInternal(
         ReadOnlySpan<float> a, int lda, bool transA,
         ReadOnlySpan<float> b, int ldb, bool transB,
@@ -1545,6 +1669,17 @@ internal static partial class SimdGemm
         bool allowParallel,
         bool clearedOutput = false)
     {
+        // Degenerate shapes are a documented quiet no-op, and the kernels never touch the
+        // operands, so validating them would reject callers the contract accepts - an empty c or
+        // an unused ldb is legal when there is no work to do.
+        if (m > 0 && n > 0 && k > 0)
+        {
+            ValidateGemmOperands(
+                a.Length, lda, transA,
+                b.Length, ldb, transB,
+                c.Length, m, k, n);
+        }
+
         // batch=1 / small-M, large-N, no-transpose: parallelize over N (output features). The
         // small-matmul fast path below requires m >= Mr and SgemmDirectParallelM requires m >= 64,
         // so a tiny-M GEMM (foundation-model batch=1 / decode forward, fused QKV/FFN projections)
@@ -2088,6 +2223,17 @@ internal static partial class SimdGemm
         ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c,
         int m, int k, int n)
     {
+        // Public entry into the pointer kernels: it does not pass through
+        // SgemmAddInternal, so it carries its own precondition. Strides are implicit in
+        // this overload's contract -- A is [m,k] at lda=k, B is [k,n] at ldb=n.
+        if (m > 0 && n > 0 && k > 0)
+        {
+            ValidateGemmOperands(
+                a.Length, k, false,
+                b.Length, n, false,
+                c.Length, m, k, n);
+        }
+
         c.Clear();
         SgemmDirectParallelM(a, k, b, n, c, m, k, n, clearedOutput: true);
     }
@@ -2107,6 +2253,17 @@ internal static partial class SimdGemm
         ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c,
         int m, int k, int n)
     {
+        // Public entry into the pointer kernels: it does not pass through
+        // SgemmAddInternal, so it carries its own precondition. Strides are implicit in
+        // this overload's contract -- A is [m,k] at lda=k, B is [k,n] at ldb=n.
+        if (m > 0 && n > 0 && k > 0)
+        {
+            ValidateGemmOperands(
+                a.Length, k, false,
+                b.Length, n, false,
+                c.Length, m, k, n);
+        }
+
         SgemmDirectParallelM(a, k, b, n, c, m, k, n, clearedOutput: true);
     }
 
@@ -2118,7 +2275,10 @@ internal static partial class SimdGemm
     /// carry pack / macro-loop overhead at thin-M, ~60 GF/s). Each output row is
     /// written by exactly one thread in fixed K order, so it is deterministic across
     /// thread counts. Contiguous row-major (lda=k, ldb=n, ldc=n); requires Fma +
-    /// n % 8 == 0 (caller gates). Every C element is overwritten (full 4-row × 8-col
+    /// Any n: the 8-wide column loop peels its tail into a masked block. It previously declared
+    /// "n % 8 == 0 (caller gates)" and stored full width regardless, which wrote past the end of C
+    /// for any caller that did not gate -- and this entry does not validate operands at all.
+    /// Every C element is overwritten (full 4-row × 8-col
     /// tiles cover the M-full / N region; the M%4 tail rows are computed scalar), so
     /// no pre-clear is needed.
     /// </summary>
@@ -2170,11 +2330,27 @@ internal static partial class SimdGemm
     }
 
     /// <summary>4-row × 8-col register-blocked FP64 microkernel over M-blocks
-    /// [blockStart, blockEnd). n % 8 == 0 (caller-guaranteed); overwrites C.</summary>
+    /// [blockStart, blockEnd). Any n (the column tail is masked); overwrites C.</summary>
     private static unsafe void DgemmDirectBlockRange(
         double* A, double* B, double* C, int blockStart, int blockEnd, int k, int n)
     {
         const int MRd = 4;
+
+        // See SgemmTransABlock for the full account. In short: this loop is 8 columns wide and n
+        // need not be, and a full-width store on the final step writes 8 - n % 8 doubles past the
+        // end of each C row it touches. Those spills corrupted the NEXT row's already-written
+        // values (wrong results for every row but the last of each block), and on the last block ran
+        // past the end of C itself (GC heap corruption, surfacing as an ExecutionEngineException at
+        // some later collection). The header used to declare "n % 8 == 0", but this entry point
+        // does not enforce it -- DgemmDirectParallelMInto does not validate operands at all.
+        int nFull = (n / 8) * 8;
+        int nTail = n - nFull;
+        int tailLane0 = nTail >= 4 ? 4 : nTail;
+        int tailLane1 = nTail > 4 ? nTail - 4 : 0;
+        var tailMask0 = _partialD4Masks[tailLane0].AsDouble();
+        var tailMask1 = _partialD4Masks[tailLane1].AsDouble();
+        bool tailHasHighLane = tailLane1 > 0;
+
         for (int blk = blockStart; blk < blockEnd; blk++)
         {
             int i0 = blk * MRd;
@@ -2182,7 +2358,7 @@ internal static partial class SimdGemm
             double* a1 = A + (long)(i0 + 1) * k;
             double* a2 = A + (long)(i0 + 2) * k;
             double* a3 = A + (long)(i0 + 3) * k;
-            for (int j = 0; j < n; j += 8)
+            for (int j = 0; j < nFull; j += 8)
             {
                 var c00 = Vector256<double>.Zero; var c01 = Vector256<double>.Zero;
                 var c10 = Vector256<double>.Zero; var c11 = Vector256<double>.Zero;
@@ -2204,6 +2380,29 @@ internal static partial class SimdGemm
                 double* o2 = C + (long)(i0 + 2) * n + j; Avx.Store(o2, c20); Avx.Store(o2 + 4, c21);
                 double* o3 = C + (long)(i0 + 3) * n + j; Avx.Store(o3, c30); Avx.Store(o3 + 4, c31);
             }
+
+            if (nTail > 0)
+            {
+                var c00 = Vector256<double>.Zero; var c01 = Vector256<double>.Zero;
+                var c10 = Vector256<double>.Zero; var c11 = Vector256<double>.Zero;
+                var c20 = Vector256<double>.Zero; var c21 = Vector256<double>.Zero;
+                var c30 = Vector256<double>.Zero; var c31 = Vector256<double>.Zero;
+                double* bj = B + nFull;
+                for (int p = 0; p < k; p++)
+                {
+                    double* bp = bj + (long)p * n;
+                    var b0 = Avx.MaskLoad(bp, tailMask0);
+                    var b1 = tailHasHighLane ? Avx.MaskLoad(bp + 4, tailMask1) : Vector256<double>.Zero;
+                    var av = Vector256.Create(a0[p]); c00 = Fma.MultiplyAdd(av, b0, c00); c01 = Fma.MultiplyAdd(av, b1, c01);
+                    av = Vector256.Create(a1[p]); c10 = Fma.MultiplyAdd(av, b0, c10); c11 = Fma.MultiplyAdd(av, b1, c11);
+                    av = Vector256.Create(a2[p]); c20 = Fma.MultiplyAdd(av, b0, c20); c21 = Fma.MultiplyAdd(av, b1, c21);
+                    av = Vector256.Create(a3[p]); c30 = Fma.MultiplyAdd(av, b0, c30); c31 = Fma.MultiplyAdd(av, b1, c31);
+                }
+                double* t0 = C + (long)(i0 + 0) * n + nFull; Avx.MaskStore(t0, tailMask0, c00); if (tailHasHighLane) Avx.MaskStore(t0 + 4, tailMask1, c01);
+                double* t1 = C + (long)(i0 + 1) * n + nFull; Avx.MaskStore(t1, tailMask0, c10); if (tailHasHighLane) Avx.MaskStore(t1 + 4, tailMask1, c11);
+                double* t2 = C + (long)(i0 + 2) * n + nFull; Avx.MaskStore(t2, tailMask0, c20); if (tailHasHighLane) Avx.MaskStore(t2 + 4, tailMask1, c21);
+                double* t3 = C + (long)(i0 + 3) * n + nFull; Avx.MaskStore(t3, tailMask0, c30); if (tailHasHighLane) Avx.MaskStore(t3 + 4, tailMask1, c31);
+            }
         }
     }
 
@@ -2212,8 +2411,8 @@ internal static partial class SimdGemm
     /// (lda=m) and B is [k,n]. Same broadcast-A 4×8 kernel as
     /// <see cref="DgemmDirectParallelMInto"/> but A is read strided (a[i,p] = A[p·m+i],
     /// the 4 row values at a depth are contiguous), so NO transpose is materialised —
-    /// the transpose-into-scratch alternative regresses at thin-M. n % 8 == 0; n-major
-    /// contiguous B and C; parallel over disjoint M-row-blocks (deterministic).
+    /// the transpose-into-scratch alternative regresses at thin-M. Any n (the column tail is
+    /// masked); n-major contiguous B and C; parallel over disjoint M-row-blocks (deterministic).
     /// </summary>
     [MethodImpl(Hot)]
     public static unsafe void DgemmDirectParallelMIntoTransA(
@@ -2255,10 +2454,22 @@ internal static partial class SimdGemm
     private static unsafe void DgemmTransABlock(double* A, double* B, double* C, int blockStart, int blockEnd, int k, int n, int m)
     {
         const int MRd = 4;
+
+        // Same 8-wide column loop, same unguarded tail, same consequence as DgemmDirectBlockRange:
+        // a full-width store on the final step runs past the end of each C row, and past the end of
+        // C on the last block. See SgemmTransABlock for the full account.
+        int nFull = (n / 8) * 8;
+        int nTail = n - nFull;
+        int tailLane0 = nTail >= 4 ? 4 : nTail;
+        int tailLane1 = nTail > 4 ? nTail - 4 : 0;
+        var tailMask0 = _partialD4Masks[tailLane0].AsDouble();
+        var tailMask1 = _partialD4Masks[tailLane1].AsDouble();
+        bool tailHasHighLane = tailLane1 > 0;
+
         for (int blk = blockStart; blk < blockEnd; blk++)
         {
             int i0 = blk * MRd;
-            for (int j = 0; j < n; j += 8)
+            for (int j = 0; j < nFull; j += 8)
             {
                 var c00 = Vector256<double>.Zero; var c01 = Vector256<double>.Zero;
                 var c10 = Vector256<double>.Zero; var c11 = Vector256<double>.Zero;
@@ -2280,6 +2491,30 @@ internal static partial class SimdGemm
                 double* o1 = C + (long)(i0 + 1) * n + j; Avx.Store(o1, c10); Avx.Store(o1 + 4, c11);
                 double* o2 = C + (long)(i0 + 2) * n + j; Avx.Store(o2, c20); Avx.Store(o2 + 4, c21);
                 double* o3 = C + (long)(i0 + 3) * n + j; Avx.Store(o3, c30); Avx.Store(o3 + 4, c31);
+            }
+
+            if (nTail > 0)
+            {
+                var c00 = Vector256<double>.Zero; var c01 = Vector256<double>.Zero;
+                var c10 = Vector256<double>.Zero; var c11 = Vector256<double>.Zero;
+                var c20 = Vector256<double>.Zero; var c21 = Vector256<double>.Zero;
+                var c30 = Vector256<double>.Zero; var c31 = Vector256<double>.Zero;
+                double* bj = B + nFull;
+                for (int p = 0; p < k; p++)
+                {
+                    double* bp = bj + (long)p * n;
+                    var b0 = Avx.MaskLoad(bp, tailMask0);
+                    var b1 = tailHasHighLane ? Avx.MaskLoad(bp + 4, tailMask1) : Vector256<double>.Zero;
+                    double* ap = A + (long)p * m + i0;
+                    var av = Vector256.Create(ap[0]); c00 = Fma.MultiplyAdd(av, b0, c00); c01 = Fma.MultiplyAdd(av, b1, c01);
+                    av = Vector256.Create(ap[1]); c10 = Fma.MultiplyAdd(av, b0, c10); c11 = Fma.MultiplyAdd(av, b1, c11);
+                    av = Vector256.Create(ap[2]); c20 = Fma.MultiplyAdd(av, b0, c20); c21 = Fma.MultiplyAdd(av, b1, c21);
+                    av = Vector256.Create(ap[3]); c30 = Fma.MultiplyAdd(av, b0, c30); c31 = Fma.MultiplyAdd(av, b1, c31);
+                }
+                double* t0 = C + (long)(i0 + 0) * n + nFull; Avx.MaskStore(t0, tailMask0, c00); if (tailHasHighLane) Avx.MaskStore(t0 + 4, tailMask1, c01);
+                double* t1 = C + (long)(i0 + 1) * n + nFull; Avx.MaskStore(t1, tailMask0, c10); if (tailHasHighLane) Avx.MaskStore(t1 + 4, tailMask1, c11);
+                double* t2 = C + (long)(i0 + 2) * n + nFull; Avx.MaskStore(t2, tailMask0, c20); if (tailHasHighLane) Avx.MaskStore(t2 + 4, tailMask1, c21);
+                double* t3 = C + (long)(i0 + 3) * n + nFull; Avx.MaskStore(t3, tailMask0, c30); if (tailHasHighLane) Avx.MaskStore(t3 + 4, tailMask1, c31);
             }
         }
     }
@@ -2377,12 +2612,24 @@ internal static partial class SimdGemm
     }
 
     /// <summary>FP32 thin-M GEMM with A transposed (#368): C = Aᵀ·B, A stored [k,m]
-    /// (lda=m), strided-A 4×8 broadcast kernel (no transpose). n % 8 == 0; parallel-M
-    /// (deterministic). Float analog of <see cref="DgemmDirectParallelMIntoTransA"/>.</summary>
+    /// (lda=m), strided-A 4×8 broadcast kernel (no transpose). Any n (the column tail is masked);
+    /// parallel-M (deterministic). Float analog of
+    /// <see cref="DgemmDirectParallelMIntoTransA"/>.</summary>
     [MethodImpl(Hot)]
     public static unsafe void SgemmDirectParallelMIntoTransA(
         ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c, int m, int k, int n)
     {
+        // Public entry into the pointer kernels: it does not pass through
+        // SgemmAddInternal, so it carries its own precondition. Strides are implicit in
+        // this overload's contract -- A is [k,m] at lda=m (transposed), B is [k,n] at ldb=n.
+        if (m > 0 && n > 0 && k > 0)
+        {
+            ValidateGemmOperands(
+                a.Length, m, true,
+                b.Length, n, false,
+                c.Length, m, k, n);
+        }
+
         const int MRf = 4;
         int mFull = (m / MRf) * MRf;
         int numFullBlocks = mFull / MRf;
@@ -2420,10 +2667,43 @@ internal static partial class SimdGemm
     private static unsafe void SgemmTransABlock(float* A, float* B, float* C, int blockStart, int blockEnd, int k, int n, int m)
     {
         const int MRf = 4;
+
+        // THE COLUMN LOOP IS 8 WIDE AND n NEED NOT BE. It used to run `j < n; j += 8` and finish
+        // every step with a full-width Avx.Store, so when n was not a multiple of 8 the final step
+        // wrote 8 - n % 8 floats past the end of each of the four C rows it touched. That is two
+        // separate defects, and the quieter one is the worse.
+        //
+        // WRONG RESULTS. The j loop is OUTSIDE the four row stores, so the spill from row i at the
+        // last j overwrites the start of row i+1 -- which an EARLIER j step had already written
+        // correctly, and which no later step rewrites. Every row but the last of each block came
+        // back wrong. Measured on the pre-fix code at m=4 k=3 n=13: C[1,0] is 0.33678542 where the
+        // product is 0.694251873.
+        //
+        // HEAP CORRUPTION. The spill from the last row of the last block has no next row to land
+        // in; it goes past the end of C. Writing past a managed array corrupts the GC heap and
+        // nothing fails at the call: the process dies at some later, unrelated allocation as
+        // "Internal CLR error (0x80131506)" / ExecutionEngineException, reported against whatever
+        // code happened to trigger that collection. This is how it was found -- as a test-host death
+        // two classes away from any GEMM, via
+        // SgemmDirectParallelMIntoTransA_SizesAgainstTheTransposedA, whose M=4 K=3 N=5 case stores
+        // 8 floats at offset 15 of a 20-element C.
+        //
+        // The load has the same shape of bug: it reads a full 8 floats from B, whose rows are also
+        // only n wide.
+        //
+        // The header used to declare "n % 8 == 0". The internal dispatch does gate on that, but this
+        // kernel's public entry point does not: it validates operand LENGTHS and lets any n through.
+        //
+        // The full-width blocks below are untouched -- the tail is peeled into its own masked block
+        // so the hot path keeps its unmasked load and store.
+        int nFull = (n / 8) * 8;
+        int nTail = n - nFull;
+        var tailMask = _partialNrMasks[nTail].AsSingle();
+
         for (int blk = blockStart; blk < blockEnd; blk++)
         {
             int i0 = blk * MRf;
-            for (int j = 0; j < n; j += 8)
+            for (int j = 0; j < nFull; j += 8)
             {
                 var c0 = Vector256<float>.Zero; var c1 = Vector256<float>.Zero;
                 var c2 = Vector256<float>.Zero; var c3 = Vector256<float>.Zero;
@@ -2442,6 +2722,26 @@ internal static partial class SimdGemm
                 Avx.Store(C + (long)(i0 + 2) * n + j, c2);
                 Avx.Store(C + (long)(i0 + 3) * n + j, c3);
             }
+
+            if (nTail > 0)
+            {
+                var c0 = Vector256<float>.Zero; var c1 = Vector256<float>.Zero;
+                var c2 = Vector256<float>.Zero; var c3 = Vector256<float>.Zero;
+                float* bj = B + nFull;
+                for (int p = 0; p < k; p++)
+                {
+                    var b0 = Avx.MaskLoad(bj + (long)p * n, tailMask);
+                    float* ap = A + (long)p * m + i0;
+                    c0 = Fma.MultiplyAdd(Vector256.Create(ap[0]), b0, c0);
+                    c1 = Fma.MultiplyAdd(Vector256.Create(ap[1]), b0, c1);
+                    c2 = Fma.MultiplyAdd(Vector256.Create(ap[2]), b0, c2);
+                    c3 = Fma.MultiplyAdd(Vector256.Create(ap[3]), b0, c3);
+                }
+                Avx.MaskStore(C + (long)(i0 + 0) * n + nFull, tailMask, c0);
+                Avx.MaskStore(C + (long)(i0 + 1) * n + nFull, tailMask, c1);
+                Avx.MaskStore(C + (long)(i0 + 2) * n + nFull, tailMask, c2);
+                Avx.MaskStore(C + (long)(i0 + 3) * n + nFull, tailMask, c3);
+            }
         }
     }
 
@@ -2453,6 +2753,17 @@ internal static partial class SimdGemm
     public static unsafe void SgemmDirectParallelMIntoTransB(
         ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c, int m, int k, int n)
     {
+        // Public entry into the pointer kernels: it does not pass through
+        // SgemmAddInternal, so it carries its own precondition. Strides are implicit in
+        // this overload's contract -- A is [m,k] at lda=k, B is [n,k] at ldb=k (transposed).
+        if (m > 0 && n > 0 && k > 0)
+        {
+            ValidateGemmOperands(
+                a.Length, k, false,
+                b.Length, k, true,
+                c.Length, m, k, n);
+        }
+
         const int MRf = 4;
         int mFull = (m / MRf) * MRf;
         int numFullBlocks = mFull / MRf;
@@ -2906,10 +3217,41 @@ internal static partial class SimdGemm
         float* pA4 = pA + lda * 4;
         float* pA5 = pA + lda * 5;
 
+        // COLUMN LANE MASKS, HOISTED ABOVE THE K-LOOP because the B LOADS need them too.
+        //
+        // These kernels are entered for the N tail, where ncActual is 1..Nr-1, and they used to
+        // load a full 16-wide B row on every k step regardless:
+        //
+        //     var b0 = Avx.LoadVector256(pB);
+        //     var b1 = Avx.LoadVector256(pB + 8);
+        //
+        // The masks existed but were built AFTER the loop and used only to mask the STORE, so the
+        // reads ran past the end of B. On the final k row the last address touched is
+        // (k-1)*ldb + j + 15 while the operand check guarantees only (k-1)*ldb + n, and j + ncActual
+        // equals n -- so a tail of ncActual columns over-reads by 16 - ncActual floats with no
+        // slack to absorb it. It is harmless until that overhang crosses onto an unmapped page, and
+        // then it is an AccessViolationException that kills the process rather than failing a test:
+        // observed on a Linux CI runner as "Test Run Aborted / the host process exited
+        // unexpectedly" inside a backward-pass GEMM, on a shard that reported 250 tests executed
+        // and 0 failed.
+        //
+        // DirectKernelMxNarrow in this same file already loads B this way; these two kernels simply
+        // did not. The full-width lane keeps its unmasked load so the ncActual == Nr callers (the M
+        // tail, which passes ncActual: Nr) are not slowed down.
+        int lane0N = ncActual >= 8 ? 8 : ncActual;
+        int lane1N = ncActual >= 8 ? ncActual - 8 : 0;
+        var mask0 = _partialNrMasks[lane0N].AsSingle();
+        var mask1 = _partialNrMasks[lane1N].AsSingle();
+        bool bLane0Full = lane0N == 8;
+        bool bLane1Full = lane1N == 8;
+        bool bLane1Any = lane1N > 0;
+
         for (int p = 0; p < k; p++)
         {
-            var b0 = Avx.LoadVector256(pB);
-            var b1 = Avx.LoadVector256(pB + 8);
+            var b0 = bLane0Full ? Avx.LoadVector256(pB) : Avx.MaskLoad(pB, mask0);
+            var b1 = bLane1Full
+                ? Avx.LoadVector256(pB + 8)
+                : (bLane1Any ? Avx.MaskLoad(pB + 8, mask1) : Vector256<float>.Zero);
 
             // Row 0 always active (mcActual >= 1 guaranteed by caller).
             var a0 = Vector256.Create(pA0[p]);
@@ -2944,11 +3286,6 @@ internal static partial class SimdGemm
             pB += ldb;
         }
 
-        // Build column lane masks from ncActual (same logic as MicroKernelMxNMasked).
-        int lane0N = ncActual >= 8 ? 8 : ncActual;
-        int lane1N = ncActual >= 8 ? ncActual - 8 : 0;
-        var mask0 = _partialNrMasks[lane0N].AsSingle();
-        var mask1 = _partialNrMasks[lane1N].AsSingle();
 
         // Masked accumulate-and-store, row by row, skipping rows past mcActual.
         if (mcActual > 0) StoreMaskedAccumRowDirect(pC,            mask0, mask1, c00, c01);
@@ -3065,10 +3402,41 @@ internal static partial class SimdGemm
         float* pA4 = pA + lda * 4;
         float* pA5 = pA + lda * 5;
 
+        // COLUMN LANE MASKS, HOISTED ABOVE THE K-LOOP because the B LOADS need them too.
+        //
+        // These kernels are entered for the N tail, where ncActual is 1..Nr-1, and they used to
+        // load a full 16-wide B row on every k step regardless:
+        //
+        //     var b0 = Avx.LoadVector256(pB);
+        //     var b1 = Avx.LoadVector256(pB + 8);
+        //
+        // The masks existed but were built AFTER the loop and used only to mask the STORE, so the
+        // reads ran past the end of B. On the final k row the last address touched is
+        // (k-1)*ldb + j + 15 while the operand check guarantees only (k-1)*ldb + n, and j + ncActual
+        // equals n -- so a tail of ncActual columns over-reads by 16 - ncActual floats with no
+        // slack to absorb it. It is harmless until that overhang crosses onto an unmapped page, and
+        // then it is an AccessViolationException that kills the process rather than failing a test:
+        // observed on a Linux CI runner as "Test Run Aborted / the host process exited
+        // unexpectedly" inside a backward-pass GEMM, on a shard that reported 250 tests executed
+        // and 0 failed.
+        //
+        // DirectKernelMxNarrow in this same file already loads B this way; these two kernels simply
+        // did not. The full-width lane keeps its unmasked load so the ncActual == Nr callers (the M
+        // tail, which passes ncActual: Nr) are not slowed down.
+        int lane0N = ncActual >= 8 ? 8 : ncActual;
+        int lane1N = ncActual >= 8 ? ncActual - 8 : 0;
+        var mask0 = _partialNrMasks[lane0N].AsSingle();
+        var mask1 = _partialNrMasks[lane1N].AsSingle();
+        bool bLane0Full = lane0N == 8;
+        bool bLane1Full = lane1N == 8;
+        bool bLane1Any = lane1N > 0;
+
         for (int p = 0; p < k; p++)
         {
-            var b0 = Avx.LoadVector256(pB);
-            var b1 = Avx.LoadVector256(pB + 8);
+            var b0 = bLane0Full ? Avx.LoadVector256(pB) : Avx.MaskLoad(pB, mask0);
+            var b1 = bLane1Full
+                ? Avx.LoadVector256(pB + 8)
+                : (bLane1Any ? Avx.MaskLoad(pB + 8, mask1) : Vector256<float>.Zero);
 
             var a0 = Vector256.Create(pA0[p]);
             c00 = Fma.MultiplyAdd(a0, b0, c00); c01 = Fma.MultiplyAdd(a0, b1, c01);
@@ -3102,10 +3470,6 @@ internal static partial class SimdGemm
             pB += ldb;
         }
 
-        int lane0N = ncActual >= 8 ? 8 : ncActual;
-        int lane1N = ncActual >= 8 ? ncActual - 8 : 0;
-        var mask0 = _partialNrMasks[lane0N].AsSingle();
-        var mask1 = _partialNrMasks[lane1N].AsSingle();
 
         // Store-only: plain MaskStore (no MaskLoad-add).
         if (mcActual > 0) StoreMaskedRowDirect(pC,            mask0, mask1, c00, c01);
@@ -4141,6 +4505,23 @@ internal static partial class SimdGemm
         Vector256.Create(-1, -1, -1, -1, -1, -1,  0,  0),
         Vector256.Create(-1, -1, -1, -1, -1, -1, -1,  0),
         Vector256.Create(-1, -1, -1, -1, -1, -1, -1, -1),
+    };
+
+    /// <summary>
+    /// The FP64 counterpart of <see cref="_partialNrMasks"/>, indexed by active lanes (0..4).
+    /// </summary>
+    /// <remarks>
+    /// A <c>Vector256&lt;double&gt;</c> holds four lanes, so the FP64 block kernels -- which walk
+    /// columns eight at a time as two of these -- need a four-entry table rather than the eight-entry
+    /// one above. MSB=1 in a lane means that lane is active for MaskLoad/MaskStore.
+    /// </remarks>
+    private static readonly Vector256<long>[] _partialD4Masks = new[]
+    {
+        Vector256.Create(0L, 0L, 0L, 0L),
+        Vector256.Create(-1L, 0L, 0L, 0L),
+        Vector256.Create(-1L, -1L, 0L, 0L),
+        Vector256.Create(-1L, -1L, -1L, 0L),
+        Vector256.Create(-1L, -1L, -1L, -1L),
     };
 
     /// <summary>

@@ -377,7 +377,64 @@ public sealed class MetalDevice : IDisposable
     /// </summary>
     /// <param name="source">The MSL source code.</param>
     /// <returns>Handle to the compiled library, or IntPtr.Zero on error.</returns>
+    /// <summary>
+    /// Builds an <c>MTLCompileOptions</c> that disables fast math, or returns
+    /// <see cref="IntPtr.Zero"/> when this runtime exposes no way to do so.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Metal compiles with fast math ENABLED by default, which permits reassociating floating-point
+    /// expressions. Any kernel whose correctness rests on compensated arithmetic — Knuth
+    /// <c>two_sum</c>, an FMA-recovered product — is silently reduced to plain float accumulation
+    /// under it, with no diagnostic. A source-level pragma is not sufficient evidence that it is
+    /// off: an older compiler accepts an unknown pragma as a warning and keeps fast math.
+    /// </para>
+    /// <para>
+    /// Every selector is probed with <c>respondsToSelector:</c> first. <c>fastMathEnabled</c> is
+    /// deprecated in newer Metal in favour of <c>mathMode</c>, and calling either blind on a runtime
+    /// that lacks it raises an unrecognised-selector exception rather than returning an error, so
+    /// the caller would trade a numerical problem for a crash. Returning Zero here means "cannot be
+    /// established", and the caller is expected to FAIL CLOSED rather than assume.
+    /// </para>
+    /// </remarks>
+    public static IntPtr TryCreateStrictFloatingPointOptions()
+    {
+        IntPtr optionsClass = MetalNativeBindings.Classes.MTLCompileOptions;
+        if (optionsClass == IntPtr.Zero) return IntPtr.Zero;
+
+        IntPtr allocated = MetalNativeBindings.SendMessage(optionsClass, Selectors.Alloc);
+        if (allocated == IntPtr.Zero) return IntPtr.Zero;
+
+        IntPtr options = MetalNativeBindings.SendMessage(allocated, Selectors.Init);
+        if (options == IntPtr.Zero)
+        {
+            Release(allocated);
+            return IntPtr.Zero;
+        }
+
+        // MTLMathMode.safe == 0 on the runtimes that expose mathMode; fastMathEnabled = NO is the
+        // older spelling. IntPtr.Zero carries the 0 / NO argument in both cases.
+        if (MetalNativeBindings.SendMessageBool(options, Selectors.RespondsToSelector, Selectors.SetMathMode))
+        {
+            MetalNativeBindings.SendMessage(options, Selectors.SetMathMode, IntPtr.Zero);
+            return options;
+        }
+
+        if (MetalNativeBindings.SendMessageBool(options, Selectors.RespondsToSelector, Selectors.SetFastMathEnabled))
+        {
+            MetalNativeBindings.SendMessage(options, Selectors.SetFastMathEnabled, IntPtr.Zero);
+            return options;
+        }
+
+        // Neither spelling exists: strict floating point cannot be established on this runtime.
+        Release(options);
+        return IntPtr.Zero;
+    }
+
     public IntPtr CreateLibrary(string source, out string? error)
+        => CreateLibrary(source, IntPtr.Zero, out error);
+
+    public IntPtr CreateLibrary(string source, IntPtr compileOptions, out string? error)
     {
         ThrowIfDisposed();
         error = null;
@@ -392,7 +449,7 @@ public sealed class MetalDevice : IDisposable
         try
         {
             IntPtr errorPtr = IntPtr.Zero;
-            var library = MetalNativeBindings.SendMessageWithError(_device, Selectors.NewLibraryWithSource, sourceNS, IntPtr.Zero, ref errorPtr);
+            var library = MetalNativeBindings.SendMessageWithError(_device, Selectors.NewLibraryWithSource, sourceNS, compileOptions, ref errorPtr);
 
             if (library == IntPtr.Zero && errorPtr != IntPtr.Zero)
             {

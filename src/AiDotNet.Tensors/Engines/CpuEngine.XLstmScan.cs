@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -63,6 +64,32 @@ public partial class CpuEngine
         EnsureGateShape(iGate, batch, seqLen, numHeads, nameof(iGate));
         EnsureGateShape(fGate, batch, seqLen, numHeads, nameof(fGate));
         EnsureGateShape(oGate, batch, seqLen, numHeads, nameof(oGate));
+
+        if (GraphMode.IsActive && GraphMode.Current is { } scope)
+        {
+            scope.BindEngineIfUnset(this);
+            var capturedQ = qProj;
+            var capturedK = kProj;
+            var capturedV = vProj;
+            var capturedI = iGate;
+            var capturedF = fGate;
+            var capturedO = oGate;
+            int capturedNumHeads = numHeads;
+            return scope.RecordVariadic(
+                LazyNodeType.Custom,
+                "XLstmScan",
+                new[] { qProj, kProj, vProj, iGate, fGate, oGate },
+                new[] { batch, seqLen, modelDim },
+                (eng, output) =>
+                {
+                    var result = eng.XLstmScanForward(
+                        capturedQ, capturedK, capturedV, capturedI, capturedF, capturedO,
+                        capturedNumHeads);
+                    DirectGpuTensorEngine.CopyResultInto(eng, result, output);
+                },
+                XLstmScanBackward<T>,
+                new object[] { numHeads });
+        }
 
         var output = new Tensor<T>(new[] { batch, seqLen, modelDim });
 

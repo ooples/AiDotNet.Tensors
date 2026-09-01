@@ -45,6 +45,91 @@ public sealed class GpuCpuAutoDifferentialTests : IDisposable
     // GPU fast-math approximation noise (~1e-3) on transcendental ops.
     private const float Tol = 1e-2f;
 
+    // Differential correctness does not need a huge shape, but several ops EXPAND their input.
+    // TensorKron on [129,129] returns [16641,16641] — 276,922,881 elements, 1.1 GB as float — and
+    // CompareValue then calls ToArray() on BOTH sides for two more managed copies of the same size.
+    // Kron, Tile, Stack, CartesianProd, Dot and Inner together drove this one class to a peak of
+    // 11.5 GB, which survives a 64 GB workstation and kills a 16 GB CI runner: the shard dies
+    // having written no results, which is exactly the failure this harness was blamed for.
+    //
+    // THIS IS A BUDGET, NOT A WEAKENED ASSERTION. An oversized result makes the harness fall
+    // through to the next (smaller) candidate shape and assert the identical GPU-vs-CPU parity
+    // there, at the same tolerance. No operation loses its accuracy check and nothing is skipped;
+    // only the shape an expanding op is checked at changes, and only when its output would not fit.
+    // 32M elements is ~128 MB per tensor, far above every non-expanding op (a [129,129] input is
+    // 16,641 elements), so nothing else in the sweep changes shape at all.
+    private const long MaxResultElements = 32_000_000;
+
+    /// <summary>
+    /// Probes the op on the smallest candidate shape and extrapolates the largest input whose OUTPUT
+    /// still fits <see cref="MaxResultElements"/>. Returns <see cref="long.MaxValue"/> when the op
+    /// does not expand, or when it cannot be driven at the probe shape.
+    /// </summary>
+    /// <remarks>
+    /// EXTRAPOLATION IS BY GROWTH ORDER, NOT RATIO. Kron's output is input squared, so a ratio taken
+    /// at a small shape under-predicts enormously: 64 elements in and 4096 out is a ratio of 64,
+    /// which predicts about 1M elements at a 16,641-element input against an actual 276,922,881.
+    /// Fitting k = log(produced) / log(input) recovers the exponent instead — 2 for Kron, 1 for an
+    /// elementwise op — and inverting it gives the largest input that still fits. Under-estimating is
+    /// the safe direction here, since the cost of guessing low is only a smaller test shape.
+    /// </remarks>
+    private long EstimateMaxInputElements(MethodInfo cm, ParameterInfo[] ps, Random rng)
+    {
+        int[]? smallest = null;
+        long smallestElements = long.MaxValue;
+        foreach (var shape in CandidateShapes)
+        {
+            long n = ShapeElements(shape);
+            if (n < smallestElements) { smallestElements = n; smallest = shape; }
+        }
+
+        // A one-element probe carries no information about growth (log(1) == 0).
+        if (smallest is null || smallestElements <= 1) return long.MaxValue;
+
+        var sets = CandidateArgSets(ps, smallest, rng);
+        if (sets == null) return long.MaxValue;
+
+        foreach (var args in sets)
+        {
+            object probe;
+            try { probe = cm.Invoke(_cpu, CloneArgs(args)); }
+            catch (TargetInvocationException) { continue; } // CPU rejects this combo; try next
+            if (!IsComparableTensor(probe)) continue;
+
+            long produced = ElementCount(probe);
+            if (produced <= 1) return long.MaxValue;
+
+            double order = Math.Log(produced) / Math.Log(smallestElements);
+            if (order <= 1.0) return long.MaxValue;   // linear or shrinking: no bound needed
+
+            double allowed = Math.Pow(MaxResultElements, 1.0 / order);
+            if (allowed >= long.MaxValue) return long.MaxValue;
+            return (long)Math.Max(1.0, allowed);
+        }
+
+        return long.MaxValue;
+    }
+
+    private static long ShapeElements(int[] shape)
+    {
+        long n = 1;
+        foreach (int d in shape) n *= d;
+        return n;
+    }
+
+    private static long ElementCount(object o)
+    {
+        int[] shape =
+            o is Tensor<float> tf ? tf.Shape.ToArray()
+            : o is Tensor<Complex<float>> tc ? tc.Shape.ToArray()
+            : null;
+        if (shape == null) return 0;
+
+        long n = 1;
+        foreach (int d in shape) n *= d;
+        return n;
+    }
+
     // Candidate input shapes tried in order; the first one the CPU op accepts is used.
     // Non-aligned dims (129) stress float4 tail paths; square 2-D shapes also satisfy matmul.
     private static readonly int[][] CandidateShapes =
@@ -368,8 +453,17 @@ public sealed class GpuCpuAutoDifferentialTests : IDisposable
         var ps = gm.GetParameters();
         var rng = new Random(7);
 
+        // PREFLIGHT. The post-invoke check below is a backstop, not a bound: by the time it runs,
+        // CpuEngine.TensorKron on [129,129] has already allocated its 1.1 GB result. Measuring the
+        // op on the smallest candidate shape first costs one cheap invocation and answers the size
+        // question before anything large is built. Still lowered by the backstop if the estimate
+        // turns out optimistic.
+        long maxInputElements = EstimateMaxInputElements(cm, ps, rng);
+
         foreach (var shape in CandidateShapes)
         {
+            if (ShapeElements(shape) > maxInputElements) continue;
+
             var sets = CandidateArgSets(ps, shape, rng);
             if (sets == null) return; // signature not auto-buildable -> guard handles it
 
@@ -380,6 +474,27 @@ public sealed class GpuCpuAutoDifferentialTests : IDisposable
                 try { cpuRes = cm.Invoke(_cpu, cpuArgs); }
                 catch (TargetInvocationException) { continue; } // CPU rejects this combo; try next
                 if (!IsComparableTensor(cpuRes)) continue;
+
+                long produced = ElementCount(cpuRes);
+                if (produced > MaxResultElements)
+                {
+                    // Budget the NEXT attempt from what this one actually produced. Assuming the op
+                    // grows at least linearly, an input of inputElems * (budget / produced) fits;
+                    // for a quadratic op like Kron that under-estimates, which is the safe
+                    // direction. Without this the harness walks 129x129 -> 128x128 -> 64x64,
+                    // computing a multi-hundred-megabyte result at each step.
+                    long allowed = ShapeElements(shape) * MaxResultElements / produced;
+                    maxInputElements = Math.Max(1, Math.Min(maxInputElements, allowed));
+
+                    // The rejected result is a large-object-heap block; reclaim it before the next
+                    // candidate allocates on top of it, which is how several expanding ops in a row
+                    // reached 11.5 GB.
+                    cpuRes = null;
+                    GC.Collect();
+                    GC.WaitForPendingFinalizers();
+                    GC.Collect();
+                    break;
+                }
 
                 var gpuArgs = CloneArgs(args);
                 object gpuRes;

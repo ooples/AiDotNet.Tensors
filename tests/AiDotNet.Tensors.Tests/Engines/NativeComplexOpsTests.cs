@@ -1,5 +1,6 @@
 using System;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.Gpu;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 using Xunit.Abstractions;
@@ -9,15 +10,19 @@ namespace AiDotNet.Tensors.Tests.Engines;
 /// <summary>
 /// Full coverage tests for native Tensor&lt;Complex&lt;T&gt;&gt; IEngine operations.
 /// </summary>
-public class NativeComplexOpsTests
+public class NativeComplexOpsTests : IDisposable
 {
     private readonly IEngine _engine = AiDotNetEngine.Current;
+    private readonly GpuExecutionPolicyScope _precisionPolicy =
+        new(GpuExecutionPolicy.Preserve);
     private readonly ITestOutputHelper _output;
 
     public NativeComplexOpsTests(ITestOutputHelper output)
     {
         _output = output;
     }
+
+    public void Dispose() => _precisionPolicy.Dispose();
 
     // ================================================================
     // FFT Round-Trip

@@ -158,7 +158,7 @@ internal static class CudaNativeBindings
         IntPtr function, CudaFunctionAttribute attribute, int value);
 
     [DllImport(CudaLibrary, EntryPoint = "cuLaunchKernel")]
-    public static extern CudaResult cuLaunchKernel(
+    private static extern CudaResult cuLaunchKernelNative(
         IntPtr function,
         uint gridDimX, uint gridDimY, uint gridDimZ,
         uint blockDimX, uint blockDimY, uint blockDimZ,
@@ -166,6 +166,35 @@ internal static class CudaNativeBindings
         IntPtr stream,
         IntPtr kernelParams,
         IntPtr extra);
+
+    /// <summary>
+    /// Journals the launch, then forwards to the driver.
+    /// </summary>
+    /// <remarks>
+    /// THE CHOKE POINT. CudaBackend reaches the driver from roughly two dozen call sites, all of
+    /// which hold only a kernel handle. Wrapping the single P/Invoke covers every one of them, and
+    /// covers whichever site is added next, instead of threading a name through two dozen
+    /// signatures. The name comes from the handle registered at kernel registration.
+    /// </remarks>
+    public static CudaResult cuLaunchKernel(
+        IntPtr function,
+        uint gridDimX, uint gridDimY, uint gridDimZ,
+        uint blockDimX, uint blockDimY, uint blockDimZ,
+        uint sharedMemBytes,
+        IntPtr stream,
+        IntPtr kernelParams,
+        IntPtr extra)
+    {
+        GpuKernelDiagnostics.RecordLaunchByHandle(
+            function,
+            (long)gridDimX * gridDimY * gridDimZ * blockDimX * blockDimY * blockDimZ,
+            (long)blockDimX * blockDimY * blockDimZ,
+            -1);
+
+        return cuLaunchKernelNative(
+            function, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY, blockDimZ,
+            sharedMemBytes, stream, kernelParams, extra);
+    }
 
     [DllImport(CudaLibrary, EntryPoint = "cuLaunchCooperativeKernel")]
     public static extern CudaResult cuLaunchCooperativeKernel(

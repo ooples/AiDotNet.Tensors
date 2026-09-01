@@ -41,6 +41,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         private IntPtr _buffer;
         private readonly DirectOpenClContext _context;
         private readonly int _length;
+
+        /// <summary>Bytes this buffer holds on the device, for residency accounting.</summary>
+        private long ByteSize => (long)_length * sizeof(float);
         private bool _disposed;
 
         public IntPtr Handle => _buffer;
@@ -67,6 +70,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
                 if (err != OpenClNativeBindings.CL_SUCCESS || _buffer == IntPtr.Zero)
                     throw new InvalidOperationException($"Failed to create OpenCL buffer: {err}");
+
+                GpuKernelDiagnostics.RecordBufferAllocated(ByteSize);
             }
             finally
             {
@@ -92,6 +97,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
             if (err != OpenClNativeBindings.CL_SUCCESS || _buffer == IntPtr.Zero)
                 throw new InvalidOperationException($"Failed to create OpenCL buffer: {err}");
+
+            GpuKernelDiagnostics.RecordBufferAllocated(ByteSize);
         }
 
         /// <summary>
@@ -173,6 +180,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (_buffer != IntPtr.Zero)
             {
                 OpenClNativeBindings.ReleaseMemObject(_buffer);
+                GpuKernelDiagnostics.RecordBufferReleased(ByteSize);
                 _buffer = IntPtr.Zero;
             }
 
@@ -189,6 +197,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         private IntPtr _buffer;
         private readonly DirectOpenClContext _context;
         private readonly int _length;
+
+        /// <summary>Bytes this buffer holds on the device, for residency accounting.</summary>
+        private long ByteSize => (long)_length * 1;
         private bool _disposed;
 
         public IntPtr Handle => _buffer;
@@ -215,6 +226,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
                 if (err != OpenClNativeBindings.CL_SUCCESS || _buffer == IntPtr.Zero)
                     throw new InvalidOperationException($"Failed to create OpenCL byte buffer: {err}");
+
+                GpuKernelDiagnostics.RecordBufferAllocated(ByteSize);
             }
             finally
             {
@@ -240,6 +253,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
             if (err != OpenClNativeBindings.CL_SUCCESS || _buffer == IntPtr.Zero)
                 throw new InvalidOperationException($"Failed to create OpenCL byte buffer: {err}");
+
+            GpuKernelDiagnostics.RecordBufferAllocated(ByteSize);
         }
 
         /// <summary>
@@ -323,6 +338,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (_buffer != IntPtr.Zero)
             {
                 OpenClNativeBindings.ReleaseMemObject(_buffer);
+                GpuKernelDiagnostics.RecordBufferReleased(ByteSize);
                 _buffer = IntPtr.Zero;
             }
 
@@ -339,6 +355,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         private IntPtr _buffer;
         private readonly DirectOpenClContext _context;
         private readonly int _length;
+
+        /// <summary>Bytes this buffer holds on the device, for residency accounting.</summary>
+        private long ByteSize => (long)_length * sizeof(int);
         private bool _disposed;
 
         public IntPtr Handle => _buffer;
@@ -365,6 +384,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
                 if (err != OpenClNativeBindings.CL_SUCCESS || _buffer == IntPtr.Zero)
                     throw new InvalidOperationException($"Failed to create OpenCL int buffer: {err}");
+
+                GpuKernelDiagnostics.RecordBufferAllocated(ByteSize);
             }
             finally
             {
@@ -390,6 +411,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
             if (err != OpenClNativeBindings.CL_SUCCESS || _buffer == IntPtr.Zero)
                 throw new InvalidOperationException($"Failed to create OpenCL int buffer: {err}");
+
+            GpuKernelDiagnostics.RecordBufferAllocated(ByteSize);
         }
 
         /// <summary>
@@ -440,6 +463,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (_buffer != IntPtr.Zero)
             {
                 OpenClNativeBindings.ReleaseMemObject(_buffer);
+                GpuKernelDiagnostics.RecordBufferReleased(ByteSize);
                 _buffer = IntPtr.Zero;
             }
 
