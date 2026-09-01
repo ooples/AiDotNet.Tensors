@@ -657,6 +657,7 @@ internal sealed class DirectPtxModule : IDisposable
     private readonly DirectPtxRuntime _runtime;
     private readonly object _dynamicSharedMemoryLock = new();
     private readonly Dictionary<IntPtr, int> _dynamicSharedMemoryLimits = new();
+    private readonly HashSet<IntPtr> _registeredFunctions = new();
     private IntPtr _module;
     internal string JitInfoLog { get; }
     internal DirectPtxModuleImageKind ImageKind { get; }
@@ -693,24 +694,34 @@ internal sealed class DirectPtxModule : IDisposable
 
     internal IntPtr GetFunction(string name, out DirectPtxFunctionInfo info)
     {
-        using var _ = _runtime.Enter();
-        DirectPtxRuntime.Check(
-            CudaNativeBindings.cuModuleGetFunction(out IntPtr function, _module, name),
-            $"cuModuleGetFunction({name})");
-        // Carry this device's register-file capacity alongside the per-function JIT
-        // attributes so the resource budget can scale its register ceiling to the real
-        // GPU instead of a hardcoded literal.
-        info = DirectPtxFunctionInfo.Query(function) with
+        // Keep one lock order everywhere this module needs both locks:
+        // module metadata -> runtime context. SetMaxDynamicSharedMemory already uses this
+        // order; taking runtime -> metadata here would deadlock with it under concurrent
+        // first-use dispatch.
+        lock (_dynamicSharedMemoryLock)
         {
-            MaxRegistersPerMultiprocessor = _runtime.MaxRegistersPerMultiprocessor,
-            MaxRegistersPerBlock = _runtime.MaxRegistersPerBlock
-        };
-        if (info.LocalBytesPerThread != 0)
-            throw new InvalidOperationException(
-                $"Direct PTX kernel '{name}' was rejected: CUDA JIT allocated " +
-                $"{info.LocalBytesPerThread} local bytes/thread (register spill or local stack). " +
-                "The direct-kernel contract requires zero local memory.");
-        return function;
+            PtxCompat.ThrowIfDisposed(_module == IntPtr.Zero, this);
+            using var _ = _runtime.Enter();
+            DirectPtxRuntime.Check(
+                CudaNativeBindings.cuModuleGetFunction(out IntPtr function, _module, name),
+                $"cuModuleGetFunction({name})");
+            // Carry this device's register-file capacity alongside the per-function JIT
+            // attributes so the resource budget can scale its register ceiling to the real
+            // GPU instead of a hardcoded literal.
+            info = DirectPtxFunctionInfo.Query(function) with
+            {
+                MaxRegistersPerMultiprocessor = _runtime.MaxRegistersPerMultiprocessor,
+                MaxRegistersPerBlock = _runtime.MaxRegistersPerBlock
+            };
+            if (info.LocalBytesPerThread != 0)
+                throw new InvalidOperationException(
+                    $"Direct PTX kernel '{name}' was rejected: CUDA JIT allocated " +
+                    $"{info.LocalBytesPerThread} local bytes/thread (register spill or local stack). " +
+                    "The direct-kernel contract requires zero local memory.");
+            if (_registeredFunctions.Add(function))
+                GpuKernelDiagnostics.RegisterKernelName(function, name);
+            return function;
+        }
     }
 
     internal unsafe void Launch(
@@ -791,10 +802,19 @@ internal sealed class DirectPtxModule : IDisposable
 
     public void Dispose()
     {
-        if (_module == IntPtr.Zero) return;
-        using var _ = _runtime.Enter();
-        DirectPtxRuntime.Check(CudaNativeBindings.cuModuleUnload(_module), "cuModuleUnload");
-        _module = IntPtr.Zero;
+        lock (_dynamicSharedMemoryLock)
+        {
+            if (_module == IntPtr.Zero) return;
+            using var _ = _runtime.Enter();
+            // Remove diagnostics before unload: CUDA may reuse an invalidated function-handle
+            // address for a newly loaded module in another context, and unregistering afterward
+            // could erase that successor's correct name.
+            foreach (IntPtr function in _registeredFunctions)
+                GpuKernelDiagnostics.UnregisterKernelName(function);
+            _registeredFunctions.Clear();
+            DirectPtxRuntime.Check(CudaNativeBindings.cuModuleUnload(_module), "cuModuleUnload");
+            _module = IntPtr.Zero;
+        }
     }
 }
 

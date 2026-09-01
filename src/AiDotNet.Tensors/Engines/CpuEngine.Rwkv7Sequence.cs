@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -95,6 +96,42 @@ public partial class CpuEngine
         EnsureSameShape(rProj, vProj, nameof(vProj));
         EnsureSameShape(rProj, decayLogit, nameof(decayLogit));
         EnsureSameShape(rProj, iclRate, nameof(iclRate));
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                scope.BindEngineIfUnset(this);
+                var capturedR = rProj;
+                var capturedKappa = kappa;
+                var capturedKTilde = kTilde;
+                var capturedV = vProj;
+                var capturedDecay = decayLogit;
+                var capturedIclRate = iclRate;
+                int capturedNumHeads = numHeads;
+                var outputShape = new[] { batch, seqLen, modelDim };
+                return scope.RecordVariadic(
+                    LazyNodeType.Custom,
+                    "Rwkv7Sequence",
+                    new[] { rProj, kappa, kTilde, vProj, decayLogit, iclRate },
+                    outputShape,
+                    (eng, output) =>
+                    {
+                        var result = eng.Rwkv7SequenceForward(
+                            capturedR,
+                            capturedKappa,
+                            capturedKTilde,
+                            capturedV,
+                            capturedDecay,
+                            capturedIclRate,
+                            capturedNumHeads);
+                        DirectGpuTensorEngine.CopyResultInto(eng, result, output);
+                    },
+                    Rwkv7SequenceBackward<T>,
+                    new object[] { numHeads });
+            }
+        }
 
         var output = new Tensor<T>(new[] { batch, seqLen, modelDim });
 

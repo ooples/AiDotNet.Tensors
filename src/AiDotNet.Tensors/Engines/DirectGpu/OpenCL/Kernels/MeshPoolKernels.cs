@@ -190,8 +190,11 @@ __kernel void mesh_pool_softmax_find_max(
     barrier(CLK_LOCAL_MEM_FENCE);
 
     // Parallel reduction within work-group
-    for (int stride = localSize / 2; stride > 0; stride >>= 1) {
-        if (lid < stride) {
+    // Ceil-halving with an explicit partner bound: localSize is NOT guaranteed to be a
+        // power of two (the host clamps it to the element count), and the classic
+        // stride = localSize / 2 tree silently drops the LAST element when it is odd.
+        for (int stride_active = localSize, stride = (localSize + 1) / 2; stride > 0; stride_active = stride, stride = (stride > 1) ? (stride + 1) / 2 : 0) {
+        if (lid < stride && lid + stride < stride_active) {
             scratch[lid] = fmax(scratch[lid], scratch[lid + stride]);
         }
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -220,8 +223,11 @@ __kernel void mesh_pool_softmax_final_max(
     barrier(CLK_LOCAL_MEM_FENCE);
 
     // Parallel reduction
-    for (int stride = localSize / 2; stride > 0; stride >>= 1) {
-        if (lid < stride) {
+    // Ceil-halving with an explicit partner bound: localSize is NOT guaranteed to be a
+        // power of two (the host clamps it to the element count), and the classic
+        // stride = localSize / 2 tree silently drops the LAST element when it is odd.
+        for (int stride_active = localSize, stride = (localSize + 1) / 2; stride > 0; stride_active = stride, stride = (stride > 1) ? (stride + 1) / 2 : 0) {
+        if (lid < stride && lid + stride < stride_active) {
             scratch[lid] = fmax(scratch[lid], scratch[lid + stride]);
         }
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -261,8 +267,11 @@ __kernel void mesh_pool_softmax_exp_sum(
     barrier(CLK_LOCAL_MEM_FENCE);
 
     // Parallel sum reduction within work-group
-    for (int stride = localSize / 2; stride > 0; stride >>= 1) {
-        if (lid < stride) {
+    // Ceil-halving with an explicit partner bound: localSize is NOT guaranteed to be a
+        // power of two (the host clamps it to the element count), and the classic
+        // stride = localSize / 2 tree silently drops the LAST element when it is odd.
+        for (int stride_active = localSize, stride = (localSize + 1) / 2; stride > 0; stride_active = stride, stride = (stride > 1) ? (stride + 1) / 2 : 0) {
+        if (lid < stride && lid + stride < stride_active) {
             scratch[lid] += scratch[lid + stride];
         }
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -287,8 +296,11 @@ __kernel void mesh_pool_softmax_final_sum(
     scratch[lid] = val;
     barrier(CLK_LOCAL_MEM_FENCE);
 
-    for (int stride = localSize / 2; stride > 0; stride >>= 1) {
-        if (lid < stride) {
+    // Ceil-halving with an explicit partner bound: localSize is NOT guaranteed to be a
+        // power of two (the host clamps it to the element count), and the classic
+        // stride = localSize / 2 tree silently drops the LAST element when it is odd.
+        for (int stride_active = localSize, stride = (localSize + 1) / 2; stride > 0; stride_active = stride, stride = (stride > 1) ? (stride + 1) / 2 : 0) {
+        if (lid < stride && lid + stride < stride_active) {
             scratch[lid] += scratch[lid + stride];
         }
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -332,8 +344,11 @@ __kernel void mesh_pool_softmax_scores(
     barrier(CLK_LOCAL_MEM_FENCE);
 
     // Step 1: Find max using parallel reduction
-    for (int stride = localSize / 2; stride > 0; stride >>= 1) {
-        if (lid < stride) {
+    // Ceil-halving with an explicit partner bound: localSize is NOT guaranteed to be a
+        // power of two (the host clamps it to the element count), and the classic
+        // stride = localSize / 2 tree silently drops the LAST element when it is odd.
+        for (int stride_active = localSize, stride = (localSize + 1) / 2; stride > 0; stride_active = stride, stride = (stride > 1) ? (stride + 1) / 2 : 0) {
+        if (lid < stride && lid + stride < stride_active) {
             scratch[lid] = fmax(scratch[lid], scratch[lid + stride]);
         }
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -351,8 +366,11 @@ __kernel void mesh_pool_softmax_scores(
     barrier(CLK_LOCAL_MEM_FENCE);
 
     // Sum reduction
-    for (int stride = localSize / 2; stride > 0; stride >>= 1) {
-        if (lid < stride) {
+    // Ceil-halving with an explicit partner bound: localSize is NOT guaranteed to be a
+        // power of two (the host clamps it to the element count), and the classic
+        // stride = localSize / 2 tree silently drops the LAST element when it is odd.
+        for (int stride_active = localSize, stride = (localSize + 1) / 2; stride > 0; stride_active = stride, stride = (stride > 1) ? (stride + 1) / 2 : 0) {
+        if (lid < stride && lid + stride < stride_active) {
             scratch[lid] += scratch[lid + stride];
         }
         barrier(CLK_LOCAL_MEM_FENCE);

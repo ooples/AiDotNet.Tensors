@@ -439,7 +439,18 @@ public class FusedOptimizerNonFiniteGradientTests
                     backend.Multiply(scratch, aggregate, aggregate, size: 1);
                     backend.ClassifyFloat(gradient, scratch, mode: 2, size: length);
                     backend.Multiply(scratch, aggregate, aggregate, size: length);
-                    Assert.Equal(allFinite ? 1f : 0f, backend.Min(aggregate, length));
+                    // Reported with the case. A bare Equal here said only "expected 0, actual 1",
+                    // which does not say WHICH length or which non-finite kind slipped through —
+                    // and the bad value is deliberately placed at values[length - 1], so the length
+                    // is the whole diagnosis when a kernel drops its tail.
+                    float observed = backend.Min(aggregate, length);
+                    Assert.True(
+                        observed == (allFinite ? 1f : 0f),
+                        $"ClassifyFloat(mode 2) over {length} values with {badValue} at index "
+                            + $"{length - 1}: expected min {(allFinite ? 1f : 0f)}, got {observed}. "
+                            + "A miss here means the non-finite element was never classified — check "
+                            + "whether the kernel covers a size that is not a multiple of its "
+                            + "workgroup.");
                 }
             }
         }

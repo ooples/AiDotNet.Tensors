@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -56,6 +57,30 @@ public partial class CpuEngine
             throw new ArgumentException($"alpha must be [batch={batch}, seqLen={seqLen}, numHeads={numHeads}].", nameof(alpha));
         if (beta.Rank != 3 || beta.Shape[0] != batch || beta.Shape[1] != seqLen || beta.Shape[2] != numHeads)
             throw new ArgumentException($"beta must be [batch={batch}, seqLen={seqLen}, numHeads={numHeads}].", nameof(beta));
+
+        if (GraphMode.IsActive && GraphMode.Current is { } scope)
+        {
+            scope.BindEngineIfUnset(this);
+            var capturedQ = qProj;
+            var capturedK = kProj;
+            var capturedV = vProj;
+            var capturedAlpha = alpha;
+            var capturedBeta = beta;
+            int capturedNumHeads = numHeads;
+            return scope.RecordVariadic(
+                LazyNodeType.Custom,
+                "GatedDeltaNetScan",
+                new[] { qProj, kProj, vProj, alpha, beta },
+                new[] { batch, seqLen, modelDim },
+                (eng, output) =>
+                {
+                    var result = eng.GatedDeltaNetScanForward(
+                        capturedQ, capturedK, capturedV, capturedAlpha, capturedBeta, capturedNumHeads);
+                    DirectGpuTensorEngine.CopyResultInto(eng, result, output);
+                },
+                GatedDeltaNetScanBackward<T>,
+                new object[] { numHeads });
+        }
 
         var output = new Tensor<T>(new[] { batch, seqLen, modelDim });
 

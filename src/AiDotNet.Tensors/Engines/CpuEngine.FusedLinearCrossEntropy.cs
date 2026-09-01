@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -65,6 +66,32 @@ public partial class CpuEngine
             if (ids[r] < 0 || ids[r] >= vocab)
                 throw new ArgumentOutOfRangeException(nameof(targetIds),
                     $"targetIds[{r}] ({ids[r]}) must be in [0, vocab={vocab}).");
+
+        if (GraphMode.IsActive && GraphMode.Current is { } scope)
+        {
+            scope.BindEngineIfUnset(this);
+            var capturedHidden = hidden;
+            var capturedWeight = weight;
+            var capturedBias = bias;
+            var capturedTargetIds = targetIds;
+            var compiledSavedState = new object[] { (int[])ids.Clone(), vocab };
+            return scope.RecordVariadic(
+                LazyNodeType.Custom,
+                "FusedLinearCrossEntropy",
+                new[] { hidden, weight, bias },
+                new[] { 1 },
+                (eng, output) =>
+                {
+                    // Labels are not differentiable graph inputs, but they are live training data.
+                    // Refresh the backward state on every replay instead of freezing the trace batch.
+                    compiledSavedState[0] = (int[])capturedTargetIds.GetDataArray()!.Clone();
+                    var result = eng.FusedLinearCrossEntropyWithLogits(
+                        capturedHidden, capturedWeight, capturedBias, capturedTargetIds);
+                    DirectGpuTensorEngine.CopyResultInto(eng, result, output);
+                },
+                FusedLinearCrossEntropyIndexBackward<T>,
+                compiledSavedState);
+        }
 
         // logits = hidden·weight + bias, computed off-tape (this op records its own node).
         //
@@ -148,6 +175,28 @@ public partial class CpuEngine
         // IndexOutOfRangeException instead of this clear argument error).
         if (target.Rank != 2 || target.Shape[0] != n || target.Shape[1] != vocab)
             throw new ArgumentException($"target must be rank-2 [N={n}, vocab={vocab}].", nameof(target));
+
+        if (GraphMode.IsActive && GraphMode.Current is { } scope)
+        {
+            scope.BindEngineIfUnset(this);
+            var capturedHidden = hidden;
+            var capturedWeight = weight;
+            var capturedBias = bias;
+            var capturedTarget = target;
+            return scope.RecordVariadic(
+                LazyNodeType.Custom,
+                "FusedLinearCrossEntropy",
+                new[] { hidden, weight, bias, target },
+                new[] { 1 },
+                (eng, output) =>
+                {
+                    var result = eng.FusedLinearCrossEntropyWithLogits(
+                        capturedHidden, capturedWeight, capturedBias, capturedTarget);
+                    DirectGpuTensorEngine.CopyResultInto(eng, result, output);
+                },
+                FusedLinearCrossEntropyBackward<T>,
+                savedState: null);
+        }
 
         // logits = hidden·weight + bias, computed via the fast parallel GEMM but NOT recorded
         // (this op records its own single tape node). The logits tensor is transient — it never

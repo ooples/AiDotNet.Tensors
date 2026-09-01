@@ -444,8 +444,8 @@ extern ""C"" __global__ __launch_bounds__(256) void normalize_probabilities(
     sdata[tid] = sum;
     __syncthreads();
 
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
+    for (int s_active = blockDim.x, s = (blockDim.x + 1) / 2; s > 0; s_active = s, s = (s > 1) ? (s + 1) / 2 : 0) {
+        if (tid < s && tid + s < s_active) {
             sdata[tid] += sdata[tid + s];
         }
         __syncthreads();
@@ -563,8 +563,8 @@ extern ""C"" __global__ __launch_bounds__(256) void measurement_forward(
     sdata[tid] = localSum;
     __syncthreads();
 
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) {
+    for (int s_active = blockDim.x, s = (blockDim.x + 1) / 2; s > 0; s_active = s, s = (s > 1) ? (s + 1) / 2 : 0) {
+        if (tid < s && tid + s < s_active) {
             sdata[tid] += sdata[tid + s];
         }
         __syncthreads();

@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -65,6 +66,32 @@ public partial class CpuEngine
             throw new ArgumentException($"cParam must be [batch={batch}, seqLen={seqLen}, stateDim={stateDim}].", nameof(cParam));
         if (dParam.Length != numHeads)
             throw new ArgumentException($"dParam length ({dParam.Length}) must equal numHeads ({numHeads}).", nameof(dParam));
+
+        if (GraphMode.IsActive && GraphMode.Current is { } scope)
+        {
+            scope.BindEngineIfUnset(this);
+            var capturedX = x;
+            var capturedDelta = delta;
+            var capturedALog = aLog;
+            var capturedB = bParam;
+            var capturedC = cParam;
+            var capturedD = dParam;
+            int capturedNumHeads = numHeads;
+            return scope.RecordVariadic(
+                LazyNodeType.Custom,
+                "Mamba2SsdScan",
+                new[] { x, delta, aLog, bParam, cParam, dParam },
+                new[] { batch, seqLen, innerDim },
+                (eng, output) =>
+                {
+                    var result = eng.Mamba2SsdScanForward(
+                        capturedX, capturedDelta, capturedALog, capturedB, capturedC, capturedD,
+                        capturedNumHeads);
+                    DirectGpuTensorEngine.CopyResultInto(eng, result, output);
+                },
+                Mamba2SsdScanBackward<T>,
+                new object[] { numHeads });
+        }
 
         var output = new Tensor<T>(new[] { batch, seqLen, innerDim });
 

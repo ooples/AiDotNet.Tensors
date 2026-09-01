@@ -108,6 +108,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         #region Kernel Info
 
         public const uint CL_KERNEL_WORK_GROUP_SIZE = 0x11B0;
+
+        /// <summary>clGetKernelInfo: the number of arguments the kernel declares.</summary>
+        public const uint CL_KERNEL_NUM_ARGS = 0x1191;
         public const uint CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE = 0x11B3;
 
         #endregion
@@ -382,6 +385,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             IntPtr eventWaitList,
             IntPtr eventOut);
 
+        [DllImport(OpenClLibrary, EntryPoint = "clGetKernelInfo")]
+        public static extern int GetKernelInfo(
+            IntPtr kernel,
+            uint paramName,
+            UIntPtr paramValueSize,
+            IntPtr paramValue,
+            out UIntPtr paramValueSizeRet);
+
         [DllImport(OpenClLibrary, EntryPoint = "clGetKernelWorkGroupInfo")]
         public static extern int GetKernelWorkGroupInfo(
             IntPtr kernel,
@@ -575,6 +586,34 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         /// <summary>
         /// Gets a size_t kernel work group info value.
         /// </summary>
+        /// <summary>
+        /// The argument count the kernel declares, or -1 when the device will not report it.
+        /// </summary>
+        /// <remarks>
+        /// Used to catch a launch whose staged arguments disagree with the kernel's signature, which
+        /// otherwise runs with whatever the previous launch left in the unset slots.
+        /// </remarks>
+        public static int GetKernelNumArgs(IntPtr kernel)
+        {
+            if (kernel == IntPtr.Zero) return -1;
+
+            IntPtr buffer = Marshal.AllocHGlobal(sizeof(uint));
+            try
+            {
+                int err = GetKernelInfo(kernel, CL_KERNEL_NUM_ARGS, (UIntPtr)sizeof(uint), buffer, out _);
+                if (err != CL_SUCCESS) return -1;
+                return Marshal.ReadInt32(buffer);
+            }
+            catch (EntryPointNotFoundException)
+            {
+                return -1;
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
+        }
+
         public static UIntPtr GetKernelWorkGroupInfoSizeT(IntPtr kernel, IntPtr device, uint paramName)
         {
             int ptrSize = IntPtr.Size;
