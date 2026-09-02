@@ -14,6 +14,7 @@ internal static class DirectPtxFeatureGate
     internal const string MasterEnvironmentVariable = "AIDOTNET_DIRECT_PTX";
     internal const string EnvironmentVariable = "AIDOTNET_DIRECT_PTX_ATTENTION";
     internal const string ResidualRmsNormEnvironmentVariable = "AIDOTNET_DIRECT_PTX_RESIDUAL_RMSNORM";
+    internal const string ResidualLayerNormGeluEnvironmentVariable = "AIDOTNET_DIRECT_PTX_RESIDUAL_LAYERNORM_GELU";
     internal const string FlashDecodeEnvironmentVariable = "AIDOTNET_DIRECT_PTX_FLASH_DECODE";
     internal const string PagedDecodeEnvironmentVariable = "AIDOTNET_DIRECT_PTX_PAGED_DECODE";
     internal const string PagedPrefillEnvironmentVariable = "AIDOTNET_DIRECT_PTX_PAGED_PREFILL";
@@ -27,6 +28,8 @@ internal static class DirectPtxFeatureGate
     internal const string GlobalAvgPoolEnvironmentVariable = "AIDOTNET_DIRECT_PTX_GLOBAL_AVGPOOL";
     internal const string ComplexMultiplyEnvironmentVariable = "AIDOTNET_DIRECT_PTX_COMPLEX_MULTIPLY";
     internal const string QkvRopeCacheEnvironmentVariable = "AIDOTNET_DIRECT_PTX_QKV_ROPE_CACHE";
+    internal const string SwiGluEnvironmentVariable = "AIDOTNET_DIRECT_PTX_SWIGLU";
+    internal const string GeGluEnvironmentVariable = "AIDOTNET_DIRECT_PTX_GEGLU";
     internal const string FusedLinearEnvironmentVariable = "AIDOTNET_DIRECT_PTX_FUSED_LINEAR";
     internal const string MixedPrecisionLinearEnvironmentVariable = "AIDOTNET_DIRECT_PTX_MIXED_LINEAR";
     internal const string QuantizedLinearEnvironmentVariable = "AIDOTNET_DIRECT_PTX_QUANTIZED_LINEAR";
@@ -92,6 +95,9 @@ internal static class DirectPtxFeatureGate
     private static readonly bool[] EnvironmentVisionOperationEnabled = ReadVisionOperationGates();
     private static readonly bool EnvironmentRecurrentStateEnabled = ReadEnabled(RecurrentStateEnvironmentVariable);
     private static readonly bool EnvironmentConvolutionEnabled = ReadEnabled(ConvolutionEnvironmentVariable);
+    private static readonly bool EnvironmentSwiGluEnabled = ReadEnabled(SwiGluEnvironmentVariable);
+    private static readonly bool EnvironmentGeGluEnabled = ReadEnabled(GeGluEnvironmentVariable);
+    private static readonly bool EnvironmentResidualLayerNormGeluEnabled = ReadEnabled(ResidualLayerNormGeluEnvironmentVariable);
     private static readonly bool EnvironmentAutotuneEnabled =
         !string.Equals(Environment.GetEnvironmentVariable(AutotuneEnvironmentVariable), "0", StringComparison.Ordinal);
     private static readonly int EnvironmentCacheCapacity = ReadCacheCapacity();
@@ -172,6 +178,10 @@ internal static class DirectPtxFeatureGate
     internal static bool QuantizedLinearExperimentOverride { get; set; }
     /// <summary>Benchmark-only access to normalization cells that have not passed promotion.</summary>
     internal static bool NormalizationExperimentOverride { get; set; }
+    /// <summary>Benchmark-only access to SwiGLU cells that have not passed promotion.</summary>
+    internal static bool SwiGluExperimentOverride { get; set; }
+    /// <summary>Benchmark-only access to GeGLU cells that have not passed promotion.</summary>
+    internal static bool GeGluExperimentOverride { get; set; }
     /// <summary>Benchmark-only access to convolution cells that have not passed promotion.</summary>
     internal static bool ConvolutionExperimentOverride { get; set; }
 
@@ -244,9 +254,17 @@ internal static class DirectPtxFeatureGate
     internal static bool IsResidualRmsNormEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentResidualRmsNormEnabled);
 
+    internal static bool IsResidualLayerNormGeluEnabled => TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentResidualLayerNormGeluEnabled);
+
     internal static bool IsFlashDecodeEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentFlashDecodeEnabled);
 
+    internal static bool IsSwiGluEnabled => TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentSwiGluEnabled);
+
+    internal static bool IsGeGluEnabled => TestOverride ??
+        (EnvironmentMasterEnabled || EnvironmentGeGluEnabled);
     internal static bool IsReductionEnabled => TestOverride ??
         (EnvironmentMasterEnabled || EnvironmentReductionEnabled);
     internal static bool IsGatherEnabled => TestOverride ??

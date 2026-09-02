@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('attention', 'residual-rmsnorm', 'decode', 'paged-prefill', 'attention-backward', 'flash-attention-backward', 'qkv-rope-cache', 'rng-dropout', 'rng-stochastic', 'convolution', 'vision-box-iou', 'rglru', 'fused-linear', 'mixed-linear', 'mixed-linear-m16', 'w8a8-linear', 'solvers-4x4', 'global-avgpool', 'complex-multiply')]
+    [ValidateSet('attention', 'residual-rmsnorm', 'residual-layernorm-gelu', 'decode', 'paged-prefill', 'attention-backward', 'flash-attention-backward', 'qkv-rope-cache', 'geglu', 'geglu-backward', 'fused-linear', 'mixed-linear', 'mixed-linear-m16', 'w8a8-linear', 'convolution', 'rng-dropout', 'rng-stochastic', 'vision-box-iou', 'rglru', 'solvers-4x4', 'global-avgpool', 'complex-multiply')]
     [string]$Target = 'attention',
     [string]$OutputCsv = (Join-Path ([System.IO.Path]::GetTempPath()) ("aidotnet-direct-ptx-ncu-" + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '.csv')),
     [string]$NcuPath = $env:NSIGHT_COMPUTE_CLI
