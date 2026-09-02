@@ -234,6 +234,24 @@ class Program
             DirectPtxW8A8LinearExperiment.Run(runs);
             return;
         }
+        if (args.Length > 0 && args[0] == "--direct-ptx-geglu")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            DirectPtxGeGluExperiment.Run(runs);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-geglu-backward")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            DirectPtxGeGluExperiment.RunBackward(runs);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-swiglu")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            DirectPtxGeGluExperiment.RunSwiGluForward(runs);
+            return;
+        }
         if (args.Length > 0 && args[0] == "--direct-ptx-softmax")
         {
             // main reshaped Run to take an OPERATION FILTER rather than a run count, so forward
@@ -595,6 +613,16 @@ class Program
         if (args.Length > 0 && args[0] == "--direct-ptx-profile-normalization")
         {
             DirectPtxProfileTarget.RunNormalization();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-geglu")
+        {
+            DirectPtxProfileTarget.RunGeGlu();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-geglu-backward")
+        {
+            DirectPtxProfileTarget.RunGeGluBackward();
             return;
         }
         if (args.Length > 0 && args[0] == "--direct-ptx-profile-fused-linear")
@@ -1648,6 +1676,9 @@ class Program
         Console.WriteLine("  --direct-ptx-normalization [runs] [all|row|row256|row2048|row8192|channel]: issue #838 resident production-route screen");
         Console.WriteLine("  --export-direct-ptx-normalization-cubins [directory]: compile and preserve release SM86 cubins");
         Console.WriteLine("  --audit-direct-ptx-normalization-sass <nvdisasm> [cubins] [evidence]: fail closed on final-SASS local memory");
+        Console.WriteLine("  --direct-ptx-geglu [runs]: exact FP32 split-row tanh-GeGLU championship matrix");
+        Console.WriteLine("  --direct-ptx-geglu-backward [runs]: exact fused FP32 GeGLU derivative championship");
+        Console.WriteLine("  --direct-ptx-swiglu [runs]: exact FP32 split-row SwiGLU forward championship");
         Console.WriteLine("  --direct-ptx-vision-box-iou [runs]: resident pairwise XYXY IoU evidence matrix");
         Console.WriteLine("  --direct-ptx-vision-family [runs] [operation]: resident vision/detection/ROI/geometry evidence matrix");
         Console.WriteLine("  --generate-direct-ptx-attention-offline-cubins <ptxas> <output>: build the release attention cubin set");
@@ -1666,6 +1697,8 @@ class Program
         Console.WriteLine("  --direct-ptx-profile-attention: deterministic Nsight Compute attention target");
         Console.WriteLine("  --direct-ptx-profile-residual-rmsnorm: deterministic Nsight Compute fusion target");
         Console.WriteLine("  --direct-ptx-profile-residual-layernorm-gelu: deterministic Nsight normalization target");
+        Console.WriteLine("  --direct-ptx-profile-geglu: deterministic Nsight Compute FP32 GeGLU target");
+        Console.WriteLine("  --direct-ptx-profile-geglu-backward: deterministic Nsight GeGLU derivative target");
         Console.WriteLine("  --direct-ptx-profile-fused-linear: deterministic Nsight fused-linear target");
         Console.WriteLine("  --direct-ptx-profile-mixed-linear: deterministic Nsight FP16 mixed-linear target");
         Console.WriteLine("  --direct-ptx-profile-mixed-linear-m16: deterministic Nsight async MMA target");
