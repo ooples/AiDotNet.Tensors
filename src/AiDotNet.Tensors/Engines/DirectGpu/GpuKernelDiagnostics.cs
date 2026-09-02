@@ -140,6 +140,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu
             catch (ArgumentException) { return; }        // an unusable path: the diagnostic is best-effort
             catch (IOException) { return; }              // PathTooLongException
             catch (NotSupportedException) { return; }
+            catch (System.Security.SecurityException) { return; }   // restricted .NET Framework hosts
 
             try
             {
@@ -370,6 +371,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu
             catch (IOException) { }
             catch (UnauthorizedAccessException) { }
             catch (ArgumentException) { }
+            catch (NotSupportedException) { }                 // colon in a non-volume position (.NET Framework)
+            catch (System.Security.SecurityException) { }     // restricted hosts; this method must never throw
         }
 
         /// <summary>
