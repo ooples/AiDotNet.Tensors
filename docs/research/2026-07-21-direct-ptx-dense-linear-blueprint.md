@@ -6,189 +6,436 @@ Tracking issue: #836
 
 Parent blueprint: `2026-07-20-fused-attention-championship-blueprint.md`
 
-## Verdict
+## Status and promotion rule
 
-The first issue-#836 golden slice is an Ampere FP32 decode-token
-linear+bias+tanh-GELU specialization:
+This issue now has an executable 44-entry inventory and a direct Driver-API PTX
+implementation for every assigned dense-product, linear, epilogue, backward,
+LoRA, and vector-product family. Implementation is not the same as promotion.
+Only an exact specialization that has passed the timing gate is reachable from
+the disabled-by-default public preview flag; the remaining correct
+implementations require the internal experiment scope and fail closed in normal
+dispatch. Release promotion is stricter than preview admission and additionally
+requires executed-spill evidence from the committed head.
 
-```text
-input [1,K] + output-major weights [N,K] + bias [N]
-    -> gelu_tanh(input @ transpose(weights) + bias) [1,N]
-```
-
-`K=512,N=2048` passes the production device-time gate against current
-AiDotNet, NVIDIA cuBLASLt, and PyTorch CUDA Graphs. It is disabled by default
-behind `AIDOTNET_DIRECT_PTX_FUSED_LINEAR=1` (or the master direct-PTX gate).
-The measured `256x256` and `1024x4096` kernels remain experiment-only: the
-small cell showed an earlier P95 excursion, while the large bandwidth-bound
-cell wins but reaches only a conservative 1.06x over PyTorch Graph rather than
-the required 1.10x. Production dispatch fails closed for both with
-`fused-linear-performance-gate-not-met`.
-
-This is one golden increment, not closure of #836. The executable 39-entry
-coverage manifest assigns general GEMM, transposed/batched/fanout products,
-FP16 families, all bias/activation epilogues, forward/backward linear kernels,
-dot/outer products, cross entropy, and LoRA to later direct-PTX increments.
-
-## Assembly-line decisions
-
-1. Choose an exact semantic cell, dtype, architecture, and physical layout.
-2. Prepack immutable weights outside timing and retain a layout identity; do
-   not inspect strides in the kernel.
-3. Emit a pointer-only PTX ABI with K/N and launch geometry baked into the
-   module.
-4. Fuse reductions, bias, and activation in registers and write the final
-   tensor once.
-5. Audit the JIT result before caching; any local bytes reject admission.
-6. Prewarm before graph capture and keep the hot dispatch allocation-free.
-7. Benchmark current AiDotNet, the strongest NVIDIA library path, and PyTorch
-   eager/Graph using resident operands and identical arithmetic.
-8. Promote only cells that pass median, tail, allocation, numerical, and spill
-   gates; retain exact fallback reasons for every other cell.
-
-The generic `CudaBackend.FusedLinearGELU` contract uses input-major `[K,N]`
-weights and is deliberately unchanged. The new
-`FusedLinearGELUTransposedM1` route requires output-major `[N,K]` weights, so a
-caller cannot silently reinterpret an existing allocation. Packing is a
-model-load/weight-registry responsibility and is excluded from hot timing.
-
-## Fused dataflow and global-memory ledger
-
-One warp owns two output rows. Its lanes stream adjacent K values and weights,
-accumulate two FP32 dot products in lane-private registers, perform two warp
-shuffle reductions, and let lane zero add bias, evaluate tanh-GELU, and commit
-the two final scalars.
-
-| Allocation | Global reads | Global writes | Lifetime |
-|---|---:|---:|---|
-| input | one scalar or FP32x4 per lane/K step/output pair | 0 | read-only cache stream |
-| weights | each output-major weight exactly once | 0 | read-only cache stream |
-| bias | one scalar per output | 0 | register epilogue |
-| output | 0 | one scalar per output | final commit only |
-
-There is no GEMM output intermediate, bias intermediate, activation
-intermediate, shared memory, scratch allocation, or second global write. The
-dominant vector transactions are naturally aligned and warp-coalesced. With no
-shared allocation, shared-bank conflicts are impossible.
-
-Shared staging, 256-thread blocks, tile-major weight repacking, L2 prefetch
-hints, four outputs/warp, and full K unrolling were each implemented and
-measured during the experiment. None improved the championship cell; shared
-staging and unrolling were regressions. They are not retained merely because
-they are fashionable. `cp.async` is appropriate for future multi-row FP16/BF16
-Tensor Core tiles with reusable panels, not this M=1 FP32 GEMV stream. TF32
-`mma.sync` would also change the declared FP32 numerical contract.
-
-## Formal ABI and dispatch
-
-The launch has four pointer parameters and no scalar parameters:
-
-| Tensor | Layout | Exact extent | Access | Alignment |
-|---|---|---|---|---:|
-| input | `Vector` | `[K]` FP32 | read | 16 B |
-| weights | `LinearWeightOutputMajor` | `[N,K]` FP32 | read | 16 B |
-| bias | `Vector` | `[N]` FP32 | read | 16 B |
-| output | `Vector` | `[N]` FP32 | write | 16 B |
-
-The boundary checks the gate, Ampere architecture, promoted shape, exact byte
-extents, layout token, alignment, and output aliasing once. The emitted PTX has
-no shape, stride, leading-dimension, batch, activation-mode, or layout
-argument. Unsupported shapes, architectures, extents, aliases, and capture
-state have stable diagnostic reasons and fall back to the established
-MatMulTransposed+BiasAdd+GELU composition.
-
-The specialization key is `(K,N)`. Modules use the bounded direct-PTX cache,
-are disposed with `CudaBackend`, and carry the standard blueprint id, PTX hash,
-GPU UUID/SM/driver fingerprint, function resources, occupancy, and JIT log.
-Capture may only use a prewarmed module and performs no JIT, tuning,
-allocation, I/O, or cache eviction. A captured specialization is pinned in the
-bounded cache so later specialization churn cannot unload its retained
-`CUfunction` while a graph executable still references it.
-
-## NVIDIA benchmark evidence
-
-Environment: Windows 10.0.26200, .NET 10.0.10 / SDK 10.0.302, NVIDIA GeForce
-RTX 3080 12 GiB, SM86, driver 610.47, PyTorch 2.12.1+cu130. Every cell uses 30
-warmups and 101 samples in each of three runs. CUDA-event samples average ten
-resident launches; E2E samples are one launch plus synchronization. Packing,
-uploads, downloads, and allocations are outside timing.
-
-`GFLOPS = 2*K*N / device-time`; bias and GELU operations are not inflated into
-the rate. The following ranges are the final three-run capture. The executable
-TUI also prints E2E mean/median/P95/P99 for every row.
-
-| Shape | Method | device mean us | median us | P95 us | P99 us | GFLOPS | managed B/call | temp device B | max error |
-|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| 256x256 | Direct PTX | 11.61-11.89 | 10.56-11.17 | 16.49-19.15 | 17.82-26.83 | 11.7-12.4 | 0 | 0 | 3.7e-8-5.2e-8 |
-| 256x256 | AiDotNet NVRTC | 14.83-16.43 | 13.62-14.23 | 18.02-25.70 | 27.65-31.13 | 9.2-9.6 | 0 | 0 | 2.6e-8-4.5e-8 |
-| 256x256 | NVIDIA cuBLASLt | 24.16-26.99 | 23.76-25.91 | 28.87-38.40 | 33.48-51.20 | 5.1-5.5 | 248 | 0 | 3.7e-8-5.2e-8 |
-| 256x256 | cuBLASLt Graph | 19.19-21.61 | 18.94-20.89 | 24.06-28.26 | 26.93-58.98 | 6.3-6.9 | 0 | 0 | 3.7e-8-5.2e-8 |
-| 256x256 | PyTorch eager | 70.00-90.08 | 58.88-96.36 | 104.65-166.50 | 150.12-322.15 | 1.4-2.2 | n/a | 2,048 | 0.7e-8-1.0e-8 |
-| 256x256 | PyTorch Graph | 12.56-23.36 | 12.37-25.09 | 15.87-35.64 | 16.39-36.66 | 5.2-10.6 | n/a | 0 | 0.7e-8-1.0e-8 |
-| 512x2048 | Direct PTX | 10.01-11.90 | 9.63-11.67 | 13.62-18.22 | 18.23-21.59 | 179.6-217.9 | 0 | 0 | 1.1e-7-1.3e-7 |
-| 512x2048 | AiDotNet NVRTC | 23.89-25.19 | 23.35-23.86 | 24.88-26.42 | 26.73-33.59 | 87.9-89.8 | 0 | 0 | 5.2e-8-6.7e-8 |
-| 512x2048 | NVIDIA cuBLASLt | 31.32-38.44 | 30.60-33.16 | 35.01-65.95 | 47.82-70.86 | 63.2-68.5 | 248 | 0 | 1.1e-7-1.3e-7 |
-| 512x2048 | cuBLASLt Graph | 22.63-31.35 | 21.30-24.06 | 31.54-38.20 | 33.38-42.39 | 87.2-98.5 | 0 | 0 | 1.1e-7-1.3e-7 |
-| 512x2048 | PyTorch eager | 59.69-76.67 | 58.68-67.69 | 64.51-111.41 | 68.81-125.75 | 31.0-35.7 | n/a | 16,384 | 1.9e-8-2.4e-8 |
-| 512x2048 | PyTorch Graph | 13.15-21.30 | 13.21-15.24 | 16.90-34.41 | 17.72-81.72 | 137.7-159.0 | n/a | 0 | 1.9e-8-2.4e-8 |
-| 1024x4096 | Direct PTX candidate | 23.68-24.04 | 23.14-23.65 | 25.60-26.93 | 28.67-30.00 | 354.6-362.5 | 0 | 0 | 2.7e-7-4.3e-7 |
-| 1024x4096 | AiDotNet NVRTC | 87.51-88.29 | 87.35-87.55 | 88.17-91.75 | 89.08-93.70 | 95.8-96.0 | 0 | 0 | 0.9e-7-3.6e-7 |
-| 1024x4096 | NVIDIA cuBLASLt | 29.72-33.48 | 29.39-30.62 | 33.59-45.47 | 39.01-96.15 | 274.0-285.4 | 248 | 0 | 3.0e-7-4.3e-7 |
-| 1024x4096 | cuBLASLt Graph | 42.28-43.74 | 41.16-42.09 | 44.34-50.79 | 61.24-62.87 | 199.3-203.8 | 0 | 0 | 3.0e-7-4.3e-7 |
-| 1024x4096 | PyTorch eager | 56.01-62.54 | 52.84-55.28 | 69.53-102.60 | 91.14-259.89 | 151.7-159.0 | n/a | 32,768 | 3.7e-8-6.7e-8 |
-| 1024x4096 | PyTorch Graph | 25.84-27.03 | 25.09-25.19 | 27.65-30.11 | 28.88-36.76 | 333.0-334.4 | n/a | 0 | 3.7e-8-6.7e-8 |
-
-For the promoted 512x2048 cell, the conservative cross-run median comparison
-is `13.21 / 11.67 = 1.13x` versus the strongest PyTorch Graph competitor. Each
-paired direct P95 is below PyTorch P95, managed allocation is 0 B/call,
-temporary VRAM is 0 B, and maximum error is below `1.3e-7`. The 1024x4096
-candidate's conservative median win is only `25.09 / 23.65 = 1.06x`, so it is
-correctly not admitted despite beating all measured competitors in raw time.
-
-## Resource and spill evidence
-
-The promoted 512x2048 module records:
+The original screening candidate was the Ampere FP32 decode specialization:
 
 ```text
-BlueprintId: fused-linear-bias-gelu-v1-Ampere-decode-fp32-m1-k512-n2048
-DeviceFingerprint: gpu-79d5ac8ef419a3bce86d78a8222664cd-sm86-drv13030
-PTX SHA-256: efa80c4f5ca72b82106a432807cdfd3b22b64b302765b5b310d020d8abb3866d
-registers/thread: 24
-static shared: 0
-local bytes/thread: 0
-active 128-thread blocks/SM: 12
-PTX/binary version: 86/86
+input [1,512] + output-major weights [2048,512] + bias [2048]
+    -> gelu_tanh(input @ transpose(weights) + bias) [1,2048]
 ```
 
-The module loader rejects nonzero local bytes, more than 40 registers/thread,
-any shared allocation, or fewer than eight active blocks/SM before caching.
-Nsight Compute 2026.2.1 attaches to `aidotnet_fused_linear_gelu_m1`, but this
-Windows host returns `ERR_NVGPUCTRPERM` before counter collection. Therefore
-the PR does not claim executed SASS spill counters. Driver-JIT local size zero
-is enforced; promotion beyond the experimental rollout gate still requires an
-administrator to enable counters and the CSV verifier to prove zero executed
-spill instructions, local loads, local stores, and local spilling requests.
+The final clean release matrix did not reproduce a gate-qualified win for this
+cell or any other issue cell. All general-M, decode, FP16/BF16, backward, LoRA,
+CE, dot, outer, and batched cells therefore remain experimental until a later
+clean three-run matrix proves at least a 1.10x conservative median win,
+acceptable P95, zero hot managed bytes, zero avoidable temporary VRAM,
+numerical tolerance, and zero spill evidence.
+Correctness-only scalar FP16 PTX is deliberately not described as a Tensor Core
+kernel.
+
+The public rollout switch is disabled by default:
+
+```text
+AIDOTNET_DIRECT_PTX_FUSED_LINEAR=1
+```
+
+Unqualified shapes, semantics, layouts, and architectures continue through the
+established backend. The implementation never silently widens its admission
+domain because a related shape happened to work.
+
+## The assembly-line pattern
+
+Every future PTX operation should follow the same sequence:
+
+1. Inventory every public API and existing CUDA/NVRTC/vendor route in scope.
+2. Define one semantic cell: formula, forward/backward mode, dtype, numerical
+   mode, exact logical shape, exact physical layout, alignment, alias rules,
+   and target architecture.
+3. Choose the intended fused boundary and write a global-memory ledger before
+   emitting instructions. Any intermediate global write needs a justification.
+4. Bake shape, layout, activation, transpose, batch, dtype, and numerical mode
+   into a versioned blueprint. Keep the launch ABI pointer-only.
+5. Validate the tensor contracts once on the host. Admitted PTX contains no
+   stride checks, layout switches, generic shape branches, or leading-dimension
+   parameters.
+6. Stage reusable panels in shared memory, retain accumulators and epilogues in
+   registers, and write each final output once. Use warp shuffles, vector loads,
+   `cp.async`, or `mma.sync` only when the exact cell benefits measurably.
+7. Compile PTX to a content-addressed cubin outside capture, load that exact
+   machine-code image, reject nonzero local bytes before caching, and record
+   PTX/cubin hashes, image source, GPU UUID, SM, driver, resources, occupancy,
+   and compiler log. Raw PTX JIT is an explicit diagnostic fallback, never an
+   unreported release path.
+8. Prewarm and pin modules before graph capture. The captured path may not JIT,
+   tune, allocate, perform file I/O, or evict a referenced module.
+9. Compare resident NVIDIA paths only: current AiDotNet, the strongest eligible
+   NVIDIA library, PyTorch eager/Graph, and direct PTX. Packing, uploads, and
+   downloads remain outside device timing.
+10. Promote only exact cells that pass all gates. Keep losing cells useful as
+    direct-PTX correctness baselines, but fail them closed in production.
+
+This separation is essential: a broad generic kernel is useful for semantic
+coverage, while a narrow winning specialization is what earns production
+dispatch.
+
+## Inventory and implementation ownership
+
+`DirectPtxDenseLinearCoverageManifest` is the executable source of truth. Its
+44 unique entries cover:
+
+- FP32 `Gemm`, `GemmAsync`, `MatMul`, `MatMulTransposed`, batched GEMM, and
+  fanout;
+- FP16/BF16 GEMM, `Hgemm`, FP16 output conversion, mixed-precision fanout, and
+  transpose-free backward;
+- `GemmBias*`, fused bias/activation async, and all forward fused-linear
+  activations;
+- ReLU, sigmoid, tanh, tanh-GELU, and swish fused-linear backward;
+- indexed and dense-target fused linear cross entropy;
+- fused LoRA forward;
+- dot, strided dot, outer, batched dot, and batched outer products; and
+- the corresponding rank-aware `DirectGpuTensorEngine` entry points.
+
+No manifest entry has `PlannedDirectPtx` status. `ExperimentalDirectPtx` means
+real emitted PTX plus backend routing and tests, not a placeholder or a CUDA C
+wrapper.
+
+## Kernel families and fused dataflow
+
+### Decode linear
+
+One warp owns two output rows. Lanes stream adjacent K values and output-major
+weights, hold two dot products in registers, reduce with shuffles, add bias,
+evaluate tanh-GELU, and perform the only output stores. There is no shared or
+global intermediate.
+
+### General FP32 GEMM and fused linear
+
+The current Ampere experiment tile is `BM=16, BN=16, BK=32, TM=2, TN=2`:
+64 threads cooperatively stage A and weight panels through two alternating
+shared-memory banks (8 KiB total). Aligned `cp.async` copies fill panel N+1 while panel N feeds
+register FMAs, with a CTA barrier only at bank handoff. Each thread holds a
+2-by-2 FP32 accumulator tile. Input-major
+`[K,N]` and prepacked output-major `[N,K]` are separate PTX modules; the layout
+choice is absent from the launch ABI and the instruction path. Bias and the
+selected activation are applied to accumulator registers before the one final
+store. No-bias GEMM combines each thread's adjacent register pair into aligned
+`st.global.v2.f32` transactions, halving its epilogue store instruction count.
+Batched GEMM bakes contiguous batch strides into address arithmetic.
+
+### FP16 and BF16
+
+The broad correctness baseline bakes input dtype, output dtype, transposition, batch,
+and FP16-versus-FP32 accumulation into separate modules. It reads 16-bit
+operands, accumulates without a global conversion buffer, converts only at the
+final store, and supports the two transpose-free backward products.
+
+The exact M16/N16/K32 GEMM cell uses one warp. Each lane issues two aligned
+`cp.async` copies per operand, `ldmatrix` supplies four `mma.sync` instructions,
+all 256 FP32 results remain in eight accumulator registers per lane, and four
+vector stores commit the output once. Removing the second warp eliminates its
+scheduler and tail-latency cost without introducing a spill or intermediate.
+
+Two M=16 championship cells (`K512/N2048` and `K1024/N4096`) use a separate
+SM86 kernel: eight warps double-buffer FP16 input/output-major weight panels with
+`cp.async`, consume the packed panels with warp-collective `ldmatrix.x4` and
+non-transposed `ldmatrix.x2`, issue `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32`, retain
+FP32 accumulators through bias and tanh-GELU, and perform the only FP32 output
+stores. Shape, layout, dtype, and panel geometry are baked; the launch ABI is
+four pointers. The B load is deliberately non-transposed: the output-major
+shared panel already maps each row fragment to the column-major MMA B-register
+contract, and an additional `.trans` changes the mathematical product. A
+structured row/K/bias oracle locks this physical-layout invariant. A bounded
+GPU/driver/shape-keyed tuner evaluates N32 and N64
+tiles before persisting the winner. Its cache identity also includes both
+candidate PTX-to-cubin source identities, so an emitter edit cannot reuse a
+stale decision. The benchmark's explicit `--autotune-fp16-m16` screen skips
+default-plan prewarm, lets the first resident launch evaluate both candidates,
+and records the selected blueprint/source key. Evidence capture disables
+tuning and uses only the resulting checked-in, reproducible tile choice. These
+cells remain experiment-only until the full timing gate passes.
+
+### Fused-linear backward
+
+One pointer-only launch assigns disjoint CTA ranges to `dInput` and `dWeight`.
+The exact M64/K256/N256 ReLU cell launches 80 CTAs: 16 for dInput and 64 for
+dWeight. Every CTA owns one 32x32 result tile. Its two four-warp groups split
+the reduction dimension, stage independent panels, retain FP32 WMMA
+accumulators, and merge the two partial tiles in shared memory. This exposes
+enough independent CTAs to the 68-SM RTX 3080 instead of leaving most SMs idle.
+FP32 input, weight, grad-output, and saved-activation values are streamed in
+aligned vectors; the ReLU derivative is applied in
+registers, and the resulting operands are rounded to FP16 only while staging
+the two group-local shared partitions. Four quadrant warps per group issue
+WMMA, and the merged result is written once. The row-zero dWeight
+owners retain FP32 masked-gradient sums, reuse their group-local shared tile for
+a fixed-order 16-row fold, and write `dBias`, eliminating a third CTA range and
+separate launch. There is no materialized masked-gradient tensor, atomic, or
+global workspace. This mixed-input numerical mode is part of the exact
+blueprint and its oracle tolerance; it is never silently selected for another
+activation or shape.
+
+Other supported cells retain the generic 16x16 FP32 shared-panel topology.
+ReLU and tanh-GELU consume saved preactivation; sigmoid and tanh consume saved
+output, matching the established contracts. Gradient outputs must be disjoint
+from each other and from saved forward tensors.
+
+### LoRA
+
+One block owns one batch row. Eight warps partition K while lanes traverse
+contiguous eight-rank groups in `A[K,R]`; register shuffles and a fixed
+64-float shared fold produce the rank-sized shared projection. Warp partials
+are stored as `[warp, rank-lane]`: each publishing half-warp touches eight
+consecutive 32-bit banks, and warp zero reads the two 32-float halves with
+consecutive-bank lane addresses. The later projection reads are uniform
+broadcasts, so this shared topology introduces no distinct-address bank
+conflicts. The same launch
+reuses that projection for `@ B`, fuses scaling and the base residual in
+registers, and writes the final output once. Exact output aliasing with
+`baseOutput` is allowed; partial overlap is rejected.
+
+### Linear cross entropy
+
+One block owns one row. Projection logits are recomputed as needed but never
+materialized. Stable max and exponential-sum reductions use shared memory; the
+selected/dense loss remains in registers and contributes to the resident mean
+scalar. The block width is specialized to the baked vocabulary bucket
+(32/64/128/256 threads), avoiding idle lanes for small vocabularies. The final
+row accumulation is atomic, so this version fails closed in deterministic
+mode.
+
+### Dot and outer products
+
+The exact K4096 dense dot assigns one aligned `float4` pair to every lane in a
+1024-thread CTA, retains four component sums in registers, folds 32 warp totals
+through a 128-byte shared table and one block barrier, and performs one final
+global store. The B4/K512 batched-dot specialization instead launches one
+register-only warp CTA per batch; every lane consumes four aligned `float4`
+pairs, so it needs no shared memory or block barrier.
+
+Strided dot bakes its valid interval, offset, and step into the module. The
+exact reverse-K512 cell uses one warp, four independent component accumulators,
+precomputed reverse pointers, and five shuffle steps with no shared memory.
+The M64/N128 outer cell launches four 256-thread CTAs. Each lane loads one
+right-hand `float4` once and reuses it for two rows owned by its warp, reducing
+redundant input transactions while preserving one final vector store per four
+outputs. Fallback specializations still write every independent output exactly
+once.
+
+## Global-memory ledger
+
+| Family | Global inputs | On-chip lifetime | Global outputs |
+|---|---|---|---|
+| decode linear | input, output-major weights, bias | accumulators and GELU in registers | final output once |
+| tiled GEMM/linear | A and weight panels, optional bias | panels in shared; accumulator/epilogue in registers | final C once |
+| FP16/BF16 GEMM | 16-bit A/B | FP32 or FP16-rounded accumulator in registers | converted C once |
+| backward linear | grad output, input, weights, saved activation | derivative in registers; exact ReLU operands in shared FP16 WMMA tiles; FP32 matrix/bias accumulators | dInput/dWeight/dBias once |
+| LoRA | input, base, A, B | warp partials and rank projection in shared; residual epilogue in registers | final output once |
+| linear CE | hidden, weight, bias, target | logits in registers; reductions in shared | one atomic scalar contribution/row |
+| dense dot | two vectors | register partials, then 128-byte shared warp totals | one scalar |
+| strided dot | two vectors | four register accumulators and warp shuffles | one scalar |
+| batched dot | two batched vectors | four register accumulators and warp shuffles per batch | one scalar/batch |
+| outer | two vectors | right `float4` retained across two rows; products in registers | each output element once |
+
+There are no shape-dependent temporary device allocations in admitted direct
+paths. Caller-owned outputs and the backend stream are reused.
+
+## Contiguous-layout and ABI contract
+
+Direct PTX accepts capability-style `DirectPtxTensorView` values constructed
+only after the host proves:
+
+- non-null device pointer and exact physical byte extent;
+- declared FP32, FP16, or BF16 physical dtype;
+- canonical vector, row-major 2D/3D, input-major weight, or output-major weight
+  identity;
+- 16-byte pointer alignment and element-compatible offsets;
+- declared read/write access and non-overlap rules; and
+- no silent padding beyond the blueprint's physical extent.
+
+The emitter then receives no strides. Contiguity is therefore an admission
+fact, not a branch executed for every element. Views that cannot prove the
+required identity must be materialized or packed by the tensor/weight registry
+before dispatch, or use the established fallback. Immutable output-major decode
+weights are a model-load concern and packing time is never included in kernel
+timing.
+
+## Architecture, cache, and capture
+
+The checked-in dense-linear specializations are admitted only on measured
+GA10x/SM86. Ada, Hopper, and Blackwell do not inherit Ampere admission; each
+needs its own emitter/tile catalog, resource limits, and evidence. Unsupported
+architectures fail closed before module creation.
+
+Every module key includes canonical PTX, target SM, pipeline version 3, and all
+baked semantics. Release cells have a checked-in manifest mapping that source
+identity to exact cubin and linker-log SHA-256 values. Runtime lookup prefers
+the hash-verified embedded cubin plus its preserved verbose CUDA Driver linker
+log, then a disk cache whose binary, audit, and linker-log sidecars all match,
+and otherwise invokes the CUDA Driver linker and caches its ELF output. PTX
+source is not passed directly to `cuModuleLoadData` on the normal path. CI
+rebuilds the expected source identities, rejects stale/missing cubins or linker
+logs, disassembles the exact embedded images with pinned `nvdisasm`, and fails
+on any final-SASS `LDL` or `STL`.
+Each operation-family exporter owns only the files named by its manifest, so
+regeneration cannot delete another family's artifacts from the shared SM directory.
+
+Caches are bounded, disposed
+with `CudaBackend`, and pin graph-referenced modules. Fast cache hits avoid
+capturing delegates, preserving zero managed allocation. A capture miss returns
+an explicit prewarm-required reason rather than compiling inside capture.
+
+The loader rejects any JIT result with nonzero local bytes or a blueprint
+resource-budget violation. Audit records include blueprint id, SHA-256, device
+fingerprint, PTX/binary version, registers, shared/local bytes, maximum threads,
+active blocks per SM, occupancy inputs, and the JIT log.
+
+## Benchmark contract
+
+The per-process runner uses 30 warmups, 101 samples, 50 launches per eager CUDA-event
+sample, and five replays of a captured 200-operation graph per sample. The 1000
+logical operations amortize event and host-launch floors for sub-2-microsecond
+kernels without relying on unstable thousand-node competitor graphs or changing
+the per-operation normalization. A 64-launch tiered-JIT settling window precedes its exact allocation
+measurement. It reports device and E2E
+mean/median/P95/P99, GFLOPS/TFLOPS, managed bytes/call, temporary device bytes,
+maximum error, registers, shared/local bytes, active blocks/SM, blueprint id,
+launched/max threads, PTX/binary versions, fingerprint, PTX/cubin hashes,
+module source/path, and compiler/linker log. Missing established kernels are emitted as explicit
+`unsupported` JSON rows; they do not abort the matrix or masquerade as wins.
+The .NET temporary-memory measurement snapshots a backend logical-allocation
+counter around one settled hot launch, so it observes pooled and immediately
+freed device buffers that a free-memory before/after delta would miss.
+
+Final evidence uses `run-direct-ptx-release-evidence.ps1 -Issue836Only`. The
+orchestrator starts three separate .NET processes and three separate Python
+processes, requires three consecutive clean `nvidia-smi` samples before each
+suite, rejects foreign compute and unsafe temperature, records start/end GPU
+snapshots and exact commands, retries contaminated attempts, and hashes every
+accepted/rejected log in a manifest. The orchestrator, .NET runner, and
+PyTorch competitor runner reject other OS-level Python processes before CUDA
+registration; both in-process runners repeat the Python and `nvidia-smi pmon`
+checks around every measured method. This closes the race left by
+GPU-process tables or suite-boundary checks alone. Its machine-readable release-gate file also
+rejects nonfinite values and non-monotonic percentiles and retains every
+per-run verdict; a losing cell is never averaged into a win.
+
+PyTorch 2.12.1+cu130 eager, eager CUDA Graph,
+`torch.compile(fullgraph=True, mode="max-autotune-no-cudagraphs")`, and compiled
+CUDA Graph routes are measured by the companion Python runner. CUDA Graph rows
+use preallocated resident outputs and report zero replay-time device
+allocation. Eager rows report required result storage separately from true
+temporary peak growth, and every eager, graph, compiled, and compiled-graph
+route receives its own correctness probe. A missing compiled row makes final
+evidence incomplete. Every eligible competitor is evaluated independently; a cell passes only when all
+AiDotNet, NVIDIA-library, PyTorch eager/Graph, and PyTorch compiled/Graph pairs
+meet the median and P95 thresholds.
+The exact backward cell also measures four additional PyTorch routes with the
+same FP32 input/output ABI, in-graph FP16 operand conversion, and FP32 matrix
+accumulation. This prevents a mixed-input PTX specialization from claiming a
+win only against a different full-FP32 numerical mode.
+
+## Current exact-machine-code audit
+
+The requalification candidate contains 16 content-addressed SM86 cubins and 16
+entry points (the backward cubin is now single-entry and the Tensor-Core tuning
+domain owns N32/N64 images). The pinned final-SASS audit finds
+zero `LDL` and zero `STL` in every entry. Representative hardware rows are:
+
+| Candidate | registers/thread | static shared B | final-SASS `LDSM` | `cp.async` | Tensor Core | final-SASS local loads/stores |
+|---|---:|---:|---:|---:|---:|---:|
+| FP32 GEMM M64/K256/N256 | 60 | 8192 | 0 | 8 | 0 | 0 / 0 |
+| FP32 batched GEMM B4/M64/K256/N256 | 64 | 8192 | 0 | 8 | 0 | 0 / 0 |
+| FP32 fused GELU M64/K256/N256 | 60 | 8192 | 0 | 8 | 0 | 0 / 0 |
+| FP16 GEMM M16/K32/N16 | 28 | 2048 | 6 | 4 | 4 | 0 / 0 |
+| FP16 fused GELU M16/K512/N2048 N32 | 39 | 12288 | 64 | 24 | 32 | 0 / 0 |
+| FP16 fused GELU M16/K512/N2048 N64 | 39 | 20480 | 64 | 24 | 32 | 0 / 0 |
+| FP16 fused GELU M16/K1024/N4096 N32 | 34 | 24576 | 128 | 48 | 64 | 0 / 0 |
+| FP16 fused GELU M16/K1024/N4096 N64 | 34 | 40960 | 128 | 48 | 64 | 0 / 0 |
+| fused ReLU backward M64/K256/N256 split-K | 56 | 8192 | 4 | 0 | 4 | 0 / 0 |
+| dense dot K4096 float4 | 24 | 128 | 0 | 0 | 0 | 0 / 0 |
+| outer M64/N128 reused float4 | 22 | 0 | 0 | 0 | 0 | 0 / 0 |
+| batched dot B4/K512 float4 | 40 | 0 | 0 | 0 | 0 | 0 / 0 |
+| reverse strided dot K512 | 40 | 0 | 0 | 0 | 0 | 0 / 0 |
+
+The deterministic Nsight target additionally launches all 16 exact embedded-
+cubin entry points and rejects runtime-linked images. Executed counters remain
+a separate required gate: dedicated aggregate/local/shared register-spill
+instructions, aggregate local instructions, local-load/local-store
+instructions, and L1 local-load/local-store requests must all be present and
+zero for every launch. Static disassembly is not mislabeled as an executed
+counter capture. The same profile records LSU shared-bank read- and write-
+conflict counters for every launch, so the analytical bank maps above are
+paired with hardware evidence instead of inferred from PTX alone.
+
+## Current release evidence
+
+The final issue matrix ran from clean implementation commit
+`814d5460d672ecb55a8c04afa3c66e883bc79843` on 2026-07-22. The environment was
+Windows 10.0.26200, .NET 10.0.10 / SDK 10.0.302, NVIDIA GeForce RTX 3080,
+SM86, driver 610.47, and PyTorch 2.12.1+cu130. Three independent .NET and
+Python process pairs produced 144 AiDotNet/NVIDIA rows and 72 PyTorch rows.
+Every accepted process used the benchmark contract above; the evidence
+orchestrator rejected no attempt.
+
+The result is an honest `timing-fail`, so all 44 issue cells remain
+experimental and fail closed. No operation cleared the full conservative gate
+in all three runs. Direct PTX had the best average device median for dot,
+outer, and strided dot, but those cells still missed either the 1.10x
+cross-run median requirement or the E2E requirement. The other nine groups
+were won by an established AiDotNet, NVIDIA, or PyTorch route. This evidence
+does not support release promotion.
+
+All 72 Direct PTX rows reported zero managed bytes/call, zero temporary device
+bytes, zero JIT local bytes/thread, and error within the declared tolerance.
+The complete per-operation tables group every competitor with mean, median,
+P95, P99, TFLOPS/GFLOPS, allocation, temporary memory, error, and resource
+metrics in the [checked-in evidence report](2026-07-22-direct-ptx-dense-linear-results.md).
+Its source report SHA-256 is
+`644de70469a7c04e79b0889468f1380c6e9869670d3dcde247491383d35d3fe4`;
+the machine-readable release-gate SHA-256 is
+`a229d8abaf100ccd47ae594c8625755fc79426bdc15112f59fd9410edae16590`.
+
+Nsight Compute CLI 2026.2.1 was extracted from the official package and
+detects the local RTX 3080. Counter collection still
+returned `ERR_NVGPUCTRPERM`; the resulting diagnostic CSV is not spill proof.
+Driver-JIT local size zero is enforced now, but no specialization is claimed as
+release-promoted until the checked-in CSV verifier observes zero executed local
+loads, local stores, dedicated register-spill instructions (including local and
+shared spill paths), aggregate local instructions, and L1 local-load and
+local-store requests for all 16 exact launches. The timing orchestrator accepts
+that verified CSV explicitly and records its SHA-256 in the same release gate.
 
 ## Reproduction
 
 ```powershell
-$env:AIDOTNET_DIRECT_PTX_FUSED_LINEAR = '1'
-dotnet run --project tests/AiDotNet.Tensors.Benchmarks/AiDotNet.Tensors.Benchmarks.csproj `
-  -c Release -- --direct-ptx-fused-linear 3
+dotnet build tests/AiDotNet.Tensors.Benchmarks/AiDotNet.Tensors.Benchmarks.csproj `
+  -c Release --no-restore
 
+dotnet tests/AiDotNet.Tensors.Benchmarks/bin/Release/net10.0/AiDotNet.Tensors.Benchmarks.dll `
+  --direct-ptx-dense-linear-full 1
+
+$env:AIDOTNET_DIRECT_PTX_AUTOTUNE = '1'
+$env:AIDOTNET_AUTOTUNE_CACHE_PATH = Join-Path $env:TEMP 'aidotnet-pr859-tuning'
+dotnet tests/AiDotNet.Tensors.Benchmarks/bin/Release/net10.0/AiDotNet.Tensors.Benchmarks.dll `
+  --direct-ptx-dense-linear-full 1 --no-python `
+  --only=fused-gelu-fp16-m16-k512 --autotune-fp16-m16
+
+$ncuCsv = Join-Path $env:TEMP 'aidotnet-direct-ptx-dense-linear-ncu.csv'
 powershell -ExecutionPolicy Bypass -File `
   tests/AiDotNet.Tensors.Benchmarks/Profiling/run-direct-ptx-ncu.ps1 `
-  -Target fused-linear
+  -Target dense-linear -OutputCsv $ncuCsv
+
+powershell -ExecutionPolicy Bypass -File `
+  tests/AiDotNet.Tensors.Benchmarks/Profiling/run-direct-ptx-release-evidence.ps1 `
+  -Issue836Only -Runs 3 -SkipBuild -DenseLinearNcuCsv $ncuCsv `
+  -OutputDirectory artifacts/perf/direct-ptx-dense-linear
+
+dotnet tests/AiDotNet.Tensors.Benchmarks/bin/Release/net10.0/AiDotNet.Tensors.Benchmarks.dll `
+  --verify-direct-ptx-dense-linear-cubins
+
+dotnet tests/AiDotNet.Tensors.Benchmarks/bin/Release/net10.0/AiDotNet.Tensors.Benchmarks.dll `
+  --audit-direct-ptx-dense-linear-sass <path-to-nvdisasm>
 ```
 
-## Next increments for #836
-
-1. FP16/BF16 multi-row GEMM with architecture-specific async panel staging,
-   Tensor Core MMA, and fused bias/activation/residual epilogues.
-2. General M/N/K and transposition families using a bounded, offline-measured
-   tile catalog rather than hot-path dynamic stride branches.
-3. Batched/fanout GEMM and forward/backward linear pairs with graph-safe
-   prepacked-weight ownership.
-4. LoRA, dot/outer, and cross-entropy fusion cells from the executable manifest.
-5. Separate Ada, Hopper, and Blackwell emitters and evidence; no architecture
-   inherits Ampere promotion by assumption.
+Use `--no-python` only for focused C# screening and `--only=<operation>` for a
+single family. Neither shortcut is sufficient for final acceptance.

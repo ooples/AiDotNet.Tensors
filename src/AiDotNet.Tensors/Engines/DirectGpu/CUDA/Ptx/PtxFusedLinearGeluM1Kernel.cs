@@ -41,21 +41,11 @@ internal sealed class PtxFusedLinearGeluM1Kernel : IDisposable
         Ptx = EmitPtx(
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor,
             inputFeatures, outputFeatures);
-        var loaded = DirectPtxResourceInitialization.Complete(
-            runtime.LoadModule(Ptx),
-            module =>
-            {
-                IntPtr function = module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
-                int activeBlocks = module.GetActiveBlocksPerMultiprocessor(function, BlockThreads);
-                Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
-                DirectPtxKernelAudit audit = DirectPtxKernelAudit.Create(
-                    Blueprint, runtime.DeviceFingerprint, Ptx, info,
-                    BlockThreads, activeBlocks, module);
-                return (Function: function, Audit: audit);
-            });
-        _module = loaded.Resource;
-        _function = loaded.Value.Function;
-        Audit = loaded.Value.Audit;
+        DirectPtxLoadedKernel loaded = DirectPtxResourceInitialization.LoadKernel(
+            runtime, Ptx, EntryPoint, BlockThreads, Blueprint);
+        _module = loaded.Module;
+        _function = loaded.Function;
+        Audit = loaded.Audit;
     }
 
     internal unsafe void Launch(
@@ -247,8 +237,9 @@ internal sealed class PtxFusedLinearGeluM1Kernel : IDisposable
         inputFeatures is 256 or 512 or 1024 or 2048 or 4096 &&
         outputFeatures is 256 or 512 or 1024 or 2048 or 4096;
 
-    internal static bool IsPromotedShape(int inputFeatures, int outputFeatures) =>
-        (inputFeatures, outputFeatures) is (512, 2048);
+    // The final clean three-run issue matrix did not reproduce a release-gate
+    // win for any supported shape. Keep every specialization experiment-only.
+    internal static bool IsPromotedShape(int inputFeatures, int outputFeatures) => false;
 
     private const int OutputsPerWarp = 2;
 

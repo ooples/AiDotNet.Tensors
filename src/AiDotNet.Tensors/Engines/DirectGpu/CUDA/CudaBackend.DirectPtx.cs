@@ -8,6 +8,23 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
 public sealed partial class CudaBackend
 {
+    private long _directPtxEvidenceDeviceAllocationCount;
+    private long _directPtxEvidenceDeviceAllocationBytes;
+
+    internal (long Count, long Bytes) DirectPtxEvidenceDeviceAllocations =>
+        (System.Threading.Interlocked.Read(
+            ref _directPtxEvidenceDeviceAllocationCount),
+         System.Threading.Interlocked.Read(
+            ref _directPtxEvidenceDeviceAllocationBytes));
+
+    private void RecordDirectPtxEvidenceDeviceAllocation(long bytes)
+    {
+        System.Threading.Interlocked.Increment(
+            ref _directPtxEvidenceDeviceAllocationCount);
+        System.Threading.Interlocked.Add(
+            ref _directPtxEvidenceDeviceAllocationBytes, bytes);
+    }
+
     // Resolve process-level feature switches once when the backend is built.
     // Reading environment variables in every dispatch would violate the
     // zero-allocation hot-path contract even though the PTX launch is resident.
@@ -1208,7 +1225,9 @@ public sealed partial class CudaBackend
     }
     internal int DirectPtxMixedLinearM16PinnedKernelCount
     {
-        get { lock (_directPtxLock) return _directPtxMixedLinearM16Kernels.PinnedCount; }
+        // The M=16 mixed-linear route dispatches from the FP16 Tensor-Core linear cache since the
+        // #836 reconciliation; the legacy _directPtxMixedLinearM16Kernels cache is never populated.
+        get { lock (_directPtxLock) return _directPtxFp16TensorCoreLinearKernels.PinnedCount; }
     }
     internal int DirectPtxQuantizedLinearPinnedKernelCount
     {
@@ -1516,155 +1535,16 @@ public sealed partial class CudaBackend
         return false;
     }
 
-    /// <summary>
-    /// Attempts the exact contiguous M=16 FP16-input/weight, FP32-accumulate
-    /// Tensor Core linear + FP32 bias + tanh-GELU specialization.
-    /// </summary>
-    internal bool TryDirectPtxFusedLinearGeluFp16M16(
-        IGpuBuffer inputHalf,
-        IGpuBuffer outputMajorWeightsHalf,
-        IGpuBuffer biasFloat,
-        IGpuBuffer outputFloat,
-        int inputFeatures,
-        int outputFeatures)
+
+    internal bool IsDirectPtxGatherEnabled =>
+        DirectPtxFeatureGate.IsGatherEnabled && IsAvailable &&
+        DirectPtxArchitecture.HasValidatedGather(_ccMajor, _ccMinor);
+
+    internal long DirectPtxGatherDispatchCount =>
+        System.Threading.Interlocked.Read(ref _directPtxGatherDispatchCount);
+    internal int DirectPtxGatherPinnedKernelCount
     {
-        if (!IsDirectPtxMixedLinearEnabled) return false;
-        if (inputHalf is null || outputMajorWeightsHalf is null ||
-            biasFloat is null || outputFloat is null)
-        {
-            DirectPtxLastError = "mixed-linear-m16-null-buffer";
-            return false;
-        }
-        if (!PtxFusedLinearGeluFp16M16Kernel.IsSupportedShape(inputFeatures, outputFeatures))
-        {
-            DirectPtxLastError = "mixed-linear-m16-shape-not-implemented";
-            return false;
-        }
-        if (!PtxFusedLinearGeluFp16M16Kernel.IsPromotedShape(inputFeatures, outputFeatures) &&
-            !DirectPtxFeatureGate.MixedPrecisionLinearExperimentOverride)
-        {
-            DirectPtxLastError = "mixed-linear-m16-performance-gate-not-met";
-            return false;
-        }
-        long inputBytes = checked((long)PtxFusedLinearGeluFp16M16Kernel.Rows *
-            inputFeatures * sizeof(ushort));
-        long weightBytes = checked((long)inputFeatures * outputFeatures * sizeof(ushort));
-        long biasBytes = checked((long)outputFeatures * sizeof(float));
-        long outputBytes = checked((long)PtxFusedLinearGeluFp16M16Kernel.Rows *
-            outputFeatures * sizeof(float));
-        if (inputHalf.SizeInBytes != inputBytes ||
-            outputMajorWeightsHalf.SizeInBytes != weightBytes ||
-            biasFloat.SizeInBytes != biasBytes || outputFloat.SizeInBytes != outputBytes)
-        {
-            DirectPtxLastError = "mixed-linear-m16-physical-extent-mismatch";
-            return false;
-        }
-
-        try
-        {
-            bool capturing = IsStreamCapturing();
-            EnsureContextCurrent();
-            var key = new DirectPtxFusedLinearKey(inputFeatures, outputFeatures);
-            lock (_directPtxLock)
-            {
-                if (!_directPtxMixedLinearM16Kernels.TryGetValue(
-                    key, out PtxFusedLinearGeluFp16M16Kernel? kernel))
-                {
-                    if (capturing)
-                    {
-                        DirectPtxLastError =
-                            "Direct PTX M=16 mixed linear must be prewarmed before CUDA graph capture.";
-                        return false;
-                    }
-                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
-                    kernel = CreateAndCacheMixedLinearM16KernelSlow(key);
-                }
-                if (capturing && !PinDirectPtxKernelForCapture(
-                        _directPtxMixedLinearM16Kernels, key))
-                    throw new InvalidOperationException(
-                        "Could not pin the direct-PTX M=16 mixed-linear module for CUDA graph capture.");
-                lock (GpuDispatchLock)
-                    kernel.Launch(
-                        DirectPtxTensorView.Create(inputHalf, kernel.Blueprint.Tensors[0]),
-                        DirectPtxTensorView.Create(outputMajorWeightsHalf, kernel.Blueprint.Tensors[1]),
-                        DirectPtxTensorView.Create(biasFloat, kernel.Blueprint.Tensors[2]),
-                        DirectPtxTensorView.Create(outputFloat, kernel.Blueprint.Tensors[3]));
-            }
-            System.Threading.Interlocked.Increment(ref _directPtxMixedLinearM16DispatchCount);
-            DirectPtxLastError = null;
-            return true;
-        }
-        catch (Exception ex)
-        {
-            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
-            return false;
-        }
-    }
-
-    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
-    private PtxFusedLinearGeluFp16M16Kernel CreateAndCacheMixedLinearM16KernelSlow(
-        DirectPtxFusedLinearKey key) =>
-        _directPtxMixedLinearM16Kernels.GetOrAdd(key, () =>
-            new PtxFusedLinearGeluFp16M16Kernel(
-                _directPtxRuntime!, key.InputFeatures, key.OutputFeatures));
-
-    internal bool PrewarmDirectPtxFusedLinearGeluFp16M16(
-        int inputFeatures,
-        int outputFeatures)
-    {
-        if (!IsDirectPtxMixedLinearEnabled) return false;
-        if (!PtxFusedLinearGeluFp16M16Kernel.IsSupportedShape(inputFeatures, outputFeatures))
-        {
-            DirectPtxLastError = "mixed-linear-m16-shape-not-implemented";
-            return false;
-        }
-        if (!PtxFusedLinearGeluFp16M16Kernel.IsPromotedShape(inputFeatures, outputFeatures) &&
-            !DirectPtxFeatureGate.MixedPrecisionLinearExperimentOverride)
-        {
-            DirectPtxLastError = "mixed-linear-m16-performance-gate-not-met";
-            return false;
-        }
-        try
-        {
-            if (IsStreamCapturing())
-            {
-                DirectPtxLastError = "Direct PTX M=16 mixed linear prewarm is not capture-safe.";
-                return false;
-            }
-            EnsureContextCurrent();
-            lock (_directPtxLock)
-            {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
-                var key = new DirectPtxFusedLinearKey(inputFeatures, outputFeatures);
-                if (!_directPtxMixedLinearM16Kernels.TryGetValue(key, out _))
-                    _ = CreateAndCacheMixedLinearM16KernelSlow(key);
-            }
-            DirectPtxLastError = null;
-            return true;
-        }
-        catch (Exception ex)
-        {
-            DirectPtxLastError = $"{ex.GetType().Name}: {ex.Message}";
-            return false;
-        }
-    }
-
-    internal bool TryGetDirectPtxMixedLinearM16Audit(
-        int inputFeatures,
-        int outputFeatures,
-        out DirectPtxKernelAudit audit)
-    {
-        lock (_directPtxLock)
-        {
-            var key = new DirectPtxFusedLinearKey(inputFeatures, outputFeatures);
-            if (_directPtxMixedLinearM16Kernels.TryGetValue(key, out var kernel))
-            {
-                audit = kernel.Audit;
-                return true;
-            }
-        }
-        audit = null!;
-        return false;
+        get { lock (_directPtxLock) return _directPtxGatherKernels.PinnedCount; }
     }
 
     /// <summary>
@@ -1680,11 +1560,6 @@ public sealed partial class CudaBackend
         int outputFeatures)
     {
         if (!IsDirectPtxFusedLinearEnabled) return false;
-        if (input is null || weights is null || bias is null || output is null)
-        {
-            DirectPtxLastError = "fused-linear-null-buffer";
-            return false;
-        }
         if (!PtxFusedLinearGeluM1Kernel.IsSupportedShape(inputFeatures, outputFeatures))
         {
             DirectPtxLastError = "fused-linear-shape-not-implemented";
@@ -1696,6 +1571,12 @@ public sealed partial class CudaBackend
             DirectPtxLastError = "fused-linear-performance-gate-not-met";
             return false;
         }
+        if (DirectPtxBufferIsInvalid(input) || DirectPtxBufferIsInvalid(weights) ||
+            DirectPtxBufferIsInvalid(bias) || DirectPtxBufferIsInvalid(output))
+        {
+            DirectPtxLastError = "fused-linear-null-or-invalid-buffer";
+            return false;
+        }
         long inputBytes = checked((long)inputFeatures * sizeof(float));
         long outputBytes = checked((long)outputFeatures * sizeof(float));
         long weightBytes = checked((long)inputFeatures * outputFeatures * sizeof(float));
@@ -1703,6 +1584,13 @@ public sealed partial class CudaBackend
             bias.SizeInBytes != outputBytes || output.SizeInBytes != outputBytes)
         {
             DirectPtxLastError = "fused-linear-physical-extent-mismatch";
+            return false;
+        }
+        if (DirectPtxBuffersOverlap(output, input) ||
+            DirectPtxBuffersOverlap(output, weights) ||
+            DirectPtxBuffersOverlap(output, bias))
+        {
+            DirectPtxLastError = "fused-linear-output-alias-not-supported";
             return false;
         }
 
@@ -1823,17 +1711,6 @@ public sealed partial class CudaBackend
         }
         audit = null!;
         return false;
-    }
-
-    internal bool IsDirectPtxGatherEnabled =>
-        DirectPtxFeatureGate.IsGatherEnabled && IsAvailable &&
-        DirectPtxArchitecture.HasValidatedGather(_ccMajor, _ccMinor);
-
-    internal long DirectPtxGatherDispatchCount =>
-        System.Threading.Interlocked.Read(ref _directPtxGatherDispatchCount);
-    internal int DirectPtxGatherPinnedKernelCount
-    {
-        get { lock (_directPtxLock) return _directPtxGatherKernels.PinnedCount; }
     }
 
     /// <summary>
@@ -5910,6 +5787,17 @@ public sealed partial class CudaBackend
             _directPtxGeGluKernels.Dispose();
             _directPtxGeGluBackwardKernels.Dispose();
             _directPtxFusedLinearKernels.Dispose();
+            _directPtxFp16TensorCoreLinearKernels.Dispose();
+            _directPtxFp16TensorCoreLinearPlans.Clear();
+            _directPtxFusedLinearTiledKernels.Dispose();
+            _directPtxDenseVectorKernels.Dispose();
+            _directPtxBatchedVectorKernels.Dispose();
+            _directPtxStridedDotKernels.Dispose();
+            _directPtxCrossEntropyKernels.Dispose();
+            _directPtxFp16GemmKernels.Dispose();
+            _directPtxGemmKernels.Dispose();
+            _directPtxLoRAKernels.Dispose();
+            _directPtxLinearBackwardKernels.Dispose();
             _directPtxMixedLinearKernels.Dispose();
             _directPtxMixedLinearM16Kernels.Dispose();
             _directPtxQuantizedLinearKernels.Dispose();
