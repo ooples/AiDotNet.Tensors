@@ -190,9 +190,9 @@ internal static class DirectPtxResidualLayerNormGeluExperiment
     {
         for (int i = 0; i < 8; i++) action();
         backend.Synchronize();
-        long before = GC.GetAllocatedBytesForCurrentThread();
+        long before = PtxCompat.GetAllocatedBytesForCurrentThread();
         for (int i = 0; i < Samples; i++) action();
-        long bytes = (GC.GetAllocatedBytesForCurrentThread() - before) / Samples;
+        long bytes = (PtxCompat.GetAllocatedBytesForCurrentThread() - before) / Samples;
         backend.Synchronize();
         return bytes;
     }
@@ -310,7 +310,7 @@ internal static class DirectPtxResidualLayerNormGeluExperiment
     {
         float maximum = 0;
         for (int i = 0; i < actual.Length; i++)
-            maximum = MathF.Max(maximum, MathF.Abs(actual[i] - expected[i]));
+            maximum = PtxCompat.Max(maximum, PtxCompat.Abs(actual[i] - expected[i]));
         return maximum;
     }
 
