@@ -132,6 +132,33 @@ public static class PtxParityRegistry
             "leg yet. Widening is exact for every FP16 input (including subnormals, infinities, and " +
             "signed zero), so its three-way spec can assert bit-for-bit equality on all three legs " +
             "rather than a tolerance."),
+        new PtxParitySpec("PtxFusedGeGluF32Kernel", PtxParityStatus.Deferred,
+            "GeGLU forward, fp32 (#839) — CudaBackend.GeGluForward",
+            "has a public route, but its tests compare the PTX result against a CPU reference only, so " +
+            "the gate-off CUDA==CPU leg is unproven. GeGLU splits the last axis into gate and value " +
+            "halves, so its three-way spec must drive both legs with the same halfDim split and use a " +
+            "tanh-approximation-aware tolerance, since the GELU term is the tanh form, not erf."),
+
+        new PtxParitySpec("PtxFusedGeGluBackwardF32Kernel", PtxParityStatus.Deferred,
+            "GeGLU backward, fp32 (#839) — CudaBackend.GeGluBackward",
+            "gradient kernel writing a full-width gradInput from a half-width gradOutput. Its oracle is " +
+            "the analytic GeGLU derivative, so the three-way spec needs that fp64 derivative rather " +
+            "than a finite-difference check, and the same tanh-form tolerance as the forward kernel."),
+
+        new PtxParitySpec("PtxFusedSwiGluF32Kernel", PtxParityStatus.Deferred,
+            "SwiGLU forward, fp32 (#839) — CudaBackend.SwiGluForward",
+            "same gate/value split as GeGLU with a SiLU gate. Its beta is baked into the module as a " +
+            "bit pattern, so a three-way spec must drive both legs with identical beta bits; otherwise " +
+            "the gate-off leg silently uses a different curve."),
+
+        new PtxParitySpec("PtxFusedResidualBiasLayerNormGeluD64Kernel", PtxParityStatus.Deferred,
+            "fused residual + bias + LayerNorm + GELU (D=64, #838)",
+            "reachable only through the internal TryDirectPtx* entry point; like the RMSNorm sibling it " +
+            "has no public op route on main, so a gate-off leg has nothing to compare against. Wire a " +
+            "public route plus a call-time experiment override first (mirroring softmax/reduction), " +
+            "then the four fused stages need a single fused fp64 oracle rather than a stage-by-stage " +
+            "reference, which rounds differently."),
+
         new PtxParitySpec("PtxFusedLinearGeluM1Kernel", PtxParityStatus.Deferred,
             "fused decode linear + GELU, fp32 M=1 (#836) — CudaBackend.FusedLinearGELUTransposedM1",
             "has a public route, but its tests compare the PTX result against a CPU reference only, so " +

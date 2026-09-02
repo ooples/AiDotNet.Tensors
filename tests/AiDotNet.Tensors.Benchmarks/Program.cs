@@ -181,6 +181,12 @@ class Program
             DirectPtxResidualRmsNormExperiment.Run();
             return;
         }
+        if (args.Length > 0 && args[0] == "--direct-ptx-residual-layernorm-gelu")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            DirectPtxResidualLayerNormGeluExperiment.Run(runs);
+            return;
+        }
         if (args.Length > 0 && args[0] == "--direct-ptx-fused-linear")
         {
             int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
@@ -245,6 +251,24 @@ class Program
         {
             int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
             DirectPtxW8A8LinearExperiment.Run(runs);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-geglu")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            DirectPtxGeGluExperiment.Run(runs);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-geglu-backward")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            DirectPtxGeGluExperiment.RunBackward(runs);
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-swiglu")
+        {
+            int runs = args.Length > 1 && int.TryParse(args[1], out int parsed) ? parsed : 3;
+            DirectPtxGeGluExperiment.RunSwiGluForward(runs);
             return;
         }
         if (args.Length > 0 && args[0] == "--direct-ptx-softmax")
@@ -574,6 +598,21 @@ class Program
         if (args.Length > 0 && args[0] == "--direct-ptx-profile-residual-rmsnorm")
         {
             DirectPtxProfileTarget.RunResidualRmsNorm();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-residual-layernorm-gelu")
+        {
+            DirectPtxProfileTarget.RunResidualLayerNormGelu();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-geglu")
+        {
+            DirectPtxProfileTarget.RunGeGlu();
+            return;
+        }
+        if (args.Length > 0 && args[0] == "--direct-ptx-profile-geglu-backward")
+        {
+            DirectPtxProfileTarget.RunGeGluBackward();
             return;
         }
         if (args.Length > 0 && args[0] == "--direct-ptx-profile-fused-linear")
@@ -1632,6 +1671,10 @@ class Program
         Console.WriteLine("  --direct-ptx-attention-backward [runs]: deterministic D64 backward release matrix");
         Console.WriteLine("  --direct-ptx-flash-attention-backward [runs]: D64 Flash recomputation-backward release matrix");
         Console.WriteLine("  --direct-ptx-residual-rmsnorm: second-blueprint fused residual + RMSNorm D64");
+        Console.WriteLine("  --direct-ptx-residual-layernorm-gelu [runs]: fused D64 normalization championship matrix");
+        Console.WriteLine("  --direct-ptx-geglu [runs]: exact FP32 split-row tanh-GeGLU championship matrix");
+        Console.WriteLine("  --direct-ptx-geglu-backward [runs]: exact fused FP32 GeGLU derivative championship");
+        Console.WriteLine("  --direct-ptx-swiglu [runs]: exact FP32 split-row SwiGLU forward championship");
         Console.WriteLine("  --direct-ptx-vision-box-iou [runs]: resident pairwise XYXY IoU evidence matrix");
         Console.WriteLine("  --direct-ptx-vision-family [runs] [operation]: resident vision/detection/ROI/geometry evidence matrix");
         Console.WriteLine("  --generate-direct-ptx-attention-offline-cubins <ptxas> <output>: build the release attention cubin set");
@@ -1649,6 +1692,9 @@ class Program
         Console.WriteLine("  --direct-ptx-external-gpu-baselines: forced cuDNN/Flash/Math/compiled Python GPU matrix");
         Console.WriteLine("  --direct-ptx-profile-attention: deterministic Nsight Compute attention target");
         Console.WriteLine("  --direct-ptx-profile-residual-rmsnorm: deterministic Nsight Compute fusion target");
+        Console.WriteLine("  --direct-ptx-profile-residual-layernorm-gelu: deterministic Nsight normalization target");
+        Console.WriteLine("  --direct-ptx-profile-geglu: deterministic Nsight Compute FP32 GeGLU target");
+        Console.WriteLine("  --direct-ptx-profile-geglu-backward: deterministic Nsight GeGLU derivative target");
         Console.WriteLine("  --direct-ptx-profile-fused-linear: deterministic Nsight fused-linear target");
         Console.WriteLine("  --direct-ptx-profile-dense-linear: exact-cubin Nsight target for all issue-836 entries");
         Console.WriteLine("  --direct-ptx-profile-mixed-linear: deterministic Nsight FP16 mixed-linear target");

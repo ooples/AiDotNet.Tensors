@@ -3346,6 +3346,63 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         LaunchKernel2D(kernel, gridX, gridY, DefaultBlockSize, 1, args);
     }
 
+    /// <summary>
+    /// Applies a canonical contiguous D=64 transformer boundary:
+    /// <c>GELU(LayerNorm(input + residual + preNormBias, gamma, beta))</c>.
+    /// Exact admitted shapes use a single direct-PTX kernel; all other shapes
+    /// fail closed to resident CUDA kernels without a temporary allocation.
+    /// </summary>
+    public unsafe void FusedResidualBiasLayerNormGeluD64(
+        IGpuBuffer input,
+        IGpuBuffer residual,
+        IGpuBuffer preNormBias,
+        IGpuBuffer gamma,
+        IGpuBuffer beta,
+        IGpuBuffer output,
+        int rows,
+        float epsilon = 1e-5f)
+    {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (residual is null) throw new ArgumentNullException(nameof(residual));
+        if (preNormBias is null) throw new ArgumentNullException(nameof(preNormBias));
+        if (gamma is null) throw new ArgumentNullException(nameof(gamma));
+        if (beta is null) throw new ArgumentNullException(nameof(beta));
+        if (output is null) throw new ArgumentNullException(nameof(output));
+        if (rows <= 0) throw new ArgumentOutOfRangeException(nameof(rows));
+        if (float.IsNaN(epsilon) || float.IsInfinity(epsilon) || epsilon <= 0)
+            throw new ArgumentOutOfRangeException(nameof(epsilon));
+        int elements = checked(rows * 64);
+        if (input.Size < elements || residual.Size < elements || output.Size < elements ||
+            preNormBias.Size < 64 || gamma.Size < 64 || beta.Size < 64)
+            throw new ArgumentException(
+                "Residual LayerNorm+GELU buffers are smaller than the requested canonical extents.");
+        if (TryDirectPtxFusedResidualBiasLayerNormGeluD64(
+            input, residual, preNormBias, gamma, beta, output, rows, epsilon))
+            return;
+
+        Add(input, residual, output, elements);
+        BiasAdd(output, preNormBias, output, rows, 64);
+        if (!_kernelCache.TryGetValue("layernorm_gelu", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: layernorm_gelu");
+        using var context = PushContext();
+        IntPtr inputPointer = output.Handle;
+        IntPtr outputPointer = output.Handle;
+        IntPtr gammaPointer = gamma.Handle;
+        IntPtr betaPointer = beta.Handle;
+        int normalizedSize = 64;
+        void** args = stackalloc void*[7];
+        args[0] = &inputPointer;
+        args[1] = &outputPointer;
+        args[2] = &gammaPointer;
+        args[3] = &betaPointer;
+        args[4] = &rows;
+        args[5] = &normalizedSize;
+        args[6] = &epsilon;
+        LaunchKernelWithSharedMem(
+            kernel, (uint)rows, DefaultBlockSize,
+            DefaultBlockSize * sizeof(float), args);
+    }
+
     public unsafe void Conv2DBiasAdd(IGpuBuffer output, IGpuBuffer bias, int batch, int channels, int spatialSize)
     {
         if (!_kernelCache.TryGetValue("conv2d_bias_add", out var kernel))
@@ -17328,7 +17385,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public void NotEqualsKernel(IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int size) => LaunchFusedBinary("not_equals_kernel", a, b, output, size);
 
     // --- Gated Activations ---
-    public void GluForward(IGpuBuffer input, IGpuBuffer output, int outerSize, int halfDim) => LaunchFusedAxis("glu_forward", input, output, outerSize, halfDim);
+    public void GluForward(IGpuBuffer input, IGpuBuffer output, int outerSize, int halfDim) =>
+        LaunchGatedForward("glu_forward", input, output, outerSize, halfDim);
     public unsafe void GluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int outerSize, int halfDim)
     {
         if (!_kernelCache.TryGetValue("glu_backward", out var kernel))
@@ -17340,12 +17398,50 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         uint total = (uint)(outerSize * halfDim);
         LaunchKernel(kernel, (total + DefaultBlockSize - 1) / DefaultBlockSize, DefaultBlockSize, args);
     }
-    public void GeGluForward(IGpuBuffer input, IGpuBuffer output, int outerSize, int halfDim) => LaunchFusedAxis("geglu_forward", input, output, outerSize, halfDim);
-    public unsafe void GeGluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int outerSize, int halfDim) { LaunchGatedBackward("geglu_backward", gradOutput, input, gradInput, outerSize, halfDim); }
-    public void ReGluForward(IGpuBuffer input, IGpuBuffer output, int outerSize, int halfDim) => LaunchFusedAxis("reglu_forward", input, output, outerSize, halfDim);
+    public void GeGluForward(IGpuBuffer input, IGpuBuffer output, int outerSize, int halfDim)
+    {
+        if (TryDirectPtxGeGluForward(input, output, outerSize, halfDim))
+            return;
+        LaunchGatedForward("geglu_forward", input, output, outerSize, halfDim);
+    }
+    public unsafe void GeGluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int outerSize, int halfDim)
+    {
+        if (TryDirectPtxGeGluBackward(gradOutput, input, gradInput, outerSize, halfDim))
+            return;
+        LaunchGatedBackward("geglu_backward", gradOutput, input, gradInput, outerSize, halfDim);
+    }
+    public void ReGluForward(IGpuBuffer input, IGpuBuffer output, int outerSize, int halfDim) =>
+        LaunchGatedForward("reglu_forward", input, output, outerSize, halfDim);
     public unsafe void ReGluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int outerSize, int halfDim) { LaunchGatedBackward("reglu_backward", gradOutput, input, gradInput, outerSize, halfDim); }
-    public void SwiGluForward(IGpuBuffer input, IGpuBuffer output, int outerSize, int halfDim) => LaunchFusedAxis("swiglu_forward", input, output, outerSize, halfDim);
+    public void SwiGluForward(IGpuBuffer input, IGpuBuffer output, int outerSize, int halfDim)
+    {
+        if (TryDirectPtxSwiGluForward(input, output, outerSize, halfDim))
+            return;
+        LaunchGatedForward("swiglu_forward", input, output, outerSize, halfDim);
+    }
     public unsafe void SwiGluBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int outerSize, int halfDim) { LaunchGatedBackward("swiglu_backward", gradOutput, input, gradInput, outerSize, halfDim); }
+
+    private unsafe void LaunchGatedForward(
+        string kernelName,
+        IGpuBuffer input,
+        IGpuBuffer output,
+        int outerSize,
+        int halfDim)
+    {
+        if (!_kernelCache.TryGetValue(kernelName, out var kernel))
+            throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
+        using var _ = PushContext();
+        IntPtr inputPointer = input.Handle, outputPointer = output.Handle;
+        void** args = stackalloc void*[4];
+        args[0] = &inputPointer;
+        args[1] = &outputPointer;
+        args[2] = &outerSize;
+        args[3] = &halfDim;
+        uint total = checked((uint)((long)outerSize * halfDim));
+        LaunchKernel(
+            kernel, (total + DefaultBlockSize - 1) / DefaultBlockSize,
+            DefaultBlockSize, args);
+    }
 
     private unsafe void LaunchGatedBackward(string kernelName, IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradInput, int outerSize, int halfDim)
     {
