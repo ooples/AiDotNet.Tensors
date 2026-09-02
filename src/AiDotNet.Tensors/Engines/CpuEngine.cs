@@ -3091,10 +3091,12 @@ public partial class CpuEngine : ITensorLevelEngine
             // FMA on net8+). Beats TensorPrimitives by 1.0-1.04× on every
             // tracked DiT-XL shape — same kernel family that beat MKL on
             // the iter18c sweep.
-            var aRaw = (float[])(object)a._storage.GetDataArray();
-            var bRaw = (float[])(object)b._storage.GetDataArray();
-            var rRaw = (float[])(object)result._storage.GetDataArray();
-            int aOff = a._storageOffset, bOff = b._storageOffset, rOff = result._storageOffset;
+            var aRaw = (float[])(object)(a.GetCpuBackingForStridedRead(out int aOff)
+                ?? throw new InvalidOperationException("TensorAdd requires readable contiguous CPU storage."));
+            var bRaw = (float[])(object)(b.GetCpuBackingForStridedRead(out int bOff)
+                ?? throw new InvalidOperationException("TensorAdd requires readable contiguous CPU storage."));
+            var rRaw = (float[])(object)(result.GetCpuBackingForContiguousWrite(out int rOff)
+                ?? throw new InvalidOperationException("TensorAdd requires writable contiguous CPU storage."));
             fixed (float* pAFix = aRaw, pBFix = bRaw, pRFix = rRaw)
             {
                 float* pA = pAFix + aOff;
@@ -3148,10 +3150,12 @@ public partial class CpuEngine : ITensorLevelEngine
         else if (typeof(T) == typeof(double))
         {
             // In-house: pin raw storage + offset, call SimdKernels.VectorAddUnsafe(double*).
-            var aRaw = (double[])(object)a._storage.GetDataArray();
-            var bRaw = (double[])(object)b._storage.GetDataArray();
-            var rRaw = (double[])(object)result._storage.GetDataArray();
-            int aOff = a._storageOffset, bOff = b._storageOffset, rOff = result._storageOffset;
+            var aRaw = (double[])(object)(a.GetCpuBackingForStridedRead(out int aOff)
+                ?? throw new InvalidOperationException("TensorAdd requires readable contiguous CPU storage."));
+            var bRaw = (double[])(object)(b.GetCpuBackingForStridedRead(out int bOff)
+                ?? throw new InvalidOperationException("TensorAdd requires readable contiguous CPU storage."));
+            var rRaw = (double[])(object)(result.GetCpuBackingForContiguousWrite(out int rOff)
+                ?? throw new InvalidOperationException("TensorAdd requires writable contiguous CPU storage."));
             fixed (double* pAFix = aRaw, pBFix = bRaw, pRFix = rRaw)
             {
                 double* pA = pAFix + aOff;
@@ -3250,8 +3254,8 @@ public partial class CpuEngine : ITensorLevelEngine
         // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy (breaking in-place writes)
         if (typeof(T) == typeof(float))
         {
-            var aMem = AsFloatMemory(a.Data);
-            var bMem = AsFloatMemory(b.Data);
+            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyData);
+            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyData);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             float* pA = (float*)pinA.Pointer;
@@ -3306,8 +3310,8 @@ public partial class CpuEngine : ITensorLevelEngine
         // VectorAddUnsafe pattern, dgemm-equivalent throughput on AVX2.
         if (typeof(T) == typeof(double))
         {
-            var aMem = AsDoubleMemory(a.Data);
-            var bMem = AsDoubleMemory(b.Data);
+            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyData);
+            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyData);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             double* pA = (double*)pinA.Pointer;
@@ -3364,8 +3368,8 @@ public partial class CpuEngine : ITensorLevelEngine
         int length = a.Length;
         if (typeof(T) == typeof(float))
         {
-            var aMem = AsFloatMemory(a.Data);
-            var bMem = AsFloatMemory(b.Data);
+            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyData);
+            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyData);
             var rMem = AsFloatMemory(destination.Data);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
@@ -3380,8 +3384,8 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else if (typeof(T) == typeof(double))
         {
-            var aMem = AsDoubleMemory(a.Data);
-            var bMem = AsDoubleMemory(b.Data);
+            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyData);
+            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyData);
             var rMem = AsDoubleMemory(destination.Data);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
@@ -3443,21 +3447,26 @@ public partial class CpuEngine : ITensorLevelEngine
         // [1,64,224,224] taking ~254 ms per call without this path (the generic
         // a.BroadcastAdd walks each output index via indexer — ~100× slower
         // than SIMD). Closes the AiDotNet#1394 perf wall on Conv+BN models.
-        if (TryBroadcastChannelRepeat(a, b, out int bcr_batch, out int bcr_chan, out int bcr_spatial))
+        if (TryBroadcastChannelRepeat(a, b, out int bcr_batch, out int bcr_chan, out int bcr_spatial)
+            && a.GetCpuBackingForStridedRead(out int bcr_aOff) is { } bcr_a
+            && b.GetCpuBackingForStridedRead(out int bcr_bOff) is { } bcr_b)
         {
             var res = AutoTensorCache.RentOrAllocate<T>(a._shape);
-            ApplyBroadcastChannelOp(
-                a._storage.GetDataArray(), a._storageOffset,
-                b._storage.GetDataArray(), b._storageOffset,
-                res._storage.GetDataArray(), res._storageOffset,
-                bcr_batch, bcr_chan, bcr_spatial, BroadcastOp.Add);
-            DifferentiableOps.RecordBinary("TensorBroadcastAdd", res, aOrig, bOrig, BackwardFunctions<T>.BroadcastAddBackward);
-            if (AutoTracer.ShouldRecord)
+            if (res.GetCpuBackingForContiguousWrite(out int bcr_rOff) is { } bcr_r)
             {
-                var ca = a; var cb = b;
-                AutoTracer.RecordOp("TensorBroadcastAdd", res, eng => eng.TensorAdd(ca, cb));
+                ApplyBroadcastChannelOp(
+                    bcr_a, bcr_aOff,
+                    bcr_b, bcr_bOff,
+                    bcr_r, bcr_rOff,
+                    bcr_batch, bcr_chan, bcr_spatial, BroadcastOp.Add);
+                DifferentiableOps.RecordBinary("TensorBroadcastAdd", res, aOrig, bOrig, BackwardFunctions<T>.BroadcastAddBackward);
+                if (AutoTracer.ShouldRecord)
+                {
+                    var ca = a; var cb = b;
+                    AutoTracer.RecordOp("TensorBroadcastAdd", res, eng => eng.TensorAdd(ca, cb));
+                }
+                return res;
             }
-            return res;
         }
 
         // Generic trailing-repeat fast path — same rationale as
@@ -3534,21 +3543,26 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!b.IsContiguous) b = b.Contiguous();
 
         // Channel-repeat fast path — see TensorBroadcastAdd for rationale.
-        if (TryBroadcastChannelRepeat(a, b, out int bcs_batch, out int bcs_chan, out int bcs_spatial))
+        if (TryBroadcastChannelRepeat(a, b, out int bcs_batch, out int bcs_chan, out int bcs_spatial)
+            && a.GetCpuBackingForStridedRead(out int bcs_aOff) is { } bcs_a
+            && b.GetCpuBackingForStridedRead(out int bcs_bOff) is { } bcs_b)
         {
             var res = AutoTensorCache.RentOrAllocate<T>(a._shape);
-            ApplyBroadcastChannelOp(
-                a._storage.GetDataArray(), a._storageOffset,
-                b._storage.GetDataArray(), b._storageOffset,
-                res._storage.GetDataArray(), res._storageOffset,
-                bcs_batch, bcs_chan, bcs_spatial, BroadcastOp.Subtract);
-            DifferentiableOps.RecordBinary("TensorBroadcastSubtract", res, aOrig, bOrig, BackwardFunctions<T>.BroadcastSubtractBackward);
-            if (AutoTracer.ShouldRecord)
+            if (res.GetCpuBackingForContiguousWrite(out int bcs_rOff) is { } bcs_r)
             {
-                var ca = a; var cb = b;
-                AutoTracer.RecordOp("TensorBroadcastSubtract", res, eng => eng.TensorSubtract(ca, cb));
+                ApplyBroadcastChannelOp(
+                    bcs_a, bcs_aOff,
+                    bcs_b, bcs_bOff,
+                    bcs_r, bcs_rOff,
+                    bcs_batch, bcs_chan, bcs_spatial, BroadcastOp.Subtract);
+                DifferentiableOps.RecordBinary("TensorBroadcastSubtract", res, aOrig, bOrig, BackwardFunctions<T>.BroadcastSubtractBackward);
+                if (AutoTracer.ShouldRecord)
+                {
+                    var ca = a; var cb = b;
+                    AutoTracer.RecordOp("TensorBroadcastSubtract", res, eng => eng.TensorSubtract(ca, cb));
+                }
+                return res;
             }
-            return res;
         }
 
         // Fast path for [N,M] - [M] or [N,M] - [1,M] bias subtract pattern
@@ -3643,21 +3657,26 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!b.IsContiguous) b = b.Contiguous();
 
         // Channel-repeat fast path — see TensorBroadcastAdd for rationale.
-        if (TryBroadcastChannelRepeat(a, b, out int bcd_batch, out int bcd_chan, out int bcd_spatial))
+        if (TryBroadcastChannelRepeat(a, b, out int bcd_batch, out int bcd_chan, out int bcd_spatial)
+            && a.GetCpuBackingForStridedRead(out int bcd_aOff) is { } bcd_a
+            && b.GetCpuBackingForStridedRead(out int bcd_bOff) is { } bcd_b)
         {
             var res = AutoTensorCache.RentOrAllocate<T>(a._shape);
-            ApplyBroadcastChannelOp(
-                a._storage.GetDataArray(), a._storageOffset,
-                b._storage.GetDataArray(), b._storageOffset,
-                res._storage.GetDataArray(), res._storageOffset,
-                bcd_batch, bcd_chan, bcd_spatial, BroadcastOp.Divide);
-            DifferentiableOps.RecordBinary("TensorBroadcastDivide", res, aOrig, bOrig, BackwardFunctions<T>.BroadcastDivideBackward);
-            if (AutoTracer.ShouldRecord)
+            if (res.GetCpuBackingForContiguousWrite(out int bcd_rOff) is { } bcd_r)
             {
-                var ca = a; var cb = b;
-                AutoTracer.RecordOp("TensorBroadcastDivide", res, eng => eng.TensorDivide(ca, cb));
+                ApplyBroadcastChannelOp(
+                    bcd_a, bcd_aOff,
+                    bcd_b, bcd_bOff,
+                    bcd_r, bcd_rOff,
+                    bcd_batch, bcd_chan, bcd_spatial, BroadcastOp.Divide);
+                DifferentiableOps.RecordBinary("TensorBroadcastDivide", res, aOrig, bOrig, BackwardFunctions<T>.BroadcastDivideBackward);
+                if (AutoTracer.ShouldRecord)
+                {
+                    var ca = a; var cb = b;
+                    AutoTracer.RecordOp("TensorBroadcastDivide", res, eng => eng.TensorDivide(ca, cb));
+                }
+                return res;
             }
-            return res;
         }
 
         var result = a.BroadcastDivide(b);
@@ -3704,21 +3723,26 @@ public partial class CpuEngine : ITensorLevelEngine
         // BatchNorm inference scale at [B,C,H,W] * [1,C,1,1] hits this; VGG16
         // forward profile showed 13 BN layers consuming ~44% of the step
         // before this path existed.
-        if (TryBroadcastChannelRepeat(a, b, out int bcm_batch, out int bcm_chan, out int bcm_spatial))
+        if (TryBroadcastChannelRepeat(a, b, out int bcm_batch, out int bcm_chan, out int bcm_spatial)
+            && a.GetCpuBackingForStridedRead(out int bcm_aOff) is { } bcm_a
+            && b.GetCpuBackingForStridedRead(out int bcm_bOff) is { } bcm_b)
         {
             var res = AutoTensorCache.RentOrAllocate<T>(a._shape);
-            ApplyBroadcastChannelOp(
-                a._storage.GetDataArray(), a._storageOffset,
-                b._storage.GetDataArray(), b._storageOffset,
-                res._storage.GetDataArray(), res._storageOffset,
-                bcm_batch, bcm_chan, bcm_spatial, BroadcastOp.Multiply);
-            DifferentiableOps.RecordBinary("TensorBroadcastMultiply", res, aOrig, bOrig, BackwardFunctions<T>.BroadcastMultiplyBackward);
-            if (AutoTracer.ShouldRecord)
+            if (res.GetCpuBackingForContiguousWrite(out int bcm_rOff) is { } bcm_r)
             {
-                var ca = a; var cb = b;
-                AutoTracer.RecordOp("TensorBroadcastMultiply", res, eng => eng.TensorMultiply(ca, cb));
+                ApplyBroadcastChannelOp(
+                    bcm_a, bcm_aOff,
+                    bcm_b, bcm_bOff,
+                    bcm_r, bcm_rOff,
+                    bcm_batch, bcm_chan, bcm_spatial, BroadcastOp.Multiply);
+                DifferentiableOps.RecordBinary("TensorBroadcastMultiply", res, aOrig, bOrig, BackwardFunctions<T>.BroadcastMultiplyBackward);
+                if (AutoTracer.ShouldRecord)
+                {
+                    var ca = a; var cb = b;
+                    AutoTracer.RecordOp("TensorBroadcastMultiply", res, eng => eng.TensorMultiply(ca, cb));
+                }
+                return res;
             }
-            return res;
         }
 
         // Generic trailing-repeat fast path (float + double + any T with SIMD numOps).
@@ -5057,8 +5081,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(float))
         {
-            var aMem = AsFloatMemory(a.Data);
-            var bMem = AsFloatMemory(b.Data);
+            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyData);
+            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyData);
             var rMem = AsFloatMemory(destination.Data);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
@@ -5067,8 +5091,8 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else if (typeof(T) == typeof(double))
         {
-            var aMem = AsDoubleMemory(a.Data);
-            var bMem = AsDoubleMemory(b.Data);
+            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyData);
+            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyData);
             var rMem = AsDoubleMemory(destination.Data);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
@@ -5094,8 +5118,8 @@ public partial class CpuEngine : ITensorLevelEngine
         int length = a.Length;
         if (typeof(T) == typeof(float))
         {
-            var aMem = AsFloatMemory(a.Data);
-            var bMem = AsFloatMemory(b.Data);
+            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyData);
+            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyData);
             var rMem = AsFloatMemory(destination.Data);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
@@ -5104,8 +5128,8 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else if (typeof(T) == typeof(double))
         {
-            var aMem = AsDoubleMemory(a.Data);
-            var bMem = AsDoubleMemory(b.Data);
+            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyData);
+            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyData);
             var rMem = AsDoubleMemory(destination.Data);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
@@ -5414,8 +5438,6 @@ public partial class CpuEngine : ITensorLevelEngine
         // Stride-aware: strided iteration for non-contiguous views (zero-copy)
         if (!a.IsContiguous || !b.IsContiguous)
         {
-            var aArr = a._storage.GetDataArray(); var bArr = b._storage.GetDataArray(); var rArr = result.GetDataArray();
-            var ops = MathHelper.GetNumericOperations<T>();
             // Strided operands go to the coalescing SIMD kernel, not a per-element walk.
             // See TensorAdd: implicit broadcasting made this branch the common path.
             Tensor<T>.ElementwiseInto(a, b, result, Tensor<T>.BroadcastOp.Subtract);
@@ -5424,10 +5446,12 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             // In-house SIMD: pin raw storage + offset, JIT or
             // VectorSubtractUnsafe (4× unrolled AVX2/AVX-512 with FMA).
-            var aRaw = (float[])(object)a._storage.GetDataArray();
-            var bRaw = (float[])(object)b._storage.GetDataArray();
-            var rRaw = (float[])(object)result._storage.GetDataArray();
-            int aOff = a._storageOffset, bOff = b._storageOffset, rOff = result._storageOffset;
+            var aRaw = (float[])(object)(a.GetCpuBackingForStridedRead(out int aOff)
+                ?? throw new InvalidOperationException("TensorSubtract requires readable contiguous CPU storage."));
+            var bRaw = (float[])(object)(b.GetCpuBackingForStridedRead(out int bOff)
+                ?? throw new InvalidOperationException("TensorSubtract requires readable contiguous CPU storage."));
+            var rRaw = (float[])(object)(result.GetCpuBackingForContiguousWrite(out int rOff)
+                ?? throw new InvalidOperationException("TensorSubtract requires writable contiguous CPU storage."));
             fixed (float* pAFix = aRaw, pBFix = bRaw, pRFix = rRaw)
             {
                 float* pA = pAFix + aOff;
@@ -5462,10 +5486,12 @@ public partial class CpuEngine : ITensorLevelEngine
         else if (typeof(T) == typeof(double))
         {
             // In-house: pin raw storage + offset, call VectorSubtractUnsafe(double*).
-            var aRaw = (double[])(object)a._storage.GetDataArray();
-            var bRaw = (double[])(object)b._storage.GetDataArray();
-            var rRaw = (double[])(object)result._storage.GetDataArray();
-            int aOff = a._storageOffset, bOff = b._storageOffset, rOff = result._storageOffset;
+            var aRaw = (double[])(object)(a.GetCpuBackingForStridedRead(out int aOff)
+                ?? throw new InvalidOperationException("TensorSubtract requires readable contiguous CPU storage."));
+            var bRaw = (double[])(object)(b.GetCpuBackingForStridedRead(out int bOff)
+                ?? throw new InvalidOperationException("TensorSubtract requires readable contiguous CPU storage."));
+            var rRaw = (double[])(object)(result.GetCpuBackingForContiguousWrite(out int rOff)
+                ?? throw new InvalidOperationException("TensorSubtract requires writable contiguous CPU storage."));
             fixed (double* pAFix = aRaw, pBFix = bRaw, pRFix = rRaw)
             {
                 double* pA = pAFix + aOff;
@@ -5575,18 +5601,18 @@ public partial class CpuEngine : ITensorLevelEngine
         // Stride-aware: strided iteration for non-contiguous views (zero-copy)
         if (!a.IsContiguous || !b.IsContiguous)
         {
-            var aArr = a._storage.GetDataArray(); var bArr = b._storage.GetDataArray(); var rArr = result.GetDataArray();
-            var ops = MathHelper.GetNumericOperations<T>();
             // Strided operands go to the coalescing SIMD kernel, not a per-element walk.
             // See TensorAdd: implicit broadcasting made this branch the common path.
             Tensor<T>.ElementwiseInto(a, b, result, Tensor<T>.BroadcastOp.Multiply);
         }
         else if (typeof(T) == typeof(float))
         {
-            var aRaw = (float[])(object)a._storage.GetDataArray();
-            var bRaw = (float[])(object)b._storage.GetDataArray();
-            var rRaw = (float[])(object)result._storage.GetDataArray();
-            int aOff = a._storageOffset, bOff = b._storageOffset, rOff = result._storageOffset;
+            var aRaw = (float[])(object)(a.GetCpuBackingForStridedRead(out int aOff)
+                ?? throw new InvalidOperationException("TensorMultiply requires readable contiguous CPU storage."));
+            var bRaw = (float[])(object)(b.GetCpuBackingForStridedRead(out int bOff)
+                ?? throw new InvalidOperationException("TensorMultiply requires readable contiguous CPU storage."));
+            var rRaw = (float[])(object)(result.GetCpuBackingForContiguousWrite(out int rOff)
+                ?? throw new InvalidOperationException("TensorMultiply requires writable contiguous CPU storage."));
             fixed (float* pAFix = aRaw, pBFix = bRaw, pRFix = rRaw)
             {
                 float* pA = pAFix + aOff;
@@ -5620,10 +5646,12 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else if (typeof(T) == typeof(double))
         {
-            var aRaw = (double[])(object)a._storage.GetDataArray();
-            var bRaw = (double[])(object)b._storage.GetDataArray();
-            var rRaw = (double[])(object)result._storage.GetDataArray();
-            int aOff = a._storageOffset, bOff = b._storageOffset, rOff = result._storageOffset;
+            var aRaw = (double[])(object)(a.GetCpuBackingForStridedRead(out int aOff)
+                ?? throw new InvalidOperationException("TensorMultiply requires readable contiguous CPU storage."));
+            var bRaw = (double[])(object)(b.GetCpuBackingForStridedRead(out int bOff)
+                ?? throw new InvalidOperationException("TensorMultiply requires readable contiguous CPU storage."));
+            var rRaw = (double[])(object)(result.GetCpuBackingForContiguousWrite(out int rOff)
+                ?? throw new InvalidOperationException("TensorMultiply requires writable contiguous CPU storage."));
             fixed (double* pAFix = aRaw, pBFix = bRaw, pRFix = rRaw)
             {
                 double* pA = pAFix + aOff;
@@ -5712,8 +5740,8 @@ public partial class CpuEngine : ITensorLevelEngine
         // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy (breaking in-place writes)
         if (typeof(T) == typeof(float))
         {
-            var aMem = AsFloatMemory(a.Data);
-            var bMem = AsFloatMemory(b.Data);
+            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyData);
+            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyData);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             float* pA = (float*)pinA.Pointer;
@@ -5764,8 +5792,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(double))
         {
-            var aMem = AsDoubleMemory(a.Data);
-            var bMem = AsDoubleMemory(b.Data);
+            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyData);
+            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyData);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             double* pA = (double*)pinA.Pointer;
@@ -5822,8 +5850,8 @@ public partial class CpuEngine : ITensorLevelEngine
         int length = a.Length;
         if (typeof(T) == typeof(float))
         {
-            var aMem = AsFloatMemory(a.Data);
-            var bMem = AsFloatMemory(b.Data);
+            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyData);
+            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyData);
             var rMem = AsFloatMemory(destination.Data);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
@@ -5832,8 +5860,8 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else if (typeof(T) == typeof(double))
         {
-            var aMem = AsDoubleMemory(a.Data);
-            var bMem = AsDoubleMemory(b.Data);
+            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyData);
+            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyData);
             var rMem = AsDoubleMemory(destination.Data);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
@@ -6300,78 +6328,94 @@ public partial class CpuEngine : ITensorLevelEngine
         // Stride-aware: strided iteration for non-contiguous views (zero-copy)
         if (!a.IsContiguous || !b.IsContiguous)
         {
-            var aArr = a._storage.GetDataArray(); var bArr = b._storage.GetDataArray(); var rArr = result.GetDataArray();
-            var ops = MathHelper.GetNumericOperations<T>();
             // Strided operands go to the coalescing SIMD kernel, not a per-element walk.
             // See TensorAdd: implicit broadcasting made this branch the common path.
             Tensor<T>.ElementwiseInto(a, b, result, Tensor<T>.BroadcastOp.Divide);
         }
         else if (typeof(T) == typeof(float))
         {
-            var aRaw = (float[])(object)a._storage.GetDataArray();
-            var bRaw = (float[])(object)b._storage.GetDataArray();
-            var rRaw = (float[])(object)result._storage.GetDataArray();
-            int aOff = a._storageOffset, bOff = b._storageOffset, rOff = result._storageOffset;
-            fixed (float* pAFix = aRaw, pBFix = bRaw, pRFix = rRaw)
+            var aBacking = a.GetCpuBackingForStridedRead(out int aOff);
+            var bBacking = b.GetCpuBackingForStridedRead(out int bOff);
+            var rBacking = result.GetCpuBackingForContiguousWrite(out int rOff);
+            if (aBacking is null || bBacking is null || rBacking is null)
             {
-                float* pA = pAFix + aOff;
-                float* pB = pBFix + bOff;
-                float* pR = pRFix + rOff;
-                if (CpuJitSelfTest.IsVerified && length >= 64)
+                MathHelper.GetNumericOperations<T>().Divide(a.AsSpan(), b.AsSpan(), result.AsWritableSpan());
+            }
+            else
+            {
+                var aRaw = (float[])(object)aBacking;
+                var bRaw = (float[])(object)bBacking;
+                var rRaw = (float[])(object)rBacking;
+                fixed (float* pAFix = aRaw, pBFix = bRaw, pRFix = rRaw)
                 {
-                    JitBinaryDispatch(pA, pB, pR, length, JitBinaryOp.Divide);
-                }
-                else
-                {
-                    int subChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 500_000));
-                    if (subChunks >= 2)
+                    float* pA = pAFix + aOff;
+                    float* pB = pBFix + bOff;
+                    float* pR = pRFix + rOff;
+                    if (CpuJitSelfTest.IsVerified && length >= 64)
                     {
-                        int chunkSize = (length + subChunks - 1) / subChunks;
-                        chunkSize = (chunkSize + 31) & ~31;
-                        CpuParallelSettings.ParallelForOrSerial(0, subChunks, length, chunk =>
-                        {
-                            int start = chunk * chunkSize;
-                            int count = Math.Min(chunkSize, length - start);
-                            if (count > 0)
-                                SimdKernels.VectorDivideUnsafe(pA + start, pB + start, pR + start, count);
-                        });
+                        JitBinaryDispatch(pA, pB, pR, length, JitBinaryOp.Divide);
                     }
                     else
                     {
-                        SimdKernels.VectorDivideUnsafe(pA, pB, pR, length);
+                        int subChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 500_000));
+                        if (subChunks >= 2)
+                        {
+                            int chunkSize = (length + subChunks - 1) / subChunks;
+                            chunkSize = (chunkSize + 31) & ~31;
+                            CpuParallelSettings.ParallelForOrSerial(0, subChunks, length, chunk =>
+                            {
+                                int start = chunk * chunkSize;
+                                int count = Math.Min(chunkSize, length - start);
+                                if (count > 0)
+                                    SimdKernels.VectorDivideUnsafe(pA + start, pB + start, pR + start, count);
+                            });
+                        }
+                        else
+                        {
+                            SimdKernels.VectorDivideUnsafe(pA, pB, pR, length);
+                        }
                     }
                 }
             }
         }
         else if (typeof(T) == typeof(double))
         {
-            var aRaw = (double[])(object)a._storage.GetDataArray();
-            var bRaw = (double[])(object)b._storage.GetDataArray();
-            var rRaw = (double[])(object)result._storage.GetDataArray();
-            int aOff = a._storageOffset, bOff = b._storageOffset, rOff = result._storageOffset;
-            fixed (double* pAFix = aRaw, pBFix = bRaw, pRFix = rRaw)
+            var aBacking = a.GetCpuBackingForStridedRead(out int aOff);
+            var bBacking = b.GetCpuBackingForStridedRead(out int bOff);
+            var rBacking = result.GetCpuBackingForContiguousWrite(out int rOff);
+            if (aBacking is null || bBacking is null || rBacking is null)
             {
-                double* pA = pAFix + aOff;
-                double* pB = pBFix + bOff;
-                double* pR = pRFix + rOff;
-                int subChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 250_000));
-                if (subChunks >= 2)
+                MathHelper.GetNumericOperations<T>().Divide(a.AsSpan(), b.AsSpan(), result.AsWritableSpan());
+            }
+            else
+            {
+                var aRaw = (double[])(object)aBacking;
+                var bRaw = (double[])(object)bBacking;
+                var rRaw = (double[])(object)rBacking;
+                fixed (double* pAFix = aRaw, pBFix = bRaw, pRFix = rRaw)
                 {
-                    int chunkSize = (length + subChunks - 1) / subChunks;
-                    chunkSize = (chunkSize + 15) & ~15;
-                    IntPtr ipA = (IntPtr)pA, ipB = (IntPtr)pB, ipR = (IntPtr)pR;
-                    int totalLength = length;
-                    CpuParallelSettings.ParallelForOrSerial(0, subChunks, length, chunk =>
+                    double* pA = pAFix + aOff;
+                    double* pB = pBFix + bOff;
+                    double* pR = pRFix + rOff;
+                    int subChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 250_000));
+                    if (subChunks >= 2)
                     {
-                        int start = chunk * chunkSize;
-                        int count = Math.Min(chunkSize, totalLength - start);
-                        if (count > 0)
-                            SimdKernels.VectorDivideUnsafe((double*)ipA + start, (double*)ipB + start, (double*)ipR + start, count);
-                    });
-                }
-                else
-                {
-                    SimdKernels.VectorDivideUnsafe(pA, pB, pR, length);
+                        int chunkSize = (length + subChunks - 1) / subChunks;
+                        chunkSize = (chunkSize + 15) & ~15;
+                        IntPtr ipA = (IntPtr)pA, ipB = (IntPtr)pB, ipR = (IntPtr)pR;
+                        int totalLength = length;
+                        CpuParallelSettings.ParallelForOrSerial(0, subChunks, length, chunk =>
+                        {
+                            int start = chunk * chunkSize;
+                            int count = Math.Min(chunkSize, totalLength - start);
+                            if (count > 0)
+                                SimdKernels.VectorDivideUnsafe((double*)ipA + start, (double*)ipB + start, (double*)ipR + start, count);
+                        });
+                    }
+                    else
+                    {
+                        SimdKernels.VectorDivideUnsafe(pA, pB, pR, length);
+                    }
                 }
             }
         }
@@ -46621,6 +46665,16 @@ public partial class CpuEngine : ITensorLevelEngine
     private static Memory<double> AsDoubleMemory<T>(Memory<T> data)
     {
         return Unsafe.As<Memory<T>, Memory<double>>(ref data);
+    }
+
+    private static ReadOnlyMemory<float> AsFloatReadOnlyMemory<T>(ReadOnlyMemory<T> data)
+    {
+        return Unsafe.As<ReadOnlyMemory<T>, ReadOnlyMemory<float>>(ref data);
+    }
+
+    private static ReadOnlyMemory<double> AsDoubleReadOnlyMemory<T>(ReadOnlyMemory<T> data)
+    {
+        return Unsafe.As<ReadOnlyMemory<T>, ReadOnlyMemory<double>>(ref data);
     }
 
     #region Hyperbolic Manifold Operations

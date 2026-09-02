@@ -1475,8 +1475,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
         }
 
-        // Not in any cache — fall back to GetDataArray (triggers lazy allocation + GPU download if needed)
-        return GetOrAllocateBuffer(backend, tensor.GetDataArray());
+        // Not in any cache — materialize the CPU value for upload through the read-only
+        // tensor accessor. GetDataArray() is a writable escape and therefore detaches a
+        // copy-on-write clone even though an upload only reads the operand.
+        return GetOrAllocateBuffer(backend, tensor.GetReadOnlyDataArray());
     }
 
     /// <summary>
@@ -3863,8 +3865,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return null;
         }
 
-        var leftArr = left.GetDataArray();
-        var rightArr = right.GetDataArray();
+        // Chunking stages input values only; do not request writable array escapes and
+        // accidentally privatize copy-on-write operands before the GPU upload.
+        var leftArr = left.GetReadOnlyDataArray();
+        var rightArr = right.GetReadOnlyDataArray();
         if (leftArr is not float[] leftFloat || rightArr is not float[] rightFloat) return null;
 
         var resultFloat = new float[totalElements];

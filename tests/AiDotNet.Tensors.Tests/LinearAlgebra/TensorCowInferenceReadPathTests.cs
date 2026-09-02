@@ -22,6 +22,14 @@ namespace AiDotNet.Tensors.Tests.LinearAlgebra;
 /// </summary>
 public class TensorCowInferenceReadPathTests
 {
+    public enum BinaryOperation
+    {
+        Add,
+        Subtract,
+        Multiply,
+        Divide
+    }
+
     private static readonly CpuEngine Engine = new CpuEngine();
 
     private static Tensor<float> Filled(int[] shape, int seed)
@@ -33,6 +41,28 @@ public class TensorCowInferenceReadPathTests
         for (int i = 0; i < n; i++)
             data[i] = (float)Math.Sin(0.123 * (i + seed) + 0.7);
         return new Tensor<float>(data, (int[])shape.Clone());
+    }
+
+    private static Tensor<float> PositiveFilled(int[] shape, int seed)
+    {
+        var tensor = Filled(shape, seed);
+        var data = tensor.ToArray();
+        for (int i = 0; i < data.Length; i++)
+            data[i] = 1.25f + Math.Abs(data[i]);
+        return new Tensor<float>(data, (int[])shape.Clone());
+    }
+
+    private static Tensor<double> FilledDouble(int[] shape, int seed, bool positive = false)
+    {
+        int n = 1;
+        foreach (var d in shape) n *= d;
+        var data = new double[n];
+        for (int i = 0; i < n; i++)
+        {
+            double value = Math.Sin(0.123 * (i + seed) + 0.7);
+            data[i] = positive ? 1.25 + Math.Abs(value) : value;
+        }
+        return new Tensor<double>(data, (int[])shape.Clone());
     }
 
     /// <summary>An independent non-shared weight + a COW clone of the same data.</summary>
@@ -53,6 +83,49 @@ public class TensorCowInferenceReadPathTests
         for (int i = 0; i < e.Length; i++)
             Assert.True(Math.Abs(e[i] - a[i]) <= tol + 1e-3f * Math.Abs(e[i]),
                 $"mismatch at {i}: expected {e[i]}, got {a[i]}");
+    }
+
+    private static void AssertClose(Tensor<double> expected, Tensor<double> actual, double tol = 1e-10)
+    {
+        var e = expected.ToArray();
+        var a = actual.ToArray();
+        Assert.Equal(e.Length, a.Length);
+        for (int i = 0; i < e.Length; i++)
+            Assert.True(Math.Abs(e[i] - a[i]) <= tol + 1e-9 * Math.Abs(e[i]),
+                $"mismatch at {i}: expected {e[i]}, got {a[i]}");
+    }
+
+    private static Tensor<T> ApplyBinary<T>(BinaryOperation operation, Tensor<T> left, Tensor<T> right)
+    {
+        return operation switch
+        {
+            BinaryOperation.Add => Engine.TensorAdd(left, right),
+            BinaryOperation.Subtract => Engine.TensorSubtract(left, right),
+            BinaryOperation.Multiply => Engine.TensorMultiply(left, right),
+            BinaryOperation.Divide => Engine.TensorDivide(left, right),
+            _ => throw new ArgumentOutOfRangeException(nameof(operation))
+        };
+    }
+
+    private static void ApplyBinaryInto<T>(BinaryOperation operation, Tensor<T> destination, Tensor<T> left, Tensor<T> right)
+    {
+        switch (operation)
+        {
+            case BinaryOperation.Add:
+                Engine.TensorAddInto(destination, left, right);
+                break;
+            case BinaryOperation.Subtract:
+                Engine.TensorSubtractInto(destination, left, right);
+                break;
+            case BinaryOperation.Multiply:
+                Engine.TensorMultiplyInto(destination, left, right);
+                break;
+            case BinaryOperation.Divide:
+                Engine.TensorDivideInto(destination, left, right);
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(operation));
+        }
     }
 
     [Theory]
@@ -127,19 +200,181 @@ public class TensorCowInferenceReadPathTests
         AssertClose(expected, actual);
     }
 
-    [Fact]
-    public void ElementwiseAdd_DoesNotPrivatizeCowOperand()
+    [Theory]
+    [InlineData(BinaryOperation.Add)]
+    [InlineData(BinaryOperation.Subtract)]
+    [InlineData(BinaryOperation.Multiply)]
+    [InlineData(BinaryOperation.Divide)]
+    public void ElementwiseBinaryFloat_DoesNotPrivatizeEitherCowFamily(BinaryOperation operation)
     {
-        // same-shape elementwise add (TensorAdd does not broadcast [M,N]+[N];
-        // model bias-add is covered by FusedLinear). The COW operand is read-only.
-        var x = Filled(new[] { 4, 8 }, 1);
-        var (other, otherClone) = Weight(new[] { 4, 8 }, 700);
+        var leftSource = Filled(new[] { 4, 8 }, 2400);
+        var rightSource = operation == BinaryOperation.Divide
+            ? PositiveFilled(new[] { 4, 8 }, 2500)
+            : Filled(new[] { 4, 8 }, 2500);
+        var leftClone = (Tensor<float>)leftSource.CloneShared();
+        var rightClone = (Tensor<float>)rightSource.CloneShared();
+        var expectedLeft = Filled(new[] { 4, 8 }, 2400);
+        var expectedRight = operation == BinaryOperation.Divide
+            ? PositiveFilled(new[] { 4, 8 }, 2500)
+            : Filled(new[] { 4, 8 }, 2500);
 
-        var expected = Engine.TensorAdd(x, other);
-        var actual = Engine.TensorAdd(x, otherClone);
+        var expected = ApplyBinary(operation, expectedLeft, expectedRight);
+        var actual = ApplyBinary(operation, leftClone, rightClone);
 
-        Assert.True(otherClone.IsCowShared, "elementwise add privatized the COW operand");
+        Assert.True(leftSource.IsCowShared, $"{operation} privatized the source-side left operand");
+        Assert.True(rightSource.IsCowShared, $"{operation} privatized the source-side right operand");
+        Assert.True(leftClone.IsCowShared, $"{operation} privatized the cloned left operand");
+        Assert.True(rightClone.IsCowShared, $"{operation} privatized the cloned right operand");
         AssertClose(expected, actual);
+    }
+
+    [Theory]
+    [InlineData(BinaryOperation.Add)]
+    [InlineData(BinaryOperation.Subtract)]
+    [InlineData(BinaryOperation.Multiply)]
+    [InlineData(BinaryOperation.Divide)]
+    public void ElementwiseBinaryDouble_DoesNotPrivatizeEitherCowFamily(BinaryOperation operation)
+    {
+        bool positiveRight = operation == BinaryOperation.Divide;
+        var leftSource = FilledDouble(new[] { 4, 8 }, 2600);
+        var rightSource = FilledDouble(new[] { 4, 8 }, 2700, positiveRight);
+        var leftClone = (Tensor<double>)leftSource.CloneShared();
+        var rightClone = (Tensor<double>)rightSource.CloneShared();
+        var expectedLeft = FilledDouble(new[] { 4, 8 }, 2600);
+        var expectedRight = FilledDouble(new[] { 4, 8 }, 2700, positiveRight);
+
+        var expected = ApplyBinary(operation, expectedLeft, expectedRight);
+        var actual = ApplyBinary(operation, leftClone, rightClone);
+
+        Assert.True(leftSource.IsCowShared, $"double {operation} privatized the source-side left operand");
+        Assert.True(rightSource.IsCowShared, $"double {operation} privatized the source-side right operand");
+        Assert.True(leftClone.IsCowShared, $"double {operation} privatized the cloned left operand");
+        Assert.True(rightClone.IsCowShared, $"double {operation} privatized the cloned right operand");
+        AssertClose(expected, actual);
+    }
+
+    [Theory]
+    [InlineData(BinaryOperation.Add)]
+    [InlineData(BinaryOperation.Subtract)]
+    [InlineData(BinaryOperation.Multiply)]
+    [InlineData(BinaryOperation.Divide)]
+    public void ElementwiseBinaryIntoFloat_DoesNotPrivatizeCowInputs(BinaryOperation operation)
+    {
+        var leftSource = Filled(new[] { 4, 8 }, 2800);
+        var rightSource = operation == BinaryOperation.Divide
+            ? PositiveFilled(new[] { 4, 8 }, 2900)
+            : Filled(new[] { 4, 8 }, 2900);
+        var leftClone = (Tensor<float>)leftSource.CloneShared();
+        var rightClone = (Tensor<float>)rightSource.CloneShared();
+        var expectedLeft = Filled(new[] { 4, 8 }, 2800);
+        var expectedRight = operation == BinaryOperation.Divide
+            ? PositiveFilled(new[] { 4, 8 }, 2900)
+            : Filled(new[] { 4, 8 }, 2900);
+        var expected = ApplyBinary(operation, expectedLeft, expectedRight);
+        var destination = new Tensor<float>(new[] { 4, 8 });
+
+        ApplyBinaryInto(operation, destination, leftClone, rightClone);
+
+        Assert.True(leftSource.IsCowShared, $"{operation}Into privatized the source-side left operand");
+        Assert.True(rightSource.IsCowShared, $"{operation}Into privatized the source-side right operand");
+        Assert.True(leftClone.IsCowShared, $"{operation}Into privatized the cloned left operand");
+        Assert.True(rightClone.IsCowShared, $"{operation}Into privatized the cloned right operand");
+        AssertClose(expected, destination);
+    }
+
+    [Theory]
+    [InlineData(BinaryOperation.Add)]
+    [InlineData(BinaryOperation.Subtract)]
+    [InlineData(BinaryOperation.Multiply)]
+    [InlineData(BinaryOperation.Divide)]
+    public void ElementwiseBinaryIntoDouble_DoesNotPrivatizeCowInputs(BinaryOperation operation)
+    {
+        bool positiveRight = operation == BinaryOperation.Divide;
+        var leftSource = FilledDouble(new[] { 4, 8 }, 3000);
+        var rightSource = FilledDouble(new[] { 4, 8 }, 3100, positiveRight);
+        var leftClone = (Tensor<double>)leftSource.CloneShared();
+        var rightClone = (Tensor<double>)rightSource.CloneShared();
+        var expectedLeft = FilledDouble(new[] { 4, 8 }, 3000);
+        var expectedRight = FilledDouble(new[] { 4, 8 }, 3100, positiveRight);
+        var expected = ApplyBinary(operation, expectedLeft, expectedRight);
+        var destination = new Tensor<double>(new[] { 4, 8 });
+
+        ApplyBinaryInto(operation, destination, leftClone, rightClone);
+
+        Assert.True(leftSource.IsCowShared, $"double {operation}Into privatized the source-side left operand");
+        Assert.True(rightSource.IsCowShared, $"double {operation}Into privatized the source-side right operand");
+        Assert.True(leftClone.IsCowShared, $"double {operation}Into privatized the cloned left operand");
+        Assert.True(rightClone.IsCowShared, $"double {operation}Into privatized the cloned right operand");
+        AssertClose(expected, destination);
+    }
+
+    [Fact]
+    public void BroadcastDivide_DoesNotPrivatizeCowOperands()
+    {
+        var numeratorSource = Filled(new[] { 2, 4, 3, 3 }, 1600);
+        var divisorSource = PositiveFilled(new[] { 1, 4, 1, 1 }, 1700);
+        var numeratorClone = (Tensor<float>)numeratorSource.CloneShared();
+        var divisorClone = (Tensor<float>)divisorSource.CloneShared();
+
+        var expected = Engine.TensorDivide(numeratorSource, divisorSource);
+        var actual = Engine.TensorDivide(numeratorClone, divisorClone);
+
+        Assert.True(numeratorSource.IsCowShared, "broadcast divide privatized the source-side numerator");
+        Assert.True(divisorSource.IsCowShared, "broadcast divide privatized the source-side divisor");
+        Assert.True(numeratorClone.IsCowShared, "broadcast divide privatized the cloned numerator");
+        Assert.True(divisorClone.IsCowShared, "broadcast divide privatized the cloned divisor");
+        AssertClose(expected, actual);
+    }
+
+    [Fact]
+    public void StridedDivide_DoesNotPrivatizeCowViewFamilies()
+    {
+        var leftSource = Filled(new[] { 2, 3 }, 1800);
+        var leftClone = (Tensor<float>)leftSource.CloneShared();
+        var sourceView = leftSource.Transpose(new[] { 1, 0 });
+        var cloneView = leftClone.Transpose(new[] { 1, 0 });
+        var divisor = PositiveFilled(new[] { 3, 2 }, 1900);
+
+        var expected = Engine.TensorDivide(sourceView, divisor);
+        var actual = Engine.TensorDivide(cloneView, divisor);
+
+        Assert.True(leftSource.IsCowShared, "strided divide privatized the source alias family");
+        Assert.True(leftClone.IsCowShared, "strided divide privatized the clone alias family");
+        Assert.True(sourceView.IsCowShared, "strided divide privatized the source view");
+        Assert.True(cloneView.IsCowShared, "strided divide privatized the cloned view");
+        AssertClose(expected, actual);
+    }
+
+    [SkippableFact]
+    public void DirectGpuDivide_DoesNotPrivatizeCowInputs()
+    {
+        DirectGpuTensorEngine gpu;
+        try
+        {
+            gpu = new DirectGpuTensorEngine();
+        }
+        catch
+        {
+            Skip.If(true, "No DirectGpu backend can be initialized on this machine.");
+            return;
+        }
+
+        using (gpu)
+        {
+            Skip.IfNot(gpu.IsGpuAvailable, "No DirectGpu backend is available on this machine.");
+
+            var leftSource = Filled(new[] { 8, 8 }, 2200);
+            var rightSource = PositiveFilled(new[] { 8, 8 }, 2300);
+            var leftClone = (Tensor<float>)leftSource.CloneShared();
+            var rightClone = (Tensor<float>)rightSource.CloneShared();
+
+            var expected = Engine.TensorDivide(leftSource, rightSource);
+            var actual = gpu.TensorDivide(leftClone, rightClone);
+
+            Assert.True(leftClone.IsCowShared, "DirectGpu divide privatized the cloned left operand");
+            Assert.True(rightClone.IsCowShared, "DirectGpu divide privatized the cloned right operand");
+            AssertClose(expected, actual, tol: 2e-4f);
+        }
     }
 
     [Fact]

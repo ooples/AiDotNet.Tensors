@@ -1462,8 +1462,8 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
                 throw new InvalidOperationException(
                     "Cannot get contiguous Memory from a non-contiguous tensor view. Call Contiguous() first.");
             if (_storageOffset == 0 && _storage.Length == Length)
-                return _storage.AsMemory();
-            return _storage.AsMemory().Slice(_storageOffset, Length);
+                return _storage.AsReadOnlyMemory();
+            return _storage.AsReadOnlyMemory().Slice(_storageOffset, Length);
         }
     }
 
