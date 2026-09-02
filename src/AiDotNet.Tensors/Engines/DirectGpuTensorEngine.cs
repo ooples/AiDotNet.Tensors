@@ -12079,7 +12079,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         base.UnregisterPersistentTensor(tensor);
 
-        object key = tensor.GetDataArray();
+        // Cache identity is a read-only concern. GetDataArray() advertises writable access and
+        // therefore detaches copy-on-write aliases, turning cleanup into an O(tensor size)
+        // allocation. The cache itself is keyed by the same backing-array identity accessor.
+        object? key = tensor.GetBackingArrayForCacheLookupUnsafe();
+        if (key is null)
+            return;
 
         lock (_persistentBufferLock)
         {
@@ -12110,10 +12115,23 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!TryGetBackend(out var backend))
             return;
 
-        object key = tensor.GetDataArray();
+        // Cache identity is a read-only concern: key by the backing array WITHOUT requesting writable
+        // storage, which would detach a copy-on-write alias and copy the whole tensor as a side effect
+        // of cache maintenance. A real host mutation has already passed through a write gate.
+        var key = tensor.GetBackingArrayForCacheLookupUnsafe();
+        if (key is null)
+            return;
 
         if (!_persistentBufferCache.TryGetValue(key, out var entry))
             return;
+
+        // The UPLOAD SOURCE is a different question from the cache key. The identity accessor never
+        // fires a pending deferred GPU->CPU download (DeferredArrayMaterializer), so a tensor whose
+        // latest value still lives on the device would re-upload its STALE host bytes. The read-only
+        // data accessor materialises that download without privatising a COW clone, and for the simple
+        // CPU layout the cache can hit on it hands back the very array used as the key. Resolve it
+        // BEFORE disposing the old buffer, so a failed materialisation leaves the cache entry intact.
+        T[] hostData = tensor.GetReadOnlyDataArray();
 
         try
         {
@@ -12121,7 +12139,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             entry.Buffer.Dispose();
 
             // Upload new data
-            float[] floatData = DirectGpuEngine.ToFloatArray(tensor.GetDataArray());
+            float[] floatData = DirectGpuEngine.ToFloatArray(hostData);
             IGpuBuffer newBuffer = backend.AllocateBuffer(floatData);
             backend.Synchronize();
 
