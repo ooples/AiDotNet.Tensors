@@ -172,8 +172,19 @@ internal static class DirectPtxFeatureGate
         get => s_globalAvgPoolExperimentOverride;
         set => s_globalAvgPoolExperimentOverride = value;
     }
-    /// <summary>Benchmark-only access to measured cells that have not passed promotion.</summary>
-    internal static bool FusedLinearExperimentOverride { get; set; }
+    [ThreadStatic]
+    private static bool _fusedLinearExperimentOverride;
+
+    /// <summary>
+    /// Benchmark-only access to measured cells that have not passed promotion.
+    /// The override is thread-local so parallel test/benchmark activity cannot
+    /// transiently admit an experimental route in another caller.
+    /// </summary>
+    internal static bool FusedLinearExperimentOverride
+    {
+        get => _fusedLinearExperimentOverride;
+        set => _fusedLinearExperimentOverride = value;
+    }
     /// <summary>Benchmark-only access to mixed-precision cells that have not passed promotion.</summary>
     internal static bool MixedPrecisionLinearExperimentOverride { get; set; }
     /// <summary>Benchmark-only access to quantized cells that have not passed promotion.</summary>
@@ -456,10 +467,12 @@ internal enum DirectPtxPhysicalLayout
     Bhsd,
     /// <summary>Dense row-major [row, feature].</summary>
     RowMajor2D,
+    /// <summary>Dense row-major rank-three tensor, [dim0, dim1, dim2] (e.g. [batch, row, feature]).</summary>
+    RowMajor3D,
+    /// <summary>Dense batch/channel/height/width images, including the [batch, channel, spatial] flattening.</summary>
+    Nchw,
     /// <summary>Dense row-major [batch, row, column] matrices.</summary>
     BatchedRowMajorMatrix,
-    /// <summary>Dense row-major [dim0, dim1, dim2].</summary>
-    RowMajor3D,
     /// <summary>Dense row-major [sequence, head, dimension].</summary>
     SequenceHeadDim,
     /// <summary>Dense [row, qkv, head, feature] projection output.</summary>
@@ -482,8 +495,6 @@ internal enum DirectPtxPhysicalLayout
     BoxXywh,
     /// <summary>Dense row-major bounding boxes in center-X/center-Y/width/height order.</summary>
     BoxCxcywh,
-    /// <summary>Dense images with batch/channel/height/width order.</summary>
-    Nchw,
     /// <summary>Dense images with batch/height/width/channel order.</summary>
     Nhwc,
     /// <summary>Dense normalized sampling coordinates ending in 2 or 3.</summary>

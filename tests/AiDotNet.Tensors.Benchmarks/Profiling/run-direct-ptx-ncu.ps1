@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('attention', 'residual-rmsnorm', 'residual-layernorm-gelu', 'decode', 'paged-prefill', 'attention-backward', 'flash-attention-backward', 'qkv-rope-cache', 'geglu', 'geglu-backward', 'fused-linear', 'mixed-linear', 'mixed-linear-m16', 'w8a8-linear', 'convolution', 'rng-dropout', 'rng-stochastic', 'vision-box-iou', 'rglru', 'solvers-4x4', 'global-avgpool', 'complex-multiply', 'normalization')]
+    [ValidateSet('attention', 'residual-rmsnorm', 'residual-layernorm-gelu', 'decode', 'paged-prefill', 'attention-backward', 'flash-attention-backward', 'qkv-rope-cache', 'geglu', 'geglu-backward', 'fused-linear', 'mixed-linear', 'mixed-linear-m16', 'w8a8-linear', 'convolution', 'rng-dropout', 'rng-stochastic', 'vision-box-iou', 'rglru', 'solvers-4x4', 'global-avgpool', 'complex-multiply', 'dense-linear', 'normalization')]
     [string]$Target = 'attention',
     [string]$OutputCsv = (Join-Path ([System.IO.Path]::GetTempPath()) ("aidotnet-direct-ptx-ncu-" + (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '.csv')),
     [string]$NcuPath = $env:NSIGHT_COMPUTE_CLI
@@ -41,6 +41,7 @@ $switch = switch ($Target) {
     'flash-attention-backward' { '--direct-ptx-profile-flash-attention-backward' }
     'qkv-rope-cache' { '--direct-ptx-profile-qkv-rope-cache' }
     'fused-linear' { '--direct-ptx-profile-fused-linear' }
+    'dense-linear' { '--direct-ptx-profile-dense-linear' }
     'mixed-linear' { '--direct-ptx-profile-mixed-linear' }
     'mixed-linear-m16' { '--direct-ptx-profile-mixed-linear-m16' }
     'w8a8-linear' { '--direct-ptx-profile-w8a8-linear' }
@@ -69,6 +70,7 @@ $kernel = switch ($Target) {
     'rng-stochastic' { 'regex:aidotnet_(philox_dropout|philox_uniform|philox_normal|philox_bernoulli_mask|philox_drop_threshold_mask|dropout_backward|philox_gumbel_softmax32|philox_importance_sampling64|bias_philox_dropout256|fused_ddim_step|philox_categorical32|gumbel_softmax_backward32|philox_rrelu|rrelu|rrelu_backward)_f32' }
     'qkv-rope-cache' { 'regex:aidotnet_qkv_rope_cache_d64' }
     'fused-linear' { 'regex:^aidotnet_fused_linear_gelu_m1$' }
+    'dense-linear' { 'regex:aidotnet_(fused_linear_gelu_m1|fused_linear_tiled|fused_linear_gelu_fp16_m16|fp16_gemm|fused_lora_forward|fused_linear_ce_index|fused_linear_backward|dense_(dot|outer)|batched_dot|strided_dot)' }
     'mixed-linear' { 'regex:^aidotnet_fused_linear_gelu_fp16_m1$' }
     'mixed-linear-m16' { 'regex:^aidotnet_fused_linear_gelu_fp16_m16$' }
     'w8a8-linear' { 'regex:^aidotnet_fused_linear_gelu_w8a8_m1$' }
@@ -92,6 +94,7 @@ $expectedLaunches = switch ($Target) {
     'flash-attention-backward' { 2 }
     'qkv-rope-cache' { 3 }
     'fused-linear' { 10 }
+    'dense-linear' { 16 }
     'mixed-linear' { 10 }
     'mixed-linear-m16' { 10 }
     'w8a8-linear' { 10 }
@@ -100,9 +103,16 @@ $expectedLaunches = switch ($Target) {
     'convolution' { 1 }
 }
 $metricNames = @(
+    'sass__inst_executed_register_spilling',
+    'sass__inst_executed_register_spilling_mem_local',
+    'sass__inst_executed_register_spilling_mem_shared',
     'smsp__sass_inst_executed_op_local.sum',
     'smsp__sass_inst_executed_op_local_ld.sum',
     'smsp__sass_inst_executed_op_local_st.sum',
+    'l1tex__t_requests_pipe_lsu_mem_local_op_ld.sum',
+    'l1tex__t_requests_pipe_lsu_mem_local_op_st.sum',
+    'l1tex__data_bank_conflicts_pipe_lsu_cmd_read.sum',
+    'l1tex__data_bank_conflicts_pipe_lsu_cmd_write.sum',
     'launch__registers_per_thread',
     'launch__shared_mem_per_block_static',
     'launch__shared_mem_per_block_dynamic',
@@ -125,11 +135,11 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 dotnet $targetDll --direct-ptx-verify-ncu $OutputCsv
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-# One deterministic launch is emitted for every targeted kernel identity;
+# One deterministic launch is emitted for every audited exact kernel identity;
 # normalization includes all 71 logical identities (66 distinct cubins), while
 # attention and residual-RMSNorm enumerate their sequence/row, causal, and
-# fusion variants. Nsight Compute 2026.2 raw CSV has one wide data row per
-# launch. Require every requested column on every expected launch so a partial
+# fusion variants. Nsight Compute raw CSV has one wide data row per launch.
+# Require every requested column on every expected launch so a partial
 # capture cannot be mistaken for complete evidence.
 $csvLines = @(Get-Content -LiteralPath $OutputCsv)
 $headerIndex = -1

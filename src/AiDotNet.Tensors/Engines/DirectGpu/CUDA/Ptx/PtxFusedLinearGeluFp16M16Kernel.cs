@@ -5,25 +5,26 @@ using System.Text;
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 
 /// <summary>
-/// Shape-baked M=16 FP16 linear + FP32 bias + tanh-GELU. Four warps share one
-/// asynchronously staged A panel, consume four adjacent output-major weight
-/// panels with Tensor Core MMA, and retain the FP32 result through the fused
-/// epilogue and sole global output store.
+/// Shape-baked M=16 FP16 linear + FP32 bias + tanh-GELU. Four or eight warps
+/// share one asynchronously staged A panel, consume adjacent output-major
+/// weight panels with Tensor Core MMA, and retain the FP32 result through the
+/// fused epilogue and sole global output store.
 /// </summary>
 internal sealed class PtxFusedLinearGeluFp16M16Kernel : IDisposable
 {
     internal const int Rows = 16;
-    internal const int BlockThreads = 128;
-    internal const int OutputsPerBlock = 32;
+    internal const int DefaultOutputsPerBlock = 64;
+    internal const int OutputsPerBlock = DefaultOutputsPerBlock;
+    internal const int MaxStaticSharedBytes = 40_960;
     internal const string EntryPoint = "aidotnet_fused_linear_gelu_fp16_m16";
-    private const int AsyncCopyBytes = 16;
-    private const int MmaK = 16;
 
     private readonly DirectPtxModule _module;
     private readonly IntPtr _function;
 
     internal int InputFeatures { get; }
     internal int OutputFeatures { get; }
+    internal int TileOutputsPerBlock { get; }
+    internal int BlockThreads => TileOutputsPerBlock * 4;
     internal string Ptx { get; }
     internal DirectPtxKernelBlueprint Blueprint { get; }
     internal DirectPtxKernelAudit Audit { get; }
@@ -31,7 +32,8 @@ internal sealed class PtxFusedLinearGeluFp16M16Kernel : IDisposable
     internal PtxFusedLinearGeluFp16M16Kernel(
         DirectPtxRuntime runtime,
         int inputFeatures,
-        int outputFeatures)
+        int outputFeatures,
+        int outputsPerBlock = DefaultOutputsPerBlock)
     {
         PtxCompat.ThrowIfNull(runtime, nameof(runtime));
         if (!DirectPtxArchitecture.HasValidatedMixedLinear(
@@ -39,28 +41,21 @@ internal sealed class PtxFusedLinearGeluFp16M16Kernel : IDisposable
             throw new PlatformNotSupportedException(
                 "The checked-in FP16 Tensor Core fused-linear specialization is measured only on GA10x/SM86.");
         ValidateShape(inputFeatures, outputFeatures);
+        ValidateTile(outputsPerBlock);
 
         InputFeatures = inputFeatures;
         OutputFeatures = outputFeatures;
-        Blueprint = CreateBlueprint(runtime.ArchitectureFamily, inputFeatures, outputFeatures);
+        TileOutputsPerBlock = outputsPerBlock;
+        Blueprint = CreateBlueprint(
+            runtime.ArchitectureFamily, inputFeatures, outputFeatures, outputsPerBlock);
         Ptx = EmitPtx(
             runtime.ComputeCapabilityMajor, runtime.ComputeCapabilityMinor,
-            inputFeatures, outputFeatures);
-        var loaded = DirectPtxResourceInitialization.Complete(
-            runtime.LoadModule(Ptx),
-            module =>
-            {
-                IntPtr function = module.GetFunction(EntryPoint, out DirectPtxFunctionInfo info);
-                int activeBlocks = module.GetActiveBlocksPerMultiprocessor(function, BlockThreads);
-                Blueprint.ResourceBudget.Validate(EntryPoint, info, BlockThreads, activeBlocks);
-                DirectPtxKernelAudit audit = DirectPtxKernelAudit.Create(
-                    Blueprint, runtime.DeviceFingerprint, Ptx, info,
-                    BlockThreads, activeBlocks, module);
-                return (Function: function, Audit: audit);
-            });
-        _module = loaded.Resource;
-        _function = loaded.Value.Function;
-        Audit = loaded.Value.Audit;
+            inputFeatures, outputFeatures, outputsPerBlock);
+        DirectPtxLoadedKernel loaded = DirectPtxResourceInitialization.LoadKernel(
+            runtime, Ptx, EntryPoint, BlockThreads, Blueprint);
+        _module = loaded.Module;
+        _function = loaded.Function;
+        Audit = loaded.Audit;
     }
 
     internal unsafe void Launch(
@@ -69,13 +64,11 @@ internal sealed class PtxFusedLinearGeluFp16M16Kernel : IDisposable
         DirectPtxTensorView bias,
         DirectPtxTensorView output)
     {
-        PtxFusedLinearGeluShared.Require(input, Blueprint.Tensors[0], nameof(input));
-        PtxFusedLinearGeluShared.Require(weights, Blueprint.Tensors[1], nameof(weights));
-        PtxFusedLinearGeluShared.Require(bias, Blueprint.Tensors[2], nameof(bias));
-        PtxFusedLinearGeluShared.Require(output, Blueprint.Tensors[3], nameof(output));
-        if (PtxFusedLinearGeluShared.Overlaps(output, input) ||
-            PtxFusedLinearGeluShared.Overlaps(output, weights) ||
-            PtxFusedLinearGeluShared.Overlaps(output, bias))
+        Require(input, Blueprint.Tensors[0], nameof(input));
+        Require(weights, Blueprint.Tensors[1], nameof(weights));
+        Require(bias, Blueprint.Tensors[2], nameof(bias));
+        Require(output, Blueprint.Tensors[3], nameof(output));
+        if (Overlaps(output, input) || Overlaps(output, weights) || Overlaps(output, bias))
             throw new ArgumentException("FP16 fused-linear output may not alias input, weights, or bias.");
 
         IntPtr inputPointer = input.Pointer;
@@ -89,8 +82,8 @@ internal sealed class PtxFusedLinearGeluFp16M16Kernel : IDisposable
         arguments[3] = &outputPointer;
         _module.Launch(
             _function,
-            (uint)(OutputFeatures / OutputsPerBlock), 1, 1,
-            BlockThreads, 1, 1, 0, arguments);
+            (uint)(OutputFeatures / TileOutputsPerBlock), 1, 1,
+            (uint)BlockThreads, 1, 1, 0, arguments);
     }
 
     public void Dispose() => _module.Dispose();
@@ -99,17 +92,22 @@ internal sealed class PtxFusedLinearGeluFp16M16Kernel : IDisposable
         int ccMajor,
         int ccMinor,
         int inputFeatures,
-        int outputFeatures)
+        int outputFeatures,
+        int outputsPerBlock = DefaultOutputsPerBlock)
     {
         ValidateShape(inputFeatures, outputFeatures);
+        ValidateTile(outputsPerBlock);
         int inputRowBytes = checked(inputFeatures * sizeof(ushort));
         int outputRowBytes = checked(outputFeatures * sizeof(float));
         int kPerPanel = GetKPerPanel(inputFeatures);
         int aPanelBytes = Rows * kPerPanel * sizeof(ushort);
-        int weightPanelBytes = OutputsPerBlock * kPerPanel * sizeof(ushort);
-        int aSubpanelBytes = Rows * MmaK * sizeof(ushort);
-        int weightSubpanelBytes = OutputsPerBlock * MmaK * sizeof(ushort);
-        int stagedOutputStrideBytes = 2 * AsyncCopyBytes;
+        int weightPanelBytes = outputsPerBlock * kPerPanel * sizeof(ushort);
+        int weightHalfKBytes = outputsPerBlock * 64 * sizeof(ushort);
+        // Each staged K16 weight row occupies 32 bytes. The second copy covers
+        // the upper half of the output rows, so it advances N/2 full shared
+        // rows rather than N/2 individual 16-byte transactions.
+        int weightHalfRowsBytes =
+            (outputsPerBlock / 2) * 16 * sizeof(ushort);
         int bufferBytes = aPanelBytes + weightPanelBytes;
         int staticSharedBytes = 2 * bufferBytes;
         int chunks = inputFeatures / kPerPanel;
@@ -125,12 +123,13 @@ internal sealed class PtxFusedLinearGeluFp16M16Kernel : IDisposable
         ptx.AppendLine("    .param .u64 output_ptr");
         ptx.AppendLine(")");
         ptx.AppendLine("{");
-        ptx.AppendLine("    .reg .b32 %r<20>;");
+        ptx.AppendLine("    .reg .b32 %r<24>;");
         ptx.AppendLine("    .reg .b32 %a<4>;");
         ptx.AppendLine("    .reg .b32 %b<2>;");
         ptx.AppendLine("    .reg .b64 %rd<16>;");
         ptx.AppendLine("    .reg .f32 %c<4>;");
         ptx.AppendLine("    .reg .f32 %f<4>;");
+        ptx.AppendLine("    .reg .pred %p<1>;");
         ptx.AppendLine($"    .shared .align 16 .b8 smem[{staticSharedBytes}];");
         ptx.AppendLine();
         ptx.AppendLine("    ld.param.u64 %rd0, [input_ptr];");
@@ -141,29 +140,44 @@ internal sealed class PtxFusedLinearGeluFp16M16Kernel : IDisposable
         ptx.AppendLine("    and.b32 %r1, %r0, 31;");
         ptx.AppendLine("    shr.u32 %r2, %r0, 5;");
         ptx.AppendLine("    mov.u32 %r3, %ctaid.x;");
-        ptx.AppendLine($"    mul.lo.u32 %r4, %r3, {OutputsPerBlock};");
+        ptx.AppendLine($"    mul.lo.u32 %r4, %r3, {outputsPerBlock};");
         ptx.AppendLine("    shr.u32 %r5, %r1, 2;");
         ptx.AppendLine("    and.b32 %r6, %r1, 3;");
         ptx.AppendLine("    and.b32 %r7, %r0, 7;");
         ptx.AppendLine("    shr.u32 %r8, %r0, 3;");
         ptx.AppendLine("    shr.u32 %r10, %r7, 1;");
         ptx.AppendLine("    and.b32 %r19, %r7, 1;");
-        ptx.AppendLine($"    shl.b32 %r19, %r19, {Log2(AsyncCopyBytes)};");
-        ptx.AppendLine($"    mad.lo.u32 %r13, %r10, {aSubpanelBytes}, %r19;");
-        ptx.AppendLine($"    mad.lo.u32 %r13, %r8, {stagedOutputStrideBytes}, %r13;");
-        ptx.AppendLine($"    mad.lo.u32 %r10, %r10, {weightSubpanelBytes}, %r19;");
-        ptx.AppendLine($"    mad.lo.u32 %r10, %r8, {stagedOutputStrideBytes}, %r10;");
+        ptx.AppendLine("    shl.b32 %r19, %r19, 4;");
+        ptx.AppendLine("    mad.lo.u32 %r13, %r10, 512, %r19;");
+        ptx.AppendLine("    mad.lo.u32 %r13, %r8, 32, %r13;");
+        ptx.AppendLine($"    mad.lo.u32 %r10, %r10, {outputsPerBlock * 32}, %r19;");
+        ptx.AppendLine("    mad.lo.u32 %r10, %r8, 32, %r10;");
         ptx.AppendLine("    shl.b32 %r7, %r7, 4;");
         ptx.AppendLine($"    mad.lo.u32 %r9, %r8, {inputRowBytes}, %r7;");
         ptx.AppendLine("    add.u32 %r11, %r4, %r8;");
         ptx.AppendLine($"    mad.lo.u32 %r12, %r11, {inputRowBytes}, %r7;");
-        ptx.AppendLine("    mul.lo.u32 %r14, %r5, 32;");
-        ptx.AppendLine("    shl.b32 %r16, %r6, 2;");
-        ptx.AppendLine("    add.u32 %r14, %r14, %r16;");
         ptx.AppendLine("    shl.b32 %r16, %r2, 8;");
         ptx.AppendLine("    mad.lo.u32 %r15, %r2, 8, %r4;");
         ptx.AppendLine("    shl.b32 %r17, %r6, 1;");
         ptx.AppendLine("    add.u32 %r15, %r15, %r17;");
+        // Supply the four A-matrix row sets required by ldmatrix.x4.
+        ptx.AppendLine("    and.b32 %r22, %r1, 7;");
+        ptx.AppendLine("    shr.u32 %r23, %r1, 3;");
+        ptx.AppendLine("    and.b32 %r19, %r23, 1;");
+        ptx.AppendLine("    shl.b32 %r19, %r19, 8;");
+        ptx.AppendLine("    shr.u32 %r23, %r23, 1;");
+        ptx.AppendLine("    shl.b32 %r23, %r23, 4;");
+        ptx.AppendLine("    mad.lo.u32 %r22, %r22, 32, %r19;");
+        ptx.AppendLine("    add.u32 %r22, %r22, %r23;");
+        // The packed weights are already output-major: a normal x2 load maps
+        // its row fragments directly to the column-major MMA B registers.
+        // Duplicate the two sets of row addresses in the upper half-warp.
+        ptx.AppendLine("    and.b32 %r21, %r1, 7;");
+        ptx.AppendLine("    shr.u32 %r19, %r1, 3;");
+        ptx.AppendLine("    and.b32 %r19, %r19, 1;");
+        ptx.AppendLine("    shl.b32 %r19, %r19, 4;");
+        ptx.AppendLine("    mad.lo.u32 %r21, %r21, 32, %r19;");
+        ptx.AppendLine("    setp.lt.u32 %p0, %r0, 128;");
         ptx.AppendLine("    mov.u64 %rd4, smem;");
         ptx.AppendLine("    cvt.u64.u32 %rd5, %r9;");
         ptx.AppendLine("    add.u64 %rd5, %rd0, %rd5;");
@@ -171,13 +185,13 @@ internal sealed class PtxFusedLinearGeluFp16M16Kernel : IDisposable
         ptx.AppendLine("    add.u64 %rd6, %rd1, %rd6;");
         ptx.AppendLine("    cvt.u64.u32 %rd7, %r13;");
         ptx.AppendLine("    cvt.u64.u32 %rd15, %r10;");
-        ptx.AppendLine("    cvt.u64.u32 %rd8, %r14;");
         ptx.AppendLine("    cvt.u64.u32 %rd9, %r16;");
         ptx.AppendLine();
 
         EmitAsyncPanel(
             ptx, chunk: 0, buffer: 0, inputRowBytes,
-            kPerPanel, aPanelBytes, bufferBytes);
+            kPerPanel, aPanelBytes, bufferBytes,
+            weightHalfKBytes, weightHalfRowsBytes, outputsPerBlock);
         ptx.AppendLine("    cp.async.commit_group;");
         ptx.AppendLine("    cp.async.wait_group 0;");
         ptx.AppendLine("    bar.sync 0;");
@@ -195,11 +209,14 @@ internal sealed class PtxFusedLinearGeluFp16M16Kernel : IDisposable
             {
                 EmitAsyncPanel(
                     ptx, chunk + 1, currentBuffer ^ 1, inputRowBytes,
-                    kPerPanel, aPanelBytes, bufferBytes);
+                    kPerPanel, aPanelBytes, bufferBytes,
+                    weightHalfKBytes, weightHalfRowsBytes, outputsPerBlock);
                 ptx.AppendLine("    cp.async.commit_group;");
             }
             for (int subchunk = 0; subchunk < kPerPanel / 16; subchunk++)
-                EmitMma(ptx, currentBuffer, subchunk, aPanelBytes, bufferBytes);
+                EmitMma(
+                    ptx, currentBuffer, subchunk, aPanelBytes, bufferBytes,
+                    outputsPerBlock);
             if (chunk + 1 < chunks)
             {
                 ptx.AppendLine("    cp.async.wait_group 0;");
@@ -234,34 +251,25 @@ internal sealed class PtxFusedLinearGeluFp16M16Kernel : IDisposable
         int inputRowBytes,
         int kPerPanel,
         int aPanelBytes,
-        int bufferBytes)
+        int bufferBytes,
+        int weightHalfKBytes,
+        int weightHalfRowsBytes,
+        int outputsPerBlock)
     {
         int bufferBase = buffer * bufferBytes;
         int weightsBase = bufferBase + aPanelBytes;
         int globalOffset = chunk * kPerPanel * sizeof(ushort);
-        int weightSubpanelBytes = OutputsPerBlock * MmaK * sizeof(ushort);
-        int halfOutputGroupBytes = weightSubpanelBytes / 2;
-        int secondKHalfBytes = OutputsPerBlock * (kPerPanel / 2) * sizeof(ushort);
         ptx.AppendLine("    add.u64 %rd12, %rd4, %rd7;");
         ptx.AppendLine("    add.u64 %rd13, %rd4, %rd15;");
-        ptx.AppendLine($"    cp.async.ca.shared.global [%rd12+{bufferBase}], [%rd5+{globalOffset}], 16;");
+        ptx.AppendLine($"    @%p0 cp.async.ca.shared.global [%rd12+{bufferBase}], [%rd5+{globalOffset}], 16;");
         ptx.AppendLine($"    cp.async.cg.shared.global [%rd13+{weightsBase}], [%rd6+{globalOffset}], 16;");
-        ptx.AppendLine($"    cp.async.cg.shared.global [%rd13+{weightsBase + halfOutputGroupBytes}], [%rd6+{globalOffset + (OutputsPerBlock / 2) * inputRowBytes}], 16;");
+        ptx.AppendLine($"    cp.async.cg.shared.global [%rd13+{weightsBase + weightHalfRowsBytes}], [%rd6+{globalOffset + (outputsPerBlock / 2) * inputRowBytes}], 16;");
         if (kPerPanel == 128)
         {
-            int secondAHalfBytes = Rows * (kPerPanel / 2) * sizeof(ushort);
-            int globalSecondHalfOffset = (kPerPanel / 2) * sizeof(ushort);
-            ptx.AppendLine($"    cp.async.ca.shared.global [%rd12+{bufferBase + secondAHalfBytes}], [%rd5+{globalOffset + globalSecondHalfOffset}], 16;");
-            ptx.AppendLine($"    cp.async.cg.shared.global [%rd13+{weightsBase + secondKHalfBytes}], [%rd6+{globalOffset + globalSecondHalfOffset}], 16;");
-            ptx.AppendLine($"    cp.async.cg.shared.global [%rd13+{weightsBase + secondKHalfBytes + halfOutputGroupBytes}], [%rd6+{globalOffset + (OutputsPerBlock / 2) * inputRowBytes + globalSecondHalfOffset}], 16;");
+            ptx.AppendLine($"    @%p0 cp.async.ca.shared.global [%rd12+{bufferBase + 2_048}], [%rd5+{globalOffset + 128}], 16;");
+            ptx.AppendLine($"    cp.async.cg.shared.global [%rd13+{weightsBase + weightHalfKBytes}], [%rd6+{globalOffset + 128}], 16;");
+            ptx.AppendLine($"    cp.async.cg.shared.global [%rd13+{weightsBase + weightHalfKBytes + weightHalfRowsBytes}], [%rd6+{globalOffset + (outputsPerBlock / 2) * inputRowBytes + 128}], 16;");
         }
-    }
-
-    private static int Log2(int powerOfTwo)
-    {
-        int result = 0;
-        while ((1 << result) != powerOfTwo) result++;
-        return result;
     }
 
     private static void EmitMma(
@@ -269,20 +277,22 @@ internal sealed class PtxFusedLinearGeluFp16M16Kernel : IDisposable
         int buffer,
         int subchunk,
         int aPanelBytes,
-        int bufferBytes)
+        int bufferBytes,
+        int outputsPerBlock)
     {
         int bufferBase = buffer * bufferBytes;
         int weightsBase = bufferBase + aPanelBytes;
         int aSubpanel = subchunk * 512;
-        int weightSubpanel = subchunk * 1_024;
-        ptx.AppendLine("    add.u64 %rd13, %rd4, %rd8;");
-        ptx.AppendLine($"    ld.shared.b32 %a0, [%rd13+{bufferBase + aSubpanel}];");
-        ptx.AppendLine($"    ld.shared.b32 %a2, [%rd13+{bufferBase + aSubpanel + 16}];");
-        ptx.AppendLine($"    ld.shared.b32 %a1, [%rd13+{bufferBase + aSubpanel + 256}];");
-        ptx.AppendLine($"    ld.shared.b32 %a3, [%rd13+{bufferBase + aSubpanel + 272}];");
-        ptx.AppendLine("    add.u64 %rd14, %rd13, %rd9;");
-        ptx.AppendLine($"    ld.shared.b32 %b0, [%rd14+{weightsBase + weightSubpanel}];");
-        ptx.AppendLine($"    ld.shared.b32 %b1, [%rd14+{weightsBase + weightSubpanel + 16}];");
+        int weightSubpanel = subchunk * outputsPerBlock * 16 * sizeof(ushort);
+        ptx.AppendLine("    cvt.u64.u32 %rd14, %r22;");
+        ptx.AppendLine("    add.u64 %rd13, %rd4, %rd14;");
+        ptx.AppendLine($"    ldmatrix.sync.aligned.m8n8.x4.shared.b16 " +
+            $"{{%a0,%a1,%a2,%a3}}, [%rd13+{bufferBase + aSubpanel}];");
+        ptx.AppendLine("    cvt.u64.u32 %rd14, %r21;");
+        ptx.AppendLine("    add.u64 %rd13, %rd4, %rd14;");
+        ptx.AppendLine("    add.u64 %rd13, %rd13, %rd9;");
+        ptx.AppendLine($"    ldmatrix.sync.aligned.m8n8.x2.shared.b16 " +
+            $"{{%b0,%b1}}, [%rd13+{weightsBase + weightSubpanel}];");
         ptx.AppendLine("    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 " +
             "{%c0,%c1,%c2,%c3}, {%a0,%a1,%a2,%a3}, {%b0,%b1}, {%c0,%c1,%c2,%c3};");
     }
@@ -302,7 +312,8 @@ internal sealed class PtxFusedLinearGeluFp16M16Kernel : IDisposable
     private static DirectPtxKernelBlueprint CreateBlueprint(
         DirectPtxArchitectureFamily architecture,
         int inputFeatures,
-        int outputFeatures)
+        int outputFeatures,
+        int outputsPerBlock)
     {
         var input = new DirectPtxExtent(Rows, inputFeatures);
         var weights = new DirectPtxExtent(outputFeatures, inputFeatures);
@@ -310,9 +321,9 @@ internal sealed class PtxFusedLinearGeluFp16M16Kernel : IDisposable
         var output = new DirectPtxExtent(Rows, outputFeatures);
         return new DirectPtxKernelBlueprint(
             Operation: "fused-linear-bias-gelu",
-            Version: 3,
+            Version: 5,
             Architecture: architecture,
-            Variant: $"tensorcore-async-fp16-fp32acc-m16-k{inputFeatures}-n{outputFeatures}",
+            Variant: $"tensorcore-async-ldmatrix-fp16-fp32acc-m16-nblock{outputsPerBlock}-k{inputFeatures}-n{outputFeatures}",
             Tensors:
             [
                 new("input", DirectPtxPhysicalType.Float16, DirectPtxPhysicalLayout.RowMajor2D,
@@ -327,9 +338,9 @@ internal sealed class PtxFusedLinearGeluFp16M16Kernel : IDisposable
             ],
             ResourceBudget: new DirectPtxResourceBudget(
                 MaxRegistersPerThread: 48,
-                MaxStaticSharedBytes: GetStaticSharedBytes(inputFeatures),
+                MaxStaticSharedBytes: GetStaticSharedBytes(inputFeatures, outputsPerBlock),
                 MaxLocalBytesPerThread: 0,
-                MinBlocksPerMultiprocessor: 4),
+                MinBlocksPerMultiprocessor: outputsPerBlock == 64 ? 2 : 4),
             Semantics: new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["formula"] = "gelu_tanh(fp32(input_fp16[16,K] @ transpose(weights_fp16[N,K])) + bias_fp32[N])",
@@ -337,7 +348,9 @@ internal sealed class PtxFusedLinearGeluFp16M16Kernel : IDisposable
                 ["weights"] = "canonical-contiguous-output-major-row-major-fp16",
                 ["accumulator"] = "mma-m16n8k16-fp32-register-fragment",
                 ["pipeline"] = "double-buffered-cp.async-16-byte-panels",
-                ["shared-A"] = "one-bank-conflict-free-M16-panel-reused-by-four-warps",
+                ["block-tile"] = $"M16-N{outputsPerBlock}",
+                ["shared-load"] = "warp-collective-ldmatrix-x4-A-and-x2-B-from-output-major-panels",
+                ["shared-A"] = "packed-M16-panel-reused-by-four-warps",
                 ["epilogue"] = "bias-and-tanh-gelu-in-accumulator-registers",
                 ["output"] = "canonical-contiguous-row-major-fp32-single-store",
                 ["global-intermediates"] = "none",
@@ -352,47 +365,80 @@ internal sealed class PtxFusedLinearGeluFp16M16Kernel : IDisposable
 
     internal static int GetKPerPanel(int inputFeatures) => inputFeatures == 512 ? 64 : 128;
 
-    internal static int GetStaticSharedBytes(int inputFeatures) =>
-        2 * (Rows + OutputsPerBlock) * GetKPerPanel(inputFeatures) * sizeof(ushort);
+    internal static int GetStaticSharedBytes(
+        int inputFeatures,
+        int outputsPerBlock = DefaultOutputsPerBlock) =>
+        2 * (Rows + outputsPerBlock) * GetKPerPanel(inputFeatures) * sizeof(ushort);
 
     internal static int[] GetWeightStagingDestinationOffsets(int inputFeatures)
     {
+        if (inputFeatures is not (512 or 1024))
+            throw new ArgumentOutOfRangeException(nameof(inputFeatures));
+
+        int outputsPerBlock = DefaultOutputsPerBlock;
         int kPerPanel = GetKPerPanel(inputFeatures);
-        int weightPanelBytes = OutputsPerBlock * kPerPanel * sizeof(ushort);
-        int weightSubpanelBytes = OutputsPerBlock * MmaK * sizeof(ushort);
-        int halfOutputGroupBytes = weightSubpanelBytes / 2;
-        int secondKHalfBytes = weightPanelBytes / 2;
+        int blockThreads = outputsPerBlock * 4;
         int copiesPerThread = kPerPanel == 128 ? 4 : 2;
-        var offsets = new int[BlockThreads * copiesPerThread];
+        int weightHalfKBytes = outputsPerBlock * 64 * sizeof(ushort);
+        int weightHalfRowsBytes =
+            (outputsPerBlock / 2) * 16 * sizeof(ushort);
+        var offsets = new int[blockThreads * copiesPerThread];
         int index = 0;
-        for (int thread = 0; thread < BlockThreads; thread++)
+        for (int thread = 0; thread < blockThreads; thread++)
         {
-            int laneInCopyGroup = thread & 7;
-            int outputInHalf = thread >> 3;
-            int subpanel = laneInCopyGroup >> 1;
-            int tileInOutput = laneInCopyGroup & 1;
-            int baseOffset = subpanel * weightSubpanelBytes +
-                outputInHalf * (2 * AsyncCopyBytes) + tileInOutput * AsyncCopyBytes;
-            offsets[index++] = baseOffset;
-            offsets[index++] = baseOffset + halfOutputGroupBytes;
+            int laneInEight = thread & 7;
+            int group = thread >> 3;
+            int destination =
+                (laneInEight >> 1) * outputsPerBlock * 32 +
+                (laneInEight & 1) * 16 +
+                group * 32;
+            offsets[index++] = destination;
+            offsets[index++] = destination + weightHalfRowsBytes;
             if (kPerPanel == 128)
             {
-                offsets[index++] = baseOffset + secondKHalfBytes;
-                offsets[index++] = baseOffset + secondKHalfBytes + halfOutputGroupBytes;
+                offsets[index++] = destination + weightHalfKBytes;
+                offsets[index++] =
+                    destination + weightHalfKBytes + weightHalfRowsBytes;
             }
         }
         return offsets;
     }
 
-    internal static bool IsPromotedShape(int inputFeatures, int outputFeatures) =>
-        (inputFeatures, outputFeatures) == (1024, 4096);
+    internal static bool IsPromotedShape(int inputFeatures, int outputFeatures) => false;
 
     private static void ValidateShape(int inputFeatures, int outputFeatures)
     {
         if (!IsSupportedShape(inputFeatures, outputFeatures))
             throw new ArgumentOutOfRangeException(
                 nameof(inputFeatures),
-                $"inputFeatures={inputFeatures}, outputFeatures={outputFeatures}",
                 "The M=16 Tensor Core experiment supports only K/N 512/2048 and 1024/4096.");
+    }
+
+    private static void ValidateTile(int outputsPerBlock)
+    {
+        if (outputsPerBlock is not (32 or 64))
+            throw new ArgumentOutOfRangeException(
+                nameof(outputsPerBlock), "The SM86 tuning domain contains N tiles 32 and 64.");
+    }
+
+    private static void Require(
+        DirectPtxTensorView view,
+        DirectPtxTensorContract contract,
+        string parameter)
+    {
+        if (view.Pointer == IntPtr.Zero || view.PhysicalType != contract.PhysicalType ||
+            view.Layout != contract.Layout || view.LogicalExtent != contract.LogicalExtent ||
+            view.PhysicalExtent != contract.PhysicalExtent || view.ByteLength != contract.RequiredBytes)
+            throw new ArgumentException(
+                $"{parameter} does not satisfy physical ABI '{contract.Name}'.", parameter);
+    }
+
+    private static bool Overlaps(DirectPtxTensorView left, DirectPtxTensorView right)
+    {
+        nuint leftStart = PtxCompat.ToNuint(left.Pointer);
+        nuint rightStart = PtxCompat.ToNuint(right.Pointer);
+        nuint leftEnd = checked(leftStart + left.ByteLength);
+        nuint rightEnd = checked(rightStart + right.ByteLength);
+        return leftStart < rightEnd && rightStart < leftEnd;
     }
 }
