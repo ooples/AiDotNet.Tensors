@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.130.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.129.8...v0.130.0) (2026-09-03)
+
+
+### Features
+
+* **ptx:** add experimental pointwise GLU blueprint ([#864](https://github.com/ooples/AiDotNet.Tensors/issues/864)) ([4341b37](https://github.com/ooples/AiDotNet.Tensors/commit/4341b371b2a08f205d39ec6d6203955917919143))
+* **ptx:** fuse residual LayerNorm GELU ([#863](https://github.com/ooples/AiDotNet.Tensors/issues/863)) ([e7c88ca](https://github.com/ooples/AiDotNet.Tensors/commit/e7c88ca3368706872ba00b11da5ea004d8dc33a7))
+* **ptx:** port dense GEMM, linear, LoRA, and vector kernels ([#859](https://github.com/ooples/AiDotNet.Tensors/issues/859)) ([352f2e0](https://github.com/ooples/AiDotNet.Tensors/commit/352f2e0bda99a8d5da07db214bed3b4715730a20))
+
+
+### Bug Fixes
+
+* complete graph capture and GPU backend parity ([#1006](https://github.com/ooples/AiDotNet.Tensors/issues/1006)) ([b7ab57b](https://github.com/ooples/AiDotNet.Tensors/commit/b7ab57b41fc8be2e04a10e7393315c1c80ebe2f5))
+* create the diagnostics dump directory instead of failing silently ([#1001](https://github.com/ooples/AiDotNet.Tensors/issues/1001)) ([28b0cf8](https://github.com/ooples/AiDotNet.Tensors/commit/28b0cf82b29ef16c67cbf60cb773c873107b9279))
+* **gpu:** avoid COW detach during cache maintenance ([#1002](https://github.com/ooples/AiDotNet.Tensors/issues/1002)) ([9e34d7d](https://github.com/ooples/AiDotNet.Tensors/commit/9e34d7d5d962c0b01a0b049fb904a35da92f770e))
+* preserve compiled tensor lifetimes and CPU invariants ([#1005](https://github.com/ooples/AiDotNet.Tensors/issues/1005)) ([4141c01](https://github.com/ooples/AiDotNet.Tensors/commit/4141c01c281068ac5ee02d07bd5c378de5ce4b60))
+
 ## [0.129.8](https://github.com/ooples/AiDotNet.Tensors/compare/v0.129.7...v0.129.8) (2026-08-30)
 
 
