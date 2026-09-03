@@ -368,15 +368,18 @@ public class DeterministicByDefaultTests
                 parkedObservation = BlasProvider.IsDeterministicMode;
             });
             parked.Start();
-
-            parkedReady.Wait();
-            // Main thread installs a thread-local override.
-            TensorCodecOptions.SetCurrent(new TensorCodecOptions { Deterministic = false });
-            Assert.False(BlasProvider.IsDeterministicMode); // main thread sees the override
-
-            // Release the parked thread.
-            mayExit.Set();
-            parked.Join();
+            try
+            {
+                parkedReady.Wait();
+                // Main thread installs a thread-local override.
+                TensorCodecOptions.SetCurrent(new TensorCodecOptions { Deterministic = false });
+                Assert.False(BlasProvider.IsDeterministicMode); // main thread sees the override
+            }
+            finally
+            {
+                mayExit.Set();
+                parked.Join();
+            }
 
             // The parked thread never installed an override of its own, so it
             // must still see the process-wide value (true), not main's override.

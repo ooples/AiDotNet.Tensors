@@ -682,4 +682,38 @@ public class InferencePlanSerializationTests : IDisposable
                 output,
                 new object[] { false, LstmSequenceOptionalInputs.None }));
     }
+
+    [Fact]
+    public async Task LoadedPlan_HoldsStorageLeaseUntilDisposed()
+    {
+        var engine = new CpuEngine();
+        using var input = Tensor<float>.CreateRandom(new[] { 2, 3 });
+        using var weight = Tensor<float>.CreateRandom(new[] { 3, 4 });
+        using var original = CompileMatMulSigmoid(engine, input, weight);
+        CompiledInferencePlan<float>? loaded = null;
+        try
+        {
+            using var stream = new MemoryStream();
+            await original.SaveAsync(stream);
+            stream.Position = 0;
+            loaded = (CompiledInferencePlan<float>?)
+                await CompiledPlanLoader.LoadInferenceAsync<float>(stream, engine);
+            Assert.NotNull(loaded);
+
+            Tensor<float> loadedInput = Assert.IsType<Tensor<float>>(loaded!.CompiledInputTensor);
+            var leaseSource = (ITensorStorageLeaseSource)loadedInput;
+            var storage = Assert.IsType<TensorStorage<float>>(leaseSource.StorageIdentity);
+            int refCountWithPlan = storage.RefCount;
+            Assert.True(refCountWithPlan >= 2,
+                "The deserialized tensor owner and compiled plan must hold independent storage references.");
+
+            loaded.Dispose();
+            loaded = null;
+            Assert.Equal(refCountWithPlan - 1, storage.RefCount);
+        }
+        finally
+        {
+            loaded?.Dispose();
+        }
+    }
 }
