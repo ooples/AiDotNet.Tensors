@@ -189,8 +189,8 @@ public partial class CpuEngine
                 var cd = dim;
                 var graphShape = (int[])tensor._shape.Clone();
                 graphShape[dim] = tensor._shape[dim] * repeats;
-                return scope.RecordUnary(LazyNodeType.Custom, "TensorRepeatInterleave", tensor, graphShape,
-                    (eng, output) => { var r = eng.TensorRepeatInterleave(ct, cr, cd); r.AsSpan().CopyTo(output.AsWritableSpan()); },
+                return scope.RecordUnary(LazyNodeType.TensorRepeatInterleave, "TensorRepeatInterleave", tensor, graphShape,
+                    (eng, output) => { var r = eng.TensorRepeatInterleave(ct, cr, cd); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.RepeatInterleaveBackward, new object[] { cr, cd });
             }
         }
@@ -330,6 +330,8 @@ public partial class CpuEngine
     public virtual Tensor<T> TensorAtLeast1D<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (GraphMode.IsInferenceTrace)
+            return Reshape(tensor, tensor.Rank >= 1 ? tensor._shape : new[] { 1 });
         return tensor.Rank >= 1 ? tensor : tensor.Reshape(new[] { 1 });
     }
 
@@ -439,6 +441,7 @@ public partial class CpuEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (indices == null) throw new ArgumentNullException(nameof(indices));
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
         if (GraphMode.IsActive)
         {
             var scope = GraphMode.Current;
@@ -477,6 +480,7 @@ public partial class CpuEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (indices == null) throw new ArgumentNullException(nameof(indices));
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
         int rank = tensor.Rank;
         if (dim < 0) dim += rank;
         if (dim < 0 || dim >= rank) throw new ArgumentOutOfRangeException(nameof(dim));
@@ -593,6 +597,9 @@ public partial class CpuEngine
         if (b == null) throw new ArgumentNullException(nameof(b));
         if (axesA == null) throw new ArgumentNullException(nameof(axesA));
         if (axesB == null) throw new ArgumentNullException(nameof(axesB));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { a, b }, engine => engine.TensorDot(a, b, axesA, axesB));
         if (axesA.Length != axesB.Length)
             throw new ArgumentException("axesA and axesB must have the same length");
 
@@ -669,6 +676,9 @@ public partial class CpuEngine
     {
         if (x1 == null) throw new ArgumentNullException(nameof(x1));
         if (x2 == null) throw new ArgumentNullException(nameof(x2));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { x1, x2 }, engine => engine.TensorCosineSimilarity(x1, x2, dim, eps));
         if (!x1._shape.SequenceEqual(x2._shape))
             throw new ArgumentException("CosineSimilarity: shapes must match");
 
@@ -747,6 +757,8 @@ public partial class CpuEngine
         // Output shape: 1-D of length N·(N-1)/2, ordered (0,1),(0,2),...,
         // matching torch.pdist.
         if (input == null) throw new ArgumentNullException(nameof(input));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(new[] { input }, engine => engine.TensorPDist(input, p));
         if (input.Rank != 2) throw new ArgumentException("PDist requires rank-2 input");
         int n = input._shape[0];
         int d = input._shape[1];
@@ -782,6 +794,9 @@ public partial class CpuEngine
         // Cross pairwise p-norm: output[i, j] = ‖x1[i] − x2[j]‖_p.
         if (x1 == null) throw new ArgumentNullException(nameof(x1));
         if (x2 == null) throw new ArgumentNullException(nameof(x2));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { x1, x2 }, engine => engine.TensorCDist(x1, x2, p));
         if (x1.Rank != 2 || x2.Rank != 2)
             throw new ArgumentException("CDist requires rank-2 inputs");
         if (x1._shape[1] != x2._shape[1])
@@ -902,6 +917,8 @@ public partial class CpuEngine
         // from i*b_dim + j along each axis.
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(new[] { a, b }, engine => engine.TensorKron(a, b));
 
         int rankA = a.Rank;
         int rankB = b.Rank;
@@ -982,6 +999,8 @@ public partial class CpuEngine
         // a.shape[:-1] + b.shape[:-1]; contracts matching last-axis sizes.
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(new[] { a, b }, engine => engine.TensorInner(a, b));
         if (a._shape[a.Rank - 1] != b._shape[b.Rank - 1])
             throw new ArgumentException(
                 $"Inner: last-axis sizes must match ({a._shape[a.Rank - 1]} vs {b._shape[b.Rank - 1]})");
@@ -1019,6 +1038,8 @@ public partial class CpuEngine
         if (tensors == null) throw new ArgumentNullException(nameof(tensors));
         if (tensors.Length == 0)
             throw new ArgumentException("CartesianProd requires at least one tensor");
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(tensors, engine => engine.TensorCartesianProd(tensors));
         foreach (var t in tensors)
         {
             if (t == null) throw new ArgumentNullException(nameof(tensors));
@@ -1068,6 +1089,9 @@ public partial class CpuEngine
     {
         if (tensors == null) throw new ArgumentNullException(nameof(tensors));
         if (tensors.Length == 0) return System.Array.Empty<Tensor<T>>();
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernelOutputs(
+                tensors, engine => engine.TensorMeshgrid(tensors, indexing));
         foreach (var t in tensors)
         {
             if (t == null) throw new ArgumentNullException(nameof(tensors));
@@ -1113,7 +1137,7 @@ public partial class CpuEngine
                 var rshape = new int[d];
                 for (int i = 0; i < d; i++) rshape[i] = 1;
                 rshape[axis] = tensors[k]._shape[0];
-                taped[k] = TensorBroadcastTo(tensors[k].Reshape(rshape), outShape);
+                taped[k] = TensorBroadcastTo(Reshape(tensors[k], rshape), outShape);
             }
 
             return taped;
@@ -1420,6 +1444,9 @@ public partial class CpuEngine
         // result[i] = m + log(s)
         // Numerically stable across wide dynamic ranges.
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { tensor }, engine => engine.TensorLogCumSumExp(tensor, axis));
         int rank = tensor.Rank;
         if (axis < 0) axis += rank;
         if (axis < 0 || axis >= rank) throw new ArgumentOutOfRangeException(nameof(axis));
@@ -1694,6 +1721,8 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<int> TensorNonzero<T>(Tensor<T> tensor)
     {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.DataDependentOutputShape);
+
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         var ops = MathHelper.GetNumericOperations<T>();
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
@@ -1802,6 +1831,8 @@ public partial class CpuEngine
     public virtual Tensor<T> TensorClampMin<T>(Tensor<T> tensor, T min)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(new[] { tensor }, engine => engine.TensorClampMin(tensor, min));
         var ops = MathHelper.GetNumericOperations<T>();
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var src = tensor.AsSpan();
@@ -1825,6 +1856,8 @@ public partial class CpuEngine
     public virtual Tensor<T> TensorClampMax<T>(Tensor<T> tensor, T max)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(new[] { tensor }, engine => engine.TensorClampMax(tensor, max));
         var ops = MathHelper.GetNumericOperations<T>();
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var src = tensor.AsSpan();
@@ -1848,6 +1881,14 @@ public partial class CpuEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (min is null && max is null)
             throw new ArgumentException("At least one of min / max must be supplied");
+        if (GraphMode.IsInferenceTrace)
+        {
+            Tensor<T>[] inputs = min is null
+                ? new[] { tensor, max! }
+                : max is null ? new[] { tensor, min } : new[] { tensor, min, max };
+            return CaptureInferenceKernel(
+                inputs, engine => engine.TensorClampTensor(tensor, min, max));
+        }
 
         var ops = MathHelper.GetNumericOperations<T>();
         // #257: preserve the user-facing ref before .Contiguous() discards GradFn. Recording the
@@ -1926,6 +1967,10 @@ public partial class CpuEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (source == null) throw new ArgumentNullException(nameof(source));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { tensor, source },
+                engine => engine.TensorSelectScatter(tensor, source, dim, index));
         int rank = tensor.Rank;
         if (dim < 0) dim += rank;
         if (dim < 0 || dim >= rank) throw new ArgumentOutOfRangeException(nameof(dim));
@@ -2005,6 +2050,7 @@ public partial class CpuEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (indices == null) throw new ArgumentNullException(nameof(indices));
         if (source == null) throw new ArgumentNullException(nameof(source));
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
         int rank = tensor.Rank;
         if (axis < 0) axis += rank;
         if (axis < 0 || axis >= rank) throw new ArgumentOutOfRangeException(nameof(axis));
@@ -2076,6 +2122,8 @@ public partial class CpuEngine
     public virtual Tensor<T> TensorIndexPut<T>(
         Tensor<T> tensor, Tensor<int>[] indices, Tensor<T> source, bool accumulate = false)
     {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
+
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (indices == null) throw new ArgumentNullException(nameof(indices));
         if (source == null) throw new ArgumentNullException(nameof(source));
@@ -2145,6 +2193,7 @@ public partial class CpuEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (indices == null) throw new ArgumentNullException(nameof(indices));
         if (source == null) throw new ArgumentNullException(nameof(source));
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
         int rank = tensor.Rank;
         if (axis < 0) axis += rank;
         if (axis < 0 || axis >= rank) throw new ArgumentOutOfRangeException(nameof(axis));
@@ -2214,6 +2263,9 @@ public partial class CpuEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (other == null) throw new ArgumentNullException(nameof(other));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { tensor, other }, engine => engine.TensorExpandAs(tensor, other));
         return TensorBroadcastTo(tensor, other._shape);
     }
 
@@ -2278,6 +2330,8 @@ public partial class CpuEngine
     {
         if (matrices == null) throw new ArgumentNullException(nameof(matrices));
         if (matrices.Length == 0) throw new ArgumentException("BlockDiag requires at least one matrix");
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(matrices, engine => engine.TensorBlockDiag(matrices));
 
         var ops = MathHelper.GetNumericOperations<T>();
         int totalRows = 0, totalCols = 0;
@@ -2321,6 +2375,10 @@ public partial class CpuEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (source == null) throw new ArgumentNullException(nameof(source));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { tensor, source },
+                engine => engine.TensorSliceScatter(tensor, source, dim, start, length));
         int rank = tensor.Rank;
         if (dim < 0) dim += rank;
         if (dim < 0 || dim >= rank) throw new ArgumentOutOfRangeException(nameof(dim));
@@ -2372,6 +2430,8 @@ public partial class CpuEngine
     public virtual Tensor<T> TensorIndexFill<T>(
         Tensor<T> tensor, int axis, Tensor<int> indices, T value)
     {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
+
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (indices == null) throw new ArgumentNullException(nameof(indices));
         int rank = tensor.Rank;
@@ -2413,6 +2473,8 @@ public partial class CpuEngine
         Tensor<T> tensor, int dim, Tensor<int> indices, Tensor<T> source,
         ScatterReduceMode mode, bool includeSelf = true)
     {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
+
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (indices == null) throw new ArgumentNullException(nameof(indices));
         if (source == null) throw new ArgumentNullException(nameof(source));
@@ -2552,6 +2614,7 @@ public partial class CpuEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (mask == null) throw new ArgumentNullException(nameof(mask));
         if (source == null) throw new ArgumentNullException(nameof(source));
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
         if (!tensor._shape.SequenceEqual(mask._shape))
             throw new ArgumentException(
                 $"mask shape [{string.Join(", ", mask._shape)}] must match tensor shape [{string.Join(", ", tensor._shape)}]");
@@ -2664,6 +2727,8 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<int> TensorArgsort<T>(Tensor<T> input, int axis = -1, bool descending = false)
     {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.MixedElementTypes);
+
         // Argsort is just Sort discarding the values tensor. We share the
         // same kernel path so any future SIMD Sort lands here too.
         var (_, indices) = TensorSort(input, axis, descending);
@@ -2793,6 +2858,9 @@ public partial class CpuEngine
     public virtual Tensor<T> TensorHistc<T>(Tensor<T> input, int bins, T min, T max)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { input }, engine => engine.TensorHistc(input, bins, min, max));
         if (bins < 1) throw new ArgumentOutOfRangeException(nameof(bins));
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -2913,6 +2981,9 @@ public partial class CpuEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (sections <= 0) throw new ArgumentOutOfRangeException(nameof(sections));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernelOutputs(
+                new[] { tensor }, engine => engine.TensorTensorSplit(tensor, sections, dim));
         int rank = tensor.Rank;
         if (dim < 0) dim += rank;
         if (dim < 0 || dim >= rank) throw new ArgumentOutOfRangeException(nameof(dim));
@@ -2938,6 +3009,9 @@ public partial class CpuEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (indices == null) throw new ArgumentNullException(nameof(indices));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernelOutputs(
+                new[] { tensor }, engine => engine.TensorTensorSplit(tensor, indices, dim));
         int rank = tensor.Rank;
         if (dim < 0) dim += rank;
         if (dim < 0 || dim >= rank) throw new ArgumentOutOfRangeException(nameof(dim));
@@ -2990,6 +3064,9 @@ public partial class CpuEngine
     public virtual Tensor<T> TensorUnfold<T>(Tensor<T> tensor, int dim, int size, int step)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { tensor }, engine => engine.TensorUnfold(tensor, dim, size, step));
         if (size <= 0) throw new ArgumentOutOfRangeException(nameof(size), "size must be positive");
         if (step <= 0) throw new ArgumentOutOfRangeException(nameof(step), "step must be positive");
         int rank = tensor.Rank;
@@ -3060,6 +3137,11 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorZeta<T>(Tensor<T> x, Tensor<T> q)
     {
+        if (x == null) throw new ArgumentNullException(nameof(x));
+        if (q == null) throw new ArgumentNullException(nameof(q));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(new[] { x, q }, engine => engine.TensorZeta(x, q));
+
         // ζ(x, q) = Σ_{k=0}^∞ (k + q)^{-x}.
         //
         // Strategy: accelerated Euler-Maclaurin summation. For x ≤ 1 the
@@ -3196,6 +3278,8 @@ public partial class CpuEngine
     public virtual Tensor<int> TensorSearchSorted<T>(
         Tensor<T> sortedSequence, Tensor<T> values, bool right = false)
     {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.MixedElementTypes);
+
         if (sortedSequence == null) throw new ArgumentNullException(nameof(sortedSequence));
         if (values == null) throw new ArgumentNullException(nameof(values));
         if (sortedSequence.Rank != 1)
@@ -3303,11 +3387,16 @@ public partial class CpuEngine
 
     /// <inheritdoc/>
     public virtual Tensor<int> TensorBucketize<T>(Tensor<T> input, Tensor<T> boundaries, bool right = false)
-        => TensorSearchSorted(boundaries, input, right);
+    {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.MixedElementTypes);
+        return TensorSearchSorted(boundaries, input, right);
+    }
 
     /// <inheritdoc/>
     public virtual Tensor<int> TensorBinCount(Tensor<int> input, int? minLength = null)
     {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.DataDependentOutputShape);
+
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (input.Rank != 1) throw new ArgumentException("BinCount requires a 1-D int tensor");
         if (!input.IsContiguous) input = input.Contiguous();
@@ -3334,6 +3423,8 @@ public partial class CpuEngine
     {
         if (matrices == null) throw new ArgumentNullException(nameof(matrices));
         if (matrices.Length == 0) throw new ArgumentException("MultiDot requires at least one matrix");
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(matrices, engine => engine.TensorMultiDot(matrices));
         if (matrices.Length == 1) return matrices[0];
 
         // Build einsum equation: "ab,bc,cd,...->a?" — one distinct char per
@@ -3361,6 +3452,8 @@ public partial class CpuEngine
     public virtual Tensor<int> TensorHistogramDD<T>(
         Tensor<T> samples, int[] bins, T[] mins, T[] maxs)
     {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.MixedElementTypes);
+
         if (samples == null) throw new ArgumentNullException(nameof(samples));
         if (bins == null) throw new ArgumentNullException(nameof(bins));
         if (mins == null) throw new ArgumentNullException(nameof(mins));
@@ -3425,6 +3518,8 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<int> TensorHistogram<T>(Tensor<T> input, int bins, T min, T max)
     {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.MixedElementTypes);
+
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (bins < 1) throw new ArgumentOutOfRangeException(nameof(bins));
 
@@ -3578,6 +3673,8 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorLdexp<T>(Tensor<T> x, Tensor<int> exp)
     {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
+
         if (x == null) throw new ArgumentNullException(nameof(x));
         if (exp == null) throw new ArgumentNullException(nameof(exp));
         if (!x._shape.SequenceEqual(exp._shape))
@@ -3697,6 +3794,8 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorPut<T>(Tensor<T> tensor, Tensor<int> indices, Tensor<T> source)
     {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
+
         // Flat-indexed scatter. Inverse of Take: tensor[indices.flatten()] = source.
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (indices == null) throw new ArgumentNullException(nameof(indices));
@@ -3796,6 +3895,10 @@ public partial class CpuEngine
     public virtual Tensor<T> TensorPolygamma<T>(int n, Tensor<T> tensor)
     {
         if (n < 0) throw new ArgumentOutOfRangeException(nameof(n), "Polygamma order must be >= 0");
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { tensor }, engine => engine.TensorPolygamma(n, tensor));
         if (n == 0) return TensorDigamma(tensor);
 
         var result = ElementwiseUnary(tensor, x => {
@@ -4035,6 +4138,14 @@ public partial class CpuEngine
                 edst[i] = 0;
                 continue;
             }
+            // frexp preserves non-finite values and reports no meaningful exponent. Without
+            // this guard +Infinity reached the normalization loop below and never terminated.
+            if (System.Double.IsNaN(xd) || System.Double.IsInfinity(xd))
+            {
+                mdst[i] = src[i];
+                edst[i] = 0;
+                continue;
+            }
             int e = (int)System.Math.Floor(System.Math.Log(System.Math.Abs(xd), 2.0)) + 1;
             double m = xd * System.Math.Pow(2.0, -e);
             // Normalise into [0.5, 1) — adjust by one step if floating error
@@ -4050,6 +4161,10 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorDigamma<T>(Tensor<T> tensor)
     {
+        if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(new[] { tensor }, engine => engine.TensorDigamma(tensor));
+
         var result = ElementwiseUnary(tensor, x => {
             var ops = MathHelper.GetNumericOperations<T>();
             double xd = ToDoubleSafe(x);

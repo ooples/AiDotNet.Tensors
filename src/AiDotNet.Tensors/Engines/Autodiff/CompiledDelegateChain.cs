@@ -101,6 +101,7 @@ internal sealed class CompiledDelegateChain<T>
     // Logical step count. The backing array may be larger when rented
     // from BackwardScratch<T> — only indices [0, _count) hold live data.
     private readonly int _count;
+    private BackwardStorageReleasePlan<T>? _storageReleasePlan;
 
     internal CompiledDelegateChain(BackwardStep<T>[] steps)
         : this(steps, steps.Length)
@@ -111,6 +112,7 @@ internal sealed class CompiledDelegateChain<T>
     {
         _steps = steps;
         _count = count;
+        _storageReleasePlan = BackwardStorageReleasePlan<T>.Create(steps, count);
     }
 
     /// <summary>
@@ -151,6 +153,7 @@ internal sealed class CompiledDelegateChain<T>
             // Output, Inputs, Backward, SavedState.
             _steps[i] = default;
         }
+        _storageReleasePlan = null;
     }
 
     /// <summary>
@@ -167,7 +170,8 @@ internal sealed class CompiledDelegateChain<T>
         Tensor<T> loss,
         IReadOnlyList<Tensor<T>>? sources,
         IEngine engine,
-        bool useScratch = false)
+        bool useScratch = false,
+        IReadOnlyCollection<Tensor<T>>? retainedTensors = null)
     {
         Dictionary<Tensor<T>, Tensor<T>> grads = useScratch
             ? BackwardScratch<T>.RentGrads(_count + 1)
@@ -203,26 +207,39 @@ internal sealed class CompiledDelegateChain<T>
         // Iterate only over the live range [0, _count).
         bool timing = BackwardTiming.Enabled;
 
-        // OOM fix: free each forward activation's GPU buffer on its LAST use — right after its step's backward; in
-        // reverse-topological order a step's output is fully consumed once its step runs (every consumer was an
-        // earlier step). Previously all forward activations stayed GPU-pinned for the whole backward, so the working
-        // set pegged at the card memory limit → OOM at scale (a tiny d256/L2 model OOM'd a 12 GB card past ~200K
-        // tokens). Skip the loss + sources (leaf params). Gated to the GPU engine; materialize-then-free is safe.
+        // Free graph-owned activation storages on their final declared backward use. This is storage-aware rather
+        // than tensor-object-aware because metadata views can alias a saved tensor needed by a later step. The
+        // release schedule is precomputed with the chain, preserving progressive reclamation without adding a
+        // per-replay graph scan. Loss/source/retain-grad storages remain caller-owned after backward.
         var gpuEngine = engine as AiDotNet.Tensors.Engines.DirectGpuTensorEngine;
-        HashSet<Tensor<T>>? freeSkip = null;
+        HashSet<object>? protectedStorages = null;
         if (gpuEngine is not null)
         {
-            freeSkip = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance) { loss };
-            if (sources is not null) foreach (var s in sources) freeSkip.Add(s);
+            protectedStorages = new HashSet<object>(ReferenceEqualityComparer<object>.Instance)
+            {
+                loss.StorageIdentity
+            };
+            if (sources is not null)
+                foreach (var source in sources) protectedStorages.Add(source.StorageIdentity);
+            if (retainedTensors is not null)
+                foreach (var retained in retainedTensors) protectedStorages.Add(retained.StorageIdentity);
         }
 
         for (int i = 0; i < _count; i++)
         {
             ref var step = ref _steps[i];
             if (!DifferentiableOps.IsGradientRequired(step.Output))
+            {
+                if (gpuEngine is not null)
+                    _storageReleasePlan?.ReleaseAfterStep(i, gpuEngine, protectedStorages!);
                 continue;
+            }
             if (!grads.TryGetValue(step.Output, out var gradOutput))
+            {
+                if (gpuEngine is not null)
+                    _storageReleasePlan?.ReleaseAfterStep(i, gpuEngine, protectedStorages!);
                 continue;
+            }
 
             long start = timing ? Stopwatch.GetTimestamp() : 0;
             var previousAccumulatorOwners = DifferentiableOps.BeginBackwardStep<T>();
@@ -241,8 +258,8 @@ internal sealed class CompiledDelegateChain<T>
                 BackwardTiming.Record(step.Backward.Method.Name, ticks);
             }
 
-            if (gpuEngine is not null && !freeSkip!.Contains(step.Output))
-                gpuEngine.InvalidateGpuCacheForTensor(step.Output);
+            if (gpuEngine is not null)
+                _storageReleasePlan?.ReleaseAfterStep(i, gpuEngine, protectedStorages!);
         }
 
         if (sources is not null)

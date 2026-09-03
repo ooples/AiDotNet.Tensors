@@ -253,6 +253,18 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             IntPtr eventWaitList,
             IntPtr eventOut);
 
+        [DllImport(OpenClLibrary, EntryPoint = "clEnqueueReadBuffer")]
+        public static extern int EnqueueReadBufferWithEvent(
+            IntPtr commandQueue,
+            IntPtr buffer,
+            uint blockingRead,
+            UIntPtr offset,
+            UIntPtr size,
+            IntPtr ptr,
+            uint numEventsInWaitList,
+            IntPtr eventWaitList,
+            out IntPtr eventOut);
+
         [DllImport(OpenClLibrary, EntryPoint = "clEnqueueWriteBuffer")]
         public static extern int EnqueueWriteBuffer(
             IntPtr commandQueue,
@@ -264,6 +276,18 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             uint numEventsInWaitList,
             IntPtr eventWaitList,
             IntPtr eventOut);
+
+        [DllImport(OpenClLibrary, EntryPoint = "clEnqueueWriteBuffer")]
+        public static extern int EnqueueWriteBufferWithEvent(
+            IntPtr commandQueue,
+            IntPtr buffer,
+            uint blockingWrite,
+            UIntPtr offset,
+            UIntPtr size,
+            IntPtr ptr,
+            uint numEventsInWaitList,
+            IntPtr eventWaitList,
+            out IntPtr eventOut);
 
         // clCreateSubBuffer — creates a buffer object from a region of an existing buffer
         public static IntPtr CreateSubBuffer(IntPtr buffer, int byteOffset, int byteSize)
@@ -799,4 +823,3 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         #endregion
     }
 }
-

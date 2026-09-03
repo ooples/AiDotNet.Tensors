@@ -1,7 +1,7 @@
 // Copyright (c) AiDotNet. All rights reserved.
 // CPU-vs-GPU op-parity scaffold (Tensors #775). Full-surface op enumeration.
 // Reflects the IEngine surface at runtime so the parity scaffold auto-syncs with it — every
-// tensor-returning op is enumerated, and coverage is measured against this ground truth. (A
+// tensor-producing op is enumerated, and coverage is measured against this ground truth. (A
 // Roslyn source generator could emit the same inventory at compile time; reflection gives the
 // identical auto-sync with far less machinery and is the recommended mechanism here.)
 #if !NETFRAMEWORK
@@ -15,12 +15,13 @@ namespace AiDotNet.Tensors.Tests.Engines.OpParity;
 
 public static class IEngineOpInventory
 {
-    /// <summary>Distinct names of every public <see cref="IEngine"/> method that returns a
-    /// <c>Tensor&lt;T&gt;</c> — the op surface the parity scaffold must eventually cover.</summary>
-    public static IReadOnlyList<string> TensorReturningOps() =>
+    /// <summary>Distinct names of every public <see cref="IEngine"/> method that produces a
+    /// tensor through its return value or an out parameter — the op surface the parity scaffold
+    /// must eventually cover.</summary>
+    public static IReadOnlyList<string> TensorProducingOps() =>
         typeof(IEngine)
             .GetMethods(BindingFlags.Public | BindingFlags.Instance)
-            .Where(IsTensorReturning)
+            .Where(IsTensorProducing)
             .Select(m => m.Name)
             .Distinct(System.StringComparer.Ordinal)
             .OrderBy(n => n, System.StringComparer.Ordinal)
@@ -31,19 +32,24 @@ public static class IEngineOpInventory
     public static int TotalPublicMethodOverloads() =>
         typeof(IEngine).GetMethods(BindingFlags.Public | BindingFlags.Instance).Length;
 
-    private static bool IsTensorReturning(MethodInfo m) => ProducesTensor(m.ReturnType);
+    private static bool IsTensorProducing(MethodInfo method) =>
+        ProducesTensor(method.ReturnType) ||
+        method.GetParameters().Any(parameter => parameter.IsOut && ProducesTensor(parameter.ParameterType));
 
     /// <summary>A return type "produces a tensor" if it is a bare <c>Tensor&lt;T&gt;</c>, an ARRAY of
     /// them (<c>Tensor&lt;T&gt;[]</c>), or a tuple carrying at least one — so multi-output ops like
     /// split / unstack / meshgrid enter the coverage denominator instead of silently hiding parity gaps.</summary>
     private static bool ProducesTensor(System.Type rt)
     {
+        if (rt.IsByRef && rt.GetElementType() is { } referenced) return ProducesTensor(referenced);
         // Tensor<T> reflects as the open/closed generic named "Tensor`1".
         if (rt.IsGenericType && rt.Name == "Tensor`1") return true;
         // Tensor<T>[] (or jagged arrays of tensors).
         if (rt.IsArray && rt.GetElementType() is { } el && ProducesTensor(el)) return true;
         // (Value)Tuple<...> with a tensor in any slot — split/unstack/meshgrid-style multi-returns.
-        if (rt.IsGenericType && rt.FullName is { } fn && fn.StartsWith("System.ValueTuple`", System.StringComparison.Ordinal))
+        if (rt.IsGenericType &&
+            rt.GetGenericTypeDefinition().FullName is { } fn &&
+            fn.StartsWith("System.ValueTuple`", System.StringComparison.Ordinal))
             return rt.GetGenericArguments().Any(ProducesTensor);
         return false;
     }

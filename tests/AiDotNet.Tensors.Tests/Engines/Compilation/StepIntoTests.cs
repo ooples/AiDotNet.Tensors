@@ -12,6 +12,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// contract as the inference plan: caller owns the loss / input buffers,
 /// the plan copies in + out, kernels stay compile-time-specialised.
 /// </summary>
+[Collection("CompilationGlobalState")]
 public class StepIntoTests : IDisposable
 {
     // Same engine-pinning rationale as AsyncChainTests / ExecuteIntoTests:

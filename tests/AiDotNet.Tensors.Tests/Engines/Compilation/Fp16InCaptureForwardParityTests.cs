@@ -452,12 +452,12 @@ public class Fp16InCaptureForwardParityTests
             var order = plan.Fp16HeteroOrderForTest!;
             var loss = plan.LossOutput;
 
-            var unpaged = MixedPrecisionCompiledPlan.FromCapturedOrder(gpu, order, loss, paging: false);
+            using var unpaged = MixedPrecisionCompiledPlan.FromCapturedOrder(gpu, order, loss, paging: false);
             GpuMemoryTracker.ResetPeak();
             unpaged.Forward();
             long unpagedPeak = GpuMemoryTracker.PeakBytes;
 
-            var paged = MixedPrecisionCompiledPlan.FromCapturedOrder(gpu, order, loss, paging: true);
+            using var paged = MixedPrecisionCompiledPlan.FromCapturedOrder(gpu, order, loss, paging: true);
             GpuMemoryTracker.ResetPeak();
             paged.Forward();
             long pagedPeak = GpuMemoryTracker.PeakBytes;

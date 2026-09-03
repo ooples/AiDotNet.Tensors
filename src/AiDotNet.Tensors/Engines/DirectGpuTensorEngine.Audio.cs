@@ -7,6 +7,7 @@
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.LinearAlgebra;
+using AiDotNet.Tensors.Engines.Compilation;
 
 namespace AiDotNet.Tensors.Engines;
 
@@ -53,6 +54,8 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<int> MuLawEncoding<T>(Tensor<T> input, int quantizationChannels = 256)
     {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.MixedElementTypes);
+
         if (quantizationChannels <= 1)
             throw new ArgumentException("quantizationChannels must be > 1 (μ = qc − 1 must be positive).",
                 nameof(quantizationChannels));
@@ -81,6 +84,8 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> MuLawDecoding<T>(Tensor<int> input, int quantizationChannels = 256)
     {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
+
         if (quantizationChannels <= 1)
             throw new ArgumentException("quantizationChannels must be > 1.", nameof(quantizationChannels));
         if (typeof(T) == typeof(float))

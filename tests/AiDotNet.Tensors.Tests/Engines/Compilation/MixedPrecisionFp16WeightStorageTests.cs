@@ -81,7 +81,7 @@ public class MixedPrecisionFp16WeightStorageTests
             });
         loss.LazySource = nloss;
 
-        var plan = MixedPrecisionCompiledPlan.Compile(loss, _engine);
+        using var plan = MixedPrecisionCompiledPlan.Compile(loss, _engine);
 
         // Register the fp32 master for the fp16 storage weight.
         var masters = new MasterWeights();

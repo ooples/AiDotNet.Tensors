@@ -216,7 +216,7 @@ public static class OnnxImporter
         });
         try
         {
-            using var scope = GraphMode.Enable();
+            using var scope = GraphMode.EnableInference();
             // Resolve the default-domain opset version from the model's
             // opset_import list. Softmax and a handful of other translators
             // need this to pick the correct per-opset attribute defaults.

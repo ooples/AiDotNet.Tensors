@@ -79,7 +79,7 @@ public class MixedPrecisionCompiledBackwardTests
             {
                 var sp = new LazyTensorScope(null);
                 var lossP = BuildGraph(sp, x, W);
-                var plan = MixedPrecisionCompiledPlan.Compile(lossP, _engine);
+                using var plan = MixedPrecisionCompiledPlan.Compile(lossP, _engine);
                 plan.Forward();
                 var gp = plan.Backward();
                 Assert.True(gp.Fp32.TryGetValue(x, out var gx1), "compiled grad for x missing");

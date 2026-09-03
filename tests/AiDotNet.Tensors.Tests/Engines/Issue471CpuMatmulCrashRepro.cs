@@ -12,6 +12,7 @@ namespace AiDotNet.Tensors.Tests.Engines;
 /// contracting over a big dimension (V≈50257), on AVX2-no-AVX512 hardware with OpenBLAS NOT loaded (managed
 /// AVX2 fallback). Env-gated TENSORS_RUN_REPRO=1. A clean run prints "ALL OK".
 /// </summary>
+[Collection("EngineCurrentGlobalState")]
 public class Issue471CpuMatmulCrashRepro
 {
     private readonly ITestOutputHelper _o;
@@ -23,16 +24,9 @@ public class Issue471CpuMatmulCrashRepro
         Skip.IfNot(Environment.GetEnvironmentVariable("TENSORS_RUN_REPRO") == "1",
             "Env-gated #471 repro: set TENSORS_RUN_REPRO=1 to run.");
 
-        // ResetToCpu() mutates AiDotNetEngine.Current — a shared process-wide
-        // singleton. xUnit test order is nondeterministic, so without restoring
-        // the previous selection the GPU repros below could silently run on CPU
-        // and miss the hardware path they exist to cover. Capture-and-restore
-        // around the CPU-specific body keeps this test isolated.
-        var previousEngine = AiDotNetEngine.Current;
-        AiDotNetEngine.ResetToCpu();
-        try
-        {
-            var eng = AiDotNetEngine.Current;
+        // This is a CPU-specific repro, so use an explicit local engine. ResetToCpu disposes
+        // a globally selected GPU and restoring that same reference would publish a dead engine.
+        var eng = new CpuEngine();
             _o.WriteLine($"engine={eng.Name}");
             const int d = 128;
             foreach (int V in new[] { 1000, 10000, 30000, 50257 })
@@ -58,11 +52,6 @@ public class Issue471CpuMatmulCrashRepro
             }
             _o.WriteLine("ALL OK — no crash");
             Assert.True(true);
-        }
-        finally
-        {
-            AiDotNetEngine.Current = previousEngine;
-        }
     }
 
     /// <summary>

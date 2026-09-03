@@ -31,6 +31,17 @@ internal sealed class MemoryPlanningPass : ICpuOptimizationPass
     public bool IsEnabled => true; // Always beneficial
 
     public CompiledStep<T>[]? TryOptimize<T>(CompiledStep<T>[] steps, IEngine engine)
+        => TryOptimize(steps, engine, protectedOutput: null);
+
+    /// <summary>
+    /// Plans buffer reuse while preserving the storage selected as the compiled plan's output.
+    /// An explicit output can be an internal branch rather than the final scheduled step, or a
+    /// view sharing a producer's storage, so its backing storage must remain live through replay.
+    /// </summary>
+    internal CompiledStep<T>[]? TryOptimize<T>(
+        CompiledStep<T>[] steps,
+        IEngine engine,
+        Tensor<T>? protectedOutput)
     {
         if (steps.Length < 4) return null; // Not worth the overhead for tiny plans
 
@@ -70,6 +81,22 @@ internal sealed class MemoryPlanningPass : ICpuOptimizationPass
                 lastUse[step.Inputs[j]] = i;
         }
 
+        if (protectedOutput is not null)
+        {
+            // A pure-view output is not necessarily a step output by identity. Protect every
+            // produced tensor that shares its TensorStorage so a later operation cannot recycle
+            // the selected output through an alias before Execute() returns it.
+            for (int i = 0; i < steps.Length; i++)
+            {
+                Tensor<T> produced = steps[i].OutputBuffer;
+                if (ReferenceEquals(produced, protectedOutput) ||
+                    ReferenceEquals(produced._storage, protectedOutput._storage))
+                {
+                    lastUse[produced] = steps.Length - 1;
+                }
+            }
+        }
+
         // Phase 2: Greedy buffer reuse via dead-pool
         // Walk steps again. After each step, check if any tensor's lifetime
         // just ended (lastUse == current step). If so, add it to the dead
@@ -101,7 +128,7 @@ internal sealed class MemoryPlanningPass : ICpuOptimizationPass
                 // the output tensor now shares that memory.
                 if (CanRebind(output, donor))
                 {
-                    output.RebindStorageFrom(donor);
+                    output.RebindStorageFromGraph(donor);
                     rebindMap[output] = donor;
                     reusedCount++;
                 }

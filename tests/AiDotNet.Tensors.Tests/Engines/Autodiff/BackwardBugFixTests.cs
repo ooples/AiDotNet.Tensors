@@ -18,6 +18,64 @@ public class BackwardBugFixTests
 {
     private readonly CpuEngine _engine = new();
 
+    [Fact]
+    public void ComplexNormalize_Backward_IncludesNormDenominatorPath()
+    {
+        var real = new Tensor<double>(new[] { 0.7, -1.2, 0.3, 1.6 }, new[] { 2, 2 });
+        var imag = new Tensor<double>(new[] { -0.4, 0.9, 1.1, -0.2 }, new[] { 2, 2 });
+        var realWeight = new Tensor<double>(new[] { 0.2, -0.7, 1.3, 0.5 }, new[] { 2, 2 });
+        var imagWeight = new Tensor<double>(new[] { -0.6, 0.4, 0.8, -1.1 }, new[] { 2, 2 });
+
+        double[] realAnalytical;
+        double[] imagAnalytical;
+        using (var tape = new GradientTape<double>())
+        {
+            var normalized = _engine.ComplexNormalize(real, imag);
+            var weightedReal = _engine.TensorMultiply(normalized.real, realWeight);
+            var weightedImag = _engine.TensorMultiply(normalized.imag, imagWeight);
+            var loss = _engine.ReduceSum(_engine.TensorAdd(weightedReal, weightedImag), null);
+            var gradients = tape.ComputeGradients(loss, new[] { real, imag });
+            realAnalytical = gradients[real].ToArray();
+            imagAnalytical = gradients[imag].ToArray();
+        }
+
+        double Loss()
+        {
+            var normalized = _engine.ComplexNormalize(real, imag);
+            double sum = 0.0;
+            for (int i = 0; i < real.Length; i++)
+                sum += normalized.real[i] * realWeight[i] + normalized.imag[i] * imagWeight[i];
+            return sum;
+        }
+
+        const double step = 1e-5;
+        for (int i = 0; i < real.Length; i++)
+        {
+            double original = real[i];
+            real[i] = original + step;
+            double plus = Loss();
+            real[i] = original - step;
+            double minus = Loss();
+            real[i] = original;
+            double finite = (plus - minus) / (2.0 * step);
+            Assert.True(Math.Abs(finite - realAnalytical[i]) < 1e-6,
+                $"real[{i}] gradient is {realAnalytical[i]:G10}; finite difference is {finite:G10}.");
+        }
+
+        for (int i = 0; i < imag.Length; i++)
+        {
+            double original = imag[i];
+            imag[i] = original + step;
+            double plus = Loss();
+            imag[i] = original - step;
+            double minus = Loss();
+            imag[i] = original;
+            double finite = (plus - minus) / (2.0 * step);
+            Assert.True(Math.Abs(finite - imagAnalytical[i]) < 1e-6,
+                $"imag[{i}] gradient is {imagAnalytical[i]:G10}; finite difference is {finite:G10}.");
+        }
+    }
+
     // ================================================================
     // Issue #144: OctonionMatMulTensor backward
     // ================================================================

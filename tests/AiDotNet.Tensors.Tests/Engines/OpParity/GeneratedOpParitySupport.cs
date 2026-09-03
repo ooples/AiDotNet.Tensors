@@ -7,6 +7,8 @@
 
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
+using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.OpParity;
@@ -23,7 +25,116 @@ public static class GeneratedOpParitySupport
         var cases = ByMethod[opMethod].ToList();
         Skip.If(cases.Count == 0, $"NEEDS SPEC: IEngine.{opMethod} has no CPU-vs-GPU parity case yet.");
         foreach (var c in cases)
-            OpParityHarness.CheckForward(c, fx);
+        {
+            switch (c.TensorOutputContract)
+            {
+                case TensorOutputContract.HomogeneousMultiple:
+                    OpParityHarness.CheckMultipleOutputs(c, fx);
+                    break;
+                case TensorOutputContract.HeterogeneousMultiple:
+                    OpParityHarness.CheckHeterogeneousOutputs(c, fx);
+                    break;
+                default:
+                    OpParityHarness.CheckForward(c, fx);
+                    break;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Called by source-generated tests for every IEngine operation with more than one tensor
+    /// result. The registry must explicitly describe the tuple and, when homogeneous, expose every
+    /// result through the executable multi-output delegates.
+    /// </summary>
+    public static void VerifyTensorOutputContract(
+        string opMethod,
+        TensorOutputContract expected,
+        TensorOutputOverload expectedOverload)
+    {
+        var cases = ByMethod[opMethod].ToList();
+        Assert.NotEmpty(cases);
+        Assert.Contains(cases, op =>
+            op.TensorOutputContract == expected &&
+            (expectedOverload == TensorOutputOverload.Unspecified ||
+                op.TensorOutputOverload == expectedOverload) &&
+            (expected == TensorOutputContract.HomogeneousMultiple
+                ? op.HasMultipleOutputs
+                : op.HasHeterogeneousOutputs));
+    }
+
+    /// <summary>
+    /// Lets reflection-driven GPU coverage consume the same generated multi-output contract
+    /// scaffold. No method signature is copied into a string allowlist: the reflected method
+    /// must itself expose homogeneous tensor outputs, and the typed registry contract must
+    /// provide executable delegates for every result.
+    /// </summary>
+    public static bool HasGeneratedHomogeneousOutputCoverage(MethodInfo method)
+    {
+        if (method is null || !method.IsGenericMethodDefinition || method.GetGenericArguments().Length != 1)
+            return false;
+
+        var tensorElementTypes = new List<System.Type>();
+        CollectTensorElementTypes(method.ReturnType, tensorElementTypes);
+        foreach (var parameter in method.GetParameters())
+        {
+            if (parameter.IsOut)
+                CollectTensorElementTypes(parameter.ParameterType, tensorElementTypes);
+        }
+
+        if (tensorElementTypes.Count < 2)
+            return false;
+
+        var methodElementType = method.GetGenericArguments()[0];
+        if (tensorElementTypes.Any(elementType => elementType != methodElementType))
+            return false;
+
+        return ByMethod[method.Name].Any(op =>
+            op.TensorOutputContract == TensorOutputContract.HomogeneousMultiple &&
+            op.HasMultipleOutputs);
+    }
+
+    private static void CollectTensorElementTypes(System.Type type, ICollection<System.Type> output)
+    {
+        if (type.IsByRef)
+        {
+            CollectTensorElementTypes(type.GetElementType()!, output);
+            return;
+        }
+
+        if (type.IsArray)
+        {
+            CollectTensorElementTypes(type.GetElementType()!, output);
+            return;
+        }
+
+        if (type.IsGenericType && type.GetGenericTypeDefinition() == typeof(Tensor<>))
+        {
+            output.Add(type.GetGenericArguments()[0]);
+            return;
+        }
+
+    }
+
+    /// <summary>
+    /// Called by source-generated tests for every IEngine overload whose tensor operands/results
+    /// do not all share one element type. The registry must classify the exact overload so its
+    /// executable graph-capture case proves that compilation fails closed.
+    /// </summary>
+    public static void VerifyGraphCaptureSignature(
+        string opMethod,
+        GraphCaptureSignatureConstraint expected,
+        GraphCaptureSignatureOverload expectedOverload)
+    {
+        var cases = ByMethod[opMethod].ToList();
+        Assert.NotEmpty(cases);
+        bool found = cases.Any(op =>
+            op.GraphCaptureSignatureConstraint == expected &&
+            (expectedOverload == GraphCaptureSignatureOverload.Unspecified ||
+                op.GraphCaptureSignatureOverload == expectedOverload));
+        Assert.True(found,
+            $"IEngine.{opMethod} requires {expected}/{expectedOverload}; registered cases: " +
+            string.Join(", ", cases.Select(op =>
+                $"{op.Name}={op.GraphCaptureSignatureConstraint}/{op.GraphCaptureSignatureOverload}")));
     }
 }
 #endif

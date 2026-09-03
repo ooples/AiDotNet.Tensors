@@ -38,6 +38,7 @@ public partial class CpuEngine
         if (weight is null) throw new ArgumentNullException(nameof(weight));
         if (bias is null) throw new ArgumentNullException(nameof(bias));
         if (targetIds is null) throw new ArgumentNullException(nameof(targetIds));
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
         GradientTape<T>.Current?.BindEngineIfUnset(this);
         if (hidden.Rank != 2)
             throw new ArgumentException($"hidden must be rank-2 [N, d]; got rank {hidden.Rank}.", nameof(hidden));

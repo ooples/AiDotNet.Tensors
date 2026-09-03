@@ -286,11 +286,12 @@ public class CompiledTrainingCowIsolationTests
         var selected = row.Slice(axis: 0, start: 0, end: 1);
         var loss = engine.ReduceSum(engine.TensorMultiply(selected, selected), null);
         using var plan = scope.CompileTraining(parameters, loss);
+        Assert.Null(GraphMode.Current);
         plan.ConfigureOptimizer(OptimizerType.SGD, 0.01f, 0.9f, 0.999f, 1e-8f, 0f);
 
         plan.Step();
 
-        Assert.Same(scope, GraphMode.Current);
+        Assert.Null(GraphMode.Current);
         var compiled = Assert.IsType<CompiledTrainingPlan<double>>(plan);
         Assert.Equal(new[] { 0.0, 0.0, 6.0, 0.0 }, compiled.Gradients[0].ToArray());
         Assert.Equal(1.0, parameter[0]);

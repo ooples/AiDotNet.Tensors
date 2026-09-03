@@ -16,6 +16,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation.Serialization;
 /// Validates SaveAsync → LoadInferenceAsync round-trip produces plans whose
 /// Execute() returns bitwise-identical outputs to the original.
 /// </summary>
+[Collection("CompilationGlobalState")]
 public class InferencePlanSerializationTests : IDisposable
 {
     // PR #333's GPU auto-detect ModuleInitializer makes plan compilation
@@ -381,5 +382,50 @@ public class InferencePlanSerializationTests : IDisposable
         Assert.False(plan.IsCompatibleWith(info));
 
         plan.Dispose();
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task SaveLoad_GroupedQueryAttention_PreservesSelectedOutput(
+        bool isCausal, bool selectAttentionWeights)
+    {
+        var engine = new CpuEngine();
+        var query = Tensor<float>.CreateRandom([1, 4, 3, 2]);
+        var key = Tensor<float>.CreateRandom([1, 2, 3, 2]);
+        var value = Tensor<float>.CreateRandom([1, 2, 3, 2]);
+
+        CompiledInferencePlan<float> original;
+        using (var scope = GraphMode.EnableInference())
+        {
+            var output = engine.GroupedQueryAttention(
+                query, key, value, numQueriesPerKV: 2, scale: 0.5,
+                isCausal, out var attentionWeights);
+            var selectedOutput = selectAttentionWeights ? attentionWeights : output;
+            original = scope.CompileInference(selectedOutput, new[] { query, key, value });
+        }
+
+        using var stream = new MemoryStream();
+        await original.SaveAsync(stream);
+        stream.Position = 0;
+        var loaded = (CompiledInferencePlan<float>?)
+            await CompiledPlanLoader.LoadInferenceAsync<float>(stream, engine);
+        Assert.NotNull(loaded);
+
+        var replayInputs = new[]
+        {
+            Tensor<float>.CreateRandom([1, 4, 3, 2]),
+            Tensor<float>.CreateRandom([1, 2, 3, 2]),
+            Tensor<float>.CreateRandom([1, 2, 3, 2])
+        };
+        original.SetInputs(replayInputs);
+        loaded!.SetInputs(replayInputs);
+
+        Assert.Equal(Snapshot(original.Execute()), Snapshot(loaded.Execute()));
+
+        original.Dispose();
+        loaded.Dispose();
     }
 }

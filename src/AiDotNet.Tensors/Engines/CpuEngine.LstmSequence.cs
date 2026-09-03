@@ -1,5 +1,7 @@
 using System;
 using System.Buffers;
+using System.Collections.Generic;
+using System.IO;
 using System.Runtime.CompilerServices;
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
@@ -12,6 +14,16 @@ using AiDotNet.Tensors.Interfaces;
 using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines;
+
+[Flags]
+internal enum LstmSequenceOptionalInputs : byte
+{
+    None = 0,
+    InitialHidden = 1 << 0,
+    InitialCell = 1 << 1,
+    InputBias = 1 << 2,
+    RecurrentBias = 1 << 3
+}
 
 public partial class CpuEngine
 {
@@ -186,6 +198,58 @@ public partial class CpuEngine
         if (bHh is not null && (bHh.Rank != 1 || bHh.Shape[0] != gateRows))
             throw new ArgumentException($"bHh must be [{gateRows}].", nameof(bHh));
 
+        if (GraphMode.IsActive)
+        {
+            // The state-returning API has three live outputs, while the compiled IR owns one
+            // output per node. Build it from ordinary recorded primitives instead of executing
+            // the fused kernel multiple times or refreshing out-parameters through side effects.
+            // Compiled training takes the same differentiable path. The common single-output
+            // inference overload remains one fused replay step.
+            if (wantState || !GraphMode.IsInferenceTrace)
+            {
+                return LstmSequenceForwardGraph(
+                    input, h0, c0, wIh, wHh, bIh, bHh,
+                    batch, seqLen, inFeatures, hidden, returnSequences,
+                    out finalHidden, out finalCell);
+            }
+
+            var optionalInputs = LstmSequenceOptionalInputs.None;
+            var graphInputs = new List<Tensor<T>> { input, wIh, wHh };
+            if (h0 is not null) { optionalInputs |= LstmSequenceOptionalInputs.InitialHidden; graphInputs.Add(h0); }
+            if (c0 is not null) { optionalInputs |= LstmSequenceOptionalInputs.InitialCell; graphInputs.Add(c0); }
+            if (bIh is not null) { optionalInputs |= LstmSequenceOptionalInputs.InputBias; graphInputs.Add(bIh); }
+            if (bHh is not null) { optionalInputs |= LstmSequenceOptionalInputs.RecurrentBias; graphInputs.Add(bHh); }
+
+            var capturedInputs = graphInputs.ToArray();
+            var outputShape = returnSequences
+                ? new[] { batch, seqLen, hidden }
+                : new[] { batch, hidden };
+            var scope = GraphMode.Current!;
+            scope.BindEngineIfUnset(this);
+            object[] savedState = { returnSequences, optionalInputs };
+            finalHidden = Tensor<T>.Empty();
+            finalCell = Tensor<T>.Empty();
+            return scope.RecordVariadic(
+                LazyNodeType.LstmSequenceForward,
+                "LstmSequenceForward",
+                capturedInputs,
+                outputShape,
+                (eng, output) =>
+                {
+                    UnpackLstmSequenceInputs(
+                        capturedInputs, optionalInputs,
+                        out var capturedInput, out var capturedH0, out var capturedC0,
+                        out var capturedWIh, out var capturedWHh,
+                        out var capturedBIh, out var capturedBHh);
+                    var eager = eng.LstmSequenceForward(
+                        capturedInput, capturedH0, capturedC0, capturedWIh, capturedWHh,
+                        capturedBIh, capturedBHh, returnSequences);
+                    DirectGpuTensorEngine.CopyResultInto(eng, eager, output);
+                },
+                backwardFn: null,
+                savedState: savedState);
+        }
+
         // Under an active gradient tape, float routes to the fused training path: exact
         // activations, saved per-timestep state, and a single fused BPTT node
         // (CpuEngine.LstmSequenceBackward.cs). Collapses the per-timestep training graph
@@ -193,6 +257,18 @@ public partial class CpuEngine
         // RecordIfActive keys on — GraphMode is the separate graph-compilation flag.
         if (Autodiff.DifferentiableOps.IsRecording<T>())
         {
+            // The fused BPTT node has one output edge, so it cannot represent gradients arriving
+            // independently through the sequence output, final hidden state, and final cell state.
+            // This path previously threw. Build only the state-returning tape path from ordinary
+            // differentiable primitives; inference and the single-output training hot path remain fused.
+            if (wantState)
+            {
+                return LstmSequenceForwardGraph(
+                    input, h0, c0, wIh, wHh, bIh, bHh,
+                    batch, seqLen, inFeatures, hidden, returnSequences,
+                    out finalHidden, out finalCell);
+            }
+
             if (typeof(T) == typeof(float))
             {
                 var trainOut = LstmSequenceForwardFloatTrain(
@@ -232,12 +308,6 @@ public partial class CpuEngine
                 "Route other element types through the decomposed LSTMLayer.Forward path.");
         }
 
-        // Graph-compilation mode (distinct from the eager tape) is not yet supported.
-        if (GraphMode.IsActive)
-            throw new InvalidOperationException(
-                "LstmSequenceForward does not yet support graph-compilation mode. " +
-                "Call it outside an active graph-mode scope.");
-
         // Float fast path: SimdGemm + vectorized sigmoid/tanh + ArrayPool
         // scratch buffers reused across timesteps. This is the path that
         // closes the AIsEval LSTM gap on CPU. Generic-T path below stays
@@ -263,6 +333,86 @@ public partial class CpuEngine
             input, h0, c0, wIh, wHh, bIh, bHh,
             batch, seqLen, inFeatures, hidden, gateRows, returnSequences, wantState,
             out finalHidden, out finalCell);
+    }
+
+    private Tensor<T> LstmSequenceForwardGraph<T>(
+        Tensor<T> input,
+        Tensor<T>? h0,
+        Tensor<T>? c0,
+        Tensor<T> wIh,
+        Tensor<T> wHh,
+        Tensor<T>? bIh,
+        Tensor<T>? bHh,
+        int batch,
+        int seqLen,
+        int inFeatures,
+        int hidden,
+        bool returnSequences,
+        out Tensor<T> finalHidden,
+        out Tensor<T> finalCell)
+    {
+        if (seqLen == 0)
+            throw new NotSupportedException(
+                "Graph capture of an empty LSTM sequence has no timestep node from which to derive its outputs.");
+
+        Tensor<T> currentH = h0 ?? new Tensor<T>(new[] { batch, hidden });
+        Tensor<T> currentC = c0 ?? new Tensor<T>(new[] { batch, hidden });
+        var hiddenStates = returnSequences ? new List<Tensor<T>>(seqLen) : null;
+
+        for (int t = 0; t < seqLen; t++)
+        {
+            var xt = Reshape(
+                TensorSlice(input, new[] { 0, t, 0 }, new[] { batch, 1, inFeatures }),
+                new[] { batch, inFeatures });
+            var gates = TensorAdd(
+                TensorMatMulTransposed(xt, wIh),
+                TensorMatMulTransposed(currentH, wHh));
+            if (bIh is not null) gates = TensorAdd(gates, bIh);
+            if (bHh is not null) gates = TensorAdd(gates, bHh);
+
+            var inputGate = Sigmoid(TensorSlice(gates, new[] { 0, 0 }, new[] { batch, hidden }));
+            var forgetGate = Sigmoid(TensorSlice(gates, new[] { 0, hidden }, new[] { batch, hidden }));
+            var candidate = Tanh(TensorSlice(gates, new[] { 0, 2 * hidden }, new[] { batch, hidden }));
+            var outputGate = Sigmoid(TensorSlice(gates, new[] { 0, 3 * hidden }, new[] { batch, hidden }));
+
+            currentC = TensorAdd(
+                TensorMultiply(forgetGate, currentC),
+                TensorMultiply(inputGate, candidate));
+            currentH = TensorMultiply(outputGate, Tanh(currentC));
+            hiddenStates?.Add(Reshape(currentH, new[] { batch, 1, hidden }));
+        }
+
+        finalHidden = currentH;
+        finalCell = currentC;
+        return returnSequences
+            ? TensorConcatenate(hiddenStates!.ToArray(), axis: 1)
+            : currentH;
+    }
+
+    internal static void UnpackLstmSequenceInputs<T>(
+        Tensor<T>[] inputs,
+        LstmSequenceOptionalInputs optionalInputs,
+        out Tensor<T> input,
+        out Tensor<T>? h0,
+        out Tensor<T>? c0,
+        out Tensor<T> wIh,
+        out Tensor<T> wHh,
+        out Tensor<T>? bIh,
+        out Tensor<T>? bHh)
+    {
+        if (inputs.Length < 3)
+            throw new InvalidDataException($"LSTM replay requires at least 3 inputs, got {inputs.Length}.");
+        int index = 0;
+        input = inputs[index++];
+        wIh = inputs[index++];
+        wHh = inputs[index++];
+        h0 = optionalInputs.HasFlag(LstmSequenceOptionalInputs.InitialHidden) ? inputs[index++] : null;
+        c0 = optionalInputs.HasFlag(LstmSequenceOptionalInputs.InitialCell) ? inputs[index++] : null;
+        bIh = optionalInputs.HasFlag(LstmSequenceOptionalInputs.InputBias) ? inputs[index++] : null;
+        bHh = optionalInputs.HasFlag(LstmSequenceOptionalInputs.RecurrentBias) ? inputs[index++] : null;
+        if (index != inputs.Length)
+            throw new InvalidDataException(
+                $"LSTM replay flags describe {index} inputs, but the node contains {inputs.Length}.");
     }
 
     /// <summary>

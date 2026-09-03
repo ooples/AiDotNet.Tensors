@@ -53,7 +53,7 @@ internal static class TensorCodec
         TensorCodecOptions.SetCurrent(opts);
         try
         {
-            using var scope = GraphMode.Enable();
+            using var scope = GraphMode.EnableInference();
             computation();
             return scope.CompileInference<T>();
         }

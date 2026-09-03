@@ -22,7 +22,11 @@ public class NativeComplexFftBlittableTests
     private readonly ITestOutputHelper _output;
     public NativeComplexFftBlittableTests(ITestOutputHelper output) => _output = output;
 
-    private static CpuEngine Cpu() => (AiDotNetEngine.Current as CpuEngine) ?? new CpuEngine();
+    // This fixture verifies the CPU blittable FFT implementation itself. DirectGpuTensorEngine
+    // derives from CpuEngine, so accepting AiDotNetEngine.Current here can silently select the
+    // GPU override and its speed-first FP32 conversion for double inputs. Use an exact CPU engine
+    // so the FP64 assertions cannot depend on process-wide backend selection or test order.
+    private static CpuEngine Cpu() => new CpuEngine();
 
     private static Tensor<double> RandD(int b, int n, int seed)
     {

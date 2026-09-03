@@ -1,6 +1,6 @@
 namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
-public sealed unsafe partial class VulkanBackend : IInstantNgpBackend, IUniqueConsecutiveBackend, INonzeroBackend, IModeBackend, IResidentIndexBackend, ICtcLossBackend, IImportanceSamplingBackend, INmsBackend, ISpiralIndicesBackend
+public sealed unsafe partial class VulkanBackend : IInstantNgpBackend, IFrexpBackend, IRenderingGeometryBackend, IUniqueConsecutiveBackend, INonzeroBackend, IModeBackend, IResidentIndexBackend, ICtcLossBackend, IImportanceSamplingBackend, INmsBackend, ISpiralIndicesBackend
 {
     public void HashGridEncodeLevel(
         IGpuBuffer positions, IGpuBuffer hashTable, IGpuBuffer output,
@@ -32,6 +32,75 @@ public sealed unsafe partial class VulkanBackend : IInstantNgpBackend, IUniqueCo
         if (length <= 0) return;
         GlslDispatchN(VulkanInstantNgpKernels.UniqueConsecutive, 1,
             [input, outputCapacity, outputCount], [(uint)length]);
+    }
+
+    public void Frexp(
+        IGpuBuffer input, IGpuBuffer mantissa, IGpuBuffer exponent, int length)
+    {
+        if (length <= 0) return;
+        GlslDispatchN(VulkanInstantNgpKernels.Frexp, length,
+            [input, mantissa, exponent], [(uint)length]);
+    }
+
+    public void UniqueConsecutiveWithInfo(
+        IGpuBuffer input, IGpuBuffer outputValues, IGpuBuffer outputInverse,
+        IGpuBuffer outputCounts, IGpuBuffer outputCount, int length,
+        bool returnInverse, bool returnCounts)
+    {
+        if (length <= 0) return;
+        GlslDispatchN(VulkanInstantNgpKernels.UniqueConsecutiveWithInfo, 1,
+            [input, outputValues, outputInverse, outputCounts, outputCount],
+            [(uint)length, returnInverse ? 1u : 0u, returnCounts ? 1u : 0u]);
+    }
+
+    public void ProjectGaussians3DTo2D(
+        IGpuBuffer means3D, IGpuBuffer covariances3D, IGpuBuffer means2D,
+        IGpuBuffer covariances2D, IGpuBuffer depths, IGpuBuffer visible,
+        int numGaussians, int covarianceStride, int imageWidth, int imageHeight,
+        float v00, float v01, float v02, float v03,
+        float v10, float v11, float v12, float v13,
+        float v20, float v21, float v22, float v23, float p00, float p11)
+    {
+        if (numGaussians <= 0) return;
+        GlslDispatchN(VulkanInstantNgpKernels.ProjectGaussians3DTo2D, numGaussians,
+            [means3D, covariances3D, means2D, covariances2D, depths, visible],
+            [
+                (uint)numGaussians, (uint)covarianceStride, (uint)imageWidth, (uint)imageHeight,
+                FloatBits(v00), FloatBits(v01), FloatBits(v02), FloatBits(v03),
+                FloatBits(v10), FloatBits(v11), FloatBits(v12), FloatBits(v13),
+                FloatBits(v20), FloatBits(v21), FloatBits(v22), FloatBits(v23),
+                FloatBits(p00), FloatBits(p11),
+            ]);
+    }
+
+    public void SampleRaysWithOccupancy(
+        IGpuBuffer rayOrigins, IGpuBuffer rayDirections, IGpuBuffer occupancyBitfield,
+        IGpuBuffer positions, IGpuBuffer directions, IGpuBuffer validMask, IGpuBuffer tValues,
+        int numRays, int occupancyWordCount, int gridSize, int maxSamples,
+        float minX, float minY, float minZ, float maxX, float maxY, float maxZ,
+        float nearBound, float farBound)
+    {
+        int total = checked(numRays * maxSamples);
+        if (total <= 0) return;
+        GlslDispatchN(VulkanInstantNgpKernels.SampleRaysWithOccupancy, total,
+            [rayOrigins, rayDirections, occupancyBitfield, positions, directions, validMask, tValues],
+            [
+                (uint)numRays, (uint)occupancyWordCount, (uint)gridSize, (uint)maxSamples,
+                FloatBits(minX), FloatBits(minY), FloatBits(minZ),
+                FloatBits(maxX), FloatBits(maxY), FloatBits(maxZ),
+                FloatBits(nearBound), FloatBits(farBound),
+            ]);
+    }
+
+    public void UniqueSortedWithInfo(
+        IGpuBuffer sortedInput, IGpuBuffer sortedOriginalIndices, IGpuBuffer outputValues,
+        IGpuBuffer outputInverse, IGpuBuffer outputCounts, IGpuBuffer outputCount,
+        int length, bool returnInverse, bool returnCounts)
+    {
+        if (length <= 0) return;
+        GlslDispatchN(VulkanInstantNgpKernels.UniqueSortedWithInfo, 1,
+            [sortedInput, sortedOriginalIndices, outputValues, outputInverse, outputCounts, outputCount],
+            [(uint)length, returnInverse ? 1u : 0u, returnCounts ? 1u : 0u]);
     }
 
     public void Nonzero(IGpuBuffer input, IGpuBuffer strides, IGpuBuffer outputCapacity,

@@ -4260,6 +4260,24 @@ public interface IEngine
         bool returnSequences = false);
 
     /// <summary>
+    /// Fused LSTM sequence forward that also returns the final hidden and cell states for
+    /// chunked or streaming inference.
+    /// </summary>
+    /// <param name="finalHidden">Receives the final hidden state <c>[batch, hidden]</c>.</param>
+    /// <param name="finalCell">Receives the final cell state <c>[batch, hidden]</c>.</param>
+    Tensor<T> LstmSequenceForward<T>(
+        Tensor<T> input,
+        Tensor<T>? h0,
+        Tensor<T>? c0,
+        Tensor<T> wIh,
+        Tensor<T> wHh,
+        Tensor<T>? bIh,
+        Tensor<T>? bHh,
+        out Tensor<T> finalHidden,
+        out Tensor<T> finalCell,
+        bool returnSequences = false);
+
+    /// <summary>
     /// Fused RWKV-7 "Goose" time-mixing WKV recurrence over a whole sequence in a single op
     /// (forward + custom autodiff backward). Replaces the per-timestep tape micro-ops a decomposed
     /// <c>RWKV7Block</c> loop records, which is the dominant training cost on long sequences

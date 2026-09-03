@@ -101,6 +101,7 @@ public sealed class OpenClCommandQueue : IGpuStream
         {
             throw new InvalidOperationException($"clFinish failed: {err}");
         }
+        _backend.ReapCompletedOpenClResources();
     }
 
     /// <inheritdoc/>
@@ -228,12 +229,17 @@ public sealed class OpenClCommandQueue : IGpuStream
         {
             try
             {
-                OpenClNativeBindings.ReleaseCommandQueue(_handle);
+                // A released queue handle cannot later accept the marker needed to fence a buffer whose
+                // last use occurred on this explicit stream. Finish it first and record that completion so
+                // subsequent buffer retirement/cross-queue use can proceed without touching a dead handle.
+                _backend.CompleteCommandQueueForDisposal(_handle);
             }
             catch
             {
-                // Ignore destruction errors during disposal
+                // Continue with native release; disposal remains best-effort after a device error.
             }
+            try { OpenClNativeBindings.ReleaseCommandQueue(_handle); }
+            catch { /* Ignore destruction errors during disposal. */ }
         }
 
         _handle = IntPtr.Zero;

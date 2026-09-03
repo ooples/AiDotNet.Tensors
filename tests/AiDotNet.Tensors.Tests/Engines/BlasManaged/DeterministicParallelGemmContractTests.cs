@@ -54,6 +54,33 @@ public class DeterministicParallelGemmContractTests
     public void Gemm_Double_BitIdentical_AcrossThreadCounts(int m, int n, int k)
         => AssertBitIdenticalAcrossThreadCounts<double>(m, n, k, seed: 22);
 
+    [Fact]
+    public void StreamingFloat_NAxisNonDivisibleWidth_IsBitIdenticalAcrossPartitions()
+    {
+        const int m = 2;
+        const int n = 704;
+        const int k = 257;
+        var a = RandomArray<float>(m * k, seed: 31);
+        var b = RandomArray<float>(k * n, seed: 32);
+        var serial = new float[m * n];
+        var parallel = new float[m * n];
+
+        StreamingStrategy.Run(a, k, false, b, n, false, serial, n, m, n, k,
+            new BlasOptions<float> { NumThreads = 1 });
+        StreamingStrategy.Run(a, k, false, b, n, false, parallel, n, m, n, k,
+            new BlasOptions<float> { NumThreads = 32 });
+
+        for (int i = 0; i < serial.Length; i++)
+        {
+            if (!BitIdentical(serial[i], parallel[i]))
+            {
+                Assert.Fail(
+                    $"N-axis SIMD-tile partitioning changed FP32 reduction semantics at index {i}: " +
+                    $"serial={serial[i]} parallel={parallel[i]}.");
+            }
+        }
+    }
+
     private static void AssertBitIdenticalAcrossThreadCounts<T>(int m, int n, int k, int seed)
         where T : unmanaged
     {

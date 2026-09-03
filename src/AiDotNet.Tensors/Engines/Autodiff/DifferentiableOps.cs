@@ -480,7 +480,7 @@ internal static class DifferentiableOps
     }
 
     /// <summary>
-    /// Issue #338 completion: pins every <see cref="Tensor{T}"/> stored in a recorded op's
+    /// Issue #338 completion: pins every tensor stored in a recorded op's
     /// saved state against pool/arena reuse, exactly as Record* pins the op's
     /// inputs. Many backward functions read tensors OUT of savedState rather than from the op's
     /// inputs — LayerNorm/BatchNorm/RMSNorm mean/variance/rms, attention weights and softmax
@@ -498,14 +498,9 @@ internal static class DifferentiableOps
         if (entry.SavedStatePinsHeld) return;
         var savedState = entry.SavedState;
         if (savedState is null) return;
-        bool pinnedAny = false;
-        for (int i = 0; i < savedState.Length; i++)
-            if (savedState[i] is Tensor<T> saved)
-            {
-                saved._pinnedByTape = true; // ref-counted increment (see TensorBase._pinnedByTape)
-                pinnedAny = true;
-            }
-        entry.SavedStatePinsHeld = pinnedAny;
+        var visitor = new SavedStatePinVisitor(pin: true);
+        SavedStateTensorTraversal.Visit(savedState, ref visitor);
+        entry.SavedStatePinsHeld = visitor.VisitedAny;
     }
 
     /// <summary>
@@ -523,10 +518,27 @@ internal static class DifferentiableOps
             entry.SavedStatePinsHeld = false;
             return;
         }
-        for (int i = 0; i < savedState.Length; i++)
-            if (savedState[i] is Tensor<T> saved)
-                saved._pinnedByTape = false; // ref-counted decrement, clamped at zero
+        var visitor = new SavedStatePinVisitor(pin: false);
+        SavedStateTensorTraversal.Visit(savedState, ref visitor);
         entry.SavedStatePinsHeld = false;
+    }
+
+    private struct SavedStatePinVisitor : ISavedStateTensorVisitor
+    {
+        private readonly bool _pin;
+        internal bool VisitedAny;
+
+        internal SavedStatePinVisitor(bool pin)
+        {
+            _pin = pin;
+            VisitedAny = false;
+        }
+
+        public void Visit(ITensorStorageLeaseSource tensor)
+        {
+            tensor.SetTapePinned(_pin);
+            VisitedAny = true;
+        }
     }
 
     /// <summary>

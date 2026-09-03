@@ -89,7 +89,7 @@ public class MixedPrecisionCompiledScaleGpuTests
                 finally { GraphMode.SetCurrent(null); }
             }
 
-            var plan = MixedPrecisionCompiledPlan.Compile(lossT, _engine);
+            using var plan = MixedPrecisionCompiledPlan.Compile(lossT, _engine);
             var pars = new List<Tensor<float>>(W);
 
             float first = 0, last = 0; int nan = 0;

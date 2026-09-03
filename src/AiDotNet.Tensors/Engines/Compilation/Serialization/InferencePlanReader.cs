@@ -110,8 +110,20 @@ internal static class InferencePlanReader
         // ── Tensor table ────────────────────────────────────────────────
         var tensorTable = TensorTableReader.Read<T>(reader);
 
-        // Compiled input tensor is ID 0 by convention.
-        var compiledInputTensor = tensorTable.Length > 0 ? tensorTable[0] : null;
+        // Ordered mutable-input identities (format v6+).
+        int compiledInputCount = reader.ReadInt32();
+        RequireNonNegative(compiledInputCount, nameof(compiledInputCount));
+        RequireWithinStream(bodyStream, (long)compiledInputCount * sizeof(int), nameof(compiledInputCount));
+        var compiledInputTensors = new Tensor<T>[compiledInputCount];
+        for (int i = 0; i < compiledInputCount; i++)
+        {
+            int tensorId = reader.ReadInt32();
+            if ((uint)tensorId >= (uint)tensorTable.Length)
+                throw new InvalidDataException(
+                    $"Compiled input slot {i} references tensor ID {tensorId} " +
+                    $"out of range [0, {tensorTable.Length}). The plan file is corrupt.");
+            compiledInputTensors[i] = tensorTable[tensorId];
+        }
 
         // ── Op sequence ─────────────────────────────────────────────────
         int savedStepCount = reader.ReadInt32();
@@ -143,7 +155,7 @@ internal static class InferencePlanReader
 
         // ── Construct plan ──────────────────────────────────────────────
         return CompiledInferencePlan<T>.CreateFromDeserialized(
-            steps, finalOutput, engine, inputShape, compiledInputTensor);
+            steps, finalOutput, engine, inputShape, compiledInputTensors);
     }
 
     private static CompiledStep<T> ReadStep<T>(BinaryReader reader, Tensor<T>[] tensorTable, IEngine engine, Stream bodyStream)

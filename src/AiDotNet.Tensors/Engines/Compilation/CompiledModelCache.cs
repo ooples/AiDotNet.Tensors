@@ -51,7 +51,7 @@ public sealed class CompiledModelCache<T> : IDisposable
             // Trace the forward pass under GraphMode and compile.
             // The forward function is called once to trace the graph — on subsequent calls
             // the caller must invoke plan.Execute() with current data in the input tensors.
-            using var scope = GraphMode.Enable();
+            using var scope = GraphMode.EnableInference();
             var explicitOutput = forward();
             ThrowIfForwardRecordedNothing(scope, explicitOutput);
             var plan = scope.CompileInference<T>(explicitOutput, inputShape);
@@ -96,7 +96,7 @@ public sealed class CompiledModelCache<T> : IDisposable
                 return cached;
             }
 
-            using var scope = GraphMode.Enable();
+            using var scope = GraphMode.EnableInference();
             var explicitOutput = forward();
             ThrowIfForwardRecordedNothing(scope, explicitOutput);
             var plan = scope.CompileInference<T>(explicitOutput, input);
@@ -148,7 +148,7 @@ public sealed class CompiledModelCache<T> : IDisposable
             // The trace runs the forward against the CURRENT input data, so the freshly
             // compiled plan already reflects this call — no SetInputs needed on the miss path
             // (mirrors the single-input Tensor<T> overload above).
-            using var scope = GraphMode.Enable();
+            using var scope = GraphMode.EnableInference();
             var explicitOutput = forward();
             ThrowIfForwardRecordedNothing(scope, explicitOutput);
             var plan = scope.CompileInference<T>(explicitOutput, inputs);
@@ -253,7 +253,7 @@ public sealed class CompiledModelCache<T> : IDisposable
                 return cached;
 
             // Compile with the current concrete shape
-            using var scope = GraphMode.Enable();
+            using var scope = GraphMode.EnableInference();
             var explicitOutput = forward();
             ThrowIfForwardRecordedNothing(scope, explicitOutput);
             var plan = scope.CompileInference<T>(explicitOutput, inputShape);

@@ -22,6 +22,9 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<byte> ImageDecode(byte[] encoded, ImageFormat? format = null)
     {
+        Compilation.GraphMode.ThrowIfInferenceUnsupported(
+            Compilation.GraphCaptureLimitation.HostBoundary);
+
         if (encoded is null) throw new ArgumentNullException(nameof(encoded));
         if (encoded.Length < 8) throw new ArgumentException("encoded image is too short.");
 

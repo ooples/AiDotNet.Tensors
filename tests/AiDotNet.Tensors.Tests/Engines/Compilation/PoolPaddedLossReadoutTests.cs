@@ -29,6 +29,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// compile + step, so the loss tensor is allocated from a padded slot.
 /// </para>
 /// </summary>
+[Collection("CompilationGlobalState")]
 public class PoolPaddedLossReadoutTests
 {
     private readonly ITestOutputHelper _output;

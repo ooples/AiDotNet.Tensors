@@ -17,16 +17,19 @@ internal sealed class LazyTensorScope : IDisposable
 {
     private readonly LazyTensorScope? _parent;
     private readonly List<ILazyNode> _nodes = new();
+    private readonly TensorStorageLeaseSet _storageLeases = new();
     private IEngine _engine;
     private bool _engineExplicitlyBound;
     private bool _disposed;
     private bool _realized;
-    private readonly bool _trainingParametersPreparedBeforeTrace;
+    private readonly GraphTraceKind _traceKind;
 
-    internal LazyTensorScope(LazyTensorScope? parent, bool trainingParametersPreparedBeforeTrace = false)
+    internal LazyTensorScope(
+        LazyTensorScope? parent,
+        GraphTraceKind traceKind = GraphTraceKind.Compatibility)
     {
         _parent = parent;
-        _trainingParametersPreparedBeforeTrace = trainingParametersPreparedBeforeTrace;
+        _traceKind = traceKind;
         // Default to AiDotNetEngine.Current; the first op recorded into the
         // scope will rebind via BindEngineIfUnset to the engine instance the
         // user actually invoked the op on. This matters because the global
@@ -61,6 +64,12 @@ internal sealed class LazyTensorScope : IDisposable
     internal int NodeCount => _nodes.Count;
 
     /// <summary>
+    /// The explicit purpose of this trace. Composite kernels use this to distinguish fused
+    /// inference replay from differentiable training/compatibility capture.
+    /// </summary>
+    internal GraphTraceKind TraceKind => _traceKind;
+
+    /// <summary>
     /// Records a unary operation as a lazy node. Returns a tensor whose data
     /// is not yet computed — it will be materialized during Realize().
     /// </summary>
@@ -78,7 +87,7 @@ internal sealed class LazyTensorScope : IDisposable
 
         var node = new LazyNode<T>(opType, opName, input, output, execute, backwardFn, savedState);
         output.LazySource = node;
-        _nodes.Add(node);
+        AddNode(node);
 
         return output;
     }
@@ -91,10 +100,12 @@ internal sealed class LazyTensorScope : IDisposable
         int[] outputShape,
         Action<IEngine, Tensor<TOut>> execute)
     {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.MixedElementTypes);
+
         var output = TensorAllocator.RentUninitialized<TOut>(outputShape);
         var node = new CrossTypeLazyNode<TIn, TOut>(opType, opName, input, output, execute);
         output.LazySource = node;
-        _nodes.Add(node);
+        AddNode(node);
         return output;
     }
 
@@ -116,7 +127,7 @@ internal sealed class LazyTensorScope : IDisposable
         var output = TensorAllocator.RentUninitialized<TOut>(outputShape);
         var node = new CrossTypeLazyNode<TIn, TOut>(opType, opName, input, output, execute, backwardFn, savedState);
         output.LazySource = node;
-        _nodes.Add(node);
+        AddNode(node);
         return output;
     }
 
@@ -135,7 +146,7 @@ internal sealed class LazyTensorScope : IDisposable
 
         var node = new LazyNode<T>(opType, opName, input0, input1, output, execute, backwardFn, savedState);
         output.LazySource = node;
-        _nodes.Add(node);
+        AddNode(node);
 
         return output;
     }
@@ -171,7 +182,7 @@ internal sealed class LazyTensorScope : IDisposable
             backwardFn,
             savedState);
         view.LazySource = node;
-        _nodes.Add(node);
+        AddNode(node);
         return view;
     }
 
@@ -192,7 +203,33 @@ internal sealed class LazyTensorScope : IDisposable
         var node = new LazyNode<T>(
             opType, opName, input, output, execute, backwardFn, savedState);
         output.LazySource = node;
-        _nodes.Add(node);
+        AddNode(node);
+        return output;
+    }
+
+    /// <summary>
+    /// Records an operation whose output was materialized once to establish its exact shape during
+    /// tracing, while retaining every public tensor operand as a graph dependency. This is the
+    /// variadic counterpart to <see cref="RecordMaterializedUnary{T}"/> and is used by opaque
+    /// inference nodes for kernels that do not have a primitive graph decomposition yet.
+    /// </summary>
+    internal Tensor<T> RecordMaterializedVariadic<T>(
+        LazyNodeType opType,
+        string opName,
+        Tensor<T>[] inputs,
+        Tensor<T> output,
+        Action<IEngine, Tensor<T>> execute,
+        BackwardFunction<T>? backwardFn = null,
+        object[]? savedState = null)
+    {
+        if (inputs is null) throw new ArgumentNullException(nameof(inputs));
+        if (inputs.Length == 0)
+            throw new ArgumentException("A materialized graph operation must have at least one tensor input.", nameof(inputs));
+
+        var node = new LazyNode<T>(
+            opType, opName, inputs, output, execute, backwardFn, savedState);
+        output.LazySource = node;
+        AddNode(node);
         return output;
     }
 
@@ -271,7 +308,7 @@ internal sealed class LazyTensorScope : IDisposable
             savedState: savedState,
             externalPrerequisite: prevProducer);
         target.LazySource = node;
-        _nodes.Add(node);
+        AddNode(node);
     }
 
     /// <summary>Records a variadic operation as a lazy node.</summary>
@@ -288,7 +325,7 @@ internal sealed class LazyTensorScope : IDisposable
 
         var node = new LazyNode<T>(opType, opName, inputs, output, execute, backwardFn, savedState);
         output.LazySource = node;
-        _nodes.Add(node);
+        AddNode(node);
 
         return output;
     }
@@ -332,6 +369,22 @@ internal sealed class LazyTensorScope : IDisposable
 
     /// <summary>Gets all recorded nodes (for graph compiler).</summary>
     internal IReadOnlyList<ILazyNode> Nodes => _nodes;
+
+    private void AddNode(ILazyNode node)
+    {
+        // Acquire ownership before publishing the node. A composite is free to dispose a
+        // temporary tensor immediately after its operation returns; the graph must therefore
+        // hold an independent storage reference from the moment the node becomes visible.
+        node.AddStorageLeases(_storageLeases);
+        _nodes.Add(node);
+    }
+
+    /// <summary>
+    /// Releases the trace-time lease snapshot after a successfully compiled plan has acquired
+    /// its own post-optimization snapshot. This also releases storages abandoned by memory
+    /// planning rebinds instead of retaining them for the plan's lifetime.
+    /// </summary>
+    internal void ReleaseStorageLeases() => _storageLeases.Dispose();
 
     /// <summary>
     /// Compiles the lazy graph into an inference plan for zero-overhead replay.
@@ -438,7 +491,7 @@ internal sealed class LazyTensorScope : IDisposable
             // existing internal tests). A COW parameter, however, must have
             // detached before tracing: doing it here is too late because graph
             // nodes may already retain parameter-derived storage views.
-            if (!_trainingParametersPreparedBeforeTrace && parameters[i].IsCowShared)
+            if (_traceKind != GraphTraceKind.Training && parameters[i].IsCowShared)
             {
                 throw new InvalidOperationException(
                     "Copy-on-write parameters must be prepared before a training graph is traced. " +
@@ -459,6 +512,13 @@ internal sealed class LazyTensorScope : IDisposable
     internal void MarkCompiled()
     {
         _realized = true;
+
+        // Compilation is a terminal transition for this trace. Leaving the compiled scope
+        // ambient until the lexical using statement unwinds lets plan replay (or an optimizer
+        // call made immediately after compilation) append nodes to a scope whose storage
+        // leases have already been transferred and released.
+        if (ReferenceEquals(GraphMode.Current, this))
+            GraphMode.SetCurrent(_parent);
     }
 
     public void Dispose()
@@ -474,8 +534,11 @@ internal sealed class LazyTensorScope : IDisposable
         }
         finally
         {
-            // Always restore parent scope, even if Realize() throws
-            GraphMode.SetCurrent(_parent);
+            // MarkCompiled may already have restored the parent. Only unwind this scope when
+            // it is still current; otherwise a later nested scope must remain untouched.
+            if (ReferenceEquals(GraphMode.Current, this))
+                GraphMode.SetCurrent(_parent);
+            _storageLeases.Dispose();
         }
     }
 }

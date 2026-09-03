@@ -124,7 +124,7 @@ public sealed class GpuResidencyProbeTests
             if (internalReadbacks > op.GpuAllowedReadbacks)
                 readbacks.Add($"{op.Name}\t{op.Category}\t{internalReadbacks} transfers\t" +
                     $"{internalReadbackBytes} bytes\tallowance {op.GpuAllowedReadbacks}\t" +
-                    string.Join("; ", internalReadbackSites));
+                    $"{op.GpuReadbackDescription}\t{string.Join("; ", internalReadbackSites)}");
 
             if (op.GpuProbeExpectation == GpuProbeExpectation.HostContract)
             {

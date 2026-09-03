@@ -55,7 +55,7 @@ public class MixedPrecisionComputeGradientsTests
         const int B = 8, d = 6;
         var (forward, _, _, W) = BuildLinearProblem(B, d);
 
-        var plan = MixedPrecisionCompiledPlan.Trace(forward, _engine);
+        using var plan = MixedPrecisionCompiledPlan.Trace(forward, _engine);
         var scaler = new AiDotNet.Tensors.Engines.Autodiff.GradScaler(
             new AiDotNet.Tensors.Engines.Autodiff.MixedPrecisionConfig { LossScale = 128f, DynamicLossScale = false });
         var pars = new[] { W };
@@ -92,7 +92,7 @@ public class MixedPrecisionComputeGradientsTests
     {
         const int B = 8, d = 6;
         var (forward, _, _, W) = BuildLinearProblem(B, d);
-        var plan = MixedPrecisionCompiledPlan.Trace(forward, _engine);
+        using var plan = MixedPrecisionCompiledPlan.Trace(forward, _engine);
         var pars = new[] { W };
 
         var r = plan.ComputeGradients(pars, scaler: null);
@@ -116,8 +116,8 @@ public class MixedPrecisionComputeGradientsTests
         var (fwdA, _, _, wA) = BuildLinearProblem(B, d);
         var (fwdB, _, _, wB) = BuildLinearProblem(B, d);
 
-        var planA = MixedPrecisionCompiledPlan.Trace(fwdA, _engine);
-        var planB = MixedPrecisionCompiledPlan.Trace(fwdB, _engine);
+        using var planA = MixedPrecisionCompiledPlan.Trace(fwdA, _engine);
+        using var planB = MixedPrecisionCompiledPlan.Trace(fwdB, _engine);
 
         var scaler = new AiDotNet.Tensors.Engines.Autodiff.GradScaler(
             new AiDotNet.Tensors.Engines.Autodiff.MixedPrecisionConfig { LossScale = 1024f, DynamicLossScale = false });
@@ -146,7 +146,7 @@ public class MixedPrecisionComputeGradientsTests
     {
         const int B = 8, d = 6;
         var (forward, x, t, W) = BuildLinearProblem(B, d);
-        var plan = MixedPrecisionCompiledPlan.Trace(forward, _engine);
+        using var plan = MixedPrecisionCompiledPlan.Trace(forward, _engine);
 
         var grad = plan.ComputeGradients(new[] { W }, scaler: null).Gradients[0];
         Assert.NotNull(grad);

@@ -53,7 +53,7 @@ public class MixedPrecisionPagingTests
         float[] gxRef, gw1Ref, gw2Ref;
         MixedPrecisionCompiledPlan.PagingTestOverride = false;
         {
-            var plan = MixedPrecisionCompiledPlan.Trace(forward, _engine);
+            using var plan = MixedPrecisionCompiledPlan.Trace(forward, _engine);
             plan.Forward();
             var g = plan.Backward();
             Assert.Equal(0, plan.PageOutCount);
@@ -65,7 +65,7 @@ public class MixedPrecisionPagingTests
         MixedPrecisionCompiledPlan.PagingTestOverride = true;
         try
         {
-            var plan = MixedPrecisionCompiledPlan.Trace(forward, _engine);
+            using var plan = MixedPrecisionCompiledPlan.Trace(forward, _engine);
             plan.Forward();
             var g = plan.Backward();
             pageOuts = plan.PageOutCount;

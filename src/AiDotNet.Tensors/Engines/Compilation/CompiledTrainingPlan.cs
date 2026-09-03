@@ -104,6 +104,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private readonly Tensor<T>[] _preAllocatedGrads;
     private readonly Tensor<T> _lossGradSeed;
     private readonly List<GCHandle> _pinnedHandles = new();
+    private TensorStorageLeaseSet? _storageLeases;
     // CodeRabbit #425 review: GPU optimizer state (gpuM/gpuV) is owned by the
     // plan once allocated via paramBackend.AllocateBuffer in
     // ConfigureOptimizerFloat / ConfigureOptimizerFloatGrouped, but pre-fix
@@ -204,7 +205,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         ILazyNode[]? fp16HeteroOrder = null,
         int[][]? gradPoolReZeroByStep = null,
         ForwardEmit[]? forwardEmitKinds = null,
-        Action<IEngine>?[]? forwardFixedActions = null)
+        Action<IEngine>?[]? forwardFixedActions = null,
+        TensorStorageLeaseSet? storageLeases = null)
     {
         _gradPoolReZeroByStep = gradPoolReZeroByStep;
         _forwardActions = forwardActions;
@@ -234,6 +236,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _graphRefreshTensor = graphRefreshTensor ?? compiledInputTensor;
         _forwardEmitKinds = forwardEmitKinds;
         _forwardFixedActions = forwardFixedActions;
+        _storageLeases = storageLeases;
         _fusedStepIndices = fusedStepIndices;
         _fusedForwardActions = fusedForwardActions;
         _lossGradDest = lossGradDest;
@@ -273,6 +276,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
         // Free the captured training-step graph, if any.
         InvalidateCapturedStepGraph();
+        _fp16PagedPlan?.Dispose();
+        _fp16PagedPlan = null;
+        _storageLeases?.Dispose();
+        _storageLeases = null;
     }
 
     /// <summary>
@@ -6003,30 +6010,48 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             outputBuffer.AsWritableSpan();
         }
 
-        return new CompiledTrainingPlan<T>(
-            forwardActions,
-            backwardActions.ToArray(),
-            lossOutput,
-            engine,
-            parameters,
-            allGrads.ToArray(),
-            gradients,
-            lossGradSeed,
-            originalParameterToUnique,
-            genericGradIndices,
-            gradMap.ContainsKey(lossOutput) ? gradMap[lossOutput] : null,
-            pinnedHandles,
-            forwardSteps.ToArray(),
-            compiledInputShape,
-            compiledInputTensor,
-            graphRefreshTensor,
-            fusedStepIndices.Count > 0 ? fusedStepIndices.ToArray() : null,
-            fusedForwardActions.Count > 0 ? fusedForwardActions.ToArray() : null,
-            graphStepEligible,
-            fp16HeteroOrder,
-            gradPoolReZeroByStep,
-            forwardEmitKinds,
-            forwardFixedActions);
+        TensorStorageLeaseSet? storageLeases = new TensorStorageLeaseSet();
+        try
+        {
+            for (int i = 0; i < forwardSteps.Count; i++) storageLeases.Add(forwardSteps[i]);
+            if (fp16HeteroOrder is not null)
+                for (int i = 0; i < fp16HeteroOrder.Length; i++)
+                    fp16HeteroOrder[i].AddStorageLeases(storageLeases);
+            storageLeases.Add(lossOutput);
+
+            var plan = new CompiledTrainingPlan<T>(
+                forwardActions,
+                backwardActions.ToArray(),
+                lossOutput,
+                engine,
+                parameters,
+                allGrads.ToArray(),
+                gradients,
+                lossGradSeed,
+                originalParameterToUnique,
+                genericGradIndices,
+                gradMap.ContainsKey(lossOutput) ? gradMap[lossOutput] : null,
+                pinnedHandles,
+                forwardSteps.ToArray(),
+                compiledInputShape,
+                compiledInputTensor,
+                graphRefreshTensor,
+                fusedStepIndices.Count > 0 ? fusedStepIndices.ToArray() : null,
+                fusedForwardActions.Count > 0 ? fusedForwardActions.ToArray() : null,
+                graphStepEligible,
+                fp16HeteroOrder,
+                gradPoolReZeroByStep,
+                forwardEmitKinds,
+                forwardFixedActions,
+                storageLeases);
+            storageLeases = null;
+            scope.ReleaseStorageLeases();
+            return plan;
+        }
+        finally
+        {
+            storageLeases?.Dispose();
+        }
     }
 
     /// <summary>

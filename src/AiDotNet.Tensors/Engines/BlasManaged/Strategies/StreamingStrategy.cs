@@ -303,10 +303,22 @@ internal static class StreamingStrategy
                 int ldaLocal = lda, ldbLocal = ldb, ldcLocal = ldc;
                 bool taLocal = transA, tbLocal = transB;
 
+                // Partition complete SIMD column tiles, not arbitrary columns. Splitting raw N by
+                // integer division can put a globally vectorizable column into a worker's scalar
+                // tail (for example N=704 over 32 workers produced 22-column chunks). Besides
+                // wasting SIMD capacity at every boundary, FP32 then changes from explicit FMA to
+                // scalar multiply/add and violates deterministic mode's bit-identical partitioning
+                // contract. The Run caller guarantees at least two StreamingNr tiles per worker;
+                // distribute those whole tiles evenly and leave only the matrix's genuine N tail
+                // to the final worker.
+                int fullColumnTiles = nLocal / StreamingNr;
+
                 PersistentParallelExecutor.Instance.Execute(procsLocal, p =>
                 {
-                    int nStart = (int)(((long)p * nLocal) / procsLocal);
-                    int nEnd = (int)(((long)(p + 1) * nLocal) / procsLocal);
+                    int firstTile = (int)(((long)p * fullColumnTiles) / procsLocal);
+                    int tileEnd = (int)(((long)(p + 1) * fullColumnTiles) / procsLocal);
+                    int nStart = firstTile * StreamingNr;
+                    int nEnd = p == procsLocal - 1 ? nLocal : tileEnd * StreamingNr;
                     int nChunk = nEnd - nStart;
                     if (nChunk <= 0) return;
 
