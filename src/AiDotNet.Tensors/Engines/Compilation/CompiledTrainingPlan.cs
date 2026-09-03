@@ -6724,7 +6724,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             };
         }
 
-        // Sigmoid forward: direct Padé [3,3] — bypass SigmoidUnsafe dispatch overhead
+        // Resolve the same type-safe kernel strategy used by eager/Into execution once at compile
+        // time. Hardwiring Padé here made Linux/Intel eager execution use the table kernel while
+        // replay used Padé, so execution mode changed both accuracy and boundary behavior.
         if (step.OpType == OpType.Sigmoid && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous
             && typeof(T) == typeof(float))
         {
@@ -6734,9 +6736,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var outH = PinAndTrack(
                 GetPinnableFloatBacking((Tensor<float>)(object)o), handleTracker);
             int len = inp.Length;
+            var sigmoidKernel = CpuSigmoidKernel.Resolve(len);
             return eng =>
             {
-                unsafe { PadeSigmoid.SigmoidArray((float*)inH.AddrOfPinnedObject(), (float*)outH.AddrOfPinnedObject(), len); }
+                unsafe
+                {
+                    sigmoidKernel.Invoke(
+                        (float*)inH.AddrOfPinnedObject(),
+                        (float*)outH.AddrOfPinnedObject());
+                }
             };
         }
         // Sigmoid non-float fallback

@@ -10907,55 +10907,10 @@ public partial class CpuEngine : ITensorLevelEngine
             float* pSrc = (float*)pinSrc.Pointer;
             float* pDst = (float*)pinDst.Pointer;
 
-            // JIT-compiled sigmoid: constants baked in data section, 4x unrolled
-            if (CpuJitSelfTest.IsVerified && length >= 64)
-            {
-                int sigChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 250_000));
-                if (sigChunks >= 2)
-                {
-                    int chunkSize = (length + sigChunks - 1) / sigChunks;
-                    chunkSize = (chunkSize + 31) & ~31;
-
-                    CpuParallelSettings.ParallelForOrSerial(0, sigChunks, length, chunk =>
-                    {
-                        int start = chunk * chunkSize;
-                        int count = Math.Min(chunkSize, length - start);
-                        if (count > 0)
-                        {
-                            int jitCount = count & ~7;
-                            if (jitCount > 0)
-                            {
-                                var kernel = CpuJitKernels.GetSigmoidKernel(jitCount);
-                                kernel(pSrc + start, pDst + start, jitCount);
-                            }
-                            for (int ti = jitCount; ti < count; ti++)
-                            {
-                                pDst[start + ti] = 1.0f / (1.0f + MathF.Exp(-pSrc[start + ti]));
-                            }
-                        }
-                    });
-                }
-                else
-                {
-                    // JIT kernel processes 8-wide SIMD chunks; handle tail with scalar fallback
-                    int jitLen = length & ~7;
-                    if (jitLen > 0)
-                    {
-                        var kernel = CpuJitKernels.GetSigmoidKernel(jitLen);
-                        kernel(pSrc, pDst, jitLen);
-                    }
-                    for (int i = jitLen; i < length; i++)
-                    {
-                        pDst[i] = 1.0f / (1.0f + MathF.Exp(-pSrc[i]));
-                    }
-                }
-                DifferentiableOps.RecordUnary("Sigmoid", result, tensor, BackwardFunctions<T>.SigmoidBackward);
-                { var c = tensor; AutoTracer.RecordOp("Sigmoid", result, eng => eng.Sigmoid(c)); }
-                return result;
-            }
-
-            // SIMD fallback — direct call (Padé [3,3] fused sigmoid)
-            SimdKernels.SigmoidUnsafe(pSrc, pDst, length);
+            // One type-safe resolver owns the JIT-vs-adaptive-SIMD decision for allocating,
+            // into-buffer, in-place, and compiled execution. This prevents execution mode from
+            // silently changing the numerical kernel on Linux/Intel.
+            ParallelComputeBound(pSrc, pDst, length, CpuSigmoidKernel.Execute);
             DifferentiableOps.RecordUnary("Sigmoid", result, tensor, BackwardFunctions<T>.SigmoidBackward);
             { var c = tensor; AutoTracer.RecordOp("Sigmoid", result, eng => eng.Sigmoid(c)); }
             return result;
@@ -11094,72 +11049,7 @@ public partial class CpuEngine : ITensorLevelEngine
             using var pin = mem.Pin();
             float* p = (float*)pin.Pointer;
 
-            // JIT-compiled sigmoid in-place: constants baked in data section
-            if (CpuJitSelfTest.IsVerified && length >= 64)
-            {
-                int jitChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 250_000));
-                if (jitChunks >= 2)
-                {
-                    int chunkSize = (length + jitChunks - 1) / jitChunks;
-                    chunkSize = (chunkSize + 31) & ~31;
-
-                    CpuParallelSettings.ParallelForOrSerial(0, jitChunks, length, chunk =>
-                    {
-                        int start = chunk * chunkSize;
-                        int count = Math.Min(chunkSize, length - start);
-                        if (count > 0)
-                        {
-                            int jitCount = count & ~7;
-                            if (jitCount > 0)
-                            {
-                                var kernel = CpuJitKernels.GetSigmoidKernel(jitCount);
-                                kernel(p + start, p + start, jitCount);
-                            }
-                            for (int ti = jitCount; ti < count; ti++)
-                            {
-                                float* ptr = p + start + ti;
-                                *ptr = 1.0f / (1.0f + MathF.Exp(-*ptr));
-                            }
-                        }
-                    });
-                }
-                else
-                {
-                    int jitLen = length & ~7;
-                    if (jitLen > 0)
-                    {
-                        var kernel = CpuJitKernels.GetSigmoidKernel(jitLen);
-                        kernel(p, p, jitLen);
-                    }
-                    for (int i = jitLen; i < length; i++)
-                    {
-                        p[i] = 1.0f / (1.0f + MathF.Exp(-p[i]));
-                    }
-                }
-                return;
-            }
-
-            // SIMD fallback
-            int sigChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 250_000));
-            if (sigChunks >= 2)
-            {
-                int chunkSize = (length + sigChunks - 1) / sigChunks;
-                chunkSize = (chunkSize + 31) & ~31;
-
-                CpuParallelSettings.ParallelForOrSerial(0, sigChunks, length, chunk =>
-                {
-                    int start = chunk * chunkSize;
-                    int count = Math.Min(chunkSize, length - start);
-                    if (count > 0)
-                    {
-                        SimdKernels.SigmoidUnsafe(p + start, p + start, count);
-                    }
-                });
-            }
-            else
-            {
-                SimdKernels.SigmoidUnsafe(p, p, length);
-            }
+            ParallelComputeBound(p, p, length, CpuSigmoidKernel.Execute);
             return;
         }
 
@@ -11219,7 +11109,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var dstMem = AsFloatMemory(destination.Data);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
-            ParallelComputeBound((float*)pinSrc.Pointer, (float*)pinDst.Pointer, length, Simd.SimdKernels.SigmoidUnsafe);
+            ParallelComputeBound((float*)pinSrc.Pointer, (float*)pinDst.Pointer, length, CpuSigmoidKernel.Execute);
         }
         else if (typeof(T) == typeof(double))
         {
