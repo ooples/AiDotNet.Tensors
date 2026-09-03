@@ -36,6 +36,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     // Array is never null but may be empty (degenerate empty-plan case).
     private readonly Tensor<T>[] _compiledInputTensors;
     private readonly List<GCHandle> _pinnedHandles = new();
+    private TensorStorageLeaseSet? _storageLeases;
 
     // Source plans that were stitched to form this plan — empty for plans
     // constructed from a scope compile, length 2 for each ThenAsync result.
@@ -147,22 +148,21 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         List<GCHandle>? handles = null,
         CompiledInferencePlan<T>[]? sourcePlans = null,
         Tensor<T>[]? compiledInputTensors = null,
-        bool containsCrossEngineSteps = false)
+        bool containsCrossEngineSteps = false,
+        TensorStorageLeaseSet? storageLeases = null)
     {
         _steps = steps;
         _finalOutput = finalOutput;
         _engine = engine;
-        _compiledInputShape = inputShape;
+        _compiledInputShape = (int[])inputShape.Clone();
         _containsCrossEngineSteps = containsCrossEngineSteps;
-        // Compile() / CreateFromDeserialized currently capture one input,
-        // so the array has length 0 or 1 in practice. Storing it as an array
-        // lets SetInputs generalize cleanly when multi-input Compile lands.
         _compiledInputTensors = compiledInputTensors is not null
-            ? compiledInputTensors
+            ? (Tensor<T>[])compiledInputTensors.Clone()
             : compiledInputTensor is null
             ? Array.Empty<Tensor<T>>()
             : new[] { compiledInputTensor };
         _sourcePlans = sourcePlans ?? Array.Empty<CompiledInferencePlan<T>>();
+        _storageLeases = storageLeases;
         if (handles is not null)
             _pinnedHandles.AddRange(handles);
     }
@@ -185,11 +185,8 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         if (_disposed) throw new ObjectDisposedException(nameof(CompiledInferencePlan<T>));
         cancellationToken.ThrowIfCancellationRequested();
 
-        // Current on-disk format captures a single input tensor. When
-        // Compile() starts producing multi-input plans, bump the format
-        // version and extend the writer to emit every entry.
-        var firstInput = _compiledInputTensors.Length > 0 ? _compiledInputTensors[0] : null;
-        InferencePlanWriter.Write(stream, _steps, _finalOutput, _compiledInputShape, firstInput);
+        InferencePlanWriter.Write(
+            stream, _steps, _finalOutput, _compiledInputShape, _compiledInputTensors);
         return Task.CompletedTask;
     }
 
@@ -211,7 +208,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         Tensor<T> finalOutput,
         IEngine engine,
         int[] inputShape,
-        Tensor<T>? compiledInputTensor)
+        Tensor<T>[] compiledInputTensors)
     {
         // Run TryBuildSpecializedForward on the deserialized steps so the
         // loaded plan uses the same SIMD-tuned kernels as the original.
@@ -227,47 +224,60 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         // operand) silently regresses to stale-packed-B after SetInputs(),
         // undoing the correctness fix this PR ships.
         var pinnedHandles = new List<GCHandle>();
-        var specialized = new CompiledStep<T>[steps.Length];
-        for (int i = 0; i < steps.Length; i++)
+        TensorStorageLeaseSet? storageLeases = null;
+        try
         {
-            var step = steps[i];
-            bool allowCachedB = !IsMutableSecondMatMulInput(step, compiledInputTensor);
-            MaybeRegisterFrozenMatMulWeight(step, allowCachedB);
-            var spec = CompiledTrainingPlan<T>.TryBuildSpecializedForward(step, pinnedHandles, allowCachedB);
-            if (spec != null)
+            var specialized = new CompiledStep<T>[steps.Length];
+            for (int i = 0; i < steps.Length; i++)
             {
-                var output = step.OutputBuffer;
-                specialized[i] = new CompiledStep<T>(
-                    step.OpName,
-                    (eng, o) => spec(eng),
-                    output,
-                    step.Inputs,
-                    step.BackwardFn,
-                    step.SavedState);
+                var step = steps[i];
+                bool allowCachedB = !IsMutableSecondMatMulInput(step, compiledInputTensors);
+                MaybeRegisterFrozenMatMulWeight(step, allowCachedB);
+                var spec = CompiledTrainingPlan<T>.TryBuildSpecializedForward(step, pinnedHandles, allowCachedB);
+                if (spec != null)
+                {
+                    var output = step.OutputBuffer;
+                    specialized[i] = new CompiledStep<T>(
+                        step.OpName,
+                        (eng, o) => spec(eng),
+                        output,
+                        step.Inputs,
+                        step.BackwardFn,
+                        step.SavedState);
+                }
+                else
+                {
+                    specialized[i] = step;
+                }
             }
-            else
-            {
-                specialized[i] = step;
-            }
+
+            // Clear LazySource on output tensors (same as Compile does).
+            foreach (var step in specialized)
+                step.OutputBuffer.LazySource = null;
+
+            storageLeases = CaptureStorageLeases(specialized, finalOutput, compiledInputTensors);
+            var plan = new CompiledInferencePlan<T>(
+                specialized, finalOutput, engine, inputShape,
+                handles: pinnedHandles,
+                compiledInputTensor: compiledInputTensors.Length > 0 ? compiledInputTensors[0] : null,
+                compiledInputTensors: compiledInputTensors,
+                storageLeases: storageLeases);
+            storageLeases = null;
+            return plan;
         }
-
-        // Clear LazySource on output tensors (same as Compile does).
-        foreach (var step in specialized)
-            step.OutputBuffer.LazySource = null;
-
-        var actualFinalOutput = specialized.Length > 0
-            ? specialized[specialized.Length - 1].OutputBuffer
-            : finalOutput;
-
-        return new CompiledInferencePlan<T>(
-            specialized, actualFinalOutput, engine, inputShape,
-            handles: pinnedHandles, compiledInputTensor: compiledInputTensor);
+        catch
+        {
+            storageLeases?.Dispose();
+            foreach (var handle in pinnedHandles)
+                if (handle.IsAllocated) handle.Free();
+            throw;
+        }
     }
 
     // ── Internal accessors for serialization ────────────────────────────
     // Note: CompiledInputTensor is already defined above for ThenAsync stitching.
     internal CompiledStep<T>[] Steps => _steps;
-    internal int[] CompiledInputShape => _compiledInputShape;
+    internal int[] CompiledInputShape => (int[])_compiledInputShape.Clone();
 
     /// <inheritdoc/>
     /// <remarks>
@@ -334,6 +344,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         // below where the kernels DO run concurrently with the host.
         if (IsCpuEngine(_engine))
         {
+            using var recordingSuspension = GraphMode.SuspendRecording();
             var steps = _steps;
             for (int i = 0; i < steps.Length; i++)
             {
@@ -352,9 +363,10 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         // infrastructure.
         var stream = GetOrCreateStream();
         var steps = _steps;
-        for (int i = 0; i < steps.Length; i++)
+        using (GraphMode.SuspendRecording())
         {
-            stream.Submit(steps[i], _engine);
+            for (int i = 0; i < steps.Length; i++)
+                stream.Submit(steps[i], _engine);
         }
         await stream.SyncAsync(cancellationToken).ConfigureAwait(false);
         return _finalOutput;
@@ -495,7 +507,11 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                 "Reusing it with a new upstream would rebind its input storage and " +
                 "silently invalidate the earlier pipeline.");
         }
-        nextPlanInput.RebindStorageFrom(_finalOutput);
+        if (!nextPlanInput.SharesStorageWith(_finalOutput))
+        {
+            nextPlanInput.RebindStorageFrom(_finalOutput);
+            nextPlan.RefreshStorageLeasesAfterRebind();
+        }
         nextPlan._lastStitchUpstream = _finalOutput;
 
         // CPU fast path — same rationale as ExecuteAsync. Inline both
@@ -505,6 +521,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         bool crossEngine = !ReferenceEquals(_engine, nextPlan._engine);
         if (IsCpuEngine(_engine) && IsCpuEngine(nextPlan._engine))
         {
+            using var recordingSuspension = GraphMode.SuspendRecording();
             var thisSteps = _steps;
             for (int i = 0; i < thisSteps.Length; i++)
                 thisSteps[i].Execute(_engine, thisSteps[i].OutputBuffer);
@@ -533,8 +550,11 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         // the queued kernels however the hardware allows.
         var stream = GetOrCreateStream();
         var thisSteps = _steps;
-        for (int i = 0; i < thisSteps.Length; i++)
-            stream.Submit(thisSteps[i], _engine);
+        using (GraphMode.SuspendRecording())
+        {
+            for (int i = 0; i < thisSteps.Length; i++)
+                stream.Submit(thisSteps[i], _engine);
+        }
 
         var nextSteps = nextPlan._steps;
         var nextEngine = nextPlan._engine;
@@ -549,7 +569,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
             // upstream stream returns BEFORE next's kernels finish, and
             // ChainAsync's await would resume against a still-pending
             // GPU output. Sync the upstream first to flush this plan's
-            // work, then run next's steps on its OWN cached stream and
+        // work, then run next's steps on its OWN cached stream and
             // sync that one. On CPU this is the same fast-path the
             // single-engine case takes (just with two streams instead
             // of one); on GPU it's correctness, not just perf.
@@ -557,16 +577,22 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
             await stream.SyncAsync(cancellationToken).ConfigureAwait(false);
 
             var nextStream = nextPlan.GetOrCreateStream();
-            for (int i = 0; i < nextSteps.Length; i++)
-                nextStream.Submit(nextSteps[i], nextEngine);
+            using (GraphMode.SuspendRecording())
+            {
+                for (int i = 0; i < nextSteps.Length; i++)
+                    nextStream.Submit(nextSteps[i], nextEngine);
+            }
             await nextStream.SyncAsync(cancellationToken).ConfigureAwait(false);
             return nextPlan._finalOutput;
         }
 
         // Same-engine fast path: queue everything on the upstream
         // stream and sync once.
-        for (int i = 0; i < nextSteps.Length; i++)
-            stream.Submit(nextSteps[i], _engine);
+        using (GraphMode.SuspendRecording())
+        {
+            for (int i = 0; i < nextSteps.Length; i++)
+                stream.Submit(nextSteps[i], _engine);
+        }
 
         await stream.SyncAsync(cancellationToken).ConfigureAwait(false);
         return nextPlan._finalOutput;
@@ -649,7 +675,11 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         // validates shape/contiguity/offset-zero and throws descriptively
         // if the invariants don't hold (pre-filtered above, so in practice
         // this is a belt-and-suspenders check).
-        nextPlanInput.RebindStorageFrom(_finalOutput);
+        if (!nextPlanInput.SharesStorageWith(_finalOutput))
+        {
+            nextPlanInput.RebindStorageFrom(_finalOutput);
+            nextPlan.RefreshStorageLeasesAfterRebind();
+        }
         nextPlan._lastStitchUpstream = _finalOutput;
 
         // Splice: [thisSteps..., nextSteps...]. No boundary step — the
@@ -752,6 +782,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     public Tensor<T> Execute()
     {
         if (_disposed) throw new ObjectDisposedException(nameof(CompiledInferencePlan<T>));
+        using var recordingSuspension = GraphMode.SuspendRecording();
 
         // Stitched-plan guard: the steps array holds references into each
         // source plan's pre-allocated buffers. If the caller disposed A or
@@ -1082,6 +1113,8 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                 handle.Free();
         }
         _pinnedHandles.Clear();
+        _storageLeases?.Dispose();
+        _storageLeases = null;
     }
 
     /// <summary>
@@ -1104,6 +1137,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     internal (string OpName, double AvgMs)[] ProfilePerStep(int warmup, int iters)
     {
         if (_disposed) throw new ObjectDisposedException(nameof(CompiledInferencePlan<T>));
+        using var recordingSuspension = GraphMode.SuspendRecording();
         if (warmup < 0) throw new ArgumentOutOfRangeException(nameof(warmup));
         if (iters <= 0) throw new ArgumentOutOfRangeException(nameof(iters));
 
@@ -1209,6 +1243,27 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         var compiler = new LazyGraphCompiler();
         var optimized = compiler.Compile(scope.Nodes);
 
+        // A compiled inference plan is homogeneous in T. Cross-type nodes cannot be represented
+        // by CompiledStep<T>, and silently ignoring them used to produce partial plans whose
+        // outputs were stale or uninitialized. Reject the graph until heterogeneous mutable-input
+        // rebinding and type-erased compiled steps are implemented as one coherent feature.
+        if (optimized.Count == 0)
+            throw new NotSupportedException(
+                "The captured inference graph contains no compilable tensor operations.");
+
+        if (optimized.Any(node => node is not LazyNode<T>))
+            throw new NotSupportedException(
+                "The captured inference graph crosses tensor element types. " +
+                "Heterogeneous compiled inference plans are not supported yet.");
+
+        if (explicitOutput is not null)
+        {
+            if (explicitOutput.LazySource is not ILazyNode outputNode || !optimized.Contains(outputNode))
+                throw new NotSupportedException(
+                    "The requested inference output is not rooted in the captured graph. " +
+                    "An eager operation escaped graph capture, so compiling would freeze stale data.");
+        }
+
         var steps = new List<CompiledStep<T>>();
         foreach (var node in optimized)
         {
@@ -1285,10 +1340,12 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         // TensorAdd writes to the wrong buffer" failure that surfaced as
         // ONNX Erf / Gelu / MNIST returning an upstream intermediate's
         // value instead of the declared output.
-        steps = RunStepMutatingPasses(steps, engine);
+        steps = RunStepMutatingPasses(steps, engine, explicitOutput);
 
         // Build specialized forward actions (same optimization as CompiledTrainingPlan)
         var specializedSteps = new CompiledStep<T>[steps.Count];
+        var mutableInputs = compiledInputTensors ??
+            (inputTensor is null ? Array.Empty<Tensor<T>>() : new[] { inputTensor });
         for (int i = 0; i < steps.Count; i++)
         {
             var step = steps[i];
@@ -1342,7 +1399,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                 continue;
             }
 
-            bool allowCachedB = !IsMutableSecondMatMulInput(step, inputTensor);
+            bool allowCachedB = !IsMutableSecondMatMulInput(step, mutableInputs);
             MaybeRegisterFrozenMatMulWeight(step, allowCachedB);
             var specialized = CompiledTrainingPlan<T>.TryBuildSpecializedForward(step, pinnedHandles, allowCachedB);
             if (specialized != null)
@@ -1404,9 +1461,52 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                 ? optimizedSteps[optimizedSteps.Length - 1].OutputBuffer
                 : new Tensor<T>(new int[] { 0 });
         }
-        return new CompiledInferencePlan<T>(
-            optimizedSteps, finalOutput, engine, inputShape, inputTensor, pinnedHandles,
-            compiledInputTensors: compiledInputTensors);
+        TensorStorageLeaseSet? storageLeases = CaptureStorageLeases(
+            optimizedSteps,
+            finalOutput,
+            compiledInputTensors ?? (inputTensor is null ? Array.Empty<Tensor<T>>() : new[] { inputTensor }));
+        try
+        {
+            var plan = new CompiledInferencePlan<T>(
+                optimizedSteps, finalOutput, engine, inputShape, inputTensor, pinnedHandles,
+                compiledInputTensors: compiledInputTensors,
+                storageLeases: storageLeases);
+            storageLeases = null;
+            scope.ReleaseStorageLeases();
+            return plan;
+        }
+        finally
+        {
+            storageLeases?.Dispose();
+        }
+    }
+
+    private static TensorStorageLeaseSet CaptureStorageLeases(
+        CompiledStep<T>[] steps,
+        Tensor<T> finalOutput,
+        Tensor<T>[] compiledInputs)
+    {
+        var leases = new TensorStorageLeaseSet();
+        try
+        {
+            for (int i = 0; i < steps.Length; i++) leases.Add(steps[i]);
+            leases.Add(finalOutput);
+            for (int i = 0; i < compiledInputs.Length; i++) leases.Add(compiledInputs[i]);
+            return leases;
+        }
+        catch
+        {
+            leases.Dispose();
+            throw;
+        }
+    }
+
+    private void RefreshStorageLeasesAfterRebind()
+    {
+        var replacement = CaptureStorageLeases(_steps, _finalOutput, _compiledInputTensors);
+        var previous = _storageLeases;
+        _storageLeases = replacement;
+        previous?.Dispose();
     }
 
     /// <summary>
@@ -1514,12 +1614,19 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         public int GetHashCode(TItem obj) => RuntimeHelpers.GetHashCode(obj);
     }
 
-    private static bool IsMutableSecondMatMulInput(CompiledStep<T> step, Tensor<T>? mutableInput)
+    private static bool IsMutableSecondMatMulInput(
+        CompiledStep<T> step, Tensor<T>[] mutableInputs)
     {
-        return mutableInput is not null
-            && step.OpType == OpType.TensorMatMul
-            && step.Inputs.Length >= 2
-            && ReferenceEquals(step.Inputs[1], mutableInput);
+        if (step.OpType != OpType.TensorMatMul || step.Inputs.Length < 2)
+            return false;
+
+        for (int i = 0; i < mutableInputs.Length; i++)
+        {
+            if (ReferenceEquals(step.Inputs[1], mutableInputs[i]))
+                return true;
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -1553,7 +1660,10 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
     /// DataflowFusion) to keep the specialization layer free of
     /// pre-fused opaque closures that would defeat subsequent pins.
     /// </summary>
-    private static List<CompiledStep<T>> RunStepMutatingPasses(List<CompiledStep<T>> steps, IEngine engine)
+    private static List<CompiledStep<T>> RunStepMutatingPasses(
+        List<CompiledStep<T>> steps,
+        IEngine engine,
+        Tensor<T>? explicitOutput)
     {
         if (steps.Count < 4) return steps;
 
@@ -1568,18 +1678,15 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         // matmuls whose output buffer was aliased by MemoryPlanning) — see BlasBatchPass.HasAliasedOutput.
         // Verified eager-parity across the full attention/SDPA fan-out suite (MultiInputReplayAliasingTests).
         var arr = steps.ToArray();
-        AiDotNet.Tensors.Engines.Optimization.ICpuOptimizationPass[] passes =
-            new AiDotNet.Tensors.Engines.Optimization.ICpuOptimizationPass[]
-        {
-            new AiDotNet.Tensors.Engines.Optimization.OperatorReorderingPass(),
-            new AiDotNet.Tensors.Engines.Optimization.MemoryPlanningPass(),
-        };
-        foreach (var pass in passes)
-        {
-            if (!pass.IsEnabled) continue;
-            var optimized = pass.TryOptimize(arr, engine);
-            if (optimized is not null) arr = optimized;
-        }
+        var reordering = new AiDotNet.Tensors.Engines.Optimization.OperatorReorderingPass();
+        if (reordering.IsEnabled && reordering.TryOptimize(arr, engine) is { } reordered)
+            arr = reordered;
+
+        var memoryPlanning = new AiDotNet.Tensors.Engines.Optimization.MemoryPlanningPass();
+        if (memoryPlanning.IsEnabled &&
+            memoryPlanning.TryOptimize(arr, engine, explicitOutput) is { } memoryPlanned)
+            arr = memoryPlanned;
+
         return new List<CompiledStep<T>>(arr);
     }
 

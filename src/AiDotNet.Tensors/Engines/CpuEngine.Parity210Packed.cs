@@ -1,5 +1,6 @@
 using System;
 using AiDotNet.Tensors.LinearAlgebra;
+using AiDotNet.Tensors.Engines.Compilation;
 
 namespace AiDotNet.Tensors.Engines;
 
@@ -37,6 +38,8 @@ public partial class CpuEngine
     public virtual Tensor<byte> TensorGatherPacked(
         Tensor<byte> packed, Tensor<int> indices, int axis, int valuesPerByte)
     {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.MixedElementTypes);
+
         if (packed == null) throw new ArgumentNullException(nameof(packed));
         if (indices == null) throw new ArgumentNullException(nameof(indices));
         if (valuesPerByte != 1 && valuesPerByte != 2 && valuesPerByte != 4 && valuesPerByte != 8)
@@ -89,6 +92,8 @@ public partial class CpuEngine
     public virtual Tensor<byte> TensorScatterPacked(
         Tensor<byte> packed, Tensor<int> indices, Tensor<byte> source, int axis, int valuesPerByte)
     {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.MixedElementTypes);
+
         if (packed == null) throw new ArgumentNullException(nameof(packed));
         if (indices == null) throw new ArgumentNullException(nameof(indices));
         if (source == null) throw new ArgumentNullException(nameof(source));

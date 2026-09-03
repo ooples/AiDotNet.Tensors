@@ -95,6 +95,19 @@ internal enum OpType : byte
 
     // Appended to preserve the serialized byte ordinals of every existing operation.
     Expand,
+
+    // Composite inference kernels. Appended to preserve serialized ordinals.
+    MultiHeadAttentionForward,
+    MlpForward,
+    LstmSequenceForward,
+    ScaledDotProductAttentionGqa,
+    FusedLinearMaxout,
+    FusedHierarchicalSoftmax,
+    TensorRepeatInterleave,
+    TensorMaskedFill,
+    TensorPermute,
+    TensorMultiplyScalar,
+    GroupedQueryAttention,
 }
 
 internal static class OpTypeParser
@@ -163,6 +176,17 @@ internal static class OpTypeParser
         "TensorBinaryCrossEntropy" => OpType.BinaryCrossEntropy,
         "Embedding" or "TensorEmbeddingLookup" or "TensorEmbeddingLookupFromFloatIndices" => OpType.Embedding,
         "Expand" => OpType.Expand,
+        "MultiHeadAttentionForward" => OpType.MultiHeadAttentionForward,
+        "MlpForward" => OpType.MlpForward,
+        "LstmSequenceForward" => OpType.LstmSequenceForward,
+        "ScaledDotProductAttentionGqa" => OpType.ScaledDotProductAttentionGqa,
+        "FusedLinearMaxout" => OpType.FusedLinearMaxout,
+        "FusedHierarchicalSoftmax" => OpType.FusedHierarchicalSoftmax,
+        "TensorRepeatInterleave" => OpType.TensorRepeatInterleave,
+        "TensorMaskedFill" => OpType.TensorMaskedFill,
+        "TensorPermute" => OpType.TensorPermute,
+        "TensorMultiplyScalar" => OpType.TensorMultiplyScalar,
+        "GroupedQueryAttention" => OpType.GroupedQueryAttention,
         _ => OpType.Unknown,
     };
 }

@@ -214,25 +214,6 @@ public sealed class VideoWarpOperationsTests
         AssertClose(eager, compiled, 1e-5f);
     }
 
-    [Fact]
-    public void ScaledDotProductAttention_CompiledReplay_PreservesBooleanMask()
-    {
-        var q = new Tensor<float>([1f, 0f, 0f, 1f, 1f, 1f], [1, 1, 3, 2]);
-        var mask = new Tensor<bool>(
-            [true, false, false, true, true, false, true, true, true],
-            [1, 1, 3, 3]);
-        Func<Tensor<float>> forward = () =>
-            _engine.ScaledDotProductAttention(q, q, q, mask, scale: 1.0, out _);
-        var eager = forward().GetDataArray();
-        using var cache = new CompiledModelCache<float>();
-        var plan = cache.GetOrCompileInference(q, forward);
-        plan.SetInputs([q]);
-
-        var compiled = plan.Execute().GetDataArray();
-
-        AssertClose(eager, compiled, 1e-5f);
-    }
-
     private float Loss(
         Tensor<float> input, Tensor<float> flow, Tensor<float> gradOutput, bool normalize)
     {

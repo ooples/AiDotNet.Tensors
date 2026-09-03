@@ -3,6 +3,47 @@ using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines.Compilation;
 
+internal enum GraphTraceKind : byte
+{
+    Compatibility,
+    Inference,
+    Training
+}
+
+/// <summary>
+/// Type-safe reasons an IEngine contract cannot currently be represented by a homogeneous,
+/// fixed-shape inference plan.
+/// </summary>
+internal enum GraphCaptureLimitation : byte
+{
+    DataDependentOutputShape,
+    HeterogeneousInput,
+    HeterogeneousOutput,
+    MixedElementTypes,
+    HostBoundary,
+    Stateful,
+    MissingBackwardContract
+}
+
+/// <summary>
+/// Identifies an intentional fail-closed graph-capture rejection without conflating it with an
+/// operation's ordinary <see cref="NotSupportedException"/> failures.
+/// </summary>
+internal sealed class GraphCaptureNotSupportedException : NotSupportedException
+{
+    internal GraphCaptureNotSupportedException(
+        string operationName,
+        GraphCaptureLimitation limitation,
+        string message) : base(message)
+    {
+        OperationName = operationName;
+        Limitation = limitation;
+    }
+
+    internal string OperationName { get; }
+    internal GraphCaptureLimitation Limitation { get; }
+}
+
 /// <summary>
 /// Ambient context toggle for lazy tensor evaluation. When active, tensor operations
 /// record into a computation graph instead of executing immediately. The graph is then
@@ -34,12 +75,106 @@ internal static class GraphMode
     }
 
     /// <summary>
+    /// Whether the active scope was explicitly opened for inference. Composite kernels may retain
+    /// opaque fused nodes only in this mode. The compatibility scope deliberately returns false:
+    /// callers that choose whether to compile inference or training only after tracing must receive
+    /// a differentiable primitive graph rather than a silently non-differentiable training plan.
+    /// </summary>
+    internal static bool IsInferenceTrace
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => _current?.TraceKind == GraphTraceKind.Inference;
+    }
+
+    /// <summary>
+    /// Fails before an inference trace can partially execute an operation whose public contract is
+    /// not representable by the current plan format. Compatibility and training traces are left
+    /// untouched so their existing eager/decomposed behavior remains available.
+    /// </summary>
+    internal static void ThrowIfInferenceUnsupported(
+        GraphCaptureLimitation limitation,
+        [CallerMemberName] string operationName = "")
+    {
+        if (!IsInferenceTrace) return;
+
+        ThrowUnsupported(limitation, operationName, "an inference");
+    }
+
+    /// <summary>
+    /// Fails any active graph trace for a contract that cannot be represented by either inference
+    /// or training plans. This prevents eager execution from being mistaken for a captured constant.
+    /// </summary>
+    internal static void ThrowIfActiveUnsupported(
+        GraphCaptureLimitation limitation,
+        [CallerMemberName] string operationName = "")
+    {
+        if (!IsActive) return;
+
+        ThrowUnsupported(limitation, operationName, "a compiled");
+    }
+
+    /// <summary>
+    /// Fails compatibility/training traces while allowing an explicitly inference-only capture.
+    /// </summary>
+    internal static void ThrowIfNonInferenceUnsupported(
+        GraphCaptureLimitation limitation,
+        [CallerMemberName] string operationName = "")
+    {
+        if (!IsActive || IsInferenceTrace) return;
+
+        ThrowUnsupported(limitation, operationName, "a training");
+    }
+
+    private static void ThrowUnsupported(
+        GraphCaptureLimitation limitation,
+        string operationName,
+        string graphKind)
+    {
+
+        string reason = limitation switch
+        {
+            GraphCaptureLimitation.DataDependentOutputShape =>
+                "its output shape depends on runtime tensor values",
+            GraphCaptureLimitation.HeterogeneousInput =>
+                "its tensor inputs use different element types",
+            GraphCaptureLimitation.HeterogeneousOutput =>
+                "it returns tensor outputs with different element types",
+            GraphCaptureLimitation.MixedElementTypes =>
+                "its graph crosses tensor element types",
+            GraphCaptureLimitation.HostBoundary =>
+                "it crosses a host-only data boundary",
+            GraphCaptureLimitation.Stateful =>
+                "it mutates state during execution",
+            GraphCaptureLimitation.MissingBackwardContract =>
+                "it has no backward contract",
+            _ => throw new ArgumentOutOfRangeException(nameof(limitation))
+        };
+
+        throw new GraphCaptureNotSupportedException(
+            operationName,
+            limitation,
+            $"'{operationName}' cannot be captured in {graphKind} graph because {reason}.");
+    }
+
+    /// <summary>
     /// Enables graph mode and returns a scope. All tensor operations on this thread
     /// will record into the scope's computation graph until it is disposed.
     /// </summary>
     internal static LazyTensorScope Enable()
     {
-        var scope = new LazyTensorScope(_current);
+        var scope = new LazyTensorScope(_current, GraphTraceKind.Compatibility);
+        _current = scope;
+        return scope;
+    }
+
+    /// <summary>
+    /// Enables a graph scope whose result will be compiled for inference. This explicit intent lets
+    /// inference-only composite kernels remain fused while <see cref="Enable"/> retains the safe,
+    /// differentiable compatibility behavior required by older training callers.
+    /// </summary>
+    internal static LazyTensorScope EnableInference()
+    {
+        var scope = new LazyTensorScope(_current, GraphTraceKind.Inference);
         _current = scope;
         return scope;
     }
@@ -60,7 +195,7 @@ internal static class GraphMode
             parameters[i].PrepareForInPlaceWrite();
         }
 
-        var scope = new LazyTensorScope(_current, trainingParametersPreparedBeforeTrace: true);
+        var scope = new LazyTensorScope(_current, GraphTraceKind.Training);
         _current = scope;
         return scope;
     }

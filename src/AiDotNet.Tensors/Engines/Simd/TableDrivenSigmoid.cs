@@ -16,7 +16,7 @@ namespace AiDotNet.Tensors.Engines.Simd;
 /// Computation per element: 1 multiply (index) + 1 clamp + table load + 2 FMA
 /// Total: ~5 ops vs ~14 for exp+divide path
 ///
-/// Accuracy: max 1.96e-6 absolute error (sufficient for ML, well within float32 noise)
+/// Accuracy: max 2.1e-6 absolute error within the interpolation interval.
 /// Table: 258 entries = 1032 bytes (fits in L1 cache)
 /// </summary>
 internal static class TableDrivenSigmoid
@@ -47,6 +47,7 @@ internal static class TableDrivenSigmoid
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static float Sigmoid(float x)
     {
+        if (float.IsNaN(x)) return float.NaN;
         if (x <= XMin) return 0f;
         if (x >= XMax) return 1f;
 
@@ -79,6 +80,8 @@ internal static class TableDrivenSigmoid
             var vInvStep = Vector256.Create(InvStep);
             var vZero = Vector256<float>.Zero;
             var vOne = Vector256.Create(1.0f);
+            var vTableSize = Vector256.Create((float)TableSize);
+            var vLastQuadraticStart = Vector256.Create((float)(TableSize - 2));
             var vHalf = Vector256.Create(0.5f);
             var vNeg3 = Vector256.Create(-3.0f);
             var vFour = Vector256.Create(4.0f);
@@ -90,10 +93,14 @@ internal static class TableDrivenSigmoid
                 {
                     var x = Avx.LoadVector256(input + i);
 
-                    // Clamp and compute index
+                    // Keep the bounded interpolation coordinate separate from the capped gather
+                    // index. The final quadratic starts at TableSize-2 and deliberately evaluates
+                    // frac in [0, 2]. Clamping t itself to TableSize-2 flattened the entire upper
+                    // interval to table[TableSize-2] (sigmoid(7.875) for the 256-entry table).
                     var t = Avx.Multiply(Avx.Subtract(x, vXMin), vInvStep);
-                    t = Avx.Max(vZero, Avx.Min(t, Vector256.Create((float)(TableSize - 2))));
-                    var idx = Avx.ConvertToVector256Int32WithTruncation(t);
+                    t = Avx.Max(vZero, Avx.Min(t, vTableSize));
+                    var indexCoordinate = Avx.Min(t, vLastQuadraticStart);
+                    var idx = Avx.ConvertToVector256Int32WithTruncation(indexCoordinate);
                     var frac = Avx.Subtract(t, Avx.ConvertToVector256Single(idx));
 
                     // Gather y0, y1, y2 from table
@@ -115,8 +122,18 @@ internal static class TableDrivenSigmoid
                     // result = y0 + frac * (b + frac * c)
                     var result = Fma.MultiplyAdd(frac, Fma.MultiplyAdd(frac, c, b), y0);
 
-                    // Clamp to [0, 1] for extreme inputs
+                    // Match the scalar saturation contract and propagate NaN. Clamping only the
+                    // interpolation coordinate returned sigmoid(-8)/sigmoid(8) for infinities,
+                    // while the scalar path returns the exact saturation values.
                     result = Avx.Max(vZero, Avx.Min(vOne, result));
+                    var lowMask = Avx.Compare(
+                        x, vXMin, FloatComparisonMode.OrderedLessThanOrEqualSignaling);
+                    var highMask = Avx.Compare(
+                        x, Vector256.Create(XMax), FloatComparisonMode.OrderedGreaterThanOrEqualSignaling);
+                    var nanMask = Avx.CompareNotEqual(x, x);
+                    result = Avx.BlendVariable(result, vZero, lowMask);
+                    result = Avx.BlendVariable(result, vOne, highMask);
+                    result = Avx.BlendVariable(result, x, nanMask);
 
                     Avx.Store(output + i, result);
                 }

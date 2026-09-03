@@ -123,4 +123,11 @@ internal sealed class CrossTypeLazyNode<TIn, TOut> : ILazyNode
     {
         Output.LazySource = null;
     }
+
+    public void AddStorageLeases(TensorStorageLeaseSet leases)
+    {
+        leases.Add(Input);
+        leases.Add(Output);
+        leases.AddSavedState(SavedState);
+    }
 }

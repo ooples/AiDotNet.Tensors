@@ -4,6 +4,7 @@ using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 using AiDotNet.Tensors.LinearAlgebra;
+using AiDotNet.Tensors.Engines.Compilation;
 
 namespace AiDotNet.Tensors.Engines;
 
@@ -41,6 +42,9 @@ public partial class CpuEngine
     public virtual Tensor<T> BoxConvert<T>(Tensor<T> boxes, BoxFormat from, BoxFormat to)
     {
         ValidateBoxes(boxes, nameof(boxes));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { boxes }, engine => engine.BoxConvert(boxes, from, to));
         // CXCYWH uses ½ in element type; integral T silently truncates to 0.
         if (from == BoxFormat.CXCYWH || to == BoxFormat.CXCYWH)
             RequireFloatingPoint<T>(nameof(BoxConvert));
@@ -110,6 +114,8 @@ public partial class CpuEngine
     public virtual Tensor<T> BoxArea<T>(Tensor<T> boxes)
     {
         ValidateBoxes(boxes, nameof(boxes));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(new[] { boxes }, engine => engine.BoxArea(boxes));
         var ops = MathHelper.GetNumericOperations<T>();
         int n = boxes.Length / 4;
         // Output shape is the input shape minus the trailing 4.
@@ -138,6 +144,9 @@ public partial class CpuEngine
     {
         ValidateBoxes(boxesA, nameof(boxesA));
         ValidateBoxes(boxesB, nameof(boxesB));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { boxesA, boxesB }, engine => engine.BoxIou(boxesA, boxesB));
         if (boxesA.Rank != 2 || boxesB.Rank != 2)
             throw new ArgumentException("BoxIou requires rank-2 boxes [N, 4] and [M, 4].");
         var (iou, _, _, _) = ComputePairwiseIoU(boxesA, boxesB);
@@ -150,6 +159,9 @@ public partial class CpuEngine
     {
         ValidateBoxes(boxesA, nameof(boxesA));
         ValidateBoxes(boxesB, nameof(boxesB));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { boxesA, boxesB }, engine => engine.GeneralizedBoxIou(boxesA, boxesB));
         if (boxesA.Rank != 2 || boxesB.Rank != 2)
             throw new ArgumentException("GeneralizedBoxIou requires rank-2 boxes [N, 4] and [M, 4].");
         var ops = MathHelper.GetNumericOperations<T>();
@@ -190,6 +202,11 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> DistanceBoxIou<T>(Tensor<T> boxesA, Tensor<T> boxesB)
     {
+        if (boxesA == null) throw new ArgumentNullException(nameof(boxesA));
+        if (boxesB == null) throw new ArgumentNullException(nameof(boxesB));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { boxesA, boxesB }, engine => engine.DistanceBoxIou(boxesA, boxesB));
         var result = DiouLikeImpl(boxesA, boxesB, includeAspect: false);
         DifferentiableOps.RecordBinary("DistanceBoxIou", result, boxesA, boxesB,
             BackwardFunctions<T>.DistanceBoxIouBackward);
@@ -199,6 +216,11 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> CompleteBoxIou<T>(Tensor<T> boxesA, Tensor<T> boxesB)
     {
+        if (boxesA == null) throw new ArgumentNullException(nameof(boxesA));
+        if (boxesB == null) throw new ArgumentNullException(nameof(boxesB));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { boxesA, boxesB }, engine => engine.CompleteBoxIou(boxesA, boxesB));
         var result = DiouLikeImpl(boxesA, boxesB, includeAspect: true);
         DifferentiableOps.RecordBinary("CompleteBoxIou", result, boxesA, boxesB,
             BackwardFunctions<T>.CompleteBoxIouBackward);
@@ -208,6 +230,8 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<int> Nms<T>(Tensor<T> boxes, Tensor<T> scores, double iouThreshold)
     {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.DataDependentOutputShape);
+
         ValidateBoxes(boxes, nameof(boxes));
         if (boxes.Rank != 2) throw new ArgumentException("Nms requires rank-2 boxes [N, 4].");
         if (scores.Rank != 1 || scores._shape[0] != boxes._shape[0])
@@ -272,6 +296,8 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<int> BatchedNms<T>(Tensor<T> boxes, Tensor<T> scores, Tensor<int> classIds, double iouThreshold)
     {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.DataDependentOutputShape);
+
         ValidateBoxes(boxes, nameof(boxes));
         if (boxes.Rank != 2) throw new ArgumentException("BatchedNms requires rank-2 boxes [N, 4].");
         int n = boxes._shape[0];
@@ -315,6 +341,8 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<int> MasksToBoxes<T>(Tensor<T> masks)
     {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.MixedElementTypes);
+
         if (masks.Rank != 3)
             throw new ArgumentException("MasksToBoxes requires rank-3 masks [N, H, W].");
         var ops = MathHelper.GetNumericOperations<T>();

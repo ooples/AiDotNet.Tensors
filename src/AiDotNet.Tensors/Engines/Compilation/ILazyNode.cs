@@ -34,4 +34,7 @@ internal interface ILazyNode
 
     /// <summary>Clears the LazySource reference on the output tensor after realization.</summary>
     void ClearOutputLazySource();
+
+    /// <summary>Adds every tensor storage structurally retained by this node.</summary>
+    void AddStorageLeases(TensorStorageLeaseSet leases);
 }

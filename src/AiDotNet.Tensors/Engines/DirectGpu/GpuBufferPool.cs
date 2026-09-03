@@ -9,17 +9,43 @@ internal interface IPoolableGpuBuffer
     void Release();
 }
 
+/// <summary>
+/// Typed reuse domain for an asynchronous GPU buffer. The global value preserves the
+/// existing single-stream CUDA/HIP pool. Backends with independent command queues use a
+/// native-queue affinity so an in-flight allocation is never recycled onto an unordered queue.
+/// </summary>
+internal readonly struct GpuBufferPoolAffinity : IEquatable<GpuBufferPoolAffinity>
+{
+    private readonly long _value;
+
+    private GpuBufferPoolAffinity(long value) => _value = value;
+
+    internal static GpuBufferPoolAffinity Global => default;
+
+    internal static GpuBufferPoolAffinity ForNativeQueue(IntPtr queue)
+    {
+        if (queue == IntPtr.Zero)
+            throw new ArgumentException("A GPU buffer-pool queue affinity requires a valid native queue.", nameof(queue));
+        return new GpuBufferPoolAffinity(queue.ToInt64());
+    }
+
+    public bool Equals(GpuBufferPoolAffinity other) => _value == other._value;
+    public override bool Equals(object? obj) => obj is GpuBufferPoolAffinity other && Equals(other);
+    public override int GetHashCode() => _value.GetHashCode();
+}
+
 internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class, IGpuBuffer, IPoolableGpuBuffer
 {
     private sealed class Bucket
     {
-        public readonly ConcurrentBag<TBuffer> Buffers = new();
+        public readonly ConcurrentDictionary<GpuBufferPoolAffinity, ConcurrentBag<TBuffer>> Buffers = new();
         public int Count;
     }
 
     private readonly ConcurrentDictionary<int, Bucket> _buckets = new();
     private readonly int _maxPerSize;
     private readonly int _maxSize;
+    private readonly object _lifecycleGate = new();
     private int _disposed;
 
     public GpuBufferPool(int maxPerSize, int maxSize)
@@ -46,6 +72,9 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
     }
 
     public bool TryRent(int size, out TBuffer? buffer)
+        => TryRent(size, GpuBufferPoolAffinity.Global, out buffer);
+
+    public bool TryRent(int size, GpuBufferPoolAffinity affinity, out TBuffer? buffer)
     {
         buffer = null;
         if (Volatile.Read(ref _disposed) != 0 || size <= 0 || size > _maxSize)
@@ -55,7 +84,9 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
 
         // Use power-of-two bucket key for higher cache hit rate
         int bucketKey = NextPowerOfTwo(size);
-        if (_buckets.TryGetValue(bucketKey, out var bucket) && bucket.Buffers.TryTake(out var candidate))
+        if (_buckets.TryGetValue(bucketKey, out var bucket)
+            && bucket.Buffers.TryGetValue(affinity, out var affinityBuffers)
+            && affinityBuffers.TryTake(out var candidate))
         {
             // Verify the pooled buffer's actual allocation is large enough.
             // Power-of-two bucketing can match a smaller buffer (e.g., 6272 → bucket 8192)
@@ -64,7 +95,7 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
             {
                 // Return the too-small buffer to the pool (count stays consistent since
                 // we took one out and are putting the same one back)
-                bucket.Buffers.Add(candidate);
+                affinityBuffers.Add(candidate);
                 return false;
             }
 
@@ -78,6 +109,9 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
     }
 
     public void Return(TBuffer buffer)
+        => Return(buffer, GpuBufferPoolAffinity.Global);
+
+    public void Return(TBuffer buffer, GpuBufferPoolAffinity affinity)
     {
         if (Volatile.Read(ref _disposed) != 0 || buffer.Size > _maxSize)
         {
@@ -85,24 +119,29 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
             return;
         }
 
-        // Use power-of-two bucket key matching TryRent
-        int bucketKey = NextPowerOfTwo(buffer.Size);
-        var bucket = _buckets.GetOrAdd(bucketKey, _ => new Bucket());
-        int count = Interlocked.Increment(ref bucket.Count);
-        if (Volatile.Read(ref _disposed) != 0)
+        lock (_lifecycleGate)
         {
-            Interlocked.Decrement(ref bucket.Count);
-            buffer.Release();
-            return;
-        }
-        if (count > _maxPerSize)
-        {
-            Interlocked.Decrement(ref bucket.Count);
-            buffer.Release();
-            return;
-        }
+            if (Volatile.Read(ref _disposed) != 0)
+            {
+                buffer.Release();
+                return;
+            }
 
-        bucket.Buffers.Add(buffer);
+            // Keep bucket creation, capacity accounting, and insertion atomic with Dispose's drain.
+            // Otherwise Dispose can clear the dictionary between GetOrAdd and Add, orphaning a live
+            // device buffer in a bucket that is no longer reachable.
+            int bucketKey = NextPowerOfTwo(buffer.Size);
+            var bucket = _buckets.GetOrAdd(bucketKey, _ => new Bucket());
+            int count = Interlocked.Increment(ref bucket.Count);
+            if (count > _maxPerSize)
+            {
+                Interlocked.Decrement(ref bucket.Count);
+                buffer.Release();
+                return;
+            }
+
+            bucket.Buffers.GetOrAdd(affinity, _ => new ConcurrentBag<TBuffer>()).Add(buffer);
+        }
     }
 
     /// <summary>
@@ -123,11 +162,14 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
         int released = 0;
         foreach (var bucket in _buckets.Values)
         {
-            while (bucket.Buffers.TryTake(out var buffer))
+            foreach (var affinityBuffers in bucket.Buffers.Values)
             {
-                Interlocked.Decrement(ref bucket.Count);
-                buffer.Release();
-                released++;
+                while (affinityBuffers.TryTake(out var buffer))
+                {
+                    Interlocked.Decrement(ref bucket.Count);
+                    buffer.Release();
+                    released++;
+                }
             }
         }
         return released;
@@ -149,22 +191,28 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
             return;
         }
 
-        try
+        lock (_lifecycleGate)
         {
-            foreach (var bucket in _buckets.Values)
+            try
             {
-                while (bucket.Buffers.TryTake(out var buffer))
+                foreach (var bucket in _buckets.Values)
                 {
-                    buffer.Release();
+                    foreach (var affinityBuffers in bucket.Buffers.Values)
+                    {
+                        while (affinityBuffers.TryTake(out var buffer))
+                        {
+                            buffer.Release();
+                        }
+                    }
                 }
-            }
 
-            _buckets.Clear();
-        }
-        catch (ObjectDisposedException)
-        {
-            // A concurrent teardown disposed the bag's ThreadLocal mid-drain. Cleanup is
-            // best-effort here (OS reclaims at exit); never let it crash the finalizer.
+                _buckets.Clear();
+            }
+            catch (ObjectDisposedException)
+            {
+                // A concurrent teardown disposed the bag's ThreadLocal mid-drain. Cleanup is
+                // best-effort here (OS reclaims at exit); never let it crash the finalizer.
+            }
         }
     }
 }

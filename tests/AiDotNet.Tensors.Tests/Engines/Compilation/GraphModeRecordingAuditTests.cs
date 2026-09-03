@@ -382,7 +382,10 @@ public class GraphModeRecordingAuditTests
         for (int i = 0; i < maskSpan.Length; i++) maskSpan[i] = i % 2 == 0;
 
         using var scope = GraphMode.Enable();
-        Assert.Throws<NotSupportedException>(() => engine.TensorMaskedSelect<float>(input, mask));
+        var error = Assert.Throws<GraphCaptureNotSupportedException>(
+            () => engine.TensorMaskedSelect<float>(input, mask));
+        Assert.Equal(nameof(IEngine.TensorMaskedSelect), error.OperationName);
+        Assert.Equal(GraphCaptureLimitation.DataDependentOutputShape, error.Limitation);
     }
 
     /// <summary>

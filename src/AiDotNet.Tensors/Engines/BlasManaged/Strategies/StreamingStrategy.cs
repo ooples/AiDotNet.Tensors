@@ -28,12 +28,15 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 internal static class StreamingStrategy
 {
     /// <summary>
-    /// Microkernel column-tile width used for AxisSelector threshold computation.
-    /// Conservative value matching the AVX2 streaming kernel's vector width
-    /// (8 floats / 4 doubles in a 256-bit register).
+    /// Scheduling grain used for AxisSelector threshold computation. This is deliberately
+    /// independent of the active kernel's SIMD width: the scheduler requires at least
+    /// sixteen columns per worker, while N-axis partition boundaries use the exact kernel
+    /// tile width returned by <see cref="GetColumnTileWidth{T}"/>.
     /// </summary>
-    private const int StreamingNr = 8;
+    private const int StreamingSchedulingNr = 8;
     private const int StreamingMr = 8;
+    private const int NParallelismThresholdMultiplier = 2;
+    private const int ScalarColumnTileWidth = 1;
 
     /// <summary>
     /// Compute C += op(A) · op(B) with no packing. C is read-modify-write
@@ -53,7 +56,7 @@ internal static class StreamingStrategy
         // BlasOptions.Mode. Any source asking for Deterministic wins (OR semantics).
         bool isDeterministic = BlasProvider.IsDeterministicMode || options.Mode == BlasMode.Deterministic;
 
-        var axis = AxisSelector.Select(m, n, k, StreamingMr, StreamingNr, procs, isDeterministic);
+        var axis = SelectParallelismAxis(m, n, k, procs, isDeterministic);
 
         // K-axis (Fast mode only): tall-K shape where M and N are too small for
         // M-axis or N-axis splits. AxisSelector already gates K-axis on
@@ -66,9 +69,11 @@ internal static class StreamingStrategy
             return;
         }
 
-        if (axis == ParallelismAxis.N && n >= procs * StreamingNr * 2)
+        if (axis == ParallelismAxis.N &&
+            (long)n >= (long)procs * StreamingSchedulingNr * NParallelismThresholdMultiplier)
         {
-            RunNParallel(a, lda, transA, b, ldb, transB, c, ldc, m, n, k, procs);
+            int columnTileWidth = GetColumnTileWidth<T>(transB);
+            RunNParallel(a, lda, transA, b, ldb, transB, c, ldc, m, n, k, procs, columnTileWidth);
             return;
         }
 
@@ -96,6 +101,10 @@ internal static class StreamingStrategy
 
         RunSerial(a, lda, transA, b, ldb, transB, c, ldc, m, n, k);
     }
+
+    internal static ParallelismAxis SelectParallelismAxis(
+        int m, int n, int k, int procs, bool isDeterministic) =>
+        AxisSelector.Select(m, n, k, StreamingMr, StreamingSchedulingNr, procs, isDeterministic);
 
     /// <summary>
     /// Partition M across <paramref name="procs"/> threads. Each thread
@@ -279,7 +288,8 @@ internal static class StreamingStrategy
         ReadOnlySpan<T> b, int ldb, bool transB,
         Span<T> c, int ldc,
         int m, int n, int k,
-        int procs) where T : unmanaged
+        int procs,
+        int columnTileWidth) where T : unmanaged
     {
         // Pin a, b, c so worker threads can capture raw pointers across the
         // parallel boundary (Span<T> can't cross the Parallel.For lambda).
@@ -305,8 +315,8 @@ internal static class StreamingStrategy
 
                 PersistentParallelExecutor.Instance.Execute(procsLocal, p =>
                 {
-                    int nStart = (int)(((long)p * nLocal) / procsLocal);
-                    int nEnd = (int)(((long)(p + 1) * nLocal) / procsLocal);
+                    var (nStart, nEnd) = GetNPartitionRange(
+                        nLocal, procsLocal, p, columnTileWidth);
                     int nChunk = nEnd - nStart;
                     if (nChunk <= 0) return;
 
@@ -335,6 +345,53 @@ internal static class StreamingStrategy
                 });
             }
         }
+    }
+
+    /// <summary>
+    /// Returns the active streaming kernel's smallest SIMD column tile. A transposed B
+    /// is processed one output column at a time, even when its K reduction is vectorized.
+    /// </summary>
+    internal static int GetColumnTileWidth<T>(bool transB) where T : unmanaged
+    {
+        if (transB)
+        {
+            return ScalarColumnTileWidth;
+        }
+
+        if (typeof(T) == typeof(double))
+        {
+            if (Avx512Streaming.IsSupported) return Avx512Streaming.Fp64ColumnTileWidth;
+            if (Avx2Streaming.IsSupported) return Avx2Streaming.Fp64ColumnTileWidth;
+            if (NeonStreaming.IsSupported) return NeonStreaming.Fp64ColumnTileWidth;
+            if (PortableSimdStreaming.IsSupported) return PortableSimdStreaming.Fp64ColumnTileWidth;
+            return ScalarColumnTileWidth;
+        }
+
+        if (typeof(T) == typeof(float))
+        {
+            if (Avx512Streaming.IsSupported) return Avx512Streaming.Fp32ColumnTileWidth;
+            if (Avx2Streaming.IsSupported) return Avx2Streaming.Fp32ColumnTileWidth;
+            if (NeonStreaming.IsSupported) return NeonStreaming.Fp32ColumnTileWidth;
+            return ScalarColumnTileWidth;
+        }
+
+        throw new NotSupportedException($"StreamingStrategy does not support T={typeof(T).Name}.");
+    }
+
+    /// <summary>
+    /// Partitions complete kernel tiles across workers. Every boundary except the final
+    /// matrix tail is tile-aligned, so a parallel slice follows the same SIMD path as the
+    /// corresponding columns in serial execution.
+    /// </summary>
+    internal static (int Start, int End) GetNPartitionRange(
+        int n, int procs, int partition, int columnTileWidth)
+    {
+        int fullColumnTiles = n / columnTileWidth;
+        int firstTile = (int)(((long)partition * fullColumnTiles) / procs);
+        int tileEnd = (int)(((long)(partition + 1) * fullColumnTiles) / procs);
+        int start = firstTile * columnTileWidth;
+        int end = partition == procs - 1 ? n : tileEnd * columnTileWidth;
+        return (start, end);
     }
 
     /// <summary>

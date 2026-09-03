@@ -240,7 +240,7 @@ internal sealed class AutoTracerState
 
         try
         {
-            using var scope = GraphMode.Enable();
+            using var scope = GraphMode.EnableInference();
             var engine = AiDotNetEngine.Current;
             if (engine is null) return;
 

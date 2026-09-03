@@ -27,6 +27,7 @@ using System.Collections.Concurrent;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using AiDotNet.Tensors.Engines.Gpu;
 using AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 using Xunit;
 
@@ -125,4 +126,99 @@ public class DirectOpenClContextConcurrencyTests
         // Re-entrant Dispose() is a no-op contract.
         ctx.Dispose();
     }
+
+    [SkippableFact]
+    public void BufferPool_DoesNotRecycleAllocationAcrossUnorderedThreadQueues()
+    {
+        Skip.IfNot(OpenClPresent(), "No OpenCL GPU device available on this host.");
+        using var backend = new OpenClBackend(deviceIndex: 0);
+
+        IntPtr queueABuffer = IntPtr.Zero;
+        IntPtr queueBBuffer = IntPtr.Zero;
+        Exception? workerFailure = null;
+        var firstReturned = new ManualResetEventSlim(false);
+
+        var threadA = new Thread(() =>
+        {
+            try
+            {
+                using (var first = backend.AllocateBuffer(64))
+                    queueABuffer = first.Handle;
+
+                // The same queue must retain the fast reuse path.
+                using (var sameQueue = backend.AllocateBuffer(64))
+                    Assert.Equal(queueABuffer, sameQueue.Handle);
+            }
+            catch (Exception ex)
+            {
+                workerFailure = ex;
+            }
+            finally
+            {
+                firstReturned.Set();
+            }
+        }) { IsBackground = true };
+
+        var threadB = new Thread(() =>
+        {
+            try
+            {
+                firstReturned.Wait();
+                using var differentQueue = backend.AllocateBuffer(64);
+                queueBBuffer = differentQueue.Handle;
+            }
+            catch (Exception ex)
+            {
+                workerFailure = ex;
+            }
+        }) { IsBackground = true };
+
+        threadA.Start();
+        threadB.Start();
+        Assert.True(threadA.Join(TimeSpan.FromSeconds(30)));
+        Assert.True(threadB.Join(TimeSpan.FromSeconds(30)));
+        Assert.Null(workerFailure);
+        Assert.NotEqual(IntPtr.Zero, queueABuffer);
+        Assert.NotEqual(IntPtr.Zero, queueBBuffer);
+        Assert.NotEqual(queueABuffer, queueBBuffer);
+    }
+
+    [SkippableFact]
+    public void AsyncTransfer_CrossQueueDependencyAndHostPins_PreserveData()
+    {
+        Skip.IfNot(OpenClPresent(), "No OpenCL GPU device available on this host.");
+        using var backend = new OpenClBackend(deviceIndex: 0);
+        using var producer = backend.CreateStream(GpuStreamType.HostToDevice);
+        using var consumer = backend.CreateStream(GpuStreamType.Compute);
+        const int length = 262_144;
+        using var buffer = backend.AllocateBuffer(length);
+        var destination = new float[length];
+
+        QueueTemporarySpanUpload(backend, buffer, producer, length);
+        backend.DownloadBufferAsync(buffer, destination, consumer);
+
+        // The span upload owns a staged array that is reachable only through the pending host-transfer
+        // pin after QueueTemporarySpanUpload returns. A compacting collection before either queue is
+        // synchronized exercises that lifetime, while the download on a different queue exercises the
+        // automatically inserted producer-event dependency.
+        GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+        consumer.Synchronize();
+
+        for (int i = 0; i < destination.Length; i++)
+            Assert.Equal(ExpectedValue(i), destination[i]);
+    }
+
+    private static void QueueTemporarySpanUpload(
+        OpenClBackend backend,
+        AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer buffer,
+        IGpuStream stream,
+        int length)
+    {
+        var source = new float[length];
+        for (int i = 0; i < source.Length; i++) source[i] = ExpectedValue(i);
+        backend.UploadBufferAsync(source.AsSpan(), buffer, stream);
+    }
+
+    private static float ExpectedValue(int index)
+        => ((index * 17) % 1009 - 504) / 32f;
 }

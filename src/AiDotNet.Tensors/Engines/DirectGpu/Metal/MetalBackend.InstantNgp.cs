@@ -1,6 +1,6 @@
 namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 
-public sealed partial class MetalBackend : IInstantNgpBackend, IUniqueConsecutiveBackend, INonzeroBackend, IModeBackend, IResidentIndexBackend, ICtcLossBackend, IImportanceSamplingBackend, INmsBackend, ISpiralIndicesBackend
+public sealed partial class MetalBackend : IInstantNgpBackend, IFrexpBackend, IRenderingGeometryBackend, IUniqueConsecutiveBackend, INonzeroBackend, IModeBackend, IResidentIndexBackend, ICtcLossBackend, IImportanceSamplingBackend, INmsBackend, ISpiralIndicesBackend
 {
     private void DispatchInstantNgp(
         string kernelName,
@@ -64,6 +64,120 @@ public sealed partial class MetalBackend : IInstantNgpBackend, IUniqueConsecutiv
         encoder.SetPipelineState(pipeline.Handle);
         encoder.SetBuffer(inputBuffer, 0); encoder.SetBuffer(outputBuffer, 1);
         encoder.SetBuffer(countBuffer, 2); encoder.SetBytes(length, 3);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+    }
+
+    public void Frexp(
+        IGpuBuffer input, IGpuBuffer mantissa, IGpuBuffer exponent, int length)
+    {
+        if (length <= 0) return;
+        ThrowIfDisposed();
+        var pipeline = GetPipeline(AudioLibName, _audioLibrary, "frexp_decompose");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(length);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer((MetalGpuBuffer)input, 0);
+        encoder.SetBuffer((MetalGpuBuffer)mantissa, 1);
+        encoder.SetBuffer((MetalGpuBuffer)exponent, 2);
+        encoder.SetBytes(length, 3);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+    }
+
+    public void UniqueConsecutiveWithInfo(
+        IGpuBuffer input, IGpuBuffer outputValues, IGpuBuffer outputInverse,
+        IGpuBuffer outputCounts, IGpuBuffer outputCount, int length,
+        bool returnInverse, bool returnCounts)
+    {
+        if (length <= 0) return;
+        ThrowIfDisposed();
+        var pipeline = GetPipeline(AudioLibName, _audioLibrary, "unique_consecutive_with_info");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(1);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer((MetalGpuBuffer)input, 0);
+        encoder.SetBuffer((MetalGpuBuffer)outputValues, 1);
+        encoder.SetBuffer((MetalGpuBuffer)outputInverse, 2);
+        encoder.SetBuffer((MetalGpuBuffer)outputCounts, 3);
+        encoder.SetBuffer((MetalGpuBuffer)outputCount, 4);
+        encoder.SetBytes(length, 5);
+        encoder.SetBytes(returnInverse ? 1 : 0, 6);
+        encoder.SetBytes(returnCounts ? 1 : 0, 7);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+    }
+
+    public void ProjectGaussians3DTo2D(
+        IGpuBuffer means3D, IGpuBuffer covariances3D, IGpuBuffer means2D,
+        IGpuBuffer covariances2D, IGpuBuffer depths, IGpuBuffer visible,
+        int numGaussians, int covarianceStride, int imageWidth, int imageHeight,
+        float v00, float v01, float v02, float v03,
+        float v10, float v11, float v12, float v13,
+        float v20, float v21, float v22, float v23, float p00, float p11)
+    {
+        if (numGaussians <= 0) return;
+        ThrowIfDisposed();
+        var pipeline = GetPipeline(AudioLibName, _audioLibrary, "project_gaussians_3d_to_2d");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(numGaussians);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer((MetalGpuBuffer)means3D, 0);
+        encoder.SetBuffer((MetalGpuBuffer)covariances3D, 1);
+        encoder.SetBuffer((MetalGpuBuffer)means2D, 2);
+        encoder.SetBuffer((MetalGpuBuffer)covariances2D, 3);
+        encoder.SetBuffer((MetalGpuBuffer)depths, 4); encoder.SetBuffer((MetalGpuBuffer)visible, 5);
+        encoder.SetBytes(numGaussians, 6); encoder.SetBytes(covarianceStride, 7);
+        encoder.SetBytes(imageWidth, 8); encoder.SetBytes(imageHeight, 9);
+        encoder.SetBytes(v00, 10); encoder.SetBytes(v01, 11); encoder.SetBytes(v02, 12); encoder.SetBytes(v03, 13);
+        encoder.SetBytes(v10, 14); encoder.SetBytes(v11, 15); encoder.SetBytes(v12, 16); encoder.SetBytes(v13, 17);
+        encoder.SetBytes(v20, 18); encoder.SetBytes(v21, 19); encoder.SetBytes(v22, 20); encoder.SetBytes(v23, 21);
+        encoder.SetBytes(p00, 22); encoder.SetBytes(p11, 23);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+    }
+
+    public void SampleRaysWithOccupancy(
+        IGpuBuffer rayOrigins, IGpuBuffer rayDirections, IGpuBuffer occupancyBitfield,
+        IGpuBuffer positions, IGpuBuffer directions, IGpuBuffer validMask, IGpuBuffer tValues,
+        int numRays, int occupancyWordCount, int gridSize, int maxSamples,
+        float minX, float minY, float minZ, float maxX, float maxY, float maxZ,
+        float nearBound, float farBound)
+    {
+        int total = checked(numRays * maxSamples);
+        if (total <= 0) return;
+        ThrowIfDisposed();
+        var pipeline = GetPipeline(AudioLibName, _audioLibrary, "sample_rays_with_occupancy");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(total);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer((MetalGpuBuffer)rayOrigins, 0); encoder.SetBuffer((MetalGpuBuffer)rayDirections, 1);
+        encoder.SetBuffer((MetalGpuBuffer)occupancyBitfield, 2); encoder.SetBuffer((MetalGpuBuffer)positions, 3);
+        encoder.SetBuffer((MetalGpuBuffer)directions, 4); encoder.SetBuffer((MetalGpuBuffer)validMask, 5);
+        encoder.SetBuffer((MetalGpuBuffer)tValues, 6); encoder.SetBytes(numRays, 7);
+        encoder.SetBytes(occupancyWordCount, 8); encoder.SetBytes(gridSize, 9); encoder.SetBytes(maxSamples, 10);
+        encoder.SetBytes(minX, 11); encoder.SetBytes(minY, 12); encoder.SetBytes(minZ, 13);
+        encoder.SetBytes(maxX, 14); encoder.SetBytes(maxY, 15); encoder.SetBytes(maxZ, 16);
+        encoder.SetBytes(nearBound, 17); encoder.SetBytes(farBound, 18);
+        encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
+    }
+
+    public void UniqueSortedWithInfo(
+        IGpuBuffer sortedInput, IGpuBuffer sortedOriginalIndices, IGpuBuffer outputValues,
+        IGpuBuffer outputInverse, IGpuBuffer outputCounts, IGpuBuffer outputCount,
+        int length, bool returnInverse, bool returnCounts)
+    {
+        if (length <= 0) return;
+        ThrowIfDisposed();
+        var pipeline = GetPipeline(AudioLibName, _audioLibrary, "unique_sorted_with_info");
+        var (threadgroups, threadsPerGroup) = pipeline.Calculate1DDispatch(1);
+        using var encoder = _commandQueue.CreateScopedComputeEncoder();
+        encoder.SetPipelineState(pipeline.Handle);
+        encoder.SetBuffer((MetalGpuBuffer)sortedInput, 0);
+        encoder.SetBuffer((MetalGpuBuffer)sortedOriginalIndices, 1);
+        encoder.SetBuffer((MetalGpuBuffer)outputValues, 2);
+        encoder.SetBuffer((MetalGpuBuffer)outputInverse, 3);
+        encoder.SetBuffer((MetalGpuBuffer)outputCounts, 4);
+        encoder.SetBuffer((MetalGpuBuffer)outputCount, 5);
+        encoder.SetBytes(length, 6);
+        encoder.SetBytes(returnInverse ? 1 : 0, 7);
+        encoder.SetBytes(returnCounts ? 1 : 0, 8);
         encoder.DispatchThreadgroups(threadgroups, threadsPerGroup);
     }
 

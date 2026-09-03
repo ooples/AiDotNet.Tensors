@@ -24,6 +24,9 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 /// </summary>
 internal static class NeonStreaming
 {
+    internal const int Fp64ColumnTileWidth = 2;
+    internal const int Fp32ColumnTileWidth = 4;
+
 #if NET8_0_OR_GREATER
     /// <summary>Runtime support gate. True when ARM64 AdvSimd intrinsics are usable on the current process.</summary>
     public static bool IsSupported => AdvSimd.Arm64.IsSupported;
@@ -53,7 +56,7 @@ internal static class NeonStreaming
         // NN and TN: B is contiguous along N. Process the C output in 2-wide
         // column blocks. For each output row i and each col-block jb (2 cols),
         // accumulate over k using Vector128<double> loads from B.
-        int nBlocks = n / 2;
+        int nBlocks = n / Fp64ColumnTileWidth;
 
         fixed (double* aPtr = a)
         fixed (double* bPtr = b)
@@ -64,7 +67,7 @@ internal static class NeonStreaming
                 // Process 2-col blocks via SIMD.
                 for (int jb = 0; jb < nBlocks; jb++)
                 {
-                    int jStart = jb * 2;
+                    int jStart = jb * Fp64ColumnTileWidth;
                     Vector128<double> acc = AdvSimd.LoadVector128(cPtr + i * ldc + jStart);
                     for (int kk = 0; kk < k; kk++)
                     {
@@ -76,7 +79,7 @@ internal static class NeonStreaming
                     AdvSimd.Store(cPtr + i * ldc + jStart, acc);
                 }
                 // Scalar tail for n % 2.
-                for (int j = nBlocks * 2; j < n; j++)
+                for (int j = nBlocks * Fp64ColumnTileWidth; j < n; j++)
                 {
                     double sum = cPtr[i * ldc + j];
                     for (int kk = 0; kk < k; kk++)
@@ -112,7 +115,7 @@ internal static class NeonStreaming
         }
 
         // FP32: 4-wide Vector128<float> blocks.
-        int nBlocks = n / 4;
+        int nBlocks = n / Fp32ColumnTileWidth;
 
         fixed (float* aPtr = a)
         fixed (float* bPtr = b)
@@ -123,7 +126,7 @@ internal static class NeonStreaming
                 // Process 4-col blocks via SIMD.
                 for (int jb = 0; jb < nBlocks; jb++)
                 {
-                    int jStart = jb * 4;
+                    int jStart = jb * Fp32ColumnTileWidth;
                     Vector128<float> acc = AdvSimd.LoadVector128(cPtr + i * ldc + jStart);
                     for (int kk = 0; kk < k; kk++)
                     {
@@ -135,7 +138,7 @@ internal static class NeonStreaming
                     AdvSimd.Store(cPtr + i * ldc + jStart, acc);
                 }
                 // Scalar tail for n % 4.
-                for (int j = nBlocks * 4; j < n; j++)
+                for (int j = nBlocks * Fp32ColumnTileWidth; j < n; j++)
                 {
                     float sum = cPtr[i * ldc + j];
                     for (int kk = 0; kk < k; kk++)

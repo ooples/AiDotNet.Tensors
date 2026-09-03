@@ -41,6 +41,8 @@ internal sealed class GpuCompiledPlan<T> : IDisposable
     /// </summary>
     internal Tensor<T> Execute()
     {
+        if (_disposed) throw new ObjectDisposedException(nameof(GpuCompiledPlan<T>));
+        using var recordingSuspension = GraphMode.SuspendRecording();
         if (_captured)
         {
             // Phase 5+: cuGraphLaunch replay here

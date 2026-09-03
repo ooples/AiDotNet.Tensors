@@ -3,6 +3,8 @@
 // Works on ALL .NET versions including .NET Framework 4.6.2.
 
 using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Threading;
 
@@ -34,6 +36,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         private IntPtr _platform;
         private bool _profilingSupported;
         private bool _disposed;
+        private readonly object _retirementLock = new object();
+        private readonly List<RetiredMemoryObject> _retiredMemoryObjects = new List<RetiredMemoryObject>();
+        private readonly List<PendingHostTransfer> _pendingHostTransfers = new List<PendingHostTransfer>();
+        private readonly ConcurrentDictionary<IntPtr, byte> _completedQueues = new ConcurrentDictionary<IntPtr, byte>();
         // Per-instance lock that serializes the ONE-TIME clCreateCommandQueue
         // call per worker thread. The OpenCL 1.2 spec § 5.1.1 lists
         // clCreateCommandQueue as thread-safe, but at least AMD's RDNA1 driver
@@ -45,6 +51,32 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         // matches PyTorch's CUDA stream pool which serialises cudaStreamCreate
         // for the same reason on older NVIDIA drivers.
         private readonly object _queueCreateLock = new object();
+
+        private readonly struct RetiredMemoryObject
+        {
+            internal readonly IntPtr MemoryObject;
+            internal readonly IntPtr CompletionEvent;
+            internal readonly long ByteSize;
+
+            internal RetiredMemoryObject(IntPtr memoryObject, IntPtr completionEvent, long byteSize)
+            {
+                MemoryObject = memoryObject;
+                CompletionEvent = completionEvent;
+                ByteSize = byteSize;
+            }
+        }
+
+        private readonly struct PendingHostTransfer
+        {
+            internal readonly IntPtr CompletionEvent;
+            internal readonly GCHandle PinnedMemory;
+
+            internal PendingHostTransfer(IntPtr completionEvent, GCHandle pinnedMemory)
+            {
+                CompletionEvent = completionEvent;
+                PinnedMemory = pinnedMemory;
+            }
+        }
 
         public IntPtr Context => _context;
 
@@ -93,6 +125,155 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public bool IsProfilingEnabled => _profilingSupported;
 
         public IntPtr Device => _device;
+
+        internal bool IsQueueKnownComplete(IntPtr queue)
+            => queue != IntPtr.Zero && _completedQueues.ContainsKey(queue);
+
+        internal void RegisterMemoryObject(IDirectOpenClMemoryObject memory)
+        {
+            ReapCompletedResources();
+            DirectOpenClSubmission.Register(memory);
+        }
+
+        /// <summary>
+        /// Retains a pinned managed transfer buffer until its non-blocking OpenCL command completes. A
+        /// <c>fixed</c> statement that ends immediately after <c>clEnqueueRead/WriteBuffer</c> is not a valid
+        /// asynchronous lifetime: the GC may move that array while the device still owns its pointer.
+        /// </summary>
+        internal void TrackHostTransfer(IntPtr completionEvent, GCHandle pinnedMemory)
+        {
+            if (completionEvent == IntPtr.Zero)
+            {
+                if (pinnedMemory.IsAllocated) pinnedMemory.Free();
+                throw new ArgumentException("An asynchronous host transfer requires a completion event.", nameof(completionEvent));
+            }
+
+            lock (_retirementLock)
+                _pendingHostTransfers.Add(new PendingHostTransfer(completionEvent, pinnedMemory));
+            ReapCompletedResources();
+        }
+
+        /// <summary>
+        /// Detaches a native memory object from future submissions and retires it behind a marker on its
+        /// last-use queue. This is deliberately asynchronous: pool overflow must not turn into a hidden
+        /// <c>clFinish</c> on the allocation hot path.
+        /// </summary>
+        internal void RetireMemoryObject(
+            IDirectOpenClMemoryObject memory,
+            IntPtr memoryObject,
+            long byteSize)
+        {
+            if (memoryObject == IntPtr.Zero) return;
+
+            bool releaseImmediately = false;
+            lock (DirectOpenClSubmission.Gate)
+            {
+                DirectOpenClSubmission.Unregister(memoryObject, memory);
+                IntPtr lastQueue = memory.LastSubmissionQueue;
+                memory.LastSubmissionQueue = IntPtr.Zero;
+
+                if (_disposed || lastQueue == IntPtr.Zero || IsQueueKnownComplete(lastQueue))
+                {
+                    releaseImmediately = true;
+                }
+                else
+                {
+                    int err = OpenClNativeBindings.EnqueueMarkerWithWaitList(
+                        lastQueue, 0, null, out IntPtr completionEvent);
+                    if (err == OpenClNativeBindings.CL_SUCCESS && completionEvent != IntPtr.Zero)
+                    {
+                        // Start the marker without waiting. Reaping is performed opportunistically by later
+                        // allocations/retirements and deterministically during context disposal.
+                        OpenClNativeBindings.Flush(lastQueue);
+                        lock (_retirementLock)
+                            _retiredMemoryObjects.Add(
+                                new RetiredMemoryObject(memoryObject, completionEvent, byteSize));
+                    }
+                    else
+                    {
+                        // Event creation failed, so there is no safe asynchronous ownership token. Finish only
+                        // this exceptional reclamation path rather than risking a use-after-release.
+                        OpenClNativeBindings.Finish(lastQueue);
+                        releaseImmediately = true;
+                    }
+                }
+            }
+
+            if (releaseImmediately)
+                ReleaseMemoryObject(memoryObject, byteSize);
+            else
+                ReapCompletedResources();
+        }
+
+        /// <summary>Reclaims event-fenced memory and host pins whose commands completed, without blocking.</summary>
+        internal void ReapCompletedResources()
+        {
+            lock (_retirementLock)
+            {
+                for (int i = _retiredMemoryObjects.Count - 1; i >= 0; i--)
+                {
+                    var retired = _retiredMemoryObjects[i];
+                    if (!IsEventComplete(retired.CompletionEvent)) continue;
+                    _retiredMemoryObjects.RemoveAt(i);
+                    OpenClNativeBindings.ReleaseEvent(retired.CompletionEvent);
+                    ReleaseMemoryObject(retired.MemoryObject, retired.ByteSize);
+                }
+
+                for (int i = _pendingHostTransfers.Count - 1; i >= 0; i--)
+                {
+                    var transfer = _pendingHostTransfers[i];
+                    if (!IsEventComplete(transfer.CompletionEvent)) continue;
+                    _pendingHostTransfers.RemoveAt(i);
+                    OpenClNativeBindings.ReleaseEvent(transfer.CompletionEvent);
+                    if (transfer.PinnedMemory.IsAllocated) transfer.PinnedMemory.Free();
+                }
+            }
+        }
+
+        internal int PendingMemoryRetirementCount
+        {
+            get { lock (_retirementLock) return _retiredMemoryObjects.Count; }
+        }
+
+        private static bool IsEventComplete(IntPtr eventHandle)
+        {
+            IntPtr statusPtr = Marshal.AllocHGlobal(sizeof(int));
+            try
+            {
+                int err = OpenClNativeBindings.GetEventInfo(
+                    eventHandle,
+                    OpenClNativeBindings.CL_EVENT_COMMAND_EXECUTION_STATUS,
+                    (UIntPtr)sizeof(int),
+                    statusPtr,
+                    out _);
+                if (err != OpenClNativeBindings.CL_SUCCESS) return false;
+                // Negative values are terminal command errors and are just as safe to reclaim as success.
+                return Marshal.ReadInt32(statusPtr) <= OpenClNativeBindings.CL_COMPLETE;
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(statusPtr);
+            }
+        }
+
+        private static void ReleaseMemoryObject(IntPtr memoryObject, long byteSize)
+        {
+            OpenClNativeBindings.ReleaseMemObject(memoryObject);
+            GpuKernelDiagnostics.RecordBufferReleased(byteSize);
+        }
+
+        internal void CompleteQueueForDisposal(IntPtr queue)
+        {
+            if (queue == IntPtr.Zero) return;
+            lock (DirectOpenClSubmission.Gate)
+            {
+                int err = OpenClNativeBindings.Finish(queue);
+                if (err != OpenClNativeBindings.CL_SUCCESS)
+                    throw new InvalidOperationException($"Failed to finish OpenCL command queue during disposal: {err}");
+                _completedQueues.TryAdd(queue, 0);
+            }
+            ReapCompletedResources();
+        }
 
         public string DeviceName { get; private set; } = string.Empty;
         public string DeviceVendor { get; private set; } = string.Empty;
@@ -461,10 +642,70 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public void Dispose()
         {
             if (_disposed) return;
-            // Mark disposed FIRST so any concurrent lazy-init from a worker thread
-            // sees the flag and returns IntPtr.Zero instead of creating a new queue
-            // that would leak past disposal.
-            _disposed = true;
+
+            // Stop new submissions and finish every implicit queue under the same gate used to enqueue
+            // kernels. This closes the check/enqueue/dispose race and makes context teardown a real lifetime
+            // boundary instead of releasing queue handles while work is still outstanding.
+            lock (DirectOpenClSubmission.Gate)
+            {
+                if (_disposed) return;
+                _disposed = true;
+
+                var regularToFinish = _threadCommandQueue;
+                if (regularToFinish is not null)
+                {
+                    foreach (IntPtr q in regularToFinish.Values)
+                    {
+                        if (q == IntPtr.Zero) continue;
+                        OpenClNativeBindings.Finish(q);
+                        _completedQueues.TryAdd(q, 0);
+                    }
+                }
+
+                var profilingToFinish = _threadProfilingCommandQueue;
+                if (profilingToFinish is not null)
+                {
+                    foreach (IntPtr q in profilingToFinish.Values)
+                    {
+                        if (q == IntPtr.Zero) continue;
+                        OpenClNativeBindings.Finish(q);
+                        _completedQueues.TryAdd(q, 0);
+                    }
+                }
+            }
+
+            // Every retirement marker is now either complete or belongs to an explicit stream. Waiting for
+            // those event handles covers the latter without needing to retain or enumerate stream wrappers.
+            lock (_retirementLock)
+            {
+                int eventCount = _retiredMemoryObjects.Count + _pendingHostTransfers.Count;
+                if (eventCount > 0)
+                {
+                    var events = new IntPtr[eventCount];
+                    int eventIndex = 0;
+                    for (int i = 0; i < _retiredMemoryObjects.Count; i++)
+                        events[eventIndex++] = _retiredMemoryObjects[i].CompletionEvent;
+                    for (int i = 0; i < _pendingHostTransfers.Count; i++)
+                        events[eventIndex++] = _pendingHostTransfers[i].CompletionEvent;
+                    OpenClNativeBindings.WaitForEvents((uint)events.Length, events);
+
+                    for (int i = 0; i < _retiredMemoryObjects.Count; i++)
+                    {
+                        var retired = _retiredMemoryObjects[i];
+                        OpenClNativeBindings.ReleaseEvent(retired.CompletionEvent);
+                        ReleaseMemoryObject(retired.MemoryObject, retired.ByteSize);
+                    }
+                    _retiredMemoryObjects.Clear();
+
+                    for (int i = 0; i < _pendingHostTransfers.Count; i++)
+                    {
+                        var transfer = _pendingHostTransfers[i];
+                        OpenClNativeBindings.ReleaseEvent(transfer.CompletionEvent);
+                        if (transfer.PinnedMemory.IsAllocated) transfer.PinnedMemory.Free();
+                    }
+                    _pendingHostTransfers.Clear();
+                }
+            }
 
             var profiling = _threadProfilingCommandQueue;
             _threadProfilingCommandQueue = null;

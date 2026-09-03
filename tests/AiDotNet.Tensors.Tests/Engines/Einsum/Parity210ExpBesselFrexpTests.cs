@@ -81,4 +81,27 @@ public class Parity210ExpBesselFrexpTests
         Assert.True(Close(-0.5f, m[0]));
         Assert.Equal(4, e[0]);
     }
+
+    [Fact]
+    public void Frexp_NonFiniteValues_ArePreservedWithZeroExponent()
+    {
+        var x = T(new[] { float.PositiveInfinity, float.NegativeInfinity, float.NaN }, 3);
+        var (mantissa, exponent) = E.TensorFrexp(x);
+
+        Assert.Equal(float.PositiveInfinity, mantissa[0]);
+        Assert.Equal(float.NegativeInfinity, mantissa[1]);
+        Assert.True(float.IsNaN(mantissa[2]));
+        Assert.Equal(new[] { 0, 0, 0 }, exponent.ToArray());
+    }
+
+    [Fact]
+    public void Frexp_Subnormal_ReconstructsInput()
+    {
+        float value = float.Epsilon;
+        var x = T(new[] { value }, 1);
+        var (mantissa, exponent) = E.TensorFrexp(x);
+
+        Assert.InRange(MathF.Abs(mantissa[0]), 0.5f, 1f);
+        Assert.Equal(value, mantissa[0] * (float)Math.Pow(2.0, exponent[0]));
+    }
 }

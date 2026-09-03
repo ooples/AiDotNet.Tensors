@@ -21,7 +21,10 @@ public class TapeGradientParityTests
     public TapeGradientParityTests(OpParityFixture fx) => _fx = fx;
 
     public static IEnumerable<object[]> AllOps() =>
-        OpParityRegistry.All().Where(op => ParityShard.Include(op.Name)).Select(op => new object[] { op.Name });
+        OpParityRegistry.All()
+            .Where(op => op.GraphCaptureExpectation != GraphCaptureExpectation.BackwardKernel)
+            .Where(op => ParityShard.Include(op.Name))
+            .Select(op => new object[] { op.Name });
 
     [SkippableTheory]
     [MemberData(nameof(AllOps))]

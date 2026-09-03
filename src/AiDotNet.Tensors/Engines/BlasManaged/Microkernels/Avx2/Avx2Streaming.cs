@@ -19,6 +19,9 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 /// </summary>
 internal static class Avx2Streaming
 {
+    internal const int Fp64ColumnTileWidth = 4;
+    internal const int Fp32ColumnTileWidth = 8;
+
 #if NET5_0_OR_GREATER
     /// <summary>Runtime support gate.</summary>
     public static bool IsSupported => Avx2.IsSupported && Fma.IsSupported;
@@ -55,8 +58,8 @@ internal static class Avx2Streaming
         // FP64 vec width = 4 doubles, so 4-acc covers 16 cols which is the sweet
         // spot for Zen3 FMA pipelining (needs 5+ acc, but 4 + B-load chain is close).
         int nBig = (n / 16) * 16;     // largest multiple of 16 ≤ n
-        int nBlocks = n / 4;           // 4-col blocks for the tail
-        int nBig4_blocks = nBig / 4;   // covered by the 4-acc loop
+        int nBlocks = n / Fp64ColumnTileWidth;           // 4-col blocks for the tail
+        int nBig4_blocks = nBig / Fp64ColumnTileWidth;   // covered by the 4-acc loop
 
         fixed (double* aPtr = a)
         fixed (double* bPtr = b)
@@ -89,7 +92,7 @@ internal static class Avx2Streaming
                 // ── 1-acc SIMD path: remaining 4-col blocks ──
                 for (int jb = nBig4_blocks; jb < nBlocks; jb++)
                 {
-                    int jStart = jb * 4;
+                    int jStart = jb * Fp64ColumnTileWidth;
                     Vector256<double> acc = Avx.LoadVector256(cPtr + i * ldc + jStart);
                     for (int kk = 0; kk < k; kk++)
                     {
@@ -101,7 +104,7 @@ internal static class Avx2Streaming
                     Avx.Store(cPtr + i * ldc + jStart, acc);
                 }
                 // Scalar tail for n % 4.
-                for (int j = nBlocks * 4; j < n; j++)
+                for (int j = nBlocks * Fp64ColumnTileWidth; j < n; j++)
                 {
                     double sum = cPtr[i * ldc + j];
                     for (int kk = 0; kk < k; kk++)
@@ -161,9 +164,9 @@ internal static class Avx2Streaming
         // in the D6 baseline for these shapes (ResNet50_fc, MobileNetV2_fc).
         int nBig = m == 1 ? 0 : (n / 64) * 64;       // M=1: skip 8-acc loop entirely
         int nBig32 = (n / 32) * 32;     // largest multiple of 32 ≤ n
-        int nBlocks = n / 8;             // 8-col blocks for the trailing tail
-        int nBig64_blocks = nBig / 8;    // covered by the 8-acc loop
-        int nBig32_blocks = nBig32 / 8;  // covered by either 8-acc or 4-acc
+        int nBlocks = n / Fp32ColumnTileWidth;             // 8-col blocks for the trailing tail
+        int nBig64_blocks = nBig / Fp32ColumnTileWidth;    // covered by the 8-acc loop
+        int nBig32_blocks = nBig32 / Fp32ColumnTileWidth;  // covered by either 8-acc or 4-acc
 
         fixed (float* aPtr = a)
         fixed (float* bPtr = b)
@@ -230,7 +233,7 @@ internal static class Avx2Streaming
                 // ── 1-acc SIMD path: remaining 8-col blocks ──────
                 for (int jb = nBig32_blocks; jb < nBlocks; jb++)
                 {
-                    int jStart = jb * 8;
+                    int jStart = jb * Fp32ColumnTileWidth;
                     Vector256<float> acc = Avx.LoadVector256(cPtr + i * ldc + jStart);
                     for (int kk = 0; kk < k; kk++)
                     {
@@ -242,7 +245,7 @@ internal static class Avx2Streaming
                     Avx.Store(cPtr + i * ldc + jStart, acc);
                 }
                 // ── Scalar n tail (n % 8) ──────────────────────────────────────
-                for (int j = nBlocks * 8; j < n; j++)
+                for (int j = nBlocks * Fp32ColumnTileWidth; j < n; j++)
                 {
                     float sum = cPtr[i * ldc + j];
                     for (int kk = 0; kk < k; kk++)

@@ -87,6 +87,19 @@ internal static class OpSerializationRegistry<T>
             // ── FusedLinear ─────────────────────────────────────────────
             OpType.FusedLinear => RebuildFusedLinear(inputs),
 
+            // Composite inference kernels.
+            OpType.MultiHeadAttentionForward => RebuildMultiHeadAttentionForward(inputs, savedState),
+            OpType.MlpForward => RebuildMlpForward(inputs, savedState),
+            OpType.LstmSequenceForward => RebuildLstmSequenceForward(inputs, savedState),
+            OpType.ScaledDotProductAttentionGqa => RebuildScaledDotProductAttentionGqa(inputs, savedState),
+            OpType.FusedLinearMaxout => RebuildFusedLinearMaxout(inputs, savedState),
+            OpType.FusedHierarchicalSoftmax => RebuildFusedHierarchicalSoftmax(inputs, savedState),
+            OpType.TensorRepeatInterleave => RebuildTensorRepeatInterleave(inputs, output, savedState),
+            OpType.TensorMaskedFill => RebuildTensorMaskedFill(inputs, savedState),
+            OpType.TensorPermute => RebuildTensorPermute(inputs, savedState),
+            OpType.TensorMultiplyScalar => RebuildTensorMultiplyScalar(inputs, savedState),
+            OpType.GroupedQueryAttention => RebuildGroupedQueryAttention(inputs, savedState),
+
             // ── Loss ────────────────────────────────────────────────────
             OpType.CrossEntropyLoss => Binary(inputs, (e, a, b) => e.TensorCrossEntropyLoss(a, b)),
 
@@ -101,40 +114,6 @@ internal static class OpSerializationRegistry<T>
                 "This plan cannot be deserialized. Re-compile from source instead."),
         };
     }
-
-    /// <summary>
-    /// Returns true only for OpTypes that have an actual rebuild handler in
-    /// the switch above — NOT "anything except Unknown." Callers use this to
-    /// decide whether a plan is serializable without having to catch
-    /// <see cref="NotSupportedException"/> from a later rebuild, so the two
-    /// sides must stay exactly aligned. When adding a new rebuild case,
-    /// also add its OpType to the list below.
-    /// </summary>
-    internal static bool IsSupported(OpType opType) => opType switch
-    {
-        // Unary
-        OpType.Sigmoid or OpType.Tanh or OpType.ReLU or OpType.GELU or
-        OpType.Swish or OpType.Mish or OpType.Softplus or OpType.TensorExp or
-        OpType.TensorLog or OpType.TensorSqrt or OpType.TensorAbs or
-        OpType.TensorNegate or OpType.TensorTranspose or OpType.Floor or
-        OpType.Ceiling or OpType.Round or OpType.Sin or OpType.Cos or
-        OpType.Expand or
-        // Binary
-        OpType.TensorAdd or OpType.TensorSubtract or OpType.TensorMultiply or
-        OpType.TensorDivide or OpType.TensorMax or OpType.TensorMatMul or
-        OpType.TensorBroadcastAdd or OpType.TensorBroadcastSubtract or
-        OpType.TensorBroadcastMultiply or OpType.BatchMatMul or
-        // Parameterized activations + reduce family
-        OpType.LeakyReLU or OpType.ELU or OpType.ReduceSum or OpType.Softmax or
-        OpType.Mean or
-        // Conv / pool / norm / attention / fused
-        OpType.Conv2D or OpType.MaxPool2D or OpType.AvgPool2D or
-        OpType.BatchNorm or OpType.LayerNorm or
-        OpType.ScaledDotProductAttention or OpType.FusedLinear or
-        // Loss
-        OpType.CrossEntropyLoss => true,
-        _ => false,
-    };
 
     // ════════════════════════════════════════════════════════════════════
     // Generic builders
@@ -460,5 +439,238 @@ internal static class OpSerializationRegistry<T>
                 r.AsSpan().CopyTo(output.AsWritableSpan());
             }
         };
+    }
+
+    private static Action<IEngine, Tensor<T>> RebuildMultiHeadAttentionForward(
+        Tensor<T>[] inputs, object[]? state)
+    {
+        RequireInputs(inputs, PlanFormatConstants.MultiHeadAttentionInputCount, "MultiHeadAttentionForward");
+        if (state is not { Length: PlanFormatConstants.MultiHeadAttentionSavedStateCount } ||
+            state[PlanFormatConstants.MultiHeadAttentionNumHeadsStateIndex] is not int numHeads)
+            throw new InvalidDataException("MultiHeadAttentionForward saved state is invalid.");
+        Tensor<bool>? mask = RebuildBoolTensor(
+            state[PlanFormatConstants.MultiHeadAttentionMaskDataStateIndex],
+            state[PlanFormatConstants.MultiHeadAttentionMaskShapeStateIndex],
+            "MultiHeadAttentionForward mask");
+        return (eng, output) =>
+        {
+            var result = eng.MultiHeadAttentionForward(
+                inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], numHeads, mask);
+            DirectGpuTensorEngine.CopyResultInto(eng, result, output);
+        };
+    }
+
+    private static Action<IEngine, Tensor<T>> RebuildMlpForward(
+        Tensor<T>[] inputs, object[]? state)
+    {
+        if (state is not { Length: 5 } || state[0] is not int[] biasInputIndices ||
+            state[1] is not FusedActivationType hiddenActivation ||
+            state[2] is not FusedActivationType outputActivation)
+            throw new InvalidDataException("MlpForward saved state is invalid.");
+
+        int layerCount = biasInputIndices.Length;
+        if (inputs.Length < 1 + layerCount)
+            throw new InvalidDataException(
+                $"MlpForward requires at least {1 + layerCount} inputs, got {inputs.Length}.");
+        var weights = new Tensor<T>[layerCount];
+        var biases = new Tensor<T>?[layerCount];
+        for (int i = 0; i < layerCount; i++)
+        {
+            weights[i] = inputs[1 + i];
+            int biasIndex = biasInputIndices[i];
+            if (biasIndex < -1 || biasIndex >= inputs.Length)
+                throw new InvalidDataException(
+                    $"MlpForward bias index {biasIndex} for layer {i} is out of range.");
+            biases[i] = biasIndex < 0 ? null : inputs[biasIndex];
+        }
+        var hiddenParams = state[3] as FusedActivationParams;
+        var outputParams = state[4] as FusedActivationParams;
+        return (eng, output) =>
+        {
+            var result = eng.MlpForward(
+                inputs[0], weights, biases, hiddenActivation, outputActivation,
+                hiddenParams, outputParams);
+            DirectGpuTensorEngine.CopyResultInto(eng, result, output);
+        };
+    }
+
+    private static Action<IEngine, Tensor<T>> RebuildLstmSequenceForward(
+        Tensor<T>[] inputs, object[]? state)
+    {
+        if (state is not { Length: 2 } || state[0] is not bool returnSequences ||
+            state[1] is not LstmSequenceOptionalInputs optionalInputs)
+            throw new InvalidDataException("LstmSequenceForward saved state is invalid.");
+        CpuEngine.UnpackLstmSequenceInputs(
+            inputs, optionalInputs,
+            out var input, out var h0, out var c0, out var wIh, out var wHh, out var bIh, out var bHh);
+        return (eng, output) =>
+        {
+            var result = eng.LstmSequenceForward(
+                input, h0, c0, wIh, wHh, bIh, bHh, returnSequences);
+            DirectGpuTensorEngine.CopyResultInto(eng, result, output);
+        };
+    }
+
+    private static Action<IEngine, Tensor<T>> RebuildScaledDotProductAttentionGqa(
+        Tensor<T>[] inputs, object[]? state)
+    {
+        RequireInputs(inputs, 3, "ScaledDotProductAttentionGqa");
+        if (state is not { Length: 3 } || state[0] is not double scale ||
+            state[1] is not bool isCausal || state[2] is not double softcap)
+            throw new InvalidDataException("ScaledDotProductAttentionGqa saved state is invalid.");
+        return (eng, output) =>
+        {
+            var result = eng.ScaledDotProductAttentionGqa(
+                inputs[0], inputs[1], inputs[2], scale, isCausal, softcap);
+            DirectGpuTensorEngine.CopyResultInto(eng, result, output);
+        };
+    }
+
+    private static Action<IEngine, Tensor<T>> RebuildGroupedQueryAttention(
+        Tensor<T>[] inputs, object[]? state)
+    {
+        RequireInputs(inputs, 3, "GroupedQueryAttention");
+        if (state is not { Length: 5 } || state[0] is not int numQueriesPerKV ||
+            state[1] is not bool hasScale || state[2] is not double scaleValue ||
+            state[3] is not bool isCausal || state[4] is not int selectedOutput ||
+            selectedOutput is < 0 or > 1)
+            throw new InvalidDataException("GroupedQueryAttention saved state is invalid.");
+
+        double? scale = hasScale ? scaleValue : null;
+        return (eng, output) =>
+        {
+            Tensor<T> result = eng.GroupedQueryAttention(
+                inputs[0], inputs[1], inputs[2], numQueriesPerKV, scale, isCausal,
+                out Tensor<T> attentionWeights);
+            DirectGpuTensorEngine.CopyResultInto(
+                eng, selectedOutput == 0 ? result : attentionWeights, output);
+        };
+    }
+
+    private static Action<IEngine, Tensor<T>> RebuildFusedLinearMaxout(
+        Tensor<T>[] inputs, object[]? state)
+    {
+        RequireInputsInRange(inputs, 2, 3, "FusedLinearMaxout");
+        if (state is not { Length: 1 } || state[0] is not int numPieces)
+            throw new InvalidDataException("FusedLinearMaxout saved state is invalid.");
+        return (eng, output) =>
+        {
+            var result = eng.FusedLinearMaxout(
+                inputs[0], inputs[1], inputs.Length == 3 ? inputs[2] : null, numPieces);
+            DirectGpuTensorEngine.CopyResultInto(eng, result, output);
+        };
+    }
+
+    private static Action<IEngine, Tensor<T>> RebuildFusedHierarchicalSoftmax(
+        Tensor<T>[] inputs, object[]? state)
+    {
+        RequireInputs(inputs, 2, "FusedHierarchicalSoftmax");
+        if (state is not { Length: 1 } || state[0] is not int numClasses)
+            throw new InvalidDataException("FusedHierarchicalSoftmax saved state is invalid.");
+        return (eng, output) =>
+        {
+            var result = eng.FusedHierarchicalSoftmax(inputs[0], inputs[1], numClasses);
+            DirectGpuTensorEngine.CopyResultInto(eng, result, output);
+        };
+    }
+
+    private static Action<IEngine, Tensor<T>> RebuildTensorRepeatInterleave(
+        Tensor<T>[] inputs, Tensor<T> output, object[]? state)
+    {
+        RequireInputs(inputs, 1, "TensorRepeatInterleave");
+        if (state is not { Length: 2 } || state[0] is not int repeats || state[1] is not int dim)
+            throw new InvalidDataException("TensorRepeatInterleave saved state is invalid.");
+        if (repeats < 1)
+            throw new InvalidDataException($"TensorRepeatInterleave repeat count {repeats} must be positive.");
+
+        Tensor<T> input = inputs[0];
+        if ((uint)dim >= (uint)input.Rank)
+            throw new InvalidDataException(
+                $"TensorRepeatInterleave dimension {dim} is outside rank {input.Rank}.");
+
+        int expectedAxis;
+        int expectedLength;
+        try
+        {
+            expectedAxis = checked(input._shape[dim] * repeats);
+            expectedLength = checked(input.Length * repeats);
+        }
+        catch (OverflowException ex)
+        {
+            throw new InvalidDataException(
+                "TensorRepeatInterleave output shape overflows Int32.", ex);
+        }
+
+        if (output.Rank != input.Rank || output.Length != expectedLength)
+            throw new InvalidDataException(
+                $"TensorRepeatInterleave output metadata is inconsistent with the serialized input and repeat count.");
+        for (int axis = 0; axis < input.Rank; axis++)
+        {
+            int expected = axis == dim ? expectedAxis : input._shape[axis];
+            if (output._shape[axis] != expected)
+                throw new InvalidDataException(
+                    $"TensorRepeatInterleave output axis {axis} is {output._shape[axis]}, expected {expected}.");
+        }
+        return (eng, output) =>
+        {
+            var result = eng.TensorRepeatInterleave(inputs[0], repeats, dim);
+            DirectGpuTensorEngine.CopyResultInto(eng, result, output);
+        };
+    }
+
+    private static Action<IEngine, Tensor<T>> RebuildTensorMaskedFill(
+        Tensor<T>[] inputs, object[]? state)
+    {
+        RequireInputs(inputs, 1, "TensorMaskedFill");
+        if (state is not { Length: 3 } || state[2] is not double fillValue)
+            throw new InvalidDataException("TensorMaskedFill saved state is invalid.");
+        var mask = RebuildBoolTensor(state[0], state[1], "TensorMaskedFill mask")
+            ?? throw new InvalidDataException("TensorMaskedFill mask cannot be null.");
+        var value = MathHelper.GetNumericOperations<T>().FromDouble(fillValue);
+        return (eng, output) =>
+        {
+            var result = eng.TensorMaskedFill(inputs[0], mask, value);
+            DirectGpuTensorEngine.CopyResultInto(eng, result, output);
+        };
+    }
+
+    private static Action<IEngine, Tensor<T>> RebuildTensorPermute(
+        Tensor<T>[] inputs, object[]? state)
+    {
+        RequireInputs(inputs, 1, "TensorPermute");
+        if (state is not { Length: 1 } || state[0] is not int[] axes)
+            throw new InvalidDataException("TensorPermute saved state is invalid.");
+        return (eng, output) => eng.TensorPermuteInto(output, inputs[0], axes);
+    }
+
+    private static Action<IEngine, Tensor<T>> RebuildTensorMultiplyScalar(
+        Tensor<T>[] inputs, object[]? state)
+    {
+        RequireInputs(inputs, 1, "TensorMultiplyScalar");
+        if (state is not { Length: 1 } || state[0] is not T scalar)
+            throw new InvalidDataException("TensorMultiplyScalar saved state is invalid.");
+        return (eng, output) =>
+        {
+            var result = eng.TensorMultiplyScalar(inputs[0], scalar);
+            DirectGpuTensorEngine.CopyResultInto(eng, result, output);
+        };
+    }
+
+    private static Tensor<bool>? RebuildBoolTensor(object? dataState, object? shapeState, string description)
+    {
+        if (dataState is null && shapeState is null) return null;
+        if (dataState is not bool[] data || shapeState is not int[] shape)
+            throw new InvalidDataException($"{description} saved state is invalid.");
+        long length = 1;
+        for (int i = 0; i < shape.Length; i++)
+        {
+            if (shape[i] < 0)
+                throw new InvalidDataException($"{description} has a negative shape extent.");
+            length *= shape[i];
+        }
+        if (length != data.Length)
+            throw new InvalidDataException(
+                $"{description} shape describes {length} values but contains {data.Length}.");
+        return new Tensor<bool>((bool[])data.Clone(), (int[])shape.Clone());
     }
 }

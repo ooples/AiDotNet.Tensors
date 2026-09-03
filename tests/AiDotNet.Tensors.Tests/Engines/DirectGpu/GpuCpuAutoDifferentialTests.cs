@@ -21,6 +21,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Tests.Engines.OpParity;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -35,8 +36,8 @@ public sealed class GpuCpuAutoDifferentialTests : IDisposable
 
     public GpuCpuAutoDifferentialTests()
     {
-        try { _gpu = new DirectGpuTensorEngine(); _gpuReady = _gpu.IsGpuAvailable; }
-        catch { _gpuReady = false; }
+        _gpu = new DirectGpuTensorEngine();
+        _gpuReady = _gpu.IsGpuAvailable;
     }
 
     public void Dispose() => _gpu?.Dispose();
@@ -436,11 +437,28 @@ public sealed class GpuCpuAutoDifferentialTests : IDisposable
         return -1;
     }
 
-    [Theory]
+    private bool EnsureGpuReady()
+    {
+        if (_gpuReady) return true;
+        if (string.Equals(
+            Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_GPU_TESTS"),
+            "1",
+            StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "GPU differential tests were required, but DirectGpu reported no available backend.");
+        }
+
+        Skip.If(true,
+            "DirectGpu is unavailable, so generated GPU/CPU differential parity was not verified.");
+        return false;
+    }
+
+    [SkippableTheory]
     [MemberData(nameof(OpKeys))]
     public void GpuKernel_Matches_Cpu(string opKey)
     {
-        if (!_gpuReady) return;
+        if (!EnsureGpuReady()) return;
         var gpuDef = GpuKernelOverrides().FirstOrDefault(m => Key(m) == opKey);
         Assert.NotNull(gpuDef);
         if (IsNonDeterministic(gpuDef.Name)) return; // covered by the allowlist/guard, not differentiable
@@ -535,6 +553,7 @@ public sealed class GpuCpuAutoDifferentialTests : IDisposable
             string key = Key(m);
             if (IsAutoTestableOnCpu(m, out _)) continue;          // gets a real GPU-vs-CPU check
             if (IsNonDeterministic(m.Name)) continue;             // legitimately non-differentiable
+            if (GeneratedOpParitySupport.HasGeneratedHomogeneousOutputCoverage(m)) continue;
             if (DedicatedlyCovered.Contains(key)) continue;       // has a hand-written dedicated test
             uncovered.Add(key);
         }

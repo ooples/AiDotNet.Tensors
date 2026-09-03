@@ -22,6 +22,9 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<byte> ImageDecode(byte[] encoded, ImageFormat? format = null)
     {
+        Compilation.GraphMode.ThrowIfInferenceUnsupported(
+            Compilation.GraphCaptureLimitation.HostBoundary);
+
         if (encoded is null) throw new ArgumentNullException(nameof(encoded));
         if (encoded.Length < 8) throw new ArgumentException("encoded image is too short.");
 
@@ -38,6 +41,9 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual byte[] ImageEncode(Tensor<byte> image, ImageFormat format, int quality = 90)
     {
+        Compilation.GraphMode.ThrowIfInferenceUnsupported(
+            Compilation.GraphCaptureLimitation.HostBoundary);
+
         if (image is null) throw new ArgumentNullException(nameof(image));
         if (image.Rank != 3)
             throw new ArgumentException("image must be rank-3 [H, W, C].");

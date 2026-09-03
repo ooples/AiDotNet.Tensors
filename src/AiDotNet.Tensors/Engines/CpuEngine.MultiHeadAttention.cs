@@ -6,6 +6,7 @@ using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 #endif
 using AiDotNet.Tensors.Engines.Compilation;
+using AiDotNet.Tensors.Engines.Compilation.Serialization;
 using AiDotNet.Tensors.Engines.Simd;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -79,6 +80,8 @@ public partial class CpuEngine
         if (kWeight is null) throw new ArgumentNullException(nameof(kWeight));
         if (vWeight is null) throw new ArgumentNullException(nameof(vWeight));
         if (outWeight is null) throw new ArgumentNullException(nameof(outWeight));
+        if (mask is not null)
+            GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
         if (input.Rank != 3)
             throw new ArgumentException($"MultiHeadAttentionForward expects rank-3 input [B, seq, dModel]; got rank {input.Rank}.", nameof(input));
         if (numHeads <= 0)
@@ -102,9 +105,43 @@ public partial class CpuEngine
             throw new ArgumentException($"outWeight must be [{dModel}, {dModel}].", nameof(outWeight));
 
         if (GraphMode.IsActive)
-            throw new InvalidOperationException(
-                "MultiHeadAttentionForward is inference-only and does not yet support GradientTape. " +
-                "For training, call the decomposed Q/K/V + SDPA + output projection primitives directly.");
+        {
+            // Compiled training must retain a differentiable primitive graph. Compiled inference,
+            // however, must preserve this fused operation as one replay step; decomposing it there
+            // recreates the dispatch/transposition cliff this kernel exists to avoid.
+            if (!GraphMode.IsInferenceTrace)
+            {
+                var expandedMask = ExpandAttentionMaskForGraph(mask, batch, numHeads, seqLen, seqLen);
+                return MultiHeadAttentionForwardGraph(
+                    input, qWeight, kWeight, vWeight, outWeight,
+                    expandedMask, batch, seqLen, dModel, numHeads, dHead);
+            }
+
+            var scope = GraphMode.Current!;
+            scope.BindEngineIfUnset(this);
+            var graphInputs = new[] { input, qWeight, kWeight, vWeight, outWeight };
+            var capturedMask = mask;
+            var savedState = new object[PlanFormatConstants.MultiHeadAttentionSavedStateCount];
+            savedState[PlanFormatConstants.MultiHeadAttentionNumHeadsStateIndex] = numHeads;
+            savedState[PlanFormatConstants.MultiHeadAttentionMaskDataStateIndex] =
+                mask is null ? null! : mask.GetFlattenedData();
+            savedState[PlanFormatConstants.MultiHeadAttentionMaskShapeStateIndex] =
+                mask is null ? null! : (int[])mask._shape.Clone();
+            return scope.RecordVariadic(
+                LazyNodeType.MultiHeadAttentionForward,
+                "MultiHeadAttentionForward",
+                graphInputs,
+                (int[])input._shape.Clone(),
+                (eng, output) =>
+                {
+                    var eager = eng.MultiHeadAttentionForward(
+                        graphInputs[0], graphInputs[1], graphInputs[2], graphInputs[3], graphInputs[4],
+                        numHeads, capturedMask);
+                    DirectGpuTensorEngine.CopyResultInto(eng, eager, output);
+                },
+                backwardFn: null,
+                savedState);
+        }
 
         // Float fast path: direct SimdGemm + in-layout Q/K/V scratch + a
         // single output-projection transpose. Avoids the 4 strided-transpose
@@ -761,5 +798,67 @@ public partial class CpuEngine
         var concatFlat = concat.Reshape(new[] { batch * seqLen, dModel });
         var outFlat = TensorMatMul(concatFlat, outWeight);
         return outFlat.Reshape(new[] { batch, seqLen, dModel });
+    }
+
+    private Tensor<T> MultiHeadAttentionForwardGraph<T>(
+        Tensor<T> input,
+        Tensor<T> qWeight,
+        Tensor<T> kWeight,
+        Tensor<T> vWeight,
+        Tensor<T> outWeight,
+        Tensor<bool>? mask,
+        int batch,
+        int seqLen,
+        int dModel,
+        int numHeads,
+        int dHead)
+    {
+        var inputFlat = Reshape(input, new[] { batch * seqLen, dModel });
+        var qFlat = TensorMatMul(inputFlat, qWeight);
+        var kFlat = TensorMatMul(inputFlat, kWeight);
+        var vFlat = TensorMatMul(inputFlat, vWeight);
+
+        var q = TensorPermute(Reshape(qFlat, new[] { batch, seqLen, numHeads, dHead }), new[] { 0, 2, 1, 3 });
+        var k = TensorPermute(Reshape(kFlat, new[] { batch, seqLen, numHeads, dHead }), new[] { 0, 2, 1, 3 });
+        var v = TensorPermute(Reshape(vFlat, new[] { batch, seqLen, numHeads, dHead }), new[] { 0, 2, 1, 3 });
+        var attended = ScaledDotProductAttention(q, k, v, mask, scale: null, out _);
+        var concat = Reshape(
+            TensorPermute(attended, new[] { 0, 2, 1, 3 }),
+            new[] { batch * seqLen, dModel });
+        return Reshape(TensorMatMul(concat, outWeight), new[] { batch, seqLen, dModel });
+    }
+
+    private static Tensor<bool>? ExpandAttentionMaskForGraph(
+        Tensor<bool>? mask, int batch, int heads, int seqQ, int seqK)
+    {
+        if (mask is null) return null;
+        if (mask.Rank != 4)
+            throw new ArgumentException("Attention mask must be rank 4.", nameof(mask));
+
+        int[] target = { batch, heads, seqQ, seqK };
+        for (int axis = 0; axis < 4; axis++)
+        {
+            if (mask._shape[axis] != 1 && mask._shape[axis] != target[axis])
+                throw new ArgumentException(
+                    $"Attention mask axis {axis} has extent {mask._shape[axis]}; expected 1 or {target[axis]}.",
+                    nameof(mask));
+        }
+
+        if (mask._shape[0] == batch && mask._shape[1] == heads &&
+            mask._shape[2] == seqQ && mask._shape[3] == seqK)
+            return mask;
+
+        var expanded = new bool[batch * heads * seqQ * seqK];
+        int dst = 0;
+        for (int b = 0; b < batch; b++)
+            for (int h = 0; h < heads; h++)
+                for (int q = 0; q < seqQ; q++)
+                    for (int k = 0; k < seqK; k++)
+                        expanded[dst++] = mask[
+                            mask._shape[0] == 1 ? 0 : b,
+                            mask._shape[1] == 1 ? 0 : h,
+                            mask._shape[2] == 1 ? 0 : q,
+                            mask._shape[3] == 1 ? 0 : k];
+        return new Tensor<bool>(expanded, target);
     }
 }

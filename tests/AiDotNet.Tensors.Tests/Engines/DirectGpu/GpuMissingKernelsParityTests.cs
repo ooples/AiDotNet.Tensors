@@ -25,7 +25,6 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
     private readonly CpuEngine _cpu = new CpuEngine();
     private readonly DirectGpuTensorEngine _gpu;
     private readonly bool _gpuReady;
-    private readonly Exception _gpuInitException;
 
     public GpuMissingKernelsParityTests()
     {
@@ -35,16 +34,8 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         // true-fp32 CPU result legitimately differs by ~1e-3 relative (TF32's ~10-bit mantissa), which
         // would mask real logic bugs. PyTorch's own CUDA-vs-CPU correctness tests disable TF32 the same way.
         CudaDispatchPolicy.AllowTF32 = false;
-        try
-        {
-            _gpu = new DirectGpuTensorEngine();
-            _gpuReady = _gpu.IsGpuAvailable;
-        }
-        catch (Exception ex)
-        {
-            _gpuInitException = ex;
-            _gpuReady = false;
-        }
+        _gpu = new DirectGpuTensorEngine();
+        _gpuReady = _gpu.IsGpuAvailable;
     }
 
     public void Dispose() => _gpu?.Dispose();
@@ -55,7 +46,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         if (string.Equals(Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_GPU_TESTS"), "1", StringComparison.Ordinal))
             throw new InvalidOperationException(
                 "GPU tests were required (AIDOTNET_REQUIRE_GPU_TESTS=1) but DirectGpu init failed or no GPU is available.",
-                _gpuInitException);
+                innerException: null);
 
         // SKIP visibly instead of returning false. Returning false made every caller `return` early,
         // so xUnit reported these tests as PASSED even though neither the CPU nor the GPU recurrence
@@ -70,9 +61,7 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         Skip.If(true,
             "DirectGpu is unavailable on this machine, so GPU/CPU parity was NOT verified. " +
             "Set AIDOTNET_REQUIRE_GPU_TESTS=1 in a GPU-enabled job to make this a hard failure. " +
-            (_gpuInitException is null
-                ? "No GPU detected."
-                : $"Init failed: {_gpuInitException.GetType().Name}: {_gpuInitException.Message}"));
+            "No GPU detected.");
         return false; // unreachable — Skip.If throws
     }
 
@@ -593,6 +582,38 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         var cpu = _cpu.LstmSequenceForward(input, null, null, wIh, wHh, bIh, bHh, returnSeq);
         var gpu = _gpu.LstmSequenceForward(input, null, null, wIh, wHh, bIh, bHh, returnSeq);
         AssertMatch(gpu, cpu, $"LSTM[b{batch};s{seq};in{inF};h{hidden};seq={returnSeq}]");
+    }
+
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void LstmSequenceForward_StateOutputsRemainGpuAccelerated(bool returnSequences)
+    {
+        if (!EnsureGpuReady()) return;
+        const int batch = 2, sequence = 5, inputFeatures = 4, hidden = 6;
+        var input = Rand(280, batch, sequence, inputFeatures);
+        var initialHidden = Rand(281, batch, hidden);
+        var initialCell = Rand(282, batch, hidden);
+        var inputWeights = Rand(283, 4 * hidden, inputFeatures);
+        var recurrentWeights = Rand(284, 4 * hidden, hidden);
+        var inputBias = Rand(285, 4 * hidden);
+        var recurrentBias = Rand(286, 4 * hidden);
+
+        var expected = _cpu.LstmSequenceForward(
+            input, initialHidden, initialCell, inputWeights, recurrentWeights,
+            inputBias, recurrentBias, out var expectedHidden, out var expectedCell,
+            returnSequences);
+        var actual = _gpu.LstmSequenceForward(
+            input, initialHidden, initialCell, inputWeights, recurrentWeights,
+            inputBias, recurrentBias, out var actualHidden, out var actualCell,
+            returnSequences);
+
+        AssertMatch(actual, expected, $"LSTM state output sequence={returnSequences}");
+        AssertMatch(actualHidden, expectedHidden, "LSTM final hidden state");
+        AssertMatch(actualCell, expectedCell, "LSTM final cell state");
+        Assert.True(actual.IsGpuResident);
+        Assert.True(actualHidden.IsGpuResident);
+        Assert.True(actualCell.IsGpuResident);
     }
 
     // BPTT parity: run the fused LSTM forward+backward through a GradientTape on the CPU and the GPU and

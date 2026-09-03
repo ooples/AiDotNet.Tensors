@@ -435,6 +435,14 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> PadNd<T>(Tensor<T> input, int[] pad, PadMode mode, T value = default!)
     {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (pad is null) throw new ArgumentNullException(nameof(pad));
+        if (GraphMode.IsInferenceTrace)
+        {
+            var capturedPad = (int[])pad.Clone();
+            return CaptureInferenceKernel(
+                new[] { input }, engine => engine.PadNd(input, capturedPad, mode, value));
+        }
         var result = PadNdImpl(input, pad, mode, value);
         AiDotNet.Tensors.Engines.Autodiff.DifferentiableOps.RecordUnary(
             "PadNd", result, input,
@@ -764,6 +772,12 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> AffineGrid3D<T>(Tensor<T> theta, int outputDepth, int outputHeight, int outputWidth, bool alignCorners = false)
     {
+        if (theta is null) throw new ArgumentNullException(nameof(theta));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { theta },
+                engine => engine.AffineGrid3D(
+                    theta, outputDepth, outputHeight, outputWidth, alignCorners));
         var result = AffineGrid3DImpl(theta, outputDepth, outputHeight, outputWidth, alignCorners);
         AiDotNet.Tensors.Engines.Autodiff.DifferentiableOps.RecordUnary(
             "AffineGrid3D", result, theta,

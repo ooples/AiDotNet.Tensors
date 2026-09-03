@@ -63,6 +63,7 @@ internal sealed class GradientCheckpointing<T>
     /// </summary>
     public Tensor<T> ForwardWithCheckpoints()
     {
+        using var recordingSuspension = GraphMode.SuspendRecording();
         for (int seg = 0; seg < _segmentCount; seg++)
         {
             int start = seg * _segmentSize;
@@ -89,6 +90,7 @@ internal sealed class GradientCheckpointing<T>
     /// <param name="segmentIndex">Which segment to recompute (0-based).</param>
     public void RecomputeSegment(int segmentIndex)
     {
+        using var recordingSuspension = GraphMode.SuspendRecording();
         if (segmentIndex < 0 || segmentIndex >= _segmentCount)
             throw new ArgumentOutOfRangeException(nameof(segmentIndex));
 

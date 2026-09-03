@@ -21,12 +21,31 @@ public sealed class OpParityTests
         OpParityRegistry.All().ToDictionary(o => o.Name);
 
     public static IEnumerable<object[]> ForwardCases =>
-        OpParityRegistry.All().Where(o => ParityShard.Include(o.Name)).Select(o => new object[] { o.Name });
+        OpParityRegistry.All()
+            .Where(o => o.TensorOutputContract == TensorOutputContract.SingleTensor
+                && ParityShard.Include(o.Name))
+            .Select(o => new object[] { o.Name });
+
+    public static IEnumerable<object[]> MultiOutputCases =>
+        OpParityRegistry.All()
+            .Where(o => o.TensorOutputContract != TensorOutputContract.SingleTensor && ParityShard.Include(o.Name))
+            .Select(o => new object[] { o.Name });
 
     [SkippableTheory]
     [MemberData(nameof(ForwardCases))]
     public void Forward_CpuMatchesGpu(string opName)
         => OpParityHarness.CheckForward(Cases[opName], _fx);
+
+    [SkippableTheory]
+    [MemberData(nameof(MultiOutputCases))]
+    public void MultipleOutputs_CpuMatchesGpu(string opName)
+    {
+        var op = Cases[opName];
+        if (op.TensorOutputContract == TensorOutputContract.HeterogeneousMultiple)
+            OpParityHarness.CheckHeterogeneousOutputs(op, _fx);
+        else
+            OpParityHarness.CheckMultipleOutputs(op, _fx);
+    }
 
 }
 #endif

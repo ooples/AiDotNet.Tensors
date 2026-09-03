@@ -20,11 +20,13 @@ namespace AiDotNet.Tensors.Engines.Compilation;
 /// into a matching replayable pass; C adds the optimizer + loss scaling; D/E take it to GPU + AiDotNet.
 /// Gated behind <c>AIDOTNET_FP16_ACTIVATIONS</c>; the default FP32 fused path is untouched.</para>
 /// </summary>
-public sealed class MixedPrecisionCompiledPlan
+public sealed class MixedPrecisionCompiledPlan : IDisposable
 {
     private readonly IEngine _engine;
     private readonly ILazyNode[] _order;   // producers-first topological order
     private readonly Tensor<float> _output;
+    private TensorStorageLeaseSet? _storageLeases;
+    private int _disposed;
 
     /// <summary>The compiled node list in execution (producers-first) order — used by the Phase B backward.</summary>
     internal IReadOnlyList<ILazyNode> Order => _order;
@@ -84,6 +86,20 @@ public sealed class MixedPrecisionCompiledPlan
         _order = order;
         _output = output;
         _paging = paging;
+
+        var storageLeases = new TensorStorageLeaseSet();
+        try
+        {
+            for (int i = 0; i < order.Length; i++) storageLeases.Add(order[i]);
+            storageLeases.Add(output);
+            _storageLeases = storageLeases;
+        }
+        catch
+        {
+            storageLeases.Dispose();
+            throw;
+        }
+
         _gpuFp16 = (paging && engine is DirectGpuTensorEngine dg
                     && Environment.GetEnvironmentVariable("AIDOTNET_FP16_GPU_CACHE") == "1") ? dg : null;
         if (_paging) BuildPagingSchedule();
@@ -172,17 +188,26 @@ public sealed class MixedPrecisionCompiledPlan
         if (forward is null) throw new ArgumentNullException(nameof(forward));
         engine ??= AiDotNetEngine.Current;
 
-        var scope = new LazyTensorScope(null);
+        var scope = new LazyTensorScope(GraphMode.Current);
         var prevForce = MixedPrecisionEmit.TestOverrideEnabled;
         MixedPrecisionEmit.TestOverrideEnabled = true; // force FP16 activation emission for this trace
-        Tensor<float> loss;
-        using (new Gpu.AutocastScope(Gpu.PrecisionMode.Float16))
+        try
         {
-            GraphMode.SetCurrent(scope);
-            try { loss = forward(); }
-            finally { GraphMode.SetCurrent(null); MixedPrecisionEmit.TestOverrideEnabled = prevForce; }
+            using (new Gpu.AutocastScope(Gpu.PrecisionMode.Float16))
+            {
+                GraphMode.SetCurrent(scope);
+                var loss = forward();
+                scope.MarkCompiled();
+                return Compile(loss, engine);
+            }
         }
-        return Compile(loss, engine);
+        finally
+        {
+            // A failed trace is incomplete and must not be auto-realized while unwinding.
+            scope.MarkCompiled();
+            scope.Dispose();
+            MixedPrecisionEmit.TestOverrideEnabled = prevForce;
+        }
     }
 
     /// <summary>
@@ -201,7 +226,15 @@ public sealed class MixedPrecisionCompiledPlan
         // Detach outputs so AsWritableSpan/AsSpan during replay don't re-trigger Realize.
         foreach (var n in order) n.ClearOutputLazySource();
 
-        return new MixedPrecisionCompiledPlan(engine, order, finalOutput, PagingEnabledDefault);
+        var plan = new MixedPrecisionCompiledPlan(engine, order, finalOutput, PagingEnabledDefault);
+
+        // Direct Compile callers may still be inside the scope that produced this root. The
+        // plan now owns an independent lease snapshot, so terminate only that matching trace.
+        var currentScope = GraphMode.Current;
+        if (currentScope is not null && currentScope.Nodes.Contains(root))
+            currentScope.MarkCompiled();
+
+        return plan;
     }
 
     /// <summary>Replay the forward: run every node's Execute into its stable buffer; return the output.
@@ -209,6 +242,8 @@ public sealed class MixedPrecisionCompiledPlan
     /// forward use, so peak resident float = the live working set, not the whole activation set.</summary>
     public Tensor<float> Forward()
     {
+        ThrowIfDisposed();
+        using var recordingSuspension = GraphMode.SuspendRecording();
         var eng = _engine;
         // Engage the Half-resident forward store for the GPU hetero forward so each Half matmul output stays a
         // HALF GPU buffer (half the VRAM) instead of being up-cast to FP32 — but ONLY when the caller hasn't set
@@ -248,12 +283,15 @@ public sealed class MixedPrecisionCompiledPlan
         {
             _halfStore!.Remove(o);
             o.RestoreStorageFromBytes(new byte[(long)o.Length * sizeof(float)]);
+            _storageLeases!.Add(o);
         }
     }
 
     /// <summary>Backward over the captured order, with FP16 activation paging (page-in/free) when on.</summary>
     private MixedPrecisionGraphBackward.Result RunBackward(float seedScale)
     {
+        ThrowIfDisposed();
+        using var recordingSuspension = GraphMode.SuspendRecording();
         if (!_paging)
         {
             if (_freeEng is null)
@@ -396,7 +434,7 @@ public sealed class MixedPrecisionCompiledPlan
         var span = t.AsSpan();
         var h = new Half[span.Length];
         for (int i = 0; i < span.Length; i++) h[i] = (Half)span[i];
-        if (t.TryDropStorageForStreaming()) { _halfStore[t] = h; _droppedThisStep!.Add(t); PageOutCount++; }
+        if (TryDropPlanOwnedStorage(t)) { _halfStore[t] = h; _droppedThisStep!.Add(t); PageOutCount++; }
         // else: shared/view storage — can't drop safely; leave float resident (discard h).
     }
 
@@ -407,6 +445,7 @@ public sealed class MixedPrecisionCompiledPlan
         var f = new float[h.Length];
         for (int i = 0; i < h.Length; i++) f[i] = (float)h[i];
         t.RestoreStorageFromBytes(MemoryMarshal.AsBytes(f.AsSpan()));
+        _storageLeases!.Add(t);
         _halfStore.Remove(t);
     }
 
@@ -415,7 +454,25 @@ public sealed class MixedPrecisionCompiledPlan
         // GPU FP16 mode: re-compress after the last backward read (frees the upcast FP32 GPU buffer).
         if (_gpuFp16 is not null) { _gpuFp16.CompressActivationFp16(t); return; }
         // CPU mode: after the last backward read the activation is float-resident and never read again.
-        if (!_halfStore!.ContainsKey(t) && t.TryDropStorageForStreaming()) _droppedThisStep!.Add(t);
+        if (!_halfStore!.ContainsKey(t) && TryDropPlanOwnedStorage(t)) _droppedThisStep!.Add(t);
+    }
+
+    private bool TryDropPlanOwnedStorage(Tensor<float> tensor)
+    {
+        bool removedPlanLease = _storageLeases!.Remove(tensor);
+        try
+        {
+            if (tensor.TryDropStorageForStreaming())
+                return true;
+        }
+        catch
+        {
+            if (removedPlanLease) _storageLeases.Add(tensor);
+            throw;
+        }
+
+        if (removedPlanLease) _storageLeases.Add(tensor);
+        return false;
     }
 
     /// <summary>
@@ -808,4 +865,33 @@ public sealed class MixedPrecisionCompiledPlan
         }
         return order;
     }
+
+    private void ThrowIfDisposed()
+    {
+        if (System.Threading.Volatile.Read(ref _disposed) != 0)
+            throw new ObjectDisposedException(nameof(MixedPrecisionCompiledPlan));
+    }
+
+    /// <summary>Releases the graph storage retained for future replay.</summary>
+    public void Dispose()
+    {
+        Dispose(disposing: true);
+        GC.SuppressFinalize(this);
+    }
+
+    private void Dispose(bool disposing)
+    {
+        if (System.Threading.Interlocked.Exchange(ref _disposed, 1) != 0) return;
+        if (!RuntimeShutdown.IsTearingDown)
+            _storageLeases?.Dispose();
+        _storageLeases = null;
+        if (disposing)
+        {
+            _halfStore?.Clear();
+            _droppedThisStep?.Clear();
+            _adamState?.Clear();
+        }
+    }
+
+    ~MixedPrecisionCompiledPlan() => Dispose(disposing: false);
 }

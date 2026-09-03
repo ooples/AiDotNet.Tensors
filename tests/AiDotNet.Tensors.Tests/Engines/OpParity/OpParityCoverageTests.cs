@@ -12,7 +12,7 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Engines.OpParity;
 
 /// <summary>
-/// Enumerates the ENTIRE tensor-returning IEngine op surface and audits how much of it the parity
+/// Enumerates the ENTIRE tensor-producing IEngine op surface and audits how much of it the parity
 /// registry covers, writing a coverage report (covered / pending lists + %). This is the "scaffold
 /// for all operations" spine: it makes full-surface coverage measurable and forces every registry
 /// entry to name a real IEngine op, so the registry can grow toward 100% with the gaps always visible.
@@ -20,17 +20,17 @@ namespace AiDotNet.Tensors.Tests.Engines.OpParity;
 [Collection("OpParity")]
 public sealed class OpParityCoverageTests
 {
-    /// <summary>Every registry OpMethod must be a real tensor-returning IEngine op — guards typos and
+    /// <summary>Every registry OpMethod must be a real tensor-producing IEngine op — guards typos and
     /// stale specs, and keeps the coverage denominator honest.</summary>
     [Fact]
     public void EveryRegistryCase_NamesARealIEngineOp()
     {
-        var inventory = IEngineOpInventory.TensorReturningOps().ToHashSet(StringComparer.Ordinal);
+        var inventory = IEngineOpInventory.TensorProducingOps().ToHashSet(StringComparer.Ordinal);
         foreach (var op in OpParityRegistry.All())
         {
             Assert.True(inventory.Contains(op.OpMethod),
                 $"OpCase '{op.Name}' claims to cover IEngine op '{op.OpMethod}', which is not a " +
-                $"tensor-returning IEngine method (typo, or it returns something other than Tensor<T>).");
+                $"tensor-producing IEngine method (typo, or it has no tensor return/out value).");
         }
     }
 
@@ -40,7 +40,7 @@ public sealed class OpParityCoverageTests
     [Fact]
     public void FullSurface_CoverageReport()
     {
-        var inventory = IEngineOpInventory.TensorReturningOps();
+        var inventory = IEngineOpInventory.TensorProducingOps();
         var covered = OpParityRegistry.All()
             .Select(o => o.OpMethod)
             .Distinct(StringComparer.Ordinal)
@@ -74,7 +74,7 @@ public sealed class OpParityCoverageTests
             var sb = new StringBuilder();
             double pct = inventory.Count == 0 ? 0 : 100.0 * covered.Count / inventory.Count;
             sb.AppendLine($"# CPU-vs-GPU op-parity coverage (#775)");
-            sb.AppendLine($"tensor-returning IEngine ops : {inventory.Count}");
+            sb.AppendLine($"tensor-producing IEngine ops : {inventory.Count}");
             sb.AppendLine($"covered by parity registry   : {covered.Count} ({pct:F1}%)");
             sb.AppendLine($"total public IEngine overloads: {IEngineOpInventory.TotalPublicMethodOverloads()}");
             sb.AppendLine();

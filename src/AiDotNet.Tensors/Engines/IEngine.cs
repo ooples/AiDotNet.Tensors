@@ -6,6 +6,16 @@ using AiDotNet.Tensors.LinearAlgebra;
 namespace AiDotNet.Tensors.Engines;
 
 /// <summary>
+/// Marks an allocating element-wise binary operation whose CPU implementation accepts
+/// contiguous operands backed by any readable tensor storage, including GPU-resident storage.
+/// The parity test generator emits a typed mixed-residency test for every marked operation.
+/// </summary>
+[System.AttributeUsage(System.AttributeTargets.Method, AllowMultiple = false, Inherited = false)]
+internal sealed class CpuMixedResidencyElementwiseAttribute : System.Attribute
+{
+}
+
+/// <summary>
 /// Execution engine for mathematical operations.
 /// Implementations can target CPU, GPU, or other accelerators.
 /// </summary>
@@ -2056,6 +2066,7 @@ public interface IEngine
     /// GPU acceleration provides significant speedup for large tensors.
     /// </para>
     /// </remarks>
+    [CpuMixedResidencyElementwise]
     Tensor<T> TensorAdd<T>(Tensor<T> a, Tensor<T> b);
 
 
@@ -2261,6 +2272,7 @@ public interface IEngine
     /// <remarks>
     /// <para><b>US-GPU-014: Tensor Element-Wise Operations</b></para>
     /// </remarks>
+    [CpuMixedResidencyElementwise]
     Tensor<T> TensorSubtract<T>(Tensor<T> a, Tensor<T> b);
 
     /// <summary>
@@ -2277,6 +2289,7 @@ public interface IEngine
     /// <remarks>
     /// <para><b>US-GPU-014: Tensor Element-Wise Operations</b></para>
     /// </remarks>
+    [CpuMixedResidencyElementwise]
     Tensor<T> TensorMultiply<T>(Tensor<T> a, Tensor<T> b);
 
     /// <summary>
@@ -2324,6 +2337,7 @@ public interface IEngine
     /// <remarks>
     /// <para><b>US-GPU-014: Tensor Element-Wise Operations</b></para>
     /// </remarks>
+    [CpuMixedResidencyElementwise]
     Tensor<T> TensorDivide<T>(Tensor<T> a, Tensor<T> b);
 
     #region Tensor Comparison Operations
@@ -4257,6 +4271,24 @@ public interface IEngine
         Tensor<T> wHh,
         Tensor<T>? bIh,
         Tensor<T>? bHh,
+        bool returnSequences = false);
+
+    /// <summary>
+    /// Fused LSTM sequence forward that also returns the final hidden and cell states for
+    /// chunked or streaming inference.
+    /// </summary>
+    /// <param name="finalHidden">Receives the final hidden state <c>[batch, hidden]</c>.</param>
+    /// <param name="finalCell">Receives the final cell state <c>[batch, hidden]</c>.</param>
+    Tensor<T> LstmSequenceForward<T>(
+        Tensor<T> input,
+        Tensor<T>? h0,
+        Tensor<T>? c0,
+        Tensor<T> wIh,
+        Tensor<T> wHh,
+        Tensor<T>? bIh,
+        Tensor<T>? bHh,
+        out Tensor<T> finalHidden,
+        out Tensor<T> finalCell,
         bool returnSequences = false);
 
     /// <summary>
