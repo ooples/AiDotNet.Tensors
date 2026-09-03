@@ -12,6 +12,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation.Ops;
 /// Group Normalization. Validates forward parity with the eager engine path,
 /// backward gradient correctness, attribute access, and factory round-trip.
 /// </summary>
+[Collection("CompilationGlobalState")]
 public class GroupNormOpTests
 {
     // ── Forward parity: GroupNormOp produces same result as eager engine ─────

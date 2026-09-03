@@ -47,7 +47,7 @@ public class MixedPrecisionPublicApiTests
             return _engine.ReduceSum(sq);
         };
 
-        var plan = MixedPrecisionCompiledPlan.Trace(forward, _engine);
+        using var plan = MixedPrecisionCompiledPlan.Trace(forward, _engine);
         var pars = new[] { W };
 
         float first = 0, last = 0; int bad = 0;

@@ -11,6 +11,7 @@ namespace AiDotNet.Tensors.Tests.Engines;
 // op that replaces the ~6-primitive batch=1 BN training fallback. Forward must equal
 // BatchNormInference; backward must equal the exact closed-form gradient of a linear loss
 // L = Σ(y ⊙ w), since y = gamma·(x-mean)·inv + beta is affine in x/gamma/beta.
+[Collection("EngineCurrentGlobalState")]
 public class BatchNormAffineGradientTests
 {
     private readonly CpuEngine _engine = new CpuEngine();

@@ -63,7 +63,7 @@ public class MixedPrecisionCompiledStepTests
                 finally { GraphMode.SetCurrent(null); }
             }
 
-            var plan = MixedPrecisionCompiledPlan.Compile(lossT, _engine);
+            using var plan = MixedPrecisionCompiledPlan.Compile(lossT, _engine);
             var scaler = new AiDotNet.Tensors.Engines.Autodiff.GradScaler(
                 new AiDotNet.Tensors.Engines.Autodiff.MixedPrecisionConfig { LossScale = 256f, DynamicLossScale = false });
             var pars = new[] { W };

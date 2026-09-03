@@ -17,6 +17,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// assert that EVERY declared input is re-bound on replay, and that a tensor the graph never
 /// reads is rejected (fail-closed) rather than silently baked.
 /// </summary>
+[Collection("CompilationGlobalState")]
 public class MultiInputCompiledInferenceTests : IDisposable
 {
     // GetOrCompileInference captures AiDotNetEngine.Current as the plan's execution engine;

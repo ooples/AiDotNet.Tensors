@@ -66,6 +66,99 @@ public sealed class CompiledInferenceStorageContractTests : IDisposable
         }
     }
 
+    [Fact]
+    public void Compile_RetainsCompositeTemporaryStorageAfterTemporaryIsDisposed()
+    {
+        var engine = new CpuEngine();
+        using var input = new Tensor<float>(new[] { 1f, 2f }, new[] { 2 });
+
+        Tensor<float> capturedOutput;
+        ICompiledPlan<float> plan;
+        using (var scope = GraphMode.EnableInference())
+        {
+            // Composite implementations routinely scope intermediates with using. Disposing the
+            // Tensor object must not release storage that a recorded downstream node still reads.
+            {
+                using var temporary = engine.TensorAdd(input, input);
+                capturedOutput = engine.TensorMultiply(temporary, input);
+            }
+
+            plan = scope.CompileInference(capturedOutput, input);
+        }
+
+        using (plan)
+        using (capturedOutput)
+        {
+            Assert.Equal(new[] { 2f, 8f }, plan.Execute().AsSpan().ToArray());
+
+            new[] { 3f, 4f }.AsSpan().CopyTo(input.AsWritableSpan());
+            Assert.Equal(new[] { 18f, 32f }, plan.Execute().AsSpan().ToArray());
+        }
+    }
+
+    [Fact]
+    public void CompiledPlan_OwnsStorageUntilPlanDispose()
+    {
+        var engine = new CpuEngine();
+        using var input = new Tensor<float>(new[] { 1f, -2f }, new[] { 2 });
+
+        Tensor<float> capturedOutput;
+        ICompiledPlan<float> plan;
+        using (var scope = GraphMode.EnableInference())
+        {
+            capturedOutput = engine.TensorAdd(input, input);
+            plan = scope.CompileInference(capturedOutput, input);
+        }
+
+        var outputStorage = capturedOutput._storage;
+        Assert.Equal(2, outputStorage.RefCount); // tensor owner + compiled-plan lease
+
+        capturedOutput.Dispose();
+        Assert.Equal(1, outputStorage.RefCount); // compiled plan remains the sole owner
+        Assert.Equal(new[] { 2f, -4f }, plan.Execute().AsSpan().ToArray());
+
+        plan.Dispose();
+        Assert.Equal(0, outputStorage.RefCount);
+    }
+
+    [Fact]
+    public void Compile_IsTerminalAndRestoresParentBeforeLexicalDispose()
+    {
+        var engine = new CpuEngine();
+        using var input = new Tensor<float>(new[] { 1f, 2f }, new[] { 2 });
+        using var parent = GraphMode.Enable();
+        var child = GraphMode.EnableInference();
+
+        var output = engine.TensorAdd(input, input);
+        using var plan = child.CompileInference(output, input);
+
+        Assert.Same(parent, GraphMode.Current);
+        child.Dispose();
+        Assert.Same(parent, GraphMode.Current);
+    }
+
+    [Fact]
+    public void Execute_InsideIndependentTrace_DoesNotAppendReplayOperations()
+    {
+        var engine = new CpuEngine();
+        using var input = new Tensor<float>(new[] { 1f, 2f }, new[] { 2 });
+        ICompiledPlan<float> plan;
+
+        using (var scope = GraphMode.EnableInference())
+        {
+            var output = engine.TensorAdd(input, input);
+            plan = scope.CompileInference(output, input);
+        }
+
+        using (plan)
+        using (var independentTrace = GraphMode.Enable())
+        {
+            Assert.Equal(0, independentTrace.NodeCount);
+            Assert.Equal(new[] { 2f, 4f }, plan.Execute().AsSpan().ToArray());
+            Assert.Equal(0, independentTrace.NodeCount);
+        }
+    }
+
     private static void AssertSentinels(float[] backing)
     {
         Assert.Equal(999f, backing[0]);

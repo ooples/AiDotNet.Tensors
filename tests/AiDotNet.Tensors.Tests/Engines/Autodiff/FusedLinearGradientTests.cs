@@ -12,6 +12,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 /// Verifies that fused Linear+Activation ops produce identical gradients
 /// to the equivalent unfused (separate MatMul + Add + Activation) ops.
 /// </summary>
+[Collection("EngineCurrentGlobalState")]
 public class FusedLinearGradientTests : IDisposable
 {
     // PR #333's GPU auto-detect ModuleInitializer flips AiDotNetEngine.Current

@@ -69,6 +69,7 @@ internal sealed class MockBackendState
     public int ScalarMinCalls { get; set; }
     public int UnaryOpCalls { get; set; }
     public int BinaryOpCalls { get; set; }
+    public int TanhCalls { get; set; }
     public List<string> OptimizerCalls { get; } = new();
 }
 
@@ -183,6 +184,15 @@ public class MockDirectGpuBackend : DispatchProxy
                 var output = (MockGpuBuffer)args[2]!;
                 int size = (int)args[3]!;
                 for (int i = 0; i < size; i++) output.Data[i] = left.Data[i] * right.Data[i];
+                return null!;
+            }
+            case "Tanh":
+            {
+                _state.TanhCalls++;
+                var input = (MockGpuBuffer)args[0]!;
+                var output = (MockGpuBuffer)args[1]!;
+                int size = (int)args[2]!;
+                for (int i = 0; i < size; i++) output.Data[i] = MathF.Tanh(input.Data[i]);
                 return null!;
             }
             case "Min" when args.Length == 2:

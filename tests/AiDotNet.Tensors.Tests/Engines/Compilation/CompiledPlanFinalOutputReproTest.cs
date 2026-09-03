@@ -100,4 +100,37 @@ public class CompiledPlanFinalOutputReproTest
         var compiledOutput = plan.Execute();
         Assert.Equal(new[] { 10, 4 }, compiledOutput.Shape.ToArray());
     }
+
+    /// <summary>
+    /// A selected graph output can be an internal branch with later same-shaped work still in the
+    /// scope. Memory planning must keep the selected tensor's storage live through plan completion
+    /// instead of recycling it after its final graph consumer.
+    /// </summary>
+    [Fact]
+    public void CompiledPlan_ExplicitBranchOutput_IsNotRecycledByLaterBranch()
+    {
+        using var cache = new CompiledModelCache<float>();
+        var engine = new CpuEngine();
+        var input = new Tensor<float>(new[] { 1f, 2f, 3f, 4f }, new[] { 2, 2 });
+        var ones = new Tensor<float>(new[] { 1f, 1f, 1f, 1f }, new[] { 2, 2 });
+        var twos = new Tensor<float>(new[] { 2f, 2f, 2f, 2f }, new[] { 2, 2 });
+        var threes = new Tensor<float>(new[] { 3f, 3f, 3f, 3f }, new[] { 2, 2 });
+
+        Tensor<float> Forward()
+        {
+            var selected = engine.TensorAdd(input, ones);
+            var later = engine.TensorTranspose(selected);
+            later = engine.TensorMultiply(later, twos);
+            later = engine.TensorTranspose(later);
+            _ = engine.TensorAdd(later, threes);
+            return selected;
+        }
+
+        float[] expected = Forward().ToArray();
+        var plan = cache.GetOrCompileInference(input, Forward);
+        plan.SetInputs(new[] { input });
+
+        Assert.Equal(expected, plan.Execute().ToArray());
+        Assert.Equal(expected, plan.Execute().ToArray());
+    }
 }

@@ -422,6 +422,55 @@ public class SavedStatePinningReproTests
     }
 
     [Fact]
+    public void TwoRecordedEntries_SharingSavedTensor_ReleaseIndependentPins()
+    {
+        TensorPool<float>.Clear();
+        var saved = Fixed(new[] { 2 }, 3f, 1f);
+        var firstTape = new GradientTape<float>(new GradientTapeOptions { Persistent = false });
+        var secondTape = new GradientTape<float>(new GradientTapeOptions { Persistent = false });
+        try
+        {
+            firstTape.Record(new TapeEntry<float>
+            {
+                OperationName = nameof(TwoRecordedEntries_SharingSavedTensor_ReleaseIndependentPins),
+                Output = Fixed(new[] { 2 }, 5f, 1f),
+                Input0 = Fixed(new[] { 2 }, 7f, 1f),
+                InputCount = 1,
+                Backward = PassThroughBackward,
+                SavedState = new object[] { saved }
+            });
+            secondTape.Record(new TapeEntry<float>
+            {
+                OperationName = nameof(TwoRecordedEntries_SharingSavedTensor_ReleaseIndependentPins),
+                Output = Fixed(new[] { 2 }, 9f, 1f),
+                Input0 = Fixed(new[] { 2 }, 11f, 1f),
+                InputCount = 1,
+                Backward = PassThroughBackward,
+                SavedState = new object[] { saved }
+            });
+
+            Assert.Equal(2, saved._pinnedByTapeCount);
+            secondTape.Dispose();
+            Assert.Equal(1, saved._pinnedByTapeCount);
+
+            TensorPool<float>.Return(saved);
+            var scratch = TensorPool<float>.Rent(ShapeOf(saved));
+            Assert.NotSame(saved, scratch);
+            TensorPool<float>.Return(scratch);
+
+            firstTape.Dispose();
+            Assert.Equal(0, saved._pinnedByTapeCount);
+            TensorPool<float>.Return(saved);
+            Assert.Same(saved, TensorPool<float>.Rent(ShapeOf(saved)));
+        }
+        finally
+        {
+            secondTape.Dispose();
+            firstTape.Dispose();
+        }
+    }
+
+    [Fact]
     public void CachedReplay_ReleasesSavedStateAndKeepsGradientsStable()
     {
         TensorPool<float>.Clear();

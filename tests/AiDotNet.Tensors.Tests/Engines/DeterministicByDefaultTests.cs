@@ -343,7 +343,7 @@ public class DeterministicByDefaultTests
     }
 
     [Fact]
-    public async Task SetCurrent_OnOneThread_DoesNotLeakToAnotherThread()
+    public void SetCurrent_OnOneThread_DoesNotLeakToAnotherThread()
     {
         // The core thread-local invariant: thread A's override must not change
         // what thread B sees. Without this, "thread-local" would be a lie.
@@ -360,22 +360,26 @@ public class DeterministicByDefaultTests
             using var mayExit     = new ManualResetEventSlim(false);
             bool parkedObservation = false;
 
-            var parked = Task.Run(() =>
+            var parked = new Thread(() =>
             {
                 parkedReady.Set();
                 mayExit.Wait();
                 // Record the thread-local accessor's value from the parked thread.
                 parkedObservation = BlasProvider.IsDeterministicMode;
             });
-
-            parkedReady.Wait();
-            // Main thread installs a thread-local override.
-            TensorCodecOptions.SetCurrent(new TensorCodecOptions { Deterministic = false });
-            Assert.False(BlasProvider.IsDeterministicMode); // main thread sees the override
-
-            // Release the parked thread.
-            mayExit.Set();
-            await parked.ConfigureAwait(false);
+            parked.Start();
+            try
+            {
+                parkedReady.Wait();
+                // Main thread installs a thread-local override.
+                TensorCodecOptions.SetCurrent(new TensorCodecOptions { Deterministic = false });
+                Assert.False(BlasProvider.IsDeterministicMode); // main thread sees the override
+            }
+            finally
+            {
+                mayExit.Set();
+                parked.Join();
+            }
 
             // The parked thread never installed an override of its own, so it
             // must still see the process-wide value (true), not main's override.

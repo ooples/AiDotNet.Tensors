@@ -8,9 +8,13 @@ using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 
-public class CompilationComponentTests
+[Collection("CompilationGlobalState")]
+public class CompilationComponentTests : IDisposable
 {
     private const float Tolerance = 1e-5f;
+    private readonly IEngine _priorEngine = AiDotNetEngine.Current;
+
+    public void Dispose() => AiDotNetEngine.Current = _priorEngine;
 
     #region CompiledModelCache Tests
 
