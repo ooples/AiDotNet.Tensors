@@ -700,7 +700,7 @@ public class InferencePlanSerializationTests : IDisposable
                 await CompiledPlanLoader.LoadInferenceAsync<float>(stream, engine);
             Assert.NotNull(loaded);
 
-            Tensor<float> loadedInput = Assert.IsType<Tensor<float>>(loaded!.CompiledInputTensor);
+            using Tensor<float> loadedInput = Assert.IsType<Tensor<float>>(loaded!.CompiledInputTensor);
             var leaseSource = (ITensorStorageLeaseSource)loadedInput;
             var storage = Assert.IsType<TensorStorage<float>>(leaseSource.StorageIdentity);
             int refCountWithPlan = storage.RefCount;
