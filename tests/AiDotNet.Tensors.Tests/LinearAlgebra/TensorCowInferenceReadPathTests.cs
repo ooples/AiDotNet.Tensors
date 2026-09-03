@@ -148,20 +148,9 @@ public class TensorCowInferenceReadPathTests
         var nativeActual = operation(Engine, nativeLeft, nativeRight);
         AssertClose(expected, nativeActual);
 
-        DirectGpuTensorEngine gpu;
-        try
+        using (var gpu = new DirectGpuTensorEngine())
         {
-            gpu = new DirectGpuTensorEngine();
-        }
-        catch
-        {
-            return;
-        }
-
-        using (gpu)
-        {
-            if (!gpu.IsGpuAvailable)
-                return;
+            Skip.IfNot(gpu.IsGpuAvailable, "No DirectGpu backend is available on this machine.");
 
             var backend = gpu.TestBackend!;
             using var gpuLeft = Tensor<float>.FromGpuBuffer(
@@ -430,18 +419,7 @@ public class TensorCowInferenceReadPathTests
     [SkippableFact]
     public void DirectGpuDivide_DoesNotPrivatizeCowInputs()
     {
-        DirectGpuTensorEngine gpu;
-        try
-        {
-            gpu = new DirectGpuTensorEngine();
-        }
-        catch
-        {
-            Skip.If(true, "No DirectGpu backend can be initialized on this machine.");
-            return;
-        }
-
-        using (gpu)
+        using (var gpu = new DirectGpuTensorEngine())
         {
             Skip.IfNot(gpu.IsGpuAvailable, "No DirectGpu backend is available on this machine.");
 

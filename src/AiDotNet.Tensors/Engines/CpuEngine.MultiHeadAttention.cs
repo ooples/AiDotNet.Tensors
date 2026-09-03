@@ -6,6 +6,7 @@ using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 #endif
 using AiDotNet.Tensors.Engines.Compilation;
+using AiDotNet.Tensors.Engines.Compilation.Serialization;
 using AiDotNet.Tensors.Engines.Simd;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -120,12 +121,12 @@ public partial class CpuEngine
             scope.BindEngineIfUnset(this);
             var graphInputs = new[] { input, qWeight, kWeight, vWeight, outWeight };
             var capturedMask = mask;
-            object[] savedState =
-            {
-                numHeads,
-                mask is null ? null! : mask.GetFlattenedData(),
-                mask is null ? null! : (int[])mask._shape.Clone()
-            };
+            var savedState = new object[PlanFormatConstants.MultiHeadAttentionSavedStateCount];
+            savedState[PlanFormatConstants.MultiHeadAttentionNumHeadsStateIndex] = numHeads;
+            savedState[PlanFormatConstants.MultiHeadAttentionMaskDataStateIndex] =
+                mask is null ? null! : mask.GetFlattenedData();
+            savedState[PlanFormatConstants.MultiHeadAttentionMaskShapeStateIndex] =
+                mask is null ? null! : (int[])mask._shape.Clone();
             return scope.RecordVariadic(
                 LazyNodeType.MultiHeadAttentionForward,
                 "MultiHeadAttentionForward",

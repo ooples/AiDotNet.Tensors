@@ -293,6 +293,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // Key: CsrCacheKey (SparseTensor + Backend reference pair) to avoid cross-backend buffer reuse.
     private readonly ConcurrentDictionary<CsrCacheKey, CsrGpuCache> _csrBufferCache = new();
 
+    // SampleRaysWithOccupancy receives a uint tensor while GPU kernels consume int words. Keep one
+    // versioned, backend-bound conversion per engine so repeated ray batches do not download,
+    // widen, and upload an unchanged grid. A one-entry MRU is deliberately bounded.
+    private readonly object _occupancyBufferCacheGate = new();
+    private Tensor<uint>? _occupancyBufferCacheTensor;
+    private IDirectGpuBackend? _occupancyBufferCacheBackend;
+    private IGpuBuffer? _occupancyBufferCacheBuffer;
+    private int _occupancyBufferCacheVersion = -1;
+
     // Activation cache for intermediate tensors - enables GPU-resident layer chaining
     // Key: tensor data array reference, Value: (buffer, shape, timestamp)
     // This cache holds the last N activation buffers to avoid re-uploading layer outputs
@@ -1370,6 +1379,58 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             if (_state is not null && Interlocked.Exchange(ref _state.OwnsBuffer, 0) != 0)
                 _state.Buffer.Dispose();
+        }
+
+        /// <summary>
+        /// Releases an owned temporary only after work already queued on the backend can no longer
+        /// reference it. CUDA's legacy allocator needs an event-ordered release; other backends'
+        /// buffer disposal contracts already retain submitted resources as required by their APIs.
+        /// </summary>
+        public void DisposeAfterQueuedUse(IDirectGpuBackend backend)
+        {
+            if (_state is null || Interlocked.Exchange(ref _state.OwnsBuffer, 0) == 0)
+                return;
+
+            DisposeBufferAfterQueuedUse(backend, _state.Buffer);
+        }
+    }
+
+    private static void DisposeBufferAfterQueuedUse(IDirectGpuBackend backend, IGpuBuffer buffer)
+    {
+        if (backend is DirectGpu.CUDA.CudaBackend cudaBackend)
+            cudaBackend.FreeBufferDeferred(buffer);
+        else
+            buffer.Dispose();
+    }
+
+    private static void ConvertInverseStandardDeviationToVariance(
+        IDirectGpuBackend backend,
+        IGpuBuffer inverseStandardDeviationAndVariance,
+        int count,
+        float epsilon)
+    {
+        var squared = default(OwnedBuffer);
+        var reciprocal = default(OwnedBuffer);
+        try
+        {
+            squared = AllocateOutputBuffer(backend, count);
+            reciprocal = AllocateOutputBuffer(backend, count);
+            backend.Multiply(
+                inverseStandardDeviationAndVariance,
+                inverseStandardDeviationAndVariance,
+                squared.Buffer,
+                count);
+            backend.Reciprocal(squared.Buffer, reciprocal.Buffer, count);
+            backend.SubScalar(
+                reciprocal.Buffer,
+                inverseStandardDeviationAndVariance,
+                epsilon,
+                count);
+        }
+        finally
+        {
+            squared.DisposeAfterQueuedUse(backend);
+            reciprocal.DisposeAfterQueuedUse(backend);
         }
     }
 
@@ -5754,18 +5815,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (gamma is null) throw new ArgumentNullException(nameof(gamma));
         if (beta is null) throw new ArgumentNullException(nameof(beta));
+        ValidateGroupNormArguments(input, numGroups, gamma, beta, output);
 
         // Inference tracing must be handled by CpuEngine's capture scaffold. Direct execution is
         // intentionally FP32 because every DirectGpu backend stores public numeric tensors as FP32.
         if (Compilation.GraphMode.IsInferenceTrace || typeof(T) != typeof(float) ||
             !output.IsContiguous || input.Rank < 2 || numGroups <= 0 ||
-            input._shape[1] % numGroups != 0 || output.Length != input.Length ||
+            input._shape[1] % numGroups != 0 ||
             !TryGetBackend(out var gpuBackend))
         {
             base.GroupNormInto(output, input, numGroups, gamma, beta, epsilon, out mean, out variance);
             return;
         }
 
+        var aliasOutput = default(OwnedBuffer);
         try
         {
             int batch = input._shape[0];
@@ -5787,7 +5850,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // computing into a distinct temporary and copying back on the same device stream.
             bool aliasesInput = ReferenceEquals(gpuIn.Buffer, gpuOut) ||
                 (gpuIn.Buffer.Handle != IntPtr.Zero && gpuIn.Buffer.Handle == gpuOut.Handle);
-            using var aliasOutput = aliasesInput ? AllocateOutputBuffer(gpuBackend, input.Length) : default;
+            aliasOutput = aliasesInput ? AllocateOutputBuffer(gpuBackend, input.Length) : default;
             IGpuBuffer kernelOutput = aliasesInput ? aliasOutput.Buffer : gpuOut;
 
             gpuBackend.GroupNorm(
@@ -5800,9 +5863,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // Backends save inverse standard deviation for their backward kernels. The public
             // IEngine contract returns population variance, so convert invStd to variance before
             // publishing the buffer: variance = 1 / invStd^2 - epsilon.
-            gpuBackend.Multiply(gpuVariance, gpuVariance, gpuVariance, statCount);
-            gpuBackend.Reciprocal(gpuVariance, gpuVariance, statCount);
-            gpuBackend.SubScalar(gpuVariance, gpuVariance, (float)epsilon, statCount);
+            ConvertInverseStandardDeviationToVariance(
+                gpuBackend, gpuVariance, statCount, (float)epsilon);
 
             BindResidentBuffer(output, gpuOut, gpuBackend);
             BindResidentBuffer(mean, gpuMean, gpuBackend);
@@ -5813,6 +5875,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             if (ThrowOnGpuKernelFallback) throw;
             LogGpuFallback(nameof(IEngine.GroupNormInto), ex);
+        }
+        finally
+        {
+            aliasOutput.DisposeAfterQueuedUse(gpuBackend);
         }
         base.GroupNormInto(output, input, numGroups, gamma, beta, epsilon, out mean, out variance);
     }
@@ -20501,9 +20567,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             bufVar = AllocateOutputBuffer(backend, outerSize);
             backend.LayerNorm(bufIn.Buffer, bufOut.Buffer, bufGamma.Buffer, bufBeta.Buffer,
                 bufMean.Buffer, bufVar.Buffer, outerSize, normSize, (float)epsilon);
-            backend.Multiply(bufVar.Buffer, bufVar.Buffer, bufVar.Buffer, outerSize);
-            backend.Reciprocal(bufVar.Buffer, bufVar.Buffer, outerSize);
-            backend.SubScalar(bufVar.Buffer, bufVar.Buffer, (float)epsilon, outerSize);
+            ConvertInverseStandardDeviationToVariance(
+                backend, bufVar.Buffer, outerSize, (float)epsilon);
             var result = DeferTensorResult<T>(backend, bufOut.Buffer, input.Length, input.Shape.ToArray());
             mean = DeferTensorResult<T>(backend, bufMean.Buffer, outerSize, batchShape);
             variance = DeferTensorResult<T>(backend, bufVar.Buffer, outerSize, batchShape);
@@ -20522,6 +20587,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> GroupNorm<T>(Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (gamma is null) throw new ArgumentNullException(nameof(gamma));
+        if (beta is null) throw new ArgumentNullException(nameof(beta));
+        ValidateGroupNormArguments(input, numGroups, gamma, beta);
         if (IsTapeActive<T>()) return base.GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
         if (!TryGetBackend(out var backend) || input.Rank < 2)
             return base.GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
@@ -20549,9 +20618,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // GroupNorm. #642 P3 root cause of the deferred-ResBlock divergence (eager was wrong too).
             backend.GroupNorm(bufIn.Buffer, bufOut.Buffer, bufGamma.Buffer, bufBeta.Buffer,
                 bufMean.Buffer, bufVar.Buffer, batch, numGroups, channels, spatial, (float)epsilon);
-            backend.Multiply(bufVar.Buffer, bufVar.Buffer, bufVar.Buffer, batch * numGroups);
-            backend.Reciprocal(bufVar.Buffer, bufVar.Buffer, batch * numGroups);
-            backend.SubScalar(bufVar.Buffer, bufVar.Buffer, (float)epsilon, batch * numGroups);
+            ConvertInverseStandardDeviationToVariance(
+                backend, bufVar.Buffer, batch * numGroups, (float)epsilon);
             var result = DeferTensorResult<T>(backend, bufOut.Buffer, input.Length, input.Shape.ToArray());
             mean = DeferTensorResult<T>(backend, bufMean.Buffer, batch * numGroups, new[] { batch, numGroups });
             variance = DeferTensorResult<T>(backend, bufVar.Buffer, batch * numGroups, new[] { batch, numGroups });
@@ -20592,9 +20660,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             bufVar = AllocateOutputBuffer(backend, batch * channels);
             backend.InstanceNorm(bufIn.Buffer, bufOut.Buffer, bufGamma.Buffer, bufBeta.Buffer,
                 bufMean.Buffer, bufVar.Buffer, batch, channels, spatial, (float)epsilon);
-            backend.Multiply(bufVar.Buffer, bufVar.Buffer, bufVar.Buffer, batch * channels);
-            backend.Reciprocal(bufVar.Buffer, bufVar.Buffer, batch * channels);
-            backend.SubScalar(bufVar.Buffer, bufVar.Buffer, (float)epsilon, batch * channels);
+            ConvertInverseStandardDeviationToVariance(
+                backend, bufVar.Buffer, batch * channels, (float)epsilon);
             var result = DeferTensorResult<T>(backend, bufOut.Buffer, input.Length, input.Shape.ToArray());
             mean = DeferTensorResult<T>(backend, bufMean.Buffer, batch * channels, new[] { batch, channels });
             variance = DeferTensorResult<T>(backend, bufVar.Buffer, batch * channels, new[] { batch, channels });
@@ -24305,6 +24372,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             entry.Dispose();
         }
         _csrBufferCache.Clear();
+
+        lock (_occupancyBufferCacheGate)
+        {
+            if (_occupancyBufferCacheBuffer is not null && _occupancyBufferCacheBackend is not null)
+                DisposeBufferAfterQueuedUse(_occupancyBufferCacheBackend, _occupancyBufferCacheBuffer);
+            _occupancyBufferCacheTensor = null;
+            _occupancyBufferCacheBackend = null;
+            _occupancyBufferCacheBuffer = null;
+            _occupancyBufferCacheVersion = -1;
+        }
 
         if (_ownsDirectGpu)
             _directGpu?.Dispose();

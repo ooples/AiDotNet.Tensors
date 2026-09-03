@@ -154,10 +154,10 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         _steps = steps;
         _finalOutput = finalOutput;
         _engine = engine;
-        _compiledInputShape = inputShape;
+        _compiledInputShape = (int[])inputShape.Clone();
         _containsCrossEngineSteps = containsCrossEngineSteps;
         _compiledInputTensors = compiledInputTensors is not null
-            ? compiledInputTensors
+            ? (Tensor<T>[])compiledInputTensors.Clone()
             : compiledInputTensor is null
             ? Array.Empty<Tensor<T>>()
             : new[] { compiledInputTensor };
@@ -224,45 +224,60 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         // operand) silently regresses to stale-packed-B after SetInputs(),
         // undoing the correctness fix this PR ships.
         var pinnedHandles = new List<GCHandle>();
-        var specialized = new CompiledStep<T>[steps.Length];
-        for (int i = 0; i < steps.Length; i++)
+        TensorStorageLeaseSet? storageLeases = null;
+        try
         {
-            var step = steps[i];
-            bool allowCachedB = !IsMutableSecondMatMulInput(step, compiledInputTensors);
-            MaybeRegisterFrozenMatMulWeight(step, allowCachedB);
-            var spec = CompiledTrainingPlan<T>.TryBuildSpecializedForward(step, pinnedHandles, allowCachedB);
-            if (spec != null)
+            var specialized = new CompiledStep<T>[steps.Length];
+            for (int i = 0; i < steps.Length; i++)
             {
-                var output = step.OutputBuffer;
-                specialized[i] = new CompiledStep<T>(
-                    step.OpName,
-                    (eng, o) => spec(eng),
-                    output,
-                    step.Inputs,
-                    step.BackwardFn,
-                    step.SavedState);
+                var step = steps[i];
+                bool allowCachedB = !IsMutableSecondMatMulInput(step, compiledInputTensors);
+                MaybeRegisterFrozenMatMulWeight(step, allowCachedB);
+                var spec = CompiledTrainingPlan<T>.TryBuildSpecializedForward(step, pinnedHandles, allowCachedB);
+                if (spec != null)
+                {
+                    var output = step.OutputBuffer;
+                    specialized[i] = new CompiledStep<T>(
+                        step.OpName,
+                        (eng, o) => spec(eng),
+                        output,
+                        step.Inputs,
+                        step.BackwardFn,
+                        step.SavedState);
+                }
+                else
+                {
+                    specialized[i] = step;
+                }
             }
-            else
-            {
-                specialized[i] = step;
-            }
+
+            // Clear LazySource on output tensors (same as Compile does).
+            foreach (var step in specialized)
+                step.OutputBuffer.LazySource = null;
+
+            storageLeases = CaptureStorageLeases(specialized, finalOutput, compiledInputTensors);
+            var plan = new CompiledInferencePlan<T>(
+                specialized, finalOutput, engine, inputShape,
+                handles: pinnedHandles,
+                compiledInputTensor: compiledInputTensors.Length > 0 ? compiledInputTensors[0] : null,
+                compiledInputTensors: compiledInputTensors,
+                storageLeases: storageLeases);
+            storageLeases = null;
+            return plan;
         }
-
-        // Clear LazySource on output tensors (same as Compile does).
-        foreach (var step in specialized)
-            step.OutputBuffer.LazySource = null;
-
-        return new CompiledInferencePlan<T>(
-            specialized, finalOutput, engine, inputShape,
-            handles: pinnedHandles,
-            compiledInputTensor: compiledInputTensors.Length > 0 ? compiledInputTensors[0] : null,
-            compiledInputTensors: compiledInputTensors);
+        catch
+        {
+            storageLeases?.Dispose();
+            foreach (var handle in pinnedHandles)
+                if (handle.IsAllocated) handle.Free();
+            throw;
+        }
     }
 
     // ── Internal accessors for serialization ────────────────────────────
     // Note: CompiledInputTensor is already defined above for ThenAsync stitching.
     internal CompiledStep<T>[] Steps => _steps;
-    internal int[] CompiledInputShape => _compiledInputShape;
+    internal int[] CompiledInputShape => (int[])_compiledInputShape.Clone();
 
     /// <inheritdoc/>
     /// <remarks>

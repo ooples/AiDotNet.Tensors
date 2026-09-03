@@ -33,6 +33,25 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         }
     }
 
+    internal static class DirectOpenClHostTransfer
+    {
+        internal static void WaitAndRelease(IntPtr completionEvent, string operation)
+        {
+            if (completionEvent == IntPtr.Zero)
+                throw new InvalidOperationException($"{operation} did not return a completion event.");
+            try
+            {
+                int waitError = OpenClNativeBindings.WaitForEvents(1, new[] { completionEvent });
+                if (waitError != OpenClNativeBindings.CL_SUCCESS)
+                    throw new InvalidOperationException($"Failed to wait for {operation}: {waitError}");
+            }
+            finally
+            {
+                OpenClNativeBindings.ReleaseEvent(completionEvent);
+            }
+        }
+    }
+
     /// <summary>
     /// OpenCL buffer wrapper using pure P/Invoke. No managed GPU runtime dependency.
     /// </summary>
@@ -125,6 +144,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 throw new ArgumentException("Destination array too small");
 
             GCHandle handle = GCHandle.Alloc(destination, GCHandleType.Pinned);
+            IntPtr transferEvent = IntPtr.Zero;
             try
             {
                 IntPtr queue = _context.CommandQueue;
@@ -135,10 +155,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     lock (DirectOpenClSubmission.Gate)
                     {
                         using var waits = DirectOpenClSubmission.PrepareLocked(queue, memories);
-                        err = OpenClNativeBindings.EnqueueReadBuffer(
-                            queue, _buffer, 1, UIntPtr.Zero,
+                        err = OpenClNativeBindings.EnqueueReadBufferWithEvent(
+                            queue, _buffer, 0, UIntPtr.Zero,
                             (UIntPtr)(_length * sizeof(float)), handle.AddrOfPinnedObject(),
-                            waits.Count, waits.Pointer, IntPtr.Zero);
+                            waits.Count, waits.Pointer, out transferEvent);
                         if (err == OpenClNativeBindings.CL_SUCCESS)
                             DirectOpenClSubmission.CommitLocked(queue, memories);
                     }
@@ -150,10 +170,18 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
                 if (err != OpenClNativeBindings.CL_SUCCESS)
                     throw new InvalidOperationException($"Failed to read OpenCL buffer: {err}");
+                IntPtr completionEvent = transferEvent;
+                transferEvent = IntPtr.Zero;
+                DirectOpenClHostTransfer.WaitAndRelease(completionEvent, "OpenCL buffer read");
             }
             finally
             {
-                handle.Free();
+                try
+                {
+                    if (transferEvent != IntPtr.Zero)
+                        DirectOpenClHostTransfer.WaitAndRelease(transferEvent, "OpenCL buffer read cleanup");
+                }
+                finally { handle.Free(); }
             }
         }
 
@@ -166,6 +194,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 throw new ArgumentException("Source array too large");
 
             GCHandle handle = GCHandle.Alloc(source, GCHandleType.Pinned);
+            IntPtr transferEvent = IntPtr.Zero;
             try
             {
                 IntPtr queue = _context.CommandQueue;
@@ -176,10 +205,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     lock (DirectOpenClSubmission.Gate)
                     {
                         using var waits = DirectOpenClSubmission.PrepareLocked(queue, memories);
-                        err = OpenClNativeBindings.EnqueueWriteBuffer(
-                            queue, _buffer, 1, UIntPtr.Zero,
+                        err = OpenClNativeBindings.EnqueueWriteBufferWithEvent(
+                            queue, _buffer, 0, UIntPtr.Zero,
                             (UIntPtr)(source.Length * sizeof(float)), handle.AddrOfPinnedObject(),
-                            waits.Count, waits.Pointer, IntPtr.Zero);
+                            waits.Count, waits.Pointer, out transferEvent);
                         if (err == OpenClNativeBindings.CL_SUCCESS)
                             DirectOpenClSubmission.CommitLocked(queue, memories);
                     }
@@ -191,10 +220,18 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
                 if (err != OpenClNativeBindings.CL_SUCCESS)
                     throw new InvalidOperationException($"Failed to write OpenCL buffer: {err}");
+                IntPtr completionEvent = transferEvent;
+                transferEvent = IntPtr.Zero;
+                DirectOpenClHostTransfer.WaitAndRelease(completionEvent, "OpenCL buffer write");
             }
             finally
             {
-                handle.Free();
+                try
+                {
+                    if (transferEvent != IntPtr.Zero)
+                        DirectOpenClHostTransfer.WaitAndRelease(transferEvent, "OpenCL buffer write cleanup");
+                }
+                finally { handle.Free(); }
             }
         }
 
@@ -306,6 +343,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 throw new ArgumentException("Destination array too small");
 
             GCHandle handle = GCHandle.Alloc(destination, GCHandleType.Pinned);
+            IntPtr transferEvent = IntPtr.Zero;
             try
             {
                 IntPtr queue = _context.CommandQueue;
@@ -316,9 +354,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     lock (DirectOpenClSubmission.Gate)
                     {
                         using var waits = DirectOpenClSubmission.PrepareLocked(queue, memories);
-                        err = OpenClNativeBindings.EnqueueReadBuffer(
-                            queue, _buffer, 1, UIntPtr.Zero, (UIntPtr)_length,
-                            handle.AddrOfPinnedObject(), waits.Count, waits.Pointer, IntPtr.Zero);
+                        err = OpenClNativeBindings.EnqueueReadBufferWithEvent(
+                            queue, _buffer, 0, UIntPtr.Zero, (UIntPtr)_length,
+                            handle.AddrOfPinnedObject(), waits.Count, waits.Pointer, out transferEvent);
                         if (err == OpenClNativeBindings.CL_SUCCESS)
                             DirectOpenClSubmission.CommitLocked(queue, memories);
                     }
@@ -330,10 +368,18 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
                 if (err != OpenClNativeBindings.CL_SUCCESS)
                     throw new InvalidOperationException($"Failed to read OpenCL byte buffer: {err}");
+                IntPtr completionEvent = transferEvent;
+                transferEvent = IntPtr.Zero;
+                DirectOpenClHostTransfer.WaitAndRelease(completionEvent, "OpenCL byte-buffer read");
             }
             finally
             {
-                handle.Free();
+                try
+                {
+                    if (transferEvent != IntPtr.Zero)
+                        DirectOpenClHostTransfer.WaitAndRelease(transferEvent, "OpenCL byte-buffer read cleanup");
+                }
+                finally { handle.Free(); }
             }
         }
 
@@ -348,6 +394,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 return;
 
             GCHandle handle = GCHandle.Alloc(source, GCHandleType.Pinned);
+            IntPtr transferEvent = IntPtr.Zero;
             try
             {
                 IntPtr queue = _context.CommandQueue;
@@ -358,9 +405,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     lock (DirectOpenClSubmission.Gate)
                     {
                         using var waits = DirectOpenClSubmission.PrepareLocked(queue, memories);
-                        err = OpenClNativeBindings.EnqueueWriteBuffer(
-                            queue, _buffer, 1, UIntPtr.Zero, (UIntPtr)source.Length,
-                            handle.AddrOfPinnedObject(), waits.Count, waits.Pointer, IntPtr.Zero);
+                        err = OpenClNativeBindings.EnqueueWriteBufferWithEvent(
+                            queue, _buffer, 0, UIntPtr.Zero, (UIntPtr)source.Length,
+                            handle.AddrOfPinnedObject(), waits.Count, waits.Pointer, out transferEvent);
                         if (err == OpenClNativeBindings.CL_SUCCESS)
                             DirectOpenClSubmission.CommitLocked(queue, memories);
                     }
@@ -372,10 +419,18 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
                 if (err != OpenClNativeBindings.CL_SUCCESS)
                     throw new InvalidOperationException($"Failed to write OpenCL byte buffer: {err}");
+                IntPtr completionEvent = transferEvent;
+                transferEvent = IntPtr.Zero;
+                DirectOpenClHostTransfer.WaitAndRelease(completionEvent, "OpenCL byte-buffer write");
             }
             finally
             {
-                handle.Free();
+                try
+                {
+                    if (transferEvent != IntPtr.Zero)
+                        DirectOpenClHostTransfer.WaitAndRelease(transferEvent, "OpenCL byte-buffer write cleanup");
+                }
+                finally { handle.Free(); }
             }
         }
 
@@ -487,6 +542,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 throw new ArgumentException("Destination array too small");
 
             GCHandle handle = GCHandle.Alloc(destination, GCHandleType.Pinned);
+            IntPtr transferEvent = IntPtr.Zero;
             try
             {
                 IntPtr queue = _context.CommandQueue;
@@ -497,10 +553,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     lock (DirectOpenClSubmission.Gate)
                     {
                         using var waits = DirectOpenClSubmission.PrepareLocked(queue, memories);
-                        err = OpenClNativeBindings.EnqueueReadBuffer(
-                            queue, _buffer, 1, UIntPtr.Zero,
+                        err = OpenClNativeBindings.EnqueueReadBufferWithEvent(
+                            queue, _buffer, 0, UIntPtr.Zero,
                             (UIntPtr)(_length * sizeof(int)), handle.AddrOfPinnedObject(),
-                            waits.Count, waits.Pointer, IntPtr.Zero);
+                            waits.Count, waits.Pointer, out transferEvent);
                         if (err == OpenClNativeBindings.CL_SUCCESS)
                             DirectOpenClSubmission.CommitLocked(queue, memories);
                     }
@@ -512,10 +568,18 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
                 if (err != OpenClNativeBindings.CL_SUCCESS)
                     throw new InvalidOperationException($"Failed to read OpenCL int buffer: {err}");
+                IntPtr completionEvent = transferEvent;
+                transferEvent = IntPtr.Zero;
+                DirectOpenClHostTransfer.WaitAndRelease(completionEvent, "OpenCL int-buffer read");
             }
             finally
             {
-                handle.Free();
+                try
+                {
+                    if (transferEvent != IntPtr.Zero)
+                        DirectOpenClHostTransfer.WaitAndRelease(transferEvent, "OpenCL int-buffer read cleanup");
+                }
+                finally { handle.Free(); }
             }
         }
 

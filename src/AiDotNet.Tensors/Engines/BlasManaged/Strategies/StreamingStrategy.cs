@@ -35,6 +35,8 @@ internal static class StreamingStrategy
     /// </summary>
     private const int StreamingSchedulingNr = 8;
     private const int StreamingMr = 8;
+    private const int NParallelismThresholdMultiplier = 2;
+    private const int ScalarColumnTileWidth = 1;
 
     /// <summary>
     /// Compute C += op(A) · op(B) with no packing. C is read-modify-write
@@ -67,7 +69,8 @@ internal static class StreamingStrategy
             return;
         }
 
-        if (axis == ParallelismAxis.N && (long)n >= (long)procs * StreamingSchedulingNr * 2)
+        if (axis == ParallelismAxis.N &&
+            (long)n >= (long)procs * StreamingSchedulingNr * NParallelismThresholdMultiplier)
         {
             int columnTileWidth = GetColumnTileWidth<T>(transB);
             RunNParallel(a, lda, transA, b, ldb, transB, c, ldc, m, n, k, procs, columnTileWidth);
@@ -352,7 +355,7 @@ internal static class StreamingStrategy
     {
         if (transB)
         {
-            return 1;
+            return ScalarColumnTileWidth;
         }
 
         if (typeof(T) == typeof(double))
@@ -361,7 +364,7 @@ internal static class StreamingStrategy
             if (Avx2Streaming.IsSupported) return Avx2Streaming.Fp64ColumnTileWidth;
             if (NeonStreaming.IsSupported) return NeonStreaming.Fp64ColumnTileWidth;
             if (PortableSimdStreaming.IsSupported) return PortableSimdStreaming.Fp64ColumnTileWidth;
-            return 1;
+            return ScalarColumnTileWidth;
         }
 
         if (typeof(T) == typeof(float))
@@ -369,7 +372,7 @@ internal static class StreamingStrategy
             if (Avx512Streaming.IsSupported) return Avx512Streaming.Fp32ColumnTileWidth;
             if (Avx2Streaming.IsSupported) return Avx2Streaming.Fp32ColumnTileWidth;
             if (NeonStreaming.IsSupported) return NeonStreaming.Fp32ColumnTileWidth;
-            return 1;
+            return ScalarColumnTileWidth;
         }
 
         throw new NotSupportedException($"StreamingStrategy does not support T={typeof(T).Name}.");

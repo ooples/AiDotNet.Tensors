@@ -882,7 +882,8 @@ public sealed class MixedPrecisionCompiledPlan : IDisposable
     private void Dispose(bool disposing)
     {
         if (System.Threading.Interlocked.Exchange(ref _disposed, 1) != 0) return;
-        _storageLeases?.Dispose();
+        if (!RuntimeShutdown.IsTearingDown)
+            _storageLeases?.Dispose();
         _storageLeases = null;
         if (disposing)
         {

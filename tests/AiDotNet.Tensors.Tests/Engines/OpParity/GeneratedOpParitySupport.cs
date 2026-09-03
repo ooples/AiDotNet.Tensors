@@ -8,7 +8,6 @@
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
-using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.OpParity;
@@ -70,49 +69,15 @@ public static class GeneratedOpParitySupport
     /// </summary>
     public static bool HasGeneratedHomogeneousOutputCoverage(MethodInfo method)
     {
-        if (method is null || !method.IsGenericMethodDefinition || method.GetGenericArguments().Length != 1)
-            return false;
-
-        var tensorElementTypes = new List<System.Type>();
-        CollectTensorElementTypes(method.ReturnType, tensorElementTypes);
-        foreach (var parameter in method.GetParameters())
-        {
-            if (parameter.IsOut)
-                CollectTensorElementTypes(parameter.ParameterType, tensorElementTypes);
-        }
-
-        if (tensorElementTypes.Count < 2)
-            return false;
-
-        var methodElementType = method.GetGenericArguments()[0];
-        if (tensorElementTypes.Any(elementType => elementType != methodElementType))
+        if (method is null ||
+            !GeneratedTensorOutputContractCatalog.TryGetHomogeneousOverload(
+                method, out TensorOutputOverload expectedOverload))
             return false;
 
         return ByMethod[method.Name].Any(op =>
             op.TensorOutputContract == TensorOutputContract.HomogeneousMultiple &&
-            op.HasMultipleOutputs);
-    }
-
-    private static void CollectTensorElementTypes(System.Type type, ICollection<System.Type> output)
-    {
-        if (type.IsByRef)
-        {
-            CollectTensorElementTypes(type.GetElementType()!, output);
-            return;
-        }
-
-        if (type.IsArray)
-        {
-            CollectTensorElementTypes(type.GetElementType()!, output);
-            return;
-        }
-
-        if (type.IsGenericType && type.GetGenericTypeDefinition() == typeof(Tensor<>))
-        {
-            output.Add(type.GetGenericArguments()[0]);
-            return;
-        }
-
+            op.HasMultipleOutputs &&
+            op.TensorOutputOverload == expectedOverload);
     }
 
     /// <summary>

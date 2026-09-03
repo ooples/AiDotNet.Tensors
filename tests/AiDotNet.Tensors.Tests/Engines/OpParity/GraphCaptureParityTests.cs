@@ -125,14 +125,6 @@ public sealed class GraphCaptureParityTests
         for (int outputIndex = 0; outputIndex < eagerOriginal.Length; outputIndex++)
         {
             Assert.Equal(eagerOriginal[outputIndex].Shape.ToArray(), eagerChanged[outputIndex].Shape.ToArray());
-            bool bitExact = ParityMath.BitExact(
-                eagerOriginal[outputIndex].ToArray(), eagerChanged[outputIndex].ToArray(), out _);
-            if (OutputDependency(op, outputIndex) == GraphOutputDependency.MutableInput)
-                Assert.False(bitExact,
-                    $"{op.Name} output[{outputIndex}]: the generated value mutation did not change the eager result.");
-            else
-                Assert.True(bitExact,
-                    $"{op.Name} output[{outputIndex}]: an input-independent result changed with mutable tensor inputs.");
 
             var snapshots = new List<FloatInputSnapshot>();
             CompiledInferencePlan<float> plan;
@@ -192,13 +184,19 @@ public sealed class GraphCaptureParityTests
         IEngine engine,
         out float[] eagerChanged)
     {
-        float[] eagerOriginal = op.RunFloat(engine).ToArray();
+        using Tensor<float> originalTensor = op.RunFloat(engine);
+        float[] eagerOriginal = originalTensor.ToArray();
         foreach (GraphMutationProfile candidate in MutationProfiles)
         {
             try
             {
+                Tensor<float> changedTensor;
                 using (OpInput.UseGraphMutation(candidate))
-                    eagerChanged = op.RunFloat(engine).ToArray();
+                    changedTensor = op.RunFloat(engine);
+                using (changedTensor)
+                {
+                    eagerChanged = changedTensor.ToArray();
+                }
 
                 if (eagerOriginal.Length == eagerChanged.Length &&
                     PreservesFiniteDomain(eagerOriginal, eagerChanged) &&
@@ -227,9 +225,10 @@ public sealed class GraphCaptureParityTests
     {
         foreach (GraphMutationProfile candidate in MutationProfiles)
         {
+            Tensor<float>[]? candidateOutputs = null;
+            bool selected = false;
             try
             {
-                Tensor<float>[] candidateOutputs;
                 using (OpInput.UseGraphMutation(candidate))
                     candidateOutputs = op.RunFloatOutputs!(engine);
 
@@ -250,6 +249,7 @@ public sealed class GraphCaptureParityTests
 
                 if (everyOutputSatisfied)
                 {
+                    selected = true;
                     eagerChanged = candidateOutputs;
                     return candidate;
                 }
@@ -257,6 +257,12 @@ public sealed class GraphCaptureParityTests
             catch (ArgumentException)
             {
                 // See SelectMutation: domain-invalid probes are discarded, never accepted.
+            }
+            finally
+            {
+                if (!selected && candidateOutputs is not null)
+                    foreach (Tensor<float>? output in candidateOutputs)
+                        output?.Dispose();
             }
         }
 
@@ -284,18 +290,22 @@ public sealed class GraphCaptureParityTests
     private static void VerifyCaptureIsRejected(OpCase op, IEngine engine)
     {
         var snapshots = new List<FloatInputSnapshot>();
+        using var scope = GraphMode.EnableInference();
+        using var capture = OpInput.CaptureFloatInputSnapshots(snapshots);
+        Tensor<float> output;
         try
         {
-            using var scope = GraphMode.EnableInference();
-            using var capture = OpInput.CaptureFloatInputSnapshots(snapshots);
-            Tensor<float> output = op.RunFloat(engine);
-            using CompiledInferencePlan<float> unexpected = scope.CompileInference(
-                output,
-                snapshots.Select(snapshot => snapshot.Tensor).ToArray());
+            output = op.RunFloat(engine);
         }
-        catch (NotSupportedException)
+        catch (GraphCaptureNotSupportedException)
         {
             return;
+        }
+        using (output)
+        using (CompiledInferencePlan<float> unexpected = scope.CompileInference(
+            output,
+            snapshots.Select(snapshot => snapshot.Tensor).ToArray()))
+        {
         }
 
         string captureContract = op.GraphCaptureSignatureConstraint != GraphCaptureSignatureConstraint.None

@@ -61,7 +61,8 @@ namespace AiDotNet.Tensors.Tests.OpParityGen
                 contracts.Add(new OutputContractSpec(
                     method.Name,
                     homogeneous,
-                    BuildOverloadSuffix(method)));
+                    BuildOverloadSuffix(method),
+                    BuildReflectionSignaturePredicate(method)));
             }
 
             return contracts
@@ -164,6 +165,80 @@ namespace AiDotNet.Tensors.Tests.OpParityGen
             }));
         }
 
+        private static string BuildReflectionSignaturePredicate(IMethodSymbol method)
+        {
+            var checks = new List<string>
+            {
+                $"method.Name == nameof(global::AiDotNet.Tensors.Engines.IEngine.{method.Name})",
+                $"method.GetGenericArguments().Length == {method.TypeParameters.Length}",
+                $"parameters.Length == {method.Parameters.Length}"
+            };
+            for (int i = 0; i < method.Parameters.Length; i++)
+            {
+                IParameterSymbol parameter = method.Parameters[i];
+                string parameterExpression = $"parameters[{i}]";
+                string typeExpression = parameter.RefKind == RefKind.None
+                    ? parameterExpression + ".ParameterType"
+                    : parameterExpression + ".ParameterType.GetElementType()!";
+                if (parameter.RefKind != RefKind.None)
+                    checks.Add(parameterExpression + ".ParameterType.IsByRef");
+                if (parameter.RefKind == RefKind.Out)
+                    checks.Add(parameterExpression + ".IsOut");
+                else if (parameter.RefKind != RefKind.None)
+                    checks.Add("!" + parameterExpression + ".IsOut");
+                checks.Add(BuildReflectionTypePredicate(parameter.Type, typeExpression, method));
+            }
+            return string.Join(" &&\n                    ", checks);
+        }
+
+        private static string BuildReflectionTypePredicate(
+            ITypeSymbol type,
+            string expression,
+            IMethodSymbol method)
+        {
+            if (type is IArrayTypeSymbol array)
+            {
+                return $"{expression}.IsArray && {expression}.GetArrayRank() == {array.Rank} && " +
+                    BuildReflectionTypePredicate(array.ElementType, expression + ".GetElementType()!", method);
+            }
+
+            if (type is ITypeParameterSymbol parameter)
+            {
+                int position = method.TypeParameters.IndexOf(parameter);
+                return $"{expression}.IsGenericParameter && {expression}.GenericParameterPosition == {position}";
+            }
+
+            if (type is INamedTypeSymbol named)
+            {
+                if (!named.IsGenericType)
+                {
+                    string display = named.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
+                    return $"{expression} == typeof({display})";
+                }
+
+                string unbound = named.OriginalDefinition.SpecialType == SpecialType.System_Nullable_T
+                    ? "global::System.Nullable<>"
+                    : named.ConstructUnboundGenericType()
+                        .ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
+                var checks = new List<string>
+                {
+                    $"{expression}.IsGenericType",
+                    $"{expression}.GetGenericTypeDefinition() == typeof({unbound})"
+                };
+                for (int i = 0; i < named.TypeArguments.Length; i++)
+                {
+                    checks.Add(BuildReflectionTypePredicate(
+                        named.TypeArguments[i],
+                        expression + $".GetGenericArguments()[{i}]",
+                        method));
+                }
+                return "(" + string.Join(" && ", checks) + ")";
+            }
+
+            string fallback = type.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
+            return $"{expression} == typeof({fallback})";
+        }
+
         private static string TypeToken(ITypeSymbol type)
         {
             if (type is IArrayTypeSymbol array)
@@ -225,6 +300,31 @@ namespace AiDotNet.Tensors.Tests.OpParityGen
                 sb.AppendLine($"        {contract.OverloadId},");
             sb.AppendLine("    }");
             sb.AppendLine();
+            sb.AppendLine("    /// <summary>Generated structural identities for homogeneous multi-output IEngine signatures.</summary>");
+            sb.AppendLine("    public static class GeneratedTensorOutputContractCatalog");
+            sb.AppendLine("    {");
+            sb.AppendLine("        public static bool TryGetHomogeneousOverload(");
+            sb.AppendLine("            global::System.Reflection.MethodInfo method,");
+            sb.AppendLine("            out TensorOutputOverload overload)");
+            sb.AppendLine("        {");
+            sb.AppendLine("            if (method is null) throw new global::System.ArgumentNullException(nameof(method));");
+            sb.AppendLine("            global::System.Reflection.ParameterInfo[] parameters = method.GetParameters();");
+            foreach (var contract in contracts.Where(contract => contract.IsHomogeneous))
+            {
+                string overload = contract.OverloadId is null
+                    ? "TensorOutputOverload.Unspecified"
+                    : $"TensorOutputOverload.{contract.OverloadId}";
+                sb.AppendLine($"            if ({contract.ReflectionSignaturePredicate})");
+                sb.AppendLine("            {");
+                sb.AppendLine($"                overload = {overload};");
+                sb.AppendLine("                return true;");
+                sb.AppendLine("            }");
+            }
+            sb.AppendLine("            overload = TensorOutputOverload.Unspecified;");
+            sb.AppendLine("            return false;");
+            sb.AppendLine("        }");
+            sb.AppendLine("    }");
+            sb.AppendLine();
             sb.AppendLine("    /// <summary>Generated from every IEngine signature with multiple tensor results.</summary>");
             sb.AppendLine("    public sealed class GeneratedTensorOutputContractTests");
             sb.AppendLine("    {");
@@ -238,7 +338,7 @@ namespace AiDotNet.Tensors.Tests.OpParityGen
                     ? "TensorOutputOverload.Unspecified"
                     : $"TensorOutputOverload.{contract.OverloadId}";
                 sb.AppendLine("        [Fact]");
-                sb.AppendLine($"        public void OutputContract_{method}() => GeneratedOpParitySupport.VerifyTensorOutputContract(\"{contract.Name}\", {expectation}, {overload});");
+                sb.AppendLine($"        public void OutputContract_{method}() => GeneratedOpParitySupport.VerifyTensorOutputContract(nameof(global::AiDotNet.Tensors.Engines.IEngine.{contract.Name}), {expectation}, {overload});");
             }
             sb.AppendLine("    }");
             sb.AppendLine("}");
@@ -273,7 +373,7 @@ namespace AiDotNet.Tensors.Tests.OpParityGen
                     ? "GraphCaptureSignatureOverload.Unspecified"
                     : $"GraphCaptureSignatureOverload.{contract.OverloadId}";
                 sb.AppendLine("        [Fact]");
-                sb.AppendLine($"        public void CaptureContract_{method}() => GeneratedOpParitySupport.VerifyGraphCaptureSignature(\"{contract.Name}\", GraphCaptureSignatureConstraint.{contract.Constraint}, {overload});");
+                sb.AppendLine($"        public void CaptureContract_{method}() => GeneratedOpParitySupport.VerifyGraphCaptureSignature(nameof(global::AiDotNet.Tensors.Engines.IEngine.{contract.Name}), GraphCaptureSignatureConstraint.{contract.Constraint}, {overload});");
             }
             sb.AppendLine("    }");
             sb.AppendLine("}");
@@ -291,24 +391,32 @@ namespace AiDotNet.Tensors.Tests.OpParityGen
 
         private sealed class OutputContractSpec
         {
-            internal OutputContractSpec(string name, bool isHomogeneous, string overloadSuffix, string? overloadId = null)
+            internal OutputContractSpec(
+                string name,
+                bool isHomogeneous,
+                string overloadSuffix,
+                string reflectionSignaturePredicate,
+                string? overloadId = null)
             {
                 Name = name;
                 IsHomogeneous = isHomogeneous;
                 OverloadSuffix = overloadSuffix;
+                ReflectionSignaturePredicate = reflectionSignaturePredicate;
                 OverloadId = overloadId;
             }
 
             internal string Name { get; }
             internal bool IsHomogeneous { get; }
             internal string OverloadSuffix { get; }
+            internal string ReflectionSignaturePredicate { get; }
             internal string? OverloadId { get; }
 
             internal OutputContractSpec WithoutOverloadId() =>
-                new OutputContractSpec(Name, IsHomogeneous, OverloadSuffix);
+                new OutputContractSpec(Name, IsHomogeneous, OverloadSuffix, ReflectionSignaturePredicate);
 
             internal OutputContractSpec WithOverloadId(string overloadId) =>
-                new OutputContractSpec(Name, IsHomogeneous, OverloadSuffix, overloadId);
+                new OutputContractSpec(
+                    Name, IsHomogeneous, OverloadSuffix, ReflectionSignaturePredicate, overloadId);
         }
 
         private enum GraphCaptureConstraintKind

@@ -428,4 +428,258 @@ public class InferencePlanSerializationTests : IDisposable
         original.Dispose();
         loaded.Dispose();
     }
+
+    public enum SerializedCompositeOperation
+    {
+        MultiHeadAttentionForward,
+        MlpForward,
+        LstmSequenceForward,
+        ScaledDotProductAttentionGqa,
+        FusedLinearMaxout,
+        FusedHierarchicalSoftmax,
+        TensorRepeatInterleave,
+        TensorMaskedFill,
+        TensorPermute
+    }
+
+    public enum SavedStateCorruptionKind
+    {
+        EntryCount,
+        Int32ArrayLength,
+        Int64ArrayLength,
+        BoolArrayLength,
+        StringLength,
+        ByteArrayLength,
+        EnumNameLength,
+        ActivationSlopeLength
+    }
+
+    [Theory]
+    [InlineData(SerializedCompositeOperation.MultiHeadAttentionForward)]
+    [InlineData(SerializedCompositeOperation.MlpForward)]
+    [InlineData(SerializedCompositeOperation.LstmSequenceForward)]
+    [InlineData(SerializedCompositeOperation.ScaledDotProductAttentionGqa)]
+    [InlineData(SerializedCompositeOperation.FusedLinearMaxout)]
+    [InlineData(SerializedCompositeOperation.FusedHierarchicalSoftmax)]
+    [InlineData(SerializedCompositeOperation.TensorRepeatInterleave)]
+    [InlineData(SerializedCompositeOperation.TensorMaskedFill)]
+    [InlineData(SerializedCompositeOperation.TensorPermute)]
+    public async Task SaveLoad_CompositeOperation_PreservesTypeParametersAndOutput(
+        SerializedCompositeOperation operation)
+    {
+        var engine = new CpuEngine();
+        var inputs = new System.Collections.Generic.List<Tensor<float>>();
+        Tensor<bool>? mask = null;
+        Tensor<float> Input(int[] shape)
+        {
+            Tensor<float> tensor = Tensor<float>.CreateRandom(shape);
+            inputs.Add(tensor);
+            return tensor;
+        }
+
+        CompiledInferencePlan<float>? original = null;
+        CompiledInferencePlan<float>? loaded = null;
+        Tensor<float>? graphOutput = null;
+        try
+        {
+            using (var scope = operation == SerializedCompositeOperation.TensorMaskedFill
+                ? GraphMode.Enable()
+                : GraphMode.EnableInference())
+            {
+                graphOutput = operation switch
+                {
+                    SerializedCompositeOperation.MultiHeadAttentionForward =>
+                        engine.MultiHeadAttentionForward(
+                            Input(new[] { 2, 3, 4 }),
+                            Input(new[] { 4, 4 }), Input(new[] { 4, 4 }),
+                            Input(new[] { 4, 4 }), Input(new[] { 4, 4 }),
+                            numHeads: 2),
+                    SerializedCompositeOperation.MlpForward =>
+                        engine.MlpForward(
+                            Input(new[] { 2, 3 }),
+                            new[] { Input(new[] { 3, 4 }), Input(new[] { 4, 2 }) },
+                            new Tensor<float>?[] { null, null },
+                            FusedActivationType.ReLU,
+                            FusedActivationType.Sigmoid),
+                    SerializedCompositeOperation.LstmSequenceForward =>
+                        engine.LstmSequenceForward(
+                            Input(new[] { 2, 3, 4 }), null, null,
+                            Input(new[] { 8, 4 }), Input(new[] { 8, 2 }),
+                            null, null, returnSequences: true),
+                    SerializedCompositeOperation.ScaledDotProductAttentionGqa =>
+                        engine.ScaledDotProductAttentionGqa(
+                            Input(new[] { 1, 4, 3, 2 }),
+                            Input(new[] { 1, 2, 3, 2 }),
+                            Input(new[] { 1, 2, 3, 2 }),
+                            scale: 0.625, isCausal: true, softcap: 1.5),
+                    SerializedCompositeOperation.FusedLinearMaxout =>
+                        engine.FusedLinearMaxout(
+                            Input(new[] { 2, 3 }), Input(new[] { 3, 8 }),
+                            Input(new[] { 8 }), numPieces: 2),
+                    SerializedCompositeOperation.FusedHierarchicalSoftmax =>
+                        engine.FusedHierarchicalSoftmax(
+                            Input(new[] { 2, 4 }), Input(new[] { 4, 4 }), numClasses: 5),
+                    SerializedCompositeOperation.TensorRepeatInterleave =>
+                        engine.TensorRepeatInterleave(Input(new[] { 2, 3 }), repeats: 3, dim: 1),
+                    SerializedCompositeOperation.TensorMaskedFill =>
+                        engine.TensorMaskedFill(
+                            Input(new[] { 2, 3 }),
+                            mask = new Tensor<bool>(
+                                new[] { true, false, true, false, true, false }, new[] { 2, 3 }),
+                            -7.25f),
+                    SerializedCompositeOperation.TensorPermute =>
+                        engine.TensorPermute(Input(new[] { 2, 3, 4 }), new[] { 2, 0, 1 }),
+                    _ => throw new ArgumentOutOfRangeException(nameof(operation))
+                };
+                original = scope.CompileInference(graphOutput, inputs.ToArray());
+            }
+
+            OpType expectedType = operation switch
+            {
+                SerializedCompositeOperation.MultiHeadAttentionForward => OpType.MultiHeadAttentionForward,
+                SerializedCompositeOperation.MlpForward => OpType.MlpForward,
+                SerializedCompositeOperation.LstmSequenceForward => OpType.LstmSequenceForward,
+                SerializedCompositeOperation.ScaledDotProductAttentionGqa => OpType.ScaledDotProductAttentionGqa,
+                SerializedCompositeOperation.FusedLinearMaxout => OpType.FusedLinearMaxout,
+                SerializedCompositeOperation.FusedHierarchicalSoftmax => OpType.FusedHierarchicalSoftmax,
+                SerializedCompositeOperation.TensorRepeatInterleave => OpType.TensorRepeatInterleave,
+                SerializedCompositeOperation.TensorMaskedFill => OpType.TensorMaskedFill,
+                SerializedCompositeOperation.TensorPermute => OpType.TensorPermute,
+                _ => throw new ArgumentOutOfRangeException(nameof(operation))
+            };
+            Assert.Equal(expectedType, Assert.Single(original.Steps).OpType);
+
+            using var stream = new MemoryStream();
+            await original.SaveAsync(stream);
+            stream.Position = 0;
+            loaded = (CompiledInferencePlan<float>?)
+                await CompiledPlanLoader.LoadInferenceAsync<float>(stream, engine);
+            Assert.NotNull(loaded);
+            Assert.Equal(expectedType, Assert.Single(loaded!.Steps).OpType);
+            Tensor<float>[] replayInputs = inputs.ToArray();
+            original.SetInputs(replayInputs);
+            loaded.SetInputs(replayInputs);
+            Assert.Equal(Snapshot(original.Execute()), Snapshot(loaded.Execute()));
+        }
+        finally
+        {
+            loaded?.Dispose();
+            original?.Dispose();
+            graphOutput?.Dispose();
+            mask?.Dispose();
+            foreach (Tensor<float> input in inputs)
+                input.Dispose();
+        }
+    }
+
+    [Theory]
+    [InlineData(SavedStateCorruptionKind.EntryCount)]
+    [InlineData(SavedStateCorruptionKind.Int32ArrayLength)]
+    [InlineData(SavedStateCorruptionKind.Int64ArrayLength)]
+    [InlineData(SavedStateCorruptionKind.BoolArrayLength)]
+    [InlineData(SavedStateCorruptionKind.StringLength)]
+    [InlineData(SavedStateCorruptionKind.ByteArrayLength)]
+    [InlineData(SavedStateCorruptionKind.EnumNameLength)]
+    [InlineData(SavedStateCorruptionKind.ActivationSlopeLength)]
+    public void SavedStateReader_RejectsImpossibleLengthsBeforeAllocation(
+        SavedStateCorruptionKind corruption)
+    {
+        using var stream = new MemoryStream();
+        using (var writer = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true))
+        {
+            if (corruption == SavedStateCorruptionKind.EntryCount)
+            {
+                writer.Write(int.MaxValue);
+            }
+            else
+            {
+                writer.Write(1);
+                switch (corruption)
+                {
+                    case SavedStateCorruptionKind.Int32ArrayLength:
+                        writer.Write(PlanFormatConstants.TagInt32Array);
+                        writer.Write(int.MaxValue);
+                        break;
+                    case SavedStateCorruptionKind.Int64ArrayLength:
+                        writer.Write(PlanFormatConstants.TagInt64Array);
+                        writer.Write(int.MaxValue);
+                        break;
+                    case SavedStateCorruptionKind.BoolArrayLength:
+                        writer.Write(PlanFormatConstants.TagBoolArray);
+                        writer.Write(int.MaxValue);
+                        break;
+                    case SavedStateCorruptionKind.StringLength:
+                        writer.Write(PlanFormatConstants.TagString);
+                        writer.Write(int.MaxValue);
+                        break;
+                    case SavedStateCorruptionKind.ByteArrayLength:
+                        writer.Write(PlanFormatConstants.TagByteArray);
+                        writer.Write(int.MaxValue);
+                        break;
+                    case SavedStateCorruptionKind.EnumNameLength:
+                        writer.Write(PlanFormatConstants.TagEnum);
+                        writer.Write(int.MaxValue);
+                        break;
+                    case SavedStateCorruptionKind.ActivationSlopeLength:
+                        writer.Write(PlanFormatConstants.TagFusedActivationParams);
+                        writer.Write(false);
+                        writer.Write(false);
+                        writer.Write(false);
+                        writer.Write(int.MaxValue);
+                        break;
+                    default:
+                        throw new ArgumentOutOfRangeException(nameof(corruption));
+                }
+            }
+        }
+
+        stream.Position = 0;
+        using var reader = new BinaryReader(stream, Encoding.UTF8, leaveOpen: true);
+        Assert.Throws<InvalidDataException>(() =>
+            SavedStateSerializer.Read<float>(reader, Array.Empty<Tensor<float>>()));
+    }
+
+    [Theory]
+    [InlineData(int.MaxValue, 0)]
+    [InlineData(1, 1)]
+    public void RepeatInterleaveRebuilder_RejectsCorruptShapeMetadata(int repeats, int dimension)
+    {
+        using var input = new Tensor<float>(new[] { 1f, 2f }, new[] { 2 });
+        using var output = new Tensor<float>(new[] { 2 });
+
+        Assert.Throws<InvalidDataException>(() =>
+            OpSerializationRegistry<float>.RebuildForwardClosure(
+                OpType.TensorRepeatInterleave,
+                new[] { input },
+                output,
+                new object[] { repeats, dimension }));
+    }
+
+    [Fact]
+    public void LstmRebuilder_RejectsUnknownOptionalInputFlags()
+    {
+        using var tensor = new Tensor<float>(new[] { 1f }, new[] { 1 });
+        using var output = new Tensor<float>(new[] { 1 });
+
+        Assert.Throws<InvalidDataException>(() =>
+            OpSerializationRegistry<float>.RebuildForwardClosure(
+                OpType.LstmSequenceForward,
+                new[] { tensor, tensor, tensor },
+                output,
+                new object[] { false, (LstmSequenceOptionalInputs)0x80 }));
+    }
+
+    [Fact]
+    public void LstmRebuilder_RejectsInputCardinalityMismatch()
+    {
+        using var tensor = new Tensor<float>(new[] { 1f }, new[] { 1 });
+        using var output = new Tensor<float>(new[] { 1 });
+
+        Assert.Throws<InvalidDataException>(() =>
+            OpSerializationRegistry<float>.RebuildForwardClosure(
+                OpType.LstmSequenceForward,
+                new[] { tensor, tensor },
+                output,
+                new object[] { false, LstmSequenceOptionalInputs.None }));
+    }
 }

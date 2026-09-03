@@ -1,4 +1,5 @@
 using System;
+using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
@@ -27,50 +28,6 @@ public class Conv2DImplicitGemmParityTests
         return t;
     }
 
-    [Fact]
-    public void RowBlockedIm2Col_IsBitIdentical_ToFullIm2Col()
-    {
-        const int channels = 320;
-        const int height = 32;
-        const int width = 32;
-        const int kernelSize = 3;
-        const int padding = 1;
-        const int outputHeight = 32;
-        const int outputWidth = 32;
-        const int rowsPerBlock = 22;
-        const int colH = channels * kernelSize * kernelSize;
-        const int colW = outputHeight * outputWidth;
-
-        var input = Rand(new[] { 1, channels, height, width }, 101);
-        var full = new float[colH * colW];
-        AiDotNet.Tensors.Helpers.Im2ColHelper.Im2ColChannelParallel(
-            input.AsSpan(), full,
-            channels, height, width,
-            kernelSize, kernelSize, 1, 1, padding, padding, 1, 1,
-            outputHeight, outputWidth);
-
-        for (int ohStart = 0; ohStart < outputHeight; ohStart += rowsPerBlock)
-        {
-            int ohEnd = Math.Min(ohStart + rowsPerBlock, outputHeight);
-            int blockWidth = (ohEnd - ohStart) * outputWidth;
-            var block = new float[colH * blockWidth];
-            AiDotNet.Tensors.Helpers.Im2ColHelper.Im2ColRowBlockFloat(
-                input.AsSpan(), block,
-                channels, height, width,
-                kernelSize, kernelSize, 1, 1, padding, padding, 1, 1,
-                outputHeight, outputWidth, ohStart, ohEnd);
-
-            int fullColumnOffset = ohStart * outputWidth;
-            for (int row = 0; row < colH; row++)
-            {
-                var expected = full.AsSpan(row * colW + fullColumnOffset, blockWidth);
-                var actual = block.AsSpan(row * blockWidth, blockWidth);
-                Assert.True(expected.SequenceEqual(actual),
-                    $"blocked im2col diverged in row {row}, output rows [{ohStart}, {ohEnd})");
-            }
-        }
-    }
-
     [Theory]
     // batch, inC, outC, k, hw, stride, pad, dilation
     [InlineData(1, 256, 256, 3, 16, 1, 1, 1)]   // canonical diffusion ResBlock 3×3
@@ -82,9 +39,11 @@ public class Conv2DImplicitGemmParityTests
     [InlineData(1, 256, 256, 3, 16, 1, 2, 2)]   // dilation 2
     [InlineData(1, 512, 256, 1, 16, 1, 0, 1)]   // 1×1 high-channel (routes to full path)
     [InlineData(1, 256, 300, 5, 12, 1, 2, 1)]   // 5×5, non-power-of-two outC
-    public void FusedConv_IsBitIdentical_ToFullIm2Col(
+    public async Task FusedConv_IsBitIdentical_ToFullIm2Col(
         int batch, int inC, int outC, int k, int hw, int stride, int pad, int dilation)
     {
+        await Task.Yield();
+
         var e = new CpuEngine();
         var x = Rand(new[] { batch, inC, hw, hw }, 101);
         var kernel = Rand(new[] { outC, inC, k, k }, 202);

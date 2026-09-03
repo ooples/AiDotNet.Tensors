@@ -21,7 +21,27 @@ internal enum GraphCaptureLimitation : byte
     HeterogeneousOutput,
     MixedElementTypes,
     HostBoundary,
-    Stateful
+    Stateful,
+    MissingBackwardContract
+}
+
+/// <summary>
+/// Identifies an intentional fail-closed graph-capture rejection without conflating it with an
+/// operation's ordinary <see cref="NotSupportedException"/> failures.
+/// </summary>
+internal sealed class GraphCaptureNotSupportedException : NotSupportedException
+{
+    internal GraphCaptureNotSupportedException(
+        string operationName,
+        GraphCaptureLimitation limitation,
+        string message) : base(message)
+    {
+        OperationName = operationName;
+        Limitation = limitation;
+    }
+
+    internal string OperationName { get; }
+    internal GraphCaptureLimitation Limitation { get; }
 }
 
 /// <summary>
@@ -71,9 +91,45 @@ internal static class GraphMode
     /// not representable by the current plan format. Compatibility and training traces are left
     /// untouched so their existing eager/decomposed behavior remains available.
     /// </summary>
-    internal static void ThrowIfInferenceUnsupported(GraphCaptureLimitation limitation)
+    internal static void ThrowIfInferenceUnsupported(
+        GraphCaptureLimitation limitation,
+        [CallerMemberName] string operationName = "")
     {
         if (!IsInferenceTrace) return;
+
+        ThrowUnsupported(limitation, operationName, "an inference");
+    }
+
+    /// <summary>
+    /// Fails any active graph trace for a contract that cannot be represented by either inference
+    /// or training plans. This prevents eager execution from being mistaken for a captured constant.
+    /// </summary>
+    internal static void ThrowIfActiveUnsupported(
+        GraphCaptureLimitation limitation,
+        [CallerMemberName] string operationName = "")
+    {
+        if (!IsActive) return;
+
+        ThrowUnsupported(limitation, operationName, "a compiled");
+    }
+
+    /// <summary>
+    /// Fails compatibility/training traces while allowing an explicitly inference-only capture.
+    /// </summary>
+    internal static void ThrowIfNonInferenceUnsupported(
+        GraphCaptureLimitation limitation,
+        [CallerMemberName] string operationName = "")
+    {
+        if (!IsActive || IsInferenceTrace) return;
+
+        ThrowUnsupported(limitation, operationName, "a training");
+    }
+
+    private static void ThrowUnsupported(
+        GraphCaptureLimitation limitation,
+        string operationName,
+        string graphKind)
+    {
 
         string reason = limitation switch
         {
@@ -89,11 +145,15 @@ internal static class GraphMode
                 "it crosses a host-only data boundary",
             GraphCaptureLimitation.Stateful =>
                 "it mutates state during execution",
+            GraphCaptureLimitation.MissingBackwardContract =>
+                "it has no backward contract",
             _ => throw new ArgumentOutOfRangeException(nameof(limitation))
         };
 
-        throw new NotSupportedException(
-            $"This operation cannot be captured in an inference graph because {reason}.");
+        throw new GraphCaptureNotSupportedException(
+            operationName,
+            limitation,
+            $"'{operationName}' cannot be captured in {graphKind} graph because {reason}.");
     }
 
     /// <summary>

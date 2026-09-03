@@ -45,6 +45,7 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
     private readonly ConcurrentDictionary<int, Bucket> _buckets = new();
     private readonly int _maxPerSize;
     private readonly int _maxSize;
+    private readonly object _lifecycleGate = new();
     private int _disposed;
 
     public GpuBufferPool(int maxPerSize, int maxSize)
@@ -118,24 +119,29 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
             return;
         }
 
-        // Use power-of-two bucket key matching TryRent
-        int bucketKey = NextPowerOfTwo(buffer.Size);
-        var bucket = _buckets.GetOrAdd(bucketKey, _ => new Bucket());
-        int count = Interlocked.Increment(ref bucket.Count);
-        if (Volatile.Read(ref _disposed) != 0)
+        lock (_lifecycleGate)
         {
-            Interlocked.Decrement(ref bucket.Count);
-            buffer.Release();
-            return;
-        }
-        if (count > _maxPerSize)
-        {
-            Interlocked.Decrement(ref bucket.Count);
-            buffer.Release();
-            return;
-        }
+            if (Volatile.Read(ref _disposed) != 0)
+            {
+                buffer.Release();
+                return;
+            }
 
-        bucket.Buffers.GetOrAdd(affinity, _ => new ConcurrentBag<TBuffer>()).Add(buffer);
+            // Keep bucket creation, capacity accounting, and insertion atomic with Dispose's drain.
+            // Otherwise Dispose can clear the dictionary between GetOrAdd and Add, orphaning a live
+            // device buffer in a bucket that is no longer reachable.
+            int bucketKey = NextPowerOfTwo(buffer.Size);
+            var bucket = _buckets.GetOrAdd(bucketKey, _ => new Bucket());
+            int count = Interlocked.Increment(ref bucket.Count);
+            if (count > _maxPerSize)
+            {
+                Interlocked.Decrement(ref bucket.Count);
+                buffer.Release();
+                return;
+            }
+
+            bucket.Buffers.GetOrAdd(affinity, _ => new ConcurrentBag<TBuffer>()).Add(buffer);
+        }
     }
 
     /// <summary>
@@ -185,25 +191,28 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
             return;
         }
 
-        try
+        lock (_lifecycleGate)
         {
-            foreach (var bucket in _buckets.Values)
+            try
             {
-                foreach (var affinityBuffers in bucket.Buffers.Values)
+                foreach (var bucket in _buckets.Values)
                 {
-                    while (affinityBuffers.TryTake(out var buffer))
+                    foreach (var affinityBuffers in bucket.Buffers.Values)
                     {
-                        buffer.Release();
+                        while (affinityBuffers.TryTake(out var buffer))
+                        {
+                            buffer.Release();
+                        }
                     }
                 }
-            }
 
-            _buckets.Clear();
-        }
-        catch (ObjectDisposedException)
-        {
-            // A concurrent teardown disposed the bag's ThreadLocal mid-drain. Cleanup is
-            // best-effort here (OS reclaims at exit); never let it crash the finalizer.
+                _buckets.Clear();
+            }
+            catch (ObjectDisposedException)
+            {
+                // A concurrent teardown disposed the bag's ThreadLocal mid-drain. Cleanup is
+                // best-effort here (OS reclaims at exit); never let it crash the finalizer.
+            }
         }
     }
 }

@@ -4682,6 +4682,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (data == null) throw new ArgumentNullException(nameof(data));
             if (buffer == null) throw new ArgumentNullException(nameof(buffer));
             if (stream == null) throw new ArgumentNullException(nameof(stream));
+            if (data.Length > buffer.Size)
+                throw new ArgumentException(
+                    $"Source length {data.Length} exceeds buffer capacity {buffer.Size}.", nameof(data));
 
             var openClBuffer = (DirectOpenClGpuBuffer)buffer;
             GCHandle pinned = GCHandle.Alloc(data, GCHandleType.Pinned);
@@ -4746,6 +4749,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (buffer == null) throw new ArgumentNullException(nameof(buffer));
             if (destination == null) throw new ArgumentNullException(nameof(destination));
             if (stream == null) throw new ArgumentNullException(nameof(stream));
+            if (destination.Length > buffer.Size)
+                throw new ArgumentException(
+                    $"Destination length {destination.Length} exceeds buffer capacity {buffer.Size}.",
+                    nameof(destination));
 
             var openClBuffer = (DirectOpenClGpuBuffer)buffer;
             GCHandle pinned = GCHandle.Alloc(destination, GCHandleType.Pinned);

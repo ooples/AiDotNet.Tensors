@@ -28,7 +28,7 @@ public sealed class OpParityTests
 
     public static IEnumerable<object[]> MultiOutputCases =>
         OpParityRegistry.All()
-            .Where(o => (o.HasMultipleOutputs || o.HasHeterogeneousOutputs) && ParityShard.Include(o.Name))
+            .Where(o => o.TensorOutputContract != TensorOutputContract.SingleTensor && ParityShard.Include(o.Name))
             .Select(o => new object[] { o.Name });
 
     [SkippableTheory]

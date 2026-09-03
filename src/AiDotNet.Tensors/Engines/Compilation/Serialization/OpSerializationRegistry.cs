@@ -94,7 +94,7 @@ internal static class OpSerializationRegistry<T>
             OpType.ScaledDotProductAttentionGqa => RebuildScaledDotProductAttentionGqa(inputs, savedState),
             OpType.FusedLinearMaxout => RebuildFusedLinearMaxout(inputs, savedState),
             OpType.FusedHierarchicalSoftmax => RebuildFusedHierarchicalSoftmax(inputs, savedState),
-            OpType.TensorRepeatInterleave => RebuildTensorRepeatInterleave(inputs, savedState),
+            OpType.TensorRepeatInterleave => RebuildTensorRepeatInterleave(inputs, output, savedState),
             OpType.TensorMaskedFill => RebuildTensorMaskedFill(inputs, savedState),
             OpType.TensorPermute => RebuildTensorPermute(inputs, savedState),
             OpType.TensorMultiplyScalar => RebuildTensorMultiplyScalar(inputs, savedState),
@@ -114,46 +114,6 @@ internal static class OpSerializationRegistry<T>
                 "This plan cannot be deserialized. Re-compile from source instead."),
         };
     }
-
-    /// <summary>
-    /// Returns true only for OpTypes that have an actual rebuild handler in
-    /// the switch above — NOT "anything except Unknown." Callers use this to
-    /// decide whether a plan is serializable without having to catch
-    /// <see cref="NotSupportedException"/> from a later rebuild, so the two
-    /// sides must stay exactly aligned. When adding a new rebuild case,
-    /// also add its OpType to the list below.
-    /// </summary>
-    internal static bool IsSupported(OpType opType) => opType switch
-    {
-        // Unary
-        OpType.Sigmoid or OpType.Tanh or OpType.ReLU or OpType.GELU or
-        OpType.Swish or OpType.Mish or OpType.Softplus or OpType.TensorExp or
-        OpType.TensorLog or OpType.TensorSqrt or OpType.TensorAbs or
-        OpType.TensorNegate or OpType.TensorTranspose or OpType.Floor or
-        OpType.Ceiling or OpType.Round or OpType.Sin or OpType.Cos or
-        OpType.Expand or
-        // Binary
-        OpType.TensorAdd or OpType.TensorSubtract or OpType.TensorMultiply or
-        OpType.TensorDivide or OpType.TensorMax or OpType.TensorMatMul or
-        OpType.TensorBroadcastAdd or OpType.TensorBroadcastSubtract or
-        OpType.TensorBroadcastMultiply or OpType.BatchMatMul or
-        // Parameterized activations + reduce family
-        OpType.LeakyReLU or OpType.ELU or OpType.ReduceSum or OpType.Softmax or
-        OpType.Mean or
-        // Conv / pool / norm / attention / fused
-        OpType.Conv2D or OpType.MaxPool2D or OpType.AvgPool2D or
-        OpType.BatchNorm or OpType.LayerNorm or
-        OpType.ScaledDotProductAttention or OpType.FusedLinear or
-        OpType.MultiHeadAttentionForward or OpType.MlpForward or
-        OpType.LstmSequenceForward or OpType.ScaledDotProductAttentionGqa or
-        OpType.FusedLinearMaxout or OpType.FusedHierarchicalSoftmax or
-        OpType.TensorRepeatInterleave or OpType.TensorMaskedFill or
-        OpType.TensorPermute or OpType.TensorMultiplyScalar or
-        OpType.GroupedQueryAttention or
-        // Loss
-        OpType.CrossEntropyLoss => true,
-        _ => false,
-    };
 
     // ════════════════════════════════════════════════════════════════════
     // Generic builders
@@ -484,10 +444,14 @@ internal static class OpSerializationRegistry<T>
     private static Action<IEngine, Tensor<T>> RebuildMultiHeadAttentionForward(
         Tensor<T>[] inputs, object[]? state)
     {
-        RequireInputs(inputs, 5, "MultiHeadAttentionForward");
-        if (state is not { Length: 3 } || state[0] is not int numHeads)
+        RequireInputs(inputs, PlanFormatConstants.MultiHeadAttentionInputCount, "MultiHeadAttentionForward");
+        if (state is not { Length: PlanFormatConstants.MultiHeadAttentionSavedStateCount } ||
+            state[PlanFormatConstants.MultiHeadAttentionNumHeadsStateIndex] is not int numHeads)
             throw new InvalidDataException("MultiHeadAttentionForward saved state is invalid.");
-        Tensor<bool>? mask = RebuildBoolTensor(state[1], state[2], "MultiHeadAttentionForward mask");
+        Tensor<bool>? mask = RebuildBoolTensor(
+            state[PlanFormatConstants.MultiHeadAttentionMaskDataStateIndex],
+            state[PlanFormatConstants.MultiHeadAttentionMaskShapeStateIndex],
+            "MultiHeadAttentionForward mask");
         return (eng, output) =>
         {
             var result = eng.MultiHeadAttentionForward(
@@ -611,11 +575,42 @@ internal static class OpSerializationRegistry<T>
     }
 
     private static Action<IEngine, Tensor<T>> RebuildTensorRepeatInterleave(
-        Tensor<T>[] inputs, object[]? state)
+        Tensor<T>[] inputs, Tensor<T> output, object[]? state)
     {
         RequireInputs(inputs, 1, "TensorRepeatInterleave");
         if (state is not { Length: 2 } || state[0] is not int repeats || state[1] is not int dim)
             throw new InvalidDataException("TensorRepeatInterleave saved state is invalid.");
+        if (repeats < 1)
+            throw new InvalidDataException($"TensorRepeatInterleave repeat count {repeats} must be positive.");
+
+        Tensor<T> input = inputs[0];
+        if ((uint)dim >= (uint)input.Rank)
+            throw new InvalidDataException(
+                $"TensorRepeatInterleave dimension {dim} is outside rank {input.Rank}.");
+
+        int expectedAxis;
+        int expectedLength;
+        try
+        {
+            expectedAxis = checked(input._shape[dim] * repeats);
+            expectedLength = checked(input.Length * repeats);
+        }
+        catch (OverflowException ex)
+        {
+            throw new InvalidDataException(
+                "TensorRepeatInterleave output shape overflows Int32.", ex);
+        }
+
+        if (output.Rank != input.Rank || output.Length != expectedLength)
+            throw new InvalidDataException(
+                $"TensorRepeatInterleave output metadata is inconsistent with the serialized input and repeat count.");
+        for (int axis = 0; axis < input.Rank; axis++)
+        {
+            int expected = axis == dim ? expectedAxis : input._shape[axis];
+            if (output._shape[axis] != expected)
+                throw new InvalidDataException(
+                    $"TensorRepeatInterleave output axis {axis} is {output._shape[axis]}, expected {expected}.");
+        }
         return (eng, output) =>
         {
             var result = eng.TensorRepeatInterleave(inputs[0], repeats, dim);

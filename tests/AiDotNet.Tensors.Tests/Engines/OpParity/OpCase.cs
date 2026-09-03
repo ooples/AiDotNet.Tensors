@@ -86,11 +86,35 @@ public enum TensorOutputContract
     HeterogeneousMultiple
 }
 
-/// <summary>Type-safe comparison semantics for an individual numeric tensor output.</summary>
-public enum TensorOutputComparison
+public enum TensorOutputComparisonKind
 {
     Numeric,
     WrappedRadians
+}
+
+/// <summary>Type-safe comparison semantics and units for an individual numeric tensor output.</summary>
+public readonly struct TensorOutputComparison
+{
+    public TensorOutputComparisonKind Kind { get; }
+    public double AbsoluteTolerance { get; }
+
+    private TensorOutputComparison(TensorOutputComparisonKind kind, double absoluteTolerance)
+    {
+        Kind = kind;
+        AbsoluteTolerance = absoluteTolerance;
+    }
+
+    public static TensorOutputComparison Numeric =>
+        new(TensorOutputComparisonKind.Numeric, 0.0);
+
+    public static TensorOutputComparison WrappedRadians(double absoluteTolerance)
+    {
+        if (!(absoluteTolerance > 0.0) || double.IsInfinity(absoluteTolerance))
+            throw new ArgumentOutOfRangeException(
+                nameof(absoluteTolerance), "Wrapped-radian tolerance must be finite and positive.");
+        return new TensorOutputComparison(
+            TensorOutputComparisonKind.WrappedRadians, absoluteTolerance);
+    }
 }
 
 /// <summary>Whether one homogeneous result is expected to depend on mutable tensor inputs.</summary>
@@ -459,12 +483,16 @@ public sealed class OpCase
     /// </summary>
     public Func<IEngine, Tensor<float>[]>? RunFloatOutputs { get; init; }
     public Func<IEngine, Tensor<double>[]>? RunDoubleOutputs { get; init; }
-    public bool HasMultipleOutputs => RunFloatOutputs is not null && RunDoubleOutputs is not null;
+    public bool HasMultipleOutputs => ValidateDelegatePair(
+        RunFloatOutputs, RunDoubleOutputs, nameof(RunFloatOutputs), nameof(RunDoubleOutputs));
 
     public Func<IEngine, HeterogeneousTensorOutputs<float>>? RunFloatHeterogeneousOutputs { get; init; }
     public Func<IEngine, HeterogeneousTensorOutputs<double>>? RunDoubleHeterogeneousOutputs { get; init; }
-    public bool HasHeterogeneousOutputs =>
-        RunFloatHeterogeneousOutputs is not null && RunDoubleHeterogeneousOutputs is not null;
+    public bool HasHeterogeneousOutputs => ValidateDelegatePair(
+        RunFloatHeterogeneousOutputs,
+        RunDoubleHeterogeneousOutputs,
+        nameof(RunFloatHeterogeneousOutputs),
+        nameof(RunDoubleHeterogeneousOutputs));
 
     /// <summary>
     /// Typed declaration of whether the operation returns one tensor, multiple tensors of the
@@ -620,6 +648,20 @@ public sealed class OpCase
         int i = 0;
         while (i < name.Length && (char.IsLetterOrDigit(name[i]) || name[i] == '_')) i++;
         return i > 0 ? name.Substring(0, i) : name;
+    }
+
+    private bool ValidateDelegatePair<TFloat, TDouble>(
+        TFloat? floatDelegate,
+        TDouble? doubleDelegate,
+        string floatProperty,
+        string doubleProperty)
+        where TFloat : class
+        where TDouble : class
+    {
+        if ((floatDelegate is null) != (doubleDelegate is null))
+            throw new InvalidOperationException(
+                $"{Name}: {floatProperty} and {doubleProperty} must be configured together.");
+        return floatDelegate is not null;
     }
 }
 #endif

@@ -4159,6 +4159,40 @@ public partial class CpuEngine : ITensorLevelEngine
         result.Data.Span.CopyTo(aSpan);
     }
 
+    protected static void ValidateGroupNormArguments<T>(
+        Tensor<T> input,
+        int numGroups,
+        Tensor<T> gamma,
+        Tensor<T> beta,
+        Tensor<T>? output = null)
+    {
+        if (input.Rank < 2)
+            throw new ArgumentException("GroupNorm input must have rank 2 or greater.", nameof(input));
+        if (numGroups <= 0)
+            throw new ArgumentOutOfRangeException(nameof(numGroups), "Number of groups must be positive.");
+
+        int channels = input._shape[1];
+        if (channels % numGroups != 0)
+            throw new ArgumentException(
+                $"Number of channels ({channels}) must be divisible by number of groups ({numGroups}).",
+                nameof(numGroups));
+        if (gamma.Length < channels)
+            throw new ArgumentException(
+                $"GroupNorm gamma requires at least {channels} elements, got {gamma.Length}.", nameof(gamma));
+        if (beta.Length < channels)
+            throw new ArgumentException(
+                $"GroupNorm beta requires at least {channels} elements, got {beta.Length}.", nameof(beta));
+        if (output is not null)
+        {
+            if (!output.IsContiguous)
+                throw new InvalidOperationException("Output tensor must be contiguous.");
+            if (output.Length != input.Length)
+                throw new ArgumentException(
+                    $"GroupNorm output length {output.Length} must match input length {input.Length}.",
+                    nameof(output));
+        }
+    }
+
     /// <inheritdoc/>
     public void GroupNormInto<T>(Tensor<T> output, Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
@@ -4166,6 +4200,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (gamma is null) throw new ArgumentNullException(nameof(gamma));
         if (beta is null) throw new ArgumentNullException(nameof(beta));
+        ValidateGroupNormArguments(input, numGroups, gamma, beta, output);
         if (GraphMode.IsInferenceTrace)
         {
             CaptureInferenceIntoKernel(
@@ -4188,9 +4223,6 @@ public partial class CpuEngine : ITensorLevelEngine
             variance = statistics[1];
             return;
         }
-        if (!output.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
-        if (numGroups <= 0) throw new ArgumentOutOfRangeException(nameof(numGroups), "Number of groups must be positive.");
-
         // #257: preserve user-facing refs before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
         if (!gamma.IsContiguous) gamma = gamma.Contiguous();
@@ -4198,8 +4230,6 @@ public partial class CpuEngine : ITensorLevelEngine
 
         int batch = input._shape[0];
         int channels = input._shape[1];
-        if (channels % numGroups != 0)
-            throw new ArgumentException($"Number of channels ({channels}) must be divisible by number of groups ({numGroups}).");
         int channelsPerGroup = channels / numGroups;
         int spatialSize = 1;
         for (int i = 2; i < input._shape.Length; i++) spatialSize *= input._shape[i];
@@ -21423,6 +21453,7 @@ public partial class CpuEngine : ITensorLevelEngine
     public Tensor<T> MaxPool3DWithIndices<T>(Tensor<T> input, int[] poolSize, int[] stride, out int[,,,,,] maxIndices)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
         if (input.Rank != 5) throw new ArgumentException($"MaxPool3D requires 5D input tensor [batch, channels, depth, height, width]. Got rank {input.Rank}.", nameof(input));
         if (poolSize == null || poolSize.Length != 3) throw new ArgumentException("Pool size must be array of 3 elements [poolD, poolH, poolW].", nameof(poolSize));
         if (stride == null || stride.Length != 3) throw new ArgumentException("Stride must be array of 3 elements [strideD, strideH, strideW].", nameof(stride));
@@ -26780,6 +26811,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (gamma == null) throw new ArgumentNullException(nameof(gamma));
         if (beta == null) throw new ArgumentNullException(nameof(beta));
+        ValidateGroupNormArguments(input, numGroups, gamma, beta);
 
         if (GraphMode.IsInferenceTrace)
         {
@@ -26833,19 +26865,12 @@ public partial class CpuEngine : ITensorLevelEngine
         // Preserve original input ref for tape recording (#257).
         var inputOrig = input;
         if (!input.IsContiguous) input = input.Contiguous();
-        if (numGroups <= 0) throw new ArgumentOutOfRangeException(nameof(numGroups), "Number of groups must be positive.");
-
         var numOps = MathHelper.GetNumericOperations<T>();
         T eps = numOps.FromDouble(epsilon);
 
         // Input shape: [batch, channels, ...spatial]
         int batch = input._shape[0];
         int channels = input._shape[1];
-
-        if (channels % numGroups != 0)
-        {
-            throw new ArgumentException($"Number of channels ({channels}) must be divisible by number of groups ({numGroups}).");
-        }
 
         int channelsPerGroup = channels / numGroups;
 
@@ -32348,12 +32373,7 @@ public partial class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> ReduceMaxWithTensorIndices<T>(
         Tensor<T> input, int[] axes, bool keepDims, out Tensor<int> maxIndices)
     {
-        if (GraphMode.IsActive)
-        {
-            throw new NotSupportedException(
-                "ReduceMaxWithTensorIndices graph capture returns heterogeneous Tensor<T>/Tensor<int> " +
-                "outputs, which the homogeneous compiled-plan output contract cannot replay safely.");
-        }
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HeterogeneousOutput);
 
         Tensor<T> result;
         int[] absoluteIndices;
@@ -37909,6 +37929,7 @@ public partial class CpuEngine : ITensorLevelEngine
     public Tensor<T> TensorOneHot<T>(Tensor<int> indices, int depth)
     {
         if (indices == null) throw new ArgumentNullException(nameof(indices));
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.MixedElementTypes);
         if (depth <= 0) throw new ArgumentException("Depth must be positive", nameof(depth));
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -38686,7 +38707,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorTopK<T>(Tensor<T> tensor, int k, int axis, out Tensor<int> indices)
     {
-        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousOutput);
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HeterogeneousOutput);
 
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (k <= 0) throw new ArgumentException("k must be positive.", nameof(k));
@@ -38965,6 +38986,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (func == null) throw new ArgumentNullException(nameof(func));
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
 
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         try
@@ -39087,15 +39109,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Fail loudly here rather than silently returning a frozen eager copy
         // that downstream ops would capture as a compile-time constant — the
         // failure mode #365 was filed to fix.
-        if (GraphMode.IsActive && GraphMode.Current is not null)
-        {
-            throw new NotSupportedException(
-                "TensorMaskedSelect has a data-dependent output shape (the count " +
-                "of true bits in the mask is not known at trace time), so it cannot " +
-                "be recorded inside a compiled training plan / GraphMode trace. " +
-                "Materialize the result outside the trace, or restructure the model " +
-                "to use TensorWhere (static-shape masking) instead.");
-        }
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.DataDependentOutputShape);
 
         // Preserve the original tensor/mask for autograd binding so gradients
         // flow back to the caller's input, not to transient contiguous copies.
@@ -39705,6 +39719,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public (Tensor<T> values, Tensor<int> indices) TopK<T>(Tensor<T> input, int k, int axis = -1, bool largest = true)
     {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HeterogeneousOutput);
         if (axis < 0) axis = input._shape.Length + axis;
         if (axis < 0 || axis >= input._shape.Length)
             throw new ArgumentException($"Invalid axis {axis} for tensor with {input._shape.Length} dimensions");
@@ -40883,9 +40899,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            if (!GraphMode.IsInferenceTrace)
-                throw new NotSupportedException(
-                    "FusedHierarchicalSoftmax has no backward contract. Compiled training cannot capture it safely.");
+            GraphMode.ThrowIfNonInferenceUnsupported(GraphCaptureLimitation.MissingBackwardContract);
 
             var outputShape = (int[])input._shape.Clone();
             outputShape[outputShape.Length - 1] = numClasses;
@@ -48829,10 +48843,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (cavityFilters._shape[1] != n) throw new ArgumentException("cavityFilters last dim must match input N.");
         ValidatePowerOfTwo(n, nameof(input));
 
-        if (GraphMode.IsActive)
-            throw new NotSupportedException(
-                "NativeBatchedCavityForward graph capture requires heterogeneous Tensor<T>/Tensor<Complex<T>> inputs; " +
-                "executing eagerly here would freeze the cavity filter into the compiled plan.");
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HeterogeneousInput);
 
         var result = new Tensor<T>([batch, numCavities, n]);
         var ops = MathHelper.GetNumericOperations<T>();

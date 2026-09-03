@@ -99,6 +99,13 @@ internal static class PlanFormatConstants
     internal const byte TagBoolArray  = 0x0C;
     internal const byte TagFusedActivationParams = 0x0D;
 
+    // ── MultiHeadAttentionForward saved-state schema ───────────────────────
+    internal const int MultiHeadAttentionInputCount = 5;
+    internal const int MultiHeadAttentionSavedStateCount = 3;
+    internal const int MultiHeadAttentionNumHeadsStateIndex = 0;
+    internal const int MultiHeadAttentionMaskDataStateIndex = 1;
+    internal const int MultiHeadAttentionMaskShapeStateIndex = 2;
+
     // ── Tensor table flags ──────────────────────────────────────────────────
     internal const byte TensorFlagWeight       = 0x01; // model parameter
     internal const byte TensorFlagLeafInput    = 0x02; // external input

@@ -157,13 +157,23 @@ public sealed class BackendCompletenessTests
     [Fact]
     public void EveryGpuReadbackContract_IsDefined()
     {
-        var invalid = OpParityRegistry.All()
-            .Where(op => !Enum.IsDefined(typeof(GpuReadbackContract), op.GpuReadbackContract))
-            .Select(op => op.Name)
-            .OrderBy(name => name, StringComparer.Ordinal)
-            .ToArray();
+        var invalid = new List<string>();
+        foreach (OpCase op in OpParityRegistry.All())
+        {
+            if (!Enum.IsDefined(typeof(GpuReadbackContract), op.GpuReadbackContract))
+            {
+                invalid.Add(op.Name);
+                continue;
+            }
 
-        Assert.True(invalid.Length == 0,
+            Assert.True(op.GpuAllowedReadbacks >= 0,
+                $"{op.Name}: contract {op.GpuReadbackContract} has a negative readback allowance.");
+            Assert.False(string.IsNullOrWhiteSpace(op.GpuReadbackDescription),
+                $"{op.Name}: contract {op.GpuReadbackContract} has no description.");
+        }
+        invalid.Sort(StringComparer.Ordinal);
+
+        Assert.True(invalid.Count == 0,
             "GPU readback policies must use a defined GpuReadbackContract value: " +
             string.Join(", ", invalid));
     }

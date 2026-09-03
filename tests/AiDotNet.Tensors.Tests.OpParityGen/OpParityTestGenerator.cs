@@ -22,6 +22,20 @@ namespace AiDotNet.Tensors.Tests.OpParityGen
         private const string EngineMetadataName = "AiDotNet.Tensors.Engines.IEngine";
         private const string CpuMixedResidencyAttributeMetadataName =
             "AiDotNet.Tensors.Engines.CpuMixedResidencyElementwiseAttribute";
+        private static readonly DiagnosticDescriptor InvalidMixedResidencySignature = new DiagnosticDescriptor(
+            "ADNTP001",
+            "Invalid CPU mixed-residency contract",
+            "Method '{0}' has CpuMixedResidencyElementwiseAttribute but is not a binary Tensor<T> operation",
+            "AiDotNet.Tensors.Tests",
+            DiagnosticSeverity.Error,
+            isEnabledByDefault: true);
+        private static readonly DiagnosticDescriptor DuplicateMixedResidencyContract = new DiagnosticDescriptor(
+            "ADNTP002",
+            "Duplicate CPU mixed-residency contract",
+            "Method name '{0}' has more than one CpuMixedResidencyElementwiseAttribute contract",
+            "AiDotNet.Tensors.Tests",
+            DiagnosticSeverity.Error,
+            isEnabledByDefault: true);
 
         public void Initialize(IncrementalGeneratorInitializationContext context)
         {
@@ -30,25 +44,64 @@ namespace AiDotNet.Tensors.Tests.OpParityGen
 
             var mixedResidencyContracts = context.CompilationProvider.Select(
                 static (compilation, _) => GetCpuMixedResidencyContracts(compilation));
-            context.RegisterSourceOutput(mixedResidencyContracts, static (spc, names) =>
-                spc.AddSource("GeneratedCpuMixedResidencyContractTests.g.cs", EmitCpuMixedResidencyContracts(names)));
+            context.RegisterSourceOutput(mixedResidencyContracts, static (spc, result) =>
+            {
+                foreach (Diagnostic diagnostic in result.Diagnostics)
+                    spc.ReportDiagnostic(diagnostic);
+                spc.AddSource(
+                    "GeneratedCpuMixedResidencyContractTests.g.cs",
+                    EmitCpuMixedResidencyContracts(result.MethodNames));
+            });
         }
 
-        private static IReadOnlyList<string> GetCpuMixedResidencyContracts(Compilation compilation)
+        private static MixedResidencyGenerationResult GetCpuMixedResidencyContracts(Compilation compilation)
         {
             var engine = compilation.GetTypeByMetadataName(EngineMetadataName);
             var marker = compilation.GetTypeByMetadataName(CpuMixedResidencyAttributeMetadataName);
-            if (engine is null || marker is null) return System.Array.Empty<string>();
+            if (engine is null || marker is null)
+                return new MixedResidencyGenerationResult(
+                    System.Array.Empty<string>(), System.Array.Empty<Diagnostic>());
 
-            return engine.GetMembers().OfType<IMethodSymbol>()
+            var names = new SortedSet<string>(System.StringComparer.Ordinal);
+            var diagnostics = new List<Diagnostic>();
+            foreach (IMethodSymbol method in engine.GetMembers().OfType<IMethodSymbol>()
                 .Where(method => method.DeclaredAccessibility == Accessibility.Public &&
                                  method.MethodKind == MethodKind.Ordinary &&
                                  method.GetAttributes().Any(attribute =>
                                      SymbolEqualityComparer.Default.Equals(attribute.AttributeClass, marker)))
-                .OrderBy(method => method.Name, System.StringComparer.Ordinal)
-                .Select(method => method.Name)
-                .ToList();
+                .OrderBy(method => method.Name, System.StringComparer.Ordinal))
+            {
+                bool valid = method.TypeParameters.Length == 1 &&
+                    method.Parameters.Length == 2 &&
+                    method.Parameters.All(parameter =>
+                        parameter.RefKind == RefKind.None &&
+                        IsTensorOf(parameter.Type, method.TypeParameters[0])) &&
+                    IsTensorOf(method.ReturnType, method.TypeParameters[0]);
+                if (!valid)
+                {
+                    diagnostics.Add(Diagnostic.Create(
+                        InvalidMixedResidencySignature,
+                        method.Locations.FirstOrDefault() ?? Location.None,
+                        method.Name));
+                    continue;
+                }
+
+                if (!names.Add(method.Name))
+                {
+                    diagnostics.Add(Diagnostic.Create(
+                        DuplicateMixedResidencyContract,
+                        method.Locations.FirstOrDefault() ?? Location.None,
+                        method.Name));
+                }
+            }
+
+            return new MixedResidencyGenerationResult(names.ToList(), diagnostics);
         }
+
+        private static bool IsTensorOf(ITypeSymbol type, ITypeParameterSymbol elementType) =>
+            type is INamedTypeSymbol { IsGenericType: true, Name: "Tensor" } tensor &&
+            tensor.TypeArguments.Length == 1 &&
+            SymbolEqualityComparer.Default.Equals(tensor.TypeArguments[0], elementType);
 
         private static IReadOnlyList<string> GetTensorReturningOps(Compilation compilation)
         {
@@ -99,7 +152,7 @@ namespace AiDotNet.Tensors.Tests.OpParityGen
             {
                 var method = Sanitize(op);
                 sb.AppendLine("        [SkippableFact]");
-                sb.AppendLine($"        public void Parity_{method}() => GeneratedOpParitySupport.RunForwardByMethod(\"{op}\", _fx);");
+                sb.AppendLine($"        public void Parity_{method}() => GeneratedOpParitySupport.RunForwardByMethod(nameof(global::AiDotNet.Tensors.Engines.IEngine.{op}), _fx);");
             }
             sb.AppendLine("    }");
             sb.AppendLine("}");
@@ -123,7 +176,7 @@ namespace AiDotNet.Tensors.Tests.OpParityGen
             foreach (var methodName in methodNames)
             {
                 string method = Sanitize(methodName);
-                sb.AppendLine("        [Fact]");
+                sb.AppendLine("        [SkippableFact]");
                 sb.AppendLine($"        public void CpuConsumesMixedResidency_{method}() =>");
                 sb.AppendLine("            global::AiDotNet.Tensors.Tests.LinearAlgebra.TensorCowInferenceReadPathTests.VerifyCpuConsumesMixedResidencyInputs(");
                 sb.AppendLine($"                static (engine, left, right) => engine.{methodName}(left, right));");
@@ -140,6 +193,20 @@ namespace AiDotNet.Tensors.Tests.OpParityGen
             for (int i = 0; i < chars.Length; i++)
                 if (!char.IsLetterOrDigit(chars[i]) && chars[i] != '_') chars[i] = '_';
             return new string(chars);
+        }
+
+        private sealed class MixedResidencyGenerationResult
+        {
+            internal MixedResidencyGenerationResult(
+                IReadOnlyList<string> methodNames,
+                IReadOnlyList<Diagnostic> diagnostics)
+            {
+                MethodNames = methodNames;
+                Diagnostics = diagnostics;
+            }
+
+            internal IReadOnlyList<string> MethodNames { get; }
+            internal IReadOnlyList<Diagnostic> Diagnostics { get; }
         }
     }
 }

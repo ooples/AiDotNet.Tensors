@@ -45,7 +45,14 @@ internal static class SavedStateSerializer
     internal static object[]? Read<T>(BinaryReader reader, Tensor<T>[] tensorTable)
     {
         int count = reader.ReadInt32();
-        if (count < 0) return null;
+        if (count == -1) return null;
+        if (count < -1)
+            throw new InvalidDataException(
+                $"SavedState entry count {count} is invalid. The plan file is corrupt.");
+
+        // Every entry has at least a one-byte type tag. Check the payload before allocating so a
+        // corrupt length prefix cannot turn a cache miss into an unbounded object[] allocation.
+        RequireRemaining(reader, count, sizeof(byte), "entry tags");
 
         var result = new object[count];
         for (int i = 0; i < count; i++)
@@ -202,6 +209,7 @@ internal static class SavedStateSerializer
         if (typeNameLen < 0)
             throw new InvalidDataException(
                 $"SavedState enum type-name length {typeNameLen} cannot be negative. The plan file is corrupt.");
+        RequireRemaining(reader, typeNameLen, sizeof(byte), "enum type name", sizeof(long));
         var nameBytes = reader.ReadBytes(typeNameLen);
         if (nameBytes.Length != typeNameLen)
             throw new InvalidDataException(
@@ -244,6 +252,7 @@ internal static class SavedStateSerializer
         int len = reader.ReadInt32();
         if (len < 0)
             throw new InvalidDataException($"SavedState int[] length {len} cannot be negative. The plan file is corrupt.");
+        RequireRemaining(reader, len, sizeof(int), "int[]");
         var arr = new int[len];
         for (int i = 0; i < len; i++)
             arr[i] = reader.ReadInt32();
@@ -255,6 +264,7 @@ internal static class SavedStateSerializer
         int len = reader.ReadInt32();
         if (len < 0)
             throw new InvalidDataException($"SavedState long[] length {len} cannot be negative. The plan file is corrupt.");
+        RequireRemaining(reader, len, sizeof(long), "long[]");
         var arr = new long[len];
         for (int i = 0; i < len; i++)
             arr[i] = reader.ReadInt64();
@@ -266,6 +276,7 @@ internal static class SavedStateSerializer
         int len = reader.ReadInt32();
         if (len < 0)
             throw new InvalidDataException($"SavedState bool[] length {len} cannot be negative. The plan file is corrupt.");
+        RequireRemaining(reader, len, sizeof(byte), "bool[]");
         var arr = new bool[len];
         for (int i = 0; i < len; i++)
             arr[i] = reader.ReadBoolean();
@@ -293,6 +304,7 @@ internal static class SavedStateSerializer
         float[]? slopes = null;
         if (slopeLength >= 0)
         {
+            RequireRemaining(reader, slopeLength, sizeof(float), "PReLU slope[]");
             slopes = new float[slopeLength];
             for (int i = 0; i < slopeLength; i++) slopes[i] = reader.ReadSingle();
         }
@@ -310,6 +322,7 @@ internal static class SavedStateSerializer
         int len = reader.ReadInt32();
         if (len < 0)
             throw new InvalidDataException($"SavedState string length {len} cannot be negative. The plan file is corrupt.");
+        RequireRemaining(reader, len, sizeof(byte), "string");
         var bytes = reader.ReadBytes(len);
         // BinaryReader.ReadBytes returns fewer bytes on truncated streams
         // (silent short read) instead of throwing EndOfStreamException —
@@ -326,10 +339,45 @@ internal static class SavedStateSerializer
         int len = reader.ReadInt32();
         if (len < 0)
             throw new InvalidDataException($"SavedState byte[] length {len} cannot be negative. The plan file is corrupt.");
+        RequireRemaining(reader, len, sizeof(byte), "byte[]");
         var bytes = reader.ReadBytes(len);
         if (bytes.Length != len)
             throw new InvalidDataException(
                 $"SavedState byte[] payload was truncated: expected {len} bytes, got {bytes.Length}.");
         return bytes;
+    }
+
+    private static void RequireRemaining(
+        BinaryReader reader,
+        int elementCount,
+        int bytesPerElement,
+        string payloadName,
+        int trailingBytes = 0)
+    {
+        long requiredBytes;
+        try
+        {
+            requiredBytes = checked((long)elementCount * bytesPerElement + trailingBytes);
+        }
+        catch (OverflowException ex)
+        {
+            throw new InvalidDataException(
+                $"SavedState {payloadName} length {elementCount} overflows its encoded payload size.", ex);
+        }
+
+        Stream stream = reader.BaseStream;
+        if (!stream.CanSeek)
+        {
+            throw new InvalidDataException(
+                $"SavedState {payloadName} cannot be validated because the plan stream is not seekable.");
+        }
+
+        long remaining = stream.Length - stream.Position;
+        if (requiredBytes > remaining)
+        {
+            throw new InvalidDataException(
+                $"SavedState {payloadName} payload is truncated: requires {requiredBytes} byte(s), " +
+                $"but only {remaining} remain.");
+        }
     }
 }

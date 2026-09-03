@@ -40,16 +40,8 @@ public sealed class OpParityFixture : IDisposable
         _prevAllowTF32 = CudaDispatchPolicy.AllowTF32;
         CudaDispatchPolicy.AllowTF32 = false;
         Cpu = new CpuEngine();
-        try
-        {
-            Gpu = new DirectGpuTensorEngine();
-            GpuReady = Gpu.IsGpuAvailable;
-        }
-        catch (Exception ex)
-        {
-            GpuInitError = ex;
-            GpuReady = false;
-        }
+        Gpu = new DirectGpuTensorEngine();
+        GpuReady = Gpu.IsGpuAvailable;
     }
 
     /// <summary>
@@ -67,9 +59,7 @@ public sealed class OpParityFixture : IDisposable
     {
         if (!GpuReady) return;
         var old = Gpu;
-        DirectGpuTensorEngine fresh;
-        try { fresh = new DirectGpuTensorEngine(); }
-        catch { return; } // keep the existing engine if a fresh context can't be made
+        var fresh = new DirectGpuTensorEngine();
         Gpu = fresh;
         old?.Dispose();
     }
@@ -222,50 +212,67 @@ public static class OpParityHarness
         MaybeResetGpuEngine(fx);
         var gpu = fx.Gpu!;
 
-        Tensor<float>[] cpu = op.RunFloatOutputs!(fx.Cpu);
-        Tensor<float>[] cpuAgain = op.RunFloatOutputs!(fx.Cpu);
-        Tensor<float>[] gpuResults = op.RunFloatOutputs!(gpu);
-        Tensor<float>[] gpuAgain = op.RunFloatOutputs!(gpu);
-        Tensor<double>[] oracle = op.RunDoubleOutputs!(fx.Cpu);
-
-        Assert.True(cpu.Length > 1, $"{op.Name}: a multi-output contract must expose at least two outputs.");
-        Assert.Equal(cpu.Length, cpuAgain.Length);
-        Assert.Equal(cpu.Length, gpuResults.Length);
-        Assert.Equal(cpu.Length, gpuAgain.Length);
-        Assert.Equal(cpu.Length, oracle.Length);
-
-        if (op.TensorOutputComparisons is { } outputComparisons)
-            Assert.Equal(cpu.Length, outputComparisons.Count);
-
-        for (int i = 0; i < cpu.Length; i++)
+        Tensor<float>[]? cpu = null;
+        Tensor<float>[]? cpuAgain = null;
+        Tensor<float>[]? gpuResults = null;
+        Tensor<float>[]? gpuAgain = null;
+        Tensor<double>[]? oracle = null;
+        try
         {
-            Assert.NotNull(cpu[i]);
-            Assert.NotNull(cpuAgain[i]);
-            Assert.NotNull(gpuResults[i]);
-            Assert.NotNull(gpuAgain[i]);
-            Assert.NotNull(oracle[i]);
-            Assert.Equal(cpu[i].Shape.ToArray(), cpuAgain[i].Shape.ToArray());
-            Assert.Equal(cpu[i].Shape.ToArray(), gpuResults[i].Shape.ToArray());
-            Assert.Equal(cpu[i].Shape.ToArray(), gpuAgain[i].Shape.ToArray());
-            Assert.Equal(cpu[i].Shape.ToArray(), oracle[i].Shape.ToArray());
+            cpu = op.RunFloatOutputs!(fx.Cpu);
+            cpuAgain = op.RunFloatOutputs!(fx.Cpu);
+            gpuResults = op.RunFloatOutputs!(gpu);
+            gpuAgain = op.RunFloatOutputs!(gpu);
+            oracle = op.RunDoubleOutputs!(fx.Cpu);
 
-            TensorOutputComparison comparison = op.TensorOutputComparisons?[i] ?? TensorOutputComparison.Numeric;
-            if (comparison == TensorOutputComparison.WrappedRadians)
+            Assert.True(cpu.Length > 1, $"{op.Name}: a multi-output contract must expose at least two outputs.");
+            Assert.Equal(cpu.Length, cpuAgain.Length);
+            Assert.Equal(cpu.Length, gpuResults.Length);
+            Assert.Equal(cpu.Length, gpuAgain.Length);
+            Assert.Equal(cpu.Length, oracle.Length);
+
+            if (op.TensorOutputComparisons is { } outputComparisons)
+                Assert.Equal(cpu.Length, outputComparisons.Count);
+
+            for (int i = 0; i < cpu.Length; i++)
             {
-                AssertWrappedRadiansResults(
-                    $"output[{i}]", op, fx,
-                    cpu[i].ToArray(), cpuAgain[i].ToArray(),
-                    gpuResults[i].ToArray(), gpuAgain[i].ToArray(),
-                    oracle[i].ToArray(), op.Fwd);
+                Assert.NotNull(cpu[i]);
+                Assert.NotNull(cpuAgain[i]);
+                Assert.NotNull(gpuResults[i]);
+                Assert.NotNull(gpuAgain[i]);
+                Assert.NotNull(oracle[i]);
+                Assert.Equal(cpu[i].Shape.ToArray(), cpuAgain[i].Shape.ToArray());
+                Assert.Equal(cpu[i].Shape.ToArray(), gpuResults[i].Shape.ToArray());
+                Assert.Equal(cpu[i].Shape.ToArray(), gpuAgain[i].Shape.ToArray());
+                Assert.Equal(cpu[i].Shape.ToArray(), oracle[i].Shape.ToArray());
+
+                TensorOutputComparison comparison =
+                    op.TensorOutputComparisons?[i] ?? TensorOutputComparison.Numeric;
+                if (comparison.Kind == TensorOutputComparisonKind.WrappedRadians)
+                {
+                    AssertWrappedRadiansResults(
+                        $"output[{i}]", op, fx,
+                        cpu[i].ToArray(), cpuAgain[i].ToArray(),
+                        gpuResults[i].ToArray(), gpuAgain[i].ToArray(),
+                        oracle[i].ToArray(), comparison.AbsoluteTolerance);
+                }
+                else
+                {
+                    AssertResults(
+                        $"output[{i}]", op, fx,
+                        cpu[i].ToArray(), cpuAgain[i].ToArray(),
+                        gpuResults[i].ToArray(), gpuAgain[i].ToArray(),
+                        oracle[i].ToArray(), op.Fwd);
+                }
             }
-            else
-            {
-                AssertResults(
-                    $"output[{i}]", op, fx,
-                    cpu[i].ToArray(), cpuAgain[i].ToArray(),
-                    gpuResults[i].ToArray(), gpuAgain[i].ToArray(),
-                    oracle[i].ToArray(), op.Fwd);
-            }
+        }
+        finally
+        {
+            DisposeTensors(cpu);
+            DisposeTensors(cpuAgain);
+            DisposeTensors(gpuResults);
+            DisposeTensors(gpuAgain);
+            DisposeTensors(oracle);
         }
     }
 
@@ -295,33 +302,49 @@ public static class OpParityHarness
 
         MaybeResetGpuEngine(fx);
         var gpu = fx.Gpu!;
-        var cpu = op.RunFloatHeterogeneousOutputs!(fx.Cpu);
-        var cpuAgain = op.RunFloatHeterogeneousOutputs!(fx.Cpu);
-        var gpuResults = op.RunFloatHeterogeneousOutputs!(gpu);
-        var gpuAgain = op.RunFloatHeterogeneousOutputs!(gpu);
-        var oracle = op.RunDoubleHeterogeneousOutputs!(fx.Cpu);
-
-        Assert.True(cpu.Integers.Length + cpu.Booleans.Length > 0,
-            $"{op.Name}: a heterogeneous contract must expose typed metadata outputs.");
-        Assert.Equal(cpu.Numeric.Length, cpuAgain.Numeric.Length);
-        Assert.Equal(cpu.Numeric.Length, gpuResults.Numeric.Length);
-        Assert.Equal(cpu.Numeric.Length, gpuAgain.Numeric.Length);
-        Assert.Equal(cpu.Numeric.Length, oracle.Numeric.Length);
-        for (int i = 0; i < cpu.Numeric.Length; i++)
+        HeterogeneousTensorOutputs<float>? cpu = null;
+        HeterogeneousTensorOutputs<float>? cpuAgain = null;
+        HeterogeneousTensorOutputs<float>? gpuResults = null;
+        HeterogeneousTensorOutputs<float>? gpuAgain = null;
+        HeterogeneousTensorOutputs<double>? oracle = null;
+        try
         {
-            Assert.Equal(cpu.Numeric[i].Shape.ToArray(), cpuAgain.Numeric[i].Shape.ToArray());
-            Assert.Equal(cpu.Numeric[i].Shape.ToArray(), gpuResults.Numeric[i].Shape.ToArray());
-            Assert.Equal(cpu.Numeric[i].Shape.ToArray(), gpuAgain.Numeric[i].Shape.ToArray());
-            Assert.Equal(cpu.Numeric[i].Shape.ToArray(), oracle.Numeric[i].Shape.ToArray());
-            AssertResults(
-                $"numeric-output[{i}]", op, fx,
-                cpu.Numeric[i].ToArray(), cpuAgain.Numeric[i].ToArray(),
-                gpuResults.Numeric[i].ToArray(), gpuAgain.Numeric[i].ToArray(),
-                oracle.Numeric[i].ToArray(), op.Fwd);
-        }
+            cpu = op.RunFloatHeterogeneousOutputs!(fx.Cpu);
+            cpuAgain = op.RunFloatHeterogeneousOutputs!(fx.Cpu);
+            gpuResults = op.RunFloatHeterogeneousOutputs!(gpu);
+            gpuAgain = op.RunFloatHeterogeneousOutputs!(gpu);
+            oracle = op.RunDoubleHeterogeneousOutputs!(fx.Cpu);
 
-        AssertExactMetadata(op, "integer", cpu.Integers, cpuAgain.Integers, gpuResults.Integers, gpuAgain.Integers, oracle.Integers);
-        AssertExactMetadata(op, "boolean", cpu.Booleans, cpuAgain.Booleans, gpuResults.Booleans, gpuAgain.Booleans, oracle.Booleans);
+            Assert.True(cpu.Integers.Length + cpu.Booleans.Length > 0,
+                $"{op.Name}: a heterogeneous contract must expose typed metadata outputs.");
+            Assert.Equal(cpu.Numeric.Length, cpuAgain.Numeric.Length);
+            Assert.Equal(cpu.Numeric.Length, gpuResults.Numeric.Length);
+            Assert.Equal(cpu.Numeric.Length, gpuAgain.Numeric.Length);
+            Assert.Equal(cpu.Numeric.Length, oracle.Numeric.Length);
+            for (int i = 0; i < cpu.Numeric.Length; i++)
+            {
+                Assert.Equal(cpu.Numeric[i].Shape.ToArray(), cpuAgain.Numeric[i].Shape.ToArray());
+                Assert.Equal(cpu.Numeric[i].Shape.ToArray(), gpuResults.Numeric[i].Shape.ToArray());
+                Assert.Equal(cpu.Numeric[i].Shape.ToArray(), gpuAgain.Numeric[i].Shape.ToArray());
+                Assert.Equal(cpu.Numeric[i].Shape.ToArray(), oracle.Numeric[i].Shape.ToArray());
+                AssertResults(
+                    $"numeric-output[{i}]", op, fx,
+                    cpu.Numeric[i].ToArray(), cpuAgain.Numeric[i].ToArray(),
+                    gpuResults.Numeric[i].ToArray(), gpuAgain.Numeric[i].ToArray(),
+                    oracle.Numeric[i].ToArray(), op.Fwd);
+            }
+
+            AssertExactMetadata(op, "integer", cpu.Integers, cpuAgain.Integers, gpuResults.Integers, gpuAgain.Integers, oracle.Integers);
+            AssertExactMetadata(op, "boolean", cpu.Booleans, cpuAgain.Booleans, gpuResults.Booleans, gpuAgain.Booleans, oracle.Booleans);
+        }
+        finally
+        {
+            DisposeOutputs(cpu);
+            DisposeOutputs(cpuAgain);
+            DisposeOutputs(gpuResults);
+            DisposeOutputs(gpuAgain);
+            DisposeOutputs(oracle);
+        }
     }
 
     private static void AssertExactMetadata<TMetadata>(
@@ -339,29 +362,38 @@ public static class OpParityHarness
         Assert.Equal(cpu.Length, oracle.Length);
         for (int i = 0; i < cpu.Length; i++)
         {
-            Assert.Equal(cpu[i].Shape.ToArray(), cpuAgain[i].Shape.ToArray());
-            Assert.Equal(cpu[i].Shape.ToArray(), gpu[i].Shape.ToArray());
-            Assert.Equal(cpu[i].Shape.ToArray(), gpuAgain[i].Shape.ToArray());
-            Assert.Equal(cpu[i].Shape.ToArray(), oracle[i].Shape.ToArray());
-            Assert.Equal(cpu[i].ToArray(), cpuAgain[i].ToArray());
-            Assert.Equal(cpu[i].ToArray(), gpu[i].ToArray());
-            Assert.Equal(cpu[i].ToArray(), gpuAgain[i].ToArray());
-            Assert.Equal(cpu[i].ToArray(), oracle[i].ToArray());
-            _ = kind;
+            int[] expectedShape = cpu[i].Shape.ToArray();
+            Assert.True(expectedShape.SequenceEqual(cpuAgain[i].Shape.ToArray()),
+                $"{op.Name} {kind}[{i}]: repeated CPU shape differs.");
+            Assert.True(expectedShape.SequenceEqual(gpu[i].Shape.ToArray()),
+                $"{op.Name} {kind}[{i}]: GPU shape differs.");
+            Assert.True(expectedShape.SequenceEqual(gpuAgain[i].Shape.ToArray()),
+                $"{op.Name} {kind}[{i}]: repeated GPU shape differs.");
+            Assert.True(expectedShape.SequenceEqual(oracle[i].Shape.ToArray()),
+                $"{op.Name} {kind}[{i}]: oracle shape differs.");
+            TMetadata[] expected = cpu[i].ToArray();
+            Assert.True(expected.SequenceEqual(cpuAgain[i].ToArray()),
+                $"{op.Name} {kind}[{i}]: repeated CPU metadata differs.");
+            Assert.True(expected.SequenceEqual(gpu[i].ToArray()),
+                $"{op.Name} {kind}[{i}]: GPU metadata differs.");
+            Assert.True(expected.SequenceEqual(gpuAgain[i].ToArray()),
+                $"{op.Name} {kind}[{i}]: repeated GPU metadata differs.");
+            Assert.True(expected.SequenceEqual(oracle[i].ToArray()),
+                $"{op.Name} {kind}[{i}]: oracle metadata differs.");
         }
     }
 
     private static void AssertWrappedRadiansResults(
         string phase, OpCase op, OpParityFixture fx,
-        float[] cpu, float[] cpuAgain, float[] gpu, float[] gpuAgain, double[] oracle, ParityTol tolerance)
+        float[] cpu, float[] cpuAgain, float[] gpu, float[] gpuAgain, double[] oracle,
+        double absoluteTolerance)
     {
         Assert.True(cpu.Length == cpuAgain.Length && cpu.Length == gpu.Length &&
                     cpu.Length == gpuAgain.Length && cpu.Length == oracle.Length,
             $"{op.Name} {phase}: wrapped-radian output lengths differ.");
 
-        double allowed = Math.Max(tolerance.AbsFloor, tolerance.Rel);
-        Assert.True(allowed > 0.0,
-            $"{op.Name} {phase}: wrapped-radian comparison requires a positive absolute or relative tolerance.");
+        Assert.True(absoluteTolerance > 0.0,
+            $"{op.Name} {phase}: wrapped-radian comparison requires a positive absolute tolerance.");
 
         double maxCpuGpu = 0.0;
         double maxCpuOracle = 0.0;
@@ -387,9 +419,24 @@ public static class OpParityHarness
             $"{op.Name} {phase}: GPU is nondeterministic — differs at [{gpuDifference}] across identical runs.");
 
         fx.Record($"{op.Name}:{phase}\t{op.Category}\twrapped-radians\t{maxCpuGpu:R}\t{worstIndex}");
-        Assert.True(maxCpuGpu <= allowed,
-            $"{op.Name} {phase}: circular phase distance {maxCpuGpu:E3} rad exceeded {allowed:E3} rad at [{worstIndex}]. " +
+        Assert.True(maxCpuGpu <= absoluteTolerance,
+            $"{op.Name} {phase}: circular phase distance {maxCpuGpu:E3} rad exceeded {absoluteTolerance:E3} rad at [{worstIndex}]. " +
             $"Oracle circular drift — CPU {maxCpuOracle:E3} rad, GPU {maxGpuOracle:E3} rad.");
+    }
+
+    private static void DisposeTensors<T>(Tensor<T>[]? tensors)
+    {
+        if (tensors is null) return;
+        foreach (Tensor<T>? tensor in tensors)
+            tensor?.Dispose();
+    }
+
+    private static void DisposeOutputs<T>(HeterogeneousTensorOutputs<T>? outputs)
+    {
+        if (outputs is null) return;
+        DisposeTensors(outputs.Numeric);
+        DisposeTensors(outputs.Integers);
+        DisposeTensors(outputs.Booleans);
     }
 
     private static double WrappedRadiansDistance(double left, double right) =>

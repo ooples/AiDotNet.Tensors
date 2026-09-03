@@ -625,7 +625,11 @@ public static class OpParityRegistry
                 e.STFT(waveform.D(), 16, 4, window.D(), true, out var magnitude, out var phase);
                 return new[] { magnitude, phase };
             }, ParityTol.Accum(5e-3),
-            outputComparisons: new[] { TensorOutputComparison.Numeric, TensorOutputComparison.WrappedRadians });
+            outputComparisons: new[]
+            {
+                TensorOutputComparison.Numeric,
+                TensorOutputComparison.WrappedRadians(5e-3)
+            });
 
         var complexReal = OpInput.Rand(7181, new[] { 4, 6 });
         var complexImaginary = OpInput.Rand(7182, new[] { 4, 6 });

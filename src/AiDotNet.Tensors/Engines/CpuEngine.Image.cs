@@ -41,6 +41,9 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual byte[] ImageEncode(Tensor<byte> image, ImageFormat format, int quality = 90)
     {
+        Compilation.GraphMode.ThrowIfInferenceUnsupported(
+            Compilation.GraphCaptureLimitation.HostBoundary);
+
         if (image is null) throw new ArgumentNullException(nameof(image));
         if (image.Rank != 3)
             throw new ArgumentException("image must be rank-3 [H, W, C].");

@@ -31,7 +31,10 @@ public partial class CpuEngine
         if (inputs is null) throw new ArgumentNullException(nameof(inputs));
         if (inputs.Length == 0)
             throw new ArgumentException("An inference kernel must have at least one tensor input.", nameof(inputs));
+        if (Array.Exists(inputs, static input => input is null))
+            throw new ArgumentException("Inference kernel inputs cannot contain null tensors.", nameof(inputs));
         if (execute is null) throw new ArgumentNullException(nameof(execute));
+        var capturedInputs = (Tensor<T>[])inputs.Clone();
 
         scope.BindEngineIfUnset(this);
 
@@ -42,7 +45,7 @@ public partial class CpuEngine
         return scope.RecordMaterializedVariadic(
             LazyNodeType.Custom,
             operationName,
-            inputs,
+            capturedInputs,
             tracedOutput,
             (engine, output) =>
             {
@@ -69,7 +72,10 @@ public partial class CpuEngine
         if (inputs is null) throw new ArgumentNullException(nameof(inputs));
         if (inputs.Length == 0)
             throw new ArgumentException("An inference kernel must have at least one tensor input.", nameof(inputs));
+        if (Array.Exists(inputs, static input => input is null))
+            throw new ArgumentException("Inference kernel inputs cannot contain null tensors.", nameof(inputs));
         if (execute is null) throw new ArgumentNullException(nameof(execute));
+        var capturedInputs = (Tensor<T>[])inputs.Clone();
 
         scope.BindEngineIfUnset(this);
 
@@ -78,6 +84,8 @@ public partial class CpuEngine
             tracedOutputs = execute(this);
         if (tracedOutputs is null || tracedOutputs.Length == 0)
             throw new InvalidOperationException("A multi-output inference kernel returned no tensors.");
+        if (Array.Exists(tracedOutputs, static output => output is null))
+            throw new InvalidOperationException("A multi-output inference kernel returned a null tensor.");
 
         var captured = new Tensor<T>[tracedOutputs.Length];
         for (int outputIndex = 0; outputIndex < captured.Length; outputIndex++)
@@ -86,7 +94,7 @@ public partial class CpuEngine
             captured[outputIndex] = scope.RecordMaterializedVariadic(
                 LazyNodeType.Custom,
                 $"{operationName}[{selectedOutput}]",
-                inputs,
+                capturedInputs,
                 tracedOutputs[outputIndex],
                 (engine, output) =>
                 {
@@ -120,7 +128,10 @@ public partial class CpuEngine
         if (inputs is null) throw new ArgumentNullException(nameof(inputs));
         if (inputs.Length == 0)
             throw new ArgumentException("An inference kernel must have at least one tensor input.", nameof(inputs));
+        if (Array.Exists(inputs, static input => input is null))
+            throw new ArgumentException("Inference kernel inputs cannot contain null tensors.", nameof(inputs));
         if (execute is null) throw new ArgumentNullException(nameof(execute));
+        var capturedInputs = (Tensor<T>[])inputs.Clone();
 
         scope.BindEngineIfUnset(this);
         using (GraphMode.SuspendRecording())
@@ -129,7 +140,7 @@ public partial class CpuEngine
         scope.RecordMaterializedVariadic(
             LazyNodeType.Custom,
             operationName,
-            inputs,
+            capturedInputs,
             destination,
             execute);
     }

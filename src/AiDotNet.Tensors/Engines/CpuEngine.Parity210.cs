@@ -188,7 +188,7 @@ public partial class CpuEngine
                 var cr = repeats;
                 var cd = dim;
                 var graphShape = (int[])tensor._shape.Clone();
-                graphShape[dim] = tensor._shape[dim] * repeats;
+                graphShape[dim] = checked(tensor._shape[dim] * repeats);
                 return scope.RecordUnary(LazyNodeType.TensorRepeatInterleave, "TensorRepeatInterleave", tensor, graphShape,
                     (eng, output) => { var r = eng.TensorRepeatInterleave(ct, cr, cd); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.RepeatInterleaveBackward, new object[] { cr, cd });
@@ -198,7 +198,7 @@ public partial class CpuEngine
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var inShape = tensor._shape;
         var outShape = (int[])inShape.Clone();
-        outShape[dim] = inShape[dim] * repeats;
+        outShape[dim] = checked(inShape[dim] * repeats);
 
         var src = tensor.AsSpan();
         var result = AutoTensorCache.RentOrAllocate<T>(outShape);
@@ -598,8 +598,12 @@ public partial class CpuEngine
         if (axesA == null) throw new ArgumentNullException(nameof(axesA));
         if (axesB == null) throw new ArgumentNullException(nameof(axesB));
         if (GraphMode.IsInferenceTrace)
+        {
+            var capturedAxesA = (int[])axesA.Clone();
+            var capturedAxesB = (int[])axesB.Clone();
             return CaptureInferenceKernel(
-                new[] { a, b }, engine => engine.TensorDot(a, b, axesA, axesB));
+                new[] { a, b }, engine => engine.TensorDot(a, b, capturedAxesA, capturedAxesB));
+        }
         if (axesA.Length != axesB.Length)
             throw new ArgumentException("axesA and axesB must have the same length");
 
@@ -1039,7 +1043,10 @@ public partial class CpuEngine
         if (tensors.Length == 0)
             throw new ArgumentException("CartesianProd requires at least one tensor");
         if (GraphMode.IsInferenceTrace)
-            return CaptureInferenceKernel(tensors, engine => engine.TensorCartesianProd(tensors));
+        {
+            var capturedTensors = (Tensor<T>[])tensors.Clone();
+            return CaptureInferenceKernel(capturedTensors, engine => engine.TensorCartesianProd(capturedTensors));
+        }
         foreach (var t in tensors)
         {
             if (t == null) throw new ArgumentNullException(nameof(tensors));
@@ -1090,8 +1097,11 @@ public partial class CpuEngine
         if (tensors == null) throw new ArgumentNullException(nameof(tensors));
         if (tensors.Length == 0) return System.Array.Empty<Tensor<T>>();
         if (GraphMode.IsInferenceTrace)
+        {
+            var capturedTensors = (Tensor<T>[])tensors.Clone();
             return CaptureInferenceKernelOutputs(
-                tensors, engine => engine.TensorMeshgrid(tensors, indexing));
+                capturedTensors, engine => engine.TensorMeshgrid(capturedTensors, indexing));
+        }
         foreach (var t in tensors)
         {
             if (t == null) throw new ArgumentNullException(nameof(tensors));
@@ -2310,6 +2320,7 @@ public partial class CpuEngine
     public virtual Tensor<T> TensorUniqueConsecutive<T>(Tensor<T> input)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.DataDependentOutputShape);
         if (!input.IsContiguous) input = input.Contiguous();
         var src = input.AsSpan();
         if (src.Length == 0) return new Tensor<T>(new T[0], new[] { 0 });
@@ -2331,7 +2342,10 @@ public partial class CpuEngine
         if (matrices == null) throw new ArgumentNullException(nameof(matrices));
         if (matrices.Length == 0) throw new ArgumentException("BlockDiag requires at least one matrix");
         if (GraphMode.IsInferenceTrace)
-            return CaptureInferenceKernel(matrices, engine => engine.TensorBlockDiag(matrices));
+        {
+            var capturedMatrices = (Tensor<T>[])matrices.Clone();
+            return CaptureInferenceKernel(capturedMatrices, engine => engine.TensorBlockDiag(capturedMatrices));
+        }
 
         var ops = MathHelper.GetNumericOperations<T>();
         int totalRows = 0, totalCols = 0;
@@ -2665,6 +2679,7 @@ public partial class CpuEngine
         Tensor<T> input, int axis = -1, bool descending = false)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HeterogeneousOutput);
         int rank = input.Rank;
         if (axis < 0) axis += rank;
         if (axis < 0 || axis >= rank) throw new ArgumentOutOfRangeException(nameof(axis));
@@ -2740,6 +2755,7 @@ public partial class CpuEngine
         Tensor<T> input, bool sorted = true, bool returnInverse = false, bool returnCounts = false)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.DataDependentOutputShape);
         if (!input.IsContiguous) input = input.Contiguous();
         var src = input.AsSpan();
         var ops = MathHelper.GetNumericOperations<T>();
@@ -2818,6 +2834,7 @@ public partial class CpuEngine
         Tensor<T> input, bool returnInverse = false, bool returnCounts = false)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.DataDependentOutputShape);
         if (!input.IsContiguous) input = input.Contiguous();
         var src = input.AsSpan();
         var ops = MathHelper.GetNumericOperations<T>();
@@ -3010,8 +3027,11 @@ public partial class CpuEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (indices == null) throw new ArgumentNullException(nameof(indices));
         if (GraphMode.IsInferenceTrace)
+        {
+            var capturedIndices = (int[])indices.Clone();
             return CaptureInferenceKernelOutputs(
-                new[] { tensor }, engine => engine.TensorTensorSplit(tensor, indices, dim));
+                new[] { tensor }, engine => engine.TensorTensorSplit(tensor, capturedIndices, dim));
+        }
         int rank = tensor.Rank;
         if (dim < 0) dim += rank;
         if (dim < 0 || dim >= rank) throw new ArgumentOutOfRangeException(nameof(dim));
@@ -3159,8 +3179,6 @@ public partial class CpuEngine
         // with N = 10, M = 8 — single-precision accurate for x ≥ 1 + 1e-3
         // (the gray zone just above x = 1 loses a couple digits, same as
         // torch).
-        if (x == null) throw new ArgumentNullException(nameof(x));
-        if (q == null) throw new ArgumentNullException(nameof(q));
         if (!x._shape.SequenceEqual(q._shape))
             throw new ArgumentException("Zeta: x and q must have the same shape");
 
@@ -3253,6 +3271,7 @@ public partial class CpuEngine
     public virtual Tensor<T> TensorUnique<T>(Tensor<T> input, bool sorted = true)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.DataDependentOutputShape);
         if (!input.IsContiguous) input = input.Contiguous();
         var src = input.AsSpan();
 
@@ -3424,7 +3443,10 @@ public partial class CpuEngine
         if (matrices == null) throw new ArgumentNullException(nameof(matrices));
         if (matrices.Length == 0) throw new ArgumentException("MultiDot requires at least one matrix");
         if (GraphMode.IsInferenceTrace)
-            return CaptureInferenceKernel(matrices, engine => engine.TensorMultiDot(matrices));
+        {
+            var capturedMatrices = (Tensor<T>[])matrices.Clone();
+            return CaptureInferenceKernel(capturedMatrices, engine => engine.TensorMultiDot(capturedMatrices));
+        }
         if (matrices.Length == 1) return matrices[0];
 
         // Build einsum equation: "ab,bc,cd,...->a?" — one distinct char per
@@ -4122,6 +4144,7 @@ public partial class CpuEngine
     public virtual (Tensor<T> Mantissa, Tensor<int> Exponent) TensorFrexp<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HeterogeneousOutput);
         var ops = MathHelper.GetNumericOperations<T>();
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var src = tensor.AsSpan();

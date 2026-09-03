@@ -438,8 +438,11 @@ public partial class CpuEngine
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (pad is null) throw new ArgumentNullException(nameof(pad));
         if (GraphMode.IsInferenceTrace)
+        {
+            var capturedPad = (int[])pad.Clone();
             return CaptureInferenceKernel(
-                new[] { input }, engine => engine.PadNd(input, pad, mode, value));
+                new[] { input }, engine => engine.PadNd(input, capturedPad, mode, value));
+        }
         var result = PadNdImpl(input, pad, mode, value);
         AiDotNet.Tensors.Engines.Autodiff.DifferentiableOps.RecordUnary(
             "PadNd", result, input,

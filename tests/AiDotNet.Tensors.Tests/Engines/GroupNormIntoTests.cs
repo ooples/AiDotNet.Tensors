@@ -16,6 +16,12 @@ namespace AiDotNet.Tensors.Tests.Engines;
 /// </summary>
 public class GroupNormIntoTests
 {
+    public enum UndersizedAffineParameter
+    {
+        Gamma,
+        Beta
+    }
+
     [Theory]
     [InlineData(1, 32, 8, 8, 8)]
     [InlineData(1, 64, 16, 16, 8)]
@@ -83,6 +89,42 @@ public class GroupNormIntoTests
         // would corrupt unrelated data via the wrong stride pattern).
         Assert.Throws<InvalidOperationException>(() =>
             engine.GroupNormInto<double>(output, input, 4, gamma, beta, 1e-5, out _, out _));
+    }
+
+    [Theory]
+    [InlineData(UndersizedAffineParameter.Gamma)]
+    [InlineData(UndersizedAffineParameter.Beta)]
+    public void GroupNorm_RejectsUndersizedAffineParametersBeforeDispatch(
+        UndersizedAffineParameter parameter)
+    {
+        var engine = new CpuEngine();
+        using var input = Random<float>(new[] { 1, 8, 2, 2 }, 10);
+        using var full = Random<float>(new[] { 8 }, 11);
+        using var shortParameter = Random<float>(new[] { 7 }, 12);
+        Tensor<float> gamma = parameter == UndersizedAffineParameter.Gamma ? shortParameter : full;
+        Tensor<float> beta = parameter == UndersizedAffineParameter.Beta ? shortParameter : full;
+
+        Assert.Throws<ArgumentException>(() =>
+            engine.GroupNorm(input, 4, gamma, beta, 1e-5, out _, out _));
+    }
+
+    [Theory]
+    [InlineData(UndersizedAffineParameter.Gamma)]
+    [InlineData(UndersizedAffineParameter.Beta)]
+    public void DirectGpuGroupNormInto_RejectsUndersizedAffineParametersBeforeFallback(
+        UndersizedAffineParameter parameter)
+    {
+        using var direct = new DirectGpuTensorEngine(null!);
+        IEngine engine = direct;
+        using var input = Random<float>(new[] { 1, 8, 2, 2 }, 20);
+        using var output = new Tensor<float>(new[] { 1, 8, 2, 2 });
+        using var full = Random<float>(new[] { 8 }, 21);
+        using var shortParameter = Random<float>(new[] { 7 }, 22);
+        Tensor<float> gamma = parameter == UndersizedAffineParameter.Gamma ? shortParameter : full;
+        Tensor<float> beta = parameter == UndersizedAffineParameter.Beta ? shortParameter : full;
+
+        Assert.Throws<ArgumentException>(() =>
+            engine.GroupNormInto(output, input, 4, gamma, beta, 1e-5, out _, out _));
     }
 
     private static Tensor<T> Random<T>(int[] shape, int seed) where T : struct, IEquatable<T>

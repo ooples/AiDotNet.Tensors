@@ -4364,8 +4364,6 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorPut<T>(Tensor<T> tensor, Tensor<int> indices, Tensor<T> source)
     {
-        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
-
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
         if (indices is null) throw new ArgumentNullException(nameof(indices));
         if (source is null) throw new ArgumentNullException(nameof(source));
@@ -6069,14 +6067,19 @@ public partial class DirectGpuTensorEngine
         Tensor<T>? bIh, Tensor<T>? bHh,
         out Tensor<T> finalHidden, out Tensor<T> finalCell,
         bool returnSequences = false)
-        => LstmSequenceForwardGpu(
+    {
+        Tensor<T> output = LstmSequenceForwardGpu(
             input, h0, c0, wIh, wHh, bIh, bHh,
-            wantState: true, out finalHidden, out finalCell, returnSequences);
+            wantState: true, out Tensor<T>? hidden, out Tensor<T>? cell, returnSequences);
+        finalHidden = hidden ?? throw new InvalidOperationException("GPU LSTM did not return its final hidden state.");
+        finalCell = cell ?? throw new InvalidOperationException("GPU LSTM did not return its final cell state.");
+        return output;
+    }
 
     private Tensor<T> LstmSequenceForwardGpu<T>(
         Tensor<T> input, Tensor<T>? h0, Tensor<T>? c0, Tensor<T> wIh, Tensor<T> wHh,
         Tensor<T>? bIh, Tensor<T>? bHh, bool wantState,
-        out Tensor<T> finalHidden, out Tensor<T> finalCell,
+        out Tensor<T>? finalHidden, out Tensor<T>? finalCell,
         bool returnSequences)
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
@@ -6178,8 +6181,8 @@ public partial class DirectGpuTensorEngine
             }
             else
             {
-                finalHidden = Tensor<T>.Empty();
-                finalCell = Tensor<T>.Empty();
+                finalHidden = null;
+                finalCell = null;
             }
 
             // Training: if a float tape is recording, save the GPU forward caches to host and record a fused
@@ -6226,18 +6229,21 @@ public partial class DirectGpuTensorEngine
     private Tensor<T> LstmSequenceForwardFallback<T>(
         Tensor<T> input, Tensor<T>? h0, Tensor<T>? c0, Tensor<T> wIh, Tensor<T> wHh,
         Tensor<T>? bIh, Tensor<T>? bHh, bool wantState,
-        out Tensor<T> finalHidden, out Tensor<T> finalCell,
+        out Tensor<T>? finalHidden, out Tensor<T>? finalCell,
         bool returnSequences)
     {
         if (wantState)
         {
-            return base.LstmSequenceForward(
+            Tensor<T> output = base.LstmSequenceForward(
                 input, h0, c0, wIh, wHh, bIh, bHh,
-                out finalHidden, out finalCell, returnSequences);
+                out Tensor<T> hidden, out Tensor<T> cell, returnSequences);
+            finalHidden = hidden;
+            finalCell = cell;
+            return output;
         }
 
-        finalHidden = Tensor<T>.Empty();
-        finalCell = Tensor<T>.Empty();
+        finalHidden = null;
+        finalCell = null;
         return base.LstmSequenceForward(input, h0, c0, wIh, wHh, bIh, bHh, returnSequences);
     }
 
@@ -6431,45 +6437,70 @@ public partial class DirectGpuTensorEngine
             var vh = ReshapePermuteHeads(backend, TensorMatMul(input2d, vWeight), B, S, H, d);
 
             var headOuts = new Tensor<T>[B * H];
-            for (int bh = 0; bh < B * H; bh++)
+            Tensor<T>? maskFill = null;
+            Tensor<T>? maskZeros = null;
+            Tensor<bool>?[] maskSlices = Array.Empty<Tensor<bool>?>();
+            int maskHeadExtent = 0;
+            if (mask is not null)
             {
-                var qbh = TensorSlice(qh, new[] { bh, 0, 0 }, new[] { 1, S, d }).Reshape(new[] { S, d });
-                var kbh = TensorSlice(kh, new[] { bh, 0, 0 }, new[] { 1, S, d }).Reshape(new[] { S, d });
-                var vbh = TensorSlice(vh, new[] { bh, 0, 0 }, new[] { 1, S, d }).Reshape(new[] { S, d });
-                var scores = TensorMultiplyScalar(TensorMatMulTransposed(qbh, kbh), scaleT);  // [S,S] = (q·kᵀ)·scale
-                Tensor<T> attn;
-                if (mask is null)
-                {
-                    attn = SoftmaxLastAxisGpu(backend, scores);                                // softmax over keys
-                }
-                else
-                {
-                    int b = bh / H;
-                    int h = bh % H;
-                    var headMaskData = new bool[S * S];
-                    for (int q = 0; q < S; q++)
-                        for (int k = 0; k < S; k++)
-                            headMaskData[q * S + k] = mask[
-                                mask._shape[0] == 1 ? 0 : b,
-                                mask._shape[1] == 1 ? 0 : h,
-                                mask._shape[2] == 1 ? 0 : q,
-                                mask._shape[3] == 1 ? 0 : k];
+                var fillData = new T[S * S];
+                for (int i = 0; i < fillData.Length; i++)
+                    fillData[i] = (T)(object)float.NegativeInfinity;
+                maskFill = new Tensor<T>(fillData, new[] { S, S });
+                maskZeros = new Tensor<T>(new T[S * S], new[] { S, S });
+                maskHeadExtent = mask._shape[1];
+                maskSlices = new Tensor<bool>?[checked(mask._shape[0] * maskHeadExtent)];
+            }
 
-                    using var headMask = new Tensor<bool>(headMaskData, new[] { S, S });
-                    var fillData = new T[S * S];
-                    for (int i = 0; i < fillData.Length; i++)
-                        fillData[i] = (T)(object)float.NegativeInfinity;
-                    using var fill = new Tensor<T>(fillData, new[] { S, S });
-                    var maskedScores = ((IEngine)this).TensorWhere(headMask, scores, fill);
-                    var rawAttention = SoftmaxLastAxisGpu(backend, maskedScores);
+            try
+            {
+                for (int bh = 0; bh < B * H; bh++)
+                {
+                    var qbh = TensorSlice(qh, new[] { bh, 0, 0 }, new[] { 1, S, d }).Reshape(new[] { S, d });
+                    var kbh = TensorSlice(kh, new[] { bh, 0, 0 }, new[] { 1, S, d }).Reshape(new[] { S, d });
+                    var vbh = TensorSlice(vh, new[] { bh, 0, 0 }, new[] { 1, S, d }).Reshape(new[] { S, d });
+                    var scores = TensorMultiplyScalar(TensorMatMulTransposed(qbh, kbh), scaleT);
+                    Tensor<T> attn;
+                    if (mask is null)
+                    {
+                        attn = SoftmaxLastAxisGpu(backend, scores);
+                    }
+                    else
+                    {
+                        int effectiveBatch = mask._shape[0] == 1 ? 0 : bh / H;
+                        int effectiveHead = mask._shape[1] == 1 ? 0 : bh % H;
+                        int cacheIndex = effectiveBatch * maskHeadExtent + effectiveHead;
+                        Tensor<bool>? headMask = maskSlices[cacheIndex];
+                        if (headMask is null)
+                        {
+                            var headMaskData = new bool[S * S];
+                            for (int q = 0; q < S; q++)
+                                for (int k = 0; k < S; k++)
+                                    headMaskData[q * S + k] = mask[
+                                        effectiveBatch,
+                                        effectiveHead,
+                                        mask._shape[2] == 1 ? 0 : q,
+                                        mask._shape[3] == 1 ? 0 : k];
+                            headMask = new Tensor<bool>(headMaskData, new[] { S, S });
+                            maskSlices[cacheIndex] = headMask;
+                        }
 
-                    // A row whose mask is entirely false makes softmax(-inf,...) undefined. Select
-                    // through the same mask once more so those rows—and every masked element—are
-                    // exactly zero, matching the CPU contract without a host-side score readback.
-                    using var zeros = new Tensor<T>(new T[S * S], new[] { S, S });
-                    attn = ((IEngine)this).TensorWhere(headMask, rawAttention, zeros);
+                        var maskedScores = ((IEngine)this).TensorWhere(headMask, scores, maskFill!);
+                        var rawAttention = SoftmaxLastAxisGpu(backend, maskedScores);
+                        // A row whose mask is entirely false makes softmax(-inf,...) undefined. Select
+                        // through the same mask once more so those rows—and every masked element—are
+                        // exactly zero, matching the CPU contract without a host-side score readback.
+                        attn = ((IEngine)this).TensorWhere(headMask, rawAttention, maskZeros!);
+                    }
+                    headOuts[bh] = TensorMatMul(attn, vbh).Reshape(new[] { 1, S, d });
                 }
-                headOuts[bh] = TensorMatMul(attn, vbh).Reshape(new[] { 1, S, d });            // [1,S,d]
+            }
+            finally
+            {
+                foreach (Tensor<bool>? maskSlice in maskSlices)
+                    maskSlice?.Dispose();
+                maskFill?.Dispose();
+                maskZeros?.Dispose();
             }
 
             var oBHSD = TensorConcatenate(headOuts, 0).Reshape(new[] { B, H, S, d });
@@ -8996,6 +9027,40 @@ public partial class DirectGpuTensorEngine
         }
     }
 
+    private IGpuBuffer GetOrCreateOccupancyBuffer(
+        IDirectGpuBackend backend,
+        Tensor<uint> occupancyBitfield)
+    {
+        // Caller holds _occupancyBufferCacheGate through the consuming kernel enqueue. That makes
+        // replacement safe: a superseded CUDA buffer's event is recorded only after every prior
+        // enqueue that can reference it.
+        if (ReferenceEquals(_occupancyBufferCacheTensor, occupancyBitfield) &&
+            ReferenceEquals(_occupancyBufferCacheBackend, backend) &&
+            _occupancyBufferCacheVersion == occupancyBitfield.Version &&
+            _occupancyBufferCacheBuffer is IGpuBuffer cached &&
+            cached.Handle != IntPtr.Zero &&
+            cached.Size >= occupancyBitfield.Length)
+        {
+            return cached;
+        }
+
+        ReadOnlySpan<uint> occupancySpan = occupancyBitfield.AsSpan();
+        var occupancyWords = new int[occupancySpan.Length];
+        for (int i = 0; i < occupancyWords.Length; i++)
+            occupancyWords[i] = unchecked((int)occupancySpan[i]);
+        IGpuBuffer replacement = backend.AllocateIntBuffer(occupancyWords);
+
+        IGpuBuffer? retired = _occupancyBufferCacheBuffer;
+        IDirectGpuBackend? retiredBackend = _occupancyBufferCacheBackend;
+        _occupancyBufferCacheTensor = occupancyBitfield;
+        _occupancyBufferCacheBackend = backend;
+        _occupancyBufferCacheBuffer = replacement;
+        _occupancyBufferCacheVersion = occupancyBitfield.Version;
+        if (retired is not null && retiredBackend is not null)
+            DisposeBufferAfterQueuedUse(retiredBackend, retired);
+        return replacement;
+    }
+
     /// <inheritdoc/>
     public override (Tensor<T> positions, Tensor<T> directions, Tensor<bool> validMask, Tensor<T> tValues)
         SampleRaysWithOccupancy<T>(
@@ -9045,12 +9110,6 @@ public partial class DirectGpuTensorEngine
         using var originsBuffer = GetOrAllocateBuffer(backend, contiguousOrigins);
         using var directionsInputBuffer = GetOrAllocateBuffer(backend, contiguousDirections);
 
-        var occupancySpan = occupancyBitfield.AsSpan();
-        var occupancyWords = new int[occupancySpan.Length];
-        for (int i = 0; i < occupancyWords.Length; i++)
-            occupancyWords[i] = unchecked((int)occupancySpan[i]);
-        using var occupancyBuffer = backend.AllocateIntBuffer(occupancyWords);
-
         var positionsBuffer = AllocateOutputBuffer(backend, checked(totalSamples * 3));
         var directionsBuffer = AllocateOutputBuffer(backend, checked(totalSamples * 3));
         var maskBuffer = AllocateOutputBuffer(backend, totalSamples);
@@ -9058,13 +9117,17 @@ public partial class DirectGpuTensorEngine
         try
         {
             static float Scalar(T value) => (float)(object)value!;
-            geometry.SampleRaysWithOccupancy(
-                originsBuffer.Buffer, directionsInputBuffer.Buffer, occupancyBuffer,
-                positionsBuffer.Buffer, directionsBuffer.Buffer, maskBuffer.Buffer,
-                tValuesBuffer.Buffer, numRays, occupancyWords.Length, gridSize, maxSamples,
-                Scalar(sceneBoundsMin[0]), Scalar(sceneBoundsMin[1]), Scalar(sceneBoundsMin[2]),
-                Scalar(sceneBoundsMax[0]), Scalar(sceneBoundsMax[1]), Scalar(sceneBoundsMax[2]),
-                Scalar(nearBound), Scalar(farBound));
+            lock (_occupancyBufferCacheGate)
+            {
+                IGpuBuffer occupancyBuffer = GetOrCreateOccupancyBuffer(backend, occupancyBitfield);
+                geometry.SampleRaysWithOccupancy(
+                    originsBuffer.Buffer, directionsInputBuffer.Buffer, occupancyBuffer,
+                    positionsBuffer.Buffer, directionsBuffer.Buffer, maskBuffer.Buffer,
+                    tValuesBuffer.Buffer, numRays, occupancyBitfield.Length, gridSize, maxSamples,
+                    Scalar(sceneBoundsMin[0]), Scalar(sceneBoundsMin[1]), Scalar(sceneBoundsMin[2]),
+                    Scalar(sceneBoundsMax[0]), Scalar(sceneBoundsMax[1]), Scalar(sceneBoundsMax[2]),
+                    Scalar(nearBound), Scalar(farBound));
+            }
 
             var positions = DeferTensorResult<T>(backend, positionsBuffer.Buffer,
                 totalSamples * 3, new[] { totalSamples, 3 });

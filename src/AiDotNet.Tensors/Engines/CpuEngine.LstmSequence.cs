@@ -400,8 +400,25 @@ public partial class CpuEngine
         out Tensor<T>? bIh,
         out Tensor<T>? bHh)
     {
-        if (inputs.Length < 3)
-            throw new InvalidDataException($"LSTM replay requires at least 3 inputs, got {inputs.Length}.");
+        const LstmSequenceOptionalInputs supportedOptionalInputs =
+            LstmSequenceOptionalInputs.InitialHidden |
+            LstmSequenceOptionalInputs.InitialCell |
+            LstmSequenceOptionalInputs.InputBias |
+            LstmSequenceOptionalInputs.RecurrentBias;
+        if ((optionalInputs & ~supportedOptionalInputs) != 0)
+            throw new InvalidDataException(
+                $"LSTM replay contains unsupported optional-input flags 0x{(byte)(optionalInputs & ~supportedOptionalInputs):X2}.");
+
+        const int requiredInputCount = 3;
+        int expectedInputCount = requiredInputCount;
+        if ((optionalInputs & LstmSequenceOptionalInputs.InitialHidden) != 0) expectedInputCount++;
+        if ((optionalInputs & LstmSequenceOptionalInputs.InitialCell) != 0) expectedInputCount++;
+        if ((optionalInputs & LstmSequenceOptionalInputs.InputBias) != 0) expectedInputCount++;
+        if ((optionalInputs & LstmSequenceOptionalInputs.RecurrentBias) != 0) expectedInputCount++;
+        if (inputs.Length != expectedInputCount)
+            throw new InvalidDataException(
+                $"LSTM replay flags describe {expectedInputCount} inputs, but the node contains {inputs.Length}.");
+
         int index = 0;
         input = inputs[index++];
         wIh = inputs[index++];
@@ -410,9 +427,6 @@ public partial class CpuEngine
         c0 = optionalInputs.HasFlag(LstmSequenceOptionalInputs.InitialCell) ? inputs[index++] : null;
         bIh = optionalInputs.HasFlag(LstmSequenceOptionalInputs.InputBias) ? inputs[index++] : null;
         bHh = optionalInputs.HasFlag(LstmSequenceOptionalInputs.RecurrentBias) ? inputs[index++] : null;
-        if (index != inputs.Length)
-            throw new InvalidDataException(
-                $"LSTM replay flags describe {index} inputs, but the node contains {inputs.Length}.");
     }
 
     /// <summary>
