@@ -93,5 +93,19 @@ internal enum LazyNodeType : byte
     // ordinals, and serialized compiled plans identify ops by that ordinal —
     // inserting Expand next to the Broadcast* group above would renumber every
     // member after it and silently misinterpret plans written by an older build.
-    Expand
+    Expand,
+
+    // Composite inference kernels. Appended to preserve serialized ordinals.
+    MultiHeadAttentionForward,
+    MlpForward,
+    LstmSequenceForward,
+    ScaledDotProductAttentionGqa,
+    FusedLinearMaxout,
+    FusedHierarchicalSoftmax,
+
+    // Serializable primitives required by decomposed attention graphs.
+    TensorRepeatInterleave,
+    TensorMaskedFill,
+    TensorPermute,
+    GroupedQueryAttention
 }

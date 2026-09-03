@@ -2125,6 +2125,8 @@ public partial class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> ReorderToNchw<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (GraphMode.IsInferenceTrace && tensor.Layout == LinearAlgebra.TensorLayout.Nchw)
+            return Reshape(tensor, tensor._shape);
         if (tensor.Layout == LinearAlgebra.TensorLayout.Nchw) return tensor;
         if (tensor.Rank != 4)
             throw new ArgumentException($"NCHWc → NCHW reorder requires rank-4 input, got rank {tensor.Rank}.");
@@ -2450,6 +2452,10 @@ public partial class CpuEngine : ITensorLevelEngine
         if (beta == null) throw new ArgumentNullException(nameof(beta));
         if (mean == null) throw new ArgumentNullException(nameof(mean));
         if (variance == null) throw new ArgumentNullException(nameof(variance));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { x, gamma, beta, mean, variance },
+                engine => engine.BatchNormAffine(x, gamma, beta, mean, variance, epsilon));
         if (x.Rank != 4) throw new ArgumentException($"BatchNormAffine requires rank-4 NCHW input, got rank {x.Rank}.");
 
         var xOrig = x;
@@ -3086,20 +3092,21 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else if (typeof(T) == typeof(float))
         {
-            // In-house path: pin the raw storage + storageOffset and call
+            // In-house path: pin the tensor's logical memory and call
             // SimdKernels.VectorAddUnsafe (4× unrolled AVX2/AVX-512 with
             // FMA on net8+). Beats TensorPrimitives by 1.0-1.04× on every
             // tracked DiT-XL shape — same kernel family that beat MKL on
             // the iter18c sweep.
-            var aRaw = (float[])(object)a._storage.GetDataArray();
-            var bRaw = (float[])(object)b._storage.GetDataArray();
-            var rRaw = (float[])(object)result._storage.GetDataArray();
-            int aOff = a._storageOffset, bOff = b._storageOffset, rOff = result._storageOffset;
-            fixed (float* pAFix = aRaw, pBFix = bRaw, pRFix = rRaw)
+            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyData);
+            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyData);
+            var rMem = AsFloatMemory(result.Data);
+            using var pinA = aMem.Pin();
+            using var pinB = bMem.Pin();
+            using var pinR = rMem.Pin();
             {
-                float* pA = pAFix + aOff;
-                float* pB = pBFix + bOff;
-                float* pR = pRFix + rOff;
+                float* pA = (float*)pinA.Pointer;
+                float* pB = (float*)pinB.Pointer;
+                float* pR = (float*)pinR.Pointer;
 
             // JIT-compiled kernels: size-specialized, 4x unrolled, NT stores
             if (CpuJitSelfTest.IsVerified && length >= 64)
@@ -3147,16 +3154,17 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else if (typeof(T) == typeof(double))
         {
-            // In-house: pin raw storage + offset, call SimdKernels.VectorAddUnsafe(double*).
-            var aRaw = (double[])(object)a._storage.GetDataArray();
-            var bRaw = (double[])(object)b._storage.GetDataArray();
-            var rRaw = (double[])(object)result._storage.GetDataArray();
-            int aOff = a._storageOffset, bOff = b._storageOffset, rOff = result._storageOffset;
-            fixed (double* pAFix = aRaw, pBFix = bRaw, pRFix = rRaw)
+            // In-house: pin logical memory and call SimdKernels.VectorAddUnsafe(double*).
+            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyData);
+            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyData);
+            var rMem = AsDoubleMemory(result.Data);
+            using var pinA = aMem.Pin();
+            using var pinB = bMem.Pin();
+            using var pinR = rMem.Pin();
             {
-                double* pA = pAFix + aOff;
-                double* pB = pBFix + bOff;
-                double* pR = pRFix + rOff;
+                double* pA = (double*)pinA.Pointer;
+                double* pB = (double*)pinB.Pointer;
+                double* pR = (double*)pinR.Pointer;
                 int subChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 250_000));
                 if (subChunks >= 2)
                 {
@@ -3250,8 +3258,8 @@ public partial class CpuEngine : ITensorLevelEngine
         // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy (breaking in-place writes)
         if (typeof(T) == typeof(float))
         {
-            var aMem = AsFloatMemory(a.Data);
-            var bMem = AsFloatMemory(b.Data);
+            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyData);
+            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyData);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             float* pA = (float*)pinA.Pointer;
@@ -3306,8 +3314,8 @@ public partial class CpuEngine : ITensorLevelEngine
         // VectorAddUnsafe pattern, dgemm-equivalent throughput on AVX2.
         if (typeof(T) == typeof(double))
         {
-            var aMem = AsDoubleMemory(a.Data);
-            var bMem = AsDoubleMemory(b.Data);
+            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyData);
+            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyData);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             double* pA = (double*)pinA.Pointer;
@@ -3364,8 +3372,8 @@ public partial class CpuEngine : ITensorLevelEngine
         int length = a.Length;
         if (typeof(T) == typeof(float))
         {
-            var aMem = AsFloatMemory(a.Data);
-            var bMem = AsFloatMemory(b.Data);
+            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyData);
+            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyData);
             var rMem = AsFloatMemory(destination.Data);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
@@ -3380,8 +3388,8 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else if (typeof(T) == typeof(double))
         {
-            var aMem = AsDoubleMemory(a.Data);
-            var bMem = AsDoubleMemory(b.Data);
+            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyData);
+            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyData);
             var rMem = AsDoubleMemory(destination.Data);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
@@ -3443,21 +3451,26 @@ public partial class CpuEngine : ITensorLevelEngine
         // [1,64,224,224] taking ~254 ms per call without this path (the generic
         // a.BroadcastAdd walks each output index via indexer — ~100× slower
         // than SIMD). Closes the AiDotNet#1394 perf wall on Conv+BN models.
-        if (TryBroadcastChannelRepeat(a, b, out int bcr_batch, out int bcr_chan, out int bcr_spatial))
+        if (TryBroadcastChannelRepeat(a, b, out int bcr_batch, out int bcr_chan, out int bcr_spatial)
+            && a.GetCpuBackingForStridedRead(out int bcr_aOff) is { } bcr_a
+            && b.GetCpuBackingForStridedRead(out int bcr_bOff) is { } bcr_b)
         {
             var res = AutoTensorCache.RentOrAllocate<T>(a._shape);
-            ApplyBroadcastChannelOp(
-                a._storage.GetDataArray(), a._storageOffset,
-                b._storage.GetDataArray(), b._storageOffset,
-                res._storage.GetDataArray(), res._storageOffset,
-                bcr_batch, bcr_chan, bcr_spatial, BroadcastOp.Add);
-            DifferentiableOps.RecordBinary("TensorBroadcastAdd", res, aOrig, bOrig, BackwardFunctions<T>.BroadcastAddBackward);
-            if (AutoTracer.ShouldRecord)
+            if (res.GetCpuBackingForContiguousWrite(out int bcr_rOff) is { } bcr_r)
             {
-                var ca = a; var cb = b;
-                AutoTracer.RecordOp("TensorBroadcastAdd", res, eng => eng.TensorAdd(ca, cb));
+                ApplyBroadcastChannelOp(
+                    bcr_a, bcr_aOff,
+                    bcr_b, bcr_bOff,
+                    bcr_r, bcr_rOff,
+                    bcr_batch, bcr_chan, bcr_spatial, BroadcastOp.Add);
+                DifferentiableOps.RecordBinary("TensorBroadcastAdd", res, aOrig, bOrig, BackwardFunctions<T>.BroadcastAddBackward);
+                if (AutoTracer.ShouldRecord)
+                {
+                    var ca = a; var cb = b;
+                    AutoTracer.RecordOp("TensorBroadcastAdd", res, eng => eng.TensorAdd(ca, cb));
+                }
+                return res;
             }
-            return res;
         }
 
         // Generic trailing-repeat fast path — same rationale as
@@ -3534,21 +3547,26 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!b.IsContiguous) b = b.Contiguous();
 
         // Channel-repeat fast path — see TensorBroadcastAdd for rationale.
-        if (TryBroadcastChannelRepeat(a, b, out int bcs_batch, out int bcs_chan, out int bcs_spatial))
+        if (TryBroadcastChannelRepeat(a, b, out int bcs_batch, out int bcs_chan, out int bcs_spatial)
+            && a.GetCpuBackingForStridedRead(out int bcs_aOff) is { } bcs_a
+            && b.GetCpuBackingForStridedRead(out int bcs_bOff) is { } bcs_b)
         {
             var res = AutoTensorCache.RentOrAllocate<T>(a._shape);
-            ApplyBroadcastChannelOp(
-                a._storage.GetDataArray(), a._storageOffset,
-                b._storage.GetDataArray(), b._storageOffset,
-                res._storage.GetDataArray(), res._storageOffset,
-                bcs_batch, bcs_chan, bcs_spatial, BroadcastOp.Subtract);
-            DifferentiableOps.RecordBinary("TensorBroadcastSubtract", res, aOrig, bOrig, BackwardFunctions<T>.BroadcastSubtractBackward);
-            if (AutoTracer.ShouldRecord)
+            if (res.GetCpuBackingForContiguousWrite(out int bcs_rOff) is { } bcs_r)
             {
-                var ca = a; var cb = b;
-                AutoTracer.RecordOp("TensorBroadcastSubtract", res, eng => eng.TensorSubtract(ca, cb));
+                ApplyBroadcastChannelOp(
+                    bcs_a, bcs_aOff,
+                    bcs_b, bcs_bOff,
+                    bcs_r, bcs_rOff,
+                    bcs_batch, bcs_chan, bcs_spatial, BroadcastOp.Subtract);
+                DifferentiableOps.RecordBinary("TensorBroadcastSubtract", res, aOrig, bOrig, BackwardFunctions<T>.BroadcastSubtractBackward);
+                if (AutoTracer.ShouldRecord)
+                {
+                    var ca = a; var cb = b;
+                    AutoTracer.RecordOp("TensorBroadcastSubtract", res, eng => eng.TensorSubtract(ca, cb));
+                }
+                return res;
             }
-            return res;
         }
 
         // Fast path for [N,M] - [M] or [N,M] - [1,M] bias subtract pattern
@@ -3643,21 +3661,26 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!b.IsContiguous) b = b.Contiguous();
 
         // Channel-repeat fast path — see TensorBroadcastAdd for rationale.
-        if (TryBroadcastChannelRepeat(a, b, out int bcd_batch, out int bcd_chan, out int bcd_spatial))
+        if (TryBroadcastChannelRepeat(a, b, out int bcd_batch, out int bcd_chan, out int bcd_spatial)
+            && a.GetCpuBackingForStridedRead(out int bcd_aOff) is { } bcd_a
+            && b.GetCpuBackingForStridedRead(out int bcd_bOff) is { } bcd_b)
         {
             var res = AutoTensorCache.RentOrAllocate<T>(a._shape);
-            ApplyBroadcastChannelOp(
-                a._storage.GetDataArray(), a._storageOffset,
-                b._storage.GetDataArray(), b._storageOffset,
-                res._storage.GetDataArray(), res._storageOffset,
-                bcd_batch, bcd_chan, bcd_spatial, BroadcastOp.Divide);
-            DifferentiableOps.RecordBinary("TensorBroadcastDivide", res, aOrig, bOrig, BackwardFunctions<T>.BroadcastDivideBackward);
-            if (AutoTracer.ShouldRecord)
+            if (res.GetCpuBackingForContiguousWrite(out int bcd_rOff) is { } bcd_r)
             {
-                var ca = a; var cb = b;
-                AutoTracer.RecordOp("TensorBroadcastDivide", res, eng => eng.TensorDivide(ca, cb));
+                ApplyBroadcastChannelOp(
+                    bcd_a, bcd_aOff,
+                    bcd_b, bcd_bOff,
+                    bcd_r, bcd_rOff,
+                    bcd_batch, bcd_chan, bcd_spatial, BroadcastOp.Divide);
+                DifferentiableOps.RecordBinary("TensorBroadcastDivide", res, aOrig, bOrig, BackwardFunctions<T>.BroadcastDivideBackward);
+                if (AutoTracer.ShouldRecord)
+                {
+                    var ca = a; var cb = b;
+                    AutoTracer.RecordOp("TensorBroadcastDivide", res, eng => eng.TensorDivide(ca, cb));
+                }
+                return res;
             }
-            return res;
         }
 
         var result = a.BroadcastDivide(b);
@@ -3704,21 +3727,26 @@ public partial class CpuEngine : ITensorLevelEngine
         // BatchNorm inference scale at [B,C,H,W] * [1,C,1,1] hits this; VGG16
         // forward profile showed 13 BN layers consuming ~44% of the step
         // before this path existed.
-        if (TryBroadcastChannelRepeat(a, b, out int bcm_batch, out int bcm_chan, out int bcm_spatial))
+        if (TryBroadcastChannelRepeat(a, b, out int bcm_batch, out int bcm_chan, out int bcm_spatial)
+            && a.GetCpuBackingForStridedRead(out int bcm_aOff) is { } bcm_a
+            && b.GetCpuBackingForStridedRead(out int bcm_bOff) is { } bcm_b)
         {
             var res = AutoTensorCache.RentOrAllocate<T>(a._shape);
-            ApplyBroadcastChannelOp(
-                a._storage.GetDataArray(), a._storageOffset,
-                b._storage.GetDataArray(), b._storageOffset,
-                res._storage.GetDataArray(), res._storageOffset,
-                bcm_batch, bcm_chan, bcm_spatial, BroadcastOp.Multiply);
-            DifferentiableOps.RecordBinary("TensorBroadcastMultiply", res, aOrig, bOrig, BackwardFunctions<T>.BroadcastMultiplyBackward);
-            if (AutoTracer.ShouldRecord)
+            if (res.GetCpuBackingForContiguousWrite(out int bcm_rOff) is { } bcm_r)
             {
-                var ca = a; var cb = b;
-                AutoTracer.RecordOp("TensorBroadcastMultiply", res, eng => eng.TensorMultiply(ca, cb));
+                ApplyBroadcastChannelOp(
+                    bcm_a, bcm_aOff,
+                    bcm_b, bcm_bOff,
+                    bcm_r, bcm_rOff,
+                    bcm_batch, bcm_chan, bcm_spatial, BroadcastOp.Multiply);
+                DifferentiableOps.RecordBinary("TensorBroadcastMultiply", res, aOrig, bOrig, BackwardFunctions<T>.BroadcastMultiplyBackward);
+                if (AutoTracer.ShouldRecord)
+                {
+                    var ca = a; var cb = b;
+                    AutoTracer.RecordOp("TensorBroadcastMultiply", res, eng => eng.TensorMultiply(ca, cb));
+                }
+                return res;
             }
-            return res;
         }
 
         // Generic trailing-repeat fast path (float + double + any T with SIMD numOps).
@@ -4138,6 +4166,28 @@ public partial class CpuEngine : ITensorLevelEngine
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (gamma is null) throw new ArgumentNullException(nameof(gamma));
         if (beta is null) throw new ArgumentNullException(nameof(beta));
+        if (GraphMode.IsInferenceTrace)
+        {
+            CaptureInferenceIntoKernel(
+                output,
+                new[] { input, gamma, beta },
+                (engine, destination) =>
+                    engine.GroupNormInto(
+                        destination, input, numGroups, gamma, beta, epsilon, out _, out _));
+            Tensor<T>[] statistics = CaptureInferenceKernelOutputs(
+                new[] { input, gamma, beta },
+                engine =>
+                {
+                    engine.GroupNorm(
+                        input, numGroups, gamma, beta, epsilon, out Tensor<T> freshMean,
+                        out Tensor<T> freshVariance);
+                    return new[] { freshMean, freshVariance };
+                },
+                operationName: "GroupNormIntoStatistics");
+            mean = statistics[0];
+            variance = statistics[1];
+            return;
+        }
         if (!output.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
         if (numGroups <= 0) throw new ArgumentOutOfRangeException(nameof(numGroups), "Number of groups must be positive.");
 
@@ -4372,6 +4422,14 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (destination == null) throw new ArgumentNullException(nameof(destination));
         if (input == null) throw new ArgumentNullException(nameof(input));
+        if (GraphMode.IsInferenceTrace)
+        {
+            CaptureInferenceIntoKernel(
+                destination,
+                new[] { input },
+                (engine, output) => engine.GELUInto(output, input));
+            return;
+        }
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
         var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
@@ -5057,8 +5115,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(float))
         {
-            var aMem = AsFloatMemory(a.Data);
-            var bMem = AsFloatMemory(b.Data);
+            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyData);
+            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyData);
             var rMem = AsFloatMemory(destination.Data);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
@@ -5067,8 +5125,8 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else if (typeof(T) == typeof(double))
         {
-            var aMem = AsDoubleMemory(a.Data);
-            var bMem = AsDoubleMemory(b.Data);
+            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyData);
+            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyData);
             var rMem = AsDoubleMemory(destination.Data);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
@@ -5094,8 +5152,8 @@ public partial class CpuEngine : ITensorLevelEngine
         int length = a.Length;
         if (typeof(T) == typeof(float))
         {
-            var aMem = AsFloatMemory(a.Data);
-            var bMem = AsFloatMemory(b.Data);
+            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyData);
+            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyData);
             var rMem = AsFloatMemory(destination.Data);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
@@ -5104,8 +5162,8 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else if (typeof(T) == typeof(double))
         {
-            var aMem = AsDoubleMemory(a.Data);
-            var bMem = AsDoubleMemory(b.Data);
+            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyData);
+            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyData);
             var rMem = AsDoubleMemory(destination.Data);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
@@ -5414,25 +5472,24 @@ public partial class CpuEngine : ITensorLevelEngine
         // Stride-aware: strided iteration for non-contiguous views (zero-copy)
         if (!a.IsContiguous || !b.IsContiguous)
         {
-            var aArr = a._storage.GetDataArray(); var bArr = b._storage.GetDataArray(); var rArr = result.GetDataArray();
-            var ops = MathHelper.GetNumericOperations<T>();
             // Strided operands go to the coalescing SIMD kernel, not a per-element walk.
             // See TensorAdd: implicit broadcasting made this branch the common path.
             Tensor<T>.ElementwiseInto(a, b, result, Tensor<T>.BroadcastOp.Subtract);
         }
         else if (typeof(T) == typeof(float))
         {
-            // In-house SIMD: pin raw storage + offset, JIT or
+            // In-house SIMD: pin logical memory, then use JIT or
             // VectorSubtractUnsafe (4× unrolled AVX2/AVX-512 with FMA).
-            var aRaw = (float[])(object)a._storage.GetDataArray();
-            var bRaw = (float[])(object)b._storage.GetDataArray();
-            var rRaw = (float[])(object)result._storage.GetDataArray();
-            int aOff = a._storageOffset, bOff = b._storageOffset, rOff = result._storageOffset;
-            fixed (float* pAFix = aRaw, pBFix = bRaw, pRFix = rRaw)
+            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyData);
+            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyData);
+            var rMem = AsFloatMemory(result.Data);
+            using var pinA = aMem.Pin();
+            using var pinB = bMem.Pin();
+            using var pinR = rMem.Pin();
             {
-                float* pA = pAFix + aOff;
-                float* pB = pBFix + bOff;
-                float* pR = pRFix + rOff;
+                float* pA = (float*)pinA.Pointer;
+                float* pB = (float*)pinB.Pointer;
+                float* pR = (float*)pinR.Pointer;
                 if (CpuJitSelfTest.IsVerified && length >= 64)
                 {
                     JitBinaryDispatch(pA, pB, pR, length, JitBinaryOp.Subtract);
@@ -5461,16 +5518,17 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else if (typeof(T) == typeof(double))
         {
-            // In-house: pin raw storage + offset, call VectorSubtractUnsafe(double*).
-            var aRaw = (double[])(object)a._storage.GetDataArray();
-            var bRaw = (double[])(object)b._storage.GetDataArray();
-            var rRaw = (double[])(object)result._storage.GetDataArray();
-            int aOff = a._storageOffset, bOff = b._storageOffset, rOff = result._storageOffset;
-            fixed (double* pAFix = aRaw, pBFix = bRaw, pRFix = rRaw)
+            // In-house: pin logical memory and call VectorSubtractUnsafe(double*).
+            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyData);
+            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyData);
+            var rMem = AsDoubleMemory(result.Data);
+            using var pinA = aMem.Pin();
+            using var pinB = bMem.Pin();
+            using var pinR = rMem.Pin();
             {
-                double* pA = pAFix + aOff;
-                double* pB = pBFix + bOff;
-                double* pR = pRFix + rOff;
+                double* pA = (double*)pinA.Pointer;
+                double* pB = (double*)pinB.Pointer;
+                double* pR = (double*)pinR.Pointer;
                 int subChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 250_000));
                 if (subChunks >= 2)
                 {
@@ -5575,23 +5633,22 @@ public partial class CpuEngine : ITensorLevelEngine
         // Stride-aware: strided iteration for non-contiguous views (zero-copy)
         if (!a.IsContiguous || !b.IsContiguous)
         {
-            var aArr = a._storage.GetDataArray(); var bArr = b._storage.GetDataArray(); var rArr = result.GetDataArray();
-            var ops = MathHelper.GetNumericOperations<T>();
             // Strided operands go to the coalescing SIMD kernel, not a per-element walk.
             // See TensorAdd: implicit broadcasting made this branch the common path.
             Tensor<T>.ElementwiseInto(a, b, result, Tensor<T>.BroadcastOp.Multiply);
         }
         else if (typeof(T) == typeof(float))
         {
-            var aRaw = (float[])(object)a._storage.GetDataArray();
-            var bRaw = (float[])(object)b._storage.GetDataArray();
-            var rRaw = (float[])(object)result._storage.GetDataArray();
-            int aOff = a._storageOffset, bOff = b._storageOffset, rOff = result._storageOffset;
-            fixed (float* pAFix = aRaw, pBFix = bRaw, pRFix = rRaw)
+            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyData);
+            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyData);
+            var rMem = AsFloatMemory(result.Data);
+            using var pinA = aMem.Pin();
+            using var pinB = bMem.Pin();
+            using var pinR = rMem.Pin();
             {
-                float* pA = pAFix + aOff;
-                float* pB = pBFix + bOff;
-                float* pR = pRFix + rOff;
+                float* pA = (float*)pinA.Pointer;
+                float* pB = (float*)pinB.Pointer;
+                float* pR = (float*)pinR.Pointer;
                 if (CpuJitSelfTest.IsVerified && length >= 64)
                 {
                     JitBinaryDispatch(pA, pB, pR, length, JitBinaryOp.Multiply);
@@ -5620,15 +5677,16 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else if (typeof(T) == typeof(double))
         {
-            var aRaw = (double[])(object)a._storage.GetDataArray();
-            var bRaw = (double[])(object)b._storage.GetDataArray();
-            var rRaw = (double[])(object)result._storage.GetDataArray();
-            int aOff = a._storageOffset, bOff = b._storageOffset, rOff = result._storageOffset;
-            fixed (double* pAFix = aRaw, pBFix = bRaw, pRFix = rRaw)
+            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyData);
+            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyData);
+            var rMem = AsDoubleMemory(result.Data);
+            using var pinA = aMem.Pin();
+            using var pinB = bMem.Pin();
+            using var pinR = rMem.Pin();
             {
-                double* pA = pAFix + aOff;
-                double* pB = pBFix + bOff;
-                double* pR = pRFix + rOff;
+                double* pA = (double*)pinA.Pointer;
+                double* pB = (double*)pinB.Pointer;
+                double* pR = (double*)pinR.Pointer;
                 int mulChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 250_000));
                 if (mulChunks >= 2)
                 {
@@ -5712,8 +5770,8 @@ public partial class CpuEngine : ITensorLevelEngine
         // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy (breaking in-place writes)
         if (typeof(T) == typeof(float))
         {
-            var aMem = AsFloatMemory(a.Data);
-            var bMem = AsFloatMemory(b.Data);
+            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyData);
+            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyData);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             float* pA = (float*)pinA.Pointer;
@@ -5764,8 +5822,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(double))
         {
-            var aMem = AsDoubleMemory(a.Data);
-            var bMem = AsDoubleMemory(b.Data);
+            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyData);
+            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyData);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             double* pA = (double*)pinA.Pointer;
@@ -5822,8 +5880,8 @@ public partial class CpuEngine : ITensorLevelEngine
         int length = a.Length;
         if (typeof(T) == typeof(float))
         {
-            var aMem = AsFloatMemory(a.Data);
-            var bMem = AsFloatMemory(b.Data);
+            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyData);
+            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyData);
             var rMem = AsFloatMemory(destination.Data);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
@@ -5832,8 +5890,8 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else if (typeof(T) == typeof(double))
         {
-            var aMem = AsDoubleMemory(a.Data);
-            var bMem = AsDoubleMemory(b.Data);
+            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyData);
+            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyData);
             var rMem = AsDoubleMemory(destination.Data);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
@@ -6300,23 +6358,22 @@ public partial class CpuEngine : ITensorLevelEngine
         // Stride-aware: strided iteration for non-contiguous views (zero-copy)
         if (!a.IsContiguous || !b.IsContiguous)
         {
-            var aArr = a._storage.GetDataArray(); var bArr = b._storage.GetDataArray(); var rArr = result.GetDataArray();
-            var ops = MathHelper.GetNumericOperations<T>();
             // Strided operands go to the coalescing SIMD kernel, not a per-element walk.
             // See TensorAdd: implicit broadcasting made this branch the common path.
             Tensor<T>.ElementwiseInto(a, b, result, Tensor<T>.BroadcastOp.Divide);
         }
         else if (typeof(T) == typeof(float))
         {
-            var aRaw = (float[])(object)a._storage.GetDataArray();
-            var bRaw = (float[])(object)b._storage.GetDataArray();
-            var rRaw = (float[])(object)result._storage.GetDataArray();
-            int aOff = a._storageOffset, bOff = b._storageOffset, rOff = result._storageOffset;
-            fixed (float* pAFix = aRaw, pBFix = bRaw, pRFix = rRaw)
+            var aMem = AsFloatReadOnlyMemory(a.ReadOnlyData);
+            var bMem = AsFloatReadOnlyMemory(b.ReadOnlyData);
+            var rMem = AsFloatMemory(result.Data);
+            using var pinA = aMem.Pin();
+            using var pinB = bMem.Pin();
+            using var pinR = rMem.Pin();
             {
-                float* pA = pAFix + aOff;
-                float* pB = pBFix + bOff;
-                float* pR = pRFix + rOff;
+                float* pA = (float*)pinA.Pointer;
+                float* pB = (float*)pinB.Pointer;
+                float* pR = (float*)pinR.Pointer;
                 if (CpuJitSelfTest.IsVerified && length >= 64)
                 {
                     JitBinaryDispatch(pA, pB, pR, length, JitBinaryOp.Divide);
@@ -6345,15 +6402,16 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else if (typeof(T) == typeof(double))
         {
-            var aRaw = (double[])(object)a._storage.GetDataArray();
-            var bRaw = (double[])(object)b._storage.GetDataArray();
-            var rRaw = (double[])(object)result._storage.GetDataArray();
-            int aOff = a._storageOffset, bOff = b._storageOffset, rOff = result._storageOffset;
-            fixed (double* pAFix = aRaw, pBFix = bRaw, pRFix = rRaw)
+            var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyData);
+            var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyData);
+            var rMem = AsDoubleMemory(result.Data);
+            using var pinA = aMem.Pin();
+            using var pinB = bMem.Pin();
+            using var pinR = rMem.Pin();
             {
-                double* pA = pAFix + aOff;
-                double* pB = pBFix + bOff;
-                double* pR = pRFix + rOff;
+                double* pA = (double*)pinA.Pointer;
+                double* pB = (double*)pinB.Pointer;
+                double* pR = (double*)pinR.Pointer;
                 int subChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 250_000));
                 if (subChunks >= 2)
                 {
@@ -6392,6 +6450,9 @@ public partial class CpuEngine : ITensorLevelEngine
     public Tensor<T> TensorEquals<T>(Tensor<T> tensor, T value)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { tensor }, engine => engine.TensorEquals(tensor, value));
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
@@ -6411,6 +6472,8 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(new[] { a, b }, engine => engine.TensorEquals(a, b));
         var aOrig = a;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!a.IsContiguous) a = a.Contiguous();
         var bOrig = b;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
@@ -6437,6 +6500,9 @@ public partial class CpuEngine : ITensorLevelEngine
     public Tensor<T> TensorNotEquals<T>(Tensor<T> tensor, T value)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { tensor }, engine => engine.TensorNotEquals(tensor, value));
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
@@ -6456,6 +6522,8 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(new[] { a, b }, engine => engine.TensorNotEquals(a, b));
         var aOrig = a;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!a.IsContiguous) a = a.Contiguous();
         var bOrig = b;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
@@ -6483,6 +6551,8 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(new[] { a, b }, engine => engine.TensorGreaterThan(a, b));
         var aOrig = a;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!a.IsContiguous) a = a.Contiguous();
         var bOrig = b;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
@@ -6509,6 +6579,9 @@ public partial class CpuEngine : ITensorLevelEngine
     public Tensor<T> TensorGreaterThan<T>(Tensor<T> tensor, T value)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { tensor }, engine => engine.TensorGreaterThan(tensor, value));
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
@@ -6528,6 +6601,8 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(new[] { a, b }, engine => engine.TensorLessThan(a, b));
         var aOrig = a;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!a.IsContiguous) a = a.Contiguous();
         var bOrig = b;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
@@ -6554,6 +6629,9 @@ public partial class CpuEngine : ITensorLevelEngine
     public Tensor<T> TensorLessThan<T>(Tensor<T> tensor, T value)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { tensor }, engine => engine.TensorLessThan(tensor, value));
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
@@ -7313,8 +7391,9 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentException("Grid must be 4D tensor of shape [D, H, W, C]", nameof(grid));
         if (positions._shape.Length != 2 || positions._shape[1] != 3)
             throw new ArgumentException("Positions must be 2D tensor of shape [N, 3]", nameof(positions));
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_grid = grid; var c_positions = positions; return scope.RecordBinary(LazyNodeType.Custom, "TensorTrilinearInterpolate", grid, positions, grid._shape, (eng, output) => { var r = eng.TensorTrilinearInterpolate(c_grid, c_positions); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.TrilinearInterpolateBackward); } }
-        { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorTrilinearInterpolate", grid._shape); if (ac is not null) return ac.Execute(); }
+        var outputShape = new[] { positions._shape[0], grid._shape[3] };
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_grid = grid; var c_positions = positions; return scope.RecordBinary(LazyNodeType.Custom, "TensorTrilinearInterpolate", grid, positions, outputShape, (eng, output) => { var r = eng.TensorTrilinearInterpolate(c_grid, c_positions); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.TrilinearInterpolateBackward); } }
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorTrilinearInterpolate", outputShape); if (ac is not null) return ac.Execute(); }
 
         var numOps = MathHelper.GetNumericOperations<T>();
         int depth = grid._shape[0];
@@ -7323,7 +7402,7 @@ public partial class CpuEngine : ITensorLevelEngine
         int channels = grid._shape[3];
         int numPositions = positions._shape[0];
 
-        var result = TensorAllocator.Rent<T>(new[] { numPositions, channels });
+        var result = TensorAllocator.Rent<T>(outputShape);
 
         // Rewritten from per-element Tensor-indexer access (grid[z,y,x,c] × 8 corners/channel +
         // positions[n,i] + numOps.ToDouble/FromDouble dispatch) to raw-array access with native
@@ -12014,6 +12093,8 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (input == null)
             throw new ArgumentNullException(nameof(input));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(new[] { input }, engine => engine.GeGLU(input, dim));
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
@@ -12147,6 +12228,8 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (input == null)
             throw new ArgumentNullException(nameof(input));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(new[] { input }, engine => engine.SwiGLU(input, dim));
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
@@ -12271,6 +12354,8 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (input == null)
             throw new ArgumentNullException(nameof(input));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(new[] { input }, engine => engine.ReGLU(input, dim));
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
@@ -12812,14 +12897,19 @@ public partial class CpuEngine : ITensorLevelEngine
 
     internal void TensorMatMulFloatInto(Tensor<float> a, Tensor<float> b, Tensor<float> output)
     {
-        var aOrig = a;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!a.IsContiguous) a = a.Contiguous();
-        var bOrig = b;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!b.IsContiguous) b = b.Contiguous();
 
-        var aArr = a.GetDataArray();
-        var bArr = b.GetDataArray();
-        var oArr = output.GetDataArray();
+        // Read and write the tensors through their logical spans. Compiled plans commonly
+        // allocate tensors from ArrayPool buckets whose backing arrays are larger than the
+        // logical tensor. GetDataArray() must copy those tensors to preserve its exact-array
+        // contract, which both allocates on every replay and gives the cached-B GEMM path a
+        // different array identity on every call. Logical spans address pooled padding safely
+        // without materializing an intermediate array.
+        ReadOnlySpan<float> aSpan = a.AsSpan();
+        ReadOnlySpan<float> bSpan = b.AsSpan();
+        Span<float> outputSpan = output.AsWritableSpan();
+        float[]? liveB = b.GetLiveBackingArrayAllowingPaddingOrNull();
 
         // 2D × 2D — route through cached-B path (Path A: pre-pack weights)
         if (a.Rank == 2 && b.Rank == 2)
@@ -12831,11 +12921,24 @@ public partial class CpuEngine : ITensorLevelEngine
                 return;
             }
 
-            Simd.SimdGemm.SgemmWithCachedB(
-                new System.ReadOnlySpan<float>(aArr, 0, m * k),
-                bArr,
-                new System.Span<float>(oArr, 0, m * n),
-                m, k, n);
+            if (liveB is not null)
+            {
+                Simd.SimdGemm.SgemmWithCachedB(
+                    aSpan.Slice(0, m * k),
+                    liveB,
+                    outputSpan.Slice(0, m * n),
+                    m, k, n);
+            }
+            else
+            {
+                // Array-identity caching is valid only for genuine zero-offset backing
+                // storage. Views and native/mapped storage stay allocation-free via spans.
+                Simd.SimdGemm.Sgemm(
+                    aSpan.Slice(0, m * k),
+                    bSpan.Slice(0, k * n),
+                    outputSpan.Slice(0, m * n),
+                    m, k, n);
+            }
             return;
         }
 
@@ -12850,11 +12953,22 @@ public partial class CpuEngine : ITensorLevelEngine
             int n = b._shape[1];
             int batchSize = 1;
             for (int i = 0; i < aRank - 2; i++) batchSize *= a._shape[i];
-            Simd.SimdGemm.SgemmWithCachedB(
-                new System.ReadOnlySpan<float>(aArr, 0, batchSize * m * k),
-                bArr,
-                new System.Span<float>(oArr, 0, batchSize * m * n),
-                batchSize * m, k, n);
+            if (liveB is not null)
+            {
+                Simd.SimdGemm.SgemmWithCachedB(
+                    aSpan.Slice(0, batchSize * m * k),
+                    liveB,
+                    outputSpan.Slice(0, batchSize * m * n),
+                    batchSize * m, k, n);
+            }
+            else
+            {
+                Simd.SimdGemm.Sgemm(
+                    aSpan.Slice(0, batchSize * m * k),
+                    bSpan.Slice(0, k * n),
+                    outputSpan.Slice(0, batchSize * m * n),
+                    batchSize * m, k, n);
+            }
             return;
         }
 
@@ -12873,21 +12987,41 @@ public partial class CpuEngine : ITensorLevelEngine
             if (batchSize == 1)
             {
                 Simd.SimdGemm.Sgemm(
-                    new System.ReadOnlySpan<float>(aArr, 0, sliceA),
-                    new System.ReadOnlySpan<float>(bArr, 0, sliceB),
-                    new System.Span<float>(oArr, 0, sliceC),
+                    aSpan.Slice(0, sliceA),
+                    bSpan.Slice(0, sliceB),
+                    outputSpan.Slice(0, sliceC),
                     m, k, n);
             }
             else
             {
-                AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)batchSize * m * n * k, batch =>
+                // Spans cannot be captured by the parallel callback. Pin their storage for
+                // the synchronous extent of ParallelForOrSerial and capture only stable
+                // addresses; each worker reconstructs spans over its disjoint batch slice.
+                unsafe
                 {
-                    Simd.SimdGemm.SgemmSequential(
-                        new System.ReadOnlySpan<float>(aArr, batch * sliceA, sliceA),
-                        new System.ReadOnlySpan<float>(bArr, batch * sliceB, sliceB),
-                        new System.Span<float>(oArr, batch * sliceC, sliceC),
-                        m, k, n);
-                });
+                    fixed (float* aPointer = aSpan)
+                    fixed (float* bPointer = bSpan)
+                    fixed (float* outputPointer = outputSpan)
+                    {
+                        IntPtr aAddress = (IntPtr)aPointer;
+                        IntPtr bAddress = (IntPtr)bPointer;
+                        IntPtr outputAddress = (IntPtr)outputPointer;
+
+                        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(
+                            0,
+                            batchSize,
+                            (long)batchSize * m * n * k,
+                            batch =>
+                            {
+                                Simd.SimdGemm.SgemmSequential(
+                                    new ReadOnlySpan<float>((float*)aAddress.ToPointer() + batch * sliceA, sliceA),
+                                    new ReadOnlySpan<float>((float*)bAddress.ToPointer() + batch * sliceB, sliceB),
+                                    new Span<float>((float*)outputAddress.ToPointer() + batch * sliceC, sliceC),
+                                    m, k, n);
+                            },
+                            deterministicSafe: true);
+                    }
+                }
             }
             return;
         }
@@ -16627,6 +16761,8 @@ public partial class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> MaxPool2DWithTensorIndices<T>(
         Tensor<T> input, int[] poolSize, int[] stride, out Tensor<int> maxIndices)
     {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousOutput);
+
         Tensor<T> result;
         int[,,,,] coordinateIndices;
         using (new NoGradScope<T>())
@@ -21383,6 +21519,8 @@ public partial class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> MaxPool3DWithTensorIndices<T>(
         Tensor<T> input, int[] poolSize, int[] stride, out Tensor<int> maxIndices)
     {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousOutput);
+
         Tensor<T> result;
         int[,,,,,] coordinateIndices;
         using (new NoGradScope<T>())
@@ -23561,6 +23699,9 @@ public partial class CpuEngine : ITensorLevelEngine
     public Tensor<T> SphericalSoftmax<T>(Tensor<T> input, int axis = -1)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { input }, engine => engine.SphericalSoftmax(input, axis));
 
         var numOps = MathHelper.GetNumericOperations<T>();
         int rank = input.Rank;
@@ -23720,6 +23861,21 @@ public partial class CpuEngine : ITensorLevelEngine
         // pass dispatches to a different engine than the forward pass. See
         // BindEngineIfUnset's docstring for the full rationale (issue #350).
         AiDotNet.Tensors.Engines.Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
+
+        if (GraphMode.IsInferenceTrace)
+        {
+            Tensor<T>[] outputs = CaptureInferenceKernelOutputs(
+                new[] { input, gamma, beta },
+                engine =>
+                {
+                    Tensor<T> result = engine.BatchNorm(
+                        input, gamma, beta, epsilon, out Tensor<T> freshMean, out Tensor<T> freshVariance);
+                    return new[] { result, freshMean, freshVariance };
+                });
+            mean = outputs[1];
+            variance = outputs[2];
+            return outputs[0];
+        }
 
         // GraphMode: execute eagerly (out params), but record result in graph for compiled plan
         if (GraphMode.IsActive)
@@ -25177,6 +25333,21 @@ public partial class CpuEngine : ITensorLevelEngine
         if (beta == null) throw new ArgumentNullException(nameof(beta));
         GradientTape<T>.Current?.BindEngineIfUnset(this);
 
+        if (GraphMode.IsInferenceTrace)
+        {
+            Tensor<T>[] outputs = CaptureInferenceKernelOutputs(
+                new[] { input, gamma, beta },
+                engine =>
+                {
+                    Tensor<T> result = engine.LayerNorm(
+                        input, gamma, beta, epsilon, out Tensor<T> freshMean, out Tensor<T> freshVariance);
+                    return new[] { result, freshMean, freshVariance };
+                });
+            mean = outputs[1];
+            variance = outputs[2];
+            return outputs[0];
+        }
+
         if (GraphMode.IsActive)
         {
             var scope = GraphMode.Current;
@@ -26610,6 +26781,22 @@ public partial class CpuEngine : ITensorLevelEngine
         if (gamma == null) throw new ArgumentNullException(nameof(gamma));
         if (beta == null) throw new ArgumentNullException(nameof(beta));
 
+        if (GraphMode.IsInferenceTrace)
+        {
+            Tensor<T>[] outputs = CaptureInferenceKernelOutputs(
+                new[] { input, gamma, beta },
+                engine =>
+                {
+                    Tensor<T> result = engine.GroupNorm(
+                        input, numGroups, gamma, beta, epsilon,
+                        out Tensor<T> freshMean, out Tensor<T> freshVariance);
+                    return new[] { result, freshMean, freshVariance };
+                });
+            mean = outputs[1];
+            variance = outputs[2];
+            return outputs[0];
+        }
+
         if (GraphMode.IsActive)
         {
             var scope = GraphMode.Current;
@@ -27271,6 +27458,19 @@ public partial class CpuEngine : ITensorLevelEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (gamma == null) throw new ArgumentNullException(nameof(gamma));
 
+        if (GraphMode.IsInferenceTrace)
+        {
+            Tensor<T>[] outputs = CaptureInferenceKernelOutputs(
+                new[] { input, gamma },
+                engine =>
+                {
+                    Tensor<T> result = engine.RMSNorm(input, gamma, epsilon, out Tensor<T> freshRms);
+                    return new[] { result, freshRms };
+                });
+            rms = outputs[1];
+            return outputs[0];
+        }
+
         if (GraphMode.IsActive)
         {
             var scope = GraphMode.Current;
@@ -27595,6 +27795,42 @@ public partial class CpuEngine : ITensorLevelEngine
         if (kvHeads <= 0 || qHeads % kvHeads != 0)
             throw new ArgumentException($"Query heads ({qHeads}) must be a positive multiple of KV heads ({kvHeads}).");
 
+        if (GraphMode.IsActive)
+        {
+            if (!GraphMode.IsInferenceTrace)
+            {
+                int repeats = qHeads / kvHeads;
+                var graphKey = repeats == 1 ? key : TensorRepeatInterleave(key, repeats, 1);
+                var graphValue = repeats == 1 ? value : TensorRepeatInterleave(value, repeats, 1);
+                var graphMask = isCausal
+                    ? CreateCausalAttentionMaskForGraph(
+                        query._shape[0], qHeads, query._shape[2], key._shape[2],
+                        key._shape[2] - query._shape[2])
+                    : null;
+                return ScaledDotProductAttention(
+                    query, graphKey, graphValue, graphMask, scale, out _, softcap);
+            }
+
+            var scope = GraphMode.Current!;
+            scope.BindEngineIfUnset(this);
+            var graphInputs = new[] { query, key, value };
+            var outputShape = new[] { query._shape[0], qHeads, query._shape[2], value._shape[3] };
+            object[] savedState = { scale, isCausal, softcap };
+            return scope.RecordVariadic(
+                LazyNodeType.ScaledDotProductAttentionGqa,
+                "ScaledDotProductAttentionGqa",
+                graphInputs,
+                outputShape,
+                (eng, output) =>
+                {
+                    var eager = eng.ScaledDotProductAttentionGqa(
+                        graphInputs[0], graphInputs[1], graphInputs[2], scale, isCausal, softcap);
+                    DirectGpuTensorEngine.CopyResultInto(eng, eager, output);
+                },
+                backwardFn: null,
+                savedState: savedState);
+        }
+
         // CPU path: materialize the shared KV heads (managed, not on the record path — the GPU engine overrides
         // this to the fused GQA kernel that broadcasts inside the kernel with no copy), then run standard SDPA.
         Tensor<T> k = qHeads == kvHeads ? key : BroadcastKvHeads(key, qHeads);
@@ -27660,6 +27896,19 @@ public partial class CpuEngine : ITensorLevelEngine
         return new Tensor<T>(outArr, new[] { batch, qHeads, seq, headDim });
     }
 
+    private static Tensor<bool> CreateCausalAttentionMaskForGraph(
+        int batch, int heads, int seqQ, int seqK, int queryOffset)
+    {
+        var data = new bool[batch * heads * seqQ * seqK];
+        int index = 0;
+        for (int b = 0; b < batch; b++)
+            for (int h = 0; h < heads; h++)
+                for (int q = 0; q < seqQ; q++)
+                    for (int k = 0; k < seqK; k++)
+                        data[index++] = k <= q + queryOffset;
+        return new Tensor<bool>(data, new[] { batch, heads, seqQ, seqK });
+    }
+
     public Tensor<T> ScaledDotProductAttention<T>(
         Tensor<T> query,
         Tensor<T> key,
@@ -27676,6 +27925,8 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentNullException(nameof(key));
         if (value == null)
             throw new ArgumentNullException(nameof(value));
+        if (mask is not null)
+            GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
 
         // AiDotNet#1331: under GraphMode, decompose into primitive ops so each
         // records itself and the compiled plan's backward chains through the
@@ -29045,6 +29296,23 @@ public partial class CpuEngine : ITensorLevelEngine
         if (key == null) throw new ArgumentNullException(nameof(key));
         if (value == null) throw new ArgumentNullException(nameof(value));
 
+        if (GraphMode.IsInferenceTrace)
+        {
+            Tensor<T>[] inputs = attentionBias is null
+                ? new[] { query, key, value }
+                : new[] { query, key, value, attentionBias };
+            Tensor<T>[] outputs = CaptureInferenceKernelOutputs(
+                inputs,
+                engine =>
+                {
+                    Tensor<T> result = engine.FlashAttention(
+                        query, key, value, scale, isCausal, out Tensor<T> freshStats, attentionBias);
+                    return new[] { result, freshStats };
+                });
+            softmaxStats = outputs[1];
+            return outputs[0];
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
 
         int batch = query._shape[0];
@@ -30267,6 +30535,69 @@ public partial class CpuEngine : ITensorLevelEngine
         if (numQHeads != numKVHeads * numQueriesPerKV)
             throw new ArgumentException($"Query heads ({numQHeads}) must equal KV heads ({numKVHeads}) * numQueriesPerKV ({numQueriesPerKV})");
 
+        if (GraphMode.IsInferenceTrace)
+        {
+            var scope = GraphMode.Current!;
+            scope.BindEngineIfUnset(this);
+            var graphInputs = new[] { query, key, value };
+
+            object[] SavedStateFor(int selectedOutput) =>
+                new object[]
+                {
+                    numQueriesPerKV,
+                    scale.HasValue,
+                    scale.GetValueOrDefault(),
+                    isCausal,
+                    selectedOutput
+                };
+
+            Action<IEngine, Tensor<T>> ReplaySelectedOutput(int selectedOutput) => (engine, output) =>
+            {
+                Tensor<T> result = engine.GroupedQueryAttention(
+                    graphInputs[0], graphInputs[1], graphInputs[2], numQueriesPerKV, scale, isCausal,
+                    out Tensor<T> freshAttentionWeights);
+                DirectGpuTensorEngine.CopyResultInto(
+                    engine, selectedOutput == 0 ? result : freshAttentionWeights, output);
+            };
+
+            Tensor<T> graphOutput = scope.RecordVariadic(
+                LazyNodeType.GroupedQueryAttention,
+                "GroupedQueryAttention",
+                graphInputs,
+                new[] { batch, numQHeads, seqQ, value._shape[3] },
+                ReplaySelectedOutput(0),
+                backwardFn: null,
+                savedState: SavedStateFor(0));
+            attentionWeights = scope.RecordVariadic(
+                LazyNodeType.GroupedQueryAttention,
+                "GroupedQueryAttention",
+                graphInputs,
+                new[] { batch, numQHeads, seqQ, seqK },
+                ReplaySelectedOutput(1),
+                backwardFn: null,
+                savedState: SavedStateFor(1));
+            return graphOutput;
+        }
+
+        if (GraphMode.IsActive)
+        {
+            // Preserve both public outputs without a side-effect-only secondary tensor: repeating
+            // K/V and invoking the already-recorded SDPA primitive naturally places the returned
+            // attention weights in the graph. This path is used only while tracing; eager GPU
+            // execution keeps the fused GroupedQueryAttention override.
+            var graphKey = numQueriesPerKV == 1
+                ? key
+                : TensorRepeatInterleave(key, numQueriesPerKV, 1);
+            var graphValue = numQueriesPerKV == 1
+                ? value
+                : TensorRepeatInterleave(value, numQueriesPerKV, 1);
+            var graphMask = isCausal
+                ? CreateCausalAttentionMaskForGraph(batch, numQHeads, seqQ, seqK, queryOffset: 0)
+                : null;
+            return ScaledDotProductAttention(
+                query, graphKey, graphValue, graphMask, scale, out attentionWeights);
+        }
+
         // Compute scale
         double scaleValue = scale ?? 1.0 / Math.Sqrt(headDim);
         T scaleFactor = numOps.FromDouble(scaleValue);
@@ -30534,6 +30865,8 @@ public partial class CpuEngine : ITensorLevelEngine
         double leakyReluAlpha,
         out Tensor<T> attentionCoeffs)
     {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
+
         var numOps = MathHelper.GetNumericOperations<T>();
 
         int batchSize = nodeFeatures._shape[0];
@@ -30894,6 +31227,8 @@ public partial class CpuEngine : ITensorLevelEngine
         bool concatenate,
         out Tensor<T> attentionCoeffs)
     {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
+
         if (nodeFeatures is null) throw new ArgumentNullException(nameof(nodeFeatures));
         if (edgeSourceIndices is null) throw new ArgumentNullException(nameof(edgeSourceIndices));
         if (edgeTargetIndices is null) throw new ArgumentNullException(nameof(edgeTargetIndices));
@@ -31086,7 +31421,7 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentNullException(nameof(source));
         if (indices == null)
             throw new ArgumentNullException(nameof(indices));
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_source = source; var c_indices = indices; var c_dim = dim; var c_outputSize = outputSize; return scope.RecordUnary(LazyNodeType.Custom, "ScatterAdd", source, source._shape, (eng, output) => { var r = eng.ScatterAdd(c_source, c_indices, c_dim, c_outputSize); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.ScatterAddBackward); } }
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
         { var ac = AutoTracer.TryGetCompiledPlan<T>("ScatterAdd", source._shape); if (ac is not null) return ac.Execute(); }
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -31207,6 +31542,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// </summary>
     public virtual Tensor<T> ScatterMean<T>(Tensor<T> source, Tensor<int> indices, out Tensor<int>? counts, int dim = 0, int? outputSize = null)
     {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousOutput);
+
         if (source == null)
             throw new ArgumentNullException(nameof(source));
         if (indices == null)
@@ -31450,6 +31787,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// </summary>
     public Tensor<T> ScatterMax<T>(Tensor<T> source, Tensor<int> indices, out Tensor<int>? argmax, int dim = 0, int? outputSize = null)
     {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousOutput);
+
         if (source == null)
             throw new ArgumentNullException(nameof(source));
         if (indices == null)
@@ -31604,6 +31943,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// </summary>
     public Tensor<T> ScatterSoftmax<T>(Tensor<T> source, Tensor<int> indices, int dim = 0, int? outputSize = null)
     {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
+
         if (source == null)
             throw new ArgumentNullException(nameof(source));
         if (indices == null)
@@ -31807,6 +32148,26 @@ public partial class CpuEngine : ITensorLevelEngine
         return uniqueAxes.OrderBy(a => a).ToArray();
     }
 
+    private static int[] GetReductionOutputShape(int[] inputShape, int[] normalizedAxes, bool keepDims)
+    {
+        var reducedAxes = new HashSet<int>(normalizedAxes);
+        var outputShape = new List<int>(inputShape.Length);
+        for (int dimension = 0; dimension < inputShape.Length; dimension++)
+        {
+            if (reducedAxes.Contains(dimension))
+            {
+                if (keepDims)
+                    outputShape.Add(1);
+            }
+            else
+            {
+                outputShape.Add(inputShape[dimension]);
+            }
+        }
+
+        return outputShape.Count == 0 ? new[] { 1 } : outputShape.ToArray();
+    }
+
     /// <inheritdoc/>
     public virtual Tensor<T> ReduceMax<T>(Tensor<T> input, int[] axes, bool keepDims, out int[] maxIndices)
     {
@@ -31822,14 +32183,8 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 // Compute output shape
                 var effectiveAxes = axes ?? Enumerable.Range(0, input.Rank).ToArray();
-                var normAxes = new HashSet<int>(effectiveAxes.Select(a => a < 0 ? input.Rank + a : a));
-                var outShapeList = new List<int>();
-                for (int d = 0; d < input.Rank; d++)
-                {
-                    if (normAxes.Contains(d)) { if (keepDims) outShapeList.Add(1); }
-                    else outShapeList.Add(input._shape[d]);
-                }
-                var outShape = outShapeList.Count > 0 ? outShapeList.ToArray() : new[] { 1 };
+                var captureAxes = ValidateAndNormalizeAxes(effectiveAxes, input.Rank);
+                var outShape = GetReductionOutputShape(input._shape, captureAxes, keepDims);
 
                 var capturedInput = input;
                 var capturedAxes = axes;
@@ -31942,19 +32297,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var normalizedAxes = ValidateAndNormalizeAxes(axes, inputShape.Length);
 
         // Compute output shape
-        var outputShapeList = new List<int>();
-        for (int i = 0; i < inputShape.Length; i++)
-        {
-            if (normalizedAxes.Contains(i))
-            {
-                if (keepDims) outputShapeList.Add(1);
-            }
-            else
-            {
-                outputShapeList.Add(inputShape[i]);
-            }
-        }
-        var outputShape = outputShapeList.Count > 0 ? outputShapeList.ToArray() : [1];
+        var outputShape = GetReductionOutputShape(inputShape, normalizedAxes, keepDims);
 
         int outputSize = outputShape.Aggregate(1, (a, b) => a * b);
         var outputData = new T[outputSize];
@@ -32005,6 +32348,13 @@ public partial class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> ReduceMaxWithTensorIndices<T>(
         Tensor<T> input, int[] axes, bool keepDims, out Tensor<int> maxIndices)
     {
+        if (GraphMode.IsActive)
+        {
+            throw new NotSupportedException(
+                "ReduceMaxWithTensorIndices graph capture returns heterogeneous Tensor<T>/Tensor<int> " +
+                "outputs, which the homogeneous compiled-plan output contract cannot replay safely.");
+        }
+
         Tensor<T> result;
         int[] absoluteIndices;
         using (new NoGradScope<T>())
@@ -32791,8 +33141,13 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (input == null)
             throw new ArgumentNullException(nameof(input));
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_axes = axes; var c_keepDims = keepDims; var c_epsilon = epsilon; return scope.RecordUnary(LazyNodeType.Custom, "ReduceLogVariance", input, input._shape, (eng, output) => { var r = eng.ReduceLogVariance(c_input, c_axes, c_keepDims, c_epsilon); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.ReduceLogVarianceBackward); } }
-        { var ac = AutoTracer.TryGetCompiledPlan<T>("ReduceLogVariance", input._shape); if (ac is not null) return ac.Execute(); }
+        var effectiveAxes = axes == null || axes.Length == 0
+            ? Enumerable.Range(0, input.Rank).ToArray()
+            : axes;
+        var normalizedAxes = ValidateAndNormalizeAxes(effectiveAxes, input.Rank);
+        var outputShape = GetReductionOutputShape(input._shape, normalizedAxes, keepDims);
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_axes = effectiveAxes; var c_keepDims = keepDims; var c_epsilon = epsilon; return scope.RecordUnary(LazyNodeType.Custom, "ReduceLogVariance", input, outputShape, (eng, output) => { var r = eng.ReduceLogVariance(c_input, c_axes, c_keepDims, c_epsilon); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.ReduceLogVarianceBackward); } }
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("ReduceLogVariance", outputShape); if (ac is not null) return ac.Execute(); }
 
         var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
@@ -32800,7 +33155,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
 
         // Compute variance first
-        var variance = ReduceVariance(input, axes, keepDims);
+        var variance = ReduceVariance(input, effectiveAxes, keepDims);
         var varianceData = variance.GetDataArray();
 
         // Apply log(variance + epsilon) into SEPARATE buffers.
@@ -32831,10 +33186,10 @@ public partial class CpuEngine : ITensorLevelEngine
         Tensor<T> mean;
         using (new NoGradScope<T>())
         {
-            mean = ReduceMean(input, axes, keepDims);
+            mean = ReduceMean(input, effectiveAxes, keepDims);
         }
-        DifferentiableOps.RecordUnary("ReduceLogVariance", logVarResult, inputOrig, BackwardFunctions<T>.ReduceLogVarianceBackward, new object[] { axes, mean, varianceForBackward });
-        { var ci = input; var ca = axes; var ck = keepDims; var ce = epsilon; AutoTracer.RecordOp("ReduceLogVariance", logVarResult, eng => eng.ReduceLogVariance(ci, ca, ck, ce)); }
+        DifferentiableOps.RecordUnary("ReduceLogVariance", logVarResult, inputOrig, BackwardFunctions<T>.ReduceLogVarianceBackward, new object[] { effectiveAxes, mean, varianceForBackward });
+        { var ci = input; var ca = effectiveAxes; var ck = keepDims; var ce = epsilon; AutoTracer.RecordOp("ReduceLogVariance", logVarResult, eng => eng.ReduceLogVariance(ci, ca, ck, ce)); }
         return logVarResult;
     }
 
@@ -33401,6 +33756,9 @@ public partial class CpuEngine : ITensorLevelEngine
     public Tensor<T> AffineGrid<T>(Tensor<T> theta, int outputHeight, int outputWidth)
     {
         if (theta == null) throw new ArgumentNullException(nameof(theta));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { theta }, engine => engine.AffineGrid(theta, outputHeight, outputWidth));
         if (theta._shape.Length != 3 || theta._shape[1] != 2 || theta._shape[2] != 3)
             throw new ArgumentException("AffineGrid expects theta shape [batch, 2, 3]");
 
@@ -33826,6 +34184,17 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (aReal == null || aImag == null || bReal == null || bImag == null)
             throw new ArgumentNullException("ComplexMatMul inputs cannot be null");
+        if (GraphMode.IsInferenceTrace)
+        {
+            Tensor<T>[] outputs = CaptureInferenceKernelOutputs(
+                new[] { aReal, aImag, bReal, bImag },
+                engine =>
+                {
+                    var result = engine.ComplexMatMul(aReal, aImag, bReal, bImag);
+                    return new[] { result.real, result.imag };
+                });
+            return (outputs[0], outputs[1]);
+        }
         var aShape = aReal._shape;
         var bShape = bReal._shape;
         if (aShape.Length != 2 || bShape.Length != 2 || aShape[1] != bShape[0])
@@ -33889,11 +34258,35 @@ public partial class CpuEngine : ITensorLevelEngine
 
     public (Tensor<T> real, Tensor<T> imag) ComplexNormalize<T>(Tensor<T> real, Tensor<T> imag)
     {
+        if (real == null) throw new ArgumentNullException(nameof(real));
+        if (imag == null) throw new ArgumentNullException(nameof(imag));
+        if (GraphMode.IsInferenceTrace)
+        {
+            Tensor<T>[] outputs = CaptureInferenceKernelOutputs(
+                new[] { real, imag },
+                engine =>
+                {
+                    var result = engine.ComplexNormalize(real, imag);
+                    return new[] { result.real, result.imag };
+                });
+            return (outputs[0], outputs[1]);
+        }
         var magSq = ComplexMagnitudeSquared(real, imag);
         var total = TensorSum(magSq);
         var numOps = MathHelper.GetNumericOperations<T>();
         if (numOps.Equals(total, numOps.Zero))
             return (real.Clone(), imag.Clone());
+
+        // Keep the norm on the tape. Turning the reduction into a host scalar made the divisor a
+        // detached constant, so gradients included only the direct numerator path and silently
+        // omitted the normalization term. Preserve the allocation-light scalar path outside tape.
+        if (DifferentiableOps.IsTapeActiveForThread<T>())
+        {
+            var normSquared = ReduceSum(magSq, axes: null, keepDims: false);
+            var norm = TensorSqrt(normSquared);
+            return (TensorDivide(real, norm), TensorDivide(imag, norm));
+        }
+
         var denom = numOps.Sqrt(total);
         var denomTensor = AutoTensorCache.RentOrAllocate<T>(magSq._shape);
         denomTensor.Fill(denom);
@@ -34583,6 +34976,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (embeddings == null) throw new ArgumentNullException(nameof(embeddings));
         if (indices == null) throw new ArgumentNullException(nameof(indices));
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.MixedElementTypes);
         if (embeddings.Rank != 2)
             throw new ArgumentException($"Embeddings must be a 2D tensor [vocab_size, embedding_dim]. Got rank {embeddings.Rank}.");
 
@@ -34875,9 +35269,6 @@ public partial class CpuEngine : ITensorLevelEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (centers == null) throw new ArgumentNullException(nameof(centers));
         if (epsilons == null) throw new ArgumentNullException(nameof(epsilons));
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_centers = centers; var c_epsilons = epsilons; return scope.RecordVariadic(LazyNodeType.Custom, "RBFKernel", new[] { input, centers, epsilons }, input._shape, (eng, output) => { var r = eng.RBFKernel(c_input, c_centers, c_epsilons); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.RBFKernelBackward); } }
-        { var ac = AutoTracer.TryGetCompiledPlan<T>("RBFKernel", input._shape); if (ac is not null) return ac.Execute(); }
-
         if (input.Rank != 2)
             throw new ArgumentException($"input must be 2D [batch, features], got rank {input.Rank}", nameof(input));
         if (centers.Rank != 2)
@@ -34895,7 +35286,11 @@ public partial class CpuEngine : ITensorLevelEngine
         if (epsilons._shape[0] != numCenters)
             throw new ArgumentException($"epsilons length ({epsilons._shape[0]}) must match number of centers ({numCenters})", nameof(epsilons));
 
-        var output = TensorAllocator.Rent<T>([batchSize, numCenters]);
+        var outputShape = new[] { batchSize, numCenters };
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_centers = centers; var c_epsilons = epsilons; return scope.RecordVariadic(LazyNodeType.Custom, "RBFKernel", new[] { input, centers, epsilons }, outputShape, (eng, output) => { var r = eng.RBFKernel(c_input, c_centers, c_epsilons); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.RBFKernelBackward); } }
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("RBFKernel", outputShape); if (ac is not null) return ac.Execute(); }
+
+        var output = TensorAllocator.Rent<T>(outputShape);
         var inputData = input.GetFlattenedData();
         var centersData = centers.GetFlattenedData();
         var epsilonsData = epsilons.GetFlattenedData();
@@ -35041,13 +35436,11 @@ public partial class CpuEngine : ITensorLevelEngine
         if (repeats < 1) throw new ArgumentOutOfRangeException(nameof(repeats), "Repeats must be at least 1");
         if (axis < 0 || axis >= tensor._shape.Length)
             throw new ArgumentOutOfRangeException(nameof(axis), $"Axis {axis} out of range for tensor with {tensor._shape.Length} dimensions");
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_tensor = tensor; var c_repeats = repeats; var c_axis = axis; return scope.RecordUnary(LazyNodeType.Custom, "TensorRepeatElements", tensor, tensor._shape, (eng, output) => { var r = eng.TensorRepeatElements(c_tensor, c_repeats, c_axis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.RepeatElementsBackward); } }
-
-
         // Calculate output shape
         var outputShape = new int[tensor._shape.Length];
         Array.Copy(tensor._shape, outputShape, tensor._shape.Length);
         outputShape[axis] *= repeats;
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_tensor = tensor; var c_repeats = repeats; var c_axis = axis; return scope.RecordUnary(LazyNodeType.Custom, "TensorRepeatElements", tensor, outputShape, (eng, output) => { var r = eng.TensorRepeatElements(c_tensor, c_repeats, c_axis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.RepeatElementsBackward); } }
 
         var result = AutoTensorCache.RentOrAllocate<T>(outputShape);
 
@@ -35428,13 +35821,13 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_a = a; var c_b = b; return scope.RecordBinary(LazyNodeType.Custom, "TensorOuterProduct", a, b, a._shape, (eng, output) => { var r = eng.TensorOuterProduct(c_a, c_b); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.OuterProductBackward); } }
-
-
         // Flatten both tensors to 1D
         int n = a.Length;
         int m = b.Length;
-        var result = TensorAllocator.Rent<T>([n, m]);
+        var outputShape = new[] { n, m };
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_a = a; var c_b = b; return scope.RecordBinary(LazyNodeType.Custom, "TensorOuterProduct", a, b, outputShape, (eng, output) => { var r = eng.TensorOuterProduct(c_a, c_b); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.OuterProductBackward); } }
+
+        var result = TensorAllocator.Rent<T>(outputShape);
         var numOps = MathHelper.GetNumericOperations<T>();
 
         var aData = a.GetFlattenedData();
@@ -35465,13 +35858,13 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentException("Both tensors must be 2D [batch, features]");
         if (a._shape[0] != b._shape[0])
             throw new ArgumentException("Batch sizes must match");
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_a = a; var c_b = b; return scope.RecordBinary(LazyNodeType.Custom, "TensorBatchOuterProduct", a, b, a._shape, (eng, output) => { var r = eng.TensorBatchOuterProduct(c_a, c_b); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.OuterProductBackward); } }
-
-
         int batch = a._shape[0];
         int n = a._shape[1];
         int m = b._shape[1];
-        var result = TensorAllocator.Rent<T>([batch, n, m]);
+        var outputShape = new[] { batch, n, m };
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_a = a; var c_b = b; return scope.RecordBinary(LazyNodeType.Custom, "TensorBatchOuterProduct", a, b, outputShape, (eng, output) => { var r = eng.TensorBatchOuterProduct(c_a, c_b); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.OuterProductBackward); } }
+
+        var result = TensorAllocator.Rent<T>(outputShape);
         var numOps = MathHelper.GetNumericOperations<T>();
 
         CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * n * m, bIdx =>
@@ -35708,11 +36101,11 @@ public partial class CpuEngine : ITensorLevelEngine
             if (scope != null)
             {
                 var captured = tensor;
-                var capturedAxes = axes;
+                var capturedAxes = (int[])axes.Clone();
                 // Compute permuted output shape
                 var outShape = new int[axes.Length];
                 for (int i = 0; i < axes.Length; i++) outShape[i] = tensor._shape[axes[i]];
-                return scope.RecordUnary(LazyNodeType.Custom, "TensorPermute", tensor, outShape,
+                return scope.RecordUnary(LazyNodeType.TensorPermute, "TensorPermute", tensor, outShape,
                     // Permute directly INTO the pre-allocated output via TensorPermuteInto: on the GPU engine
                     // this runs backend.Permute into output's resident buffer and leaves it GPU-resident (no
                     // host materialize/download — which would break the residency chain + abort CUDA-graph
@@ -35841,6 +36234,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (destination == null) throw new ArgumentNullException(nameof(destination));
         if (indices == null) throw new ArgumentNullException(nameof(indices));
         if (updates == null) throw new ArgumentNullException(nameof(updates));
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
         if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_destination = destination; var c_indices = indices; var c_updates = updates; var c_axis = axis; return scope.RecordBinary(LazyNodeType.Custom, "TensorScatterAdd", destination, updates, destination._shape, (eng, output) => { var r = eng.TensorScatterAdd(c_destination, c_indices, c_updates, c_axis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.ScatterAddBackward); } }
 
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
@@ -35922,6 +36316,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (source == null) throw new ArgumentNullException(nameof(source));
         if (indices == null) throw new ArgumentNullException(nameof(indices));
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
         var indicesOrig = indices;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!indices.IsContiguous) indices = indices.Contiguous();
 
@@ -36707,6 +37102,8 @@ public partial class CpuEngine : ITensorLevelEngine
     public Tensor<T> TensorDiag<T>(Tensor<T> diagonal)
     {
         if (diagonal == null) throw new ArgumentNullException(nameof(diagonal));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(new[] { diagonal }, engine => engine.TensorDiag(diagonal));
 
         var numOps = MathHelper.GetNumericOperations<T>();
         int n = diagonal.Length;
@@ -36730,10 +37127,9 @@ public partial class CpuEngine : ITensorLevelEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (tensor._shape.Length != 2)
             throw new ArgumentException("Tensor must be 2D");
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_tensor = tensor; return scope.RecordUnary(LazyNodeType.Custom, "TensorDiagonal", tensor, tensor._shape, (eng, output) => { var r = eng.TensorDiagonal(c_tensor); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.DiagonalBackward); } }
-
-
         int n = Math.Min(tensor._shape[0], tensor._shape[1]);
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_tensor = tensor; return scope.RecordUnary(LazyNodeType.Custom, "TensorDiagonal", tensor, new[] { n }, (eng, output) => { var r = eng.TensorDiagonal(c_tensor); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.DiagonalBackward); } }
+
         var result = AutoTensorCache.RentOrAllocate<T>([n]);
 
         for (int i = 0; i < n; i++)
@@ -37538,6 +37934,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<int> TensorArgMax<T>(Tensor<T> tensor, int axis)
     {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.MixedElementTypes);
+
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -37589,6 +37987,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<int> TensorArgMin<T>(Tensor<T> tensor, int axis)
     {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.MixedElementTypes);
+
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
@@ -37828,6 +38228,23 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (x == null) throw new ArgumentNullException(nameof(x));
         if (y == null) throw new ArgumentNullException(nameof(y));
+        if (GraphMode.IsInferenceTrace)
+        {
+            Tensor<T>[] outputs = CaptureInferenceKernelOutputs(
+                new[] { x, y },
+                engine =>
+                {
+                    var grid = engine.TensorMeshgrid(x, y);
+                    return new[] { grid.X, grid.Y };
+                });
+            return (outputs[0], outputs[1]);
+        }
+
+        if (DifferentiableOps.IsTapeActiveForThread<T>())
+        {
+            Tensor<T>[] outputs = TensorMeshgrid(new[] { x, y }, "xy");
+            return (outputs[0], outputs[1]);
+        }
 
         int width = x.Length;
         int height = y.Length;
@@ -38269,6 +38686,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorTopK<T>(Tensor<T> tensor, int k, int axis, out Tensor<int> indices)
     {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousOutput);
+
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (k <= 0) throw new ArgumentException("k must be positive.", nameof(k));
 
@@ -38322,6 +38741,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> TensorScatter<T>(Tensor<T> destination, Tensor<int> indices, Tensor<T> source, int axis)
     {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
+
         if (destination == null) throw new ArgumentNullException(nameof(destination));
         if (indices == null) throw new ArgumentNullException(nameof(indices));
         if (source == null) throw new ArgumentNullException(nameof(source));
@@ -38356,6 +38777,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (indices == null) throw new ArgumentNullException(nameof(indices));
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
 
         if (axis < 0) axis = tensor.Rank + axis;
 
@@ -38566,6 +38988,10 @@ public partial class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> TensorMaskedFill<T>(Tensor<T> tensor, Tensor<bool> mask, T value)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
+        if (mask == null) throw new ArgumentNullException(nameof(mask));
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
+        if (!tensor._shape.SequenceEqual(mask._shape))
+            throw new ArgumentException($"Tensor shape [{string.Join(", ", tensor._shape)}] must match mask shape [{string.Join(", ", mask._shape)}].", nameof(mask));
 
         if (GraphMode.IsActive)
         {
@@ -38573,14 +38999,17 @@ public partial class CpuEngine : ITensorLevelEngine
             if (scope != null)
             {
                 var ct = tensor; var cm = mask; var cv = value;
-                return scope.RecordUnary(LazyNodeType.Custom, "TensorMaskedFill", tensor, tensor._shape,
+                var maskData = mask.GetFlattenedData();
+                var maskShape = (int[])mask._shape.Clone();
+                double fillValue = MathHelper.GetNumericOperations<T>().ToDouble(value);
+                return scope.RecordUnary(LazyNodeType.TensorMaskedFill, "TensorMaskedFill", tensor, tensor._shape,
                     (eng, output) => { var r = eng.TensorMaskedFill(ct, cm, cv); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
-                    BackwardFunctions<T>.MaskedFillBackward, new object[] { mask });
+                    BackwardFunctions<T>.MaskedFillBackward,
+                    new object[] { (bool[])maskData.Clone(), maskShape, fillValue });
             }
         }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorMaskedFill", tensor._shape); if (ac is not null) return ac.Execute(); }
 
-        if (mask == null) throw new ArgumentNullException(nameof(mask));
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
@@ -38605,6 +39034,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (mask == null) throw new ArgumentNullException(nameof(mask));
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         if (!tensor._shape.SequenceEqual(mask._shape))
@@ -38701,6 +39131,9 @@ public partial class CpuEngine : ITensorLevelEngine
         if (condition == null) throw new ArgumentNullException(nameof(condition));
         if (x == null) throw new ArgumentNullException(nameof(x));
         if (y == null) throw new ArgumentNullException(nameof(y));
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
+        if (!condition._shape.SequenceEqual(x._shape) || !x._shape.SequenceEqual(y._shape))
+            throw new ArgumentException("condition, x, and y must have the same shape.");
 
         var result = AutoTensorCache.RentOrAllocate<T>(x._shape);
         var condData = condition.GetFlattenedData();
@@ -38731,14 +39164,15 @@ public partial class CpuEngine : ITensorLevelEngine
         if (condition == null) throw new ArgumentNullException(nameof(condition));
         if (x == null) throw new ArgumentNullException(nameof(x));
         if (y == null) throw new ArgumentNullException(nameof(y));
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
         var yOrig = y;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!y.IsContiguous) y = y.Contiguous();
         var xOrig = x;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!x.IsContiguous) x = x.Contiguous();
         var conditionOrig = condition;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!condition.IsContiguous) condition = condition.Contiguous();
-        if (x.Length != y.Length || x.Length != condition.Length)
-            throw new ArgumentException("All tensors must have the same length.");
+        if (!condition._shape.SequenceEqual(x._shape) || !x._shape.SequenceEqual(y._shape))
+            throw new ArgumentException("condition, x, and y must have the same shape.");
 
         var result = AutoTensorCache.RentOrAllocate<T>(x._shape);
         var condData = condition.GetFlattenedData();
@@ -38768,6 +39202,10 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> PositionalEncoding<T>(Tensor<T> positions, int numFrequencies)
     {
+        if (positions == null) throw new ArgumentNullException(nameof(positions));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { positions }, engine => engine.PositionalEncoding(positions, numFrequencies));
         return NeRFOperations.PositionalEncoding(positions, numFrequencies);
     }
 
@@ -38780,6 +39218,13 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> VolumeRendering<T>(Tensor<T> rgbSamples, Tensor<T> densitySamples, Tensor<T> tValues)
     {
+        if (rgbSamples == null) throw new ArgumentNullException(nameof(rgbSamples));
+        if (densitySamples == null) throw new ArgumentNullException(nameof(densitySamples));
+        if (tValues == null) throw new ArgumentNullException(nameof(tValues));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { rgbSamples, densitySamples, tValues },
+                engine => engine.VolumeRendering(rgbSamples, densitySamples, tValues));
         return NeRFOperations.VolumeRendering(rgbSamples, densitySamples, tValues);
     }
 
@@ -38806,6 +39251,21 @@ public partial class CpuEngine : ITensorLevelEngine
         int numSamples,
         bool stratified = true)
     {
+        if (rayOrigins == null) throw new ArgumentNullException(nameof(rayOrigins));
+        if (rayDirections == null) throw new ArgumentNullException(nameof(rayDirections));
+        if (GraphMode.IsInferenceTrace)
+        {
+            Tensor<T>[] outputs = CaptureInferenceKernelOutputs(
+                new[] { rayOrigins, rayDirections },
+                engine =>
+                {
+                    var sampled = engine.SampleRayPoints(
+                        rayOrigins, rayDirections, nearBound, farBound, numSamples, stratified);
+                    return new[] { sampled.positions, sampled.directions, sampled.tValues };
+                });
+            return (outputs[0], outputs[1], outputs[2]);
+        }
+
         return NeRFOperations.SampleRayPoints(
             rayOrigins, rayDirections, nearBound, farBound, numSamples, stratified);
     }
@@ -38824,6 +39284,7 @@ public partial class CpuEngine : ITensorLevelEngine
         int imageHeight,
         T focalLength)
     {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HostBoundary);
         return NeRFOperations.GenerateCameraRays(
             cameraPosition, cameraRotation, imageWidth, imageHeight, focalLength);
     }
@@ -38833,7 +39294,7 @@ public partial class CpuEngine : ITensorLevelEngine
     #region Gaussian Splatting Operations
 
     /// <inheritdoc/>
-    public void ProjectGaussians3DTo2D<T>(
+    public virtual void ProjectGaussians3DTo2D<T>(
         Tensor<T> means3D,
         Tensor<T> covariances3D,
         Matrix<T> viewMatrix,
@@ -38845,6 +39306,7 @@ public partial class CpuEngine : ITensorLevelEngine
         out Tensor<T> depths,
         out Tensor<bool> visible)
     {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HostBoundary);
         GaussianSplattingOperations.ProjectGaussians3DTo2D(
             means3D, covariances3D, viewMatrix, projMatrix,
             imageWidth, imageHeight,
@@ -38862,6 +39324,18 @@ public partial class CpuEngine : ITensorLevelEngine
         int imageHeight,
         int tileSize = 16)
     {
+        if (means2D == null) throw new ArgumentNullException(nameof(means2D));
+        if (covariances2D == null) throw new ArgumentNullException(nameof(covariances2D));
+        if (colors == null) throw new ArgumentNullException(nameof(colors));
+        if (opacities == null) throw new ArgumentNullException(nameof(opacities));
+        if (depths == null) throw new ArgumentNullException(nameof(depths));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { means2D, covariances2D, colors, opacities, depths },
+                engine => engine.RasterizeGaussians(
+                    means2D, covariances2D, colors, opacities, depths, imageWidth, imageHeight,
+                    tileSize));
+
         return GaussianSplattingOperations.RasterizeGaussians(
             means2D, covariances2D, colors, opacities, depths,
             imageWidth, imageHeight, tileSize);
@@ -38892,6 +39366,12 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> EvaluateSphericalHarmonics<T>(Tensor<T> shCoefficients, Tensor<T> viewDirections, int degree)
     {
+        if (shCoefficients == null) throw new ArgumentNullException(nameof(shCoefficients));
+        if (viewDirections == null) throw new ArgumentNullException(nameof(viewDirections));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { shCoefficients, viewDirections },
+                engine => engine.EvaluateSphericalHarmonics(shCoefficients, viewDirections, degree));
         return GaussianSplattingOperations.EvaluateSphericalHarmonics(shCoefficients, viewDirections, degree);
     }
 
@@ -38909,6 +39389,12 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> ComputeGaussianCovariance<T>(Tensor<T> rotations, Tensor<T> scales)
     {
+        if (rotations == null) throw new ArgumentNullException(nameof(rotations));
+        if (scales == null) throw new ArgumentNullException(nameof(scales));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { rotations, scales },
+                engine => engine.ComputeGaussianCovariance(rotations, scales));
         return GaussianSplattingOperations.ComputeGaussianCovariance(rotations, scales);
     }
 
@@ -38936,6 +39422,13 @@ public partial class CpuEngine : ITensorLevelEngine
         int[] resolutions,
         int featuresPerLevel)
     {
+        if (positions == null) throw new ArgumentNullException(nameof(positions));
+        if (hashTables == null) throw new ArgumentNullException(nameof(hashTables));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { positions }.Concat(hashTables).ToArray(),
+                engine => engine.MultiresolutionHashEncoding(
+                    positions, hashTables, resolutions, featuresPerLevel));
         return InstantNGPOperations.MultiresolutionHashEncoding(
             positions, hashTables, resolutions, featuresPerLevel);
     }
@@ -38961,12 +39454,21 @@ public partial class CpuEngine : ITensorLevelEngine
         T threshold,
         T decayFactor)
     {
+        if (occupancyGrid == null) throw new ArgumentNullException(nameof(occupancyGrid));
+        if (densities == null) throw new ArgumentNullException(nameof(densities));
+        if (positions == null) throw new ArgumentNullException(nameof(positions));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { occupancyGrid, densities, positions },
+                engine => engine.UpdateOccupancyGrid(
+                    occupancyGrid, densities, positions, gridSize, threshold, decayFactor));
+
         return InstantNGPOperations.UpdateOccupancyGrid(
             occupancyGrid, densities, positions, gridSize, threshold, decayFactor);
     }
 
     /// <inheritdoc/>
-    public (Tensor<T> positions, Tensor<T> directions, Tensor<bool> validMask, Tensor<T> tValues) SampleRaysWithOccupancy<T>(
+    public virtual (Tensor<T> positions, Tensor<T> directions, Tensor<bool> validMask, Tensor<T> tValues) SampleRaysWithOccupancy<T>(
         Tensor<T> rayOrigins,
         Tensor<T> rayDirections,
         Tensor<uint> occupancyBitfield,
@@ -38977,6 +39479,7 @@ public partial class CpuEngine : ITensorLevelEngine
         T farBound,
         int maxSamples)
     {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
         return InstantNGPOperations.SampleRaysWithOccupancy(
             rayOrigins, rayDirections, occupancyBitfield, gridSize,
             sceneBoundsMin, sceneBoundsMax, nearBound, farBound, maxSamples);
@@ -38993,6 +39496,7 @@ public partial class CpuEngine : ITensorLevelEngine
         Tensor<T> weights,
         Tensor<T> biases)
     {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
         return MeshConvolutionOperations.SpiralConv(vertexFeatures, spiralIndices, weights, biases);
     }
 
@@ -39029,6 +39533,15 @@ public partial class CpuEngine : ITensorLevelEngine
         Tensor<T> biases,
         T diffusionTime)
     {
+        if (vertexFeatures == null) throw new ArgumentNullException(nameof(vertexFeatures));
+        if (laplacian == null) throw new ArgumentNullException(nameof(laplacian));
+        if (weights == null) throw new ArgumentNullException(nameof(weights));
+        if (biases == null) throw new ArgumentNullException(nameof(biases));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { vertexFeatures, laplacian, weights, biases },
+                engine => engine.DiffusionConv(
+                    vertexFeatures, laplacian, weights, biases, diffusionTime));
         return MeshConvolutionOperations.DiffusionConv(vertexFeatures, laplacian, weights, biases, diffusionTime);
     }
 
@@ -39049,6 +39562,7 @@ public partial class CpuEngine : ITensorLevelEngine
         Tensor<int> faces,
         LaplacianType laplacianType = LaplacianType.Cotangent)
     {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
         return MeshConvolutionOperations.ComputeMeshLaplacian(vertices, faces, laplacianType);
     }
 
@@ -39058,6 +39572,8 @@ public partial class CpuEngine : ITensorLevelEngine
         Tensor<int> faces,
         int spiralLength)
     {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.MixedElementTypes);
+
         return MeshConvolutionOperations.GenerateSpiralIndices(vertices, faces, spiralLength);
     }
 
@@ -39068,6 +39584,11 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> PairwiseDistanceSquared<T>(Tensor<T> x, Tensor<T> y)
     {
+        if (x == null) throw new ArgumentNullException(nameof(x));
+        if (y == null) throw new ArgumentNullException(nameof(y));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { x, y }, engine => engine.PairwiseDistanceSquared(x, y));
         if (x._shape.Length != 2 || y._shape.Length != 2)
             throw new ArgumentException("Input tensors must be 2D [N, D]");
         if (x._shape[1] != y._shape[1])
@@ -39169,6 +39690,10 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> PairwiseDistance<T>(Tensor<T> x, Tensor<T> y)
     {
+        if (x == null) throw new ArgumentNullException(nameof(x));
+        if (y == null) throw new ArgumentNullException(nameof(y));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(new[] { x, y }, engine => engine.PairwiseDistance(x, y));
         var xOrig = x;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!x.IsContiguous) x = x.Contiguous();
         var yOrig = y;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
@@ -39245,6 +39770,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<int> ArgSort<T>(Tensor<T> input, int axis = -1, bool descending = false)
     {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.MixedElementTypes);
+
         if (axis < 0) axis = input._shape.Length + axis;
         if (axis < 0 || axis >= input._shape.Length)
             throw new ArgumentException($"Invalid axis {axis} for tensor with {input._shape.Length} dimensions");
@@ -39294,6 +39821,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> Gather<T>(Tensor<T> input, Tensor<int> indices, int axis)
     {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
+
         var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
         if (axis < 0) axis = input._shape.Length + axis;
@@ -39359,6 +39888,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> Scatter<T>(Tensor<T> input, Tensor<int> indices, Tensor<T> values, int axis)
     {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
+
         if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; var cind = indices; var cv = values; var ca = axis; return scope.RecordBinary(LazyNodeType.Custom, "Scatter", input, values, input._shape, (eng, output) => { var r = eng.Scatter(ci, cind, cv, ca); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.ScatterBackward, new object[] { indices, axis }); } }
 
         { var ac = AutoTracer.TryGetCompiledPlan<T>("Scatter", input._shape); if (ac is not null) return ac.Execute(); }
@@ -39406,6 +39937,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> ScatterAdd<T>(Tensor<T> input, Tensor<int> indices, Tensor<T> values, int axis)
     {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
+
         var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
         var indicesOrig = indices;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
@@ -39571,13 +40104,14 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a._shape.Length != 1 || b._shape.Length != 1)
             throw new ArgumentException("Both inputs must be 1D tensors");
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_a = a; var c_b = b; return scope.RecordBinary(LazyNodeType.Custom, "TensorOuter", a, b, a._shape, (eng, output) => { var r = eng.TensorOuter(c_a, c_b); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.OuterProductBackward); } }
-        { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorOuter", a._shape); if (ac is not null) return ac.Execute(); }
-
         int n = a._shape[0];
         int m = b._shape[0];
+        var outputShape = new[] { n, m };
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_a = a; var c_b = b; return scope.RecordBinary(LazyNodeType.Custom, "TensorOuter", a, b, outputShape, (eng, output) => { var r = eng.TensorOuter(c_a, c_b); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.OuterProductBackward); } }
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorOuter", outputShape); if (ac is not null) return ac.Execute(); }
+
         var numOps = MathHelper.GetNumericOperations<T>();
-        var result = TensorAllocator.Rent<T>([n, m]);
+        var result = TensorAllocator.Rent<T>(outputShape);
 
         for (int i = 0; i < n; i++)
         {
@@ -40237,6 +40771,48 @@ public partial class CpuEngine : ITensorLevelEngine
         if (weights == null) throw new ArgumentNullException(nameof(weights));
         if (numPieces < 2) throw new ArgumentException("numPieces must be >= 2.", nameof(numPieces));
 
+        if (GraphMode.IsActive)
+        {
+            if (input.Rank < 1 || weights.Rank != 2 || input._shape[input.Rank - 1] != weights._shape[0])
+                throw new ArgumentException("FusedLinearMaxout input and weight shapes are incompatible.", nameof(weights));
+            int graphFeatures = weights._shape[1];
+            if (graphFeatures % numPieces != 0)
+                throw new ArgumentException(
+                    $"Maxout feature dimension ({graphFeatures}) must be divisible by numPieces ({numPieces}).",
+                    nameof(numPieces));
+            int graphUnits = graphFeatures / numPieces;
+
+            if (!GraphMode.IsInferenceTrace)
+            {
+                var graphPre = FusedLinear(input, weights, bias, FusedActivationType.None);
+                var groupedShape = new int[graphPre.Rank + 1];
+                for (int i = 0; i < graphPre.Rank - 1; i++) groupedShape[i] = graphPre._shape[i];
+                groupedShape[groupedShape.Length - 2] = graphUnits;
+                groupedShape[groupedShape.Length - 1] = numPieces;
+                return ReduceMax(Reshape(graphPre, groupedShape), new[] { groupedShape.Length - 1 }, keepDims: false);
+            }
+
+            var outputShape = (int[])input._shape.Clone();
+            outputShape[outputShape.Length - 1] = graphUnits;
+            var graphInputs = bias is null ? new[] { input, weights } : new[] { input, weights, bias };
+            var scope = GraphMode.Current!;
+            scope.BindEngineIfUnset(this);
+            return scope.RecordVariadic(
+                LazyNodeType.FusedLinearMaxout,
+                "FusedLinearMaxout",
+                graphInputs,
+                outputShape,
+                (eng, output) =>
+                {
+                    var eager = eng.FusedLinearMaxout(
+                        graphInputs[0], graphInputs[1], graphInputs.Length == 3 ? graphInputs[2] : null,
+                        numPieces);
+                    DirectGpuTensorEngine.CopyResultInto(eng, eager, output);
+                },
+                backwardFn: null,
+                savedState: new object[] { numPieces });
+        }
+
         // GEMM + bias (no activation) — reuse the fused linear fast path.
         var pre = FusedLinear(input, weights, bias, FusedActivationType.None);
         int n = pre._shape[pre._shape.Length - 1];
@@ -40304,6 +40880,31 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentException(
                 $"treeDepth ({treeDepth}) is too small for {numClasses} classes; need >= {minDepth}.",
                 nameof(nodeWeights));
+
+        if (GraphMode.IsActive)
+        {
+            if (!GraphMode.IsInferenceTrace)
+                throw new NotSupportedException(
+                    "FusedHierarchicalSoftmax has no backward contract. Compiled training cannot capture it safely.");
+
+            var outputShape = (int[])input._shape.Clone();
+            outputShape[outputShape.Length - 1] = numClasses;
+            var scope = GraphMode.Current!;
+            scope.BindEngineIfUnset(this);
+            return scope.RecordBinary(
+                LazyNodeType.FusedHierarchicalSoftmax,
+                "FusedHierarchicalSoftmax",
+                input,
+                nodeWeights,
+                outputShape,
+                (eng, output) =>
+                {
+                    var eager = eng.FusedHierarchicalSoftmax(input, nodeWeights, numClasses);
+                    DirectGpuTensorEngine.CopyResultInto(eng, eager, output);
+                },
+                backwardFn: null,
+                savedState: new object[] { numClasses });
+        }
 
         int rows = input.Length / d;
         var outShape = (int[])input._shape.Clone();
@@ -40593,6 +41194,29 @@ public partial class CpuEngine : ITensorLevelEngine
         out Tensor<T> saveMean,
         out Tensor<T> saveVar)
     {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (gamma == null) throw new ArgumentNullException(nameof(gamma));
+        if (beta == null) throw new ArgumentNullException(nameof(beta));
+        if (runningMean == null) throw new ArgumentNullException(nameof(runningMean));
+        if (runningVar == null) throw new ArgumentNullException(nameof(runningVar));
+        if (GraphMode.IsInferenceTrace)
+        {
+            if (training)
+                GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.Stateful);
+            Tensor<T>[] outputs = CaptureInferenceKernelOutputs(
+                new[] { input, gamma, beta, runningMean, runningVar },
+                engine =>
+                {
+                    Tensor<T> result = engine.FusedBatchNorm(
+                        input, gamma, beta, runningMean, runningVar, epsilon, momentum, training,
+                        activation, out Tensor<T> freshMean, out Tensor<T> freshVariance);
+                    return new[] { result, freshMean, freshVariance };
+                });
+            saveMean = outputs[1];
+            saveVar = outputs[2];
+            return outputs[0];
+        }
+
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (gamma == null) throw new ArgumentNullException(nameof(gamma));
         if (beta == null) throw new ArgumentNullException(nameof(beta));
@@ -40902,10 +41526,6 @@ public partial class CpuEngine : ITensorLevelEngine
     public Tensor<T> RFFT<T>(Tensor<T> input)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; return scope.RecordUnary(LazyNodeType.Custom, "RFFT", input, input._shape, (eng, output) => { var r = eng.RFFT(c_input); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, null); } }
-        { var ac = AutoTracer.TryGetCompiledPlan<T>("RFFT", input._shape); if (ac is not null) return ac.Execute(); }
-
-        var numOps = MathHelper.GetNumericOperations<T>();
         int n = input._shape[^1]; // Last dimension is the signal length
         if (n <= 0)
             throw new ArgumentException("The signal length must be positive.", nameof(input));
@@ -40919,6 +41539,10 @@ public partial class CpuEngine : ITensorLevelEngine
         // Compute shape for output (last dim becomes 2 * numFreqs for interleaved complex)
         var outputShape = input.Shape.ToArray();
         outputShape[^1] = numFreqs * 2; // Interleaved real/imag
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; return scope.RecordUnary(LazyNodeType.Custom, "RFFT", input, outputShape, (eng, output) => { var r = eng.RFFT(c_input); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, null); } }
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("RFFT", outputShape); if (ac is not null) return ac.Execute(); }
+
+        var numOps = MathHelper.GetNumericOperations<T>();
         var result = AutoTensorCache.RentOrAllocate<T>(outputShape);
         var inputData = input.GetFlattenedData();
         var resultData = result.GetDataArray();
@@ -40987,8 +41611,13 @@ public partial class CpuEngine : ITensorLevelEngine
     public Tensor<T> IRFFT<T>(Tensor<T> input, int outputLength)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_outputLength = outputLength; return scope.RecordUnary(LazyNodeType.Custom, "IRFFT", input, input._shape, (eng, output) => { var r = eng.IRFFT(c_input, c_outputLength); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, null); } }
-        { var ac = AutoTracer.TryGetCompiledPlan<T>("IRFFT", input._shape); if (ac is not null) return ac.Execute(); }
+        if (outputLength <= 0)
+            throw new ArgumentOutOfRangeException(nameof(outputLength), "Output length must be positive.");
+
+        var outputShape = input.Shape.ToArray();
+        outputShape[^1] = outputLength;
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_outputLength = outputLength; return scope.RecordUnary(LazyNodeType.Custom, "IRFFT", input, outputShape, (eng, output) => { var r = eng.IRFFT(c_input, c_outputLength); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, null); } }
+        { var ac = AutoTracer.TryGetCompiledPlan<T>("IRFFT", outputShape); if (ac is not null) return ac.Execute(); }
 
         var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
@@ -41009,9 +41638,6 @@ public partial class CpuEngine : ITensorLevelEngine
         if (nFft < outputLength) nFft = outputLength;
         if (nFft < 1) nFft = 1;
 
-        // Output shape
-        var outputShape = input.Shape.ToArray();
-        outputShape[^1] = outputLength;
         var result = AutoTensorCache.RentOrAllocate<T>(outputShape);
         var inputData = input.GetFlattenedData();
         var resultData = result.GetDataArray();
@@ -41077,6 +41703,19 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (inputReal == null) throw new ArgumentNullException(nameof(inputReal));
         if (inputImag == null) throw new ArgumentNullException(nameof(inputImag));
+        if (GraphMode.IsInferenceTrace)
+        {
+            Tensor<T>[] outputs = CaptureInferenceKernelOutputs(
+                new[] { inputReal, inputImag },
+                engine =>
+                {
+                    engine.FFT(inputReal, inputImag, out Tensor<T> real, out Tensor<T> imaginary);
+                    return new[] { real, imaginary };
+                });
+            outputReal = outputs[0];
+            outputImag = outputs[1];
+            return;
+        }
         if (!inputReal._shape.SequenceEqual(inputImag._shape))
             throw new ArgumentException("Input real and imaginary parts must have the same shape");
 
@@ -41122,6 +41761,19 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (inputReal == null) throw new ArgumentNullException(nameof(inputReal));
         if (inputImag == null) throw new ArgumentNullException(nameof(inputImag));
+        if (GraphMode.IsInferenceTrace)
+        {
+            Tensor<T>[] outputs = CaptureInferenceKernelOutputs(
+                new[] { inputReal, inputImag },
+                engine =>
+                {
+                    engine.IFFT(inputReal, inputImag, out Tensor<T> real, out Tensor<T> imaginary);
+                    return new[] { real, imaginary };
+                });
+            outputReal = outputs[0];
+            outputImag = outputs[1];
+            return;
+        }
         var inputRealOrig = inputReal;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!inputReal.IsContiguous) inputReal = inputReal.Contiguous();
         var inputImagOrig = inputImag;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
@@ -41173,6 +41825,19 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (inputReal == null) throw new ArgumentNullException(nameof(inputReal));
         if (inputImag == null) throw new ArgumentNullException(nameof(inputImag));
+        if (GraphMode.IsInferenceTrace)
+        {
+            Tensor<T>[] outputs = CaptureInferenceKernelOutputs(
+                new[] { inputReal, inputImag },
+                engine =>
+                {
+                    engine.FFT2D(inputReal, inputImag, out Tensor<T> real, out Tensor<T> imaginary);
+                    return new[] { real, imaginary };
+                });
+            outputReal = outputs[0];
+            outputImag = outputs[1];
+            return;
+        }
         var inputRealOrig = inputReal;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!inputReal.IsContiguous) inputReal = inputReal.Contiguous();
         var inputImagOrig = inputImag;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
@@ -41233,6 +41898,19 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (inputReal == null) throw new ArgumentNullException(nameof(inputReal));
         if (inputImag == null) throw new ArgumentNullException(nameof(inputImag));
+        if (GraphMode.IsInferenceTrace)
+        {
+            Tensor<T>[] outputs = CaptureInferenceKernelOutputs(
+                new[] { inputReal, inputImag },
+                engine =>
+                {
+                    engine.IFFT2D(inputReal, inputImag, out Tensor<T> real, out Tensor<T> imaginary);
+                    return new[] { real, imaginary };
+                });
+            outputReal = outputs[0];
+            outputImag = outputs[1];
+            return;
+        }
         if (inputReal._shape.Length < 2)
             throw new ArgumentException("Input must be at least 2D");
 
@@ -41320,6 +41998,21 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (window == null) throw new ArgumentNullException(nameof(window));
+        if (GraphMode.IsInferenceTrace)
+        {
+            Tensor<T>[] outputs = CaptureInferenceKernelOutputs(
+                new[] { input, window },
+                engine =>
+                {
+                    engine.STFT(
+                        input, nFft, hopLength, window, center, out Tensor<T> magnitude,
+                        out Tensor<T> phase);
+                    return new[] { magnitude, phase };
+                });
+            magnitudeOut = outputs[0];
+            phaseOut = outputs[1];
+            return;
+        }
         if (window.Length != nFft)
             throw new ArgumentException($"Window length {window.Length} must equal nFft {nFft}");
 
@@ -41459,6 +42152,11 @@ public partial class CpuEngine : ITensorLevelEngine
         if (magnitude == null) throw new ArgumentNullException(nameof(magnitude));
         if (phase == null) throw new ArgumentNullException(nameof(phase));
         if (window == null) throw new ArgumentNullException(nameof(window));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { magnitude, phase, window },
+                engine => engine.ISTFT(
+                    magnitude, phase, nFft, hopLength, window, center, length));
 
         var numOps = MathHelper.GetNumericOperations<T>();
         int numFreqs = magnitude._shape[^2];
@@ -41623,6 +42321,12 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (window == null) throw new ArgumentNullException(nameof(window));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { input, window },
+                engine => engine.MelSpectrogram(
+                    input, sampleRate, nFft, hopLength, nMels, fMin, fMax, window,
+                    powerToDb));
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
@@ -41737,6 +42441,11 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (magnitude == null) throw new ArgumentNullException(nameof(magnitude));
         if (window == null) throw new ArgumentNullException(nameof(window));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { magnitude, window },
+                engine => engine.GriffinLim(
+                    magnitude, nFft, hopLength, window, iterations, momentum, length));
 
         var numOps = MathHelper.GetNumericOperations<T>();
         int numFreqs = magnitude._shape[^2];
@@ -42943,6 +43652,25 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> InstanceNorm<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (gamma == null) throw new ArgumentNullException(nameof(gamma));
+        if (beta == null) throw new ArgumentNullException(nameof(beta));
+
+        if (GraphMode.IsInferenceTrace)
+        {
+            Tensor<T>[] outputs = CaptureInferenceKernelOutputs(
+                new[] { input, gamma, beta },
+                engine =>
+                {
+                    Tensor<T> result = engine.InstanceNorm(
+                        input, gamma, beta, epsilon, out Tensor<T> freshMean, out Tensor<T> freshVariance);
+                    return new[] { result, freshMean, freshVariance };
+                });
+            mean = outputs[1];
+            variance = outputs[2];
+            return outputs[0];
+        }
+
         if (GraphMode.IsActive)
         {
             var scope = GraphMode.Current;
@@ -43134,6 +43862,20 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> Dropout<T>(Tensor<T> input, double dropoutRate, bool training, out Tensor<T> mask)
     {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (GraphMode.IsInferenceTrace && (!training || dropoutRate <= 0))
+        {
+            Tensor<T>[] outputs = CaptureInferenceKernelOutputs(
+                new[] { input },
+                engine =>
+                {
+                    Tensor<T> result = engine.Dropout(input, dropoutRate, training, out Tensor<T> freshMask);
+                    return new[] { result, freshMask };
+                });
+            mask = outputs[1];
+            return outputs[0];
+        }
+
         if (GraphMode.IsActive)
         {
             var scope = GraphMode.Current;
@@ -43293,6 +44035,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> Embedding<T>(Tensor<int> indices, Tensor<T> embeddingTable)
     {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
+
         if (GraphMode.IsActive)
         {
             var scope = GraphMode.Current;
@@ -43577,6 +44321,9 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> GlobalAvgPool2D<T>(Tensor<T> input)
     {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(new[] { input }, engine => engine.GlobalAvgPool2D(input));
         var numOps = MathHelper.GetNumericOperations<T>();
         int batch = input._shape[0];
         int channels = input._shape[1];
@@ -43665,6 +44412,9 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public Tensor<T> GlobalMaxPool2D<T>(Tensor<T> input)
     {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(new[] { input }, engine => engine.GlobalMaxPool2D(input));
         var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -44920,6 +45670,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <summary>Cosine similarity loss between two tensors.</summary>
     public Tensor<T> TensorCosineSimilarityLoss<T>(Tensor<T> a, Tensor<T> b)
     {
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_a = a; var c_b = b; return scope.RecordBinary(LazyNodeType.Custom, "CosineSimilarity", a, b, new[] { 1 }, (eng, output) => { var r = eng.TensorCosineSimilarityLoss(c_a, c_b); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.CosineSimilarityBackward); } }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         double dotProd = 0, normA = 0, normB = 0;
         for (int i = 0; i < a.Length; i++)
@@ -44931,8 +45683,6 @@ public partial class CpuEngine : ITensorLevelEngine
             normB += vb * vb;
         }
         double sim = dotProd / (Math.Sqrt(normA) * Math.Sqrt(normB) + 1e-8);
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_a = a; var c_b = b; return scope.RecordBinary(LazyNodeType.Custom, "CosineSimilarity", a, b, a._shape, (eng, output) => { var r = eng.TensorCosineSimilarityLoss(c_a, c_b); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.CosineSimilarityBackward); } }
-
         var result = new Tensor<T>(new[] { numOps.FromDouble(sim) }, [1]);
         DifferentiableOps.RecordBinary("CosineSimilarity", result, a, b,
             BackwardFunctions<T>.CosineSimilarityBackward);
@@ -45446,6 +46196,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <summary>IndexSelect: select indices along a given axis (differentiable).</summary>
     public Tensor<T> TensorIndexSelectDiff<T>(Tensor<T> source, Tensor<int> indices, int axis)
     {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
+
         // TensorIndexSelect already records to the tape — no additional recording needed
         return TensorIndexSelect(source, indices, axis);
     }
@@ -46180,7 +46932,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> FusedLinearReLU<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
     {
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; var cw = weight; var cb = bias; return scope.RecordVariadic(LazyNodeType.FusedLinearReLU, "FusedLinearReLU", new[] { input, weight, bias }, input._shape, (eng, output) => { var r = eng.FusedLinearReLU(ci, cw, cb); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.FusedMatMulAddReLUBackward); } }
+        if (GraphMode.IsActive)
+            return FusedLinear(input, weight, bias, FusedActivationType.ReLU);
 
         var linear = TensorMatMul(input, weight);
         var biased = TensorBroadcastAdd(linear, bias);
@@ -46198,7 +46951,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> FusedLinearSigmoid<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
     {
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; var cw = weight; var cb = bias; return scope.RecordVariadic(LazyNodeType.FusedLinearSigmoid, "FusedLinearSigmoid", new[] { input, weight, bias }, input._shape, (eng, output) => { var r = eng.FusedLinearSigmoid(ci, cw, cb); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.FusedMatMulAddSigmoidBackward); } }
+        if (GraphMode.IsActive)
+            return FusedLinear(input, weight, bias, FusedActivationType.Sigmoid);
 
         var linear = TensorMatMul(input, weight);
         var biased = TensorBroadcastAdd(linear, bias);
@@ -46214,7 +46968,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> FusedLinearTanh<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
     {
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; var cw = weight; var cb = bias; return scope.RecordVariadic(LazyNodeType.Custom, "FusedLinearTanh", new[] { input, weight, bias }, input._shape, (eng, output) => { var r = eng.FusedLinearTanh(ci, cw, cb); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.FusedMatMulAddTanhBackward); } }
+        if (GraphMode.IsActive)
+            return FusedLinear(input, weight, bias, FusedActivationType.Tanh);
 
         var linear = TensorMatMul(input, weight);
         var biased = TensorBroadcastAdd(linear, bias);
@@ -46230,7 +46985,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> FusedLinearGELU<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
     {
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; var cw = weight; var cb = bias; return scope.RecordVariadic(LazyNodeType.FusedLinearGELU, "FusedLinearGELU", new[] { input, weight, bias }, input._shape, (eng, output) => { var r = eng.FusedLinearGELU(ci, cw, cb); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.FusedMatMulAddGELUBackward); } }
+        if (GraphMode.IsActive)
+            return FusedLinear(input, weight, bias, FusedActivationType.GELU);
 
         var linear = TensorMatMul(input, weight);
         var biased = TensorBroadcastAdd(linear, bias);
@@ -46248,7 +47004,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> FusedLinearSwish<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
     {
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; var cw = weight; var cb = bias; return scope.RecordVariadic(LazyNodeType.Custom, "FusedLinearSwish", new[] { input, weight, bias }, input._shape, (eng, output) => { var r = eng.FusedLinearSwish(ci, cw, cb); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.FusedMatMulAddSwishBackward); } }
+        if (GraphMode.IsActive)
+            return FusedLinear(input, weight, bias, FusedActivationType.Swish);
 
         var linear = TensorMatMul(input, weight);
         var biased = TensorBroadcastAdd(linear, bias);
@@ -46623,6 +47380,16 @@ public partial class CpuEngine : ITensorLevelEngine
         return Unsafe.As<Memory<T>, Memory<double>>(ref data);
     }
 
+    private static ReadOnlyMemory<float> AsFloatReadOnlyMemory<T>(ReadOnlyMemory<T> data)
+    {
+        return Unsafe.As<ReadOnlyMemory<T>, ReadOnlyMemory<float>>(ref data);
+    }
+
+    private static ReadOnlyMemory<double> AsDoubleReadOnlyMemory<T>(ReadOnlyMemory<T> data)
+    {
+        return Unsafe.As<ReadOnlyMemory<T>, ReadOnlyMemory<double>>(ref data);
+    }
+
     #region Hyperbolic Manifold Operations
 
     private static readonly CpuHyperbolicManifoldEngine _hyperbolicEngine = CpuHyperbolicManifoldEngine.Instance;
@@ -46993,11 +47760,10 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a.Length % 2 != 0)
             throw new ArgumentException("Complex tensors must have even length (interleaved re/im).");
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c = a; return scope.RecordUnary(LazyNodeType.Custom, "ComplexMagnitude", a, a._shape, (eng, output) => { var r = eng.TensorComplexMagnitude(c); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.ComplexMagnitudeBackward); } }
-
-
         var ops = MathHelper.GetNumericOperations<T>();
         int pairs = a.Length / 2;
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c = a; return scope.RecordUnary(LazyNodeType.Custom, "ComplexMagnitude", a, new[] { pairs }, (eng, output) => { var r = eng.TensorComplexMagnitude(c); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.ComplexMagnitudeBackward); } }
+
         var result = new Tensor<T>(new[] { pairs });
 
         for (int i = 0; i < pairs; i++)
@@ -47553,6 +48319,13 @@ public partial class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> NativeNormalizeRows<T>(Tensor<T> input, bool inPlace = false)
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
+        if (GraphMode.IsInferenceTrace)
+        {
+            if (inPlace)
+                GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.Stateful);
+            return CaptureInferenceKernel(
+                new[] { input }, engine => engine.NativeNormalizeRows(input, inPlace));
+        }
         if (input.Rank != 2) throw new ArgumentException($"NativeNormalizeRows requires a 2D tensor. Got rank {input.Rank}.", nameof(input));
 
         int rows = input._shape[0];
@@ -47779,6 +48552,8 @@ public partial class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> NativeTanh<T>(Tensor<T> input)
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(new[] { input }, engine => engine.NativeTanh(input));
         var result = new Tensor<T>(input._shape);
         int n = input.Length;
 
@@ -47825,6 +48600,8 @@ public partial class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> NativeExp<T>(Tensor<T> input)
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(new[] { input }, engine => engine.NativeExp(input));
         var result = new Tensor<T>(input._shape);
         int n = input.Length;
 
@@ -47880,6 +48657,9 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (imag is null) throw new ArgumentNullException(nameof(imag));
         if (real is null) throw new ArgumentNullException(nameof(real));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { imag, real }, engine => engine.NativeAtan2(imag, real));
         // Require matching shape, not just length. Equal-length tensors with different shapes
         // would silently pair values by flat index which is almost never what the caller wants.
         if (imag.Rank != real.Rank)
@@ -47936,6 +48716,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc />
     public virtual Tensor<T> NativeMagnitudeAndPhase<T>(Tensor<Complex<T>> input, out Tensor<T> phase)
     {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.MixedElementTypes);
         if (input is null) throw new ArgumentNullException(nameof(input));
         var magnitude = new Tensor<T>(input._shape);
         phase = new Tensor<T>(input._shape);
@@ -48048,6 +48829,11 @@ public partial class CpuEngine : ITensorLevelEngine
         if (cavityFilters._shape[1] != n) throw new ArgumentException("cavityFilters last dim must match input N.");
         ValidatePowerOfTwo(n, nameof(input));
 
+        if (GraphMode.IsActive)
+            throw new NotSupportedException(
+                "NativeBatchedCavityForward graph capture requires heterogeneous Tensor<T>/Tensor<Complex<T>> inputs; " +
+                "executing eagerly here would freeze the cavity filter into the compiled plan.");
+
         var result = new Tensor<T>([batch, numCavities, n]);
         var ops = MathHelper.GetNumericOperations<T>();
 
@@ -48105,6 +48891,10 @@ public partial class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> NativeMfccFeatures<T>(Tensor<T> waveforms, int numSegments, int numMfcc, int paddedDim)
     {
         if (waveforms is null) throw new ArgumentNullException(nameof(waveforms));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { waveforms },
+                engine => engine.NativeMfccFeatures(waveforms, numSegments, numMfcc, paddedDim));
         if (waveforms.Rank != 1 && waveforms.Rank != 2)
             throw new ArgumentException($"waveforms must be 1D [N] or 2D [batch, N]. Got rank {waveforms.Rank}.", nameof(waveforms));
         if (numSegments <= 0) throw new ArgumentException("numSegments must be positive.", nameof(numSegments));
@@ -48179,6 +48969,10 @@ public partial class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> NativeWidebandFeatures<T>(Tensor<T> waveforms, int numSegments, int numBins)
     {
         if (waveforms is null) throw new ArgumentNullException(nameof(waveforms));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { waveforms },
+                engine => engine.NativeWidebandFeatures(waveforms, numSegments, numBins));
         if (waveforms.Rank != 1 && waveforms.Rank != 2)
             throw new ArgumentException($"waveforms must be 1D [N] or 2D [batch, N]. Got rank {waveforms.Rank}.", nameof(waveforms));
         if (numSegments <= 0) throw new ArgumentException("numSegments must be positive.", nameof(numSegments));
@@ -48251,6 +49045,11 @@ public partial class CpuEngine : ITensorLevelEngine
         double thetaLow, double thetaHigh, (double low, double high)[] gammaBands)
     {
         if (waveforms is null) throw new ArgumentNullException(nameof(waveforms));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { waveforms },
+                engine => engine.NativePacFeatures(
+                    waveforms, sampleRate, envelopeRate, thetaLow, thetaHigh, gammaBands));
         if (waveforms.Rank != 1 && waveforms.Rank != 2)
             throw new ArgumentException($"waveforms must be 1D [N] or 2D [batch, N]. Got rank {waveforms.Rank}.", nameof(waveforms));
         if (sampleRate <= 0) throw new ArgumentException("sampleRate must be positive.", nameof(sampleRate));
@@ -50337,6 +51136,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc />
     public Tensor<T> TensorCTCLoss<T>(Tensor<T> logProbs, Tensor<int> targets, int[] inputLengths, int[] targetLengths, int blank = 0)
     {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
+
         if (logProbs.Rank != 3)
             throw new ArgumentException("logProbs must be 3D [T, N, C].");
 

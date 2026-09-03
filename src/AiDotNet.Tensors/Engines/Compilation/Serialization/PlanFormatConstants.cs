@@ -29,8 +29,10 @@ internal static class PlanFormatConstants
     /// Version 5 adds Fletcher-Reeves conjugate-gradient scalar state to the
     /// same payload. Version 4 plans do not contain that value and must be
     /// rejected rather than shifting the following parameter-state fields.
+    /// Version 6 records the complete ordered mutable-input tensor ID list for
+    /// inference plans. Earlier versions retained only the first input slot.
     /// </remarks>
-    internal const ushort CurrentFormatVersion = 5;
+    internal const ushort CurrentFormatVersion = 6;
 
     /// <summary>
     /// Tensor-codec version. Semantically distinct from the format version:
@@ -39,7 +41,7 @@ internal static class PlanFormatConstants
     /// than codec V1 — the loader checks this and returns null (forces
     /// recompile) rather than silently mis-replaying.
     /// </summary>
-    internal const int TensorCodecVersion = 1;
+    internal const int TensorCodecVersion = 2;
 
     // ── Plan type ───────────────────────────────────────────────────────────
     internal const byte PlanTypeInference = 0;
@@ -94,6 +96,8 @@ internal static class PlanFormatConstants
     internal const byte TagEnum       = 0x09; // assembly-qualified type name + int value
     internal const byte TagInt64      = 0x0A;
     internal const byte TagInt64Array = 0x0B; // long[] — used by index snapshots that may exceed int.MaxValue (large-vocab embeddings)
+    internal const byte TagBoolArray  = 0x0C;
+    internal const byte TagFusedActivationParams = 0x0D;
 
     // ── Tensor table flags ──────────────────────────────────────────────────
     internal const byte TensorFlagWeight       = 0x01; // model parameter

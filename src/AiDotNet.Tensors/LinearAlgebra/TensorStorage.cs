@@ -213,6 +213,14 @@ internal sealed class TensorStorage<T>
     internal ReadOnlySpan<T> AsSpan() => _data.AsSpan();
 
     /// <summary>
+    /// Gets the underlying data as read-only memory without requesting a writable
+    /// vector escape. This must remain separate from <see cref="AsMemory"/> so pure
+    /// engine input reads do not trigger a copy-on-write detach.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal ReadOnlyMemory<T> AsReadOnlyMemory() => _data.AsMemory();
+
+    /// <summary>
     /// Gets the underlying data as a writable span.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

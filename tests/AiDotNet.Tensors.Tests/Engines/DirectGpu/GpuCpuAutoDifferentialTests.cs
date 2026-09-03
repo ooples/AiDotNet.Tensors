@@ -21,6 +21,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Tests.Engines.OpParity;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -535,6 +536,7 @@ public sealed class GpuCpuAutoDifferentialTests : IDisposable
             string key = Key(m);
             if (IsAutoTestableOnCpu(m, out _)) continue;          // gets a real GPU-vs-CPU check
             if (IsNonDeterministic(m.Name)) continue;             // legitimately non-differentiable
+            if (GeneratedOpParitySupport.HasGeneratedHomogeneousOutputCoverage(m)) continue;
             if (DedicatedlyCovered.Contains(key)) continue;       // has a hand-written dedicated test
             uncovered.Add(key);
         }

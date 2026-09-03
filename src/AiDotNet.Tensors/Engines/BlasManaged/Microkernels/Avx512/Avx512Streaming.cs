@@ -18,6 +18,9 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 /// </summary>
 internal static class Avx512Streaming
 {
+    internal const int Fp64ColumnTileWidth = 8;
+    internal const int Fp32ColumnTileWidth = 16;
+
 #if NET8_0_OR_GREATER
     /// <summary>Runtime support gate.</summary>
     public static bool IsSupported => Avx512F.IsSupported;
@@ -45,7 +48,7 @@ internal static class Avx512Streaming
 
         // NN and TN: B is contiguous along N. Process the C output in 8-wide
         // column blocks (Vector512<double> has 8 lanes = fp64 register width / 8B).
-        int nBlocks = n / 8;
+        int nBlocks = n / Fp64ColumnTileWidth;
 
         fixed (double* aPtr = a)
         fixed (double* bPtr = b)
@@ -56,7 +59,7 @@ internal static class Avx512Streaming
                 // SIMD path: 8-col blocks.
                 for (int jb = 0; jb < nBlocks; jb++)
                 {
-                    int jStart = jb * 8;
+                    int jStart = jb * Fp64ColumnTileWidth;
                     Vector512<double> acc = Avx512F.LoadVector512(cPtr + i * ldc + jStart);
                     for (int kk = 0; kk < k; kk++)
                     {
@@ -68,7 +71,7 @@ internal static class Avx512Streaming
                     Avx512F.Store(cPtr + i * ldc + jStart, acc);
                 }
                 // Scalar tail for n % 8.
-                for (int j = nBlocks * 8; j < n; j++)
+                for (int j = nBlocks * Fp64ColumnTileWidth; j < n; j++)
                 {
                     double sum = cPtr[i * ldc + j];
                     for (int kk = 0; kk < k; kk++)
@@ -102,7 +105,7 @@ internal static class Avx512Streaming
         }
 
         // FP32: 16-wide blocks via Vector512<float>.
-        int nBlocks = n / 16;
+        int nBlocks = n / Fp32ColumnTileWidth;
 
         fixed (float* aPtr = a)
         fixed (float* bPtr = b)
@@ -113,7 +116,7 @@ internal static class Avx512Streaming
                 // SIMD path: 16-col blocks.
                 for (int jb = 0; jb < nBlocks; jb++)
                 {
-                    int jStart = jb * 16;
+                    int jStart = jb * Fp32ColumnTileWidth;
                     Vector512<float> acc = Avx512F.LoadVector512(cPtr + i * ldc + jStart);
                     for (int kk = 0; kk < k; kk++)
                     {
@@ -125,7 +128,7 @@ internal static class Avx512Streaming
                     Avx512F.Store(cPtr + i * ldc + jStart, acc);
                 }
                 // Scalar tail for n % 16.
-                for (int j = nBlocks * 16; j < n; j++)
+                for (int j = nBlocks * Fp32ColumnTileWidth; j < n; j++)
                 {
                     float sum = cPtr[i * ldc + j];
                     for (int kk = 0; kk < k; kk++)

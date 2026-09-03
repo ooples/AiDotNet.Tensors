@@ -2,7 +2,7 @@ using AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
-public sealed partial class CudaBackend : IInstantNgpBackend, IUniqueConsecutiveBackend, INonzeroBackend, IModeBackend, IResidentIndexBackend, ICtcLossBackend, IImportanceSamplingBackend, INmsBackend, ISpiralIndicesBackend
+public sealed partial class CudaBackend : IInstantNgpBackend, IFrexpBackend, IRenderingGeometryBackend, IUniqueConsecutiveBackend, INonzeroBackend, IModeBackend, IResidentIndexBackend, ICtcLossBackend, IImportanceSamplingBackend, INmsBackend, ISpiralIndicesBackend
 {
     private IntPtr ResolveInstantNgpKernel(string name)
     {
@@ -63,6 +63,107 @@ public sealed partial class CudaBackend : IInstantNgpBackend, IUniqueConsecutive
         int n = length;
         void** args = stackalloc void*[4];
         args[0] = &i; args[1] = &o; args[2] = &c; args[3] = &n;
+        LaunchKernel(kernel, 1, 1, args);
+    }
+
+    public unsafe void Frexp(
+        IGpuBuffer input, IGpuBuffer mantissa, IGpuBuffer exponent, int length)
+    {
+        if (length <= 0) return;
+        var kernel = ResolveInstantNgpKernel("frexp_decompose");
+        using var _ = PushContext();
+        IntPtr i = input.Handle, m = mantissa.Handle, e = exponent.Handle;
+        int n = length;
+        void** args = stackalloc void*[4];
+        args[0] = &i; args[1] = &m; args[2] = &e; args[3] = &n;
+        LaunchKernel(kernel, (uint)((length + DefaultBlockSize - 1) / DefaultBlockSize),
+            DefaultBlockSize, args);
+    }
+
+    public unsafe void UniqueConsecutiveWithInfo(
+        IGpuBuffer input, IGpuBuffer outputValues, IGpuBuffer outputInverse,
+        IGpuBuffer outputCounts, IGpuBuffer outputCount, int length,
+        bool returnInverse, bool returnCounts)
+    {
+        if (length <= 0) return;
+        var kernel = ResolveInstantNgpKernel("unique_consecutive_with_info");
+        using var _ = PushContext();
+        IntPtr i = input.Handle, v = outputValues.Handle, inverse = outputInverse.Handle;
+        IntPtr counts = outputCounts.Handle, count = outputCount.Handle;
+        int n = length, ri = returnInverse ? 1 : 0, rc = returnCounts ? 1 : 0;
+        void** args = stackalloc void*[8];
+        args[0] = &i; args[1] = &v; args[2] = &inverse; args[3] = &counts;
+        args[4] = &count; args[5] = &n; args[6] = &ri; args[7] = &rc;
+        LaunchKernel(kernel, 1, 1, args);
+    }
+
+    public unsafe void ProjectGaussians3DTo2D(
+        IGpuBuffer means3D, IGpuBuffer covariances3D, IGpuBuffer means2D,
+        IGpuBuffer covariances2D, IGpuBuffer depths, IGpuBuffer visible,
+        int numGaussians, int covarianceStride, int imageWidth, int imageHeight,
+        float v00, float v01, float v02, float v03,
+        float v10, float v11, float v12, float v13,
+        float v20, float v21, float v22, float v23, float p00, float p11)
+    {
+        if (numGaussians <= 0) return;
+        var kernel = ResolveInstantNgpKernel("project_gaussians_3d_to_2d");
+        using var _ = PushContext();
+        IntPtr m3 = means3D.Handle, c3 = covariances3D.Handle, m2 = means2D.Handle;
+        IntPtr c2 = covariances2D.Handle, d = depths.Handle, vis = visible.Handle;
+        int n = numGaussians, cs = covarianceStride, width = imageWidth, height = imageHeight;
+        void** args = stackalloc void*[24];
+        args[0] = &m3; args[1] = &c3; args[2] = &m2; args[3] = &c2;
+        args[4] = &d; args[5] = &vis; args[6] = &n; args[7] = &cs;
+        args[8] = &width; args[9] = &height;
+        args[10] = &v00; args[11] = &v01; args[12] = &v02; args[13] = &v03;
+        args[14] = &v10; args[15] = &v11; args[16] = &v12; args[17] = &v13;
+        args[18] = &v20; args[19] = &v21; args[20] = &v22; args[21] = &v23;
+        args[22] = &p00; args[23] = &p11;
+        LaunchKernel(kernel,
+            (uint)((numGaussians + DefaultBlockSize - 1) / DefaultBlockSize),
+            DefaultBlockSize, args);
+    }
+
+    public unsafe void SampleRaysWithOccupancy(
+        IGpuBuffer rayOrigins, IGpuBuffer rayDirections, IGpuBuffer occupancyBitfield,
+        IGpuBuffer positions, IGpuBuffer directions, IGpuBuffer validMask, IGpuBuffer tValues,
+        int numRays, int occupancyWordCount, int gridSize, int maxSamples,
+        float minX, float minY, float minZ, float maxX, float maxY, float maxZ,
+        float nearBound, float farBound)
+    {
+        int total = checked(numRays * maxSamples);
+        if (total <= 0) return;
+        var kernel = ResolveInstantNgpKernel("sample_rays_with_occupancy");
+        using var _ = PushContext();
+        IntPtr o = rayOrigins.Handle, di = rayDirections.Handle, occ = occupancyBitfield.Handle;
+        IntPtr p = positions.Handle, dout = directions.Handle, mask = validMask.Handle, tv = tValues.Handle;
+        int nr = numRays, words = occupancyWordCount, gs = gridSize, samples = maxSamples;
+        void** args = stackalloc void*[19];
+        args[0] = &o; args[1] = &di; args[2] = &occ; args[3] = &p;
+        args[4] = &dout; args[5] = &mask; args[6] = &tv; args[7] = &nr;
+        args[8] = &words; args[9] = &gs; args[10] = &samples;
+        args[11] = &minX; args[12] = &minY; args[13] = &minZ;
+        args[14] = &maxX; args[15] = &maxY; args[16] = &maxZ;
+        args[17] = &nearBound; args[18] = &farBound;
+        LaunchKernel(kernel, (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize),
+            DefaultBlockSize, args);
+    }
+
+    public unsafe void UniqueSortedWithInfo(
+        IGpuBuffer sortedInput, IGpuBuffer sortedOriginalIndices, IGpuBuffer outputValues,
+        IGpuBuffer outputInverse, IGpuBuffer outputCounts, IGpuBuffer outputCount,
+        int length, bool returnInverse, bool returnCounts)
+    {
+        if (length <= 0) return;
+        var kernel = ResolveInstantNgpKernel("unique_sorted_with_info");
+        using var _ = PushContext();
+        IntPtr i = sortedInput.Handle, original = sortedOriginalIndices.Handle;
+        IntPtr v = outputValues.Handle, inverse = outputInverse.Handle;
+        IntPtr counts = outputCounts.Handle, count = outputCount.Handle;
+        int n = length, ri = returnInverse ? 1 : 0, rc = returnCounts ? 1 : 0;
+        void** args = stackalloc void*[9];
+        args[0] = &i; args[1] = &original; args[2] = &v; args[3] = &inverse;
+        args[4] = &counts; args[5] = &count; args[6] = &n; args[7] = &ri; args[8] = &rc;
         LaunchKernel(kernel, 1, 1, args);
     }
 

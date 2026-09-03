@@ -453,10 +453,23 @@ public static class MeshConvolutionOperations
         Tensor<T> biases,
         T diffusionTime)
     {
-        var numOps = MathHelper.GetNumericOperations<T>();
+        if (vertexFeatures is null) throw new ArgumentNullException(nameof(vertexFeatures));
+        if (laplacian is null) throw new ArgumentNullException(nameof(laplacian));
+        if (weights is null) throw new ArgumentNullException(nameof(weights));
+        if (biases is null) throw new ArgumentNullException(nameof(biases));
+        if (vertexFeatures.Rank != 2)
+            throw new ArgumentException("Vertex features must have shape [numVertices, inputChannels].", nameof(vertexFeatures));
         int numVertices = vertexFeatures._shape[0];
         int inputChannels = vertexFeatures._shape[1];
+        if (laplacian.Rank != 2 || laplacian._shape[0] != numVertices || laplacian._shape[1] != numVertices)
+            throw new ArgumentException("Laplacian must have shape [numVertices, numVertices].", nameof(laplacian));
+        if (weights.Rank != 2 || weights._shape[1] != inputChannels)
+            throw new ArgumentException("Weights must have shape [outputChannels, inputChannels].", nameof(weights));
         int outputChannels = weights._shape[0];
+        if (biases.Rank != 1 || biases._shape[0] != outputChannels)
+            throw new ArgumentException("Biases must have shape [outputChannels].", nameof(biases));
+
+        var numOps = MathHelper.GetNumericOperations<T>();
 
         double t = numOps.ToDouble(diffusionTime);
         double t2 = t * t / 2.0;
@@ -613,10 +626,24 @@ public static class MeshConvolutionOperations
         Tensor<T> weights,
         T diffusionTime)
     {
-        var numOps = MathHelper.GetNumericOperations<T>();
-        int numVertices = outputGradient._shape[0];
-        int outputChannels = outputGradient._shape[1];
+        if (outputGradient is null) throw new ArgumentNullException(nameof(outputGradient));
+        if (vertexFeatures is null) throw new ArgumentNullException(nameof(vertexFeatures));
+        if (laplacian is null) throw new ArgumentNullException(nameof(laplacian));
+        if (weights is null) throw new ArgumentNullException(nameof(weights));
+        if (vertexFeatures.Rank != 2)
+            throw new ArgumentException("Vertex features must have shape [numVertices, inputChannels].", nameof(vertexFeatures));
+        int featureVertices = vertexFeatures._shape[0];
         int inputChannels = vertexFeatures._shape[1];
+        if (outputGradient.Rank != 2 || outputGradient._shape[0] != featureVertices)
+            throw new ArgumentException("Output gradient must have shape [numVertices, outputChannels].", nameof(outputGradient));
+        int outputChannels = outputGradient._shape[1];
+        if (laplacian.Rank != 2 || laplacian._shape[0] != featureVertices || laplacian._shape[1] != featureVertices)
+            throw new ArgumentException("Laplacian must have shape [numVertices, numVertices].", nameof(laplacian));
+        if (weights.Rank != 2 || weights._shape[0] != outputChannels || weights._shape[1] != inputChannels)
+            throw new ArgumentException("Weights must have shape [outputChannels, inputChannels].", nameof(weights));
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        int numVertices = featureVertices;
 
         double t = numOps.ToDouble(diffusionTime);
         double t2 = t * t / 2.0;

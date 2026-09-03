@@ -51,7 +51,7 @@ internal interface IStreamingDroppable
 /// Represents a base class for multi-dimensional arrays of numeric values used in machine learning and AI computations.
 /// </summary>
 /// <typeparam name="T">The numeric type of the tensor elements (e.g., float, double, int).</typeparam>
-public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
+public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorStorageLeaseSource
 {
     private bool _disposed;
     // ================================================================
@@ -70,6 +70,35 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     /// usual "views share storage, storage itself is immutable" invariant.
     /// </remarks>
     internal TensorStorage<T> _storage;
+
+    /// <summary>
+    /// Reference identity of the backing storage. Views expose the same identity even though
+    /// they are distinct tensor objects, allowing lifetime planners to reason about aliases.
+    /// </summary>
+    internal object StorageIdentity => _storage;
+
+    object ITensorStorageLeaseSource.StorageIdentity => _storage;
+
+    TensorStorageLease ITensorStorageLeaseSource.AcquireStorageLease()
+    {
+        // RebindStorageFrom can replace _storage. Acquire the exact storage observed by this
+        // attempt; if a concurrent rebind released it first, retry against the newly published
+        // storage rather than retaining an obsolete, already-dead allocation.
+        while (true)
+        {
+            var storage = _storage;
+            try
+            {
+                return new TensorStorageLease<T>(storage);
+            }
+            catch (ObjectDisposedException) when (!ReferenceEquals(storage, _storage))
+            {
+            }
+        }
+    }
+
+    void ITensorStorageLeaseSource.SetTapePinned(bool pinned)
+        => _pinnedByTape = pinned;
 
     /// <summary>
     /// Direct reference to underlying Vector for backward compatibility with existing engine code.
@@ -417,7 +446,22 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     /// leading to use-after-free when <paramref name="source"/> was disposed.
     /// </para>
     /// </remarks>
+    internal bool SharesStorageWith(TensorBase<T> other)
+        => other is not null && ReferenceEquals(_storage, other._storage);
+
     internal void RebindStorageFrom(TensorBase<T> source)
+        => RebindStorageFromCore(source, graphOwnsStorage: false);
+
+    /// <summary>
+    /// Graph-planner rebind for a tensor whose public owner may already have disposed it.
+    /// A disposed tensor no longer owns a storage reference, so the planner must update its
+    /// metadata without releasing the graph lease as though it were still the tensor's ref.
+    /// Both old and new storages are independently retained by the active graph scope.
+    /// </summary>
+    internal void RebindStorageFromGraph(TensorBase<T> source)
+        => RebindStorageFromCore(source, graphOwnsStorage: true);
+
+    private void RebindStorageFromCore(TensorBase<T> source, bool graphOwnsStorage)
     {
         if (source is null) throw new ArgumentNullException(nameof(source));
 
@@ -457,6 +501,16 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
         // (shouldn't happen with current code, but preserves source-of-truth).
         if (ReferenceEquals(_storage, source._storage))
         {
+            _data = source._data;
+            return;
+        }
+
+        if (graphOwnsStorage && _disposed)
+        {
+            // Dispose already released this Tensor object's reference. The scope lease owns the
+            // old storage and the plan snapshot will acquire the new one after optimization;
+            // changing either refcount here would steal or manufacture a tensor-owner reference.
+            _storage = source._storage;
             _data = source._data;
             return;
         }
@@ -1033,7 +1087,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
     /// <returns>The GPU buffer, or null when no GPU mapping exists.</returns>
     public Engines.DirectGpu.IGpuBuffer? TryGetGpuBuffer()
     {
-        if (_gpuBuffer is not null) return _gpuBuffer;
+        if (_gpuBuffer is not null && _gpuBuffer.Handle != IntPtr.Zero) return _gpuBuffer;
         // GpuPinned / GpuOffload tensors carry a device pointer set by
         // WeightRegistry.RegisterWeight. Wrap it on demand for caller use.
         if (OffloadDevicePointer != IntPtr.Zero
@@ -1462,8 +1516,8 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable
                 throw new InvalidOperationException(
                     "Cannot get contiguous Memory from a non-contiguous tensor view. Call Contiguous() first.");
             if (_storageOffset == 0 && _storage.Length == Length)
-                return _storage.AsMemory();
-            return _storage.AsMemory().Slice(_storageOffset, Length);
+                return _storage.AsReadOnlyMemory();
+            return _storage.AsReadOnlyMemory().Slice(_storageOffset, Length);
         }
     }
 

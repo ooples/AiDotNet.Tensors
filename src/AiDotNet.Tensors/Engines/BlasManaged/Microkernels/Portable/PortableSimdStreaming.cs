@@ -56,6 +56,8 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 /// </remarks>
 internal static class PortableSimdStreaming
 {
+    internal static int Fp64ColumnTileWidth => Vector<double>.Count;
+
     /// <summary>
     /// True when the BCL reports real SIMD and a <see cref="Vector{T}"/> of double holds more than
     /// one lane. Without hardware acceleration <see cref="Vector{T}"/> is emulated in software and
@@ -78,7 +80,7 @@ internal static class PortableSimdStreaming
             return;
         }
 
-        int lanes = Vector<double>.Count;
+        int lanes = Fp64ColumnTileWidth;
 
         // transB strides B along j (gather); a sub-lane n has no vector work to do. Both are
         // handled by the scalar kernel so the numerics stay on one code path.

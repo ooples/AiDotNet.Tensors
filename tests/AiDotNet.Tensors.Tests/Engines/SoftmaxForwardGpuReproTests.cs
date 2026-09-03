@@ -20,6 +20,7 @@ namespace AiDotNet.Tensors.Tests.Engines;
 /// Both must produce a valid per-row distribution (each row in [0,1], sums to 1) matching a CPU
 /// reference. Run on native Windows so the OpenCL GPU engages.
 /// </summary>
+[Collection("DirectGpuSerial")]
 public class SoftmaxForwardGpuReproTests
 {
     private readonly ITestOutputHelper _out;
@@ -210,12 +211,12 @@ public class SoftmaxForwardGpuReproTests
 
     // GPU-resident operands for a [batch, InF] @ [InF, OutF] + bias linear layer, built via the graph.
     private static (Tensor<float> input, Tensor<float> weights, Tensor<float> bias, Tensor<float> output)
-        MakeGpuOperands(int batch, float[] a, float[] w, float[] bv)
+        MakeGpuOperands(DirectGpuTensorEngine engine, int batch, float[] a, float[] w, float[] bv)
     {
-        var input = new Tensor<float>(a, new[] { batch, InF }).Gpu();
-        var weights = new Tensor<float>(w, new[] { InF, OutF }).Gpu();
-        var bias = new Tensor<float>(bv, new[] { OutF }).Gpu();
-        var output = new Tensor<float>(new[] { batch, OutF }).Gpu();
+        var input = engine.UploadToGpu<float>(a, new[] { batch, InF }, GpuTensorRole.Input);
+        var weights = engine.UploadToGpu<float>(w, new[] { InF, OutF }, GpuTensorRole.Weight);
+        var bias = engine.UploadToGpu<float>(bv, new[] { OutF }, GpuTensorRole.Bias);
+        var output = engine.UploadToGpu<float>(new float[batch * OutF], new[] { batch, OutF }, GpuTensorRole.Output);
         return (input, weights, bias, output);
     }
 
@@ -239,7 +240,7 @@ public class SoftmaxForwardGpuReproTests
         _out.WriteLine($"Engine: {engine.Name}   batch={batch}  (deferred graph, async fused route)");
 
         var (a, w, b) = MakeInputs(batch);
-        var (input, weights, bias, output) = MakeGpuOperands(batch, a, w, b);
+        var (input, weights, bias, output) = MakeGpuOperands(engine, batch, a, w, b);
         float[] gpu;
         try
         {
@@ -279,7 +280,7 @@ public class SoftmaxForwardGpuReproTests
         _out.WriteLine($"Engine: {engine.Name}   batch={batch}  (deferred graph, separate-node route)");
 
         var (a, w, b) = MakeInputs(batch);
-        var (input, weights, bias, output) = MakeGpuOperands(batch, a, w, b);
+        var (input, weights, bias, output) = MakeGpuOperands(engine, batch, a, w, b);
         float[] gpu;
         try
         {

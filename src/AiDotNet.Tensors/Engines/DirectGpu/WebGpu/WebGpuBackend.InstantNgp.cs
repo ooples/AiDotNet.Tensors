@@ -1,7 +1,7 @@
 #if NET7_0_OR_GREATER
 namespace AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 
-public sealed partial class WebGpuBackend : IInstantNgpBackend, IUniqueConsecutiveBackend, INonzeroBackend, IModeBackend, IResidentIndexBackend, ICtcLossBackend, IImportanceSamplingBackend, INmsBackend, ISpiralIndicesBackend
+public sealed partial class WebGpuBackend : IInstantNgpBackend, IFrexpBackend, IRenderingGeometryBackend, IUniqueConsecutiveBackend, INonzeroBackend, IModeBackend, IResidentIndexBackend, ICtcLossBackend, IImportanceSamplingBackend, INmsBackend, ISpiralIndicesBackend
 {
     private static float[] InstantNgpUniforms(
         int numPoints, int resolution, int tableSize, int featuresPerLevel,
@@ -51,6 +51,93 @@ public sealed partial class WebGpuBackend : IInstantNgpBackend, IUniqueConsecuti
             "main", input, outputCapacity, outputCount,
             [BitConverter.Int32BitsToSingle(length), 0f, 0f, 0f], 1)
             .GetAwaiter().GetResult();
+    }
+
+    public void Frexp(
+        IGpuBuffer input, IGpuBuffer mantissa, IGpuBuffer exponent, int length)
+    {
+        if (length <= 0) return;
+        Dispatch3BufferAsync("Frexp", WebGpuInstantNgpKernels.Frexp, "main",
+            input, mantissa, exponent,
+            [BitConverter.Int32BitsToSingle(length), 0f, 0f, 0f], length)
+            .GetAwaiter().GetResult();
+    }
+
+    public void UniqueConsecutiveWithInfo(
+        IGpuBuffer input, IGpuBuffer outputValues, IGpuBuffer outputInverse,
+        IGpuBuffer outputCounts, IGpuBuffer outputCount, int length,
+        bool returnInverse, bool returnCounts)
+    {
+        if (length <= 0) return;
+        Dispatch5BufferAsync("UniqueConsecutiveWithInfo",
+            WebGpuInstantNgpKernels.UniqueConsecutiveWithInfo, "main",
+            input, outputValues, outputInverse, outputCounts, outputCount,
+            [
+                BitConverter.Int32BitsToSingle(length),
+                BitConverter.Int32BitsToSingle(returnInverse ? 1 : 0),
+                BitConverter.Int32BitsToSingle(returnCounts ? 1 : 0),
+                0f,
+            ], 1).GetAwaiter().GetResult();
+    }
+
+    public void ProjectGaussians3DTo2D(
+        IGpuBuffer means3D, IGpuBuffer covariances3D, IGpuBuffer means2D,
+        IGpuBuffer covariances2D, IGpuBuffer depths, IGpuBuffer visible,
+        int numGaussians, int covarianceStride, int imageWidth, int imageHeight,
+        float v00, float v01, float v02, float v03,
+        float v10, float v11, float v12, float v13,
+        float v20, float v21, float v22, float v23, float p00, float p11)
+    {
+        if (numGaussians <= 0) return;
+        Dispatch6BufferAsync("ProjectGaussians3DTo2D",
+            WebGpuInstantNgpKernels.ProjectGaussians3DTo2D, "main",
+            means3D, covariances3D, means2D, covariances2D, depths, visible,
+            [
+                BitConverter.Int32BitsToSingle(numGaussians),
+                BitConverter.Int32BitsToSingle(covarianceStride),
+                BitConverter.Int32BitsToSingle(imageWidth),
+                BitConverter.Int32BitsToSingle(imageHeight),
+                v00, v01, v02, v03, v10, v11, v12, v13,
+                v20, v21, v22, v23, p00, p11, 0f, 0f,
+            ], numGaussians).GetAwaiter().GetResult();
+    }
+
+    public void SampleRaysWithOccupancy(
+        IGpuBuffer rayOrigins, IGpuBuffer rayDirections, IGpuBuffer occupancyBitfield,
+        IGpuBuffer positions, IGpuBuffer directions, IGpuBuffer validMask, IGpuBuffer tValues,
+        int numRays, int occupancyWordCount, int gridSize, int maxSamples,
+        float minX, float minY, float minZ, float maxX, float maxY, float maxZ,
+        float nearBound, float farBound)
+    {
+        int total = checked(numRays * maxSamples);
+        if (total <= 0) return;
+        DispatchNBufferAsync("SampleRaysWithOccupancy",
+            WebGpuInstantNgpKernels.SampleRaysWithOccupancy, "main",
+            [rayOrigins, rayDirections, occupancyBitfield, positions, directions, validMask, tValues],
+            [
+                BitConverter.Int32BitsToSingle(numRays),
+                BitConverter.Int32BitsToSingle(occupancyWordCount),
+                BitConverter.Int32BitsToSingle(gridSize),
+                BitConverter.Int32BitsToSingle(maxSamples),
+                minX, minY, minZ, maxX, maxY, maxZ, nearBound, farBound,
+            ], total).GetAwaiter().GetResult();
+    }
+
+    public void UniqueSortedWithInfo(
+        IGpuBuffer sortedInput, IGpuBuffer sortedOriginalIndices, IGpuBuffer outputValues,
+        IGpuBuffer outputInverse, IGpuBuffer outputCounts, IGpuBuffer outputCount,
+        int length, bool returnInverse, bool returnCounts)
+    {
+        if (length <= 0) return;
+        Dispatch6BufferAsync("UniqueSortedWithInfo",
+            WebGpuInstantNgpKernels.UniqueSortedWithInfo, "main",
+            sortedInput, sortedOriginalIndices, outputValues, outputInverse, outputCounts, outputCount,
+            [
+                BitConverter.Int32BitsToSingle(length),
+                BitConverter.Int32BitsToSingle(returnInverse ? 1 : 0),
+                BitConverter.Int32BitsToSingle(returnCounts ? 1 : 0),
+                0f,
+            ], 1).GetAwaiter().GetResult();
     }
 
     public void Nonzero(IGpuBuffer input, IGpuBuffer strides, IGpuBuffer outputCapacity,

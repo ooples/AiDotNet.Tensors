@@ -123,6 +123,205 @@ struct UniqueP { length: i32 };
 }
 ";
 
+    public static string Frexp => @"
+@group(0) @binding(0) var<storage, read> input_ : array<f32>;
+@group(0) @binding(1) var<storage, read_write> mantissa : array<f32>;
+@group(0) @binding(2) var<storage, read_write> exponent : array<f32>;
+struct FrexpP { length: i32 };
+@group(0) @binding(3) var<uniform> p : FrexpP;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id : vec3<u32>) {
+    let gid = i32(id.x);
+    if (gid >= p.length) { return; }
+    var value = input_[gid];
+    var bits = bitcast<u32>(value);
+    let magnitude = bits & 0x7fffffffu;
+    var exponentBits = magnitude >> 23u;
+    if (exponentBits == 0xffu || magnitude == 0u) {
+        mantissa[gid] = value;
+        exponent[gid] = 0.0;
+        return;
+    }
+    var scaleAdjustment = 0;
+    if (exponentBits == 0u) {
+        value = value * 16777216.0;
+        bits = bitcast<u32>(value);
+        exponentBits = (bits & 0x7fffffffu) >> 23u;
+        scaleAdjustment = -24;
+    }
+    mantissa[gid] = bitcast<f32>((bits & 0x807fffffu) | (126u << 23u));
+    exponent[gid] = f32(i32(exponentBits) - 126 + scaleAdjustment);
+}
+";
+
+    public static string UniqueConsecutiveWithInfo => @"
+@group(0) @binding(0) var<storage, read> input_ : array<f32>;
+@group(0) @binding(1) var<storage, read_write> outputValues : array<f32>;
+@group(0) @binding(2) var<storage, read_write> outputInverse : array<f32>;
+@group(0) @binding(3) var<storage, read_write> outputCounts : array<f32>;
+@group(0) @binding(4) var<storage, read_write> outputCount : array<f32>;
+struct UniqueInfoP { length: i32, returnInverse: i32, returnCounts: i32 };
+@group(0) @binding(5) var<uniform> p : UniqueInfoP;
+@compute @workgroup_size(1) fn main(@builtin(global_invocation_id) id : vec3<u32>) {
+    if (id.x != 0u) { return; }
+    if (p.length <= 0) { outputCount[0] = 0.0; return; }
+    var count = 1;
+    outputValues[0] = input_[0];
+    if (p.returnInverse != 0) { outputInverse[0] = 0.0; }
+    if (p.returnCounts != 0) { outputCounts[0] = 1.0; }
+    for (var i = 1; i < p.length; i = i + 1) {
+        if (input_[i] != input_[i - 1]) {
+            outputValues[count] = input_[i];
+            if (p.returnCounts != 0) { outputCounts[count] = 1.0; }
+            count = count + 1;
+        } else if (p.returnCounts != 0) {
+            outputCounts[count - 1] = outputCounts[count - 1] + 1.0;
+        }
+        if (p.returnInverse != 0) { outputInverse[i] = f32(count - 1); }
+    }
+    outputCount[0] = f32(count);
+}
+";
+
+    public static string UniqueSortedWithInfo => @"
+@group(0) @binding(0) var<storage, read> sortedInput : array<f32>;
+@group(0) @binding(1) var<storage, read> sortedOriginalIndices : array<f32>;
+@group(0) @binding(2) var<storage, read_write> outputValues : array<f32>;
+@group(0) @binding(3) var<storage, read_write> outputInverse : array<f32>;
+@group(0) @binding(4) var<storage, read_write> outputCounts : array<f32>;
+@group(0) @binding(5) var<storage, read_write> outputCount : array<f32>;
+struct UniqueInfoP { length: i32, returnInverse: i32, returnCounts: i32 };
+@group(0) @binding(6) var<uniform> p : UniqueInfoP;
+@compute @workgroup_size(1) fn main(@builtin(global_invocation_id) id : vec3<u32>) {
+    if (id.x != 0u) { return; }
+    var count = 0;
+    for (var i = 0; i < p.length; i = i + 1) {
+        if (i == 0 || sortedInput[i] != sortedInput[i - 1]) {
+            outputValues[count] = sortedInput[i];
+            if (p.returnCounts != 0) { outputCounts[count] = 0.0; }
+            count = count + 1;
+        }
+        let group = count - 1;
+        if (p.returnCounts != 0) { outputCounts[group] = outputCounts[group] + 1.0; }
+        if (p.returnInverse != 0) {
+            outputInverse[i32(sortedOriginalIndices[i])] = f32(group);
+        }
+    }
+    outputCount[0] = f32(count);
+}
+";
+
+    public static string ProjectGaussians3DTo2D => @"
+@group(0) @binding(0) var<storage, read> means3D : array<f32>;
+@group(0) @binding(1) var<storage, read> covariances3D : array<f32>;
+@group(0) @binding(2) var<storage, read_write> means2D : array<f32>;
+@group(0) @binding(3) var<storage, read_write> covariances2D : array<f32>;
+@group(0) @binding(4) var<storage, read_write> depths : array<f32>;
+@group(0) @binding(5) var<storage, read_write> visible : array<f32>;
+struct ProjectP {
+    numGaussians: i32, covarianceStride: i32, imageWidth: i32, imageHeight: i32,
+    v00: f32, v01: f32, v02: f32, v03: f32,
+    v10: f32, v11: f32, v12: f32, v13: f32,
+    v20: f32, v21: f32, v22: f32, v23: f32, p00: f32, p11: f32,
+};
+@group(0) @binding(6) var<uniform> p : ProjectP;
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id : vec3<u32>) {
+    let i = i32(id.x);
+    if (i >= p.numGaussians) { return; }
+    means2D[i * 2] = 0.0; means2D[i * 2 + 1] = 0.0;
+    covariances2D[i * 3] = 0.0; covariances2D[i * 3 + 1] = 0.0;
+    covariances2D[i * 3 + 2] = 0.0; depths[i] = 0.0; visible[i] = 0.0;
+    let mx = means3D[i * 3]; let my = means3D[i * 3 + 1]; let mz = means3D[i * 3 + 2];
+    let camX = p.v00 * mx + p.v01 * my + p.v02 * mz + p.v03;
+    let camY = p.v10 * mx + p.v11 * my + p.v12 * mz + p.v13;
+    let camZ = p.v20 * mx + p.v21 * my + p.v22 * mz + p.v23;
+    if (camZ <= 0.001) { return; }
+    let invZ = 1.0 / camZ;
+    let cx = f32(p.imageWidth) * 0.5; let cy = f32(p.imageHeight) * 0.5;
+    let screenX = p.p00 * camX * invZ * cx + cx;
+    let screenY = p.p11 * camY * invZ * cy + cy;
+    if (screenX < -f32(p.imageWidth) || screenX > 2.0 * f32(p.imageWidth) ||
+        screenY < -f32(p.imageHeight) || screenY > 2.0 * f32(p.imageHeight)) { return; }
+    let c = i * p.covarianceStride;
+    let c00 = covariances3D[c]; let c01 = covariances3D[c + 1]; let c02 = covariances3D[c + 2];
+    let c11 = covariances3D[c + select(4, 3, p.covarianceStride == 6)];
+    let c12 = covariances3D[c + select(5, 4, p.covarianceStride == 6)];
+    let c22 = covariances3D[c + select(8, 5, p.covarianceStride == 6)];
+    let j00 = p.p00 * invZ; let j02 = -p.p00 * camX * invZ * invZ;
+    let j11 = p.p11 * invZ; let j12 = -p.p11 * camY * invZ * invZ;
+    let cov00 = j00*j00*c00 + 2.0*j00*j02*c02 + j02*j02*c22 + 0.3;
+    let cov01 = j00*j11*c01 + j00*j12*c02 + j02*j11*c12 + j02*j12*c22;
+    let cov11 = j11*j11*c11 + 2.0*j11*j12*c12 + j12*j12*c22 + 0.3;
+    means2D[i * 2] = screenX; means2D[i * 2 + 1] = screenY;
+    covariances2D[i * 3] = cov00; covariances2D[i * 3 + 1] = cov01;
+    covariances2D[i * 3 + 2] = cov11; depths[i] = camZ; visible[i] = 1.0;
+}
+";
+
+    public static string SampleRaysWithOccupancy => @"
+@group(0) @binding(0) var<storage, read> rayOrigins : array<f32>;
+@group(0) @binding(1) var<storage, read> rayDirections : array<f32>;
+@group(0) @binding(2) var<storage, read> occupancyBitfield : array<u32>;
+@group(0) @binding(3) var<storage, read_write> positions : array<f32>;
+@group(0) @binding(4) var<storage, read_write> directions : array<f32>;
+@group(0) @binding(5) var<storage, read_write> validMask : array<f32>;
+@group(0) @binding(6) var<storage, read_write> tValues : array<f32>;
+struct SampleP {
+    numRays: i32, occupancyWordCount: i32, gridSize: i32, maxSamples: i32,
+    minX: f32, minY: f32, minZ: f32, maxX: f32, maxY: f32, maxZ: f32,
+    nearBound: f32, farBound: f32,
+};
+@group(0) @binding(7) var<uniform> p : SampleP;
+fn sample_ray_axis(origin: f32, direction: f32, minimum: f32, maximum: f32,
+    tMin: f32, tMax: f32) -> vec3<f32> {
+    if (abs(direction) < 1.0e-8) {
+        if (origin < minimum || origin > maximum) { return vec3<f32>(0.0, tMin, tMax); }
+        return vec3<f32>(1.0, tMin, tMax);
+    }
+    var t1 = (minimum - origin) / direction;
+    var t2 = (maximum - origin) / direction;
+    if (t1 > t2) { let temporary = t1; t1 = t2; t2 = temporary; }
+    let nextMin = max(tMin, t1); let nextMax = min(tMax, t2);
+    return vec3<f32>(select(0.0, 1.0, nextMax >= nextMin), nextMin, nextMax);
+}
+@compute @workgroup_size(256) fn main(@builtin(global_invocation_id) id : vec3<u32>) {
+    let sampleIndex = i32(id.x);
+    let totalSamples = p.numRays * p.maxSamples;
+    if (sampleIndex >= totalSamples) { return; }
+    let positionIndex = sampleIndex * 3;
+    positions[positionIndex] = 0.0; positions[positionIndex + 1] = 0.0;
+    positions[positionIndex + 2] = 0.0; directions[positionIndex] = 0.0;
+    directions[positionIndex + 1] = 0.0; directions[positionIndex + 2] = 0.0;
+    validMask[sampleIndex] = 0.0; tValues[sampleIndex] = 0.0;
+    let ray = sampleIndex / p.maxSamples; let sample = sampleIndex - ray * p.maxSamples;
+    let ox = rayOrigins[ray * 3]; let oy = rayOrigins[ray * 3 + 1]; let oz = rayOrigins[ray * 3 + 2];
+    let dx = rayDirections[ray * 3]; let dy = rayDirections[ray * 3 + 1]; let dz = rayDirections[ray * 3 + 2];
+    var tMin = p.nearBound; var tMax = p.farBound;
+    var hit = sample_ray_axis(ox, dx, p.minX, p.maxX, tMin, tMax);
+    if (hit.x == 0.0) { return; } tMin = hit.y; tMax = hit.z;
+    hit = sample_ray_axis(oy, dy, p.minY, p.maxY, tMin, tMax);
+    if (hit.x == 0.0) { return; } tMin = hit.y; tMax = hit.z;
+    hit = sample_ray_axis(oz, dz, p.minZ, p.maxZ, tMin, tMax);
+    if (hit.x == 0.0) { return; } tMin = hit.y; tMax = hit.z;
+    let t = tMin + ((tMax - tMin) / f32(p.maxSamples)) * (f32(sample) + 0.5);
+    let px = ox + t * dx; let py = oy + t * dy; let pz = oz + t * dz;
+    let nx = clamp((px - p.minX) / max(1.0e-10, p.maxX - p.minX), 0.0, 0.999999);
+    let ny = clamp((py - p.minY) / max(1.0e-10, p.maxY - p.minY), 0.0, 0.999999);
+    let nz = clamp((pz - p.minZ) / max(1.0e-10, p.maxZ - p.minZ), 0.0, 0.999999);
+    let gx = min(i32(nx * f32(p.gridSize)), p.gridSize - 1);
+    let gy = min(i32(ny * f32(p.gridSize)), p.gridSize - 1);
+    let gz = min(i32(nz * f32(p.gridSize)), p.gridSize - 1);
+    let cell = (gx * p.gridSize + gy) * p.gridSize + gz;
+    let word = cell >> 5; let bit = cell & 31;
+    var occupied = false;
+    if (word < p.occupancyWordCount) {
+        occupied = (occupancyBitfield[word] & (1u << u32(bit))) != 0u;
+    }
+    positions[positionIndex] = px; positions[positionIndex + 1] = py; positions[positionIndex + 2] = pz;
+    directions[positionIndex] = dx; directions[positionIndex + 1] = dy; directions[positionIndex + 2] = dz;
+    validMask[sampleIndex] = select(0.0, 1.0, occupied); tValues[sampleIndex] = t;
+}
+";
+
     public static string Nonzero => @"
 @group(0) @binding(0) var<storage, read> input_ : array<f32>;
 @group(0) @binding(1) var<storage, read> strides : array<i32>;

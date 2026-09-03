@@ -297,7 +297,7 @@ public static class TapeGradientParityHarness
     /// </summary>
     private static (List<LeafGradientSnapshot> Leaves, long Materialisations, int LeafCount,
         bool UsesContractIdentity, int CapturedInputCount) TapeGradient(
-        IEngine engine, Func<IEngine, Tensor<float>> runFloat)
+        IEngine engine, OpCase op)
     {
         var prior = AiDotNetEngine.Current;
         AiDotNetEngine.Current = engine;
@@ -308,6 +308,8 @@ public static class TapeGradientParityHarness
         Tensor<float>? weight = null;
         Tensor<float>? weighted = null;
         Tensor<float>? loss = null;
+        Tensor<float>[]? retainedOutputs = null;
+        Tensor<float>[]? retainedFlattenedOutputs = null;
         try
         {
             AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.ResetMaterializeCount();
@@ -316,7 +318,36 @@ public static class TapeGradientParityHarness
             try
             {
                 using (OpInput.CaptureFloatInputs(capturedInputs))
-                    output = runFloat(engine);
+                {
+                    if (op.TensorOutputContract == TensorOutputContract.HomogeneousMultiple
+                        && op.RunFloatOutputs is not null)
+                    {
+                        // The ordinary forward/residency projection disposes its constituent outputs
+                        // immediately. A tape projection cannot: multi-output backward implementations
+                        // may legitimately save any constituent for the backward walk. Retain both the
+                        // outputs and their reshape views until after ComputeGradients, then release them
+                        // in this method's existing deterministic cleanup.
+                        retainedOutputs = op.RunFloatOutputs(engine);
+                        if (retainedOutputs.Length == 0)
+                        {
+                            output = new Tensor<float>(new[] { 0 });
+                        }
+                        else
+                        {
+                            retainedFlattenedOutputs = new Tensor<float>[retainedOutputs.Length];
+                            for (int i = 0; i < retainedOutputs.Length; i++)
+                            {
+                                retainedFlattenedOutputs[i] = engine.Reshape(
+                                    retainedOutputs[i], new[] { retainedOutputs[i].Length });
+                            }
+                            output = engine.TensorConcatenate(retainedFlattenedOutputs, 0);
+                        }
+                    }
+                    else
+                    {
+                        output = op.RunFloat(engine);
+                    }
+                }
 
                 // Non-uniform weighting: a constant upstream gradient can mask a wrong backward, because several
                 // different index mappings then produce the same total.
@@ -380,6 +411,10 @@ public static class TapeGradientParityHarness
                 DisposeOnce(weighted);
                 DisposeOnce(weight);
                 DisposeOnce(output);
+                if (retainedFlattenedOutputs is not null)
+                    foreach (var flattened in retainedFlattenedOutputs) DisposeOnce(flattened);
+                if (retainedOutputs is not null)
+                    foreach (var retained in retainedOutputs) DisposeOnce(retained);
                 foreach (var source in sources) DisposeOnce(source);
                 foreach (var input in capturedInputs) DisposeOnce(input);
             }
@@ -429,9 +464,9 @@ public static class TapeGradientParityHarness
         if (gpu is null) { Skip.If(true, "GPU engine unavailable after reset."); return; }
 
         var (cpuLeafList, _, cpuLeaves, cpuUsesContractIdentity, cpuCapturedInputs) =
-            TapeGradient(fx.Cpu, op.RunFloat);
+            TapeGradient(fx.Cpu, op);
         var (gpuLeafList, materialisations, gpuLeaves, gpuUsesContractIdentity, gpuCapturedInputs) =
-            TapeGradient(gpu, op.RunFloat);
+            TapeGradient(gpu, op);
 
         if (cpuLeaves == 0 && gpuLeaves == 0)
         {
@@ -517,13 +552,17 @@ public static class TapeGradientParityHarness
             + $"(CPU {cpuLeaves} leaves, GPU {gpuLeaves}).");
 
         double maxAbs = 0, maxRel = 0;
-        foreach (var (cg, gg) in pairs)
+        string? firstNonFinite = null;
+        for (int pairIndex = 0; pairIndex < pairs.Count; pairIndex++)
         {
+            var (cg, gg) = pairs[pairIndex];
             Assert.True(cg.Length == gg.Length,
                 $"{opName} tapegrad: paired leaves have identical inputs but gradients of different length "
                 + $"(CPU={cg.Length} GPU={gg.Length}) — the engines disagree about that input's gradient shape.");
             for (int i = 0; i < cg.Length; i++)
             {
+                if (firstNonFinite is null && (!float.IsFinite(cg[i]) || !float.IsFinite(gg[i])))
+                    firstNonFinite = $"leaf={pairIndex} index={i} cpu={cg[i]} gpu={gg[i]}";
                 double d = Math.Abs(cg[i] - gg[i]);
                 maxAbs = Math.Max(maxAbs, d);
                 maxRel = Math.Max(maxRel, d / Math.Max(1.0, Math.Abs(cg[i])));
@@ -550,6 +589,7 @@ public static class TapeGradientParityHarness
 
         Assert.True(maxRel <= 1e-4,
             $"{opName} tapegrad: GPU gradient diverged from CPU (maxAbs={maxAbs:E3} maxRel={maxRel:E3}). "
+            + (firstNonFinite is null ? string.Empty : $"First non-finite value: {firstNonFinite}. ")
             + "A gross mismatch means the recorded backward, its saved state, or the overload is wrong — "
             + "NOT float rounding. Scatter failed exactly this way at 3.14e-01 while both the forward and "
             + "the backward KERNEL were correct.");

@@ -1419,7 +1419,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // is the LIVE data regardless of the host Version snapshot — accept it. Clearing it on a version
             // mismatch (the path below) would orphan a deferred materializer registered by BindResidentBuffer →
             // a later host read fires it on a recycled buffer = #226 "buffer released before materialization".
-            if (ResidentStepActive || (tensor._gpuBufferVersion == tensor.Version && IsCachedGpuBufferLive(tensor, backend)))
+            if (tensor._gpuBuffer.Handle != IntPtr.Zero
+                && (ResidentStepActive || (tensor._gpuBufferVersion == tensor.Version && IsCachedGpuBufferLive(tensor, backend))))
                 return new OwnedBuffer(tensor._gpuBuffer, ownsBuffer: false);
 
             // Stale snapshot — also clear any matching activation-cache entry so
@@ -1475,8 +1476,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
         }
 
-        // Not in any cache — fall back to GetDataArray (triggers lazy allocation + GPU download if needed)
-        return GetOrAllocateBuffer(backend, tensor.GetDataArray());
+        // Not in any cache — materialize the CPU value for upload through the read-only
+        // tensor accessor. GetDataArray() is a writable escape and therefore detaches a
+        // copy-on-write clone even though an upload only reads the operand.
+        return GetOrAllocateBuffer(backend, tensor.GetReadOnlyDataArray());
     }
 
     /// <summary>
@@ -1489,11 +1492,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <see cref="EvictActivationsCreatedAfter"/> on tape dispose, then handed to the next
     /// forward call's upload). For a CPU tensor we therefore confirm the activation cache
     /// STILL maps this tensor's key to the very same buffer; if not, the field is stale and
-    /// the caller must re-upload. GPU-resident results are not tracked by the activation
-    /// cache, so their field stays authoritative.
+    /// the caller must re-upload. A zero native handle is always dead, including for a
+    /// GPU-resident tensor whose activation-cache owner has already released its buffer.
     /// </summary>
     private bool IsCachedGpuBufferLive<T>(Tensor<T> tensor, IDirectGpuBackend backend)
     {
+        if (tensor._gpuBuffer is null || tensor._gpuBuffer.Handle == IntPtr.Zero) return false;
         if (tensor.IsGpuResident) return true;
         var key = (object?)tensor.GetBackingArrayForCacheLookupUnsafe() ?? tensor.DataVector;
         // _activationCache is a ConcurrentDictionary — this read is lock-free.
@@ -1723,7 +1727,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // buffer to UploadTensorRaw callers.
         if (tensor._gpuBuffer is not null && ReferenceEquals(tensor._gpuBackend, backend))
         {
-            if (ResidentStepActive || (tensor._gpuBufferVersion == tensor.Version && IsCachedGpuBufferLive(tensor, backend)))
+            if (tensor._gpuBuffer.Handle != IntPtr.Zero
+                && (ResidentStepActive || (tensor._gpuBufferVersion == tensor.Version && IsCachedGpuBufferLive(tensor, backend))))
                 return new OwnedBuffer(tensor._gpuBuffer, ownsBuffer: false);   // compiled step: buffers pinned, don't orphan aliases
 
             var staleArray = tensor.GetBackingArrayForCacheLookupUnsafe();
@@ -3155,7 +3160,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (eng is DirectGpuTensorEngine gpu && gpu.TryAliasResidentOutput(src, dest))
         { AliasDiag("OK aliased"); return; }
         AliasDiag(eng is DirectGpuTensorEngine ? "FELLBACK host-copy" : "not-gpu-engine");
-        src.AsSpan().CopyTo(dest.AsWritableSpan());
+        var destination = dest.AsWritableSpan();
+        if (src.IsContiguous)
+            src.AsSpan().CopyTo(destination);
+        else
+            src.CopyLogicalTo(destination);
+        dest.IncrementVersion();
     }
 
     private bool TryAliasResidentOutput<T>(Tensor<T> src, Tensor<T> dest)
@@ -3173,7 +3183,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // so the stricter gate would wrongly decline and force a host-copy that fires a deferred download = CUDA
         // 900 inside the capture. This matches GetOrAllocateContiguousInputBuffer's resolution.
         IGpuBuffer? srcBuf = null;
-        if (src._gpuBuffer is not null && ReferenceEquals(src._gpuBackend, backend))
+        if (src._gpuBuffer is not null && src._gpuBuffer.Handle != IntPtr.Zero
+            && ReferenceEquals(src._gpuBackend, backend))
         {
             srcBuf = src._gpuBuffer;
         }
@@ -3863,8 +3874,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return null;
         }
 
-        var leftArr = left.GetDataArray();
-        var rightArr = right.GetDataArray();
+        // Chunking stages input values only; do not request writable array escapes and
+        // accidentally privatize copy-on-write operands before the GPU upload.
+        var leftArr = left.GetReadOnlyDataArray();
+        var rightArr = right.GetReadOnlyDataArray();
         if (leftArr is not float[] leftFloat || rightArr is not float[] rightFloat) return null;
 
         var resultFloat = new float[totalElements];
@@ -4164,7 +4177,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var kC = tensor.GetBackingArrayForCacheLookupUnsafe();
             if (kC is not null) return new OwnedBuffer(Fp16InputToFp32Stable(backend, tHalfC, tCountC, kC), ownsBuffer: false);
         }
-        if (tensor._gpuBuffer is not null && ReferenceEquals(tensor._gpuBackend, backend))
+        if (tensor._gpuBuffer is not null && tensor._gpuBuffer.Handle != IntPtr.Zero
+            && ReferenceEquals(tensor._gpuBackend, backend))
             return new OwnedBuffer(tensor._gpuBuffer, ownsBuffer: false);
 
         return GetOrAllocateBuffer(backend, tensor);
@@ -5736,39 +5750,69 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     void IEngine.GroupNormInto<T>(Tensor<T> output, Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
-        if (TryGetBackend(out var gpuBackend))
+        if (output is null) throw new ArgumentNullException(nameof(output));
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (gamma is null) throw new ArgumentNullException(nameof(gamma));
+        if (beta is null) throw new ArgumentNullException(nameof(beta));
+
+        // Inference tracing must be handled by CpuEngine's capture scaffold. Direct execution is
+        // intentionally FP32 because every DirectGpu backend stores public numeric tensors as FP32.
+        if (Compilation.GraphMode.IsInferenceTrace || typeof(T) != typeof(float) ||
+            !output.IsContiguous || input.Rank < 2 || numGroups <= 0 ||
+            input._shape[1] % numGroups != 0 || output.Length != input.Length ||
+            !TryGetBackend(out var gpuBackend))
         {
-            try
-            {
-                var floatInput = (Tensor<float>)(object)input;
-                var floatOutput = (Tensor<float>)(object)output;
-                var floatGamma = (Tensor<float>)(object)gamma;
-                var floatBeta = (Tensor<float>)(object)beta;
+            base.GroupNormInto(output, input, numGroups, gamma, beta, epsilon, out mean, out variance);
+            return;
+        }
 
-                int batch = input.Shape._dims[0], channels = input.Shape._dims[1];
-                int spatial = input.Length / (batch * channels);
+        try
+        {
+            int batch = input._shape[0];
+            int channels = input._shape[1];
+            int spatial = input.Length / (batch * channels);
+            int statCount = batch * numGroups;
 
-                using var gpuIn = gpuBackend.AllocateBuffer(floatInput.GetDataArray());
-                using var gpuGamma = gpuBackend.AllocateBuffer(floatGamma.GetDataArray());
-                using var gpuBeta = gpuBackend.AllocateBuffer(floatBeta.GetDataArray());
-                using var gpuOut = gpuBackend.AllocateBuffer(input.Length);
-                using var gpuMean = gpuBackend.AllocateBuffer(batch * numGroups);
-                using var gpuVar = gpuBackend.AllocateBuffer(batch * numGroups);
+            using var gpuIn = GetOrAllocateBuffer(gpuBackend, input);
+            using var gpuGamma = GetWeightBufferPreferResident(gpuBackend, gamma, PersistentTensorRole.Weights);
+            using var gpuBeta = GetWeightBufferPreferResident(gpuBackend, beta, PersistentTensorRole.Biases);
+            mean = new Tensor<T>(new[] { batch, numGroups });
+            variance = new Tensor<T>(new[] { batch, numGroups });
+            IGpuBuffer gpuOut = GetOrCreateResidentBuffer(gpuBackend, output, input.Length);
+            IGpuBuffer gpuMean = GetOrCreateResidentBuffer(gpuBackend, mean, statCount);
+            IGpuBuffer gpuVariance = GetOrCreateResidentBuffer(gpuBackend, variance, statCount);
 
-                gpuBackend.GroupNorm(gpuIn, gpuOut, gpuGamma, gpuBeta, gpuMean, gpuVar,
-                    batch, numGroups, channels, spatial, (float)epsilon);
-                DownloadIntoTensor(gpuBackend, gpuOut, floatOutput);
+            // GroupNorm kernels reduce from the input while other threads write output, so an
+            // input/output alias is not generally safe. Preserve the in-place public contract by
+            // computing into a distinct temporary and copying back on the same device stream.
+            bool aliasesInput = ReferenceEquals(gpuIn.Buffer, gpuOut) ||
+                (gpuIn.Buffer.Handle != IntPtr.Zero && gpuIn.Buffer.Handle == gpuOut.Handle);
+            using var aliasOutput = aliasesInput ? AllocateOutputBuffer(gpuBackend, input.Length) : default;
+            IGpuBuffer kernelOutput = aliasesInput ? aliasOutput.Buffer : gpuOut;
 
-                mean = new Tensor<T>(new int[] { batch, numGroups });
-                variance = new Tensor<T>(new int[] { batch, numGroups });
-                DownloadIntoTensor(gpuBackend, gpuMean, (Tensor<float>)(object)mean);
-                DownloadIntoTensor(gpuBackend, gpuVar, (Tensor<float>)(object)variance);
-                return;
-            }
-            catch
-            {
-                // Fall through to CPU
-            }
+            gpuBackend.GroupNorm(
+                gpuIn.Buffer, kernelOutput, gpuGamma.Buffer, gpuBeta.Buffer,
+                gpuMean, gpuVariance,
+                batch, numGroups, channels, spatial, (float)epsilon);
+            if (aliasesInput)
+                gpuBackend.Copy(kernelOutput, 0, gpuOut, 0, input.Length);
+
+            // Backends save inverse standard deviation for their backward kernels. The public
+            // IEngine contract returns population variance, so convert invStd to variance before
+            // publishing the buffer: variance = 1 / invStd^2 - epsilon.
+            gpuBackend.Multiply(gpuVariance, gpuVariance, gpuVariance, statCount);
+            gpuBackend.Reciprocal(gpuVariance, gpuVariance, statCount);
+            gpuBackend.SubScalar(gpuVariance, gpuVariance, (float)epsilon, statCount);
+
+            BindResidentBuffer(output, gpuOut, gpuBackend);
+            BindResidentBuffer(mean, gpuMean, gpuBackend);
+            BindResidentBuffer(variance, gpuVariance, gpuBackend);
+            return;
+        }
+        catch (Exception ex)
+        {
+            if (ThrowOnGpuKernelFallback) throw;
+            LogGpuFallback(nameof(IEngine.GroupNormInto), ex);
         }
         base.GroupNormInto(output, input, numGroups, gamma, beta, epsilon, out mean, out variance);
     }
@@ -8281,6 +8325,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> MaxPool2DWithTensorIndices<T>(
         Tensor<T> input, int[] poolSize, int[] stride, out Tensor<int> maxIndices)
     {
+        Compilation.GraphMode.ThrowIfInferenceUnsupported(
+            Compilation.GraphCaptureLimitation.HeterogeneousOutput);
+
         if (!TryGetBackend(out var backend) || input.Rank != 4
             || poolSize is not { Length: 2 } || stride is not { Length: 2 })
             return base.MaxPool2DWithTensorIndices(input, poolSize, stride, out maxIndices);
@@ -10910,6 +10957,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (weight is null) throw new ArgumentNullException(nameof(weight));
         if (bias is null) throw new ArgumentNullException(nameof(bias));
         if (targetIds is null) throw new ArgumentNullException(nameof(targetIds));
+        Compilation.GraphMode.ThrowIfInferenceUnsupported(
+            Compilation.GraphCaptureLimitation.HeterogeneousInput);
         if (Compilation.GraphMode.IsActive || IsTapeActive<T>())
             return base.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, targetIds);
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend))
@@ -15280,6 +15329,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.Embedding<T>(Tensor<int> indices, Tensor<T> embeddingTable)
     {
+        Compilation.GraphMode.ThrowIfInferenceUnsupported(
+            Compilation.GraphCaptureLimitation.HeterogeneousInput);
         if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || !TryGetBackend(out var backend))
             return base.Embedding(indices, embeddingTable);
@@ -20237,7 +20288,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 // inside cuStreamCapture = CUDA 906 → the catch → CpuEngine.TensorPermuteInto → get_Memory()
                 // download → cuStreamSynchronize CUDA 900 → capture aborts (the #38 attention-transpose blocker).
                 // Matches TryAliasResidentOutput's resident-step buffer-resolution rationale.
-                if (output._gpuBuffer is not null && ReferenceEquals(output._gpuBackend, backend))
+                if (output._gpuBuffer is not null && output._gpuBuffer.Handle != IntPtr.Zero
+                    && ReferenceEquals(output._gpuBackend, backend))
                     outBuf = output._gpuBuffer;
                 else if (arr is not null)
                     lock (_activationCacheLock)
@@ -20872,6 +20924,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorGather<T>(Tensor<T> source, Tensor<int> indices, int axis)
     {
+        Compilation.GraphMode.ThrowIfInferenceUnsupported(
+            Compilation.GraphCaptureLimitation.HeterogeneousInput);
         if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || !TryGetBackend(out var backend) || axis != 0)
             return base.TensorGather(source, indices, axis);
@@ -20923,6 +20977,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // RecordUnary).
     public override Tensor<T> Embedding<T>(Tensor<int> indices, Tensor<T> embeddingTable)
     {
+        Compilation.GraphMode.ThrowIfInferenceUnsupported(
+            Compilation.GraphCaptureLimitation.HeterogeneousInput);
         if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || !TryGetBackend(out var backend))
             return base.Embedding(indices, embeddingTable);
@@ -21741,6 +21797,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> ScatterMean<T>(Tensor<T> source, Tensor<int> indices, out Tensor<int>? counts, int dim, int? outputSize)
     {
+        Compilation.GraphMode.ThrowIfInferenceUnsupported(
+            Compilation.GraphCaptureLimitation.HeterogeneousOutput);
+
         // #775: gather-form scatter-mean (deterministic, bit-exact with CpuEngine; the old atomic
         // backend.ScatterMean path fell back). Dim-0 float case with an explicit outputSize and a
         // long-enough index; else base. Both the mean and counts stay resident.
@@ -22391,6 +22450,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
         if (indices is null) throw new ArgumentNullException(nameof(indices));
+        Compilation.GraphMode.ThrowIfInferenceUnsupported(
+            Compilation.GraphCaptureLimitation.HeterogeneousInput);
         int normalizedAxis = axis < 0 ? tensor.Rank + axis : axis;
         if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || normalizedAxis < 0 || normalizedAxis >= tensor.Rank || !TryGetBackend(out var backend)
@@ -22440,6 +22501,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorMaskedFill<T>(Tensor<T> tensor, Tensor<bool> mask, T value)
     {
+        if (tensor is null) throw new ArgumentNullException(nameof(tensor));
+        if (mask is null) throw new ArgumentNullException(nameof(mask));
+        Compilation.GraphMode.ThrowIfInferenceUnsupported(
+            Compilation.GraphCaptureLimitation.HeterogeneousInput);
         if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || !tensor._shape.SequenceEqual(mask._shape) || !TryGetBackend(out var backend))
             return base.TensorMaskedFill(tensor, mask, value);
@@ -22466,6 +22531,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
         if (mask is null) throw new ArgumentNullException(nameof(mask));
+        Compilation.GraphMode.ThrowIfInferenceUnsupported(
+            Compilation.GraphCaptureLimitation.HeterogeneousInput);
         if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || !tensor._shape.SequenceEqual(mask._shape) || !TryGetBackend(out var backend))
             return base.TensorMaskedFill(tensor, mask, value);
@@ -22491,32 +22558,67 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
     }
 
+    Tensor<T> IEngine.TensorWhere<T>(Tensor<bool> condition, Tensor<T> x, Tensor<T> y)
+    {
+        if (condition is null) throw new ArgumentNullException(nameof(condition));
+        if (x is null) throw new ArgumentNullException(nameof(x));
+        if (y is null) throw new ArgumentNullException(nameof(y));
+        Compilation.GraphMode.ThrowIfInferenceUnsupported(
+            Compilation.GraphCaptureLimitation.HeterogeneousInput);
+        if (!condition._shape.SequenceEqual(x._shape) || !x._shape.SequenceEqual(y._shape))
+            throw new ArgumentException("condition, x, and y must have the same shape.");
+        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend))
+            return base.TensorWhere(condition, x, y);
+
+        try
+        {
+            // CLR bool storage is byte-addressed, while every current device Where kernel consumes
+            // an fp32 0/1 predicate. Convert explicitly instead of reinterpreting the host bytes.
+            var predicate = new float[condition.Length];
+            for (int i = 0; i < predicate.Length; i++) predicate[i] = condition[i] ? 1f : 0f;
+            using var condBuf = new OwnedBuffer(backend.AllocateBuffer(predicate), ownsBuffer: true);
+            using var xBuf = GetOrAllocateBuffer(backend, x);
+            using var yBuf = GetOrAllocateBuffer(backend, y);
+            var outBuf = AllocateOutputBuffer(backend, x.Length);
+            backend.Where(condBuf.Buffer, xBuf.Buffer, yBuf.Buffer, outBuf.Buffer, x.Length);
+            var output = DeferTensorResult<T>(backend, outBuf.Buffer, x.Length, x.Shape.ToArray());
+
+            object[]? savedState = null;
+            if (IsTapeActive<T>())
+            {
+                var condBytes = new byte[condition.Length];
+                for (int i = 0; i < condBytes.Length; i++) condBytes[i] = condition[i] ? (byte)1 : (byte)0;
+                savedState = new object[] { condBytes };
+            }
+            Autodiff.DifferentiableOps.RecordBinary("TensorWhere", output, x, y,
+                Autodiff.BackwardFunctions<T>.WhereBackward, savedState);
+            return output;
+        }
+        catch (Exception)
+        {
+            if (ThrowOnGpuKernelFallback) throw;
+            return base.TensorWhere(condition, x, y);
+        }
+    }
+
     /// <inheritdoc/>
     public override Tensor<T> TensorWhere<T>(Tensor<Bit> condition, Tensor<T> x, Tensor<T> y)
     {
         if (condition is null) throw new ArgumentNullException(nameof(condition));
         if (x is null) throw new ArgumentNullException(nameof(x));
         if (y is null) throw new ArgumentNullException(nameof(y));
-        if (x.Length != y.Length || x.Length != condition.Length)
-            throw new ArgumentException("All tensors must have the same length.");
+        Compilation.GraphMode.ThrowIfInferenceUnsupported(
+            Compilation.GraphCaptureLimitation.HeterogeneousInput);
+        if (!condition._shape.SequenceEqual(x._shape) || !x._shape.SequenceEqual(y._shape))
+            throw new ArgumentException("condition, x, and y must have the same shape.");
         // Bit masks ARE GPU-resident: PackMaskResident finishes through FinishGpuOp, which DEFERS the
         // download and keeps the device buffer cached. That buffer holds exactly the float 0/1 the
         // where_select kernel reads, because it is the output of the comparison kernel that produced the
         // mask (see equals_kernel). So the resident case can and should run on-device.
         //
-        // The guard is residency, not type. A Tensor<Bit> built on the HOST has no cached buffer; uploading
-        // its Bit[] storage and reinterpreting it as float selects on garbage — that is what broke 10
-        // comparison ops (TensorIsNan/IsInf/IsFinite, TensorEqScalar, TensorLogicalAnd/Not/Or/Xor,
-        // TensorIsIn) when where_select was first added. Requiring an already-resident condition keeps those
-        // correct on the CPU path while letting the comparison -> where chain stay on the device.
-        // MEASURED 2026-07-20 for the comparison family (TensorIsNan/IsInf/IsFinite, TensorEq,
-        // TensorLogicalAnd/Not/Or/Xor): the mask arriving here reports
-        //     arr=Bit[]  cached=False  tensorBuf=False  IsGpuResident=False
-        // i.e. it is NOT resident by any measure, so this gate cannot fire for them and they stay on the
-        // CPU path. Those ops sit at "launches 1/2" on the residency worklist, and the missing launch is NOT
-        // this Where — the chain has already left the device before it. Fixing them means making the
-        // PRODUCING comparison op keep its mask resident; this gate is then already in place to carry the
-        // mask through.
+        // A Tensor<Bit> built on the HOST has no cached fp32 buffer; uploading its Bit[] storage and
+        // reinterpreting it as float selects on garbage. Host masks therefore take the explicit 0/1
+        // conversion below, while masks produced by comparison kernels reuse their resident fp32 encoding.
         // Residency for a Bit mask lives in the ACTIVATION CACHE, keyed by backing array — FinishGpuOp
         // registers it there and defers the download; it is NOT exposed through Tensor.TryGetGpuBuffer(),
         // which stays null for these. Probe the cache directly, or this always falls back and the
@@ -22531,37 +22633,53 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // and WhereBackward matches `Tensor<T>` or `byte[]` and otherwise falls through — a Tensor<Bit> is
         // neither when T is float, so the backward silently took the wrong branch. Recording the same
         // byte[] encoding CpuEngine uses makes the two paths agree.
-        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend)
-            || condArr is null || !IsDeviceResidentArray(condArr))
+        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend))
             return base.TensorWhere(condition, x, y);
 
         try
         {
-            using var condBuf = GetOrAllocateBuffer(backend, condition);
-            using var xBuf = GetOrAllocateBuffer(backend, x);
-            using var yBuf = GetOrAllocateBuffer(backend, y);
-            var outBuf = AllocateOutputBuffer(backend, x.Length);
-            backend.Where(condBuf.Buffer, xBuf.Buffer, yBuf.Buffer, outBuf.Buffer, x.Length);
-            var output = DeferTensorResult<T>(backend, outBuf.Buffer, x.Length, x.Shape.ToArray());
-            // Same byte[] 0/1 encoding CpuEngine records. WhereBackward accepts Tensor<T> or byte[];
-            // handing it a Tensor<Bit> matches neither and falls through to the wrong branch.
-            //
-            // Build it ONLY when a tape will consume it. Indexing the mask element-by-element pulls a
-            // GPU-resident Bit tensor back to the host, and this line was the single call site behind
-            // ALL 11 entries on the internal-readback worklist (every comparison op reaches Where, each
-            // showing 1 transfer before materialization). RecordBinary returns immediately when no tape
-            // is recording, so with no tape the array was pure waste that also broke residency. With a
-            // tape it is built exactly as before, so backward behaviour is unchanged.
-            object[]? savedState = null;
-            if (IsTapeActive<T>())
+            OwnedBuffer condBuf;
+            if (condArr is not null && IsDeviceResidentArray(condArr))
             {
-                var condBytes = new byte[condition.Length];
-                for (int i = 0; i < condBytes.Length; i++) condBytes[i] = (bool)condition[i] ? (byte)1 : (byte)0;
-                savedState = new object[] { condBytes };
+                // Comparison kernels already encode resident Bit predicates as fp32 0/1.
+                condBuf = GetOrAllocateBuffer(backend, condition);
             }
-            Autodiff.DifferentiableOps.RecordBinary("TensorWhere", output, x, y,
-                Autodiff.BackwardFunctions<T>.WhereBackward, savedState);
-            return output;
+            else
+            {
+                // AiDotNet Bit is not an fp32 storage type. Upload an explicit predicate buffer
+                // for host-created masks instead of reinterpreting its managed representation.
+                var predicate = new float[condition.Length];
+                for (int i = 0; i < predicate.Length; i++)
+                    predicate[i] = (bool)condition[i] ? 1f : 0f;
+                condBuf = new OwnedBuffer(backend.AllocateBuffer(predicate), ownsBuffer: true);
+            }
+            using (condBuf)
+            {
+                using var xBuf = GetOrAllocateBuffer(backend, x);
+                using var yBuf = GetOrAllocateBuffer(backend, y);
+                var outBuf = AllocateOutputBuffer(backend, x.Length);
+                backend.Where(condBuf.Buffer, xBuf.Buffer, yBuf.Buffer, outBuf.Buffer, x.Length);
+                var output = DeferTensorResult<T>(backend, outBuf.Buffer, x.Length, x.Shape.ToArray());
+                // Same byte[] 0/1 encoding CpuEngine records. WhereBackward accepts Tensor<T> or byte[];
+                // handing it a Tensor<Bit> matches neither and falls through to the wrong branch.
+                //
+                // Build it ONLY when a tape will consume it. Indexing the mask element-by-element pulls a
+                // GPU-resident Bit tensor back to the host, and this line was the single call site behind
+                // ALL 11 entries on the internal-readback worklist (every comparison op reaches Where, each
+                // showing 1 transfer before materialization). RecordBinary returns immediately when no tape
+                // is recording, so with no tape the array was pure waste that also broke residency. With a
+                // tape it is built exactly as before, so backward behaviour is unchanged.
+                object[]? savedState = null;
+                if (IsTapeActive<T>())
+                {
+                    var condBytes = new byte[condition.Length];
+                    for (int i = 0; i < condBytes.Length; i++) condBytes[i] = (bool)condition[i] ? (byte)1 : (byte)0;
+                    savedState = new object[] { condBytes };
+                }
+                Autodiff.DifferentiableOps.RecordBinary("TensorWhere", output, x, y,
+                    Autodiff.BackwardFunctions<T>.WhereBackward, savedState);
+                return output;
+            }
         }
         catch (Exception)
         {
@@ -25330,6 +25448,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (tensor._gpuBufferIsSplitComplex
             && tensor.IsContiguous && tensor._storageOffset == 0
             && tensor._gpuBuffer is not null
+            && tensor._gpuBuffer.Handle != IntPtr.Zero
             && ReferenceEquals(tensor._gpuBackend, backend)
             && (ResidentStepActive
                 || (tensor._gpuBufferVersion == tensor.Version
@@ -26524,6 +26643,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> NativeMagnitudeAndPhase<T>(Tensor<Complex<T>> input, out Tensor<T> phase)
     {
+        if (Compilation.GraphMode.IsActive)
+            return base.NativeMagnitudeAndPhase(input, out phase);
         if (!TryGetBackend(out var backend)) return base.NativeMagnitudeAndPhase(input, out phase);
         try
         {

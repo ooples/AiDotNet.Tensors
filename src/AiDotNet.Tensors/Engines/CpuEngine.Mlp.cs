@@ -82,9 +82,88 @@ public partial class CpuEngine
                 nameof(biases));
 
         if (GraphMode.IsActive)
-            throw new InvalidOperationException(
-                "MlpForward is inference-only and does not yet support GradientTape. " +
-                "For training, call the decomposed FusedLinear / DenseLayer path which records each layer.");
+        {
+            if (!GraphMode.IsInferenceTrace)
+            {
+                var trainingValue = input;
+                int trainingLast = weights.Count - 1;
+                for (int i = 0; i < weights.Count; i++)
+                {
+                    var activation = i == trainingLast ? outputActivation : hiddenActivation;
+                    var activationParams = i == trainingLast ? outputActivationParams : hiddenActivationParams;
+                    trainingValue = FusedLinear(trainingValue, weights[i], biases[i], activation, activationParams);
+                }
+                return trainingValue;
+            }
+
+            if (input.Rank < 1)
+                throw new ArgumentException("MlpForward input must have at least one dimension.", nameof(input));
+
+            int runningFeatures = input._shape[input.Rank - 1];
+            var capturedWeights = new Tensor<T>[weights.Count];
+            var capturedBiases = new Tensor<T>?[biases.Count];
+            var biasInputIndices = new int[biases.Count];
+            var graphInputs = new List<Tensor<T>>(1 + weights.Count + biases.Count) { input };
+            for (int i = 0; i < weights.Count; i++)
+            {
+                var weight = weights[i]
+                    ?? throw new ArgumentException($"weights[{i}] cannot be null.", nameof(weights));
+                if (weight.Rank != 2 || weight._shape[0] != runningFeatures)
+                    throw new ArgumentException(
+                        $"weights[{i}] must be [{runningFeatures}, outFeatures]; got [{string.Join(",", weight._shape)}].",
+                        nameof(weights));
+                var bias = biases[i];
+                if (bias is not null && (bias.Rank != 1 || bias._shape[0] != weight._shape[1]))
+                    throw new ArgumentException(
+                        $"biases[{i}] must be [{weight._shape[1]}].", nameof(biases));
+
+                capturedWeights[i] = weight;
+                capturedBiases[i] = bias;
+                graphInputs.Add(weight);
+                runningFeatures = weight._shape[1];
+            }
+            for (int i = 0; i < capturedBiases.Length; i++)
+            {
+                if (capturedBiases[i] is null)
+                {
+                    biasInputIndices[i] = -1;
+                }
+                else
+                {
+                    biasInputIndices[i] = graphInputs.Count;
+                    graphInputs.Add(capturedBiases[i]!);
+                }
+            }
+
+            var outputShape = (int[])input._shape.Clone();
+            outputShape[outputShape.Length - 1] = runningFeatures;
+            var scope = GraphMode.Current!;
+            scope.BindEngineIfUnset(this);
+            var capturedInputs = graphInputs.ToArray();
+            object[] savedState =
+            {
+                biasInputIndices,
+                hiddenActivation,
+                outputActivation,
+                hiddenActivationParams!,
+                outputActivationParams!
+            };
+            return scope.RecordVariadic(
+                LazyNodeType.MlpForward,
+                "MlpForward",
+                capturedInputs,
+                outputShape,
+                (eng, output) =>
+                {
+                    var eager = eng.MlpForward(
+                        capturedInputs[0], capturedWeights, capturedBiases,
+                        hiddenActivation, outputActivation,
+                        hiddenActivationParams, outputActivationParams);
+                    DirectGpuTensorEngine.CopyResultInto(eng, eager, output);
+                },
+                backwardFn: null,
+                savedState: savedState);
+        }
 
         // Issue #436: small-batch inference GEMMs are oversubscribed by the
         // default all-cores native-BLAS thread count. On a 16-core box the

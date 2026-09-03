@@ -10,6 +10,7 @@ using System;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
+using AiDotNet.Tensors.Engines.Compilation;
 
 namespace AiDotNet.Tensors.Engines;
 
@@ -24,6 +25,13 @@ public partial class CpuEngine
         int outputHeight, int outputWidth,
         float spatialScale, int samplingRatio, bool aligned)
     {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (boxes == null) throw new ArgumentNullException(nameof(boxes));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { input, boxes },
+                engine => engine.RoIAlign(
+                    input, boxes, outputHeight, outputWidth, spatialScale, samplingRatio, aligned));
         var result = RoIAlignImpl(input, boxes, outputHeight, outputWidth, spatialScale, samplingRatio, aligned);
         DifferentiableOps.RecordBinary("RoIAlign", result, input, boxes,
             BackwardFunctions<T>.RoIAlignBackward,
@@ -119,6 +127,12 @@ public partial class CpuEngine
     public virtual Tensor<T> RoIPool<T>(Tensor<T> input, Tensor<T> boxes,
         int outputHeight, int outputWidth, float spatialScale)
     {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (boxes == null) throw new ArgumentNullException(nameof(boxes));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { input, boxes },
+                engine => engine.RoIPool(input, boxes, outputHeight, outputWidth, spatialScale));
         var result = RoIPoolImpl(input, boxes, outputHeight, outputWidth, spatialScale);
         DifferentiableOps.RecordBinary("RoIPool", result, input, boxes,
             BackwardFunctions<T>.RoIPoolBackward,
@@ -201,6 +215,14 @@ public partial class CpuEngine
         int outputHeight, int outputWidth, int outputChannels,
         float spatialScale, int samplingRatio)
     {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (boxes == null) throw new ArgumentNullException(nameof(boxes));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { input, boxes },
+                engine => engine.PsRoIAlign(
+                    input, boxes, outputHeight, outputWidth, outputChannels, spatialScale,
+                    samplingRatio));
         var result = PsRoIAlignImpl(input, boxes, outputHeight, outputWidth, outputChannels, spatialScale, samplingRatio);
         DifferentiableOps.RecordBinary("PsRoIAlign", result, input, boxes,
             BackwardFunctions<T>.PsRoIAlignBackward,
@@ -273,6 +295,13 @@ public partial class CpuEngine
     public virtual Tensor<T> PsRoIPool<T>(Tensor<T> input, Tensor<T> boxes,
         int outputHeight, int outputWidth, int outputChannels, float spatialScale)
     {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (boxes == null) throw new ArgumentNullException(nameof(boxes));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { input, boxes },
+                engine => engine.PsRoIPool(
+                    input, boxes, outputHeight, outputWidth, outputChannels, spatialScale));
         var result = PsRoIPoolImpl(input, boxes, outputHeight, outputWidth, outputChannels, spatialScale);
         DifferentiableOps.RecordBinary("PsRoIPool", result, input, boxes,
             BackwardFunctions<T>.PsRoIPoolBackward,
@@ -341,6 +370,14 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> Spectrogram<T>(Tensor<T> waveform, int nFft, int hopLength, int winLength, Tensor<T>? window = null)
     {
+        if (waveform == null) throw new ArgumentNullException(nameof(waveform));
+        if (GraphMode.IsInferenceTrace)
+        {
+            Tensor<T>[] inputs = window is null ? new[] { waveform } : new[] { waveform, window };
+            return CaptureInferenceKernel(
+                inputs,
+                engine => engine.Spectrogram(waveform, nFft, hopLength, winLength, window));
+        }
         // Run STFT and return only magnitude. Backward uses the saved
         // phase to pipe the magnitude gradient through ISTFT — see
         // BackwardFunctions<T>.SpectrogramBackward.
@@ -368,6 +405,10 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> AmplitudeToDB<T>(Tensor<T> input, float minAmplitude = 1e-10f, float? topDb = null)
     {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { input }, engine => engine.AmplitudeToDB(input, minAmplitude, topDb));
         var result = AmplitudeToDBImpl(input, minAmplitude, topDb);
         // topDb clips post-hoc against the peak — the clip mask ideally
         // zeros gradient where clipped, but that needs a saved mask.
@@ -408,6 +449,8 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<int> MuLawEncoding<T>(Tensor<T> input, int quantizationChannels = 256)
     {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.MixedElementTypes);
+
         if (quantizationChannels < 2)
             throw new ArgumentException("quantizationChannels must be >= 2 (μ = qc − 1 must be positive).",
                 nameof(quantizationChannels));
@@ -432,6 +475,8 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> MuLawDecoding<T>(Tensor<int> input, int quantizationChannels = 256)
     {
+        GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
+
         if (quantizationChannels < 2)
             throw new ArgumentException("quantizationChannels must be >= 2.", nameof(quantizationChannels));
         var ops = MathHelper.GetNumericOperations<T>();
@@ -452,6 +497,10 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> ComputeDeltas<T>(Tensor<T> input, int winLength = 5)
     {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { input }, engine => engine.ComputeDeltas(input, winLength));
         var result = ComputeDeltasImpl(input, winLength);
         DifferentiableOps.RecordUnary("ComputeDeltas", result, input,
             BackwardFunctions<T>.ComputeDeltasBackward,
@@ -500,6 +549,10 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> Resample<T>(Tensor<T> waveform, int origRate, int newRate)
     {
+        if (waveform == null) throw new ArgumentNullException(nameof(waveform));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { waveform }, engine => engine.Resample(waveform, origRate, newRate));
         var result = ResampleImpl(waveform, origRate, newRate);
         DifferentiableOps.RecordUnary("Resample", result, waveform,
             BackwardFunctions<T>.ResampleBackward,
@@ -589,6 +642,11 @@ public partial class CpuEngine
     public virtual Tensor<T> PitchShift<T>(Tensor<T> waveform, int sampleRate, double nSteps,
         int nFft = 512, int hopLength = 128)
     {
+        if (waveform == null) throw new ArgumentNullException(nameof(waveform));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { waveform },
+                engine => engine.PitchShift(waveform, sampleRate, nSteps, nFft, hopLength));
         // Semitone ratio.
         double rate = Math.Pow(2.0, nSteps / 12.0);
         // Time-stretch by 1/rate so pitch shifts when resampled back.
@@ -603,6 +661,10 @@ public partial class CpuEngine
     public virtual Tensor<T> TimeStretch<T>(Tensor<T> waveform, double rate,
         int nFft = 512, int hopLength = 128)
     {
+        if (waveform == null) throw new ArgumentNullException(nameof(waveform));
+        if (GraphMode.IsInferenceTrace)
+            return CaptureInferenceKernel(
+                new[] { waveform }, engine => engine.TimeStretch(waveform, rate, nFft, hopLength));
         if (rate <= 0) throw new ArgumentException("rate must be positive.");
         if (nFft < 2) throw new ArgumentException("nFft must be at least 2 (Hann window divides by nFft−1).");
         if (hopLength <= 0) throw new ArgumentException("hopLength must be positive.");

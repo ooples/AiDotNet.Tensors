@@ -36,7 +36,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
     /// <summary>
     /// OpenCL buffer wrapper using pure P/Invoke. No managed GPU runtime dependency.
     /// </summary>
-    internal sealed class DirectOpenClBuffer : IDisposable
+    internal sealed class DirectOpenClBuffer : IDisposable, IDirectOpenClMemoryObject
     {
         private IntPtr _buffer;
         private readonly DirectOpenClContext _context;
@@ -48,6 +48,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         public IntPtr Handle => _buffer;
         public int Length => _length;
+        public IntPtr NativeHandle => _buffer;
+        public DirectOpenClContext OwningContext => _context;
+        public IntPtr LastSubmissionQueue { get; set; }
 
         /// <summary>
         /// Creates a buffer and uploads data from host.
@@ -72,6 +75,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     throw new InvalidOperationException($"Failed to create OpenCL buffer: {err}");
 
                 GpuKernelDiagnostics.RecordBufferAllocated(ByteSize);
+                _context.RegisterMemoryObject(this);
             }
             finally
             {
@@ -99,6 +103,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 throw new InvalidOperationException($"Failed to create OpenCL buffer: {err}");
 
             GpuKernelDiagnostics.RecordBufferAllocated(ByteSize);
+            _context.RegisterMemoryObject(this);
         }
 
         /// <summary>
@@ -122,16 +127,26 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             GCHandle handle = GCHandle.Alloc(destination, GCHandleType.Pinned);
             try
             {
-                int err = OpenClNativeBindings.EnqueueReadBuffer(
-                    _context.CommandQueue,
-                    _buffer,
-                    1, // blocking
-                    UIntPtr.Zero,
-                    (UIntPtr)(_length * sizeof(float)),
-                    handle.AddrOfPinnedObject(),
-                    0,
-                    IntPtr.Zero,
-                    IntPtr.Zero);
+                IntPtr queue = _context.CommandQueue;
+                var memories = DirectOpenClSubmission.GetDirectSubmissionMemories(this);
+                int err;
+                try
+                {
+                    lock (DirectOpenClSubmission.Gate)
+                    {
+                        using var waits = DirectOpenClSubmission.PrepareLocked(queue, memories);
+                        err = OpenClNativeBindings.EnqueueReadBuffer(
+                            queue, _buffer, 1, UIntPtr.Zero,
+                            (UIntPtr)(_length * sizeof(float)), handle.AddrOfPinnedObject(),
+                            waits.Count, waits.Pointer, IntPtr.Zero);
+                        if (err == OpenClNativeBindings.CL_SUCCESS)
+                            DirectOpenClSubmission.CommitLocked(queue, memories);
+                    }
+                }
+                finally
+                {
+                    DirectOpenClSubmission.ReleaseDirectSubmissionMemories(memories);
+                }
 
                 if (err != OpenClNativeBindings.CL_SUCCESS)
                     throw new InvalidOperationException($"Failed to read OpenCL buffer: {err}");
@@ -153,16 +168,26 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             GCHandle handle = GCHandle.Alloc(source, GCHandleType.Pinned);
             try
             {
-                int err = OpenClNativeBindings.EnqueueWriteBuffer(
-                    _context.CommandQueue,
-                    _buffer,
-                    1, // blocking
-                    UIntPtr.Zero,
-                    (UIntPtr)(source.Length * sizeof(float)),
-                    handle.AddrOfPinnedObject(),
-                    0,
-                    IntPtr.Zero,
-                    IntPtr.Zero);
+                IntPtr queue = _context.CommandQueue;
+                var memories = DirectOpenClSubmission.GetDirectSubmissionMemories(this);
+                int err;
+                try
+                {
+                    lock (DirectOpenClSubmission.Gate)
+                    {
+                        using var waits = DirectOpenClSubmission.PrepareLocked(queue, memories);
+                        err = OpenClNativeBindings.EnqueueWriteBuffer(
+                            queue, _buffer, 1, UIntPtr.Zero,
+                            (UIntPtr)(source.Length * sizeof(float)), handle.AddrOfPinnedObject(),
+                            waits.Count, waits.Pointer, IntPtr.Zero);
+                        if (err == OpenClNativeBindings.CL_SUCCESS)
+                            DirectOpenClSubmission.CommitLocked(queue, memories);
+                    }
+                }
+                finally
+                {
+                    DirectOpenClSubmission.ReleaseDirectSubmissionMemories(memories);
+                }
 
                 if (err != OpenClNativeBindings.CL_SUCCESS)
                     throw new InvalidOperationException($"Failed to write OpenCL buffer: {err}");
@@ -179,9 +204,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
             if (_buffer != IntPtr.Zero)
             {
-                OpenClNativeBindings.ReleaseMemObject(_buffer);
-                GpuKernelDiagnostics.RecordBufferReleased(ByteSize);
+                IntPtr memoryObject = _buffer;
                 _buffer = IntPtr.Zero;
+                _context.RetireMemoryObject(this, memoryObject, ByteSize);
             }
 
             _disposed = true;
@@ -192,7 +217,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
     /// OpenCL byte buffer wrapper using pure P/Invoke.
     /// Used for storing packed sparse indices (1 byte per group of 4 elements).
     /// </summary>
-    internal sealed class DirectOpenClByteBuffer : IDisposable
+    internal sealed class DirectOpenClByteBuffer : IDisposable, IDirectOpenClMemoryObject
     {
         private IntPtr _buffer;
         private readonly DirectOpenClContext _context;
@@ -204,6 +229,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         public IntPtr Handle => _buffer;
         public int Length => _length;
+        public IntPtr NativeHandle => _buffer;
+        public DirectOpenClContext OwningContext => _context;
+        public IntPtr LastSubmissionQueue { get; set; }
 
         /// <summary>
         /// Creates a byte buffer and uploads data from host.
@@ -228,6 +256,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     throw new InvalidOperationException($"Failed to create OpenCL byte buffer: {err}");
 
                 GpuKernelDiagnostics.RecordBufferAllocated(ByteSize);
+                _context.RegisterMemoryObject(this);
             }
             finally
             {
@@ -255,6 +284,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 throw new InvalidOperationException($"Failed to create OpenCL byte buffer: {err}");
 
             GpuKernelDiagnostics.RecordBufferAllocated(ByteSize);
+            _context.RegisterMemoryObject(this);
         }
 
         /// <summary>
@@ -278,16 +308,25 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             GCHandle handle = GCHandle.Alloc(destination, GCHandleType.Pinned);
             try
             {
-                int err = OpenClNativeBindings.EnqueueReadBuffer(
-                    _context.CommandQueue,
-                    _buffer,
-                    1, // blocking
-                    UIntPtr.Zero,
-                    (UIntPtr)_length,
-                    handle.AddrOfPinnedObject(),
-                    0,
-                    IntPtr.Zero,
-                    IntPtr.Zero);
+                IntPtr queue = _context.CommandQueue;
+                var memories = DirectOpenClSubmission.GetDirectSubmissionMemories(this);
+                int err;
+                try
+                {
+                    lock (DirectOpenClSubmission.Gate)
+                    {
+                        using var waits = DirectOpenClSubmission.PrepareLocked(queue, memories);
+                        err = OpenClNativeBindings.EnqueueReadBuffer(
+                            queue, _buffer, 1, UIntPtr.Zero, (UIntPtr)_length,
+                            handle.AddrOfPinnedObject(), waits.Count, waits.Pointer, IntPtr.Zero);
+                        if (err == OpenClNativeBindings.CL_SUCCESS)
+                            DirectOpenClSubmission.CommitLocked(queue, memories);
+                    }
+                }
+                finally
+                {
+                    DirectOpenClSubmission.ReleaseDirectSubmissionMemories(memories);
+                }
 
                 if (err != OpenClNativeBindings.CL_SUCCESS)
                     throw new InvalidOperationException($"Failed to read OpenCL byte buffer: {err}");
@@ -311,16 +350,25 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             GCHandle handle = GCHandle.Alloc(source, GCHandleType.Pinned);
             try
             {
-                int err = OpenClNativeBindings.EnqueueWriteBuffer(
-                    _context.CommandQueue,
-                    _buffer,
-                    1, // blocking
-                    UIntPtr.Zero,
-                    (UIntPtr)source.Length,
-                    handle.AddrOfPinnedObject(),
-                    0,
-                    IntPtr.Zero,
-                    IntPtr.Zero);
+                IntPtr queue = _context.CommandQueue;
+                var memories = DirectOpenClSubmission.GetDirectSubmissionMemories(this);
+                int err;
+                try
+                {
+                    lock (DirectOpenClSubmission.Gate)
+                    {
+                        using var waits = DirectOpenClSubmission.PrepareLocked(queue, memories);
+                        err = OpenClNativeBindings.EnqueueWriteBuffer(
+                            queue, _buffer, 1, UIntPtr.Zero, (UIntPtr)source.Length,
+                            handle.AddrOfPinnedObject(), waits.Count, waits.Pointer, IntPtr.Zero);
+                        if (err == OpenClNativeBindings.CL_SUCCESS)
+                            DirectOpenClSubmission.CommitLocked(queue, memories);
+                    }
+                }
+                finally
+                {
+                    DirectOpenClSubmission.ReleaseDirectSubmissionMemories(memories);
+                }
 
                 if (err != OpenClNativeBindings.CL_SUCCESS)
                     throw new InvalidOperationException($"Failed to write OpenCL byte buffer: {err}");
@@ -337,9 +385,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
             if (_buffer != IntPtr.Zero)
             {
-                OpenClNativeBindings.ReleaseMemObject(_buffer);
-                GpuKernelDiagnostics.RecordBufferReleased(ByteSize);
+                IntPtr memoryObject = _buffer;
                 _buffer = IntPtr.Zero;
+                _context.RetireMemoryObject(this, memoryObject, ByteSize);
             }
 
             _disposed = true;
@@ -350,7 +398,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
     /// OpenCL int buffer wrapper using pure P/Invoke.
     /// Used for atomic counters in work-stealing kernels.
     /// </summary>
-    internal sealed class DirectOpenClIntBuffer : IDisposable
+    internal sealed class DirectOpenClIntBuffer : IDisposable, IDirectOpenClMemoryObject
     {
         private IntPtr _buffer;
         private readonly DirectOpenClContext _context;
@@ -362,6 +410,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         public IntPtr Handle => _buffer;
         public int Length => _length;
+        public IntPtr NativeHandle => _buffer;
+        public DirectOpenClContext OwningContext => _context;
+        public IntPtr LastSubmissionQueue { get; set; }
 
         /// <summary>
         /// Creates an int buffer and uploads data from host.
@@ -386,6 +437,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     throw new InvalidOperationException($"Failed to create OpenCL int buffer: {err}");
 
                 GpuKernelDiagnostics.RecordBufferAllocated(ByteSize);
+                _context.RegisterMemoryObject(this);
             }
             finally
             {
@@ -413,6 +465,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 throw new InvalidOperationException($"Failed to create OpenCL int buffer: {err}");
 
             GpuKernelDiagnostics.RecordBufferAllocated(ByteSize);
+            _context.RegisterMemoryObject(this);
         }
 
         /// <summary>
@@ -436,16 +489,26 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             GCHandle handle = GCHandle.Alloc(destination, GCHandleType.Pinned);
             try
             {
-                int err = OpenClNativeBindings.EnqueueReadBuffer(
-                    _context.CommandQueue,
-                    _buffer,
-                    1, // blocking
-                    UIntPtr.Zero,
-                    (UIntPtr)(_length * sizeof(int)),
-                    handle.AddrOfPinnedObject(),
-                    0,
-                    IntPtr.Zero,
-                    IntPtr.Zero);
+                IntPtr queue = _context.CommandQueue;
+                var memories = DirectOpenClSubmission.GetDirectSubmissionMemories(this);
+                int err;
+                try
+                {
+                    lock (DirectOpenClSubmission.Gate)
+                    {
+                        using var waits = DirectOpenClSubmission.PrepareLocked(queue, memories);
+                        err = OpenClNativeBindings.EnqueueReadBuffer(
+                            queue, _buffer, 1, UIntPtr.Zero,
+                            (UIntPtr)(_length * sizeof(int)), handle.AddrOfPinnedObject(),
+                            waits.Count, waits.Pointer, IntPtr.Zero);
+                        if (err == OpenClNativeBindings.CL_SUCCESS)
+                            DirectOpenClSubmission.CommitLocked(queue, memories);
+                    }
+                }
+                finally
+                {
+                    DirectOpenClSubmission.ReleaseDirectSubmissionMemories(memories);
+                }
 
                 if (err != OpenClNativeBindings.CL_SUCCESS)
                     throw new InvalidOperationException($"Failed to read OpenCL int buffer: {err}");
@@ -462,9 +525,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
             if (_buffer != IntPtr.Zero)
             {
-                OpenClNativeBindings.ReleaseMemObject(_buffer);
-                GpuKernelDiagnostics.RecordBufferReleased(ByteSize);
+                IntPtr memoryObject = _buffer;
                 _buffer = IntPtr.Zero;
+                _context.RetireMemoryObject(this, memoryObject, ByteSize);
             }
 
             _disposed = true;

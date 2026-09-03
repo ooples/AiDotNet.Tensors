@@ -221,6 +221,17 @@ internal sealed class LazyNode<T> : ILazyNode
         Output.LazySource = null;
     }
 
+    public void AddStorageLeases(TensorStorageLeaseSet leases)
+    {
+        leases.Add(Input0);
+        if (Input1 is not null) leases.Add(Input1);
+        if (Input2 is not null) leases.Add(Input2);
+        if (InputsOverflow is not null)
+            for (int i = 0; i < InputsOverflow.Length; i++) leases.Add(InputsOverflow[i]);
+        leases.Add(Output);
+        leases.AddSavedState(SavedState);
+    }
+
     /// <summary>Get input tensors as array for backward compatibility.</summary>
     public Tensor<T>[] GetInputsArray()
     {

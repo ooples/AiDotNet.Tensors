@@ -17,12 +17,15 @@ namespace AiDotNet.Tensors.Tests.Engines;
 /// absent one falls back to a correct CPU engine. Before the gate, a "present but wrong" backend
 /// would be adopted and fail this assertion.
 /// </summary>
+[Collection("EngineCurrentGlobalState")]
 public class GpuAutoDetectCorrectnessGateTests
 {
     [Fact]
     public void AutoDetect_LeavesActiveEngineComputingCorrectly()
     {
         var prior = AiDotNetEngine.Current;
+        var isolatedBaseline = new CpuEngine();
+        AiDotNetEngine.Current = isolatedBaseline;
         try
         {
             // Adopts the GPU only if it passes the correctness probe; otherwise stays on CPU.
@@ -41,7 +44,14 @@ public class GpuAutoDetectCorrectnessGateTests
         }
         finally
         {
+            var detected = AiDotNetEngine.Current;
             AiDotNetEngine.Current = prior;
+            if (!ReferenceEquals(detected, prior) &&
+                !ReferenceEquals(detected, isolatedBaseline) &&
+                detected is IDisposable disposable)
+            {
+                disposable.Dispose();
+            }
         }
     }
 }

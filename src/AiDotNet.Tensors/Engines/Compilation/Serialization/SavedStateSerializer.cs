@@ -11,7 +11,8 @@ namespace AiDotNet.Tensors.Engines.Compilation.Serialization;
 ///
 /// <para>Supported types: <c>null</c>, <c>int</c>, <c>int[]</c>, <c>long</c>,
 /// <c>long[]</c>, <c>double</c>, <c>float</c>, <c>bool</c>, <c>string</c>,
-/// <c>byte[]</c>, and <c>Tensor&lt;T&gt;</c> (serialized as a tensor-table
+/// <c>byte[]</c>, <c>bool[]</c>, <see cref="FusedActivationParams"/>, and
+/// <c>Tensor&lt;T&gt;</c> (serialized as a tensor-table
 /// ID reference). <c>long[]</c> support exists for index snapshots that may
 /// exceed <c>int.MaxValue</c> (e.g. large-vocab embedding lookups with
 /// <c>Tensor&lt;long&gt;</c> indices).</para>
@@ -114,6 +115,30 @@ internal static class SavedStateSerializer
                 writer.Write(byteArr);
                 break;
 
+            case bool[] boolArr:
+                writer.Write(PlanFormatConstants.TagBoolArray);
+                writer.Write(boolArr.Length);
+                for (int j = 0; j < boolArr.Length; j++)
+                    writer.Write(boolArr[j]);
+                break;
+
+            case FusedActivationParams activationParams:
+                writer.Write(PlanFormatConstants.TagFusedActivationParams);
+                WriteNullableSingle(writer, activationParams.Alpha);
+                WriteNullableSingle(writer, activationParams.Beta);
+                WriteNullableSingle(writer, activationParams.Theta);
+                if (activationParams.PReluSlope is null)
+                {
+                    writer.Write(-1);
+                }
+                else
+                {
+                    writer.Write(activationParams.PReluSlope.Length);
+                    for (int j = 0; j < activationParams.PReluSlope.Length; j++)
+                        writer.Write(activationParams.PReluSlope[j]);
+                }
+                break;
+
             case Tensor<T> tensor:
                 writer.Write(PlanFormatConstants.TagTensorRef);
                 writer.Write(tensorMap.GetId(tensor));
@@ -142,7 +167,7 @@ internal static class SavedStateSerializer
                 // load never encounters a mystery tag byte.
                 throw new NotSupportedException(
                     $"SavedState entry of type {value.GetType().FullName} cannot be serialized. " +
-                    "Supported types: null, int, int[], long, long[], double, float, bool, string, byte[], Tensor<T>, Enum.");
+                    "Supported types: null, int, int[], long, long[], double, float, bool, string, byte[], bool[], FusedActivationParams, Tensor<T>, Enum.");
         }
     }
 
@@ -156,6 +181,8 @@ internal static class SavedStateSerializer
             PlanFormatConstants.TagInt32Array => ReadInt32Array(reader),
             PlanFormatConstants.TagInt64      => reader.ReadInt64(),
             PlanFormatConstants.TagInt64Array => ReadInt64Array(reader),
+            PlanFormatConstants.TagBoolArray  => ReadBoolArray(reader),
+            PlanFormatConstants.TagFusedActivationParams => ReadFusedActivationParams(reader),
             PlanFormatConstants.TagDouble     => reader.ReadDouble(),
             PlanFormatConstants.TagFloat      => (object)reader.ReadSingle(),
             PlanFormatConstants.TagBool       => reader.ReadBoolean(),
@@ -232,6 +259,50 @@ internal static class SavedStateSerializer
         for (int i = 0; i < len; i++)
             arr[i] = reader.ReadInt64();
         return arr;
+    }
+
+    private static bool[] ReadBoolArray(BinaryReader reader)
+    {
+        int len = reader.ReadInt32();
+        if (len < 0)
+            throw new InvalidDataException($"SavedState bool[] length {len} cannot be negative. The plan file is corrupt.");
+        var arr = new bool[len];
+        for (int i = 0; i < len; i++)
+            arr[i] = reader.ReadBoolean();
+        return arr;
+    }
+
+    private static void WriteNullableSingle(BinaryWriter writer, float? value)
+    {
+        writer.Write(value.HasValue);
+        if (value.HasValue) writer.Write(value.Value);
+    }
+
+    private static float? ReadNullableSingle(BinaryReader reader)
+        => reader.ReadBoolean() ? reader.ReadSingle() : null;
+
+    private static FusedActivationParams ReadFusedActivationParams(BinaryReader reader)
+    {
+        float? alpha = ReadNullableSingle(reader);
+        float? beta = ReadNullableSingle(reader);
+        float? theta = ReadNullableSingle(reader);
+        int slopeLength = reader.ReadInt32();
+        if (slopeLength < -1)
+            throw new InvalidDataException(
+                $"SavedState PReLU slope length {slopeLength} is invalid. The plan file is corrupt.");
+        float[]? slopes = null;
+        if (slopeLength >= 0)
+        {
+            slopes = new float[slopeLength];
+            for (int i = 0; i < slopeLength; i++) slopes[i] = reader.ReadSingle();
+        }
+        return new FusedActivationParams
+        {
+            Alpha = alpha,
+            Beta = beta,
+            Theta = theta,
+            PReluSlope = slopes
+        };
     }
 
     private static string ReadString(BinaryReader reader)

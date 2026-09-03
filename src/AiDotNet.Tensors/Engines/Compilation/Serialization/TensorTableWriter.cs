@@ -22,12 +22,22 @@ internal static class TensorTableWriter
         CompiledStep<T>[] steps,
         Tensor<T>? compiledInputTensor,
         Tensor<T>[]? parameterTensors = null)
+        => BuildMap(
+            steps,
+            compiledInputTensor is null ? Array.Empty<Tensor<T>>() : new[] { compiledInputTensor },
+            parameterTensors);
+
+    internal static TensorIdMap<T> BuildMap<T>(
+        CompiledStep<T>[] steps,
+        Tensor<T>[] compiledInputTensors,
+        Tensor<T>[]? parameterTensors = null)
     {
         var map = new TensorIdMap<T>();
 
-        // Register compiled input first (ID 0 by convention).
-        if (compiledInputTensor is not null)
-            map.GetOrAdd(compiledInputTensor);
+        // Register mutable inputs first and in slot order. The inference writer also emits their
+        // explicit IDs, so ordering remains stable even if map construction evolves later.
+        for (int i = 0; i < compiledInputTensors.Length; i++)
+            map.GetOrAdd(compiledInputTensors[i]);
 
         // Register parameter tensors (training plans).
         if (parameterTensors is not null)
@@ -70,6 +80,19 @@ internal static class TensorTableWriter
         CompiledStep<T>[] steps,
         Tensor<T>? compiledInputTensor,
         Tensor<T>[]? parameterTensors)
+        => Write(
+            writer,
+            map,
+            steps,
+            compiledInputTensor is null ? Array.Empty<Tensor<T>>() : new[] { compiledInputTensor },
+            parameterTensors);
+
+    internal static void Write<T>(
+        BinaryWriter writer,
+        TensorIdMap<T> map,
+        CompiledStep<T>[] steps,
+        Tensor<T>[] compiledInputTensors,
+        Tensor<T>[]? parameterTensors)
     {
         var tensors = map.Ordered;
         writer.Write(tensors.Count);
@@ -82,6 +105,9 @@ internal static class TensorTableWriter
         // but different identity.
         var paramSet = new HashSet<Tensor<T>>(
             parameterTensors ?? Array.Empty<Tensor<T>>(),
+            ReferenceEqualityComparer<Tensor<T>>.Instance);
+        var inputSet = new HashSet<Tensor<T>>(
+            compiledInputTensors,
             ReferenceEqualityComparer<Tensor<T>>.Instance);
 
         // Build the set of tensors that are step OUTPUT buffers. Any tensor
@@ -108,7 +134,7 @@ internal static class TensorTableWriter
 
             // Classify this tensor.
             bool isExplicitParam = paramSet.Contains(tensor);
-            bool isLeaf = ReferenceEquals(tensor, compiledInputTensor);
+            bool isLeaf = inputSet.Contains(tensor);
             bool isOutputBuffer = outputBufferSet.Contains(tensor);
 
             // A "frozen weight" is a tensor that:

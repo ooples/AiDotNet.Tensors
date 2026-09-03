@@ -124,6 +124,12 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             get => _isAvailable && !_disposed;
             private set => _isAvailable = value;
         }
+        internal void ReapCompletedOpenClResources()
+            => _context?.ReapCompletedResources();
+
+        internal void CompleteCommandQueueForDisposal(IntPtr commandQueue)
+            => _context?.CompleteQueueForDisposal(commandQueue);
+
         public string? InitializationError { get; private set; }
         public string BackendName => "OpenCL";
         public TensorDevice DeviceType => TensorDevice.OpenCL;
@@ -1258,14 +1264,15 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (_context == null)
                 throw new InvalidOperationException("OpenCL context not available");
 
-            if (_bufferPool.TryRent(data.Length, out var pooled) && pooled != null)
+            var affinity = GpuBufferPoolAffinity.ForNativeQueue(_context.CommandQueue);
+            if (_bufferPool.TryRent(data.Length, affinity, out var pooled) && pooled != null)
             {
                 pooled.Buffer.CopyFromHost(data);
                 return pooled;
             }
 
             var buffer = new DirectOpenClBuffer(_context, data);
-            return new DirectOpenClGpuBuffer(buffer, _bufferPool.Return);
+            return new DirectOpenClGpuBuffer(buffer, ReturnOpenClBufferToPool);
         }
 
         public IGpuBuffer AllocateBuffer(int size)
@@ -1273,11 +1280,29 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (_context == null)
                 throw new InvalidOperationException("OpenCL context not available");
 
-            if (_bufferPool.TryRent(size, out var pooled) && pooled != null)
+            var affinity = GpuBufferPoolAffinity.ForNativeQueue(_context.CommandQueue);
+            if (_bufferPool.TryRent(size, affinity, out var pooled) && pooled != null)
                 return pooled;
 
             var buffer = new DirectOpenClBuffer(_context, size);
-            return new DirectOpenClGpuBuffer(buffer, _bufferPool.Return);
+            return new DirectOpenClGpuBuffer(buffer, ReturnOpenClBufferToPool);
+        }
+
+        private void ReturnOpenClBufferToPool(DirectOpenClGpuBuffer buffer)
+        {
+            var context = _context;
+            if (context is null || _disposed)
+            {
+                buffer.Release();
+                return;
+            }
+
+            IntPtr lastQueue;
+            lock (DirectOpenClSubmission.Gate)
+                lastQueue = buffer.Buffer.LastSubmissionQueue;
+            if (lastQueue == IntPtr.Zero)
+                lastQueue = context.CommandQueue;
+            _bufferPool.Return(buffer, GpuBufferPoolAffinity.ForNativeQueue(lastQueue));
         }
 
         public float[] DownloadBuffer(IGpuBuffer buffer)
@@ -1337,17 +1362,55 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             var sizeBytes = new UIntPtr((ulong)size * sizeof(float));
 
             GpuLaunchProbe.OnLaunch(); // device-to-device copy = GPU-resident work (keeps data on device)
-            int err = OpenClNativeBindings.EnqueueCopyBuffer(
+            int err = EnqueueTrackedCopy(
                 _context.CommandQueue,
+                ((DirectOpenClGpuBuffer)source).Buffer,
+                ((DirectOpenClGpuBuffer)destination).Buffer,
                 srcHandle,
                 destHandle,
                 srcOffsetBytes,
                 destOffsetBytes,
-                sizeBytes,
-                0, IntPtr.Zero, IntPtr.Zero);
+                sizeBytes);
 
             if (err != OpenClNativeBindings.CL_SUCCESS)
                 throw new InvalidOperationException($"OpenCL copy failed: {err}");
+        }
+
+        private static int EnqueueTrackedCopy(
+            IntPtr commandQueue,
+            DirectOpenClBuffer source,
+            DirectOpenClBuffer destination,
+            IntPtr sourceHandle,
+            IntPtr destinationHandle,
+            UIntPtr sourceOffset,
+            UIntPtr destinationOffset,
+            UIntPtr byteCount)
+        {
+            var memories = DirectOpenClSubmission.GetDirectSubmissionMemories(source, destination);
+            try
+            {
+                lock (DirectOpenClSubmission.Gate)
+                {
+                    using var waits = DirectOpenClSubmission.PrepareLocked(commandQueue, memories);
+                    int err = OpenClNativeBindings.EnqueueCopyBuffer(
+                        commandQueue,
+                        sourceHandle,
+                        destinationHandle,
+                        sourceOffset,
+                        destinationOffset,
+                        byteCount,
+                        waits.Count,
+                        waits.Pointer,
+                        IntPtr.Zero);
+                    if (err == OpenClNativeBindings.CL_SUCCESS)
+                        DirectOpenClSubmission.CommitLocked(commandQueue, memories);
+                    return err;
+                }
+            }
+            finally
+            {
+                DirectOpenClSubmission.ReleaseDirectSubmissionMemories(memories);
+            }
         }
 
         #endregion
@@ -2354,22 +2417,38 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (ClBlastNative.IsAvailable)
             {
                 IntPtr queue = _context.CommandQueue;
+                var memories = DirectOpenClSubmission.GetDirectSubmissionMemories(bufferA, bufferB, bufferC);
 
                 // CLBlast row-major: C[M,N] = A[M,K] · Bᵀ where B is stored as
                 // [N, K] row-major. We pass transA=No, transB=Yes; ldA=K (row
                 // stride of A), ldB=K (row stride of B as stored), ldC=N.
-                var status = ClBlastNative.Sgemm(
-                    ClBlastNative.Layout.RowMajor,
-                    ClBlastNative.Transpose.No,
-                    ClBlastNative.Transpose.Yes,
-                    (UIntPtr)M, (UIntPtr)N, (UIntPtr)K,
-                    alpha,
-                    bufferA.Handle, UIntPtr.Zero, (UIntPtr)K,
-                    bufferB.Handle, UIntPtr.Zero, (UIntPtr)K,
-                    beta,
-                    bufferC.Handle, UIntPtr.Zero, (UIntPtr)N,
-                    ref queue,
-                    IntPtr.Zero);
+                ClBlastNative.StatusCode status;
+                try
+                {
+                    lock (DirectOpenClSubmission.Gate)
+                    {
+                        using var waits = DirectOpenClSubmission.PrepareLocked(queue, memories);
+                        waits.EnqueueBridgeMarker(queue);
+                        status = ClBlastNative.Sgemm(
+                            ClBlastNative.Layout.RowMajor,
+                            ClBlastNative.Transpose.No,
+                            ClBlastNative.Transpose.Yes,
+                            (UIntPtr)M, (UIntPtr)N, (UIntPtr)K,
+                            alpha,
+                            bufferA.Handle, UIntPtr.Zero, (UIntPtr)K,
+                            bufferB.Handle, UIntPtr.Zero, (UIntPtr)K,
+                            beta,
+                            bufferC.Handle, UIntPtr.Zero, (UIntPtr)N,
+                            ref queue,
+                            IntPtr.Zero);
+                        if (status == ClBlastNative.StatusCode.Success)
+                            DirectOpenClSubmission.CommitLocked(queue, memories);
+                    }
+                }
+                finally
+                {
+                    DirectOpenClSubmission.ReleaseDirectSubmissionMemories(memories);
+                }
                 if (status == ClBlastNative.StatusCode.Success)
                 {
                     // CLBlast enqueues directly through the native OpenCL command queue,
@@ -4596,7 +4675,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         }
 
         /// <inheritdoc/>
-        public unsafe void UploadBufferAsync(float[] data, IGpuBuffer buffer, IGpuStream stream)
+        public void UploadBufferAsync(float[] data, IGpuBuffer buffer, IGpuStream stream)
         {
             if (_context == null)
                 throw new InvalidOperationException("OpenCL context not available");
@@ -4605,53 +4684,62 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (stream == null) throw new ArgumentNullException(nameof(stream));
 
             var openClBuffer = (DirectOpenClGpuBuffer)buffer;
-            fixed (float* dataPtr = data)
+            GCHandle pinned = GCHandle.Alloc(data, GCHandleType.Pinned);
+            IntPtr transferEvent = IntPtr.Zero;
+            bool ownershipTransferred = false;
+            var memories = DirectOpenClSubmission.GetDirectSubmissionMemories(openClBuffer.Buffer);
+            try
             {
-                int err = OpenClNativeBindings.EnqueueWriteBuffer(
-                    stream.Handle,
-                    openClBuffer.Buffer.Handle,
-                    0, // non-blocking
-                    UIntPtr.Zero,
-                    (UIntPtr)(data.Length * sizeof(float)),
-                    (IntPtr)dataPtr,
-                    0,
-                    IntPtr.Zero,
-                    IntPtr.Zero);
+                int err;
+                lock (DirectOpenClSubmission.Gate)
+                {
+                    using var waits = DirectOpenClSubmission.PrepareLocked(stream.Handle, memories);
+                    err = OpenClNativeBindings.EnqueueWriteBufferWithEvent(
+                        stream.Handle, openClBuffer.Buffer.Handle, 0, UIntPtr.Zero,
+                        (UIntPtr)(data.Length * sizeof(float)), pinned.AddrOfPinnedObject(),
+                        waits.Count, waits.Pointer, out transferEvent);
+                    if (err == OpenClNativeBindings.CL_SUCCESS)
+                        DirectOpenClSubmission.CommitLocked(stream.Handle, memories);
+                }
 
                 if (err != OpenClNativeBindings.CL_SUCCESS)
                     throw new InvalidOperationException($"clEnqueueWriteBuffer failed: {err}");
+
+                OpenClNativeBindings.Flush(stream.Handle);
+                _context.TrackHostTransfer(transferEvent, pinned);
+                ownershipTransferred = true;
+            }
+            finally
+            {
+                DirectOpenClSubmission.ReleaseDirectSubmissionMemories(memories);
+                if (!ownershipTransferred)
+                {
+                    if (transferEvent != IntPtr.Zero)
+                    {
+                        OpenClNativeBindings.WaitForEvents(1, new[] { transferEvent });
+                        OpenClNativeBindings.ReleaseEvent(transferEvent);
+                    }
+                    if (pinned.IsAllocated) pinned.Free();
+                }
             }
         }
 
         /// <inheritdoc/>
-        public unsafe void UploadBufferAsync(ReadOnlySpan<float> data, IGpuBuffer buffer, IGpuStream stream)
+        public void UploadBufferAsync(ReadOnlySpan<float> data, IGpuBuffer buffer, IGpuStream stream)
         {
             if (_context == null)
                 throw new InvalidOperationException("OpenCL context not available");
             if (buffer == null) throw new ArgumentNullException(nameof(buffer));
             if (stream == null) throw new ArgumentNullException(nameof(stream));
 
-            var openClBuffer = (DirectOpenClGpuBuffer)buffer;
-            fixed (float* dataPtr = data)
-            {
-                int err = OpenClNativeBindings.EnqueueWriteBuffer(
-                    stream.Handle,
-                    openClBuffer.Buffer.Handle,
-                    0, // non-blocking
-                    UIntPtr.Zero,
-                    (UIntPtr)(data.Length * sizeof(float)),
-                    (IntPtr)dataPtr,
-                    0,
-                    IntPtr.Zero,
-                    IntPtr.Zero);
-
-                if (err != OpenClNativeBindings.CL_SUCCESS)
-                    throw new InvalidOperationException($"clEnqueueWriteBuffer failed: {err}");
-            }
+            // A ReadOnlySpan may point at movable managed memory or the caller's stack. Neither can legally
+            // outlive this asynchronous method, so stage it into an owned array whose pin is retained by the
+            // event-backed array overload until the device copy completes.
+            UploadBufferAsync(data.ToArray(), buffer, stream);
         }
 
         /// <inheritdoc/>
-        public unsafe void DownloadBufferAsync(IGpuBuffer buffer, float[] destination, IGpuStream stream)
+        public void DownloadBufferAsync(IGpuBuffer buffer, float[] destination, IGpuStream stream)
         {
             if (_context == null)
                 throw new InvalidOperationException("OpenCL context not available");
@@ -4660,21 +4748,43 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (stream == null) throw new ArgumentNullException(nameof(stream));
 
             var openClBuffer = (DirectOpenClGpuBuffer)buffer;
-            fixed (float* destPtr = destination)
+            GCHandle pinned = GCHandle.Alloc(destination, GCHandleType.Pinned);
+            IntPtr transferEvent = IntPtr.Zero;
+            bool ownershipTransferred = false;
+            var memories = DirectOpenClSubmission.GetDirectSubmissionMemories(openClBuffer.Buffer);
+            try
             {
-                int err = OpenClNativeBindings.EnqueueReadBuffer(
-                    stream.Handle,
-                    openClBuffer.Buffer.Handle,
-                    0, // non-blocking
-                    UIntPtr.Zero,
-                    (UIntPtr)(destination.Length * sizeof(float)),
-                    (IntPtr)destPtr,
-                    0,
-                    IntPtr.Zero,
-                    IntPtr.Zero);
+                int err;
+                lock (DirectOpenClSubmission.Gate)
+                {
+                    using var waits = DirectOpenClSubmission.PrepareLocked(stream.Handle, memories);
+                    err = OpenClNativeBindings.EnqueueReadBufferWithEvent(
+                        stream.Handle, openClBuffer.Buffer.Handle, 0, UIntPtr.Zero,
+                        (UIntPtr)(destination.Length * sizeof(float)), pinned.AddrOfPinnedObject(),
+                        waits.Count, waits.Pointer, out transferEvent);
+                    if (err == OpenClNativeBindings.CL_SUCCESS)
+                        DirectOpenClSubmission.CommitLocked(stream.Handle, memories);
+                }
 
                 if (err != OpenClNativeBindings.CL_SUCCESS)
                     throw new InvalidOperationException($"clEnqueueReadBuffer failed: {err}");
+
+                OpenClNativeBindings.Flush(stream.Handle);
+                _context.TrackHostTransfer(transferEvent, pinned);
+                ownershipTransferred = true;
+            }
+            finally
+            {
+                DirectOpenClSubmission.ReleaseDirectSubmissionMemories(memories);
+                if (!ownershipTransferred)
+                {
+                    if (transferEvent != IntPtr.Zero)
+                    {
+                        OpenClNativeBindings.WaitForEvents(1, new[] { transferEvent });
+                        OpenClNativeBindings.ReleaseEvent(transferEvent);
+                    }
+                    if (pinned.IsAllocated) pinned.Free();
+                }
             }
         }
 
@@ -4699,16 +4809,15 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             var dstBuffer = (DirectOpenClGpuBuffer)destination;
 
             GpuLaunchProbe.OnLaunch(); // device-to-device copy = GPU-resident work
-            int err = OpenClNativeBindings.EnqueueCopyBuffer(
+            int err = EnqueueTrackedCopy(
                 stream.Handle,
+                srcBuffer.Buffer,
+                dstBuffer.Buffer,
                 srcBuffer.Buffer.Handle,
                 dstBuffer.Buffer.Handle,
                 UIntPtr.Zero,
                 UIntPtr.Zero,
-                (UIntPtr)(size * sizeof(float)),
-                0,
-                IntPtr.Zero,
-                IntPtr.Zero);
+                (UIntPtr)(size * sizeof(float)));
 
             if (err != OpenClNativeBindings.CL_SUCCESS)
                 throw new InvalidOperationException($"clEnqueueCopyBuffer failed: {err}");
@@ -5620,19 +5729,34 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             var bufferC = ((DirectOpenClGpuBuffer)C).Buffer;
 
             IntPtr queue = _context.CommandQueue;
-
-            var status = ClBlastNative.Sgemm(
-                ClBlastNative.Layout.RowMajor,
-                ClBlastNative.Transpose.No,
-                ClBlastNative.Transpose.No,
-                (UIntPtr)M, (UIntPtr)N, (UIntPtr)K,
-                alpha,
-                bufferA.Handle, UIntPtr.Zero, (UIntPtr)K,
-                bufferB.Handle, UIntPtr.Zero, (UIntPtr)N,
-                beta,
-                bufferC.Handle, UIntPtr.Zero, (UIntPtr)N,
-                ref queue,
-                IntPtr.Zero);
+            var memories = DirectOpenClSubmission.GetDirectSubmissionMemories(bufferA, bufferB, bufferC);
+            ClBlastNative.StatusCode status;
+            try
+            {
+                lock (DirectOpenClSubmission.Gate)
+                {
+                    using var waits = DirectOpenClSubmission.PrepareLocked(queue, memories);
+                    waits.EnqueueBridgeMarker(queue);
+                    status = ClBlastNative.Sgemm(
+                        ClBlastNative.Layout.RowMajor,
+                        ClBlastNative.Transpose.No,
+                        ClBlastNative.Transpose.No,
+                        (UIntPtr)M, (UIntPtr)N, (UIntPtr)K,
+                        alpha,
+                        bufferA.Handle, UIntPtr.Zero, (UIntPtr)K,
+                        bufferB.Handle, UIntPtr.Zero, (UIntPtr)N,
+                        beta,
+                        bufferC.Handle, UIntPtr.Zero, (UIntPtr)N,
+                        ref queue,
+                        IntPtr.Zero);
+                    if (status == ClBlastNative.StatusCode.Success)
+                        DirectOpenClSubmission.CommitLocked(queue, memories);
+                }
+            }
+            finally
+            {
+                DirectOpenClSubmission.ReleaseDirectSubmissionMemories(memories);
+            }
 
             if (status != ClBlastNative.StatusCode.Success)
             {
@@ -8727,7 +8851,6 @@ KERNEL VARIANTS (A/B testing):
             Fill(gradQuery, 0f, batch * numQHeads * seqQ * headDim);
             Fill(gradKey, 0f, batch * numKVHeads * seqK * headDim);
             Fill(gradValue, 0f, batch * numKVHeads * seqK * headDim);
-
             if (GpuDeterminism.IsActive)
             {
                 // Issue #382: gradkey/gradValue scatter atomics are FP-non-deterministic;
@@ -11884,16 +12007,15 @@ KERNEL VARIANTS (A/B testing):
 
             // Use EnqueueCopyBuffer for device-to-device copy
             GpuLaunchProbe.OnLaunch(); // device-to-device copy = GPU-resident work
-            int err = OpenClNativeBindings.EnqueueCopyBuffer(
+            int err = EnqueueTrackedCopy(
                 _context.CommandQueue,
+                srcBuf,
+                dstBuf,
                 srcBuf.Handle,
                 dstBuf.Handle,
                 UIntPtr.Zero,
                 UIntPtr.Zero,
-                (UIntPtr)(size * sizeof(float)),
-                0,
-                IntPtr.Zero,
-                IntPtr.Zero);
+                (UIntPtr)(size * sizeof(float)));
 
             if (err != OpenClNativeBindings.CL_SUCCESS)
                 throw new InvalidOperationException($"Failed to copy OpenCL buffer: {err}");

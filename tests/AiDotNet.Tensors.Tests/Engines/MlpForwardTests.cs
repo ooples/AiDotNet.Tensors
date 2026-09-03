@@ -140,22 +140,6 @@ public class MlpForwardTests
     }
 
     [Fact]
-    public void MlpForward_UnderGraphMode_Throws()
-    {
-        var rng = new Random(1);
-        var input = MakeRandom(rng, 2, 4);
-        var weights = new List<Tensor<float>> { MakeRandom(rng, 4, 3) };
-        var biases = new List<Tensor<float>?> { MakeRandom(rng, 3) };
-
-        using (GraphMode.Enable())
-        {
-            Assert.Throws<InvalidOperationException>(() =>
-                _engine.MlpForward(input, weights, biases,
-                    FusedActivationType.ReLU, FusedActivationType.None));
-        }
-    }
-
-    [Fact]
     public void MlpForward_MismatchedBiasCount_Throws()
     {
         var rng = new Random(1);
