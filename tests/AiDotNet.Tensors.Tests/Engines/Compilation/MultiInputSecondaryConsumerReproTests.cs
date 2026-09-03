@@ -13,6 +13,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// directly. If the multi-input replay re-binds correctly the compiled output must match
 /// eager for every (x, t) pair.
 /// </summary>
+[Collection("CompilationGlobalState")]
 public class MultiInputSecondaryConsumerReproTests : IDisposable
 {
     private readonly IEngine _prior = AiDotNetEngine.Current;

@@ -30,12 +30,15 @@ using Xunit.Abstractions;
 
 namespace AiDotNet.Tensors.Tests.Engines;
 
-public class Issue319TrainingLoopPerfTests
+[Collection("EngineCurrentGlobalState")]
+public class Issue319TrainingLoopPerfTests : IDisposable
 {
     private readonly ITestOutputHelper _output;
+    private readonly IEngine _priorEngine;
     public Issue319TrainingLoopPerfTests(ITestOutputHelper output)
     {
         _output = output;
+        _priorEngine = AiDotNetEngine.Current;
         // Reset shared engine + caches so alloc-counting probes aren't
         // contaminated by pooled tensors / AutoTracer state from earlier
         // tests in the same process. The perf-regression assertions use
@@ -46,6 +49,8 @@ public class Issue319TrainingLoopPerfTests
         AiDotNet.Tensors.Helpers.AutoTensorCache.Clear();
         AiDotNet.Tensors.Engines.Autodiff.TensorPool<float>.Clear();
     }
+
+    public void Dispose() => AiDotNetEngine.Current = _priorEngine;
 
     [Fact]
     public void TensorAdd_BroadcastBiasGradientReducesTheSequenceAxis()

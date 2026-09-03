@@ -1622,7 +1622,8 @@ public sealed class GradientTape<T> : IDisposable
             // returned grads dict carries the data either way.
             if (_cachedDelegateChain is not null)
             {
-                var cachedResult = _cachedDelegateChain.Execute(loss, sources, _engine, useScratch: acquiredScratch);
+                var cachedResult = _cachedDelegateChain.Execute(
+                    loss, sources, _engine, useScratch: acquiredScratch, retainedTensors: _retainGrad);
                 HashSet<Tensor<T>>? cachedSourceSet = null;
                 if (sources is not null)
                 {
@@ -1699,7 +1700,8 @@ public sealed class GradientTape<T> : IDisposable
                 _cachedDelegateChain = chain;
 
             // Execute the chain
-            var result = chain.Execute(loss, sources, engine, useScratch: acquiredScratch);
+            var result = chain.Execute(
+                loss, sources, engine, useScratch: acquiredScratch, retainedTensors: _retainGrad);
 
             // Build rebindable plan for fresh-tape callers (closes the
             // consumer fresh-tape gap from issue #327). MUST run AFTER

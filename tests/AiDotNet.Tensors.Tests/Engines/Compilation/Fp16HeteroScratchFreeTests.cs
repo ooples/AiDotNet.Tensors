@@ -72,7 +72,7 @@ public class Fp16HeteroScratchFreeTests
         {
             var (order, loss) = CaptureHetero(gpu);
             gpu.ClearActivationCache(); // isolate this run's cache accounting from the capture + the other run
-            var plan = MixedPrecisionCompiledPlan.FromCapturedOrder(gpu, order, loss, paging: false);
+            using var plan = MixedPrecisionCompiledPlan.FromCapturedOrder(gpu, order, loss, paging: false);
             // Replicate the real Step condition: eviction suspended for the whole forward+backward (#226), so
             // without the scratch-free the per-op backward scratch genuinely accumulates in the cache.
             gpu.SuspendActivationEviction();
@@ -106,7 +106,7 @@ public class Fp16HeteroScratchFreeTests
         {
             var (order, loss) = CaptureHetero(gpu);
             gpu.ClearActivationCache();
-            var plan = MixedPrecisionCompiledPlan.FromCapturedOrder(gpu, order, loss, paging: false);
+            using var plan = MixedPrecisionCompiledPlan.FromCapturedOrder(gpu, order, loss, paging: false);
             gpu.SuspendActivationEviction();
             try
             {

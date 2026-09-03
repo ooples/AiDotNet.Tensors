@@ -16,6 +16,7 @@ using Xunit.Abstractions;
 
 namespace AiDotNet.Tensors.Tests.Engines;
 
+[Collection("EngineCurrentGlobalState")]
 public class Issue338PhaseGCoverageTests
 {
     private readonly ITestOutputHelper _output;

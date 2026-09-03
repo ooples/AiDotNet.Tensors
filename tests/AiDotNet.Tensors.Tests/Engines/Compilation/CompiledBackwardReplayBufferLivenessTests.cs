@@ -29,6 +29,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// each subsequent step inside its OWN fresh per-step arena, checking the trained parameter's
 /// gradient stays non-zero and finite on every replay step.</para>
 /// </summary>
+[Collection("CompilationGlobalState")]
 public class CompiledBackwardReplayBufferLivenessTests
 {
     private readonly ITestOutputHelper _o;

@@ -16,6 +16,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// validation at chain time, and proper rejection of disposed /
 /// foreign / shape-mismatched plans.
 /// </summary>
+[Collection("CompilationGlobalState")]
 public class AsyncChainTests : IDisposable
 {
     // PR #333's GPU auto-detect ModuleInitializer flips AiDotNetEngine.Current

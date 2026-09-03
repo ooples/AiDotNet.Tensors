@@ -19,6 +19,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// input is compared against an equally-mutated oracle. These tests snapshot inputs BEFORE Execute and
 /// reuse the same instances across calls.
 /// </summary>
+[Collection("CompilationGlobalState")]
 public class MultiInputReplayAliasingTests : IDisposable
 {
     private readonly IEngine _priorEngine = AiDotNetEngine.Current;

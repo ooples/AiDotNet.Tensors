@@ -33,8 +33,7 @@ public class OneDnnProviderTests
         Skip.IfNot(OneDnnProvider.IsAvailable,
             "dnnl.dll not deployed for this runtime; oneDNN optional accelerator inactive.");
 
-        AiDotNetEngine.ResetToCpu();
-        var eng = AiDotNetEngine.Current;
+        var eng = new CpuEngine();
 
         // 1 batch, 1 in-channel, 3x3 input; one 2x2 kernel; stride 1, no pad → 2x2 output.
         // input:            kernel:

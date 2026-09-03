@@ -43,7 +43,7 @@ public class MixedPrecisionAdamTests
             return _engine.ReduceSum(sq);
         };
 
-        var plan = MixedPrecisionCompiledPlan.Trace(forward, _engine);
+        using var plan = MixedPrecisionCompiledPlan.Trace(forward, _engine);
         var scaler = new AiDotNet.Tensors.Engines.Autodiff.GradScaler(
             new AiDotNet.Tensors.Engines.Autodiff.MixedPrecisionConfig { LossScale = 128f, DynamicLossScale = false });
         var pars = new[] { W };

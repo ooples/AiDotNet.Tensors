@@ -23,6 +23,7 @@ internal sealed class OptimizedBackwardPlan<T>
     private readonly Tensor<T> _loss;
     private readonly Tensor<T>[]? _sources;
     private readonly IEngine _engine;
+    private readonly BackwardStorageReleasePlan<T> _storageReleasePlan;
 
     /// <summary>
     /// Optional reference to the owning tape's RetainGrad set. Same parity rule
@@ -54,6 +55,7 @@ internal sealed class OptimizedBackwardPlan<T>
         _sources = sources;
         _engine = engine;
         _retainGrad = retainGrad;
+        _storageReleasePlan = BackwardStorageReleasePlan<T>.Create(entries, reachableIndices);
         _ = analysis; // Retained for future backward optimization passes
     }
 
@@ -109,38 +111,42 @@ internal sealed class OptimizedBackwardPlan<T>
         _inputsBuf2 = BackwardInputBuffers<T>.Get2();
         _inputsBuf3 = BackwardInputBuffers<T>.Get3();
 
-        // OOM fix: free each forward activation's GPU buffer as soon as it is DEAD — right after its entry's backward,
-        // in reverse-topological order its output is fully consumed (every consumer was processed earlier). Previously
-        // all forward activations stayed GPU-pinned for the whole backward, pegging the card at its memory limit →
-        // OOM at scale. Skip the loss + sources/retained tensors: the loss IS an entry.Output (the loss op's
-        // output), and the caller reads its value after backward, so it must never be freed mid-walk — same
-        // contract as CompiledDelegateChain.Execute. Sources and retain-grad tensors are likewise consumed by
-        // the caller after backward and must survive too. (Gated to GPU engine; materialize-then-free is
-        // correctness-safe.)
+        // Reclaim graph-owned activation storages progressively after their final declared backward use.
+        // Storage identity, not Tensor object identity, is the lifetime unit because metadata views alias their
+        // source. Loss/source/retain-grad storages remain protected for the caller.
         var gpuEngine = _engine as AiDotNet.Tensors.Engines.DirectGpuTensorEngine;
-        HashSet<Tensor<T>>? freeSkip = null;
+        HashSet<object>? protectedStorages = null;
         if (gpuEngine is not null)
         {
-            freeSkip = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance) { _loss };
-            if (_sources is not null) foreach (var s in _sources) freeSkip.Add(s);
-            if (_retainGrad is not null) foreach (var r in _retainGrad) freeSkip.Add(r);
-        }
-        void FreeDeadActivation(Tensor<T> t)
-        {
-            if (gpuEngine is not null && (freeSkip is null || !freeSkip.Contains(t)))
-                gpuEngine.InvalidateGpuCacheForTensor(t);
+            protectedStorages = new HashSet<object>(ReferenceEqualityComparer<object>.Instance)
+            {
+                _loss.StorageIdentity
+            };
+            if (_sources is not null)
+                foreach (var source in _sources) protectedStorages.Add(source.StorageIdentity);
+            if (_retainGrad is not null)
+                foreach (var retained in _retainGrad) protectedStorages.Add(retained.StorageIdentity);
         }
 
         try
         {
-            foreach (int i in _reachableIndices)
+            for (int executionStep = 0; executionStep < _reachableIndices.Length; executionStep++)
             {
+                int i = _reachableIndices[executionStep];
                 ref var entry = ref _entries[i];
 
                 if (!DifferentiableOps.IsGradientRequired(entry.Output))
+                {
+                    if (gpuEngine is not null)
+                        _storageReleasePlan.ReleaseAfterStep(executionStep, gpuEngine, protectedStorages!);
                     continue;
+                }
                 if (!grads.TryGetValue(entry.Output, out var gradOutput))
+                {
+                    if (gpuEngine is not null)
+                        _storageReleasePlan.ReleaseAfterStep(executionStep, gpuEngine, protectedStorages!);
                     continue;
+                }
 
                 entry.ValidateInputVersions();
 
@@ -150,7 +156,8 @@ internal sealed class OptimizedBackwardPlan<T>
                     // Try optimized path for MatMul operations
                     if (TryOptimizedMatMulBackward(ref entry, gradOutput, cse, grads))
                     {
-                        FreeDeadActivation(entry.Output);
+                        if (gpuEngine is not null)
+                            _storageReleasePlan.ReleaseAfterStep(executionStep, gpuEngine, protectedStorages!);
                         continue;
                     }
 
@@ -170,12 +177,14 @@ internal sealed class OptimizedBackwardPlan<T>
                     if (BackwardTiming.Enabled)
                         BackwardTiming.Record(entry.Backward.Method.Name, System.Diagnostics.Stopwatch.GetTimestamp() - _bwdStart);
 
-                    FreeDeadActivation(entry.Output);
                 }
                 finally
                 {
                     DifferentiableOps.EndBackwardStep(previousAccumulatorOwners);
                 }
+
+                if (gpuEngine is not null)
+                    _storageReleasePlan.ReleaseAfterStep(executionStep, gpuEngine, protectedStorages!);
             }
         }
         finally

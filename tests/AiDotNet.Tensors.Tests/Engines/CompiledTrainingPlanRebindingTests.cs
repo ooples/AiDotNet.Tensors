@@ -10,6 +10,7 @@ namespace AiDotNet.Tensors.Tests.Engines;
 /// Tests that CompiledTrainingPlan.Step() sees in-place parameter updates.
 /// Repro for: compiled plan returning constant loss after SGD updates.
 /// </summary>
+[Collection("CompilationGlobalState")]
 public class CompiledTrainingPlanRebindingTests : IDisposable
 {
     // PR #333's [ModuleInitializer] auto-promotes AiDotNetEngine.Current to a

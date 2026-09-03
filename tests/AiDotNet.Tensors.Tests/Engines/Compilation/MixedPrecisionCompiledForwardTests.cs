@@ -71,7 +71,7 @@ public class MixedPrecisionCompiledForwardTests
                 }
                 finally { GraphMode.SetCurrent(null); }
             }
-            var plan = MixedPrecisionCompiledPlan.Compile(yPlan, _engine);
+            using var plan = MixedPrecisionCompiledPlan.Compile(yPlan, _engine);
 
             var out1 = plan.Forward().ToArray();
             AssertClose(ref1, out1, "initial replay vs fresh trace");

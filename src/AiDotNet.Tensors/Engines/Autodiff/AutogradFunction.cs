@@ -76,7 +76,7 @@ public abstract class AutogradFunction<T>
 /// <summary>
 /// Context object for saving tensors between forward and backward passes.
 /// </summary>
-public sealed class AutogradContext
+public sealed class AutogradContext : ISavedStateTensorContainer
 {
     private readonly List<object> _saved = [];
 
@@ -100,4 +100,6 @@ public sealed class AutogradContext
 
     /// <summary>Gets the number of saved items.</summary>
     public int SavedCount => _saved.Count;
+
+    IReadOnlyList<object> ISavedStateTensorContainer.SavedStateValues => _saved;
 }
