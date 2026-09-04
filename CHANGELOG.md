@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.130.2](https://github.com/ooples/AiDotNet.Tensors/compare/v0.130.1...v0.130.2) (2026-09-04)
+
+
+### Bug Fixes
+
+* **compilation:** classify empty graph capture failures ([#1009](https://github.com/ooples/AiDotNet.Tensors/issues/1009)) ([04cdf64](https://github.com/ooples/AiDotNet.Tensors/commit/04cdf641f3a8cc168efc100001a2be1313dc833e))
+
 ## [0.130.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.130.0...v0.130.1) (2026-09-04)
 
 
