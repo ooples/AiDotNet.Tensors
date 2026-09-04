@@ -10,24 +10,24 @@ namespace AiDotNet.Tensors.Engines.Simd;
 /// Table-driven sigmoid with quadratic interpolation.
 ///
 /// Instead of computing 1/(1+exp(-x)) which requires expensive exp + divide,
-/// use a precomputed 258-entry lookup table covering [-8, 8] with quadratic
-/// interpolation. Outside this range, sigmoid saturates to 0 or 1.
+/// use a precomputed 514-entry lookup table covering [-16, 16] with quadratic
+/// interpolation. Outside this range, sigmoid saturates to 0 or 1 at float32 precision.
 ///
 /// Computation per element: 1 multiply (index) + 1 clamp + table load + 2 FMA
 /// Total: ~5 ops vs ~14 for exp+divide path
 ///
 /// Accuracy: max 2.1e-6 absolute error within the interpolation interval.
-/// Table: 258 entries = 1032 bytes (fits in L1 cache)
+/// Table: 514 entries = 2056 bytes (fits in L1 cache)
 /// </summary>
 internal static class TableDrivenSigmoid
 {
-    private const int TableSize = 256;
-    private const float XMin = -8.0f;
-    private const float XMax = 8.0f;
+    private const int TableSize = 512;
+    private const float XMin = -16.0f;
+    private const float XMax = 16.0f;
     private const float Step = (XMax - XMin) / TableSize; // 0.0625
     private const float InvStep = TableSize / (XMax - XMin); // 16.0
 
-    // Pre-computed sigmoid values at 258 points (256 + 2 for quadratic interpolation boundary)
+    // Pre-computed sigmoid values at 514 points (512 + 2 for quadratic interpolation boundary)
     private static readonly float[] Table = GenerateTable();
 
     private static float[] GenerateTable()
@@ -48,8 +48,8 @@ internal static class TableDrivenSigmoid
     internal static float Sigmoid(float x)
     {
         if (float.IsNaN(x)) return float.NaN;
-        if (x <= XMin) return 0f;
-        if (x >= XMax) return 1f;
+        if (x < XMin) return 0f;
+        if (x > XMax) return 1f;
 
         float t = (x - XMin) * InvStep;
         int idx = (int)t;
@@ -127,9 +127,9 @@ internal static class TableDrivenSigmoid
                     // while the scalar path returns the exact saturation values.
                     result = Avx.Max(vZero, Avx.Min(vOne, result));
                     var lowMask = Avx.Compare(
-                        x, vXMin, FloatComparisonMode.OrderedLessThanOrEqualSignaling);
+                        x, vXMin, FloatComparisonMode.OrderedLessThanSignaling);
                     var highMask = Avx.Compare(
-                        x, Vector256.Create(XMax), FloatComparisonMode.OrderedGreaterThanOrEqualSignaling);
+                        x, Vector256.Create(XMax), FloatComparisonMode.OrderedGreaterThanSignaling);
                     var nanMask = Avx.CompareNotEqual(x, x);
                     result = Avx.BlendVariable(result, vZero, lowMask);
                     result = Avx.BlendVariable(result, vOne, highMask);
