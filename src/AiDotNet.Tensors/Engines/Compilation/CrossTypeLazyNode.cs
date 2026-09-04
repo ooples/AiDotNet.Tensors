@@ -124,6 +124,13 @@ internal sealed class CrossTypeLazyNode<TIn, TOut> : ILazyNode
         Output.LazySource = null;
     }
 
+    /// <summary>Detaches this node from its output when its trace is abandoned.</summary>
+    public void RestoreOutputLazySource()
+    {
+        if (ReferenceEquals(Output.LazySource, this))
+            Output.LazySource = null;
+    }
+
     public void AddStorageLeases(TensorStorageLeaseSet leases)
     {
         leases.Add(Input);

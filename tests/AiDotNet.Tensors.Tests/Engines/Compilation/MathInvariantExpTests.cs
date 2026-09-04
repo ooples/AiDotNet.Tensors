@@ -150,7 +150,7 @@ public class MathInvariantExpTests
             // For moderate inputs, sigmoid should be strictly between 0 and 1
             if (MathF.Abs(input[i]) < 15f) // float32 sigmoid saturates at ~16
                 Assert.True(output[i] > 0f && output[i] < 1f,
-                    $"sigmoid({input[i]}) = {output[i]} — must be in (0,1) for |x| < 30");
+                    $"sigmoid({input[i]}) = {output[i]} — must be in (0,1) for |x| < 15");
         }
     }
 

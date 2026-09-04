@@ -22,7 +22,9 @@ internal enum GraphCaptureLimitation : byte
     MixedElementTypes,
     HostBoundary,
     Stateful,
-    MissingBackwardContract
+    MissingBackwardContract,
+    NoCompilableOperations,
+    UnrootedOutput
 }
 
 /// <summary>
@@ -147,6 +149,10 @@ internal static class GraphMode
                 "it mutates state during execution",
             GraphCaptureLimitation.MissingBackwardContract =>
                 "it has no backward contract",
+            GraphCaptureLimitation.NoCompilableOperations =>
+                "it contains no compilable tensor operations",
+            GraphCaptureLimitation.UnrootedOutput =>
+                "its requested output is not rooted in the captured graph",
             _ => throw new ArgumentOutOfRangeException(nameof(limitation))
         };
 

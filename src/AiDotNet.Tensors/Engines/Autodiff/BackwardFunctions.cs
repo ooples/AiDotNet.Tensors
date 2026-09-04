@@ -3924,6 +3924,17 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        // Eager tape entries contain only the two differentiable branches.
+        // Compiled graph nodes additionally retain the condition as input 0
+        // so its producer remains in the replay graph.
+        int branchInputOffset = inputs.Length switch
+        {
+            2 => 0,
+            3 => 1,
+            _ => throw new InvalidOperationException(
+                $"TensorWhere backward expected 2 or 3 inputs, but received {inputs.Length}.")
+        };
+
         var numOps = MathHelper.GetNumericOperations<T>();
         if (savedState[0] is Tensor<T> condTensor)
         {
@@ -3942,8 +3953,8 @@ internal static class BackwardFunctions<T>
             var ones = engine.TensorAddScalar(engine.TensorMultiplyScalar(mask, numOps.Zero), numOps.One);
             var invCond = engine.TensorSubtract(ones, mask);
             var gradY = engine.TensorMultiply(gradOutput, invCond);
-            DifferentiableOps.AccumulateGrad(grads, inputs[0], gradX, engine);
-            DifferentiableOps.AccumulateGrad(grads, inputs[1], gradY, engine);
+            DifferentiableOps.AccumulateGrad(grads, inputs[branchInputOffset], gradX, engine);
+            DifferentiableOps.AccumulateGrad(grads, inputs[branchInputOffset + 1], gradY, engine);
             return;
         }
 
@@ -3968,8 +3979,8 @@ internal static class BackwardFunctions<T>
         var invCond2 = engine.TensorSubtract(
             engine.TensorAddScalar(engine.TensorMultiplyScalar(condT, numOps.Zero), numOps.One), condT);
         var gradY2 = engine.TensorMultiply(gradOutput, invCond2);
-        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradX2, engine);
-        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradY2, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[branchInputOffset], gradX2, engine);
+        DifferentiableOps.AccumulateGrad(grads, inputs[branchInputOffset + 1], gradY2, engine);
     }
 
     /// <summary>MaskedFill backward: zero gradient where mask is true</summary>

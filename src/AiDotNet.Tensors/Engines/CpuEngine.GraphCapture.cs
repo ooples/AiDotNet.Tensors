@@ -9,6 +9,61 @@ namespace AiDotNet.Tensors.Engines;
 public partial class CpuEngine
 {
     /// <summary>
+    /// Captures a value-dependent unary comparison in any graph kind. Comparison
+    /// results are forward-only masks: they must be recomputed on every replay,
+    /// but gradients do not flow through the discontinuous predicate itself.
+    /// </summary>
+    protected Tensor<T> CaptureComparisonKernel<T>(
+        Tensor<T> input,
+        Func<IEngine, Tensor<T>> execute,
+        [CallerMemberName] string operationName = "")
+    {
+        var scope = GraphMode.Current
+            ?? throw new InvalidOperationException("Comparison capture requires an active graph scope.");
+        if (execute is null) throw new ArgumentNullException(nameof(execute));
+
+        scope.BindEngineIfUnset(this);
+        return scope.RecordUnary(
+            LazyNodeType.Custom,
+            operationName,
+            input,
+            input._shape,
+            (engine, output) =>
+            {
+                Tensor<T> result = execute(engine);
+                DirectGpuTensorEngine.CopyResultInto(engine, result, output);
+            });
+    }
+
+    /// <summary>
+    /// Captures a value-dependent binary comparison in any graph kind. The
+    /// output shape is identical to the already-validated operand shape.
+    /// </summary>
+    protected Tensor<T> CaptureComparisonKernel<T>(
+        Tensor<T> left,
+        Tensor<T> right,
+        Func<IEngine, Tensor<T>> execute,
+        [CallerMemberName] string operationName = "")
+    {
+        var scope = GraphMode.Current
+            ?? throw new InvalidOperationException("Comparison capture requires an active graph scope.");
+        if (execute is null) throw new ArgumentNullException(nameof(execute));
+
+        scope.BindEngineIfUnset(this);
+        return scope.RecordBinary(
+            LazyNodeType.Custom,
+            operationName,
+            left,
+            right,
+            left._shape,
+            (engine, output) =>
+            {
+                Tensor<T> result = execute(engine);
+                DirectGpuTensorEngine.CopyResultInto(engine, result, output);
+            });
+    }
+
+    /// <summary>
     /// Captures a kernel as one opaque inference node while preserving the public tensor operands
     /// as graph leaves. The eager trace invocation establishes the exact output shape; replay calls
     /// the engine bound to the graph, so a DirectGpuTensorEngine trace continues to dispatch to GPU

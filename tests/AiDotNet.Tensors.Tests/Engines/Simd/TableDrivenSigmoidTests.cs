@@ -16,21 +16,21 @@ public sealed class TableDrivenSigmoidTests
         float[] input =
         [
             float.NegativeInfinity,
+            -16.0f,
+            -15.999f,
+            -15.9375f,
             -8.0f,
-            -7.999f,
-            -7.9375f,
-            7.875f,
-            7.9375f,
-            7.999f,
             8.0f,
+            15.875f,
+            15.9375f,
+            15.999f,
+            16.0f,
             float.PositiveInfinity,
             float.NaN,
             -0.125f,
             0.125f,
             -3.25f,
             3.25f,
-            -1.0f,
-            1.0f,
         ];
         var output = new float[input.Length];
 
@@ -62,7 +62,7 @@ public sealed class TableDrivenSigmoidTests
         var input = new float[length];
         var output = new float[length];
         for (int i = 0; i < length; i++)
-            input[i] = 7.75f + 0.249f * i / (length - 1);
+            input[i] = 15.75f + 0.249f * i / (length - 1);
 
         fixed (float* inputPtr = input)
         fixed (float* outputPtr = output)
@@ -74,6 +74,31 @@ public sealed class TableDrivenSigmoidTests
             Assert.True(
                 MathF.Abs(expected - output[i]) <= 2.2e-6f,
                 $"index {i}, x={input[i]:R}: expected={expected:R}, actual={output[i]:R}");
+        }
+    }
+
+    [Theory]
+    [InlineData(-16f)]
+    [InlineData(-14.375474f)]
+    [InlineData(14.375474f)]
+    [InlineData(16f)]
+    public unsafe void SigmoidArray_CentralRangeDoesNotPrematurelySaturate(float value)
+    {
+        var input = new float[8];
+        var output = new float[8];
+        Array.Fill(input, value);
+
+        fixed (float* inputPtr = input)
+        fixed (float* outputPtr = output)
+            TableDrivenSigmoid.SigmoidArray(inputPtr, outputPtr, input.Length);
+
+        float expected = 1.0f / (1.0f + MathF.Exp(-value));
+        for (int i = 0; i < output.Length; i++)
+        {
+            Assert.True(output[i] > 0f && output[i] < 1f,
+                $"table sigmoid({value}) = {output[i]} — central inputs must not saturate");
+            Assert.True(MathF.Abs(output[i] - expected) < 1e-6f,
+                $"table sigmoid({value}) = {output[i]}, expected {expected}");
         }
     }
 }

@@ -6480,9 +6480,9 @@ public partial class CpuEngine : ITensorLevelEngine
     public Tensor<T> TensorEquals<T>(Tensor<T> tensor, T value)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
-        if (GraphMode.IsInferenceTrace)
-            return CaptureInferenceKernel(
-                new[] { tensor }, engine => engine.TensorEquals(tensor, value));
+        if (GraphMode.IsActive)
+            return CaptureComparisonKernel(
+                tensor, engine => engine.TensorEquals(tensor, value));
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
@@ -6502,18 +6502,17 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
-        if (GraphMode.IsInferenceTrace)
-            return CaptureInferenceKernel(new[] { a, b }, engine => engine.TensorEquals(a, b));
-        var aOrig = a;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
-        if (!a.IsContiguous) a = a.Contiguous();
-        var bOrig = b;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
-        if (!b.IsContiguous) b = b.Contiguous();
         if (!ShapesMatch(a._shape, b._shape))
         {
             throw new ArgumentException(
                 $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
         }
-
+        if (GraphMode.IsActive)
+            return CaptureComparisonKernel(a, b, engine => engine.TensorEquals(a, b));
+        var aOrig = a;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
+        if (!a.IsContiguous) a = a.Contiguous();
+        var bOrig = b;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
+        if (!b.IsContiguous) b = b.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = AutoTensorCache.RentOrAllocate<T>(a._shape);
         var srcA = a.AsSpan();
@@ -6530,9 +6529,9 @@ public partial class CpuEngine : ITensorLevelEngine
     public Tensor<T> TensorNotEquals<T>(Tensor<T> tensor, T value)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
-        if (GraphMode.IsInferenceTrace)
-            return CaptureInferenceKernel(
-                new[] { tensor }, engine => engine.TensorNotEquals(tensor, value));
+        if (GraphMode.IsActive)
+            return CaptureComparisonKernel(
+                tensor, engine => engine.TensorNotEquals(tensor, value));
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
@@ -6552,18 +6551,17 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
-        if (GraphMode.IsInferenceTrace)
-            return CaptureInferenceKernel(new[] { a, b }, engine => engine.TensorNotEquals(a, b));
-        var aOrig = a;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
-        if (!a.IsContiguous) a = a.Contiguous();
-        var bOrig = b;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
-        if (!b.IsContiguous) b = b.Contiguous();
         if (!ShapesMatch(a._shape, b._shape))
         {
             throw new ArgumentException(
                 $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
         }
-
+        if (GraphMode.IsActive)
+            return CaptureComparisonKernel(a, b, engine => engine.TensorNotEquals(a, b));
+        var aOrig = a;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
+        if (!a.IsContiguous) a = a.Contiguous();
+        var bOrig = b;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
+        if (!b.IsContiguous) b = b.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = AutoTensorCache.RentOrAllocate<T>(a._shape);
         var srcA = a.AsSpan();
@@ -6581,18 +6579,17 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
-        if (GraphMode.IsInferenceTrace)
-            return CaptureInferenceKernel(new[] { a, b }, engine => engine.TensorGreaterThan(a, b));
-        var aOrig = a;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
-        if (!a.IsContiguous) a = a.Contiguous();
-        var bOrig = b;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
-        if (!b.IsContiguous) b = b.Contiguous();
         if (!ShapesMatch(a._shape, b._shape))
         {
             throw new ArgumentException(
                 $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
         }
-
+        if (GraphMode.IsActive)
+            return CaptureComparisonKernel(a, b, engine => engine.TensorGreaterThan(a, b));
+        var aOrig = a;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
+        if (!a.IsContiguous) a = a.Contiguous();
+        var bOrig = b;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
+        if (!b.IsContiguous) b = b.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = AutoTensorCache.RentOrAllocate<T>(a._shape);
         var srcA = a.AsSpan();
@@ -6609,9 +6606,9 @@ public partial class CpuEngine : ITensorLevelEngine
     public Tensor<T> TensorGreaterThan<T>(Tensor<T> tensor, T value)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
-        if (GraphMode.IsInferenceTrace)
-            return CaptureInferenceKernel(
-                new[] { tensor }, engine => engine.TensorGreaterThan(tensor, value));
+        if (GraphMode.IsActive)
+            return CaptureComparisonKernel(
+                tensor, engine => engine.TensorGreaterThan(tensor, value));
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
@@ -6631,18 +6628,17 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (b == null) throw new ArgumentNullException(nameof(b));
-        if (GraphMode.IsInferenceTrace)
-            return CaptureInferenceKernel(new[] { a, b }, engine => engine.TensorLessThan(a, b));
-        var aOrig = a;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
-        if (!a.IsContiguous) a = a.Contiguous();
-        var bOrig = b;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
-        if (!b.IsContiguous) b = b.Contiguous();
         if (!ShapesMatch(a._shape, b._shape))
         {
             throw new ArgumentException(
                 $"Tensor shapes must match. Got {FormatShape(a._shape)} and {FormatShape(b._shape)}.");
         }
-
+        if (GraphMode.IsActive)
+            return CaptureComparisonKernel(a, b, engine => engine.TensorLessThan(a, b));
+        var aOrig = a;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
+        if (!a.IsContiguous) a = a.Contiguous();
+        var bOrig = b;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
+        if (!b.IsContiguous) b = b.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = AutoTensorCache.RentOrAllocate<T>(a._shape);
         var srcA = a.AsSpan();
@@ -6659,9 +6655,9 @@ public partial class CpuEngine : ITensorLevelEngine
     public Tensor<T> TensorLessThan<T>(Tensor<T> tensor, T value)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
-        if (GraphMode.IsInferenceTrace)
-            return CaptureInferenceKernel(
-                new[] { tensor }, engine => engine.TensorLessThan(tensor, value));
+        if (GraphMode.IsActive)
+            return CaptureComparisonKernel(
+                tensor, engine => engine.TensorLessThan(tensor, value));
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
@@ -35640,6 +35636,9 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (condition == null) throw new ArgumentNullException(nameof(condition));
         if (x == null) throw new ArgumentNullException(nameof(x));
+        if (y == null) throw new ArgumentNullException(nameof(y));
+        if (!condition._shape.SequenceEqual(x._shape) || !condition._shape.SequenceEqual(y._shape))
+            throw new ArgumentException("All tensors must have the same shape");
 
         if (GraphMode.IsActive)
         {
@@ -35647,22 +35646,25 @@ public partial class CpuEngine : ITensorLevelEngine
             if (scope != null)
             {
                 var cc = condition; var cx = x; var cy = y;
+                BackwardFunction<T>? backwardFn = GraphMode.IsInferenceTrace
+                    ? null
+                    : BackwardFunctions<T>.WhereBackward;
+                object[]? savedState = GraphMode.IsInferenceTrace
+                    ? null
+                    : new object[] { condition };
                 return scope.RecordVariadic(LazyNodeType.Custom, "TensorWhere",
                     new[] { condition, x, y }, x._shape,
-                    (eng, output) => { var r = eng.TensorWhere(cc, cx, cy); DirectGpuTensorEngine.CopyResultInto(eng, r, output); });
+                    (eng, output) => { var r = eng.TensorWhere(cc, cx, cy); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
+                    backwardFn,
+                    savedState);
             }
         }
-        if (y == null) throw new ArgumentNullException(nameof(y));
         var yOrig = y;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!y.IsContiguous) y = y.Contiguous();
         var xOrig = x;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!x.IsContiguous) x = x.Contiguous();
         var conditionOrig = condition;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!condition.IsContiguous) condition = condition.Contiguous();
-
-        // All tensors must have the same shape (or be broadcastable, but we'll require same shape for simplicity)
-        if (!condition._shape.SequenceEqual(x._shape) || !condition._shape.SequenceEqual(y._shape))
-            throw new ArgumentException("All tensors must have the same shape");
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = AutoTensorCache.RentOrAllocate<T>(condition._shape);
