@@ -273,7 +273,7 @@ public sealed class CompiledModelCache<T> : IDisposable
     /// forward lambda doesn't record any tensor operations. A zero-op plan
     /// with zero captured inputs is always a mistake — <see cref="ICompiledPlan{T}.SetInputs"/>
     /// cannot wire user data into a graph that has no nodes, and the
-    /// resulting <c>ArgumentException</c> ("This plan was compiled with 0
+    /// resulting input-binding exception ("This plan was compiled with 0
     /// captured input(s)") gives the user no hint about WHY the plan is
     /// empty. The most common cause: the forward body allocates a fresh
     /// tensor with <c>new Tensor&lt;T&gt;(...)</c> and fills it via indexer
@@ -288,14 +288,15 @@ public sealed class CompiledModelCache<T> : IDisposable
         // we match the existing CompileInference contract.
         if (explicitOutput is null)
             return;
-        throw new ArgumentException(
+        throw new GraphCaptureNotSupportedException(
+            "forward",
+            GraphCaptureLimitation.NoCompilableOperations,
             "The forward lambda did not record any tensor operations, so the compiled plan " +
             "has zero steps and cannot accept inputs. This typically happens when the forward " +
             "uses `new Tensor<T>(...)` and writes values through the indexer — both bypass the " +
             "lazy-graph tracer. Use engine operations on the input tensor (TensorAdd, " +
             "TensorMultiply, MatMul, activation methods, etc.) so the tracer captures the " +
-            "computation graph. See issue #239.",
-            "forward");
+            "computation graph. See issue #239.");
     }
 
     public void Dispose()

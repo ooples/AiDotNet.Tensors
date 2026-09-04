@@ -28,6 +28,15 @@ namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 /// </summary>
 public class CompileTracerBugfixTests
 {
+    public enum EmptyGraphEntryPoint : byte
+    {
+        Tensor,
+        Shape,
+        MultipleInputs,
+        Training,
+        SymbolicShape
+    }
+
     // ── Issue #238 ───────────────────────────────────────────────────────
 
     [Fact]
@@ -116,16 +125,22 @@ public class CompileTracerBugfixTests
 
     // ── Issue #239 ───────────────────────────────────────────────────────
 
-    [Fact]
-    public void Issue239_GetOrCompileInference_ThrowsClearErrorWhenForwardRecordsNothing()
+    [Theory]
+    [InlineData(EmptyGraphEntryPoint.Tensor)]
+    [InlineData(EmptyGraphEntryPoint.Shape)]
+    [InlineData(EmptyGraphEntryPoint.MultipleInputs)]
+    [InlineData(EmptyGraphEntryPoint.Training)]
+    [InlineData(EmptyGraphEntryPoint.SymbolicShape)]
+    public void Issue239_EmptyGraphEntryPoints_ThrowTypedCaptureLimitation(
+        EmptyGraphEntryPoint entryPoint)
     {
         // Minimal repro from the issue: forward allocates a fresh Tensor<T>
         // and writes values through the indexer. Both ops bypass the lazy
         // graph, so the scope captures zero nodes. Before the fix this
         // silently returned an unusable 0-step plan and SetInputs threw
         // "compiled with 0 captured input(s); got 1". After the fix the
-        // compile step throws a descriptive ArgumentException pointing at
-        // the forward lambda.
+        // compile step throws a typed capture limitation pointing at the
+        // forward lambda.
 
         var input = new Tensor<double>(new[] { 2 });
         input[0] = 1.0;
@@ -133,23 +148,42 @@ public class CompileTracerBugfixTests
 
         using var cache = new CompiledModelCache<double>();
 
-        var ex = Assert.Throws<ArgumentException>(() =>
+        var secondInput = new Tensor<double>(new[] { 2 });
+        Action compile = entryPoint switch
         {
-            cache.GetOrCompileInference(input, () =>
-            {
-                var output = new Tensor<double>(new[] { 2 });
-                output[0] = input[0] * 2.0;
-                output[1] = input[1] * 3.0;
-                return output;
-            });
-        });
+            EmptyGraphEntryPoint.Tensor => () => cache.GetOrCompileInference(input, CreateOutput),
+            EmptyGraphEntryPoint.Shape => () => cache.GetOrCompileInference(new[] { 2 }, CreateOutput),
+            EmptyGraphEntryPoint.MultipleInputs => () => cache.GetOrCompileInference(
+                new[] { input, secondInput },
+                CreateOutput),
+            EmptyGraphEntryPoint.Training => () => cache.GetOrCompileTraining(
+                new[] { 2 },
+                CreateOutput,
+                Array.Empty<Tensor<double>>()),
+            EmptyGraphEntryPoint.SymbolicShape => () => cache.GetOrCompileInference(
+                new[] { 2 },
+                CreateOutput,
+                SymbolicShape.AllDynamic(new[] { 2 })),
+            _ => throw new ArgumentOutOfRangeException(nameof(entryPoint))
+        };
 
-        Assert.Equal("forward", ex.ParamName);
+        var ex = Assert.Throws<GraphCaptureNotSupportedException>(compile);
+
+        Assert.Equal("forward", ex.OperationName);
+        Assert.Equal(GraphCaptureLimitation.NoCompilableOperations, ex.Limitation);
         // Spot-check that the error points at the bypass-the-tracer root
         // cause and references the issue — future readers can trace back.
         Assert.Contains("forward lambda did not record any tensor operations",
                         ex.Message);
         Assert.Contains("#239", ex.Message);
+
+        Tensor<double> CreateOutput()
+        {
+            var output = new Tensor<double>(new[] { 2 });
+            output[0] = input[0] * 2.0;
+            output[1] = input[1] * 3.0;
+            return output;
+        }
     }
 
     [Fact]
@@ -175,26 +209,4 @@ public class CompileTracerBugfixTests
         Assert.Equal(6.0, output[1], precision: 6);
     }
 
-    [Fact]
-    public void Issue239_IntShapeOverload_ThrowsSameError()
-    {
-        // The int[]-shape overload must guard the same scenario — a layer
-        // library calling the shape overload shouldn't get a silently
-        // broken plan either.
-
-        using var cache = new CompiledModelCache<double>();
-
-        var ex = Assert.Throws<ArgumentException>(() =>
-        {
-            cache.GetOrCompileInference(new[] { 2 }, () =>
-            {
-                var output = new Tensor<double>(new[] { 2 });
-                output[0] = 1.0;
-                output[1] = 2.0;
-                return output;
-            });
-        });
-
-        Assert.Equal("forward", ex.ParamName);
-    }
 }
