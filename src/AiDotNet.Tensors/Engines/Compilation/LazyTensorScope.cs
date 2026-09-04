@@ -521,6 +521,20 @@ internal sealed class LazyTensorScope : IDisposable
             GraphMode.SetCurrent(_parent);
     }
 
+    /// <summary>
+    /// Discards an incomplete explicit compilation trace without executing it.
+    /// Inference and training scopes are opened to build plans, so replaying a
+    /// partial graph while an exception unwinds would introduce work and user-
+    /// visible side effects that the failed operation never requested.
+    /// </summary>
+    private void Abandon()
+    {
+        foreach (var node in _nodes)
+            node.ClearOutputLazySource();
+
+        _realized = true;
+    }
+
     public void Dispose()
     {
         if (_disposed) return;
@@ -528,9 +542,17 @@ internal sealed class LazyTensorScope : IDisposable
 
         try
         {
-            // Auto-realize on dispose if not yet done (safety net)
+            // Compatibility scopes retain the historical lazy-evaluation
+            // contract. Explicit inference/training scopes exist only to
+            // compile a plan; if compilation did not complete, abandon the
+            // partial trace instead of executing callbacks during Dispose.
             if (!_realized)
-                Realize();
+            {
+                if (_traceKind == GraphTraceKind.Compatibility)
+                    Realize();
+                else
+                    Abandon();
+            }
         }
         finally
         {

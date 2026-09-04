@@ -70,6 +70,9 @@ internal sealed class MockBackendState
     public int UnaryOpCalls { get; set; }
     public int BinaryOpCalls { get; set; }
     public int TanhCalls { get; set; }
+    public int EqualsCalls { get; set; }
+    public int NotEqualsCalls { get; set; }
+    public int WhereCalls { get; set; }
     public List<string> OptimizerCalls { get; } = new();
 }
 
@@ -193,6 +196,48 @@ public class MockDirectGpuBackend : DispatchProxy
                 var output = (MockGpuBuffer)args[1]!;
                 int size = (int)args[2]!;
                 for (int i = 0; i < size; i++) output.Data[i] = MathF.Tanh(input.Data[i]);
+                return null!;
+            }
+            case "EqualsKernel":
+            {
+                _state.EqualsCalls++;
+                var left = (MockGpuBuffer)args[0]!;
+                var right = (MockGpuBuffer)args[1]!;
+                var output = (MockGpuBuffer)args[2]!;
+                int size = (int)args[3]!;
+                for (int i = 0; i < size; i++) output.Data[i] = left.Data[i] == right.Data[i] ? 1f : 0f;
+                return null!;
+            }
+            case "NotEqualScalar":
+            {
+                _state.NotEqualsCalls++;
+                var input = (MockGpuBuffer)args[0]!;
+                var output = (MockGpuBuffer)args[1]!;
+                float value = (float)args[2]!;
+                int size = (int)args[3]!;
+                for (int i = 0; i < size; i++) output.Data[i] = input.Data[i] != value ? 1f : 0f;
+                return null!;
+            }
+            case "NotEqualsKernel":
+            {
+                _state.NotEqualsCalls++;
+                var left = (MockGpuBuffer)args[0]!;
+                var right = (MockGpuBuffer)args[1]!;
+                var output = (MockGpuBuffer)args[2]!;
+                int size = (int)args[3]!;
+                for (int i = 0; i < size; i++) output.Data[i] = left.Data[i] != right.Data[i] ? 1f : 0f;
+                return null!;
+            }
+            case "Where":
+            {
+                _state.WhereCalls++;
+                var condition = (MockGpuBuffer)args[0]!;
+                var whenTrue = (MockGpuBuffer)args[1]!;
+                var whenFalse = (MockGpuBuffer)args[2]!;
+                var output = (MockGpuBuffer)args[3]!;
+                int size = (int)args[4]!;
+                for (int i = 0; i < size; i++)
+                    output.Data[i] = condition.Data[i] != 0f ? whenTrue.Data[i] : whenFalse.Data[i];
                 return null!;
             }
             case "Min" when args.Length == 2:

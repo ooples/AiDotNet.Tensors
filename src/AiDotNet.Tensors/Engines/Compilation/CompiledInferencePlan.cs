@@ -1248,18 +1248,24 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         // outputs were stale or uninitialized. Reject the graph until heterogeneous mutable-input
         // rebinding and type-erased compiled steps are implemented as one coherent feature.
         if (optimized.Count == 0)
-            throw new NotSupportedException(
+            throw new GraphCaptureNotSupportedException(
+                nameof(Compile),
+                GraphCaptureLimitation.NoCompilableOperations,
                 "The captured inference graph contains no compilable tensor operations.");
 
         if (optimized.Any(node => node is not LazyNode<T>))
-            throw new NotSupportedException(
+            throw new GraphCaptureNotSupportedException(
+                nameof(Compile),
+                GraphCaptureLimitation.MixedElementTypes,
                 "The captured inference graph crosses tensor element types. " +
                 "Heterogeneous compiled inference plans are not supported yet.");
 
         if (explicitOutput is not null)
         {
             if (explicitOutput.LazySource is not ILazyNode outputNode || !optimized.Contains(outputNode))
-                throw new NotSupportedException(
+                throw new GraphCaptureNotSupportedException(
+                    nameof(Compile),
+                    GraphCaptureLimitation.UnrootedOutput,
                     "The requested inference output is not rooted in the captured graph. " +
                     "An eager operation escaped graph capture, so compiling would freeze stale data.");
         }

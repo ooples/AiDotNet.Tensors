@@ -19639,6 +19639,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorWhere<T>(Tensor<T> condition, Tensor<T> x, Tensor<T> y)
     {
+        // The base engine records the condition and both branches as graph inputs.
+        // Executing the GPU kernel while tracing would freeze the trace-time mask;
+        // replay reaches this fast path after graph capture has ended.
+        if (Compilation.GraphMode.IsActive)
+            return base.TensorWhere(condition, x, y);
+
         if (!TryGetBackend(out var backend))
             return base.TensorWhere(condition, x, y);
 
@@ -24511,7 +24517,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.TensorEquals<T>(Tensor<T> tensor, T value)
     {
-        if (!IsTapeActive<T>() && typeof(T) == typeof(float) && tensor.IsContiguous
+        if (!IsTapeActive<T>() && !Compilation.GraphMode.IsActive
+            && typeof(T) == typeof(float) && tensor.IsContiguous
             && TryGetBackend(out var backend))
         {
             try
@@ -24539,7 +24546,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.TensorNotEquals<T>(Tensor<T> tensor, T value)
     {
-        if (!IsTapeActive<T>() && typeof(T) == typeof(float) && tensor.IsContiguous
+        if (!IsTapeActive<T>() && !Compilation.GraphMode.IsActive
+            && typeof(T) == typeof(float) && tensor.IsContiguous
             && TryGetBackend(out var backend))
         {
             try
@@ -24565,7 +24573,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.TensorEquals<T>(Tensor<T> a, Tensor<T> b2)
     {
-        if (TryGetBackend(out var b) && ShapesMatch(a.Shape._dims, b2.Shape._dims))
+        if (!IsTapeActive<T>() && !Compilation.GraphMode.IsActive && typeof(T) == typeof(float)
+            && TryGetBackend(out var b) && ShapesMatch(a.Shape._dims, b2.Shape._dims))
         {
             try
             {
@@ -24582,7 +24591,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.TensorNotEquals<T>(Tensor<T> a, Tensor<T> b2)
     {
-        if (TryGetBackend(out var b) && ShapesMatch(a.Shape._dims, b2.Shape._dims))
+        if (!IsTapeActive<T>() && !Compilation.GraphMode.IsActive && typeof(T) == typeof(float)
+            && TryGetBackend(out var b) && ShapesMatch(a.Shape._dims, b2.Shape._dims))
         {
             try
             {
