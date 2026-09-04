@@ -531,7 +531,7 @@ internal static partial class SimdGemm
         {
             c.Clear();
             SgemmAddInternal(a, k, false, b.AsSpan(), n, false, c, m, k, n,
-                allowParallel: true, clearedOutput: true);
+                allowParallel: UseParallelGemm, clearedOutput: true);
             return;
         }
 
@@ -558,7 +558,7 @@ internal static partial class SimdGemm
             // for SgemmWithCachedB, so zero c before passing clearedOutput:true.
             c.Clear();
             SgemmAddInternal(a, k, false, b.AsSpan(), n, false, c, m, k, n,
-                allowParallel: true, clearedOutput: true);
+                allowParallel: UseParallelGemm, clearedOutput: true);
             return;
         }
 
@@ -832,7 +832,7 @@ internal static partial class SimdGemm
         if (n > Nc || Avx512Sgemm.CanUse)
         {
             SgemmAddInternal(a, k, false, b.AsSpan(), n, false, c, m, k, n,
-                allowParallel: true, clearedOutput: true);
+                allowParallel: UseParallelGemm, clearedOutput: true);
             return;
         }
 
@@ -1389,6 +1389,34 @@ internal static partial class SimdGemm
     }
 
     /// <summary>
+    /// Runs the managed SGEMM implementation under an explicit per-call execution policy for autotuning.
+    /// </summary>
+    /// <remarks>
+    /// This bypasses the process-wide <see cref="UseParallelGemm"/> switch. It lets startup and background
+    /// tuning compare both policies without changing the behavior of concurrent production GEMM calls.
+    /// </remarks>
+    internal static void SgemmForAutotune(
+        ReadOnlySpan<float> a,
+        ReadOnlySpan<float> b,
+        Span<float> c,
+        int m,
+        int k,
+        int n,
+        SgemmExecutionMode executionMode)
+    {
+        if (!Enum.IsDefined(typeof(SgemmExecutionMode), executionMode))
+            throw new ArgumentOutOfRangeException(nameof(executionMode));
+
+        c.Clear();
+        SgemmAddInternal(
+            a, k, false,
+            b, n, false,
+            c, m, k, n,
+            allowParallel: executionMode == SgemmExecutionMode.Parallel,
+            clearedOutput: true);
+    }
+
+    /// <summary>
     /// Computes C = op(A) * op(B) with optional transpose on either operand.
     /// op(X) = X when transX=false, op(X) = X^T when transX=true.
     /// lda/ldb are the leading dimensions (row strides) of the source storage.
@@ -1465,7 +1493,7 @@ internal static partial class SimdGemm
         }
 
         c.Clear();
-        SgemmAddInternal(a, lda, transA, b, ldb, transB, c, m, k, n, allowParallel: true, clearedOutput: true);
+        SgemmAddInternal(a, lda, transA, b, ldb, transB, c, m, k, n, allowParallel: UseParallelGemm, clearedOutput: true);
     }
 
     // Set to 1 once OpenBLAS is pinned single-thread (we own the parallelism).
@@ -1536,7 +1564,7 @@ internal static partial class SimdGemm
         }
         // clearedC=true allows the small-matmul fast path to use store-only kernels
         // (saves load-add per micro-tile). beta=1 uses load-add-store accumulate.
-        SgemmAddInternal(a, k, false, b, n, false, c, m, k, n, allowParallel: true, clearedOutput: clearedC);
+        SgemmAddInternal(a, k, false, b, n, false, c, m, k, n, allowParallel: UseParallelGemm, clearedOutput: clearedC);
     }
 
     /// <summary>
@@ -1565,7 +1593,7 @@ internal static partial class SimdGemm
         int m, int k, int n)
     {
         // SgemmAdd is C += A·B by definition — do NOT pass clearedOutput=true here.
-        SgemmAddInternal(a, lda, transA, b, ldb, transB, c, m, k, n, allowParallel: true, clearedOutput: false);
+        SgemmAddInternal(a, lda, transA, b, ldb, transB, c, m, k, n, allowParallel: UseParallelGemm, clearedOutput: false);
     }
 
     /// <summary>
@@ -1686,7 +1714,7 @@ internal static partial class SimdGemm
         // otherwise runs single-threaded over a huge N. N-partitioning saturates the cores even at
         // m=1. Gated above ParallelWorkThreshold so small GEMMs stay serial (dispatch would
         // dominate). Race-free: each worker owns a disjoint column range (overwrite or accumulate).
-        if (allowParallel && UseParallelGemm && !transA && !transB
+        if (allowParallel && !transA && !transB
             && m > 0 && m <= NParallelSmallMMaxM && n >= Nr
             && (long)m * k * n >= ParallelWorkThreshold)
         {
@@ -3589,7 +3617,6 @@ internal static partial class SimdGemm
         int Mc = ChooseAdaptiveMc(m, k, n);
         int numRowBlocks = (m + Mc - 1) / Mc;
         bool canParallelize = allowParallel
-            && UseParallelGemm
             && maxThreads > 1
             && numRowBlocks >= 1
             && !transA && !transB  // Parallel path uses the no-transpose Pack overloads

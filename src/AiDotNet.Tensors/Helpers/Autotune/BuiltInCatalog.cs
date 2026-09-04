@@ -27,22 +27,24 @@ namespace AiDotNet.Tensors.Helpers.Autotune;
 /// claim load-bearing by actually registering a kernel that benchmarks
 /// and stores.</para>
 ///
-/// <para><b>Concurrency contract — run warmup BEFORE serving traffic.</b>
-/// The <c>SGEMM</c> benchmark below toggles the process-wide
-/// <see cref="SimdGemm.UseParallelGemm"/> flag to measure each variant and
-/// restores it before returning. This is safe only when no other thread is
-/// calling <c>SimdGemm.Sgemm</c> concurrently with the warmup; a concurrent
-/// GEMM caller would observe the wrong parallelism choice for the duration
-/// of the benchmark, producing correct results but degraded (or inflated)
-/// throughput attributable to the wrong variant. In practice warmup is
-/// a startup-time operation run before the application handles requests,
-/// so this window is empty. Future follow-up: introduce a scoped override
-/// on <see cref="SimdGemm"/> (e.g.
-/// <c>SimdGemm.WithParallelGemm(bool, Action)</c>) and route the benchmark
-/// through it so concurrent callers are never perturbed.</para>
+/// <para>The SGEMM benchmark uses an explicit per-call execution mode. It never
+/// mutates <see cref="SimdGemm.UseParallelGemm"/>, so startup and background
+/// warmup cannot change the policy observed by concurrent production calls.</para>
 /// </summary>
 internal static class BuiltInCatalog
 {
+    private enum SgemmVariant
+    {
+        Sequential = 0,
+        Parallel = 1
+    }
+
+    private enum SparseMmVariant
+    {
+        Csr = 0,
+        Dense = 1
+    }
+
     public static readonly KernelId SGEMM = new("gemm", "cpu-simd-sgemm");
 
     /// <summary>Sparse vs dense matmul crossover. PyTorch users have to
@@ -98,12 +100,15 @@ internal static class BuiltInCatalog
         // only makes sense when work justifies the thread-pool overhead; we
         // still ENUMERATE both so the benchmark can record that sequential
         // won at small shapes (consumers may still want that data).
-        yield return "sequential";
-        yield return "parallel";
+        yield return Serialize(SgemmVariant.Sequential);
+        yield return Serialize(SgemmVariant.Parallel);
     }
 
     private static Task<double> BenchmarkSgemmVariant(ShapeProfile shape, string variant, CancellationToken ct)
     {
+        if (!TryParseSgemmVariant(variant, out SgemmVariant typedVariant))
+            throw new ArgumentException($"Unknown SGEMM variant '{variant}'.", nameof(variant));
+
         // Shape profile for GEMM is (M, N, K). Other ranks fall back to a
         // square-ish heuristic — pick the geometric mean as the side length
         // so the benchmark still runs something meaningful. Returning 0
@@ -141,40 +146,24 @@ internal static class BuiltInCatalog
         var a = new float[(int)aLen];
         var b = new float[(int)bLen];
         var c = new float[(int)cLen];
-        var rng = new Random(0x515EE + variant.GetHashCode());
+        var rng = new Random(0x515EE + (int)typedVariant);
         for (int i = 0; i < a.Length; i++) a[i] = (float)rng.NextDouble();
         for (int i = 0; i < b.Length; i++) b[i] = (float)rng.NextDouble();
 
         // Warm up — let JIT compile and L1 prime.
-        SimdGemm.Sgemm(a, b, c, m, k, n);
-        SimdGemm.Sgemm(a, b, c, m, k, n);
+        SgemmExecutionMode executionMode = typedVariant == SgemmVariant.Parallel
+            ? SgemmExecutionMode.Parallel
+            : SgemmExecutionMode.Sequential;
+        SimdGemm.SgemmForAutotune(a, b, c, m, k, n, executionMode);
+        SimdGemm.SgemmForAutotune(a, b, c, m, k, n, executionMode);
         ct.ThrowIfCancellationRequested();
 
-        // Measure. Toggle the process-wide parallel switch per variant.
-        // SimdGemm exposes only the global flag today — save/restore bounds
-        // the mutation to this benchmark. CALLER CONTRACT (see class
-        // docstring): warmup must run when no other thread is calling
-        // SimdGemm.Sgemm; a concurrent caller during this window would see
-        // the wrong parallelism choice (correct results, wrong throughput
-        // for that one call). The warmup driver calls BenchmarkVariant
-        // sequentially so variants don't fight each other; a future scoped
-        // SimdGemm.WithParallelGemm(...) helper will make this robust
-        // against concurrent application callers too.
-        bool savedParallel = SimdGemm.UseParallelGemm;
-        SimdGemm.UseParallelGemm = variant == "parallel";
         const int iters = 5;
         var sw = Stopwatch.StartNew();
-        try
+        for (int i = 0; i < iters; i++)
         {
-            for (int i = 0; i < iters; i++)
-            {
-                ct.ThrowIfCancellationRequested();
-                SimdGemm.Sgemm(a, b, c, m, k, n);
-            }
-        }
-        finally
-        {
-            SimdGemm.UseParallelGemm = savedParallel;
+            ct.ThrowIfCancellationRequested();
+            SimdGemm.SgemmForAutotune(a, b, c, m, k, n, executionMode);
         }
         sw.Stop();
         double secsPerIter = sw.Elapsed.TotalSeconds / iters;
@@ -187,12 +176,15 @@ internal static class BuiltInCatalog
     {
         // CSR · dense vs dense · dense. Both are valid for any shape; the
         // benchmark times each at the supplied (rows, cols, k, density).
-        yield return "csr";
-        yield return "dense";
+        yield return Serialize(SparseMmVariant.Csr);
+        yield return Serialize(SparseMmVariant.Dense);
     }
 
     private static Task<double> BenchmarkSparseMmVariant(ShapeProfile shape, string variant, CancellationToken ct)
     {
+        if (!TryParseSparseMmVariant(variant, out SparseMmVariant typedVariant))
+            throw new ArgumentException($"Unknown sparse-matmul variant '{variant}'.", nameof(variant));
+
         // Shape profile is (rows, cols, k, densityPermille) where rows×k
         // is the sparse-LHS shape, k×cols is dense-RHS, densityPermille is
         // the fraction of A's entries that are non-zero (per-thousand so
@@ -208,7 +200,7 @@ internal static class BuiltInCatalog
         long bLen = (long)k * cols;
         if (aLen > int.MaxValue || bLen > int.MaxValue) return Task.FromResult(0.0);
 
-        var rng = new Random(0x5BA5E5 + variant.GetHashCode());
+        var rng = new Random(0x5BA5E5 + (int)typedVariant);
         // Build a sparse A at the requested density.
         int nnzPerRow = (int)Math.Max(1, (long)k * permille / 1000);
         var rowPtr = new int[rows + 1];
@@ -240,10 +232,12 @@ internal static class BuiltInCatalog
         // and bias the autotuner toward "csr" for the wrong reason —
         // a real caller already has the dense representation when
         // they're choosing a kernel.
-        float[]? aDense = variant == "dense" ? ToDense(rowPtr, colIdx, values, rows, k) : null;
+        float[]? aDense = typedVariant == SparseMmVariant.Dense
+            ? ToDense(rowPtr, colIdx, values, rows, k)
+            : null;
 
         // Warm up.
-        if (variant == "csr")
+        if (typedVariant == SparseMmVariant.Csr)
         {
             CsrDenseSimd.Multiply(rowPtr, colIdx, values, bDense, output, rows, cols);
             CsrDenseSimd.Multiply(rowPtr, colIdx, values, bDense, output, rows, cols);
@@ -256,7 +250,7 @@ internal static class BuiltInCatalog
         ct.ThrowIfCancellationRequested();
 
         var sw = Stopwatch.StartNew();
-        if (variant == "csr")
+        if (typedVariant == SparseMmVariant.Csr)
         {
             for (int i = 0; i < iters; i++)
             {
@@ -276,10 +270,56 @@ internal static class BuiltInCatalog
         double secsPerIter = sw.Elapsed.TotalSeconds / iters;
         if (secsPerIter <= 0) return Task.FromResult(0.0);
         // GFLOPs/s — sparse counts 2·nnz·cols, dense counts 2·rows·k·cols.
-        double flops = variant == "csr"
+        double flops = typedVariant == SparseMmVariant.Csr
             ? 2.0 * (rows * (long)nnzPerRow) * cols
             : 2.0 * rows * k * cols;
         return Task.FromResult(flops / 1e9 / secsPerIter);
+    }
+
+    private static string Serialize(SgemmVariant variant) => variant switch
+    {
+        SgemmVariant.Sequential => "sequential",
+        SgemmVariant.Parallel => "parallel",
+        _ => throw new ArgumentOutOfRangeException(nameof(variant))
+    };
+
+    private static bool TryParseSgemmVariant(string value, out SgemmVariant variant)
+    {
+        switch (value)
+        {
+            case "sequential":
+                variant = SgemmVariant.Sequential;
+                return true;
+            case "parallel":
+                variant = SgemmVariant.Parallel;
+                return true;
+            default:
+                variant = default;
+                return false;
+        }
+    }
+
+    private static string Serialize(SparseMmVariant variant) => variant switch
+    {
+        SparseMmVariant.Csr => "csr",
+        SparseMmVariant.Dense => "dense",
+        _ => throw new ArgumentOutOfRangeException(nameof(variant))
+    };
+
+    private static bool TryParseSparseMmVariant(string value, out SparseMmVariant variant)
+    {
+        switch (value)
+        {
+            case "csr":
+                variant = SparseMmVariant.Csr;
+                return true;
+            case "dense":
+                variant = SparseMmVariant.Dense;
+                return true;
+            default:
+                variant = default;
+                return false;
+        }
     }
 
     private static float[] ToDense(int[] rowPtr, int[] colIdx, float[] values, int rows, int k)

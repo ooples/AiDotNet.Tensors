@@ -27,9 +27,18 @@
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
     <PackageRequireLicenseAcceptance>True</PackageRequireLicenseAcceptance>
     <LangVersion>latest</LangVersion>
+    <EvolutionProjectPath Condition="'$(EvolutionProjectPath)' == ''">$(MSBuildProjectDirectory)\..\..\..\AiDotNet.Evolution\src\AiDotNet.Evolution\AiDotNet.Evolution.csproj</EvolutionProjectPath>
     <PackageIcon>Favicon.jpg</PackageIcon>
     <PackageReadmeFile>README.md</PackageReadmeFile>
   </PropertyGroup>
+
+  <ItemGroup Condition="'$(UseLocalEvolution)' == 'true'">
+    <ProjectReference Include="$(EvolutionProjectPath)" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(UseLocalEvolution)' != 'true'">
+    <PackageReference Include="AiDotNet.Evolution" Version="0.1.0-preview.1" />
+  </ItemGroup>
 
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|AnyCPU'">
     <TreatWarningsAsErrors>True</TreatWarningsAsErrors>

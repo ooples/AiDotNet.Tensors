@@ -44,6 +44,15 @@ public sealed class GpuDeviceFingerprintTests
     }
 
     [Fact]
+    public void TypedVendor_IsTheControlValueWhileLegacyTokenRemainsCompatible()
+    {
+        var fp = new GpuDeviceFingerprint(GpuVendorKind.Amd, "AMD Instinct MI300X", 9, 4, 60100, "gpu-0");
+
+        Assert.Equal(GpuVendorKind.Amd, fp.VendorKind);
+        Assert.Equal("amd", fp.Vendor);
+    }
+
+    [Fact]
     public void ModelKey_ExcludesUuid_SoTwoCardsOfSameModelShareIt_ButLocalKeysDiffer()
     {
         // Two physical RTX 3080s in one box: same model/driver/arch, distinct UUIDs.
