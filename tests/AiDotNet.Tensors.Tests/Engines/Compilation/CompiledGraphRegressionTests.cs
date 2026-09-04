@@ -266,6 +266,62 @@ public class CompiledGraphRegressionTests
     }
 
     [Fact]
+    public void FailedCompilationAfterOutputDetach_RestoresEnclosingProducerAfterInPlaceChain()
+    {
+        using var input = new Tensor<float>(new[] { 1f }, new[] { 1 });
+        using var invalidPlanInput = new Tensor<float>(new[] { 2f }, new[] { 1 });
+        Tensor<float>? output = null;
+        ILazyNode? enclosingProducer = null;
+        int enclosingCallbackCount = 0;
+        int nestedCallbackCount = 0;
+
+        using (var enclosingScope = GraphMode.Enable())
+        {
+            output = enclosingScope.RecordUnary(
+                LazyNodeType.Custom,
+                "EnclosingProducer",
+                input,
+                input._shape,
+                (_, destination) =>
+                {
+                    enclosingCallbackCount++;
+                    destination[0] = 7f;
+                });
+            enclosingProducer = output.LazySource;
+
+            using (var nestedScope = GraphMode.EnableInference())
+            {
+                nestedScope.RecordInPlace(
+                    LazyNodeType.Custom,
+                    "NestedMutation1",
+                    output,
+                    Array.Empty<Tensor<float>>(),
+                    (_, _) => nestedCallbackCount++);
+                nestedScope.RecordInPlace(
+                    LazyNodeType.Custom,
+                    "NestedMutation2",
+                    output,
+                    Array.Empty<Tensor<float>>(),
+                    (_, _) => nestedCallbackCount++);
+
+                // Multi-input validation runs after CompiledInferencePlan has detached lazy
+                // outputs. Supplying a tensor the graph never reads forces that later stage to
+                // fail and exercises restoration from the saved enclosing producer.
+                Assert.Throws<InvalidOperationException>(() =>
+                    nestedScope.CompileInference(output, new[] { invalidPlanInput }));
+            }
+
+            Assert.Same(enclosingProducer, output.LazySource);
+            Assert.Equal(0, nestedCallbackCount);
+        }
+
+        Assert.Equal(1, enclosingCallbackCount);
+        Assert.Equal(0, nestedCallbackCount);
+        Assert.Equal(7f, output![0]);
+        output.Dispose();
+    }
+
+    [Fact]
     public void CompatibilityTrace_StillExecutesRecordedCallbacksOnDispose()
     {
         using var input = new Tensor<float>(new[] { 1f }, new[] { 1 });
