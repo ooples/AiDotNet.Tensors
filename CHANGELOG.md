@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.130.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.130.0...v0.130.1) (2026-09-04)
+
+
+### Bug Fixes
+
+* **compilation:** preserve dynamic masks across graph replay ([fa2c2b7](https://github.com/ooples/AiDotNet.Tensors/commit/fa2c2b72cfc3e3ccbda85446f1d057c5972100e5))
+
 ## [0.130.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.129.8...v0.130.0) (2026-09-03)
 
 
