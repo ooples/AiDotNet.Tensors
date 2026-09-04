@@ -398,8 +398,8 @@ internal sealed class LazyTensorScope : IDisposable
     /// </remarks>
     internal CompiledInferencePlan<T> CompileInference<T>()
     {
-        MarkCompiled();
-        return CompiledInferencePlan<T>.Compile(this, _engine, explicitOutput: null);
+        return CompilePlan(
+            () => CompiledInferencePlan<T>.Compile(this, _engine, explicitOutput: null));
     }
 
     /// <summary>
@@ -409,8 +409,8 @@ internal sealed class LazyTensorScope : IDisposable
     /// </summary>
     internal CompiledInferencePlan<T> CompileInference<T>(Tensor<T> explicitOutput)
     {
-        MarkCompiled();
-        return CompiledInferencePlan<T>.Compile(this, _engine, explicitOutput);
+        return CompilePlan(
+            () => CompiledInferencePlan<T>.Compile(this, _engine, explicitOutput));
     }
 
     /// <summary>
@@ -420,8 +420,8 @@ internal sealed class LazyTensorScope : IDisposable
     /// </summary>
     internal CompiledInferencePlan<T> CompileInference<T>(Tensor<T> explicitOutput, Tensor<T> input)
     {
-        MarkCompiled();
-        return CompiledInferencePlan<T>.Compile(this, _engine, explicitOutput, input);
+        return CompilePlan(
+            () => CompiledInferencePlan<T>.Compile(this, _engine, explicitOutput, input));
     }
 
     /// <summary>
@@ -430,8 +430,8 @@ internal sealed class LazyTensorScope : IDisposable
     /// </summary>
     internal CompiledInferencePlan<T> CompileInference<T>(Tensor<T> explicitOutput, int[] inputShape)
     {
-        MarkCompiled();
-        return CompiledInferencePlan<T>.Compile(this, _engine, explicitOutput, inputShape);
+        return CompilePlan(
+            () => CompiledInferencePlan<T>.Compile(this, _engine, explicitOutput, inputShape));
     }
 
     /// <summary>
@@ -442,8 +442,8 @@ internal sealed class LazyTensorScope : IDisposable
     /// </summary>
     internal CompiledInferencePlan<T> CompileInference<T>(Tensor<T> explicitOutput, Tensor<T>[] inputs)
     {
-        MarkCompiled();
-        return CompiledInferencePlan<T>.Compile(this, _engine, explicitOutput, inputs);
+        return CompilePlan(
+            () => CompiledInferencePlan<T>.Compile(this, _engine, explicitOutput, inputs));
     }
 
     /// <summary>
@@ -459,8 +459,8 @@ internal sealed class LazyTensorScope : IDisposable
     internal CompiledTrainingPlan<T> CompileTraining<T>(Tensor<T>[] parameters)
     {
         EnsureTrainingParametersPrepared(parameters);
-        MarkCompiled();
-        return CompiledTrainingPlan<T>.Compile(this, _engine, parameters, explicitLoss: null);
+        return CompilePlan(
+            () => CompiledTrainingPlan<T>.Compile(this, _engine, parameters, explicitLoss: null));
     }
 
     /// <summary>
@@ -470,8 +470,26 @@ internal sealed class LazyTensorScope : IDisposable
     internal CompiledTrainingPlan<T> CompileTraining<T>(Tensor<T>[] parameters, Tensor<T> explicitLoss)
     {
         EnsureTrainingParametersPrepared(parameters);
-        MarkCompiled();
-        return CompiledTrainingPlan<T>.Compile(this, _engine, parameters, explicitLoss);
+        return CompilePlan(
+            () => CompiledTrainingPlan<T>.Compile(this, _engine, parameters, explicitLoss));
+    }
+
+    /// <summary>
+    /// Completes the terminal transition from a trace to a compiled plan. Any compiler failure
+    /// abandons the trace before the original exception continues to the caller.
+    /// </summary>
+    private TPlan CompilePlan<TPlan>(Func<TPlan> compile)
+    {
+        try
+        {
+            MarkCompiled();
+            return compile();
+        }
+        catch
+        {
+            Abandon();
+            throw;
+        }
     }
 
     /// <summary>
@@ -529,8 +547,11 @@ internal sealed class LazyTensorScope : IDisposable
     /// </summary>
     private void Abandon()
     {
-        foreach (var node in _nodes)
-            node.ClearOutputLazySource();
+        // Undo in reverse recording order. Several in-place nodes can successively replace the
+        // same target's LazySource, so each one must expose its predecessor before that predecessor
+        // can restore the producer from an enclosing scope.
+        for (int i = _nodes.Count - 1; i >= 0; i--)
+            _nodes[i].RestoreOutputLazySource();
 
         _realized = true;
     }

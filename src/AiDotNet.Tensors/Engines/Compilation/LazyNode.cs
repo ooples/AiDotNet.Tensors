@@ -221,6 +221,16 @@ internal sealed class LazyNode<T> : ILazyNode
         Output.LazySource = null;
     }
 
+    /// <summary>
+    /// Removes this abandoned node from its output without severing a producer from an enclosing
+    /// scope. In-place recording temporarily replaces that producer with this node.
+    /// </summary>
+    public void RestoreOutputLazySource()
+    {
+        if (ReferenceEquals(Output.LazySource, this))
+            Output.LazySource = _externalPrerequisite;
+    }
+
     public void AddStorageLeases(TensorStorageLeaseSet leases)
     {
         leases.Add(Input0);
