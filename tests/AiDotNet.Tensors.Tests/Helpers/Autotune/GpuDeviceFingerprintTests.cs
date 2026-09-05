@@ -12,6 +12,13 @@ namespace AiDotNet.Tensors.Tests.Helpers.Autotune;
 /// </summary>
 public sealed class GpuDeviceFingerprintTests
 {
+    [Fact]
+    public void KernelTuningFingerprint_RejectsDefaultGpuStruct()
+    {
+        Assert.Throws<ArgumentException>(() =>
+            KernelTuningDeviceFingerprint.FromGpu(default));
+    }
+
     // Reproduces the exact legacy formatter that DirectPtxRuntime used before
     // the structured fingerprint: gpu-{uuid}-sm{maj}{min}-drv{driver}.
     private static string LegacyToken(string uuid, int maj, int min, int drv) =>

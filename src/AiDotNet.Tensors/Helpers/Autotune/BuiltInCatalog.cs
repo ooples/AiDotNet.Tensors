@@ -232,9 +232,9 @@ internal static class BuiltInCatalog
         // and bias the autotuner toward "csr" for the wrong reason —
         // a real caller already has the dense representation when
         // they're choosing a kernel.
-        float[]? aDense = typedVariant == SparseMmVariant.Dense
+        float[] aDense = typedVariant == SparseMmVariant.Dense
             ? ToDense(rowPtr, colIdx, values, rows, k)
-            : null;
+            : Array.Empty<float>();
 
         // Warm up.
         if (typedVariant == SparseMmVariant.Csr)
@@ -244,8 +244,8 @@ internal static class BuiltInCatalog
         }
         else
         {
-            SimdGemm.Sgemm(aDense!, bDense, output, rows, k, cols);
-            SimdGemm.Sgemm(aDense!, bDense, output, rows, k, cols);
+            SimdGemm.Sgemm(aDense, bDense, output, rows, k, cols);
+            SimdGemm.Sgemm(aDense, bDense, output, rows, k, cols);
         }
         ct.ThrowIfCancellationRequested();
 
@@ -263,7 +263,7 @@ internal static class BuiltInCatalog
             for (int i = 0; i < iters; i++)
             {
                 ct.ThrowIfCancellationRequested();
-                SimdGemm.Sgemm(aDense!, bDense, output, rows, k, cols);
+                SimdGemm.Sgemm(aDense, bDense, output, rows, k, cols);
             }
         }
         sw.Stop();

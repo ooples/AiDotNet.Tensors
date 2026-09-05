@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using AiDotNet.Evolution;
 using AiDotNet.Tensors.Helpers.Autotune;
 using Xunit;
 
@@ -114,74 +113,6 @@ public sealed class ConvTileAutotuneTests : IDisposable
             64, 64, 3136, tileEdges: new[] { 16, 16, -4, 32, 8 });
 
         Assert.Equal(new[] { 16, 32, 8 }, candidates.Select(candidate => candidate.TileEdge));
-    }
-
-    [Fact]
-    public async Task EvolutionFactory_UsesTheTypedGpuBenchmarkSeamEndToEnd()
-    {
-        var fingerprint = new GpuDeviceFingerprint(
-            GpuVendorKind.Nvidia, "Fake RTX", 8, 6, 12030, "fake-evolution");
-        var deployment = new KernelTuningDeployment<ConvTileConfiguration>();
-        EvolutionKernelAutotuner<ConvTileConfiguration> tuner = ConvTileAutotune.CreateEvolutionTuner(
-            fingerprint,
-            batch: 1,
-            outputChannels: 64,
-            inputChannels: 64,
-            spatial: 3136,
-            (configuration, _, _) => new ValueTask<KernelTuningMeasurement>(new KernelTuningMeasurement(
-                configuration.TileEdge == 32 ? 1200 : 600,
-                TimeSpan.FromMilliseconds(1))),
-            searchSpaceVersion: "tiles-v1",
-            benchmarkVersion: "gpu-timer-v1",
-            options: new EvolutionEngineOptions
-            {
-                RunId = "conv-tile-evolution-test",
-                MaxEvaluationAttempts = 4,
-                MaxProposals = 4,
-                MaxGenerations = 0,
-                ProposalBatchSize = 4,
-                MaxDegreeOfParallelism = 1,
-                IslandCount = 1,
-                MigrationInterval = 0,
-                MigrantsPerIsland = 1
-            },
-            deployment: deployment);
-
-        EvolutionKernelTuningResult<ConvTileConfiguration> result = await tuner.TuneAsync(
-            ConvTileAutotune.TypedCandidates(64, 64, 3136));
-
-        Assert.Equal(32, result.Deployment.Configuration.TileEdge);
-        Assert.True(deployment.TryGet(out ConvTileConfiguration active));
-        Assert.Equal(32, active.TileEdge);
-    }
-
-    [Fact]
-    public async Task EvolutionFactory_RejectsASeedOutsideTheValidatedGpuLaunchSpace()
-    {
-        var fingerprint = new GpuDeviceFingerprint(
-            GpuVendorKind.Nvidia, "Fake RTX", 8, 6, 12030, "fake-evolution-invalid-seed");
-        bool benchmarkCalled = false;
-        EvolutionKernelAutotuner<ConvTileConfiguration> tuner = ConvTileAutotune.CreateEvolutionTuner(
-            fingerprint,
-            batch: 1,
-            outputChannels: 64,
-            inputChannels: 64,
-            spatial: 3136,
-            (configuration, _, _) =>
-            {
-                benchmarkCalled = true;
-                return new ValueTask<KernelTuningMeasurement>(
-                    new KernelTuningMeasurement(1, TimeSpan.FromMilliseconds(1)));
-            },
-            searchSpaceVersion: "tiles-v1",
-            benchmarkVersion: "gpu-timer-v1",
-            tileEdges: new[] { 16, 32 });
-
-        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => tuner.TuneAsync(new[]
-        {
-            new ConvTileConfiguration(8)
-        }));
-        Assert.False(benchmarkCalled);
     }
 
     [Theory]

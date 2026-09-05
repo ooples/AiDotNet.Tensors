@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
-using AiDotNet.Evolution;
 
 namespace AiDotNet.Tensors.Helpers.Autotune;
 
@@ -104,53 +103,6 @@ public static class ConvTileAutotune
         return result;
     }
 
-    /// <summary>
-    /// Creates an evolutionary tuner whose benchmark delegate can launch the typed configuration on the real GPU.
-    /// </summary>
-    /// <remarks>
-    /// The returned tuner performs search off the serving path and atomically publishes its winner through
-    /// <paramref name="deployment"/>. CPU-only tests may supply a deterministic fake benchmark; production callers
-    /// supply the same delegate shape backed by CUDA, PTX, Vulkan, Metal, or another device backend.
-    /// </remarks>
-    public static EvolutionKernelAutotuner<ConvTileConfiguration> CreateEvolutionTuner(
-        GpuDeviceFingerprint fingerprint,
-        int batch,
-        int outputChannels,
-        int inputChannels,
-        int spatial,
-        Func<ConvTileConfiguration, EvolutionEvaluationContext, CancellationToken,
-            ValueTask<KernelTuningMeasurement>> benchmark,
-        string searchSpaceVersion,
-        string benchmarkVersion,
-        EvolutionEngineOptions? options = null,
-        IEvolutionCheckpointStore? checkpointStore = null,
-        KernelTuningDeployment<ConvTileConfiguration>? deployment = null,
-        IReadOnlyList<int>? tileEdges = null,
-        int maxThreadsPerBlock = 1024)
-    {
-        if (batch <= 0) throw new ArgumentOutOfRangeException(nameof(batch));
-        if (benchmark is null) throw new ArgumentNullException(nameof(benchmark));
-        IReadOnlyList<ConvTileConfiguration> candidates = TypedCandidates(
-            outputChannels, inputChannels, spatial, tileEdges, maxThreadsPerBlock);
-        if (candidates.Count == 0)
-            throw new ArgumentException("The supplied shape and device limit admit no convolution tiles.", nameof(tileEdges));
-
-        var identity = new KernelTuningIdentity(
-            new KernelId(Category, TiledOneByOneName),
-            Shape(batch, outputChannels, inputChannels, spatial),
-            fingerprint,
-            searchSpaceVersion,
-            benchmarkVersion);
-        return new EvolutionKernelAutotuner<ConvTileConfiguration>(
-            identity,
-            new ConvTileCodec(candidates),
-            new ConvTileVariation(candidates),
-            benchmark,
-            options,
-            checkpointStore: checkpointStore,
-            deployment: deployment);
-    }
-
     /// <summary>True when at least one offered tile can launch this contract.</summary>
     public static bool HasLaunchableTile(
         int outputChannels, int inputChannels, int spatial,
@@ -201,8 +153,8 @@ public static class ConvTileAutotune
     public static bool TryParseTile(string? variant, out int tile)
     {
         tile = 0;
-        if (string.IsNullOrEmpty(variant) ||
-            !variant!.StartsWith(VariantPrefix, StringComparison.Ordinal))
+        if (variant is null || variant.Length == 0 ||
+            !variant.StartsWith(VariantPrefix, StringComparison.Ordinal))
             return false;
         return int.TryParse(
             variant.Substring(VariantPrefix.Length),
@@ -221,71 +173,4 @@ public static class ConvTileAutotune
         return false;
     }
 
-    private sealed class ConvTileCodec : IEvolutionGenomeCodec<ConvTileConfiguration>
-    {
-        private readonly HashSet<int> _allowedTileEdges;
-
-        public ConvTileCodec(IReadOnlyList<ConvTileConfiguration> candidates)
-        {
-            _allowedTileEdges = new HashSet<int>(candidates.Select(candidate => candidate.TileEdge));
-            VersionHash = CandidateSpaceHash("conv-tile-payload-v1", candidates);
-        }
-
-        public string Id => "conv-tile";
-
-        public string VersionHash { get; }
-
-        public string Serialize(ConvTileConfiguration genome) =>
-            _allowedTileEdges.Contains(genome.TileEdge)
-                ? genome.TileEdge.ToString(CultureInfo.InvariantCulture)
-                : throw new ArgumentOutOfRangeException(
-                    nameof(genome),
-                    "The tile edge is not part of this tuner's validated candidate space.");
-
-        public ConvTileConfiguration Deserialize(string payload)
-        {
-            if (!int.TryParse(payload, NumberStyles.None, CultureInfo.InvariantCulture, out int tileEdge) ||
-                !_allowedTileEdges.Contains(tileEdge))
-            {
-                throw new InvalidDataException(
-                    "The convolution tile payload is not part of this tuner's validated candidate space.");
-            }
-            return new ConvTileConfiguration(tileEdge);
-        }
-    }
-
-    private sealed class ConvTileVariation : IVariationOperator<ConvTileConfiguration>
-    {
-        private readonly ConvTileConfiguration[] _candidates;
-
-        public ConvTileVariation(IReadOnlyList<ConvTileConfiguration> candidates)
-        {
-            _candidates = candidates.ToArray();
-            VersionHash = CandidateSpaceHash("conv-tile-finite-space-v1", candidates);
-        }
-
-        public string Id => "conv-tile-finite-space";
-
-        public string VersionHash { get; }
-
-        public ValueTask<ConvTileConfiguration> ProposeAsync(
-            EvolutionVariationContext<ConvTileConfiguration> context,
-            CancellationToken cancellationToken = default)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            return new ValueTask<ConvTileConfiguration>(
-                _candidates[context.Random.NextInt(_candidates.Length)]);
-        }
-    }
-
-    private static string CandidateSpaceHash(
-        string componentVersion,
-        IReadOnlyList<ConvTileConfiguration> candidates)
-    {
-        var components = new string[candidates.Count + 1];
-        components[0] = componentVersion;
-        for (int i = 0; i < candidates.Count; i++)
-            components[i + 1] = candidates[i].TileEdge.ToString(CultureInfo.InvariantCulture);
-        return EvolutionHash.Combine(components);
-    }
 }

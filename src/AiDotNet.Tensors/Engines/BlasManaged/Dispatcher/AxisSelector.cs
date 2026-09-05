@@ -6,7 +6,7 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 /// Parallelism axis enumeration. Used by <see cref="AxisSelector"/> to
 /// communicate which axis the strategy should split work along.
 /// </summary>
-internal enum ParallelismAxis : byte
+public enum ParallelismAxis : byte
 {
     /// <summary>Sequential — no parallel split (below work threshold).</summary>
     None = 0,

@@ -24,6 +24,12 @@ namespace AiDotNet.Tensors.Engines.Einsum;
 /// </remarks>
 public static class EinsumPathOptimizer
 {
+    /// <summary>Current typed contraction-order search-space version.</summary>
+    public const int CurrentSearchSpaceVersion = 1;
+
+    /// <summary>Current correctness and timing protocol for promoted contraction orders.</summary>
+    public const int CurrentBenchmarkProtocolVersion = 1;
+
     /// <summary>
     /// Reserved internal label that stands for the full ellipsis batch block.
     /// Never appears in user-supplied equations (the parser accepts only ASCII
@@ -45,7 +51,7 @@ public static class EinsumPathOptimizer
         var sizes = new Dictionary<char, long>(binding.LabelSizes.Count + 1);
         foreach (var kv in binding.LabelSizes) sizes[kv.Key] = kv.Value;
         long batchProduct = 1L;
-        foreach (var d in binding.BatchDims) batchProduct *= d;
+        foreach (var d in binding.BatchDims) batchProduct = checked(batchProduct * d);
         if (eq.HasEllipsis) sizes[EllipsisMarker] = batchProduct;
 
         // Build the starting "live" operand-label sets. Each live entry is
@@ -65,15 +71,23 @@ public static class EinsumPathOptimizer
 
         // Zero- or one-operand case: no pairwise contractions needed.
         if (live.Count <= 1)
-            return new EinsumPath(Array.Empty<EinsumPathStep>(), 0);
+            return new EinsumPath(
+                Array.Empty<EinsumPathStep>(),
+                0,
+                new EinsumContractionOrder(Array.Empty<EinsumContractionPair>()),
+                EinsumPathStrategy.Greedy);
 
         var steps = new List<EinsumPathStep>(live.Count - 1);
+        var choices = new List<EinsumContractionPair>(live.Count - 1);
         long total = 0;
 
         while (live.Count > 1)
         {
-            (int bestI, int bestJ, HashSet<char> bestResult, long bestCost, int bestRemoved)
-                = (-1, -1, null!, long.MaxValue, -1);
+            int bestI = -1;
+            int bestJ = -1;
+            HashSet<char>? bestResult = null;
+            long bestCost = long.MaxValue;
+            int bestRemoved = -1;
 
             for (int i = 0; i < live.Count - 1; i++)
             for (int j = i + 1; j < live.Count; j++)
@@ -97,7 +111,7 @@ public static class EinsumPathOptimizer
                 resultLabels.IntersectWith(needed);
 
                 int removed = combined.Count - resultLabels.Count;
-                long cost = 2L * ProductOfSizes(combined, sizes);
+                long cost = checked(2L * ProductOfSizes(combined, sizes));
 
                 // Greedy objective (opt_einsum-style):
                 //   primary: minimise cost
@@ -112,28 +126,36 @@ public static class EinsumPathOptimizer
                 }
             }
 
+            HashSet<char> selectedResult = bestResult ?? throw new InvalidOperationException(
+                "Greedy einsum planning failed to select a contraction pair.");
+
             // Labels contracted (summed) by this step = combined − result.
             var contracted = new HashSet<char>(live[bestI]);
             contracted.UnionWith(live[bestJ]);
-            contracted.ExceptWith(bestResult);
+            contracted.ExceptWith(selectedResult);
 
             var step = new EinsumPathStep(
                 leftIndex: bestI,
                 rightIndex: bestJ,
-                resultLabels: bestResult.ToArray(),
+                resultLabels: selectedResult.ToArray(),
                 contractedLabels: contracted.ToArray(),
                 estimatedFlops: bestCost);
             steps.Add(step);
-            total += bestCost;
+            choices.Add(new EinsumContractionPair(bestI, bestJ));
+            total = checked(total + bestCost);
 
             // Replace the pair with the intermediate.
             // Remove higher index first so lower-index removal does not shift.
             live.RemoveAt(bestJ);
             live.RemoveAt(bestI);
-            live.Add(bestResult);
+            live.Add(selectedResult);
         }
 
-        return new EinsumPath(steps, total);
+        return new EinsumPath(
+            steps,
+            total,
+            new EinsumContractionOrder(choices),
+            EinsumPathStrategy.Greedy);
     }
 
     private static long ProductOfSizes(HashSet<char> labels, Dictionary<char, long> sizes)
@@ -144,54 +166,166 @@ public static class EinsumPathOptimizer
     }
 
     /// <summary>
-    /// Cache-aware path selection: checks <see cref="AutotuneCache"/> for a
-    /// previously-recorded winner keyed by (equation, operand shapes) on the
-    /// current hardware; on a miss runs <see cref="Greedy"/> and stores the
-    /// chosen variant for future runs.  Callers get the same
-    /// <see cref="EinsumPath"/> back either way.
+    /// Cache-aware path selection: returns a previously-recorded, fully
+    /// validated contraction order or computes and records a greedy path.
     /// </summary>
     /// <remarks>
-    /// The first call for a given (equation, shapes) pays the O(n⁴) greedy
-    /// cost; subsequent calls are O(1) after a filesystem read. This matches
-    /// the "opt_einsum-as-cached-warmup" pattern the #210 plan calls out.
-    /// When branch-and-bound / Hungarian variants land, the stored
-    /// <c>Variant</c> field will tell the optimiser which algorithm produced
-    /// the cached path so stale entries can be invalidated.
+    /// Cache rows carry the actual typed pair sequence, not merely the name of
+    /// the algorithm that produced it. Malformed, stale, or shape-incompatible
+    /// rows fail closed and are replaced by a newly computed greedy path.
     /// </remarks>
-    public static EinsumPath Optimize(EinsumShapeBinding binding)
+    public static EinsumPath Optimize(EinsumShapeBinding binding) => Optimize(
+        binding,
+        KernelTuningDeviceFingerprint.CurrentCpu(),
+        new KernelSearchSpaceVersion(CurrentSearchSpaceVersion),
+        new KernelBenchmarkProtocolVersion(CurrentBenchmarkProtocolVersion));
+
+    /// <summary>
+    /// Selects a path for an exact execution device, search space, and
+    /// benchmark protocol without allowing winners to cross those boundaries.
+    /// </summary>
+    public static EinsumPath Optimize(
+        EinsumShapeBinding binding,
+        KernelTuningDeviceFingerprint device,
+        KernelSearchSpaceVersion searchSpaceVersion,
+        KernelBenchmarkProtocolVersion benchmarkProtocolVersion)
     {
         if (binding is null) throw new ArgumentNullException(nameof(binding));
+        KernelTuningIdentity identity = EinsumPathCache.CreateIdentity(
+            binding, device, searchSpaceVersion, benchmarkProtocolVersion);
 
-        var kernelId = new KernelId("einsum", binding.Equation.Source);
-        var shapeDims = new List<int>();
-        foreach (var operandShape in binding.OperandShapes)
-            foreach (var d in operandShape) shapeDims.Add(d);
-        var shape = new ShapeProfile(shapeDims.ToArray());
+        if (EinsumPathCache.TryLoad(binding, identity, out EinsumPath? cached) && cached is not null)
+            return cached;
 
-        var cached = AutotuneCache.Lookup(kernelId, shape);
-        if (cached != null && string.Equals(cached.Variant, "greedy", StringComparison.Ordinal))
-        {
-            // Fresh cache hit for the only variant we implement today.
-            // When branch-and-bound lands we'll also accept "bnb" here and
-            // dispatch accordingly; for now any unknown variant is ignored.
-        }
-
-        var path = Greedy(binding);
-
-        // Store-best-effort: ignore exceptions so einsum never fails because
-        // of a read-only HOME / missing cache directory.
-        AutotuneCache.TryStore(kernelId, shape, new KernelChoice
-        {
-            Variant = "greedy",
-            Parameters = new Dictionary<string, string>
-            {
-                { "numOperands", binding.Equation.Operands.Count.ToString() },
-                { "estimatedFlops", path.TotalFlops.ToString() },
-            },
-        });
-
+        EinsumPath path = Greedy(binding);
+        EinsumPathCache.TryStore(binding, identity, path);
         return path;
     }
+
+    /// <summary>Builds and validates a path from a typed pair sequence.</summary>
+    internal static EinsumPath BuildPath(
+        EinsumShapeBinding binding,
+        EinsumContractionOrder order,
+        EinsumPathStrategy strategy)
+    {
+        if (binding is null) throw new ArgumentNullException(nameof(binding));
+        if (order is null) throw new ArgumentNullException(nameof(order));
+        if (!Enum.IsDefined(typeof(EinsumPathStrategy), strategy))
+            throw new ArgumentOutOfRangeException(nameof(strategy));
+
+        EinsumEquation equation = binding.Equation;
+        int expectedSteps = Math.Max(0, equation.Operands.Count - 1);
+        if (order.Pairs.Count != expectedSteps)
+            throw new ArgumentException(
+                "A contraction order must contain exactly one fewer pair than operands.",
+                nameof(order));
+
+        var sizes = new Dictionary<char, long>(binding.LabelSizes.Count + 1);
+        foreach (KeyValuePair<char, int> pair in binding.LabelSizes)
+            sizes[pair.Key] = pair.Value;
+        long batchProduct = 1L;
+        foreach (int dimension in binding.BatchDims)
+            batchProduct = checked(batchProduct * dimension);
+        if (equation.HasEllipsis) sizes[EllipsisMarker] = batchProduct;
+
+        var live = new List<HashSet<char>>(equation.Operands.Count);
+        for (int i = 0; i < equation.Operands.Count; i++)
+        {
+            OperandLabels operand = equation.Operands[i];
+            var labels = new HashSet<char>(operand.Labels);
+            if (operand.HasEllipsis) labels.Add(EllipsisMarker);
+            live.Add(labels);
+        }
+
+        var outputLabels = new HashSet<char>(equation.Output.Labels);
+        if (equation.Output.HasEllipsis) outputLabels.Add(EllipsisMarker);
+        var steps = new List<EinsumPathStep>(expectedSteps);
+        long total = 0;
+
+        foreach (EinsumContractionPair pair in order.Pairs)
+        {
+            if (pair.LeftIndex < 0 || pair.RightIndex <= pair.LeftIndex || pair.RightIndex >= live.Count)
+                throw new ArgumentException(
+                    "A contraction pair indexes outside the current live operand list.",
+                    nameof(order));
+
+            var combined = new HashSet<char>(live[pair.LeftIndex]);
+            combined.UnionWith(live[pair.RightIndex]);
+            var needed = new HashSet<char>(outputLabels);
+            for (int i = 0; i < live.Count; i++)
+            {
+                if (i == pair.LeftIndex || i == pair.RightIndex) continue;
+                needed.UnionWith(live[i]);
+            }
+
+            var resultLabels = new HashSet<char>(combined);
+            resultLabels.IntersectWith(needed);
+            var contractedLabels = new HashSet<char>(combined);
+            contractedLabels.ExceptWith(resultLabels);
+            long cost = checked(2L * ProductOfSizes(combined, sizes));
+            steps.Add(new EinsumPathStep(
+                pair.LeftIndex,
+                pair.RightIndex,
+                resultLabels.ToArray(),
+                contractedLabels.ToArray(),
+                cost));
+            total = checked(total + cost);
+
+            live.RemoveAt(pair.RightIndex);
+            live.RemoveAt(pair.LeftIndex);
+            live.Add(resultLabels);
+        }
+
+        return new EinsumPath(steps, total, order, strategy);
+    }
+}
+
+/// <summary>Identifies how an einsum contraction order was selected.</summary>
+public enum EinsumPathStrategy
+{
+    /// <summary>The deterministic greedy cost heuristic selected the order.</summary>
+    Greedy = 0,
+
+    /// <summary>An offline evolutionary benchmark selected the order.</summary>
+    Evolutionary = 1,
+
+    /// <summary>An external caller supplied the order.</summary>
+    External = 2
+}
+
+/// <summary>One typed pair selection in the current live operand list.</summary>
+public readonly record struct EinsumContractionPair
+{
+    /// <summary>Creates a canonical pair whose left index is smaller than its right index.</summary>
+    public EinsumContractionPair(int leftIndex, int rightIndex)
+    {
+        if (leftIndex < 0) throw new ArgumentOutOfRangeException(nameof(leftIndex));
+        if (rightIndex <= leftIndex) throw new ArgumentOutOfRangeException(nameof(rightIndex));
+        LeftIndex = leftIndex;
+        RightIndex = rightIndex;
+    }
+
+    /// <summary>Index of the first live operand.</summary>
+    public int LeftIndex { get; }
+
+    /// <summary>Index of the second live operand.</summary>
+    public int RightIndex { get; }
+}
+
+/// <summary>An immutable, typed sequence of pairwise contraction choices.</summary>
+public sealed class EinsumContractionOrder
+{
+    private readonly IReadOnlyList<EinsumContractionPair> _pairs;
+
+    /// <summary>Creates an immutable snapshot of a pair sequence.</summary>
+    public EinsumContractionOrder(IEnumerable<EinsumContractionPair> pairs)
+    {
+        if (pairs is null) throw new ArgumentNullException(nameof(pairs));
+        _pairs = Array.AsReadOnly(pairs.ToArray());
+    }
+
+    /// <summary>Pair choices in execution order.</summary>
+    public IReadOnlyList<EinsumContractionPair> Pairs => _pairs;
 }
 
 /// <summary>
@@ -205,11 +339,38 @@ public sealed class EinsumPath
     /// <summary>Sum of <see cref="EinsumPathStep.EstimatedFlops"/> across all steps.</summary>
     public long TotalFlops { get; }
 
+    /// <summary>Typed pair choices that reproduce this path.</summary>
+    public EinsumContractionOrder ContractionOrder { get; }
+
+    /// <summary>How the contraction order was selected.</summary>
+    public EinsumPathStrategy Strategy { get; }
+
     /// <summary>Constructs a path.</summary>
     public EinsumPath(IReadOnlyList<EinsumPathStep> steps, long totalFlops)
+        : this(
+            steps,
+            totalFlops,
+            new EinsumContractionOrder((steps ?? throw new ArgumentNullException(nameof(steps)))
+                .Select(step => new EinsumContractionPair(step.LeftIndex, step.RightIndex))),
+            EinsumPathStrategy.External)
     {
-        Steps = steps;
+    }
+
+    internal EinsumPath(
+        IReadOnlyList<EinsumPathStep> steps,
+        long totalFlops,
+        EinsumContractionOrder contractionOrder,
+        EinsumPathStrategy strategy)
+    {
+        if (steps is null) throw new ArgumentNullException(nameof(steps));
+        if (totalFlops < 0) throw new ArgumentOutOfRangeException(nameof(totalFlops));
+        if (contractionOrder is null) throw new ArgumentNullException(nameof(contractionOrder));
+        if (!Enum.IsDefined(typeof(EinsumPathStrategy), strategy))
+            throw new ArgumentOutOfRangeException(nameof(strategy));
+        Steps = Array.AsReadOnly(steps.ToArray());
         TotalFlops = totalFlops;
+        ContractionOrder = contractionOrder;
+        Strategy = strategy;
     }
 }
 
@@ -248,10 +409,15 @@ public sealed class EinsumPathStep
         IReadOnlyList<char> contractedLabels,
         long estimatedFlops)
     {
+        if (leftIndex < 0) throw new ArgumentOutOfRangeException(nameof(leftIndex));
+        if (rightIndex <= leftIndex) throw new ArgumentOutOfRangeException(nameof(rightIndex));
+        if (resultLabels is null) throw new ArgumentNullException(nameof(resultLabels));
+        if (contractedLabels is null) throw new ArgumentNullException(nameof(contractedLabels));
+        if (estimatedFlops < 0) throw new ArgumentOutOfRangeException(nameof(estimatedFlops));
         LeftIndex = leftIndex;
         RightIndex = rightIndex;
-        ResultLabels = resultLabels;
-        ContractedLabels = contractedLabels;
+        ResultLabels = Array.AsReadOnly(resultLabels.ToArray());
+        ContractedLabels = Array.AsReadOnly(contractedLabels.ToArray());
         EstimatedFlops = estimatedFlops;
     }
 }

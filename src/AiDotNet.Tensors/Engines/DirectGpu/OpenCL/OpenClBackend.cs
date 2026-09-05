@@ -1611,6 +1611,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     NdimbSize = 8,
                     UseTrueVectorLDS = true,
                     UseColumnMajorA = true,
+                    KernelTemplate = GemmKernelTemplate.ClBlastBaselineK0,
                     KernelName = "clblast_baseline_k0"
                 };
                 _clblastBaselineConfig = defaultBaseline;
@@ -2033,15 +2034,15 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     // Pad "A" (originally B) if needed - NO TRANSPOSE, just copy with padding
                     if (aNeedsPad)
                     {
-                        if (timingEnabled) { Synchronize(); sw!.Restart(); }
+                        if (sw is not null) { Synchronize(); sw.Restart(); }
                         aTemp = AllocateBuffer((int)aSize);
-                        if (timingEnabled) { allocTime += sw!.ElapsedTicks; sw.Restart(); }
+                        if (sw is not null) { allocTime += sw.ElapsedTicks; sw.Restart(); }
                         // B is K×N row-major. Reinterpreted as column-major, it's N×K.
                         // We need mCeiled×kCeiled = swappedM_ceiled × K_ceiled.
                         // Copy K rows of N elements, with output stride mCeiled.
                         ClBlastCopyMatrix(B, aTemp, N, K, N, 0, mCeiled, kCeiled, mCeiled, 0, true);
                         aBuf = aTemp;
-                        if (timingEnabled) { Synchronize(); packATime = sw!.ElapsedTicks; }
+                        if (sw is not null) { Synchronize(); packATime = sw.ElapsedTicks; }
                     }
 
                     // Materialize "B" (originally A) as A^T — ALWAYS, even when no padding.
@@ -2057,46 +2058,46 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     // wrong results for every non-symmetric input >= MinIndirectSize (symmetric
                     // inputs like all-ones masked the bug). Transposing A fixes it. (#364 follow-up)
                     {
-                        if (timingEnabled) { sw!.Restart(); }
+                        if (sw is not null) { sw.Restart(); }
                         bTemp = AllocateBuffer((int)bSize);
-                        if (timingEnabled) { allocTime += sw!.ElapsedTicks; sw.Restart(); }
+                        if (sw is not null) { allocTime += sw.ElapsedTicks; sw.Restart(); }
                         // A is M×K row-major (one=K cols, two=M rows, ld=K). Transpose to
                         // A^T = K×M, padded to (kCeiled rows × nCeiled cols), ld=nCeiled.
                         ClBlastTransposeMatrix(A, bTemp, K, M, K, 0, nCeiled, kCeiled, nCeiled, 0, true);
                         bBuf = bTemp;
-                        if (timingEnabled) { Synchronize(); packBTime = sw!.ElapsedTicks; }
+                        if (sw is not null) { Synchronize(); packBTime = sw.ElapsedTicks; }
                     }
 
                     // Pad C if needed (for beta != 0) - NO TRANSPOSE
                     if (cNeedsPad)
                     {
-                        if (timingEnabled) { sw!.Restart(); }
+                        if (sw is not null) { sw.Restart(); }
                         cTemp = AllocateBuffer((int)cSize);
-                        if (timingEnabled) { allocTime += sw!.ElapsedTicks; sw.Restart(); }
+                        if (sw is not null) { allocTime += sw.ElapsedTicks; sw.Restart(); }
                         if (beta != 0.0f)
                         {
                             // C is M×N row-major. Reinterpreted as column-major, it's N×M.
                             // We need mCeiled×nCeiled.
                             ClBlastCopyMatrix(C, cTemp, N, M, N, 0, mCeiled, nCeiled, mCeiled, 0, true);
-                            if (timingEnabled) { Synchronize(); packCTime = sw!.ElapsedTicks; }
+                            if (sw is not null) { Synchronize(); packCTime = sw.ElapsedTicks; }
                         }
                         cBuf = cTemp;
                     }
 
                     // Execute GEMM with swapped dimensions
-                    if (timingEnabled) { sw!.Restart(); }
+                    if (sw is not null) { sw.Restart(); }
                     if (!TryExecuteDynamicGemm(aBuf, bBuf, cBuf, mCeiled, nCeiled, kCeiled, alpha, beta, config))
                         return false;
-                    if (timingEnabled) { Synchronize(); gemmTime = sw!.ElapsedTicks; }
+                    if (sw is not null) { Synchronize(); gemmTime = sw.ElapsedTicks; }
 
                     // Copy result back if we used temp buffer - NO TRANSPOSE
                     if (cNeedsPad)
                     {
-                        if (timingEnabled) { sw!.Restart(); }
+                        if (sw is not null) { sw.Restart(); }
                         // Result is mCeiled×nCeiled column-major = nCeiled×mCeiled row-major.
                         // But we want M×N row-major. Copy with original dimensions.
                         ClBlastCopyMatrix(cBuf, C, mCeiled, nCeiled, mCeiled, 0, N, M, N, 0, false);
-                        if (timingEnabled) { Synchronize(); unpackCTime = sw!.ElapsedTicks; }
+                        if (sw is not null) { Synchronize(); unpackCTime = sw.ElapsedTicks; }
                     }
 
                     if (timingEnabled)
@@ -2159,47 +2160,47 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 {
                     if (!aNoTemp)
                     {
-                        if (timingEnabled) { Synchronize(); sw!.Restart(); }
+                        if (sw is not null) { Synchronize(); sw.Restart(); }
                         aTemp = AllocateBuffer((int)aSize);
                         aBuf = aTemp;
-                        if (timingEnabled) { allocTime += sw!.ElapsedTicks; sw.Restart(); }
+                        if (sw is not null) { allocTime += sw.ElapsedTicks; sw.Restart(); }
                         ClBlastCopyMatrix(A, aBuf, aOne, aTwo, aOne, 0, aOneI, aTwoI, aOneI, 0, true);
-                        if (timingEnabled) { Synchronize(); packATime = sw!.ElapsedTicks; }
+                        if (sw is not null) { Synchronize(); packATime = sw.ElapsedTicks; }
                     }
 
                     if (!bNoTemp)
                     {
-                        if (timingEnabled) { sw!.Restart(); }
+                        if (sw is not null) { sw.Restart(); }
                         bTemp = AllocateBuffer((int)bSize);
                         bBuf = bTemp;
-                        if (timingEnabled) { allocTime += sw!.ElapsedTicks; sw.Restart(); }
+                        if (sw is not null) { allocTime += sw.ElapsedTicks; sw.Restart(); }
                         ClBlastCopyMatrix(B, bBuf, bOne, bTwo, bOne, 0, bOneI, bTwoI, bOneI, 0, true);
-                        if (timingEnabled) { Synchronize(); packBTime = sw!.ElapsedTicks; }
+                        if (sw is not null) { Synchronize(); packBTime = sw.ElapsedTicks; }
                     }
 
                     if (!cNoTemp)
                     {
-                        if (timingEnabled) { sw!.Restart(); }
+                        if (sw is not null) { sw.Restart(); }
                         cTemp = AllocateBuffer((int)cSize);
                         cBuf = cTemp;
-                        if (timingEnabled) { allocTime += sw!.ElapsedTicks; sw.Restart(); }
+                        if (sw is not null) { allocTime += sw.ElapsedTicks; sw.Restart(); }
                         if (beta != 0.0f)
                         {
                             ClBlastCopyMatrix(C, cBuf, cOne, cTwo, cOne, 0, cOneI, cTwoI, cOneI, 0, true);
-                            if (timingEnabled) { Synchronize(); packCTime = sw!.ElapsedTicks; }
+                            if (sw is not null) { Synchronize(); packCTime = sw.ElapsedTicks; }
                         }
                     }
 
-                    if (timingEnabled) { sw!.Restart(); }
+                    if (sw is not null) { sw.Restart(); }
                     if (!TryExecuteDynamicGemm(aBuf, bBuf, cBuf, mCeiled, nCeiled, kCeiled, alpha, beta, config))
                         return false;
-                    if (timingEnabled) { Synchronize(); gemmTime = sw!.ElapsedTicks; }
+                    if (sw is not null) { Synchronize(); gemmTime = sw.ElapsedTicks; }
 
                     if (!cNoTemp)
                     {
-                        if (timingEnabled) { sw!.Restart(); }
+                        if (sw is not null) { sw.Restart(); }
                         ClBlastCopyMatrix(cBuf, C, cOneI, cTwoI, cOneI, 0, cOne, cTwo, cOne, 0, false);
-                        if (timingEnabled) { Synchronize(); unpackCTime = sw!.ElapsedTicks; }
+                        if (sw is not null) { Synchronize(); unpackCTime = sw.ElapsedTicks; }
                     }
 
                     if (timingEnabled)
@@ -2348,14 +2349,12 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         private static bool IsClBlastBaselineKernel0(GemmConfig config)
         {
-            return !string.IsNullOrWhiteSpace(config.KernelName) &&
-                config.KernelName.StartsWith("clblast_baseline_k0", StringComparison.OrdinalIgnoreCase);
+            return config.KernelTemplate == GemmKernelTemplate.ClBlastBaselineK0;
         }
 
         private static bool IsClBlastBaselineKernel1(GemmConfig config)
         {
-            return !string.IsNullOrWhiteSpace(config.KernelName) &&
-                config.KernelName.StartsWith("clblast_baseline_k1", StringComparison.OrdinalIgnoreCase);
+            return config.KernelTemplate == GemmKernelTemplate.ClBlastBaselineK1;
         }
 
         private static bool IsClBlastBaselineKernel(GemmConfig config)

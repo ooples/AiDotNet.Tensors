@@ -897,23 +897,30 @@ internal static partial class SimdGemm
             && maxThreads > 1
             && numRowBlocks >= 1
             && (long)m * k * n >= ParallelWorkThreshold;
+        bool useParallel2D = canParallelize && cached.NumColSubBlocks >= 2;
 
         int mcRounded = ((Mc + Mr - 1) / Mr) * Mr;
         int packedASizePerRow = mcRounded * Kc;
         int packedBSizePerSub = cached.PackedSubs.Length > 0 ? cached.PackedSubs[0].Length : 0;
 
-        var packedABufs = canParallelize ? new float[numRowBlocks][] : null;
-        if (canParallelize)
+        var packedABufs = useParallel2D ? new float[numRowBlocks][] : Array.Empty<float[]>();
+        if (useParallel2D)
             for (int r = 0; r < numRowBlocks; r++)
-                packedABufs![r] = System.Buffers.ArrayPool<float>.Shared.Rent(packedASizePerRow);
-        var packedABuf = canParallelize ? null : System.Buffers.ArrayPool<float>.Shared.Rent(packedASizePerRow);
+                packedABufs[r] = System.Buffers.ArrayPool<float>.Shared.Rent(packedASizePerRow);
+        float[] packedABuf = useParallel2D
+            ? Array.Empty<float>()
+            : System.Buffers.ArrayPool<float>.Shared.Rent(packedASizePerRow);
 
         // One dequant scratch per col-sub for parallel mode; one for sequential.
-        var dequantBufs = canParallelize ? new float[cached.NumColSubBlocks][] : null;
-        if (canParallelize)
+        var dequantBufs = useParallel2D
+            ? new float[cached.NumColSubBlocks][]
+            : Array.Empty<float[]>();
+        if (useParallel2D)
             for (int cs = 0; cs < cached.NumColSubBlocks; cs++)
-                dequantBufs![cs] = System.Buffers.ArrayPool<float>.Shared.Rent(packedBSizePerSub);
-        var dequantBuf = canParallelize ? null : System.Buffers.ArrayPool<float>.Shared.Rent(packedBSizePerSub);
+                dequantBufs[cs] = System.Buffers.ArrayPool<float>.Shared.Rent(packedBSizePerSub);
+        float[] dequantBuf = useParallel2D
+            ? Array.Empty<float>()
+            : System.Buffers.ArrayPool<float>.Shared.Rent(packedBSizePerSub);
 
         try
         {
@@ -927,7 +934,7 @@ internal static partial class SimdGemm
                 int kc = System.Math.Min(Kc, k - pc);
                 int subsBase = pcIter * cached.NumColSubBlocks;
 
-                if (canParallelize && cached.NumColSubBlocks >= 2)
+                if (useParallel2D)
                 {
                     int localNumRowBlocks = numRowBlocks;
                     int localMc = Mc;
@@ -939,8 +946,8 @@ internal static partial class SimdGemm
                     int localColSubSize = cached.ColSubSize;
                     int localNumColSubs = cached.NumColSubBlocks;
                     int localNc = nc;
-                    var localPackedABufs = packedABufs!;
-                    var localDequantBufs = dequantBufs!;
+                    var localPackedABufs = packedABufs;
+                    var localDequantBufs = dequantBufs;
                     var localCachedSubs = cached.PackedSubs;
                     int localSubsBase = subsBase;
                     float localScale = cachedScale;
@@ -1003,12 +1010,12 @@ internal static partial class SimdGemm
                 else
                 {
                     // Sequential fallback
-                    PackA(a, packedABuf!, k, false, ic: 0, mc: System.Math.Min(Mc, m), pc, kc);
+                    PackA(a, packedABuf, k, false, ic: 0, mc: System.Math.Min(Mc, m), pc, kc);
                     for (int ic = 0; ic < m; ic += Mc)
                     {
                         int mc = System.Math.Min(Mc, m - ic);
                         if (ic > 0)
-                            PackA(a, packedABuf!, k, false, ic, mc, pc, kc);
+                            PackA(a, packedABuf, k, false, ic, mc, pc, kc);
 
                         for (int cs = 0; cs < cached.NumColSubBlocks; cs++)
                         {
@@ -1017,9 +1024,9 @@ internal static partial class SimdGemm
                             if (subNc > 0)
                             {
                                 Int8Quantizer.DequantizeInt8ToFloat32(
-                                    cached.PackedSubs[subsBase + cs], dequantBuf!, cachedScale);
+                                    cached.PackedSubs[subsBase + cs], dequantBuf, cachedScale);
                                 MacroKernel(
-                                    packedABuf!, dequantBuf!,
+                                    packedABuf, dequantBuf,
                                     c, mc, subNc, kc, n,
                                     ic, jc + jStart);
                             }
@@ -1030,14 +1037,14 @@ internal static partial class SimdGemm
         }
         finally
         {
-            if (packedABuf is not null)
+            if (!useParallel2D)
                 System.Buffers.ArrayPool<float>.Shared.Return(packedABuf);
-            if (dequantBuf is not null)
+            if (!useParallel2D)
                 System.Buffers.ArrayPool<float>.Shared.Return(dequantBuf);
-            if (packedABufs is not null)
+            if (useParallel2D)
                 for (int r = 0; r < numRowBlocks; r++)
                     System.Buffers.ArrayPool<float>.Shared.Return(packedABufs[r]);
-            if (dequantBufs is not null)
+            if (useParallel2D)
                 for (int cs = 0; cs < cached.NumColSubBlocks; cs++)
                     System.Buffers.ArrayPool<float>.Shared.Return(dequantBufs[cs]);
         }
@@ -1066,12 +1073,14 @@ internal static partial class SimdGemm
 
         int mcRounded = ((Mc + Mr - 1) / Mr) * Mr;
         int packedASizePerRow = mcRounded * Kc;
-        float[]? packedABuf = useParallel2D ? null : GetThreadPackedABuffer(packedASizePerRow);
-        var packedABufs = useParallel2D ? new float[numRowBlocks][] : null;
+        float[] packedABuf = useParallel2D
+            ? Array.Empty<float>()
+            : GetThreadPackedABuffer(packedASizePerRow);
+        var packedABufs = useParallel2D ? new float[numRowBlocks][] : Array.Empty<float[]>();
         if (useParallel2D)
         {
             for (int r = 0; r < numRowBlocks; r++)
-                packedABufs![r] = System.Buffers.ArrayPool<float>.Shared.Rent(packedASizePerRow);
+                packedABufs[r] = System.Buffers.ArrayPool<float>.Shared.Rent(packedASizePerRow);
         }
 
         try
@@ -1099,7 +1108,7 @@ internal static partial class SimdGemm
                     int localColSubSize = cached.ColSubSize;
                     int localNumColSubs = cached.NumColSubBlocks;
                     int localNc = nc;
-                    var localPackedABufs = packedABufs!;
+                    var localPackedABufs = packedABufs;
                     var localCachedSubs = cached.PackedSubs;
                     int localSubsBase = subsBase;
 
@@ -1148,7 +1157,7 @@ internal static partial class SimdGemm
                 else
                 {
                     // Sequential fallback
-                    var packedA = packedABuf!;
+                    var packedA = packedABuf;
                     PackA(a, packedA, k, false, ic: 0, mc: System.Math.Min(Mc, m), pc, kc);
                     for (int ic = 0; ic < m; ic += Mc)
                     {
@@ -1172,7 +1181,7 @@ internal static partial class SimdGemm
         }
         finally
         {
-            if (packedABufs is not null)
+            if (useParallel2D)
             {
                 for (int r = 0; r < numRowBlocks; r++)
                     System.Buffers.ArrayPool<float>.Shared.Return(packedABufs[r]);

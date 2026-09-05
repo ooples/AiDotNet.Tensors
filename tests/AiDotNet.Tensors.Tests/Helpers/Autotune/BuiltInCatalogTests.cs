@@ -64,9 +64,9 @@ public sealed class BuiltInCatalogTests : IDisposable
         // Acceptance: every common kernel, every supplied shape → non-null Lookup.
         foreach (var s in shapes)
         {
-            var choice = AutotuneCache.Lookup(BuiltInCatalog.SGEMM, new ShapeProfile(s));
-            Assert.NotNull(choice);
-            Assert.False(string.IsNullOrEmpty(choice!.Variant));
+            KernelChoice choice = Assert.IsType<KernelChoice>(
+                AutotuneCache.Lookup(BuiltInCatalog.SGEMM, new ShapeProfile(s)));
+            Assert.False(string.IsNullOrEmpty(choice.Variant));
             Assert.True(choice.MeasuredGflops > 0,
                 $"Expected positive GFLOPS for {BuiltInCatalog.SGEMM.ToFileStem()}@{string.Join("x", s)}");
         }

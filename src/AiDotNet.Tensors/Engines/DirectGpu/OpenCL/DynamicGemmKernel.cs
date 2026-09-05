@@ -751,23 +751,21 @@ internal sealed class DynamicGemmKernel : IDisposable
 
     private static bool TryGetClBlastBaselineKernel(GemmConfig config, out int gemmK)
     {
-        gemmK = 0;
-        if (string.IsNullOrWhiteSpace(config.KernelName))
-            return false;
-
-        if (config.KernelName.StartsWith("clblast_baseline_k1", StringComparison.OrdinalIgnoreCase))
+        switch (config.KernelTemplate)
         {
-            gemmK = 1;
-            return true;
+            case GemmKernelTemplate.ClBlastBaselineK0:
+                gemmK = 0;
+                return true;
+            case GemmKernelTemplate.ClBlastBaselineK1:
+                gemmK = 1;
+                return true;
+            case GemmKernelTemplate.Tuned:
+                gemmK = 0;
+                return false;
+            default:
+                throw new ArgumentOutOfRangeException(
+                    nameof(config), config.KernelTemplate, "Unknown GEMM kernel template.");
         }
-
-        if (config.KernelName.StartsWith("clblast_baseline_k0", StringComparison.OrdinalIgnoreCase))
-        {
-            gemmK = 0;
-            return true;
-        }
-
-        return false;
     }
 
     private static string GetKernelEntryName(GemmConfig config)

@@ -13,6 +13,17 @@ using Microsoft.Extensions.Logging;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 
+/// <summary>Kernel source template selected independently from a human-readable configuration label.</summary>
+public enum GemmKernelTemplate
+{
+    /// <summary>The parameterized AiDotNet GEMM template.</summary>
+    Tuned = 0,
+    /// <summary>The CLBlast-compatible GEMMK=0 template.</summary>
+    ClBlastBaselineK0 = 1,
+    /// <summary>The CLBlast-compatible GEMMK=1 template.</summary>
+    ClBlastBaselineK1 = 2
+}
+
 /// <summary>
 /// GEMM kernel configuration parameters.
 /// </summary>
@@ -27,6 +38,9 @@ public readonly struct GemmConfig
     public int VectorWidthN { get; init; }
     public bool UseDoubleBuffering { get; init; }
     public bool UseVectorizedLoads { get; init; }
+    /// <summary>Gets the type-safe source template that controls code generation.</summary>
+    public GemmKernelTemplate KernelTemplate { get; init; }
+    /// <summary>Gets a diagnostic label. This value never controls code generation.</summary>
     public string KernelName { get; init; }
 
     // CLBlast-style parameters for higher performance
@@ -55,7 +69,7 @@ public readonly struct GemmConfig
     /// Used by DynamicGemmKernel to cache compiled kernels.
     /// </summary>
     public string ToKey() =>
-        $"{(string.IsNullOrWhiteSpace(KernelName) ? "default" : KernelName)}_{TileM}_{TileN}_{TileK}_{ThreadTileM}_{ThreadTileN}_{VectorWidthM}_{VectorWidthN}_{UseDoubleBuffering}_{UseVectorizedLoads}_{KReg}_{KUnroll}_{UseSubgroupOps}_{StrideM}_{StrideN}_{CacheA}_{CacheB}_{MdimaSize}_{NdimbSize}_{UseTrueVectorLDS}_{UseColumnMajorA}";
+        $"{(int)KernelTemplate}_{TileM}_{TileN}_{TileK}_{ThreadTileM}_{ThreadTileN}_{VectorWidthM}_{VectorWidthN}_{UseDoubleBuffering}_{UseVectorizedLoads}_{KReg}_{KUnroll}_{UseSubgroupOps}_{StrideM}_{StrideN}_{CacheA}_{CacheB}_{MdimaSize}_{NdimbSize}_{UseTrueVectorLDS}_{UseColumnMajorA}";
 
     public override string ToString() =>
         $"{KernelName}[{TileM}x{TileN}x{TileK}, TT:{ThreadTileM}x{ThreadTileN}, VW:{VectorWidthM}x{VectorWidthN}, K:{KReg}x{KUnroll}, SG:{UseSubgroupOps}, SA/B:{(CacheA ? 1 : 0)}/{(CacheB ? 1 : 0)}, MD:{MdimaSize}x{NdimbSize}, ACol:{(UseColumnMajorA ? 1 : 0)}]";
@@ -77,7 +91,7 @@ public readonly struct TuningResult
 /// Auto-tuner for GEMM kernel selection and parameter optimization.
 /// Uses Bayesian-inspired heuristics to quickly find optimal configurations.
 /// </summary>
-public sealed class GemmAutoTuner
+public sealed partial class GemmAutoTuner
 {
     private readonly Dictionary<(int M, int N, int K), GemmConfig> _cache = new();
     private readonly object _cacheLock = new();
@@ -287,12 +301,13 @@ public sealed class GemmAutoTuner
     private static void LogTrialCsv(int trialIndex, string phase, string strategy, int M, int N, int K,
         TuningResult result, GpuCapabilities? capabilities)
     {
-        if (string.IsNullOrWhiteSpace(TrialLogFilePath))
+        string? configuredPath = TrialLogFilePath;
+        if (configuredPath is null || string.IsNullOrWhiteSpace(configuredPath))
             return;
 
         try
         {
-            string path = TrialLogFilePath!;
+            string path = configuredPath;
             string? dir = Path.GetDirectoryName(path);
             if (!string.IsNullOrEmpty(dir))
                 Directory.CreateDirectory(dir);
@@ -414,8 +429,7 @@ public sealed class GemmAutoTuner
         int vwn = Math.Max(1, config.VectorWidthN > 0 ? config.VectorWidthN : 1);
         int kreg = Math.Max(1, config.KReg > 0 ? config.KReg : 1);
         int kunroll = Math.Max(1, config.KUnroll > 0 ? config.KUnroll : 1);
-        bool usesClBlastBaselineK0 = !string.IsNullOrWhiteSpace(config.KernelName) &&
-            config.KernelName.StartsWith("clblast_baseline_k0", StringComparison.OrdinalIgnoreCase);
+        bool usesClBlastBaselineK0 = config.KernelTemplate == GemmKernelTemplate.ClBlastBaselineK0;
 
         int mwi = Math.Max(1, tileM / threadTileM);
         int nwi = Math.Max(1, tileN / threadTileN);
@@ -645,6 +659,7 @@ public sealed class GemmAutoTuner
             MdimaSize = 8, NdimbSize = 8,
             UseTrueVectorLDS = true,
             UseColumnMajorA = true,
+            KernelTemplate = GemmKernelTemplate.ClBlastBaselineK0,
             KernelName = "clblast_baseline_k0_small"
         },
         // Fallback for very small matrices
@@ -666,6 +681,7 @@ public sealed class GemmAutoTuner
             MdimaSize = 8, NdimbSize = 8,
             UseTrueVectorLDS = true,
             UseColumnMajorA = true,
+            KernelTemplate = GemmKernelTemplate.ClBlastBaselineK0,
             KernelName = "clblast_baseline_k0_medium"
         },
         // Original baseline for comparison
@@ -681,6 +697,7 @@ public sealed class GemmAutoTuner
             MdimaSize = 16, NdimbSize = 8,
             UseTrueVectorLDS = true,
             UseColumnMajorA = true,
+            KernelTemplate = GemmKernelTemplate.ClBlastBaselineK0,
             KernelName = "clblast_baseline_k0"
         },
     };
@@ -702,6 +719,7 @@ public sealed class GemmAutoTuner
             MdimaSize = 8, NdimbSize = 16,
             UseTrueVectorLDS = true,
             UseColumnMajorA = true,
+            KernelTemplate = GemmKernelTemplate.ClBlastBaselineK0,
             KernelName = "clblast_baseline_k0_large"
         },
         // Original CLBlast baseline for fallback/comparison
@@ -717,6 +735,7 @@ public sealed class GemmAutoTuner
             MdimaSize = 16, NdimbSize = 8,
             UseTrueVectorLDS = true,
             UseColumnMajorA = true,
+            KernelTemplate = GemmKernelTemplate.ClBlastBaselineK0,
             KernelName = "clblast_baseline_k0"
         },
         // Alternative: 128x64 for M-dominant shapes
@@ -732,6 +751,7 @@ public sealed class GemmAutoTuner
             MdimaSize = 16, NdimbSize = 8,
             UseTrueVectorLDS = true,
             UseColumnMajorA = true,
+            KernelTemplate = GemmKernelTemplate.ClBlastBaselineK0,
             KernelName = "clblast_baseline_k0_large_m"
         },
     };
@@ -1305,6 +1325,7 @@ public sealed class GemmAutoTuner
             NdimbSize = 8,
             UseTrueVectorLDS = true,
             UseColumnMajorA = true,
+            KernelTemplate = GemmKernelTemplate.ClBlastBaselineK0,
             KernelName = "clblast_baseline_k0"
         });
 
@@ -1332,6 +1353,7 @@ public sealed class GemmAutoTuner
             NdimbSize = 8,
             UseTrueVectorLDS = false,
             UseColumnMajorA = false,
+            KernelTemplate = GemmKernelTemplate.ClBlastBaselineK1,
             KernelName = "clblast_baseline_k1"
         });
 
