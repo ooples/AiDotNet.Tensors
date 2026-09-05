@@ -1,6 +1,7 @@
 using System.Threading;
 using System.Threading.Tasks;
 using AiDotNet.Tensors.Helpers.Autotune;
+using AiDotNet.Tensors.Engines.Simd;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Helpers.Autotune;
@@ -63,9 +64,9 @@ public sealed class BuiltInCatalogTests : IDisposable
         // Acceptance: every common kernel, every supplied shape → non-null Lookup.
         foreach (var s in shapes)
         {
-            var choice = AutotuneCache.Lookup(BuiltInCatalog.SGEMM, new ShapeProfile(s));
-            Assert.NotNull(choice);
-            Assert.False(string.IsNullOrEmpty(choice!.Variant));
+            KernelChoice choice = Assert.IsType<KernelChoice>(
+                AutotuneCache.Lookup(BuiltInCatalog.SGEMM, new ShapeProfile(s)));
+            Assert.False(string.IsNullOrEmpty(choice.Variant));
             Assert.True(choice.MeasuredGflops > 0,
                 $"Expected positive GFLOPS for {BuiltInCatalog.SGEMM.ToFileStem()}@{string.Join("x", s)}");
         }
@@ -98,6 +99,54 @@ public sealed class BuiltInCatalogTests : IDisposable
         var report = await AutotuneCache.WarmupCategoryAsync("gemm", shapes);
         Assert.Equal(1, report.KernelsWarmed);
         Assert.NotNull(AutotuneCache.Lookup(BuiltInCatalog.SGEMM, new ShapeProfile(shapes[0])));
+    }
+
+    [Fact]
+    public async Task ParallelGemmBenchmark_NeverMutatesTheProcessWideParallelPolicy()
+    {
+        bool previous = SimdGemm.UseParallelGemm;
+        try
+        {
+            SimdGemm.UseParallelGemm = false;
+            BuiltInCatalog.EnsureRegistered();
+            AutotuneCatalogEntry entry = Assert.Single(
+                AutotuneKernelCatalog.Entries,
+                candidate => candidate.Id == BuiltInCatalog.SGEMM);
+            Task<double> benchmark = Task.Run(async () =>
+                await entry.BenchmarkVariant(
+                    new ShapeProfile(256, 256, 256),
+                    "parallel",
+                    CancellationToken.None));
+
+            while (!benchmark.IsCompleted)
+            {
+                Assert.False(Volatile.Read(ref SimdGemm.UseParallelGemm));
+                Thread.Yield();
+            }
+
+            Assert.True(await benchmark > 0);
+            Assert.False(SimdGemm.UseParallelGemm);
+        }
+        finally
+        {
+            SimdGemm.UseParallelGemm = previous;
+        }
+    }
+
+    [Theory]
+    [InlineData("gemm", "corrupt")]
+    [InlineData("sparse_mm", "corrupt")]
+    public async Task BuiltInBenchmark_RejectsUnknownFiniteVariant(
+        string category,
+        string variant)
+    {
+        BuiltInCatalog.EnsureRegistered();
+        AutotuneCatalogEntry entry = Assert.Single(AutotuneKernelCatalog.EntriesForCategory(category));
+
+        await Assert.ThrowsAsync<ArgumentException>(() => entry.BenchmarkVariant(
+            new ShapeProfile(16, 16, 16, 500),
+            variant,
+            CancellationToken.None));
     }
 
     [Fact]

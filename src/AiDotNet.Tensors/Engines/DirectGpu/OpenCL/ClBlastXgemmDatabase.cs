@@ -13,10 +13,25 @@ internal static class ClBlastXgemmDatabase
             return false;
 
         int gemmK = parameters[0];
-        string kernelName = gemmK == 1 ? "clblast_baseline_k1" : "clblast_baseline_k0";
+        GemmKernelTemplate kernelTemplate;
+        string kernelName;
+        switch (gemmK)
+        {
+            case 0:
+                kernelTemplate = GemmKernelTemplate.ClBlastBaselineK0;
+                kernelName = "clblast_baseline_k0";
+                break;
+            case 1:
+                kernelTemplate = GemmKernelTemplate.ClBlastBaselineK1;
+                kernelName = "clblast_baseline_k1";
+                break;
+            default:
+                return false;
+        }
 
         config = new GemmConfig
         {
+            KernelTemplate = kernelTemplate,
             KernelName = kernelName,
             TileM = parameters[6],
             TileN = parameters[9],

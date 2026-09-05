@@ -106,6 +106,15 @@ public sealed class ConvTileAutotuneTests : IDisposable
         Assert.Equal("16", c.Parameters[ConvTileAutotune.TileParameter]);
     }
 
+    [Fact]
+    public void TypedCandidates_AreTheCanonicalValidatedCandidateSpace()
+    {
+        IReadOnlyList<ConvTileConfiguration> candidates = ConvTileAutotune.TypedCandidates(
+            64, 64, 3136, tileEdges: new[] { 16, 16, -4, 32, 8 });
+
+        Assert.Equal(new[] { 16, 32, 8 }, candidates.Select(candidate => candidate.TileEdge));
+    }
+
     [Theory]
     [InlineData("tile-16", true, 16)]
     [InlineData("tile-8", true, 8)]

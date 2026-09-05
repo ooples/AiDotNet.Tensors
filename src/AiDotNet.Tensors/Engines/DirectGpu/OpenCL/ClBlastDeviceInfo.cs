@@ -11,7 +11,7 @@ internal readonly struct ClBlastDeviceInfo
     public string Architecture { get; }
     public string DeviceName { get; }
 
-    private ClBlastDeviceInfo(string type, string vendor, string architecture, string deviceName)
+    internal ClBlastDeviceInfo(string type, string vendor, string architecture, string deviceName)
     {
         Type = type;
         Vendor = vendor;

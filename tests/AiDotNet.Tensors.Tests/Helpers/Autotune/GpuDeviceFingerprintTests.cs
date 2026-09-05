@@ -12,6 +12,13 @@ namespace AiDotNet.Tensors.Tests.Helpers.Autotune;
 /// </summary>
 public sealed class GpuDeviceFingerprintTests
 {
+    [Fact]
+    public void KernelTuningFingerprint_RejectsDefaultGpuStruct()
+    {
+        Assert.Throws<ArgumentException>(() =>
+            KernelTuningDeviceFingerprint.FromGpu(default));
+    }
+
     // Reproduces the exact legacy formatter that DirectPtxRuntime used before
     // the structured fingerprint: gpu-{uuid}-sm{maj}{min}-drv{driver}.
     private static string LegacyToken(string uuid, int maj, int min, int drv) =>
@@ -41,6 +48,15 @@ public sealed class GpuDeviceFingerprintTests
     {
         var fp = GpuDeviceFingerprint.FromCuda(model, "uuid1", 8, 6, 12030);
         Assert.Equal(expectedVendor, fp.Vendor);
+    }
+
+    [Fact]
+    public void TypedVendor_IsTheControlValueWhileLegacyTokenRemainsCompatible()
+    {
+        var fp = new GpuDeviceFingerprint(GpuVendorKind.Amd, "AMD Instinct MI300X", 9, 4, 60100, "gpu-0");
+
+        Assert.Equal(GpuVendorKind.Amd, fp.VendorKind);
+        Assert.Equal("amd", fp.Vendor);
     }
 
     [Fact]

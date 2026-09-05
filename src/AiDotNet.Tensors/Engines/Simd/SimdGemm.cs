@@ -531,7 +531,7 @@ internal static partial class SimdGemm
         {
             c.Clear();
             SgemmAddInternal(a, k, false, b.AsSpan(), n, false, c, m, k, n,
-                allowParallel: true, clearedOutput: true);
+                allowParallel: UseParallelGemm, clearedOutput: true);
             return;
         }
 
@@ -558,7 +558,7 @@ internal static partial class SimdGemm
             // for SgemmWithCachedB, so zero c before passing clearedOutput:true.
             c.Clear();
             SgemmAddInternal(a, k, false, b.AsSpan(), n, false, c, m, k, n,
-                allowParallel: true, clearedOutput: true);
+                allowParallel: UseParallelGemm, clearedOutput: true);
             return;
         }
 
@@ -832,7 +832,7 @@ internal static partial class SimdGemm
         if (n > Nc || Avx512Sgemm.CanUse)
         {
             SgemmAddInternal(a, k, false, b.AsSpan(), n, false, c, m, k, n,
-                allowParallel: true, clearedOutput: true);
+                allowParallel: UseParallelGemm, clearedOutput: true);
             return;
         }
 
@@ -897,23 +897,30 @@ internal static partial class SimdGemm
             && maxThreads > 1
             && numRowBlocks >= 1
             && (long)m * k * n >= ParallelWorkThreshold;
+        bool useParallel2D = canParallelize && cached.NumColSubBlocks >= 2;
 
         int mcRounded = ((Mc + Mr - 1) / Mr) * Mr;
         int packedASizePerRow = mcRounded * Kc;
         int packedBSizePerSub = cached.PackedSubs.Length > 0 ? cached.PackedSubs[0].Length : 0;
 
-        var packedABufs = canParallelize ? new float[numRowBlocks][] : null;
-        if (canParallelize)
+        var packedABufs = useParallel2D ? new float[numRowBlocks][] : Array.Empty<float[]>();
+        if (useParallel2D)
             for (int r = 0; r < numRowBlocks; r++)
-                packedABufs![r] = System.Buffers.ArrayPool<float>.Shared.Rent(packedASizePerRow);
-        var packedABuf = canParallelize ? null : System.Buffers.ArrayPool<float>.Shared.Rent(packedASizePerRow);
+                packedABufs[r] = System.Buffers.ArrayPool<float>.Shared.Rent(packedASizePerRow);
+        float[] packedABuf = useParallel2D
+            ? Array.Empty<float>()
+            : System.Buffers.ArrayPool<float>.Shared.Rent(packedASizePerRow);
 
         // One dequant scratch per col-sub for parallel mode; one for sequential.
-        var dequantBufs = canParallelize ? new float[cached.NumColSubBlocks][] : null;
-        if (canParallelize)
+        var dequantBufs = useParallel2D
+            ? new float[cached.NumColSubBlocks][]
+            : Array.Empty<float[]>();
+        if (useParallel2D)
             for (int cs = 0; cs < cached.NumColSubBlocks; cs++)
-                dequantBufs![cs] = System.Buffers.ArrayPool<float>.Shared.Rent(packedBSizePerSub);
-        var dequantBuf = canParallelize ? null : System.Buffers.ArrayPool<float>.Shared.Rent(packedBSizePerSub);
+                dequantBufs[cs] = System.Buffers.ArrayPool<float>.Shared.Rent(packedBSizePerSub);
+        float[] dequantBuf = useParallel2D
+            ? Array.Empty<float>()
+            : System.Buffers.ArrayPool<float>.Shared.Rent(packedBSizePerSub);
 
         try
         {
@@ -927,7 +934,7 @@ internal static partial class SimdGemm
                 int kc = System.Math.Min(Kc, k - pc);
                 int subsBase = pcIter * cached.NumColSubBlocks;
 
-                if (canParallelize && cached.NumColSubBlocks >= 2)
+                if (useParallel2D)
                 {
                     int localNumRowBlocks = numRowBlocks;
                     int localMc = Mc;
@@ -939,8 +946,8 @@ internal static partial class SimdGemm
                     int localColSubSize = cached.ColSubSize;
                     int localNumColSubs = cached.NumColSubBlocks;
                     int localNc = nc;
-                    var localPackedABufs = packedABufs!;
-                    var localDequantBufs = dequantBufs!;
+                    var localPackedABufs = packedABufs;
+                    var localDequantBufs = dequantBufs;
                     var localCachedSubs = cached.PackedSubs;
                     int localSubsBase = subsBase;
                     float localScale = cachedScale;
@@ -1003,12 +1010,12 @@ internal static partial class SimdGemm
                 else
                 {
                     // Sequential fallback
-                    PackA(a, packedABuf!, k, false, ic: 0, mc: System.Math.Min(Mc, m), pc, kc);
+                    PackA(a, packedABuf, k, false, ic: 0, mc: System.Math.Min(Mc, m), pc, kc);
                     for (int ic = 0; ic < m; ic += Mc)
                     {
                         int mc = System.Math.Min(Mc, m - ic);
                         if (ic > 0)
-                            PackA(a, packedABuf!, k, false, ic, mc, pc, kc);
+                            PackA(a, packedABuf, k, false, ic, mc, pc, kc);
 
                         for (int cs = 0; cs < cached.NumColSubBlocks; cs++)
                         {
@@ -1017,9 +1024,9 @@ internal static partial class SimdGemm
                             if (subNc > 0)
                             {
                                 Int8Quantizer.DequantizeInt8ToFloat32(
-                                    cached.PackedSubs[subsBase + cs], dequantBuf!, cachedScale);
+                                    cached.PackedSubs[subsBase + cs], dequantBuf, cachedScale);
                                 MacroKernel(
-                                    packedABuf!, dequantBuf!,
+                                    packedABuf, dequantBuf,
                                     c, mc, subNc, kc, n,
                                     ic, jc + jStart);
                             }
@@ -1030,14 +1037,14 @@ internal static partial class SimdGemm
         }
         finally
         {
-            if (packedABuf is not null)
+            if (!useParallel2D)
                 System.Buffers.ArrayPool<float>.Shared.Return(packedABuf);
-            if (dequantBuf is not null)
+            if (!useParallel2D)
                 System.Buffers.ArrayPool<float>.Shared.Return(dequantBuf);
-            if (packedABufs is not null)
+            if (useParallel2D)
                 for (int r = 0; r < numRowBlocks; r++)
                     System.Buffers.ArrayPool<float>.Shared.Return(packedABufs[r]);
-            if (dequantBufs is not null)
+            if (useParallel2D)
                 for (int cs = 0; cs < cached.NumColSubBlocks; cs++)
                     System.Buffers.ArrayPool<float>.Shared.Return(dequantBufs[cs]);
         }
@@ -1066,12 +1073,14 @@ internal static partial class SimdGemm
 
         int mcRounded = ((Mc + Mr - 1) / Mr) * Mr;
         int packedASizePerRow = mcRounded * Kc;
-        float[]? packedABuf = useParallel2D ? null : GetThreadPackedABuffer(packedASizePerRow);
-        var packedABufs = useParallel2D ? new float[numRowBlocks][] : null;
+        float[] packedABuf = useParallel2D
+            ? Array.Empty<float>()
+            : GetThreadPackedABuffer(packedASizePerRow);
+        var packedABufs = useParallel2D ? new float[numRowBlocks][] : Array.Empty<float[]>();
         if (useParallel2D)
         {
             for (int r = 0; r < numRowBlocks; r++)
-                packedABufs![r] = System.Buffers.ArrayPool<float>.Shared.Rent(packedASizePerRow);
+                packedABufs[r] = System.Buffers.ArrayPool<float>.Shared.Rent(packedASizePerRow);
         }
 
         try
@@ -1099,7 +1108,7 @@ internal static partial class SimdGemm
                     int localColSubSize = cached.ColSubSize;
                     int localNumColSubs = cached.NumColSubBlocks;
                     int localNc = nc;
-                    var localPackedABufs = packedABufs!;
+                    var localPackedABufs = packedABufs;
                     var localCachedSubs = cached.PackedSubs;
                     int localSubsBase = subsBase;
 
@@ -1148,7 +1157,7 @@ internal static partial class SimdGemm
                 else
                 {
                     // Sequential fallback
-                    var packedA = packedABuf!;
+                    var packedA = packedABuf;
                     PackA(a, packedA, k, false, ic: 0, mc: System.Math.Min(Mc, m), pc, kc);
                     for (int ic = 0; ic < m; ic += Mc)
                     {
@@ -1172,7 +1181,7 @@ internal static partial class SimdGemm
         }
         finally
         {
-            if (packedABufs is not null)
+            if (useParallel2D)
             {
                 for (int r = 0; r < numRowBlocks; r++)
                     System.Buffers.ArrayPool<float>.Shared.Return(packedABufs[r]);
@@ -1389,6 +1398,34 @@ internal static partial class SimdGemm
     }
 
     /// <summary>
+    /// Runs the managed SGEMM implementation under an explicit per-call execution policy for autotuning.
+    /// </summary>
+    /// <remarks>
+    /// This bypasses the process-wide <see cref="UseParallelGemm"/> switch. It lets startup and background
+    /// tuning compare both policies without changing the behavior of concurrent production GEMM calls.
+    /// </remarks>
+    internal static void SgemmForAutotune(
+        ReadOnlySpan<float> a,
+        ReadOnlySpan<float> b,
+        Span<float> c,
+        int m,
+        int k,
+        int n,
+        SgemmExecutionMode executionMode)
+    {
+        if (!Enum.IsDefined(typeof(SgemmExecutionMode), executionMode))
+            throw new ArgumentOutOfRangeException(nameof(executionMode));
+
+        c.Clear();
+        SgemmAddInternal(
+            a, k, false,
+            b, n, false,
+            c, m, k, n,
+            allowParallel: executionMode == SgemmExecutionMode.Parallel,
+            clearedOutput: true);
+    }
+
+    /// <summary>
     /// Computes C = op(A) * op(B) with optional transpose on either operand.
     /// op(X) = X when transX=false, op(X) = X^T when transX=true.
     /// lda/ldb are the leading dimensions (row strides) of the source storage.
@@ -1465,7 +1502,7 @@ internal static partial class SimdGemm
         }
 
         c.Clear();
-        SgemmAddInternal(a, lda, transA, b, ldb, transB, c, m, k, n, allowParallel: true, clearedOutput: true);
+        SgemmAddInternal(a, lda, transA, b, ldb, transB, c, m, k, n, allowParallel: UseParallelGemm, clearedOutput: true);
     }
 
     // Set to 1 once OpenBLAS is pinned single-thread (we own the parallelism).
@@ -1536,7 +1573,7 @@ internal static partial class SimdGemm
         }
         // clearedC=true allows the small-matmul fast path to use store-only kernels
         // (saves load-add per micro-tile). beta=1 uses load-add-store accumulate.
-        SgemmAddInternal(a, k, false, b, n, false, c, m, k, n, allowParallel: true, clearedOutput: clearedC);
+        SgemmAddInternal(a, k, false, b, n, false, c, m, k, n, allowParallel: UseParallelGemm, clearedOutput: clearedC);
     }
 
     /// <summary>
@@ -1565,7 +1602,7 @@ internal static partial class SimdGemm
         int m, int k, int n)
     {
         // SgemmAdd is C += A·B by definition — do NOT pass clearedOutput=true here.
-        SgemmAddInternal(a, lda, transA, b, ldb, transB, c, m, k, n, allowParallel: true, clearedOutput: false);
+        SgemmAddInternal(a, lda, transA, b, ldb, transB, c, m, k, n, allowParallel: UseParallelGemm, clearedOutput: false);
     }
 
     /// <summary>
@@ -1686,7 +1723,7 @@ internal static partial class SimdGemm
         // otherwise runs single-threaded over a huge N. N-partitioning saturates the cores even at
         // m=1. Gated above ParallelWorkThreshold so small GEMMs stay serial (dispatch would
         // dominate). Race-free: each worker owns a disjoint column range (overwrite or accumulate).
-        if (allowParallel && UseParallelGemm && !transA && !transB
+        if (allowParallel && !transA && !transB
             && m > 0 && m <= NParallelSmallMMaxM && n >= Nr
             && (long)m * k * n >= ParallelWorkThreshold)
         {
@@ -3589,7 +3626,6 @@ internal static partial class SimdGemm
         int Mc = ChooseAdaptiveMc(m, k, n);
         int numRowBlocks = (m + Mc - 1) / Mc;
         bool canParallelize = allowParallel
-            && UseParallelGemm
             && maxThreads > 1
             && numRowBlocks >= 1
             && !transA && !transB  // Parallel path uses the no-transpose Pack overloads

@@ -24,6 +24,7 @@ public class SgemmInt8CachedTests
     [InlineData(256, 768, 768)]  // BERT QKV proj
     [InlineData(256, 768, 3072)] // BERT FFN up
     [InlineData(256, 3072, 768)] // BERT FFN down
+    [InlineData(640, 1024, 32)]  // parallel work with one column sub-block
     public void Int8MatchesFloat32WithinSnrBudget(int m, int k, int n)
     {
         var rng = new Random(0xD42 + m + k + n);

@@ -70,17 +70,35 @@ public static class ConvTileAutotune
         IReadOnlyList<int>? tileEdges = null,
         int maxThreadsPerBlock = 1024)
     {
+        IReadOnlyList<ConvTileConfiguration> typed = TypedCandidates(
+            outputChannels, inputChannels, spatial, tileEdges, maxThreadsPerBlock);
+        var result = new List<AutotuneCandidate>(typed.Count);
+        for (int i = 0; i < typed.Count; i++) result.Add(CandidateFor(typed[i]));
+        return result;
+    }
+
+    /// <summary>
+    /// Returns valid tile configurations without encoding launch decisions into strings.
+    /// </summary>
+    public static IReadOnlyList<ConvTileConfiguration> TypedCandidates(
+        int outputChannels,
+        int inputChannels,
+        int spatial,
+        IReadOnlyList<int>? tileEdges = null,
+        int maxThreadsPerBlock = 1024)
+    {
         ValidateLaunchArguments(outputChannels, inputChannels, spatial, maxThreadsPerBlock);
 
         IReadOnlyList<int> edges = tileEdges ?? DefaultTileEdges;
-        var result = new List<AutotuneCandidate>(edges.Count);
+        var result = new List<ConvTileConfiguration>(edges.Count);
         var seen = new HashSet<int>();
-        foreach (int t in edges)
+        foreach (int tileEdge in edges)
         {
-            if (t <= 0 || !seen.Add(t)) continue;                 // ignore junk / duplicates
-            if (!IsLaunchableTile(t, outputChannels, inputChannels, spatial, maxThreadsPerBlock))
+            if (tileEdge <= 0 || !seen.Add(tileEdge)) continue;
+            if (!IsLaunchableTile(
+                    tileEdge, outputChannels, inputChannels, spatial, maxThreadsPerBlock))
                 continue;
-            result.Add(CandidateFor(t));
+            result.Add(new ConvTileConfiguration(tileEdge));
         }
         return result;
     }
@@ -120,8 +138,12 @@ public static class ConvTileAutotune
     /// <summary>Builds the candidate for a specific tile edge.</summary>
     public static AutotuneCandidate CandidateFor(int tile)
     {
-        if (tile <= 0) throw new ArgumentOutOfRangeException(nameof(tile));
-        string edge = tile.ToString(CultureInfo.InvariantCulture);
+        return CandidateFor(new ConvTileConfiguration(tile));
+    }
+
+    private static AutotuneCandidate CandidateFor(ConvTileConfiguration configuration)
+    {
+        string edge = configuration.TileEdge.ToString(CultureInfo.InvariantCulture);
         return new AutotuneCandidate(
             VariantPrefix + edge,
             new Dictionary<string, string>(StringComparer.Ordinal) { [TileParameter] = edge });
@@ -131,8 +153,8 @@ public static class ConvTileAutotune
     public static bool TryParseTile(string? variant, out int tile)
     {
         tile = 0;
-        if (string.IsNullOrEmpty(variant) ||
-            !variant!.StartsWith(VariantPrefix, StringComparison.Ordinal))
+        if (variant is null || variant.Length == 0 ||
+            !variant.StartsWith(VariantPrefix, StringComparison.Ordinal))
             return false;
         return int.TryParse(
             variant.Substring(VariantPrefix.Length),
@@ -150,4 +172,5 @@ public static class ConvTileAutotune
         tile = 0;
         return false;
     }
+
 }
