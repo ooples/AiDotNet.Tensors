@@ -452,14 +452,35 @@ public static class CpuParallelSettings
     /// accumulation kernels leave this <see langword="false"/> so deterministic mode
     /// serializes them for reproducibility.</param>
     public static void ParallelForOrSerial(int fromInclusive, int toExclusive, long totalWork, Action<int> body, bool deterministicSafe = false)
+        => ParallelForOrSerial(
+            fromInclusive,
+            toExclusive,
+            totalWork,
+            body,
+            MaxDegreeOfParallelism,
+            deterministicSafe);
+
+    /// <summary>
+    /// Grain-size-aware parallel loop with a per-dispatch degree cap. The process-wide cap still
+    /// wins, so a global single-thread setting cannot be overridden by a tuned kernel plan.
+    /// </summary>
+    public static void ParallelForOrSerial(
+        int fromInclusive,
+        int toExclusive,
+        long totalWork,
+        Action<int> body,
+        int maximumDegreeOfParallelism,
+        bool deterministicSafe = false)
     {
         if (toExclusive <= fromInclusive) return;
+        if (maximumDegreeOfParallelism <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maximumDegreeOfParallelism));
         // Honor the class-level MaxDegreeOfParallelism contract: if the user has
         // pinned to 1 thread, run serial regardless of work size. Same
         // pattern as ParallelForChunks (line 84) and the legacy LightweightParallel
         // code path. Snapshot BOTH gating values once so a concurrent setter
         // mid-call can't toggle us between the serial and parallel paths.
-        int maxDegree = MaxDegreeOfParallelism;
+        int maxDegree = Math.Min(MaxDegreeOfParallelism, maximumDegreeOfParallelism);
         // DeterministicReductions forces order-dependent reductions serial for
         // bit-reproducibility; deterministicSafe callers stay parallel (they're already
         // reproducible across thread counts) so deterministic mode doesn't lose GEMM
@@ -524,7 +545,7 @@ public static class CpuParallelSettings
         int byWork = (int)Math.Min(count, Math.Max(1, totalWork / workPerChunk));
         int chunks = Math.Min(maxDegree, byWork);
         int from = fromInclusive;
-        PersistentParallelExecutor.Instance.Execute(chunks, chunk =>
+        PersistentParallelExecutor.Instance.Execute(chunks, maxDegree, chunk =>
         {
             using var _region = EnterParallelRegion();
             int cs = from + (int)((long)chunk * count / chunks);

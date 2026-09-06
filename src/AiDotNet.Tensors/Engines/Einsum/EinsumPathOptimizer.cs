@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using AiDotNet.Evolution;
 using AiDotNet.Tensors.Helpers.Autotune;
 
 namespace AiDotNet.Tensors.Engines.Einsum;
@@ -90,41 +91,41 @@ public static class EinsumPathOptimizer
             int bestRemoved = -1;
 
             for (int i = 0; i < live.Count - 1; i++)
-            for (int j = i + 1; j < live.Count; j++)
-            {
-                // Combined labels of the pair.
-                var combined = new HashSet<char>(live[i]);
-                combined.UnionWith(live[j]);
-
-                // Labels still needed downstream (present in any other live
-                // operand or in the output).
-                var needed = new HashSet<char>(outputSet);
-                for (int k = 0; k < live.Count; k++)
+                for (int j = i + 1; j < live.Count; j++)
                 {
-                    if (k == i || k == j) continue;
-                    needed.UnionWith(live[k]);
+                    // Combined labels of the pair.
+                    var combined = new HashSet<char>(live[i]);
+                    combined.UnionWith(live[j]);
+
+                    // Labels still needed downstream (present in any other live
+                    // operand or in the output).
+                    var needed = new HashSet<char>(outputSet);
+                    for (int k = 0; k < live.Count; k++)
+                    {
+                        if (k == i || k == j) continue;
+                        needed.UnionWith(live[k]);
+                    }
+
+                    // Result labels = combined ∩ needed. Labels removed by this
+                    // step = combined − result.
+                    var resultLabels = new HashSet<char>(combined);
+                    resultLabels.IntersectWith(needed);
+
+                    int removed = combined.Count - resultLabels.Count;
+                    long cost = checked(2L * ProductOfSizes(combined, sizes));
+
+                    // Greedy objective (opt_einsum-style):
+                    //   primary: minimise cost
+                    //   tiebreak: maximise 'removed'
+                    if (cost < bestCost || (cost == bestCost && removed > bestRemoved))
+                    {
+                        bestI = i;
+                        bestJ = j;
+                        bestResult = resultLabels;
+                        bestCost = cost;
+                        bestRemoved = removed;
+                    }
                 }
-
-                // Result labels = combined ∩ needed. Labels removed by this
-                // step = combined − result.
-                var resultLabels = new HashSet<char>(combined);
-                resultLabels.IntersectWith(needed);
-
-                int removed = combined.Count - resultLabels.Count;
-                long cost = checked(2L * ProductOfSizes(combined, sizes));
-
-                // Greedy objective (opt_einsum-style):
-                //   primary: minimise cost
-                //   tiebreak: maximise 'removed'
-                if (cost < bestCost || (cost == bestCost && removed > bestRemoved))
-                {
-                    bestI = i;
-                    bestJ = j;
-                    bestResult = resultLabels;
-                    bestCost = cost;
-                    bestRemoved = removed;
-                }
-            }
 
             HashSet<char> selectedResult = bestResult ?? throw new InvalidOperationException(
                 "Greedy einsum planning failed to select a contraction pair.");
@@ -313,7 +314,7 @@ public readonly record struct EinsumContractionPair
 }
 
 /// <summary>An immutable, typed sequence of pairwise contraction choices.</summary>
-public sealed class EinsumContractionOrder
+public sealed class EinsumContractionOrder : IImmutableEvolutionGenome
 {
     private readonly IReadOnlyList<EinsumContractionPair> _pairs;
 

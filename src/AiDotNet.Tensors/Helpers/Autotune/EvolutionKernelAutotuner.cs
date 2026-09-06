@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using AiDotNet.Evolution;
 
 namespace AiDotNet.Tensors.Helpers.Autotune;
@@ -28,7 +29,7 @@ public sealed class EvolutionKernelTuningResult<TConfiguration>
     public KernelTuningDeploymentSnapshot<TConfiguration> ActiveDeployment { get; }
     /// <summary>Gets whether the proposed winner cleared the promotion threshold.</summary>
     public bool WasPromoted { get; }
-    /// <summary>Gets whether a promoted winner was persisted successfully.</summary>
+    /// <summary>Gets whether the configuration left active by this run was persisted successfully.</summary>
     public bool WasPersisted { get; }
 }
 
@@ -46,6 +47,14 @@ public sealed class EvolutionKernelAutotuner<TConfiguration>
     private const string GradientRelativeErrorMetric = "gradient-relative-error";
     private const string GradientAbsoluteToleranceMetric = "gradient-absolute-tolerance";
     private const string GradientRelativeToleranceMetric = "gradient-relative-tolerance";
+    private const string WorkUnitsMetric = "work-units-per-operation";
+    private const string WorkUnitMetric = "work-unit";
+    private const string TimingScopeMetric = "timing-scope";
+    private const string WorkspaceStatusMetric = "workspace-status";
+    private const string OccupancyStatusMetric = "occupancy-status";
+    private const string RegistersStatusMetric = "registers-status";
+    private const string CompileStatusMetric = "compile-status";
+    private const string LaunchCountStatusMetric = "launch-count-status";
 
     private readonly KernelTuningIdentity _identity;
     private readonly IEvolutionGenomeCodec<TConfiguration> _codec;
@@ -54,6 +63,7 @@ public sealed class EvolutionKernelAutotuner<TConfiguration>
     private readonly KernelTuningOptions _tuningOptions;
     private readonly Func<TConfiguration, EvolutionEvaluationContext, CancellationToken,
         ValueTask<KernelTuningTrialResult>> _evaluator;
+    private readonly IKernelTuningFinalistEvaluator<TConfiguration> _finalistEvaluator;
     private readonly Func<int, IEvolutionArchive<TConfiguration>> _archiveFactory;
     private readonly IEvolutionCheckpointStore? _checkpointStore;
     private readonly KernelTuningDeployment<TConfiguration> _deployment;
@@ -67,6 +77,7 @@ public sealed class EvolutionKernelAutotuner<TConfiguration>
         IVariationOperator<TConfiguration> variation,
         Func<TConfiguration, EvolutionEvaluationContext, CancellationToken,
             ValueTask<KernelTuningTrialResult>> evaluator,
+        IKernelTuningFinalistEvaluator<TConfiguration> finalistEvaluator,
         EvolutionEngineOptions? engineOptions = null,
         KernelTuningOptions? tuningOptions = null,
         Func<int, IEvolutionArchive<TConfiguration>>? archiveFactory = null,
@@ -79,6 +90,7 @@ public sealed class EvolutionKernelAutotuner<TConfiguration>
         _codec = codec ?? throw new ArgumentNullException(nameof(codec));
         _variation = variation ?? throw new ArgumentNullException(nameof(variation));
         _evaluator = evaluator ?? throw new ArgumentNullException(nameof(evaluator));
+        _finalistEvaluator = finalistEvaluator ?? throw new ArgumentNullException(nameof(finalistEvaluator));
         _engineOptions = (engineOptions ?? CreateDefaultEngineOptions(identity)).SnapshotAndValidate();
         if (_engineOptions.MaxEvaluationAttempts == 0)
             throw new ArgumentException(
@@ -86,7 +98,7 @@ public sealed class EvolutionKernelAutotuner<TConfiguration>
         if (_engineOptions.MaxProposals == 0)
             throw new ArgumentException(
                 "Kernel tuning requires a positive proposal budget.", nameof(engineOptions));
-        _tuningOptions = (tuningOptions ?? new KernelTuningOptions()).SnapshotAndValidate();
+        _tuningOptions = (tuningOptions ?? new KernelTuningOptions()).SnapshotAndValidate(identity.Device.Kind);
         _archiveFactory = archiveFactory ?? (_ => CreateDefaultArchive(_tuningOptions.ArchiveDescriptors));
         _checkpointStore = checkpointStore;
         _deployment = (deploymentRegistry ?? new KernelTuningDeploymentRegistry<TConfiguration>()).GetOrCreate(identity);
@@ -98,6 +110,7 @@ public sealed class EvolutionKernelAutotuner<TConfiguration>
     public KernelTuningDeployment<TConfiguration> Deployment => _deployment;
 
     internal int MaximumProposals => _engineOptions.MaxProposals;
+    internal int MaximumEvaluationAttempts => _engineOptions.MaxEvaluationAttempts;
 
     /// <summary>Hydrates a locally persisted winner after fully validating its typed payload and evidence.</summary>
     public bool TryHydrate()
@@ -165,11 +178,55 @@ public sealed class EvolutionKernelAutotuner<TConfiguration>
     }
 
     /// <summary>Runs tuning during an explicit offline or startup workflow.</summary>
-    public async Task<EvolutionKernelTuningResult<TConfiguration>> TuneAsync(
+    public Task<EvolutionKernelTuningResult<TConfiguration>> TuneAsync(
         IEnumerable<TConfiguration> seeds,
         CancellationToken cancellationToken = default)
     {
         TConfiguration[] seedSnapshot = ValidateAndSnapshotSeeds(seeds);
+        return TuneCoreAsync(seedSnapshot, _engineOptions, cancellationToken);
+    }
+
+    /// <summary>
+    /// Evaluates every member of a declared finite search space exactly once, then applies the same sealed
+    /// finalist replay and deployment gate used by evolutionary search.
+    /// </summary>
+    public Task<EvolutionKernelTuningResult<TConfiguration>> TuneExhaustiveAsync(
+        IEnumerable<TConfiguration> configurations,
+        CancellationToken cancellationToken = default)
+    {
+        TConfiguration[] snapshot = ValidateAndSnapshotSeeds(configurations);
+        if (snapshot.Length > _engineOptions.MaxEvaluationAttempts)
+        {
+            throw new ArgumentException(
+                "The finite search space exceeds the configured evaluation-attempt budget.",
+                nameof(configurations));
+        }
+        var identities = new HashSet<string>(StringComparer.Ordinal);
+        for (int i = 0; i < snapshot.Length; i++)
+        {
+            string payload = _codec.Serialize(snapshot[i]);
+            if (!identities.Add(EvolutionHash.Compute(payload)))
+            {
+                throw new ArgumentException(
+                    "The finite search space contains duplicate canonical configurations.",
+                    nameof(configurations));
+            }
+        }
+
+        EvolutionEngineOptions exhaustiveOptions = _engineOptions.SnapshotAndValidate();
+        exhaustiveOptions.MaxEvaluationAttempts = snapshot.Length;
+        exhaustiveOptions.MaxProposals = snapshot.Length;
+        exhaustiveOptions.MaxGenerations = 0;
+        exhaustiveOptions.ProposalBatchSize = Math.Min(
+            exhaustiveOptions.ProposalBatchSize, snapshot.Length);
+        return TuneCoreAsync(snapshot, exhaustiveOptions, cancellationToken);
+    }
+
+    private async Task<EvolutionKernelTuningResult<TConfiguration>> TuneCoreAsync(
+        TConfiguration[] seedSnapshot,
+        EvolutionEngineOptions runOptions,
+        CancellationToken cancellationToken)
+    {
         using IDisposable deviceLease = await KernelTuningCoordinator.EnterAsync(
             _identity.Device, cancellationToken).ConfigureAwait(false);
         TryHydrate();
@@ -183,7 +240,7 @@ public sealed class EvolutionKernelAutotuner<TConfiguration>
             task,
             _variation,
             _archiveFactory,
-            _engineOptions,
+            runOptions,
             checkpointStore: _checkpointStore,
             genomeCodec: _codec);
 
@@ -195,24 +252,76 @@ public sealed class EvolutionKernelAutotuner<TConfiguration>
         if (!CanDeploy(bestConfiguration))
             throw new InvalidOperationException(
                 "Kernel tuning selected a configuration that failed its deployment invariant.");
-        KernelTuningMeasurement measurement = KernelTuningTask.ReadMeasurement(best.Evaluation);
+        _ = task.ReadMeasurement(best.Evaluation);
+        KernelTuningFinalistReplay<TConfiguration> replay = await _finalistEvaluator.ReplayAsync(
+            _identity, bestConfiguration, existing, cancellationToken).ConfigureAwait(false)
+            ?? throw new InvalidOperationException("The finalist evaluator returned no replay evidence.");
+        ValidateReplayIncumbent(existing, replay.IncumbentConfiguration);
+        if (!CanDeploy(replay.IncumbentConfiguration))
+            throw new InvalidOperationException("The finalist replay returned an incumbent that cannot be deployed.");
+
         var proposed = new KernelTuningDeploymentSnapshot<TConfiguration>(
             _identity,
             bestConfiguration,
             best.Evaluation.GenomeId,
-            measurement,
-            run.StateHash);
+            replay.CandidateMeasurement,
+            run.StateHash,
+            replay.Evidence,
+            KernelTuningEvidenceRole.Candidate);
 
-        if (existing is not null &&
-            proposed.Measurement.ThroughputGflops <
-            existing.Measurement.ThroughputGflops * _tuningOptions.MinimumPromotionRatio)
+        if (!_tuningOptions.QualifiesForPromotion(replay.Evidence))
         {
-            return new EvolutionKernelTuningResult<TConfiguration>(run, proposed, existing, false, false);
+            if (existing is not null)
+                return new EvolutionKernelTuningResult<TConfiguration>(run, proposed, existing, false, false);
+
+            KernelTuningDeploymentSnapshot<TConfiguration> incumbent = CreateReplaySnapshot(
+                replay.IncumbentConfiguration,
+                replay.IncumbentMeasurement,
+                replay.Evidence,
+                run.StateHash,
+                KernelTuningEvidenceRole.Incumbent);
+            _deployment.Publish(incumbent);
+            bool incumbentPersisted = TryPersist(incumbent);
+            return new EvolutionKernelTuningResult<TConfiguration>(
+                run, proposed, incumbent, false, incumbentPersisted);
         }
 
         _deployment.Publish(proposed);
         bool persisted = TryPersist(proposed);
         return new EvolutionKernelTuningResult<TConfiguration>(run, proposed, proposed, true, persisted);
+    }
+
+    private KernelTuningDeploymentSnapshot<TConfiguration> CreateReplaySnapshot(
+        TConfiguration configuration,
+        KernelTuningMeasurement measurement,
+        KernelTuningPairedEvidence evidence,
+        string runStateHash,
+        KernelTuningEvidenceRole evidenceRole)
+    {
+        string payload = _codec.Serialize(configuration) ?? throw new InvalidOperationException(
+            "The kernel configuration codec returned a null payload.");
+        return new KernelTuningDeploymentSnapshot<TConfiguration>(
+            _identity,
+            configuration,
+            EvolutionHash.Compute(payload),
+            measurement,
+            runStateHash,
+            evidence,
+            evidenceRole);
+    }
+
+    private void ValidateReplayIncumbent(
+        KernelTuningDeploymentSnapshot<TConfiguration>? existing,
+        TConfiguration replayIncumbent)
+    {
+        if (existing is null) return;
+        string expected = _codec.Serialize(existing.Configuration) ?? throw new InvalidOperationException(
+            "The kernel configuration codec returned a null incumbent payload.");
+        string actual = _codec.Serialize(replayIncumbent) ?? throw new InvalidOperationException(
+            "The kernel configuration codec returned a null replay-incumbent payload.");
+        if (!string.Equals(expected, actual, StringComparison.Ordinal))
+            throw new InvalidOperationException(
+                "A finalist replay must compare against the exact active deployment.");
     }
 
     private bool TryPersist(KernelTuningDeploymentSnapshot<TConfiguration> snapshot)
@@ -311,6 +420,8 @@ public sealed class EvolutionKernelAutotuner<TConfiguration>
             ValueTask<KernelTuningTrialResult>> _evaluator;
         private readonly KernelTuningDescriptorDefinition[] _descriptors;
         private readonly Func<TConfiguration, bool> _deploymentValidator;
+        private readonly ConcurrentDictionary<string, KernelTuningMeasurement> _measurements =
+            new(StringComparer.Ordinal);
 
         internal KernelTuningTask(
             KernelTuningIdentity identity,
@@ -327,14 +438,14 @@ public sealed class EvolutionKernelAutotuner<TConfiguration>
             Id = "tensor-kernel-" + identity.Kernel.ToFileStem();
             VersionHash = EvolutionHash.Combine(new[]
             {
-                "tensor-kernel-tuning-task-v2",
+                "tensor-kernel-tuning-task-v3",
                 identity.StableKey,
                 codec.Id,
                 codec.VersionHash
             });
             EvaluatorVersionHash = EvolutionHash.Combine(new[]
             {
-                "tensor-kernel-benchmark-v2",
+                "tensor-kernel-benchmark-v3",
                 identity.BenchmarkProtocolVersion.ToString(),
                 identity.Device.LocalKey
             });
@@ -374,18 +485,28 @@ public sealed class EvolutionKernelAutotuner<TConfiguration>
                 return FailureResult(trial);
             KernelTuningMeasurement measurement = trial.Measurement ?? throw new InvalidOperationException(
                 "A passed kernel trial must carry a measurement.");
+            _measurements[candidate.CanonicalGenome.Id] = measurement;
 
             var descriptors = new Dictionary<string, double>(StringComparer.Ordinal);
             for (int i = 0; i < _descriptors.Length; i++)
             {
                 KernelTuningDescriptorDefinition descriptor = _descriptors[i];
+                if (!measurement.TryGetMetric(descriptor.Metric, out double descriptorValue))
+                {
+                    return FailureResult(KernelTuningTrialResult.Rejected(
+                        KernelTuningTrialStatus.RequiredMetricUnavailable,
+                        $"Required archive metric '{descriptor.Metric}' is not measured by this backend."));
+                }
                 descriptors.Add(
                     KernelTuningMetricNames.Get(descriptor.Metric),
-                    measurement.GetMetric(descriptor.Metric));
+                    descriptorValue);
             }
             var metrics = new Dictionary<string, double>(StringComparer.Ordinal);
             foreach (KernelTuningMetric metric in Enum.GetValues(typeof(KernelTuningMetric)))
-                metrics.Add(KernelTuningMetricNames.Get(metric), measurement.GetMetric(metric));
+            {
+                if (measurement.TryGetMetric(metric, out double metricValue))
+                    metrics.Add(KernelTuningMetricNames.Get(metric), metricValue);
+            }
             metrics.Add(TimingSampleCountMetric, measurement.Timing.SampleCount);
             metrics.Add(ValidationScopeMetric, (int)measurement.Correctness.Scope);
             metrics.Add(OutputAbsoluteErrorMetric, measurement.Correctness.OutputAbsoluteError);
@@ -396,18 +517,28 @@ public sealed class EvolutionKernelAutotuner<TConfiguration>
             metrics.Add(GradientRelativeErrorMetric, measurement.Correctness.GradientRelativeError);
             metrics.Add(GradientAbsoluteToleranceMetric, measurement.Correctness.GradientAbsoluteTolerance);
             metrics.Add(GradientRelativeToleranceMetric, measurement.Correctness.GradientRelativeTolerance);
+            metrics.Add(WorkUnitsMetric, measurement.Workload.UnitsPerOperation);
+            metrics.Add(WorkUnitMetric, (int)measurement.Workload.Unit);
+            metrics.Add(TimingScopeMetric, (int)measurement.TimingScope);
+            metrics.Add(WorkspaceStatusMetric, (int)measurement.Resources.WorkspaceBytesMetric.Status);
+            metrics.Add(OccupancyStatusMetric, (int)measurement.Resources.OccupancyRatioMetric.Status);
+            metrics.Add(RegistersStatusMetric, (int)measurement.Resources.RegistersPerThreadMetric.Status);
+            metrics.Add(CompileStatusMetric, (int)measurement.Resources.CompileTimeMetric.Status);
+            metrics.Add(LaunchCountStatusMetric, (int)measurement.Resources.KernelLaunchCountMetric.Status);
             return new EvolutionTaskResult(
                 EvolutionEvaluationStatus.Completed,
-                measurement.ThroughputGflops,
+                measurement.PerformanceRatePerSecond,
                 EvolutionOptimizationDirection.Maximize,
                 descriptors,
-                costUnits: measurement.Resources.CompileTime.TotalMilliseconds +
+                costUnits: MeasuredCompileMilliseconds(measurement.Resources) +
                            measurement.Timing.P95.TotalMilliseconds * measurement.Timing.SampleCount,
                 metrics: metrics);
         }
 
-        internal static KernelTuningMeasurement ReadMeasurement(EvolutionEvaluation evaluation)
+        internal KernelTuningMeasurement ReadMeasurement(EvolutionEvaluation evaluation)
         {
+            if (_measurements.TryGetValue(evaluation.GenomeId, out KernelTuningMeasurement? measured))
+                return measured;
             IReadOnlyDictionary<string, double> metrics = evaluation.Metrics;
             double Metric(KernelTuningMetric metric) => metrics[KernelTuningMetricNames.Get(metric)];
             var timing = KernelTimingStatistics.FromSummary(
@@ -415,11 +546,11 @@ public sealed class EvolutionKernelAutotuner<TConfiguration>
                 Metric(KernelTuningMetric.MedianLatencyMilliseconds),
                 Metric(KernelTuningMetric.P95LatencyMilliseconds));
             var resources = new KernelTuningResourceUsage(
-                ReadExactInt64(metrics, KernelTuningMetricNames.Get(KernelTuningMetric.WorkspaceBytes)),
-                Metric(KernelTuningMetric.OccupancyRatio),
-                ReadExactInt32(metrics, KernelTuningMetricNames.Get(KernelTuningMetric.RegistersPerThread)),
-                TimeSpan.FromMilliseconds(Metric(KernelTuningMetric.CompileMilliseconds)),
-                ReadExactInt32(metrics, KernelTuningMetricNames.Get(KernelTuningMetric.KernelLaunchCount)));
+                ReadInt64Resource(metrics, WorkspaceStatusMetric, KernelTuningMetric.WorkspaceBytes),
+                ReadDoubleResource(metrics, OccupancyStatusMetric, KernelTuningMetric.OccupancyRatio),
+                ReadInt32Resource(metrics, RegistersStatusMetric, KernelTuningMetric.RegistersPerThread),
+                ReadTimeResource(metrics, CompileStatusMetric, KernelTuningMetric.CompileMilliseconds),
+                ReadInt32Resource(metrics, LaunchCountStatusMetric, KernelTuningMetric.KernelLaunchCount));
             var correctness = new KernelTuningCorrectnessEvidence(
                 (KernelTuningValidationScope)ReadExactInt32(metrics, ValidationScopeMetric),
                 metrics[OutputAbsoluteErrorMetric],
@@ -430,9 +561,64 @@ public sealed class EvolutionKernelAutotuner<TConfiguration>
                 metrics[GradientRelativeErrorMetric],
                 metrics[GradientAbsoluteToleranceMetric],
                 metrics[GradientRelativeToleranceMetric]);
+            var workload = new KernelTuningWorkload(
+                metrics[WorkUnitsMetric],
+                (KernelTuningWorkUnit)ReadExactInt32(metrics, WorkUnitMetric));
             return new KernelTuningMeasurement(
-                Metric(KernelTuningMetric.ThroughputGflops), timing, resources, correctness);
+                workload,
+                (KernelTuningTimingScope)ReadExactInt32(metrics, TimingScopeMetric),
+                timing,
+                resources,
+                correctness);
         }
+
+        private static double MeasuredCompileMilliseconds(KernelTuningResourceUsage resources) =>
+            resources.CompileTimeMetric.TryGetValue(out TimeSpan compileTime)
+                ? compileTime.TotalMilliseconds
+                : 0d;
+
+        private static KernelTuningResourceMetric<long> ReadInt64Resource(
+            IReadOnlyDictionary<string, double> metrics,
+            string statusName,
+            KernelTuningMetric metric) =>
+            ResourceMetric(
+                (KernelTuningResourceMetricStatus)ReadExactInt32(metrics, statusName),
+                () => ReadExactInt64(metrics, KernelTuningMetricNames.Get(metric)));
+
+        private static KernelTuningResourceMetric<int> ReadInt32Resource(
+            IReadOnlyDictionary<string, double> metrics,
+            string statusName,
+            KernelTuningMetric metric) =>
+            ResourceMetric(
+                (KernelTuningResourceMetricStatus)ReadExactInt32(metrics, statusName),
+                () => ReadExactInt32(metrics, KernelTuningMetricNames.Get(metric)));
+
+        private static KernelTuningResourceMetric<double> ReadDoubleResource(
+            IReadOnlyDictionary<string, double> metrics,
+            string statusName,
+            KernelTuningMetric metric) =>
+            ResourceMetric(
+                (KernelTuningResourceMetricStatus)ReadExactInt32(metrics, statusName),
+                () => metrics[KernelTuningMetricNames.Get(metric)]);
+
+        private static KernelTuningResourceMetric<TimeSpan> ReadTimeResource(
+            IReadOnlyDictionary<string, double> metrics,
+            string statusName,
+            KernelTuningMetric metric) =>
+            ResourceMetric(
+                (KernelTuningResourceMetricStatus)ReadExactInt32(metrics, statusName),
+                () => TimeSpan.FromMilliseconds(metrics[KernelTuningMetricNames.Get(metric)]));
+
+        private static KernelTuningResourceMetric<T> ResourceMetric<T>(
+            KernelTuningResourceMetricStatus status,
+            Func<T> measuredValue)
+            where T : struct => status switch
+            {
+                KernelTuningResourceMetricStatus.Measured => KernelTuningResourceMetric<T>.Measured(measuredValue()),
+                KernelTuningResourceMetricStatus.NotApplicable => KernelTuningResourceMetric<T>.NotApplicable(),
+                KernelTuningResourceMetricStatus.Unavailable => KernelTuningResourceMetric<T>.Unavailable(),
+                _ => throw new InvalidDataException("Kernel resource metric status is invalid.")
+            };
 
         private static int ReadExactInt32(
             IReadOnlyDictionary<string, double> metrics,
@@ -493,6 +679,7 @@ public sealed class EvolutionKernelAutotuner<TConfiguration>
             KernelTuningTrialStatus.OutputMismatch => "output_mismatch",
             KernelTuningTrialStatus.GradientMismatch => "gradient_mismatch",
             KernelTuningTrialStatus.BenchmarkFailed => "benchmark_failed",
+            KernelTuningTrialStatus.RequiredMetricUnavailable => "required_metric_unavailable",
             _ => throw new ArgumentOutOfRangeException(nameof(status))
         };
     }

@@ -52,6 +52,7 @@ public static class EinsumEvolutionAutotuner
         KernelTuningDeviceFingerprint device,
         Func<EinsumPath, EvolutionEvaluationContext, CancellationToken,
             ValueTask<KernelTuningTrialResult>> evaluator,
+        IKernelTuningFinalistEvaluator<EinsumContractionOrder> finalistEvaluator,
         KernelSearchSpaceVersion searchSpaceVersion,
         KernelBenchmarkProtocolVersion benchmarkProtocolVersion,
         IEnumerable<EinsumContractionOrder>? additionalSeeds = null,
@@ -64,6 +65,7 @@ public static class EinsumEvolutionAutotuner
     {
         if (binding is null) throw new ArgumentNullException(nameof(binding));
         if (evaluator is null) throw new ArgumentNullException(nameof(evaluator));
+        if (finalistEvaluator is null) throw new ArgumentNullException(nameof(finalistEvaluator));
         EnsureSearchable(binding);
 
         var codec = new EinsumContractionOrderCodec(binding.Equation.Operands.Count);
@@ -97,6 +99,7 @@ public static class EinsumEvolutionAutotuner
                 }
                 return await evaluator(path, context, token).ConfigureAwait(false);
             },
+            finalistEvaluator,
             resolvedEngineOptions,
             tuningOptions,
             checkpointStore: checkpointStore,
@@ -129,6 +132,7 @@ public static class EinsumEvolutionAutotuner
         KernelTuningDeviceFingerprint device,
         Func<EinsumPath, EvolutionEvaluationContext, CancellationToken,
             ValueTask<KernelTuningTrialResult>> evaluator,
+        IKernelTuningFinalistEvaluator<EinsumContractionOrder> finalistEvaluator,
         KernelSearchSpaceVersion searchSpaceVersion,
         KernelBenchmarkProtocolVersion benchmarkProtocolVersion,
         IKernelTuningIdleGate idleGate,
@@ -150,6 +154,7 @@ public static class EinsumEvolutionAutotuner
                 binding,
                 device,
                 evaluator,
+                finalistEvaluator,
                 searchSpaceVersion,
                 benchmarkProtocolVersion,
                 additionalSeeds,

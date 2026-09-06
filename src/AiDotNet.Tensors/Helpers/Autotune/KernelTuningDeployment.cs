@@ -14,7 +14,9 @@ public sealed class KernelTuningDeploymentSnapshot<TConfiguration>
         TConfiguration configuration,
         string genomeId,
         KernelTuningMeasurement measurement,
-        string runStateHash)
+        string runStateHash,
+        KernelTuningPairedEvidence promotionEvidence,
+        KernelTuningEvidenceRole evidenceRole)
     {
         Identity = identity ?? throw new ArgumentNullException(nameof(identity));
         Configuration = configuration is null
@@ -27,6 +29,21 @@ public sealed class KernelTuningDeploymentSnapshot<TConfiguration>
         RunStateHash = string.IsNullOrWhiteSpace(runStateHash)
             ? throw new ArgumentException("A source run-state hash is required.", nameof(runStateHash))
             : runStateHash;
+        PromotionEvidence = promotionEvidence ?? throw new ArgumentNullException(nameof(promotionEvidence));
+        if (!Enum.IsDefined(typeof(KernelTuningEvidenceRole), evidenceRole))
+            throw new ArgumentOutOfRangeException(nameof(evidenceRole));
+        KernelTimingStatistics expectedTiming = evidenceRole == KernelTuningEvidenceRole.Candidate
+            ? promotionEvidence.CandidateTiming
+            : promotionEvidence.IncumbentTiming;
+        if (measurement.Timing.SampleCount != expectedTiming.SampleCount ||
+            measurement.Timing.Median != expectedTiming.Median ||
+            measurement.Timing.P95 != expectedTiming.P95)
+        {
+            throw new ArgumentException(
+                "The deployment measurement must come from its selected side of the paired replay.",
+                nameof(measurement));
+        }
+        EvidenceRole = evidenceRole;
     }
 
     /// <summary>Gets the exact kernel, device, shape, and protocol identity.</summary>
@@ -39,6 +56,10 @@ public sealed class KernelTuningDeploymentSnapshot<TConfiguration>
     public KernelTuningMeasurement Measurement { get; }
     /// <summary>Gets the deterministic state hash of the selecting run, or the persisted source hash.</summary>
     public string RunStateHash { get; }
+    /// <summary>Gets the sealed paired replay that qualified this active deployment or retained its incumbent.</summary>
+    public KernelTuningPairedEvidence PromotionEvidence { get; }
+    /// <summary>Gets which side of <see cref="PromotionEvidence"/> produced <see cref="Measurement"/>.</summary>
+    public KernelTuningEvidenceRole EvidenceRole { get; }
 }
 
 /// <summary>Lock-free deployment handle for one pre-resolved tuning identity.</summary>
@@ -126,7 +147,7 @@ public interface IKernelTuningStore<TConfiguration>
 public sealed class AutotuneCacheKernelTuningStore<TConfiguration> : IKernelTuningStore<TConfiguration>
     where TConfiguration : notnull
 {
-    private const string Variant = "typed-evolution-v1";
+    private const string Variant = "typed-evolution-v3";
     private const string IdentityKey = "identity";
     private const string CodecIdKey = "codec-id";
     private const string CodecVersionKey = "codec-version";
@@ -149,6 +170,18 @@ public sealed class AutotuneCacheKernelTuningStore<TConfiguration> : IKernelTuni
     private const string GradientRelativeErrorKey = "gradient-relative-error";
     private const string GradientAbsoluteToleranceKey = "gradient-absolute-tolerance";
     private const string GradientRelativeToleranceKey = "gradient-relative-tolerance";
+    private const string WorkUnitsKey = "work-units-per-operation";
+    private const string WorkUnitKey = "work-unit";
+    private const string TimingScopeKey = "timing-scope";
+    private const string WorkspaceStatusKey = "workspace-status";
+    private const string OccupancyStatusKey = "occupancy-status";
+    private const string RegistersStatusKey = "registers-status";
+    private const string CompileStatusKey = "compile-status";
+    private const string LaunchCountStatusKey = "launch-count-status";
+    private const string EvidenceRoleKey = "evidence-role";
+    private const string CalibratedNoiseRatioKey = "calibrated-noise-ratio";
+    private const string CandidateSamplesKey = "candidate-samples-milliseconds";
+    private const string IncumbentSamplesKey = "incumbent-samples-milliseconds";
 
     /// <inheritdoc />
     public bool TryLoad(
@@ -188,6 +221,18 @@ public sealed class AutotuneCacheKernelTuningStore<TConfiguration> : IKernelTuni
                 !TryDouble(choice.Parameters, GradientRelativeErrorKey, out double gradientRel) ||
                 !TryDouble(choice.Parameters, GradientAbsoluteToleranceKey, out double gradientAbsTol) ||
                 !TryDouble(choice.Parameters, GradientRelativeToleranceKey, out double gradientRelTol) ||
+                !TryDouble(choice.Parameters, WorkUnitsKey, out double workUnits) ||
+                !TryInt(choice.Parameters, WorkUnitKey, out int workUnitValue) ||
+                !TryInt(choice.Parameters, TimingScopeKey, out int timingScopeValue) ||
+                !TryInt(choice.Parameters, WorkspaceStatusKey, out int workspaceStatusValue) ||
+                !TryInt(choice.Parameters, OccupancyStatusKey, out int occupancyStatusValue) ||
+                !TryInt(choice.Parameters, RegistersStatusKey, out int registersStatusValue) ||
+                !TryInt(choice.Parameters, CompileStatusKey, out int compileStatusValue) ||
+                !TryInt(choice.Parameters, LaunchCountStatusKey, out int launchStatusValue) ||
+                !TryInt(choice.Parameters, EvidenceRoleKey, out int evidenceRoleValue) ||
+                !TryDouble(choice.Parameters, CalibratedNoiseRatioKey, out double calibratedNoiseRatio) ||
+                !TryGet(choice.Parameters, CandidateSamplesKey, out string candidateSamplesRaw) ||
+                !TryGet(choice.Parameters, IncumbentSamplesKey, out string incumbentSamplesRaw) ||
                 !KernelTuningMeasurement.IsFinite(choice.MeasuredGflops) || choice.MeasuredGflops <= 0 ||
                 !KernelTuningMeasurement.IsFinite(choice.MeasuredTimeMs) || choice.MeasuredTimeMs <= 0)
             {
@@ -204,16 +249,51 @@ public sealed class AutotuneCacheKernelTuningStore<TConfiguration> : IKernelTuni
                 return false;
             }
 
-            var timing = KernelTimingStatistics.FromSummary(sampleCount, choice.MeasuredTimeMs, p95Ms);
+            TimeSpan[] candidateSamples = ParseSamples(candidateSamplesRaw);
+            TimeSpan[] incumbentSamples = ParseSamples(incumbentSamplesRaw);
+            if (candidateSamples.Length != incumbentSamples.Length) return false;
+            var pairedSamples = new KernelTuningPairedSample[candidateSamples.Length];
+            for (int i = 0; i < pairedSamples.Length; i++)
+                pairedSamples[i] = new KernelTuningPairedSample(candidateSamples[i], incumbentSamples[i]);
+            var evidence = new KernelTuningPairedEvidence(pairedSamples, calibratedNoiseRatio);
+            var evidenceRole = (KernelTuningEvidenceRole)evidenceRoleValue;
+            KernelTimingStatistics timing = evidenceRole switch
+            {
+                KernelTuningEvidenceRole.Candidate => evidence.CandidateTiming,
+                KernelTuningEvidenceRole.Incumbent => evidence.IncumbentTiming,
+                _ => throw new InvalidDataException("The persisted evidence role is invalid.")
+            };
+            if (timing.SampleCount != sampleCount ||
+                timing.Median.TotalMilliseconds != choice.MeasuredTimeMs ||
+                timing.P95.TotalMilliseconds != p95Ms)
+            {
+                return false;
+            }
             var resources = new KernelTuningResourceUsage(
-                workspaceBytes, occupancy, registers, TimeSpan.FromMilliseconds(compileMs), launches);
+                ResourceMetric((KernelTuningResourceMetricStatus)workspaceStatusValue, workspaceBytes),
+                ResourceMetric((KernelTuningResourceMetricStatus)occupancyStatusValue, occupancy),
+                ResourceMetric((KernelTuningResourceMetricStatus)registersStatusValue, registers),
+                ResourceMetric((KernelTuningResourceMetricStatus)compileStatusValue, TimeSpan.FromMilliseconds(compileMs)),
+                ResourceMetric((KernelTuningResourceMetricStatus)launchStatusValue, launches));
             var correctness = new KernelTuningCorrectnessEvidence(
                 (KernelTuningValidationScope)scopeValue,
                 outputAbs, outputRel, outputAbsTol, outputRelTol,
                 gradientAbs, gradientRel, gradientAbsTol, gradientRelTol);
-            var measurement = new KernelTuningMeasurement(choice.MeasuredGflops, timing, resources, correctness);
+            var measurement = new KernelTuningMeasurement(
+                new KernelTuningWorkload(workUnits, (KernelTuningWorkUnit)workUnitValue),
+                (KernelTuningTimingScope)timingScopeValue,
+                timing,
+                resources,
+                correctness);
+            if (measurement.BillionsOfWorkUnitsPerSecond != choice.MeasuredGflops) return false;
             snapshot = new KernelTuningDeploymentSnapshot<TConfiguration>(
-                identity, configuration, genomeId, measurement, runStateHash);
+                identity,
+                configuration,
+                genomeId,
+                measurement,
+                runStateHash,
+                evidence,
+                evidenceRole);
             return true;
         }
         catch
@@ -246,11 +326,11 @@ public sealed class AutotuneCacheKernelTuningStore<TConfiguration> : IKernelTuni
             [RunStateHashKey] = snapshot.RunStateHash,
             [SampleCountKey] = Format(measurement.Timing.SampleCount),
             [P95MillisecondsKey] = Format(measurement.Timing.P95.TotalMilliseconds),
-            [WorkspaceBytesKey] = Format(resources.WorkspaceBytes),
-            [OccupancyRatioKey] = Format(resources.OccupancyRatio),
-            [RegistersPerThreadKey] = Format(resources.RegistersPerThread),
-            [CompileMillisecondsKey] = Format(resources.CompileTime.TotalMilliseconds),
-            [KernelLaunchCountKey] = Format(resources.KernelLaunchCount),
+            [WorkspaceStatusKey] = Format((int)resources.WorkspaceBytesMetric.Status),
+            [OccupancyStatusKey] = Format((int)resources.OccupancyRatioMetric.Status),
+            [RegistersStatusKey] = Format((int)resources.RegistersPerThreadMetric.Status),
+            [CompileStatusKey] = Format((int)resources.CompileTimeMetric.Status),
+            [LaunchCountStatusKey] = Format((int)resources.KernelLaunchCountMetric.Status),
             [ValidationScopeKey] = Format((int)correctness.Scope),
             [OutputAbsoluteErrorKey] = Format(correctness.OutputAbsoluteError),
             [OutputRelativeErrorKey] = Format(correctness.OutputRelativeError),
@@ -259,8 +339,23 @@ public sealed class AutotuneCacheKernelTuningStore<TConfiguration> : IKernelTuni
             [GradientAbsoluteErrorKey] = Format(correctness.GradientAbsoluteError),
             [GradientRelativeErrorKey] = Format(correctness.GradientRelativeError),
             [GradientAbsoluteToleranceKey] = Format(correctness.GradientAbsoluteTolerance),
-            [GradientRelativeToleranceKey] = Format(correctness.GradientRelativeTolerance)
+            [GradientRelativeToleranceKey] = Format(correctness.GradientRelativeTolerance),
+            [WorkUnitsKey] = Format(measurement.Workload.UnitsPerOperation),
+            [WorkUnitKey] = Format((int)measurement.Workload.Unit),
+            [TimingScopeKey] = Format((int)measurement.TimingScope),
+            [EvidenceRoleKey] = Format((int)snapshot.EvidenceRole),
+            [CalibratedNoiseRatioKey] = Format(snapshot.PromotionEvidence.CalibratedNoiseRatio),
+            [CandidateSamplesKey] = FormatSamples(
+                snapshot.PromotionEvidence.Samples.Select(item => item.Candidate)),
+            [IncumbentSamplesKey] = FormatSamples(
+                snapshot.PromotionEvidence.Samples.Select(item => item.Incumbent))
         };
+        AddMetric(parameters, WorkspaceBytesKey, resources.WorkspaceBytesMetric, Format);
+        AddMetric(parameters, OccupancyRatioKey, resources.OccupancyRatioMetric, Format);
+        AddMetric(parameters, RegistersPerThreadKey, resources.RegistersPerThreadMetric, Format);
+        AddMetric(parameters, CompileMillisecondsKey, resources.CompileTimeMetric,
+            value => Format(value.TotalMilliseconds));
+        AddMetric(parameters, KernelLaunchCountKey, resources.KernelLaunchCountMetric, Format);
         if (!string.Equals(EvolutionHash.Compute(parameters[GenomePayloadKey]), snapshot.GenomeId, StringComparison.Ordinal))
             throw new InvalidOperationException("The snapshot genome id does not match its canonical payload.");
 
@@ -271,9 +366,52 @@ public sealed class AutotuneCacheKernelTuningStore<TConfiguration> : IKernelTuni
             {
                 Variant = Variant,
                 Parameters = parameters,
-                MeasuredGflops = measurement.ThroughputGflops,
+                MeasuredGflops = measurement.BillionsOfWorkUnitsPerSecond,
                 MeasuredTimeMs = measurement.Timing.Median.TotalMilliseconds
             });
+    }
+
+    private static KernelTuningResourceMetric<T> ResourceMetric<T>(
+        KernelTuningResourceMetricStatus status,
+        T value)
+        where T : struct => status switch
+        {
+            KernelTuningResourceMetricStatus.Measured => KernelTuningResourceMetric<T>.Measured(value),
+            KernelTuningResourceMetricStatus.NotApplicable => KernelTuningResourceMetric<T>.NotApplicable(),
+            KernelTuningResourceMetricStatus.Unavailable => KernelTuningResourceMetric<T>.Unavailable(),
+            _ => throw new InvalidDataException("The persisted resource metric status is invalid.")
+        };
+
+    private static void AddMetric<T>(
+        IDictionary<string, string> target,
+        string key,
+        KernelTuningResourceMetric<T> metric,
+        Func<T, string> format)
+        where T : struct
+    {
+        if (metric.TryGetValue(out T value)) target.Add(key, format(value));
+        else target.Add(key, "0");
+    }
+
+    private static string FormatSamples(IEnumerable<TimeSpan> samples) =>
+        string.Join(",", samples.Select(sample => Format(sample.TotalMilliseconds)));
+
+    private static TimeSpan[] ParseSamples(string value)
+    {
+        string[] fields = value.Split(',');
+        if (fields.Length < KernelTuningPairedEvidence.MinimumSampleCount)
+            throw new InvalidDataException("Persisted finalist evidence has too few samples.");
+        var samples = new TimeSpan[fields.Length];
+        for (int i = 0; i < fields.Length; i++)
+        {
+            if (!double.TryParse(fields[i], NumberStyles.Float, CultureInfo.InvariantCulture, out double milliseconds) ||
+                !KernelTuningMeasurement.IsFinite(milliseconds) || milliseconds <= 0)
+            {
+                throw new InvalidDataException("Persisted finalist evidence contains an invalid sample.");
+            }
+            samples[i] = TimeSpan.FromMilliseconds(milliseconds);
+        }
+        return samples;
     }
 
     private static KernelId CacheKernel(KernelTuningIdentity identity) => new(

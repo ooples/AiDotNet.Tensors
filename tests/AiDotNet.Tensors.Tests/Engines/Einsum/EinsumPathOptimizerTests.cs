@@ -6,6 +6,7 @@ using System.Threading.Tasks;
 using AiDotNet.Evolution;
 using AiDotNet.Tensors.Engines.Einsum;
 using AiDotNet.Tensors.Helpers.Autotune;
+using AiDotNet.Tensors.Tests.Helpers.Autotune;
 using Xunit;
 
 public class EinsumPathOptimizerTests
@@ -267,6 +268,7 @@ public sealed class EinsumEvolutionAutotunerTests : IDisposable
             binding,
             KernelTuningDeviceFingerprint.CurrentCpu(),
             Measure,
+            Finalist(binding),
             new KernelSearchSpaceVersion(1),
             new KernelBenchmarkProtocolVersion(1),
             new[] { measuredWinner },
@@ -307,6 +309,7 @@ public sealed class EinsumEvolutionAutotunerTests : IDisposable
             binding,
             KernelTuningDeviceFingerprint.CurrentCpu(),
             Measure,
+            Finalist(binding),
             new KernelSearchSpaceVersion(1),
             new KernelBenchmarkProtocolVersion(1),
             new[] { measuredWinner },
@@ -363,12 +366,19 @@ public sealed class EinsumEvolutionAutotunerTests : IDisposable
         var codec = new EinsumEvolutionAutotuner.EinsumContractionOrderCodec(
             binding.Equation.Operands.Count);
         string payload = codec.Serialize(path.ContractionOrder);
+        KernelTuningFinalistReplay<EinsumContractionOrder> replay = Finalist(binding)
+            .ReplayAsync(identity, path.ContractionOrder, null)
+            .AsTask()
+            .GetAwaiter()
+            .GetResult();
         return new KernelTuningDeploymentSnapshot<EinsumContractionOrder>(
             identity,
             path.ContractionOrder,
             EvolutionHash.Compute(payload),
-            Measurement(path, 200),
-            "test-einsum-run-state");
+            replay.CandidateMeasurement,
+            "test-einsum-run-state",
+            replay.Evidence,
+            KernelTuningEvidenceRole.Candidate);
     }
 
     private static void StoreEvolution(
@@ -384,28 +394,25 @@ public sealed class EinsumEvolutionAutotunerTests : IDisposable
 
     private static KernelTuningMeasurement Measurement(EinsumPath path, double throughput)
     {
-        var timing = KernelTimingStatistics.FromSamples(new[]
-        {
-            TimeSpan.FromMilliseconds(1.00),
-            TimeSpan.FromMilliseconds(0.98),
-            TimeSpan.FromMilliseconds(1.02),
-            TimeSpan.FromMilliseconds(0.99),
-            TimeSpan.FromMilliseconds(1.01)
-        });
         var resources = new KernelTuningResourceUsage(
             workspaceBytes: 4096,
             occupancyRatio: 1,
             registersPerThread: 0,
             compileTime: TimeSpan.Zero,
             kernelLaunchCount: path.Steps.Count);
-        var correctness = new KernelTuningCorrectnessEvidence(
-            KernelTuningValidationScope.Output,
-            outputAbsoluteError: 0,
-            outputRelativeError: 0,
-            outputAbsoluteTolerance: 1e-6,
-            outputRelativeTolerance: 1e-6);
-        return new KernelTuningMeasurement(throughput, timing, resources, correctness);
+        return DeterministicFinalistEvaluator<EinsumContractionOrder>.SearchMeasurement(
+            throughput,
+            resources);
     }
+
+    private static DeterministicFinalistEvaluator<EinsumContractionOrder> Finalist(
+        EinsumShapeBinding binding) => new(
+        EinsumPathOptimizer.Greedy(binding).ContractionOrder,
+        OrderThroughput,
+        _ => KernelTuningResourceUsage.ForCpu(4096, TimeSpan.Zero, operationCount: 2));
+
+    private static double OrderThroughput(EinsumContractionOrder order) =>
+        order.Pairs[0] == new EinsumContractionPair(0, 2) ? 200 : 100;
 
     private sealed class MemoryStore : IKernelTuningStore<EinsumContractionOrder>
     {

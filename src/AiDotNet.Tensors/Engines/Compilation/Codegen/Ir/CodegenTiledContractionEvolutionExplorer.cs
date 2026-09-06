@@ -30,6 +30,7 @@ public static class CodegenTiledContractionEvolutionExplorer
         Func<CodegenTiledContractionSchedule, CodegenTiledContractionPlan,
             EvolutionEvaluationContext, CancellationToken,
             ValueTask<KernelTuningTrialResult>> evaluator,
+        IKernelTuningFinalistEvaluator<CodegenTiledContractionSchedule> finalistEvaluator,
         KernelSearchSpaceVersion searchSpaceVersion,
         IEnumerable<CodegenTiledContractionSchedule>? additionalSeeds = null,
         EvolutionEngineOptions? engineOptions = null,
@@ -40,6 +41,7 @@ public static class CodegenTiledContractionEvolutionExplorer
     {
         if (spec is null) throw new ArgumentNullException(nameof(spec));
         if (evaluator is null) throw new ArgumentNullException(nameof(evaluator));
+        if (finalistEvaluator is null) throw new ArgumentNullException(nameof(finalistEvaluator));
         if (computeMajor <= 0) throw new ArgumentOutOfRangeException(nameof(computeMajor));
         if (computeMinor < 0) throw new ArgumentOutOfRangeException(nameof(computeMinor));
         if (!CodegenTiledContractionPlan.TryCreate(
@@ -76,6 +78,7 @@ public static class CodegenTiledContractionEvolutionExplorer
                 }
                 return await evaluator(schedule, plan, context, token).ConfigureAwait(false);
             },
+            finalistEvaluator,
             resolvedOptions,
             tuningOptions,
             checkpointStore: checkpointStore,

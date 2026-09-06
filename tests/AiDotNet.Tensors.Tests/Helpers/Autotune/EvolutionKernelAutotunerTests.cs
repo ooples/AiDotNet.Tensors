@@ -33,7 +33,7 @@ public sealed class EvolutionKernelAutotunerTests : IDisposable
         Assert.True(result.WasPromoted);
         Assert.True(result.WasPersisted);
         Assert.Equal(FakeKernelVariant.Wide, result.ProposedWinner.Configuration.Variant);
-        Assert.Equal(240d, result.ActiveDeployment.Measurement.ThroughputGflops);
+        Assert.InRange(result.ActiveDeployment.Measurement.ThroughputGflops, 239.9, 240.1);
         Assert.Equal(3, result.Run.Counters.EvaluationAttempts);
         EvolutionArchiveEntry<FakeKernelConfiguration> best = result.Run.Best ??
             throw new InvalidOperationException("A successful tuning run must have a best entry.");
@@ -43,6 +43,49 @@ public sealed class EvolutionKernelAutotunerTests : IDisposable
         Assert.DoesNotContain("throughput-gflops", best.Evaluation.Descriptors.Keys);
         Assert.True(tuner.Deployment.TryGet(out FakeKernelConfiguration active));
         Assert.Equal(result.ActiveDeployment.Configuration, active);
+    }
+
+    [Fact]
+    public async Task TuneExhaustiveAsync_EvaluatesOnlyTheCompleteFiniteDomain()
+    {
+        EvolutionEngineOptions options = EngineOptions();
+        options.MaxEvaluationAttempts = 12;
+        options.MaxProposals = 12;
+        options.MaxGenerations = 12;
+        var tuner = new EvolutionKernelAutotuner<FakeKernelConfiguration>(
+            Identity(),
+            new FakeKernelCodec(),
+            new FakeKernelVariation(),
+            MeasurePassed,
+            Finalist(),
+            options,
+            deploymentRegistry: new KernelTuningDeploymentRegistry<FakeKernelConfiguration>(),
+            store: new MemoryStore());
+
+        EvolutionKernelTuningResult<FakeKernelConfiguration> result =
+            await tuner.TuneExhaustiveAsync(Seeds());
+
+        Assert.Equal(Seeds().Count, result.Run.Counters.EvaluationAttempts);
+        Assert.Equal(Seeds().Count, result.Run.Counters.Proposals);
+        Assert.Equal(FakeKernelVariant.Wide, result.ProposedWinner.Configuration.Variant);
+    }
+
+    [Fact]
+    public async Task TuneExhaustiveAsync_RejectsDuplicateOrOverBudgetDomains()
+    {
+        EvolutionKernelAutotuner<FakeKernelConfiguration> tuner = CreateTuner(
+            new KernelTuningDeploymentRegistry<FakeKernelConfiguration>(),
+            new MemoryStore(),
+            MeasurePassed);
+        FakeKernelConfiguration duplicate = Seeds()[0];
+        FakeKernelConfiguration[] overBudget = Seeds()
+            .Append(new FakeKernelConfiguration(FakeKernelVariant.Safe, 16))
+            .ToArray();
+
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            tuner.TuneExhaustiveAsync(new[] { duplicate, duplicate }));
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            tuner.TuneExhaustiveAsync(overBudget));
     }
 
     [Fact]
@@ -72,15 +115,16 @@ public sealed class EvolutionKernelAutotunerTests : IDisposable
         EvolutionKernelAutotuner<FakeKernelConfiguration> replacement = CreateTuner(
             registry,
             store,
-            (configuration, _, _) => new ValueTask<KernelTuningTrialResult>(Passed(configuration, bonus: 5)));
+            (configuration, _, _) => new ValueTask<KernelTuningTrialResult>(Passed(configuration, bonus: 5)),
+            finalistBonus: 5);
 
         EvolutionKernelTuningResult<FakeKernelConfiguration> result = await replacement.TuneAsync(Seeds());
 
         Assert.False(result.WasPromoted);
         Assert.False(result.WasPersisted);
-        Assert.Equal(245d, result.ProposedWinner.Measurement.ThroughputGflops);
+        Assert.InRange(result.ProposedWinner.Measurement.ThroughputGflops, 244.9, 245.1);
         Assert.Same(initial.ActiveDeployment, result.ActiveDeployment);
-        Assert.Equal(240d, result.ActiveDeployment.Measurement.ThroughputGflops);
+        Assert.InRange(result.ActiveDeployment.Measurement.ThroughputGflops, 239.9, 240.1);
     }
 
     [Fact]
@@ -98,14 +142,15 @@ public sealed class EvolutionKernelAutotunerTests : IDisposable
                 using (cancellationToken.Register(() => releaseFirst.TrySetCanceled()))
                     await releaseFirst.Task;
                 return Passed(configuration, bonus: 200);
-            });
+            },
+            finalistBonus: 200);
         EvolutionKernelAutotuner<FakeKernelConfiguration> second = CreateTuner(
             registry,
             new MemoryStore(),
             MeasurePassed);
 
         Task<EvolutionKernelTuningResult<FakeKernelConfiguration>> firstRun =
-            first.TuneAsync(Seeds().Take(1));
+            first.TuneAsync(Seeds().TakeLast(1));
         await firstStarted.Task;
         Task<EvolutionKernelTuningResult<FakeKernelConfiguration>> secondRun =
             second.TuneAsync(Seeds().Take(1));
@@ -116,7 +161,7 @@ public sealed class EvolutionKernelAutotunerTests : IDisposable
         Assert.True(firstResult.WasPromoted);
         Assert.False(secondResult.WasPromoted);
         Assert.Same(firstResult.ActiveDeployment, secondResult.ActiveDeployment);
-        Assert.Equal(280d, secondResult.ActiveDeployment.Measurement.ThroughputGflops);
+        Assert.InRange(secondResult.ActiveDeployment.Measurement.ThroughputGflops, 439.9, 440.1);
     }
 
     [Fact]
@@ -142,6 +187,7 @@ public sealed class EvolutionKernelAutotunerTests : IDisposable
     {
         var first = new EvolutionKernelAutotuner<FakeKernelConfiguration>(
             Identity(), new FakeKernelCodec(), new FakeKernelVariation(), MeasurePassed,
+            Finalist(),
             EngineOptions(), deploymentRegistry: new KernelTuningDeploymentRegistry<FakeKernelConfiguration>());
         EvolutionKernelTuningResult<FakeKernelConfiguration> tuned = await first.TuneAsync(Seeds());
         Assert.True(tuned.WasPersisted);
@@ -156,6 +202,7 @@ public sealed class EvolutionKernelAutotunerTests : IDisposable
                 evaluatorCalled = true;
                 throw new InvalidOperationException("Hydration must not benchmark.");
             },
+            Finalist(),
             EngineOptions(),
             deploymentRegistry: new KernelTuningDeploymentRegistry<FakeKernelConfiguration>());
 
@@ -189,6 +236,7 @@ public sealed class EvolutionKernelAutotunerTests : IDisposable
             new FakeKernelCodec(),
             new FakeKernelVariation(),
             MeasurePassed,
+            Finalist(),
             EngineOptions(),
             deploymentRegistry: new KernelTuningDeploymentRegistry<FakeKernelConfiguration>(),
             store: store,
@@ -211,14 +259,15 @@ public sealed class EvolutionKernelAutotunerTests : IDisposable
             identity.BenchmarkProtocolVersion);
         KernelTuningDeploymentSnapshot<FakeKernelConfiguration> wrongIdentity =
             Snapshot(otherIdentity, configuration, bonus: 0);
-        KernelTuningMeasurement measurement = Passed(configuration).Measurement ??
-            throw new InvalidOperationException("A passed trial must carry a measurement.");
+        KernelTuningFinalistReplay<FakeKernelConfiguration> replay = Replay(configuration);
         var wrongGenome = new KernelTuningDeploymentSnapshot<FakeKernelConfiguration>(
             identity,
             configuration,
             "not-the-canonical-genome-id",
-            measurement,
-            "test-run-state");
+            replay.CandidateMeasurement,
+            "test-run-state",
+            replay.Evidence,
+            KernelTuningEvidenceRole.Candidate);
 
         EvolutionKernelAutotuner<FakeKernelConfiguration> identityTuner = CreateTuner(
             new KernelTuningDeploymentRegistry<FakeKernelConfiguration>(),
@@ -260,6 +309,7 @@ public sealed class EvolutionKernelAutotunerTests : IDisposable
                 evaluatorCalls++;
                 return new ValueTask<KernelTuningTrialResult>(Passed(configuration));
             },
+            Finalist(),
             EngineOptions(),
             deploymentRegistry: new KernelTuningDeploymentRegistry<FakeKernelConfiguration>(),
             store: new MemoryStore(),
@@ -288,6 +338,7 @@ public sealed class EvolutionKernelAutotunerTests : IDisposable
             new FakeKernelCodec(),
             new FakeKernelVariation(),
             MeasurePassed,
+            Finalist(),
             EngineOptions(),
             deploymentRegistry: registry,
             store: store);
@@ -360,6 +411,7 @@ public sealed class EvolutionKernelAutotunerTests : IDisposable
             new FakeKernelCodec(),
             new FakeKernelVariation(),
             MeasurePassed,
+            Finalist(),
             noProposals));
 
         EvolutionEngineOptions noEvaluations = EngineOptions();
@@ -369,6 +421,7 @@ public sealed class EvolutionKernelAutotunerTests : IDisposable
             new FakeKernelCodec(),
             new FakeKernelVariation(),
             MeasurePassed,
+            Finalist(),
             noEvaluations));
     }
 
@@ -406,12 +459,14 @@ public sealed class EvolutionKernelAutotunerTests : IDisposable
         KernelTuningDeploymentRegistry<FakeKernelConfiguration> registry,
         IKernelTuningStore<FakeKernelConfiguration> store,
         Func<FakeKernelConfiguration, EvolutionEvaluationContext, CancellationToken,
-            ValueTask<KernelTuningTrialResult>> evaluator) =>
+            ValueTask<KernelTuningTrialResult>> evaluator,
+        double finalistBonus = 0) =>
         new(
             Identity(),
             new FakeKernelCodec(),
             new FakeKernelVariation(),
             evaluator,
+            Finalist(finalistBonus),
             EngineOptions(),
             deploymentRegistry: registry,
             store: store);
@@ -459,27 +514,10 @@ public sealed class EvolutionKernelAutotunerTests : IDisposable
             FakeKernelVariant.Wide => 240,
             _ => throw new ArgumentOutOfRangeException(nameof(configuration))
         };
-        var timing = KernelTimingStatistics.FromSamples(new[]
-        {
-            TimeSpan.FromMilliseconds(1.1),
-            TimeSpan.FromMilliseconds(1.0),
-            TimeSpan.FromMilliseconds(0.9),
-            TimeSpan.FromMilliseconds(1.05),
-            TimeSpan.FromMilliseconds(0.95)
-        });
-        var resources = new KernelTuningResourceUsage(
-            configuration.TileEdge * 1024L,
-            0.5 + configuration.TileEdge / 100d,
-            configuration.TileEdge,
-            TimeSpan.FromMilliseconds(3));
-        var correctness = new KernelTuningCorrectnessEvidence(
-            KernelTuningValidationScope.Output,
-            outputAbsoluteError: 1e-7,
-            outputRelativeError: 2e-7,
-            outputAbsoluteTolerance: 1e-5,
-            outputRelativeTolerance: 1e-5);
         return KernelTuningTrialResult.Passed(
-            new KernelTuningMeasurement(throughput + bonus, timing, resources, correctness));
+            DeterministicFinalistEvaluator<FakeKernelConfiguration>.SearchMeasurement(
+                throughput + bonus,
+                Resources(configuration)));
     }
 
     private static KernelTuningDeploymentSnapshot<FakeKernelConfiguration> Snapshot(
@@ -488,16 +526,44 @@ public sealed class EvolutionKernelAutotunerTests : IDisposable
         double bonus)
     {
         var codec = new FakeKernelCodec();
-        KernelTuningMeasurement measurement = Passed(configuration, bonus).Measurement ??
-            throw new InvalidOperationException("A passed trial must carry a measurement.");
+        KernelTuningFinalistReplay<FakeKernelConfiguration> replay = Replay(configuration, bonus);
         string payload = codec.Serialize(configuration);
         return new KernelTuningDeploymentSnapshot<FakeKernelConfiguration>(
             identity,
             configuration,
             EvolutionHash.Compute(payload),
-            measurement,
-            "test-run-state");
+            replay.CandidateMeasurement,
+            "test-run-state",
+            replay.Evidence,
+            KernelTuningEvidenceRole.Candidate);
     }
+
+    private static DeterministicFinalistEvaluator<FakeKernelConfiguration> Finalist(double bonus = 0) => new(
+        Seeds()[0],
+        configuration => Throughput(configuration) + bonus,
+        Resources);
+
+    private static KernelTuningFinalistReplay<FakeKernelConfiguration> Replay(
+        FakeKernelConfiguration configuration,
+        double bonus = 0) => Finalist(bonus)
+        .ReplayAsync(Identity(), configuration, null)
+        .AsTask()
+        .GetAwaiter()
+        .GetResult();
+
+    private static double Throughput(FakeKernelConfiguration configuration) => configuration.Variant switch
+    {
+        FakeKernelVariant.Safe => 80,
+        FakeKernelVariant.Fast => 160,
+        FakeKernelVariant.Wide => 240,
+        _ => throw new ArgumentOutOfRangeException(nameof(configuration))
+    };
+
+    private static KernelTuningResourceUsage Resources(FakeKernelConfiguration configuration) => new(
+        configuration.TileEdge * 1024L,
+        0.5 + configuration.TileEdge / 100d,
+        configuration.TileEdge,
+        TimeSpan.FromMilliseconds(3));
 
     private enum FakeKernelVariant
     {

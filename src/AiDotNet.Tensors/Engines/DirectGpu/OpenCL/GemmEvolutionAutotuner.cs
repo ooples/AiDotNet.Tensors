@@ -131,6 +131,7 @@ public sealed partial class GemmAutoTuner
         GpuDeviceFingerprint fingerprint,
         Func<GemmConfig, EvolutionEvaluationContext, CancellationToken,
             ValueTask<KernelTuningTrialResult>> evaluator,
+        IKernelTuningFinalistEvaluator<OpenClGemmConfiguration> finalistEvaluator,
         KernelSearchSpaceVersion searchSpaceVersion,
         KernelBenchmarkProtocolVersion benchmarkProtocolVersion,
         EvolutionEngineOptions? engineOptions = null,
@@ -141,6 +142,7 @@ public sealed partial class GemmAutoTuner
     {
         ValidateEvolutionArguments(m, n, k, capabilities);
         if (evaluator is null) throw new ArgumentNullException(nameof(evaluator));
+        if (finalistEvaluator is null) throw new ArgumentNullException(nameof(finalistEvaluator));
         var identity = new KernelTuningIdentity(
             EvolutionKernelId,
             new ShapeProfile(m, n, k),
@@ -158,6 +160,7 @@ public sealed partial class GemmAutoTuner
                 if (invalid is not null) return invalid;
                 return await evaluator(candidate, context, cancellationToken).ConfigureAwait(false);
             },
+            finalistEvaluator,
             engineOptions,
             tuningOptions,
             checkpointStore: checkpointStore,
@@ -178,6 +181,7 @@ public sealed partial class GemmAutoTuner
         GpuDeviceFingerprint fingerprint,
         Func<GemmConfig, EvolutionEvaluationContext, CancellationToken,
             ValueTask<KernelTuningTrialResult>> evaluator,
+        IKernelTuningFinalistEvaluator<OpenClGemmConfiguration> finalistEvaluator,
         KernelSearchSpaceVersion searchSpaceVersion,
         KernelBenchmarkProtocolVersion benchmarkProtocolVersion,
         IEnumerable<GemmConfig>? additionalSeeds = null,
@@ -191,7 +195,7 @@ public sealed partial class GemmAutoTuner
         IReadOnlyList<OpenClGemmConfiguration> seeds = GetEvolutionSeeds(
             m, n, k, capabilities, additionalSeeds);
         EvolutionKernelAutotuner<OpenClGemmConfiguration> tuner = CreateEvolutionTuner(
-            m, n, k, capabilities, fingerprint, evaluator,
+            m, n, k, capabilities, fingerprint, evaluator, finalistEvaluator,
             searchSpaceVersion, benchmarkProtocolVersion,
             engineOptions, tuningOptions, checkpointStore, deploymentRegistry, store);
         if (seeds.Count > tuner.MaximumProposals)
@@ -415,30 +419,30 @@ public sealed partial class GemmAutoTuner
         private static OpenClGemmConfiguration Mutate(
             OpenClGemmConfiguration value,
             StableRandom random) => random.NextInt(21) switch
-        {
-            0 => value with { KernelTemplate = (GemmKernelTemplate)random.NextInt(3) },
-            1 => value with { TileM = Pick(TileSizes, random) },
-            2 => value with { TileN = Pick(TileSizes, random) },
-            3 => value with { TileK = Pick(KTileSizes, random) },
-            4 => value with { ThreadTileM = Pick(ThreadDimensions, random) },
-            5 => value with { ThreadTileN = Pick(ThreadDimensions, random) },
-            6 => value with { VectorWidthM = Pick(VectorWidths, random) },
-            7 => value with { VectorWidthN = Pick(VectorWidths, random) },
-            8 => value with { UseDoubleBuffering = !value.UseDoubleBuffering },
-            9 => value with { UseVectorizedLoads = !value.UseVectorizedLoads },
-            10 => value with { KReg = Pick(RegisterTiles, random) },
-            11 => value with { KUnroll = Pick(UnrollFactors, random) },
-            12 => value with { UseSubgroupOps = !value.UseSubgroupOps },
-            13 => value with { StrideM = !value.StrideM },
-            14 => value with { StrideN = !value.StrideN },
-            15 => value with { CacheA = !value.CacheA },
-            16 => value with { CacheB = !value.CacheB },
-            17 => value with { MdimaSize = Pick(CooperativeDimensions, random) },
-            18 => value with { NdimbSize = Pick(CooperativeDimensions, random) },
-            19 => value with { UseTrueVectorLds = !value.UseTrueVectorLds },
-            20 => value with { UseColumnMajorA = !value.UseColumnMajorA },
-            _ => throw new InvalidOperationException()
-        };
+            {
+                0 => value with { KernelTemplate = (GemmKernelTemplate)random.NextInt(3) },
+                1 => value with { TileM = Pick(TileSizes, random) },
+                2 => value with { TileN = Pick(TileSizes, random) },
+                3 => value with { TileK = Pick(KTileSizes, random) },
+                4 => value with { ThreadTileM = Pick(ThreadDimensions, random) },
+                5 => value with { ThreadTileN = Pick(ThreadDimensions, random) },
+                6 => value with { VectorWidthM = Pick(VectorWidths, random) },
+                7 => value with { VectorWidthN = Pick(VectorWidths, random) },
+                8 => value with { UseDoubleBuffering = !value.UseDoubleBuffering },
+                9 => value with { UseVectorizedLoads = !value.UseVectorizedLoads },
+                10 => value with { KReg = Pick(RegisterTiles, random) },
+                11 => value with { KUnroll = Pick(UnrollFactors, random) },
+                12 => value with { UseSubgroupOps = !value.UseSubgroupOps },
+                13 => value with { StrideM = !value.StrideM },
+                14 => value with { StrideN = !value.StrideN },
+                15 => value with { CacheA = !value.CacheA },
+                16 => value with { CacheB = !value.CacheB },
+                17 => value with { MdimaSize = Pick(CooperativeDimensions, random) },
+                18 => value with { NdimbSize = Pick(CooperativeDimensions, random) },
+                19 => value with { UseTrueVectorLds = !value.UseTrueVectorLds },
+                20 => value with { UseColumnMajorA = !value.UseColumnMajorA },
+                _ => throw new InvalidOperationException()
+            };
 
         private static int Pick(IReadOnlyList<int> values, StableRandom random) =>
             values[random.NextInt(values.Count)];

@@ -225,7 +225,9 @@ public enum KernelTuningTrialStatus
     /// <summary>The gradient differs from the trusted reference.</summary>
     GradientMismatch = 5,
     /// <summary>Benchmark execution failed after correctness validation.</summary>
-    BenchmarkFailed = 6
+    BenchmarkFailed = 6,
+    /// <summary>A descriptor required by the search policy was not measured by this backend.</summary>
+    RequiredMetricUnavailable = 7
 }
 
 /// <summary>Robust latency statistics computed from repeated device measurements.</summary>
@@ -234,11 +236,18 @@ public sealed class KernelTimingStatistics
     /// <summary>Minimum number of measured samples accepted by the tuning infrastructure.</summary>
     public const int MinimumSampleCount = 3;
 
-    private KernelTimingStatistics(int sampleCount, TimeSpan median, TimeSpan p95)
+    private readonly IReadOnlyList<TimeSpan> _samples;
+
+    private KernelTimingStatistics(
+        int sampleCount,
+        TimeSpan median,
+        TimeSpan p95,
+        IReadOnlyList<TimeSpan> samples)
     {
         SampleCount = sampleCount;
         Median = median;
         P95 = p95;
+        _samples = samples;
     }
 
     /// <summary>Gets the number of post-warmup samples.</summary>
@@ -247,6 +256,10 @@ public sealed class KernelTimingStatistics
     public TimeSpan Median { get; }
     /// <summary>Gets the nearest-rank 95th-percentile latency.</summary>
     public TimeSpan P95 { get; }
+    /// <summary>Gets the immutable raw samples when this instance was computed locally.</summary>
+    public IReadOnlyList<TimeSpan> Samples => _samples;
+    /// <summary>Gets whether raw samples, rather than only a persisted summary, are available.</summary>
+    public bool HasRawSamples => _samples.Count == SampleCount;
 
     /// <summary>Computes immutable statistics from post-warmup samples.</summary>
     public static KernelTimingStatistics FromSamples(IEnumerable<TimeSpan> samples)
@@ -267,10 +280,12 @@ public sealed class KernelTimingStatistics
             ? (milliseconds[milliseconds.Length / 2 - 1] + milliseconds[milliseconds.Length / 2]) / 2d
             : milliseconds[milliseconds.Length / 2];
         int p95Index = Math.Max(0, (int)Math.Ceiling(milliseconds.Length * 0.95d) - 1);
+        TimeSpan[] immutableSamples = milliseconds.Select(TimeSpan.FromMilliseconds).ToArray();
         return new KernelTimingStatistics(
             milliseconds.Length,
             TimeSpan.FromMilliseconds(median),
-            TimeSpan.FromMilliseconds(milliseconds[p95Index]));
+            TimeSpan.FromMilliseconds(milliseconds[p95Index]),
+            Array.AsReadOnly(immutableSamples));
     }
 
     internal static KernelTimingStatistics FromSummary(int sampleCount, double medianMs, double p95Ms)
@@ -281,7 +296,10 @@ public sealed class KernelTimingStatistics
         if (!KernelTuningMeasurement.IsFinite(p95Ms) || p95Ms < medianMs)
             throw new ArgumentOutOfRangeException(nameof(p95Ms));
         return new KernelTimingStatistics(
-            sampleCount, TimeSpan.FromMilliseconds(medianMs), TimeSpan.FromMilliseconds(p95Ms));
+            sampleCount,
+            TimeSpan.FromMilliseconds(medianMs),
+            TimeSpan.FromMilliseconds(p95Ms),
+            Array.Empty<TimeSpan>());
     }
 }
 
@@ -373,30 +391,115 @@ public sealed class KernelTuningResourceUsage
         int registersPerThread,
         TimeSpan compileTime,
         int kernelLaunchCount = 1)
+        : this(
+            KernelTuningResourceMetric<long>.Measured(workspaceBytes),
+            KernelTuningResourceMetric<double>.Measured(occupancyRatio),
+            KernelTuningResourceMetric<int>.Measured(registersPerThread),
+            KernelTuningResourceMetric<TimeSpan>.Measured(compileTime),
+            KernelTuningResourceMetric<int>.Measured(kernelLaunchCount))
     {
-        if (workspaceBytes < 0) throw new ArgumentOutOfRangeException(nameof(workspaceBytes));
-        if (!KernelTuningMeasurement.IsFinite(occupancyRatio) || occupancyRatio < 0 || occupancyRatio > 1)
-            throw new ArgumentOutOfRangeException(nameof(occupancyRatio));
-        if (registersPerThread < 0) throw new ArgumentOutOfRangeException(nameof(registersPerThread));
-        if (compileTime < TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(compileTime));
-        if (kernelLaunchCount <= 0) throw new ArgumentOutOfRangeException(nameof(kernelLaunchCount));
-        WorkspaceBytes = workspaceBytes;
-        OccupancyRatio = occupancyRatio;
-        RegistersPerThread = registersPerThread;
-        CompileTime = compileTime;
-        KernelLaunchCount = kernelLaunchCount;
     }
 
-    /// <summary>Gets temporary workspace in bytes.</summary>
-    public long WorkspaceBytes { get; }
-    /// <summary>Gets occupancy in the inclusive range zero to one.</summary>
-    public double OccupancyRatio { get; }
-    /// <summary>Gets registers consumed per thread.</summary>
-    public int RegistersPerThread { get; }
-    /// <summary>Gets candidate compilation latency.</summary>
-    public TimeSpan CompileTime { get; }
-    /// <summary>Gets the operation's kernel-launch count.</summary>
-    public int KernelLaunchCount { get; }
+    /// <summary>Creates resource evidence with explicit measured/not-applicable/unavailable state per metric.</summary>
+    public KernelTuningResourceUsage(
+        KernelTuningResourceMetric<long> workspaceBytes,
+        KernelTuningResourceMetric<double> occupancyRatio,
+        KernelTuningResourceMetric<int> registersPerThread,
+        KernelTuningResourceMetric<TimeSpan> compileTime,
+        KernelTuningResourceMetric<int> kernelLaunchCount)
+    {
+        ValidateMetric(workspaceBytes, value => value >= 0, nameof(workspaceBytes));
+        ValidateMetric(
+            occupancyRatio,
+            value => KernelTuningMeasurement.IsFinite(value) && value >= 0 && value <= 1,
+            nameof(occupancyRatio));
+        ValidateMetric(registersPerThread, value => value >= 0, nameof(registersPerThread));
+        ValidateMetric(compileTime, value => value >= TimeSpan.Zero, nameof(compileTime));
+        ValidateMetric(kernelLaunchCount, value => value > 0, nameof(kernelLaunchCount));
+        WorkspaceBytesMetric = workspaceBytes;
+        OccupancyRatioMetric = occupancyRatio;
+        RegistersPerThreadMetric = registersPerThread;
+        CompileTimeMetric = compileTime;
+        KernelLaunchCountMetric = kernelLaunchCount;
+    }
+
+    /// <summary>Gets typed temporary-workspace evidence.</summary>
+    public KernelTuningResourceMetric<long> WorkspaceBytesMetric { get; }
+    /// <summary>Gets typed occupancy evidence.</summary>
+    public KernelTuningResourceMetric<double> OccupancyRatioMetric { get; }
+    /// <summary>Gets typed register evidence.</summary>
+    public KernelTuningResourceMetric<int> RegistersPerThreadMetric { get; }
+    /// <summary>Gets typed compile-time evidence.</summary>
+    public KernelTuningResourceMetric<TimeSpan> CompileTimeMetric { get; }
+    /// <summary>Gets typed launch-count evidence.</summary>
+    public KernelTuningResourceMetric<int> KernelLaunchCountMetric { get; }
+
+    /// <summary>Gets measured temporary workspace in bytes.</summary>
+    public long WorkspaceBytes => WorkspaceBytesMetric.Value;
+    /// <summary>Gets measured occupancy in the inclusive range zero to one.</summary>
+    public double OccupancyRatio => OccupancyRatioMetric.Value;
+    /// <summary>Gets measured registers consumed per thread.</summary>
+    public int RegistersPerThread => RegistersPerThreadMetric.Value;
+    /// <summary>Gets measured candidate compilation latency.</summary>
+    public TimeSpan CompileTime => CompileTimeMetric.Value;
+    /// <summary>Gets the measured operation kernel-launch count.</summary>
+    public int KernelLaunchCount => KernelLaunchCountMetric.Value;
+
+    /// <summary>Creates CPU evidence without inventing GPU occupancy or register values.</summary>
+    public static KernelTuningResourceUsage ForCpu(
+        long workspaceBytes,
+        TimeSpan compileTime,
+        int operationCount = 1) => new(
+        KernelTuningResourceMetric<long>.Measured(workspaceBytes),
+        KernelTuningResourceMetric<double>.NotApplicable(),
+        KernelTuningResourceMetric<int>.NotApplicable(),
+        KernelTuningResourceMetric<TimeSpan>.Measured(compileTime),
+        KernelTuningResourceMetric<int>.Measured(operationCount));
+
+    internal bool TryGetMetric(KernelTuningMetric metric, out double value)
+    {
+        value = 0;
+        switch (metric)
+        {
+            case KernelTuningMetric.WorkspaceBytes:
+                if (!WorkspaceBytesMetric.TryGetValue(out long workspace)) return false;
+                value = workspace;
+                return true;
+            case KernelTuningMetric.Log2WorkspaceBytes:
+                if (!WorkspaceBytesMetric.TryGetValue(out workspace)) return false;
+                value = Math.Log(workspace + 1d, 2d);
+                return true;
+            case KernelTuningMetric.OccupancyRatio:
+                return OccupancyRatioMetric.TryGetValue(out value);
+            case KernelTuningMetric.RegistersPerThread:
+                if (!RegistersPerThreadMetric.TryGetValue(out int registers)) return false;
+                value = registers;
+                return true;
+            case KernelTuningMetric.CompileMilliseconds:
+                if (!CompileTimeMetric.TryGetValue(out TimeSpan compile)) return false;
+                value = compile.TotalMilliseconds;
+                return true;
+            case KernelTuningMetric.KernelLaunchCount:
+                if (!KernelLaunchCountMetric.TryGetValue(out int launches)) return false;
+                value = launches;
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private static void ValidateMetric<T>(
+        KernelTuningResourceMetric<T> metric,
+        Func<T, bool> predicate,
+        string parameterName)
+        where T : struct
+    {
+        if (metric.Status == KernelTuningResourceMetricStatus.Measured &&
+            (!metric.TryGetValue(out T value) || !predicate(value)))
+        {
+            throw new ArgumentOutOfRangeException(parameterName);
+        }
+    }
 }
 
 /// <summary>One locally validated, repeatedly measured kernel result.</summary>
@@ -404,21 +507,36 @@ public sealed class KernelTuningMeasurement
 {
     /// <summary>Creates a correctness-gated measurement.</summary>
     public KernelTuningMeasurement(
-        double throughputGflops,
+        KernelTuningWorkload workload,
+        KernelTuningTimingScope timingScope,
         KernelTimingStatistics timing,
         KernelTuningResourceUsage resources,
         KernelTuningCorrectnessEvidence correctness)
     {
-        if (!IsFinite(throughputGflops) || throughputGflops <= 0)
-            throw new ArgumentOutOfRangeException(nameof(throughputGflops));
-        ThroughputGflops = throughputGflops;
+        if (!Enum.IsDefined(typeof(KernelTuningTimingScope), timingScope))
+            throw new ArgumentOutOfRangeException(nameof(timingScope));
+        Workload = workload;
+        TimingScope = timingScope;
         Timing = timing ?? throw new ArgumentNullException(nameof(timing));
         Resources = resources ?? throw new ArgumentNullException(nameof(resources));
         Correctness = correctness ?? throw new ArgumentNullException(nameof(correctness));
+        PerformanceRatePerSecond = workload.UnitsPerOperation / Timing.Median.TotalSeconds;
+        if (!IsFinite(PerformanceRatePerSecond) || PerformanceRatePerSecond <= 0)
+            throw new ArgumentOutOfRangeException(nameof(timing));
     }
 
-    /// <summary>Gets measured throughput.</summary>
-    public double ThroughputGflops { get; }
+    /// <summary>Gets the typed work represented by each timing sample.</summary>
+    public KernelTuningWorkload Workload { get; }
+    /// <summary>Gets the boundary included in each timing sample.</summary>
+    public KernelTuningTimingScope TimingScope { get; }
+    /// <summary>Gets the derived work rate used as the maximize-direction search quality.</summary>
+    public double PerformanceRatePerSecond { get; }
+    /// <summary>Gets billions of work units per second for the legacy cache transport.</summary>
+    internal double BillionsOfWorkUnitsPerSecond => PerformanceRatePerSecond / 1e9d;
+    /// <summary>Gets measured GFLOP/s when the declared work unit is floating-point operations.</summary>
+    public double ThroughputGflops => Workload.Unit == KernelTuningWorkUnit.FloatingPointOperations
+        ? BillionsOfWorkUnitsPerSecond
+        : throw new InvalidOperationException("GFLOP/s is defined only for a floating-point-operation workload.");
     /// <summary>Gets robust timing statistics.</summary>
     public KernelTimingStatistics Timing { get; }
     /// <summary>Gets device-resource measurements.</summary>
@@ -426,21 +544,36 @@ public sealed class KernelTuningMeasurement
     /// <summary>Gets local correctness evidence.</summary>
     public KernelTuningCorrectnessEvidence Correctness { get; }
 
-    internal double GetMetric(KernelTuningMetric metric) => metric switch
+    internal bool TryGetMetric(KernelTuningMetric metric, out double value)
     {
-        KernelTuningMetric.ThroughputGflops => ThroughputGflops,
-        KernelTuningMetric.MedianLatencyMilliseconds => Timing.Median.TotalMilliseconds,
-        KernelTuningMetric.P95LatencyMilliseconds => Timing.P95.TotalMilliseconds,
-        KernelTuningMetric.WorkspaceBytes => Resources.WorkspaceBytes,
-        KernelTuningMetric.Log2WorkspaceBytes => Math.Log(Resources.WorkspaceBytes + 1d, 2d),
-        KernelTuningMetric.OccupancyRatio => Resources.OccupancyRatio,
-        KernelTuningMetric.RegistersPerThread => Resources.RegistersPerThread,
-        KernelTuningMetric.CompileMilliseconds => Resources.CompileTime.TotalMilliseconds,
-        KernelTuningMetric.MaximumNumericalError => Correctness.MaximumError,
-        KernelTuningMetric.Log10NumericalError => Math.Log10(Math.Max(Correctness.MaximumError, 1e-16d)),
-        KernelTuningMetric.KernelLaunchCount => Resources.KernelLaunchCount,
-        _ => throw new ArgumentOutOfRangeException(nameof(metric))
-    };
+        switch (metric)
+        {
+            case KernelTuningMetric.ThroughputGflops:
+                value = Workload.Unit == KernelTuningWorkUnit.FloatingPointOperations
+                    ? ThroughputGflops
+                    : 0;
+                return Workload.Unit == KernelTuningWorkUnit.FloatingPointOperations;
+            case KernelTuningMetric.MedianLatencyMilliseconds:
+                value = Timing.Median.TotalMilliseconds;
+                return true;
+            case KernelTuningMetric.P95LatencyMilliseconds:
+                value = Timing.P95.TotalMilliseconds;
+                return true;
+            case KernelTuningMetric.MaximumNumericalError:
+                value = Correctness.MaximumError;
+                return true;
+            case KernelTuningMetric.Log10NumericalError:
+                value = Math.Log10(Math.Max(Correctness.MaximumError, 1e-16d));
+                return true;
+            default:
+                return Resources.TryGetMetric(metric, out value);
+        }
+    }
+
+    internal double GetRequiredMetric(KernelTuningMetric metric) =>
+        TryGetMetric(metric, out double value)
+            ? value
+            : throw new InvalidOperationException($"Kernel metric '{metric}' has no measured value for this backend.");
 
     internal static bool IsFinite(double value) => !double.IsNaN(value) && !double.IsInfinity(value);
 }
@@ -517,10 +650,23 @@ public sealed class KernelTuningDescriptorDefinition
         KernelTuningMetricNames.Get(Metric), Minimum, Maximum, BinCount, OutOfRangePolicy);
 }
 
+/// <summary>Selects the resource descriptor profile used by the typed tuning archive.</summary>
+public enum KernelTuningArchiveProfile
+{
+    /// <summary>Selects the built-in profile from the tuning identity's device kind.</summary>
+    DeviceDefault = 0,
+    /// <summary>Uses CPU resource axes.</summary>
+    Cpu = 1,
+    /// <summary>Uses GPU resource axes.</summary>
+    Gpu = 2,
+    /// <summary>Uses the explicitly supplied <see cref="KernelTuningOptions.ArchiveDescriptors"/>.</summary>
+    Custom = 3,
+}
+
 /// <summary>Promotion and archive policy for typed kernel tuning.</summary>
 public sealed class KernelTuningOptions
 {
-    private static readonly IReadOnlyList<KernelTuningDescriptorDefinition> DefaultDescriptors =
+    private static readonly IReadOnlyList<KernelTuningDescriptorDefinition> DefaultGpuDescriptors =
         Array.AsReadOnly(new KernelTuningDescriptorDefinition[]
     {
         new(KernelTuningMetric.Log2WorkspaceBytes, 0, 40, 16),
@@ -528,20 +674,62 @@ public sealed class KernelTuningOptions
         new(KernelTuningMetric.RegistersPerThread, 0, 512, 16)
     });
 
+    private static readonly IReadOnlyList<KernelTuningDescriptorDefinition> DefaultCpuDescriptors =
+        Array.AsReadOnly(new KernelTuningDescriptorDefinition[]
+    {
+        new(KernelTuningMetric.Log2WorkspaceBytes, 0, 40, 16),
+        new(KernelTuningMetric.KernelLaunchCount, 1, 256, 16)
+    });
+
     /// <summary>Gets or sets the minimum throughput ratio required to replace an active winner.</summary>
     public double MinimumPromotionRatio { get; set; } = GpuFirstRunAutotuner.MinimumPromotionRatio;
 
-    /// <summary>Gets or sets the real resource/correctness axes used by MAP-Elites.</summary>
-    public IReadOnlyList<KernelTuningDescriptorDefinition> ArchiveDescriptors { get; set; } = DefaultDescriptors;
+    /// <summary>Gets or sets the largest candidate/incumbent P95 latency ratio accepted for promotion.</summary>
+    public double MaximumP95LatencyRatio { get; set; } = 1d;
 
-    internal KernelTuningOptions SnapshotAndValidate()
+    /// <summary>Gets or sets how the archive resource axes are selected.</summary>
+    public KernelTuningArchiveProfile ArchiveProfile { get; set; } = KernelTuningArchiveProfile.DeviceDefault;
+
+    /// <summary>
+    /// Gets or sets the real resource/correctness axes used when <see cref="ArchiveProfile"/> is
+    /// <see cref="KernelTuningArchiveProfile.Custom"/>.
+    /// </summary>
+    public IReadOnlyList<KernelTuningDescriptorDefinition> ArchiveDescriptors { get; set; } =
+        Array.Empty<KernelTuningDescriptorDefinition>();
+
+    internal KernelTuningOptions SnapshotAndValidate(KernelTuningDeviceKind deviceKind)
     {
         if (!KernelTuningMeasurement.IsFinite(MinimumPromotionRatio) || MinimumPromotionRatio < 1d)
             throw new ArgumentOutOfRangeException(nameof(MinimumPromotionRatio));
-        if (ArchiveDescriptors is null || ArchiveDescriptors.Count == 0)
+        if (!KernelTuningMeasurement.IsFinite(MaximumP95LatencyRatio) || MaximumP95LatencyRatio <= 0)
+            throw new ArgumentOutOfRangeException(nameof(MaximumP95LatencyRatio));
+        if (!Enum.IsDefined(typeof(KernelTuningArchiveProfile), ArchiveProfile))
+            throw new ArgumentOutOfRangeException(nameof(ArchiveProfile));
+        if (!Enum.IsDefined(typeof(KernelTuningDeviceKind), deviceKind))
+            throw new ArgumentOutOfRangeException(nameof(deviceKind));
+        if (ArchiveDescriptors is null)
+            throw new ArgumentNullException(nameof(ArchiveDescriptors));
+
+        IReadOnlyList<KernelTuningDescriptorDefinition> resolved = ArchiveProfile switch
+        {
+            KernelTuningArchiveProfile.DeviceDefault => deviceKind == KernelTuningDeviceKind.Cpu
+                ? DefaultCpuDescriptors
+                : DefaultGpuDescriptors,
+            KernelTuningArchiveProfile.Cpu => DefaultCpuDescriptors,
+            KernelTuningArchiveProfile.Gpu => DefaultGpuDescriptors,
+            KernelTuningArchiveProfile.Custom => ArchiveDescriptors,
+            _ => throw new ArgumentOutOfRangeException(nameof(ArchiveProfile))
+        };
+        if (ArchiveProfile != KernelTuningArchiveProfile.Custom && ArchiveDescriptors.Count != 0)
+        {
+            throw new ArgumentException(
+                "Explicit archive descriptors require the Custom archive profile.",
+                nameof(ArchiveDescriptors));
+        }
+        if (resolved.Count == 0)
             throw new ArgumentException("At least one archive descriptor is required.", nameof(ArchiveDescriptors));
         var seen = new HashSet<KernelTuningMetric>();
-        KernelTuningDescriptorDefinition[] copy = ArchiveDescriptors.ToArray();
+        KernelTuningDescriptorDefinition[] copy = resolved.ToArray();
         for (int i = 0; i < copy.Length; i++)
         {
             if (copy[i] is null) throw new ArgumentException("Archive descriptors cannot contain null.", nameof(ArchiveDescriptors));
@@ -551,8 +739,23 @@ public sealed class KernelTuningOptions
         return new KernelTuningOptions
         {
             MinimumPromotionRatio = MinimumPromotionRatio,
+            MaximumP95LatencyRatio = MaximumP95LatencyRatio,
+            ArchiveProfile = ArchiveProfile == KernelTuningArchiveProfile.DeviceDefault
+                ? deviceKind == KernelTuningDeviceKind.Cpu
+                    ? KernelTuningArchiveProfile.Cpu
+                    : KernelTuningArchiveProfile.Gpu
+                : ArchiveProfile,
             ArchiveDescriptors = Array.AsReadOnly(copy)
         };
+    }
+
+    internal bool QualifiesForPromotion(KernelTuningPairedEvidence evidence)
+    {
+        if (evidence is null) throw new ArgumentNullException(nameof(evidence));
+        double requiredSpeedup = Math.Max(MinimumPromotionRatio, evidence.CalibratedNoiseRatio);
+        return evidence.MedianSpeedup >= requiredSpeedup &&
+               evidence.LowerSpeedupBound >= 1d &&
+               evidence.P95LatencyRatio <= MaximumP95LatencyRatio;
     }
 }
 

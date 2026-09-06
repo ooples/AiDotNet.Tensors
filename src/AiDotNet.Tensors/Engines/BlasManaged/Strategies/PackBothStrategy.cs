@@ -122,8 +122,11 @@ internal static class PackBothStrategy
         // each thread rents its own pack-A from PerThreadPool.Current ([ThreadStatic]),
         // while pack-B is shared (read-only inside the parallel region).
         bool hasWorkspace = !options.Workspace.IsEmpty;
+        ParallelismAxis? requestedAxis = options.ParallelismAxis;
+        if (requestedAxis == ParallelismAxis.K)
+            throw new NotSupportedException("PackBoth does not implement K-axis parallelism.");
 
-        if (hasWorkspace)
+        if (hasWorkspace || requestedAxis == ParallelismAxis.None)
         {
             // ── Serial path (workspace-backed) ──────────────────────────────────────
             var carver = new WorkspaceCarver(options.Workspace);
@@ -170,8 +173,13 @@ internal static class PackBothStrategy
             // leaves ≥75% of cores idle on the M-axis path — there the extra MN parallelism of
             // the 2D grid wins despite the redundant B-pack. So ALSO take 2D when the M-axis
             // would use ≤ a quarter of the cores (numMBlocks*4 < procs), regardless of absolute M.
-            bool use2D = MN2DDriver.ShouldUse2DGrid(numMBlocks, numNBlocks, procs)
-                         && (m < 256 || numMBlocks * 4 <= procs);
+            bool use2D = requestedAxis switch
+            {
+                ParallelismAxis.MN_2D => true,
+                ParallelismAxis.M or ParallelismAxis.N => false,
+                _ => MN2DDriver.ShouldUse2DGrid(numMBlocks, numNBlocks, procs)
+                     && (m < 256 || numMBlocks * 4 <= procs)
+            };
 
             // #653 diagnostic: AIDOTNET_GEMM_TRACE=1 prints the chosen parallel path +
             // blocking so we can see what a real forward GEMM actually runs. stderr only,
@@ -211,7 +219,7 @@ internal static class PackBothStrategy
                 }
             }
             int numNBlocksN = (n + ncN - 1) / ncN;
-            bool useNAxis = !s_disableNAxis
+            bool nAxisEligible = !s_disableNAxis
                 && MachineKernelGemm.IsFp32PanelAvailable
                 // The N-axis path computes with RunPanelFp32 = the 6×16 panel kernel (mr=6), but packs A
                 // with `mr`. Under AVX-512 the strategy selects the 16×16 microkernel (mr=16), so the A-pack
@@ -235,6 +243,9 @@ internal static class PackBothStrategy
                 && numNBlocksN >= 2 && numNBlocksN >= Math.Min(4, effProcs)
                 && options.Epilogue.Activation == AiDotNet.Tensors.Engines.FusedActivationType.None
                 && options.Epilogue.BiasN.IsEmpty && options.Epilogue.SkipMxN.IsEmpty;
+            bool useNAxis = nAxisEligible && (requestedAxis is null || requestedAxis == ParallelismAxis.N);
+            if (requestedAxis == ParallelismAxis.N && !nAxisEligible)
+                throw new NotSupportedException("This shape or hardware cannot execute the requested PackBoth N-axis plan.");
 
             if (useNAxis)
             {
@@ -247,7 +258,7 @@ internal static class PackBothStrategy
                         (float*)aPtrN, a.Length, lda,
                         (float*)bPtrN, b.Length, ldb,
                         (float*)cPtrN, c.Length, ldc,
-                        m, n, k, mc, ncN, kc, mr, nr);
+                        m, n, k, mc, ncN, kc, mr, nr, procs);
                 }
                 return;
             }
@@ -543,6 +554,8 @@ internal static class PackBothStrategy
         // Snapshot options fields: BlasOptions<T> is a ref struct and cannot be captured.
         WeightPackHandle? packedA = options.PackedA;
         WeightPackHandle? packedB = options.PackedB;
+        int maximumDop = options.NumThreads > 0 ? options.NumThreads : Environment.ProcessorCount;
+        if (options.NumThreads < 0) maximumDop = 1;
 
         // Convert pinned pointers to nint (platform int) so they can be captured by the lambda.
         // Worker threads reconstruct spans from these captured pointers.
@@ -577,301 +590,301 @@ internal static class PackBothStrategy
         try
         {
 
-        for (int jc = 0; jc < n; jc += nc)
-        {
-            int effectiveNc = Math.Min(nc, n - jc);
-
-            for (int pc = 0; pc < k; pc += kc)
+            for (int jc = 0; jc < n; jc += nc)
             {
-                int effectiveKc = Math.Min(kc, k - pc);
+                int effectiveNc = Math.Min(nc, n - jc);
 
-                // ── Pack B (shared, single calling-thread, before the parallel ic region) ──
-                int effectivePackBBytes = effectiveKc * effectiveNc * elemSize;
-                // Round up Nc to the next multiple of Nr so the last partial-N stripe
-                // is zero-padded into a full Nr-wide row (Task G2). The backing byte[]
-                // (packBBytesSpan.Length = kc * nc * elemSize) always has room for this padding.
-                int packedNc = ((effectiveNc + nr - 1) / nr) * nr;
-                int packedBElemCount = effectiveKc * packedNc;
-                int packedBByteCount = packedBElemCount * elemSize;
-                bool packBFromPrePack = false;
-                // CodeRabbit #366: gate on the PADDED byte count and copy the
-                // full padded region — see the serial path for rationale.
-                // Sub-E (#373): multi-panel consume — when the handle is
-                // multi-panel and (TileMc, TileKc) match (nc, kc), copy from
-                // the specific (jcIdx, pcIdx) tile rather than offset 0. The
-                // pre-Sub-E single-panel path stays as the fallback else-branch.
-                // PackNr gate (see WeightPackHandle.PackNr): the panel stripes are
-                // nr-interleaved; an active-nr mismatch (scalar fallback on small
-                // shapes vs a wide prepack tile) reads garbage. Mismatch -> live pack.
-                if (packedB != null && WeightPackCache.IsCacheCurrent(packedB) && packedB.PackNr == nr)
+                for (int pc = 0; pc < k; pc += kc)
                 {
-                    if (packedB.MultiPanelStride > 0
-                        && packedB.TileMc == nc && packedB.TileKc == kc)
+                    int effectiveKc = Math.Min(kc, k - pc);
+
+                    // ── Pack B (shared, single calling-thread, before the parallel ic region) ──
+                    int effectivePackBBytes = effectiveKc * effectiveNc * elemSize;
+                    // Round up Nc to the next multiple of Nr so the last partial-N stripe
+                    // is zero-padded into a full Nr-wide row (Task G2). The backing byte[]
+                    // (packBBytesSpan.Length = kc * nc * elemSize) always has room for this padding.
+                    int packedNc = ((effectiveNc + nr - 1) / nr) * nr;
+                    int packedBElemCount = effectiveKc * packedNc;
+                    int packedBByteCount = packedBElemCount * elemSize;
+                    bool packBFromPrePack = false;
+                    // CodeRabbit #366: gate on the PADDED byte count and copy the
+                    // full padded region — see the serial path for rationale.
+                    // Sub-E (#373): multi-panel consume — when the handle is
+                    // multi-panel and (TileMc, TileKc) match (nc, kc), copy from
+                    // the specific (jcIdx, pcIdx) tile rather than offset 0. The
+                    // pre-Sub-E single-panel path stays as the fallback else-branch.
+                    // PackNr gate (see WeightPackHandle.PackNr): the panel stripes are
+                    // nr-interleaved; an active-nr mismatch (scalar fallback on small
+                    // shapes vs a wide prepack tile) reads garbage. Mismatch -> live pack.
+                    if (packedB != null && WeightPackCache.IsCacheCurrent(packedB) && packedB.PackNr == nr)
                     {
-                        int jcIdx = jc / nc;
-                        int pcIdx = pc / kc;
-                        var tile = packedB.GetTileSlice(jcIdx, pcIdx);
-                        if (!tile.IsEmpty && tile.Length >= packedBByteCount)
+                        if (packedB.MultiPanelStride > 0
+                            && packedB.TileMc == nc && packedB.TileKc == kc)
                         {
-                            tile.Slice(0, packedBByteCount)
-                                .CopyTo(packBArr.AsSpan(packBAlignedOffset, packedBByteCount));
+                            int jcIdx = jc / nc;
+                            int pcIdx = pc / kc;
+                            var tile = packedB.GetTileSlice(jcIdx, pcIdx);
+                            if (!tile.IsEmpty && tile.Length >= packedBByteCount)
+                            {
+                                tile.Slice(0, packedBByteCount)
+                                    .CopyTo(packBArr.AsSpan(packBAlignedOffset, packedBByteCount));
+                                packBFromPrePack = true;
+                            }
+                        }
+                        else if (packedB.PackedBuffer.Length >= packedBByteCount)
+                        {
+                            // Legacy single-panel: pre-packed B is already in byte[] form — copy
+                            // into packBArr so the parallel lambda reads from a stable, capturable byte[].
+                            packedB.PackedBuffer.AsSpan(0, packedBByteCount)
+                                   .CopyTo(packBArr.AsSpan(packBAlignedOffset, packedBByteCount));
                             packBFromPrePack = true;
                         }
                     }
-                    else if (packedB.PackedBuffer.Length >= packedBByteCount)
+
+                    if (packBFromPrePack)
                     {
-                        // Legacy single-panel: pre-packed B is already in byte[] form — copy
-                        // into packBArr so the parallel lambda reads from a stable, capturable byte[].
-                        packedB.PackedBuffer.AsSpan(0, packedBByteCount)
-                               .CopyTo(packBArr.AsSpan(packBAlignedOffset, packedBByteCount));
-                        packBFromPrePack = true;
-                    }
-                }
-
-                if (packBFromPrePack)
-                {
-                    BlasManagedStatsTracker.IncrementPackCacheHit();
-                }
-                else
-                {
-                    if (packedB != null) BlasManagedStatsTracker.IncrementPackCacheMiss();
-                    // Pack B[pc..pc+effectiveKc, jc..jc+effectiveNc] into packBArr.
-                    // transB=false: panel starts at b[pc * ldb + jc].
-                    // transB=true:  panel starts at b[jc * ldb + pc].
-                    int bSliceOffset = transB ? jc * ldb + pc : pc * ldb + jc;
-                    int totalNumStripes = (effectiveNc + nr - 1) / nr;
-
-                    // Sub-N (#404): parallelize pack-B across stripes when the
-                    // buffer is large enough to amortize Parallel.For overhead.
-                    // Each stripe writes a disjoint region of packBArr
-                    // ([stripeIdx, Kc, Nr]) — no synchronization needed.
-                    // Threshold: ≥4 stripes AND ≥procs threads available AND
-                    // ≥256 KB of pack work — below that, serial wins.
-                    int packBStripeSize = effectiveKc * nr * elemSize;
-                    int procsLocal = options.NumThreads > 0 ? options.NumThreads : Environment.ProcessorCount;
-                    if (options.NumThreads < 0) procsLocal = 1;
-                    bool packBParallelWorthwhile =
-                        totalNumStripes >= 4
-                        && procsLocal >= 2
-                        && (long)packBStripeSize * totalNumStripes >= 256 * 1024;
-
-                    int bSliceOffset_cap = bSliceOffset;
-                    int effectiveKc_packB_cap = effectiveKc;
-                    int effectiveNc_packB_cap = effectiveNc;
-                    int bLen_cap = bLen;
-
-                    if (packBParallelWorthwhile)
-                    {
-                        // Partition stripes across procs threads. Each thread packs
-                        // [chunkStart, chunkEnd) stripes into its own slice of packBArr.
-                        int chunkSize = Math.Max(1, (totalNumStripes + procsLocal - 1) / procsLocal);
-                        int numChunks = (totalNumStripes + chunkSize - 1) / chunkSize;
-                        long packTotalWork = (long)packBStripeSize * totalNumStripes;
-
-                        CpuParallelSettings.ParallelForOrSerial(0, numChunks, packTotalWork, chunkIdx =>
-                        {
-                            int stripeStart = chunkIdx * chunkSize;
-                            int stripeEnd = Math.Min(stripeStart + chunkSize, totalNumStripes);
-                            int numStripesInChunk = stripeEnd - stripeStart;
-                            if (numStripesInChunk <= 0) return;
-
-                            unsafe
-                            {
-                                int srcAdjustedOffset = bSliceOffset_cap;  // base for the (jc, pc) panel
-                                ReadOnlySpan<T> bSliceLocal = new ReadOnlySpan<T>((T*)bPtrInt + srcAdjustedOffset, bLen_cap - srcAdjustedOffset);
-                                int packedStripeOffElems = stripeStart * effectiveKc_packB_cap * nr;
-                                Span<T> packBSliceLocal = MemoryMarshal.Cast<byte, T>(
-                                    packBArr.AsSpan(packBAlignedOffset + packedStripeOffElems * elemSize,
-                                                    numStripesInChunk * effectiveKc_packB_cap * nr * elemSize));
-                                Avx2Pack.PackBStripeRange<T>(
-                                    bSliceLocal, ldb, transB,
-                                    packBSliceLocal,
-                                    stripeStart, numStripesInChunk,
-                                    effectiveNc_packB_cap, effectiveKc_packB_cap, nr);
-                            }
-                        }, deterministicSafe: true); // disjoint stripe packing — order-independent
+                        BlasManagedStatsTracker.IncrementPackCacheHit();
                     }
                     else
                     {
-                        // Serial pack — buffer too small or single-thread context.
-                        // Pass a padded slice (packedBByteCount) so ScalarPack.PackB can
-                        // zero-pad the partial tail stripe when effectiveNc % nr != 0.
-                        ReadOnlySpan<T> bSlice = new ReadOnlySpan<T>((T*)bPtrInt + bSliceOffset, bLen - bSliceOffset);
-                        Span<T> packBTemp = MemoryMarshal.Cast<byte, T>(packBArr.AsSpan(packBAlignedOffset, packedBByteCount));
-                        long _pbStart = PackBothProfiler.Enabled ? Stopwatch.GetTimestamp() : 0L;
-                        Avx2Pack.PackB<T>(
-                            b: bSlice, ldb, transB,
-                            packed: packBTemp,
-                            nc: effectiveNc, kc: effectiveKc, nr);
-                        if (PackBothProfiler.Enabled) PackBothProfiler.AddPackB(Stopwatch.GetTimestamp() - _pbStart);
-                    }
-                }
+                        if (packedB != null) BlasManagedStatsTracker.IncrementPackCacheMiss();
+                        // Pack B[pc..pc+effectiveKc, jc..jc+effectiveNc] into packBArr.
+                        // transB=false: panel starts at b[pc * ldb + jc].
+                        // transB=true:  panel starts at b[jc * ldb + pc].
+                        int bSliceOffset = transB ? jc * ldb + pc : pc * ldb + jc;
+                        int totalNumStripes = (effectiveNc + nr - 1) / nr;
 
-                // ── M-axis parallel split on the ic loop ──────────────────────────────────
-                // Each icIdx body owns disjoint C rows [ic, ic+effectiveMc) → no sync on C.
-                int numIcBlocks = (m + mc - 1) / mc;
-                // Grain-size estimate: mc × effectiveNc × effectiveKc multiplied by
-                // numIcBlocks gives total MACs across all parallel iterations.
-                long totalWork = (long)mc * effectiveNc * effectiveKc * numIcBlocks;
+                        // Sub-N (#404): parallelize pack-B across stripes when the
+                        // buffer is large enough to amortize Parallel.For overhead.
+                        // Each stripe writes a disjoint region of packBArr
+                        // ([stripeIdx, Kc, Nr]) — no synchronization needed.
+                        // Threshold: ≥4 stripes AND ≥procs threads available AND
+                        // ≥256 KB of pack work — below that, serial wins.
+                        int packBStripeSize = effectiveKc * nr * elemSize;
+                        int procsLocal = options.NumThreads > 0 ? options.NumThreads : Environment.ProcessorCount;
+                        if (options.NumThreads < 0) procsLocal = 1;
+                        bool packBParallelWorthwhile =
+                            totalNumStripes >= 4
+                            && procsLocal >= 2
+                            && (long)packBStripeSize * totalNumStripes >= 256 * 1024;
 
-                // Capture loop-iteration locals (int/nint are value-type, safe to capture).
-                int jc_cap = jc, pc_cap = pc;
-                int effectiveNc_cap = effectiveNc, effectiveKc_cap = effectiveKc;
-                int packedBByteCount_cap = packedBByteCount;
-                byte[] packBArr_cap = packBArr;
-                int packBAlignedOffset_cap = packBAlignedOffset;
+                        int bSliceOffset_cap = bSliceOffset;
+                        int effectiveKc_packB_cap = effectiveKc;
+                        int effectiveNc_packB_cap = effectiveNc;
+                        int bLen_cap = bLen;
 
-                CpuParallelSettings.ParallelForOrSerial(0, numIcBlocks, totalWork, icIdx =>
-                {
-                    int ic = icIdx * mc;
-                    int effectiveMc = Math.Min(mc, m - ic);
-
-                    // ── Pack A (per-thread, from PerThreadPool.Current) ────────────────
-                    int effectivePackABytes = effectiveMc * effectiveKc_cap * elemSize;
-                    Span<T> activePackA;
-                    bool prePackHitParallel = false;
-                    Span<byte> packAByteSlice = default;
-                    // PackMr gate (see WeightPackHandle.PackMr): the panel stripes
-                    // are mr-interleaved at PACK time; consuming with a different
-                    // active mr reads the wrong stride and yields garbage. Both
-                    // branches below require the recorded tile to match.
-                    if (packedA != null && WeightPackCache.IsCacheCurrent(packedA) && packedA.PackMr == mr)
-                    {
-                        if (packedA.MultiPanelStride > 0)
+                        if (packBParallelWorthwhile)
                         {
-                            // Sub-E: multi-panel. Tile sizes must match this call's mc/kc.
-                            if (packedA.TileMc == mc && packedA.TileKc == effectiveKc_cap)
+                            // Partition stripes across procs threads. Each thread packs
+                            // [chunkStart, chunkEnd) stripes into its own slice of packBArr.
+                            int chunkSize = Math.Max(1, (totalNumStripes + procsLocal - 1) / procsLocal);
+                            int numChunks = (totalNumStripes + chunkSize - 1) / chunkSize;
+                            long packTotalWork = (long)packBStripeSize * totalNumStripes;
+
+                            CpuParallelSettings.ParallelForOrSerial(0, numChunks, packTotalWork, chunkIdx =>
                             {
-                                int icIdxLocal = ic / mc;
-                                int pcIdxLocal = pc_cap / effectiveKc_cap;
-                                var tile = packedA.GetTileSlice(icIdxLocal, pcIdxLocal);
-                                if (!tile.IsEmpty)
+                                int stripeStart = chunkIdx * chunkSize;
+                                int stripeEnd = Math.Min(stripeStart + chunkSize, totalNumStripes);
+                                int numStripesInChunk = stripeEnd - stripeStart;
+                                if (numStripesInChunk <= 0) return;
+
+                                unsafe
                                 {
-                                    packAByteSlice = tile;
-                                    prePackHitParallel = true;
+                                    int srcAdjustedOffset = bSliceOffset_cap;  // base for the (jc, pc) panel
+                                    ReadOnlySpan<T> bSliceLocal = new ReadOnlySpan<T>((T*)bPtrInt + srcAdjustedOffset, bLen_cap - srcAdjustedOffset);
+                                    int packedStripeOffElems = stripeStart * effectiveKc_packB_cap * nr;
+                                    Span<T> packBSliceLocal = MemoryMarshal.Cast<byte, T>(
+                                        packBArr.AsSpan(packBAlignedOffset + packedStripeOffElems * elemSize,
+                                                        numStripesInChunk * effectiveKc_packB_cap * nr * elemSize));
+                                    Avx2Pack.PackBStripeRange<T>(
+                                        bSliceLocal, ldb, transB,
+                                        packBSliceLocal,
+                                        stripeStart, numStripesInChunk,
+                                        effectiveNc_packB_cap, effectiveKc_packB_cap, nr);
+                                }
+                            }, procsLocal, deterministicSafe: true); // disjoint stripe packing — order-independent
+                        }
+                        else
+                        {
+                            // Serial pack — buffer too small or single-thread context.
+                            // Pass a padded slice (packedBByteCount) so ScalarPack.PackB can
+                            // zero-pad the partial tail stripe when effectiveNc % nr != 0.
+                            ReadOnlySpan<T> bSlice = new ReadOnlySpan<T>((T*)bPtrInt + bSliceOffset, bLen - bSliceOffset);
+                            Span<T> packBTemp = MemoryMarshal.Cast<byte, T>(packBArr.AsSpan(packBAlignedOffset, packedBByteCount));
+                            long _pbStart = PackBothProfiler.Enabled ? Stopwatch.GetTimestamp() : 0L;
+                            Avx2Pack.PackB<T>(
+                                b: bSlice, ldb, transB,
+                                packed: packBTemp,
+                                nc: effectiveNc, kc: effectiveKc, nr);
+                            if (PackBothProfiler.Enabled) PackBothProfiler.AddPackB(Stopwatch.GetTimestamp() - _pbStart);
+                        }
+                    }
+
+                    // ── M-axis parallel split on the ic loop ──────────────────────────────────
+                    // Each icIdx body owns disjoint C rows [ic, ic+effectiveMc) → no sync on C.
+                    int numIcBlocks = (m + mc - 1) / mc;
+                    // Grain-size estimate: mc × effectiveNc × effectiveKc multiplied by
+                    // numIcBlocks gives total MACs across all parallel iterations.
+                    long totalWork = (long)mc * effectiveNc * effectiveKc * numIcBlocks;
+
+                    // Capture loop-iteration locals (int/nint are value-type, safe to capture).
+                    int jc_cap = jc, pc_cap = pc;
+                    int effectiveNc_cap = effectiveNc, effectiveKc_cap = effectiveKc;
+                    int packedBByteCount_cap = packedBByteCount;
+                    byte[] packBArr_cap = packBArr;
+                    int packBAlignedOffset_cap = packBAlignedOffset;
+
+                    CpuParallelSettings.ParallelForOrSerial(0, numIcBlocks, totalWork, icIdx =>
+                    {
+                        int ic = icIdx * mc;
+                        int effectiveMc = Math.Min(mc, m - ic);
+
+                        // ── Pack A (per-thread, from PerThreadPool.Current) ────────────────
+                        int effectivePackABytes = effectiveMc * effectiveKc_cap * elemSize;
+                        Span<T> activePackA;
+                        bool prePackHitParallel = false;
+                        Span<byte> packAByteSlice = default;
+                        // PackMr gate (see WeightPackHandle.PackMr): the panel stripes
+                        // are mr-interleaved at PACK time; consuming with a different
+                        // active mr reads the wrong stride and yields garbage. Both
+                        // branches below require the recorded tile to match.
+                        if (packedA != null && WeightPackCache.IsCacheCurrent(packedA) && packedA.PackMr == mr)
+                        {
+                            if (packedA.MultiPanelStride > 0)
+                            {
+                                // Sub-E: multi-panel. Tile sizes must match this call's mc/kc.
+                                if (packedA.TileMc == mc && packedA.TileKc == effectiveKc_cap)
+                                {
+                                    int icIdxLocal = ic / mc;
+                                    int pcIdxLocal = pc_cap / effectiveKc_cap;
+                                    var tile = packedA.GetTileSlice(icIdxLocal, pcIdxLocal);
+                                    if (!tile.IsEmpty)
+                                    {
+                                        packAByteSlice = tile;
+                                        prePackHitParallel = true;
+                                    }
+                                }
+                            }
+                            else if (packedA.PackedBuffer.Length >= effectivePackABytes)
+                            {
+                                packAByteSlice = packedA.PackedBuffer.AsSpan(0, effectivePackABytes);
+                                prePackHitParallel = true;
+                            }
+                        }
+                        if (prePackHitParallel)
+                        {
+                            BlasManagedStatsTracker.IncrementPackCacheHit();
+                            activePackA = MemoryMarshal.Cast<byte, T>(packAByteSlice);
+                        }
+                        else
+                        {
+                            if (packedA != null) BlasManagedStatsTracker.IncrementPackCacheMiss();
+                            // Layer 1: per-thread pool — [ThreadStatic] ensures each worker
+                            // thread rents from its own PerThreadPool instance.
+                            // Workspace (Layer 5) and Arena (Layer 4) are intentionally bypassed:
+                            //   Workspace: single caller buffer, not thread-partitionable.
+                            //   Arena: [ThreadStatic] — worker threads may have no arena active.
+                            Span<byte> packABytesSpan_inner = PerThreadPool.Current.RentPackA(effectivePackABytes);
+                            activePackA = MemoryMarshal.Cast<byte, T>(packABytesSpan_inner)
+                                                       .Slice(0, effectiveMc * effectiveKc_cap);
+
+                            int aSliceOffset = transA ? pc_cap * lda + ic : ic * lda + pc_cap;
+                            ReadOnlySpan<T> aSlice = new ReadOnlySpan<T>((T*)aPtrInt + aSliceOffset, aLen - aSliceOffset);
+                            long _paStart = PackBothProfiler.Enabled ? Stopwatch.GetTimestamp() : 0L;
+                            Avx2Pack.PackA<T>(
+                                a: aSlice, lda, transA,
+                                packed: activePackA,
+                                mc: effectiveMc, kc: effectiveKc_cap, mr);
+                            if (PackBothProfiler.Enabled) PackBothProfiler.AddPackA(Stopwatch.GetTimestamp() - _paStart);
+                        }
+
+                        // Shared pack-B: reconstruct span from captured byte[] (read-only).
+                        // Use packedBByteCount_cap (Nr-padded size) so the tail stripe
+                        // (packed by ScalarPack.PackB with zero-padding) is accessible.
+                        Span<T> activePackB = MemoryMarshal.Cast<byte, T>(
+                            packBArr_cap.AsSpan(packBAlignedOffset_cap, packedBByteCount_cap));
+
+                        // ── Inner microkernel loop ─────────────────────────────────────────
+                        long _krStart = PackBothProfiler.Enabled ? Stopwatch.GetTimestamp() : 0L;
+                        int njrFull = effectiveNc_cap / nr;          // full Nr-wide tiles
+                        int nrTail = effectiveNc_cap - njrFull * nr; // partial-N remainder
+                                                                     // FP32 6×16 MACHINE-CODE PANEL fast path: one hand-emitted asm call per 6-row
+                                                                     // block processes ALL its full-Nr tiles (A reused, B streamed, N-loop in asm),
+                                                                     // eliminating the per-tile dispatch + re-prologue that caps in-context
+                                                                     // throughput — the OpenBLAS macro-kernel granularity. Bit-identical to the
+                                                                     // per-tile loop (MachineKernelPanelTests). Partial-N tail keeps the generic
+                                                                     // tail dispatch. Gated to the live (non-pre-packed) Auto path.
+                        bool mcPanel = !s_disablePanel && typeof(T) == typeof(float)
+                            && mr == 6 && nr == 16 && njrFull > 0
+                            && MachineKernelGemm.IsFp32PanelAvailable;
+                        if (mcPanel)
+                        {
+                            int njrBytesA = effectiveKc_cap * mr;
+                            for (int ir = 0; ir < effectiveMc; ir += mr)
+                            {
+                                if (ir + mr > effectiveMc) break;
+                                int packedAStripeOff = (ir / mr) * effectiveKc_cap * mr;
+                                var aPanel = MemoryMarshal.Cast<T, float>(activePackA.Slice(packedAStripeOff, njrBytesA));
+                                // Chunk the N-tiles per asm call: one giant panel call (e.g. 384 tiles
+                                // for n=6144) regresses vs ~256 (the single call's B/C working set
+                                // spills cache); chunking keeps each call's footprint bounded while
+                                // still amortizing dispatch over MaxPanelTiles tiles.
+                                int maxPanelTiles = Math.Max(1, MaxPanelTiles); // guard sweep-set 0/negative
+                                for (int jb = 0; jb < njrFull; jb += maxPanelTiles)
+                                {
+                                    int chunk = Math.Min(maxPanelTiles, njrFull - jb);
+                                    int cPanelOff = (ic + ir) * ldc + (jc_cap + jb * nr);
+                                    MachineKernelGemm.RunPanelFp32(
+                                        aPanel,
+                                        MemoryMarshal.Cast<T, float>(activePackB.Slice(jb * effectiveKc_cap * nr, chunk * effectiveKc_cap * nr)),
+                                        MemoryMarshal.Cast<T, float>(new Span<T>((T*)cPtrInt + cPanelOff, cLen - cPanelOff)),
+                                        ldc, effectiveKc_cap, chunk);
+                                }
+                                if (nrTail > 0)
+                                {
+                                    int jrTail = njrFull * nr;
+                                    int cTileOff = (ic + ir) * ldc + (jc_cap + jrTail);
+                                    DispatchMicrokernelWithTail<T>(
+                                        activePackA.Slice(packedAStripeOff, effectiveKc_cap * mr),
+                                        activePackB.Slice(njrFull * effectiveKc_cap * nr, effectiveKc_cap * nr),
+                                        new Span<T>((T*)cPtrInt + cTileOff, cLen - cTileOff),
+                                        ldc, effectiveKc_cap, mr, nr, nrTail);
                                 }
                             }
                         }
-                        else if (packedA.PackedBuffer.Length >= effectivePackABytes)
-                        {
-                            packAByteSlice = packedA.PackedBuffer.AsSpan(0, effectivePackABytes);
-                            prePackHitParallel = true;
-                        }
-                    }
-                    if (prePackHitParallel)
-                    {
-                        BlasManagedStatsTracker.IncrementPackCacheHit();
-                        activePackA = MemoryMarshal.Cast<byte, T>(packAByteSlice);
-                    }
-                    else
-                    {
-                        if (packedA != null) BlasManagedStatsTracker.IncrementPackCacheMiss();
-                        // Layer 1: per-thread pool — [ThreadStatic] ensures each worker
-                        // thread rents from its own PerThreadPool instance.
-                        // Workspace (Layer 5) and Arena (Layer 4) are intentionally bypassed:
-                        //   Workspace: single caller buffer, not thread-partitionable.
-                        //   Arena: [ThreadStatic] — worker threads may have no arena active.
-                        Span<byte> packABytesSpan_inner = PerThreadPool.Current.RentPackA(effectivePackABytes);
-                        activePackA = MemoryMarshal.Cast<byte, T>(packABytesSpan_inner)
-                                                   .Slice(0, effectiveMc * effectiveKc_cap);
-
-                        int aSliceOffset = transA ? pc_cap * lda + ic : ic * lda + pc_cap;
-                        ReadOnlySpan<T> aSlice = new ReadOnlySpan<T>((T*)aPtrInt + aSliceOffset, aLen - aSliceOffset);
-                        long _paStart = PackBothProfiler.Enabled ? Stopwatch.GetTimestamp() : 0L;
-                        Avx2Pack.PackA<T>(
-                            a: aSlice, lda, transA,
-                            packed: activePackA,
-                            mc: effectiveMc, kc: effectiveKc_cap, mr);
-                        if (PackBothProfiler.Enabled) PackBothProfiler.AddPackA(Stopwatch.GetTimestamp() - _paStart);
-                    }
-
-                    // Shared pack-B: reconstruct span from captured byte[] (read-only).
-                    // Use packedBByteCount_cap (Nr-padded size) so the tail stripe
-                    // (packed by ScalarPack.PackB with zero-padding) is accessible.
-                    Span<T> activePackB = MemoryMarshal.Cast<byte, T>(
-                        packBArr_cap.AsSpan(packBAlignedOffset_cap, packedBByteCount_cap));
-
-                    // ── Inner microkernel loop ─────────────────────────────────────────
-                    long _krStart = PackBothProfiler.Enabled ? Stopwatch.GetTimestamp() : 0L;
-                    int njrFull = effectiveNc_cap / nr;          // full Nr-wide tiles
-                    int nrTail = effectiveNc_cap - njrFull * nr; // partial-N remainder
-                    // FP32 6×16 MACHINE-CODE PANEL fast path: one hand-emitted asm call per 6-row
-                    // block processes ALL its full-Nr tiles (A reused, B streamed, N-loop in asm),
-                    // eliminating the per-tile dispatch + re-prologue that caps in-context
-                    // throughput — the OpenBLAS macro-kernel granularity. Bit-identical to the
-                    // per-tile loop (MachineKernelPanelTests). Partial-N tail keeps the generic
-                    // tail dispatch. Gated to the live (non-pre-packed) Auto path.
-                    bool mcPanel = !s_disablePanel && typeof(T) == typeof(float)
-                        && mr == 6 && nr == 16 && njrFull > 0
-                        && MachineKernelGemm.IsFp32PanelAvailable;
-                    if (mcPanel)
-                    {
-                        int njrBytesA = effectiveKc_cap * mr;
-                        for (int ir = 0; ir < effectiveMc; ir += mr)
-                        {
-                            if (ir + mr > effectiveMc) break;
-                            int packedAStripeOff = (ir / mr) * effectiveKc_cap * mr;
-                            var aPanel = MemoryMarshal.Cast<T, float>(activePackA.Slice(packedAStripeOff, njrBytesA));
-                            // Chunk the N-tiles per asm call: one giant panel call (e.g. 384 tiles
-                            // for n=6144) regresses vs ~256 (the single call's B/C working set
-                            // spills cache); chunking keeps each call's footprint bounded while
-                            // still amortizing dispatch over MaxPanelTiles tiles.
-                            int maxPanelTiles = Math.Max(1, MaxPanelTiles); // guard sweep-set 0/negative
-                            for (int jb = 0; jb < njrFull; jb += maxPanelTiles)
+                        else
+                            for (int jr = 0; jr < effectiveNc_cap; jr += nr)
                             {
-                                int chunk = Math.Min(maxPanelTiles, njrFull - jb);
-                                int cPanelOff = (ic + ir) * ldc + (jc_cap + jb * nr);
-                                MachineKernelGemm.RunPanelFp32(
-                                    aPanel,
-                                    MemoryMarshal.Cast<T, float>(activePackB.Slice(jb * effectiveKc_cap * nr, chunk * effectiveKc_cap * nr)),
-                                    MemoryMarshal.Cast<T, float>(new Span<T>((T*)cPtrInt + cPanelOff, cLen - cPanelOff)),
-                                    ldc, effectiveKc_cap, chunk);
-                            }
-                            if (nrTail > 0)
-                            {
-                                int jrTail = njrFull * nr;
-                                int cTileOff = (ic + ir) * ldc + (jc_cap + jrTail);
-                                DispatchMicrokernelWithTail<T>(
+                                // Partial-N tile on the last jr iteration when effectiveNc % nr != 0.
+                                int effectiveNr = Math.Min(nr, effectiveNc_cap - jr);
+                                for (int ir = 0; ir < effectiveMc; ir += mr)
+                                {
+                                    // M-tail: skip partial rows — caller guarantees m % mr == 0
+                                    // (BlasManaged.cs falls back to scalar otherwise). Guard here
+                                    // in case effectiveMc is not a multiple of mr for any reason.
+                                    if (ir + mr > effectiveMc) break;
+
+                                    // Stripe offsets into packed panels.
+                                    // Stripe layout: [numStripes, Kc, Mr/Nr] → stripe * Kc * Mr/Nr.
+                                    int packedAStripeOff = (ir / mr) * effectiveKc_cap * mr;
+                                    int packedBStripeOff = (jr / nr) * effectiveKc_cap * nr;
+
+                                    // C tile: rows [ic+ir, ic+ir+mr), cols [jc_cap+jr, jc_cap+jr+nr).
+                                    // Disjoint from all other icIdx values → no write synchronization.
+                                    int cTileOff = (ic + ir) * ldc + (jc_cap + jr);
+                                    Span<T> cTile = new Span<T>((T*)cPtrInt + cTileOff, cLen - cTileOff);
+                                    DispatchMicrokernelWithTail<T>(
                                     activePackA.Slice(packedAStripeOff, effectiveKc_cap * mr),
-                                    activePackB.Slice(njrFull * effectiveKc_cap * nr, effectiveKc_cap * nr),
-                                    new Span<T>((T*)cPtrInt + cTileOff, cLen - cTileOff),
-                                    ldc, effectiveKc_cap, mr, nr, nrTail);
+                                    activePackB.Slice(packedBStripeOff, effectiveKc_cap * nr),
+                                    cTile,
+                                    ldc, effectiveKc_cap,
+                                    mr, nr, effectiveNr);
+                                }
                             }
-                        }
-                    }
-                    else
-                    for (int jr = 0; jr < effectiveNc_cap; jr += nr)
-                    {
-                        // Partial-N tile on the last jr iteration when effectiveNc % nr != 0.
-                        int effectiveNr = Math.Min(nr, effectiveNc_cap - jr);
-                        for (int ir = 0; ir < effectiveMc; ir += mr)
-                        {
-                            // M-tail: skip partial rows — caller guarantees m % mr == 0
-                            // (BlasManaged.cs falls back to scalar otherwise). Guard here
-                            // in case effectiveMc is not a multiple of mr for any reason.
-                            if (ir + mr > effectiveMc) break;
-
-                            // Stripe offsets into packed panels.
-                            // Stripe layout: [numStripes, Kc, Mr/Nr] → stripe * Kc * Mr/Nr.
-                            int packedAStripeOff = (ir / mr) * effectiveKc_cap * mr;
-                            int packedBStripeOff = (jr / nr) * effectiveKc_cap * nr;
-
-                            // C tile: rows [ic+ir, ic+ir+mr), cols [jc_cap+jr, jc_cap+jr+nr).
-                            // Disjoint from all other icIdx values → no write synchronization.
-                            int cTileOff = (ic + ir) * ldc + (jc_cap + jr);
-                            Span<T> cTile = new Span<T>((T*)cPtrInt + cTileOff, cLen - cTileOff);
-                            DispatchMicrokernelWithTail<T>(
-                                activePackA.Slice(packedAStripeOff, effectiveKc_cap * mr),
-                                activePackB.Slice(packedBStripeOff, effectiveKc_cap * nr),
-                                cTile,
-                                ldc, effectiveKc_cap,
-                                mr, nr, effectiveNr);
-                        }
-                    }
-                    if (PackBothProfiler.Enabled) PackBothProfiler.AddKernel(Stopwatch.GetTimestamp() - _krStart);
-                }, deterministicSafe: true); // M-axis (ic) split: disjoint C rows, fixed-order K reduction per tile
+                        if (PackBothProfiler.Enabled) PackBothProfiler.AddKernel(Stopwatch.GetTimestamp() - _krStart);
+                    }, maximumDop, deterministicSafe: true); // M-axis (ic) split: disjoint C rows, fixed-order K reduction per tile
+                }
             }
-        }
 
         }
         finally
@@ -911,7 +924,8 @@ internal static class PackBothStrategy
         float* aPtr, int aLen, int lda,
         float* bPtr, int bLen, int ldb,
         float* cPtr, int cLen, int ldc,
-        int m, int n, int k, int mc, int nc, int kc, int mr, int nr)
+        int m, int n, int k, int mc, int nc, int kc, int mr, int nr,
+        int maximumDop)
     {
         int numKPanels = (k + kc - 1) / kc;
         int numNBlocks = (n + nc - 1) / nc;
@@ -943,135 +957,138 @@ internal static class PackBothStrategy
             }
             nint bAddr = (nint)bPtr, cAddr = (nint)cPtr, aOrigAddr = (nint)aPtr;
             int ldaL = lda, mFullL = mFull, mTailL = m;
-            fixed (float* paBase = packAArr) { nint aPackAddr = (nint)paBase;
-
-            int kcL = kc, ncL = nc, nrL = nr, mrL = mr, ldbL = ldb, ldcL = ldc;
-            int numKPanelsL = numKPanels, numMrL = numMr, aPanelStrideL = aPanelStride;
-            int kL = k, nL = n, bLenL = bLen, cLenL = cLen;
-            long totalWork = (long)m * n * k * 2;
-
-            Action<int> nAxisBody = jcIdx =>
+            fixed (float* paBase = packAArr)
             {
-                int jc = jcIdx * ncL;
-                int effNc = Math.Min(ncL, nL - jc);
-                int njrFull = effNc / nrL;
-                int nrTail = effNc - njrFull * nrL;
-                int packedNc = ((effNc + nrL - 1) / nrL) * nrL;
+                nint aPackAddr = (nint)paBase;
 
-                // Private per-thread packed-B for this N-block: [K-panel][Kc × packedNc].
-                int bPanelStride = kcL * packedNc;
-                byte[] packBArr = System.Buffers.ArrayPool<byte>.Shared.Rent(numKPanelsL * bPanelStride * sizeof(float));
-                try
+                int kcL = kc, ncL = nc, nrL = nr, mrL = mr, ldbL = ldb, ldcL = ldc;
+                int numKPanelsL = numKPanels, numMrL = numMr, aPanelStrideL = aPanelStride;
+                int kL = k, nL = n, bLenL = bLen, cLenL = cLen;
+                long totalWork = (long)m * n * k * 2;
+
+                Action<int> nAxisBody = jcIdx =>
                 {
-                    // Single shared packed-A copy (PR #762 removed per-CCX pinning/replication).
-                    float* pa = (float*)aPackAddr;
-                    float* bb = (float*)bAddr;
-                    float* cc = (float*)cAddr;
-                    var packBSpan = MemoryMarshal.Cast<byte, float>(packBArr.AsSpan());
-                    int numStripes = (effNc + nrL - 1) / nrL;
+                    int jc = jcIdx * ncL;
+                    int effNc = Math.Min(ncL, nL - jc);
+                    int njrFull = effNc / nrL;
+                    int nrTail = effNc - njrFull * nrL;
+                    int packedNc = ((effNc + nrL - 1) / nrL) * nrL;
 
-                    for (int pIdx = 0; pIdx < numKPanelsL; pIdx++)
+                    // Private per-thread packed-B for this N-block: [K-panel][Kc × packedNc].
+                    int bPanelStride = kcL * packedNc;
+                    byte[] packBArr = System.Buffers.ArrayPool<byte>.Shared.Rent(numKPanelsL * bPanelStride * sizeof(float));
+                    try
                     {
-                        int pc = pIdx * kcL;
-                        int effKc = Math.Min(kcL, kL - pc);
-                        Avx2Pack.PackBStripeRange<float>(
-                            new ReadOnlySpan<float>(bb + pc * ldbL + jc, bLenL - (pc * ldbL + jc)), ldbL, false,
-                            packBSpan.Slice(pIdx * bPanelStride, effKc * packedNc),
-                            0, numStripes, effNc, effKc, nrL);
-                    }
+                        // Single shared packed-A copy (PR #762 removed per-CCX pinning/replication).
+                        float* pa = (float*)aPackAddr;
+                        float* bb = (float*)bAddr;
+                        float* cc = (float*)cAddr;
+                        var packBSpan = MemoryMarshal.Cast<byte, float>(packBArr.AsSpan());
+                        int numStripes = (effNc + nrL - 1) / nrL;
 
-                    // Compute: for each K-panel (ascending → correct C accumulation), each
-                    // Mr-block does one chunked panel call over the N-block's full tiles + tail.
-                    // #475: when enabled, the whole Mr-sweep runs in the machine-code MACRO kernel
-                    // (one asm call per K-panel/N-chunk), taking RyuJIT off the hot path.
-                    bool useMacro = s_macroKernel && njrFull > 0 && MachineKernelGemm.IsFp32MacroAvailable;
-                    fixed (float* pbPacked = packBSpan)
-                    {
                         for (int pIdx = 0; pIdx < numKPanelsL; pIdx++)
                         {
                             int pc = pIdx * kcL;
                             int effKc = Math.Min(kcL, kL - pc);
-                            var bPanel = packBSpan.Slice(pIdx * bPanelStride, effKc * packedNc);
-                            int maxPanelTiles = Math.Max(1, MaxPanelTiles); // guard sweep-set 0/negative
+                            Avx2Pack.PackBStripeRange<float>(
+                                new ReadOnlySpan<float>(bb + pc * ldbL + jc, bLenL - (pc * ldbL + jc)), ldbL, false,
+                                packBSpan.Slice(pIdx * bPanelStride, effKc * packedNc),
+                                0, numStripes, effNc, effKc, nrL);
+                        }
 
-                            if (useMacro)
+                        // Compute: for each K-panel (ascending → correct C accumulation), each
+                        // Mr-block does one chunked panel call over the N-block's full tiles + tail.
+                        // #475: when enabled, the whole Mr-sweep runs in the machine-code MACRO kernel
+                        // (one asm call per K-panel/N-chunk), taking RyuJIT off the hot path.
+                        bool useMacro = s_macroKernel && njrFull > 0 && MachineKernelGemm.IsFp32MacroAvailable;
+                        fixed (float* pbPacked = packBSpan)
+                        {
+                            for (int pIdx = 0; pIdx < numKPanelsL; pIdx++)
                             {
-                                float* aBase0 = pa + pIdx * aPanelStrideL;
-                                float* bBase0 = pbPacked + pIdx * bPanelStride;
-                                int aStrideBytes = effKc * mrL * sizeof(float);
-                                for (int jb = 0; jb < njrFull; jb += maxPanelTiles)
+                                int pc = pIdx * kcL;
+                                int effKc = Math.Min(kcL, kL - pc);
+                                var bPanel = packBSpan.Slice(pIdx * bPanelStride, effKc * packedNc);
+                                int maxPanelTiles = Math.Max(1, MaxPanelTiles); // guard sweep-set 0/negative
+
+                                if (useMacro)
                                 {
-                                    int chunk = Math.Min(maxPanelTiles, njrFull - jb);
-                                    MachineKernelGemm.RunMacroPanelFp32(
-                                        aBase0, bBase0 + jb * effKc * nrL, cc + jc + jb * nrL,
-                                        ldcL, effKc, chunk, numMrL, aStrideBytes);
-                                }
-                            }
-                            else if (njrFull > 0)
-                            {
-                                for (int ir = 0; ir < numMrL; ir++)
-                                {
-                                    var aPanel = new ReadOnlySpan<float>(pa + pIdx * aPanelStrideL + ir * effKc * mrL, effKc * mrL);
-                                    int cOff = (ir * mrL) * ldcL + jc;
+                                    float* aBase0 = pa + pIdx * aPanelStrideL;
+                                    float* bBase0 = pbPacked + pIdx * bPanelStride;
+                                    int aStrideBytes = effKc * mrL * sizeof(float);
                                     for (int jb = 0; jb < njrFull; jb += maxPanelTiles)
                                     {
                                         int chunk = Math.Min(maxPanelTiles, njrFull - jb);
-                                        MachineKernelGemm.RunPanelFp32(
-                                            aPanel,
-                                            bPanel.Slice(jb * effKc * nrL, chunk * effKc * nrL),
-                                            new Span<float>(cc + cOff + jb * nrL, cLenL - (cOff + jb * nrL)),
-                                            ldcL, effKc, chunk);
+                                        MachineKernelGemm.RunMacroPanelFp32(
+                                            aBase0, bBase0 + jb * effKc * nrL, cc + jc + jb * nrL,
+                                            ldcL, effKc, chunk, numMrL, aStrideBytes);
+                                    }
+                                }
+                                else if (njrFull > 0)
+                                {
+                                    for (int ir = 0; ir < numMrL; ir++)
+                                    {
+                                        var aPanel = new ReadOnlySpan<float>(pa + pIdx * aPanelStrideL + ir * effKc * mrL, effKc * mrL);
+                                        int cOff = (ir * mrL) * ldcL + jc;
+                                        for (int jb = 0; jb < njrFull; jb += maxPanelTiles)
+                                        {
+                                            int chunk = Math.Min(maxPanelTiles, njrFull - jb);
+                                            MachineKernelGemm.RunPanelFp32(
+                                                aPanel,
+                                                bPanel.Slice(jb * effKc * nrL, chunk * effKc * nrL),
+                                                new Span<float>(cc + cOff + jb * nrL, cLenL - (cOff + jb * nrL)),
+                                                ldcL, effKc, chunk);
+                                        }
+                                    }
+                                }
+
+                                // Nr tail (effNc % nr != 0): per-Mr-block managed dispatch (small).
+                                if (nrTail > 0)
+                                {
+                                    int jrTail = njrFull * nrL;
+                                    var bTail = bPanel.Slice(njrFull * effKc * nrL, effKc * nrL);
+                                    for (int ir = 0; ir < numMrL; ir++)
+                                    {
+                                        var aPanel = new ReadOnlySpan<float>(pa + pIdx * aPanelStrideL + ir * effKc * mrL, effKc * mrL);
+                                        int cOff = (ir * mrL) * ldcL + jc + jrTail;
+                                        DispatchMicrokernelWithTail<float>(
+                                            aPanel, bTail,
+                                            new Span<float>(cc + cOff, cLenL - cOff),
+                                            ldcL, effKc, mrL, nrL, nrTail);
                                     }
                                 }
                             }
+                        }
 
-                            // Nr tail (effNc % nr != 0): per-Mr-block managed dispatch (small).
-                            if (nrTail > 0)
+                        // #90 M-tail: rows [mFull, m) aren't in packed-A (only full Mr-stripes). This N-block
+                        // owns disjoint C columns [jc, jc+effNc), so accumulate those tail rows here with a
+                        // scalar K-loop reading the ORIGINAL A and B (the <mr leftover rows are a small fraction;
+                        // e.g. 4/256 for the DiT m=256 shapes). C := A·B (overwrite). Ascending k ⇒ deterministic
+                        // and disjoint-column ⇒ no cross-thread write race. No-op when mFull == m (m % mr == 0).
+                        if (mFullL < mTailL)
+                        {
+                            float* aOrig = (float*)aOrigAddr;
+                            float* bOrig = (float*)bAddr;
+                            float* cOut = (float*)cAddr;
+                            for (int r = mFullL; r < mTailL; r++)
                             {
-                                int jrTail = njrFull * nrL;
-                                var bTail = bPanel.Slice(njrFull * effKc * nrL, effKc * nrL);
-                                for (int ir = 0; ir < numMrL; ir++)
+                                float* aRow = aOrig + (long)r * ldaL;
+                                float* cRow = cOut + (long)r * ldcL + jc;
+                                for (int col = 0; col < effNc; col++)
                                 {
-                                    var aPanel = new ReadOnlySpan<float>(pa + pIdx * aPanelStrideL + ir * effKc * mrL, effKc * mrL);
-                                    int cOff = (ir * mrL) * ldcL + jc + jrTail;
-                                    DispatchMicrokernelWithTail<float>(
-                                        aPanel, bTail,
-                                        new Span<float>(cc + cOff, cLenL - cOff),
-                                        ldcL, effKc, mrL, nrL, nrTail);
+                                    float s = 0f;
+                                    float* bCol = bOrig + jc + col;
+                                    for (int kk = 0; kk < kL; kk++) s += aRow[kk] * bCol[(long)kk * ldbL];
+                                    cRow[col] = s;
                                 }
                             }
                         }
                     }
-
-                    // #90 M-tail: rows [mFull, m) aren't in packed-A (only full Mr-stripes). This N-block
-                    // owns disjoint C columns [jc, jc+effNc), so accumulate those tail rows here with a
-                    // scalar K-loop reading the ORIGINAL A and B (the <mr leftover rows are a small fraction;
-                    // e.g. 4/256 for the DiT m=256 shapes). C := A·B (overwrite). Ascending k ⇒ deterministic
-                    // and disjoint-column ⇒ no cross-thread write race. No-op when mFull == m (m % mr == 0).
-                    if (mFullL < mTailL)
-                    {
-                        float* aOrig = (float*)aOrigAddr;
-                        float* bOrig = (float*)bAddr;
-                        float* cOut = (float*)cAddr;
-                        for (int r = mFullL; r < mTailL; r++)
-                        {
-                            float* aRow = aOrig + (long)r * ldaL;
-                            float* cRow = cOut + (long)r * ldcL + jc;
-                            for (int col = 0; col < effNc; col++)
-                            {
-                                float s = 0f;
-                                float* bCol = bOrig + jc + col;
-                                for (int kk = 0; kk < kL; kk++) s += aRow[kk] * bCol[(long)kk * ldbL];
-                                cRow[col] = s;
-                            }
-                        }
-                    }
-                }
-                finally { System.Buffers.ArrayPool<byte>.Shared.Return(packBArr); }
-            }; // N-axis body: disjoint C columns, fixed-order K reduction (bit-exact regardless of dispatch)
-            // Dispatch the N-block parallel-for through the persistent worker pool (PR #762 made this the
-            // sole path, removing the #85 L3-domain-PINNED experiment). Disjoint C columns ⇒ bit-exact.
-            CpuParallelSettings.ParallelForOrSerial(0, numNBlocks, totalWork, nAxisBody, deterministicSafe: true);
+                    finally { System.Buffers.ArrayPool<byte>.Shared.Return(packBArr); }
+                }; // N-axis body: disjoint C columns, fixed-order K reduction (bit-exact regardless of dispatch)
+                   // Dispatch the N-block parallel-for through the persistent worker pool (PR #762 made this the
+                   // sole path, removing the #85 L3-domain-PINNED experiment). Disjoint C columns ⇒ bit-exact.
+                CpuParallelSettings.ParallelForOrSerial(
+                    0, numNBlocks, totalWork, nAxisBody, maximumDop, deterministicSafe: true);
             }
         }
         finally { System.Buffers.ArrayPool<float>.Shared.Return(packAArr); }
@@ -1093,6 +1110,8 @@ internal static class PackBothStrategy
         int mc, int kc, int mr, int nr,
         in BlasOptions<T> options, int elemSize) where T : unmanaged
     {
+        int maximumDop = options.NumThreads > 0 ? options.NumThreads : Environment.ProcessorCount;
+        if (options.NumThreads < 0) maximumDop = 1;
         int numKPanels = (k + kc - 1) / kc;
         int numStripes = (n + nr - 1) / nr;
         int packedNc = numStripes * nr;
@@ -1140,7 +1159,7 @@ internal static class PackBothStrategy
                     packBStripe,
                     stripe, 1,
                     ncCol, effKc, nrCap);
-            }, deterministicSafe: true);
+            }, maximumDop, deterministicSafe: true);
 
             // ── ONE parallel region over ic blocks; each thread walks the full K-loop ──
             int numIcBlocks = (m + mc - 1) / mc;
@@ -1185,7 +1204,7 @@ internal static class PackBothStrategy
                         }
                     }
                 }
-            }, deterministicSafe: true);
+            }, maximumDop, deterministicSafe: true);
         }
         finally
         {
@@ -1227,6 +1246,8 @@ internal static class PackBothStrategy
         int mr, int nr,
         in BlasOptions<T> options, int elemSize) where T : unmanaged
     {
+        int maximumDop = options.NumThreads > 0 ? options.NumThreads : Environment.ProcessorCount;
+        if (options.NumThreads < 0) maximumDop = 1;
         int numIcBlocks = (m + mc - 1) / mc;
         int numJcBlocks = (n + nc - 1) / nc;
         int totalTiles = MN2DDriver.TotalItems(numIcBlocks, numJcBlocks);
@@ -1370,7 +1391,7 @@ internal static class PackBothStrategy
                             mr, nr, effectiveNr);
                     }
                 }
-            }, deterministicSafe: true); // 2D MN-grid split: each (ic,jc) tile disjoint, fixed-order K reduction
+            }, maximumDop, deterministicSafe: true); // 2D MN-grid split: each (ic,jc) tile disjoint, fixed-order K reduction
         }
     }
 

@@ -1,6 +1,7 @@
 using AiDotNet.Evolution;
 using AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 using AiDotNet.Tensors.Helpers.Autotune;
+using AiDotNet.Tensors.Tests.Helpers.Autotune;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
@@ -58,6 +59,7 @@ public sealed class GemmEvolutionAutotunerTests
                 gpuEvaluations++;
                 return new ValueTask<KernelTuningTrialResult>(Passed(configuration, 100));
             },
+            Finalist(valid),
             new KernelSearchSpaceVersion(1),
             new KernelBenchmarkProtocolVersion(1),
             EngineOptions(maximumEvaluations: 2),
@@ -100,6 +102,7 @@ public sealed class GemmEvolutionAutotunerTests
                 gpuEvaluations++;
                 return new ValueTask<KernelTuningTrialResult>(Passed(configuration, 100));
             },
+            Finalist(valid),
             new KernelSearchSpaceVersion(1),
             new KernelBenchmarkProtocolVersion(1),
             EngineOptions(maximumEvaluations: 2),
@@ -136,6 +139,7 @@ public sealed class GemmEvolutionAutotunerTests
                     double score = configuration.TileM * configuration.TileN;
                     return new ValueTask<KernelTuningTrialResult>(Passed(configuration, score));
                 },
+                Finalist(seeds[0]),
                 new KernelSearchSpaceVersion(1),
                 new KernelBenchmarkProtocolVersion(1),
                 additionalSeeds: seeds.Select(seed => seed.ToGemmConfig()),
@@ -145,8 +149,11 @@ public sealed class GemmEvolutionAutotunerTests
 
         Assert.Equal(seeds.Length, evaluations);
         Assert.Equal(seeds.Length, result.Run.Counters.EvaluationAttempts);
-        Assert.Equal(seeds.Max(seed => seed.TileM * seed.TileN),
-            result.ActiveDeployment.Measurement.ThroughputGflops);
+        double expectedThroughput = seeds.Max(seed => seed.TileM * seed.TileN);
+        Assert.InRange(
+            result.ActiveDeployment.Measurement.ThroughputGflops,
+            expectedThroughput * 0.999,
+            expectedThroughput * 1.001);
         Assert.Equal(KernelTuningValidationScope.Output,
             result.ActiveDeployment.Measurement.Correctness.Scope);
         Assert.True(result.ActiveDeployment.Measurement.Timing.SampleCount >=
@@ -224,14 +231,6 @@ public sealed class GemmEvolutionAutotunerTests
 
     private static KernelTuningTrialResult Passed(GemmConfig configuration, double throughput)
     {
-        var timing = KernelTimingStatistics.FromSamples(new[]
-        {
-            TimeSpan.FromMilliseconds(1.1),
-            TimeSpan.FromMilliseconds(1.0),
-            TimeSpan.FromMilliseconds(0.9),
-            TimeSpan.FromMilliseconds(1.05),
-            TimeSpan.FromMilliseconds(0.95)
-        });
         long workspace = (long)configuration.TileK *
                          (configuration.TileM + configuration.TileN) * sizeof(float);
         double occupancy = Math.Min(1d, 256d /
@@ -239,15 +238,29 @@ public sealed class GemmEvolutionAutotunerTests
         int registers = Math.Max(1,
             configuration.TileM / configuration.ThreadTileM *
             configuration.TileN / configuration.ThreadTileN);
-        return KernelTuningTrialResult.Passed(new KernelTuningMeasurement(
+        return KernelTuningTrialResult.Passed(
+            DeterministicFinalistEvaluator<OpenClGemmConfiguration>.SearchMeasurement(
             throughput,
-            timing,
             new KernelTuningResourceUsage(
-                workspace, occupancy, registers, TimeSpan.FromMilliseconds(5)),
-            new KernelTuningCorrectnessEvidence(
-                KernelTuningValidationScope.Output,
-                1e-7, 2e-7, 1e-5, 1e-5)));
+                workspace, occupancy, registers, TimeSpan.FromMilliseconds(5))));
     }
+
+    private static DeterministicFinalistEvaluator<OpenClGemmConfiguration> Finalist(
+        OpenClGemmConfiguration incumbent) => new(
+        incumbent,
+        configuration => configuration.TileM * configuration.TileN,
+        configuration =>
+        {
+            long workspace = (long)configuration.TileK *
+                             (configuration.TileM + configuration.TileN) * sizeof(float);
+            double occupancy = Math.Min(1d, 256d /
+                Math.Max(1d, configuration.ThreadTileM * configuration.ThreadTileN));
+            int registers = Math.Max(1,
+                configuration.TileM / configuration.ThreadTileM *
+                configuration.TileN / configuration.ThreadTileN);
+            return new KernelTuningResourceUsage(
+                workspace, occupancy, registers, TimeSpan.FromMilliseconds(5));
+        });
 
     private static GemmConfig Copy(
         GemmConfig source,
@@ -255,30 +268,30 @@ public sealed class GemmEvolutionAutotunerTests
         int? threadTileN = null,
         bool? useSubgroupOps = null,
         string? kernelName = null) => new()
-    {
-        KernelTemplate = source.KernelTemplate,
-        KernelName = kernelName ?? source.KernelName,
-        TileM = source.TileM,
-        TileN = source.TileN,
-        TileK = source.TileK,
-        ThreadTileM = threadTileM ?? source.ThreadTileM,
-        ThreadTileN = threadTileN ?? source.ThreadTileN,
-        VectorWidthM = source.VectorWidthM,
-        VectorWidthN = source.VectorWidthN,
-        UseDoubleBuffering = source.UseDoubleBuffering,
-        UseVectorizedLoads = source.UseVectorizedLoads,
-        KReg = source.KReg,
-        KUnroll = source.KUnroll,
-        UseSubgroupOps = useSubgroupOps ?? source.UseSubgroupOps,
-        StrideM = source.StrideM,
-        StrideN = source.StrideN,
-        CacheA = source.CacheA,
-        CacheB = source.CacheB,
-        MdimaSize = source.MdimaSize,
-        NdimbSize = source.NdimbSize,
-        UseTrueVectorLDS = source.UseTrueVectorLDS,
-        UseColumnMajorA = source.UseColumnMajorA
-    };
+        {
+            KernelTemplate = source.KernelTemplate,
+            KernelName = kernelName ?? source.KernelName,
+            TileM = source.TileM,
+            TileN = source.TileN,
+            TileK = source.TileK,
+            ThreadTileM = threadTileM ?? source.ThreadTileM,
+            ThreadTileN = threadTileN ?? source.ThreadTileN,
+            VectorWidthM = source.VectorWidthM,
+            VectorWidthN = source.VectorWidthN,
+            UseDoubleBuffering = source.UseDoubleBuffering,
+            UseVectorizedLoads = source.UseVectorizedLoads,
+            KReg = source.KReg,
+            KUnroll = source.KUnroll,
+            UseSubgroupOps = useSubgroupOps ?? source.UseSubgroupOps,
+            StrideM = source.StrideM,
+            StrideN = source.StrideN,
+            CacheA = source.CacheA,
+            CacheB = source.CacheB,
+            MdimaSize = source.MdimaSize,
+            NdimbSize = source.NdimbSize,
+            UseTrueVectorLDS = source.UseTrueVectorLDS,
+            UseColumnMajorA = source.UseColumnMajorA
+        };
 
     private sealed class MemoryStore : IKernelTuningStore<OpenClGemmConfiguration>
     {

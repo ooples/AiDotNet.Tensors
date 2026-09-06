@@ -2,11 +2,12 @@
 
 using System;
 using System.Collections.Generic;
+using AiDotNet.Evolution;
 
 namespace AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 
 /// <summary>One exact, replayable SIMT contraction tile in the measured search space.</summary>
-public sealed class CodegenTiledContractionSchedule
+public sealed class CodegenTiledContractionSchedule : IImmutableEvolutionGenome
 {
     private static readonly IReadOnlyList<CodegenTiledContractionSchedule> _searchSpace =
         BuildSearchSpace();

@@ -5,6 +5,7 @@ using System.Threading.Tasks;
 using AiDotNet.Evolution;
 using AiDotNet.Tensors.Engines.Compilation.Codegen.Ir;
 using AiDotNet.Tensors.Helpers.Autotune;
+using AiDotNet.Tensors.Tests.Helpers.Autotune;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.Codegen;
@@ -74,6 +75,8 @@ public sealed class CodegenTiledContractionEvolutionExplorerTests
         CodegenKernelSpec spec = (CodegenKernelCatalog.Find("conv2d_1x1_bias_relu") ??
             throw new InvalidOperationException("The test catalog entry is missing.")).Bench;
         var invalid = new CodegenTiledContractionSchedule(64, 112, 64, 8, 4);
+        CodegenTiledContractionSchedule incumbent = CodegenTiledContractionSchedule.SearchSpace.First(
+            schedule => CodegenTiledContractionPlan.TryCreate(spec, schedule, out _, out _));
         bool invalidReachedEvaluator = false;
         int evaluations = 0;
         var options = new EvolutionEngineOptions
@@ -106,6 +109,7 @@ public sealed class CodegenTiledContractionEvolutionExplorerTests
                     Assert.InRange(plan.BlockThreads, 32, 256);
                     return new ValueTask<KernelTuningTrialResult>(Passed(schedule));
                 },
+                Finalist(incumbent),
                 new KernelSearchSpaceVersion(1),
                 new[] { invalid },
                 options,
@@ -123,29 +127,27 @@ public sealed class CodegenTiledContractionEvolutionExplorerTests
 
     private static KernelTuningTrialResult Passed(CodegenTiledContractionSchedule schedule)
     {
-        var timing = KernelTimingStatistics.FromSamples(new[]
-        {
-            TimeSpan.FromMilliseconds(1.00),
-            TimeSpan.FromMilliseconds(0.99),
-            TimeSpan.FromMilliseconds(1.01),
-            TimeSpan.FromMilliseconds(0.98),
-            TimeSpan.FromMilliseconds(1.02)
-        });
         var resources = new KernelTuningResourceUsage(
             workspaceBytes: schedule.TileK * (long)(schedule.TileM + schedule.TileN) * sizeof(float) * 2,
             occupancyRatio: 0.75,
             registersPerThread: schedule.ThreadTileM * schedule.ThreadTileN,
             compileTime: TimeSpan.FromMilliseconds(2));
-        var correctness = new KernelTuningCorrectnessEvidence(
-            KernelTuningValidationScope.Output,
-            outputAbsoluteError: 0,
-            outputRelativeError: 0,
-            outputAbsoluteTolerance: CodegenMeasurementProtocol.AccumulationTolerance,
-            outputRelativeTolerance: CodegenMeasurementProtocol.AccumulationTolerance);
         double throughput = schedule.TileM * schedule.TileN / 100d;
         return KernelTuningTrialResult.Passed(
-            new KernelTuningMeasurement(throughput, timing, resources, correctness));
+            DeterministicFinalistEvaluator<CodegenTiledContractionSchedule>.SearchMeasurement(
+                throughput,
+                resources));
     }
+
+    private static DeterministicFinalistEvaluator<CodegenTiledContractionSchedule> Finalist(
+        CodegenTiledContractionSchedule incumbent) => new(
+        incumbent,
+        schedule => schedule.TileM * schedule.TileN / 100d,
+        schedule => new KernelTuningResourceUsage(
+            workspaceBytes: schedule.TileK * (long)(schedule.TileM + schedule.TileN) * sizeof(float) * 2,
+            occupancyRatio: 0.75,
+            registersPerThread: schedule.ThreadTileM * schedule.ThreadTileN,
+            compileTime: TimeSpan.FromMilliseconds(2)));
 
     private sealed class MemoryStore : IKernelTuningStore<CodegenTiledContractionSchedule>
     {
