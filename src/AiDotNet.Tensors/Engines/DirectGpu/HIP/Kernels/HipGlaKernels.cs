@@ -22,7 +22,6 @@ internal static class HipGlaKernels
     {
         return @"
 #include <hip/hip_runtime.h>
-#include <math.h>
 
 #define GLA_MAX_HEADDIM 256
 

@@ -6,6 +6,7 @@ using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Threading;
+using AiDotNet.Tensors.Engines.Compilation.Codegen;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.HIP.Kernels;
 using AiDotNet.Tensors.Engines.DirectGpu.Sparsity;
@@ -30,7 +31,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 /// <item>RX 6800 XT: 8,000+ GFLOPS (optimized scalar)</item>
 /// </list>
 /// </remarks>
-public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IPixelShuffleBackend
+public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IPixelShuffleBackend, INativeGpuCodegenExecutor
 {
     /// <summary>
     /// HIP has no cuDNN-equivalent half/bfloat16 conv path yet — returns
@@ -1292,7 +1293,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             HipNativeBindings.CheckError(copyResult, "hipMemcpy H2D");
         }
 
-        return new HipGpuBuffer(devicePtr, data.Length, ReturnBufferToPool);
+        return new HipGpuBuffer(devicePtr, data.Length, this, ReturnBufferToPool);
     }
 
     public IGpuBuffer AllocateBuffer(int size)
@@ -1316,7 +1317,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         var memsetResult = HipNativeBindings.hipMemset(devicePtr, 0, sizeBytes); // lgtm[cs/call-to-unmanaged-code] HIP interop requires native driver calls.
         HipNativeBindings.CheckError(memsetResult, "hipMemset");
 
-        return new HipGpuBuffer(devicePtr, size, ReturnBufferToPool);
+        return new HipGpuBuffer(devicePtr, size, this, ReturnBufferToPool);
     }
 
     /// <summary>
@@ -1334,7 +1335,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
         var allocResult = HipNativeBindings.hipMalloc(ref devicePtr, sizeBytes); // lgtm[cs/call-to-unmanaged-code] HIP interop requires native driver calls.
         HipNativeBindings.CheckError(allocResult, "hipMalloc");
-        return new HipGpuBuffer(devicePtr, size, ReturnBufferToPool);
+        return new HipGpuBuffer(devicePtr, size, this, ReturnBufferToPool);
     }
 
     public float[] DownloadBuffer(IGpuBuffer buffer)
@@ -5680,7 +5681,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         result = HipNativeBindings.hipMemset(devicePtr, 0, sizeBytes);
         HipNativeBindings.CheckError(result, "hipMemset(int)");
 
-        return new HipGpuBuffer(devicePtr, size);
+        return new HipGpuBuffer(devicePtr, size, this);
     }
 
     /// <inheritdoc/>
@@ -5736,7 +5737,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             handle.Free();
         }
 
-        return new HipGpuBuffer(devicePtr, size);
+        return new HipGpuBuffer(devicePtr, size, this);
     }
 
     #region Locally Connected Convolution Operations
@@ -11191,6 +11192,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (_disposed) return;
         _disposed = true;
 
+        DisposeCompiledCodegenKernels();
+
         // Dispose the default stream wrapper (does not destroy underlying stream)
         _defaultStream?.Dispose();
         _defaultStream = null;
@@ -12272,13 +12275,19 @@ internal sealed class HipGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
     public IntPtr Handle { get; }
     public int Size { get; }
     public long SizeInBytes => Size * sizeof(float);
+    internal HipBackend OwningBackend { get; }
     private readonly Action<HipGpuBuffer>? _returnToPool;
     private int _poolState;
 
-    public HipGpuBuffer(IntPtr handle, int size, Action<HipGpuBuffer>? returnToPool = null)
+    public HipGpuBuffer(
+        IntPtr handle,
+        int size,
+        HipBackend owningBackend,
+        Action<HipGpuBuffer>? returnToPool = null)
     {
         Handle = handle;
         Size = size;
+        OwningBackend = owningBackend ?? throw new ArgumentNullException(nameof(owningBackend));
         _returnToPool = returnToPool;
     }
 

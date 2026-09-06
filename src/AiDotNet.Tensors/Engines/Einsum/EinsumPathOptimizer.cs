@@ -178,6 +178,7 @@ public static class EinsumPathOptimizer
     public static EinsumPath Optimize(EinsumShapeBinding binding) => Optimize(
         binding,
         KernelTuningDeviceFingerprint.CurrentCpu(),
+        KernelTuningBackend.ManagedCpu,
         new KernelSearchSpaceVersion(CurrentSearchSpaceVersion),
         new KernelBenchmarkProtocolVersion(CurrentBenchmarkProtocolVersion));
 
@@ -188,12 +189,13 @@ public static class EinsumPathOptimizer
     public static EinsumPath Optimize(
         EinsumShapeBinding binding,
         KernelTuningDeviceFingerprint device,
+        KernelTuningBackend backend,
         KernelSearchSpaceVersion searchSpaceVersion,
         KernelBenchmarkProtocolVersion benchmarkProtocolVersion)
     {
         if (binding is null) throw new ArgumentNullException(nameof(binding));
         KernelTuningIdentity identity = EinsumPathCache.CreateIdentity(
-            binding, device, searchSpaceVersion, benchmarkProtocolVersion);
+            binding, device, backend, searchSpaceVersion, benchmarkProtocolVersion);
 
         if (EinsumPathCache.TryLoad(binding, identity, out EinsumPath? cached) && cached is not null)
             return cached;

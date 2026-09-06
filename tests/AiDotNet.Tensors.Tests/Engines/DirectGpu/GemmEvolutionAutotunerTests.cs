@@ -57,12 +57,13 @@ public sealed class GemmEvolutionAutotunerTests
             (configuration, context, cancellationToken) =>
             {
                 gpuEvaluations++;
-                return new ValueTask<KernelTuningTrialResult>(Passed(configuration, 100));
+                return new ValueTask<KernelTuningTrialResult>(Passed(configuration.ToGemmConfig(), 100));
             },
             Finalist(valid),
             new KernelSearchSpaceVersion(1),
             new KernelBenchmarkProtocolVersion(1),
-            EngineOptions(maximumEvaluations: 2),
+            requiredTemplate: null,
+            engineOptions: EngineOptions(maximumEvaluations: 2),
             deploymentRegistry: new KernelTuningDeploymentRegistry<OpenClGemmConfiguration>(),
             store: new MemoryStore());
 
@@ -100,12 +101,13 @@ public sealed class GemmEvolutionAutotunerTests
             (configuration, context, cancellationToken) =>
             {
                 gpuEvaluations++;
-                return new ValueTask<KernelTuningTrialResult>(Passed(configuration, 100));
+                return new ValueTask<KernelTuningTrialResult>(Passed(configuration.ToGemmConfig(), 100));
             },
             Finalist(valid),
             new KernelSearchSpaceVersion(1),
             new KernelBenchmarkProtocolVersion(1),
-            EngineOptions(maximumEvaluations: 2),
+            requiredTemplate: null,
+            engineOptions: EngineOptions(maximumEvaluations: 2),
             deploymentRegistry: new KernelTuningDeploymentRegistry<OpenClGemmConfiguration>(),
             store: new MemoryStore());
 
@@ -137,7 +139,8 @@ public sealed class GemmEvolutionAutotunerTests
                 {
                     evaluations++;
                     double score = configuration.TileM * configuration.TileN;
-                    return new ValueTask<KernelTuningTrialResult>(Passed(configuration, score));
+                    return new ValueTask<KernelTuningTrialResult>(
+                        Passed(configuration.ToGemmConfig(), score));
                 },
                 Finalist(seeds[0]),
                 new KernelSearchSpaceVersion(1),
@@ -180,6 +183,51 @@ public sealed class GemmEvolutionAutotunerTests
             DynamicGemmKernel.ValidateConfig(arbitraryName),
             DynamicGemmKernel.ValidateConfig(misleadingName));
         Assert.Equal(arbitraryName.ToKey(), misleadingName.ToKey());
+    }
+
+    [Fact]
+    public void DynamicKernelValidation_UsesSelectedDeviceLimits()
+    {
+        GemmConfig candidate = new GemmAutoTuner().GetEvolutionSeeds(
+            256, 256, 256, Capabilities(supportsSubgroups: true))[0].ToGemmConfig();
+        long requiredLocalMemory = DynamicGemmKernel.EstimateLocalMemoryBytes(candidate);
+
+        Assert.Null(DynamicGemmKernel.ValidateConfig(
+            candidate,
+            maxWorkGroupSize: candidate.ThreadTileM * candidate.ThreadTileN,
+            localMemoryBytes: requiredLocalMemory));
+        Assert.Contains("device limit", DynamicGemmKernel.ValidateConfig(
+            candidate,
+            maxWorkGroupSize: candidate.ThreadTileM * candidate.ThreadTileN - 1,
+            localMemoryBytes: requiredLocalMemory));
+        Assert.Contains("device limit", DynamicGemmKernel.ValidateConfig(
+            candidate,
+            maxWorkGroupSize: candidate.ThreadTileM * candidate.ThreadTileN,
+            localMemoryBytes: requiredLocalMemory - 1));
+        Assert.Contains("X dimension", DynamicGemmKernel.ValidateConfig(
+            candidate,
+            maxWorkGroupSize: candidate.ThreadTileM * candidate.ThreadTileN,
+            localMemoryBytes: requiredLocalMemory,
+            maxWorkItemSizeX: candidate.ThreadTileM - 1,
+            maxWorkItemSizeY: candidate.ThreadTileN));
+        Assert.Contains("Y dimension", DynamicGemmKernel.ValidateConfig(
+            candidate,
+            maxWorkGroupSize: candidate.ThreadTileM * candidate.ThreadTileN,
+            localMemoryBytes: requiredLocalMemory,
+            maxWorkItemSizeX: candidate.ThreadTileM,
+            maxWorkItemSizeY: candidate.ThreadTileN - 1));
+    }
+
+    [Fact]
+    public void OpenClLaunchAlignment_DoesNotOverflowAtInt32Boundary()
+    {
+        UIntPtr aligned = DirectOpenClKernel.AlignWorkSize(int.MaxValue, 256);
+
+        Assert.Equal(2_147_483_648UL, (ulong)aligned);
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            DirectOpenClKernel.AlignWorkSize(0, 256));
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            DirectOpenClKernel.AlignWorkSize(256, 0));
     }
 
     [Theory]
@@ -226,8 +274,8 @@ public sealed class GemmEvolutionAutotunerTests
         DeviceName = "Test GPU"
     };
 
-    private static GpuDeviceFingerprint Fingerprint() => new(
-        GpuVendorKind.Amd, "Test GPU", 10, 1, 1, "test-opencl-0");
+    private static KernelTuningDeviceFingerprint Fingerprint() => new(
+        KernelTuningDeviceKind.AmdGpu, "test-opencl-0", "amd-test-gpu-opencl");
 
     private static KernelTuningTrialResult Passed(GemmConfig configuration, double throughput)
     {

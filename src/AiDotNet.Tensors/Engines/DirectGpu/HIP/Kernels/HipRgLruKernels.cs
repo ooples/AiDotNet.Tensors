@@ -11,7 +11,6 @@ internal static class HipRgLruKernels
     {
         return @"
 #include <hip/hip_runtime.h>
-#include <math.h>
 
 extern ""C"" __global__ __launch_bounds__(1024) void rglru_scan_forward(
     const float* V, const float* R, const float* I, const float* decay,

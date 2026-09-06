@@ -31,9 +31,15 @@ public class PtxGraphEmitterTests
         var emitter = new PtxGraphEmitter();
         var result = emitter.Emit(graph, CodegenElementType.Float32);
 
+        Assert.False(result.Declined, result.DeclineReason);
+        PtxCodegenKernel kernel = Assert.IsType<PtxCodegenKernel>(result.Kernel);
         Assert.NotNull(result.Source);
-        Assert.Contains(".visible .entry", result.Source!, StringComparison.Ordinal);
-        Assert.Contains("max.f32", result.Source!, StringComparison.Ordinal);   // the ReLU
+        Assert.Contains(".visible .entry", result.Source, StringComparison.Ordinal);
+        Assert.Contains("max.f32", result.Source, StringComparison.Ordinal);   // the ReLU
+        Assert.Equal(CodegenTarget.DirectPtx, kernel.Target);
+        Assert.Equal(CodegenNativeCompilationKind.CudaPtxModuleLoader,
+            kernel.RequiredRuntime.Compilation);
+        Assert.Equal(1024, kernel.OutputElementCount);
         Assert.NotNull(emitter.LastSpec);
         Assert.True(emitter.LastLaunchBlocks > 0);
     }
@@ -62,9 +68,10 @@ public class PtxGraphEmitterTests
             CodegenElementType.Float32, new[] { 1024 }));
 
         Assert.True(CodegenGraphToSpec.TryTranslate(graph, "fused", out var spec, out string reason), reason);
+        Assert.NotNull(spec);
 
         // product of two operands, a bias, and a ReLU -- the spec's exact body.
-        Assert.Equal(2, spec!.ProductInputs.Count);
+        Assert.Equal(2, spec.ProductInputs.Count);
         Assert.True(spec.BiasInput.HasValue);
         Assert.Equal(CodegenActivationKind.ReLU, spec.Activation);
     }
@@ -86,7 +93,8 @@ public class PtxGraphEmitterTests
 
         var result = new PtxGraphEmitter().Emit(graph, CodegenElementType.Float32);
         Assert.True(result.Declined);
-        Assert.Contains("Sqrt", result.DeclineReason!, StringComparison.Ordinal);
+        Assert.NotNull(result.DeclineReason);
+        Assert.Contains("Sqrt", result.DeclineReason, StringComparison.Ordinal);
     }
 
     /// <summary>A dtype the released cubins do not cover must decline, not emit fp32.</summary>
@@ -98,7 +106,8 @@ public class PtxGraphEmitterTests
 
         var result = new PtxGraphEmitter().Emit(graph, CodegenElementType.Float64);
         Assert.True(result.Declined);
-        Assert.Contains("fp32", result.DeclineReason!, StringComparison.Ordinal);
+        Assert.NotNull(result.DeclineReason);
+        Assert.Contains("fp32", result.DeclineReason, StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -120,12 +129,13 @@ public class PtxGraphEmitterTests
 
         Assert.True(CodegenGraphToSpec.TryTranslate(
             graph, "mul256", out var spec, out string reason), reason);
+        Assert.NotNull(spec);
 
         var lhs = new double[256];
         var rhs = new double[256];
         for (int i = 0; i < 256; i++) { lhs[i] = (i % 17) - 8; rhs[i] = (i % 5) - 2; }
 
-        double[] got = spec!.Interpret(new[] { lhs, rhs });
+        double[] got = spec.Interpret(new[] { lhs, rhs });
         for (int i = 0; i < 256; i++)
             Assert.Equal(lhs[i] * rhs[i], got[i], 10);
     }

@@ -100,7 +100,8 @@ public sealed partial class GemmAutoTuner
         int n,
         int k,
         GpuCapabilities capabilities,
-        IEnumerable<GemmConfig>? additionalSeeds = null)
+        IEnumerable<GemmConfig>? additionalSeeds = null,
+        GemmKernelTemplate? requiredTemplate = null)
     {
         ValidateEvolutionArguments(m, n, k, capabilities);
         var seeds = new List<OpenClGemmConfiguration>();
@@ -108,14 +109,14 @@ public sealed partial class GemmAutoTuner
         lock (_cacheLock)
         {
             if (_cache.TryGetValue((m, n, k), out GemmConfig active))
-                TryAddValidSeed(active, capabilities, seen, seeds);
+                TryAddValidSeed(active, m, n, k, capabilities, requiredTemplate, seen, seeds);
         }
         foreach (GemmConfig candidate in GetCandidateConfigs(m, n, k, capabilities))
-            TryAddValidSeed(candidate, capabilities, seen, seeds);
+            TryAddValidSeed(candidate, m, n, k, capabilities, requiredTemplate, seen, seeds);
         if (additionalSeeds is not null)
         {
             foreach (GemmConfig candidate in additionalSeeds)
-                TryAddValidSeed(candidate, capabilities, seen, seeds);
+                TryAddValidSeed(candidate, m, n, k, capabilities, requiredTemplate, seen, seeds);
         }
         if (seeds.Count == 0)
             throw new InvalidOperationException("The OpenCL device admits no valid GEMM seed configuration.");
@@ -128,12 +129,13 @@ public sealed partial class GemmAutoTuner
         int n,
         int k,
         GpuCapabilities capabilities,
-        GpuDeviceFingerprint fingerprint,
-        Func<GemmConfig, EvolutionEvaluationContext, CancellationToken,
+        KernelTuningDeviceFingerprint fingerprint,
+        Func<OpenClGemmConfiguration, EvolutionEvaluationContext, CancellationToken,
             ValueTask<KernelTuningTrialResult>> evaluator,
         IKernelTuningFinalistEvaluator<OpenClGemmConfiguration> finalistEvaluator,
         KernelSearchSpaceVersion searchSpaceVersion,
         KernelBenchmarkProtocolVersion benchmarkProtocolVersion,
+        GemmKernelTemplate? requiredTemplate = null,
         EvolutionEngineOptions? engineOptions = null,
         KernelTuningOptions? tuningOptions = null,
         IEvolutionCheckpointStore? checkpointStore = null,
@@ -143,22 +145,31 @@ public sealed partial class GemmAutoTuner
         ValidateEvolutionArguments(m, n, k, capabilities);
         if (evaluator is null) throw new ArgumentNullException(nameof(evaluator));
         if (finalistEvaluator is null) throw new ArgumentNullException(nameof(finalistEvaluator));
+        if (requiredTemplate.HasValue &&
+            !Enum.IsDefined(typeof(GemmKernelTemplate), requiredTemplate.Value))
+        {
+            throw new ArgumentOutOfRangeException(nameof(requiredTemplate));
+        }
         var identity = new KernelTuningIdentity(
             EvolutionKernelId,
-            new ShapeProfile(m, n, k),
+            requiredTemplate.HasValue
+                ? new ShapeProfile(m, n, k, (int)requiredTemplate.Value)
+                : new ShapeProfile(m, n, k, -1),
             fingerprint,
+            KernelTuningBackend.OpenCl,
             searchSpaceVersion,
             benchmarkProtocolVersion);
         return new EvolutionKernelAutotuner<OpenClGemmConfiguration>(
             identity,
             new OpenClGemmCodec(),
-            new OpenClGemmVariation(capabilities),
+            new OpenClGemmVariation(capabilities, requiredTemplate),
             async (configuration, context, cancellationToken) =>
             {
                 GemmConfig candidate = configuration.ToGemmConfig();
-                KernelTuningTrialResult? invalid = ValidateEvolutionCandidate(candidate, capabilities);
+                KernelTuningTrialResult? invalid = ValidateEvolutionCandidate(
+                    candidate, m, n, k, capabilities, requiredTemplate);
                 if (invalid is not null) return invalid;
-                return await evaluator(candidate, context, cancellationToken).ConfigureAwait(false);
+                return await evaluator(configuration, context, cancellationToken).ConfigureAwait(false);
             },
             finalistEvaluator,
             engineOptions,
@@ -167,7 +178,8 @@ public sealed partial class GemmAutoTuner
             deploymentRegistry: deploymentRegistry,
             store: store,
             deploymentValidator: configuration =>
-                ValidateEvolutionCandidate(configuration.ToGemmConfig(), capabilities) is null);
+                ValidateEvolutionCandidate(
+                    configuration.ToGemmConfig(), m, n, k, capabilities, requiredTemplate) is null);
     }
 
     /// <summary>
@@ -178,13 +190,14 @@ public sealed partial class GemmAutoTuner
         int n,
         int k,
         GpuCapabilities capabilities,
-        GpuDeviceFingerprint fingerprint,
-        Func<GemmConfig, EvolutionEvaluationContext, CancellationToken,
+        KernelTuningDeviceFingerprint fingerprint,
+        Func<OpenClGemmConfiguration, EvolutionEvaluationContext, CancellationToken,
             ValueTask<KernelTuningTrialResult>> evaluator,
         IKernelTuningFinalistEvaluator<OpenClGemmConfiguration> finalistEvaluator,
         KernelSearchSpaceVersion searchSpaceVersion,
         KernelBenchmarkProtocolVersion benchmarkProtocolVersion,
         IEnumerable<GemmConfig>? additionalSeeds = null,
+        GemmKernelTemplate? requiredTemplate = null,
         EvolutionEngineOptions? engineOptions = null,
         KernelTuningOptions? tuningOptions = null,
         IEvolutionCheckpointStore? checkpointStore = null,
@@ -193,11 +206,11 @@ public sealed partial class GemmAutoTuner
         CancellationToken cancellationToken = default)
     {
         IReadOnlyList<OpenClGemmConfiguration> seeds = GetEvolutionSeeds(
-            m, n, k, capabilities, additionalSeeds);
+            m, n, k, capabilities, additionalSeeds, requiredTemplate);
         EvolutionKernelAutotuner<OpenClGemmConfiguration> tuner = CreateEvolutionTuner(
             m, n, k, capabilities, fingerprint, evaluator, finalistEvaluator,
             searchSpaceVersion, benchmarkProtocolVersion,
-            engineOptions, tuningOptions, checkpointStore, deploymentRegistry, store);
+            requiredTemplate, engineOptions, tuningOptions, checkpointStore, deploymentRegistry, store);
         if (seeds.Count > tuner.MaximumProposals)
             seeds = seeds.Take(tuner.MaximumProposals).ToArray();
         EvolutionKernelTuningResult<OpenClGemmConfiguration> result =
@@ -209,11 +222,15 @@ public sealed partial class GemmAutoTuner
 
     private static void TryAddValidSeed(
         GemmConfig candidate,
+        int m,
+        int n,
+        int k,
         GpuCapabilities capabilities,
+        GemmKernelTemplate? requiredTemplate,
         ISet<OpenClGemmConfiguration> seen,
         ICollection<OpenClGemmConfiguration> seeds)
     {
-        if (ValidateEvolutionCandidate(candidate, capabilities) is not null) return;
+        if (ValidateEvolutionCandidate(candidate, m, n, k, capabilities, requiredTemplate) is not null) return;
 
         OpenClGemmConfiguration typed = OpenClGemmConfiguration.FromGemmConfig(candidate);
         if (seen.Add(typed)) seeds.Add(typed);
@@ -221,10 +238,20 @@ public sealed partial class GemmAutoTuner
 
     private static KernelTuningTrialResult? ValidateEvolutionCandidate(
         GemmConfig candidate,
-        GpuCapabilities capabilities)
+        int m,
+        int n,
+        int k,
+        GpuCapabilities capabilities,
+        GemmKernelTemplate? requiredTemplate = null)
     {
         if (!Enum.IsDefined(typeof(GemmKernelTemplate), candidate.KernelTemplate))
             return KernelTuningTrialResult.Rejected(KernelTuningTrialStatus.InvalidConfiguration);
+        if (requiredTemplate.HasValue && candidate.KernelTemplate != requiredTemplate.Value)
+        {
+            return KernelTuningTrialResult.Rejected(
+                KernelTuningTrialStatus.InvalidConfiguration,
+                "The candidate belongs to a different OpenCL kernel template family.");
+        }
         if (candidate.TileM <= 0 || candidate.TileN <= 0 || candidate.TileK <= 0 ||
             candidate.ThreadTileM <= 0 || candidate.ThreadTileN <= 0 ||
             candidate.VectorWidthM <= 0 || candidate.VectorWidthN <= 0 ||
@@ -248,49 +275,53 @@ public sealed partial class GemmAutoTuner
                 KernelTuningTrialStatus.ResourceLimitExceeded,
                 "The candidate exceeds the device work-group limit.");
         }
-        long localBytes = EstimateLocalMemoryBytes(candidate);
+        long localBytes = DynamicGemmKernel.EstimateLocalMemoryBytes(candidate);
         if (localBytes > capabilities.LocalMemoryBytes)
         {
             return KernelTuningTrialResult.Rejected(
                 KernelTuningTrialStatus.ResourceLimitExceeded,
                 "The candidate exceeds the device local-memory limit.");
         }
-        string? validationError = DynamicGemmKernel.ValidateConfig(candidate);
+        string? validationError = DynamicGemmKernel.ValidateConfig(
+            candidate,
+            capabilities.MaxWorkGroupSize,
+            capabilities.LocalMemoryBytes,
+            capabilities.MaxWorkItemSizeX,
+            capabilities.MaxWorkItemSizeY);
+        if (validationError is null && !HasRepresentablePackedGeometry(candidate, m, n, k))
+        {
+            validationError = "The padded GEMM geometry cannot be represented by OpenCL buffer lengths.";
+        }
         return validationError is null
             ? null
             : KernelTuningTrialResult.Rejected(
                 KernelTuningTrialStatus.InvalidConfiguration, validationError);
     }
 
-    private static long EstimateLocalMemoryBytes(GemmConfig candidate)
+    private static bool HasRepresentablePackedGeometry(GemmConfig candidate, int m, int n, int k)
     {
         try
         {
             checked
             {
-                int vectorM = Math.Max(1, candidate.VectorWidthM);
-                int vectorN = Math.Max(1, candidate.VectorWidthN);
-                if (candidate.KernelTemplate != GemmKernelTemplate.Tuned)
-                {
-                    long floats =
-                        (candidate.CacheA ? (long)candidate.TileK * candidate.TileM / vectorM : 0) +
-                        (candidate.CacheB ? (long)candidate.TileK * candidate.TileN / vectorN : 0);
-                    return floats * sizeof(float);
-                }
-
-                long outputM = candidate.TileM / candidate.ThreadTileM;
-                long outputN = candidate.TileN / candidate.ThreadTileN;
-                bool doubleBuffered = candidate.UseDoubleBuffering && outputM * outputN <= 16;
-                long multiplier = doubleBuffered ? 2L : 1L;
-                return multiplier * candidate.TileK *
-                       ((long)candidate.TileM + candidate.TileN + 2L) * sizeof(float);
+                long kMultiple = (long)candidate.TileK * candidate.KReg;
+                long mPadded = RoundUp(m, candidate.TileM);
+                long nPadded = RoundUp(n, candidate.TileN);
+                long kPadded = RoundUp(k, kMultiple);
+                return mPadded <= int.MaxValue && nPadded <= int.MaxValue && kPadded <= int.MaxValue &&
+                       mPadded * kPadded <= int.MaxValue &&
+                       kPadded * nPadded <= int.MaxValue &&
+                       mPadded * nPadded <= int.MaxValue;
             }
         }
         catch (OverflowException)
         {
-            return long.MaxValue;
+            return false;
         }
     }
+
+    private static long RoundUp(int value, long multiple) =>
+        checked((((long)value + multiple - 1L) / multiple) * multiple);
 
     private static void ValidateEvolutionArguments(int m, int n, int k, GpuCapabilities capabilities)
     {
@@ -302,6 +333,10 @@ public sealed partial class GemmAutoTuner
             throw new ArgumentOutOfRangeException(nameof(capabilities.MaxWorkGroupSize));
         if (capabilities.LocalMemoryBytes <= 0)
             throw new ArgumentOutOfRangeException(nameof(capabilities.LocalMemoryBytes));
+        if (capabilities.MaxWorkItemSizeX <= 0)
+            throw new ArgumentOutOfRangeException(nameof(capabilities.MaxWorkItemSizeX));
+        if (capabilities.MaxWorkItemSizeY <= 0)
+            throw new ArgumentOutOfRangeException(nameof(capabilities.MaxWorkItemSizeY));
     }
 
     private sealed class OpenClGemmCodec : IEvolutionGenomeCodec<OpenClGemmConfiguration>
@@ -386,8 +421,15 @@ public sealed partial class GemmAutoTuner
         private static readonly int[] UnrollFactors = { 1, 2, 4, 8 };
         private static readonly int[] CooperativeDimensions = { 8, 16, 32, 64 };
         private readonly GpuCapabilities _capabilities;
+        private readonly GemmKernelTemplate? _requiredTemplate;
 
-        internal OpenClGemmVariation(GpuCapabilities capabilities) => _capabilities = capabilities;
+        internal OpenClGemmVariation(
+            GpuCapabilities capabilities,
+            GemmKernelTemplate? requiredTemplate)
+        {
+            _capabilities = capabilities;
+            _requiredTemplate = requiredTemplate;
+        }
 
         public string Id => "opencl-gemm-constrained-variation";
         public string VersionHash => "2";
@@ -400,6 +442,8 @@ public sealed partial class GemmAutoTuner
             OpenClGemmConfiguration candidate = SelectParent(context);
             int mutationCount = 1 + context.Random.NextInt(3);
             for (int i = 0; i < mutationCount; i++) candidate = Mutate(candidate, context.Random);
+            if (_requiredTemplate.HasValue)
+                candidate = candidate with { KernelTemplate = _requiredTemplate.Value };
             if (!_capabilities.SupportsSubgroups && candidate.UseSubgroupOps)
                 candidate = candidate with { UseSubgroupOps = false };
             return new ValueTask<OpenClGemmConfiguration>(candidate);

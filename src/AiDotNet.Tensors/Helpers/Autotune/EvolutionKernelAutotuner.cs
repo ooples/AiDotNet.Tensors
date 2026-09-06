@@ -495,7 +495,7 @@ public sealed class EvolutionKernelAutotuner<TConfiguration>
                 {
                     return FailureResult(KernelTuningTrialResult.Rejected(
                         KernelTuningTrialStatus.RequiredMetricUnavailable,
-                        $"Required archive metric '{descriptor.Metric}' is not measured by this backend."));
+                        $"Required archive metric '{descriptor.Metric}' has no numeric evidence on this backend."));
                 }
                 descriptors.Add(
                     KernelTuningMetricNames.Get(descriptor.Metric),
@@ -607,7 +607,7 @@ public sealed class EvolutionKernelAutotuner<TConfiguration>
             KernelTuningMetric metric) =>
             ResourceMetric(
                 (KernelTuningResourceMetricStatus)ReadExactInt32(metrics, statusName),
-                () => TimeSpan.FromMilliseconds(metrics[KernelTuningMetricNames.Get(metric)]));
+                () => KernelTuningDuration.FromMilliseconds(metrics[KernelTuningMetricNames.Get(metric)]));
 
         private static KernelTuningResourceMetric<T> ResourceMetric<T>(
             KernelTuningResourceMetricStatus status,
@@ -615,6 +615,7 @@ public sealed class EvolutionKernelAutotuner<TConfiguration>
             where T : struct => status switch
             {
                 KernelTuningResourceMetricStatus.Measured => KernelTuningResourceMetric<T>.Measured(measuredValue()),
+                KernelTuningResourceMetricStatus.Estimated => KernelTuningResourceMetric<T>.Estimated(measuredValue()),
                 KernelTuningResourceMetricStatus.NotApplicable => KernelTuningResourceMetric<T>.NotApplicable(),
                 KernelTuningResourceMetricStatus.Unavailable => KernelTuningResourceMetric<T>.Unavailable(),
                 _ => throw new InvalidDataException("Kernel resource metric status is invalid.")

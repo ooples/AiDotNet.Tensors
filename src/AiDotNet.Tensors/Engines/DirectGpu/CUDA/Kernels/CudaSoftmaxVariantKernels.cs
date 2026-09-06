@@ -10,6 +10,10 @@ public static class CudaSoftmaxVariantKernels
     public static string GetSource()
     {
         return @"
+#ifndef INFINITY
+#define INFINITY __int_as_float(0x7f800000)
+#endif
+
 // ============================================================================
 // LogSoftmax: log(softmax(x)) = x - max(x) - log(sum(exp(x - max(x))))
 // Numerically stable, single-pass per row

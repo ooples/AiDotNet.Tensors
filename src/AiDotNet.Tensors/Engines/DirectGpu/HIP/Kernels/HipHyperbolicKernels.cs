@@ -13,7 +13,6 @@ internal static class HipHyperbolicKernels
     {
         return @"
 #include <hip/hip_runtime.h>
-#include <math.h>
 
 // Epsilon for division safety (preventing divide-by-zero)
 #define EPSILON_DIV 1e-10f

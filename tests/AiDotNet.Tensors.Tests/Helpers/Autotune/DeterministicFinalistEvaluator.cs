@@ -73,11 +73,11 @@ internal sealed class DeterministicFinalistEvaluator<TConfiguration> :
     {
         KernelTimingStatistics timing = KernelTimingStatistics.FromSamples(new[]
         {
-            TimeSpan.FromMilliseconds(1.1),
-            TimeSpan.FromMilliseconds(1.0),
-            TimeSpan.FromMilliseconds(0.9),
-            TimeSpan.FromMilliseconds(1.05),
-            TimeSpan.FromMilliseconds(0.95)
+            KernelTuningDuration.FromMilliseconds(1.1),
+            KernelTuningDuration.FromMilliseconds(1.0),
+            KernelTuningDuration.FromMilliseconds(0.9),
+            KernelTuningDuration.FromMilliseconds(1.05),
+            KernelTuningDuration.FromMilliseconds(0.95)
         });
         var workload = new KernelTuningWorkload(
             throughputGflops * 1e9d * timing.Median.TotalSeconds,
@@ -99,7 +99,7 @@ internal sealed class DeterministicFinalistEvaluator<TConfiguration> :
     }
 
     private static TimeSpan Latency(double throughputGflops, double multiplier) =>
-        TimeSpan.FromSeconds(multiplier / throughputGflops);
+        KernelTuningDuration.FromSeconds(multiplier / throughputGflops);
 
     private static KernelTuningCorrectnessEvidence Correctness() => new(
         KernelTuningValidationScope.Output,

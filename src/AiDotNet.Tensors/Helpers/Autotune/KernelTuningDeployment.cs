@@ -273,7 +273,9 @@ public sealed class AutotuneCacheKernelTuningStore<TConfiguration> : IKernelTuni
                 ResourceMetric((KernelTuningResourceMetricStatus)workspaceStatusValue, workspaceBytes),
                 ResourceMetric((KernelTuningResourceMetricStatus)occupancyStatusValue, occupancy),
                 ResourceMetric((KernelTuningResourceMetricStatus)registersStatusValue, registers),
-                ResourceMetric((KernelTuningResourceMetricStatus)compileStatusValue, TimeSpan.FromMilliseconds(compileMs)),
+                ResourceMetric(
+                    (KernelTuningResourceMetricStatus)compileStatusValue,
+                    KernelTuningDuration.FromMilliseconds(compileMs)),
                 ResourceMetric((KernelTuningResourceMetricStatus)launchStatusValue, launches));
             var correctness = new KernelTuningCorrectnessEvidence(
                 (KernelTuningValidationScope)scopeValue,
@@ -377,6 +379,7 @@ public sealed class AutotuneCacheKernelTuningStore<TConfiguration> : IKernelTuni
         where T : struct => status switch
         {
             KernelTuningResourceMetricStatus.Measured => KernelTuningResourceMetric<T>.Measured(value),
+            KernelTuningResourceMetricStatus.Estimated => KernelTuningResourceMetric<T>.Estimated(value),
             KernelTuningResourceMetricStatus.NotApplicable => KernelTuningResourceMetric<T>.NotApplicable(),
             KernelTuningResourceMetricStatus.Unavailable => KernelTuningResourceMetric<T>.Unavailable(),
             _ => throw new InvalidDataException("The persisted resource metric status is invalid.")
@@ -409,7 +412,7 @@ public sealed class AutotuneCacheKernelTuningStore<TConfiguration> : IKernelTuni
             {
                 throw new InvalidDataException("Persisted finalist evidence contains an invalid sample.");
             }
-            samples[i] = TimeSpan.FromMilliseconds(milliseconds);
+            samples[i] = KernelTuningDuration.FromMilliseconds(milliseconds);
         }
         return samples;
     }

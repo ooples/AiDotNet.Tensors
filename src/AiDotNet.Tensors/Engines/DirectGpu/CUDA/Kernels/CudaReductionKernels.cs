@@ -11,31 +11,41 @@ public static class CudaReductionKernels
     public static string GetSource()
     {
         return @"
+#ifndef INFINITY
+#define INFINITY __int_as_float(0x7f800000)
+#endif
+
+#ifdef __HIP_PLATFORM_AMD__
+#define AIDOTNET_SHFL_DOWN(mask, value, offset) __shfl_down(value, offset)
+#else
+#define AIDOTNET_SHFL_DOWN(mask, value, offset) __shfl_down_sync(mask, value, offset)
+#endif
+
 // ============================================================================
 // Warp-level reduction primitives (32 threads, zero shared memory)
 // ============================================================================
 
 __device__ float warp_reduce_sum(float val) {
     for (int offset = 16; offset > 0; offset >>= 1)
-        val += __shfl_down_sync(0xffffffff, val, offset);
+        val += AIDOTNET_SHFL_DOWN(0xffffffff, val, offset);
     return val;
 }
 
 __device__ float warp_reduce_max(float val) {
     for (int offset = 16; offset > 0; offset >>= 1)
-        val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));
+        val = fmaxf(val, AIDOTNET_SHFL_DOWN(0xffffffff, val, offset));
     return val;
 }
 
 __device__ float warp_reduce_min(float val) {
     for (int offset = 16; offset > 0; offset >>= 1)
-        val = fminf(val, __shfl_down_sync(0xffffffff, val, offset));
+        val = fminf(val, AIDOTNET_SHFL_DOWN(0xffffffff, val, offset));
     return val;
 }
 
 __device__ float warp_reduce_prod(float val) {
     for (int offset = 16; offset > 0; offset >>= 1)
-        val *= __shfl_down_sync(0xffffffff, val, offset);
+        val *= AIDOTNET_SHFL_DOWN(0xffffffff, val, offset);
     return val;
 }
 

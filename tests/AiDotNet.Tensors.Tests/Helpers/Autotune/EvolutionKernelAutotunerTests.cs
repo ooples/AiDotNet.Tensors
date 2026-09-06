@@ -38,8 +38,10 @@ public sealed class EvolutionKernelAutotunerTests : IDisposable
         EvolutionArchiveEntry<FakeKernelConfiguration> best = result.Run.Best ??
             throw new InvalidOperationException("A successful tuning run must have a best entry.");
         Assert.Contains("log2-workspace-bytes", best.Evaluation.Descriptors.Keys);
-        Assert.Contains("occupancy-ratio", best.Evaluation.Descriptors.Keys);
-        Assert.Contains("registers-per-thread", best.Evaluation.Descriptors.Keys);
+        Assert.Contains("log10-numerical-error", best.Evaluation.Descriptors.Keys);
+        Assert.Contains("kernel-launch-count", best.Evaluation.Descriptors.Keys);
+        Assert.DoesNotContain("occupancy-ratio", best.Evaluation.Descriptors.Keys);
+        Assert.DoesNotContain("registers-per-thread", best.Evaluation.Descriptors.Keys);
         Assert.DoesNotContain("throughput-gflops", best.Evaluation.Descriptors.Keys);
         Assert.True(tuner.Deployment.TryGet(out FakeKernelConfiguration active));
         Assert.Equal(result.ActiveDeployment.Configuration, active);
@@ -149,8 +151,9 @@ public sealed class EvolutionKernelAutotunerTests : IDisposable
             new MemoryStore(),
             MeasurePassed);
 
+        IReadOnlyList<FakeKernelConfiguration> firstSeeds = Seeds();
         Task<EvolutionKernelTuningResult<FakeKernelConfiguration>> firstRun =
-            first.TuneAsync(Seeds().TakeLast(1));
+            first.TuneAsync(new[] { firstSeeds[firstSeeds.Count - 1] });
         await firstStarted.Task;
         Task<EvolutionKernelTuningResult<FakeKernelConfiguration>> secondRun =
             second.TuneAsync(Seeds().Take(1));
@@ -219,6 +222,12 @@ public sealed class EvolutionKernelAutotunerTests : IDisposable
         Assert.Equal(
             tuned.ActiveDeployment.Measurement.Correctness.OutputAbsoluteError,
             hydratedSnapshot.Measurement.Correctness.OutputAbsoluteError);
+        Assert.Equal(
+            KernelTuningResourceMetricStatus.Estimated,
+            hydratedSnapshot.Measurement.Resources.OccupancyRatioMetric.Status);
+        Assert.Equal(
+            tuned.ActiveDeployment.Measurement.Resources.OccupancyRatio,
+            hydratedSnapshot.Measurement.Resources.OccupancyRatio);
     }
 
     [Fact]
@@ -255,6 +264,7 @@ public sealed class EvolutionKernelAutotunerTests : IDisposable
             new KernelId("test", "different-kernel"),
             identity.Shape,
             identity.Device,
+            identity.Backend,
             identity.SearchSpaceVersion,
             identity.BenchmarkProtocolVersion);
         KernelTuningDeploymentSnapshot<FakeKernelConfiguration> wrongIdentity =
@@ -426,25 +436,34 @@ public sealed class EvolutionKernelAutotunerTests : IDisposable
     }
 
     [Fact]
-    public void Identity_CoversDeviceShapeAndTypedProtocolVersions()
+    public void Identity_CoversDeviceBackendShapeAndTypedProtocolVersions()
     {
         KernelTuningIdentity baseline = Identity();
         var otherShape = new KernelTuningIdentity(
             baseline.Kernel, new ShapeProfile(64, 64, 1024), baseline.Device,
+            baseline.Backend,
             baseline.SearchSpaceVersion, baseline.BenchmarkProtocolVersion);
         var otherDevice = new KernelTuningIdentity(
             baseline.Kernel, baseline.Shape,
             new GpuDeviceFingerprint(GpuVendorKind.Nvidia, "Fake GPU", 8, 6, 550, "fake-1"),
+            baseline.Backend,
+            baseline.SearchSpaceVersion, baseline.BenchmarkProtocolVersion);
+        var otherBackend = new KernelTuningIdentity(
+            baseline.Kernel, baseline.Shape, baseline.Device,
+            KernelTuningBackend.OpenCl,
             baseline.SearchSpaceVersion, baseline.BenchmarkProtocolVersion);
         var otherSearchSpace = new KernelTuningIdentity(
             baseline.Kernel, baseline.Shape, baseline.Device,
+            baseline.Backend,
             new KernelSearchSpaceVersion(2), baseline.BenchmarkProtocolVersion);
         var otherProtocol = new KernelTuningIdentity(
             baseline.Kernel, baseline.Shape, baseline.Device,
+            baseline.Backend,
             baseline.SearchSpaceVersion, new KernelBenchmarkProtocolVersion(2));
 
         Assert.NotEqual(baseline.StableKey, otherShape.StableKey);
         Assert.NotEqual(baseline.StableKey, otherDevice.StableKey);
+        Assert.NotEqual(baseline.StableKey, otherBackend.StableKey);
         Assert.NotEqual(baseline.StableKey, otherSearchSpace.StableKey);
         Assert.NotEqual(baseline.StableKey, otherProtocol.StableKey);
     }
@@ -489,6 +508,7 @@ public sealed class EvolutionKernelAutotunerTests : IDisposable
         new KernelId("test", "fake-gpu-kernel"),
         new ShapeProfile(64, 64, 4096),
         new GpuDeviceFingerprint(GpuVendorKind.Nvidia, "Fake GPU", 8, 6, 550, "fake-0"),
+        KernelTuningBackend.Cuda,
         new KernelSearchSpaceVersion(1),
         new KernelBenchmarkProtocolVersion(1));
 
@@ -560,10 +580,11 @@ public sealed class EvolutionKernelAutotunerTests : IDisposable
     };
 
     private static KernelTuningResourceUsage Resources(FakeKernelConfiguration configuration) => new(
-        configuration.TileEdge * 1024L,
-        0.5 + configuration.TileEdge / 100d,
-        configuration.TileEdge,
-        TimeSpan.FromMilliseconds(3));
+        KernelTuningResourceMetric<long>.Measured(configuration.TileEdge * 1024L),
+        KernelTuningResourceMetric<double>.Estimated(0.5 + configuration.TileEdge / 100d),
+        KernelTuningResourceMetric<int>.Estimated(configuration.TileEdge),
+        KernelTuningResourceMetric<TimeSpan>.Measured(TimeSpan.FromMilliseconds(3)),
+        KernelTuningResourceMetric<int>.Measured(1));
 
     private enum FakeKernelVariant
     {

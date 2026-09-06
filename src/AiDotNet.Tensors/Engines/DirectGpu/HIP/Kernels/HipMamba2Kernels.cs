@@ -14,7 +14,6 @@ internal static class HipMamba2Kernels
     {
         return @"
 #include <hip/hip_runtime.h>
-#include <math.h>
 
 #define MAMBA2_MAX_STATEDIM 256
 

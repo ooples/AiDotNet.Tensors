@@ -903,7 +903,12 @@ public sealed partial class GemmAutoTuner
         int invalidConfigs = 0;
         foreach (var cfg in allConfigs)
         {
-            if (DynamicGemmKernel.ValidateConfig(cfg) == null)
+            if (DynamicGemmKernel.ValidateConfig(
+                    cfg,
+                    capabilities.MaxWorkGroupSize,
+                    capabilities.LocalMemoryBytes,
+                    capabilities.MaxWorkItemSizeX,
+                    capabilities.MaxWorkItemSizeY) == null)
                 validConfigs++;
             else
                 invalidConfigs++;
@@ -1144,7 +1149,12 @@ public sealed partial class GemmAutoTuner
         string? progressLabel = null)
     {
         // First validate the configuration
-        var validationError = DynamicGemmKernel.ValidateConfig(config);
+        var validationError = DynamicGemmKernel.ValidateConfig(
+            config,
+            capabilities.MaxWorkGroupSize,
+            capabilities.LocalMemoryBytes,
+            capabilities.MaxWorkItemSizeX,
+            capabilities.MaxWorkItemSizeY);
         if (validationError != null)
         {
             LogDiag($"  Config invalid: {validationError}");
@@ -3422,6 +3432,8 @@ public sealed class GpuCapabilities
     public long GlobalMemoryBytes { get; init; }
     public int LocalMemoryBytes { get; init; }
     public int MaxWorkGroupSize { get; init; }
+    public int MaxWorkItemSizeX { get; init; } = int.MaxValue;
+    public int MaxWorkItemSizeY { get; init; } = int.MaxValue;
     public int WavefrontSize { get; init; }  // 32 for NVIDIA, 64 for AMD
     public bool SupportsFP16 { get; init; }
     public bool SupportsSubgroups { get; init; }
@@ -3439,7 +3451,8 @@ public sealed class GpuCapabilities
         int maxWorkGroupSize,
         string vendor,
         string device,
-        string extensions)
+        string extensions,
+        IReadOnlyList<ulong>? maxWorkItemSizes = null)
     {
         bool isAmd = vendor.Contains("AMD", StringComparison.OrdinalIgnoreCase) ||
                      vendor.Contains("Advanced Micro Devices", StringComparison.OrdinalIgnoreCase);
@@ -3451,6 +3464,8 @@ public sealed class GpuCapabilities
             GlobalMemoryBytes = globalMemory,
             LocalMemoryBytes = localMemory,
             MaxWorkGroupSize = maxWorkGroupSize,
+            MaxWorkItemSizeX = GetWorkItemLimit(maxWorkItemSizes, 0, maxWorkGroupSize),
+            MaxWorkItemSizeY = GetWorkItemLimit(maxWorkItemSizes, 1, maxWorkGroupSize),
             WavefrontSize = isAmd ? 64 : (isNvidia ? 32 : 32),
             SupportsFP16 = extensions.Contains("cl_khr_fp16"),
             SupportsSubgroups = extensions.Contains("cl_khr_subgroups") ||
@@ -3474,6 +3489,8 @@ public sealed class GpuCapabilities
             GlobalMemoryBytes = 4L * 1024 * 1024 * 1024,
             LocalMemoryBytes = 64 * 1024,
             MaxWorkGroupSize = 256,
+            MaxWorkItemSizeX = 256,
+            MaxWorkItemSizeY = 256,
             WavefrontSize = 64,
             SupportsFP16 = false,
             SupportsSubgroups = false,
@@ -3495,6 +3512,7 @@ public sealed class GpuCapabilities
         sb.AppendLine($"Global Memory: {GlobalMemoryBytes / (1024 * 1024)} MB");
         sb.AppendLine($"Local Memory: {LocalMemoryBytes / 1024} KB");
         sb.AppendLine($"Max Work Group Size: {MaxWorkGroupSize}");
+        sb.AppendLine($"Max Work Item Sizes: {MaxWorkItemSizeX}x{MaxWorkItemSizeY}");
         sb.AppendLine($"Wavefront Size: {WavefrontSize}");
         sb.AppendLine($"Features: FP16={SupportsFP16}, Subgroups={SupportsSubgroups}, MFMA={SupportsMFMA}");
 
@@ -3503,6 +3521,16 @@ public sealed class GpuCapabilities
         sb.AppendLine($"Theoretical Peak (estimate): {theoreticalGflops:F0} GFLOPS");
 
         return sb.ToString();
+    }
+
+    private static int GetWorkItemLimit(
+        IReadOnlyList<ulong>? limits,
+        int dimension,
+        int fallback)
+    {
+        if (limits is null || dimension >= limits.Count)
+            return fallback;
+        return checked((int)Math.Min(limits[dimension], (ulong)int.MaxValue));
     }
 
     /// <summary>

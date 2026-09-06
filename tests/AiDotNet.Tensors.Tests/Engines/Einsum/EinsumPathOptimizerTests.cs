@@ -203,6 +203,7 @@ public sealed class EinsumEvolutionAutotunerTests : IDisposable
         KernelTuningIdentity gpuIdentity = EinsumPathCache.CreateIdentity(
             binding,
             gpu,
+            KernelTuningBackend.Cuda,
             new KernelSearchSpaceVersion(EinsumPathOptimizer.CurrentSearchSpaceVersion),
             new KernelBenchmarkProtocolVersion(EinsumPathOptimizer.CurrentBenchmarkProtocolVersion));
         var storedOrder = new EinsumContractionOrder(new[]
@@ -218,6 +219,7 @@ public sealed class EinsumEvolutionAutotunerTests : IDisposable
         EinsumPath gpuPath = EinsumPathOptimizer.Optimize(
             binding,
             gpu,
+            KernelTuningBackend.Cuda,
             new KernelSearchSpaceVersion(EinsumPathOptimizer.CurrentSearchSpaceVersion),
             new KernelBenchmarkProtocolVersion(EinsumPathOptimizer.CurrentBenchmarkProtocolVersion));
 
@@ -267,6 +269,7 @@ public sealed class EinsumEvolutionAutotunerTests : IDisposable
         EinsumEvolutionTuningResult result = await EinsumEvolutionAutotuner.TuneAsync(
             binding,
             KernelTuningDeviceFingerprint.CurrentCpu(),
+            KernelTuningBackend.ManagedCpu,
             Measure,
             Finalist(binding),
             new KernelSearchSpaceVersion(1),
@@ -308,6 +311,7 @@ public sealed class EinsumEvolutionAutotunerTests : IDisposable
         EinsumEvolutionTuningResult result = await EinsumEvolutionAutotuner.TuneAsync(
             binding,
             KernelTuningDeviceFingerprint.CurrentCpu(),
+            KernelTuningBackend.ManagedCpu,
             Measure,
             Finalist(binding),
             new KernelSearchSpaceVersion(1),
@@ -343,6 +347,7 @@ public sealed class EinsumEvolutionAutotunerTests : IDisposable
         EinsumPathCache.CreateIdentity(
             binding,
             KernelTuningDeviceFingerprint.CurrentCpu(),
+            KernelTuningBackend.ManagedCpu,
             new KernelSearchSpaceVersion(EinsumPathOptimizer.CurrentSearchSpaceVersion),
             new KernelBenchmarkProtocolVersion(EinsumPathOptimizer.CurrentBenchmarkProtocolVersion));
 

@@ -37,7 +37,9 @@ public enum KernelTuningResourceMetricStatus
     /// <summary>The backend measured the value.</summary>
     Measured = 1,
     /// <summary>The metric does not apply to this backend.</summary>
-    NotApplicable = 2
+    NotApplicable = 2,
+    /// <summary>The backend derived an estimate from declared configuration and device limits.</summary>
+    Estimated = 3
 }
 
 /// <summary>Which side of paired replay evidence a deployment measurement describes.</summary>
@@ -63,18 +65,26 @@ public readonly record struct KernelTuningResourceMetric<T>
         _value = value;
     }
 
-    /// <summary>Gets whether the value was measured, does not apply, or is unavailable.</summary>
+    /// <summary>Gets whether the value was measured, estimated, does not apply, or is unavailable.</summary>
     public KernelTuningResourceMetricStatus Status { get; }
 
-    /// <summary>Gets the measured value.</summary>
-    /// <exception cref="InvalidOperationException">The metric was not measured.</exception>
-    public T Value => Status == KernelTuningResourceMetricStatus.Measured
+    /// <summary>Gets the available measured or estimated value.</summary>
+    /// <exception cref="InvalidOperationException">The metric has no numeric evidence.</exception>
+    public T Value => HasValue
         ? _value
-        : throw new InvalidOperationException("A resource metric without measured evidence has no numeric value.");
+        : throw new InvalidOperationException("A resource metric without numeric evidence has no value.");
+
+    /// <summary>Gets whether this evidence carries a numeric value.</summary>
+    public bool HasValue => Status == KernelTuningResourceMetricStatus.Measured ||
+                            Status == KernelTuningResourceMetricStatus.Estimated;
 
     /// <summary>Creates a measured resource value.</summary>
     public static KernelTuningResourceMetric<T> Measured(T value) =>
         new(KernelTuningResourceMetricStatus.Measured, value);
+
+    /// <summary>Creates a value estimated from configuration and known device limits.</summary>
+    public static KernelTuningResourceMetric<T> Estimated(T value) =>
+        new(KernelTuningResourceMetricStatus.Estimated, value);
 
     /// <summary>Creates a marker for a resource that has no meaning on this backend.</summary>
     public static KernelTuningResourceMetric<T> NotApplicable() =>
@@ -87,7 +97,7 @@ public readonly record struct KernelTuningResourceMetric<T>
     internal bool TryGetValue(out T value)
     {
         value = _value;
-        return Status == KernelTuningResourceMetricStatus.Measured;
+        return HasValue;
     }
 }
 
@@ -357,7 +367,10 @@ public sealed class DeviceEventKernelTuningTimer : IKernelTuningTimer
     }
 }
 
-/// <summary>Monotonic host timer for synchronous CPU kernels.</summary>
+/// <summary>
+/// Monotonic host timer for operations whose backend synchronization is included by the
+/// experiment scaffold. This can time CPU work or a complete accelerator dispatch pipeline.
+/// </summary>
 public sealed class StopwatchKernelTuningTimer : IKernelTuningTimer
 {
     /// <inheritdoc />

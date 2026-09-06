@@ -360,7 +360,11 @@ internal static class HipNativeBindings
         HipDeviceAttribute attribute,
         int deviceId);
 
-    [DllImport(HipLibrary, CallingConvention = CallingConvention.Cdecl)]
+    // HipDeviceProperties mirrors hipDeviceProp_tR0600. The unversioned export is not an
+    // ABI promise on ROCm 6 and, on Windows, can populate the retained R0000 layout. Reading
+    // that memory as R0600 leaves GcnArchName empty and silently compiles code for gfx900.
+    [DllImport(HipLibrary, CallingConvention = CallingConvention.Cdecl,
+        EntryPoint = "hipGetDevicePropertiesR0600")]
     public static extern HipError hipGetDeviceProperties(
         ref HipDeviceProperties props,
         int deviceId);

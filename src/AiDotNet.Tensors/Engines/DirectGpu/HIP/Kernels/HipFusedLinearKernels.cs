@@ -14,7 +14,6 @@ internal static class HipFusedLinearKernels
     {
         return @"
 #include <hip/hip_runtime.h>
-#include <math.h>
 
 // ===========================================================================
 // Activation helpers (device functions)

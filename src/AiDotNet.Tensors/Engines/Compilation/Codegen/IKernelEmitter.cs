@@ -11,7 +11,7 @@ namespace AiDotNet.Tensors.Engines.Compilation.Codegen;
 
 /// <summary>
 /// Outcome of an emitter's run over a <see cref="CodegenGraph"/> —
-/// either a compiled, callable <see cref="CodegenKernel"/> or a
+/// either a target-specific <see cref="CodegenKernel"/> or a
 /// structured failure explaining why the emitter can't handle this
 /// graph (so a fallback emitter / the engine's composed-ops path
 /// can pick up without retrying).
@@ -91,6 +91,13 @@ public abstract class CodegenKernel
     public CodegenTarget Target { get; }
 
     /// <summary>
+    /// Gets the typed runtime contract required to turn this emitted representation into an
+    /// executable artifact. This describes the required native lowering; it is not evidence that
+    /// a source-emitting kernel has already been compiled or executed.
+    /// </summary>
+    public CodegenTargetRuntime RequiredRuntime => CodegenTargetRuntime.For(Target);
+
+    /// <summary>
     /// Binding order of the kernel's inputs — matches the order of
     /// <see cref="CodegenGraph.InputNodes"/> at emit time. Callers
     /// pass input tensors in this order.
@@ -143,7 +150,7 @@ public enum CodegenTarget
     /// the emitter that proves the IR contract without requiring
     /// the Roslyn/external-toolchain dependency of Phase C emitters.
     /// </summary>
-    CpuDotNetJit,
+    CpuDotNetJit = 0,
     /// <summary>
     /// Hand-emitted AVX-512 intrinsic kernel — uses
     /// <see cref="System.Runtime.Intrinsics.X86.Avx512F"/> directly via
@@ -154,24 +161,26 @@ public enum CodegenTarget
     /// pointwise — gives a deterministic vectorisation guarantee that
     /// the generic JIT path doesn't.
     /// </summary>
-    CpuAvx512,
+    CpuAvx512 = 1,
     /// <summary>OpenAI Triton (CUDA).</summary>
-    Triton,
+    Triton = 2,
     /// <summary>HIP kernel source (AMD ROCm).</summary>
-    Hip,
+    Hip = 3,
     /// <summary>Metal Shading Language (Apple).</summary>
-    Msl,
+    Msl = 4,
     /// <summary>WebGPU Shading Language.</summary>
-    Wgsl,
+    Wgsl = 5,
     /// <summary>GLSL compute (Vulkan).</summary>
-    Glsl,
+    Glsl = 6,
     /// <summary>
     /// Direct PTX emitted from the index-map layer, bypassing a source language and
     /// its compiler. Specialised per shape, which is the property a shipped library
     /// cannot have: reduction indices fold to compile-time constants and interval
     /// analysis removes the bounds guards that folding proves unnecessary.
     /// </summary>
-    DirectPtx,
+    DirectPtx = 7,
+    /// <summary>OpenCL C compiled to the selected device driver's native binary.</summary>
+    OpenCl = 8,
 }
 
 /// <summary>

@@ -9,6 +9,10 @@ public static class CudaLossForwardKernels
     public static string GetSource()
     {
         return @"
+#ifndef INFINITY
+#define INFINITY __int_as_float(0x7f800000)
+#endif
+
 // ============================================================================
 // Cross-Entropy Loss: -sum(target * log(pred)) per sample
 // ============================================================================

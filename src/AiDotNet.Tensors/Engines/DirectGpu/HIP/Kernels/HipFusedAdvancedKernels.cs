@@ -13,7 +13,6 @@ internal static class HipFusedAdvancedKernels
 
     public static string GetSource() => @"
 #include <hip/hip_runtime.h>
-#include <math.h>
 
 __device__ __forceinline__ float fused_activate(float x, int activation)
 {

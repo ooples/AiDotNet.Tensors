@@ -8,6 +8,7 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Threading;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.Compilation.Codegen;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels;
 using AiDotNet.Tensors.Engines.Gpu;
@@ -30,7 +31,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
     /// <item>Bank-conflict-free shared memory</item>
     /// </list>
     /// </remarks>
-    public sealed partial class OpenClBackend : IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IExtendedConvKernels, IPixelShuffleBackend
+    public sealed partial class OpenClBackend : IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IExtendedConvKernels, IPixelShuffleBackend, INativeGpuCodegenExecutor
     {
         /// <summary>
         /// OpenCL has no cuDNN-equivalent half/bfloat16 conv path —
@@ -93,10 +94,25 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         private const string GemmVendorThresholdEnvVar = "AIDOTNET_GPU_GEMM_VENDOR_THRESHOLD";
         private const int DefaultBayesianTrials = 500;
         private const long DefaultVendorGemmThreshold = 128L * 128L * 128L;
+
+        private enum OfflineTuningMode
+        {
+            Disabled = 0,
+            Evolutionary = 1,
+            Exhaustive = 2
+        }
+
+        private enum GemmImplementationPreference
+        {
+            Automatic = 0,
+            Vendor = 1,
+            BuiltIn = 2
+        }
         private readonly Dictionary<(int M, int N, int K), GemmConfig> _tunedConfigCache = new();
         private readonly object _tunedConfigLock = new();
         private bool _tuningDbResetDone;
         private readonly ILogger? _logger;
+        private readonly int _deviceIndex;
         private readonly object _clblastLock = new();
         private bool _clblastBaselineInitialized;
         private GemmConfig? _clblastBaselineConfig;
@@ -193,6 +209,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public OpenClBackend(int deviceIndex, ILogger? logger = null)
         {
             _logger = logger;
+            _deviceIndex = deviceIndex;
             _kernelCache = new OpenClKernelCache();
             _programs = new List<DirectOpenClProgram>();
             _maxWorkItemSizes = Array.Empty<ulong>();
@@ -269,7 +286,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
                 // Initialize default stream wrapper
                 _defaultStream = new OpenClCommandQueue(this, _context.CommandQueue, _context.Context, _context.Device,
-                    GpuStreamType.Default, _context.IsProfilingEnabled, ownsHandle: false);
+                    GpuStreamType.Default, profilingEnabled: false, ownsHandle: false);
                 WriteDiag("[OpenClBackend] Default command queue wrapper initialized.");
 
                 WriteDiag("[OpenClBackend] Compiling kernels...");
@@ -1112,13 +1129,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         private static bool ShouldUseVendorGemm(int m, int n, int k, bool offlineEnabled)
         {
-            string? mode = Environment.GetEnvironmentVariable(GemmVendorImplEnvVar);
-            if (IsVendorGemmDisabled(mode))
+            GemmImplementationPreference preference = GetGemmImplementationPreference();
+            if (preference == GemmImplementationPreference.BuiltIn)
             {
                 return false;
             }
 
-            if (IsVendorGemmForced(mode))
+            if (preference == GemmImplementationPreference.Vendor)
             {
                 return true;
             }
@@ -1140,42 +1157,45 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             return work >= GetEnvLong(GemmVendorThresholdEnvVar, DefaultVendorGemmThreshold);
         }
 
-        private static bool IsVendorGemmForced(string? mode)
+        private static GemmImplementationPreference GetGemmImplementationPreference()
         {
-            return string.Equals(mode, "vendor", StringComparison.OrdinalIgnoreCase) ||
-                   string.Equals(mode, "clblast", StringComparison.OrdinalIgnoreCase);
+            string? value = Environment.GetEnvironmentVariable(GemmVendorImplEnvVar);
+            if (string.Equals(value, "vendor", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(value, "clblast", StringComparison.OrdinalIgnoreCase))
+            {
+                return GemmImplementationPreference.Vendor;
+            }
+            if (string.Equals(value, "builtin", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(value, "internal", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(value, "kernel", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(value, "custom", StringComparison.OrdinalIgnoreCase))
+            {
+                return GemmImplementationPreference.BuiltIn;
+            }
+            return GemmImplementationPreference.Automatic;
         }
 
-        private static bool IsVendorGemmDisabled(string? mode)
+        private static OfflineTuningMode GetOfflineTuningMode()
         {
-            return string.Equals(mode, "builtin", StringComparison.OrdinalIgnoreCase) ||
-                   string.Equals(mode, "internal", StringComparison.OrdinalIgnoreCase) ||
-                   string.Equals(mode, "kernel", StringComparison.OrdinalIgnoreCase) ||
-                   string.Equals(mode, "custom", StringComparison.OrdinalIgnoreCase);
-        }
-
-        private static bool TryGetOfflineTuningMode(out bool useExhaustive)
-        {
-            useExhaustive = false;
-            var value = Environment.GetEnvironmentVariable(OfflineTuningEnvVar);
+            string? value = Environment.GetEnvironmentVariable(OfflineTuningEnvVar);
             if (string.IsNullOrWhiteSpace(value))
-                return false;
+                return OfflineTuningMode.Disabled;
 
             if (value.Equals("0", StringComparison.OrdinalIgnoreCase) ||
                 value.Equals("false", StringComparison.OrdinalIgnoreCase) ||
                 value.Equals("off", StringComparison.OrdinalIgnoreCase))
             {
-                return false;
+                return OfflineTuningMode.Disabled;
             }
 
             if (value.Equals("exhaustive", StringComparison.OrdinalIgnoreCase) ||
                 value.Equals("full", StringComparison.OrdinalIgnoreCase) ||
                 value.Equals("all", StringComparison.OrdinalIgnoreCase))
             {
-                useExhaustive = true;
+                return OfflineTuningMode.Exhaustive;
             }
 
-            return true;
+            return OfflineTuningMode.Evolutionary;
         }
 
         private void ConfigureOfflineTuning()
@@ -1421,7 +1441,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         {
             config = default;
             var key = (M, N, K);
-            bool offlineEnabled = TryGetOfflineTuningMode(out bool useExhaustive);
+            OfflineTuningMode tuningMode = GetOfflineTuningMode();
+            bool offlineEnabled = tuningMode != OfflineTuningMode.Disabled;
+            bool useExhaustive = tuningMode == OfflineTuningMode.Exhaustive;
             if (offlineEnabled)
                 ConfigureOfflineTuning();
 
@@ -1459,7 +1481,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 if (cachedEntry.HasValue && cachedEntry.Value.GFlops > 0)
                 {
                     var cachedConfig = cachedEntry.Value.Config;
-                    var validationError = DynamicGemmKernel.ValidateConfig(cachedConfig);
+                    var validationError = ValidateDynamicGemmConfig(cachedConfig);
                     if (validationError == null)
                     {
                         fallbackConfig ??= cachedConfig;
@@ -1922,7 +1944,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             int K,
             float alpha,
             float beta,
-            GemmConfig config)
+            GemmConfig config,
+            bool allowDirectSubstitution = true)
         {
             // CLBlast uses MinIndirectSize threshold to decide between XgemmDirect and Xgemm kernels.
             // XgemmDirect is faster for small matrices (no packing overhead).
@@ -1940,7 +1963,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 (M >= _clblastMinIndirectSize || N >= _clblastMinIndirectSize);
 
             // Try direct path only for small matrices (below MinIndirectSize threshold)
-            if (!useIndirectPath || forceDirect)
+            if (allowDirectSubstitution && (!useIndirectPath || forceDirect))
             {
                 if (traceEnabled)
                     WriteDiag($"[GEMM-TRACE {M}x{N}x{K}] Trying DIRECT path (M/N < {_clblastMinIndirectSize} or forceDirect={forceDirect})");
@@ -2282,10 +2305,22 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             kernel.Execute2D(rows, cols, localSizeX, localSizeY);
         }
 
-        private bool TryExecutePackedDynamicGemm(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha, float beta, GemmConfig config)
+        private bool TryExecutePackedDynamicGemm(
+            IGpuBuffer A,
+            IGpuBuffer B,
+            IGpuBuffer C,
+            int M,
+            int N,
+            int K,
+            float alpha,
+            float beta,
+            GemmConfig config,
+            bool requireExactConfiguration = false)
         {
             if (IsClBlastBaselineKernel(config))
-                return TryExecuteClBlastBaselineGemm(A, B, C, M, N, K, alpha, beta, config);
+                return TryExecuteClBlastBaselineGemm(
+                    A, B, C, M, N, K, alpha, beta, config,
+                    allowDirectSubstitution: !requireExactConfiguration);
 
             int kReg = config.KReg > 0 ? config.KReg : 1;
             int kUnit = config.TileK * kReg;
@@ -2367,7 +2402,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (_dynamicGemm == null)
                 return false;
 
-            var validationError = DynamicGemmKernel.ValidateConfig(config);
+            var validationError = ValidateDynamicGemmConfig(config);
             if (validationError != null)
             {
                 if (EnableTuningDiagnostics)
@@ -2392,6 +2427,30 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 }
                 return false;
             }
+        }
+
+        private string? ValidateDynamicGemmConfig(GemmConfig config)
+        {
+            DirectOpenClContext context = _context ??
+                throw new InvalidOperationException("OpenCL context not available.");
+            int maxWorkGroupSize = checked((int)Math.Min(context.MaxWorkGroupSize, (ulong)int.MaxValue));
+            int maxWorkItemSizeX = checked((int)Math.Min(
+                context.MaxWorkItemSizes.Length > 0
+                    ? context.MaxWorkItemSizes[0]
+                    : context.MaxWorkGroupSize,
+                (ulong)int.MaxValue));
+            int maxWorkItemSizeY = checked((int)Math.Min(
+                context.MaxWorkItemSizes.Length > 1
+                    ? context.MaxWorkItemSizes[1]
+                    : context.MaxWorkGroupSize,
+                (ulong)int.MaxValue));
+            long localMemoryBytes = checked((long)Math.Min(context.LocalMemSize, (ulong)long.MaxValue));
+            return DynamicGemmKernel.ValidateConfig(
+                config,
+                maxWorkGroupSize,
+                localMemoryBytes,
+                maxWorkItemSizeX,
+                maxWorkItemSizeY);
         }
 
         /// <inheritdoc/>
@@ -2473,7 +2532,22 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             var bufferB = ((DirectOpenClGpuBuffer)B).Buffer;
             var bufferC = ((DirectOpenClGpuBuffer)C).Buffer;
 
-            bool offlineEnabled = TryGetOfflineTuningMode(out _);
+            bool offlineEnabled = GetOfflineTuningMode() != OfflineTuningMode.Disabled;
+            RecordGemmDispatch(OpenClGemmDispatchPath.None);
+
+            // A deployment reaches this slot only after the first-party experiment scaffold has
+            // compiled it, compared its output with the independent CPU oracle, and applied the
+            // paired finalist gate. Give that exact typed deployment priority over generic vendor
+            // heuristics; otherwise a successful tuning run would never affect serving.
+            if (_dynamicGemm != null &&
+                TryGetEvolutionaryGemmDeployment(M, N, K, out GemmConfig evolutionaryConfig) &&
+                TryExecutePackedDynamicGemm(
+                    A, B, C, M, N, K, alpha, beta, evolutionaryConfig,
+                    requireExactConfiguration: true))
+            {
+                RecordGemmDispatch(OpenClGemmDispatchPath.EvolutionaryNativeKernel);
+                return;
+            }
 
             // DIAGNOSTIC TRACING (always prints for debugging)
             bool traceEnabled = Environment.GetEnvironmentVariable("AIDOTNET_GEMM_TRACE") == "1";
@@ -2485,6 +2559,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
                 if (TryExecuteClBlastLibraryGemm(A, B, C, M, N, K, alpha, beta))
                 {
+                    RecordGemmDispatch(OpenClGemmDispatchPath.ClBlastLibrary);
                     if (traceEnabled)
                         WriteDiag($"[GEMM-TRACE {M}x{N}x{K}] SUCCESS: CLBlast library executed");
                     return;
@@ -2505,6 +2580,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
                 if (TryExecuteClBlastBaselineGemm(A, B, C, M, N, K, alpha, beta, baselineConfig))
                 {
+                    RecordGemmDispatch(OpenClGemmDispatchPath.ClBlastGeneratedKernel);
                     if (traceEnabled)
                         WriteDiag($"[GEMM-TRACE {M}x{N}x{K}] SUCCESS: CLBlast baseline executed");
                     return;
@@ -2525,6 +2601,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     WriteDiag($"[GEMM-TRACE {M}x{N}x{K}] Trying dynamic GEMM");
                 if (TryExecutePackedDynamicGemm(A, B, C, M, N, K, alpha, beta, tunedConfig))
                 {
+                    RecordGemmDispatch(OpenClGemmDispatchPath.LegacyTunedNativeKernel);
                     if (traceEnabled)
                         WriteDiag($"[GEMM-TRACE {M}x{N}x{K}] SUCCESS: Dynamic GEMM executed");
                     return;
@@ -2536,6 +2613,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             // FALLBACK: Using our own kernels (NOT CLBlast identical!)
             if (traceEnabled)
                 WriteDiag($"[GEMM-TRACE {M}x{N}x{K}] FALLBACK: Using built-in kernel (NOT CLBlast!)");
+            RecordGemmDispatch(OpenClGemmDispatchPath.BuiltInKernel);
 
             // Choose kernel based on matrix size
             // Use optimized kernel for matrices >= 128 in any dimension
@@ -4617,6 +4695,21 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             return new OpenClCommandQueue(this, _context.Context, _context.Device, streamType, enableProfiling: false);
         }
 
+        /// <summary>
+        /// Creates an explicitly profiling-capable queue for device-event benchmarking.
+        /// The normal serving queues remain profiling-free so timing instrumentation adds no
+        /// overhead to production dispatch.
+        /// </summary>
+        public IGpuStream CreateProfilingStream(GpuStreamType streamType)
+        {
+            if (_context == null)
+                throw new InvalidOperationException("OpenCL context not available");
+            if (!_context.IsProfilingEnabled)
+                throw new NotSupportedException("The selected OpenCL device does not support profiling queues.");
+            return new OpenClCommandQueue(
+                this, _context.Context, _context.Device, streamType, enableProfiling: true);
+        }
+
         /// <inheritdoc/>
         public IGpuStream CreateStream(GpuStreamType streamType, int priority)
         {
@@ -5422,7 +5515,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             ConfigureOfflineTuning();
 
             var capabilities = GpuCapabilities.Detect(ComputeUnits, GlobalMemoryBytes, (int)LocalMemoryBytes,
-                (int)_maxWorkGroupSize, DeviceVendor, DeviceName, _context.Extensions);
+                (int)_maxWorkGroupSize, DeviceVendor, DeviceName, _context.Extensions, _maxWorkItemSizes);
 
             WriteDiag("=== Bayesian GEMM Optimization ===");
             WriteDiag($"Matrix: {M}x{N}x{K}, Device: {DeviceName}, Max trials: {maxTrials}");
@@ -5465,7 +5558,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 benchmarkAttempts++;
 
                 // Validate config before attempting execution
-                var validationError = DynamicGemmKernel.ValidateConfig(config);
+                var validationError = ValidateDynamicGemmConfig(config);
                 if (validationError != null)
                 {
                     benchmarkFailures++;
@@ -5619,7 +5712,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             ConfigureOfflineTuning();
 
             var capabilities = GpuCapabilities.Detect(ComputeUnits, GlobalMemoryBytes, (int)LocalMemoryBytes,
-                (int)_maxWorkGroupSize, DeviceVendor, DeviceName, _context.Extensions);
+                (int)_maxWorkGroupSize, DeviceVendor, DeviceName, _context.Extensions, _maxWorkItemSizes);
 
             WriteDiag("=== EXHAUSTIVE GEMM Optimization (CLBlast-style) ===");
             WriteDiag($"Matrix: {M}x{N}x{K}, Device: {DeviceName}");
@@ -5650,7 +5743,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             double BenchmarkConfig(GemmConfig config, bool allowCached)
             {
                 // Validate config before attempting execution
-                var validationError = DynamicGemmKernel.ValidateConfig(config);
+                var validationError = ValidateDynamicGemmConfig(config);
                 if (validationError != null)
                 {
                     if (EnableTuningDiagnostics)
@@ -6158,9 +6251,9 @@ DEBUG:
   AIDOTNET_FORCE_DIRECT=1     Force XgemmDirect path (skip indirect path)
 
 KERNEL VARIANTS (A/B testing):
-  AIDOTNET_GEMM_VARIANT=0     Original CLBlast baseline
-  AIDOTNET_GEMM_VARIANT=1     XOR LDS swizzling (eliminates bank conflicts)
-  AIDOTNET_GEMM_VARIANT=2     RDNA1 optimized (swizzle + Wave32 hints)
+  AIDOTNET_GEMM_VARIANT=ClBlastBaseline Original CLBlast baseline
+  AIDOTNET_GEMM_VARIANT=XorSwizzle      XOR LDS swizzling
+  AIDOTNET_GEMM_VARIANT=RdnaOptimized   RDNA optimized source
 ");
         }
 
@@ -6193,22 +6286,27 @@ KERNEL VARIANTS (A/B testing):
             try
             {
                 long flops = 2L * M * N * K;
-                var results = new List<(string Name, double Gflops, double TimeMs)>();
+                var results = new List<(DynamicGemmKernelVariant Variant, string Name, double Gflops, double TimeMs)>();
                 float[]? referenceResult = null;
 
                 // Test each kernel variant
-                for (int variant = 0; variant <= 2; variant++)
+                foreach (DynamicGemmKernelVariant variant in new[]
+                         {
+                             DynamicGemmKernelVariant.ClBlastBaseline,
+                             DynamicGemmKernelVariant.XorSwizzle,
+                             DynamicGemmKernelVariant.RdnaOptimized
+                         })
                 {
                     string variantName = variant switch
                     {
-                        0 => "CLBlast Baseline",
-                        1 => "XOR Swizzle",
-                        2 => "RDNA1 Optimized",
-                        _ => "Unknown"
+                        DynamicGemmKernelVariant.ClBlastBaseline => "CLBlast Baseline",
+                        DynamicGemmKernelVariant.XorSwizzle => "XOR Swizzle",
+                        DynamicGemmKernelVariant.RdnaOptimized => "RDNA Optimized",
+                        _ => throw new ArgumentOutOfRangeException(nameof(variant))
                     };
 
                     // Set kernel variant
-                    int originalVariant = DynamicGemmKernel.KernelVariant;
+                    DynamicGemmKernelVariant originalVariant = DynamicGemmKernel.KernelVariant;
                     bool originalDiag = DynamicGemmKernel.EnableDiagnostics;
                     DynamicGemmKernel.KernelVariant = variant;
                     DynamicGemmKernel.EnableDiagnostics = true; // Enable for debugging
@@ -6239,10 +6337,10 @@ KERNEL VARIANTS (A/B testing):
 
                         double timeMs = sw.Elapsed.TotalMilliseconds / benchmarkRuns;
                         double gflops = flops / (timeMs * 1e6);
-                        results.Add((variantName, gflops, timeMs));
+                        results.Add((variant, variantName, gflops, timeMs));
 
                         // Store reference result for verification
-                        if (variant == 0)
+                        if (variant == DynamicGemmKernelVariant.ClBlastBaseline)
                         {
                             referenceResult = ((DirectOpenClGpuBuffer)bufC).Download();
                         }
@@ -6292,8 +6390,7 @@ KERNEL VARIANTS (A/B testing):
                     // Recommendation
                     sb.AppendLine();
                     sb.AppendLine("To use the best variant, set environment variable:");
-                    int bestVariant = results.IndexOf(best);
-                    sb.AppendLine($"  AIDOTNET_GEMM_VARIANT={bestVariant}");
+                    sb.AppendLine($"  AIDOTNET_GEMM_VARIANT={best.Variant}");
                 }
 
                 return sb.ToString();
@@ -6383,17 +6480,22 @@ KERNEL VARIANTS (A/B testing):
                     float[]? referenceResult = null;
 
                     // Test each kernel variant
-                    for (int variant = 0; variant <= 2; variant++)
+                    foreach (DynamicGemmKernelVariant variant in new[]
+                             {
+                                 DynamicGemmKernelVariant.ClBlastBaseline,
+                                 DynamicGemmKernelVariant.XorSwizzle,
+                                 DynamicGemmKernelVariant.RdnaOptimized
+                             })
                     {
                         string variantName = variant switch
                         {
-                            0 => "CLBlast",
-                            1 => "XOR Swizzle",
-                            2 => "RDNA1 Opt",
-                            _ => "Unknown"
+                            DynamicGemmKernelVariant.ClBlastBaseline => "CLBlast",
+                            DynamicGemmKernelVariant.XorSwizzle => "XOR Swizzle",
+                            DynamicGemmKernelVariant.RdnaOptimized => "RDNA Opt",
+                            _ => throw new ArgumentOutOfRangeException(nameof(variant))
                         };
 
-                        int originalVariant = DynamicGemmKernel.KernelVariant;
+                        DynamicGemmKernelVariant originalVariant = DynamicGemmKernel.KernelVariant;
                         DynamicGemmKernel.KernelVariant = variant;
                         _dynamicGemm?.ClearCache();
 
@@ -6423,7 +6525,7 @@ KERNEL VARIANTS (A/B testing):
 
                             // Verify correctness
                             bool correct = true;
-                            if (variant == 0)
+                            if (variant == DynamicGemmKernelVariant.ClBlastBaseline)
                             {
                                 referenceResult = ((DirectOpenClGpuBuffer)bufC).Download();
                             }
@@ -13742,6 +13844,7 @@ KERNEL VARIANTS (A/B testing):
             // KeyNotFoundException this guard exists to prevent.
             _disposed = true;
 
+            DisposeCompiledCodegenKernels();
             _dynamicGemm?.Dispose();
             _bufferPool.Dispose();
 

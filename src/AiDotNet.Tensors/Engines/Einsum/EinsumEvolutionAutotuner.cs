@@ -50,6 +50,7 @@ public static class EinsumEvolutionAutotuner
     public static async Task<EinsumEvolutionTuningResult> TuneAsync(
         EinsumShapeBinding binding,
         KernelTuningDeviceFingerprint device,
+        KernelTuningBackend backend,
         Func<EinsumPath, EvolutionEvaluationContext, CancellationToken,
             ValueTask<KernelTuningTrialResult>> evaluator,
         IKernelTuningFinalistEvaluator<EinsumContractionOrder> finalistEvaluator,
@@ -71,7 +72,7 @@ public static class EinsumEvolutionAutotuner
         var codec = new EinsumContractionOrderCodec(binding.Equation.Operands.Count);
         var variation = new EinsumContractionOrderVariation(binding.Equation.Operands.Count);
         KernelTuningIdentity identity = CreateIdentity(
-            binding, device, searchSpaceVersion, benchmarkProtocolVersion);
+            binding, device, backend, searchSpaceVersion, benchmarkProtocolVersion);
         EvolutionEngineOptions resolvedEngineOptions = engineOptions ?? DefaultEngineOptions(identity);
         var tuner = new EvolutionKernelAutotuner<EinsumContractionOrder>(
             identity,
@@ -130,6 +131,7 @@ public static class EinsumEvolutionAutotuner
     public static async Task<EinsumEvolutionTuningResult> TuneInBackgroundAsync(
         EinsumShapeBinding binding,
         KernelTuningDeviceFingerprint device,
+        KernelTuningBackend backend,
         Func<EinsumPath, EvolutionEvaluationContext, CancellationToken,
             ValueTask<KernelTuningTrialResult>> evaluator,
         IKernelTuningFinalistEvaluator<EinsumContractionOrder> finalistEvaluator,
@@ -147,12 +149,13 @@ public static class EinsumEvolutionAutotuner
         if (idleGate is null) throw new ArgumentNullException(nameof(idleGate));
         if (binding is null) throw new ArgumentNullException(nameof(binding));
         KernelTuningIdentity identity = CreateIdentity(
-            binding, device, searchSpaceVersion, benchmarkProtocolVersion);
+            binding, device, backend, searchSpaceVersion, benchmarkProtocolVersion);
         await idleGate.WaitUntilIdleAsync(identity, cancellationToken).ConfigureAwait(false);
         return await Task.Run(
             () => TuneAsync(
                 binding,
                 device,
+                backend,
                 evaluator,
                 finalistEvaluator,
                 searchSpaceVersion,
@@ -170,10 +173,11 @@ public static class EinsumEvolutionAutotuner
     private static KernelTuningIdentity CreateIdentity(
         EinsumShapeBinding binding,
         KernelTuningDeviceFingerprint device,
+        KernelTuningBackend backend,
         KernelSearchSpaceVersion searchSpaceVersion,
         KernelBenchmarkProtocolVersion benchmarkProtocolVersion) =>
         EinsumPathCache.CreateIdentity(
-            binding, device, searchSpaceVersion, benchmarkProtocolVersion);
+            binding, device, backend, searchSpaceVersion, benchmarkProtocolVersion);
 
     private static EvolutionEngineOptions DefaultEngineOptions(KernelTuningIdentity identity) => new()
     {

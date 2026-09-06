@@ -14,7 +14,6 @@ internal static class HipConvLSTMKernels
     {
         return @"
 #include <hip/hip_runtime.h>
-#include <math.h>
 
 #define EPSILON 1e-15f
 

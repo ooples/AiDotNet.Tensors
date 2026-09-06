@@ -15,7 +15,6 @@ internal static class HipXLstmKernels
     {
         return @"
 #include <hip/hip_runtime.h>
-#include <math.h>
 
 #define XLSTM_MAX_HEADDIM 64
 #define XLSTM_MAX_HH 4096

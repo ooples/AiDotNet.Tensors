@@ -79,32 +79,74 @@ public static class GpuEmitterCommon
     /// </summary>
     public static string? CheckSupport(CodegenGraph graph, CodegenElementType dtype, HashSet<CodegenElementType> supportedDtypes)
     {
+        if (graph is null) return "Graph is null.";
+        if (supportedDtypes is null) return "Supported dtype set is null.";
         if (!supportedDtypes.Contains(dtype))
             return $"Dtype {dtype} not supported by this emitter.";
+        if (graph.Nodes.Count == 0) return "Graph is empty.";
+        if (graph.InputNodes.Count == 0) return "GPU pointwise graph has no input.";
+        if (graph.OutputNodes.Count == 0) return "GPU pointwise graph has no output.";
 
         foreach (var node in graph.Nodes)
         {
-            var cat = CodegenOpKinds.Categorize(node.Op);
-            if (cat != CodegenOpCategory.Pointwise && cat != CodegenOpCategory.Movement)
-                return $"GPU pointwise emitter does not yet handle {cat} ops (found {node.Op}).";
+            if (!CanEmitPointwiseNode(node.Op))
+                return $"GPU pointwise emitter does not yet handle {node.Op}.";
+            int expectedArity = GetPointwiseArity(node.Op);
+            if (node.Inputs.Length != expectedArity)
+            {
+                return $"GPU pointwise op {node.Op} requires {expectedArity} input(s), " +
+                       $"but the graph supplies {node.Inputs.Length}.";
+            }
         }
 
         // Phase C emits per-thread element-wise kernels — every node
         // must have the same element count so a single global thread
         // index suffices.
-        if (graph.Nodes.Count == 0) return "Graph is empty.";
-        long refCount = 1;
-        for (int i = 0; i < graph.Nodes[0].Shape.Length; i++) refCount *= graph.Nodes[0].Shape[i];
+        if (!TryGetElementCount(graph.Nodes[0].Shape, out long refCount, out string? reason))
+            return reason;
         foreach (var node in graph.Nodes)
         {
-            long c = 1;
-            for (int i = 0; i < node.Shape.Length; i++) c *= node.Shape[i];
+            if (!TryGetElementCount(node.Shape, out long c, out reason))
+                return reason;
             if (c != refCount)
                 return $"Phase C pointwise emitter requires uniform element count across nodes; "
                      + $"found {refCount} vs {c} at op {node.Op}.";
         }
         return null;
     }
+
+    private static bool CanEmitPointwiseNode(CodegenOpKind op) => op is
+        CodegenOpKind.LoadInput or
+        CodegenOpKind.StoreOutput or
+        CodegenOpKind.Add or
+        CodegenOpKind.Sub or
+        CodegenOpKind.Mul or
+        CodegenOpKind.Div or
+        CodegenOpKind.Max or
+        CodegenOpKind.Min or
+        CodegenOpKind.Negate or
+        CodegenOpKind.Sqrt or
+        CodegenOpKind.Exp or
+        CodegenOpKind.Log or
+        CodegenOpKind.Sin or
+        CodegenOpKind.Cos or
+        CodegenOpKind.Tan or
+        CodegenOpKind.Tanh or
+        CodegenOpKind.Abs or
+        CodegenOpKind.Floor or
+        CodegenOpKind.Ceil or
+        CodegenOpKind.Round or
+        CodegenOpKind.ReLU or
+        CodegenOpKind.Sigmoid;
+
+    private static int GetPointwiseArity(CodegenOpKind op) => op switch
+    {
+        CodegenOpKind.LoadInput => 0,
+        CodegenOpKind.StoreOutput => 1,
+        CodegenOpKind.Add or CodegenOpKind.Sub or CodegenOpKind.Mul or CodegenOpKind.Div or
+        CodegenOpKind.Max or CodegenOpKind.Min => 2,
+        _ => 1
+    };
 
     /// <summary>
     /// Formats a single pointwise op node as an infix/prefix/function-call
@@ -143,22 +185,68 @@ public static class GpuEmitterCommon
     /// </summary>
     public static int GetElementCount(CodegenGraph graph)
     {
-        long c = 1;
-        for (int i = 0; i < graph.Nodes[0].Shape.Length; i++) c *= graph.Nodes[0].Shape[i];
-        if (c > int.MaxValue)
-            throw new InvalidOperationException($"Element count {c} exceeds int.MaxValue.");
+        if (graph is null) throw new ArgumentNullException(nameof(graph));
+        if (graph.Nodes.Count == 0) throw new InvalidOperationException("Graph is empty.");
+        if (!TryGetElementCount(graph.Nodes[0].Shape, out long c, out string? reason))
+            throw new InvalidOperationException(reason);
+        if (c > int.MaxValue) throw new InvalidOperationException($"Element count {c} exceeds int.MaxValue.");
         return (int)c;
+    }
+
+    /// <summary>
+    /// Enforces that a source-kernel launch covers the exact uniform extent emitted from the graph.
+    /// </summary>
+    internal static void ValidateLaunchElementCount(GpuSourceKernel kernel, int elementCount)
+    {
+        if (kernel is null) throw new ArgumentNullException(nameof(kernel));
+        if (elementCount <= 0) throw new ArgumentOutOfRangeException(nameof(elementCount));
+        int emittedElementCount = GetElementCount(kernel.Graph);
+        if (elementCount != emittedElementCount)
+        {
+            throw new ArgumentException(
+                $"Launch element count {elementCount} does not match emitted extent {emittedElementCount}.",
+                nameof(elementCount));
+        }
+    }
+
+    private static bool TryGetElementCount(
+        IReadOnlyList<int> shape,
+        out long elementCount,
+        out string? reason)
+    {
+        elementCount = 1;
+        for (int i = 0; i < shape.Count; i++)
+        {
+            int dimension = shape[i];
+            if (dimension <= 0)
+            {
+                reason = $"GPU pointwise emission requires positive dimensions; found {dimension}.";
+                return false;
+            }
+
+            try
+            {
+                elementCount = checked(elementCount * dimension);
+            }
+            catch (OverflowException)
+            {
+                reason = "GPU pointwise element count exceeds Int64 capacity.";
+                return false;
+            }
+        }
+
+        reason = null;
+        return true;
     }
 }
 
 /// <summary>
 /// Kernel returned by Phase C source-emitting emitters — carries
 /// the emitted source plus the dialect's kernel entry point name.
-/// Phase C doesn't yet wire the source into backend dispatch (that
-/// integration lives with each GPU backend's native compilation
-/// surface); <see cref="Execute{T}"/> throws
-/// <see cref="NotSupportedException"/> until the backend-dispatch
-/// wiring lands.
+/// Execution is intentionally owned by each backend because compilation, native artifact
+/// caching, queues, and buffers are backend-specific. Every supported GPU backend exposes that
+/// lifecycle through <see cref="INativeGpuCodegenExecutor"/>. Direct array execution remains
+/// unsupported.
 /// </summary>
 public sealed class GpuSourceKernel : CodegenKernel
 {
@@ -168,22 +256,31 @@ public sealed class GpuSourceKernel : CodegenKernel
     /// <summary>Entry-point function name within <see cref="Source"/>.</summary>
     public string EntryPoint { get; }
 
+    /// <summary>
+    /// Workgroup width embedded in the source language, or null when the backend selects it at launch.
+    /// </summary>
+    public int? DeclaredWorkgroupSize { get; }
+
     internal GpuSourceKernel(
         CodegenGraph graph,
         CodegenElementType dtype,
         CodegenTarget target,
         string source,
-        string entryPoint)
+        string entryPoint,
+        int? declaredWorkgroupSize = null)
         : base(dtype, graph, target)
     {
+        if (declaredWorkgroupSize.HasValue && declaredWorkgroupSize.Value <= 0)
+            throw new ArgumentOutOfRangeException(nameof(declaredWorkgroupSize));
         Source = source;
         EntryPoint = entryPoint;
+        DeclaredWorkgroupSize = declaredWorkgroupSize;
     }
 
     /// <inheritdoc/>
     public override void Execute<T>(T[][] inputs, T[][] outputs)
         => throw new NotSupportedException(
-            $"{Target} kernel source is emitted but backend-dispatch wiring is a follow-up PR. "
-          + "Use Source / EntryPoint to feed into the target's compiler externally, "
-          + "or switch to CodegenTarget.CpuDotNetJit for local execution.");
+            $"{Target} source kernels require their native GPU backend and device buffers. "
+          + "Use the matching backend execution API, or switch to CodegenTarget.CpuDotNetJit "
+          + "for direct managed-array execution.");
 }

@@ -114,6 +114,23 @@ public sealed class KernelTuningExperimentTests
     }
 
     [Fact]
+    public void ResourceState_PreservesEstimatedEvidenceWithoutCallingItMeasured()
+    {
+        KernelTuningResourceMetric<double> metric =
+            KernelTuningResourceMetric<double>.Estimated(0.75);
+
+        Assert.Equal(KernelTuningResourceMetricStatus.Estimated, metric.Status);
+        Assert.True(metric.HasValue);
+        Assert.Equal(0.75, metric.Value);
+        Assert.Throws<ArgumentOutOfRangeException>(() => new KernelTuningResourceUsage(
+            KernelTuningResourceMetric<long>.Measured(0),
+            KernelTuningResourceMetric<double>.Estimated(1.01),
+            KernelTuningResourceMetric<int>.Estimated(16),
+            KernelTuningResourceMetric<TimeSpan>.Measured(TimeSpan.Zero),
+            KernelTuningResourceMetric<int>.Measured(1)));
+    }
+
+    [Fact]
     public void ArchiveProfile_DeviceDefaultResolvesFromTypedDeviceKind()
     {
         var options = new KernelTuningOptions
@@ -130,8 +147,10 @@ public sealed class KernelTuningExperimentTests
             descriptor => descriptor.Metric == KernelTuningMetric.KernelLaunchCount);
         Assert.DoesNotContain(cpu.ArchiveDescriptors,
             descriptor => descriptor.Metric == KernelTuningMetric.OccupancyRatio);
-        Assert.Equal(KernelTuningArchiveProfile.Gpu, gpu.ArchiveProfile);
+        Assert.Equal(KernelTuningArchiveProfile.PortableGpu, gpu.ArchiveProfile);
         Assert.Contains(gpu.ArchiveDescriptors,
+            descriptor => descriptor.Metric == KernelTuningMetric.Log10NumericalError);
+        Assert.DoesNotContain(gpu.ArchiveDescriptors,
             descriptor => descriptor.Metric == KernelTuningMetric.OccupancyRatio);
     }
 
@@ -164,7 +183,7 @@ public sealed class KernelTuningExperimentTests
         TimeSpan elapsed = await timer.MeasureAsync(cancellationToken =>
         {
             clock.Events.Add(DeviceClockEventKind.Operation);
-            return ValueTask.CompletedTask;
+            return default;
         });
 
         Assert.Equal(TimeSpan.FromMilliseconds(2), elapsed);
@@ -187,13 +206,14 @@ public sealed class KernelTuningExperimentTests
             new RecordingDeviceClock(TimeSpan.Zero));
 
         await Assert.ThrowsAsync<InvalidOperationException>(async () =>
-            await timer.MeasureAsync(cancellationToken => ValueTask.CompletedTask));
+            await timer.MeasureAsync(cancellationToken => default));
     }
 
     private static KernelTuningIdentity Identity() => new(
         new KernelId("test", "experiment"),
         new ShapeProfile(8, 8),
         KernelTuningDeviceFingerprint.CurrentCpu(),
+        KernelTuningBackend.ManagedCpu,
         new KernelSearchSpaceVersion(1),
         new KernelBenchmarkProtocolVersion(1));
 
@@ -237,7 +257,7 @@ public sealed class KernelTuningExperimentTests
             CancellationToken cancellationToken = default)
         {
             _events.Add(new BackendEvent(BackendEventKind.Prepare, configuration));
-            return ValueTask.CompletedTask;
+            return default;
         }
 
         public ValueTask ExecuteAsync(
@@ -246,13 +266,13 @@ public sealed class KernelTuningExperimentTests
         {
             LastExecuted = configuration;
             _events.Add(new BackendEvent(BackendEventKind.Execute, configuration));
-            return ValueTask.CompletedTask;
+            return default;
         }
 
         public ValueTask SynchronizeAsync(CancellationToken cancellationToken = default)
         {
             _events.Add(new BackendEvent(BackendEventKind.Synchronize, LastExecuted));
-            return ValueTask.CompletedTask;
+            return default;
         }
 
         public ValueTask<KernelTuningCorrectnessEvidence> ValidateAsync(
@@ -327,7 +347,7 @@ public sealed class KernelTuningExperimentTests
         {
             cancellationToken.ThrowIfCancellationRequested();
             _events.Add(DeviceClockEventKind.Wait);
-            return ValueTask.CompletedTask;
+            return default;
         }
 
         public void Dispose() => _events.Add(DeviceClockEventKind.Dispose);

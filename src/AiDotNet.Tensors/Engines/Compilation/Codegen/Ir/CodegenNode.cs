@@ -111,7 +111,7 @@ public readonly struct CodegenNode
         get
         {
             long total = 1;
-            for (int i = 0; i < Shape.Length; i++) total *= Shape[i];
+            for (int i = 0; i < Shape.Length; i++) total = checked(total * Shape[i]);
             return total;
         }
     }

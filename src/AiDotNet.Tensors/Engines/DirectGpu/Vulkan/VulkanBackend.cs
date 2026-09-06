@@ -6,6 +6,7 @@ using System.Buffers;
 using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
 using System.Threading;
+using AiDotNet.Tensors.Engines.Compilation.Codegen;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
@@ -33,7 +34,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 /// Shader modules are compiled once and reused across operations.
 /// </para>
 /// </remarks>
-public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchExecution, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IPixelShuffleBackend
+public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchExecution, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IPixelShuffleBackend, INativeGpuCodegenExecutor
 {
     /// <summary>
     /// Vulkan has no cuDNN-equivalent half/bfloat16 conv path — returns
@@ -224,7 +225,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         using (var sha = System.Security.Cryptography.SHA256.Create())
         {
             var hashBytes = sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(glslSource));
-            sourceHash = BitConverter.ToString(hashBytes, 0, 8).Replace("-", "");
+            sourceHash = BitConverter.ToString(hashBytes).Replace("-", string.Empty);
         }
         string cacheKey = $"{sourceHash}_{bindingCount}_{pushConstantSize}";
         if (_glslPipelineCache.TryGetValue(cacheKey, out var cached))
@@ -338,7 +339,12 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     /// Executes a GLSL-compiled compute pipeline with N buffers + push constants (#1464 recurrence ops).
     /// Buffers bind to set=0, binding=0..N-1 in order; pushConstants are the kernel's int params as uints.
     /// </summary>
-    private void GlslNaryOp(string glslSource, IGpuBuffer[] buffers, int dispatchSize, uint[] pushConstants)
+    private void GlslNaryOp(
+        string glslSource,
+        IGpuBuffer[] buffers,
+        int dispatchSize,
+        uint[] pushConstants,
+        int workgroupSize = VulkanKernels.WorkgroupSize)
     {
         EnsureInitialized();
         if (dispatchSize <= 0) return;
@@ -352,7 +358,8 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         lock (_computeLock)
         {
             pipeline.UpdateDescriptorSet(storages);
-            RecordAndExecuteWithPushData(pipeline, dispatchSize, pushConstants, pushConstantSize, threadRes);
+            RecordAndExecuteWithPushData(
+                pipeline, dispatchSize, pushConstants, pushConstantSize, threadRes, workgroupSize);
         }
     }
 
@@ -749,8 +756,15 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     /// Pushes the exact values needed by the GLSL shader's push_constant block.
     /// Caller MUST hold _computeLock.
     /// </summary>
-    private void RecordAndExecuteWithPushData(VulkanComputePipeline pipeline, int dispatchSize, uint[] pushConstants, uint pushConstantSize, ThreadCommandResources threadRes)
+    private void RecordAndExecuteWithPushData(
+        VulkanComputePipeline pipeline,
+        int dispatchSize,
+        uint[] pushConstants,
+        uint pushConstantSize,
+        ThreadCommandResources threadRes,
+        int workgroupSize = VulkanKernels.WorkgroupSize)
     {
+        if (workgroupSize <= 0) throw new ArgumentOutOfRangeException(nameof(workgroupSize));
         // Batch mode: record into batch command buffer without immediate submit
         if (_batchMode && Environment.CurrentManagedThreadId == _batchOwnerThreadId)
         {
@@ -770,7 +784,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
             {
                 VulkanNativeBindings.vkCmdPushConstants(batchCmd, pipeline.Layout, VulkanNativeBindings.VK_SHADER_STAGE_COMPUTE_BIT, 0, pushConstantSize, ptr);
             }
-            uint batchWgCount = VulkanKernels.CalculateWorkgroupCount(dispatchSize);
+            uint batchWgCount = CalculateWorkgroupCount(dispatchSize, workgroupSize);
             VulkanNativeBindings.vkCmdDispatch(batchCmd, batchWgCount, 1, 1);
             _batchDispatchCount++;
             return;
@@ -797,10 +811,17 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
             VulkanNativeBindings.vkCmdPushConstants(cmdBuffer, pipeline.Layout, VulkanNativeBindings.VK_SHADER_STAGE_COMPUTE_BIT, 0, pushConstantSize, ptr);
         }
 
-        uint workgroupCount = VulkanKernels.CalculateWorkgroupCount(dispatchSize);
+        uint workgroupCount = CalculateWorkgroupCount(dispatchSize, workgroupSize);
         VulkanNativeBindings.vkCmdDispatch(cmdBuffer, workgroupCount, 1, 1);
         VulkanNativeBindings.vkEndCommandBuffer(cmdBuffer);
         _device.SubmitAndWait(cmdBuffer, threadRes.Fence);
+    }
+
+    private static uint CalculateWorkgroupCount(int elementCount, int workgroupSize)
+    {
+        if (elementCount <= 0) throw new ArgumentOutOfRangeException(nameof(elementCount));
+        if (workgroupSize <= 0) throw new ArgumentOutOfRangeException(nameof(workgroupSize));
+        return checked((uint)(((long)elementCount + workgroupSize - 1L) / workgroupSize));
     }
 
     /// <summary>

@@ -39,6 +39,7 @@ internal static class EinsumPathCache
     internal static KernelTuningIdentity CreateIdentity(
         EinsumShapeBinding binding,
         KernelTuningDeviceFingerprint device,
+        KernelTuningBackend backend,
         KernelSearchSpaceVersion searchSpaceVersion,
         KernelBenchmarkProtocolVersion benchmarkProtocolVersion)
     {
@@ -47,6 +48,7 @@ internal static class EinsumPathCache
             new KernelId("einsum-evolution", EvolutionHash.Compute(binding.Equation.Source)),
             CreateShape(binding),
             device,
+            backend,
             searchSpaceVersion,
             benchmarkProtocolVersion);
     }

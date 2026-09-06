@@ -127,6 +127,7 @@ public static class CodegenTiledContractionEvolutionExplorer
                 computeMajor,
                 computeMinor),
             KernelTuningDeviceFingerprint.FromGpu(device),
+            KernelTuningBackend.Cuda,
             searchSpaceVersion,
             new KernelBenchmarkProtocolVersion(CodegenMeasurementProtocol.Version));
     }

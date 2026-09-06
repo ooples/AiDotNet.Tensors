@@ -17,7 +17,7 @@ public sealed class OpenClEvent : IGpuEvent
     private IntPtr _handle;
     private bool _disposed;
     private readonly OpenClCommandQueue? _sourceQueue;
-    private readonly bool _profilingEnabled;
+    private bool _profilingEnabled;
 
     /// <inheritdoc/>
     public IntPtr Handle => _handle;
@@ -89,6 +89,9 @@ public sealed class OpenClEvent : IGpuEvent
         }
 
         _handle = newHandle;
+        // Timing capability belongs to the queue that produced this event. An event created
+        // with enableTiming=true but recorded on an ordinary queue must not claim otherwise.
+        _profilingEnabled = openClQueue.IsProfilingEnabled;
     }
 
     /// <inheritdoc/>

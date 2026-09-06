@@ -24,7 +24,6 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP.Kernels
         public static string GetSource()
         {
             return @"
-#include <math.h>
 
 // =================================================================
 // Atan2 element-wise: output[i] = atan2(imag[i], real[i])

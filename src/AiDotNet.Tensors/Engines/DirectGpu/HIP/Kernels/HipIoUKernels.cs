@@ -14,7 +14,6 @@ internal static class HipIoUKernels
     {
         return @"
 #include <hip/hip_runtime.h>
-#include <math.h>
 
 // ===========================================================================
 // Device helpers for box coordinate extraction and IoU computation
@@ -59,7 +58,7 @@ extern ""C"" __global__ void iou_loss(
     float iou = compute_iou(
         predicted[off], predicted[off+1], predicted[off+2], predicted[off+3],
         target[off], target[off+1], target[off+2], target[off+3],
-        NULL, NULL);
+        nullptr, nullptr);
     loss[i] = 1.0f - iou;
 }
 
@@ -102,7 +101,7 @@ extern ""C"" __global__ void diou_loss(
     int off = i * 4;
     float px1=predicted[off], py1=predicted[off+1], px2=predicted[off+2], py2=predicted[off+3];
     float tx1=target[off], ty1=target[off+1], tx2=target[off+2], ty2=target[off+3];
-    float iou = compute_iou(px1,py1,px2,py2, tx1,ty1,tx2,ty2, NULL, NULL);
+    float iou = compute_iou(px1,py1,px2,py2, tx1,ty1,tx2,ty2, nullptr, nullptr);
     float pcx = 0.5f*(px1+px2), pcy = 0.5f*(py1+py2);
     float tcx = 0.5f*(tx1+tx2), tcy = 0.5f*(ty1+ty2);
     float dx = pcx - tcx, dy = pcy - tcy;
@@ -130,7 +129,7 @@ extern ""C"" __global__ void ciou_loss(
     int off = i * 4;
     float px1=predicted[off], py1=predicted[off+1], px2=predicted[off+2], py2=predicted[off+3];
     float tx1=target[off], ty1=target[off+1], tx2=target[off+2], ty2=target[off+3];
-    float iou = compute_iou(px1,py1,px2,py2, tx1,ty1,tx2,ty2, NULL, NULL);
+    float iou = compute_iou(px1,py1,px2,py2, tx1,ty1,tx2,ty2, nullptr, nullptr);
     // Center distance
     float pcx = 0.5f*(px1+px2), pcy = 0.5f*(py1+py2);
     float tcx = 0.5f*(tx1+tx2), tcy = 0.5f*(ty1+ty2);

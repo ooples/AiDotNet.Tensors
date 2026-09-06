@@ -12,7 +12,6 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP.Kernels
         {
             return @"
 #include <hip/hip_runtime.h>
-#include <math.h>
 
 // ===========================================================================
 // FUSED CONVOLUTION KERNELS: CONV2D + BIAS/BATCHNORM + ACTIVATION

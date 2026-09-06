@@ -459,6 +459,7 @@ public static class BlasManagedEvolutionAutotuner
             typeof(T) == typeof(float) ? Fp32Kernel : Fp64Kernel,
             shape,
             KernelTuningDeviceFingerprint.CurrentCpu(),
+            KernelTuningBackend.ManagedCpu,
             searchSpaceVersion,
             benchmarkProtocolVersion);
     }

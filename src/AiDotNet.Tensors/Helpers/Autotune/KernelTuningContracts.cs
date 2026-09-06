@@ -20,6 +20,32 @@ public enum KernelTuningDeviceKind
     OtherAccelerator = 5
 }
 
+/// <summary>
+/// Runtime/compiler backend that turns a typed kernel configuration into device code.
+/// Kept separate from <see cref="KernelTuningDeviceKind"/> because the same physical
+/// GPU can execute through more than one incompatible backend (for example HIP and
+/// OpenCL on AMD, or CUDA and OpenCL on NVIDIA).
+/// </summary>
+public enum KernelTuningBackend
+{
+    /// <summary>Managed CPU implementation.</summary>
+    ManagedCpu = 0,
+    /// <summary>.NET JIT or intrinsic-emitted CPU implementation.</summary>
+    DotNetJit = 1,
+    /// <summary>NVIDIA CUDA driver path, including NVRTC and direct PTX.</summary>
+    Cuda = 2,
+    /// <summary>OpenCL C compiled by the selected device driver.</summary>
+    OpenCl = 3,
+    /// <summary>AMD HIP/ROCm runtime compilation path.</summary>
+    Hip = 4,
+    /// <summary>Apple Metal Shading Language path.</summary>
+    Metal = 5,
+    /// <summary>Vulkan SPIR-V path.</summary>
+    Vulkan = 6,
+    /// <summary>WebGPU WGSL path.</summary>
+    WebGpu = 7
+}
+
 /// <summary>Typed identity of a CPU or accelerator used for cache isolation and tuning coordination.</summary>
 public readonly record struct KernelTuningDeviceFingerprint
 {
@@ -112,6 +138,7 @@ public sealed class KernelTuningIdentity
         KernelId kernel,
         ShapeProfile shape,
         KernelTuningDeviceFingerprint device,
+        KernelTuningBackend backend,
         KernelSearchSpaceVersion searchSpaceVersion,
         KernelBenchmarkProtocolVersion benchmarkProtocolVersion)
     {
@@ -121,6 +148,8 @@ public sealed class KernelTuningIdentity
             throw new ArgumentException("A kernel name is required.", nameof(kernel));
         if (string.IsNullOrWhiteSpace(device.LocalKey))
             throw new ArgumentException("A valid device fingerprint is required.", nameof(device));
+        if (!Enum.IsDefined(typeof(KernelTuningBackend), backend))
+            throw new ArgumentOutOfRangeException(nameof(backend));
         if (searchSpaceVersion.Value <= 0) throw new ArgumentOutOfRangeException(nameof(searchSpaceVersion));
         if (benchmarkProtocolVersion.Value <= 0)
             throw new ArgumentOutOfRangeException(nameof(benchmarkProtocolVersion));
@@ -130,14 +159,16 @@ public sealed class KernelTuningIdentity
             ? throw new ArgumentNullException(nameof(shape))
             : new ShapeProfile(shape.Dimensions);
         Device = device;
+        Backend = backend;
         SearchSpaceVersion = searchSpaceVersion;
         BenchmarkProtocolVersion = benchmarkProtocolVersion;
         StableKey = EvolutionHash.Combine(new[]
         {
-            "tensor-kernel-tuning-identity-v2",
+            "tensor-kernel-tuning-identity-v3",
             Kernel.ToFileStem(),
             Shape.ToFileStem(),
             Device.LocalKey,
+            ((int)Backend).ToString(CultureInfo.InvariantCulture),
             SearchSpaceVersion.ToString(),
             BenchmarkProtocolVersion.ToString()
         });
@@ -148,12 +179,14 @@ public sealed class KernelTuningIdentity
         KernelId kernel,
         ShapeProfile shape,
         GpuDeviceFingerprint device,
+        KernelTuningBackend backend,
         KernelSearchSpaceVersion searchSpaceVersion,
         KernelBenchmarkProtocolVersion benchmarkProtocolVersion)
         : this(
             kernel,
             shape,
             KernelTuningDeviceFingerprint.FromGpu(device),
+            backend,
             searchSpaceVersion,
             benchmarkProtocolVersion)
     {
@@ -165,6 +198,8 @@ public sealed class KernelTuningIdentity
     public ShapeProfile Shape { get; }
     /// <summary>Gets the physical device and driver identity.</summary>
     public KernelTuningDeviceFingerprint Device { get; }
+    /// <summary>Gets the runtime/compiler backend whose artifacts and measurements are compatible.</summary>
+    public KernelTuningBackend Backend { get; }
     /// <summary>Gets the typed search-space version.</summary>
     public KernelSearchSpaceVersion SearchSpaceVersion { get; }
     /// <summary>Gets the typed correctness and timing protocol version.</summary>
@@ -230,6 +265,40 @@ public enum KernelTuningTrialStatus
     RequiredMetricUnavailable = 7
 }
 
+/// <summary>
+/// Converts fractional timing units without the whole-millisecond rounding performed by .NET Framework's
+/// <see cref="TimeSpan.FromMilliseconds(double)"/> and <see cref="TimeSpan.FromSeconds(double)"/> implementations.
+/// </summary>
+internal static class KernelTuningDuration
+{
+    internal static TimeSpan FromMilliseconds(double milliseconds) =>
+        FromUnits(milliseconds, TimeSpan.TicksPerMillisecond, nameof(milliseconds));
+
+    internal static TimeSpan FromSeconds(double seconds) =>
+        FromUnits(seconds, TimeSpan.TicksPerSecond, nameof(seconds));
+
+    private static TimeSpan FromUnits(double value, long ticksPerUnit, string parameterName)
+    {
+        if (double.IsNaN(value) || double.IsInfinity(value))
+            throw new ArgumentOutOfRangeException(parameterName, value, "A duration must be finite.");
+
+        double ticks = value * ticksPerUnit;
+        if (double.IsNaN(ticks) || double.IsInfinity(ticks))
+            throw new ArgumentOutOfRangeException(parameterName, value, "The duration exceeds the TimeSpan range.");
+
+        try
+        {
+            long roundedTicks = checked((long)Math.Round(ticks, MidpointRounding.AwayFromZero));
+            return TimeSpan.FromTicks(roundedTicks);
+        }
+        catch (OverflowException)
+        {
+            throw new ArgumentOutOfRangeException(
+                parameterName, value, "The duration exceeds the TimeSpan range.");
+        }
+    }
+}
+
 /// <summary>Robust latency statistics computed from repeated device measurements.</summary>
 public sealed class KernelTimingStatistics
 {
@@ -265,27 +334,27 @@ public sealed class KernelTimingStatistics
     public static KernelTimingStatistics FromSamples(IEnumerable<TimeSpan> samples)
     {
         if (samples is null) throw new ArgumentNullException(nameof(samples));
-        double[] milliseconds = samples.Select(sample => sample.TotalMilliseconds).ToArray();
-        if (milliseconds.Length < MinimumSampleCount)
+        TimeSpan[] ordered = samples.ToArray();
+        if (ordered.Length < MinimumSampleCount)
             throw new ArgumentException(
                 $"At least {MinimumSampleCount} post-warmup measurements are required.", nameof(samples));
-        for (int i = 0; i < milliseconds.Length; i++)
+        for (int i = 0; i < ordered.Length; i++)
         {
-            if (!KernelTuningMeasurement.IsFinite(milliseconds[i]) || milliseconds[i] <= 0)
+            if (ordered[i] <= TimeSpan.Zero)
                 throw new ArgumentOutOfRangeException(nameof(samples), "Every timing sample must be finite and positive.");
         }
 
-        Array.Sort(milliseconds);
-        double median = milliseconds.Length % 2 == 0
-            ? (milliseconds[milliseconds.Length / 2 - 1] + milliseconds[milliseconds.Length / 2]) / 2d
-            : milliseconds[milliseconds.Length / 2];
-        int p95Index = Math.Max(0, (int)Math.Ceiling(milliseconds.Length * 0.95d) - 1);
-        TimeSpan[] immutableSamples = milliseconds.Select(TimeSpan.FromMilliseconds).ToArray();
+        Array.Sort(ordered);
+        long medianTicks = ordered.Length % 2 == 0
+            ? ordered[ordered.Length / 2 - 1].Ticks +
+              (ordered[ordered.Length / 2].Ticks - ordered[ordered.Length / 2 - 1].Ticks) / 2L
+            : ordered[ordered.Length / 2].Ticks;
+        int p95Index = Math.Max(0, (int)Math.Ceiling(ordered.Length * 0.95d) - 1);
         return new KernelTimingStatistics(
-            milliseconds.Length,
-            TimeSpan.FromMilliseconds(median),
-            TimeSpan.FromMilliseconds(milliseconds[p95Index]),
-            Array.AsReadOnly(immutableSamples));
+            ordered.Length,
+            TimeSpan.FromTicks(medianTicks),
+            ordered[p95Index],
+            Array.AsReadOnly(ordered));
     }
 
     internal static KernelTimingStatistics FromSummary(int sampleCount, double medianMs, double p95Ms)
@@ -297,8 +366,8 @@ public sealed class KernelTimingStatistics
             throw new ArgumentOutOfRangeException(nameof(p95Ms));
         return new KernelTimingStatistics(
             sampleCount,
-            TimeSpan.FromMilliseconds(medianMs),
-            TimeSpan.FromMilliseconds(p95Ms),
+            KernelTuningDuration.FromMilliseconds(medianMs),
+            KernelTuningDuration.FromMilliseconds(p95Ms),
             Array.Empty<TimeSpan>());
     }
 }
@@ -400,7 +469,7 @@ public sealed class KernelTuningResourceUsage
     {
     }
 
-    /// <summary>Creates resource evidence with explicit measured/not-applicable/unavailable state per metric.</summary>
+    /// <summary>Creates resource evidence with an explicit evidence state per metric.</summary>
     public KernelTuningResourceUsage(
         KernelTuningResourceMetric<long> workspaceBytes,
         KernelTuningResourceMetric<double> occupancyRatio,
@@ -434,15 +503,15 @@ public sealed class KernelTuningResourceUsage
     /// <summary>Gets typed launch-count evidence.</summary>
     public KernelTuningResourceMetric<int> KernelLaunchCountMetric { get; }
 
-    /// <summary>Gets measured temporary workspace in bytes.</summary>
+    /// <summary>Gets available temporary-workspace evidence in bytes.</summary>
     public long WorkspaceBytes => WorkspaceBytesMetric.Value;
-    /// <summary>Gets measured occupancy in the inclusive range zero to one.</summary>
+    /// <summary>Gets available occupancy evidence in the inclusive range zero to one.</summary>
     public double OccupancyRatio => OccupancyRatioMetric.Value;
-    /// <summary>Gets measured registers consumed per thread.</summary>
+    /// <summary>Gets available register-use evidence per thread.</summary>
     public int RegistersPerThread => RegistersPerThreadMetric.Value;
-    /// <summary>Gets measured candidate compilation latency.</summary>
+    /// <summary>Gets available candidate compilation-latency evidence.</summary>
     public TimeSpan CompileTime => CompileTimeMetric.Value;
-    /// <summary>Gets the measured operation kernel-launch count.</summary>
+    /// <summary>Gets available operation kernel-launch-count evidence.</summary>
     public int KernelLaunchCount => KernelLaunchCountMetric.Value;
 
     /// <summary>Creates CPU evidence without inventing GPU occupancy or register values.</summary>
@@ -494,7 +563,7 @@ public sealed class KernelTuningResourceUsage
         string parameterName)
         where T : struct
     {
-        if (metric.Status == KernelTuningResourceMetricStatus.Measured &&
+        if (metric.HasValue &&
             (!metric.TryGetValue(out T value) || !predicate(value)))
         {
             throw new ArgumentOutOfRangeException(parameterName);
@@ -573,7 +642,7 @@ public sealed class KernelTuningMeasurement
     internal double GetRequiredMetric(KernelTuningMetric metric) =>
         TryGetMetric(metric, out double value)
             ? value
-            : throw new InvalidOperationException($"Kernel metric '{metric}' has no measured value for this backend.");
+            : throw new InvalidOperationException($"Kernel metric '{metric}' has no numeric evidence for this backend.");
 
     internal static bool IsFinite(double value) => !double.IsNaN(value) && !double.IsInfinity(value);
 }
@@ -657,10 +726,15 @@ public enum KernelTuningArchiveProfile
     DeviceDefault = 0,
     /// <summary>Uses CPU resource axes.</summary>
     Cpu = 1,
-    /// <summary>Uses GPU resource axes.</summary>
+    /// <summary>
+    /// Uses occupancy and register-allocation axes. Select this only when the backend reports
+    /// numeric evidence for both metrics; portable GPU backends should use <see cref="PortableGpu"/>.
+    /// </summary>
     Gpu = 2,
     /// <summary>Uses the explicitly supplied <see cref="KernelTuningOptions.ArchiveDescriptors"/>.</summary>
     Custom = 3,
+    /// <summary>Uses only GPU metrics every backend can provide without inventing occupancy or registers.</summary>
+    PortableGpu = 4,
 }
 
 /// <summary>Promotion and archive policy for typed kernel tuning.</summary>
@@ -678,6 +752,14 @@ public sealed class KernelTuningOptions
         Array.AsReadOnly(new KernelTuningDescriptorDefinition[]
     {
         new(KernelTuningMetric.Log2WorkspaceBytes, 0, 40, 16),
+        new(KernelTuningMetric.KernelLaunchCount, 1, 256, 16)
+    });
+
+    private static readonly IReadOnlyList<KernelTuningDescriptorDefinition> PortableGpuDescriptors =
+        Array.AsReadOnly(new KernelTuningDescriptorDefinition[]
+    {
+        new(KernelTuningMetric.Log2WorkspaceBytes, 0, 40, 16),
+        new(KernelTuningMetric.Log10NumericalError, -16, 0, 16),
         new(KernelTuningMetric.KernelLaunchCount, 1, 256, 16)
     });
 
@@ -714,10 +796,11 @@ public sealed class KernelTuningOptions
         {
             KernelTuningArchiveProfile.DeviceDefault => deviceKind == KernelTuningDeviceKind.Cpu
                 ? DefaultCpuDescriptors
-                : DefaultGpuDescriptors,
+                : PortableGpuDescriptors,
             KernelTuningArchiveProfile.Cpu => DefaultCpuDescriptors,
             KernelTuningArchiveProfile.Gpu => DefaultGpuDescriptors,
             KernelTuningArchiveProfile.Custom => ArchiveDescriptors,
+            KernelTuningArchiveProfile.PortableGpu => PortableGpuDescriptors,
             _ => throw new ArgumentOutOfRangeException(nameof(ArchiveProfile))
         };
         if (ArchiveProfile != KernelTuningArchiveProfile.Custom && ArchiveDescriptors.Count != 0)
@@ -743,7 +826,7 @@ public sealed class KernelTuningOptions
             ArchiveProfile = ArchiveProfile == KernelTuningArchiveProfile.DeviceDefault
                 ? deviceKind == KernelTuningDeviceKind.Cpu
                     ? KernelTuningArchiveProfile.Cpu
-                    : KernelTuningArchiveProfile.Gpu
+                    : KernelTuningArchiveProfile.PortableGpu
                 : ArchiveProfile,
             ArchiveDescriptors = Array.AsReadOnly(copy)
         };
