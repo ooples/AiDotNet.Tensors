@@ -3,18 +3,20 @@ using AiDotNet.Evolution;
 
 namespace AiDotNet.Tensors.Helpers.Autotune;
 
-/// <summary>The engine result, proposed winner, and active deployment from a tuning run.</summary>
+/// <summary>The engine result and paired before/after deployment evidence from a tuning run.</summary>
 public sealed class EvolutionKernelTuningResult<TConfiguration>
     where TConfiguration : notnull
 {
     internal EvolutionKernelTuningResult(
         EvolutionRunResult<TConfiguration> run,
+        KernelTuningDeploymentSnapshot<TConfiguration> incumbentDeployment,
         KernelTuningDeploymentSnapshot<TConfiguration> proposedWinner,
         KernelTuningDeploymentSnapshot<TConfiguration> activeDeployment,
         bool wasPromoted,
         bool wasPersisted)
     {
         Run = run;
+        IncumbentDeployment = incumbentDeployment;
         ProposedWinner = proposedWinner;
         ActiveDeployment = activeDeployment;
         WasPromoted = wasPromoted;
@@ -23,6 +25,8 @@ public sealed class EvolutionKernelTuningResult<TConfiguration>
 
     /// <summary>Gets the complete quality-diversity run result.</summary>
     public EvolutionRunResult<TConfiguration> Run { get; }
+    /// <summary>Gets the incumbent remeasured in the same sealed paired replay as the proposed winner.</summary>
+    public KernelTuningDeploymentSnapshot<TConfiguration> IncumbentDeployment { get; }
     /// <summary>Gets the best candidate measured by this run.</summary>
     public KernelTuningDeploymentSnapshot<TConfiguration> ProposedWinner { get; }
     /// <summary>Gets the configuration left active after promotion policy was applied.</summary>
@@ -268,27 +272,31 @@ public sealed class EvolutionKernelAutotuner<TConfiguration>
             run.StateHash,
             replay.Evidence,
             KernelTuningEvidenceRole.Candidate);
+        KernelTuningDeploymentSnapshot<TConfiguration> incumbent = CreateReplaySnapshot(
+            replay.IncumbentConfiguration,
+            replay.IncumbentMeasurement,
+            replay.Evidence,
+            run.StateHash,
+            KernelTuningEvidenceRole.Incumbent);
 
         if (!_tuningOptions.QualifiesForPromotion(replay.Evidence))
         {
             if (existing is not null)
-                return new EvolutionKernelTuningResult<TConfiguration>(run, proposed, existing, false, false);
+            {
+                return new EvolutionKernelTuningResult<TConfiguration>(
+                    run, incumbent, proposed, existing, false, false);
+            }
 
-            KernelTuningDeploymentSnapshot<TConfiguration> incumbent = CreateReplaySnapshot(
-                replay.IncumbentConfiguration,
-                replay.IncumbentMeasurement,
-                replay.Evidence,
-                run.StateHash,
-                KernelTuningEvidenceRole.Incumbent);
             _deployment.Publish(incumbent);
             bool incumbentPersisted = TryPersist(incumbent);
             return new EvolutionKernelTuningResult<TConfiguration>(
-                run, proposed, incumbent, false, incumbentPersisted);
+                run, incumbent, proposed, incumbent, false, incumbentPersisted);
         }
 
         _deployment.Publish(proposed);
         bool persisted = TryPersist(proposed);
-        return new EvolutionKernelTuningResult<TConfiguration>(run, proposed, proposed, true, persisted);
+        return new EvolutionKernelTuningResult<TConfiguration>(
+            run, incumbent, proposed, proposed, true, persisted);
     }
 
     private KernelTuningDeploymentSnapshot<TConfiguration> CreateReplaySnapshot(

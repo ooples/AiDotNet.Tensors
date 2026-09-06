@@ -32,7 +32,14 @@ public sealed class EvolutionKernelAutotunerTests : IDisposable
 
         Assert.True(result.WasPromoted);
         Assert.True(result.WasPersisted);
+        Assert.Equal(FakeKernelVariant.Safe, result.IncumbentDeployment.Configuration.Variant);
+        Assert.InRange(result.IncumbentDeployment.Measurement.ThroughputGflops, 79.9, 80.1);
+        Assert.Equal(KernelTuningEvidenceRole.Incumbent, result.IncumbentDeployment.EvidenceRole);
         Assert.Equal(FakeKernelVariant.Wide, result.ProposedWinner.Configuration.Variant);
+        Assert.Equal(KernelTuningEvidenceRole.Candidate, result.ProposedWinner.EvidenceRole);
+        Assert.Same(
+            result.IncumbentDeployment.PromotionEvidence,
+            result.ProposedWinner.PromotionEvidence);
         Assert.InRange(result.ActiveDeployment.Measurement.ThroughputGflops, 239.9, 240.1);
         Assert.Equal(3, result.Run.Counters.EvaluationAttempts);
         EvolutionArchiveEntry<FakeKernelConfiguration> best = result.Run.Best ??
@@ -45,6 +52,30 @@ public sealed class EvolutionKernelAutotunerTests : IDisposable
         Assert.DoesNotContain("throughput-gflops", best.Evaluation.Descriptors.Keys);
         Assert.True(tuner.Deployment.TryGet(out FakeKernelConfiguration active));
         Assert.Equal(result.ActiveDeployment.Configuration, active);
+    }
+
+    [Fact]
+    public async Task TuneAsync_ReturnsAndActivatesMeasuredIncumbentWhenFirstProposalIsRejected()
+    {
+        FakeKernelConfiguration incumbent = Seeds()[0];
+        EvolutionKernelAutotuner<FakeKernelConfiguration> tuner = CreateTuner(
+            new KernelTuningDeploymentRegistry<FakeKernelConfiguration>(),
+            new MemoryStore(),
+            MeasurePassed);
+
+        EvolutionKernelTuningResult<FakeKernelConfiguration> result =
+            await tuner.TuneAsync(new[] { incumbent });
+
+        Assert.False(result.WasPromoted);
+        Assert.True(result.WasPersisted);
+        Assert.Equal(incumbent, result.IncumbentDeployment.Configuration);
+        Assert.Equal(KernelTuningEvidenceRole.Incumbent, result.IncumbentDeployment.EvidenceRole);
+        Assert.Same(result.IncumbentDeployment, result.ActiveDeployment);
+        Assert.NotSame(result.IncumbentDeployment, result.ProposedWinner);
+        Assert.Equal(KernelTuningEvidenceRole.Candidate, result.ProposedWinner.EvidenceRole);
+        Assert.Same(
+            result.IncumbentDeployment.PromotionEvidence,
+            result.ProposedWinner.PromotionEvidence);
     }
 
     [Fact]
@@ -125,6 +156,9 @@ public sealed class EvolutionKernelAutotunerTests : IDisposable
         Assert.False(result.WasPromoted);
         Assert.False(result.WasPersisted);
         Assert.InRange(result.ProposedWinner.Measurement.ThroughputGflops, 244.9, 245.1);
+        Assert.Equal(initial.ActiveDeployment.Configuration, result.IncumbentDeployment.Configuration);
+        Assert.InRange(result.IncumbentDeployment.Measurement.ThroughputGflops, 244.9, 245.1);
+        Assert.NotSame(initial.ActiveDeployment, result.IncumbentDeployment);
         Assert.Same(initial.ActiveDeployment, result.ActiveDeployment);
         Assert.InRange(result.ActiveDeployment.Measurement.ThroughputGflops, 239.9, 240.1);
     }
@@ -163,6 +197,9 @@ public sealed class EvolutionKernelAutotunerTests : IDisposable
         EvolutionKernelTuningResult<FakeKernelConfiguration> secondResult = await secondRun;
         Assert.True(firstResult.WasPromoted);
         Assert.False(secondResult.WasPromoted);
+        Assert.Equal(
+            firstResult.ActiveDeployment.Configuration,
+            secondResult.IncumbentDeployment.Configuration);
         Assert.Same(firstResult.ActiveDeployment, secondResult.ActiveDeployment);
         Assert.InRange(secondResult.ActiveDeployment.Measurement.ThroughputGflops, 439.9, 440.1);
     }
