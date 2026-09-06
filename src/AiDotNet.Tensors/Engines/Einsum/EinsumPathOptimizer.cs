@@ -314,7 +314,7 @@ public readonly record struct EinsumContractionPair
 }
 
 /// <summary>An immutable, typed sequence of pairwise contraction choices.</summary>
-public sealed class EinsumContractionOrder : IImmutableEvolutionGenome
+public sealed class EinsumContractionOrder : IImmutableEvolutionGenome<EinsumContractionOrder>
 {
     private readonly IReadOnlyList<EinsumContractionPair> _pairs;
 
@@ -327,6 +327,9 @@ public sealed class EinsumContractionOrder : IImmutableEvolutionGenome
 
     /// <summary>Pair choices in execution order.</summary>
     public IReadOnlyList<EinsumContractionPair> Pairs => _pairs;
+
+    /// <inheritdoc/>
+    public EinsumContractionOrder CreateOwnedSnapshot() => new(_pairs);
 }
 
 /// <summary>

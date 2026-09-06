@@ -3,6 +3,7 @@ using AiDotNet.Tensors.Engines.BlasManaged;
 using AiDotNet.Tensors.Helpers.Autotune;
 using AiDotNet.Tensors.Tests.Helpers.Autotune;
 using Xunit;
+using Xunit.Abstractions;
 
 namespace AiDotNet.Tensors.Tests.Engines.BlasManaged;
 
@@ -10,11 +11,13 @@ namespace AiDotNet.Tensors.Tests.Engines.BlasManaged;
 public sealed class BlasManagedEvolutionAutotunerTests : IDisposable
 {
     private const string CacheEnvironmentVariable = "AIDOTNET_AUTOTUNE_CACHE_PATH";
+    private readonly ITestOutputHelper _output;
     private readonly string? _originalCachePath;
     private readonly string _temporaryCachePath;
 
-    public BlasManagedEvolutionAutotunerTests()
+    public BlasManagedEvolutionAutotunerTests(ITestOutputHelper output)
     {
+        _output = output;
         _originalCachePath = Environment.GetEnvironmentVariable(CacheEnvironmentVariable);
         _temporaryCachePath = Path.Combine(
             Path.GetTempPath(), "aidotnet-blas-evolution-" + Guid.NewGuid().ToString("N"));
@@ -173,6 +176,9 @@ public sealed class BlasManagedEvolutionAutotunerTests : IDisposable
             MinimumPromotionRatio = 1,
             MaximumP95LatencyRatio = 5,
         };
+        var store = new RecordingStore();
+        var searchSpaceVersion = new KernelSearchSpaceVersion(2);
+        var benchmarkProtocolVersion = new KernelBenchmarkProtocolVersion(2);
 
         EvolutionKernelTuningResult<BlasManagedGemmConfiguration> result = await
             BlasManagedEvolutionAutotuner.TuneAsync<float>(
@@ -180,20 +186,51 @@ public sealed class BlasManagedEvolutionAutotunerTests : IDisposable
                 transA: true,
                 transB: false,
                 deterministic: true,
-                new KernelSearchSpaceVersion(2),
-                new KernelBenchmarkProtocolVersion(2),
+                searchSpaceVersion,
+                benchmarkProtocolVersion,
                 engineOptions: EngineOptions(seeds.Count),
                 tuningOptions: tuningOptions,
                 deploymentRegistry: new KernelTuningDeploymentRegistry<BlasManagedGemmConfiguration>(),
-                store: new MemoryStore(),
+                store: store,
                 inputSeed: 9173,
                 warmupCount: 1,
                 searchSampleCount: 3,
                 holdoutSampleCount: 7);
 
+        KernelTuningPairedEvidence evidence = result.ProposedWinner.PromotionEvidence;
+        var incumbent = new BlasManagedGemmConfiguration(
+            PackingMode.Auto,
+            ParallelismAxis.None,
+            Mc: 0,
+            Nc: 0,
+            Kc: 0,
+            ThreadCount: 0);
+        _output.WriteLine("incumbent={0}", incumbent);
+        _output.WriteLine("proposed={0}", result.ProposedWinner.Configuration);
+        _output.WriteLine("active={0}", result.ActiveDeployment.Configuration);
+        _output.WriteLine("promoted={0}; persisted={1}", result.WasPromoted, result.WasPersisted);
+        _output.WriteLine(
+            "median-speedup={0:R}; lower-speedup={1:R}; p95-latency-ratio={2:R}; calibrated-noise-ratio={3:R}",
+            evidence.MedianSpeedup,
+            evidence.LowerSpeedupBound,
+            evidence.P95LatencyRatio,
+            evidence.CalibratedNoiseRatio);
+        for (int index = 0; index < evidence.Samples.Count; index++)
+        {
+            KernelTuningPairedSample sample = evidence.Samples[index];
+            _output.WriteLine(
+                "holdout[{0}]: candidate-ticks={1}; incumbent-ticks={2}; speedup={3:R}",
+                index,
+                sample.Candidate.Ticks,
+                sample.Incumbent.Ticks,
+                sample.Speedup);
+        }
+
         Assert.Equal(seeds.Count, result.Run.Counters.EvaluationAttempts);
         Assert.Equal(7, result.ProposedWinner.PromotionEvidence.Samples.Count);
         Assert.True(result.ProposedWinner.Measurement.Timing.HasRawSamples);
+        Assert.Equal(1, store.LoadCount);
+        Assert.Equal(1, store.StoreCount);
         Assert.Equal(KernelTuningWorkUnit.FloatingPointOperations,
             result.ProposedWinner.Measurement.Workload.Unit);
         Assert.Equal(2d * m * n * k,
@@ -211,6 +248,23 @@ public sealed class BlasManagedEvolutionAutotunerTests : IDisposable
             hasEvolutionDeployment);
         if (hasEvolutionDeployment)
             Assert.Equal(result.ActiveDeployment.Configuration, deployed);
+
+        bool hydrated = BlasManagedEvolutionAutotuner.TryActivatePersisted<float>(
+            m,
+            n,
+            k,
+            transA: true,
+            transB: false,
+            deterministic: true,
+            searchSpaceVersion: searchSpaceVersion,
+            benchmarkProtocolVersion: benchmarkProtocolVersion,
+            store: store);
+        _output.WriteLine("cache-hydrated={0}; cache-loads={1}; cache-stores={2}",
+            hydrated,
+            store.LoadCount,
+            store.StoreCount);
+        Assert.True(hydrated);
+        Assert.Equal(2, store.LoadCount);
 
         float[] a = Enumerable.Range(0, k * m)
             .Select(index => (index % 17 - 8) * 0.01f)
@@ -430,11 +484,15 @@ public sealed class BlasManagedEvolutionAutotunerTests : IDisposable
     {
         private KernelTuningDeploymentSnapshot<BlasManagedGemmConfiguration>? _snapshot;
 
+        public int LoadCount { get; private set; }
+        public int StoreCount { get; private set; }
+
         public bool TryLoad(
             KernelTuningIdentity identity,
             IEvolutionGenomeCodec<BlasManagedGemmConfiguration> codec,
             out KernelTuningDeploymentSnapshot<BlasManagedGemmConfiguration>? snapshot)
         {
+            LoadCount++;
             snapshot = _snapshot;
             return snapshot is not null;
         }
@@ -443,6 +501,7 @@ public sealed class BlasManagedEvolutionAutotunerTests : IDisposable
             KernelTuningDeploymentSnapshot<BlasManagedGemmConfiguration> snapshot,
             IEvolutionGenomeCodec<BlasManagedGemmConfiguration> codec)
         {
+            StoreCount++;
             _snapshot = snapshot;
             return true;
         }
