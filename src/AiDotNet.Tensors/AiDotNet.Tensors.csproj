@@ -177,6 +177,18 @@
   </ItemGroup>
 
   <!--
+    Vulkan's generated-kernel path lowers GLSL to SPIR-V at runtime through
+    shaderc_shared. Shipping the native runtime transitively keeps this a
+    user capability instead of silently requiring a developer-installed
+    Vulkan SDK. The package carries native assets for Windows, Linux, and
+    macOS across their supported x64/Arm RIDs; our existing P/Invoke surface
+    remains the only managed binding layer.
+  -->
+  <ItemGroup>
+    <PackageReference Include="Silk.NET.Shaderc.Native" Version="2.23.0" />
+  </ItemGroup>
+
+  <!--
     BouncyCastle.Cryptography (Org.BouncyCastle) — Ed25519 (EdDSA, RFC 8032) verification for the offline
     `aidn2.` license-token path (AsymmetricEntitlementVerifier / Ed25519LicenseRevocation). This is the
     Tensors runtime's FIRST BouncyCastle dependency: the rest of the runtime deliberately uses only
