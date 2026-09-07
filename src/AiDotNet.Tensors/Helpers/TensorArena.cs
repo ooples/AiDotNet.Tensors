@@ -741,6 +741,25 @@ public sealed class TensorArena : IDisposable
                 {
                     _tensorRingCursors[i] = cursor + 1;
                     var cached = (LinearAlgebra.Tensor<T>)bucket[cursor];
+
+                    // Tensor<T> is publicly IDisposable, so a caller may legitimately release a
+                    // short-lived engine result before the next step. The arena still retains the
+                    // wrapper in this ring; reissuing it after Reset used to hand the next operation
+                    // a wrapper whose TensorStorage reference count was already zero. Do not revive
+                    // the disposed object (which would make an externally retained disposed handle
+                    // usable again). Replace just this ring slot with a fresh wrapper and backing
+                    // buffer. The exceptional dispose-before-reset path pays one allocation while
+                    // the normal zero-allocation reuse path below remains unchanged.
+                    if (cached.IsDisposed)
+                    {
+                        var replacementArray = RentPersistent(typeof(T), totalSize) as T[] ?? new T[totalSize];
+                        _ringBackingArrays.Add((typeof(T), totalSize, replacementArray));
+                        TrackBackingBytes<T>(totalSize);
+                        cached = LinearAlgebra.Tensor<T>.FromMemory(
+                            new Memory<T>(replacementArray, 0, totalSize), shape);
+                        bucket[cursor] = cached;
+                    }
+
                     // The ring buckets by element COUNT, not shape. The cached wrapper
                     // carries the shape it was FIRST created with, so a same-count /
                     // different-shape request (e.g. an [B,L] vs [L,B] permute in N-BEATS)

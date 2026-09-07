@@ -54,6 +54,12 @@ internal interface IStreamingDroppable
 public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorStorageLeaseSource
 {
     private bool _disposed;
+
+    /// <summary>
+    /// Reports whether this wrapper has released its storage reference. Used by the tensor arena to
+    /// avoid reissuing a disposed wrapper after a reset.
+    /// </summary>
+    internal bool IsDisposed => _disposed;
     // ================================================================
     // Core storage and metadata
     // ================================================================
@@ -2354,6 +2360,24 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         if (_device != TensorDevice.CPU)
             return null;
         return _storage.TryGetBackingArraySegment(out var array, out int baseOffset)
+            && baseOffset == 0
+            ? array
+            : null;
+    }
+
+    /// <summary>
+    /// Read-only counterpart to <see cref="GetLiveBackingArrayAllowingPaddingOrNull"/>.
+    /// It exposes the same zero-offset, possibly pool-padded managed storage without
+    /// invoking the vector's before-write hook, so lookup and input-kernel paths do not
+    /// privatize copy-on-write peers. The returned array must never be mutated.
+    /// </summary>
+    internal T[]? GetReadOnlyLiveBackingArrayAllowingPaddingOrNull()
+    {
+        if (!IsContiguous || _storageOffset != 0)
+            return null;
+        if (_device != TensorDevice.CPU)
+            return null;
+        return _storage.TryGetBackingArraySegmentForReadOnlyAccess(out var array, out int baseOffset)
             && baseOffset == 0
             ? array
             : null;

@@ -961,7 +961,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
             if (inT._gpuBuffer is not { } buf || !ReferenceEquals(inT._gpuBackend, cb))
                 throw new InvalidOperationException(
                     $"Captured-graph input {i} has no resident buffer on the capture backend; cannot refresh in place.");
-            var data = inT.GetDataArray();
+            var data = inT.GetReadOnlyDataArray();
             if (buf.Size < data.Length)
                 throw new InvalidOperationException(
                     $"Captured-graph input {i} resident buffer (size {buf.Size}) is smaller than its host data " +

@@ -950,6 +950,26 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradB, engine);
     }
 
+    /// <summary>
+    /// d(channel_bias_add(input,bias))/dinput = grad and
+    /// d/dbias = sum(grad, batch and spatial axes).
+    /// </summary>
+    internal static void ChannelBiasAddBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], gradOutput, engine);
+
+        int rank = gradOutput.Rank;
+        var reductionAxes = new int[rank - 1];
+        reductionAxes[0] = 0;
+        for (int axis = 2; axis < rank; axis++)
+            reductionAxes[axis - 1] = axis;
+
+        var gradBias = engine.ReduceSum(gradOutput, reductionAxes);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradBias, engine);
+    }
+
     /// <summary>d(broadcast_sub(a,b))/da = reduce(grad), d/db = -reduce(grad)</summary>
     internal static void BroadcastSubtractBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
