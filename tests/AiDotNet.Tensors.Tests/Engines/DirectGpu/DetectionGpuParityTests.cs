@@ -13,26 +13,19 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// <c>CpuEngine</c> and there's nothing GPU-side to validate.
 /// </summary>
 [Collection("VulkanGlobalState")]
-public class DetectionGpuParityTests : IDisposable
+public class DetectionGpuParityTests : IClassFixture<DirectGpuTensorEngineTestFixture>
 {
-    private readonly DirectGpuTensorEngine? _gpu;
+    private readonly DirectGpuTensorEngineTestFixture _fixture;
     private readonly CpuEngine _cpu = new();
     private readonly bool _gpuAvailable;
     private const float Tolerance = 1e-4f;
+    private DirectGpuTensorEngine Gpu => _fixture.Engine ?? throw new InvalidOperationException(
+        "Direct GPU engine was not initialized.", _fixture.InitializationException);
 
-    public DetectionGpuParityTests()
+    public DetectionGpuParityTests(DirectGpuTensorEngineTestFixture fixture)
     {
-        // Only swallow PlatformNotSupportedException / DllNotFoundException
-        // (no native GPU runtime on this machine). A real kernel / module
-        // compilation regression should surface as a test failure, not a
-        // silent skip.
-        try
-        {
-            _gpu = new DirectGpuTensorEngine();
-            _gpuAvailable = _gpu.IsGpuAvailable && BackendImplementsDetection();
-        }
-        catch (PlatformNotSupportedException) { _gpuAvailable = false; }
-        catch (System.DllNotFoundException) { _gpuAvailable = false; }
+        _fixture = fixture;
+        _gpuAvailable = fixture.IsAvailable && BackendImplementsDetection();
     }
 
     private bool BackendImplementsDetection()
@@ -40,11 +33,9 @@ public class DetectionGpuParityTests : IDisposable
         var backendField = typeof(DirectGpuTensorEngine).GetField(
             "_backend",
             System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
-        var backend = backendField?.GetValue(_gpu);
+        var backend = backendField?.GetValue(_fixture.Engine);
         return backend is IDetectionBackend;
     }
-
-    public void Dispose() => (_gpu as IDisposable)?.Dispose();
 
     private void SkipIfUnavailable() => Skip.If(!_gpuAvailable,
         "GPU backend without IDetectionBackend support — CPU fallback is exercised by BoxOpsTests instead.");
@@ -88,7 +79,7 @@ public class DetectionGpuParityTests : IDisposable
         SkipIfUnavailable();
         var a = RandBoxes(1, 16);
         var b = RandBoxes(2, 12);
-        AssertClose(_gpu!.BoxIou(a, b), _cpu.BoxIou(a, b));
+        AssertClose(Gpu.BoxIou(a, b), _cpu.BoxIou(a, b));
     }
 
     [SkippableFact]
@@ -97,7 +88,7 @@ public class DetectionGpuParityTests : IDisposable
         SkipIfUnavailable();
         var a = RandBoxes(3, 10);
         var b = RandBoxes(4, 14);
-        AssertClose(_gpu!.GeneralizedBoxIou(a, b), _cpu.GeneralizedBoxIou(a, b));
+        AssertClose(Gpu.GeneralizedBoxIou(a, b), _cpu.GeneralizedBoxIou(a, b));
     }
 
     [SkippableFact]
@@ -106,7 +97,7 @@ public class DetectionGpuParityTests : IDisposable
         SkipIfUnavailable();
         var a = RandBoxes(5, 8);
         var b = RandBoxes(6, 10);
-        AssertClose(_gpu!.DistanceBoxIou(a, b), _cpu.DistanceBoxIou(a, b));
+        AssertClose(Gpu.DistanceBoxIou(a, b), _cpu.DistanceBoxIou(a, b));
     }
 
     [SkippableFact]
@@ -117,7 +108,7 @@ public class DetectionGpuParityTests : IDisposable
         var b = RandBoxes(8, 9);
         // CIoU's atan term loses some FP precision on GPU vs CPU; relax
         // tolerance very slightly to absorb 1-2 ULPs of accumulated error.
-        AssertClose(_gpu!.CompleteBoxIou(a, b), _cpu.CompleteBoxIou(a, b), tol: 5e-4f);
+        AssertClose(Gpu.CompleteBoxIou(a, b), _cpu.CompleteBoxIou(a, b), tol: 5e-4f);
     }
 
     [SkippableFact]
@@ -125,7 +116,7 @@ public class DetectionGpuParityTests : IDisposable
     {
         SkipIfUnavailable();
         var boxes = RandBoxes(9, 32);
-        AssertClose(_gpu!.BoxArea(boxes), _cpu.BoxArea(boxes));
+        AssertClose(Gpu.BoxArea(boxes), _cpu.BoxArea(boxes));
     }
 
     [SkippableFact]
@@ -138,7 +129,7 @@ public class DetectionGpuParityTests : IDisposable
             foreach (BoxFormat to in (BoxFormat[])Enum.GetValues(typeof(BoxFormat)))
             {
                 if (from == to) continue;
-                AssertClose(_gpu!.BoxConvert(boxes, from, to), _cpu.BoxConvert(boxes, from, to));
+                AssertClose(Gpu.BoxConvert(boxes, from, to), _cpu.BoxConvert(boxes, from, to));
             }
     }
 
@@ -150,7 +141,7 @@ public class DetectionGpuParityTests : IDisposable
         // exactly 1.0 modulo FP roundoff.
         SkipIfUnavailable();
         var boxes = RandBoxes(11, 24);
-        AssertClose(_gpu!.BoxIou(boxes, boxes), _cpu.BoxIou(boxes, boxes));
+        AssertClose(Gpu.BoxIou(boxes, boxes), _cpu.BoxIou(boxes, boxes));
     }
 
     // ========================================================================
@@ -175,7 +166,7 @@ public class DetectionGpuParityTests : IDisposable
         var a = RandBoxes(21, 6);
         var b = RandBoxes(22, 8);
         var go = RandGrad(23, 6, 8);
-        var (gpuA, gpuB) = _gpu!.BoxIouBackward(go, a, b);
+        var (gpuA, gpuB) = Gpu.BoxIouBackward(go, a, b);
         var (cpuA, cpuB) = _cpu.BoxIouBackward(go, a, b);
         AssertClose(gpuA, cpuA, tol: 1e-3f);
         AssertClose(gpuB, cpuB, tol: 1e-3f);
@@ -188,7 +179,7 @@ public class DetectionGpuParityTests : IDisposable
         var a = RandBoxes(24, 5);
         var b = RandBoxes(25, 7);
         var go = RandGrad(26, 5, 7);
-        var (gpuA, gpuB) = _gpu!.GeneralizedBoxIouBackward(go, a, b);
+        var (gpuA, gpuB) = Gpu.GeneralizedBoxIouBackward(go, a, b);
         var (cpuA, cpuB) = _cpu.GeneralizedBoxIouBackward(go, a, b);
         AssertClose(gpuA, cpuA, tol: 1e-3f);
         AssertClose(gpuB, cpuB, tol: 1e-3f);
@@ -201,7 +192,7 @@ public class DetectionGpuParityTests : IDisposable
         var a = RandBoxes(27, 4);
         var b = RandBoxes(28, 6);
         var go = RandGrad(29, 4, 6);
-        var (gpuA, gpuB) = _gpu!.DistanceBoxIouBackward(go, a, b);
+        var (gpuA, gpuB) = Gpu.DistanceBoxIouBackward(go, a, b);
         var (cpuA, cpuB) = _cpu.DistanceBoxIouBackward(go, a, b);
         AssertClose(gpuA, cpuA, tol: 1e-3f);
         AssertClose(gpuB, cpuB, tol: 1e-3f);
@@ -214,7 +205,7 @@ public class DetectionGpuParityTests : IDisposable
         var a = RandBoxes(30, 4);
         var b = RandBoxes(31, 5);
         var go = RandGrad(32, 4, 5);
-        var (gpuA, gpuB) = _gpu!.CompleteBoxIouBackward(go, a, b);
+        var (gpuA, gpuB) = Gpu.CompleteBoxIouBackward(go, a, b);
         var (cpuA, cpuB) = _cpu.CompleteBoxIouBackward(go, a, b);
         // CIoU has an atan term — fp32 on GPU vs fp64 on CPU gives a slightly
         // larger delta than the other variants.

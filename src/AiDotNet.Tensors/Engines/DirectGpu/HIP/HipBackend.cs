@@ -12270,20 +12270,26 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 internal sealed class HipGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
 {
     public IntPtr Handle { get; }
-    public int Size { get; }
-    public long SizeInBytes => Size * sizeof(float);
+    private int _size;
+    public int Size => Volatile.Read(ref _size);
+    public int Capacity { get; }
+    public long SizeInBytes => (long)Size * sizeof(float);
     private readonly Action<HipGpuBuffer>? _returnToPool;
     private int _poolState;
 
     public HipGpuBuffer(IntPtr handle, int size, Action<HipGpuBuffer>? returnToPool = null)
     {
         Handle = handle;
-        Size = size;
+        _size = size;
+        Capacity = size;
         _returnToPool = returnToPool;
     }
 
-    public void MarkRented()
+    public void MarkRented(int size)
     {
+        if (size <= 0 || size > Capacity)
+            throw new ArgumentOutOfRangeException(nameof(size));
+        Volatile.Write(ref _size, size);
         Interlocked.Exchange(ref _poolState, 0);
     }
 

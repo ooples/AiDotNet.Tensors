@@ -1,6 +1,7 @@
 using System;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.LinearAlgebra;
+using AiDotNet.Tensors.Tests.Engines.DirectGpu;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -29,21 +30,23 @@ namespace AiDotNet.Tensors.Tests.Engines.Audio;
 /// </para>
 /// </remarks>
 [Collection("DirectGpuSerial")]
-public class TimeStretchStageDiffTests : IDisposable
+public class TimeStretchStageDiffTests : IClassFixture<DirectGpuTensorEngineTestFixture>
 {
     private readonly ITestOutputHelper _out;
     private readonly CpuEngine _cpu = new();
-    private readonly DirectGpuTensorEngine? _gpu;
+    private readonly DirectGpuTensorEngineTestFixture _fixture;
     private readonly bool _available;
+    private DirectGpuTensorEngine Gpu => _fixture.Engine ?? throw new InvalidOperationException(
+        "Direct GPU engine was not initialized.", _fixture.InitializationException);
 
-    public TimeStretchStageDiffTests(ITestOutputHelper o)
+    public TimeStretchStageDiffTests(
+        ITestOutputHelper o,
+        DirectGpuTensorEngineTestFixture fixture)
     {
         _out = o;
-        try { _gpu = new DirectGpuTensorEngine(); _available = _gpu.IsGpuAvailable; }
-        catch { _available = false; }
+        _fixture = fixture;
+        _available = fixture.IsAvailable;
     }
-
-    public void Dispose() { _gpu?.Dispose(); GC.SuppressFinalize(this); }
 
     private const int L = 257;
     private const int NFft = 512;
@@ -100,7 +103,7 @@ public class TimeStretchStageDiffTests : IDisposable
         var w = Hann(NFft);
 
         _cpu.STFT(x, NFft, Hop, w, center: true, out var cMag, out var cPhase);
-        ((AiDotNet.Tensors.Engines.IEngine)_gpu!).STFT(x, NFft, Hop, w, center: true, out var gMag, out var gPhase);
+        ((AiDotNet.Tensors.Engines.IEngine)Gpu).STFT(x, NFft, Hop, w, center: true, out var gMag, out var gPhase);
 
         _out.WriteLine($"cpu mag shape=[{string.Join(",", cMag.Shape.ToArray())}] gpu mag shape=[{string.Join(",", gMag.Shape.ToArray())}]");
         double dm = MaxAbsDiff(cMag, gMag, "STFT magnitude");
@@ -210,7 +213,7 @@ public class TimeStretchStageDiffTests : IDisposable
         Skip.If(!_available, "GPU backend not available");
         var x = Signal();
         var c = _cpu.TimeStretch(x, rate, NFft, Hop);
-        var g = _gpu!.TimeStretch(x, rate, NFft, Hop);
+        var g = Gpu.TimeStretch(x, rate, NFft, Hop);
 
         int outFrames = (int)Math.Floor(3 / rate);
         Assert.Equal(c.Length, g.Length);
@@ -244,7 +247,7 @@ public class TimeStretchStageDiffTests : IDisposable
         var x = Signal();
 
         var c = _cpu.TimeStretch(x, Rate, NFft, Hop);
-        var g = _gpu!.TimeStretch(x, Rate, NFft, Hop);
+        var g = Gpu.TimeStretch(x, Rate, NFft, Hop);
 
         _out.WriteLine($"outFrames would be floor(3/{Rate}) = {(int)Math.Floor(3 / Rate)}");
         double d = MaxAbsDiff(c, g, "TimeStretch output");
@@ -275,7 +278,7 @@ public class TimeStretchStageDiffTests : IDisposable
 
         int targetLen = (int)Math.Round(L / Rate);
         var c = _cpu.ISTFT(mag, phase, nFft, hop, w, center: true, length: targetLen);
-        var g = ((AiDotNet.Tensors.Engines.IEngine)_gpu!).ISTFT(mag, phase, nFft, hop, w, center: true, length: targetLen);
+        var g = ((AiDotNet.Tensors.Engines.IEngine)Gpu).ISTFT(mag, phase, nFft, hop, w, center: true, length: targetLen);
 
         // How far the frames actually reach, so a residual in the UNCOVERED tail can be told apart
         // from one inside the reconstructed region.
@@ -383,7 +386,7 @@ public class TimeStretchStageDiffTests : IDisposable
         _cpu.STFT(x, NFft, Hop, w, center: center, out var mag, out var phase);
 
         var c = _cpu.ISTFT(mag, phase, NFft, Hop, w, center, length: null);
-        var g = ((AiDotNet.Tensors.Engines.IEngine)_gpu!).ISTFT(mag, phase, NFft, Hop, w, center, length: null);
+        var g = ((AiDotNet.Tensors.Engines.IEngine)Gpu).ISTFT(mag, phase, NFft, Hop, w, center, length: null);
 
         if (c.Length != g.Length)
         {
@@ -448,7 +451,7 @@ public class TimeStretchStageDiffTests : IDisposable
         // more signal than the input could reconstruct, and the 6.868E-002 it reported was an artifact
         // of that. The real TimeStretch path feeds ISTFT the vocoder's SIX frames, which do cover 514.
         var c = _cpu.ISTFT(mag, phase, NFft, Hop, w, center: true, length: null);
-        var g = ((AiDotNet.Tensors.Engines.IEngine)_gpu!).ISTFT(mag, phase, NFft, Hop, w, center: true, length: null);
+        var g = ((AiDotNet.Tensors.Engines.IEngine)Gpu).ISTFT(mag, phase, NFft, Hop, w, center: true, length: null);
 
         double d = MaxAbsDiff(c, g, "ISTFT output");
         // fp32 bound: the GPU sums nFft=512 terms in a direct inverse DFT where the CPU uses an fp64

@@ -19,27 +19,20 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// Skips when no OpenCL device is available, unless AIDOTNET_REQUIRE_GPU_TESTS=1.
 /// </summary>
 [Collection("DirectGpuSerial")]
-public sealed class QuantGemmOpenClTests : IDisposable
+public sealed class QuantGemmOpenClTests : IClassFixture<OpenClBackendTestFixture>
 {
     private readonly OpenClBackend? _backend;
     private readonly bool _ready;
     private readonly Exception? _initException;
 
-    public QuantGemmOpenClTests()
+    public QuantGemmOpenClTests(OpenClBackendTestFixture fixture)
     {
-        try
-        {
-            _backend = new OpenClBackend();
-            _ready = _backend.IsAvailable;
-        }
-        catch (Exception ex)
-        {
-            _initException = ex;
-            _ready = false;
-        }
+        _backend = fixture.Backend;
+        _initException = fixture.InitializationException;
+        _ready = fixture.IsAvailable;
     }
 
-    public void Dispose() => _backend?.Dispose();
+    private OpenClBackend Backend => _backend ?? throw new InvalidOperationException("OpenCL backend is unavailable.");
 
     private bool EnsureReady()
     {
@@ -85,7 +78,7 @@ public sealed class QuantGemmOpenClTests : IDisposable
     public void DequantGemmInt8_MatchesCpuOracle(int groupSize)
     {
         if (!EnsureReady()) return;
-        var backend = _backend!;
+        var backend = Backend;
 
         const int M = 8, K = 128, N = 64;
         var rng = new Random(20260717);
@@ -158,7 +151,7 @@ public sealed class QuantGemmOpenClTests : IDisposable
     public void DequantGemmInt4_MatchesCpuOracle(int groupSize)
     {
         if (!EnsureReady()) return;
-        var backend = _backend!;
+        var backend = Backend;
 
         const int M = 8, K = 128, N = 64;
         const int kn = K * N;
@@ -237,7 +230,7 @@ public sealed class QuantGemmOpenClTests : IDisposable
     public void DequantGemmFp8E4M3_MatchesCpuOracle(int groupSize)
     {
         if (!EnsureReady()) return;
-        var backend = _backend!;
+        var backend = Backend;
 
         const int M = 8, K = 128, N = 64;
         const int kn = K * N;

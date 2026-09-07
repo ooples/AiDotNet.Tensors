@@ -12,29 +12,28 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 [Collection("DirectGpuSerial")]
-public sealed class FlashDecodeHipTests : IDisposable
+public sealed class FlashDecodeHipTests : IClassFixture<HipBackendTestFixture>
 {
-    private readonly HipBackend? _backend;
-    private readonly bool _ready;
+    private readonly HipBackendTestFixture _fixture;
+    private bool IsReady => _fixture.IsAvailable;
+    private HipBackend Backend => _fixture.Backend ?? throw new InvalidOperationException(
+        "HIP backend was not initialized.", _fixture.InitializationException);
 
-    public FlashDecodeHipTests()
+    public FlashDecodeHipTests(HipBackendTestFixture fixture)
     {
-        try { _backend = new HipBackend(); _ready = _backend.IsAvailable; }
-        catch { _ready = false; }
+        _fixture = fixture;
     }
-
-    public void Dispose() => _backend?.Dispose();
 
     [Fact]
     public void Probe_HipAvailability()
     {
         if (Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_HIP") != "1") return;
-        Assert.True(_ready, "HIP/ROCm backend NOT available on this host");
+        Assert.True(IsReady, "HIP/ROCm backend NOT available on this host");
     }
 
     private bool EnsureReady()
     {
-        if (_ready) return true;
+        if (IsReady) return true;
         if (string.Equals(Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_HIP"), "1", StringComparison.Ordinal))
             throw new InvalidOperationException("GPU tests required but HIP/ROCm was unavailable.");
         return false;
@@ -70,7 +69,7 @@ public sealed class FlashDecodeHipTests : IDisposable
 
     private void RunAndCompare(int heads, int kvHeads, int headDim, int seqLen, int splits)
     {
-        var backend = _backend!;
+        var backend = Backend;
         var rng = new Random(0xFDE + heads + kvHeads + seqLen + splits);
         int stepStride = kvHeads * headDim;
         var k = new float[seqLen * stepStride];

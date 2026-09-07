@@ -11,35 +11,22 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// Tests are skipped when no GPU backend is available.
 /// </summary>
 [Collection("DirectGpuSerial")]
-public class GpuFusedKernelCorrectnessTests : IDisposable
+public class GpuFusedKernelCorrectnessTests : IClassFixture<DirectGpuTensorEngineTestFixture>
 {
     private readonly CpuEngine _cpu = new();
-    private readonly DirectGpuTensorEngine? _gpu;
+    private readonly DirectGpuTensorEngineTestFixture _fixture;
     private const float Tolerance = 1e-4f;
+    private DirectGpuTensorEngine Gpu => _fixture.Engine ?? throw new InvalidOperationException(
+        "Direct GPU engine was not initialized.", _fixture.InitializationException);
 
-    public GpuFusedKernelCorrectnessTests()
+    public GpuFusedKernelCorrectnessTests(DirectGpuTensorEngineTestFixture fixture)
     {
-        try
-        {
-            _gpu = new DirectGpuTensorEngine();
-            if (!_gpu.IsGpuAvailable)
-                _gpu = null;
-        }
-        catch
-        {
-            _gpu = null;
-        }
-    }
-
-    public void Dispose()
-    {
-        _gpu?.Dispose();
-        GC.SuppressFinalize(this);
+        _fixture = fixture;
     }
 
     private void SkipIfNoGpu()
     {
-        Skip.If(_gpu is null, "No GPU backend available");
+        Skip.If(!_fixture.IsAvailable, "No GPU backend available");
     }
 
     private static Tensor<float> RandomTensor(int[] shape, int seed = 42)
@@ -80,7 +67,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
         var a = RandomTensor(new[] { 64, 128 }, 1);
         var b = RandomTensor(new[] { 64, 128 }, 2);
         var cpuResult = _cpu.TensorAdd(a, b);
-        var gpuResult = _gpu!.TensorAdd(a, b);
+        var gpuResult = Gpu.TensorAdd(a, b);
         AssertTensorsClose(cpuResult, gpuResult);
     }
 
@@ -91,7 +78,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
         var a = RandomTensor(new[] { 64, 128 }, 3);
         var b = RandomTensor(new[] { 64, 128 }, 4);
         var cpuResult = _cpu.TensorMultiply(a, b);
-        var gpuResult = _gpu!.TensorMultiply(a, b);
+        var gpuResult = Gpu.TensorMultiply(a, b);
         AssertTensorsClose(cpuResult, gpuResult);
     }
 
@@ -102,7 +89,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
         var a = RandomTensor(new[] { 64, 128 }, 5);
         var b = RandomTensor(new[] { 64, 128 }, 6);
         var cpuResult = _cpu.TensorSubtract(a, b);
-        var gpuResult = _gpu!.TensorSubtract(a, b);
+        var gpuResult = Gpu.TensorSubtract(a, b);
         AssertTensorsClose(cpuResult, gpuResult);
     }
 
@@ -118,7 +105,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
             bData[i] = (float)(rng.NextDouble() * 1.8 + 0.1); // [0.1, 1.9]
         var b = new Tensor<float>(bData, new[] { 64, 128 });
         var cpuResult = _cpu.TensorDivide(a, b);
-        var gpuResult = _gpu!.TensorDivide(a, b);
+        var gpuResult = Gpu.TensorDivide(a, b);
         AssertTensorsClose(cpuResult, gpuResult, 1e-3f);
     }
 
@@ -132,7 +119,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
         SkipIfNoGpu();
         var input = RandomTensor(new[] { 1024 }, 10);
         var cpuResult = _cpu.TensorSum(input);
-        var gpuResult = _gpu!.TensorSum(input);
+        var gpuResult = Gpu.TensorSum(input);
         AssertClose(cpuResult, gpuResult, 1e-2f); // Reductions have higher tolerance due to order of operations
     }
 
@@ -142,7 +129,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
         SkipIfNoGpu();
         var input = RandomTensor(new[] { 1024 }, 11);
         var cpuResult = _cpu.TensorMean(input);
-        var gpuResult = _gpu!.TensorMean(input);
+        var gpuResult = Gpu.TensorMean(input);
         AssertClose(cpuResult, gpuResult, 1e-3f);
     }
 
@@ -156,7 +143,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
         SkipIfNoGpu();
         var input = RandomTensor(new[] { 256 }, 20);
         var cpuResult = _cpu.TensorExp(input);
-        var gpuResult = _gpu!.TensorExp(input);
+        var gpuResult = Gpu.TensorExp(input);
         AssertTensorsClose(cpuResult, gpuResult, 1e-3f);
     }
 
@@ -171,7 +158,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
             data[i] = (float)(rng.NextDouble() * 9.9 + 0.1); // [0.1, 10]
         var input = new Tensor<float>(data, new[] { 256 });
         var cpuResult = _cpu.TensorLog(input);
-        var gpuResult = _gpu!.TensorLog(input);
+        var gpuResult = Gpu.TensorLog(input);
         AssertTensorsClose(cpuResult, gpuResult, 1e-3f);
     }
 
@@ -181,7 +168,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
         SkipIfNoGpu();
         var input = RandomTensor(new[] { 512 }, 22);
         var cpuResult = _cpu.TensorSigmoid(input);
-        var gpuResult = _gpu!.TensorSigmoid(input);
+        var gpuResult = Gpu.TensorSigmoid(input);
         AssertTensorsClose(cpuResult, gpuResult);
     }
 
@@ -191,7 +178,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
         SkipIfNoGpu();
         var input = RandomTensor(new[] { 512 }, 23);
         var cpuResult = _cpu.TensorTanh(input);
-        var gpuResult = _gpu!.TensorTanh(input);
+        var gpuResult = Gpu.TensorTanh(input);
         AssertTensorsClose(cpuResult, gpuResult);
     }
 
@@ -201,7 +188,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
         SkipIfNoGpu();
         var input = RandomTensor(new[] { 512 }, 24);
         var cpuResult = _cpu.TensorReLU(input);
-        var gpuResult = _gpu!.TensorReLU(input);
+        var gpuResult = Gpu.TensorReLU(input);
         AssertTensorsClose(cpuResult, gpuResult);
     }
 
@@ -211,7 +198,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
         SkipIfNoGpu();
         var input = RandomTensor(new[] { 512 }, 25);
         var cpuResult = _cpu.TensorGELU(input);
-        var gpuResult = _gpu!.TensorGELU(input);
+        var gpuResult = Gpu.TensorGELU(input);
         AssertTensorsClose(cpuResult, gpuResult, 1e-3f);
     }
 
@@ -225,7 +212,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
         SkipIfNoGpu();
         var input = RandomTensor(new[] { 256 }, 30);
         var cpuResult = _cpu.TensorClip(input, -0.5f, 0.5f);
-        var gpuResult = _gpu!.TensorClip(input, -0.5f, 0.5f);
+        var gpuResult = Gpu.TensorClip(input, -0.5f, 0.5f);
         AssertTensorsClose(cpuResult, gpuResult);
     }
 
@@ -240,7 +227,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
             data[i] = (float)(rng.NextDouble() * 4 + 0.1);
         var input = new Tensor<float>(data, new[] { 256 });
         var cpuResult = _cpu.TensorPow(input, 2.5f);
-        var gpuResult = _gpu!.TensorPow(input, 2.5f);
+        var gpuResult = Gpu.TensorPow(input, 2.5f);
         AssertTensorsClose(cpuResult, gpuResult, 1e-2f);
     }
 
@@ -250,7 +237,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
         SkipIfNoGpu();
         var input = new Tensor<float>(new float[] { 1.5f, -2.3f, 3.7f, 0.1f, -0.9f, 4.0f }, new[] { 6 });
         var cpuResult = _cpu.TensorFrac(input);
-        var gpuResult = _gpu!.TensorFrac(input);
+        var gpuResult = Gpu.TensorFrac(input);
         AssertTensorsClose(cpuResult, gpuResult);
     }
 
@@ -259,7 +246,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
     {
         SkipIfNoGpu();
         var cpuResult = _cpu.TensorEye<float>(4);
-        var gpuResult = _gpu!.TensorEye<float>(4);
+        var gpuResult = Gpu.TensorEye<float>(4);
         AssertTensorsClose(cpuResult, gpuResult);
     }
 
@@ -270,7 +257,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
         var a = new Tensor<float>(new float[] { 1, 2, 3, 4 }, new[] { 4 });
         var b = new Tensor<float>(new float[] { 1, 5, 3, 6 }, new[] { 4 });
         var cpuResult = _cpu.TensorEquals(a, b);
-        var gpuResult = _gpu!.TensorEquals(a, b);
+        var gpuResult = Gpu.TensorEquals(a, b);
         AssertTensorsClose(cpuResult, gpuResult);
     }
 
@@ -281,7 +268,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
         var a = new Tensor<float>(new float[] { 1, 2, 3 }, new[] { 3 });
         var b = new Tensor<float>(new float[] { 4, 5 }, new[] { 2 });
         var cpuResult = _cpu.TensorOuter(a, b);
-        var gpuResult = _gpu!.TensorOuter(a, b);
+        var gpuResult = Gpu.TensorOuter(a, b);
         AssertTensorsClose(cpuResult, gpuResult);
     }
 
@@ -292,7 +279,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
         var a = new Vector<float>(new float[] { 1, 2, 3, 4 });
         var b = new Vector<float>(new float[] { 5, 6, 7, 8 });
         var cpuResult = _cpu.DotProduct(a, b);
-        var gpuResult = _gpu!.DotProduct(a, b);
+        var gpuResult = Gpu.DotProduct(a, b);
         AssertClose(cpuResult, gpuResult);
     }
 
@@ -303,7 +290,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
         // GLU splits last dim in half: [batch, 2*dim] -> [batch, dim]
         var input = RandomTensor(new[] { 4, 16 }, 40);
         var cpuResult = _cpu.GLU(input, -1);
-        var gpuResult = _gpu!.GLU(input, -1);
+        var gpuResult = Gpu.GLU(input, -1);
         AssertTensorsClose(cpuResult, gpuResult, 1e-3f);
     }
 
@@ -313,7 +300,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
         SkipIfNoGpu();
         var input = RandomTensor(new[] { 4, 16 }, 41);
         var cpuResult = _cpu.GeGLU(input, -1);
-        var gpuResult = _gpu!.GeGLU(input, -1);
+        var gpuResult = Gpu.GeGLU(input, -1);
         AssertTensorsClose(cpuResult, gpuResult, 1e-3f);
     }
 
@@ -335,7 +322,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
             for (int j = 0; j < 6; j++)
                 b[i, j] = (float)(rng.NextDouble() * 2 - 1);
         var cpuResult = _cpu.MatrixMultiply(a, b);
-        var gpuResult = _gpu!.MatrixMultiply(a, b);
+        var gpuResult = Gpu.MatrixMultiply(a, b);
         for (int i = 0; i < 4; i++)
             for (int j = 0; j < 6; j++)
                 AssertClose(cpuResult[i, j], gpuResult[i, j], 1e-3f);
@@ -355,7 +342,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
                 b[i, j] = (float)(rng.NextDouble() * 2 - 1);
             }
         var cpuResult = _cpu.MatrixAdd(a, b);
-        var gpuResult = _gpu!.MatrixAdd(a, b);
+        var gpuResult = Gpu.MatrixAdd(a, b);
         for (int i = 0; i < 4; i++)
             for (int j = 0; j < 8; j++)
                 AssertClose(cpuResult[i, j], gpuResult[i, j]);
@@ -371,7 +358,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
         SkipIfNoGpu();
         var input = RandomTensor(new[] { 4, 32 }, 60);
         var cpuResult = _cpu.Softmax(input, -1);
-        var gpuResult = _gpu!.Softmax(input, -1);
+        var gpuResult = Gpu.Softmax(input, -1);
         AssertTensorsClose(cpuResult, gpuResult, 1e-3f);
     }
 
@@ -387,7 +374,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
         var gamma = new Tensor<float>(new float[] { 1, 1, 1, 1 }, new[] { 4 });
         var beta = new Tensor<float>(new float[] { 0, 0, 0, 0 }, new[] { 4 });
         var cpuResult = _cpu.BatchNorm(input, gamma, beta, 1e-5, out _, out _);
-        var gpuResult = _gpu!.BatchNorm(input, gamma, beta, 1e-5, out _, out _);
+        var gpuResult = Gpu.BatchNorm(input, gamma, beta, 1e-5, out _, out _);
         AssertTensorsClose(cpuResult, gpuResult, 1e-3f);
     }
 
@@ -402,7 +389,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
         var input = RandomTensor(new[] { 1, 3, 8, 8 }, 80);
         var kernel = RandomTensor(new[] { 16, 3, 3, 3 }, 81);
         var cpuResult = _cpu.Conv2D(input, kernel, 1, 1, 1);
-        var gpuResult = _gpu!.Conv2D(input, kernel, 1, 1, 1);
+        var gpuResult = Gpu.Conv2D(input, kernel, 1, 1, 1);
         AssertTensorsClose(cpuResult, gpuResult, 1e-2f);
     }
 
@@ -417,7 +404,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
         var a = RandomTensor(new[] { 1, 64, 32, 32 }, 90);
         var b = RandomTensor(new[] { 1, 64, 32, 32 }, 91);
         var cpuResult = _cpu.TensorAdd(a, b);
-        var gpuResult = _gpu!.TensorAdd(a, b);
+        var gpuResult = Gpu.TensorAdd(a, b);
         AssertTensorsClose(cpuResult, gpuResult);
     }
 
@@ -431,7 +418,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
         SkipIfNoGpu();
         var input = RandomTensor(new[] { 256 }, 100);
         var cpuResult = _cpu.TensorAddScalar(input, 3.14f);
-        var gpuResult = _gpu!.TensorAddScalar(input, 3.14f);
+        var gpuResult = Gpu.TensorAddScalar(input, 3.14f);
         AssertTensorsClose(cpuResult, gpuResult);
     }
 
@@ -442,7 +429,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
         var a = RandomTensor(new[] { 4, 8 }, 101);
         var b = RandomTensor(new[] { 1, 8 }, 102);
         var cpuResult = _cpu.TensorMultiply(a, b);
-        var gpuResult = _gpu!.TensorMultiply(a, b);
+        var gpuResult = Gpu.TensorMultiply(a, b);
         AssertTensorsClose(cpuResult, gpuResult);
     }
 
@@ -452,7 +439,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
         SkipIfNoGpu();
         var input = RandomTensor(new[] { 256 }, 103);
         var cpuResult = _cpu.TensorSiLU(input);
-        var gpuResult = _gpu!.TensorSiLU(input);
+        var gpuResult = Gpu.TensorSiLU(input);
         AssertTensorsClose(cpuResult, gpuResult, 1e-3f);
     }
 
@@ -462,7 +449,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
         SkipIfNoGpu();
         var input = RandomTensor(new[] { 256 }, 104);
         var cpuResult = _cpu.TensorMish(input);
-        var gpuResult = _gpu!.TensorMish(input);
+        var gpuResult = Gpu.TensorMish(input);
         AssertTensorsClose(cpuResult, gpuResult, 1e-3f);
     }
 
@@ -472,7 +459,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
         SkipIfNoGpu();
         var diag = new Tensor<float>(new float[] { 1, 2, 3, 4 }, new[] { 4 });
         var cpuResult = _cpu.TensorDiag(diag);
-        var gpuResult = _gpu!.TensorDiag(diag);
+        var gpuResult = Gpu.TensorDiag(diag);
         AssertTensorsClose(cpuResult, gpuResult);
     }
 
@@ -481,7 +468,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
     {
         SkipIfNoGpu();
         var cpuResult = _cpu.TensorLinspace(0f, 10f, 100);
-        var gpuResult = _gpu!.TensorLinspace(0f, 10f, 100);
+        var gpuResult = Gpu.TensorLinspace(0f, 10f, 100);
         AssertTensorsClose(cpuResult, gpuResult);
     }
 
@@ -491,7 +478,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
         SkipIfNoGpu();
         var input = RandomTensor(new[] { 4, 64 }, 106);
         var cpuResult = _cpu.ReduceSum(input, new[] { 1 }, false);
-        var gpuResult = _gpu!.ReduceSum(input, new[] { 1 }, false);
+        var gpuResult = Gpu.ReduceSum(input, new[] { 1 }, false);
         AssertTensorsClose(cpuResult, gpuResult, 1e-2f);
     }
 
@@ -501,7 +488,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
         SkipIfNoGpu();
         var input = RandomTensor(new[] { 4, 64 }, 107);
         var cpuResult = _cpu.ReduceMean(input, new[] { 1 }, false);
-        var gpuResult = _gpu!.ReduceMean(input, new[] { 1 }, false);
+        var gpuResult = Gpu.ReduceMean(input, new[] { 1 }, false);
         AssertTensorsClose(cpuResult, gpuResult, 1e-3f);
     }
 
@@ -511,7 +498,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
         SkipIfNoGpu();
         var input = RandomTensor(new[] { 1, 3, 8, 8 }, 108);
         var cpuResult = _cpu.Pad(input, 1, 1, 1, 1, 0f);
-        var gpuResult = _gpu!.Pad(input, 1, 1, 1, 1, 0f);
+        var gpuResult = Gpu.Pad(input, 1, 1, 1, 1, 0f);
         AssertTensorsClose(cpuResult, gpuResult);
     }
 
@@ -521,7 +508,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
         SkipIfNoGpu();
         var input = RandomTensor(new[] { 256 }, 109);
         var cpuResult = _cpu.TensorSumOfSquares(input);
-        var gpuResult = _gpu!.TensorSumOfSquares(input);
+        var gpuResult = Gpu.TensorSumOfSquares(input);
         AssertClose(cpuResult, gpuResult, 1e-1f);
     }
 
@@ -530,7 +517,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
     {
         SkipIfNoGpu();
         var cpuResult = _cpu.TensorTriangularMask<float>(8, true, 0);
-        var gpuResult = _gpu!.TensorTriangularMask<float>(8, true, 0);
+        var gpuResult = Gpu.TensorTriangularMask<float>(8, true, 0);
         AssertTensorsClose(cpuResult, gpuResult);
     }
 
@@ -544,7 +531,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
         SkipIfNoGpu();
         var input = RandomTensor(new[] { 4, 32 }, 110);
         var cpuResult = _cpu.TensorSoftmax(input, -1);
-        var gpuResult = _gpu!.TensorSoftmax(input, -1);
+        var gpuResult = Gpu.TensorSoftmax(input, -1);
         AssertTensorsClose(cpuResult, gpuResult, 1e-3f);
     }
 
@@ -554,7 +541,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
         SkipIfNoGpu();
         var input = RandomTensor(new[] { 4, 32 }, 111);
         var cpuResult = _cpu.TensorLogSoftmax(input, -1);
-        var gpuResult = _gpu!.TensorLogSoftmax(input, -1);
+        var gpuResult = Gpu.TensorLogSoftmax(input, -1);
         AssertTensorsClose(cpuResult, gpuResult, 1e-3f);
     }
 
@@ -565,7 +552,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
         var a = RandomTensor(new[] { 8, 16 }, 112);
         var b = RandomTensor(new[] { 1, 16 }, 113);
         var cpuResult = _cpu.TensorAdd(a, b);
-        var gpuResult = _gpu!.TensorAdd(a, b);
+        var gpuResult = Gpu.TensorAdd(a, b);
         AssertTensorsClose(cpuResult, gpuResult);
     }
 
@@ -575,7 +562,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
         SkipIfNoGpu();
         var input = RandomTensor(new[] { 4, 8 }, 114);
         var cpuResult = _cpu.TensorCumSum(input, 1);
-        var gpuResult = _gpu!.TensorCumSum(input, 1);
+        var gpuResult = Gpu.TensorCumSum(input, 1);
         AssertTensorsClose(cpuResult, gpuResult, 1e-3f);
     }
 
@@ -583,7 +570,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
     public void TensorRandomUniform_HasCorrectShape()
     {
         SkipIfNoGpu();
-        var result = _gpu!.TensorRandomUniform<float>(new[] { 4, 8 });
+        var result = Gpu.TensorRandomUniform<float>(new[] { 4, 8 });
         Assert.Equal(new[] { 4, 8 }, result.Shape.ToArray());
         Assert.Equal(32, result.Length);
         // Values should be in [0, 1)
@@ -600,7 +587,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
         SkipIfNoGpu();
         var input = RandomTensor(new[] { 4, 8, 16 }, 116);
         var cpuResult = _cpu.ReduceSum(input, new[] { 2 }, false);
-        var gpuResult = _gpu!.ReduceSum(input, new[] { 2 }, false);
+        var gpuResult = Gpu.ReduceSum(input, new[] { 2 }, false);
         AssertTensorsClose(cpuResult, gpuResult, 1e-2f);
     }
 
@@ -610,7 +597,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
         SkipIfNoGpu();
         var input = RandomTensor(new[] { 1, 3, 4, 4 }, 117);
         var cpuResult = _cpu.Upsample(input, 2, 2);
-        var gpuResult = _gpu!.Upsample(input, 2, 2);
+        var gpuResult = Gpu.Upsample(input, 2, 2);
         AssertTensorsClose(cpuResult, gpuResult);
     }
 
@@ -620,7 +607,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
         SkipIfNoGpu();
         var input = RandomTensor(new[] { 1, 12, 4, 4 }, 118); // 12 = 3 * 2^2
         var cpuResult = _cpu.PixelShuffle(input, 2);
-        var gpuResult = _gpu!.PixelShuffle(input, 2);
+        var gpuResult = Gpu.PixelShuffle(input, 2);
         AssertTensorsClose(cpuResult, gpuResult);
     }
 
@@ -631,7 +618,7 @@ public class GpuFusedKernelCorrectnessTests : IDisposable
         var a = RandomTensor(new[] { 2, 4, 8 }, 119);
         var b = RandomTensor(new[] { 2, 8, 6 }, 120);
         var cpuResult = _cpu.TensorBatchMatMul(a, b);
-        var gpuResult = _gpu!.TensorBatchMatMul(a, b);
+        var gpuResult = Gpu.TensorBatchMatMul(a, b);
         AssertTensorsClose(cpuResult, gpuResult, 1e-2f);
     }
 

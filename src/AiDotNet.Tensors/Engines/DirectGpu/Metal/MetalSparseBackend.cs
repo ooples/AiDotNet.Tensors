@@ -32,22 +32,6 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal
         /// <summary>True when Metal is available on this host (macOS + Metal-compatible GPU).</summary>
         public static bool IsAvailable => MetalNativeBindings.IsPlatformSupported;
 
-        // The buffer pool may hand back a buffer physically LARGER than requested;
-        // DownloadBuffer copies the buffer's physical element count, which would
-        // overflow a snug destination. Download into a buffer-sized scratch and
-        // copy back exactly the logical elements. Mirrors OpenClSparseBackend.DownloadExact.
-        private static void DownloadExact(MetalBackend backend, IGpuBuffer buffer, float[] destination)
-        {
-            if (buffer.Size == destination.Length)
-            {
-                backend.DownloadBuffer(buffer, destination);
-                return;
-            }
-            var scratch = new float[buffer.Size];
-            backend.DownloadBuffer(buffer, scratch);
-            Array.Copy(scratch, destination, destination.Length);
-        }
-
         private static MetalBackend GetOrCreate()
         {
             var existing = _cached;
@@ -101,7 +85,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal
                 backend.CsrSpMM(valuesBuf, colIdxBuf, rowPtrBuf, bBuf, outBuf,
                     rows, cols, n, values.Length);
 
-                DownloadExact(backend, outBuf, output);
+                backend.DownloadBuffer(outBuf, output);
                 return output;
             }
             finally
@@ -143,7 +127,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal
 
                 backend.CsrSddmm(rowBuf, colBuf, xBuf, yBuf, outBuf, nnz, innerK);
 
-                DownloadExact(backend, outBuf, output);
+                backend.DownloadBuffer(outBuf, output);
                 return output;
             }
             finally

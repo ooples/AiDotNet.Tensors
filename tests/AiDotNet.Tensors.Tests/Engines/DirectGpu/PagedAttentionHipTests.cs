@@ -12,29 +12,28 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 [Collection("DirectGpuSerial")]
-public sealed class PagedAttentionHipTests : IDisposable
+public sealed class PagedAttentionHipTests : IClassFixture<HipBackendTestFixture>
 {
-    private readonly HipBackend? _backend;
-    private readonly bool _ready;
+    private readonly HipBackendTestFixture _fixture;
+    private bool IsReady => _fixture.IsAvailable;
+    private HipBackend Backend => _fixture.Backend ?? throw new InvalidOperationException(
+        "HIP backend was not initialized.", _fixture.InitializationException);
 
-    public PagedAttentionHipTests()
+    public PagedAttentionHipTests(HipBackendTestFixture fixture)
     {
-        try { _backend = new HipBackend(); _ready = _backend.IsAvailable; }
-        catch { _ready = false; }
+        _fixture = fixture;
     }
-
-    public void Dispose() => _backend?.Dispose();
 
     [Fact]
     public void Probe_HipAvailability()
     {
         if (Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_HIP") != "1") return;
-        Assert.True(_ready, "HIP/ROCm backend NOT available on this host");
+        Assert.True(IsReady, "HIP/ROCm backend NOT available on this host");
     }
 
     private bool EnsureReady()
     {
-        if (_ready) return true;
+        if (IsReady) return true;
         if (string.Equals(Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_HIP"), "1", StringComparison.Ordinal))
             throw new InvalidOperationException("GPU tests required but HIP/ROCm was unavailable.");
         return false;
@@ -47,7 +46,7 @@ public sealed class PagedAttentionHipTests : IDisposable
     public void PagedAttentionDecode_MatchesCpuOracle(int heads, int headDim, int blockSize, int seqLen)
     {
         if (!EnsureReady()) return;
-        var backend = _backend!;
+        var backend = Backend;
         var rng = new Random(0xA77 + heads + seqLen);
 
         int numLogicalBlocks = (seqLen + blockSize - 1) / blockSize;
@@ -125,7 +124,7 @@ public sealed class PagedAttentionHipTests : IDisposable
     public void PagedAttentionPrefill_MatchesCpuOracle(int heads, int headDim, int blockSize, int numQueries, int startPos)
     {
         if (!EnsureReady()) return;
-        var backend = _backend!;
+        var backend = Backend;
         var rng = new Random(0xB99 + heads + numQueries + startPos);
 
         int maxKeyLen = startPos + numQueries;
@@ -209,7 +208,7 @@ public sealed class PagedAttentionHipTests : IDisposable
     public void PagedAttentionDecodeGqa_MatchesCpuOracle(int heads, int kvHeads, int headDim, int blockSize, int seqLen)
     {
         if (!EnsureReady()) return;
-        var backend = _backend!;
+        var backend = Backend;
         var rng = new Random(0xC55 + heads + kvHeads + seqLen);
         int numLogicalBlocks = (seqLen + blockSize - 1) / blockSize;
         int maxBlocks = numLogicalBlocks + 5;
@@ -282,7 +281,7 @@ public sealed class PagedAttentionHipTests : IDisposable
     public void PagedAttentionPrefillGqa_MatchesCpuOracle(int heads, int kvHeads, int headDim, int blockSize, int numQueries, int startPos)
     {
         if (!EnsureReady()) return;
-        var backend = _backend!;
+        var backend = Backend;
         var rng = new Random(0xD66 + heads + kvHeads + numQueries + startPos);
         int maxKeyLen = startPos + numQueries;
         int numLogicalBlocks = (maxKeyLen + blockSize - 1) / blockSize;

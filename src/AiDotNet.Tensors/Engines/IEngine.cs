@@ -6070,7 +6070,7 @@ public interface IEngine
 
     /// <summary>Gradient of <see cref="ForwardSplat{T}"/> with respect to its flow.</summary>
     Tensor<T> ForwardSplatBackwardFlow<T>(
-        Tensor<T> gradOutput, Tensor<T> input, Tensor<T> flow, Tensor<T> output,
+        Tensor<T> gradOutput, Tensor<T> input, Tensor<T> flow, Tensor<T>? output,
         bool normalize = true);
 
     /// <summary>

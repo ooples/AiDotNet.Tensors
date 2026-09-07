@@ -4603,9 +4603,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             writeA = !writeA;
         }
 
-        // DownloadBuffer intentionally requires a destination large enough for the buffer's physical
-        // capacity. A reduction's logical size can be one while its scratch buffer is larger, so make
-        // the final device value live in an exact one-element allocation before reading it back.
+        // DownloadBuffer copies the allocation's logical extent. Reduction scratch buffers retain
+        // their maximum partial-count extent, so make the final value live in a one-element logical
+        // allocation before reading it back.
         if (current.Handle != scalarResult.Handle)
             Copy(current, scalarResult, 1);
 
@@ -18165,9 +18165,11 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         private readonly Action<CudaGpuBuffer>? _returnToPool;
         private readonly IntPtr _asyncFreeStream; // non-zero ⇒ free via cuMemFreeAsync on this stream (#558 layer 6)
         private int _poolState;
+        private int _size;
 
-        public int Size { get; }
-        public long SizeInBytes { get; }
+        public int Size => Volatile.Read(ref _size);
+        public int Capacity { get; }
+        public long SizeInBytes => (long)Size * sizeof(float);
         public IntPtr Handle => _devicePtr;
         internal bool IsAsyncFreed => _asyncFreeStream != IntPtr.Zero;
 
@@ -18176,14 +18178,17 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         {
             _context = context;
             _devicePtr = devicePtr;
-            Size = size;
-            SizeInBytes = (long)size * sizeof(float);
+            _size = size;
+            Capacity = size;
             _returnToPool = returnToPool;
             _asyncFreeStream = asyncFreeStream;
         }
 
-        public void MarkRented()
+        public void MarkRented(int size)
         {
+            if (size <= 0 || size > Capacity)
+                throw new ArgumentOutOfRangeException(nameof(size));
+            Volatile.Write(ref _size, size);
             Interlocked.Exchange(ref _poolState, 0);
         }
 

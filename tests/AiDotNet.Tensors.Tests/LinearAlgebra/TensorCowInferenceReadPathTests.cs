@@ -51,6 +51,12 @@ public class TensorCowInferenceReadPathTests
         InstanceNorm
     }
 
+    public enum ChannelBiasGradientTarget
+    {
+        Input,
+        Bias
+    }
+
     private static readonly CpuEngine Engine = new CpuEngine();
 
     private static Tensor<float> Filled(int[] shape, int seed)
@@ -795,6 +801,30 @@ public class TensorCowInferenceReadPathTests
     }
 
     [Fact]
+    public void ChannelBiasAdd_ThirdPartyEngineFallbackSupportsCompiledReplay()
+    {
+        IEngine proxy = DispatchProxy.Create<IEngine, ForwardingEngineProxy>();
+        var forwarding = (ForwardingEngineProxy)(object)proxy;
+        forwarding.Inner = new CpuEngine();
+        var input = Filled(new[] { 2, 4, 3, 5 }, 4120);
+        var bias = Filled(new[] { 4 }, 4130);
+        var expected = Engine.TensorChannelBiasAdd(input, bias);
+
+        CompiledInferencePlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            proxy.TensorChannelBiasAdd(input, bias);
+            plan = scope.CompileInference<float>();
+        }
+
+        using (plan)
+        using (var actual = plan.Execute())
+        {
+            AssertClose(expected, actual);
+        }
+    }
+
+    [Fact]
     public void FusedConv2D_CompiledCaptureDoesNotRetainParameterViews()
     {
         var input = Filled(new[] { 1, 2, 5, 5 }, 4140);
@@ -845,6 +875,40 @@ public class TensorCowInferenceReadPathTests
             Assert.Equal(1f, value);
         foreach (float value in gradients[bias].ToArray())
             Assert.Equal(16f, value);
+    }
+
+    [Theory]
+    [InlineData(ChannelBiasGradientTarget.Input, 0)]
+    [InlineData(ChannelBiasGradientTarget.Bias, 1)]
+    public void ChannelBiasAdd_BackwardOnlyReducesWhenBiasGradientIsRequested(
+        ChannelBiasGradientTarget target,
+        int expectedBackwardReductionCount)
+    {
+        var engine = new ReduceSumCountingEngine();
+        var input = Filled(new[] { 2, 3, 2, 4 }, 4170);
+        var bias = Filled(new[] { 3 }, 4180);
+        var source = target switch
+        {
+            ChannelBiasGradientTarget.Input => input,
+            ChannelBiasGradientTarget.Bias => bias,
+            _ => throw new ArgumentOutOfRangeException(nameof(target))
+        };
+
+        Dictionary<Tensor<float>, Tensor<float>> gradients;
+        using (var tape = new GradientTape<float>())
+        {
+            Tensor<float> channelInput = input;
+            for (int i = 0; i < 105; i++)
+                channelInput = engine.TensorMultiplyScalar(channelInput, 1f);
+            var output = engine.TensorChannelBiasAdd(channelInput, bias);
+            var loss = engine.ReduceSum(output, null);
+            engine.ResetReduceSumCallCount();
+            gradients = tape.ComputeGradients(loss, new[] { source });
+        }
+
+        Assert.Equal(expectedBackwardReductionCount, engine.ReduceSumCallCount);
+        Assert.Single(gradients);
+        Assert.True(gradients.ContainsKey(source));
     }
 
     [SkippableFact]
@@ -985,6 +1049,22 @@ public class TensorCowInferenceReadPathTests
                 ExceptionDispatchInfo.Capture(exception.InnerException).Throw();
                 throw;
             }
+        }
+    }
+
+    private sealed class ReduceSumCountingEngine : CpuEngine
+    {
+        internal int ReduceSumCallCount { get; private set; }
+
+        internal void ResetReduceSumCallCount()
+        {
+            ReduceSumCallCount = 0;
+        }
+
+        public override Tensor<T> ReduceSum<T>(Tensor<T> tensor, int[]? axes = null, bool keepDims = false)
+        {
+            ReduceSumCallCount++;
+            return base.ReduceSum(tensor, axes, keepDims);
         }
     }
 }

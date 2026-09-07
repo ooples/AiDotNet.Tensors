@@ -15,27 +15,20 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 [Collection("DirectGpuSerial")]
-public sealed class RopeGqaOpenClTests : IDisposable
+public sealed class RopeGqaOpenClTests : IClassFixture<OpenClBackendTestFixture>
 {
     private readonly OpenClBackend? _backend;
     private readonly bool _ready;
     private readonly Exception? _initException;
 
-    public RopeGqaOpenClTests()
+    public RopeGqaOpenClTests(OpenClBackendTestFixture fixture)
     {
-        try
-        {
-            _backend = new OpenClBackend();
-            _ready = _backend.IsAvailable;
-        }
-        catch (Exception ex)
-        {
-            _initException = ex;
-            _ready = false;
-        }
+        _backend = fixture.Backend;
+        _initException = fixture.InitializationException;
+        _ready = fixture.IsAvailable;
     }
 
-    public void Dispose() => _backend?.Dispose();
+    private OpenClBackend Backend => _backend ?? throw new InvalidOperationException("OpenCL backend is unavailable.");
 
     private bool EnsureReady()
     {
@@ -95,7 +88,7 @@ public sealed class RopeGqaOpenClTests : IDisposable
     public void RopeInterleaved_MatchesCpuReference(int startPosition)
     {
         if (!EnsureReady()) return;
-        var backend = _backend!;
+        var backend = Backend;
 
         const int heads = 3, seqLen = 6, headDim = 8, maxSeq = 32;
         int rows = heads * seqLen; // single batch: leading (heads) * seqLen
@@ -284,7 +277,7 @@ public sealed class RopeGqaOpenClTests : IDisposable
     public void GqaScaledDotProductAttention_MatchesCpuReference(bool causal)
     {
         if (!EnsureReady()) return;
-        var backend = _backend!;
+        var backend = Backend;
 
         // SmolLM2-style ratio: 9 query heads share 3 KV heads (group of 3).
         const int batch = 1, qHeads = 6, kvHeads = 2, seqQ = 5, seqK = 5, headDim = 8;
@@ -328,7 +321,7 @@ public sealed class RopeGqaOpenClTests : IDisposable
     public void GqaWithEqualHeads_EqualsStandardAttention()
     {
         if (!EnsureReady()) return;
-        var backend = _backend!;
+        var backend = Backend;
 
         const int batch = 1, heads = 4, seqQ = 4, seqK = 4, headDim = 8;
         float scale = 1f / (float)Math.Sqrt(headDim);

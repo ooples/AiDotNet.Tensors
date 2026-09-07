@@ -1,11 +1,16 @@
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Threading;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu;
 
 internal interface IPoolableGpuBuffer
 {
-    void MarkRented();
+    /// <summary>Gets the physical allocation capacity in elements.</summary>
+    int Capacity { get; }
+
+    /// <summary>Marks the allocation as rented for the requested logical element count.</summary>
+    void MarkRented(int size);
     void Release();
 }
 
@@ -85,27 +90,46 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
         // Use power-of-two bucket key for higher cache hit rate
         int bucketKey = NextPowerOfTwo(size);
         if (_buckets.TryGetValue(bucketKey, out var bucket)
-            && bucket.Buffers.TryGetValue(affinity, out var affinityBuffers)
-            && affinityBuffers.TryTake(out var candidate))
+            && bucket.Buffers.TryGetValue(affinity, out var affinityBuffers))
         {
-            // Verify the pooled buffer's actual allocation is large enough.
-            // Power-of-two bucketing can match a smaller buffer (e.g., 6272 → bucket 8192)
-            // with a larger request (e.g., 8192 → bucket 8192).
-            if (candidate.Size < size)
+            List<TBuffer>? undersized = null;
+            while (affinityBuffers.TryTake(out var candidate))
             {
-                // Return the too-small buffer to the pool (count stays consistent since
-                // we took one out and are putting the same one back)
-                affinityBuffers.Add(candidate);
-                return false;
+                Interlocked.Decrement(ref bucket.Count);
+
+                // Power-of-two bucketing can contain different physical capacities (for example,
+                // both 6272 and 8192 elements in bucket 8192). Keep searching instead of turning
+                // an undersized top entry into a false miss when a sufficient entry is also pooled.
+                if (candidate.Capacity < size)
+                {
+                    (undersized ??= new List<TBuffer>()).Add(candidate);
+                    continue;
+                }
+
+                RestoreUndersizedCandidates(undersized, affinity);
+                candidate.MarkRented(size);
+                buffer = candidate;
+                return true;
             }
 
-            Interlocked.Decrement(ref bucket.Count);
-            candidate.MarkRented();
-            buffer = candidate;
-            return true;
+            RestoreUndersizedCandidates(undersized, affinity);
         }
 
         return false;
+    }
+
+    private void RestoreUndersizedCandidates(
+        List<TBuffer>? candidates,
+        GpuBufferPoolAffinity affinity)
+    {
+        if (candidates is null)
+            return;
+
+        // Re-enter through Return so disposal, maximum-size checks, and capacity accounting remain
+        // atomic with the lifecycle gate. Adding directly to the bag could race Dispose and orphan
+        // an allocation in a bucket that has already been removed.
+        foreach (TBuffer candidate in candidates)
+            Return(candidate, affinity);
     }
 
     public void Return(TBuffer buffer)
@@ -113,7 +137,7 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
 
     public void Return(TBuffer buffer, GpuBufferPoolAffinity affinity)
     {
-        if (Volatile.Read(ref _disposed) != 0 || buffer.Size > _maxSize)
+        if (Volatile.Read(ref _disposed) != 0 || buffer.Capacity > _maxSize)
         {
             buffer.Release();
             return;
@@ -130,7 +154,7 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
             // Keep bucket creation, capacity accounting, and insertion atomic with Dispose's drain.
             // Otherwise Dispose can clear the dictionary between GetOrAdd and Add, orphaning a live
             // device buffer in a bucket that is no longer reachable.
-            int bucketKey = NextPowerOfTwo(buffer.Size);
+            int bucketKey = NextPowerOfTwo(buffer.Capacity);
             var bucket = _buckets.GetOrAdd(bucketKey, _ => new Bucket());
             int count = Interlocked.Increment(ref bucket.Count);
             if (count > _maxPerSize)

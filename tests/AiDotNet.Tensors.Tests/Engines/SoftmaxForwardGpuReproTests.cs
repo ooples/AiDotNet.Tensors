@@ -6,6 +6,7 @@ using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.Gpu;
 using AiDotNet.Tensors.Engines.Gpu.Graph;
 using AiDotNet.Tensors.LinearAlgebra;
+using AiDotNet.Tensors.Tests.Engines.DirectGpu;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -21,10 +22,21 @@ namespace AiDotNet.Tensors.Tests.Engines;
 /// reference. Run on native Windows so the OpenCL GPU engages.
 /// </summary>
 [Collection("DirectGpuSerial")]
-public class SoftmaxForwardGpuReproTests
+public class SoftmaxForwardGpuReproTests :
+    IClassFixture<DirectGpuTensorEngineTestFixture>
 {
     private readonly ITestOutputHelper _out;
-    public SoftmaxForwardGpuReproTests(ITestOutputHelper outp) => _out = outp;
+    private readonly DirectGpuTensorEngineTestFixture _fixture;
+    private DirectGpuTensorEngine Gpu => _fixture.Engine ?? throw new InvalidOperationException(
+        "Direct GPU engine was not initialized.", _fixture.InitializationException);
+
+    public SoftmaxForwardGpuReproTests(
+        ITestOutputHelper outp,
+        DirectGpuTensorEngineTestFixture fixture)
+    {
+        _out = outp;
+        _fixture = fixture;
+    }
 
     private const int InF = 4, OutF = 4;
 
@@ -92,7 +104,7 @@ public class SoftmaxForwardGpuReproTests
     [InlineData(2)]
     public void FusedLinearSoftmax_IsValidDistribution(int batch)
     {
-        using var engine = new DirectGpuTensorEngine();
+        var engine = Gpu;
         Skip.IfNot(engine.SupportsGpu, "No GPU backend available (expected on WSL/CPU-only hosts).");
         _out.WriteLine($"Engine: {engine.Name}   batch={batch}");
 
@@ -124,7 +136,7 @@ public class SoftmaxForwardGpuReproTests
     [InlineData(2)]
     public void FusedGemmBiasActivationAsyncSoftmax_IsValidDistribution(int batch)
     {
-        using var engine = new DirectGpuTensorEngine();
+        var engine = Gpu;
         Skip.IfNot(engine.SupportsGpu, "No GPU backend available (expected on WSL/CPU-only hosts).");
         var backend = engine.GetBackend();
         Skip.IfNot(backend is IAsyncGpuBackend, "Backend is not async-capable.");
@@ -169,7 +181,7 @@ public class SoftmaxForwardGpuReproTests
     [InlineData(2)]
     public void FusedGemmBiasActivationAsyncSoftmax_HonorsNonDefaultStream(int batch)
     {
-        using var engine = new DirectGpuTensorEngine();
+        var engine = Gpu;
         Skip.IfNot(engine.SupportsGpu, "No GPU backend available (expected on WSL/CPU-only hosts).");
         var backend = engine.GetBackend();
         Skip.IfNot(backend is IAsyncGpuBackend, "Backend is not async-capable.");
@@ -232,7 +244,7 @@ public class SoftmaxForwardGpuReproTests
     [InlineData(2)]
     public void DeferredGraph_FusedLinearSoftmax_AsyncFusedRoute_IsValidDistribution(int batch)
     {
-        using var engine = new DirectGpuTensorEngine();
+        var engine = Gpu;
         Skip.IfNot(engine.SupportsGpu, "No GPU backend available (expected on WSL/CPU-only hosts).");
         var backend = engine.GetBackend();
         Skip.IfNot(backend is IAsyncGpuBackend, "Async fused graph route requires an IAsyncGpuBackend (CUDA/HIP/OpenCL).");
@@ -272,7 +284,7 @@ public class SoftmaxForwardGpuReproTests
     [InlineData(2)]
     public void DeferredGraph_FusedLinearSoftmax_SeparateNodeRoute_IsValidDistribution(int batch)
     {
-        using var engine = new DirectGpuTensorEngine();
+        var engine = Gpu;
         Skip.IfNot(engine.SupportsGpu, "No GPU backend available (expected on WSL/CPU-only hosts).");
         var backend = engine.GetBackend();
         Skip.If(backend is IAsyncGpuBackend,

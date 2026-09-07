@@ -13,22 +13,19 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// and the engine falls through to CpuEngine.
 /// </summary>
 [Collection("VulkanGlobalState")]
-public class GeometryGpuParityTests : IDisposable
+public class GeometryGpuParityTests : IClassFixture<DirectGpuTensorEngineTestFixture>
 {
-    private readonly DirectGpuTensorEngine? _gpu;
+    private readonly DirectGpuTensorEngineTestFixture _fixture;
     private readonly CpuEngine _cpu = new();
     private readonly bool _gpuAvailable;
     private const float Tolerance = 1e-3f;
+    private DirectGpuTensorEngine Gpu => _fixture.Engine ?? throw new InvalidOperationException(
+        "Direct GPU engine was not initialized.", _fixture.InitializationException);
 
-    public GeometryGpuParityTests()
+    public GeometryGpuParityTests(DirectGpuTensorEngineTestFixture fixture)
     {
-        try
-        {
-            _gpu = new DirectGpuTensorEngine();
-            _gpuAvailable = _gpu.IsGpuAvailable && BackendImplementsGeometry();
-        }
-        catch (PlatformNotSupportedException) { _gpuAvailable = false; }
-        catch (System.DllNotFoundException) { _gpuAvailable = false; }
+        _fixture = fixture;
+        _gpuAvailable = fixture.IsAvailable && BackendImplementsGeometry();
     }
 
     private bool BackendImplementsGeometry()
@@ -38,12 +35,10 @@ public class GeometryGpuParityTests : IDisposable
         var directGpuField = typeof(DirectGpuTensorEngine).GetField(
             "_directGpu",
             System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
-        var directGpu = directGpuField?.GetValue(_gpu);
+        var directGpu = directGpuField?.GetValue(_fixture.Engine);
         var backend = directGpu?.GetType().GetProperty("Backend")?.GetValue(directGpu);
         return backend is IGeometryBackend;
     }
-
-    public void Dispose() => (_gpu as IDisposable)?.Dispose();
 
     private void SkipIfUnavailable() => Skip.If(!_gpuAvailable,
         "GPU backend without IGeometryBackend support — CPU fallback is exercised by GeometryOpsTests instead.");
@@ -89,7 +84,7 @@ public class GeometryGpuParityTests : IDisposable
     {
         SkipIfUnavailable();
         var input = Rand4D(1, 2, 3, 8, 10);
-        var g = _gpu!.Interpolate(input, new[] { 12, 15 }, mode, alignCorners);
+        var g = Gpu.Interpolate(input, new[] { 12, 15 }, mode, alignCorners);
         var c = _cpu.Interpolate(input, new[] { 12, 15 }, mode, alignCorners);
         AssertClose(g, c);
     }
@@ -104,7 +99,7 @@ public class GeometryGpuParityTests : IDisposable
         SkipIfUnavailable();
         var input = Rand4D(2, 1, 2, 4, 5);
         int[] pad = { 1, 2, 1, 1, 0, 0, 0, 0 };
-        var g = _gpu!.PadNd(input, pad, mode, 0.5f);
+        var g = Gpu.PadNd(input, pad, mode, 0.5f);
         var c = _cpu.PadNd(input, pad, mode, 0.5f);
         AssertClose(g, c);
     }
@@ -119,7 +114,7 @@ public class GeometryGpuParityTests : IDisposable
         var gridData = new float[1 * 3 * 3 * 2];
         for (int i = 0; i < gridData.Length; i++) gridData[i] = (float)(rng.NextDouble() * 2 - 1);
         var grid = new Tensor<float>(gridData, new[] { 1, 3, 3, 2 });
-        var g = _gpu!.GridSample(input, grid, GridSampleMode.Bilinear, GridSamplePadding.Zeros, false);
+        var g = Gpu.GridSample(input, grid, GridSampleMode.Bilinear, GridSamplePadding.Zeros, false);
         var c = _cpu.GridSample(input, grid, GridSampleMode.Bilinear, GridSamplePadding.Zeros, false);
         AssertClose(g, c);
     }
@@ -132,7 +127,7 @@ public class GeometryGpuParityTests : IDisposable
         var t = new float[1 * 3 * 4];
         for (int i = 0; i < t.Length; i++) t[i] = (float)(rng.NextDouble() * 2 - 1);
         var theta = new Tensor<float>(t, new[] { 1, 3, 4 });
-        var g = _gpu!.AffineGrid3D(theta, 2, 3, 3, alignCorners: false);
+        var g = Gpu.AffineGrid3D(theta, 2, 3, 3, alignCorners: false);
         var c = _cpu.AffineGrid3D(theta, 2, 3, 3, alignCorners: false);
         AssertClose(g, c);
     }
@@ -149,8 +144,8 @@ public class GeometryGpuParityTests : IDisposable
         Dictionary<Tensor<float>, Tensor<float>> gpuGradients;
         using (var tape = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<float>())
         {
-            gpuOutput = _gpu!.PartialCorrelationVolume(gpuFirst, gpuSecond, radius: 1);
-            var loss = _gpu.ReduceSum(gpuOutput, null);
+            gpuOutput = Gpu.PartialCorrelationVolume(gpuFirst, gpuSecond, radius: 1);
+            var loss = Gpu.ReduceSum(gpuOutput, null);
             gpuGradients = tape.ComputeGradients(loss, [gpuFirst, gpuSecond]);
         }
         Assert.True(gpuOutput.IsGpuResident, "Correlation output must remain GPU-resident.");
@@ -185,7 +180,7 @@ public class GeometryGpuParityTests : IDisposable
         var input = Rand4D(6, 1, 2, 4, 5);
         var flow = Rand4D(7, 1, 2, 4, 5, range: 0.35f);
 
-        var gpu = _gpu!.ForwardSplat(input, flow, normalize);
+        var gpu = Gpu.ForwardSplat(input, flow, normalize);
         var cpu = _cpu.ForwardSplat(input, flow, normalize);
 
         AssertClose(gpu, cpu, 2e-3f);
@@ -198,7 +193,7 @@ public class GeometryGpuParityTests : IDisposable
         var input = Rand4D(16, 1, 2, 4, 5);
         var flow = Rand4D(17, 1, 2, 4, 5, range: 0.35f);
         using var cache = new CompiledModelCache<float>();
-        Func<Tensor<float>> forward = () => _gpu!.ForwardSplat(input, flow);
+        Func<Tensor<float>> forward = () => Gpu.ForwardSplat(input, flow);
 
         var error = Assert.Throws<NotSupportedException>(() =>
             cache.GetOrCompileInference([input, flow], forward));
@@ -217,7 +212,7 @@ public class GeometryGpuParityTests : IDisposable
         var flow = Rand4D(9, 1, 2, 4, 5, range: 0.35f);
         var gradOutput = Rand4D(10, 1, 2, 4, 5);
 
-        var gpu = _gpu!.ForwardSplatBackwardInput(gradOutput, input, flow, normalize);
+        var gpu = Gpu.ForwardSplatBackwardInput(gradOutput, input, flow, normalize);
         var cpu = _cpu.ForwardSplatBackwardInput(gradOutput, input, flow, normalize);
 
         AssertClose(gpu, cpu, 2e-3f);
@@ -232,10 +227,10 @@ public class GeometryGpuParityTests : IDisposable
         var input = Rand4D(11, 1, 2, 4, 5);
         var flow = Rand4D(12, 1, 2, 4, 5, range: 0.35f);
         var gradOutput = Rand4D(13, 1, 2, 4, 5);
-        var gpuOutput = _gpu!.ForwardSplat(input, flow, normalize);
+        var gpuOutput = Gpu.ForwardSplat(input, flow, normalize);
         var cpuOutput = _cpu.ForwardSplat(input, flow, normalize);
 
-        var gpu = _gpu.ForwardSplatBackwardFlow(
+        var gpu = Gpu.ForwardSplatBackwardFlow(
             gradOutput, input, flow, gpuOutput, normalize);
         var cpu = _cpu.ForwardSplatBackwardFlow(
             gradOutput, input, flow, cpuOutput, normalize);
@@ -253,19 +248,19 @@ public class GeometryGpuParityTests : IDisposable
         var wrongShape = Rand4D(21, 1, 2, 2, 2);
 
         var gradError = Assert.Throws<ArgumentException>(() =>
-            _gpu!.ForwardSplatBackwardFlow(wrongShape, input, flow, input));
+            Gpu.ForwardSplatBackwardFlow(wrongShape, input, flow, input));
         Assert.Equal("gradOutput", gradError.ParamName);
 
         var outputError = Assert.Throws<ArgumentException>(() =>
-            _gpu!.ForwardSplatBackwardFlow(gradOutput, input, flow, wrongShape));
+            Gpu.ForwardSplatBackwardFlow(gradOutput, input, flow, wrongShape));
         Assert.Equal("output", outputError.ParamName);
 
         var nullOutputError = Assert.Throws<ArgumentNullException>(() =>
-            _gpu!.ForwardSplatBackwardFlow(gradOutput, input, flow, null!));
+            Gpu.ForwardSplatBackwardFlow(gradOutput, input, flow, null));
         Assert.Equal("output", nullOutputError.ParamName);
 
-        var unnormalized = _gpu!.ForwardSplatBackwardFlow(
-            gradOutput, input, flow, null!, normalize: false);
+        var unnormalized = Gpu.ForwardSplatBackwardFlow(
+            gradOutput, input, flow, null, normalize: false);
         Assert.Equal(flow.Shape.ToArray(), unnormalized.Shape.ToArray());
     }
 }

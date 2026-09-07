@@ -28,19 +28,24 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 [Collection("DirectGpuSerial")]
-public sealed class GpuCpuAutoDifferentialTests : IDisposable
+public sealed class GpuCpuAutoDifferentialTests : IClassFixture<GpuCpuAutoDifferentialFixture>
 {
-    private readonly CpuEngine _cpu = new CpuEngine();
+    private enum TensorParameterShape
+    {
+        CandidateShape,
+        ChannelVector
+    }
+
+    private readonly CpuEngine _cpu;
     private readonly DirectGpuTensorEngine _gpu;
     private readonly bool _gpuReady;
 
-    public GpuCpuAutoDifferentialTests()
+    public GpuCpuAutoDifferentialTests(GpuCpuAutoDifferentialFixture fixture)
     {
-        _gpu = new DirectGpuTensorEngine();
-        _gpuReady = _gpu.IsGpuAvailable;
+        _cpu = fixture.Cpu;
+        _gpu = fixture.Gpu;
+        _gpuReady = fixture.IsGpuReady;
     }
-
-    public void Dispose() => _gpu?.Dispose();
 
     // Catches structural kernel bugs (the ones found ranged 1.8e-2 .. NaN) while tolerating
     // GPU fast-math approximation noise (~1e-3) on transcendental ops.
@@ -74,7 +79,7 @@ public sealed class GpuCpuAutoDifferentialTests : IDisposable
     /// elementwise op — and inverting it gives the largest input that still fits. Under-estimating is
     /// the safe direction here, since the cost of guessing low is only a smaller test shape.
     /// </remarks>
-    private long EstimateMaxInputElements(MethodInfo cm, ParameterInfo[] ps, Random rng)
+    private long EstimateMaxInputElements(MethodInfo cm, Random rng)
     {
         int[]? smallest = null;
         long smallestElements = long.MaxValue;
@@ -87,7 +92,7 @@ public sealed class GpuCpuAutoDifferentialTests : IDisposable
         // A one-element probe carries no information about growth (log(1) == 0).
         if (smallest is null || smallestElements <= 1) return long.MaxValue;
 
-        var sets = CandidateArgSets(ps, smallest, rng);
+        var sets = CandidateArgSets(cm, smallest, rng);
         if (sets == null) return long.MaxValue;
 
         foreach (var args in sets)
@@ -239,10 +244,44 @@ public sealed class GpuCpuAutoDifferentialTests : IDisposable
 
     // Per-parameter candidate values. Tensors are generated from the current shape; scalar/array
     // params get a short list of plausible values. Returns null if the type isn't drivable at all.
-    private static List<object> ParamCandidates(ParameterInfo p, int[] shape, Random rng)
+    private static List<object> ParamCandidates(
+        MethodInfo method,
+        ParameterInfo parameter,
+        int[] shape,
+        Random rng)
     {
-        if (p.ParameterType.IsByRef) return new List<object> { null }; // out-param: placeholder, written by the call
-        return CandidatesForType(p.ParameterType, p.HasDefaultValue, p.HasDefaultValue ? p.DefaultValue : null, shape, rng);
+        if (parameter.ParameterType.IsByRef)
+            return new List<object> { null }; // out-param: placeholder, written by the call
+
+        if (parameter.ParameterType == typeof(Tensor<float>))
+        {
+            TensorParameterShape parameterShape = GetTensorParameterShape(method, parameter);
+            return parameterShape switch
+            {
+                TensorParameterShape.CandidateShape => new List<object> { RandTensor(shape, rng) },
+                TensorParameterShape.ChannelVector when shape.Length >= 2 =>
+                    new List<object> { RandTensor(new[] { shape[1] }, rng) },
+                TensorParameterShape.ChannelVector => new List<object>(),
+                _ => throw new ArgumentOutOfRangeException(nameof(parameterShape))
+            };
+        }
+
+        return CandidatesForType(
+            parameter.ParameterType,
+            parameter.HasDefaultValue,
+            parameter.HasDefaultValue ? parameter.DefaultValue : null,
+            shape,
+            rng);
+    }
+
+    private static TensorParameterShape GetTensorParameterShape(
+        MethodInfo method,
+        ParameterInfo parameter)
+    {
+        if (method.Name == nameof(CpuEngine.TensorChannelBiasAdd) && parameter.Position == 1)
+            return TensorParameterShape.ChannelVector;
+
+        return TensorParameterShape.CandidateShape;
     }
 
     private static List<object> CandidatesForType(Type pt, bool hasDefault, object defVal, int[] shape, Random rng)
@@ -316,15 +355,17 @@ public sealed class GpuCpuAutoDifferentialTests : IDisposable
 
     // All candidate argument sets for a method+shape (bounded cartesian product), or null if any
     // parameter type is undrivable. At least one (non-out) Tensor input is required.
-    private static List<object[]> CandidateArgSets(ParameterInfo[] ps, int[] shape, Random rng)
+    private static List<object[]> CandidateArgSets(MethodInfo method, int[] shape, Random rng)
     {
+        var parameters = method.GetParameters();
         var perParam = new List<List<object>>();
         bool hasTensorInput = false;
-        foreach (var p in ps)
+        foreach (var parameter in parameters)
         {
-            var c = ParamCandidates(p, shape, rng);
+            var c = ParamCandidates(method, parameter, shape, rng);
             if (c == null || c.Count == 0) return null;
-            if (!p.ParameterType.IsByRef && IsTensorParam(p.ParameterType)) hasTensorInput = true;
+            if (!parameter.ParameterType.IsByRef && IsTensorParam(parameter.ParameterType))
+                hasTensorInput = true;
             perParam.Add(c);
         }
         if (!hasTensorInput) return null;
@@ -377,7 +418,7 @@ public sealed class GpuCpuAutoDifferentialTests : IDisposable
         var rng = new Random(1);
         foreach (var shape in CandidateShapes)
         {
-            var sets = CandidateArgSets(ps, shape, rng);
+            var sets = CandidateArgSets(cm, shape, rng);
             if (sets == null) { reason = "undrivable parameter (ValueTuple/unknown ref type)"; return false; }
             anyDrivable = true;
             foreach (var args in sets)
@@ -476,13 +517,13 @@ public sealed class GpuCpuAutoDifferentialTests : IDisposable
         // op on the smallest candidate shape first costs one cheap invocation and answers the size
         // question before anything large is built. Still lowered by the backstop if the estimate
         // turns out optimistic.
-        long maxInputElements = EstimateMaxInputElements(cm, ps, rng);
+        long maxInputElements = EstimateMaxInputElements(cm, rng);
 
         foreach (var shape in CandidateShapes)
         {
             if (ShapeElements(shape) > maxInputElements) continue;
 
-            var sets = CandidateArgSets(ps, shape, rng);
+            var sets = CandidateArgSets(cm, shape, rng);
             if (sets == null) return; // signature not auto-buildable -> guard handles it
 
             foreach (var args in sets)
@@ -602,12 +643,6 @@ public sealed class GpuCpuAutoDifferentialTests : IDisposable
         "LocallyConnectedConv2DBackwardInput(Tensor<T>,Tensor<T>,Int32[],Int32[])",
         "LocallyConnectedConv2DBackwardWeights(Tensor<T>,Tensor<T>,Int32[],Int32[])",
         "MaxPool2DBackward(Tensor<T>,Int32[],Int32[],Int32[],Int32[])",
-        // Channel bias add takes a rank-N channel-first input and a rank-1 bias, so the two operands
-        // have deliberately different shapes and the single-shape generic generator cannot drive it.
-        // Dedicated GPU-vs-CPU parity in TensorCowInferenceReadPathTests
-        // .DirectGpuChannelBiasAdd_StaysResidentAndPreservesCowBias, which compares the resident GPU
-        // result against the CPU engine and also asserts the empty-channel edge case separately.
-        "TensorChannelBiasAdd(Tensor<T>,Tensor<T>)",
         // conv / transposed-conv / im2col — distinct input vs. kernel shapes + interdependent geometry
         "Conv3D(Tensor<T>,Tensor<T>,Int32,Int32,Int32)",
         "ConvTranspose2D(Tensor<T>,Tensor<T>,Int32[],Int32[],Int32[])",
@@ -701,6 +736,25 @@ public sealed class GpuCpuAutoDifferentialTests : IDisposable
         "TensorSelectScatter(Tensor<T>,Tensor<T>,Int32,Int32)",
         "TimeStretch(Tensor<T>,Double,Int32,Int32)",
     };
+}
+
+/// <summary>
+/// Owns one DirectGpu backend for the complete reflection-driven theory. xUnit creates a new test
+/// class instance for every MemberData row; constructing the backend in the test-class constructor
+/// therefore recreated an OpenCL context hundreds of times and could wedge the AMD driver during a
+/// full-suite run. A class fixture retains test isolation from every other class while reducing this
+/// class to one context lifetime.
+/// </summary>
+public sealed class GpuCpuAutoDifferentialFixture : IDisposable
+{
+    public CpuEngine Cpu { get; } = new CpuEngine();
+    public DirectGpuTensorEngine Gpu { get; } = new DirectGpuTensorEngine();
+    public bool IsGpuReady => Gpu.IsGpuAvailable;
+
+    public void Dispose()
+    {
+        Gpu.Dispose();
+    }
 }
 
 /// <summary>Serializes all DirectGpu test classes so they don't share an OpenCL context concurrently

@@ -29,27 +29,20 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// </para>
 /// </summary>
 [Collection("DirectGpuSerial")]
-public sealed class OpenClHalfPrecisionGemmTests : IDisposable
+public sealed class OpenClHalfPrecisionGemmTests : IClassFixture<OpenClBackendTestFixture>
 {
-    private readonly OpenClBackend _backend;
+    private readonly OpenClBackend? _backend;
     private readonly bool _ready;
-    private readonly Exception _initException;
+    private readonly Exception? _initException;
 
-    public OpenClHalfPrecisionGemmTests()
+    public OpenClHalfPrecisionGemmTests(OpenClBackendTestFixture fixture)
     {
-        try
-        {
-            _backend = new OpenClBackend();
-            _ready = _backend.IsAvailable && _backend.SupportsHgemm;
-        }
-        catch (Exception ex)
-        {
-            _initException = ex;
-            _ready = false;
-        }
+        _backend = fixture.Backend;
+        _initException = fixture.InitializationException;
+        _ready = fixture.IsAvailable && _backend?.SupportsHgemm == true;
     }
 
-    public void Dispose() => _backend?.Dispose();
+    private OpenClBackend Backend => _backend ?? throw new InvalidOperationException("OpenCL backend is unavailable.");
 
     private bool EnsureReady()
     {
@@ -104,16 +97,16 @@ public sealed class OpenClHalfPrecisionGemmTests : IDisposable
     {
         // Upload FP32, then convert to FP16 on the device (cl_khr_fp16 path) —
         // the same two ConvertToFp16 calls the engine's MatrixMultiply makes.
-        var aFp32 = _backend.AllocateBuffer(a);
-        var bFp32 = _backend.AllocateBuffer(b);
+        var aFp32 = Backend.AllocateBuffer(a);
+        var bFp32 = Backend.AllocateBuffer(b);
 
         // FP16 buffers hold M*K / K*N halfs (2 bytes each). Allocating that many
         // floats over-allocates (4 bytes each) which is harmless and mirrors the
         // CUDA engine path's AllocateOutputBuffer(M*K) sizing.
-        var aFp16 = _backend.AllocateBuffer(m * k);
-        var bFp16 = _backend.AllocateBuffer(k * n);
-        _backend.ConvertToFp16(aFp32, aFp16, m * k);
-        _backend.ConvertToFp16(bFp32, bFp16, k * n);
+        var aFp16 = Backend.AllocateBuffer(m * k);
+        var bFp16 = Backend.AllocateBuffer(k * n);
+        Backend.ConvertToFp16(aFp32, aFp16, m * k);
+        Backend.ConvertToFp16(bFp32, bFp16, k * n);
 
         aFp32.Dispose();
         bFp32.Dispose();
@@ -149,11 +142,11 @@ public sealed class OpenClHalfPrecisionGemmTests : IDisposable
         var expected = CpuReferenceFromFp16(a, b, m, n, k);
 
         var (aFp16, bFp16) = UploadFp16Inputs(a, b, m, n, k);
-        using var cBuf = _backend.AllocateBuffer(m * n);
+        using var cBuf = Backend.AllocateBuffer(m * n);
         try
         {
-            ((IGpuHalfPrecisionBackend)_backend).GemmFp16In32fOut(aFp16, bFp16, cBuf, m, n, k);
-            var actual = _backend.DownloadBuffer(cBuf);
+            ((IGpuHalfPrecisionBackend)Backend).GemmFp16In32fOut(aFp16, bFp16, cBuf, m, n, k);
+            var actual = Backend.DownloadBuffer(cBuf);
             // Inputs already FP16-rounded on both sides; remaining error is just
             // FP32 accumulation order across the tiled K loop.
             AssertClose(expected, actual, absTol: 1e-2, relTol: 1e-2);
@@ -177,14 +170,14 @@ public sealed class OpenClHalfPrecisionGemmTests : IDisposable
 
         var (aFp16, bFp16) = UploadFp16Inputs(a, b, m, n, k);
         // FP16 output buffer (M*N halfs); over-allocate as floats.
-        using var cFp16 = _backend.AllocateBuffer(m * n);
+        using var cFp16 = Backend.AllocateBuffer(m * n);
         // Convert the FP16 result back to FP32 for comparison.
-        using var cFp32 = _backend.AllocateBuffer(m * n);
+        using var cFp32 = Backend.AllocateBuffer(m * n);
         try
         {
-            ((IGpuHalfPrecisionBackend)_backend).Hgemm(aFp16, bFp16, cFp16, m, n, k);
-            _backend.ConvertToFp32(cFp16, cFp32, m * n);
-            var actual = _backend.DownloadBuffer(cFp32);
+            ((IGpuHalfPrecisionBackend)Backend).Hgemm(aFp16, bFp16, cFp16, m, n, k);
+            Backend.ConvertToFp32(cFp16, cFp32, m * n);
+            var actual = Backend.DownloadBuffer(cFp32);
             // The result itself is rounded to FP16, so the dominant error is the
             // final half-rounding of the accumulated value (~1e-3 relative).
             AssertClose(expected, actual, absTol: 5e-2, relTol: 3e-2);
@@ -201,8 +194,8 @@ public sealed class OpenClHalfPrecisionGemmTests : IDisposable
     {
         Skip.If(!EnsureReady(), "OpenCL FP16 GEMM not available on this system.");
 
-        using var dummy = _backend.AllocateBuffer(4);
-        var half = (IGpuHalfPrecisionBackend)_backend;
+        using var dummy = Backend.AllocateBuffer(4);
+        var half = (IGpuHalfPrecisionBackend)Backend;
         Assert.Throws<ArgumentOutOfRangeException>(
             () => half.GemmFp16In32fOut(dummy, dummy, dummy, 0, 4, 4));
         Assert.Throws<ArgumentOutOfRangeException>(

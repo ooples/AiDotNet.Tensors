@@ -4142,19 +4142,12 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 writeA = !writeA;
             }
 
-            // Sized to the BUFFER, not to the one value being read. The final buffer is whichever
-            // scratch the last pass wrote, and its capacity is the first pass's partial count -- not
-            // one. CopyToHost validates the destination against the whole buffer, so downloading
-            // into float[1] threw "Destination array too small" for any input needing more than one
-            // partial (1025 elements at a local size of 256 gives 5). That was unreachable until the
-            // reductions started returning the right answer for shorter inputs, so it sat behind the
-            // non-power-of-two tail bug rather than beside it.
-            int downloadLength = current is DirectOpenClGpuBuffer resultBuffer
-                ? Math.Max(1, resultBuffer.Buffer.Length)
-                : 1;
-            var result = new float[downloadLength];
-            DownloadBuffer(current, result);
-            return result[0];
+            // Only the leading scalar is live after the final reduction pass. Read that value
+            // directly instead of copying the scratch buffer's logical size (or its still larger
+            // pooled capacity) merely to discard the tail.
+            var resultBuffer = (DirectOpenClGpuBuffer)current;
+            GpuLaunchProbe.OnReadback(sizeof(float));
+            return resultBuffer.Buffer.ToArray(1)[0];
         }
 
         public void SumAxis(IGpuBuffer A, IGpuBuffer B, int outerSize, int reduceSize)
@@ -13839,29 +13832,35 @@ KERNEL VARIANTS (A/B testing):
         internal readonly DirectOpenClBuffer Buffer;
         private readonly Action<DirectOpenClGpuBuffer>? _returnToPool;
         private int _poolState;
+        private int _size;
 
-        public int Size => Buffer.Length;
-        public long SizeInBytes => Buffer.Length * sizeof(float);
+        public int Size => Volatile.Read(ref _size);
+        public int Capacity => Buffer.Length;
+        public long SizeInBytes => (long)Size * sizeof(float);
         public IntPtr Handle => Buffer.Handle;
 
         public DirectOpenClGpuBuffer(DirectOpenClBuffer buffer, Action<DirectOpenClGpuBuffer>? returnToPool = null)
         {
             Buffer = buffer;
             _returnToPool = returnToPool;
+            _size = buffer.Length;
         }
 
         public float[] Download()
         {
-            return Buffer.ToArray();
+            return Buffer.ToArray(Size);
         }
 
         public void Download(float[] destination)
         {
-            Buffer.CopyToHost(destination);
+            Buffer.CopyToHost(destination, Size);
         }
 
-        public void MarkRented()
+        public void MarkRented(int size)
         {
+            if (size <= 0 || size > Capacity)
+                throw new ArgumentOutOfRangeException(nameof(size));
+            Volatile.Write(ref _size, size);
             Interlocked.Exchange(ref _poolState, 0);
         }
 

@@ -65,26 +65,17 @@ public static class TensorChannelBiasEngineExtensions
         for (int axis = 2; axis < rank; axis++)
             channelFirst[axis] = axis - 1;
 
-        // The intermediates hold their own storage references. The returned permutation takes its
-        // own reference on whatever storage it shares, so releasing them here cannot reclaim
-        // storage the result still needs - it only avoids pinning pooled or device-backed buffers
-        // for as long as the caller holds the result.
-        var permuted = engine.TensorPermute(input, channelsLast);
-        try
+        // Graph-mode results are placeholders owned by the recorded chain. Disposing them here
+        // would invalidate the captured inputs before the scope can compile the plan.
+        if (Compilation.GraphMode.IsActive)
         {
-            var biased = engine.TensorAdd(permuted, bias);
-            try
-            {
-                return engine.TensorPermute(biased, channelFirst);
-            }
-            finally
-            {
-                biased.Dispose();
-            }
+            var capturedPermuted = engine.TensorPermute(input, channelsLast);
+            var capturedBiased = engine.TensorAdd(capturedPermuted, bias);
+            return engine.TensorPermute(capturedBiased, channelFirst);
         }
-        finally
-        {
-            permuted.Dispose();
-        }
+
+        using var permuted = engine.TensorPermute(input, channelsLast);
+        using var biased = engine.TensorAdd(permuted, bias);
+        return engine.TensorPermute(biased, channelFirst);
     }
 }

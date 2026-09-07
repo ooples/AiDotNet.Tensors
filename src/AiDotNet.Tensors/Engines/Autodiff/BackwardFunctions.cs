@@ -959,21 +959,21 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         if (DifferentiableOps.IsGradientRequired(inputs[0]))
-        {
             DifferentiableOps.AccumulateGrad(grads, inputs[0], gradOutput, engine);
-        }
 
-        if (DifferentiableOps.IsGradientRequired(inputs[1]))
-        {
-            int rank = gradOutput.Rank;
-            var reductionAxes = new int[rank - 1];
-            reductionAxes[0] = 0;
-            for (int axis = 2; axis < rank; axis++)
-                reductionAxes[axis - 1] = axis;
+        // Avoid allocating the axes and reducing the entire activation when the caller only
+        // requested gradients that flow through the input branch.
+        if (!DifferentiableOps.IsGradientRequired(inputs[1]))
+            return;
 
-            var gradBias = engine.ReduceSum(gradOutput, reductionAxes);
-            DifferentiableOps.AccumulateGrad(grads, inputs[1], gradBias, engine);
-        }
+        int rank = gradOutput.Rank;
+        var reductionAxes = new int[rank - 1];
+        reductionAxes[0] = 0;
+        for (int axis = 2; axis < rank; axis++)
+            reductionAxes[axis - 1] = axis;
+
+        var gradBias = engine.ReduceSum(gradOutput, reductionAxes);
+        DifferentiableOps.AccumulateGrad(grads, inputs[1], gradBias, engine);
     }
 
     /// <summary>d(broadcast_sub(a,b))/da = reduce(grad), d/db = -reduce(grad)</summary>

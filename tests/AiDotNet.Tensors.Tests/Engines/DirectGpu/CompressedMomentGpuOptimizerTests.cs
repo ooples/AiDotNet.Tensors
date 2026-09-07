@@ -1,6 +1,7 @@
 // Copyright (c) AiDotNet. All rights reserved.
 
 using System;
+using System.Collections.Generic;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.CUDA;
@@ -17,7 +18,8 @@ using AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 [Collection("DirectGpuSerial")]
-public sealed class CompressedMomentGpuOptimizerTests
+public sealed class CompressedMomentGpuOptimizerTests :
+    IClassFixture<CompressedMomentGpuOptimizerTests.BackendFixture>
 {
     public enum BackendKind
     {
@@ -95,12 +97,18 @@ public sealed class CompressedMomentGpuOptimizerTests
     private static bool RequireGpu =>
         string.Equals(Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_GPU_TESTS"), "1", StringComparison.Ordinal);
 
+    private readonly BackendFixture _backends;
+
+    public CompressedMomentGpuOptimizerTests(BackendFixture backends)
+    {
+        _backends = backends;
+    }
+
     [SkippableTheory]
     [MemberData(nameof(Backends))]
     public void ByteBufferUploadDownload_RoundTripsRawBytes(BackendKind kind)
     {
-        var acquired = TryCreate(kind);
-        using var scope = acquired;
+        var acquired = _backends.Get(kind);
         var backend = RequireReady(kind, acquired);
         byte[] expected =
         [
@@ -118,9 +126,8 @@ public sealed class CompressedMomentGpuOptimizerTests
     [MemberData(nameof(Backends))]
     public void Fp32AdamAndAdamW_MatchCpuReference(BackendKind kind)
     {
-        var acquired = TryCreate(kind, requiresGlslCompiler: true);
-        using var scope = acquired;
-        var backend = RequireReady(kind, acquired);
+        var acquired = _backends.Get(kind);
+        var backend = RequireReady(kind, acquired, requiresGlslCompiler: true);
 
         const int length = 41;
         const float lr = 0.01f;
@@ -159,8 +166,7 @@ public sealed class CompressedMomentGpuOptimizerTests
     [MemberData(nameof(Backends))]
     public void MultiTensorAdamAndAdamW_MatchPerTensor(BackendKind kind)
     {
-        var acquired = TryCreate(kind);
-        using var scope = acquired;
+        var acquired = _backends.Get(kind);
         var backend = RequireReady(kind, acquired);
         Skip.If(backend is not IMultiTensorGpuOptimizerBackend,
             $"{kind} backend does not implement IMultiTensorGpuOptimizerBackend.");
@@ -224,9 +230,8 @@ public sealed class CompressedMomentGpuOptimizerTests
     [MemberData(nameof(DenseOptimizerBackends))]
     public void DensePlanSupportedOptimizer_MatchesCpuReference(BackendKind kind, OptimizerType optimizer)
     {
-        var acquired = TryCreate(kind, requiresGlslCompiler: true);
-        using var scope = acquired;
-        var backend = RequireReady(kind, acquired);
+        var acquired = _backends.Get(kind);
+        var backend = RequireReady(kind, acquired, requiresGlslCompiler: true);
 
         const int length = 47;
         const int steps = 4;
@@ -295,9 +300,8 @@ public sealed class CompressedMomentGpuOptimizerTests
     [MemberData(nameof(Backends))]
     public void Bf16AdamAndAdamW_MatchCpuReference(BackendKind kind)
     {
-        var acquired = TryCreate(kind, requiresGlslCompiler: true);
-        using var scope = acquired;
-        var backend = RequireReady(kind, acquired);
+        var acquired = _backends.Get(kind);
+        var backend = RequireReady(kind, acquired, requiresGlslCompiler: true);
         var compressed = Assert.IsAssignableFrom<ICompressedMomentGpuOptimizerBackend>(backend);
 
         const int length = 43;
@@ -332,9 +336,8 @@ public sealed class CompressedMomentGpuOptimizerTests
     [MemberData(nameof(Backends))]
     public void Int8Adam_MatchesCpuReference(BackendKind kind)
     {
-        var acquired = TryCreate(kind, requiresGlslCompiler: true);
-        using var scope = acquired;
-        var backend = RequireReady(kind, acquired);
+        var acquired = _backends.Get(kind);
+        var backend = RequireReady(kind, acquired, requiresGlslCompiler: true);
         var compressed = Assert.IsAssignableFrom<ICompressedMomentGpuOptimizerBackend>(backend);
 
         const int length = 67;
@@ -367,7 +370,7 @@ public sealed class CompressedMomentGpuOptimizerTests
             backend.DownloadBuffer(param), length, 2e-3f, $"{kind} int8 Adam");
     }
 
-    private static AcquiredBackend TryCreate(BackendKind kind, bool requiresGlslCompiler = false)
+    private static AcquiredBackend TryCreate(BackendKind kind)
     {
         try
         {
@@ -406,12 +409,9 @@ public sealed class CompressedMomentGpuOptimizerTests
                 {
                     var b = VulkanBackend.Instance;
                     bool initialized = b.Initialize();
-                    return initialized && (!requiresGlslCompiler || b.IsGlslCompilerAvailable)
+                    return initialized
                         ? new AcquiredBackend(b, () => { }, null)
-                        : new AcquiredBackend(null, () => { }, initialized
-                            ? new InvalidOperationException(
-                                "Vulkan optimizer kernels require a runtime GLSL compiler (libshaderc).")
-                            : null);
+                        : new AcquiredBackend(null, () => { }, null);
                 }
 #if NET7_0_OR_GREATER
                 case BackendKind.WebGpu:
@@ -432,8 +432,22 @@ public sealed class CompressedMomentGpuOptimizerTests
         }
     }
 
-    private static IDirectGpuBackend RequireReady(BackendKind kind, AcquiredBackend acquired)
+    private static IDirectGpuBackend RequireReady(
+        BackendKind kind,
+        AcquiredBackend acquired,
+        bool requiresGlslCompiler = false)
     {
+        if (acquired.Backend is VulkanBackend vulkan &&
+            requiresGlslCompiler &&
+            !vulkan.IsGlslCompilerAvailable)
+        {
+            if (RequireGpu)
+                throw new InvalidOperationException(
+                    "GPU tests were required (AIDOTNET_REQUIRE_GPU_TESTS=1), but Vulkan optimizer kernels require a runtime GLSL compiler (libshaderc).");
+
+            Skip.If(true, "Vulkan optimizer kernels require a runtime GLSL compiler (libshaderc).");
+        }
+
         if (acquired.Backend is not null)
             return acquired.Backend;
 
@@ -742,7 +756,7 @@ public sealed class CompressedMomentGpuOptimizerTests
         return (ushort)((bits + rounding) >> 16);
     }
 
-    private sealed class AcquiredBackend : IDisposable
+    internal sealed class AcquiredBackend : IDisposable
     {
         private readonly Action _dispose;
 
@@ -758,5 +772,47 @@ public sealed class CompressedMomentGpuOptimizerTests
         public Exception? Error { get; }
 
         public void Dispose() => _dispose();
+    }
+
+    public sealed class BackendFixture : IDisposable
+    {
+        private readonly Dictionary<BackendKind, AcquiredBackend> _backends = new();
+
+        private readonly object _gate = new();
+
+        private bool _disposed;
+
+        private AcquiredBackend GetOrCreate(BackendKind kind)
+        {
+            lock (_gate)
+            {
+                if (_disposed)
+                    throw new ObjectDisposedException(nameof(BackendFixture));
+
+                if (!_backends.TryGetValue(kind, out var acquired))
+                {
+                    acquired = TryCreate(kind);
+                    _backends.Add(kind, acquired);
+                }
+
+                return acquired;
+            }
+        }
+
+        internal AcquiredBackend Get(BackendKind kind) => GetOrCreate(kind);
+
+        public void Dispose()
+        {
+            lock (_gate)
+            {
+                if (_disposed)
+                    return;
+
+                _disposed = true;
+                foreach (var acquired in _backends.Values)
+                    acquired.Dispose();
+                _backends.Clear();
+            }
+        }
     }
 }

@@ -27,22 +27,6 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan
         /// <summary>True when Vulkan is available on this host (loader + physical device).</summary>
         public static bool IsAvailable => VulkanDevicePrimitives.IsAvailable;
 
-        // The buffer pool may hand back a buffer physically LARGER than requested;
-        // DownloadBuffer copies the buffer's physical element count, which would
-        // overflow a snug destination. Download into a buffer-sized scratch and
-        // copy back exactly the logical elements. Mirrors OpenClSparseBackend.DownloadExact.
-        private static void DownloadExact(VulkanBackend backend, IGpuBuffer buffer, float[] destination)
-        {
-            if (buffer.Size == destination.Length)
-            {
-                backend.DownloadBuffer(buffer, destination);
-                return;
-            }
-            var scratch = new float[buffer.Size];
-            backend.DownloadBuffer(buffer, scratch);
-            Array.Copy(scratch, destination, destination.Length);
-        }
-
         private static VulkanBackend GetOrCreate()
         {
             var backend = VulkanBackend.Instance;
@@ -91,7 +75,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan
                 backend.CsrSpMM(valuesBuf, colIdxBuf, rowPtrBuf, bBuf, outBuf,
                     rows, cols, n, values.Length);
 
-                DownloadExact(backend, outBuf, output);
+                backend.DownloadBuffer(outBuf, output);
                 return output;
             }
             finally
@@ -133,7 +117,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan
 
                 backend.CsrSddmm(rowBuf, colBuf, xBuf, yBuf, outBuf, nnz, innerK);
 
-                DownloadExact(backend, outBuf, output);
+                backend.DownloadBuffer(outBuf, output);
                 return output;
             }
             finally

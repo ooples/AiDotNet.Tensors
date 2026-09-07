@@ -13,18 +13,18 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 [Collection("DirectGpuSerial")]
-public sealed class FlashDecodeOpenClTests : IDisposable
+public sealed class FlashDecodeOpenClTests : IClassFixture<OpenClBackendTestFixture>
 {
     private readonly OpenClBackend? _backend;
     private readonly bool _ready;
 
-    public FlashDecodeOpenClTests()
+    public FlashDecodeOpenClTests(OpenClBackendTestFixture fixture)
     {
-        try { _backend = new OpenClBackend(); _ready = _backend.IsAvailable; }
-        catch { _ready = false; }
+        _backend = fixture.Backend;
+        _ready = fixture.IsAvailable;
     }
 
-    public void Dispose() => _backend?.Dispose();
+    private OpenClBackend Backend => _backend ?? throw new InvalidOperationException("OpenCL backend is unavailable.");
 
     private bool EnsureReady()
     {
@@ -65,7 +65,7 @@ public sealed class FlashDecodeOpenClTests : IDisposable
 
     private void RunAndCompare(int heads, int kvHeads, int headDim, int seqLen, int splits)
     {
-        var backend = _backend!;
+        var backend = Backend;
         var rng = new Random(0xFDE + heads + kvHeads + seqLen + splits);
         int stepStride = kvHeads * headDim;
         var k = new float[seqLen * stepStride];

@@ -13,18 +13,18 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 [Collection("DirectGpuSerial")]
-public sealed class DevicePagedKVCacheOpenClTests : IDisposable
+public sealed class DevicePagedKVCacheOpenClTests : IClassFixture<OpenClBackendTestFixture>
 {
     private readonly OpenClBackend? _backend;
     private readonly bool _ready;
 
-    public DevicePagedKVCacheOpenClTests()
+    public DevicePagedKVCacheOpenClTests(OpenClBackendTestFixture fixture)
     {
-        try { _backend = new OpenClBackend(); _ready = _backend.IsAvailable; }
-        catch { _ready = false; }
+        _backend = fixture.Backend;
+        _ready = fixture.IsAvailable;
     }
 
-    public void Dispose() => _backend?.Dispose();
+    private OpenClBackend Backend => _backend ?? throw new InvalidOperationException("OpenCL backend is unavailable.");
 
     private bool EnsureReady()
     {
@@ -67,7 +67,7 @@ public sealed class DevicePagedKVCacheOpenClTests : IDisposable
     public void Append_Then_Decode_MatchesOracle(int heads, int headDim, int blockSize, int seqLen)
     {
         if (!EnsureReady()) return;
-        var backend = _backend!;
+        var backend = Backend;
         var rng = new Random(0xBEE + heads + seqLen);
         int stepStride = heads * headDim;
 
@@ -127,7 +127,7 @@ public sealed class DevicePagedKVCacheOpenClTests : IDisposable
         // engine) consume paged attention without depending on a concrete backend type. Verify the backend
         // advertises it and that dispatching through the interface produces the same result as the oracle.
         if (!EnsureReady()) return;
-        var backend = _backend!;
+        var backend = Backend;
         Assert.True(backend is IDirectGpuBackend, "OpenClBackend must implement IDirectGpuBackend paged attention.");
         var paged = (IDirectGpuBackend)backend;
 
@@ -170,7 +170,7 @@ public sealed class DevicePagedKVCacheOpenClTests : IDisposable
     public void Free_ReturnsBlocksToPool_AndReuses()
     {
         if (!EnsureReady()) return;
-        var backend = _backend!;
+        var backend = Backend;
         int heads = 2, headDim = 16, blockSize = 8, stepStride = heads * headDim;
         using var cache = new DevicePagedKVCache(backend, maxBlocks: 4, blockSize, heads, headDim);
 
@@ -191,7 +191,7 @@ public sealed class DevicePagedKVCacheOpenClTests : IDisposable
     public void ShareBlocks_TargetSeesSharedPrefix()
     {
         if (!EnsureReady()) return;
-        var backend = _backend!;
+        var backend = Backend;
         int heads = 2, headDim = 16, blockSize = 8, stepStride = heads * headDim;
         int prefixTokens = 12;
         using var cache = new DevicePagedKVCache(backend, maxBlocks: 8, blockSize, heads, headDim);
@@ -236,7 +236,7 @@ public sealed class DevicePagedKVCacheOpenClTests : IDisposable
     public void ShareBlocks_RefcountedFree_NoDoubleFree()
     {
         if (!EnsureReady()) return;
-        var backend = _backend!;
+        var backend = Backend;
         int heads = 2, headDim = 16, blockSize = 8, stepStride = heads * headDim;
         using var cache = new DevicePagedKVCache(backend, maxBlocks: 8, blockSize, heads, headDim);
 
@@ -264,7 +264,7 @@ public sealed class DevicePagedKVCacheOpenClTests : IDisposable
     public void CowAppend_AfterShare_LeavesSourceIntact()
     {
         if (!EnsureReady()) return;
-        var backend = _backend!;
+        var backend = Backend;
         int heads = 2, headDim = 16, blockSize = 8, stepStride = heads * headDim;
         using var cache = new DevicePagedKVCache(backend, maxBlocks: 16, blockSize, heads, headDim);
 
