@@ -599,7 +599,7 @@ public class TensorCowInferenceReadPathTests
         }
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(NormalizationForwardPath.GroupNormInto)]
     [InlineData(NormalizationForwardPath.GroupNormSwishInto)]
     public void DirectGpuNormalizationInto_PreservesCowOperands(NormalizationForwardPath path)
@@ -641,7 +641,7 @@ public class TensorCowInferenceReadPathTests
         AssertClose(expected, actual, tol: 2e-4f);
     }
 
-    [Fact]
+    [SkippableFact]
     public void DirectGpuAddGroupNormInto_PreservesCowOperands()
     {
         using var gpu = new DirectGpuTensorEngine();
@@ -862,6 +862,7 @@ public class TensorCowInferenceReadPathTests
 
         Assert.True(biasSource.IsCowShared, "GPU channel bias add privatized the source-side bias");
         Assert.True(biasClone.IsCowShared, "GPU channel bias add privatized the cloned bias");
+        Assert.True(actual.IsGpuResident, "GPU channel bias add did not keep the result resident.");
         AssertClose(expected, actual, tol: 2e-4f);
     }
 

@@ -602,6 +602,12 @@ public sealed class GpuCpuAutoDifferentialTests : IDisposable
         "LocallyConnectedConv2DBackwardInput(Tensor<T>,Tensor<T>,Int32[],Int32[])",
         "LocallyConnectedConv2DBackwardWeights(Tensor<T>,Tensor<T>,Int32[],Int32[])",
         "MaxPool2DBackward(Tensor<T>,Int32[],Int32[],Int32[],Int32[])",
+        // Channel bias add takes a rank-N channel-first input and a rank-1 bias, so the two operands
+        // have deliberately different shapes and the single-shape generic generator cannot drive it.
+        // Dedicated GPU-vs-CPU parity in TensorCowInferenceReadPathTests
+        // .DirectGpuChannelBiasAdd_StaysResidentAndPreservesCowBias, which compares the resident GPU
+        // result against the CPU engine and also asserts the empty-channel edge case separately.
+        "TensorChannelBiasAdd(Tensor<T>,Tensor<T>)",
         // conv / transposed-conv / im2col — distinct input vs. kernel shapes + interdependent geometry
         "Conv3D(Tensor<T>,Tensor<T>,Int32,Int32,Int32)",
         "ConvTranspose2D(Tensor<T>,Tensor<T>,Int32[],Int32[],Int32[])",
