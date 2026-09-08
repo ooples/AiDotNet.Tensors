@@ -13,7 +13,7 @@ Create the policy at [nuget.org](https://www.nuget.org/account/trustedpublishing
 | Workflow file | `automated-release.yml` |
 | Environment | Leave blank |
 
-Enter only `automated-release.yml`, not `.github/workflows/automated-release.yml`. The values are case-sensitive. The policy must authorize every package produced by the release workflow.
+Enter only `automated-release.yml`, not `.github/workflows/automated-release.yml`. NuGet matches the owner, repository, and workflow file values case-insensitively. The policy must authorize every package produced by the release workflow.
 
 See the official [NuGet trusted-publishing documentation](https://learn.microsoft.com/en-us/nuget/nuget-org/trusted-publishing).
 
