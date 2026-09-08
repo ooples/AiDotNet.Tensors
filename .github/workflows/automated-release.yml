@@ -16,14 +16,11 @@ on:
 concurrency:
   # NEVER cancel an in-flight publish — building/packing 7 packages and pushing to NuGet must complete
   # atomically. Releases are infrequent now (only on Release-PR merge), so serialization is cheap.
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: automated-release-publish
   cancel-in-progress: false
 
 permissions:
-  contents: write
-  issues: write
-  pull-requests: write
-  id-token: write
+  contents: read
 
 env:
   DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
@@ -41,19 +38,19 @@ jobs:
       should_release: ${{ steps.version.outputs.should_release }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           ref: ${{ github.event.release.tag_name || inputs.tag }}
 
       - name: Setup .NET
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
           dotnet-version: '10.0.x'
           dotnet-quality: 'preview'
 
       - name: Cache NuGet packages
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4
         with:
           path: ~/.nuget/packages
           key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', '**/Directory.Build.props') }}
@@ -74,9 +71,11 @@ jobs:
           if [ -n "$RP_TAG" ]; then
             VER="${RP_TAG#v}"
             echo "Publishing release tag $RP_TAG (version $VER)"
-            echo "version=$VER" >> "$GITHUB_OUTPUT"
-            echo "should_release=true" >> "$GITHUB_OUTPUT"
-            echo "changelog=Release $RP_TAG (see the GitHub release notes)" >> "$GITHUB_OUTPUT"
+            {
+              echo "version=$VER"
+              echo "should_release=true"
+              echo "changelog=Release $RP_TAG (see the GitHub release notes)"
+            } >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -152,9 +151,11 @@ jobs:
               ;;
             none)
               echo "No conventional commits found, no version bump"
-              echo "should_release=false" >> $GITHUB_OUTPUT
-              echo "version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
-              echo "changelog=No release needed - no conventional commits found" >> $GITHUB_OUTPUT
+              {
+                echo "should_release=false"
+                echo "version=$CURRENT_VERSION"
+                echo "changelog=No release needed - no conventional commits found"
+              } >> "$GITHUB_OUTPUT"
               exit 0
               ;;
           esac
@@ -247,15 +248,14 @@ jobs:
 
           echo "$CHANGELOG"
 
-          echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
-          echo "should_release=true" >> $GITHUB_OUTPUT
-
           echo "$CHANGELOG" > /tmp/changelog.txt
           {
+            echo "version=$NEW_VERSION"
+            echo "should_release=true"
             echo 'changelog<<EOF'
             cat /tmp/changelog.txt
             echo EOF
-          } >> $GITHUB_OUTPUT
+          } >> "$GITHUB_OUTPUT"
 
       - name: Restore dependencies
         if: steps.version.outputs.should_release == 'true'
@@ -273,20 +273,22 @@ jobs:
     needs: version-and-build
     timeout-minutes: 20
     if: needs.version-and-build.outputs.should_release == 'true'
+    outputs:
+      package-artifact-id: ${{ steps.upload-packages.outputs.artifact-id }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.release.tag_name || inputs.tag }}
 
       - name: Setup .NET
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
           dotnet-version: '10.0.x'
           dotnet-quality: 'preview'
 
       - name: Cache NuGet packages
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v4
         with:
           path: ~/.nuget/packages
           key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', '**/Directory.Build.props') }}
@@ -482,33 +484,51 @@ jobs:
           }
 
       - name: Upload package artifacts
-        uses: actions/upload-artifact@v4
+        id: upload-packages
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: nuget-packages-${{ github.sha }}
           path: out/*.nupkg
           if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
 
   publish-nuget:
     name: Publish to NuGet
+    permissions:
+      id-token: write # Required for NuGet trusted publishing.
     runs-on: ubuntu-latest
     needs: [version-and-build, pack]
     timeout-minutes: 10
     if: needs.version-and-build.outputs.should_release == 'true'
     steps:
       - name: Download packages
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v7.0.0
         with:
-          name: nuget-packages-${{ github.sha }}
+          artifact-ids: ${{ needs.pack.outputs.package-artifact-id }}
           path: out/
 
       - name: Setup .NET
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
           dotnet-version: '8.0.x'
 
+      - name: Authenticate to NuGet with trusted publishing
+        id: nuget-login
+        uses: NuGet/login@8d196754b4036150537f80ac539e15c2f1028841 # v1.2.0
+        with:
+          user: ooples
+
       - name: Push to NuGet
         shell: bash
+        env:
+          NUGET_API_KEY: ${{ steps.nuget-login.outputs.NUGET_API_KEY }}
         run: |
+          set -euo pipefail
+          if [ -z "$NUGET_API_KEY" ]; then
+            echo "::error::NuGet trusted publishing did not issue a temporary API key."
+            exit 1
+          fi
           shopt -s nullglob
           pkgs=(out/*.nupkg)
 
@@ -519,14 +539,14 @@ jobs:
 
           # Every package (including the CUDA meta + its fragment packages) is now under
           # nuget.org's 250 MB limit, so push them all. --skip-duplicate keeps a re-run of
-          # an already-published version green; a genuine push failure (bad API key,
+          # an already-published version green; a genuine push failure (authentication,
           # validation, an unexpectedly over-limit package) still fails the job under
           # `bash -e`, which is what we want — a silent skip would hide a broken release.
           for pkg in "${pkgs[@]}"; do
             size=$(stat -c%s "$pkg")
             echo "Publishing $pkg to NuGet ($((size / 1024 / 1024)) MB)..."
             dotnet nuget push "$pkg" \
-              --api-key ${{ secrets.NUGET_API_KEY }} \
+              --api-key "$NUGET_API_KEY" \
               --source https://api.nuget.org/v3/index.json \
               --skip-duplicate
             echo "Successfully published $pkg"
@@ -534,15 +554,17 @@ jobs:
 
   github-release:
     name: Create GitHub Release
+    permissions:
+      contents: write # Required to attach packages to the existing GitHub release.
     runs-on: ubuntu-latest
-    needs: [version-and-build, publish-nuget]
+    needs: [version-and-build, pack, publish-nuget]
     timeout-minutes: 10
     if: needs.version-and-build.outputs.should_release == 'true'
     steps:
       - name: Download packages
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v7.0.0
         with:
-          name: nuget-packages-${{ github.sha }}
+          artifact-ids: ${{ needs.pack.outputs.package-artifact-id }}
           path: out/
 
       - name: List artifacts
@@ -556,9 +578,11 @@ jobs:
             name=$(basename "$pkg" | sed -E 's/\.[0-9]+\.[0-9]+\.[0-9]+.*\.nupkg$//')
             PKGS="${PKGS}- **${name}**\n"
           done
-          echo "list<<EOF" >> $GITHUB_OUTPUT
-          echo -e "$PKGS" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          {
+            echo "list<<EOF"
+            echo -e "$PKGS"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Attach packages to the release
         # release-please already created the GitHub release (with its bundled changelog) — that is
