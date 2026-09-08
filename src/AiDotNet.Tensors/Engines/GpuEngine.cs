@@ -112,7 +112,9 @@ public sealed class GpuEngine : DirectGpuTensorEngine
                     computeUnits: backend.ComputeUnits,
                     globalMemoryBytes: backend.GlobalMemoryBytes);
             }
-            return new GpuBackendInfo(GpuBackendType.OpenCl, false, "OpenCL backend initialization failed - no suitable GPU device found");
+            string detail = backend.InitializationException?.Message ??
+                "OpenCL backend initialization failed because no suitable GPU device was found.";
+            return new GpuBackendInfo(GpuBackendType.OpenCl, false, detail);
         }
         catch (DllNotFoundException ex)
         {
@@ -148,7 +150,9 @@ public sealed class GpuEngine : DirectGpuTensorEngine
                     globalMemoryBytes: backend.GlobalMemoryBytes,
                     additionalInfo: $"Architecture: {backend.Architecture}");
             }
-            return new GpuBackendInfo(GpuBackendType.Hip, false, "HIP backend initialization failed - kernel compilation may have failed");
+            string detail = backend.InitializationException?.Message ??
+                "HIP backend initialization failed without a diagnostic.";
+            return new GpuBackendInfo(GpuBackendType.Hip, false, detail);
         }
         catch (DllNotFoundException ex)
         {

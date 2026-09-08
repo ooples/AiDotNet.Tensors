@@ -52,8 +52,9 @@ public sealed class Fp16FusedBackwardParityTests
                     var b = new OpenClBackend();
                     if (b is IGpuHalfPrecisionBackend half && b.IsAvailable && half.SupportsFp16FusedBackward)
                         return (half, b, b.Dispose, null);
+                    Exception? initializationException = b.InitializationException;
                     b.Dispose();
-                    return (null, null, () => { }, null);
+                    return (null, null, () => { }, initializationException);
                 }
                 case BackendKind.Vulkan:
                 {
@@ -148,6 +149,8 @@ public sealed class Fp16FusedBackwardParityTests
         var (half, backend, dispose, error) = TryCreate(kind);
         if (backend is null || half is null)
         {
+            if (error is not null)
+                throw new InvalidOperationException($"The {kind} backend failed to initialize.", error);
             if (RequireGpu)
                 throw new InvalidOperationException(
                     $"GPU tests were required (AIDOTNET_REQUIRE_GPU_TESTS=1) but the {kind} backend's " +
@@ -202,6 +205,8 @@ public sealed class Fp16FusedBackwardParityTests
         var (half, backend, dispose, error) = TryCreate(kind);
         if (backend is null || half is null)
         {
+            if (error is not null)
+                throw new InvalidOperationException($"The {kind} backend failed to initialize.", error);
             if (RequireGpu)
                 throw new InvalidOperationException(
                     $"GPU tests were required (AIDOTNET_REQUIRE_GPU_TESTS=1) but the {kind} backend's " +

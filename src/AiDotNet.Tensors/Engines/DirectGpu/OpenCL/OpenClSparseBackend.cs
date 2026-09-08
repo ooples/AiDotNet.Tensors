@@ -37,7 +37,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
                 var backend = new OpenClBackend(0);
                 if (!backend.IsAvailable)
-                    throw new InvalidOperationException("OpenCL SpMM backend failed to initialise.");
+                {
+                    Exception? initializationException = backend.InitializationException;
+                    backend.Dispose();
+                    throw new InvalidOperationException(
+                        "OpenCL SpMM backend failed to initialise.",
+                        initializationException);
+                }
                 _cached = backend;
                 return backend;
             }

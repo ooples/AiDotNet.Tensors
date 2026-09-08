@@ -388,15 +388,14 @@ public sealed class CompressedMomentGpuOptimizerTests :
                     var b = new HipBackend();
                     return b.IsAvailable
                         ? new AcquiredBackend(b, b.Dispose, null)
-                        : new AcquiredBackend(null, b.Dispose, null);
+                        : new AcquiredBackend(null, b.Dispose, b.InitializationException);
                 }
                 case BackendKind.OpenCl:
                 {
                     var b = new OpenClBackend();
                     return b.IsAvailable
                         ? new AcquiredBackend(b, b.Dispose, null)
-                        : new AcquiredBackend(null, b.Dispose,
-                            b.InitializationError is null ? null : new InvalidOperationException(b.InitializationError));
+                        : new AcquiredBackend(null, b.Dispose, b.InitializationException);
                 }
                 case BackendKind.Metal:
                 {

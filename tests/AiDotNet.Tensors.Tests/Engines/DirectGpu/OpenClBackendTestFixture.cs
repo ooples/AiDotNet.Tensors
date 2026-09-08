@@ -4,6 +4,7 @@
 #nullable enable
 
 using System;
+using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
@@ -18,12 +19,20 @@ public sealed class OpenClBackendTestFixture : IDisposable
     public OpenClBackendTestFixture()
     {
         var backend = new OpenClBackend();
-        if (backend.InitializationError is string initializationError)
+        if (backend.InitializationState == GpuBackendInitializationState.Failed)
+        {
+            Exception cause = backend.InitializationException ?? new InvalidOperationException(
+                "OpenCL reported failed initialization without preserving its cause.");
+            backend.Dispose();
+            throw new InvalidOperationException("OpenCL was detected, but backend initialization failed.", cause);
+        }
+
+        if (backend.IsAvailable !=
+            (backend.InitializationState == GpuBackendInitializationState.Succeeded))
         {
             backend.Dispose();
             throw new InvalidOperationException(
-                "OpenCL was detected, but backend initialization failed.",
-                new InvalidOperationException(initializationError));
+                "OpenCL availability and typed initialization state are inconsistent.");
         }
 
         Backend = backend;

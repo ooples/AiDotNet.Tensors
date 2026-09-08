@@ -130,7 +130,15 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         internal void CompleteCommandQueueForDisposal(IntPtr commandQueue)
             => _context?.CompleteQueueForDisposal(commandQueue);
 
-        public string? InitializationError { get; private set; }
+        /// <summary>Gets the outcome of this backend's initialization attempt.</summary>
+        public GpuBackendInitializationState InitializationState { get; private set; }
+
+        /// <summary>Gets the typed failure captured when <see cref="InitializationState"/> is failed.</summary>
+        public Exception? InitializationException { get; private set; }
+
+        /// <summary>Gets the legacy text representation of <see cref="InitializationException"/>.</summary>
+        [Obsolete("Use InitializationException for typed failure details.")]
+        public string? InitializationError => InitializationException?.ToString();
         public string BackendName => "OpenCL";
         public TensorDevice DeviceType => TensorDevice.OpenCL;
         public string DeviceName { get; }
@@ -196,6 +204,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             _kernelCache = new OpenClKernelCache();
             _programs = new List<DirectOpenClProgram>();
             _maxWorkItemSizes = Array.Empty<ulong>();
+            InitializationState = GpuBackendInitializationState.Unavailable;
 
             // Gate on GPU presence (not just OpenCL ICD presence). On a CPU-only box
             // with an OpenCL CPU runtime installed (Intel/AMD/POCL), the legacy
@@ -279,19 +288,34 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 // Initialize dynamic kernel generator for Bayesian-optimized GEMM
                 _dynamicGemm = new DynamicGemmKernel(_context);
                 WriteDiag("[OpenClBackend] Dynamic GEMM kernel generator initialized.");
+                InitializationState = GpuBackendInitializationState.Succeeded;
             }
             catch (Exception ex)
             {
-                InitializationError = ex.ToString();
-                WriteDiag($"[OpenClBackend] Initialization FAILED: {ex.GetType().Name}: {ex.Message}");
-                if (ex.InnerException != null)
-                    WriteDiag($"[OpenClBackend] Inner: {ex.InnerException.Message}");
-                System.Diagnostics.Debug.WriteLine($"OpenClBackend initialization failed: {ex.Message}");
-                IsAvailable = false;
+                RecordInitializationFailure(ex);
                 DeviceName = "None";
                 DeviceVendor = "None";
-                _context?.Dispose();
-                _context = null;
+            }
+        }
+
+        private void RecordInitializationFailure(Exception exception)
+        {
+            InitializationState = GpuBackendInitializationState.Failed;
+            InitializationException = exception;
+            IsAvailable = false;
+            WriteDiag($"[OpenClBackend] Initialization FAILED: {exception.GetType().Name}: {exception.Message}");
+            if (exception.InnerException != null)
+                WriteDiag($"[OpenClBackend] Inner: {exception.InnerException.Message}");
+            System.Diagnostics.Debug.WriteLine($"OpenClBackend initialization failed: {exception.Message}");
+
+            try
+            {
+                Dispose();
+            }
+            catch (Exception cleanupException)
+            {
+                InitializationException = new AggregateException(
+                    "OpenCL backend initialization and cleanup both failed.", exception, cleanupException);
             }
         }
 

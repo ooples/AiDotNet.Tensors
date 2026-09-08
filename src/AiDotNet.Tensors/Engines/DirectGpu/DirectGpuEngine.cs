@@ -374,6 +374,11 @@ public sealed class DirectGpuEngine : IDisposable
                 System.Diagnostics.Debug.WriteLine($"DirectGpuEngine: Using OpenCL backend on {openClBackend.DeviceName}");
                 return openClBackend;
             }
+            if (openClBackend.InitializationException is Exception initializationException)
+            {
+                Trace.WriteLine($"[DirectGpuEngine] OpenCL backend initialization failed: {initializationException.Message}");
+                System.Diagnostics.Debug.WriteLine($"OpenCL backend initialization failed: {initializationException.Message}");
+            }
             Trace.WriteLine("[DirectGpuEngine] OpenCL backend created but not available, disposing...");
             openClBackend.Dispose();
         }
@@ -415,6 +420,11 @@ public sealed class DirectGpuEngine : IDisposable
                     Trace.WriteLine($"[DirectGpuEngine] SUCCESS: Using HIP backend with {hipBackend.Architecture} architecture");
                     System.Diagnostics.Debug.WriteLine($"DirectGpuEngine: Using HIP backend with {hipBackend.Architecture} architecture");
                     return hipBackend;
+                }
+                if (hipBackend.InitializationException is Exception initializationException)
+                {
+                    Trace.WriteLine($"[DirectGpuEngine] HIP backend initialization failed: {initializationException.Message}");
+                    System.Diagnostics.Debug.WriteLine($"HIP backend initialization failed: {initializationException.Message}");
                 }
                 Trace.WriteLine("[DirectGpuEngine] HIP backend created but not available, disposing...");
                 hipBackend.Dispose();
@@ -1328,4 +1338,3 @@ public sealed class DirectGpuEngine : IDisposable
         _disposed = true;
     }
 }
-

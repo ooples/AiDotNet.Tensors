@@ -133,6 +133,33 @@ public sealed class HipHalfPrecisionGemmTests : IClassFixture<HipBackendTestFixt
     }
 
     [SkippableFact]
+    public void Hgemm_Fp16Output_MatchesCpuReferenceWithinHalfPrecision()
+    {
+        Skip.If(!EnsureReady(), "HIP FP16 GEMM not available on this system.");
+
+        const int m = 64, n = 64, k = 128;
+        var a = RandomMatrix(m, k, seed: 24);
+        var b = RandomMatrix(k, n, seed: 42);
+        var expected = CpuReferenceFromFp16(a, b, m, n, k);
+
+        var (aFp16, bFp16) = UploadFp16Inputs(a, b, m, n, k);
+        using var cFp16 = Backend.AllocateBuffer(m * n);
+        using var cFp32 = Backend.AllocateBuffer(m * n);
+        try
+        {
+            ((IGpuHalfPrecisionBackend)Backend).Hgemm(aFp16, bFp16, cFp16, m, n, k);
+            Backend.ConvertToFp32(cFp16, cFp32, m * n);
+            var actual = Backend.DownloadBuffer(cFp32);
+            AssertClose(expected, actual, absTol: 5e-2, relTol: 3e-2);
+        }
+        finally
+        {
+            aFp16.Dispose();
+            bFp16.Dispose();
+        }
+    }
+
+    [SkippableFact]
     public void GemmFp16In32fOut_RejectsNonPositiveDimensions()
     {
         Skip.If(!EnsureReady(), "HIP FP16 GEMM not available on this system.");

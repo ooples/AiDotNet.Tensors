@@ -19,7 +19,9 @@ public sealed class MesaRoutedScanGpuParityTests
     [MemberData(nameof(Backends))]
     public void MesaNativeForward_MatchesCpuEngine(BackendKind kind)
     {
-        (IDirectGpuBackend? backend, Action dispose) = TryCreate(kind);
+        (IDirectGpuBackend? backend, Action dispose, Exception? error) = TryCreate(kind);
+        if (error is not null)
+            throw new InvalidOperationException($"The {kind} backend failed to initialize.", error);
         Skip.If(backend is null, $"{kind} backend is unavailable on this host.");
         try
         {
@@ -44,7 +46,9 @@ public sealed class MesaRoutedScanGpuParityTests
     [MemberData(nameof(Backends))]
     public void RoutedNativeForward_MatchesCpuEngine(BackendKind kind)
     {
-        (IDirectGpuBackend? backend, Action dispose) = TryCreate(kind);
+        (IDirectGpuBackend? backend, Action dispose, Exception? error) = TryCreate(kind);
+        if (error is not null)
+            throw new InvalidOperationException($"The {kind} backend failed to initialize.", error);
         Skip.If(backend is null, $"{kind} backend is unavailable on this host.");
         try
         {
@@ -78,14 +82,14 @@ public sealed class MesaRoutedScanGpuParityTests
                 $"{kind} output[{i}]={actual[i]:R}, CPU={expected[i]:R}");
     }
 
-    private static (IDirectGpuBackend?,Action) TryCreate(BackendKind kind)
+    private static (IDirectGpuBackend?,Action,Exception?) TryCreate(BackendKind kind)
     {
         try
         {
-            if(kind==BackendKind.OpenCL){var backend=new OpenClBackend();if(backend.IsAvailable)return(backend,backend.Dispose);backend.Dispose();return(null,()=>{});}
-            var vulkan=VulkanBackend.Instance;return vulkan.Initialize()&&vulkan.IsGlslCompilerAvailable?(vulkan,()=>{}):(null,()=>{});
+            if(kind==BackendKind.OpenCL){var backend=new OpenClBackend();if(backend.IsAvailable)return(backend,backend.Dispose,null);Exception? initializationException=backend.InitializationException;backend.Dispose();return(null,()=>{},initializationException);}
+            var vulkan=VulkanBackend.Instance;return vulkan.Initialize()&&vulkan.IsGlslCompilerAvailable?(vulkan,()=>{},null):(null,()=>{},null);
         }
-        catch{return(null,()=>{});}
+        catch(Exception ex){return(null,()=>{},ex);}
     }
 
     private static float[] Values(int length,int seed,float scale=0.25f)

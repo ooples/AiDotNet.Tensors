@@ -19,7 +19,9 @@ public sealed class ComplexDiagonalSsmGpuParityTests
     [MemberData(nameof(Backends))]
     public void NativeForward_MatchesCpuEngine(BackendKind kind)
     {
-        (IDirectGpuBackend? backend, Action dispose) = TryCreate(kind);
+        (IDirectGpuBackend? backend, Action dispose, Exception? error) = TryCreate(kind);
+        if (error is not null)
+            throw new InvalidOperationException($"The {kind} backend failed to initialize.", error);
         Skip.If(backend is null, $"{kind} backend is unavailable on this host.");
         try
         {
@@ -46,20 +48,21 @@ public sealed class ComplexDiagonalSsmGpuParityTests
         finally { dispose(); }
     }
 
-    private static (IDirectGpuBackend?,Action) TryCreate(BackendKind kind)
+    private static (IDirectGpuBackend?,Action,Exception?) TryCreate(BackendKind kind)
     {
         try
         {
             if(kind==BackendKind.OpenCL)
             {
                 var backend=new OpenClBackend();
-                if(backend.IsAvailable) return (backend,backend.Dispose);
-                backend.Dispose(); return (null,()=>{});
+                if(backend.IsAvailable) return (backend,backend.Dispose,null);
+                Exception? initializationException=backend.InitializationException;
+                backend.Dispose(); return (null,()=>{},initializationException);
             }
             var vulkan=VulkanBackend.Instance;
-            return vulkan.Initialize() && vulkan.IsGlslCompilerAvailable ? (vulkan,()=>{}) : (null,()=>{});
+            return vulkan.Initialize() && vulkan.IsGlslCompilerAvailable ? (vulkan,()=>{},null) : (null,()=>{},null);
         }
-        catch { return (null,()=>{}); }
+        catch(Exception ex) { return (null,()=>{},ex); }
     }
 
     private static float[] Values(int length,int seed,float scale=0.3f)

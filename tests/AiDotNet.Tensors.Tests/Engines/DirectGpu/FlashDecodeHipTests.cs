@@ -29,6 +29,7 @@ public sealed class FlashDecodeHipTests : IClassFixture<HipBackendTestFixture>
         Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_HIP") != "1",
             "HIP availability is asserted only in the required-HIP lane.");
         Assert.True(IsReady, "HIP/ROCm backend NOT available on this host");
+        Assert.Empty(Backend.KernelCompilationFailures);
     }
 
     private bool EnsureReady()

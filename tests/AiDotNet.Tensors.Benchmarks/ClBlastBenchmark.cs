@@ -230,6 +230,12 @@ public static class ClBlastBenchmark
                 BenchmarkDenseLayerTuned(context, backend, 128, 4096, 4096);
             }
         }
+        else if (backend.InitializationException is Exception initializationException)
+        {
+            throw new InvalidOperationException(
+                "The OpenCL backend was detected but failed to initialize.",
+                initializationException);
+        }
     }
 
     private static void BenchmarkSizeTuned(OpenClContext context, OpenClBackend backend, int size)

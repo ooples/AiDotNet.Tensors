@@ -569,6 +569,19 @@ extern ""C"" __global__ void rdna_gemm_wave32(
     }
 
     /// <summary>
+    /// Gets the HIP compilation flag for the exact target reported by the selected device.
+    /// </summary>
+    internal static string GetCompileFlags(string architectureTarget)
+    {
+        if (string.IsNullOrWhiteSpace(architectureTarget))
+        {
+            throw new ArgumentException("A HIP architecture target is required.", nameof(architectureTarget));
+        }
+
+        return $"--offload-arch={architectureTarget}";
+    }
+
+    /// <summary>
     /// Returns true if the architecture supports MFMA instructions.
     /// </summary>
     public static bool SupportsMfma(AmdGpuArchitecture arch)

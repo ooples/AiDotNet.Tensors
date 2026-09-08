@@ -47,7 +47,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     private IntPtr _scalarGemmF32;
     private IntPtr _rdnaGemmWave32;
     private readonly Dictionary<string, IntPtr> _kernelCache;
+    private readonly List<HipKernelCompilationException> _kernelCompilationFailures = new();
     private AmdGpuArchitecture _architecture;
+    private string _architectureTarget = string.Empty;
     private bool _disposed;
     private const int MaxPooledBufferElements = 16_777_216;
     private const int MaxPooledBuffersPerSize = 4;
@@ -139,6 +141,15 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         get => _isAvailable && !_disposed;
         private set => _isAvailable = value;
     }
+    /// <summary>Gets the outcome of this backend's initialization attempt.</summary>
+    public GpuBackendInitializationState InitializationState { get; private set; }
+
+    /// <summary>Gets the typed failure captured when <see cref="InitializationState"/> is failed.</summary>
+    public Exception? InitializationException { get; private set; }
+
+    /// <summary>Gets typed diagnostics for optional HIP kernel modules that could not be compiled.</summary>
+    public IReadOnlyList<HipKernelCompilationException> KernelCompilationFailures => _kernelCompilationFailures;
+
     public string BackendName => $"HIP ({GetKernelTypeName()})";
     public TensorDevice DeviceType => TensorDevice.HIP;
     public string DeviceName { get; }
@@ -247,11 +258,12 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     public HipBackend(int deviceIndex)
     {
         _kernelCache = new Dictionary<string, IntPtr>();
+        DeviceName = "None";
+        InitializationState = GpuBackendInitializationState.Unavailable;
 
         if (!HipNativeBindings.IsAvailable)
         {
             IsAvailable = false;
-            DeviceName = "None";
             return;
         }
 
@@ -261,8 +273,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             var result = HipNativeBindings.hipSetDevice(deviceIndex);
             if (result != HipError.Success)
             {
-                IsAvailable = false;
-                DeviceName = "None";
+                RecordInitializationFailure(new HipException(
+                    "hipSetDevice failed during HIP backend initialization.", result));
                 return;
             }
 
@@ -271,8 +283,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             result = HipNativeBindings.hipGetDeviceProperties(ref _deviceProps, deviceIndex);
             if (result != HipError.Success)
             {
-                IsAvailable = false;
-                DeviceName = "None";
+                RecordInitializationFailure(new HipException(
+                    "hipGetDeviceProperties failed during HIP backend initialization.", result));
                 return;
             }
 
@@ -288,22 +300,25 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             // into the typed exception is tracked as follow-up work.
             MaxBufferAllocBytes = (long)(ulong)_deviceProps.TotalGlobalMem;
 
-            // Detect architecture from GCN arch name
-            _architecture = DetectArchitecture(_deviceProps.GcnArchName, 0);
+            // The exact target matters: a module compiled for even a nearby gfx family can compile
+            // successfully and then fail to load with ErrorNoBinaryForGpu. Keep the coarse enum only
+            // for dispatch selection and use the runtime-reported target for hipRTC.
+            if (!TryParseArchitectureTarget(_deviceProps.GcnArchName, out _architectureTarget, out _architecture))
+            {
+                RecordInitializationFailure(new InvalidOperationException(
+                    "HIP returned an invalid or empty gcnArchName for the selected device."));
+                return;
+            }
 
             // Check cooperative launch support
-            int coopLaunchSupport = 0;
-            result = HipNativeBindings.hipDeviceGetAttribute(
-                ref coopLaunchSupport,
-                HipDeviceAttribute.CooperativeLaunch,
-                deviceIndex);
-            _supportsCooperativeLaunch = result == HipError.Success && coopLaunchSupport != 0;
+            _supportsCooperativeLaunch = _deviceProps.CooperativeLaunch != 0;
 
             // Create compute stream
             result = HipNativeBindings.hipStreamCreate(ref _stream);
             if (result != HipError.Success)
             {
-                IsAvailable = false;
+                RecordInitializationFailure(new HipException(
+                    "hipStreamCreate failed during HIP backend initialization.", result));
                 return;
             }
 
@@ -320,55 +335,96 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             if (!hasGemmKernel)
             {
                 Console.WriteLine("[HipBackend] No GEMM kernels compiled - backend not available");
-                IsAvailable = false;
+                RecordInitializationFailure(new InvalidOperationException(
+                    "HIP backend initialization produced no usable GEMM kernel."));
                 return;
             }
 
             IsAvailable = true;
+            InitializationState = GpuBackendInitializationState.Succeeded;
         }
         catch (Exception ex)
         {
-            System.Diagnostics.Debug.WriteLine($"HipBackend initialization failed: {ex.Message}");
-            IsAvailable = false;
-            DeviceName = "None";
+            RecordInitializationFailure(ex);
         }
     }
 
-    private AmdGpuArchitecture DetectArchitecture(string gcnArchName, int gcnArch)
+    private void RecordInitializationFailure(Exception exception)
     {
-        // Parse GCN architecture name (e.g., "gfx90a", "gfx1100", "gfx1030")
-        if (string.IsNullOrEmpty(gcnArchName))
+        InitializationState = GpuBackendInitializationState.Failed;
+        InitializationException = exception;
+        IsAvailable = false;
+        System.Diagnostics.Debug.WriteLine($"HipBackend initialization failed: {exception.Message}");
+
+        try
         {
-            return gcnArch switch
-            {
-                >= 1100 => AmdGpuArchitecture.RDNA3,
-                >= 1030 => AmdGpuArchitecture.RDNA2,
-                >= 1010 => AmdGpuArchitecture.RDNA,
-                >= 940 => AmdGpuArchitecture.MI300,
-                >= 908 => AmdGpuArchitecture.MI100,
-                _ => AmdGpuArchitecture.GCN
-            };
+            Dispose();
+        }
+        catch (Exception cleanupException)
+        {
+            InitializationException = new AggregateException(
+                "HIP backend initialization and cleanup both failed.", exception, cleanupException);
+        }
+    }
+
+    internal static bool TryParseArchitectureTarget(
+        string? gcnArchName,
+        out string target,
+        out AmdGpuArchitecture architecture)
+    {
+        target = string.Empty;
+        architecture = AmdGpuArchitecture.Unknown;
+        if (gcnArchName is null || gcnArchName.Trim().Length == 0)
+        {
+            return false;
         }
 
-        string archLower = gcnArchName.ToLowerInvariant();
-        if (archLower.Contains("gfx942") || archLower.Contains("gfx941") || archLower.Contains("gfx940"))
-            return AmdGpuArchitecture.MI300;
-        if (archLower.Contains("gfx90a"))
-            return AmdGpuArchitecture.MI200;
-        if (archLower.Contains("gfx908"))
-            return AmdGpuArchitecture.MI100;
-        if (archLower.Contains("gfx1100") || archLower.Contains("gfx1101") || archLower.Contains("gfx1102"))
-            return AmdGpuArchitecture.RDNA3;
-        if (archLower.Contains("gfx1030") || archLower.Contains("gfx1031") || archLower.Contains("gfx1032"))
-            return AmdGpuArchitecture.RDNA2;
-        if (archLower.Contains("gfx1010") || archLower.Contains("gfx1011") || archLower.Contains("gfx1012"))
-            return AmdGpuArchitecture.RDNA;
+        string reportedTarget = gcnArchName.Trim();
+        int featureSeparator = reportedTarget.IndexOf(':');
+        target = (featureSeparator >= 0 ? reportedTarget.Substring(0, featureSeparator) : reportedTarget)
+            .ToLowerInvariant();
 
-        return AmdGpuArchitecture.GCN;
+        if (target.Length < 4 || !target.StartsWith("gfx", StringComparison.Ordinal))
+        {
+            target = string.Empty;
+            return false;
+        }
+
+        for (int i = 3; i < target.Length; i++)
+        {
+            char c = target[i];
+            bool isAsciiDigit = c >= '0' && c <= '9';
+            bool isAsciiLetter = c >= 'a' && c <= 'z';
+            if (!isAsciiDigit && !isAsciiLetter)
+            {
+                target = string.Empty;
+                return false;
+            }
+        }
+
+        architecture = target switch
+        {
+            "gfx940" or "gfx941" or "gfx942" => AmdGpuArchitecture.MI300,
+            "gfx90a" => AmdGpuArchitecture.MI200,
+            "gfx908" => AmdGpuArchitecture.MI100,
+            "gfx1100" or "gfx1101" or "gfx1102" => AmdGpuArchitecture.RDNA3,
+            "gfx1030" or "gfx1031" or "gfx1032" => AmdGpuArchitecture.RDNA2,
+            "gfx1010" or "gfx1011" or "gfx1012" => AmdGpuArchitecture.RDNA,
+            _ => AmdGpuArchitecture.GCN
+        };
+        return true;
     }
 
     private void TryInitializeHipBlas()
     {
+        // rocBLAS aborts the process (rather than returning a status) when its Tensile package has
+        // no code object for the selected GPU. Preflight the installed architecture data so an
+        // unsupported vendor path safely uses the direct HIP-kernel fallback instead.
+        if (!HipBlasNative.TryConfigureForArchitecture(_architectureTarget))
+        {
+            return;
+        }
+
         if (!HipBlasNative.IsAvailable)
         {
             return;
@@ -462,17 +518,29 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     {
         // Get kernel source
         string source = HipMfmaKernel.GetSource();
-        string compileFlags = HipMfmaKernel.GetCompileFlags(_architecture);
+        string compileFlags = HipMfmaKernel.GetCompileFlags(_architectureTarget);
 
         Console.WriteLine($"[HipBackend] Compiling kernels for {_architecture} with flags: {compileFlags}");
 
         try
         {
             // Compile MFMA/GEMM module
-            CompileKernelModule(source, "mfma_gemm", ref _mfmaModule, new[]
+            HipKernelCompilationException? gemmCompilationFailure = CompileKernelModule(
+                source, "mfma_gemm", ref _mfmaModule, new[]
             {
                 "mfma_gemm_f32", "mfma_gemm_f16", "scalar_gemm_f32", "rdna_gemm_wave32"
             });
+
+            bool hasRequiredGemmKernel = _kernelCache.ContainsKey("scalar_gemm_f32") ||
+                                         _kernelCache.ContainsKey("mfma_gemm_f32") ||
+                                         _kernelCache.ContainsKey("rdna_gemm_wave32");
+            if (!hasRequiredGemmKernel)
+            {
+                throw gemmCompilationFailure ?? new HipKernelCompilationException(
+                    "mfma_gemm",
+                    HipKernelCompilationStage.FunctionLookup,
+                    "The HIP GEMM module did not expose a usable FP32 kernel.");
+            }
 
             // Store GEMM kernel handles for quick lookup
             if (_kernelCache.TryGetValue("mfma_gemm_f32", out var mfmaF32))
@@ -768,17 +836,28 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         {
             Console.WriteLine($"[HipBackend] Kernel compilation EXCEPTION: {ex.GetType().Name}: {ex.Message}");
             System.Diagnostics.Debug.WriteLine($"HIP kernel compilation failed: {ex.Message}");
+            throw;
         }
     }
 
-    private void CompileKernelModule(string source, string moduleName, ref IntPtr module, string[] kernelNames)
+    private HipKernelCompilationException? CompileKernelModule(
+        string source,
+        string moduleName,
+        ref IntPtr module,
+        string[] kernelNames)
     {
-        CompileKernelModule(source, moduleName, ref module, kernelNames, useFastMath: true);
+        return CompileKernelModule(source, moduleName, ref module, kernelNames, useFastMath: true);
     }
 
-    private void CompileKernelModule(string source, string moduleName, ref IntPtr module, string[] kernelNames, bool useFastMath)
+    private HipKernelCompilationException? CompileKernelModule(
+        string source,
+        string moduleName,
+        ref IntPtr module,
+        string[] kernelNames,
+        bool useFastMath)
     {
-        string compileFlags = HipMfmaKernel.GetCompileFlags(_architecture);
+        source = HipKernelSourceCompatibility.Prepare(source);
+        string compileFlags = HipMfmaKernel.GetCompileFlags(_architectureTarget);
 
         IntPtr prog = IntPtr.Zero;
         var rtcResult = HipNativeBindings.hiprtcCreateProgram(
@@ -786,8 +865,11 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
         if (rtcResult != HipRtcResult.Success)
         {
-            Console.WriteLine($"[HipBackend] Failed to create program for {moduleName}: {rtcResult}");
-            return;
+            return RecordKernelCompilationFailure(new HipKernelCompilationException(
+                moduleName,
+                HipKernelCompilationStage.ProgramCreation,
+                $"hiprtcCreateProgram failed with {rtcResult}.",
+                rtcResult));
         }
 
         var options = new List<string>(compileFlags.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries))
@@ -802,18 +884,24 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
         if (rtcResult != HipRtcResult.Success)
         {
+            string log = string.Empty;
             UIntPtr logSize = UIntPtr.Zero;
             HipNativeBindings.hiprtcGetProgramLogSize(prog, ref logSize);
             if ((ulong)logSize > 0)
             {
                 IntPtr logPtr = Marshal.AllocHGlobal((int)(ulong)logSize);
                 HipNativeBindings.hiprtcGetProgramLog(prog, logPtr);
-                string log = Marshal.PtrToStringAnsi(logPtr) ?? "";
+                log = Marshal.PtrToStringAnsi(logPtr) ?? string.Empty;
                 Marshal.FreeHGlobal(logPtr);
-                Console.WriteLine($"[HipBackend] Compile failed for {moduleName}: {log}");
             }
             HipNativeBindings.hiprtcDestroyProgram(ref prog);
-            return;
+            return RecordKernelCompilationFailure(new HipKernelCompilationException(
+                moduleName,
+                HipKernelCompilationStage.Compilation,
+                string.IsNullOrWhiteSpace(log)
+                    ? $"hiprtcCompileProgram failed with {rtcResult}."
+                    : log.TrimEnd('\0', '\r', '\n'),
+                rtcResult));
         }
 
         UIntPtr codeSize = UIntPtr.Zero;
@@ -821,7 +909,11 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (rtcResult != HipRtcResult.Success || (ulong)codeSize == 0)
         {
             HipNativeBindings.hiprtcDestroyProgram(ref prog);
-            return;
+            return RecordKernelCompilationFailure(new HipKernelCompilationException(
+                moduleName,
+                HipKernelCompilationStage.CodeSize,
+                $"hiprtcGetCodeSize returned {rtcResult} with {codeSize} bytes.",
+                rtcResult));
         }
 
         IntPtr code = Marshal.AllocHGlobal((int)(ulong)codeSize);
@@ -831,7 +923,11 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (rtcResult != HipRtcResult.Success)
         {
             Marshal.FreeHGlobal(code);
-            return;
+            return RecordKernelCompilationFailure(new HipKernelCompilationException(
+                moduleName,
+                HipKernelCompilationStage.CodeRetrieval,
+                $"hiprtcGetCode failed with {rtcResult}.",
+                rtcResult));
         }
 
         var hipResult = HipNativeBindings.hipModuleLoadData(ref module, code);
@@ -839,24 +935,54 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
         if (hipResult != HipError.Success)
         {
-            Console.WriteLine($"[HipBackend] Failed to load module {moduleName}: {hipResult}");
-            return;
+            return RecordKernelCompilationFailure(new HipKernelCompilationException(
+                moduleName,
+                HipKernelCompilationStage.ModuleLoad,
+                $"hipModuleLoadData failed with {hipResult}.",
+                hipError: hipResult));
         }
 
         // Load all kernel functions
+        int loadedKernelCount = 0;
+        HipError lastLookupError = HipError.Success;
         foreach (var kernelName in kernelNames)
         {
             IntPtr func = IntPtr.Zero;
             hipResult = HipNativeBindings.hipModuleGetFunction(ref func, module, kernelName);
             if (hipResult == HipError.Success)
             {
+                loadedKernelCount++;
                 _kernelCache[kernelName] = func;
                 // Lets the native-launch choke point journal this kernel BY NAME (Issue #996).
                 // INSIDE the guard: registering on a failed lookup would map IntPtr.Zero to this
                 // name and misattribute a later fault to a kernel that never resolved.
                 GpuKernelDiagnostics.RegisterKernelName(func, kernelName);
             }
+            else
+            {
+                lastLookupError = hipResult;
+            }
         }
+
+        if (loadedKernelCount != kernelNames.Length)
+        {
+            return RecordKernelCompilationFailure(new HipKernelCompilationException(
+                moduleName,
+                HipKernelCompilationStage.FunctionLookup,
+                $"Resolved {loadedKernelCount} of {kernelNames.Length} kernel functions.",
+                hipError: lastLookupError));
+        }
+
+        return null;
+    }
+
+    private HipKernelCompilationException RecordKernelCompilationFailure(
+        HipKernelCompilationException exception)
+    {
+        _kernelCompilationFailures.Add(exception);
+        Console.WriteLine($"[HipBackend] {exception.Message}");
+        System.Diagnostics.Debug.WriteLine($"[HipBackend] {exception}");
+        return exception;
     }
 
     private unsafe void LaunchKernel(IntPtr kernel, uint gridX, uint blockSize, IntPtr[] args, uint sharedMem = 0)

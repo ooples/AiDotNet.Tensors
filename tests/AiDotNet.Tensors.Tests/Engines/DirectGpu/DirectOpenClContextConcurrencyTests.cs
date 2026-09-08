@@ -50,6 +50,21 @@ public class DirectOpenClContextConcurrencyTests
     private static bool OpenClPresent() =>
         DirectOpenClContext.IsAvailable && DirectOpenClContext.GetDeviceCount() > 0;
 
+    private static OpenClBackend CreateBackendOrThrow()
+    {
+        var backend = new OpenClBackend(deviceIndex: 0);
+        if (backend.IsAvailable)
+        {
+            return backend;
+        }
+
+        Exception? initializationException = backend.InitializationException;
+        backend.Dispose();
+        throw new InvalidOperationException(
+            "An OpenCL device was detected but the backend failed to initialize.",
+            initializationException);
+    }
+
     [SkippableFact]
     public void EachWorkerThreadGetsDistinctQueueHandle()
     {
@@ -187,7 +202,7 @@ public class DirectOpenClContextConcurrencyTests
     public void BufferPool_DoesNotRecycleAllocationAcrossUnorderedThreadQueues()
     {
         Skip.IfNot(OpenClPresent(), "No OpenCL GPU device available on this host.");
-        using var backend = new OpenClBackend(deviceIndex: 0);
+        using var backend = CreateBackendOrThrow();
 
         IntPtr queueABuffer = IntPtr.Zero;
         IntPtr queueBBuffer = IntPtr.Zero;
@@ -243,7 +258,7 @@ public class DirectOpenClContextConcurrencyTests
     public void BufferPool_ReusesCapacityWithoutExposingItAsLogicalSize()
     {
         Skip.IfNot(OpenClPresent(), "No OpenCL GPU device available on this host.");
-        using var backend = new OpenClBackend(deviceIndex: 0);
+        using var backend = CreateBackendOrThrow();
         IntPtr physicalHandle;
 
         using (var capacity = backend.AllocateBuffer(8192))
@@ -266,7 +281,7 @@ public class DirectOpenClContextConcurrencyTests
     public void AsyncTransfer_CrossQueueDependencyAndHostPins_PreserveData()
     {
         Skip.IfNot(OpenClPresent(), "No OpenCL GPU device available on this host.");
-        using var backend = new OpenClBackend(deviceIndex: 0);
+        using var backend = CreateBackendOrThrow();
         using var producer = backend.CreateStream(GpuStreamType.HostToDevice);
         using var consumer = backend.CreateStream(GpuStreamType.Compute);
         const int length = 262_144;
