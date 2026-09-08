@@ -19,12 +19,10 @@ public sealed class RopeGqaOpenClTests : IClassFixture<OpenClBackendTestFixture>
 {
     private readonly OpenClBackend? _backend;
     private readonly bool _ready;
-    private readonly Exception? _initException;
 
     public RopeGqaOpenClTests(OpenClBackendTestFixture fixture)
     {
         _backend = fixture.Backend;
-        _initException = fixture.InitializationException;
         _ready = fixture.IsAvailable;
     }
 
@@ -34,7 +32,7 @@ public sealed class RopeGqaOpenClTests : IClassFixture<OpenClBackendTestFixture>
     {
         if (_ready) return true;
         if (string.Equals(Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_GPU_TESTS"), "1", StringComparison.Ordinal))
-            throw new InvalidOperationException("GPU tests required but the OpenCL backend was unavailable.", _initException);
+            throw new InvalidOperationException("GPU tests required but the OpenCL backend was unavailable.");
         return false;
     }
 
@@ -82,12 +80,12 @@ public sealed class RopeGqaOpenClTests : IClassFixture<OpenClBackendTestFixture>
         return outp;
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(0)]
     [InlineData(5)]   // decode with a non-zero absolute position offset
     public void RopeInterleaved_MatchesCpuReference(int startPosition)
     {
-        if (!EnsureReady()) return;
+        Skip.If(!EnsureReady(), "OpenCL backend is unavailable.");
         var backend = Backend;
 
         const int heads = 3, seqLen = 6, headDim = 8, maxSeq = 32;
@@ -271,12 +269,12 @@ public sealed class RopeGqaOpenClTests : IClassFixture<OpenClBackendTestFixture>
                 $"CPU GQA-SDPA mismatch at {i}: expected {expected[i]}, got {actual[i]}");
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(false)]
     [InlineData(true)]
     public void GqaScaledDotProductAttention_MatchesCpuReference(bool causal)
     {
-        if (!EnsureReady()) return;
+        Skip.If(!EnsureReady(), "OpenCL backend is unavailable.");
         var backend = Backend;
 
         // SmolLM2-style ratio: 9 query heads share 3 KV heads (group of 3).
@@ -317,10 +315,10 @@ public sealed class RopeGqaOpenClTests : IClassFixture<OpenClBackendTestFixture>
     }
 
     // Guards the MHA collapse: numKVHeads == qHeads must equal a plain full-head reference.
-    [Fact]
+    [SkippableFact]
     public void GqaWithEqualHeads_EqualsStandardAttention()
     {
-        if (!EnsureReady()) return;
+        Skip.If(!EnsureReady(), "OpenCL backend is unavailable.");
         var backend = Backend;
 
         const int batch = 1, heads = 4, seqQ = 4, seqK = 4, headDim = 8;

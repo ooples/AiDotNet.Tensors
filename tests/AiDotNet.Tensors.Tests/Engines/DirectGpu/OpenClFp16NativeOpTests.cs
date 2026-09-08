@@ -25,12 +25,10 @@ public sealed class OpenClFp16NativeOpTests : IClassFixture<OpenClBackendTestFix
 {
     private readonly OpenClBackend? _backend;
     private readonly bool _ready;
-    private readonly Exception? _initException;
 
     public OpenClFp16NativeOpTests(OpenClBackendTestFixture fixture)
     {
         _backend = fixture.Backend;
-        _initException = fixture.InitializationException;
         _ready = fixture.IsAvailable && _backend?.SupportsFp16NativeOps == true;
     }
 
@@ -41,8 +39,7 @@ public sealed class OpenClFp16NativeOpTests : IClassFixture<OpenClBackendTestFix
         if (_ready) return true;
         if (string.Equals(Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_GPU_TESTS"), "1", StringComparison.Ordinal))
             throw new InvalidOperationException(
-                "GPU tests were required (AIDOTNET_REQUIRE_GPU_TESTS=1) but the OpenCL FP16-native op kernels were unavailable.",
-                _initException);
+                "GPU tests were required (AIDOTNET_REQUIRE_GPU_TESTS=1) but the OpenCL FP16-native op kernels were unavailable.");
         return false;
     }
 

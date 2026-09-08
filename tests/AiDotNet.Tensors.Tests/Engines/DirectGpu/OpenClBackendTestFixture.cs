@@ -17,25 +17,24 @@ public sealed class OpenClBackendTestFixture : IDisposable
 {
     public OpenClBackendTestFixture()
     {
-        try
+        var backend = new OpenClBackend();
+        if (backend.InitializationError is string initializationError)
         {
-            Backend = new OpenClBackend();
-            if (!Backend.IsAvailable && Backend.InitializationError is string initializationError)
-                InitializationException = new InvalidOperationException(initializationError);
+            backend.Dispose();
+            throw new InvalidOperationException(
+                "OpenCL was detected, but backend initialization failed.",
+                new InvalidOperationException(initializationError));
         }
-        catch (Exception ex)
-        {
-            InitializationException = ex;
-        }
+
+        Backend = backend;
     }
 
-    public OpenClBackend? Backend { get; }
-    public Exception? InitializationException { get; }
-    public bool IsAvailable => Backend?.IsAvailable == true;
+    public OpenClBackend Backend { get; }
+    public bool IsAvailable => Backend.IsAvailable;
 
     public void Dispose()
     {
-        Backend?.Dispose();
+        Backend.Dispose();
     }
 }
 

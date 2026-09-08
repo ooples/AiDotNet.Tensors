@@ -60,13 +60,13 @@ public sealed class DevicePagedKVCacheOpenClTests : IClassFixture<OpenClBackendT
         return outp;
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(4, 64, 16, 40)]   // 40 tokens over 16-token blocks → 3 blocks, partial last
     [InlineData(2, 32, 8, 20)]
     [InlineData(8, 32, 32, 100)]
     public void Append_Then_Decode_MatchesOracle(int heads, int headDim, int blockSize, int seqLen)
     {
-        if (!EnsureReady()) return;
+        Skip.If(!EnsureReady(), "OpenCL backend is unavailable.");
         var backend = Backend;
         var rng = new Random(0xBEE + heads + seqLen);
         int stepStride = heads * headDim;
@@ -120,13 +120,13 @@ public sealed class DevicePagedKVCacheOpenClTests : IClassFixture<OpenClBackendT
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void Backend_PagedAttention_OnInterface_MatchesOracle()
     {
         // The capability interface (IPagedAttentionBackend) is how higher layers (e.g. an inference/serving
         // engine) consume paged attention without depending on a concrete backend type. Verify the backend
         // advertises it and that dispatching through the interface produces the same result as the oracle.
-        if (!EnsureReady()) return;
+        Skip.If(!EnsureReady(), "OpenCL backend is unavailable.");
         var backend = Backend;
         Assert.True(backend is IDirectGpuBackend, "OpenClBackend must implement IDirectGpuBackend paged attention.");
         var paged = (IDirectGpuBackend)backend;
@@ -166,10 +166,10 @@ public sealed class DevicePagedKVCacheOpenClTests : IClassFixture<OpenClBackendT
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void Free_ReturnsBlocksToPool_AndReuses()
     {
-        if (!EnsureReady()) return;
+        Skip.If(!EnsureReady(), "OpenCL backend is unavailable.");
         var backend = Backend;
         int heads = 2, headDim = 16, blockSize = 8, stepStride = heads * headDim;
         using var cache = new DevicePagedKVCache(backend, maxBlocks: 4, blockSize, heads, headDim);
@@ -187,10 +187,10 @@ public sealed class DevicePagedKVCacheOpenClTests : IClassFixture<OpenClBackendT
         Assert.Equal(10, cache.GetLength(2));
     }
 
-    [Fact]
+    [SkippableFact]
     public void ShareBlocks_TargetSeesSharedPrefix()
     {
-        if (!EnsureReady()) return;
+        Skip.If(!EnsureReady(), "OpenCL backend is unavailable.");
         var backend = Backend;
         int heads = 2, headDim = 16, blockSize = 8, stepStride = heads * headDim;
         int prefixTokens = 12;
@@ -232,10 +232,10 @@ public sealed class DevicePagedKVCacheOpenClTests : IClassFixture<OpenClBackendT
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void ShareBlocks_RefcountedFree_NoDoubleFree()
     {
-        if (!EnsureReady()) return;
+        Skip.If(!EnsureReady(), "OpenCL backend is unavailable.");
         var backend = Backend;
         int heads = 2, headDim = 16, blockSize = 8, stepStride = heads * headDim;
         using var cache = new DevicePagedKVCache(backend, maxBlocks: 8, blockSize, heads, headDim);
@@ -260,10 +260,10 @@ public sealed class DevicePagedKVCacheOpenClTests : IClassFixture<OpenClBackendT
         Assert.Equal(4, cache.AllocatedBlocks);                // 2 + 2 distinct blocks; no double-hand-out
     }
 
-    [Fact]
+    [SkippableFact]
     public void CowAppend_AfterShare_LeavesSourceIntact()
     {
-        if (!EnsureReady()) return;
+        Skip.If(!EnsureReady(), "OpenCL backend is unavailable.");
         var backend = Backend;
         int heads = 2, headDim = 16, blockSize = 8, stepStride = heads * headDim;
         using var cache = new DevicePagedKVCache(backend, maxBlocks: 16, blockSize, heads, headDim);

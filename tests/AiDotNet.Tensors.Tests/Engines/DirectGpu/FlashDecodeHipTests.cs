@@ -16,18 +16,18 @@ public sealed class FlashDecodeHipTests : IClassFixture<HipBackendTestFixture>
 {
     private readonly HipBackendTestFixture _fixture;
     private bool IsReady => _fixture.IsAvailable;
-    private HipBackend Backend => _fixture.Backend ?? throw new InvalidOperationException(
-        "HIP backend was not initialized.", _fixture.InitializationException);
+    private HipBackend Backend => _fixture.Backend;
 
     public FlashDecodeHipTests(HipBackendTestFixture fixture)
     {
         _fixture = fixture;
     }
 
-    [Fact]
+    [SkippableFact]
     public void Probe_HipAvailability()
     {
-        if (Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_HIP") != "1") return;
+        Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_HIP") != "1",
+            "HIP availability is asserted only in the required-HIP lane.");
         Assert.True(IsReady, "HIP/ROCm backend NOT available on this host");
     }
 
@@ -103,7 +103,7 @@ public sealed class FlashDecodeHipTests : IClassFixture<HipBackendTestFixture>
         }
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(4, 64, 40, 8)]
     [InlineData(8, 32, 100, 8)]
     [InlineData(4, 64, 7, 8)]
@@ -111,16 +111,16 @@ public sealed class FlashDecodeHipTests : IClassFixture<HipBackendTestFixture>
     [InlineData(6, 48, 77, 0)]   // splits=0 -> internal default derivation
     public void MhaDecode_MatchesOracle(int heads, int headDim, int seqLen, int splits)
     {
-        if (!EnsureReady()) return;
+        Skip.If(!EnsureReady(), "HIP/ROCm backend is unavailable.");
         RunAndCompare(heads, heads, headDim, seqLen, splits);
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(8, 2, 64, 50, 8)]
     [InlineData(8, 1, 64, 40, 8)]
     public void GqaDecode_MatchesOracle(int heads, int kvHeads, int headDim, int seqLen, int splits)
     {
-        if (!EnsureReady()) return;
+        Skip.If(!EnsureReady(), "HIP/ROCm backend is unavailable.");
         RunAndCompare(heads, kvHeads, headDim, seqLen, splits);
     }
 }

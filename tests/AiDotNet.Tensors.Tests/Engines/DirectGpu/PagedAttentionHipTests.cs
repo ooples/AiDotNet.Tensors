@@ -16,18 +16,18 @@ public sealed class PagedAttentionHipTests : IClassFixture<HipBackendTestFixture
 {
     private readonly HipBackendTestFixture _fixture;
     private bool IsReady => _fixture.IsAvailable;
-    private HipBackend Backend => _fixture.Backend ?? throw new InvalidOperationException(
-        "HIP backend was not initialized.", _fixture.InitializationException);
+    private HipBackend Backend => _fixture.Backend;
 
     public PagedAttentionHipTests(HipBackendTestFixture fixture)
     {
         _fixture = fixture;
     }
 
-    [Fact]
+    [SkippableFact]
     public void Probe_HipAvailability()
     {
-        if (Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_HIP") != "1") return;
+        Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_HIP") != "1",
+            "HIP availability is asserted only in the required-HIP lane.");
         Assert.True(IsReady, "HIP/ROCm backend NOT available on this host");
     }
 
@@ -39,13 +39,13 @@ public sealed class PagedAttentionHipTests : IClassFixture<HipBackendTestFixture
         return false;
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(4, 64, 16, 40)]
     [InlineData(2, 128, 8, 20)]
     [InlineData(8, 32, 32, 100)]
     public void PagedAttentionDecode_MatchesCpuOracle(int heads, int headDim, int blockSize, int seqLen)
     {
-        if (!EnsureReady()) return;
+        Skip.If(!EnsureReady(), "HIP/ROCm backend is unavailable.");
         var backend = Backend;
         var rng = new Random(0xA77 + heads + seqLen);
 
@@ -117,13 +117,13 @@ public sealed class PagedAttentionHipTests : IClassFixture<HipBackendTestFixture
         }
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(4, 64, 16, 8, 0)]
     [InlineData(2, 128, 8, 12, 5)]
     [InlineData(8, 32, 32, 20, 40)]
     public void PagedAttentionPrefill_MatchesCpuOracle(int heads, int headDim, int blockSize, int numQueries, int startPos)
     {
-        if (!EnsureReady()) return;
+        Skip.If(!EnsureReady(), "HIP/ROCm backend is unavailable.");
         var backend = Backend;
         var rng = new Random(0xB99 + heads + numQueries + startPos);
 
@@ -201,13 +201,13 @@ public sealed class PagedAttentionHipTests : IClassFixture<HipBackendTestFixture
         }
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(8, 2, 64, 16, 40)]
     [InlineData(4, 4, 32, 8, 20)]
     [InlineData(8, 1, 64, 32, 50)]
     public void PagedAttentionDecodeGqa_MatchesCpuOracle(int heads, int kvHeads, int headDim, int blockSize, int seqLen)
     {
-        if (!EnsureReady()) return;
+        Skip.If(!EnsureReady(), "HIP/ROCm backend is unavailable.");
         var backend = Backend;
         var rng = new Random(0xC55 + heads + kvHeads + seqLen);
         int numLogicalBlocks = (seqLen + blockSize - 1) / blockSize;
@@ -275,12 +275,12 @@ public sealed class PagedAttentionHipTests : IClassFixture<HipBackendTestFixture
         }
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(8, 2, 64, 16, 8, 0)]
     [InlineData(8, 1, 32, 8, 12, 5)]
     public void PagedAttentionPrefillGqa_MatchesCpuOracle(int heads, int kvHeads, int headDim, int blockSize, int numQueries, int startPos)
     {
-        if (!EnsureReady()) return;
+        Skip.If(!EnsureReady(), "HIP/ROCm backend is unavailable.");
         var backend = Backend;
         var rng = new Random(0xD66 + heads + kvHeads + numQueries + startPos);
         int maxKeyLen = startPos + numQueries;

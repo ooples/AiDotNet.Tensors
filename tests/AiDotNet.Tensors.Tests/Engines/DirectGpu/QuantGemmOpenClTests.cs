@@ -23,12 +23,10 @@ public sealed class QuantGemmOpenClTests : IClassFixture<OpenClBackendTestFixtur
 {
     private readonly OpenClBackend? _backend;
     private readonly bool _ready;
-    private readonly Exception? _initException;
 
     public QuantGemmOpenClTests(OpenClBackendTestFixture fixture)
     {
         _backend = fixture.Backend;
-        _initException = fixture.InitializationException;
         _ready = fixture.IsAvailable;
     }
 
@@ -38,7 +36,7 @@ public sealed class QuantGemmOpenClTests : IClassFixture<OpenClBackendTestFixtur
     {
         if (_ready) return true;
         if (string.Equals(Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_GPU_TESTS"), "1", StringComparison.Ordinal))
-            throw new InvalidOperationException("GPU tests required but the OpenCL backend was unavailable.", _initException);
+            throw new InvalidOperationException("GPU tests required but the OpenCL backend was unavailable.");
         return false;
     }
 
@@ -71,13 +69,13 @@ public sealed class QuantGemmOpenClTests : IClassFixture<OpenClBackendTestFixtur
         return outp;
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(0)]    // per-tensor (scaleCount == 1)
     [InlineData(64)]   // per-group over flattened K*N
     [InlineData(128)]  // per-group, different group size
     public void DequantGemmInt8_MatchesCpuOracle(int groupSize)
     {
-        if (!EnsureReady()) return;
+        Skip.If(!EnsureReady(), "OpenCL backend is unavailable.");
         var backend = Backend;
 
         const int M = 8, K = 128, N = 64;
@@ -144,13 +142,13 @@ public sealed class QuantGemmOpenClTests : IClassFixture<OpenClBackendTestFixtur
         }
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(0)]    // per-tensor (scaleCount == 1)
     [InlineData(64)]   // per-group over flattened K*N
     [InlineData(128)]  // per-group, different group size
     public void DequantGemmInt4_MatchesCpuOracle(int groupSize)
     {
-        if (!EnsureReady()) return;
+        Skip.If(!EnsureReady(), "OpenCL backend is unavailable.");
         var backend = Backend;
 
         const int M = 8, K = 128, N = 64;
@@ -223,13 +221,13 @@ public sealed class QuantGemmOpenClTests : IClassFixture<OpenClBackendTestFixtur
         }
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(0)]    // per-tensor (scaleCount == 1)
     [InlineData(64)]   // per-group over flattened K*N
     [InlineData(128)]  // per-group, different group size
     public void DequantGemmFp8E4M3_MatchesCpuOracle(int groupSize)
     {
-        if (!EnsureReady()) return;
+        Skip.If(!EnsureReady(), "OpenCL backend is unavailable.");
         var backend = Backend;
 
         const int M = 8, K = 128, N = 64;

@@ -12,25 +12,17 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// </summary>
 public sealed class HipBackendTestFixture : IDisposable
 {
-    public HipBackend? Backend { get; }
-    public Exception? InitializationException { get; }
-    public bool IsAvailable => Backend?.IsAvailable == true;
+    public HipBackend Backend { get; }
+    public bool IsAvailable => Backend.IsAvailable;
 
     public HipBackendTestFixture()
     {
-        try
-        {
-            Backend = new HipBackend();
-        }
-        catch (Exception ex)
-        {
-            InitializationException = ex;
-        }
+        Backend = new HipBackend();
     }
 
     public void Dispose()
     {
-        Backend?.Dispose();
+        Backend.Dispose();
     }
 }
 

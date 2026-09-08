@@ -27,13 +27,12 @@ public sealed class HipHalfPrecisionGemmTests : IClassFixture<HipBackendTestFixt
 {
     private readonly HipBackendTestFixture _fixture;
     private readonly bool _ready;
-    private HipBackend Backend => _fixture.Backend ?? throw new InvalidOperationException(
-        "HIP backend was not initialized.", _fixture.InitializationException);
+    private HipBackend Backend => _fixture.Backend;
 
     public HipHalfPrecisionGemmTests(HipBackendTestFixture fixture)
     {
         _fixture = fixture;
-        _ready = fixture.Backend?.IsAvailable == true && fixture.Backend.SupportsHgemm;
+        _ready = fixture.Backend.IsAvailable && fixture.Backend.SupportsHgemm;
     }
 
     private bool EnsureReady()
@@ -46,8 +45,7 @@ public sealed class HipHalfPrecisionGemmTests : IClassFixture<HipBackendTestFixt
         {
             throw new InvalidOperationException(
                 "GPU tests were required (AIDOTNET_REQUIRE_GPU_TESTS=1) but the HIP backend " +
-                "or hipBLAS was unavailable.",
-                _fixture.InitializationException);
+                "or hipBLAS was unavailable.");
         }
 
         return false;

@@ -33,12 +33,10 @@ public sealed class OpenClHalfPrecisionGemmTests : IClassFixture<OpenClBackendTe
 {
     private readonly OpenClBackend? _backend;
     private readonly bool _ready;
-    private readonly Exception? _initException;
 
     public OpenClHalfPrecisionGemmTests(OpenClBackendTestFixture fixture)
     {
         _backend = fixture.Backend;
-        _initException = fixture.InitializationException;
         _ready = fixture.IsAvailable && _backend?.SupportsHgemm == true;
     }
 
@@ -54,8 +52,7 @@ public sealed class OpenClHalfPrecisionGemmTests : IClassFixture<OpenClBackendTe
         {
             throw new InvalidOperationException(
                 "GPU tests were required (AIDOTNET_REQUIRE_GPU_TESTS=1) but the OpenCL " +
-                "backend or its FP16 GEMM kernels were unavailable.",
-                _initException);
+                "backend or its FP16 GEMM kernels were unavailable.");
         }
 
         return false;

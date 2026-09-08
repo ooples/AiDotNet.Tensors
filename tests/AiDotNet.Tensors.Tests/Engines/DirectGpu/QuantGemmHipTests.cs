@@ -20,18 +20,18 @@ public sealed class QuantGemmHipTests : IClassFixture<HipBackendTestFixture>
 
     private readonly HipBackendTestFixture _fixture;
     private bool IsReady => _fixture.IsAvailable;
-    private HipBackend Backend => _fixture.Backend ?? throw new InvalidOperationException(
-        "HIP backend was not initialized.", _fixture.InitializationException);
+    private HipBackend Backend => _fixture.Backend;
 
     public QuantGemmHipTests(HipBackendTestFixture fixture)
     {
         _fixture = fixture;
     }
 
-    [Fact]
+    [SkippableFact]
     public void Probe_HipAvailability()
     {
-        if (Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_HIP") != "1") return;
+        Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_HIP") != "1",
+            "HIP availability is asserted only in the required-HIP lane.");
         Assert.True(IsReady, "HIP/ROCm backend NOT available on this host");
     }
 
@@ -95,12 +95,12 @@ public sealed class QuantGemmHipTests : IClassFixture<HipBackendTestFixture>
         }
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(0)]
     [InlineData(64)]
     public void DequantGemmInt8_MatchesCpuOracle(int groupSize)
     {
-        if (!EnsureReady()) return;
+        Skip.If(!EnsureReady(), "HIP/ROCm backend is unavailable.");
         var backend = Backend;
         var rng = new Random(0x8100 + groupSize);
         var act = RandomAct(rng);
@@ -131,12 +131,12 @@ public sealed class QuantGemmHipTests : IClassFixture<HipBackendTestFixture>
         AssertClose(expected, actual, $"int8(gs={groupSize})");
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(0)]
     [InlineData(64)]
     public void DequantGemmInt4_MatchesCpuOracle(int groupSize)
     {
-        if (!EnsureReady()) return;
+        Skip.If(!EnsureReady(), "HIP/ROCm backend is unavailable.");
         var backend = Backend;
         var rng = new Random(0x4400 + groupSize);
         var act = RandomAct(rng);
@@ -172,12 +172,12 @@ public sealed class QuantGemmHipTests : IClassFixture<HipBackendTestFixture>
         AssertClose(expected, actual, $"int4(gs={groupSize})");
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(0)]
     [InlineData(64)]
     public void DequantGemmFp8E4M3_MatchesCpuOracle(int groupSize)
     {
-        if (!EnsureReady()) return;
+        Skip.If(!EnsureReady(), "HIP/ROCm backend is unavailable.");
         var backend = Backend;
         var rng = new Random(0xF800 + groupSize);
         var act = RandomAct(rng);

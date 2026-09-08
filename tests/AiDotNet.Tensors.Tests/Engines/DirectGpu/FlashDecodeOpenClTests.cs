@@ -100,7 +100,7 @@ public sealed class FlashDecodeOpenClTests : IClassFixture<OpenClBackendTestFixt
         }
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(4, 64, 40, 8)]    // MHA, default-ish splits
     [InlineData(8, 32, 100, 8)]
     [InlineData(2, 128, 20, 4)]
@@ -108,24 +108,24 @@ public sealed class FlashDecodeOpenClTests : IClassFixture<OpenClBackendTestFixt
     [InlineData(4, 64, 64, 1)]    // single split == serial reference
     public void MhaDecode_MatchesOracle(int heads, int headDim, int seqLen, int splits)
     {
-        if (!EnsureReady()) return;
+        Skip.If(!EnsureReady(), "OpenCL backend is unavailable.");
         RunAndCompare(heads, heads, headDim, seqLen, splits);
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(8, 2, 64, 50, 8)]  // GQA: 8 query heads share 2 KV heads
     [InlineData(8, 1, 64, 40, 8)]  // MQA
     [InlineData(4, 4, 32, 30, 4)]  // kvHeads == heads (MHA via GQA path)
     public void GqaDecode_MatchesOracle(int heads, int kvHeads, int headDim, int seqLen, int splits)
     {
-        if (!EnsureReady()) return;
+        Skip.If(!EnsureReady(), "OpenCL backend is unavailable.");
         RunAndCompare(heads, kvHeads, headDim, seqLen, splits);
     }
 
-    [Fact]
+    [SkippableFact]
     public void DefaultSplits_MatchesOracle()
     {
-        if (!EnsureReady()) return;
+        Skip.If(!EnsureReady(), "OpenCL backend is unavailable.");
         RunAndCompare(heads: 6, kvHeads: 3, headDim: 48, seqLen: 77, splits: 0); // splits=0 → internal default
     }
 }
