@@ -20,25 +20,18 @@ using BM = AiDotNet.Tensors.Engines.BlasManaged.BlasManaged;
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 [Collection("DirectGpuSerial")]
-public sealed class GpuMissingKernelsParityTests : IDisposable
+public sealed class GpuMissingKernelsParityTests : IClassFixture<GpuMissingKernelsParityFixture>
 {
-    private readonly CpuEngine _cpu = new CpuEngine();
+    private readonly CpuEngine _cpu;
     private readonly DirectGpuTensorEngine _gpu;
     private readonly bool _gpuReady;
 
-    public GpuMissingKernelsParityTests()
+    public GpuMissingKernelsParityTests(GpuMissingKernelsParityFixture fixture)
     {
-        // GPU/CPU parity validates kernel LOGIC, so it must compare at MATCHED precision: force strict
-        // fp32 on the GPU (TF32 off) before the backend initializes. TF32 stays the production default
-        // (industry standard, ~5× fp32 throughput) and is unaffected here — but a TF32 GPU result vs a
-        // true-fp32 CPU result legitimately differs by ~1e-3 relative (TF32's ~10-bit mantissa), which
-        // would mask real logic bugs. PyTorch's own CUDA-vs-CPU correctness tests disable TF32 the same way.
-        CudaDispatchPolicy.AllowTF32 = false;
-        _gpu = new DirectGpuTensorEngine();
-        _gpuReady = _gpu.IsGpuAvailable;
+        _cpu = fixture.Cpu;
+        _gpu = fixture.Gpu;
+        _gpuReady = fixture.IsGpuReady;
     }
-
-    public void Dispose() => _gpu?.Dispose();
 
     private bool EnsureGpuReady()
     {
@@ -1524,6 +1517,49 @@ public sealed class GpuMissingKernelsParityTests : IDisposable
         var cpu = _cpu.TensorCosineSimilarity(x1, x2, -1);
         var gpu = _gpu.TensorCosineSimilarity(x1, x2, -1);
         AssertMatch(gpu, cpu, $"TensorCosineSimilarity[{string.Join("x", shape)}]");
+    }
+}
+
+/// <summary>
+/// Owns one GPU context for this complete parity family. xUnit creates a new test-class instance for
+/// every theory row, so constructing the engine in the test constructor repeatedly created and tore
+/// down OpenCL contexts until the AMD driver stalled during a full-suite run.
+/// </summary>
+public sealed class GpuMissingKernelsParityFixture : IDisposable
+{
+    private readonly bool _priorAllowTf32;
+
+    public GpuMissingKernelsParityFixture()
+    {
+        // GPU/CPU parity validates kernel logic at matched precision. Set this before the shared
+        // backend initializes; production still retains its normal TF32 default outside this suite.
+        _priorAllowTf32 = CudaDispatchPolicy.AllowTF32;
+        CudaDispatchPolicy.AllowTF32 = false;
+        try
+        {
+            Gpu = new DirectGpuTensorEngine();
+        }
+        catch
+        {
+            CudaDispatchPolicy.AllowTF32 = _priorAllowTf32;
+            throw;
+        }
+    }
+
+    public CpuEngine Cpu { get; } = new CpuEngine();
+    public DirectGpuTensorEngine Gpu { get; }
+    public bool IsGpuReady => Gpu.IsGpuAvailable;
+
+    public void Dispose()
+    {
+        try
+        {
+            Gpu.Dispose();
+        }
+        finally
+        {
+            CudaDispatchPolicy.AllowTF32 = _priorAllowTf32;
+        }
     }
 }
 #endif

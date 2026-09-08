@@ -8,32 +8,22 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 [Collection("DirectGpuSerial")]
-public sealed class OpenClComplexTopKTests : IDisposable
+public sealed class OpenClComplexTopKTests : IClassFixture<OpenClBackendTestFixture>
 {
     private readonly OpenClBackend? _backend;
-    private readonly Exception? _initException;
 
-    public OpenClComplexTopKTests()
+    public OpenClComplexTopKTests(OpenClBackendTestFixture fixture)
     {
-        try
-        {
-            _backend = new OpenClBackend();
-        }
-        catch (Exception ex)
-        {
-            _initException = ex;
-        }
+        _backend = fixture.Backend;
     }
-
-    public void Dispose() => _backend?.Dispose();
 
     private OpenClBackend RequireBackend()
     {
         bool ready = _backend?.IsAvailable == true;
         if (!ready && string.Equals(Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_GPU_TESTS"), "1", StringComparison.Ordinal))
-            throw new InvalidOperationException("OpenCL was required but unavailable.", _initException);
+            throw new InvalidOperationException("OpenCL was required but unavailable.");
         Skip.If(!ready, "OpenCL backend unavailable.");
-        return _backend!;
+        return _backend ?? throw new InvalidOperationException("OpenCL backend is unavailable.");
     }
 
     [SkippableFact]

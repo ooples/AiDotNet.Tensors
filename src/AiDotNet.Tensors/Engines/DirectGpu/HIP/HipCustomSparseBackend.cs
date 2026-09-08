@@ -43,9 +43,7 @@ internal static class HipCustomSparseBackend
         if (!IsAvailable)
             throw new InvalidOperationException("HIP custom-kernel SpMM backend is not available.");
 
-        var backend = new HipBackend();
-        if (!backend.IsAvailable)
-            throw new InvalidOperationException("HIP backend failed to initialise.");
+        using var backend = CreateBackend();
 
         var output = new float[rows * n];
 
@@ -90,9 +88,7 @@ internal static class HipCustomSparseBackend
         if (!IsAvailable)
             throw new InvalidOperationException("HIP custom-kernel SDDMM backend is not available.");
 
-        var backend = new HipBackend();
-        if (!backend.IsAvailable)
-            throw new InvalidOperationException("HIP backend failed to initialise.");
+        using var backend = CreateBackend();
 
         int nnz = rowIndices.Length;
         var output = new float[nnz];
@@ -133,9 +129,7 @@ internal static class HipCustomSparseBackend
         if (!IsAvailable)
             throw new InvalidOperationException("HIP custom-kernel SpMM backend is not available.");
 
-        var backend = new HipBackend();
-        if (!backend.IsAvailable)
-            throw new InvalidOperationException("HIP backend failed to initialise.");
+        using var backend = CreateBackend();
 
         var output = new double[rows * n];
 
@@ -177,6 +171,21 @@ internal static class HipCustomSparseBackend
             HipNativeBindings.CheckError(
                 HipNativeBindings.hipMemcpy(device, (IntPtr)src, bytes, HipMemcpyKind.HostToDevice),
                 "hipMemcpy(int[])");
+    }
+
+    private static HipBackend CreateBackend()
+    {
+        var backend = new HipBackend();
+        if (backend.IsAvailable)
+        {
+            return backend;
+        }
+
+        Exception? initializationException = backend.InitializationException;
+        backend.Dispose();
+        throw new InvalidOperationException(
+            "HIP backend failed to initialise.",
+            initializationException);
     }
 
     private static unsafe void UploadDoubles(IntPtr device, double[] host)

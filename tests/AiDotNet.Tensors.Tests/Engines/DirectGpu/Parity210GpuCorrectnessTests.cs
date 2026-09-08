@@ -15,30 +15,19 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 [Collection("DirectGpuSerial")]
-public class Parity210GpuCorrectnessTests : IDisposable
+public class Parity210GpuCorrectnessTests : IClassFixture<DirectGpuTensorEngineTestFixture>
 {
-    private readonly DirectGpuTensorEngine? _gpu;
+    private readonly DirectGpuTensorEngineTestFixture _fixture;
     private readonly bool _available;
     private readonly CpuEngine _cpu = new();
     private const float Tolerance = 1e-4f;
+    private DirectGpuTensorEngine Gpu => _fixture.Engine ?? throw new InvalidOperationException(
+        "Direct GPU engine was not initialized.", _fixture.InitializationException);
 
-    public Parity210GpuCorrectnessTests()
+    public Parity210GpuCorrectnessTests(DirectGpuTensorEngineTestFixture fixture)
     {
-        try
-        {
-            _gpu = new DirectGpuTensorEngine();
-            _available = _gpu.IsGpuAvailable;
-        }
-        catch
-        {
-            _available = false;
-        }
-    }
-
-    public void Dispose()
-    {
-        _gpu?.Dispose();
-        GC.SuppressFinalize(this);
+        _fixture = fixture;
+        _available = fixture.IsAvailable;
     }
 
     private static Tensor<float> Randn(int seed, params int[] shape)
@@ -77,7 +66,7 @@ public class Parity210GpuCorrectnessTests : IDisposable
     {
         Skip.If(!_available, "GPU backend not available");
         var x = Randn(42, 64);
-        var g = _gpu!.TensorErfc(x);
+        var g = Gpu.TensorErfc(x);
         var c = _cpu.TensorErfc(x);
         AssertClose(g, c, 5e-4f);
     }
@@ -90,7 +79,7 @@ public class Parity210GpuCorrectnessTests : IDisposable
         var src = Randn(1, 64).GetDataArray();
         for (int i = 0; i < src.Length; i++) src[i] = MathF.Abs(src[i]) + 0.1f;
         var x = new Tensor<float>(src, new[] { 64 });
-        var g = _gpu!.TensorLgamma(x);
+        var g = Gpu.TensorLgamma(x);
         var c = _cpu.TensorLgamma(x);
         AssertClose(g, c, 5e-3f);  // lgamma has higher precision drift
     }
@@ -100,7 +89,7 @@ public class Parity210GpuCorrectnessTests : IDisposable
     {
         Skip.If(!_available, "GPU backend not available");
         var x = Randn(7, 32);
-        var g = _gpu!.TensorI0(x);
+        var g = Gpu.TensorI0(x);
         var c = _cpu.TensorI0(x);
         AssertClose(g, c, 1e-3f);
     }
@@ -114,7 +103,7 @@ public class Parity210GpuCorrectnessTests : IDisposable
         var rng = new Random(3);
         for (int i = 0; i < src.Length; i++) src[i] = (float)(rng.NextDouble() * 1.8 - 0.9);
         var x = new Tensor<float>(src, new[] { 32 });
-        var g = _gpu!.TensorErfinv(x);
+        var g = Gpu.TensorErfinv(x);
         var c = _cpu.TensorErfinv(x);
         AssertClose(g, c, 5e-3f);
     }
@@ -129,7 +118,7 @@ public class Parity210GpuCorrectnessTests : IDisposable
         Skip.If(!_available, "GPU backend not available");
         var a = Randn(10, 128);
         var b = Randn(11, 128);
-        var g = _gpu!.TensorHypot(a, b);
+        var g = Gpu.TensorHypot(a, b);
         var c = _cpu.TensorHypot(a, b);
         AssertClose(g, c);
     }
@@ -140,7 +129,7 @@ public class Parity210GpuCorrectnessTests : IDisposable
         Skip.If(!_available, "GPU backend not available");
         var a = Randn(20, 128);
         var b = Randn(21, 128);
-        var g = _gpu!.TensorLogAddExp(a, b);
+        var g = Gpu.TensorLogAddExp(a, b);
         var c = _cpu.TensorLogAddExp(a, b);
         AssertClose(g, c);
     }
@@ -154,7 +143,7 @@ public class Parity210GpuCorrectnessTests : IDisposable
     {
         Skip.If(!_available, "GPU backend not available");
         var x = Randn(30, 8, 8);
-        var g = _gpu!.TensorTriu(x, diagonal: 0);
+        var g = Gpu.TensorTriu(x, diagonal: 0);
         var c = _cpu.TensorTriu(x, diagonal: 0);
         AssertClose(g, c, 0f);  // exact — just a mask
     }
@@ -164,7 +153,7 @@ public class Parity210GpuCorrectnessTests : IDisposable
     {
         Skip.If(!_available, "GPU backend not available");
         var x = Randn(31, 6, 8);
-        var g = _gpu!.TensorTril(x, diagonal: 1);
+        var g = Gpu.TensorTril(x, diagonal: 1);
         var c = _cpu.TensorTril(x, diagonal: 1);
         AssertClose(g, c, 0f);
     }
@@ -174,7 +163,7 @@ public class Parity210GpuCorrectnessTests : IDisposable
     {
         Skip.If(!_available, "GPU backend not available");
         var x = Randn(40, 6, 4);
-        var g = _gpu!.TensorFlip(x, new[] { 1 });
+        var g = Gpu.TensorFlip(x, new[] { 1 });
         var c = _cpu.TensorFlip(x, new[] { 1 });
         AssertClose(g, c, 0f);
     }
@@ -184,7 +173,7 @@ public class Parity210GpuCorrectnessTests : IDisposable
     {
         Skip.If(!_available, "GPU backend not available");
         var x = Randn(50, 4, 6);
-        var g = _gpu!.TensorRoll(x, new[] { 2 }, new[] { 1 });
+        var g = Gpu.TensorRoll(x, new[] { 2 }, new[] { 1 });
         var c = _cpu.TensorRoll(x, new[] { 2 }, new[] { 1 });
         AssertClose(g, c, 0f);
     }
@@ -194,7 +183,7 @@ public class Parity210GpuCorrectnessTests : IDisposable
     {
         Skip.If(!_available, "GPU backend not available");
         var x = Randn(60, 4, 5);
-        var g = _gpu!.TensorDiagEmbed(x, offset: 0);
+        var g = Gpu.TensorDiagEmbed(x, offset: 0);
         var c = _cpu.TensorDiagEmbed(x, offset: 0);
         AssertClose(g, c, 0f);
     }
@@ -208,7 +197,7 @@ public class Parity210GpuCorrectnessTests : IDisposable
     {
         Skip.If(!_available, "GPU backend not available");
         var x = Randn(70, 8, 64);
-        var g = _gpu!.TensorCumSum(x, axis: -1);
+        var g = Gpu.TensorCumSum(x, axis: -1);
         var c = _cpu.TensorCumSum(x, axis: -1);
         AssertClose(g, c, 1e-3f);
     }
@@ -218,7 +207,7 @@ public class Parity210GpuCorrectnessTests : IDisposable
     {
         Skip.If(!_available, "GPU backend not available");
         var x = Randn(71, 4, 32);
-        var g = _gpu!.TensorCumMax(x, axis: -1);
+        var g = Gpu.TensorCumMax(x, axis: -1);
         var c = _cpu.TensorCumMax(x, axis: -1);
         AssertClose(g, c, 0f);
     }
@@ -228,7 +217,7 @@ public class Parity210GpuCorrectnessTests : IDisposable
     {
         Skip.If(!_available, "GPU backend not available");
         var x = Randn(72, 4, 32);
-        var g = _gpu!.TensorLogCumSumExp(x, axis: -1);
+        var g = Gpu.TensorLogCumSumExp(x, axis: -1);
         var c = _cpu.TensorLogCumSumExp(x, axis: -1);
         AssertClose(g, c, 5e-3f);
     }
@@ -243,7 +232,7 @@ public class Parity210GpuCorrectnessTests : IDisposable
         Skip.If(!_available, "GPU backend not available");
         var arr = new float[] { 1f, float.NaN, 3f, float.PositiveInfinity, -2f, float.NegativeInfinity };
         var x = new Tensor<float>(arr, new[] { 6 });
-        var g = _gpu!.TensorNanToNum(x);
+        var g = Gpu.TensorNanToNum(x);
         var c = _cpu.TensorNanToNum(x);
         AssertClose(g, c, 1e-3f);
     }

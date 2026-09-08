@@ -130,7 +130,15 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         internal void CompleteCommandQueueForDisposal(IntPtr commandQueue)
             => _context?.CompleteQueueForDisposal(commandQueue);
 
-        public string? InitializationError { get; private set; }
+        /// <summary>Gets the outcome of this backend's initialization attempt.</summary>
+        public GpuBackendInitializationState InitializationState { get; private set; }
+
+        /// <summary>Gets the typed failure captured when <see cref="InitializationState"/> is failed.</summary>
+        public Exception? InitializationException { get; private set; }
+
+        /// <summary>Gets the legacy text representation of <see cref="InitializationException"/>.</summary>
+        [Obsolete("Use InitializationException for typed failure details.")]
+        public string? InitializationError => InitializationException?.ToString();
         public string BackendName => "OpenCL";
         public TensorDevice DeviceType => TensorDevice.OpenCL;
         public string DeviceName { get; }
@@ -196,6 +204,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             _kernelCache = new OpenClKernelCache();
             _programs = new List<DirectOpenClProgram>();
             _maxWorkItemSizes = Array.Empty<ulong>();
+            InitializationState = GpuBackendInitializationState.Unavailable;
 
             // Gate on GPU presence (not just OpenCL ICD presence). On a CPU-only box
             // with an OpenCL CPU runtime installed (Intel/AMD/POCL), the legacy
@@ -279,19 +288,34 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 // Initialize dynamic kernel generator for Bayesian-optimized GEMM
                 _dynamicGemm = new DynamicGemmKernel(_context);
                 WriteDiag("[OpenClBackend] Dynamic GEMM kernel generator initialized.");
+                InitializationState = GpuBackendInitializationState.Succeeded;
             }
             catch (Exception ex)
             {
-                InitializationError = ex.ToString();
-                WriteDiag($"[OpenClBackend] Initialization FAILED: {ex.GetType().Name}: {ex.Message}");
-                if (ex.InnerException != null)
-                    WriteDiag($"[OpenClBackend] Inner: {ex.InnerException.Message}");
-                System.Diagnostics.Debug.WriteLine($"OpenClBackend initialization failed: {ex.Message}");
-                IsAvailable = false;
+                RecordInitializationFailure(ex);
                 DeviceName = "None";
                 DeviceVendor = "None";
-                _context?.Dispose();
-                _context = null;
+            }
+        }
+
+        private void RecordInitializationFailure(Exception exception)
+        {
+            InitializationState = GpuBackendInitializationState.Failed;
+            InitializationException = exception;
+            IsAvailable = false;
+            WriteDiag($"[OpenClBackend] Initialization FAILED: {exception.GetType().Name}: {exception.Message}");
+            if (exception.InnerException != null)
+                WriteDiag($"[OpenClBackend] Inner: {exception.InnerException.Message}");
+            System.Diagnostics.Debug.WriteLine($"OpenClBackend initialization failed: {exception.Message}");
+
+            try
+            {
+                Dispose();
+            }
+            catch (Exception cleanupException)
+            {
+                InitializationException = new AggregateException(
+                    "OpenCL backend initialization and cleanup both failed.", exception, cleanupException);
             }
         }
 
@@ -4142,19 +4166,12 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 writeA = !writeA;
             }
 
-            // Sized to the BUFFER, not to the one value being read. The final buffer is whichever
-            // scratch the last pass wrote, and its capacity is the first pass's partial count -- not
-            // one. CopyToHost validates the destination against the whole buffer, so downloading
-            // into float[1] threw "Destination array too small" for any input needing more than one
-            // partial (1025 elements at a local size of 256 gives 5). That was unreachable until the
-            // reductions started returning the right answer for shorter inputs, so it sat behind the
-            // non-power-of-two tail bug rather than beside it.
-            int downloadLength = current is DirectOpenClGpuBuffer resultBuffer
-                ? Math.Max(1, resultBuffer.Buffer.Length)
-                : 1;
-            var result = new float[downloadLength];
-            DownloadBuffer(current, result);
-            return result[0];
+            // Only the leading scalar is live after the final reduction pass. Read that value
+            // directly instead of copying the scratch buffer's logical size (or its still larger
+            // pooled capacity) merely to discard the tail.
+            var resultBuffer = (DirectOpenClGpuBuffer)current;
+            GpuLaunchProbe.OnReadback(sizeof(float));
+            return resultBuffer.Buffer.ToArray(1)[0];
         }
 
         public void SumAxis(IGpuBuffer A, IGpuBuffer B, int outerSize, int reduceSize)
@@ -13839,29 +13856,35 @@ KERNEL VARIANTS (A/B testing):
         internal readonly DirectOpenClBuffer Buffer;
         private readonly Action<DirectOpenClGpuBuffer>? _returnToPool;
         private int _poolState;
+        private int _size;
 
-        public int Size => Buffer.Length;
-        public long SizeInBytes => Buffer.Length * sizeof(float);
+        public int Size => Volatile.Read(ref _size);
+        public int Capacity => Buffer.Length;
+        public long SizeInBytes => (long)Size * sizeof(float);
         public IntPtr Handle => Buffer.Handle;
 
         public DirectOpenClGpuBuffer(DirectOpenClBuffer buffer, Action<DirectOpenClGpuBuffer>? returnToPool = null)
         {
             Buffer = buffer;
             _returnToPool = returnToPool;
+            _size = buffer.Length;
         }
 
         public float[] Download()
         {
-            return Buffer.ToArray();
+            return Buffer.ToArray(Size);
         }
 
         public void Download(float[] destination)
         {
-            Buffer.CopyToHost(destination);
+            Buffer.CopyToHost(destination, Size);
         }
 
-        public void MarkRented()
+        public void MarkRented(int size)
         {
+            if (size <= 0 || size > Capacity)
+                throw new ArgumentOutOfRangeException(nameof(size));
+            Volatile.Write(ref _size, size);
             Interlocked.Exchange(ref _poolState, 0);
         }
 

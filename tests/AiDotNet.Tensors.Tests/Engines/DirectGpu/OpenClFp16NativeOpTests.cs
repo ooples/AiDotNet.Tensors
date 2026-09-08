@@ -21,35 +21,25 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// skipping when a GPU is required) per the no-silent-pass guideline.
 /// </summary>
 [Collection("DirectGpuSerial")]
-public sealed class OpenClFp16NativeOpTests : IDisposable
+public sealed class OpenClFp16NativeOpTests : IClassFixture<OpenClBackendTestFixture>
 {
-    private readonly OpenClBackend _backend;
+    private readonly OpenClBackend? _backend;
     private readonly bool _ready;
-    private readonly Exception _initException;
 
-    public OpenClFp16NativeOpTests()
+    public OpenClFp16NativeOpTests(OpenClBackendTestFixture fixture)
     {
-        try
-        {
-            _backend = new OpenClBackend();
-            _ready = _backend.IsAvailable && _backend.SupportsFp16NativeOps;
-        }
-        catch (Exception ex)
-        {
-            _initException = ex;
-            _ready = false;
-        }
+        _backend = fixture.Backend;
+        _ready = fixture.IsAvailable && _backend?.SupportsFp16NativeOps == true;
     }
 
-    public void Dispose() => _backend?.Dispose();
+    private OpenClBackend Backend => _backend ?? throw new InvalidOperationException("OpenCL backend is unavailable.");
 
     private bool EnsureReady()
     {
         if (_ready) return true;
         if (string.Equals(Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_GPU_TESTS"), "1", StringComparison.Ordinal))
             throw new InvalidOperationException(
-                "GPU tests were required (AIDOTNET_REQUIRE_GPU_TESTS=1) but the OpenCL FP16-native op kernels were unavailable.",
-                _initException);
+                "GPU tests were required (AIDOTNET_REQUIRE_GPU_TESTS=1) but the OpenCL FP16-native op kernels were unavailable.");
         return false;
     }
 
@@ -65,17 +55,17 @@ public sealed class OpenClFp16NativeOpTests : IDisposable
 
     private IGpuBuffer ToFp16(float[] x)
     {
-        using var f32 = _backend.AllocateBuffer(x);
-        var f16 = _backend.AllocateBuffer(x.Length); // over-allocated as floats; harmless
-        _backend.ConvertToFp16(f32, f16, x.Length);
+        using var f32 = Backend.AllocateBuffer(x);
+        var f16 = Backend.AllocateBuffer(x.Length); // over-allocated as floats; harmless
+        Backend.ConvertToFp16(f32, f16, x.Length);
         return f16;
     }
 
     private float[] FromFp16(IGpuBuffer f16, int n)
     {
-        using var f32 = _backend.AllocateBuffer(n);
-        _backend.ConvertToFp32(f16, f32, n);
-        return _backend.DownloadBuffer(f32);
+        using var f32 = Backend.AllocateBuffer(n);
+        Backend.ConvertToFp32(f16, f32, n);
+        return Backend.DownloadBuffer(f32);
     }
 
     private static void AssertClose(float[] expected, float[] actual, double absTol, double relTol)
@@ -107,8 +97,8 @@ public sealed class OpenClFp16NativeOpTests : IDisposable
         }
 
         using var inB = ToFp16(x);
-        using var outB = _backend.AllocateBuffer(n);
-        _backend.Fp16Gelu(inB, outB, n);
+        using var outB = Backend.AllocateBuffer(n);
+        Backend.Fp16Gelu(inB, outB, n);
         AssertClose(expected, FromFp16(outB, n), absTol: 3e-2, relTol: 4e-2);
     }
 
@@ -124,8 +114,8 @@ public sealed class OpenClFp16NativeOpTests : IDisposable
         for (int i = 0; i < n; i++) { float xi = ToFp16AndBack(x[i]); expected[i] = xi > 0 ? xi : 0; }
 
         using var inB = ToFp16(x);
-        using var outB = _backend.AllocateBuffer(n);
-        _backend.Fp16Relu(inB, outB, n);
+        using var outB = Backend.AllocateBuffer(n);
+        Backend.Fp16Relu(inB, outB, n);
         AssertClose(expected, FromFp16(outB, n), absTol: 1e-3, relTol: 1e-3);
     }
 
@@ -142,8 +132,8 @@ public sealed class OpenClFp16NativeOpTests : IDisposable
 
         using var aB = ToFp16(a);
         using var bB = ToFp16(b);
-        using var outB = _backend.AllocateBuffer(n);
-        _backend.Fp16Add(aB, bB, outB, n);
+        using var outB = Backend.AllocateBuffer(n);
+        Backend.Fp16Add(aB, bB, outB, n);
         AssertClose(expected, FromFp16(outB, n), absTol: 2e-2, relTol: 2e-2);
     }
 
@@ -151,10 +141,10 @@ public sealed class OpenClFp16NativeOpTests : IDisposable
     public void Fp16NativeOps_RejectNonPositiveLength()
     {
         Skip.If(!EnsureReady(), "OpenCL FP16-native ops not available.");
-        using var dummy = _backend.AllocateBuffer(4);
-        Assert.Throws<ArgumentOutOfRangeException>(() => _backend.Fp16Gelu(dummy, dummy, 0));
-        Assert.Throws<ArgumentOutOfRangeException>(() => _backend.Fp16Relu(dummy, dummy, -1));
-        Assert.Throws<ArgumentOutOfRangeException>(() => _backend.Fp16Add(dummy, dummy, dummy, 0));
+        using var dummy = Backend.AllocateBuffer(4);
+        Assert.Throws<ArgumentOutOfRangeException>(() => Backend.Fp16Gelu(dummy, dummy, 0));
+        Assert.Throws<ArgumentOutOfRangeException>(() => Backend.Fp16Relu(dummy, dummy, -1));
+        Assert.Throws<ArgumentOutOfRangeException>(() => Backend.Fp16Add(dummy, dummy, dummy, 0));
     }
 }
 

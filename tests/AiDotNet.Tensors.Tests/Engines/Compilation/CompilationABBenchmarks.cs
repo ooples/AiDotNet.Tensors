@@ -36,15 +36,24 @@ public class CompilationABBenchmarks
         var target = CreateRandom(new[] { batchSize, outputDim }, 2);
         var w1 = CreateRandom(new[] { inputDim, hiddenDim }, 3);
         var w2 = CreateRandom(new[] { hiddenDim, outputDim }, 4);
+        var w1c = w1.Clone();
+        var w2c = w2.Clone();
         float lr = 0.01f;
 
         // === Eager training (GradientTape) ===
-        AutoTracer.Enabled = false;
-        double eagerMs = MeasureTrainingStep(engine, input, target, w1, w2, lr, warmup, measure);
-        AutoTracer.Enabled = true;
+        bool previousAutoTracer = AutoTracer.Enabled;
+        double eagerMs;
+        try
+        {
+            AutoTracer.Enabled = false;
+            eagerMs = MeasureTrainingStep(engine, input, target, w1, w2, lr, warmup, measure);
+        }
+        finally
+        {
+            AutoTracer.Enabled = previousAutoTracer;
+        }
 
         // === Compiled training (GraphMode + CompiledTrainingPlan) ===
-        var w1c = w1.Clone(); var w2c = w2.Clone();
         double compiledMs = MeasureCompiledTrainingStep(engine, input, target, w1c, w2c, lr, warmup, measure);
 
         double speedup = eagerMs / compiledMs;
@@ -301,23 +310,17 @@ public class CompilationABBenchmarks
         Tensor<float> w1, Tensor<float> w2, float lr, int warmup, int measure)
     {
         // Compile once
-        using var scope = GraphMode.Enable();
+        Tensor<float>[] parameters = [w1, w2];
+        using var scope = GraphMode.EnableTraining(parameters);
         var h = engine.ReLU(engine.TensorMatMul(input, w1));
         var pred = engine.TensorMatMul(h, w2);
         var diff = engine.TensorSubtract(pred, target);
         var loss = engine.ReduceSum(engine.TensorMultiply(diff, diff), null);
-        var plan = scope.CompileTraining(new[] { w1, w2 });
+        using var plan = scope.CompileTraining(parameters, loss);
+        plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: lr);
 
-        // Replay
-        return Measure(() =>
-        {
-            plan.Step();
-            var grads = plan.Gradients;
-            if (grads[0] is not null)
-                engine.TensorSubtractInPlace(w1, engine.TensorMultiplyScalar(grads[0], lr));
-            if (grads[1] is not null)
-                engine.TensorSubtractInPlace(w2, engine.TensorMultiplyScalar(grads[1], lr));
-        }, warmup, measure);
+        // Replay the complete compiled training step, including the plan's fused optimizer.
+        return Measure(() => plan.Step(), warmup, measure);
     }
 
     private double MeasureInference(IEngine engine, Tensor<float> input,

@@ -128,7 +128,7 @@ public partial class DirectGpuTensorEngine
 
     /// <inheritdoc />
     public override Tensor<T> ForwardSplatBackwardFlow<T>(
-        Tensor<T> gradOutput, Tensor<T> input, Tensor<T> flow, Tensor<T> output,
+        Tensor<T> gradOutput, Tensor<T> input, Tensor<T> flow, Tensor<T>? output,
         bool normalize = true)
         => ForwardSplatBackwardFlowWithWeights(
             gradOutput, input, flow, output, normalize, normalizationWeights: null);
@@ -166,7 +166,9 @@ public partial class DirectGpuTensorEngine
             if (normalize)
             {
                 // Quotient rule: subtract d grid_sample(sum_c(G_c * output_c), p_i)/dp_i.
-                var weightedOutput = TensorMultiply(destinationGradient, output!);
+                var normalizedOutput = output ?? throw new InvalidOperationException(
+                    "Normalized forward-splat flow backward requires the forward output.");
+                var weightedOutput = TensorMultiply(destinationGradient, normalizedOutput);
                 var correctionField = ReduceSum(weightedOutput, [1], keepDims: true);
                 var ones = CreateFilledTensor<T>(
                     [input.Shape[0], 1, input.Shape[2], input.Shape[3]], 1.0);

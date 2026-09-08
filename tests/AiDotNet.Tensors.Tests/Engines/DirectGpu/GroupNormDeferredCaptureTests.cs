@@ -24,11 +24,15 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// </list>
 /// </summary>
 [Collection("VulkanGlobalState")]
-public sealed class GroupNormDeferredCaptureTests : IDisposable
+public sealed class GroupNormDeferredCaptureTests :
+    IDisposable,
+    IClassFixture<DirectGpuTensorEngineTestFixture>
 {
-    private readonly DirectGpuTensorEngine? _gpu;
+    private readonly DirectGpuTensorEngineTestFixture _fixture;
     private readonly bool _gpuAvailable;
     private const float Tolerance = 1e-3f;
+    private DirectGpuTensorEngine Gpu => _fixture.Engine ?? throw new InvalidOperationException(
+        "Direct GPU engine was not initialized.", _fixture.InitializationException);
 
     // Flip to true when the deferred-graph buffer-management bug is fixed. Root-caused on a
     // GTX 1660 Ti: in a DEEP deferred graph, a tensor produced early and held across several
@@ -44,18 +48,18 @@ public sealed class GroupNormDeferredCaptureTests : IDisposable
     private const int Groups = 32;
     private const int Sp = 16;
 
-    public GroupNormDeferredCaptureTests()
+    public GroupNormDeferredCaptureTests(DirectGpuTensorEngineTestFixture fixture)
     {
-        try
-        {
-            _gpu = new DirectGpuTensorEngine();
-            _gpuAvailable = _gpu.IsGpuAvailable;
-        }
-        catch (PlatformNotSupportedException) { _gpuAvailable = false; }
-        catch (DllNotFoundException) { _gpuAvailable = false; }
+        _fixture = fixture;
+        _gpuAvailable = fixture.IsAvailable;
     }
 
-    public void Dispose() => (_gpu as IDisposable)?.Dispose();
+    public void Dispose()
+    {
+        // Keep backend/kernel initialization class-scoped while restoring per-test activation
+        // isolation. Every deferred scope executes synchronously and is disposed before this hook.
+        _fixture.Engine?.ClearActivationCache();
+    }
 
     private static Tensor<float> Rand(int[] shape, int seed)
     {
@@ -69,7 +73,7 @@ public sealed class GroupNormDeferredCaptureTests : IDisposable
     private Tensor<float> ResBlock(Tensor<float> input, Tensor<float> gamma, Tensor<float> beta,
         Tensor<float> k1, Tensor<float> k2)
     {
-        var gpu = _gpu!;
+        var gpu = Gpu;
         var h = gpu.GroupNorm(input, Groups, gamma, beta, 1e-5, out _, out _);
         gpu.SwishInPlace(h);
         h = gpu.Conv2D(h, k1, 1, 1, 1);
@@ -116,7 +120,7 @@ public sealed class GroupNormDeferredCaptureTests : IDisposable
     public void GroupNorm_ChannelsNeNumGroups_MatchesCpu()
     {
         Skip.IfNot(_gpuAvailable, "No CUDA device.");
-        var gpu = _gpu!;
+        var gpu = Gpu;
         var input = Rand(new[] { 1, C, Sp, Sp }, 1);
         var gamma = Rand(new[] { C }, 2);
         var beta = Rand(new[] { C }, 3);
@@ -134,7 +138,7 @@ public sealed class GroupNormDeferredCaptureTests : IDisposable
     public void DeferredResBlock_MatchesEager()
     {
         Skip.IfNot(_gpuAvailable, "No CUDA device.");
-        var gpu = _gpu!;
+        var gpu = Gpu;
         var input = Rand(new[] { 1, C, Sp, Sp }, 1);
         var gamma = Rand(new[] { C }, 2);
         var beta = Rand(new[] { C }, 3);
@@ -149,8 +153,10 @@ public sealed class GroupNormDeferredCaptureTests : IDisposable
         using (var scope = gpu.BeginDeferredScope())
         {
             Skip.If(scope is null, "Deferred execution unsupported.");
+            if (scope is null)
+                throw new InvalidOperationException("Deferred execution was reported as supported without a scope.");
             deferred = ResBlock(input, gamma, beta, k1, k2);
-            scope!.Execute();
+            scope.Execute();
         }
 
         // Shape is part of the contract — Math.Min would mask a wrong-shape regression.
@@ -169,7 +175,7 @@ public sealed class GroupNormDeferredCaptureTests : IDisposable
         AssertDeferredMatchesEager("SwishInPlace", () =>
         {
             var h = input.Clone();
-            _gpu!.SwishInPlace(h);
+            Gpu.SwishInPlace(h);
             return h;
         });
     }
@@ -183,8 +189,8 @@ public sealed class GroupNormDeferredCaptureTests : IDisposable
         var beta = Rand(new[] { C }, 93);
         AssertDeferredMatchesEager("GroupNorm+Swish", () =>
         {
-            var h = _gpu!.GroupNorm(input, Groups, gamma, beta, 1e-5, out _, out _);
-            _gpu.SwishInPlace(h);
+            var h = Gpu.GroupNorm(input, Groups, gamma, beta, 1e-5, out _, out _);
+            Gpu.SwishInPlace(h);
             return h;
         });
     }
@@ -199,9 +205,9 @@ public sealed class GroupNormDeferredCaptureTests : IDisposable
         var kernel = Rand(new[] { C, C, 3, 3 }, 97);
         AssertDeferredMatchesEager("GroupNorm+Swish+Conv", () =>
         {
-            var h = _gpu!.GroupNorm(input, Groups, gamma, beta, 1e-5, out _, out _);
-            _gpu.SwishInPlace(h);
-            return _gpu.Conv2D(h, kernel, 1, 1, 1);
+            var h = Gpu.GroupNorm(input, Groups, gamma, beta, 1e-5, out _, out _);
+            Gpu.SwishInPlace(h);
+            return Gpu.Conv2D(h, kernel, 1, 1, 1);
         });
     }
 
@@ -251,7 +257,7 @@ public sealed class GroupNormDeferredCaptureTests : IDisposable
         // Channel-axis concat was the #642 gap — the old GPU path only handled the last axis, so
         // this fell to CPU (breaking the device-resident chain). Validate GPU eager + deferred == CPU.
         Skip.IfNot(_gpuAvailable, "No CUDA device.");
-        var gpu = _gpu!;
+        var gpu = Gpu;
         var a = Rand(new[] { 1, C, Sp, Sp }, 7);
         var b = Rand(new[] { 1, C / 2, Sp, Sp }, 8);
 
@@ -267,8 +273,10 @@ public sealed class GroupNormDeferredCaptureTests : IDisposable
         using (var scope = gpu.BeginDeferredScope())
         {
             Skip.If(scope is null, "Deferred execution unsupported.");
+            if (scope is null)
+                throw new InvalidOperationException("Deferred execution was reported as supported without a scope.");
             deferred = gpu.TensorConcatenate(new[] { a, b }, axis: 1);
-            scope!.Execute();
+            scope.Execute();
         }
         float defDiff = 0;
         for (int i = 0; i < cpu.Length; i++) defDiff = Math.Max(defDiff, Math.Abs(cpu[i] - deferred[i]));
@@ -285,11 +293,13 @@ public sealed class GroupNormDeferredCaptureTests : IDisposable
         for (int i = 0; i < eager.Length; i++) eagerCopy[i] = eager[i];
 
         Tensor<float> deferred;
-        using (var scope = _gpu!.BeginDeferredScope())
+        using (var scope = Gpu.BeginDeferredScope())
         {
             Skip.If(scope is null, "Deferred execution unsupported.");
+            if (scope is null)
+                throw new InvalidOperationException("Deferred execution was reported as supported without a scope.");
             deferred = op();
-            scope!.Execute();
+            scope.Execute();
         }
         // Shape is part of the contract — Math.Min would mask a wrong-shape regression.
         Assert.Equal(eagerCopy.Length, deferred.Length);
@@ -304,7 +314,7 @@ public sealed class GroupNormDeferredCaptureTests : IDisposable
     {
         Skip.IfNot(_gpuAvailable, "No CUDA device.");
         var input = Rand(new[] { 1, C, Sp, Sp }, 11);
-        AssertDeferredMatchesEager("Upsample", () => _gpu!.Upsample(input, 2, 2));
+        AssertDeferredMatchesEager("Upsample", () => Gpu.Upsample(input, 2, 2));
     }
 
     [SkippableFact]
@@ -317,7 +327,7 @@ public sealed class GroupNormDeferredCaptureTests : IDisposable
         var kernel = Rand(new[] { C, C, 3, 3 }, 22);
         var bias = Rand(new[] { C }, 23);
         AssertDeferredMatchesEager("FusedConv2D+bias",
-            () => _gpu!.FusedConv2D(input, kernel, bias, 1, 1, 1, 1, 1, 1, FusedActivationType.None));
+            () => Gpu.FusedConv2D(input, kernel, bias, 1, 1, 1, 1, 1, 1, FusedActivationType.None));
     }
 
     [SkippableFact]
@@ -325,7 +335,7 @@ public sealed class GroupNormDeferredCaptureTests : IDisposable
     {
         Skip.IfNot(_gpuAvailable, "No CUDA device.");
         var m = Rand(new[] { 64, 96 }, 24);   // 2-D → backend.Transpose
-        AssertDeferredMatchesEager("TensorTranspose", () => _gpu!.TensorTranspose(m));
+        AssertDeferredMatchesEager("TensorTranspose", () => Gpu.TensorTranspose(m));
     }
 
     [SkippableFact]
@@ -334,7 +344,7 @@ public sealed class GroupNormDeferredCaptureTests : IDisposable
         // 1x1 adaptive avg-pool → GlobalAvgPool2D (SE blocks / attention pooling).
         Skip.IfNot(_gpuAvailable, "No CUDA device.");
         var input = Rand(new[] { 1, C, Sp, Sp }, 25);
-        AssertDeferredMatchesEager("AdaptiveAvgPool2D", () => _gpu!.AdaptiveAvgPool2D(input, 1, 1));
+        AssertDeferredMatchesEager("AdaptiveAvgPool2D", () => Gpu.AdaptiveAvgPool2D(input, 1, 1));
     }
 
     [SkippableFact]
@@ -344,7 +354,7 @@ public sealed class GroupNormDeferredCaptureTests : IDisposable
         var indices = new Tensor<int>(new[] { 4 });
         for (int i = 0; i < 4; i++) indices[i] = i % 3;
         var table = Rand(new[] { 3, 16 }, 26);
-        AssertDeferredMatchesEager("Embedding", () => _gpu!.Embedding(indices, table));
+        AssertDeferredMatchesEager("Embedding", () => Gpu.Embedding(indices, table));
     }
 
     [SkippableFact]
@@ -352,7 +362,7 @@ public sealed class GroupNormDeferredCaptureTests : IDisposable
     {
         Skip.IfNot(_gpuAvailable, "No CUDA device.");
         var input = Rand(new[] { 1, C, Sp, Sp }, 12);
-        AssertDeferredMatchesEager("MaxPool2D", () => _gpu!.MaxPool2D(input, 2, 2, 0));
+        AssertDeferredMatchesEager("MaxPool2D", () => Gpu.MaxPool2D(input, 2, 2, 0));
     }
 
     [SkippableFact]
@@ -363,7 +373,7 @@ public sealed class GroupNormDeferredCaptureTests : IDisposable
         // garbage 15th pointer → 0xC0000005 on small inputs (surfaced under deferred replay).
         Skip.IfNot(_gpuAvailable, "No CUDA device.");
         var input = Rand(new[] { 1, C, Sp, Sp }, 13);
-        AssertDeferredMatchesEager("AvgPool2D", () => _gpu!.AvgPool2D(input, 2, 2, 0));
+        AssertDeferredMatchesEager("AvgPool2D", () => Gpu.AvgPool2D(input, 2, 2, 0));
     }
 
     [SkippableFact]
@@ -373,7 +383,7 @@ public sealed class GroupNormDeferredCaptureTests : IDisposable
         var input = Rand(new[] { 1, C, Sp, Sp }, 14);
         var kernel = Rand(new[] { C, C, 2, 2 }, 15);   // [inC, outC, kH, kW]
         AssertDeferredMatchesEager("ConvTranspose2D",
-            () => _gpu!.ConvTranspose2D(input, kernel, new[] { 2, 2 }, new[] { 0, 0 }, new[] { 0, 0 }));
+            () => Gpu.ConvTranspose2D(input, kernel, new[] { 2, 2 }, new[] { 0, 0 }, new[] { 0, 0 }));
     }
 
     [SkippableFact]
@@ -397,7 +407,7 @@ public sealed class GroupNormDeferredCaptureTests : IDisposable
 
         Func<Tensor<float>> deep = () =>
         {
-            var gpu = _gpu!;
+            var gpu = Gpu;
             var h = input;
             var skip = h;
             for (int i = 0; i < 8; i++) h = ResBlock(h, gamma, beta, k1, k2);
@@ -448,7 +458,7 @@ public sealed class GroupNormDeferredCaptureTests : IDisposable
         var kMerge = Rand(new[] { C, 2 * C, 3, 3 }, 86);
         AssertDeferredMatchesEager("LongLivedSkipConcat(3x intervening)", () =>
         {
-            var gpu = _gpu!;
+            var gpu = Gpu;
             var skip = gpu.GroupNorm(input, Groups, gamma, beta, 1e-5, out _, out _); // produced early
             var h = skip;
             for (int i = 0; i < 3; i++) h = ResBlock(h, gamma, beta, k1, k2);          // intervening ops
@@ -464,7 +474,7 @@ public sealed class GroupNormDeferredCaptureTests : IDisposable
         // structural/ResBlock tests above.
         Skip.IfNot(_gpuAvailable, "No CUDA device.");
         var scores = Rand(new[] { 4, 64, 64 }, 31);
-        AssertDeferredMatchesEager("Softmax(-1)", () => _gpu!.Softmax(scores, -1));
+        AssertDeferredMatchesEager("Softmax(-1)", () => Gpu.Softmax(scores, -1));
     }
 
     [SkippableFact]
@@ -481,9 +491,9 @@ public sealed class GroupNormDeferredCaptureTests : IDisposable
         var v = Rand(new[] { heads, s, dh }, 43);
         AssertDeferredMatchesEager("SelfAttention(QKᵀ·softmax·V)", () =>
         {
-            var scores = _gpu!.BatchMatMul(q, kT);   // [heads, s, s]
-            scores = _gpu!.Softmax(scores, -1);
-            return _gpu!.BatchMatMul(scores, v);     // [heads, s, dh]
+            var scores = Gpu.BatchMatMul(q, kT);   // [heads, s, s]
+            scores = Gpu.Softmax(scores, -1);
+            return Gpu.BatchMatMul(scores, v);     // [heads, s, dh]
         });
     }
 
@@ -499,8 +509,8 @@ public sealed class GroupNormDeferredCaptureTests : IDisposable
         var v = Rand(new[] { heads, s, dh }, 53);
         AssertDeferredMatchesEager("BatchMatMulChain", () =>
         {
-            var scores = _gpu!.BatchMatMul(q, kT);   // [heads, s, s]
-            return _gpu!.BatchMatMul(scores, v);     // [heads, s, dh] (no softmax in between)
+            var scores = Gpu.BatchMatMul(q, kT);   // [heads, s, s]
+            return Gpu.BatchMatMul(scores, v);     // [heads, s, dh] (no softmax in between)
         });
     }
 
@@ -508,10 +518,13 @@ public sealed class GroupNormDeferredCaptureTests : IDisposable
     public void CudaGraphCapture_ReplaysResBlockCorrectly()
     {
         Skip.IfNot(_gpuAvailable, "No CUDA device.");
-        var gpu = _gpu!;
+        var gpu = Gpu;
         var backend = gpu.GetBackend();
-        Skip.If(backend is not AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend, "Capture path is CUDA-only.");
-        var cudaBackend = (AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend)backend!;
+        if (backend is not AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend cudaBackend)
+        {
+            Skip.If(true, "Capture path is CUDA-only.");
+            throw new InvalidOperationException("CUDA capture was reported as supported without a CUDA backend.");
+        }
 
         var input = Rand(new[] { 1, C, Sp, Sp }, 1);
         var gamma = Rand(new[] { C }, 2);
@@ -526,11 +539,13 @@ public sealed class GroupNormDeferredCaptureTests : IDisposable
         // Record the resident graph (buffers allocated at record time → Execute is alloc-free).
         var scope = gpu.BeginDeferredScope() as DeferredScope;
         Skip.If(scope is null, "Deferred execution unsupported.");
+        if (scope is null)
+            throw new InvalidOperationException("Deferred execution was reported as supported without a scope.");
         ExecutionGraph? graph = null;
         try
         {
             Tensor<float> result = ResBlock(input, gamma, beta, k1, k2);
-            graph = scope!.Compile();   // owns the stream pool (GraphCompiler transferred ownership)
+            graph = scope.Compile();   // owns the stream pool (GraphCompiler transferred ownership)
 
             // Warmup: full graph once (H2D populates resident buffers + JIT).
             foreach (var node in graph.TopologicalOrder) node.Execute(backend);
@@ -556,7 +571,7 @@ public sealed class GroupNormDeferredCaptureTests : IDisposable
         {
             // Dispose the scope first (its Dispose may touch the compiled graph), then the graph —
             // which disposes the stream pool the GraphCompiler transferred to it (no leak).
-            scope?.Dispose();
+            scope.Dispose();
             graph?.Dispose();
         }
     }

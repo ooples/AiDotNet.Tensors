@@ -24,22 +24,6 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         /// <summary>True when an OpenCL device/context is available on this host.</summary>
         public static bool IsAvailable => OpenClBackend.IsOpenClAvailable;
 
-        // The buffer pool may hand back a buffer physically LARGER than requested (e.g. a small
-        // odd-sized output renting an 8-element buffer left over from a prior op). DownloadBuffer
-        // copies the buffer's physical element count, which would overflow a snug destination, so
-        // download into a buffer-sized scratch and copy back exactly the logical elements.
-        private static void DownloadExact(OpenClBackend backend, IGpuBuffer buffer, float[] destination)
-        {
-            if (buffer.Size == destination.Length)
-            {
-                backend.DownloadBuffer(buffer, destination);
-                return;
-            }
-            var scratch = new float[buffer.Size];
-            backend.DownloadBuffer(buffer, scratch);
-            Array.Copy(scratch, destination, destination.Length);
-        }
-
         private static OpenClBackend GetOrCreate()
         {
             var existing = _cached;
@@ -53,7 +37,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
                 var backend = new OpenClBackend(0);
                 if (!backend.IsAvailable)
-                    throw new InvalidOperationException("OpenCL SpMM backend failed to initialise.");
+                {
+                    Exception? initializationException = backend.InitializationException;
+                    backend.Dispose();
+                    throw new InvalidOperationException(
+                        "OpenCL SpMM backend failed to initialise.",
+                        initializationException);
+                }
                 _cached = backend;
                 return backend;
             }
@@ -91,7 +81,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 backend.CsrSpMM(valuesBuf, colIdxBuf, rowPtrBuf, bBuf, outBuf,
                     rows, cols, n, values.Length);
 
-                DownloadExact(backend, outBuf, output);
+                backend.DownloadBuffer(outBuf, output);
                 return output;
             }
             finally
@@ -141,7 +131,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 else
                     backend.CsrSddmm(rowBuf, colBuf, xBuf, yBuf, outBuf, nnz, innerK);
 
-                DownloadExact(backend, outBuf, output);
+                backend.DownloadBuffer(outBuf, output);
                 return output;
             }
             finally
