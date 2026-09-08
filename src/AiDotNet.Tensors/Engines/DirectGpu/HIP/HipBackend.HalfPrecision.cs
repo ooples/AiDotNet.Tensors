@@ -62,7 +62,7 @@ public sealed partial class HipBackend : IGpuHalfPrecisionBackend
         if (m <= 0) throw new ArgumentOutOfRangeException(nameof(m), "Dimensions must be positive.");
         if (n <= 0) throw new ArgumentOutOfRangeException(nameof(n), "Dimensions must be positive.");
         if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k), "Dimensions must be positive.");
-        EnsureHalfGemmSupported();
+        EnsureFp16FusedBackwardSupported();
 
         var outType = gradOutHalf ? HipBlasNative.HipBlasDatatype.R_16F : HipBlasNative.HipBlasDatatype.R_32F;
         float alpha = 1.0f, beta = 0.0f;
@@ -174,6 +174,14 @@ public sealed partial class HipBackend : IGpuHalfPrecisionBackend
         if (!SupportsHgemm)
             throw new NotSupportedException(
                 "Half-precision GEMM requires either a compatible hipBLAS installation or the direct HIP conversion and GEMM kernels.");
+    }
+
+    private void EnsureFp16FusedBackwardSupported()
+    {
+        if (!SupportsFp16FusedBackward)
+            throw new NotSupportedException(
+                "The fused half-precision matrix-multiply backward pass requires a compatible hipBLAS installation; " +
+                "the direct HIP forward-GEMM fallback does not support transposed fused gradients.");
     }
 
     private void GemmFp16In32fOutDirect(
