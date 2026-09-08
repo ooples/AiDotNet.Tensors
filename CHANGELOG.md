@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.130.3](https://github.com/ooples/AiDotNet.Tensors/compare/v0.130.2...v0.130.3) (2026-09-08)
+
+
+### Bug Fixes
+
+* **tensors:** preserve COW storage across inference reads ([#1012](https://github.com/ooples/AiDotNet.Tensors/issues/1012)) ([d3a78d1](https://github.com/ooples/AiDotNet.Tensors/commit/d3a78d152539d1cced7a246c9bcba4ad16a557dc))
+
 ## [0.130.2](https://github.com/ooples/AiDotNet.Tensors/compare/v0.130.1...v0.130.2) (2026-09-04)
 
 
