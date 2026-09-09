@@ -52,8 +52,9 @@ public sealed class Fp16FusedBackwardParityTests
                     var b = new OpenClBackend();
                     if (b is IGpuHalfPrecisionBackend half && b.IsAvailable && half.SupportsFp16FusedBackward)
                         return (half, b, b.Dispose, null);
+                    Exception? initializationException = b.InitializationException;
                     b.Dispose();
-                    return (null, null, () => { }, null);
+                    return (null, null, () => { }, initializationException);
                 }
                 case BackendKind.Vulkan:
                 {
@@ -131,11 +132,7 @@ public sealed class Fp16FusedBackwardParityTests
 
     private static void AssertClose(float[] expected, float[] actual, double absTol, double relTol, string what)
     {
-        // actual may be longer than expected: AllocateBuffer pools/rents, so the result buffer can have
-        // capacity > the requested element count, and DownloadBuffer returns that capacity. The valid result
-        // is the first expected.Length contiguous (row-major) elements; the pooled tail is stale.
-        Assert.True(actual.Length >= expected.Length,
-            $"{what}: downloaded {actual.Length} elements, fewer than the expected {expected.Length}.");
+        Assert.Equal(expected.Length, actual.Length);
         for (int i = 0; i < expected.Length; i++)
         {
             double diff = Math.Abs(expected[i] - actual[i]);
@@ -152,6 +149,8 @@ public sealed class Fp16FusedBackwardParityTests
         var (half, backend, dispose, error) = TryCreate(kind);
         if (backend is null || half is null)
         {
+            if (error is not null)
+                throw new InvalidOperationException($"The {kind} backend failed to initialize.", error);
             if (RequireGpu)
                 throw new InvalidOperationException(
                     $"GPU tests were required (AIDOTNET_REQUIRE_GPU_TESTS=1) but the {kind} backend's " +
@@ -206,6 +205,8 @@ public sealed class Fp16FusedBackwardParityTests
         var (half, backend, dispose, error) = TryCreate(kind);
         if (backend is null || half is null)
         {
+            if (error is not null)
+                throw new InvalidOperationException($"The {kind} backend failed to initialize.", error);
             if (RequireGpu)
                 throw new InvalidOperationException(
                     $"GPU tests were required (AIDOTNET_REQUIRE_GPU_TESTS=1) but the {kind} backend's " +

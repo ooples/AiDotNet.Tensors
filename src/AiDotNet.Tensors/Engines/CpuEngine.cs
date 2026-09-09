@@ -3404,6 +3404,101 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    public virtual Tensor<T> TensorChannelBiasAdd<T>(Tensor<T> input, Tensor<T> bias)
+    {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (bias == null) throw new ArgumentNullException(nameof(bias));
+        if (input.Rank < 2)
+            throw new ArgumentException("Channel-bias addition requires an input with rank at least two.", nameof(input));
+        if (bias.Rank != 1 || bias._shape[0] != input._shape[1])
+        {
+            throw new ArgumentException(
+                $"Channel bias must have shape [{input._shape[1]}], but got [{string.Join(",", bias._shape)}].",
+                nameof(bias));
+        }
+
+        var scope = GraphMode.Current;
+        if (scope is not null)
+        {
+            var capturedInput = input;
+            var capturedBias = bias;
+            return scope.RecordBinary(
+                LazyNodeType.Custom,
+                "TensorChannelBiasAdd",
+                input,
+                bias,
+                input._shape,
+                (engine, output) =>
+                {
+                    var eager = engine.TensorChannelBiasAdd(capturedInput, capturedBias);
+                    DirectGpuTensorEngine.CopyResultInto(engine, eager, output);
+                },
+                BackwardFunctions<T>.ChannelBiasAddBackward);
+        }
+
+        var originalInput = input;
+        var originalBias = bias;
+        if (!input.IsContiguous) input = input.Contiguous();
+        if (!bias.IsContiguous) bias = bias.Contiguous();
+
+        int batchCount = input._shape[0];
+        int channelCount = input._shape[1];
+        int spatialSize = 1;
+        for (int dimension = 2; dimension < input.Rank; dimension++)
+            spatialSize *= input._shape[dimension];
+        var result = AutoTensorCache.RentOrAllocate<T>(input._shape);
+
+        if (input.GetCpuBackingForStridedRead(out int inputOffset) is { } inputData
+            && bias.GetCpuBackingForStridedRead(out int biasOffset) is { } biasData
+            && result.GetCpuBackingForContiguousWrite(out int resultOffset) is { } resultData)
+        {
+            ApplyBroadcastChannelOp(
+                inputData, inputOffset,
+                biasData, biasOffset,
+                resultData, resultOffset,
+                batchCount, channelCount, spatialSize,
+                BroadcastOp.Add);
+        }
+        else
+        {
+            var numeric = MathHelper.GetNumericOperations<T>();
+            var inputSpan = input.ReadOnlyData.Span;
+            var biasSpan = bias.ReadOnlyData.Span;
+            var resultSpan = result.Data.Span;
+            for (int batch = 0; batch < batchCount; batch++)
+            {
+                for (int channel = 0; channel < channelCount; channel++)
+                {
+                    T channelBias = biasSpan[channel];
+                    int planeOffset = (batch * channelCount + channel) * spatialSize;
+                    for (int spatial = 0; spatial < spatialSize; spatial++)
+                    {
+                        int index = planeOffset + spatial;
+                        resultSpan[index] = numeric.Add(inputSpan[index], channelBias);
+                    }
+                }
+            }
+        }
+
+        DifferentiableOps.RecordBinary(
+            "TensorChannelBiasAdd",
+            result,
+            originalInput,
+            originalBias,
+            BackwardFunctions<T>.ChannelBiasAddBackward);
+        if (AutoTracer.ShouldRecord)
+        {
+            var capturedInput = input;
+            var capturedBias = bias;
+            AutoTracer.RecordOp(
+                "TensorChannelBiasAdd",
+                result,
+                engine => engine.TensorChannelBiasAdd(capturedInput, capturedBias));
+        }
+        return result;
+    }
+
+    /// <inheritdoc/>
     public virtual Tensor<T> TensorBroadcastAdd<T>(Tensor<T> a, Tensor<T> b)
     {
         using var _opScope = AiDotNet.Tensors.Engines.Profiling.Profiler.OpScope("TensorBroadcastAdd");
@@ -4096,7 +4191,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var aSpan = a.Data.Span;
-        var bSpan = b.Data.Span;
+        var bSpan = b.ReadOnlyData.Span;
 
         // Fast path: same shape — no broadcasting needed
         if (ShapesMatch(a._shape, b._shape))
@@ -4244,10 +4339,12 @@ public partial class CpuEngine : ITensorLevelEngine
         // out-tensors are still allocated (small: [batch, numGroups]).
         if (typeof(T) == typeof(float))
         {
-            using var pinIn = input.Data.Pin();
+            // Input and affine parameters are read-only. Pinning through Data would
+            // privatize every COW peer during compiled GroupNorm replay.
+            using var pinIn = input.ReadOnlyData.Pin();
             using var pinOut = output.Data.Pin();
-            using var pinGamma = gamma.Data.Pin();
-            using var pinBeta = beta.Data.Pin();
+            using var pinGamma = gamma.ReadOnlyData.Pin();
+            using var pinBeta = beta.ReadOnlyData.Pin();
             unsafe
             {
                 float epsF = (float)epsilon;
@@ -12825,7 +12922,7 @@ public partial class CpuEngine : ITensorLevelEngine
         ReadOnlySpan<float> aSpan = a.AsSpan();
         ReadOnlySpan<float> bSpan = b.AsSpan();
         Span<float> outputSpan = output.AsWritableSpan();
-        float[]? liveB = b.GetLiveBackingArrayAllowingPaddingOrNull();
+        float[]? liveB = b.GetReadOnlyLiveBackingArrayAllowingPaddingOrNull();
 
         // 2D × 2D — route through cached-B path (Path A: pre-pack weights)
         if (a.Rank == 2 && b.Rank == 2)
@@ -12833,7 +12930,7 @@ public partial class CpuEngine : ITensorLevelEngine
             int m = a._shape[0], k = a._shape[1], n = b._shape[1];
             if (n == 1)
             {
-                TensorMatMulGemvFloat(a.Data, b.Data, output.Data, m, k);
+                TensorMatMulGemvFloat(a.ReadOnlyData, b.ReadOnlyData, output.Data, m, k);
                 return;
             }
 
@@ -13177,7 +13274,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         // Try BLAS-accelerated path for float/double tensors
-        if (MatrixMultiplyHelper.TryGemm(a.Data, 0, b.Data, 0, result.Data, 0, m, n, p))
+        if (MatrixMultiplyHelper.TryGemm(a.ReadOnlyData, 0, b.ReadOnlyData, 0, result.Data, 0, m, n, p))
         {
             return result;
         }
@@ -13195,7 +13292,8 @@ public partial class CpuEngine : ITensorLevelEngine
         // NOT clear the destination. Pre-clear result here so the accumulation
         // starts from zero and we get matmul (c = a·b), not c += a·b.
         result.AsWritableSpan().Clear();
-        MatrixMultiplyHelper.MultiplyBlocked(numOps, a.Data, b.Data, result.Data, m, n, p, n, p, p);
+        MatrixMultiplyHelper.MultiplyBlocked(
+            numOps, a.ReadOnlyData, b.ReadOnlyData, result.Data, m, n, p, n, p, p);
 
         return result;
     }
@@ -13341,8 +13439,8 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (typeof(T) == typeof(float))
         {
-            var aMem = (Memory<float>)(object)a.Data;
-            var bMem = (Memory<float>)(object)b.Data;
+            var aMem = (ReadOnlyMemory<float>)(object)a.ReadOnlyData;
+            var bMem = (ReadOnlyMemory<float>)(object)b.ReadOnlyData;
             var rMem = (Memory<float>)(object)result.Data;
             TensorMatMulGemvFloat(aMem, bMem, rMem, m, k);
             return true;
@@ -13350,8 +13448,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(double))
         {
-            var aMem = (Memory<double>)(object)a.Data;
-            var bMem = (Memory<double>)(object)b.Data;
+            var aMem = (ReadOnlyMemory<double>)(object)a.ReadOnlyData;
+            var bMem = (ReadOnlyMemory<double>)(object)b.ReadOnlyData;
             var rMem = (Memory<double>)(object)result.Data;
             TensorMatMulGemvDouble(aMem, bMem, rMem, m, k);
             return true;
@@ -13531,7 +13629,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
 
             if (MatrixMultiplyHelper.TryGemm(
-                a.Data, 0, b.Data, 0, result.Data, 0,
+                aData, 0, bData, 0, result.Data, 0,
                 batchSize * m, n, p))
             {
                 return result;
@@ -13547,7 +13645,7 @@ public partial class CpuEngine : ITensorLevelEngine
             int resultOffset = batch * matrixSizeResult;
 
             // Try BLAS for each batch slice
-            if (MatrixMultiplyHelper.TryGemm(a.Data, aOffset, b.Data, 0, result.Data, resultOffset, m, n, p))
+            if (MatrixMultiplyHelper.TryGemm(aData, aOffset, bData, 0, result.Data, resultOffset, m, n, p))
             {
                 return;
             }
@@ -13558,7 +13656,7 @@ public partial class CpuEngine : ITensorLevelEngine
             // MultiplyBlocked spawn a second tier would oversubscribe.
             result.Data.Span.Slice(resultOffset, matrixSizeResult).Clear();
             MatrixMultiplyHelper.MultiplyBlocked(
-                numOps, a.Data, b.Data, result.Data,
+                numOps, aData, bData, result.Data,
                 m, n, p, n, p, p,
                 aOffset: aOffset, bOffset: 0, cOffset: resultOffset,
                 allowParallel: false);
@@ -13672,7 +13770,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
                 // Try BLAS dgemm first — that's the absolute fastest when libopenblas
                 // is loaded. Falls through to the in-house kernel below.
-                if (MatrixMultiplyHelper.TryGemm(a.Data, aOffset, b.Data, bOffset, result.Data, resultOffset, m, n, p))
+                if (MatrixMultiplyHelper.TryGemm(aData, aOffset, bData, bOffset, result.Data, resultOffset, m, n, p))
                 {
                     return;
                 }
@@ -13694,7 +13792,7 @@ public partial class CpuEngine : ITensorLevelEngine
             int resultOffset = batch * matrixSizeResult;
 
             // Try BLAS for each batch slice
-            if (MatrixMultiplyHelper.TryGemm(a.Data, aOffset, b.Data, bOffset, result.Data, resultOffset, m, n, p))
+            if (MatrixMultiplyHelper.TryGemm(aData, aOffset, bData, bOffset, result.Data, resultOffset, m, n, p))
             {
                 return;
             }
@@ -13704,7 +13802,7 @@ public partial class CpuEngine : ITensorLevelEngine
             // because we're already inside a Parallel.For over batch.
             result.Data.Span.Slice(resultOffset, matrixSizeResult).Clear();
             MatrixMultiplyHelper.MultiplyBlocked(
-                numOps, a.Data, b.Data, result.Data,
+                numOps, aData, bData, result.Data,
                 m, n, p, n, p, p,
                 aOffset: aOffset, bOffset: bOffset, cOffset: resultOffset,
                 allowParallel: false);
@@ -13809,8 +13907,8 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         var result = preAllocatedOutput ?? TensorAllocator.Rent<T>([batch, outChannels, outputHeight, outputWidth]);
-        var inputData = input.GetDataArray();
-        var kernelData = kernel.GetDataArray();
+        var inputData = input.GetReadOnlyDataArray();
+        var kernelData = kernel.GetReadOnlyDataArray();
         var outputData = result.GetDataArray();
 
         // NCHWc fast path: when the caller pre-reordered input + kernel into
@@ -17592,8 +17690,8 @@ public partial class CpuEngine : ITensorLevelEngine
         int outputHeight = (height - 1) * strideH - 2 * padH + kernelHeight + outPadH;
         int outputWidth = (width - 1) * strideW - 2 * padW + kernelWidth + outPadW;
 
-        var inputData = input.GetDataArray();
-        var kernelData = kernel.GetDataArray();
+        var inputData = input.GetReadOnlyDataArray();
+        var kernelData = kernel.GetReadOnlyDataArray();
         var outputData = new T[batch * outChannels * outputHeight * outputWidth];
 
         // ────────────────────────────────────────────────────────────────────
@@ -23892,9 +23990,9 @@ public partial class CpuEngine : ITensorLevelEngine
         int batch = workingInput._shape[0];
         int features = workingInput._shape[1];
 
-        var inputData = workingInput.GetDataArray();
-        var gammaData = gamma.GetDataArray();
-        var betaData = beta.GetDataArray();
+        var inputData = workingInput.GetReadOnlyDataArray();
+        var gammaData = gamma.GetReadOnlyDataArray();
+        var betaData = beta.GetReadOnlyDataArray();
 
         var meanData = new T[features];
         var varData = new T[features];
@@ -24664,7 +24762,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var gradOutputData = gradOutput.GetDataArray();
         var inputData = input.GetFlattenedData();
-        var gammaData = gamma.GetDataArray();
+        var gammaData = gamma.GetReadOnlyDataArray();
         var meanData = mean.GetDataArray();
         var varData = variance.GetDataArray();
 
@@ -24822,8 +24920,8 @@ public partial class CpuEngine : ITensorLevelEngine
         T elementsT = numOps.FromDouble(elementsPerChannel);
 
         var gradOutputData = gradOutput.GetDataArray();
-        var inputData = input.GetDataArray();
-        var gammaData = gamma.GetDataArray();
+        var inputData = input.GetReadOnlyDataArray();
+        var gammaData = gamma.GetReadOnlyDataArray();
         var meanData = mean.GetDataArray();
         var varData = variance.GetDataArray();
 
@@ -25183,8 +25281,8 @@ public partial class CpuEngine : ITensorLevelEngine
         T spatialT = numOps.FromDouble(spatialSize);
 
         var gradOutputData = gradOutput.GetDataArray();
-        var inputData = input.GetDataArray();
-        var gammaData = gamma.GetDataArray();
+        var inputData = input.GetReadOnlyDataArray();
+        var gammaData = gamma.GetReadOnlyDataArray();
         var meanData = mean.GetDataArray();
         var varData = variance.GetDataArray();
 
@@ -26895,7 +26993,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var gradOutputData = gradOutput.GetDataArray();
         var inputData = input.GetFlattenedData();
-        var gammaData = gamma.GetDataArray();
+        var gammaData = gamma.GetReadOnlyDataArray();
         var meanData = mean.GetDataArray();
         var varData = variance.GetDataArray();
 
@@ -27437,8 +27535,8 @@ public partial class CpuEngine : ITensorLevelEngine
         if (batchDims == 0) { batchSize = 1; batchShape = [1]; }
 
         int featureSize = gamma.Length;
-        var inputData = input.GetDataArray();
-        var gammaData = gamma.GetDataArray();
+        var inputData = input.GetReadOnlyDataArray();
+        var gammaData = gamma.GetReadOnlyDataArray();
         var rmsData = new T[batchSize];
         var outputData = new T[batchSize * featureSize];
 
@@ -27550,7 +27648,7 @@ public partial class CpuEngine : ITensorLevelEngine
         int featureSize = gamma.Length;
         var gradOutputData = gradOutput.GetDataArray();
         var inputData = input.GetFlattenedData();
-        var gammaData = gamma.GetDataArray();
+        var gammaData = gamma.GetReadOnlyDataArray();
         var rmsData = rms.GetDataArray();
         var gradGammaData = new T[featureSize];
         var gradInputData = new T[input.Length];
@@ -40951,12 +41049,9 @@ public partial class CpuEngine : ITensorLevelEngine
             var convResult = Conv2D(input, kernel, new[] { strideH, strideW }, new[] { padH, padW }, new[] { dilationH, dilationW });
             if (bias != null)
             {
-                var biasView = bias;
-                if (bias.Rank == 1 && convResult.Rank == 4 && bias._shape[0] == convResult._shape[1])
-                {
-                    biasView = Reshape(bias, new[] { 1, bias._shape[0], 1, 1 });
-                }
-                convResult = TensorBroadcastAdd(convResult, biasView);
+                convResult = bias.Rank == 1
+                    ? TensorChannelBiasAdd(convResult, bias)
+                    : TensorBroadcastAdd(convResult, bias);
             }
             return ApplyActivationRecorded(convResult, activation);
         }
@@ -40976,7 +41071,7 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             int N = result._shape[0], C = result._shape[1], H = result._shape[2], W = result._shape[3];
             var outArr = (float[])(object)result.GetDataArray();
-            var biasArr = bias != null ? (float[])(object)bias.GetDataArray() : null;
+            var biasArr = bias != null ? (float[])(object)bias.GetReadOnlyDataArray() : null;
             CpuFusedOperations.ApplyBiasActivationNCHWInPlace(outArr, biasArr, N, C, H, W, activation);
             return result;
         }
@@ -40996,7 +41091,7 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             int N = result._shape[0], C = result._shape[1], H = result._shape[2], W = result._shape[3];
             var outArr = (double[])(object)result.GetDataArray();
-            var biasArr = bias != null ? (double[])(object)bias.GetDataArray() : null;
+            var biasArr = bias != null ? (double[])(object)bias.GetReadOnlyDataArray() : null;
             CpuFusedOperations.ApplyBiasActivationNCHWInPlace(outArr, biasArr, N, C, H, W, activation);
             return result;
         }
@@ -41007,12 +41102,9 @@ public partial class CpuEngine : ITensorLevelEngine
         // with the NCHW result's channel axis, not the innermost (W) dim.
         if (bias != null)
         {
-            var biasView = bias;
-            if (bias.Rank == 1 && result.Rank == 4 && bias._shape[0] == result._shape[1])
-            {
-                biasView = Reshape(bias, new[] { 1, bias._shape[0], 1, 1 });
-            }
-            result = TensorBroadcastAdd(result, biasView);
+            result = bias.Rank == 1
+                ? TensorChannelBiasAdd(result, bias)
+                : TensorBroadcastAdd(result, bias);
         }
         ApplyFusedActivationInPlace(result, activation);
         return result;
@@ -41038,8 +41130,9 @@ public partial class CpuEngine : ITensorLevelEngine
         // Step 2: Add bias if provided (reshape to [1, outChannels, 1, 1, 1] for NCDHW broadcast)
         if (bias != null)
         {
-            var biasExpanded = bias.Reshape(1, bias._shape[0], 1, 1, 1);
-            result = TensorBroadcastAdd(result, biasExpanded);
+            result = bias.Rank == 1
+                ? TensorChannelBiasAdd(result, bias)
+                : TensorBroadcastAdd(result, bias);
         }
 
         // Activation: use the recorded variant when EITHER a gradient
@@ -41073,8 +41166,9 @@ public partial class CpuEngine : ITensorLevelEngine
         // Step 2: Add bias if provided (reshape to [1, outChannels, 1, 1] for NCHW broadcast)
         if (bias != null)
         {
-            var biasExpanded = bias.Reshape(1, bias._shape[0], 1, 1);
-            result = TensorBroadcastAdd(result, biasExpanded);
+            result = bias.Rank == 1
+                ? TensorChannelBiasAdd(result, bias)
+                : TensorBroadcastAdd(result, bias);
         }
 
         // Activation — see FusedConv3D note above. GraphMode included
@@ -43611,8 +43705,8 @@ public partial class CpuEngine : ITensorLevelEngine
         for (int i = 2; i < input.Rank; i++) spatialSize *= input._shape[i];
 
         var inputData = input.GetFlattenedData();
-        var gammaData = gamma.GetDataArray();
-        var betaData = beta.GetDataArray();
+        var gammaData = gamma.GetReadOnlyDataArray();
+        var betaData = beta.GetReadOnlyDataArray();
         var meanData = new T[batch * channels];
         var varData = new T[batch * channels];
         var resultData = new T[input.Length];
@@ -43705,7 +43799,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var gradOutData = gradOutput.GetDataArray();
         var inputData = input.GetFlattenedData();
-        var gammaData = gamma.GetDataArray();
+        var gammaData = gamma.GetReadOnlyDataArray();
         var meanData = mean.GetDataArray();
         var varData = variance.GetDataArray();
         var gradInputData = new T[input.Length];

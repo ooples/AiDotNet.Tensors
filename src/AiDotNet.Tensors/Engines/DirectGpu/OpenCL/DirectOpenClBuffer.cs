@@ -136,11 +136,33 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         }
 
         /// <summary>
+        /// Downloads the requested leading elements without exposing unused pooled capacity.
+        /// </summary>
+        public float[] ToArray(int elementCount)
+        {
+            if (elementCount < 0 || elementCount > _length)
+                throw new ArgumentOutOfRangeException(nameof(elementCount));
+            var result = new float[elementCount];
+            CopyToHost(result, elementCount);
+            return result;
+        }
+
+        /// <summary>
         /// Downloads buffer contents to existing array.
         /// </summary>
         public void CopyToHost(float[] destination)
         {
-            if (destination.Length < _length)
+            CopyToHost(destination, _length);
+        }
+
+        /// <summary>
+        /// Downloads the requested leading elements without copying the unused tail of a pooled allocation.
+        /// </summary>
+        public void CopyToHost(float[] destination, int elementCount)
+        {
+            if (elementCount < 0 || elementCount > _length)
+                throw new ArgumentOutOfRangeException(nameof(elementCount));
+            if (destination.Length < elementCount)
                 throw new ArgumentException("Destination array too small");
 
             GCHandle handle = GCHandle.Alloc(destination, GCHandleType.Pinned);
@@ -157,7 +179,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                         using var waits = DirectOpenClSubmission.PrepareLocked(queue, memories);
                         err = OpenClNativeBindings.EnqueueReadBufferWithEvent(
                             queue, _buffer, 0, UIntPtr.Zero,
-                            (UIntPtr)(_length * sizeof(float)), handle.AddrOfPinnedObject(),
+                            (UIntPtr)(elementCount * sizeof(float)), handle.AddrOfPinnedObject(),
                             waits.Count, waits.Pointer, out transferEvent);
                         if (err == OpenClNativeBindings.CL_SUCCESS)
                             DirectOpenClSubmission.CommitLocked(queue, memories);

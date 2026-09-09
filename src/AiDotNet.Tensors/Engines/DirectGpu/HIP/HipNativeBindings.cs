@@ -3,7 +3,9 @@
 // Provides direct access to HIP for MFMA kernel execution.
 
 using System;
+using System.Linq;
 using System.Runtime.InteropServices;
+using AiDotNet.Tensors.Engines;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 
@@ -165,20 +167,20 @@ internal static class HipNativeBindings
     // ROCm 6.4 on Windows installs versioned DLLs:
     //   C:\Program Files\AMD\ROCm\6.4\bin\amdhip64_6.dll
     //   C:\Program Files\AMD\ROCm\6.4\bin\hiprtc0604.dll
-#if WINDOWS
+#if NETFRAMEWORK
     private const string HipLibrary = "amdhip64_6";
     private const string HipRtcLibrary = "hiprtc0604";
 #else
-    private const string HipLibrary = "libamdhip64";
-    private const string HipRtcLibrary = "libhiprtc";
+    private const string HipLibrary = RocmNativeLibraryResolver.RuntimeImportName;
+    private const string HipRtcLibrary = RocmNativeLibraryResolver.RuntimeCompilerImportName;
 #endif
 
     private static bool _isAvailable;
     private static bool _availabilityChecked;
     private static bool _dllPathInitialized;
+    internal static string? RocmBinPath { get; private set; }
     public static bool EnableDiagnostics { get; set; }
 
-#if WINDOWS
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern IntPtr AddDllDirectory(string lpPathName);
 
@@ -187,6 +189,14 @@ internal static class HipNativeBindings
 
     private const uint LOAD_LIBRARY_SEARCH_DEFAULT_DIRS = 0x00001000;
     private const uint LOAD_LIBRARY_SEARCH_USER_DIRS = 0x00000400;
+
+#if NET5_0_OR_GREATER
+    static HipNativeBindings()
+    {
+        NativeLibraryResolverRegistry.Register(
+            (libraryName, assembly, searchPath) =>
+                RocmNativeLibraryResolver.Resolve(libraryName, assembly, searchPath, RocmBinPath));
+    }
 #endif
 
     /// <summary>
@@ -198,7 +208,11 @@ internal static class HipNativeBindings
         if (_dllPathInitialized) return;
         _dllPathInitialized = true;
 
-#if WINDOWS
+        if (RocmNativeLibraryResolver.CurrentOperatingSystem != RocmOperatingSystem.Windows)
+        {
+            return;
+        }
+
         try
         {
             // Find ROCm installation directory
@@ -208,6 +222,7 @@ internal static class HipNativeBindings
                 string binPath = System.IO.Path.Combine(rocmPath, "bin");
                 if (System.IO.Directory.Exists(binPath))
                 {
+                    RocmBinPath = binPath;
                     // Enable user-defined DLL directories
                     SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | LOAD_LIBRARY_SEARCH_USER_DIRS);
 
@@ -233,7 +248,6 @@ internal static class HipNativeBindings
         {
             LogDiagnostic($"[HIP Diagnostics] Error initializing DLL search path: {ex.Message}");
         }
-#endif
     }
 
     /// <summary>
@@ -241,11 +255,16 @@ internal static class HipNativeBindings
     /// </summary>
     private static string? FindRocmPath()
     {
-#if WINDOWS
+        if (RocmNativeLibraryResolver.CurrentOperatingSystem != RocmOperatingSystem.Windows)
+        {
+            return null;
+        }
+
         // Check common ROCm installation paths
         string[] basePaths = new[]
         {
-            @"C:\Program Files\AMD\ROCm",
+            System.IO.Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "AMD", "ROCm"),
             Environment.GetEnvironmentVariable("HIP_PATH") ?? "",
             Environment.GetEnvironmentVariable("ROCM_PATH") ?? ""
         };
@@ -257,8 +276,8 @@ internal static class HipNativeBindings
             if (System.IO.Directory.Exists(basePath))
             {
                 // Check if it's a versioned path (e.g., C:\Program Files\AMD\ROCm\6.4)
-                string hipDll = System.IO.Path.Combine(basePath, "bin", "amdhip64_6.dll");
-                if (System.IO.File.Exists(hipDll))
+                string binPath = System.IO.Path.Combine(basePath, "bin");
+                if (ContainsHipRuntime(binPath))
                 {
                     LogDiagnostic($"[HIP Diagnostics] Found ROCm at: {basePath}");
                     return basePath;
@@ -267,10 +286,13 @@ internal static class HipNativeBindings
                 // Check for versioned subdirectories (e.g., 6.4, 5.7, etc.)
                 try
                 {
-                    foreach (var versionDir in System.IO.Directory.GetDirectories(basePath))
+                    string[] versionDirectories = System.IO.Directory.GetDirectories(basePath)
+                        .OrderByDescending(GetRocmVersion)
+                        .ToArray();
+                    foreach (var versionDir in versionDirectories)
                     {
-                        hipDll = System.IO.Path.Combine(versionDir, "bin", "amdhip64_6.dll");
-                        if (System.IO.File.Exists(hipDll))
+                        binPath = System.IO.Path.Combine(versionDir, "bin");
+                        if (ContainsHipRuntime(binPath))
                         {
                             LogDiagnostic($"[HIP Diagnostics] Found ROCm at: {versionDir}");
                             return versionDir;
@@ -283,8 +305,19 @@ internal static class HipNativeBindings
                 }
             }
         }
-#endif
         return null;
+    }
+
+    private static bool ContainsHipRuntime(string binPath)
+    {
+        return System.IO.Directory.Exists(binPath) &&
+               System.IO.Directory.GetFiles(binPath, "amdhip64_*.dll").Length > 0;
+    }
+
+    private static Version GetRocmVersion(string path)
+    {
+        string? directoryName = System.IO.Path.GetFileName(path);
+        return Version.TryParse(directoryName, out Version? version) ? version : new Version(0, 0);
     }
 
     private static void LogDiagnostic(string message)
@@ -360,9 +393,10 @@ internal static class HipNativeBindings
         HipDeviceAttribute attribute,
         int deviceId);
 
-    // HipDeviceProperties mirrors hipDeviceProp_tR0600. The unversioned export is not an
-    // ABI promise on ROCm 6 and, on Windows, can populate the retained R0000 layout. Reading
-    // that memory as R0600 leaves GcnArchName empty and silently compiles code for gfx900.
+    // HIP 6 headers map hipGetDeviceProperties to the R0600 ABI. Importing the
+    // unversioned compatibility symbol with the R0600 managed layout corrupts
+    // fields near the end of the structure, including gcnArchName, and can make
+    // hipRTC compile code for the wrong GPU target.
     [DllImport(HipLibrary, CallingConvention = CallingConvention.Cdecl,
         EntryPoint = "hipGetDevicePropertiesR0600")]
     public static extern HipError hipGetDeviceProperties(
@@ -711,6 +745,17 @@ public enum HipRtcResult
     ErrorInternalError = 11
 }
 
+/// <summary>Identifies the stage at which HIP runtime kernel compilation failed.</summary>
+public enum HipKernelCompilationStage
+{
+    ProgramCreation = 0,
+    Compilation = 1,
+    CodeSize = 2,
+    CodeRetrieval = 3,
+    ModuleLoad = 4,
+    FunctionLookup = 5
+}
+
 /// <summary>
 /// HIP device arch feature flags.
 /// </summary>
@@ -905,5 +950,35 @@ public class HipException : Exception
         : base(message)
     {
         ErrorCode = errorCode;
+    }
+}
+
+/// <summary>Describes a typed HIP runtime kernel compilation failure.</summary>
+public sealed class HipKernelCompilationException : Exception
+{
+    /// <summary>Gets the logical module that failed.</summary>
+    public string ModuleName { get; }
+
+    /// <summary>Gets the compilation stage that failed.</summary>
+    public HipKernelCompilationStage Stage { get; }
+
+    /// <summary>Gets the hipRTC result, when the failure came from hipRTC.</summary>
+    public HipRtcResult? RuntimeCompilationResult { get; }
+
+    /// <summary>Gets the HIP runtime error, when the failure came from the HIP runtime.</summary>
+    public HipError? HipError { get; }
+
+    internal HipKernelCompilationException(
+        string moduleName,
+        HipKernelCompilationStage stage,
+        string detail,
+        HipRtcResult? runtimeCompilationResult = null,
+        HipError? hipError = null)
+        : base($"HIP kernel module '{moduleName}' failed during {stage}: {detail}")
+    {
+        ModuleName = moduleName;
+        Stage = stage;
+        RuntimeCompilationResult = runtimeCompilationResult;
+        HipError = hipError;
     }
 }

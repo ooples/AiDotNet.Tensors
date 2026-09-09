@@ -15,25 +15,18 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// so the geometry is always self-consistent.
 /// </summary>
 [Collection("DirectGpuSerial")]
-public sealed class GpuConvKernelCoverageTests : IDisposable
+public sealed class GpuConvKernelCoverageTests : IDisposable, IClassFixture<DirectGpuTensorEngineTestFixture>
 {
-    private readonly DirectGpuTensorEngine _gpu;
+    private readonly DirectGpuTensorEngineTestFixture _fixture;
     private readonly CpuEngine _cpu = new();
     private readonly bool _ready;
+    private DirectGpuTensorEngine Gpu => _fixture.Engine ?? throw new InvalidOperationException(
+        "Direct GPU engine was not initialized.", _fixture.InitializationException);
 
-    public GpuConvKernelCoverageTests()
+    public GpuConvKernelCoverageTests(DirectGpuTensorEngineTestFixture fixture)
     {
-        // Only swallow the two exceptions that mean "no native GPU runtime on this host"
-        // (PlatformNotSupportedException / DllNotFoundException). A real GPU setup or kernel/module
-        // compilation regression MUST surface as a test failure, not get converted into an "unavailable"
-        // skip that hides the regression this suite exists to catch. Mirrors DetectionGpuParityTests.
-        try
-        {
-            _gpu = new DirectGpuTensorEngine();
-            _ready = _gpu.SupportsGpu;
-        }
-        catch (PlatformNotSupportedException) { _ready = false; }
-        catch (DllNotFoundException) { _ready = false; }
+        _fixture = fixture;
+        _ready = fixture.IsAvailable && Gpu.SupportsGpu;
 
         // Prove the GPU kernel ACTUALLY runs: make the conv/pool/attention catch blocks (here in the engine
         // AND inside the Metal/Vulkan backends) rethrow instead of silently falling back to the CPU reference.
@@ -47,7 +40,6 @@ public sealed class GpuConvKernelCoverageTests : IDisposable
     public void Dispose()
     {
         DirectGpuTensorEngine.ThrowOnGpuKernelFallback = false;
-        _gpu?.Dispose();
     }
 
     // Skip (visibly, via Xunit.SkipException) rather than silently `return` when
@@ -96,7 +88,7 @@ public sealed class GpuConvKernelCoverageTests : IDisposable
         var kernel = R(2, 2, 1, 3, 3); // [inCh, mult, kH, kW]
         int[] stride = { 1, 1 }, pad = { 1, 1 };
         AssertClose(_cpu.DepthwiseConv2D(input, kernel, stride, pad),
-                    _gpu.DepthwiseConv2D(input, kernel, stride, pad), "DepthwiseConv2D");
+                    Gpu.DepthwiseConv2D(input, kernel, stride, pad), "DepthwiseConv2D");
     }
 
     // ---- DepthwiseConv1D (reshapes to the on-GPU DepthwiseConv2D kernel) ----
@@ -107,7 +99,7 @@ public sealed class GpuConvKernelCoverageTests : IDisposable
         var input = R(1, 1, 3, 8);   // [batch, channels, length]
         var kernel = R(2, 3, 1, 3);  // [channels, mult, K]
         AssertClose(_cpu.DepthwiseConv1D(input, kernel, 1, 1),
-                    _gpu.DepthwiseConv1D(input, kernel, 1, 1), "DepthwiseConv1D");
+                    Gpu.DepthwiseConv1D(input, kernel, 1, 1), "DepthwiseConv1D");
     }
 
     // ---- DeformableConv2D (forward + all four backward) ----
@@ -128,7 +120,7 @@ public sealed class GpuConvKernelCoverageTests : IDisposable
     {
         SkipIfUnavailable();
         var s = DeformSetup();
-        AssertClose(s.fwd, _gpu.DeformableConv2D(s.input, s.kernel, s.offset, s.mask, s.stride, s.pad, s.dil),
+        AssertClose(s.fwd, Gpu.DeformableConv2D(s.input, s.kernel, s.offset, s.mask, s.stride, s.pad, s.dil),
                     "DeformableConv2D");
     }
 
@@ -148,7 +140,7 @@ public sealed class GpuConvKernelCoverageTests : IDisposable
         int[] stride = { 1, 1 }, pad = { 1, 1 }, dil = { 1, 1 };
         AssertClose(
             _cpu.DeformableConv2DGrouped(input, kernel, offset, null, stride, pad, dil, groups, deformGroups),
-            _gpu.DeformableConv2DGrouped(input, kernel, offset, null, stride, pad, dil, groups, deformGroups),
+            Gpu.DeformableConv2DGrouped(input, kernel, offset, null, stride, pad, dil, groups, deformGroups),
             $"DeformableConv2DGrouped(g={groups},dg={deformGroups})");
     }
 
@@ -166,7 +158,7 @@ public sealed class GpuConvKernelCoverageTests : IDisposable
         int[] stride = { 1, 1 }, pad = { 1, 1 }, dil = { 1, 1 };
         AssertClose(
             _cpu.DeformableConv2DGrouped(input, kernel, offset, mask, stride, pad, dil, groups, deformGroups),
-            _gpu.DeformableConv2DGrouped(input, kernel, offset, mask, stride, pad, dil, groups, deformGroups),
+            Gpu.DeformableConv2DGrouped(input, kernel, offset, mask, stride, pad, dil, groups, deformGroups),
             "DeformableConv2DGroupedWithMask");
     }
 
@@ -194,7 +186,7 @@ public sealed class GpuConvKernelCoverageTests : IDisposable
         int[] inShape = s.input.Shape.ToArray();
         AssertClose(
             _cpu.DeformableConv2DGroupedBackwardInput(s.grad, s.input, s.kernel, s.offset, null, inShape, s.stride, s.pad, s.dil, s.groups, s.dg),
-            _gpu.DeformableConv2DGroupedBackwardInput(s.grad, s.input, s.kernel, s.offset, null, inShape, s.stride, s.pad, s.dil, s.groups, s.dg),
+            Gpu.DeformableConv2DGroupedBackwardInput(s.grad, s.input, s.kernel, s.offset, null, inShape, s.stride, s.pad, s.dil, s.groups, s.dg),
             $"GroupedBackwardInput(g={groups},dg={dg})");
     }
 
@@ -208,7 +200,7 @@ public sealed class GpuConvKernelCoverageTests : IDisposable
         int[] kShape = s.kernel.Shape.ToArray();
         AssertClose(
             _cpu.DeformableConv2DGroupedBackwardKernel(s.grad, s.input, s.offset, null, kShape, s.stride, s.pad, s.dil, s.groups, s.dg),
-            _gpu.DeformableConv2DGroupedBackwardKernel(s.grad, s.input, s.offset, null, kShape, s.stride, s.pad, s.dil, s.groups, s.dg),
+            Gpu.DeformableConv2DGroupedBackwardKernel(s.grad, s.input, s.offset, null, kShape, s.stride, s.pad, s.dil, s.groups, s.dg),
             $"GroupedBackwardKernel(g={groups},dg={dg})");
     }
 
@@ -221,7 +213,7 @@ public sealed class GpuConvKernelCoverageTests : IDisposable
         var s = GroupedBwdSetup(groups, dg);
         AssertClose(
             _cpu.DeformableConv2DGroupedBackwardOffset(s.grad, s.input, s.kernel, s.offset, null, s.stride, s.pad, s.dil, s.groups, s.dg),
-            _gpu.DeformableConv2DGroupedBackwardOffset(s.grad, s.input, s.kernel, s.offset, null, s.stride, s.pad, s.dil, s.groups, s.dg),
+            Gpu.DeformableConv2DGroupedBackwardOffset(s.grad, s.input, s.kernel, s.offset, null, s.stride, s.pad, s.dil, s.groups, s.dg),
             $"GroupedBackwardOffset(g={groups},dg={dg})");
     }
 
@@ -240,7 +232,7 @@ public sealed class GpuConvKernelCoverageTests : IDisposable
         var grad = Like(44, fwd);
         AssertClose(
             _cpu.DeformableConv2DGroupedBackwardMask(grad, input, kernel, offset, mask, stride, pad, dil, groups, dg),
-            _gpu.DeformableConv2DGroupedBackwardMask(grad, input, kernel, offset, mask, stride, pad, dil, groups, dg),
+            Gpu.DeformableConv2DGroupedBackwardMask(grad, input, kernel, offset, mask, stride, pad, dil, groups, dg),
             "GroupedBackwardMask");
     }
 
@@ -252,7 +244,7 @@ public sealed class GpuConvKernelCoverageTests : IDisposable
         int[] inShape = s.input.Shape.ToArray();
         AssertClose(
             _cpu.DeformableConv2DBackwardInput(s.grad, s.input, s.kernel, s.offset, s.mask, inShape, s.stride, s.pad, s.dil),
-            _gpu.DeformableConv2DBackwardInput(s.grad, s.input, s.kernel, s.offset, s.mask, inShape, s.stride, s.pad, s.dil),
+            Gpu.DeformableConv2DBackwardInput(s.grad, s.input, s.kernel, s.offset, s.mask, inShape, s.stride, s.pad, s.dil),
             "DeformableConv2DBackwardInput");
     }
 
@@ -264,7 +256,7 @@ public sealed class GpuConvKernelCoverageTests : IDisposable
         int[] kShape = s.kernel.Shape.ToArray();
         AssertClose(
             _cpu.DeformableConv2DBackwardKernel(s.grad, s.input, s.offset, s.mask, kShape, s.stride, s.pad, s.dil),
-            _gpu.DeformableConv2DBackwardKernel(s.grad, s.input, s.offset, s.mask, kShape, s.stride, s.pad, s.dil),
+            Gpu.DeformableConv2DBackwardKernel(s.grad, s.input, s.offset, s.mask, kShape, s.stride, s.pad, s.dil),
             "DeformableConv2DBackwardKernel");
     }
 
@@ -275,7 +267,7 @@ public sealed class GpuConvKernelCoverageTests : IDisposable
         var s = DeformSetup();
         AssertClose(
             _cpu.DeformableConv2DBackwardOffset(s.grad, s.input, s.kernel, s.offset, s.mask, s.stride, s.pad, s.dil),
-            _gpu.DeformableConv2DBackwardOffset(s.grad, s.input, s.kernel, s.offset, s.mask, s.stride, s.pad, s.dil),
+            Gpu.DeformableConv2DBackwardOffset(s.grad, s.input, s.kernel, s.offset, s.mask, s.stride, s.pad, s.dil),
             "DeformableConv2DBackwardOffset");
     }
 
@@ -286,7 +278,7 @@ public sealed class GpuConvKernelCoverageTests : IDisposable
         var s = DeformSetup();
         AssertClose(
             _cpu.DeformableConv2DBackwardMask(s.grad, s.input, s.kernel, s.offset, s.mask, s.stride, s.pad, s.dil),
-            _gpu.DeformableConv2DBackwardMask(s.grad, s.input, s.kernel, s.offset, s.mask, s.stride, s.pad, s.dil),
+            Gpu.DeformableConv2DBackwardMask(s.grad, s.input, s.kernel, s.offset, s.mask, s.stride, s.pad, s.dil),
             "DeformableConv2DBackwardMask");
     }
 
@@ -299,7 +291,7 @@ public sealed class GpuConvKernelCoverageTests : IDisposable
         var kernel = R(21, 2, 1, 2, 2, 2);  // [Cout, Cin, kD, kH, kW]
         AssertClose(
             _cpu.FusedConv3D(input, kernel, null, 1, 1, 1, 0, 0, 0, 1, 1, 1, FusedActivationType.None),
-            _gpu.FusedConv3D(input, kernel, null, 1, 1, 1, 0, 0, 0, 1, 1, 1, FusedActivationType.None),
+            Gpu.FusedConv3D(input, kernel, null, 1, 1, 1, 0, 0, 0, 1, 1, 1, FusedActivationType.None),
             "FusedConv3D");
     }
 
@@ -312,7 +304,7 @@ public sealed class GpuConvKernelCoverageTests : IDisposable
         var kernel = R(31, 1, 2, 2, 2);  // [Cin, Cout, kH, kW]
         AssertClose(
             _cpu.FusedConvTranspose2D(input, kernel, null, 2, 2, 0, 0, 0, 0, FusedActivationType.None),
-            _gpu.FusedConvTranspose2D(input, kernel, null, 2, 2, 0, 0, 0, 0, FusedActivationType.None),
+            Gpu.FusedConvTranspose2D(input, kernel, null, 2, 2, 0, 0, 0, 0, FusedActivationType.None),
             "FusedConvTranspose2D");
     }
 
@@ -331,7 +323,7 @@ public sealed class GpuConvKernelCoverageTests : IDisposable
     {
         SkipIfUnavailable();
         var s = LocalSetup();
-        AssertClose(s.fwd, _gpu.LocallyConnectedConv2D(s.input, s.weights, null, s.stride), "LocallyConnectedConv2D");
+        AssertClose(s.fwd, Gpu.LocallyConnectedConv2D(s.input, s.weights, null, s.stride), "LocallyConnectedConv2D");
     }
 
     [SkippableFact]
@@ -342,7 +334,7 @@ public sealed class GpuConvKernelCoverageTests : IDisposable
         int[] inShape = s.input.Shape.ToArray();
         AssertClose(
             _cpu.LocallyConnectedConv2DBackwardInput(s.grad, s.weights, inShape, s.stride),
-            _gpu.LocallyConnectedConv2DBackwardInput(s.grad, s.weights, inShape, s.stride),
+            Gpu.LocallyConnectedConv2DBackwardInput(s.grad, s.weights, inShape, s.stride),
             "LocallyConnectedConv2DBackwardInput");
     }
 
@@ -354,7 +346,7 @@ public sealed class GpuConvKernelCoverageTests : IDisposable
         int[] wShape = s.weights.Shape.ToArray();
         AssertClose(
             _cpu.LocallyConnectedConv2DBackwardWeights(s.grad, s.input, wShape, s.stride),
-            _gpu.LocallyConnectedConv2DBackwardWeights(s.grad, s.input, wShape, s.stride),
+            Gpu.LocallyConnectedConv2DBackwardWeights(s.grad, s.input, wShape, s.stride),
             "LocallyConnectedConv2DBackwardWeights");
     }
 
@@ -373,7 +365,7 @@ public sealed class GpuConvKernelCoverageTests : IDisposable
 
         var dQc = _cpu.FlashAttentionBackward(grad, q, k, v, output, stats, scale, false,
             out var dKc, out var dVc, out var _unusedC, null);
-        var dQg = _gpu.FlashAttentionBackward(grad, q, k, v, output, stats, scale, false,
+        var dQg = Gpu.FlashAttentionBackward(grad, q, k, v, output, stats, scale, false,
             out var dKg, out var dVg, out var _unusedG, null);
         // The method returns gradQuery and yields gradKey/gradValue via out params.
         AssertClose(dQc, dQg, "FlashAttentionBackward.dQ");
@@ -392,7 +384,7 @@ public sealed class GpuConvKernelCoverageTests : IDisposable
         var kernel = R(61, 3, 2, 3, 3); // [outC, inC, kH, kW]
         int[] stride = { 1, 1 }, pad = { 1, 1 }, dil = { 1, 1 };
         AssertClose(_cpu.Conv2D(input, kernel, stride, pad, dil),
-                    _gpu.Conv2D(input, kernel, stride, pad, dil), "Conv2D");
+                    Gpu.Conv2D(input, kernel, stride, pad, dil), "Conv2D");
     }
 
     [SkippableFact]
@@ -403,7 +395,7 @@ public sealed class GpuConvKernelCoverageTests : IDisposable
         var kernel = R(63, 3, 2, 2, 2, 2); // [outC, inC, kD, kH, kW]
         int[] stride = { 1, 1, 1 }, pad = { 0, 0, 0 }, dil = { 1, 1, 1 };
         AssertClose(_cpu.Conv3D(input, kernel, stride, pad, dil),
-                    _gpu.Conv3D(input, kernel, stride, pad, dil), "Conv3D");
+                    Gpu.Conv3D(input, kernel, stride, pad, dil), "Conv3D");
     }
 
     [SkippableFact]
@@ -411,7 +403,7 @@ public sealed class GpuConvKernelCoverageTests : IDisposable
     {
         SkipIfUnavailable();
         var input = R(64, 2, 3, 5, 5);
-        AssertClose(_cpu.GlobalAvgPool2D(input), _gpu.GlobalAvgPool2D(input), "GlobalAvgPool2D");
+        AssertClose(_cpu.GlobalAvgPool2D(input), Gpu.GlobalAvgPool2D(input), "GlobalAvgPool2D");
     }
 
     [SkippableFact]
@@ -419,7 +411,7 @@ public sealed class GpuConvKernelCoverageTests : IDisposable
     {
         SkipIfUnavailable();
         var input = R(65, 2, 3, 5, 5);
-        AssertClose(_cpu.GlobalMaxPool2D(input), _gpu.GlobalMaxPool2D(input), "GlobalMaxPool2D");
+        AssertClose(_cpu.GlobalMaxPool2D(input), Gpu.GlobalMaxPool2D(input), "GlobalMaxPool2D");
     }
 
     [SkippableFact]
@@ -429,6 +421,6 @@ public sealed class GpuConvKernelCoverageTests : IDisposable
         var input = R(66, 1, 2, 4, 4, 4);
         int[] pool = { 2, 2, 2 }, stride = { 2, 2, 2 }, pad = { 0, 0, 0 };
         AssertClose(_cpu.MaxPool3D(input, pool, stride, pad),
-                    _gpu.MaxPool3D(input, pool, stride, pad), "MaxPool3D");
+                    Gpu.MaxPool3D(input, pool, stride, pad), "MaxPool3D");
     }
 }

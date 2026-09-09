@@ -1,8 +1,11 @@
 // Copyright (c) AiDotNet. All rights reserved.
 // hipBLAS native bindings for HIP GEMM acceleration.
 using System;
+using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
+using AiDotNet.Tensors.Engines;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.HIP;
 
@@ -12,6 +15,19 @@ internal static class HipBlasNative
     private static volatile bool _isAvailable;
     private static volatile bool _checkedAvailability;
     private static readonly object AvailabilityLock = new object();
+
+#if NET5_0_OR_GREATER
+    static HipBlasNative()
+    {
+        NativeLibraryResolverRegistry.Register(
+            (libraryName, assembly, searchPath) =>
+                RocmNativeLibraryResolver.Resolve(
+                    libraryName,
+                    assembly,
+                    searchPath,
+                    HipNativeBindings.RocmBinPath));
+    }
+#endif
 
     internal enum HipBlasStatus
     {
@@ -77,6 +93,86 @@ internal static class HipBlasNative
                 return _isAvailable;
             }
         }
+    }
+
+    internal static bool TryConfigureForArchitecture(string architectureTarget)
+    {
+        string? configuredPath = Environment.GetEnvironmentVariable("ROCBLAS_TENSILE_LIBPATH");
+        if (!string.IsNullOrWhiteSpace(configuredPath))
+        {
+            return Directory.Exists(configuredPath) &&
+                   HasCompatibleTensileLibrary(configuredPath, architectureTarget);
+        }
+
+        var libraryDirectories = new List<string>();
+        if (!string.IsNullOrWhiteSpace(HipNativeBindings.RocmBinPath))
+        {
+            libraryDirectories.Add(Path.Combine(HipNativeBindings.RocmBinPath, "rocblas", "library"));
+        }
+
+        libraryDirectories.Add(Path.Combine(AppContext.BaseDirectory, "rocblas", "library"));
+
+        foreach (string variableName in new[] { "ROCM_PATH", "HIP_PATH" })
+        {
+            string? root = Environment.GetEnvironmentVariable(variableName);
+            if (!string.IsNullOrWhiteSpace(root))
+            {
+                libraryDirectories.Add(Path.Combine(root, "lib", "rocblas", "library"));
+                libraryDirectories.Add(Path.Combine(root, "bin", "rocblas", "library"));
+            }
+        }
+
+        libraryDirectories.Add(Path.Combine(Path.DirectorySeparatorChar.ToString(), "opt", "rocm", "lib", "rocblas", "library"));
+
+        string? libraryDirectory = FindCompatibleTensileLibrary(libraryDirectories, architectureTarget);
+        if (libraryDirectory is null)
+        {
+            // rocBLAS terminates the process when it cannot locate architecture data. Prefer the
+            // all-GPU direct fallback over probing an unverifiable vendor installation.
+            return false;
+        }
+
+        Environment.SetEnvironmentVariable("ROCBLAS_TENSILE_LIBPATH", libraryDirectory);
+
+        return true;
+    }
+
+    internal static string? FindCompatibleTensileLibrary(
+        IEnumerable<string> libraryDirectories,
+        string architectureTarget)
+    {
+        if (libraryDirectories is null)
+        {
+            throw new ArgumentNullException(nameof(libraryDirectories));
+        }
+
+        foreach (string directory in libraryDirectories.Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            if (Directory.Exists(directory) && HasCompatibleTensileLibrary(directory, architectureTarget))
+            {
+                return directory;
+            }
+        }
+
+        return null;
+    }
+
+    internal static bool HasCompatibleTensileLibrary(
+        string libraryDirectory,
+        string architectureTarget)
+    {
+        if (string.IsNullOrWhiteSpace(libraryDirectory))
+        {
+            throw new ArgumentException("A rocBLAS library directory is required.", nameof(libraryDirectory));
+        }
+
+        if (string.IsNullOrWhiteSpace(architectureTarget))
+        {
+            throw new ArgumentException("A HIP architecture target is required.", nameof(architectureTarget));
+        }
+
+        return File.Exists(Path.Combine(libraryDirectory, "TensileLibrary.dat")) ||
+               File.Exists(Path.Combine(libraryDirectory, $"TensileLibrary_lazy_{architectureTarget}.dat"));
     }
 
     [DllImport(HipBlasLibrary, EntryPoint = "hipblasCreate", CallingConvention = CallingConvention.Cdecl)]
@@ -158,15 +254,11 @@ internal static class HipBlasNative
 
     private static bool TryLoadLibrary()
     {
-        string[] candidates =
-        {
-            HipBlasLibrary,
-            "hipblas.dll",
-            "libhipblas.so",
-            "libhipblas.dylib"
-        };
-
-        return candidates.Where(CanLoadLibrary).Any();
+        return RocmNativeLibraryResolver.GetCandidates(
+                RocmNativeLibraryKind.HipBlas,
+                RocmNativeLibraryResolver.CurrentOperatingSystem,
+                HipNativeBindings.RocmBinPath)
+            .Any(CanLoadLibrary);
     }
 
     private static bool CanLoadLibrary(string name)

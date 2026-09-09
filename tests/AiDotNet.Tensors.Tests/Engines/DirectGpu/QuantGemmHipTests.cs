@@ -14,31 +14,30 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 [Collection("DirectGpuSerial")]
-public sealed class QuantGemmHipTests : IDisposable
+public sealed class QuantGemmHipTests : IClassFixture<HipBackendTestFixture>
 {
     private const int M = 8, K = 128, N = 64, KN = K * N;
 
-    private readonly HipBackend? _backend;
-    private readonly bool _ready;
+    private readonly HipBackendTestFixture _fixture;
+    private bool IsReady => _fixture.IsAvailable;
+    private HipBackend Backend => _fixture.Backend;
 
-    public QuantGemmHipTests()
+    public QuantGemmHipTests(HipBackendTestFixture fixture)
     {
-        try { _backend = new HipBackend(); _ready = _backend.IsAvailable; }
-        catch { _ready = false; }
+        _fixture = fixture;
     }
 
-    public void Dispose() => _backend?.Dispose();
-
-    [Fact]
+    [SkippableFact]
     public void Probe_HipAvailability()
     {
-        if (Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_HIP") != "1") return;
-        Assert.True(_ready, "HIP/ROCm backend NOT available on this host");
+        Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_HIP") != "1",
+            "HIP availability is asserted only in the required-HIP lane.");
+        Assert.True(IsReady, "HIP/ROCm backend NOT available on this host");
     }
 
     private bool EnsureReady()
     {
-        if (_ready) return true;
+        if (IsReady) return true;
         if (string.Equals(Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_HIP"), "1", StringComparison.Ordinal))
             throw new InvalidOperationException("GPU tests required but HIP/ROCm was unavailable.");
         return false;
@@ -96,13 +95,13 @@ public sealed class QuantGemmHipTests : IDisposable
         }
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(0)]
     [InlineData(64)]
     public void DequantGemmInt8_MatchesCpuOracle(int groupSize)
     {
-        if (!EnsureReady()) return;
-        var backend = _backend!;
+        Skip.If(!EnsureReady(), "HIP/ROCm backend is unavailable.");
+        var backend = Backend;
         var rng = new Random(0x8100 + groupSize);
         var act = RandomAct(rng);
         var w = new sbyte[KN];
@@ -132,13 +131,13 @@ public sealed class QuantGemmHipTests : IDisposable
         AssertClose(expected, actual, $"int8(gs={groupSize})");
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(0)]
     [InlineData(64)]
     public void DequantGemmInt4_MatchesCpuOracle(int groupSize)
     {
-        if (!EnsureReady()) return;
-        var backend = _backend!;
+        Skip.If(!EnsureReady(), "HIP/ROCm backend is unavailable.");
+        var backend = Backend;
         var rng = new Random(0x4400 + groupSize);
         var act = RandomAct(rng);
         var w = new int[KN];
@@ -173,13 +172,13 @@ public sealed class QuantGemmHipTests : IDisposable
         AssertClose(expected, actual, $"int4(gs={groupSize})");
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(0)]
     [InlineData(64)]
     public void DequantGemmFp8E4M3_MatchesCpuOracle(int groupSize)
     {
-        if (!EnsureReady()) return;
-        var backend = _backend!;
+        Skip.If(!EnsureReady(), "HIP/ROCm backend is unavailable.");
+        var backend = Backend;
         var rng = new Random(0xF800 + groupSize);
         var act = RandomAct(rng);
         var raws = new byte[KN];

@@ -231,7 +231,7 @@ public partial class CpuEngine
 
     /// <inheritdoc />
     public virtual Tensor<T> ForwardSplatBackwardFlow<T>(
-        Tensor<T> gradOutput, Tensor<T> input, Tensor<T> flow, Tensor<T> output,
+        Tensor<T> gradOutput, Tensor<T> input, Tensor<T> flow, Tensor<T>? output,
         bool normalize = true)
         => ForwardSplatBackwardFlowWithWeights(
             gradOutput, input, flow, output, normalize, normalizationWeights: null);
@@ -246,11 +246,13 @@ public partial class CpuEngine
         ValidateSplatInputs(input, flow);
         if (gradOutput.Shape != input.Shape)
             throw new ArgumentException("gradOutput shape must match input shape.", nameof(gradOutput));
+        Tensor<T>? normalizedOutput = null;
         if (normalize)
         {
             if (output is null) throw new ArgumentNullException(nameof(output));
             if (output.Shape != input.Shape)
                 throw new ArgumentException("output shape must match input shape.", nameof(output));
+            normalizedOutput = output;
         }
         ValidateNormalizationWeights(normalizationWeights, input);
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -279,8 +281,8 @@ public partial class CpuEngine
                 for (int c = 0; c < channels; c++)
                 {
                     double source = numOps.ToDouble(input[b, c, y, x]);
-                    double normalizedSource = normalize
-                        ? source - numOps.ToDouble(output![b, c, dy, dx])
+                    double normalizedSource = normalizedOutput is not null
+                        ? source - numOps.ToDouble(normalizedOutput[b, c, dy, dx])
                         : source;
                     contribution += numOps.ToDouble(gradOutput[b, c, dy, dx]) * normalizedSource / divisor;
                 }

@@ -24,16 +24,20 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// - Memory layout mismatches
 /// </summary>
 [Collection("VulkanGlobalState")]
-public class GpuCpuConsistencyTests
+public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFixture>
 {
+    private readonly DirectGpuTensorEngineTestFixture _directGpuFixture;
     private readonly bool _isVulkanAvailable;
     private readonly VulkanBackend? _backend;
     private readonly bool _isDirectGpuAvailable;
     private const float Tolerance = 1e-5f;
     private const float RelativeTolerance = 1e-4f;
+    private DirectGpuTensorEngine Gpu => _directGpuFixture.Engine ?? throw new InvalidOperationException(
+        "Direct GPU engine was not initialized.", _directGpuFixture.InitializationException);
 
-    public GpuCpuConsistencyTests()
+    public GpuCpuConsistencyTests(DirectGpuTensorEngineTestFixture directGpuFixture)
     {
+        _directGpuFixture = directGpuFixture;
         try
         {
             _backend = VulkanBackend.Instance;
@@ -44,17 +48,9 @@ public class GpuCpuConsistencyTests
             _isVulkanAvailable = false;
         }
 
-        // Probe DirectGpuEngine availability (CUDA, OpenCL, HIP) separately from Vulkan.
-        // Tests that use DirectGpuTensorEngine should check this instead of Vulkan.
-        try
-        {
-            using var probe = new DirectGpuTensorEngine();
-            _isDirectGpuAvailable = probe.IsGpuAvailable;
-        }
-        catch
-        {
-            _isDirectGpuAvailable = false;
-        }
+        // DirectGpu availability is probed once per class by the fixture. A real initialization
+        // regression still escapes fixture construction; only absent platform/runtime cases skip.
+        _isDirectGpuAvailable = directGpuFixture.IsAvailable;
     }
 
     /// <summary>
@@ -129,7 +125,7 @@ public class GpuCpuConsistencyTests
     public void EagerResidentBinary_ReuploadsVersionBumpedInput()
     {
         SkipIfNoDirectGpu();
-        using var gpu = new DirectGpuTensorEngine();
+        var gpu = Gpu;
         var left = new Tensor<float>([1f, 2f, 3f, 4f], [4]);
         var right = new Tensor<float>([2f, 2f, 2f, 2f], [4]);
 
@@ -163,7 +159,7 @@ public class GpuCpuConsistencyTests
         var input = new Tensor<float>(inputValues, new[] { inputValues.Length });
         var gradient = new Tensor<float>(gradientValues, new[] { gradientValues.Length });
         var cpu = new CpuEngine();
-        using var gpu = new DirectGpuTensorEngine();
+        var gpu = Gpu;
 
         float[] expected = cpu.HardsigmoidBackward(gradient, input).GetDataArray();
         GpuLaunchProbe.Reset();
@@ -191,7 +187,7 @@ public class GpuCpuConsistencyTests
         const double lower = 0.125;
         const double upper = 0.333;
         float slope = (float)((lower + upper) / 2.0);
-        using var gpu = new DirectGpuTensorEngine();
+        var gpu = Gpu;
         using var tape = new GradientTape<float>();
         tape.BindEngineIfUnset(gpu);
 
@@ -218,7 +214,7 @@ public class GpuCpuConsistencyTests
     public void BroadcastBinary_AcceleratedPaths_RecordAutodiff()
     {
         SkipIfNoDirectGpu();
-        using var gpu = new DirectGpuTensorEngine();
+        var gpu = Gpu;
         var operations = new (string Name, Func<Tensor<float>, Tensor<float>, Tensor<float>> Run)[]
         {
             ("add", gpu.TensorAdd),
@@ -249,7 +245,7 @@ public class GpuCpuConsistencyTests
     {
         SkipIfNoDirectGpu();
         var cpu = new CpuEngine();
-        using var gpu = new DirectGpuTensorEngine();
+        var gpu = Gpu;
         using var scope = gpu.BeginGpuScope();
         var operations = new (string Name, Func<IEngine, Tensor<float>, Tensor<float>, Tensor<float>> Run)[]
         {
@@ -917,7 +913,7 @@ public class GpuCpuConsistencyTests
         cpu.ScaledDotProductAttentionBackward(gradOutput, query, key, value, expectedWeights, scale,
             out var expectedGradQuery, out var expectedGradKey, out var expectedGradValue);
 
-        using var gpu = new DirectGpuTensorEngine();
+        var gpu = Gpu;
         using var scope = gpu.BeginGpuScope();
         var actual = ((IEngine)gpu).ScaledDotProductAttention(
             query, key, value, null, scale, out var actualWeights);
@@ -982,7 +978,7 @@ public class GpuCpuConsistencyTests
         var cpu = new CpuEngine();
         var expected = cpu.ScaledDotProductAttention(query, key, value, null, scale, out var expectedWeights, softcap);
 
-        using var gpu = new DirectGpuTensorEngine();
+        var gpu = Gpu;
         using var scope = gpu.BeginGpuScope();
         var actual = ((IEngine)gpu).ScaledDotProductAttention(
             query, key, value, null, scale, out var actualWeights, softcap);
@@ -1034,7 +1030,7 @@ public class GpuCpuConsistencyTests
         cpu.ScaledDotProductAttentionBackward(gradOutput, query, key, value, expectedWeights, scale,
             out var expectedGradQuery, out var expectedGradKey, out var expectedGradValue);
 
-        using var gpu = new DirectGpuTensorEngine();
+        var gpu = Gpu;
         using var scope = gpu.BeginGpuScope();
         var actual = ((IEngine)gpu).ScaledDotProductAttention(
             query, key, value, mask, scale, out var actualWeights);
@@ -1093,7 +1089,7 @@ public class GpuCpuConsistencyTests
         var cpu = new CpuEngine();
         var expected = cpu.TensorPermute(input, new[] { 0, 2, 1, 3 });
 
-        using var gpu = new DirectGpuTensorEngine();
+        var gpu = Gpu;
         using var scope = gpu.BeginGpuScope();
         var actual = ((IEngine)gpu).TensorPermute(input, new[] { 0, 2, 1, 3 });
 
@@ -1125,7 +1121,7 @@ public class GpuCpuConsistencyTests
         var cpu = new CpuEngine();
         var expected = cpu.TensorPermute(input, new[] { 0, 2, 1, 3 });
 
-        using var gpu = new DirectGpuTensorEngine();
+        var gpu = Gpu;
         using var scope = gpu.BeginGpuScope();
         // Force the input GPU-resident: reshape to [B*S*H, D], matmul by the DxD identity (stays on device),
         // reshape back to [B,S,H,D]. The permute then operates on a device buffer.
@@ -1157,7 +1153,7 @@ public class GpuCpuConsistencyTests
         var cpu = new CpuEngine();
         var expected = cpu.Reshape(input, new[] { 1, s, 9, 64 });
 
-        using var gpu = new DirectGpuTensorEngine();
+        var gpu = Gpu;
         using var scope = gpu.BeginGpuScope();
         var actual = ((IEngine)gpu).Reshape(input, new[] { 1, s, 9, 64 });
 
@@ -1185,7 +1181,7 @@ public class GpuCpuConsistencyTests
         var cpu = new CpuEngine();
         var expected = cpu.TensorMatMul(input, weights);
 
-        using var gpu = new DirectGpuTensorEngine();
+        var gpu = Gpu;
         using var scope = gpu.BeginGpuScope();
         var actual = ((IEngine)gpu).TensorMatMul(input, weights);
 
@@ -1332,7 +1328,7 @@ public class GpuCpuConsistencyTests
 
         // No BeginGpuScope: mirrors real model construction/load/forward, which set the engine as Current
         // but do not open a residency scope. The persistent-buffer refresh must work in this mode too.
-        using var gpu = new DirectGpuTensorEngine();
+        var gpu = Gpu;
 
         // Construction: weight tensor holds RANDOM init; register it as a persistent GPU buffer.
         var w = new Tensor<float>((float[])randomInit.Clone(), new[] { K, N });
@@ -1373,7 +1369,7 @@ public class GpuCpuConsistencyTests
             Enumerable.Range(0, M * K).Select(i => 0.1f * (i % 7) - 0.2f).ToArray(), new[] { M, K });
         var bias = new Tensor<float>(new float[N], new[] { N });
 
-        using var gpu = new DirectGpuTensorEngine();
+        var gpu = Gpu;
         var w = new Tensor<float>((float[])w0.Clone(), new[] { K, N });
         ((IEngine)gpu).RegisterPersistentTensor(w, PersistentTensorRole.Weights);
 
@@ -1419,7 +1415,7 @@ public class GpuCpuConsistencyTests
         var b = new Tensor<float>(query, new[] { cols, 1 });
 
         var cpuEngine = new CpuEngine();
-        using var gpuEngine = new DirectGpuTensorEngine();
+        var gpuEngine = Gpu;
         var cpuResult = cpuEngine.TensorMatMul(a, b);
         var gpuResult = gpuEngine.TensorMatMul(a, b);
 
@@ -1464,7 +1460,7 @@ public class GpuCpuConsistencyTests
         var cpuResult = ((IEngine)cpuEngine).TensorLerp(a, b, t);
 
         // GPU via DirectGpuTensorEngine (falls back to CPU if no GPU)
-        using var gpuEngine = new DirectGpuTensorEngine();
+        var gpuEngine = Gpu;
         var gpuResult = ((IEngine)gpuEngine).TensorLerp(a, b, t);
 
         // Compare
@@ -1487,7 +1483,7 @@ public class GpuCpuConsistencyTests
         b.SetFlat(0, 10f); b.SetFlat(1, 20f); b.SetFlat(2, 30f); b.SetFlat(3, 40f);
 
         var cpuEngine = new CpuEngine();
-        using var gpuEngine = new DirectGpuTensorEngine();
+        var gpuEngine = Gpu;
 
         // t=0 should return a, t=1 should return b
         var cpuAt0 = ((IEngine)cpuEngine).TensorLerp(a, b, 0f);
@@ -1536,7 +1532,7 @@ public class GpuCpuConsistencyTests
         var cpuResult = ((IEngine)cpuEngine).TensorAddScaled(a, b, scaleA, scaleB);
 
         // GPU via DirectGpuTensorEngine
-        using var gpuEngine = new DirectGpuTensorEngine();
+        var gpuEngine = Gpu;
         var gpuResult = ((IEngine)gpuEngine).TensorAddScaled(a, b, scaleA, scaleB);
 
         // Compare
@@ -1569,7 +1565,7 @@ public class GpuCpuConsistencyTests
         float sigma = 0.05f;  // noise weight
 
         var cpuEngine = new CpuEngine();
-        using var gpuEngine = new DirectGpuTensorEngine();
+        var gpuEngine = Gpu;
 
         var cpuResult = ((IEngine)cpuEngine).TensorAddScaled(signal, noise, alpha, sigma);
         var gpuResult = ((IEngine)gpuEngine).TensorAddScaled(signal, noise, alpha, sigma);
@@ -1592,7 +1588,7 @@ public class GpuCpuConsistencyTests
             .ToArray();
         var source = new Tensor<float>((float[])data.Clone(), new[] { n, c, h, w });
         var cpu = new CpuEngine();
-        using var gpu = new DirectGpuTensorEngine();
+        var gpu = Gpu;
 
         var expectedPacked = cpu.ReorderToNchwc(source, TensorLayout.Nchwc8);
         var actualPacked = gpu.ReorderToNchwc(source, TensorLayout.Nchwc8);
@@ -1619,7 +1615,7 @@ public class GpuCpuConsistencyTests
         var boundaries = new Tensor<float>(new float[] { -2, 0, 3, 8 }, new[] { 4 });
         var probes = new Tensor<float>(new float[] { -3, -2, 1, 8, 10 }, new[] { 5 });
         IEngine cpu = new CpuEngine();
-        using var gpuEngine = new DirectGpuTensorEngine();
+        var gpuEngine = Gpu;
         IEngine gpu = gpuEngine;
 
         var expectedMax = cpu.TensorArgMax(values, 0);
@@ -1647,7 +1643,7 @@ public class GpuCpuConsistencyTests
         var gradient = new Tensor<float>(Enumerable.Range(0, 16).Select(i => (i + 1) * 0.25f).ToArray(),
             new[] { 2, 2, 4 });
         IEngine cpu = new CpuEngine();
-        using var gpuEngine = new DirectGpuTensorEngine();
+        var gpuEngine = Gpu;
         IEngine gpu = gpuEngine;
 
         var expected = cpu.TensorEmbeddingLookup<float, int>(table, indices);
@@ -1670,7 +1666,7 @@ public class GpuCpuConsistencyTests
             .ToArray();
         var waveform = new Tensor<float>(samples, new[] { samples.Length });
         IEngine cpu = new CpuEngine();
-        using var gpuEngine = new DirectGpuTensorEngine();
+        var gpuEngine = Gpu;
         IEngine gpu = gpuEngine;
 
         var expected = cpu.PitchShift(waveform, 16_000, 3.0, nFft: 16, hopLength: 4);
@@ -1691,7 +1687,7 @@ public class GpuCpuConsistencyTests
         SkipIfNoDirectGpu();
         var logits = new Tensor<float>(Enumerable.Range(0, 15).Select(i => (i - 7) * 0.2f).ToArray(),
             new[] { 3, 5 });
-        using var gpuEngine = new DirectGpuTensorEngine();
+        var gpuEngine = Gpu;
         IEngine gpu = gpuEngine;
 
         var soft = gpu.GumbelSoftmax(logits, temperature: 0.75, hard: false, axis: -1);
@@ -1726,7 +1722,7 @@ public class GpuCpuConsistencyTests
         var source = new Tensor<byte>(new byte[] { 250, 249, 240, 239, 230, 229, 220, 219 },
             new[] { 2, 2, 2 });
         IEngine cpu = new CpuEngine();
-        using var gpuEngine = new DirectGpuTensorEngine();
+        var gpuEngine = Gpu;
         IEngine gpu = gpuEngine;
 
         var expectedGather = cpu.TensorGatherPacked(packed, indices, axis: 1, valuesPerByte: 2);
@@ -1755,7 +1751,7 @@ public class GpuCpuConsistencyTests
             1, 2, 1, 0
         }, new[] { 2, 4 });
         IEngine cpu = new CpuEngine();
-        using var gpuEngine = new DirectGpuTensorEngine();
+        var gpuEngine = Gpu;
         IEngine gpu = gpuEngine;
 
         var expected = cpu.ImportanceSampling(tValues, weights, numFineSamples: 8);
@@ -1774,7 +1770,7 @@ public class GpuCpuConsistencyTests
         var probes = new Tensor<float>(new float[] { -3, -2, -1, 0, 1, 2, 3, 7, 8, 9 },
             new[] { 10 });
         IEngine cpu = new CpuEngine();
-        using var gpuEngine = new DirectGpuTensorEngine();
+        var gpuEngine = Gpu;
         IEngine gpu = gpuEngine;
 
         var expectedIndices = cpu.TensorSearchSorted(boundaries, probes, right: true);
@@ -1805,7 +1801,7 @@ public class GpuCpuConsistencyTests
             new[] { 6 });
         var classIds = new Tensor<int>(new[] { 0, 0, 1, 1, 0, 1 }, new[] { 6 });
         IEngine cpu = new CpuEngine();
-        using var gpuEngine = new DirectGpuTensorEngine();
+        var gpuEngine = Gpu;
         IEngine gpu = gpuEngine;
 
         var expected = cpu.Nms(boxes, scores, 0.5);
@@ -1840,7 +1836,7 @@ public class GpuCpuConsistencyTests
             0, 4, 1
         }, new[] { 4, 3 });
         IEngine cpu = new CpuEngine();
-        using var gpuEngine = new DirectGpuTensorEngine();
+        var gpuEngine = Gpu;
         IEngine gpu = gpuEngine;
 
         var expected = cpu.GenerateSpiralIndices(vertices, faces, spiralLength: 4);
@@ -1859,7 +1855,7 @@ public class GpuCpuConsistencyTests
             .ToArray();
         var input = new Tensor<float>(values, new[] { 4, 3, 8 });
         IEngine cpu = new CpuEngine();
-        using var gpuEngine = new DirectGpuTensorEngine();
+        var gpuEngine = Gpu;
         IEngine gpu = gpuEngine;
 
         var expectedSpectrum = cpu.NativeComplexFFTND(input, new[] { 0, 2 });
@@ -1901,7 +1897,7 @@ public class GpuCpuConsistencyTests
             .ToArray();
         var input = new Tensor<float>(values, new[] { 16 });
         IEngine cpu = new CpuEngine();
-        using var gpuEngine = new DirectGpuTensorEngine();
+        var gpuEngine = Gpu;
         IEngine gpu = gpuEngine;
 
         var cpuSpectrum = cpu.NativeComplexFFT(input);
@@ -1943,7 +1939,7 @@ public class GpuCpuConsistencyTests
             .ToArray();
         var window = new Tensor<float>(windowValues, new[] { nFft });
         IEngine cpu = new CpuEngine();
-        using var gpuEngine = new DirectGpuTensorEngine();
+        var gpuEngine = Gpu;
         IEngine gpu = gpuEngine;
 
         cpu.STFT(input, nFft, hopLength, window, center: true, out var expectedMagnitude, out var expectedPhase);
@@ -1979,7 +1975,7 @@ public class GpuCpuConsistencyTests
         var window = new Tensor<float>(Enumerable.Range(0, nFft)
             .Select(i => 0.5f - 0.5f * MathF.Cos(2f * MathF.PI * i / nFft)).ToArray(), new[] { nFft });
         IEngine cpu = new CpuEngine();
-        using var gpuEngine = new DirectGpuTensorEngine();
+        var gpuEngine = Gpu;
         IEngine gpu = gpuEngine;
 
         var expected = cpu.MelSpectrogram(input, 16000, nFft, hopLength, nMels, 0f, 8000f, window, true);
@@ -1999,7 +1995,7 @@ public class GpuCpuConsistencyTests
     {
         SkipIfNoDirectGpu();
         IEngine cpu = new CpuEngine();
-        using var gpuEngine = new DirectGpuTensorEngine();
+        var gpuEngine = Gpu;
         IEngine gpu = gpuEngine;
 
         var real1D = new Tensor<float>(Enumerable.Range(0, 3 * 8)
@@ -2057,7 +2053,7 @@ public class GpuCpuConsistencyTests
             .Select(i => DeterministicValue(i + 1101)).ToArray(), new[] { 32 });
         var window = new Tensor<float>(Enumerable.Range(0, nFft)
             .Select(i => 0.5f - 0.5f * MathF.Cos(2f * MathF.PI * i / nFft)).ToArray(), new[] { nFft });
-        using var gpuEngine = new DirectGpuTensorEngine();
+        var gpuEngine = Gpu;
         IEngine gpu = gpuEngine;
         gpu.STFT(input, nFft, hopLength, window, center: true, out var magnitude, out _);
 
@@ -2079,7 +2075,7 @@ public class GpuCpuConsistencyTests
     public void FusedBiasDropout_KeepsOutputAndMaskResident()
     {
         SkipIfNoDirectGpu();
-        using var gpu = new DirectGpuTensorEngine();
+        var gpu = Gpu;
         var source = new Tensor<float>(new[] { -2f, -1f, 0f, 1f, 2f, 3f }, new[] { 2, 3 });
         var biasSource = new Tensor<float>(new[] { 0.5f, -1.5f, 2f }, new[] { 3 });
         var input = gpu.TensorAddScalar(source, 0f);
@@ -2123,7 +2119,7 @@ public class GpuCpuConsistencyTests
     public void InterleavedFft_DeinterleaveTransformAndReassemblyStayResident()
     {
         SkipIfNoDirectGpu();
-        using var gpu = new DirectGpuTensorEngine();
+        var gpu = Gpu;
         var data = new float[32];
         for (int i = 0; i < data.Length / 2; i++)
         {
@@ -2162,7 +2158,7 @@ public class GpuCpuConsistencyTests
     public void AdvancedFusedKernels_WriteResidentDestinationTensors()
     {
         SkipIfNoDirectGpu();
-        using var gpu = new DirectGpuTensorEngine();
+        var gpu = Gpu;
         var input = new Tensor<float>(new[] { 1f, -2f, 0.5f, 3f, -1f, 2f }, new[] { 2, 3 });
         var baseOutput = new Tensor<float>(new[] { 0.25f, -0.5f, 1f, 2f }, new[] { 2, 2 });
         var loraA = new Tensor<float>(new[] { 0.5f, -1f, 2f }, new[] { 3, 1 });
@@ -2213,7 +2209,7 @@ public class GpuCpuConsistencyTests
     public void TensorIsIn_SortAndLookupStayResident()
     {
         SkipIfNoDirectGpu();
-        using var gpu = new DirectGpuTensorEngine();
+        var gpu = Gpu;
         var elementsSource = new Tensor<float>(
             new[] { 1f, 2f, 3f, 4f, 5f, 6f }, new[] { 2, 3 });
         var testSource = new Tensor<float>(
@@ -2250,7 +2246,7 @@ public class GpuCpuConsistencyTests
     public void TensorMaskedSelect_ResidentMaskCompactsOnDevice()
     {
         SkipIfNoDirectGpu();
-        using var gpu = new DirectGpuTensorEngine();
+        var gpu = Gpu;
         var values = gpu.TensorAddScalar(new Tensor<float>(
             new[] { -3f, -2f, -1f, 0f, 1f, 2f }, new[] { 2, 3 }), 0f);
         var maskValues = gpu.TensorAddScalar(new Tensor<float>(
@@ -2280,7 +2276,7 @@ public class GpuCpuConsistencyTests
     public void TensorMode_ReducesResidentInputWithCpuTieSemantics()
     {
         SkipIfNoDirectGpu();
-        using var gpu = new DirectGpuTensorEngine();
+        var gpu = Gpu;
         var cpu = new CpuEngine();
         var source = new Tensor<float>(
             new[] { float.NaN, 3f, 2f, 3f, 2f, -1f }, new[] { 2, 3 });
@@ -2307,7 +2303,7 @@ public class GpuCpuConsistencyTests
     public void ResidentIndices_WriteOperationsStayOnDeviceAndPreserveOrdering()
     {
         SkipIfNoDirectGpu();
-        using var gpu = new DirectGpuTensorEngine();
+        var gpu = Gpu;
         var sortInput = gpu.TensorAddScalar(new Tensor<float>(
             new[] { 30f, 10f, 40f, 20f }, new[] { 4 }), 0f);
         var (_, indices) = gpu.TensorSort(sortInput);
@@ -2513,7 +2509,7 @@ public class GpuCpuConsistencyTests
     public void GraphAttention_BatchedResidentEdgesHaveNoInternalReadbacksAndMatchCpu()
     {
         SkipIfNoDirectGpu();
-        using var gpuEngine = new DirectGpuTensorEngine();
+        var gpuEngine = Gpu;
         IEngine gpu = gpuEngine;
         IEngine cpu = new CpuEngine();
         var (_, sourceIndices) = gpuEngine.TensorSort(gpuEngine.TensorAddScalar(
@@ -2564,7 +2560,7 @@ public class GpuCpuConsistencyTests
     public void UniformMeshLaplacian_ResidentFacesHaveNoInternalReadbacksAndMatchCpuExactly()
     {
         SkipIfNoDirectGpu();
-        using var gpuEngine = new DirectGpuTensorEngine();
+        var gpuEngine = Gpu;
         IEngine gpu = gpuEngine;
         IEngine cpu = new CpuEngine();
         var boundaries = new Tensor<float>(new[] { 0f, 1f, 2f, 3f }, new[] { 4 });
@@ -2600,7 +2596,7 @@ public class GpuCpuConsistencyTests
     public void StandaloneNormalizationGpu_ResidentStateHasNoInternalReadbacksAndMatchesCpu()
     {
         SkipIfNoDirectGpu();
-        using var gpuEngine = new DirectGpuTensorEngine();
+        var gpuEngine = Gpu;
         IEngine gpu = gpuEngine;
         IEngine cpu = new CpuEngine();
 

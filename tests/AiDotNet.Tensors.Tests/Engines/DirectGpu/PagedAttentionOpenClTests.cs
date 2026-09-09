@@ -13,36 +13,35 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 [Collection("DirectGpuSerial")]
-public sealed class PagedAttentionOpenClTests : IDisposable
+public sealed class PagedAttentionOpenClTests : IClassFixture<OpenClBackendTestFixture>
 {
     private readonly OpenClBackend? _backend;
     private readonly bool _ready;
-    private readonly Exception? _initException;
 
-    public PagedAttentionOpenClTests()
+    public PagedAttentionOpenClTests(OpenClBackendTestFixture fixture)
     {
-        try { _backend = new OpenClBackend(); _ready = _backend.IsAvailable; }
-        catch (Exception ex) { _initException = ex; _ready = false; }
+        _backend = fixture.Backend;
+        _ready = fixture.IsAvailable;
     }
 
-    public void Dispose() => _backend?.Dispose();
+    private OpenClBackend Backend => _backend ?? throw new InvalidOperationException("OpenCL backend is unavailable.");
 
     private bool EnsureReady()
     {
         if (_ready) return true;
         if (string.Equals(Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_GPU_TESTS"), "1", StringComparison.Ordinal))
-            throw new InvalidOperationException("GPU tests required but OpenCL was unavailable.", _initException);
+            throw new InvalidOperationException("GPU tests required but OpenCL was unavailable.");
         return false;
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(4, 64, 16, 40)]
     [InlineData(2, 128, 8, 20)]
     [InlineData(8, 32, 32, 100)]
     public void PagedAttentionDecode_MatchesCpuOracle(int heads, int headDim, int blockSize, int seqLen)
     {
-        if (!EnsureReady()) return;
-        var backend = _backend!;
+        Skip.If(!EnsureReady(), "OpenCL backend is unavailable.");
+        var backend = Backend;
         var rng = new Random(0xA77 + heads + seqLen);
 
         int numLogicalBlocks = (seqLen + blockSize - 1) / blockSize;
@@ -115,14 +114,14 @@ public sealed class PagedAttentionOpenClTests : IDisposable
         }
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(4, 64, 16, 8, 0)]    // heads, headDim, blockSize, numQueries, startPos
     [InlineData(2, 128, 8, 12, 5)]
     [InlineData(8, 32, 32, 20, 40)]
     public void PagedAttentionPrefill_MatchesCpuOracle(int heads, int headDim, int blockSize, int numQueries, int startPos)
     {
-        if (!EnsureReady()) return;
-        var backend = _backend!;
+        Skip.If(!EnsureReady(), "OpenCL backend is unavailable.");
+        var backend = Backend;
         var rng = new Random(0xB99 + heads + numQueries + startPos);
 
         int maxKeyLen = startPos + numQueries; // key positions 0..startPos+numQueries-1
@@ -200,14 +199,14 @@ public sealed class PagedAttentionOpenClTests : IDisposable
         }
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(8, 2, 64, 16, 40)]  // heads, kvHeads, headDim, blockSize, seqLen — GQA
     [InlineData(4, 4, 32, 8, 20)]   // kvHeads==heads => MHA
     [InlineData(8, 1, 64, 32, 50)]  // kvHeads==1 => MQA
     public void PagedAttentionDecodeGqa_MatchesCpuOracle(int heads, int kvHeads, int headDim, int blockSize, int seqLen)
     {
-        if (!EnsureReady()) return;
-        var backend = _backend!;
+        Skip.If(!EnsureReady(), "OpenCL backend is unavailable.");
+        var backend = Backend;
         var rng = new Random(0xC55 + heads + kvHeads + seqLen);
 
         int numLogicalBlocks = (seqLen + blockSize - 1) / blockSize;
@@ -275,13 +274,13 @@ public sealed class PagedAttentionOpenClTests : IDisposable
         }
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(8, 2, 64, 16, 8, 0)]  // heads, kvHeads, headDim, blockSize, numQueries, startPos
     [InlineData(8, 1, 32, 8, 12, 5)]
     public void PagedAttentionPrefillGqa_MatchesCpuOracle(int heads, int kvHeads, int headDim, int blockSize, int numQueries, int startPos)
     {
-        if (!EnsureReady()) return;
-        var backend = _backend!;
+        Skip.If(!EnsureReady(), "OpenCL backend is unavailable.");
+        var backend = Backend;
         var rng = new Random(0xD66 + heads + kvHeads + numQueries + startPos);
 
         int maxKeyLen = startPos + numQueries;

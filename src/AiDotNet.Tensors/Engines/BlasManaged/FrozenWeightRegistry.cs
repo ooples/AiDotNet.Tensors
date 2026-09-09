@@ -67,7 +67,9 @@ public static class FrozenWeightRegistry
 
         if (typeof(T) == typeof(float))
         {
-            var data = (float[])(object)weight.GetDataArray();
+            // Pre-packing only reads the weight. A writable accessor would detach
+            // a COW clone merely because the inference compiler registered it.
+            var data = (float[])(object)weight.GetReadOnlyDataArray();
             var handle = BlasManaged.PrePackB<float>(data, n, transB: false, k: k, n: n);
             var floatWeight = (Tensor<float>)(object)weight;
             // CWT.AddOrUpdate is .NET 6+; for compat AddBefore pattern.
@@ -83,7 +85,7 @@ public static class FrozenWeightRegistry
         }
         if (typeof(T) == typeof(double))
         {
-            var data = (double[])(object)weight.GetDataArray();
+            var data = (double[])(object)weight.GetReadOnlyDataArray();
             var handle = BlasManaged.PrePackB<double>(data, n, transB: false, k: k, n: n);
             var doubleWeight = (Tensor<double>)(object)weight;
             lock (_doubleTableLock)

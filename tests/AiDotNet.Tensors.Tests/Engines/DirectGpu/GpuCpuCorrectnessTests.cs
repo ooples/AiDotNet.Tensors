@@ -26,31 +26,20 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 [Collection("DirectGpuSerial")]
-public sealed class GpuCpuCorrectnessTests : IDisposable
+public sealed class GpuCpuCorrectnessTests : IClassFixture<GpuCpuCorrectnessFixture>
 {
-    private readonly CpuEngine _cpu = new CpuEngine();
+    private readonly CpuEngine _cpu;
     private readonly DirectGpuTensorEngine _gpu;
     private readonly bool _gpuReady;
     private readonly Exception _gpuInitException;
 
-    public GpuCpuCorrectnessTests()
+    public GpuCpuCorrectnessTests(GpuCpuCorrectnessFixture fixture)
     {
-        try
-        {
-            _gpu = new DirectGpuTensorEngine();
-            _gpuReady = _gpu.IsGpuAvailable;
-        }
-        catch (Exception ex)
-        {
-            // Capture so an opt-in CI gate (AIDOTNET_REQUIRE_GPU_TESTS=1) can
-            // surface the underlying init failure instead of letting the suite
-            // pass green as a no-op when a GPU was supposed to be available.
-            _gpuInitException = ex;
-            _gpuReady = false;
-        }
+        _cpu = fixture.Cpu;
+        _gpu = fixture.Gpu;
+        _gpuReady = fixture.IsGpuReady;
+        _gpuInitException = fixture.InitializationException;
     }
-
-    public void Dispose() => _gpu?.Dispose();
 
     /// <summary>
     /// Returns whether the GPU is usable for this test. Tests should early-
@@ -599,6 +588,39 @@ public sealed class GpuCpuCorrectnessTests : IDisposable
         var subDc = (Vector<double>)c.Subtract(ad, bd);
         for (int i = 0; i < n; i++)
             Assert.True(System.Math.Abs(subD[i] - subDc[i]) < Tol, $"Subtract<double>[{n}] idx {i}: gpu {subD[i]} vs cpu {subDc[i]}");
+    }
+}
+
+/// <summary>
+/// Retains one backend across this 233-case correctness family. A fixture is required because xUnit
+/// creates a separate test-class instance for every theory row; per-instance construction otherwise
+/// churns hundreds of native GPU contexts before later GPU families begin.
+/// </summary>
+public sealed class GpuCpuCorrectnessFixture : IDisposable
+{
+    public GpuCpuCorrectnessFixture()
+    {
+        try
+        {
+            Gpu = new DirectGpuTensorEngine();
+            IsGpuReady = Gpu.IsGpuAvailable;
+        }
+        catch (Exception ex)
+        {
+            // Preserve the suite's opt-in hard-failure contract without making CPU-only hosts fail.
+            InitializationException = ex;
+            IsGpuReady = false;
+        }
+    }
+
+    public CpuEngine Cpu { get; } = new CpuEngine();
+    public DirectGpuTensorEngine Gpu { get; }
+    public bool IsGpuReady { get; }
+    public Exception InitializationException { get; }
+
+    public void Dispose()
+    {
+        Gpu?.Dispose();
     }
 }
 #endif

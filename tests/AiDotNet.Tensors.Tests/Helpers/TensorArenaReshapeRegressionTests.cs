@@ -129,6 +129,39 @@ public class TensorArenaReshapeRegressionTests
     }
 
     /// <summary>
+    /// A ring tensor is an ordinary disposable Tensor to its caller. Releasing one before Reset must
+    /// not poison that ring slot and cause an unrelated operation in the next step to receive dead
+    /// TensorStorage. The arena replaces the disposed wrapper; ordinary live wrappers still take the
+    /// allocation-free same-object path covered above.
+    /// </summary>
+    [Fact]
+    public void RingReuse_DisposedTensorIsReplacedAfterReset()
+    {
+        using var arena = TensorArena.Create();
+
+        var first = arena.TryRentTensor<float>(64, new[] { 8, 8 });
+        Assert.NotNull(first);
+        if (first is null)
+            return;
+
+        first.Dispose();
+        arena.Reset();
+
+        var replacement = arena.TryRentTensor<float>(64, new[] { 4, 16 });
+        Assert.NotNull(replacement);
+        if (replacement is null)
+            return;
+
+        Assert.NotSame(first, replacement);
+        Assert.Equal(new[] { 4, 16 }, replacement.Shape.ToArray());
+        for (int i = 0; i < replacement.Length; i++)
+            replacement[i] = i;
+
+        using var view = replacement.Reshape(new[] { 2, 32 });
+        Assert.Equal(63f, view[1, 31]);
+    }
+
+    /// <summary>
     /// Pinned/heap allocations (optimizer moments, weights) must NOT be
     /// recycled by Reset(). A pinned tensor's contents survive a Reset +
     /// re-rent-of-same-size cycle even when the scratch consumer scribbles

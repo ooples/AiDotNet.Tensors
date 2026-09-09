@@ -17,6 +17,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         // OpenCL library name varies by platform
         private const string OpenClLibrary = "OpenCL";
 
+        // Some AMD OpenCL drivers do not safely tolerate clCreateCommandQueue entering from
+        // multiple host threads, even when the calls target different contexts. Keep the gate
+        // process-wide so per-context queues, profiling probes, and explicit streams all obey
+        // the same native-driver contract. This is initialization-only; steady-state enqueues
+        // never take this lock.
+        private static readonly object CommandQueueCreationLock = new object();
+
         #region Error Codes
 
         public const int CL_SUCCESS = 0;
@@ -170,11 +177,23 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         #region Command Queue Functions
 
         [DllImport(OpenClLibrary, EntryPoint = "clCreateCommandQueue")]
-        public static extern IntPtr CreateCommandQueue(
+        private static extern IntPtr CreateCommandQueueNative(
             IntPtr context,
             IntPtr device,
             ulong properties,
             out int errcode);
+
+        public static IntPtr CreateCommandQueue(
+            IntPtr context,
+            IntPtr device,
+            ulong properties,
+            out int errcode)
+        {
+            lock (CommandQueueCreationLock)
+            {
+                return CreateCommandQueueNative(context, device, properties, out errcode);
+            }
+        }
 
         [DllImport(OpenClLibrary, EntryPoint = "clReleaseCommandQueue")]
         public static extern int ReleaseCommandQueue(IntPtr commandQueue);

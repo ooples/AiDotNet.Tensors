@@ -25,17 +25,22 @@ public sealed partial class HipBackend : IGpuHalfPrecisionBackend
 {
     /// <inheritdoc/>
     /// <remarks>
-    /// True when hipBLAS loaded and a handle was created — both
-    /// <see cref="Hgemm"/> (rocBLAS hgemm) and
-    /// <see cref="GemmFp16In32fOut"/> (hipblasGemmEx, FP16→FP32) are hipBLAS
-    /// calls, so device + library availability is the only gate.
+    /// True when either hipBLAS can serve this exact GPU architecture or the direct HIP conversion
+    /// and FP32 GEMM kernels can provide the all-GPU fallback.
     /// </remarks>
-    public bool SupportsHgemm => _hipblasAvailable && _hipblasHandle != IntPtr.Zero;
+    public bool SupportsHgemm => HasVendorHalfGemm || HasDirectHalfGemmFallback;
 
     /// <inheritdoc/>
-    /// <remarks>The fused backward is two <c>hipblasGemmEx</c> launches with transpose flags — same library +
-    /// device gate as the forward GEMM, so it tracks <see cref="SupportsHgemm"/>.</remarks>
-    public bool SupportsFp16FusedBackward => SupportsHgemm;
+    /// <remarks>The fused backward requires two transposed <c>hipblasGemmEx</c> launches. The direct
+    /// forward fallback does not claim this separate capability.</remarks>
+    public bool SupportsFp16FusedBackward => HasVendorHalfGemm;
+
+    private bool HasVendorHalfGemm => _hipblasAvailable && _hipblasHandle != IntPtr.Zero;
+
+    private bool HasDirectHalfGemmFallback =>
+        _kernelCache.ContainsKey("convert_fp32_to_fp16") &&
+        _kernelCache.ContainsKey("convert_fp16_to_fp32") &&
+        (_scalarGemmF32 != IntPtr.Zero || _rdnaGemmWave32 != IntPtr.Zero || _mfmaGemmF32 != IntPtr.Zero);
 
     /// <inheritdoc/>
     /// <remarks>
@@ -57,7 +62,7 @@ public sealed partial class HipBackend : IGpuHalfPrecisionBackend
         if (m <= 0) throw new ArgumentOutOfRangeException(nameof(m), "Dimensions must be positive.");
         if (n <= 0) throw new ArgumentOutOfRangeException(nameof(n), "Dimensions must be positive.");
         if (k <= 0) throw new ArgumentOutOfRangeException(nameof(k), "Dimensions must be positive.");
-        EnsureHalfGemmSupported();
+        EnsureFp16FusedBackwardSupported();
 
         var outType = gradOutHalf ? HipBlasNative.HipBlasDatatype.R_16F : HipBlasNative.HipBlasDatatype.R_32F;
         float alpha = 1.0f, beta = 0.0f;
@@ -100,6 +105,15 @@ public sealed partial class HipBackend : IGpuHalfPrecisionBackend
         ValidateHalfGemmArgs(aFp16, bFp16, cFp16, m, n, k);
         EnsureHalfGemmSupported();
 
+        if (!HasVendorHalfGemm)
+        {
+            using var cFp32 = AllocateBuffer(checked(m * n));
+            GemmFp16In32fOutDirect(aFp16, bFp16, cFp32, m, n, k);
+            ConvertToFp16(cFp32, cFp16, checked(m * n));
+            SyncHalfGemm();
+            return;
+        }
+
         // alpha = 1.0, beta = 0.0 as IEEE-754 binary16 bit patterns.
         ushort alpha = 0x3C00;
         ushort beta = 0x0000;
@@ -127,6 +141,12 @@ public sealed partial class HipBackend : IGpuHalfPrecisionBackend
         ValidateHalfGemmArgs(aFp16, bFp16, cFp32, m, n, k);
         EnsureHalfGemmSupported();
 
+        if (!HasVendorHalfGemm)
+        {
+            GemmFp16In32fOutDirect(aFp16, bFp16, cFp32, m, n, k);
+            return;
+        }
+
         // FP32 alpha/beta (compute type = FP32). The accumulator is FP32 even
         // though A/B are FP16 — the standard AMP mixed-precision matmul.
         float alpha = 1.0f, beta = 0.0f;
@@ -153,7 +173,30 @@ public sealed partial class HipBackend : IGpuHalfPrecisionBackend
     {
         if (!SupportsHgemm)
             throw new NotSupportedException(
-                "Half-precision GEMM requires hipBLAS, which is not available on this device.");
+                "Half-precision GEMM requires either a compatible hipBLAS installation or the direct HIP conversion and GEMM kernels.");
+    }
+
+    private void EnsureFp16FusedBackwardSupported()
+    {
+        if (!SupportsFp16FusedBackward)
+            throw new NotSupportedException(
+                "The fused half-precision matrix-multiply backward pass requires a compatible hipBLAS installation; " +
+                "the direct HIP forward-GEMM fallback does not support transposed fused gradients.");
+    }
+
+    private void GemmFp16In32fOutDirect(
+        IGpuBuffer aFp16,
+        IGpuBuffer bFp16,
+        IGpuBuffer cFp32,
+        int m,
+        int n,
+        int k)
+    {
+        using var aFp32 = AllocateBuffer(checked(m * k));
+        using var bFp32 = AllocateBuffer(checked(k * n));
+        ConvertToFp32(aFp16, aFp32, checked(m * k));
+        ConvertToFp32(bFp16, bFp32, checked(k * n));
+        Gemm(aFp32, bFp32, cFp32, m, n, k);
     }
 
     private void SyncHalfGemm()

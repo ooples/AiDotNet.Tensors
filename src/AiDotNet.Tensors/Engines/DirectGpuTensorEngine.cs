@@ -6226,13 +6226,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 int batch = input.Shape._dims[0], channels = input.Shape._dims[1];
                 int spatial = input.Length / (batch * channels);
 
-                using var gpuIn = gpuBackend.AllocateBuffer(floatInput.GetDataArray());
-                using var gpuGamma = gpuBackend.AllocateBuffer(floatGamma.GetDataArray());
-                using var gpuBeta = gpuBackend.AllocateBuffer(floatBeta.GetDataArray());
+                using var gpuIn = GetOrAllocateBuffer(gpuBackend, floatInput);
+                using var gpuGamma = GetWeightBufferPreferResident(
+                    gpuBackend, floatGamma, PersistentTensorRole.Weights);
+                using var gpuBeta = GetWeightBufferPreferResident(
+                    gpuBackend, floatBeta, PersistentTensorRole.Biases);
                 using var gpuOut = gpuBackend.AllocateBuffer(input.Length);
                 if (gpuBackend is Engines.DirectGpu.CUDA.CudaBackend cudaBackend &&
                     cudaBackend.TryDirectPtxGroupNormSwishUnit64(
-                        gpuIn, gpuOut, gpuGamma, gpuBeta,
+                        gpuIn.Buffer, gpuOut, gpuGamma.Buffer, gpuBeta.Buffer,
                         batch, numGroups, channels, spatial, (float)epsilon))
                 {
                     DownloadIntoTensor(gpuBackend, gpuOut, floatOutput);
@@ -6244,7 +6246,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
                 // GroupNorm then Swish (sigmoid * x). Interface order is
                 // (batch, numGroups, channels, spatialSize) — see the value-returning GroupNorm fix.
-                gpuBackend.GroupNorm(gpuIn, gpuNorm, gpuGamma, gpuBeta, gpuMean, gpuVar,
+                gpuBackend.GroupNorm(gpuIn.Buffer, gpuNorm, gpuGamma.Buffer, gpuBeta.Buffer, gpuMean, gpuVar,
                     batch, numGroups, channels, spatial, (float)epsilon);
                 gpuBackend.Swish(gpuNorm, gpuOut, input.Length);
                 DownloadIntoTensor(gpuBackend, gpuOut, floatOutput);
@@ -6273,14 +6275,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 int batch = a.Shape._dims[0], channels = a.Shape._dims[1];
                 int spatial = a.Length / (batch * channels);
 
-                using var gpuA = gpuBackend.AllocateBuffer(floatA.GetDataArray());
-                using var gpuB = gpuBackend.AllocateBuffer(floatB.GetDataArray());
-                using var gpuGamma = gpuBackend.AllocateBuffer(floatGamma.GetDataArray());
-                using var gpuBeta = gpuBackend.AllocateBuffer(floatBeta.GetDataArray());
+                using var gpuA = GetOrAllocateBuffer(gpuBackend, floatA);
+                using var gpuB = GetOrAllocateBuffer(gpuBackend, floatB);
+                using var gpuGamma = GetWeightBufferPreferResident(
+                    gpuBackend, floatGamma, PersistentTensorRole.Weights);
+                using var gpuBeta = GetWeightBufferPreferResident(
+                    gpuBackend, floatBeta, PersistentTensorRole.Biases);
                 using var gpuOut = gpuBackend.AllocateBuffer(a.Length);
                 if (gpuBackend is Engines.DirectGpu.CUDA.CudaBackend cudaBackend &&
                     cudaBackend.TryDirectPtxAddGroupNormUnit64(
-                        gpuA, gpuB, gpuOut, gpuGamma, gpuBeta,
+                        gpuA.Buffer, gpuB.Buffer, gpuOut, gpuGamma.Buffer, gpuBeta.Buffer,
                         batch, numGroups, channels, spatial, (float)epsilon))
                 {
                     DownloadIntoTensor(gpuBackend, gpuOut, floatOutput);
@@ -6291,8 +6295,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 using var gpuVar = gpuBackend.AllocateBuffer(batch * numGroups);
 
                 // Add then GroupNorm
-                gpuBackend.Add(gpuA, gpuB, gpuSum, a.Length);
-                gpuBackend.GroupNorm(gpuSum, gpuOut, gpuGamma, gpuBeta, gpuMean, gpuVar,
+                gpuBackend.Add(gpuA.Buffer, gpuB.Buffer, gpuSum, a.Length);
+                gpuBackend.GroupNorm(gpuSum, gpuOut, gpuGamma.Buffer, gpuBeta.Buffer, gpuMean, gpuVar,
                     batch, numGroups, channels, spatial, (float)epsilon);
                 DownloadIntoTensor(gpuBackend, gpuOut, floatOutput);
                 return;
@@ -22105,6 +22109,76 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // ──────────────────────────────────────────────────────────────
     // GPU-accelerated broadcast ops (override virtual methods)
     // ──────────────────────────────────────────────────────────────
+
+    public override Tensor<T> TensorChannelBiasAdd<T>(Tensor<T> input, Tensor<T> bias)
+    {
+        // Let the base implementation record the semantic operation. Its replay delegate dispatches
+        // virtually back here with graph recording suspended, preserving GPU execution without doing
+        // eager device work during capture.
+        if (Compilation.GraphMode.IsActive)
+            return base.TensorChannelBiasAdd(input, bias);
+
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>()
+            || input.Rank < 2
+            || bias.Rank != 1
+            || bias.Shape._dims[0] != input.Shape._dims[1]
+            || input.Length == 0
+            || !TryGetBackend(out var backend))
+        {
+            return base.TensorChannelBiasAdd(input, bias);
+        }
+
+        try
+        {
+            int batchCount = input.Shape._dims[0];
+            int channelCount = input.Shape._dims[1];
+            int spatialSize = input.Length / (batchCount * channelCount);
+            using var inputBuffer = GetOrAllocateBuffer(backend, input);
+            using var biasBuffer = GetWeightBufferPreferResident(
+                backend, bias, PersistentTensorRole.Biases);
+            var outputBuffer = AllocateOutputBuffer(backend, input.Length);
+            bool outputHandedOff = false;
+
+            try
+            {
+                backend.Copy(inputBuffer.Buffer, outputBuffer.Buffer, input.Length);
+                backend.Conv2DBiasAdd(
+                    outputBuffer.Buffer,
+                    biasBuffer.Buffer,
+                    batchCount,
+                    channelCount,
+                    spatialSize);
+
+                var output = DeferTensorResult<T>(
+                    backend,
+                    outputBuffer.Buffer,
+                    input.Length,
+                    input.Shape.ToArray());
+                outputHandedOff = true;
+                if (ResidentStepActive && typeof(T) == typeof(float))
+                    BindResidentBuffer(output, outputBuffer.Buffer, backend);
+
+                Autodiff.DifferentiableOps.RecordBinary(
+                    "TensorChannelBiasAdd",
+                    output,
+                    input,
+                    bias,
+                    Autodiff.BackwardFunctions<T>.ChannelBiasAddBackward);
+                return output;
+            }
+            finally
+            {
+                if (!outputHandedOff)
+                    outputBuffer.Dispose();
+            }
+        }
+        catch (Exception ex)
+        {
+            GpuLaunchProbe.OnFallback("TensorChannelBiasAdd", ex);
+            if (ThrowOnGpuKernelFallback) throw;
+            return base.TensorChannelBiasAdd(input, bias);
+        }
+    }
 
     public override Tensor<T> TensorBroadcastAdd<T>(Tensor<T> a, Tensor<T> b)
     {

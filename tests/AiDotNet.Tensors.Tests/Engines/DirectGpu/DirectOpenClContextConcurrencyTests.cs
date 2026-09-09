@@ -5,9 +5,10 @@
 // The OpenCL 1.2 spec § 5.1.1 lists clCreateCommandQueue as thread-safe, but
 // the AMD RDNA1 driver crashes amdocl64.dll with an access violation when
 // multiple host threads enter that entry point concurrently. The
-// DirectOpenClContext fix wraps the native call in a per-instance lock so
-// the host-side enqueue path is fully parallel after the one-time setup,
-// without exposing the driver-level race.
+// Queue creation now passes through a process-wide native-call gate, with a
+// per-context first-touch lock as a second layer. The host-side enqueue path
+// remains fully parallel after the one-time setup without exposing the
+// cross-context driver race.
 //
 // These tests assert the OBSERVABLE contracts that fall out of that design:
 //   * Each worker thread gets a DISTINCT queue handle.
@@ -24,6 +25,7 @@
 
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -47,6 +49,21 @@ public class DirectOpenClContextConcurrencyTests
     /// </summary>
     private static bool OpenClPresent() =>
         DirectOpenClContext.IsAvailable && DirectOpenClContext.GetDeviceCount() > 0;
+
+    private static OpenClBackend CreateBackendOrThrow()
+    {
+        var backend = new OpenClBackend(deviceIndex: 0);
+        if (backend.IsAvailable)
+        {
+            return backend;
+        }
+
+        Exception? initializationException = backend.InitializationException;
+        backend.Dispose();
+        throw new InvalidOperationException(
+            "An OpenCL device was detected but the backend failed to initialize.",
+            initializationException);
+    }
 
     [SkippableFact]
     public void EachWorkerThreadGetsDistinctQueueHandle()
@@ -80,6 +97,60 @@ public class DirectOpenClContextConcurrencyTests
         var distinct = handles.Where(h => h != IntPtr.Zero).Distinct().ToArray();
         Assert.Equal(threadCount, handles.Count);
         Assert.Equal(threadCount, distinct.Length);
+    }
+
+    [SkippableFact]
+    public void DifferentContextsSerializeNativeQueueCreation()
+    {
+        Skip.IfNot(OpenClPresent(), "No OpenCL GPU device available on this host.");
+        const int contextCount = 4;
+        var contexts = new List<DirectOpenClContext>(contextCount);
+        using var startGate = new ManualResetEventSlim(false);
+        var handles = new ConcurrentBag<IntPtr>();
+        var failures = new ConcurrentBag<Exception>();
+        try
+        {
+            for (int index = 0; index < contextCount; index++)
+                contexts.Add(new DirectOpenClContext(deviceIndex: 0));
+
+            Thread[] threads = contexts
+                .Select(context => new Thread(() => FetchQueue(context)))
+                .ToArray();
+
+            foreach (Thread thread in threads)
+            {
+                thread.IsBackground = true;
+                thread.Start();
+            }
+
+            startGate.Set();
+            foreach (Thread thread in threads)
+                Assert.True(thread.Join(TimeSpan.FromSeconds(30)),
+                    "Cross-context queue creation did not return within 30s.");
+
+            Assert.Empty(failures);
+            Assert.Equal(contextCount, handles.Count);
+            Assert.Equal(contextCount, handles.Distinct().Count());
+            Assert.DoesNotContain(IntPtr.Zero, handles);
+        }
+        finally
+        {
+            foreach (DirectOpenClContext context in contexts)
+                context.Dispose();
+        }
+
+        void FetchQueue(DirectOpenClContext context)
+        {
+            try
+            {
+                startGate.Wait();
+                handles.Add(context.CommandQueue);
+            }
+            catch (Exception ex)
+            {
+                failures.Add(ex);
+            }
+        }
     }
 
     [SkippableFact]
@@ -131,7 +202,7 @@ public class DirectOpenClContextConcurrencyTests
     public void BufferPool_DoesNotRecycleAllocationAcrossUnorderedThreadQueues()
     {
         Skip.IfNot(OpenClPresent(), "No OpenCL GPU device available on this host.");
-        using var backend = new OpenClBackend(deviceIndex: 0);
+        using var backend = CreateBackendOrThrow();
 
         IntPtr queueABuffer = IntPtr.Zero;
         IntPtr queueBBuffer = IntPtr.Zero;
@@ -184,10 +255,33 @@ public class DirectOpenClContextConcurrencyTests
     }
 
     [SkippableFact]
+    public void BufferPool_ReusesCapacityWithoutExposingItAsLogicalSize()
+    {
+        Skip.IfNot(OpenClPresent(), "No OpenCL GPU device available on this host.");
+        using var backend = CreateBackendOrThrow();
+        IntPtr physicalHandle;
+
+        using (var capacity = backend.AllocateBuffer(8192))
+            physicalHandle = capacity.Handle;
+
+        var expected = Enumerable.Range(0, 5000).Select(i => (float)i).ToArray();
+        using (var smaller = backend.AllocateBuffer(expected))
+        {
+            Assert.Equal(physicalHandle, smaller.Handle);
+            Assert.Equal(expected.Length, smaller.Size);
+            Assert.Equal(expected, backend.DownloadBuffer(smaller));
+        }
+
+        using var larger = backend.AllocateBuffer(8000);
+        Assert.Equal(physicalHandle, larger.Handle);
+        Assert.Equal(8000, larger.Size);
+    }
+
+    [SkippableFact]
     public void AsyncTransfer_CrossQueueDependencyAndHostPins_PreserveData()
     {
         Skip.IfNot(OpenClPresent(), "No OpenCL GPU device available on this host.");
-        using var backend = new OpenClBackend(deviceIndex: 0);
+        using var backend = CreateBackendOrThrow();
         using var producer = backend.CreateStream(GpuStreamType.HostToDevice);
         using var consumer = backend.CreateStream(GpuStreamType.Compute);
         const int length = 262_144;

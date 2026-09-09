@@ -106,19 +106,12 @@ internal sealed class FusedConv2DBiasActivationOp<T> : ICompiledOp<T>
         int dH = DilationH, dW = DilationW;
         var activation = Activation;
 
-        // Reshape bias to [1, Cout, 1, 1] for broadcasting over [N, C, H, W].
-        // CpuEngine.FusedConv2D calls TensorAdd(convResult, bias)
-        // which follows NumPy broadcasting rules — a raw [Cout] shape can't
-        // broadcast against [N, Cout, H, W] (trailing dims don't align).
-        // Only reshape if bias is 1D; if already 4D (e.g., from a fusion pass
-        // that extracted it from a BroadcastAdd), use as-is.
-        var reshapedBias = bias is not null && bias.Rank == 1
-            ? bias.Reshape(new[] { 1, bias._shape[0], 1, 1 })
-            : bias;
-
         return (eng, output) =>
         {
-            var result = eng.FusedConv2D(input, kernel, reshapedBias, sH, sW, pH, pW, dH, dW, activation);
+            // Keep a rank-1 parameter rank-1. FusedConv2D owns channel-bias semantics directly;
+            // constructing a long-lived reshape here creates a storage alias that prevents safe
+            // copy-on-write model clones for the entire compiled-plan lifetime.
+            var result = eng.FusedConv2D(input, kernel, bias, sH, sW, pH, pW, dH, dW, activation);
             result.AsSpan().CopyTo(output.AsWritableSpan());
         };
     }

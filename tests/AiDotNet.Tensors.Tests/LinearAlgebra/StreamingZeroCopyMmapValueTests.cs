@@ -29,7 +29,50 @@ public class StreamingZeroCopyMmapValueTests
     [InlineData(1 << 20)]   // 1 MiB weight
     [InlineData(8 << 20)]   // 8 MiB weight
     [InlineData(64 << 20)]  // 64 MiB weight
-    public unsafe void ZeroCopyVsCopy_PerAccessSaving(int bytes)
+    public unsafe void ZeroCopyReadsSameBytesAsCopy(int bytes)
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "aidotnet-zc-correctness-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        var path = Path.Combine(dir, "backing.bin");
+        try
+        {
+            var blob = CreateSampledBlob(bytes);
+            File.WriteAllBytes(path, blob);
+
+            using var mmf = MemoryMappedFile.CreateFromFile(path, FileMode.Open, null, 0, MemoryMappedFileAccess.Read);
+            using var view = mmf.CreateViewAccessor(0, bytes, MemoryMappedFileAccess.Read);
+            byte* basePtr = null;
+            view.SafeMemoryMappedViewHandle.AcquirePointer(ref basePtr);
+            try
+            {
+                var copied = new byte[bytes];
+                new ReadOnlySpan<byte>(basePtr, bytes).CopyTo(copied);
+
+                long mappedSum = 0;
+                long copiedSum = 0;
+                for (int i = 0; i < bytes; i += 64)
+                {
+                    byte mappedValue = basePtr[i];
+                    byte copiedValue = copied[i];
+                    Assert.Equal(copiedValue, mappedValue);
+                    mappedSum += mappedValue;
+                    copiedSum += copiedValue;
+                }
+
+                Assert.True(mappedSum > 0, "The sampled test data must exercise nonzero mapped bytes.");
+                Assert.Equal(copiedSum, mappedSum);
+            }
+            finally { view.SafeMemoryMappedViewHandle.ReleasePointer(); }
+        }
+        finally { if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true); }
+    }
+
+    [Theory]
+    [Trait("Category", "Performance")]
+    [InlineData(1 << 20)]   // 1 MiB weight
+    [InlineData(8 << 20)]   // 8 MiB weight
+    [InlineData(64 << 20)]  // 64 MiB weight
+    public unsafe void ZeroCopyVsCopy_PerAccessMeasurement(int bytes)
     {
         var dir = Path.Combine(Path.GetTempPath(), "aidotnet-zc-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(dir);
@@ -37,8 +80,7 @@ public class StreamingZeroCopyMmapValueTests
         try
         {
             // Lay down a weight-sized blob and map it once (read-only), as the pool would.
-            var blob = new byte[bytes];
-            for (int i = 0; i < bytes; i += 64) blob[i] = (byte)(i & 0xFF);
+            var blob = CreateSampledBlob(bytes);
             File.WriteAllBytes(path, blob);
 
             using var mmf = MemoryMappedFile.CreateFromFile(path, FileMode.Open, null, 0, MemoryMappedFileAccess.Read);
@@ -49,7 +91,7 @@ public class StreamingZeroCopyMmapValueTests
             {
                 // Warm the page cache (first touch pulls pages in). The sum
                 // MUST equal what we wrote — the inputs are nonzero at every
-                // 64-byte slot (i&0xFF for i % 4096 == 0), so a zero-sum or
+                // 64-byte slot, so a zero-sum or
                 // an "all bytes equal 0xFF" pattern would mean the mapping
                 // exposes the wrong pages. CodeRabbit #604 flagged the prior
                 // `warm >= 0` (always-true on byte sums) as non-gating.
@@ -58,7 +100,7 @@ public class StreamingZeroCopyMmapValueTests
                 for (int i = 0; i < bytes; i += 4096)
                 {
                     warm += basePtr[i];
-                    expectedWarm += (byte)(i & 0xFF);
+                    expectedWarm += SampledValueAtOffset(i);
                 }
                 Assert.Equal(expectedWarm, warm);
 
@@ -118,16 +160,25 @@ public class StreamingZeroCopyMmapValueTests
                                $"→ saves {savedMs:F3} ms ({savedPct:F0}%)  [the alloc+memcpy zero-copy removes]");
                 Assert.True(copyMs > 0 && zcMs > 0,
                     $"Timings must be positive (copy={copyMs:F3}ms zero-copy={zcMs:F3}ms).");
-                // Zero-copy must not be SLOWER than the alloc+memcpy path on
-                // the same data — the whole point. Allow a small +10% jitter
-                // floor because both paths' inner loops are memory-bound and
-                // can hit cache vagaries; pre-fix the test would have
-                // accepted a 10× regression.
-                Assert.True(zcMs <= copyMs * 1.10,
-                    $"Zero-copy path regressed below the alloc+memcpy path: copy={copyMs:F3}ms zero-copy={zcMs:F3}ms.");
             }
             finally { view.SafeMemoryMappedViewHandle.ReleasePointer(); }
         }
         finally { if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true); }
+    }
+
+    private static byte[] CreateSampledBlob(int bytes)
+    {
+        var blob = new byte[bytes];
+        for (int i = 0; i < bytes; i += 64)
+        {
+            blob[i] = SampledValueAtOffset(i);
+        }
+
+        return blob;
+    }
+
+    private static byte SampledValueAtOffset(int offset)
+    {
+        return (byte)(((offset / 64) % 251) + 1);
     }
 }

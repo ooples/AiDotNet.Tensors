@@ -15,33 +15,24 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 [Collection("DirectGpuSerial")]
-public sealed class RopeGqaOpenClTests : IDisposable
+public sealed class RopeGqaOpenClTests : IClassFixture<OpenClBackendTestFixture>
 {
     private readonly OpenClBackend? _backend;
     private readonly bool _ready;
-    private readonly Exception? _initException;
 
-    public RopeGqaOpenClTests()
+    public RopeGqaOpenClTests(OpenClBackendTestFixture fixture)
     {
-        try
-        {
-            _backend = new OpenClBackend();
-            _ready = _backend.IsAvailable;
-        }
-        catch (Exception ex)
-        {
-            _initException = ex;
-            _ready = false;
-        }
+        _backend = fixture.Backend;
+        _ready = fixture.IsAvailable;
     }
 
-    public void Dispose() => _backend?.Dispose();
+    private OpenClBackend Backend => _backend ?? throw new InvalidOperationException("OpenCL backend is unavailable.");
 
     private bool EnsureReady()
     {
         if (_ready) return true;
         if (string.Equals(Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_GPU_TESTS"), "1", StringComparison.Ordinal))
-            throw new InvalidOperationException("GPU tests required but the OpenCL backend was unavailable.", _initException);
+            throw new InvalidOperationException("GPU tests required but the OpenCL backend was unavailable.");
         return false;
     }
 
@@ -89,13 +80,13 @@ public sealed class RopeGqaOpenClTests : IDisposable
         return outp;
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(0)]
     [InlineData(5)]   // decode with a non-zero absolute position offset
     public void RopeInterleaved_MatchesCpuReference(int startPosition)
     {
-        if (!EnsureReady()) return;
-        var backend = _backend!;
+        Skip.If(!EnsureReady(), "OpenCL backend is unavailable.");
+        var backend = Backend;
 
         const int heads = 3, seqLen = 6, headDim = 8, maxSeq = 32;
         int rows = heads * seqLen; // single batch: leading (heads) * seqLen
@@ -278,13 +269,13 @@ public sealed class RopeGqaOpenClTests : IDisposable
                 $"CPU GQA-SDPA mismatch at {i}: expected {expected[i]}, got {actual[i]}");
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(false)]
     [InlineData(true)]
     public void GqaScaledDotProductAttention_MatchesCpuReference(bool causal)
     {
-        if (!EnsureReady()) return;
-        var backend = _backend!;
+        Skip.If(!EnsureReady(), "OpenCL backend is unavailable.");
+        var backend = Backend;
 
         // SmolLM2-style ratio: 9 query heads share 3 KV heads (group of 3).
         const int batch = 1, qHeads = 6, kvHeads = 2, seqQ = 5, seqK = 5, headDim = 8;
@@ -324,11 +315,11 @@ public sealed class RopeGqaOpenClTests : IDisposable
     }
 
     // Guards the MHA collapse: numKVHeads == qHeads must equal a plain full-head reference.
-    [Fact]
+    [SkippableFact]
     public void GqaWithEqualHeads_EqualsStandardAttention()
     {
-        if (!EnsureReady()) return;
-        var backend = _backend!;
+        Skip.If(!EnsureReady(), "OpenCL backend is unavailable.");
+        var backend = Backend;
 
         const int batch = 1, heads = 4, seqQ = 4, seqK = 4, headDim = 8;
         float scale = 1f / (float)Math.Sqrt(headDim);

@@ -33,9 +33,11 @@ internal static class HipSparseBackend
         if (!IsAvailable)
             throw new InvalidOperationException("HIP rocSPARSE backend is not available.");
 
-        var backend = new HipBackend();
+        using var backend = new HipBackend();
         if (!backend.IsAvailable)
-            throw new InvalidOperationException("HIP backend failed to initialise.");
+            throw new InvalidOperationException(
+                "HIP backend failed to initialise.",
+                backend.InitializationException);
 
         var output = new float[rows * n];
         // All allocations / pins live inside the try so any failure in

@@ -12,29 +12,29 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 [Collection("DirectGpuSerial")]
-public sealed class FlashDecodeHipTests : IDisposable
+public sealed class FlashDecodeHipTests : IClassFixture<HipBackendTestFixture>
 {
-    private readonly HipBackend? _backend;
-    private readonly bool _ready;
+    private readonly HipBackendTestFixture _fixture;
+    private bool IsReady => _fixture.IsAvailable;
+    private HipBackend Backend => _fixture.Backend;
 
-    public FlashDecodeHipTests()
+    public FlashDecodeHipTests(HipBackendTestFixture fixture)
     {
-        try { _backend = new HipBackend(); _ready = _backend.IsAvailable; }
-        catch { _ready = false; }
+        _fixture = fixture;
     }
 
-    public void Dispose() => _backend?.Dispose();
-
-    [Fact]
+    [SkippableFact]
     public void Probe_HipAvailability()
     {
-        if (Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_HIP") != "1") return;
-        Assert.True(_ready, "HIP/ROCm backend NOT available on this host");
+        Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_HIP") != "1",
+            "HIP availability is asserted only in the required-HIP lane.");
+        Assert.True(IsReady, "HIP/ROCm backend NOT available on this host");
+        Assert.Empty(Backend.KernelCompilationFailures);
     }
 
     private bool EnsureReady()
     {
-        if (_ready) return true;
+        if (IsReady) return true;
         if (string.Equals(Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_HIP"), "1", StringComparison.Ordinal))
             throw new InvalidOperationException("GPU tests required but HIP/ROCm was unavailable.");
         return false;
@@ -70,7 +70,7 @@ public sealed class FlashDecodeHipTests : IDisposable
 
     private void RunAndCompare(int heads, int kvHeads, int headDim, int seqLen, int splits)
     {
-        var backend = _backend!;
+        var backend = Backend;
         var rng = new Random(0xFDE + heads + kvHeads + seqLen + splits);
         int stepStride = kvHeads * headDim;
         var k = new float[seqLen * stepStride];
@@ -104,7 +104,7 @@ public sealed class FlashDecodeHipTests : IDisposable
         }
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(4, 64, 40, 8)]
     [InlineData(8, 32, 100, 8)]
     [InlineData(4, 64, 7, 8)]
@@ -112,16 +112,16 @@ public sealed class FlashDecodeHipTests : IDisposable
     [InlineData(6, 48, 77, 0)]   // splits=0 -> internal default derivation
     public void MhaDecode_MatchesOracle(int heads, int headDim, int seqLen, int splits)
     {
-        if (!EnsureReady()) return;
+        Skip.If(!EnsureReady(), "HIP/ROCm backend is unavailable.");
         RunAndCompare(heads, heads, headDim, seqLen, splits);
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(8, 2, 64, 50, 8)]
     [InlineData(8, 1, 64, 40, 8)]
     public void GqaDecode_MatchesOracle(int heads, int kvHeads, int headDim, int seqLen, int splits)
     {
-        if (!EnsureReady()) return;
+        Skip.If(!EnsureReady(), "HIP/ROCm backend is unavailable.");
         RunAndCompare(heads, kvHeads, headDim, seqLen, splits);
     }
 }

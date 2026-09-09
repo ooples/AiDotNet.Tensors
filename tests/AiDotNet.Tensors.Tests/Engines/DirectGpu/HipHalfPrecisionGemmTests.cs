@@ -23,27 +23,17 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// guideline. Requires AMD ROCm + hipBLAS; skips on non-ROCm hosts.
 /// </summary>
 [Collection("DirectGpuSerial")]
-public sealed class HipHalfPrecisionGemmTests : IDisposable
+public sealed class HipHalfPrecisionGemmTests : IClassFixture<HipBackendTestFixture>
 {
-    private readonly HipBackend _backend;
+    private readonly HipBackendTestFixture _fixture;
     private readonly bool _ready;
-    private readonly Exception _initException;
+    private HipBackend Backend => _fixture.Backend;
 
-    public HipHalfPrecisionGemmTests()
+    public HipHalfPrecisionGemmTests(HipBackendTestFixture fixture)
     {
-        try
-        {
-            _backend = new HipBackend();
-            _ready = _backend.IsAvailable && _backend.SupportsHgemm;
-        }
-        catch (Exception ex)
-        {
-            _initException = ex;
-            _ready = false;
-        }
+        _fixture = fixture;
+        _ready = fixture.Backend.IsAvailable && fixture.Backend.SupportsHgemm;
     }
-
-    public void Dispose() => _backend?.Dispose();
 
     private bool EnsureReady()
     {
@@ -55,8 +45,7 @@ public sealed class HipHalfPrecisionGemmTests : IDisposable
         {
             throw new InvalidOperationException(
                 "GPU tests were required (AIDOTNET_REQUIRE_GPU_TESTS=1) but the HIP backend " +
-                "or hipBLAS was unavailable.",
-                _initException);
+                "or hipBLAS was unavailable.");
         }
 
         return false;
@@ -93,12 +82,12 @@ public sealed class HipHalfPrecisionGemmTests : IDisposable
     private (IGpuBuffer aFp16, IGpuBuffer bFp16) UploadFp16Inputs(
         float[] a, float[] b, int m, int n, int k)
     {
-        using var aFp32 = _backend.AllocateBuffer(a);
-        using var bFp32 = _backend.AllocateBuffer(b);
-        var aFp16 = _backend.AllocateBuffer(m * k);
-        var bFp16 = _backend.AllocateBuffer(k * n);
-        _backend.ConvertToFp16(aFp32, aFp16, m * k);
-        _backend.ConvertToFp16(bFp32, bFp16, k * n);
+        using var aFp32 = Backend.AllocateBuffer(a);
+        using var bFp32 = Backend.AllocateBuffer(b);
+        var aFp16 = Backend.AllocateBuffer(m * k);
+        var bFp16 = Backend.AllocateBuffer(k * n);
+        Backend.ConvertToFp16(aFp32, aFp16, m * k);
+        Backend.ConvertToFp16(bFp32, bFp16, k * n);
         return (aFp16, bFp16);
     }
 
@@ -129,12 +118,39 @@ public sealed class HipHalfPrecisionGemmTests : IDisposable
         var expected = CpuReferenceFromFp16(a, b, m, n, k);
 
         var (aFp16, bFp16) = UploadFp16Inputs(a, b, m, n, k);
-        using var cBuf = _backend.AllocateBuffer(m * n);
+        using var cBuf = Backend.AllocateBuffer(m * n);
         try
         {
-            ((IGpuHalfPrecisionBackend)_backend).GemmFp16In32fOut(aFp16, bFp16, cBuf, m, n, k);
-            var actual = _backend.DownloadBuffer(cBuf);
+            ((IGpuHalfPrecisionBackend)Backend).GemmFp16In32fOut(aFp16, bFp16, cBuf, m, n, k);
+            var actual = Backend.DownloadBuffer(cBuf);
             AssertClose(expected, actual, absTol: 1e-2, relTol: 1e-2);
+        }
+        finally
+        {
+            aFp16.Dispose();
+            bFp16.Dispose();
+        }
+    }
+
+    [SkippableFact]
+    public void Hgemm_Fp16Output_MatchesCpuReferenceWithinHalfPrecision()
+    {
+        Skip.If(!EnsureReady(), "HIP FP16 GEMM not available on this system.");
+
+        const int m = 64, n = 64, k = 128;
+        var a = RandomMatrix(m, k, seed: 24);
+        var b = RandomMatrix(k, n, seed: 42);
+        var expected = CpuReferenceFromFp16(a, b, m, n, k);
+
+        var (aFp16, bFp16) = UploadFp16Inputs(a, b, m, n, k);
+        using var cFp16 = Backend.AllocateBuffer(m * n);
+        using var cFp32 = Backend.AllocateBuffer(m * n);
+        try
+        {
+            ((IGpuHalfPrecisionBackend)Backend).Hgemm(aFp16, bFp16, cFp16, m, n, k);
+            Backend.ConvertToFp32(cFp16, cFp32, m * n);
+            var actual = Backend.DownloadBuffer(cFp32);
+            AssertClose(expected, actual, absTol: 5e-2, relTol: 3e-2);
         }
         finally
         {
@@ -148,8 +164,8 @@ public sealed class HipHalfPrecisionGemmTests : IDisposable
     {
         Skip.If(!EnsureReady(), "HIP FP16 GEMM not available on this system.");
 
-        using var dummy = _backend.AllocateBuffer(4);
-        var half = (IGpuHalfPrecisionBackend)_backend;
+        using var dummy = Backend.AllocateBuffer(4);
+        var half = (IGpuHalfPrecisionBackend)Backend;
         Assert.Throws<ArgumentOutOfRangeException>(
             () => half.GemmFp16In32fOut(dummy, dummy, dummy, 0, 4, 4));
         Assert.Throws<ArgumentOutOfRangeException>(

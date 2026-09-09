@@ -272,6 +272,11 @@ public static class DirectGpuBackendFactory
             {
                 return backend;
             }
+            if (backend.InitializationException is Exception initializationException)
+            {
+                logger?.LogWarning(initializationException,
+                    "HIP backend initialization failed on device {DeviceIndex}.", deviceIndex);
+            }
             backend.Dispose();
         }
         catch (Exception ex)
@@ -295,6 +300,11 @@ public static class DirectGpuBackendFactory
             if (backend.IsAvailable)
             {
                 return backend;
+            }
+            if (backend.InitializationException is Exception initializationException)
+            {
+                logger?.LogWarning(initializationException,
+                    "OpenCL backend initialization failed on device {DeviceIndex}.", deviceIndex);
             }
             backend.Dispose();
         }

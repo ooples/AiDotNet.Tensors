@@ -227,9 +227,9 @@ extern ""C"" __global__ __launch_bounds__(256) void fp16_relu(
     int pairIdx = idx * 2;
     if (pairIdx + 1 < size) {
         __half2 v = *reinterpret_cast<const __half2*>(&input[pairIdx]);
-        float2 fv = __half22float2(v);
+        float2 values = __half22float2(v);
         *reinterpret_cast<__half2*>(&output[pairIdx]) =
-            __floats2half2_rn(fmaxf(fv.x, 0.0f), fmaxf(fv.y, 0.0f));
+            __floats2half2_rn(fmaxf(values.x, 0.0f), fmaxf(values.y, 0.0f));
     } else if (pairIdx < size) {
         __half v = *reinterpret_cast<const __half*>(&input[pairIdx]);
         __half zero = __float2half(0.0f);
@@ -333,7 +333,7 @@ extern ""C"" __global__ __launch_bounds__(256) void fp16_reduce_sum(
 
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1)
-        val += __shfl_down(val, offset);
+        val += __shfl_down(val, offset, 32);
 
     unsigned int lane = tid & 31;
     unsigned int warpId = tid >> 5;
@@ -344,7 +344,7 @@ extern ""C"" __global__ __launch_bounds__(256) void fp16_reduce_sum(
     val = (tid < numWarps) ? scratch[tid] : 0.0f;
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1)
-        val += __shfl_down(val, offset);
+        val += __shfl_down(val, offset, 32);
     // NON-DETERMINISTIC (issue #382); see fp16_reduce_sum_deterministic.
     if (tid == 0) atomicAdd(&output[0], val);
 }
@@ -361,7 +361,7 @@ extern ""C"" __global__ __launch_bounds__(256) void fp16_reduce_sum_deterministi
     }
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1)
-        val += __shfl_down(val, offset);
+        val += __shfl_down(val, offset, 32);
     unsigned int lane = tid & 31;
     unsigned int warpId = tid >> 5;
     if (lane == 0) scratch_d[warpId] = val;
@@ -370,7 +370,7 @@ extern ""C"" __global__ __launch_bounds__(256) void fp16_reduce_sum_deterministi
     val = (tid < numWarps) ? scratch_d[tid] : 0.0f;
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1)
-        val += __shfl_down(val, offset);
+        val += __shfl_down(val, offset, 32);
     if (tid == 0) *output = val;
 }
 
@@ -396,7 +396,7 @@ extern ""C"" __global__ __launch_bounds__(256) void fp16_softmax(
     }
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1)
-        maxVal = fmaxf(maxVal, __shfl_down(maxVal, offset));
+        maxVal = fmaxf(maxVal, __shfl_down(maxVal, offset, 32));
     if ((threadIdx.x & 31) == 0) smem[threadIdx.x >> 5] = maxVal;
     __syncthreads();
     {
@@ -404,7 +404,7 @@ extern ""C"" __global__ __launch_bounds__(256) void fp16_softmax(
         maxVal = (threadIdx.x < nw) ? smem[threadIdx.x] : -1e30f;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
-            maxVal = fmaxf(maxVal, __shfl_down(maxVal, offset));
+            maxVal = fmaxf(maxVal, __shfl_down(maxVal, offset, 32));
         if (threadIdx.x == 0) smem[0] = maxVal;
     }
     __syncthreads();
@@ -417,7 +417,7 @@ extern ""C"" __global__ __launch_bounds__(256) void fp16_softmax(
     }
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1)
-        sumVal += __shfl_down(sumVal, offset);
+        sumVal += __shfl_down(sumVal, offset, 32);
     if ((threadIdx.x & 31) == 0) smem[threadIdx.x >> 5] = sumVal;
     __syncthreads();
     {
@@ -425,7 +425,7 @@ extern ""C"" __global__ __launch_bounds__(256) void fp16_softmax(
         sumVal = (threadIdx.x < nw2) ? smem[threadIdx.x] : 0.0f;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
-            sumVal += __shfl_down(sumVal, offset);
+            sumVal += __shfl_down(sumVal, offset, 32);
         if (threadIdx.x == 0) smem[0] = sumVal;
     }
     __syncthreads();

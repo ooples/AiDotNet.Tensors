@@ -1,6 +1,21 @@
 namespace AiDotNet.Tensors.Engines.DirectGpu;
 
 /// <summary>
+/// Describes the outcome of a direct GPU backend's initialization attempt.
+/// </summary>
+public enum GpuBackendInitializationState
+{
+    /// <summary>The required runtime or device is not available, so initialization was not attempted.</summary>
+    Unavailable = 0,
+
+    /// <summary>The backend initialized successfully and was ready to serve work.</summary>
+    Succeeded = 1,
+
+    /// <summary>The runtime or device was detected, but backend initialization failed.</summary>
+    Failed = 2
+}
+
+/// <summary>
 /// Interface for direct GPU backend implementations (OpenCL, CUDA, etc.).
 /// The core surface is float32; backends that ship cuDNN-equivalent
 /// half/bfloat16 paths expose them through the

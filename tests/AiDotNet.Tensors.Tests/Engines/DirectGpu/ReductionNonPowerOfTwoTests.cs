@@ -2,6 +2,7 @@
 #if !NETFRAMEWORK
 using System;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.DirectGpu;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu
@@ -31,8 +32,16 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu
     /// mismatch rather than a tolerance question.
     /// </para>
     /// </remarks>
-    public class ReductionNonPowerOfTwoTests
+    [Collection("DirectGpuSerial")]
+    public class ReductionNonPowerOfTwoTests : IClassFixture<DirectGpuTensorEngineTestFixture>
     {
+        private readonly DirectGpuTensorEngineTestFixture _fixture;
+
+        public ReductionNonPowerOfTwoTests(DirectGpuTensorEngineTestFixture fixture)
+        {
+            _fixture = fixture;
+        }
+
         public static TheoryData<int> Lengths()
         {
             var data = new TheoryData<int>();
@@ -47,10 +56,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu
         [MemberData(nameof(Lengths))]
         public void Sum_IsExact_AtAnyLength(int length)
         {
-            using var engine = TryCreateGpuEngine();
-            Skip.If(engine is null, "No direct GPU backend is available on this host.");
-            var backend = engine!.GetBackend();
-            Skip.If(backend is null, "No direct GPU backend is available on this host.");
+            var backend = RequireBackend();
 
             // 1, 2, 3, ... n : every element distinct, so a dropped or doubled lane cannot cancel
             // out, and the total is exact in float for these sizes.
@@ -58,7 +64,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu
             for (int i = 0; i < length; i++) values[i] = i + 1;
             double expected = (double)length * (length + 1) / 2.0;
 
-            using var buffer = backend!.AllocateBuffer(values);
+            using var buffer = backend.AllocateBuffer(values);
             float actual = backend.Sum(buffer, length);
 
             Assert.True(
@@ -73,10 +79,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu
         [MemberData(nameof(Lengths))]
         public void MinAndMax_SeeEveryLane_AtAnyLength(int length)
         {
-            using var engine = TryCreateGpuEngine();
-            Skip.If(engine is null, "No direct GPU backend is available on this host.");
-            var backend = engine!.GetBackend();
-            Skip.If(backend is null, "No direct GPU backend is available on this host.");
+            var backend = RequireBackend();
 
             // The extremes sit at the LAST index, which is the lane a truncated tree drops.
             var low = new float[length];
@@ -85,7 +88,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu
             low[length - 1] = -5f;
             high[length - 1] = 99f;
 
-            using var lowBuffer = backend!.AllocateBuffer(low);
+            using var lowBuffer = backend.AllocateBuffer(low);
             using var highBuffer = backend.AllocateBuffer(high);
 
             Assert.True(
@@ -97,42 +100,21 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu
         }
 
         /// <summary>
-        /// Returns null ONLY when this host genuinely has no GPU backend.
+        /// Returns the class-scoped backend or skips only when this host genuinely has no GPU backend.
         /// </summary>
         /// <remarks>
-        /// A blanket <c>catch (Exception)</c> here turns every initialisation failure into a skipped
-        /// test, so a real regression on a GPU-capable host reads as "no GPU available" and the
-        /// suite stays green. Only the absence of the runtime itself is treated as "no backend" —
-        /// a missing ICD or entry point, or an unsupported platform. Anything else is a failure and
-        /// is allowed to fail.
+        /// A blanket <c>catch (Exception)</c> in the fixture would turn every initialisation failure
+        /// into a skipped test, so a real regression on a GPU-capable host would read as "no GPU
+        /// available." The shared fixture catches only a missing runtime or an unsupported platform;
+        /// an incompatible entry point and every other construction failure are allowed to fail.
         /// </remarks>
-        private static DirectGpuTensorEngine? TryCreateGpuEngine()
+        private IDirectGpuBackend RequireBackend()
         {
-            DirectGpuTensorEngine engine;
-            try
-            {
-                engine = new DirectGpuTensorEngine();
-            }
-            catch (DllNotFoundException)
-            {
-                return null;
-            }
-            catch (EntryPointNotFoundException)
-            {
-                return null;
-            }
-            catch (PlatformNotSupportedException)
-            {
-                return null;
-            }
-
-            if (!engine.IsGpuAvailable)
-            {
-                engine.Dispose();
-                return null;
-            }
-
-            return engine;
+            Skip.IfNot(_fixture.IsAvailable, "No direct GPU backend is available on this host.");
+            var engine = _fixture.Engine ?? throw new InvalidOperationException(
+                "Direct GPU engine was not initialized.", _fixture.InitializationException);
+            return engine.GetBackend() ?? throw new InvalidOperationException(
+                "The initialized Direct GPU engine did not expose a backend.");
         }
     }
 }
