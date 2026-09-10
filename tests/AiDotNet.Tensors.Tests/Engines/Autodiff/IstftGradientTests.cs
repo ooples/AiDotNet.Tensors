@@ -358,4 +358,47 @@ public class IstftGradientTests
 
         Assert.True(moved, "the round-trip gradient is identically zero");
     }
+
+    [Theory]
+    [InlineData(8)]
+    [InlineData(16)]
+    [InlineData(5)]
+    [InlineData(7)]
+    public void Istft_InvertsStft(int nFft)
+    {
+        // ISTFT(STFT(x)) must return x in the interior, where every sample is covered by a full set
+        // of overlapping frames.
+        //
+        // This is the test the gradchecks could not be: they compare the adjoint against the
+        // forward, so they pass whether or not the forward is a correct inverse. It was not, at odd
+        // nFft - the Hermitian extension stopped one bin early, which is only right when there is a
+        // Nyquist bin to leave alone. Worst interior error before the fix was 0.055 at nFft 5 and
+        // 3.5e-3 at nFft 7, against 4.4e-16 at nFft 8.
+        int hop = Math.Max(1, nFft / 4);
+        const int n = 96;
+
+        var x = new double[n];
+        for (int i = 0; i < n; i++)
+        {
+            x[i] = 0.6 + Math.Sin(0.37 * i) + (0.4 * Math.Cos(1.13 * i));
+        }
+
+        var signal = new Tensor<double>(x, new[] { n });
+
+        var w = new double[nFft];
+        for (int i = 0; i < nFft; i++)
+        {
+            w[i] = 0.5 - (0.5 * Math.Cos(2.0 * Math.PI * i / (nFft - 1)));
+        }
+
+        var window = new Tensor<double>(w, new[] { nFft });
+
+        _engine.STFT(signal, nFft, hop, window, center: true, out var magnitude, out var phase);
+        var reconstructed = _engine.ISTFT(magnitude, phase, nFft, hop, window, center: true, n);
+
+        for (int i = nFft; i < n - nFft; i++)
+        {
+            Assert.Equal(x[i], reconstructed[i], 1e-12);
+        }
+    }
 }

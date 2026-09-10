@@ -42252,8 +42252,18 @@ public partial class CpuEngine : ITensorLevelEngine
                     imagIn[k] = numOps.FromDouble(mag * Math.Sin(ph));
                 }
 
-                // Reconstruct negative frequencies using conjugate symmetry
-                for (int k = 1; k < numFreqs - 1; k++)
+                // Reconstruct negative frequencies using conjugate symmetry.
+                //
+                // The bound is 2k < nFft, not k < numFreqs - 1. Those agree only when nFft is even,
+                // where bin nFft/2 is Nyquist and is its own conjugate so must not be mirrored. An
+                // ODD nFft has no Nyquist bin, and stopping a bin early left the top of the spectrum
+                // at zero: the inverse transform was then not of a conjugate-symmetric spectrum, its
+                // result was not real, and taking the real part discarded the difference.
+                //
+                // Measured as a STFT -> ISTFT round trip on a smooth signal, worst interior error:
+                // nFft 8 gave 4.4e-16 and nFft 16 gave 6.7e-16, against 0.055 at nFft 5 and 3.5e-3
+                // at nFft 7. IstftRoundTripTests pins all four.
+                for (int k = 1; k < numFreqs && (k * 2) < nFft; k++)
                 {
                     realIn[nFft - k] = realIn[k];
                     imagIn[nFft - k] = numOps.Negate(imagIn[k]);

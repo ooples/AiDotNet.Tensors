@@ -8929,10 +8929,10 @@ internal static class BackwardFunctions<T>
     /// imaginary parts of <c>FFT(gz_f)</c>.
     /// </description></item>
     /// <item><description>
-    /// <b>Hermitian extension and the polar map.</b> The forward copied bins
-    /// <c>1 .. numFreqs-2</c> to <c>nFft-k</c> with the imaginary part negated, so each of those
-    /// bins receives two contributions while DC and Nyquist receive one. Then <c>C[k] = m
-    /// exp(I*p)</c> gives <c>dL/dm = gCRe cos(p) + gCIm sin(p)</c> and
+    /// <b>Hermitian extension and the polar map.</b> The forward copied every bin with
+    /// <c>2k &lt; nFft</c> to <c>nFft-k</c> with the imaginary part negated, so each of those bins
+    /// receives two contributions while DC - and Nyquist, when <c>nFft</c> is even - receives one.
+    /// Then <c>C[k] = m exp(I*p)</c> gives <c>dL/dm = gCRe cos(p) + gCIm sin(p)</c> and
     /// <c>dL/dp = m * (gCIm cos(p) - gCRe sin(p))</c>.
     /// </description></item>
     /// </list>
@@ -9033,7 +9033,10 @@ internal static class BackwardFunctions<T>
                     double gradReal = numOps.ToDouble(adjointReal[k]);
                     double gradImag = numOps.ToDouble(adjointImag[k]);
 
-                    if (k >= 1 && k < numFreqs - 1)
+                    // Same bound as the forward mirror, for the same reason: 2k < nFft rather than
+                    // k < numFreqs - 1, which differ exactly when nFft is odd. The fold has to track
+                    // whatever the forward copies or this stops being its transpose.
+                    if (k >= 1 && (k * 2) < nFft)
                     {
                         gradReal += numOps.ToDouble(adjointReal[nFft - k]);
                         gradImag -= numOps.ToDouble(adjointImag[nFft - k]);
