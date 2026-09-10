@@ -5241,14 +5241,24 @@ public partial class DirectGpuTensorEngine
                 backend.Synchronize();
                 var magArr = FinishGpuOp<T>(backend, bufMag, outLen);
                 magHandedOff = true;
-                var phaseArr = FinishGpuOp<T>(backend, bufPhase, outLen);
-                phaseHandedOff = true;
                 var mag = new Tensor<T>(magArr, newShape);
-                var phase = new Tensor<T>(phaseArr, (int[])newShape.Clone());
-                int origLength = waveform._shape[rank - 1];
-                // Same backward contract as the base (phase piped through ISTFT); no-op when no tape is active.
-                DifferentiableOps.RecordUnary("Spectrogram", mag, waveform,
-                    BackwardFunctions<T>.SpectrogramBackward, new object[] { nFft, hopLength, win, phase, origLength });
+
+                // The companion output is only needed to seed the backward pass, and RecordUnary
+                // returns on its first line when no tape is active. Materialising it during
+                // inference therefore buys nothing and costs something: FinishGpuOp registers a
+                // pending device-to-host download and puts the buffer in the activation cache,
+                // where it can displace an activation that is actually wanted and be paid for
+                // again on eviction. Left unclaimed, the finally block below frees it outright.
+                if (DifferentiableOps.IsRecording<T>())
+                {
+                    var phaseArr = FinishGpuOp<T>(backend, bufPhase, outLen);
+                    phaseHandedOff = true;
+                    var phase = new Tensor<T>(phaseArr, (int[])newShape.Clone());
+                    int origLength = waveform._shape[rank - 1];
+                    DifferentiableOps.RecordUnary("Spectrogram", mag, waveform,
+                        BackwardFunctions<T>.SpectrogramBackward, new object[] { nFft, hopLength, win, phase, origLength });
+                }
+
                 return mag;
             }
             finally
@@ -5329,17 +5339,28 @@ public partial class DirectGpuTensorEngine
                 // DOWNLOAD, so without this the padded buffer could be freed before a deferred
                 // materialization runs the kernel. Same reasoning as Spectrogram above.
                 backend.Synchronize();
-                var magArr = FinishGpuOp<T>(backend, bufMag, outLen);
-                magHandedOff = true;
                 var phaseArr = FinishGpuOp<T>(backend, bufPhase, outLen);
                 phaseHandedOff = true;
-                var mag = new Tensor<T>(magArr, newShape);
-                var phase = new Tensor<T>(phaseArr, (int[])newShape.Clone());
-                int origLength = waveform._shape[rank - 1];
-                // Mirror of the Spectrogram contract: that one saves the phase it discards, this one
-                // saves the magnitude, which the phase adjoint needs to scale each bin by 1/|C|.
-                DifferentiableOps.RecordUnary("StftPhase", phase, waveform,
-                    BackwardFunctions<T>.StftPhaseBackward, new object[] { nFft, hopLength, win, mag, origLength });
+                var phase = new Tensor<T>(phaseArr, newShape);
+
+                // The companion output is only needed to seed the backward pass, and RecordUnary
+                // returns on its first line when no tape is active. Materialising it during
+                // inference therefore buys nothing and costs something: FinishGpuOp registers a
+                // pending device-to-host download and puts the buffer in the activation cache,
+                // where it can displace an activation that is actually wanted and be paid for
+                // again on eviction. Left unclaimed, the finally block below frees it outright.
+                // Mirror of the Spectrogram contract: that one saves the phase it discards, this
+                // one saves the magnitude, which the phase adjoint needs to scale each bin by 1/|C|.
+                if (DifferentiableOps.IsRecording<T>())
+                {
+                    var magArr = FinishGpuOp<T>(backend, bufMag, outLen);
+                    magHandedOff = true;
+                    var mag = new Tensor<T>(magArr, (int[])newShape.Clone());
+                    int origLength = waveform._shape[rank - 1];
+                    DifferentiableOps.RecordUnary("StftPhase", phase, waveform,
+                        BackwardFunctions<T>.StftPhaseBackward, new object[] { nFft, hopLength, win, mag, origLength });
+                }
+
                 return phase;
             }
             finally
