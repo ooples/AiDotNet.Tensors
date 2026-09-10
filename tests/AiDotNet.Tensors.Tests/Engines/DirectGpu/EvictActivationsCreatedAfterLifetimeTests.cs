@@ -176,6 +176,173 @@ public class EvictActivationsCreatedAfterLifetimeTests
     }
 
     [Fact]
+    public void BindResidentBuffer_RekeysMaterializedLazyTensorBeforeTapeEviction()
+    {
+        // A deferred GPU tensor is initially cached by DataVector. After its first host
+        // materialization it has an array, but the resident cache entry intentionally remains.
+        // A later in-place gradient accumulation binds the array-backed tensor again. The cache
+        // owner and materializer must move to the same array key before per-tape eviction, or the
+        // vector-keyed entry is freed while the array callback still points at its buffer.
+        using var engine = new DirectGpuTensorEngine();
+        var engineType = typeof(DirectGpuTensorEngine);
+        var activationCacheField = engineType.GetField(
+            "_activationCache", BindingFlags.NonPublic | BindingFlags.Instance)
+            ?? throw new InvalidOperationException("DirectGpuTensorEngine activation cache field was not found.");
+        var cacheActivation = engineType.GetMethod(
+            "CacheActivation", BindingFlags.NonPublic | BindingFlags.Instance,
+            null,
+            new[]
+            {
+                typeof(object), typeof(IGpuBuffer), typeof(int[]), typeof(IDirectGpuBackend),
+                typeof(bool), typeof(int)
+            },
+            null) ?? throw new InvalidOperationException("DirectGpuTensorEngine CacheActivation method was not found.");
+        object activationCache = activationCacheField.GetValue(engine)
+            ?? throw new InvalidOperationException("DirectGpuTensorEngine activation cache was null.");
+
+        var state = new MockBackendState();
+        var backend = MockDirectGpuBackend.Create(state);
+        var buffer = new MockGpuBuffer(new[] { 3f, 5f, 7f, 11f });
+        var tensor = AiDotNet.Tensors.LinearAlgebra.Tensor<float>.CreateGpuResident(
+            new[] { 1, 4 }, TensorDevice.OpenCL);
+        object vectorKey = tensor.DataVector;
+        Assert.Null(tensor.GetBackingArrayForCacheLookupUnsafe());
+
+        AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.Register(vectorKey, key =>
+        {
+            var values = backend.DownloadBuffer(buffer);
+            ((AiDotNet.Tensors.LinearAlgebra.VectorBase<float>)key).MaterializeBacking(values);
+        });
+        cacheActivation.Invoke(engine, new object[]
+        {
+            vectorKey, buffer, new[] { 1, 4 }, backend, false, 0
+        });
+
+        Assert.Equal(new[] { 3f, 5f, 7f, 11f }, tensor.ToArray());
+        object arrayKey = tensor.GetBackingArrayForCacheLookupUnsafe()
+            ?? throw new InvalidOperationException("Expected host materialization to create a backing array.");
+        var dictionary = (System.Collections.IDictionary)activationCache;
+        object entry = dictionary[vectorKey]
+            ?? throw new InvalidOperationException("Expected the lazy tensor cache entry to remain vector-keyed.");
+        Assert.False(dictionary.Contains(arrayKey));
+        Assert.False(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(vectorKey));
+        Assert.Equal(1, state.DownloadBufferCalls);
+        Assert.Equal(buffer.SizeInBytes, engine.CurrentActivationCacheBytes);
+
+        try
+        {
+            engine.BindResidentBuffer(tensor, buffer, backend);
+
+            Assert.False(dictionary.Contains(vectorKey));
+            Assert.True(dictionary.Contains(arrayKey));
+            Assert.Same(entry, dictionary[arrayKey]);
+            Assert.False(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(vectorKey));
+            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(arrayKey));
+            Assert.Equal(1, state.DownloadBufferCalls);
+            Assert.Equal(buffer.SizeInBytes, engine.CurrentActivationCacheBytes);
+
+            engine.EvictActivationsCreatedAfter(0L);
+
+            Assert.Equal(2, state.DownloadBufferCalls);
+            Assert.Equal(new[] { 3f, 5f, 7f, 11f }, tensor.ToArray());
+            Assert.False(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(arrayKey));
+            Assert.Equal(0L, engine.CurrentActivationCacheBytes);
+            Assert.Equal(1, buffer.DisposeCount);
+        }
+        finally
+        {
+            AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.Remove(vectorKey);
+            AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.Remove(arrayKey);
+        }
+    }
+
+    [Fact]
+    public void BindResidentBuffer_ReplacesCompetingArrayOwnerWithoutDoubleAccounting()
+    {
+        // Adversarial form of the lazy-to-materialized transition: another path has
+        // already cached a stale value under the new array key. The resident bind must
+        // leave exactly one authoritative owner, detach the stale materializer, and
+        // release only the displaced buffer.
+        using var engine = new DirectGpuTensorEngine();
+        var engineType = typeof(DirectGpuTensorEngine);
+        var activationCacheField = engineType.GetField(
+            "_activationCache", BindingFlags.NonPublic | BindingFlags.Instance)
+            ?? throw new InvalidOperationException("DirectGpuTensorEngine activation cache field was not found.");
+        var cacheActivation = engineType.GetMethod(
+            "CacheActivation", BindingFlags.NonPublic | BindingFlags.Instance,
+            null,
+            new[]
+            {
+                typeof(object), typeof(IGpuBuffer), typeof(int[]), typeof(IDirectGpuBackend),
+                typeof(bool), typeof(int)
+            },
+            null) ?? throw new InvalidOperationException("DirectGpuTensorEngine CacheActivation method was not found.");
+        object activationCache = activationCacheField.GetValue(engine)
+            ?? throw new InvalidOperationException("DirectGpuTensorEngine activation cache was null.");
+        var dictionary = (System.Collections.IDictionary)activationCache;
+
+        var state = new MockBackendState();
+        var backend = MockDirectGpuBackend.Create(state);
+        var residentBuffer = new MockGpuBuffer(new[] { 2f, 3f, 5f, 7f });
+        var displacedBuffer = new MockGpuBuffer(new[] { 11f, 13f, 17f, 19f });
+        var tensor = AiDotNet.Tensors.LinearAlgebra.Tensor<float>.CreateGpuResident(
+            new[] { 1, 4 }, TensorDevice.OpenCL);
+        object vectorKey = tensor.DataVector;
+
+        AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.Register(vectorKey, key =>
+        {
+            var values = backend.DownloadBuffer(residentBuffer);
+            ((AiDotNet.Tensors.LinearAlgebra.VectorBase<float>)key).MaterializeBacking(values);
+        });
+        cacheActivation.Invoke(engine, new object[]
+        {
+            vectorKey, residentBuffer, new[] { 1, 4 }, backend, false, 0
+        });
+        Assert.Equal(new[] { 2f, 3f, 5f, 7f }, tensor.ToArray());
+        object arrayKey = tensor.GetBackingArrayForCacheLookupUnsafe()
+            ?? throw new InvalidOperationException("Expected host materialization to create a backing array.");
+        object residentEntry = dictionary[vectorKey]
+            ?? throw new InvalidOperationException("Expected the resident vector-keyed cache entry.");
+
+        cacheActivation.Invoke(engine, new object[]
+        {
+            arrayKey, displacedBuffer, new[] { 1, 4 }, backend, false, 0
+        });
+        bool staleMaterializerRan = false;
+        AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.Register(
+            arrayKey, _ => staleMaterializerRan = true);
+
+        try
+        {
+            Assert.Equal(residentBuffer.SizeInBytes + displacedBuffer.SizeInBytes,
+                engine.CurrentActivationCacheBytes);
+
+            engine.BindResidentBuffer(tensor, residentBuffer, backend);
+
+            Assert.False(staleMaterializerRan);
+            Assert.False(dictionary.Contains(vectorKey));
+            Assert.Single(dictionary.Keys.Cast<object>());
+            Assert.Same(residentEntry, dictionary[arrayKey]);
+            Assert.Equal(residentBuffer.SizeInBytes, engine.CurrentActivationCacheBytes);
+            Assert.Equal(1, displacedBuffer.DisposeCount);
+            Assert.Equal(0, residentBuffer.DisposeCount);
+            Assert.Equal(1, state.DownloadBufferCalls);
+
+            engine.EvictActivationsCreatedAfter(0L);
+
+            Assert.Equal(2, state.DownloadBufferCalls);
+            Assert.Equal(new[] { 2f, 3f, 5f, 7f }, tensor.ToArray());
+            Assert.Equal(1, residentBuffer.DisposeCount);
+            Assert.Equal(0L, engine.CurrentActivationCacheBytes);
+        }
+        finally
+        {
+            AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.Remove(vectorKey);
+            AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.Remove(arrayKey);
+        }
+    }
+
+    [Fact]
     public void EvictActivationsCreatedAfter_DiscardsPendingDownloadsWhenRequested()
     {
         using var engine = new DirectGpuTensorEngine();
