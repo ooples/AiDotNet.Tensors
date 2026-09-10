@@ -4356,6 +4356,44 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         t._gpuBuffer = buf; t._gpuBackend = backend; t._gpuBufferVersion = t.Version;
         var arr = t.GetBackingArrayForCacheLookupUnsafe();
         if (arr is null) return;
+
+        // A zero-allocation GPU result starts life with its activation-cache entry and deferred
+        // materializer keyed by DataVector. Its first host access creates a backing array, but the
+        // cache entry deliberately survives so later GPU work can reuse the resident buffer. If an
+        // in-place/resident operation subsequently binds that same tensor, host reads are now keyed
+        // by the backing array. Leaving the cache owner on DataVector while registering the new
+        // materializer on the array lets deterministic tape eviction free the vector-owned buffer
+        // without seeing the array's pending download (OpenCL CL_INVALID_MEM_OBJECT / -38).
+        //
+        // Transfer the existing cache entry to the tensor's authoritative host key. This is a pure
+        // dictionary re-key: it preserves the buffer, timestamp, byte accounting, and GPU residency,
+        // and adds no device synchronization or host transfer to the hot path.
+        var displacedEntry = RekeyActivationCacheForResidentBinding(
+            t, arr, buf, backend, out var previousVectorKey);
+
+        // Bind is an authoritative overwrite of this tensor's resident value. Supersede either
+        // historical key rather than relying on Register's intentional first-write-wins behavior;
+        // otherwise an older callback can remain attached to a buffer that no longer owns the value.
+        if (previousVectorKey is not null)
+            Helpers.DeferredArrayMaterializer.Remove(previousVectorKey);
+        Helpers.DeferredArrayMaterializer.Remove(arr);
+        if (displacedEntry is not null)
+        {
+            // The replaced array entry represented the tensor's previous resident value.
+            // Release it only after its obsolete materializer has been detached. CUDA can
+            // preserve stream ordering; other backends synchronize only on this exceptional
+            // duplicate-owner repair path, never on the normal bind path.
+            if (displacedEntry.Backend is Engines.DirectGpu.CUDA.CudaBackend cudaBackend)
+            {
+                cudaBackend.FreeBufferDeferred(displacedEntry.Buffer);
+            }
+            else
+            {
+                try { displacedEntry.Backend.Synchronize(); }
+                catch { /* best-effort: disposal must still release the stale cache owner */ }
+                displacedEntry.Dispose();
+            }
+        }
         // #3 FP16-act: this array now holds FP32 — drop any stale FP16 tag (a pooled array reused FP16→FP32).
         if (Fp16ActEnabled) _fp16ResidentArrays.TryRemove(arr, out _);
         if (s_currentForwardOp is not null) if (s_producerDiagEnabled && s_producerOf.Count < ProducerDiagCap) s_producerOf[arr] = s_currentForwardOp;
@@ -4366,6 +4404,84 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var conv = DirectGpuEngine.FromFloatArray<T>(f);
             System.Array.Copy(conv, (T[])a, System.Math.Min(conv.Length, ((T[])a).Length));
         });
+    }
+
+    private ActivationCacheEntry? RekeyActivationCacheForResidentBinding<T>(
+        Tensor<T> tensor,
+        object arrayKey,
+        IGpuBuffer buffer,
+        IDirectGpuBackend backend,
+        out object? previousVectorKey)
+    {
+        previousVectorKey = null;
+
+        // The normal array-backed path was cached correctly at creation time. Keep that common
+        // route to one lock-free dictionary read, without even touching DataVector or its guard.
+        if (_activationCache.TryGetValue(arrayKey, out var arrayEntry)
+            && ReferenceEquals(arrayEntry.Buffer, buffer)
+            && ReferenceEquals(arrayEntry.Backend, backend))
+            return null;
+
+        // Only a tensor that acquired its host array after a zero-allocation GPU result can need
+        // migration. Resolve the old identity after the common path has returned.
+        object vectorKey = tensor.DataVector;
+
+        lock (_activationCacheLock)
+        {
+            if (_activationCache.TryGetValue(arrayKey, out arrayEntry)
+                && ReferenceEquals(arrayEntry.Buffer, buffer)
+                && ReferenceEquals(arrayEntry.Backend, backend))
+                return null;
+
+            if (!_activationCache.TryGetValue(vectorKey, out var vectorEntry)
+                || !ReferenceEquals(vectorEntry.Buffer, buffer)
+                || !ReferenceEquals(vectorEntry.Backend, backend))
+                return null;
+
+            // A second entry can have been cached under the newly materialized array between the
+            // vector-keyed result's host read and this bind. The bind makes `buffer` authoritative,
+            // so atomically replace that stale array owner while moving the original entry. This
+            // restores one cache owner for one tensor and preserves the original entry's timestamp.
+            ActivationCacheEntry? displaced = null;
+            if (_activationCache.TryGetValue(arrayKey, out arrayEntry))
+            {
+                if (!_activationCache.TryRemove(arrayKey, out displaced))
+                    return null;
+            }
+
+            if (!_activationCache.TryRemove(vectorKey, out var owner))
+            {
+                if (displaced is not null)
+                    _activationCache.TryAdd(arrayKey, displaced);
+                return null;
+            }
+
+            if (!_activationCache.TryAdd(arrayKey, owner))
+            {
+                // Concurrent mutation is not expected while the engine lock is held, but restore
+                // both original owners if it occurs so accounting and lifetime remain conservative.
+                _activationCache.TryAdd(vectorKey, owner);
+                if (displaced is not null)
+                    _activationCache.TryAdd(arrayKey, displaced);
+                return null;
+            }
+
+            previousVectorKey = vectorKey;
+
+            if (displaced is not null)
+            {
+                System.Threading.Interlocked.Add(
+                    ref _currentActivationCacheBytes, -displaced.Buffer.SizeInBytes);
+                System.Threading.Interlocked.Add(
+                    ref _currentActivationManagedBytes, -displaced.ManagedBytes);
+            }
+
+            // If corrupt duplicate ownership pointed both entries at the same buffer, the surviving
+            // vector entry (now array-keyed) remains its owner; never dispose that shared handle.
+            return displaced is not null && !ReferenceEquals(displaced.Buffer, buffer)
+                ? displaced
+                : null;
+        }
     }
 
     /// <summary>
