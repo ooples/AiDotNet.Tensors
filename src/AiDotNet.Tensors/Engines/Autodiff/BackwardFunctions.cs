@@ -270,6 +270,72 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
+    /// <summary>d(asin(x))/dx = grad / sqrt(1 - x^2)</summary>
+    internal static void AsinBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var grad = engine.TensorMultiply(gradOutput, InverseSqrtOneMinusSquare(inputs[0], engine));
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+    }
+
+    /// <summary>d(acos(x))/dx = -grad / sqrt(1 - x^2)</summary>
+    internal static void AcosBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var slope = engine.TensorNegate(InverseSqrtOneMinusSquare(inputs[0], engine));
+        var grad = engine.TensorMultiply(gradOutput, slope);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+    }
+
+    /// <summary>d(atan(x))/dx = grad / (1 + x^2)</summary>
+    internal static void AtanBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var x = inputs[0];
+        var denominator = engine.TensorAddScalar(engine.TensorMultiply(x, x), numOps.One);
+        var grad = engine.TensorDivide(gradOutput, denominator);
+        DifferentiableOps.AccumulateGrad(grads, x, grad, engine);
+    }
+
+    /// <summary>
+    /// d(atan2(y, x))/dy = grad * x / (x^2 + y^2), d/dx = -grad * y / (x^2 + y^2).
+    /// </summary>
+    /// <remarks>
+    /// The four-quadrant form differs from atan(y/x) in its value but not in its derivative, which
+    /// is what makes it usable in a loss: the branch cut moves, the slope does not.
+    /// </remarks>
+    internal static void Atan2Backward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var y = inputs[0];
+        var x = inputs[1];
+
+        var denominator = engine.TensorAdd(engine.TensorMultiply(x, x), engine.TensorMultiply(y, y));
+
+        var gradY = engine.TensorDivide(engine.TensorMultiply(gradOutput, x), denominator);
+        DifferentiableOps.AccumulateGrad(grads, y, gradY, engine);
+
+        var gradX = engine.TensorNegate(engine.TensorDivide(engine.TensorMultiply(gradOutput, y), denominator));
+        DifferentiableOps.AccumulateGrad(grads, x, gradX, engine);
+    }
+
+    /// <summary>
+    /// 1 / sqrt(1 - x^2), the slope shared by arcsine and arccosine up to a sign.
+    /// </summary>
+    private static Tensor<T> InverseSqrtOneMinusSquare(Tensor<T> x, IEngine engine)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        // 1 - x^2 as one-plus-negative-square: the engine has no subtract-from-scalar.
+        var oneMinusSquare = engine.TensorAddScalar(engine.TensorNegate(engine.TensorMultiply(x, x)), numOps.One);
+
+        return engine.TensorReciprocal(engine.TensorSqrt(oneMinusSquare));
+    }
+
     /// <summary>d(clamp(x, min, max))/dx = grad where min &lt; x &lt; max, else 0</summary>
     internal static void ClampBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
