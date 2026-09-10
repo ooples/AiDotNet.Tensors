@@ -417,6 +417,19 @@ public abstract class VectorBase<T>
     /// </summary>
     internal bool TryGetBackingArraySegmentForReadOnlyAccess(out T[]? array, out int offset)
     {
+        // Memory<T>.Empty is backed by the process-wide Array.Empty<T>() singleton. A
+        // zero-allocation GPU vector therefore has an implementation array, but it does
+        // not yet have a host backing store. Exposing that singleton as cache identity
+        // aliases every lazy tensor of the same element type to one key and sends engine
+        // code down the array-backed path before materialization. Preserve the semantic
+        // contract: no host allocation means no backing-array identity.
+        if (IsLazyAllocated)
+        {
+            array = null;
+            offset = 0;
+            return false;
+        }
+
         if (_cachedArray is not null)
         {
             array = _cachedArray;
