@@ -18,7 +18,6 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP.Kernels
         ];
 
         public static string GetSource() => @"
-#include <math.h>
 
 extern ""C"" __global__ __launch_bounds__(256) void audio_amplitude_to_db(
     const float* __restrict__ input, float* __restrict__ output,

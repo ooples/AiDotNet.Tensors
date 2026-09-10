@@ -25,7 +25,6 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP.Kernels
         };
 
         public static string GetSource() => @"
-#include <math.h>
 
 // ----------------------------------------------------------------------------
 // Shared device helpers.

@@ -459,7 +459,10 @@ internal static partial class SimdGemm
 
         return new PrePackedB
         {
-            K = k, N = n, Kc = Kc, Mc = Mc,
+            K = k,
+            N = n,
+            Kc = Kc,
+            Mc = Mc,
             NumColSubBlocks = numColSubBlocks,
             ColSubSize = colSubSize,
             PackedSubs = packedSubs,
@@ -531,7 +534,7 @@ internal static partial class SimdGemm
         {
             c.Clear();
             SgemmAddInternal(a, k, false, b.AsSpan(), n, false, c, m, k, n,
-                allowParallel: true, clearedOutput: true);
+                allowParallel: UseParallelGemm, clearedOutput: true);
             return;
         }
 
@@ -558,7 +561,7 @@ internal static partial class SimdGemm
             // for SgemmWithCachedB, so zero c before passing clearedOutput:true.
             c.Clear();
             SgemmAddInternal(a, k, false, b.AsSpan(), n, false, c, m, k, n,
-                allowParallel: true, clearedOutput: true);
+                allowParallel: UseParallelGemm, clearedOutput: true);
             return;
         }
 
@@ -788,7 +791,10 @@ internal static partial class SimdGemm
 
         return new Int8PrePackedB
         {
-            K = k, N = n, Kc = Kc, Mc = Mc,
+            K = k,
+            N = n,
+            Kc = Kc,
+            Mc = Mc,
             NumColSubBlocks = numColSubBlocks,
             ColSubSize = colSubSize,
             PackedSubs = packedSubs,
@@ -832,7 +838,7 @@ internal static partial class SimdGemm
         if (n > Nc || Avx512Sgemm.CanUse)
         {
             SgemmAddInternal(a, k, false, b.AsSpan(), n, false, c, m, k, n,
-                allowParallel: true, clearedOutput: true);
+                allowParallel: UseParallelGemm, clearedOutput: true);
             return;
         }
 
@@ -897,23 +903,30 @@ internal static partial class SimdGemm
             && maxThreads > 1
             && numRowBlocks >= 1
             && (long)m * k * n >= ParallelWorkThreshold;
+        bool useParallel2D = canParallelize && cached.NumColSubBlocks >= 2;
 
         int mcRounded = ((Mc + Mr - 1) / Mr) * Mr;
         int packedASizePerRow = mcRounded * Kc;
         int packedBSizePerSub = cached.PackedSubs.Length > 0 ? cached.PackedSubs[0].Length : 0;
 
-        var packedABufs = canParallelize ? new float[numRowBlocks][] : null;
-        if (canParallelize)
+        var packedABufs = useParallel2D ? new float[numRowBlocks][] : Array.Empty<float[]>();
+        if (useParallel2D)
             for (int r = 0; r < numRowBlocks; r++)
-                packedABufs![r] = System.Buffers.ArrayPool<float>.Shared.Rent(packedASizePerRow);
-        var packedABuf = canParallelize ? null : System.Buffers.ArrayPool<float>.Shared.Rent(packedASizePerRow);
+                packedABufs[r] = System.Buffers.ArrayPool<float>.Shared.Rent(packedASizePerRow);
+        float[] packedABuf = useParallel2D
+            ? Array.Empty<float>()
+            : System.Buffers.ArrayPool<float>.Shared.Rent(packedASizePerRow);
 
         // One dequant scratch per col-sub for parallel mode; one for sequential.
-        var dequantBufs = canParallelize ? new float[cached.NumColSubBlocks][] : null;
-        if (canParallelize)
+        var dequantBufs = useParallel2D
+            ? new float[cached.NumColSubBlocks][]
+            : Array.Empty<float[]>();
+        if (useParallel2D)
             for (int cs = 0; cs < cached.NumColSubBlocks; cs++)
-                dequantBufs![cs] = System.Buffers.ArrayPool<float>.Shared.Rent(packedBSizePerSub);
-        var dequantBuf = canParallelize ? null : System.Buffers.ArrayPool<float>.Shared.Rent(packedBSizePerSub);
+                dequantBufs[cs] = System.Buffers.ArrayPool<float>.Shared.Rent(packedBSizePerSub);
+        float[] dequantBuf = useParallel2D
+            ? Array.Empty<float>()
+            : System.Buffers.ArrayPool<float>.Shared.Rent(packedBSizePerSub);
 
         try
         {
@@ -927,7 +940,7 @@ internal static partial class SimdGemm
                 int kc = System.Math.Min(Kc, k - pc);
                 int subsBase = pcIter * cached.NumColSubBlocks;
 
-                if (canParallelize && cached.NumColSubBlocks >= 2)
+                if (useParallel2D)
                 {
                     int localNumRowBlocks = numRowBlocks;
                     int localMc = Mc;
@@ -939,8 +952,8 @@ internal static partial class SimdGemm
                     int localColSubSize = cached.ColSubSize;
                     int localNumColSubs = cached.NumColSubBlocks;
                     int localNc = nc;
-                    var localPackedABufs = packedABufs!;
-                    var localDequantBufs = dequantBufs!;
+                    var localPackedABufs = packedABufs;
+                    var localDequantBufs = dequantBufs;
                     var localCachedSubs = cached.PackedSubs;
                     int localSubsBase = subsBase;
                     float localScale = cachedScale;
@@ -1003,12 +1016,12 @@ internal static partial class SimdGemm
                 else
                 {
                     // Sequential fallback
-                    PackA(a, packedABuf!, k, false, ic: 0, mc: System.Math.Min(Mc, m), pc, kc);
+                    PackA(a, packedABuf, k, false, ic: 0, mc: System.Math.Min(Mc, m), pc, kc);
                     for (int ic = 0; ic < m; ic += Mc)
                     {
                         int mc = System.Math.Min(Mc, m - ic);
                         if (ic > 0)
-                            PackA(a, packedABuf!, k, false, ic, mc, pc, kc);
+                            PackA(a, packedABuf, k, false, ic, mc, pc, kc);
 
                         for (int cs = 0; cs < cached.NumColSubBlocks; cs++)
                         {
@@ -1017,9 +1030,9 @@ internal static partial class SimdGemm
                             if (subNc > 0)
                             {
                                 Int8Quantizer.DequantizeInt8ToFloat32(
-                                    cached.PackedSubs[subsBase + cs], dequantBuf!, cachedScale);
+                                    cached.PackedSubs[subsBase + cs], dequantBuf, cachedScale);
                                 MacroKernel(
-                                    packedABuf!, dequantBuf!,
+                                    packedABuf, dequantBuf,
                                     c, mc, subNc, kc, n,
                                     ic, jc + jStart);
                             }
@@ -1030,14 +1043,14 @@ internal static partial class SimdGemm
         }
         finally
         {
-            if (packedABuf is not null)
+            if (!useParallel2D)
                 System.Buffers.ArrayPool<float>.Shared.Return(packedABuf);
-            if (dequantBuf is not null)
+            if (!useParallel2D)
                 System.Buffers.ArrayPool<float>.Shared.Return(dequantBuf);
-            if (packedABufs is not null)
+            if (useParallel2D)
                 for (int r = 0; r < numRowBlocks; r++)
                     System.Buffers.ArrayPool<float>.Shared.Return(packedABufs[r]);
-            if (dequantBufs is not null)
+            if (useParallel2D)
                 for (int cs = 0; cs < cached.NumColSubBlocks; cs++)
                     System.Buffers.ArrayPool<float>.Shared.Return(dequantBufs[cs]);
         }
@@ -1066,12 +1079,14 @@ internal static partial class SimdGemm
 
         int mcRounded = ((Mc + Mr - 1) / Mr) * Mr;
         int packedASizePerRow = mcRounded * Kc;
-        float[]? packedABuf = useParallel2D ? null : GetThreadPackedABuffer(packedASizePerRow);
-        var packedABufs = useParallel2D ? new float[numRowBlocks][] : null;
+        float[] packedABuf = useParallel2D
+            ? Array.Empty<float>()
+            : GetThreadPackedABuffer(packedASizePerRow);
+        var packedABufs = useParallel2D ? new float[numRowBlocks][] : Array.Empty<float[]>();
         if (useParallel2D)
         {
             for (int r = 0; r < numRowBlocks; r++)
-                packedABufs![r] = System.Buffers.ArrayPool<float>.Shared.Rent(packedASizePerRow);
+                packedABufs[r] = System.Buffers.ArrayPool<float>.Shared.Rent(packedASizePerRow);
         }
 
         try
@@ -1099,7 +1114,7 @@ internal static partial class SimdGemm
                     int localColSubSize = cached.ColSubSize;
                     int localNumColSubs = cached.NumColSubBlocks;
                     int localNc = nc;
-                    var localPackedABufs = packedABufs!;
+                    var localPackedABufs = packedABufs;
                     var localCachedSubs = cached.PackedSubs;
                     int localSubsBase = subsBase;
 
@@ -1148,7 +1163,7 @@ internal static partial class SimdGemm
                 else
                 {
                     // Sequential fallback
-                    var packedA = packedABuf!;
+                    var packedA = packedABuf;
                     PackA(a, packedA, k, false, ic: 0, mc: System.Math.Min(Mc, m), pc, kc);
                     for (int ic = 0; ic < m; ic += Mc)
                     {
@@ -1172,7 +1187,7 @@ internal static partial class SimdGemm
         }
         finally
         {
-            if (packedABufs is not null)
+            if (useParallel2D)
             {
                 for (int r = 0; r < numRowBlocks; r++)
                     System.Buffers.ArrayPool<float>.Shared.Return(packedABufs[r]);
@@ -1389,6 +1404,34 @@ internal static partial class SimdGemm
     }
 
     /// <summary>
+    /// Runs the managed SGEMM implementation under an explicit per-call execution policy for autotuning.
+    /// </summary>
+    /// <remarks>
+    /// This bypasses the process-wide <see cref="UseParallelGemm"/> switch. It lets startup and background
+    /// tuning compare both policies without changing the behavior of concurrent production GEMM calls.
+    /// </remarks>
+    internal static void SgemmForAutotune(
+        ReadOnlySpan<float> a,
+        ReadOnlySpan<float> b,
+        Span<float> c,
+        int m,
+        int k,
+        int n,
+        SgemmExecutionMode executionMode)
+    {
+        if (!Enum.IsDefined(typeof(SgemmExecutionMode), executionMode))
+            throw new ArgumentOutOfRangeException(nameof(executionMode));
+
+        c.Clear();
+        SgemmAddInternal(
+            a, k, false,
+            b, n, false,
+            c, m, k, n,
+            allowParallel: executionMode == SgemmExecutionMode.Parallel,
+            clearedOutput: true);
+    }
+
+    /// <summary>
     /// Computes C = op(A) * op(B) with optional transpose on either operand.
     /// op(X) = X when transX=false, op(X) = X^T when transX=true.
     /// lda/ldb are the leading dimensions (row strides) of the source storage.
@@ -1465,7 +1508,7 @@ internal static partial class SimdGemm
         }
 
         c.Clear();
-        SgemmAddInternal(a, lda, transA, b, ldb, transB, c, m, k, n, allowParallel: true, clearedOutput: true);
+        SgemmAddInternal(a, lda, transA, b, ldb, transB, c, m, k, n, allowParallel: UseParallelGemm, clearedOutput: true);
     }
 
     // Set to 1 once OpenBLAS is pinned single-thread (we own the parallelism).
@@ -1536,7 +1579,7 @@ internal static partial class SimdGemm
         }
         // clearedC=true allows the small-matmul fast path to use store-only kernels
         // (saves load-add per micro-tile). beta=1 uses load-add-store accumulate.
-        SgemmAddInternal(a, k, false, b, n, false, c, m, k, n, allowParallel: true, clearedOutput: clearedC);
+        SgemmAddInternal(a, k, false, b, n, false, c, m, k, n, allowParallel: UseParallelGemm, clearedOutput: clearedC);
     }
 
     /// <summary>
@@ -1565,7 +1608,7 @@ internal static partial class SimdGemm
         int m, int k, int n)
     {
         // SgemmAdd is C += A·B by definition — do NOT pass clearedOutput=true here.
-        SgemmAddInternal(a, lda, transA, b, ldb, transB, c, m, k, n, allowParallel: true, clearedOutput: false);
+        SgemmAddInternal(a, lda, transA, b, ldb, transB, c, m, k, n, allowParallel: UseParallelGemm, clearedOutput: false);
     }
 
     /// <summary>
@@ -1686,7 +1729,7 @@ internal static partial class SimdGemm
         // otherwise runs single-threaded over a huge N. N-partitioning saturates the cores even at
         // m=1. Gated above ParallelWorkThreshold so small GEMMs stay serial (dispatch would
         // dominate). Race-free: each worker owns a disjoint column range (overwrite or accumulate).
-        if (allowParallel && UseParallelGemm && !transA && !transB
+        if (allowParallel && !transA && !transB
             && m > 0 && m <= NParallelSmallMMaxM && n >= Nr
             && (long)m * k * n >= ParallelWorkThreshold)
         {
@@ -1989,7 +2032,7 @@ internal static partial class SimdGemm
                 int jv = 0;
                 for (; jv < nvecUnroll; jv += 4)
                 {
-                    cRowVec[jv]     += aipVec * bRowVec[jv];
+                    cRowVec[jv] += aipVec * bRowVec[jv];
                     cRowVec[jv + 1] += aipVec * bRowVec[jv + 1];
                     cRowVec[jv + 2] += aipVec * bRowVec[jv + 2];
                     cRowVec[jv + 3] += aipVec * bRowVec[jv + 3];
@@ -3062,8 +3105,8 @@ internal static partial class SimdGemm
             pB += ldb;
         }
 
-        if (mcActual > 0) StoreNarrowRow(pC,           mask0, mask1, c00, c01, hasTail, clearedOutput);
-        if (mcActual > 1) StoreNarrowRow(pC + ldc,     mask0, mask1, c10, c11, hasTail, clearedOutput);
+        if (mcActual > 0) StoreNarrowRow(pC, mask0, mask1, c00, c01, hasTail, clearedOutput);
+        if (mcActual > 1) StoreNarrowRow(pC + ldc, mask0, mask1, c10, c11, hasTail, clearedOutput);
         if (mcActual > 2) StoreNarrowRow(pC + ldc * 2, mask0, mask1, c20, c21, hasTail, clearedOutput);
         if (mcActual > 3) StoreNarrowRow(pC + ldc * 3, mask0, mask1, c30, c31, hasTail, clearedOutput);
         if (mcActual > 4) StoreNarrowRow(pC + ldc * 4, mask0, mask1, c40, c41, hasTail, clearedOutput);
@@ -3288,12 +3331,12 @@ internal static partial class SimdGemm
 
 
         // Masked accumulate-and-store, row by row, skipping rows past mcActual.
-        if (mcActual > 0) StoreMaskedAccumRowDirect(pC,            mask0, mask1, c00, c01);
-        if (mcActual > 1) StoreMaskedAccumRowDirect(pC + ldc,      mask0, mask1, c10, c11);
-        if (mcActual > 2) StoreMaskedAccumRowDirect(pC + ldc * 2,  mask0, mask1, c20, c21);
-        if (mcActual > 3) StoreMaskedAccumRowDirect(pC + ldc * 3,  mask0, mask1, c30, c31);
-        if (mcActual > 4) StoreMaskedAccumRowDirect(pC + ldc * 4,  mask0, mask1, c40, c41);
-        if (mcActual > 5) StoreMaskedAccumRowDirect(pC + ldc * 5,  mask0, mask1, c50, c51);
+        if (mcActual > 0) StoreMaskedAccumRowDirect(pC, mask0, mask1, c00, c01);
+        if (mcActual > 1) StoreMaskedAccumRowDirect(pC + ldc, mask0, mask1, c10, c11);
+        if (mcActual > 2) StoreMaskedAccumRowDirect(pC + ldc * 2, mask0, mask1, c20, c21);
+        if (mcActual > 3) StoreMaskedAccumRowDirect(pC + ldc * 3, mask0, mask1, c30, c31);
+        if (mcActual > 4) StoreMaskedAccumRowDirect(pC + ldc * 4, mask0, mask1, c40, c41);
+        if (mcActual > 5) StoreMaskedAccumRowDirect(pC + ldc * 5, mask0, mask1, c50, c51);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -3472,12 +3515,12 @@ internal static partial class SimdGemm
 
 
         // Store-only: plain MaskStore (no MaskLoad-add).
-        if (mcActual > 0) StoreMaskedRowDirect(pC,            mask0, mask1, c00, c01);
-        if (mcActual > 1) StoreMaskedRowDirect(pC + ldc,      mask0, mask1, c10, c11);
-        if (mcActual > 2) StoreMaskedRowDirect(pC + ldc * 2,  mask0, mask1, c20, c21);
-        if (mcActual > 3) StoreMaskedRowDirect(pC + ldc * 3,  mask0, mask1, c30, c31);
-        if (mcActual > 4) StoreMaskedRowDirect(pC + ldc * 4,  mask0, mask1, c40, c41);
-        if (mcActual > 5) StoreMaskedRowDirect(pC + ldc * 5,  mask0, mask1, c50, c51);
+        if (mcActual > 0) StoreMaskedRowDirect(pC, mask0, mask1, c00, c01);
+        if (mcActual > 1) StoreMaskedRowDirect(pC + ldc, mask0, mask1, c10, c11);
+        if (mcActual > 2) StoreMaskedRowDirect(pC + ldc * 2, mask0, mask1, c20, c21);
+        if (mcActual > 3) StoreMaskedRowDirect(pC + ldc * 3, mask0, mask1, c30, c31);
+        if (mcActual > 4) StoreMaskedRowDirect(pC + ldc * 4, mask0, mask1, c40, c41);
+        if (mcActual > 5) StoreMaskedRowDirect(pC + ldc * 5, mask0, mask1, c50, c51);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -3589,7 +3632,6 @@ internal static partial class SimdGemm
         int Mc = ChooseAdaptiveMc(m, k, n);
         int numRowBlocks = (m + Mc - 1) / Mc;
         bool canParallelize = allowParallel
-            && UseParallelGemm
             && maxThreads > 1
             && numRowBlocks >= 1
             && !transA && !transB  // Parallel path uses the no-transpose Pack overloads
@@ -4060,8 +4102,8 @@ internal static partial class SimdGemm
                     int p = 0;
                     for (; p + 4 <= kc; p += 4)
                     {
-                        pp[0]  = row0[0]; pp[1]  = row1[0]; pp[2]  = row2[0]; pp[3]  = row3[0]; pp[4]  = row4[0]; pp[5]  = row5[0];
-                        pp[6]  = row0[1]; pp[7]  = row1[1]; pp[8]  = row2[1]; pp[9]  = row3[1]; pp[10] = row4[1]; pp[11] = row5[1];
+                        pp[0] = row0[0]; pp[1] = row1[0]; pp[2] = row2[0]; pp[3] = row3[0]; pp[4] = row4[0]; pp[5] = row5[0];
+                        pp[6] = row0[1]; pp[7] = row1[1]; pp[8] = row2[1]; pp[9] = row3[1]; pp[10] = row4[1]; pp[11] = row5[1];
                         pp[12] = row0[2]; pp[13] = row1[2]; pp[14] = row2[2]; pp[15] = row3[2]; pp[16] = row4[2]; pp[17] = row5[2];
                         pp[18] = row0[3]; pp[19] = row1[3]; pp[20] = row2[3]; pp[21] = row3[3]; pp[22] = row4[3]; pp[23] = row5[3];
                         pp += 24;
@@ -4604,12 +4646,12 @@ internal static partial class SimdGemm
         fixed (float* pC = c)
         {
             float* row = pC + cRow * ldc + cCol;
-            if (mc_actual > 0) StoreMaskedAccumRow(row,             mask0, mask1, c00, c01);
-            if (mc_actual > 1) StoreMaskedAccumRow(row + ldc,       mask0, mask1, c10, c11);
-            if (mc_actual > 2) StoreMaskedAccumRow(row + ldc * 2,   mask0, mask1, c20, c21);
-            if (mc_actual > 3) StoreMaskedAccumRow(row + ldc * 3,   mask0, mask1, c30, c31);
-            if (mc_actual > 4) StoreMaskedAccumRow(row + ldc * 4,   mask0, mask1, c40, c41);
-            if (mc_actual > 5) StoreMaskedAccumRow(row + ldc * 5,   mask0, mask1, c50, c51);
+            if (mc_actual > 0) StoreMaskedAccumRow(row, mask0, mask1, c00, c01);
+            if (mc_actual > 1) StoreMaskedAccumRow(row + ldc, mask0, mask1, c10, c11);
+            if (mc_actual > 2) StoreMaskedAccumRow(row + ldc * 2, mask0, mask1, c20, c21);
+            if (mc_actual > 3) StoreMaskedAccumRow(row + ldc * 3, mask0, mask1, c30, c31);
+            if (mc_actual > 4) StoreMaskedAccumRow(row + ldc * 4, mask0, mask1, c40, c41);
+            if (mc_actual > 5) StoreMaskedAccumRow(row + ldc * 5, mask0, mask1, c50, c51);
         }
     }
 

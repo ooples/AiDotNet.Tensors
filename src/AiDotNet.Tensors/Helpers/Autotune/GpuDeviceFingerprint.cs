@@ -24,8 +24,11 @@ namespace AiDotNet.Tensors.Helpers.Autotune;
 /// </summary>
 public readonly struct GpuDeviceFingerprint : IEquatable<GpuDeviceFingerprint>
 {
+    /// <summary>Typed vendor family for dispatch and compatibility decisions.</summary>
+    public GpuVendorKind VendorKind { get; }
+
     /// <summary>Normalized vendor: <c>nvidia</c>, <c>amd</c>, <c>intel</c>, <c>apple</c>, or <c>other</c>.</summary>
-    public string Vendor { get; }
+    public string Vendor => VendorToken(VendorKind);
 
     /// <summary>Raw device model name as reported by the driver (e.g. "NVIDIA GeForce RTX 3080").</summary>
     public string Model { get; }
@@ -45,10 +48,23 @@ public readonly struct GpuDeviceFingerprint : IEquatable<GpuDeviceFingerprint>
     public GpuDeviceFingerprint(
         string vendor, string model, int architectureMajor, int architectureMinor,
         int driverVersion, string uniqueId)
+        : this(ParseVendor(vendor), model, architectureMajor, architectureMinor, driverVersion, uniqueId)
     {
+    }
+
+    /// <summary>Creates a typed GPU fingerprint.</summary>
+    public GpuDeviceFingerprint(
+        GpuVendorKind vendor, string model, int architectureMajor, int architectureMinor,
+        int driverVersion, string uniqueId)
+    {
+        if (!Enum.IsDefined(typeof(GpuVendorKind), vendor))
+            throw new ArgumentOutOfRangeException(nameof(vendor));
+        if (architectureMajor < 0) throw new ArgumentOutOfRangeException(nameof(architectureMajor));
+        if (architectureMinor < 0) throw new ArgumentOutOfRangeException(nameof(architectureMinor));
+        if (driverVersion < 0) throw new ArgumentOutOfRangeException(nameof(driverVersion));
         if (string.IsNullOrWhiteSpace(uniqueId))
             throw new ArgumentException("A per-card unique id is required.", nameof(uniqueId));
-        Vendor = string.IsNullOrWhiteSpace(vendor) ? "other" : vendor;
+        VendorKind = vendor;
         Model = model ?? string.Empty;
         ArchitectureMajor = architectureMajor;
         ArchitectureMinor = architectureMinor;
@@ -118,25 +134,47 @@ public readonly struct GpuDeviceFingerprint : IEquatable<GpuDeviceFingerprint>
             return false;
         if (string.IsNullOrWhiteSpace(uuid)) return false;
 
-        fingerprint = new GpuDeviceFingerprint("other", string.Empty, major, minor, driver, uuid);
+        fingerprint = new GpuDeviceFingerprint(GpuVendorKind.Other, string.Empty, major, minor, driver, uuid);
         return true;
     }
 
-    private static string DetectVendor(string model)
+    private static GpuVendorKind DetectVendor(string model)
     {
-        if (string.IsNullOrWhiteSpace(model)) return "other";
+        if (string.IsNullOrWhiteSpace(model)) return GpuVendorKind.Other;
         string m = model.ToUpperInvariant();
         if (Contains(m, "NVIDIA") || Contains(m, "GEFORCE") || Contains(m, "TESLA") ||
             Contains(m, "QUADRO") || Contains(m, "RTX") || Contains(m, "GTX") || Contains(m, "TITAN"))
-            return "nvidia";
+            return GpuVendorKind.Nvidia;
         if (Contains(m, "AMD") || Contains(m, "RADEON") || Contains(m, "INSTINCT") || Contains(m, "FIREPRO"))
-            return "amd";
+            return GpuVendorKind.Amd;
         if (Contains(m, "INTEL") || Contains(m, "ARC ") || Contains(m, "IRIS") || Contains(m, "UHD GRAPHICS"))
-            return "intel";
+            return GpuVendorKind.Intel;
         if (Contains(m, "APPLE") || Contains(m, "M1") || Contains(m, "M2") || Contains(m, "M3"))
-            return "apple";
-        return "other";
+            return GpuVendorKind.Apple;
+        return GpuVendorKind.Other;
     }
+
+    private static GpuVendorKind ParseVendor(string vendor)
+    {
+        if (string.IsNullOrWhiteSpace(vendor)) return GpuVendorKind.Other;
+        return vendor.Trim().ToUpperInvariant() switch
+        {
+            "NVIDIA" => GpuVendorKind.Nvidia,
+            "AMD" => GpuVendorKind.Amd,
+            "INTEL" => GpuVendorKind.Intel,
+            "APPLE" => GpuVendorKind.Apple,
+            _ => GpuVendorKind.Other
+        };
+    }
+
+    private static string VendorToken(GpuVendorKind vendor) => vendor switch
+    {
+        GpuVendorKind.Nvidia => "nvidia",
+        GpuVendorKind.Amd => "amd",
+        GpuVendorKind.Intel => "intel",
+        GpuVendorKind.Apple => "apple",
+        _ => "other"
+    };
 
     private static bool Contains(string haystack, string needle) =>
         haystack.IndexOf(needle, StringComparison.Ordinal) >= 0;
@@ -170,7 +208,7 @@ public readonly struct GpuDeviceFingerprint : IEquatable<GpuDeviceFingerprint>
         ArchitectureMajor == other.ArchitectureMajor &&
         ArchitectureMinor == other.ArchitectureMinor &&
         DriverVersion == other.DriverVersion &&
-        string.Equals(Vendor, other.Vendor, StringComparison.Ordinal) &&
+        VendorKind == other.VendorKind &&
         string.Equals(Model, other.Model, StringComparison.Ordinal);
 
     public override bool Equals(object? obj) => obj is GpuDeviceFingerprint other && Equals(other);
@@ -180,10 +218,12 @@ public readonly struct GpuDeviceFingerprint : IEquatable<GpuDeviceFingerprint>
         unchecked
         {
             int hash = 17;
-            hash = hash * 31 + (UniqueId?.GetHashCode() ?? 0);
+            hash = hash * 31 + StringComparer.Ordinal.GetHashCode(UniqueId ?? string.Empty);
             hash = hash * 31 + ArchitectureMajor;
             hash = hash * 31 + ArchitectureMinor;
             hash = hash * 31 + DriverVersion;
+            hash = hash * 31 + (int)VendorKind;
+            hash = hash * 31 + StringComparer.Ordinal.GetHashCode(Model ?? string.Empty);
             return hash;
         }
     }

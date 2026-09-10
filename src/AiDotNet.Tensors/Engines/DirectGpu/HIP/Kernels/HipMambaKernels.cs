@@ -13,7 +13,6 @@ internal static class HipMambaKernels
     {
         return @"
 #include <hip/hip_runtime.h>
-#include <math.h>
 
 #define MAMBA_MAX_STATEDIM 256
 #define MESA_MAX_HEADDIM 32

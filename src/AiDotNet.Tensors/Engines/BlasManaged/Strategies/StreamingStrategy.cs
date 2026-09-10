@@ -56,7 +56,8 @@ internal static class StreamingStrategy
         // BlasOptions.Mode. Any source asking for Deterministic wins (OR semantics).
         bool isDeterministic = BlasProvider.IsDeterministicMode || options.Mode == BlasMode.Deterministic;
 
-        var axis = SelectParallelismAxis(m, n, k, procs, isDeterministic);
+        var axis = AxisSelector.Select(
+            m, n, k, StreamingMr, StreamingSchedulingNr, procs, isDeterministic, options.ParallelismAxis);
 
         // K-axis (Fast mode only): tall-K shape where M and N are too small for
         // M-axis or N-axis splits. AxisSelector already gates K-axis on
@@ -137,7 +138,7 @@ internal static class StreamingStrategy
                 int ldaLocal = lda, ldbLocal = ldb, ldcLocal = ldc;
                 bool taLocal = transA, tbLocal = transB;
 
-                PersistentParallelExecutor.Instance.Execute(procsLocal, p =>
+                PersistentParallelExecutor.Instance.Execute(procsLocal, procsLocal, p =>
                 {
                     int mStart = (int)(((long)p * mLocal) / procsLocal);
                     int mEnd = (int)(((long)(p + 1) * mLocal) / procsLocal);
@@ -199,7 +200,7 @@ internal static class StreamingStrategy
                     bool taLocal = transA, tbLocal = transB;
                     int procsLocal = procs;
 
-                    PersistentParallelExecutor.Instance.Execute(procsLocal, p =>
+                    PersistentParallelExecutor.Instance.Execute(procsLocal, procsLocal, p =>
                     {
                         var (kStart, kLen) = KAxisDriver.GetThreadRange(k, procsLocal, p);
                         if (kLen <= 0) return;
@@ -245,7 +246,7 @@ internal static class StreamingStrategy
                     bool taLocal = transA, tbLocal = transB;
                     int procsLocal = procs;
 
-                    PersistentParallelExecutor.Instance.Execute(procsLocal, p =>
+                    PersistentParallelExecutor.Instance.Execute(procsLocal, procsLocal, p =>
                     {
                         var (kStart, kLen) = KAxisDriver.GetThreadRange(k, procsLocal, p);
                         if (kLen <= 0) return;
@@ -313,7 +314,7 @@ internal static class StreamingStrategy
                 int ldaLocal = lda, ldbLocal = ldb, ldcLocal = ldc;
                 bool taLocal = transA, tbLocal = transB;
 
-                PersistentParallelExecutor.Instance.Execute(procsLocal, p =>
+                PersistentParallelExecutor.Instance.Execute(procsLocal, procsLocal, p =>
                 {
                     var (nStart, nEnd) = GetNPartitionRange(
                         nLocal, procsLocal, p, columnTileWidth);

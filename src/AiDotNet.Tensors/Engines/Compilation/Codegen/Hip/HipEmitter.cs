@@ -55,7 +55,6 @@ public sealed class HipEmitter : IKernelEmitter
 
         var sb = new StringBuilder();
         sb.AppendLine("#include <hip/hip_runtime.h>");
-        sb.AppendLine("#include <math.h>");
         sb.AppendLine();
         sb.Append($"extern \"C\" __global__ void {entryPoint}(");
         for (int i = 0; i < inputCount; i++) sb.Append($"const {scalar}* __restrict__ in_{i}, ");

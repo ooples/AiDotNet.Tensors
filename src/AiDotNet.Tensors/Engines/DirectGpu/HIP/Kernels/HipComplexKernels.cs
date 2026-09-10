@@ -23,7 +23,6 @@ internal static class HipComplexKernels
     {
         return @"
 #include <hip/hip_runtime.h>
-#include <math.h>
 
 #define PI 3.14159265358979323846f
 

@@ -8,8 +8,6 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
         public static string GetSource()
         {
             return @"
-#include <math.h>
-
 // Capsule prediction transform for DigitCapsuleLayer
 // Computes: pred[b,i,c,d] = sum_k(input[b,i,k] * weights[i,c,k,d])
 // Input: [batchSize, inputCapsules, inputDim]

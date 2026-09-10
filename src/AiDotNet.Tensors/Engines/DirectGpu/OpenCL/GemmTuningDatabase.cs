@@ -458,6 +458,7 @@ internal sealed class GemmTuningDatabase : IDisposable
                 sb.Append(FormattableString.Invariant($"\"VectorWidthN\": {config.VectorWidthN}, "));
                 sb.Append(FormattableString.Invariant($"\"UseDoubleBuffering\": {config.UseDoubleBuffering.ToString().ToLower()}, "));
                 sb.Append(FormattableString.Invariant($"\"UseVectorizedLoads\": {config.UseVectorizedLoads.ToString().ToLower()}, "));
+                sb.Append(FormattableString.Invariant($"\"KernelTemplate\": {(int)config.KernelTemplate}, "));
                 // CLBlast-style parameters
                 sb.Append(FormattableString.Invariant($"\"KReg\": {config.KReg}, "));
                 sb.Append(FormattableString.Invariant($"\"KUnroll\": {config.KUnroll}, "));
@@ -552,6 +553,7 @@ internal sealed class GemmTuningDatabase : IDisposable
                     VectorWidthN = GetIntValue("VectorWidthN"),
                     UseDoubleBuffering = GetBoolValue("UseDoubleBuffering"),
                     UseVectorizedLoads = GetBoolValue("UseVectorizedLoads"),
+                    KernelTemplate = ReadKernelTemplate(obj, GetStringValue("KernelName")),
                     // CLBlast-style parameters
                     KReg = GetIntValue("KReg"),
                     KUnroll = GetIntValue("KUnroll"),
@@ -585,6 +587,27 @@ internal sealed class GemmTuningDatabase : IDisposable
         }
 
         return results;
+    }
+
+    private static GemmKernelTemplate ReadKernelTemplate(JsonElement value, string legacyKernelName)
+    {
+        if (value.TryGetProperty("KernelTemplate", out JsonElement templateValue))
+        {
+            if (templateValue.TryGetInt32(out int rawTemplate) &&
+                Enum.IsDefined(typeof(GemmKernelTemplate), rawTemplate))
+            {
+                return (GemmKernelTemplate)rawTemplate;
+            }
+
+            throw new InvalidDataException("The persisted GEMM kernel template is invalid.");
+        }
+
+        // One-time migration at the persistence boundary for databases written before the typed field existed.
+        if (legacyKernelName.StartsWith("clblast_baseline_k1", StringComparison.OrdinalIgnoreCase))
+            return GemmKernelTemplate.ClBlastBaselineK1;
+        if (legacyKernelName.StartsWith("clblast_baseline_k0", StringComparison.OrdinalIgnoreCase))
+            return GemmKernelTemplate.ClBlastBaselineK0;
+        return GemmKernelTemplate.Tuned;
     }
 
     public void Dispose()

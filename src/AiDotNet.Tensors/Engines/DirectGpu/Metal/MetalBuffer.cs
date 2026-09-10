@@ -30,6 +30,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 /// </remarks>
 public sealed class MetalGpuBuffer : IGpuBuffer
 {
+    private readonly MetalDevice? _device;
     private IntPtr _buffer;
     private bool _disposed;
     private readonly object _lock = new();
@@ -53,6 +54,9 @@ public sealed class MetalGpuBuffer : IGpuBuffer
     /// Gets whether the buffer is disposed.
     /// </summary>
     public bool IsDisposed => _disposed;
+
+    /// <summary>Gets the Metal device that allocated this buffer, when known.</summary>
+    internal MetalDevice? OwningDevice => _device;
 
     /// <summary>
     /// Gets the storage mode of the buffer.
@@ -98,6 +102,7 @@ public sealed class MetalGpuBuffer : IGpuBuffer
         }
 
         Size = elementCount;
+        _device = device;
         StorageMode = options;
 
         var sizeInBytes = (ulong)elementCount * sizeof(float);
@@ -128,6 +133,7 @@ public sealed class MetalGpuBuffer : IGpuBuffer
         }
 
         Size = data.Length;
+        _device = device;
         StorageMode = options;
 
         var sizeInBytes = (ulong)data.Length * sizeof(float);

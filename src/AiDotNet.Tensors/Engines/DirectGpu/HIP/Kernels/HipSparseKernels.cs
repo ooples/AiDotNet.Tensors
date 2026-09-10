@@ -13,7 +13,6 @@ internal static class HipSparseKernels
     {
         return @"
 #include <hip/hip_runtime.h>
-#include <math.h>
 
 // ===========================================================================
 // CSR SPARSE MATRIX - DENSE MATRIX MULTIPLICATION (SpMM)

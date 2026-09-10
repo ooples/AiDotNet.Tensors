@@ -430,6 +430,37 @@ public static partial class BlasManaged
     {
         if (m <= 0 || n <= 0 || k <= 0) return;
 
+        // An explicitly activated evolutionary result owns the whole execution decision. Re-enter
+        // once with a concrete packing mode and the exact measured axis/block/thread configuration,
+        // which also prevents an earlier Auto-only JIT/GEMV/Goto shortcut from silently bypassing
+        // the deployed winner. Processes that never activate evolution pay only the guarded count read.
+        bool deterministic = BlasProvider.IsDeterministicMode || options.Mode == BlasMode.Deterministic;
+        if (options.PackingMode == PackingMode.Auto &&
+            BlasManagedAutotune.TryLookupEvolutionStrategy<T>(
+                m, n, k, transA, transB, deterministic, out BlasManagedGemmConfiguration evolved) &&
+            IsEvolutionReplayEligible(in options))
+        {
+            var evolvedOptions = new BlasOptions<T>
+            {
+                PackingMode = evolved.PackingMode,
+                Epilogue = options.Epilogue,
+                Workspace = options.Workspace,
+                PackedA = options.PackedA,
+                PackedB = options.PackedB,
+                NumThreads = evolved.ThreadCount,
+                ParallelismAxis = evolved.ParallelismAxis,
+                Mc = evolved.Mc,
+                Nc = evolved.Nc,
+                Kc = evolved.Kc,
+                AutotuneKey = options.AutotuneKey,
+                MaxJitCacheBytes = options.MaxJitCacheBytes,
+                Mode = options.Mode,
+                BetaZero = options.BetaZero,
+            };
+            GemmCore(a, lda, transA, b, ldb, transB, c, ldc, m, n, k, in evolvedOptions);
+            return;
+        }
+
         // Thin-M pre-packed B re-dispatch: the fast thin-M / machine-code kernels below cannot
         // consume pre-packed tiles (they're gated on PackedB == null), so a pre-packed thin-M GEMM
         // falls to the slow tuned strategy. That strategy parallelizes over the M-axis, so with few
@@ -453,6 +484,10 @@ public static partial class BlasManaged
                     PackedA = options.PackedA,
                     PackedB = null,
                     NumThreads = options.NumThreads,
+                    ParallelismAxis = options.ParallelismAxis,
+                    Mc = options.Mc,
+                    Nc = options.Nc,
+                    Kc = options.Kc,
                     AutotuneKey = options.AutotuneKey,
                     MaxJitCacheBytes = options.MaxJitCacheBytes,
                     Mode = options.Mode,
@@ -585,7 +620,7 @@ public static partial class BlasManaged
         // When M*N*K is below the threshold AND the caller hasn't requested
         // a specific PackingMode, skip strategy selection / autotune /
         // microkernel-tile picking and route directly to StreamingStrategy.
-        if ((long)m * n * k <= TinyShapeWorkThreshold && options.PackingMode == PackingMode.Auto)
+        if (IsTinyShapeBypassEligible(m, n, k, in options, deterministic))
         {
             // Streaming read-modify-writes C; zero the tile under beta=0 (not write-first).
             if (betaZero) ClearOutputTile(c, ldc, m, n);
@@ -772,7 +807,7 @@ public static partial class BlasManaged
         // a supplied pre-packed handle must consume with the SAME 8×8 tile it was packed
         // against (PickMicrokernelTilePrePack), independent of mode.
         var (mr, nr) = (options.PackedB is null && options.PackedA is null)
-            ? PickMicrokernelTile<T>()
+            ? PickMicrokernelTile<T>(deterministic)
             : PickMicrokernelTilePrePack<T>();
 
         // The FP32 6×16 kernel is PackBoth-ONLY: PackAOnly's strided-B path uses an 8×8
@@ -857,6 +892,10 @@ public static partial class BlasManaged
                 PackedA = options.PackedA,
                 PackedB = options.PackedB,
                 NumThreads = options.NumThreads,
+                ParallelismAxis = options.ParallelismAxis,
+                Mc = options.Mc,
+                Nc = options.Nc,
+                Kc = options.Kc,
                 AutotuneKey = options.AutotuneKey,
                 MaxJitCacheBytes = options.MaxJitCacheBytes,
                 Mode = options.Mode,
@@ -951,13 +990,33 @@ public static partial class BlasManaged
                 transA, transB,
                 mr, nr,
                 procs,
-                BlasProvider.IsDeterministicMode,
+                deterministic,
                 hasEpilogue,
                 options.PackingMode);
 
         int mcFromAutotune = autotuneMc;
         int ncFromAutotune = autotuneNc;
         int kcFromAutotune = autotuneKc;
+
+        bool hasExplicitBlocking = options.Mc != 0 || options.Nc != 0 || options.Kc != 0;
+        if (hasExplicitBlocking && strategy == PackingMode.ForcePackBoth)
+        {
+            if (options.Mc <= 0 || options.Nc <= 0 || options.Kc <= 0)
+                throw new ArgumentException("Mc, Nc, and Kc must all be positive when explicit blocking is used.", nameof(options));
+            (mcFromAutotune, ncFromAutotune, kcFromAutotune) = AutotuneDispatcher.ClampBlocking(
+                options.Mc, options.Nc, options.Kc, m, n, k, mr, nr);
+        }
+        else if (hasExplicitBlocking && strategy == PackingMode.ForcePackAOnly)
+        {
+            if (options.Mc <= 0 || options.Nc != 0 || options.Kc <= 0)
+                throw new ArgumentException("PackAOnly explicit blocking requires positive Mc/Kc and an unused Nc of zero.", nameof(options));
+            (mcFromAutotune, _, kcFromAutotune) = AutotuneDispatcher.ClampBlocking(
+                options.Mc, nr, options.Kc, m, n, k, mr, nr);
+        }
+        else if (hasExplicitBlocking)
+        {
+            throw new ArgumentException("Streaming configurations do not consume blocking factors.", nameof(options));
+        }
 
         // Sub-E (#373): when a multi-panel pre-pack handle is supplied, override
         // the autotuner's tile choice to match the handle. Otherwise the strategy
@@ -1111,7 +1170,7 @@ public static partial class BlasManaged
                     else if (typeof(T) == typeof(double))
                     {
                         // Query PickMicrokernelTile to respect Fast/Deterministic mode.
-                        var (tileMr, tileNr) = PickMicrokernelTile<T>();
+                        var (tileMr, tileNr) = PickMicrokernelTile<T>(deterministic);
                         if (tileMr == 6 && tileNr == 8 && Avx2Fp64_6x8.IsSupported
                             && m % 6 == 0 && n % 8 == 0)
                         {
@@ -1183,6 +1242,55 @@ public static partial class BlasManaged
         // in from a property of another in ref struct directly).
         var epilogue = options.Epilogue;
         EpilogueChain.Apply<T>(c, ldc, m, n, in epilogue);
+    }
+
+    /// <summary>
+    /// The current first-party evolution protocol measures the unadorned default GEMM call context.
+    /// Do not replay that evidence into paths whose workspace, prepack, epilogue, or explicit controls
+    /// can change the executed algorithm or timed work.
+    /// </summary>
+    internal static bool IsEvolutionReplayEligible<T>(in BlasOptions<T> options)
+        where T : unmanaged
+    {
+        var epilogue = options.Epilogue;
+        return options.PackingMode == PackingMode.Auto &&
+            options.Workspace.IsEmpty &&
+            options.PackedA is null &&
+            options.PackedB is null &&
+            options.NumThreads == 0 &&
+            options.ParallelismAxis is null &&
+            options.Mc == 0 &&
+            options.Nc == 0 &&
+            options.Kc == 0 &&
+            options.AutotuneKey == 0 &&
+            options.MaxJitCacheBytes == 0 &&
+            !options.BetaZero &&
+            EpilogueFlagsCompute.Compute(in epilogue) == EpilogueFlags.None;
+    }
+
+    /// <summary>
+    /// Returns whether a small default GEMM cannot form even one complete SIMD output tile and should therefore
+    /// skip dispatcher work before reaching the same Streaming fallback. Product alone is insufficient: an aligned
+    /// 16x16 output can profit from the packed microkernel even when its total work is below the old threshold.
+    /// </summary>
+    internal static bool IsTinyShapeBypassEligible<T>(
+        int m,
+        int n,
+        int k,
+        in BlasOptions<T> options,
+        bool deterministic)
+        where T : unmanaged
+    {
+        if ((long)m * n * k > TinyShapeWorkThreshold ||
+            options.PackingMode != PackingMode.Auto ||
+            options.PackedA is not null ||
+            options.PackedB is not null)
+        {
+            return false;
+        }
+
+        (int mr, int nr) = PickMicrokernelTile<T>(deterministic);
+        return m < mr || n < nr;
     }
 
     /// <summary>
@@ -1479,7 +1587,10 @@ public static partial class BlasManaged
     /// This selection drives the layout of packed-A and packed-B, so it must
     /// match the microkernel the strategy ultimately dispatches to.
     /// </summary>
-    private static (int Mr, int Nr) PickMicrokernelTile<T>() where T : unmanaged
+    private static (int Mr, int Nr) PickMicrokernelTile<T>() where T : unmanaged =>
+        PickMicrokernelTile<T>(Helpers.BlasProvider.IsDeterministicMode);
+
+    private static (int Mr, int Nr) PickMicrokernelTile<T>(bool deterministic) where T : unmanaged
     {
         if (typeof(T) == typeof(double))
         {
@@ -1490,7 +1601,7 @@ public static partial class BlasManaged
             // keeps 4×8 because 6×8's different reduction order (plain K-loop vs the 4×8's
             // unroll-4) would break the bit-exact invariant the Streaming bypass /
             // serial-vs-parallel paths assert (acceptable only where Fast mode is set).
-            if (!Helpers.BlasProvider.IsDeterministicMode && Avx2Fp64_6x8.IsSupported) return (6, 8);
+            if (!deterministic && Avx2Fp64_6x8.IsSupported) return (6, 8);
             if (Avx2Fp64_4x8.IsSupported) return (4, 8);
             // Neon FP64 uses (4, 4) — same as scalar; DispatchMicrokernel picks the right kernel.
             return (4, 4);
@@ -1512,6 +1623,20 @@ public static partial class BlasManaged
             return (4, 4);
         }
         return (4, 4);
+    }
+
+    internal static (int Mr, int Nr) GetEvolutionTuningTile<T>(
+        PackingMode packingMode,
+        bool deterministic)
+        where T : unmanaged
+    {
+        var tile = PickMicrokernelTile<T>(deterministic);
+        if (packingMode == PackingMode.ForcePackAOnly && typeof(T) == typeof(float)
+            && tile.Mr == 6 && Avx2Fp32_8x8.IsSupported)
+        {
+            return (8, 8);
+        }
+        return tile;
     }
 
     /// <summary>

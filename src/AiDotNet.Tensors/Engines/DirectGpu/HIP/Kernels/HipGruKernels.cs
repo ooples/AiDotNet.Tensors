@@ -15,7 +15,6 @@ internal static class HipGruKernels
         return @"
 #include <hip/hip_runtime.h>
 #include <hip/hip_cooperative_groups.h>
-#include <math.h>
 
 namespace cg = cooperative_groups;
 

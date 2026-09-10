@@ -14,7 +14,6 @@ internal static class HipGatedDeltaNetKernels
     {
         return @"
 #include <hip/hip_runtime.h>
-#include <math.h>
 
 #define GDN_MAX_HEADDIM 256
 

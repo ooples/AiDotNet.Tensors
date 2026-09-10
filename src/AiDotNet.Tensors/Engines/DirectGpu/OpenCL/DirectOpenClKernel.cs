@@ -266,11 +266,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         {
             ThrowIfUnusable();
             GpuLaunchProbe.OnLaunch();
-            // Round up global size to multiple of local size
-            int alignedGlobal = ((globalSize + localSize - 1) / localSize) * localSize;
-
-            var globalSizes = new UIntPtr[] { (UIntPtr)alignedGlobal };
-            var localSizes = new UIntPtr[] { (UIntPtr)localSize };
+            var globalSizes = new UIntPtr[] { AlignWorkSize(globalSize, localSize) };
+            var localSizes = new UIntPtr[] { PositiveWorkSize(localSize, nameof(localSize)) };
 
             BeginLaunch(TotalOf(globalSizes), TotalOf(localSizes));
 
@@ -294,12 +291,16 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         {
             ThrowIfUnusable();
             GpuLaunchProbe.OnLaunch();
-            // Round up global sizes to multiples of local sizes
-            int alignedGlobalX = ((globalSizeX + localSizeX - 1) / localSizeX) * localSizeX;
-            int alignedGlobalY = ((globalSizeY + localSizeY - 1) / localSizeY) * localSizeY;
-
-            var globalSizes = new UIntPtr[] { (UIntPtr)alignedGlobalX, (UIntPtr)alignedGlobalY };
-            var localSizes = new UIntPtr[] { (UIntPtr)localSizeX, (UIntPtr)localSizeY };
+            var globalSizes = new UIntPtr[]
+            {
+                AlignWorkSize(globalSizeX, localSizeX),
+                AlignWorkSize(globalSizeY, localSizeY)
+            };
+            var localSizes = new UIntPtr[]
+            {
+                PositiveWorkSize(localSizeX, nameof(localSizeX)),
+                PositiveWorkSize(localSizeY, nameof(localSizeY))
+            };
 
             BeginLaunch(TotalOf(globalSizes), TotalOf(localSizes));
 
@@ -323,13 +324,18 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         {
             ThrowIfUnusable();
             GpuLaunchProbe.OnLaunch();
-            // Round up global sizes to multiples of local sizes
-            int alignedGlobalX = ((globalSizeX + localSizeX - 1) / localSizeX) * localSizeX;
-            int alignedGlobalY = ((globalSizeY + localSizeY - 1) / localSizeY) * localSizeY;
-            int alignedGlobalZ = ((globalSizeZ + localSizeZ - 1) / localSizeZ) * localSizeZ;
-
-            var globalSizes = new UIntPtr[] { (UIntPtr)alignedGlobalX, (UIntPtr)alignedGlobalY, (UIntPtr)alignedGlobalZ };
-            var localSizes = new UIntPtr[] { (UIntPtr)localSizeX, (UIntPtr)localSizeY, (UIntPtr)localSizeZ };
+            var globalSizes = new UIntPtr[]
+            {
+                AlignWorkSize(globalSizeX, localSizeX),
+                AlignWorkSize(globalSizeY, localSizeY),
+                AlignWorkSize(globalSizeZ, localSizeZ)
+            };
+            var localSizes = new UIntPtr[]
+            {
+                PositiveWorkSize(localSizeX, nameof(localSizeX)),
+                PositiveWorkSize(localSizeY, nameof(localSizeY)),
+                PositiveWorkSize(localSizeZ, nameof(localSizeZ))
+            };
 
             BeginLaunch(TotalOf(globalSizes), TotalOf(localSizes));
 
@@ -360,11 +366,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         {
             ThrowIfUnusable();
             GpuLaunchProbe.OnLaunch();
-            // Round up global size to multiple of local size
-            int alignedGlobal = ((globalSize + localSize - 1) / localSize) * localSize;
-
-            var globalSizes = new UIntPtr[] { (UIntPtr)alignedGlobal };
-            var localSizes = new UIntPtr[] { (UIntPtr)localSize };
+            var globalSizes = new UIntPtr[] { AlignWorkSize(globalSize, localSize) };
+            var localSizes = new UIntPtr[] { PositiveWorkSize(localSize, nameof(localSize)) };
 
             BeginLaunch(TotalOf(globalSizes), TotalOf(localSizes));
 
@@ -393,12 +396,16 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         {
             ThrowIfUnusable();
             GpuLaunchProbe.OnLaunch();
-            // Round up global sizes to multiples of local sizes
-            int alignedGlobalX = ((globalSizeX + localSizeX - 1) / localSizeX) * localSizeX;
-            int alignedGlobalY = ((globalSizeY + localSizeY - 1) / localSizeY) * localSizeY;
-
-            var globalSizes = new UIntPtr[] { (UIntPtr)alignedGlobalX, (UIntPtr)alignedGlobalY };
-            var localSizes = new UIntPtr[] { (UIntPtr)localSizeX, (UIntPtr)localSizeY };
+            var globalSizes = new UIntPtr[]
+            {
+                AlignWorkSize(globalSizeX, localSizeX),
+                AlignWorkSize(globalSizeY, localSizeY)
+            };
+            var localSizes = new UIntPtr[]
+            {
+                PositiveWorkSize(localSizeX, nameof(localSizeX)),
+                PositiveWorkSize(localSizeY, nameof(localSizeY))
+            };
 
             BeginLaunch(TotalOf(globalSizes), TotalOf(localSizes));
 
@@ -430,13 +437,18 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         {
             ThrowIfUnusable();
             GpuLaunchProbe.OnLaunch();
-            // Round up global sizes to multiples of local sizes
-            int alignedGlobalX = ((globalSizeX + localSizeX - 1) / localSizeX) * localSizeX;
-            int alignedGlobalY = ((globalSizeY + localSizeY - 1) / localSizeY) * localSizeY;
-            int alignedGlobalZ = ((globalSizeZ + localSizeZ - 1) / localSizeZ) * localSizeZ;
-
-            var globalSizes = new UIntPtr[] { (UIntPtr)alignedGlobalX, (UIntPtr)alignedGlobalY, (UIntPtr)alignedGlobalZ };
-            var localSizes = new UIntPtr[] { (UIntPtr)localSizeX, (UIntPtr)localSizeY, (UIntPtr)localSizeZ };
+            var globalSizes = new UIntPtr[]
+            {
+                AlignWorkSize(globalSizeX, localSizeX),
+                AlignWorkSize(globalSizeY, localSizeY),
+                AlignWorkSize(globalSizeZ, localSizeZ)
+            };
+            var localSizes = new UIntPtr[]
+            {
+                PositiveWorkSize(localSizeX, nameof(localSizeX)),
+                PositiveWorkSize(localSizeY, nameof(localSizeY)),
+                PositiveWorkSize(localSizeZ, nameof(localSizeZ))
+            };
 
             BeginLaunch(TotalOf(globalSizes), TotalOf(localSizes));
 
@@ -471,12 +483,18 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 return IntPtr.Zero;
             }
 
-            // Round up global sizes to multiples of local sizes
-            int alignedGlobalX = ((globalSizeX + localSizeX - 1) / localSizeX) * localSizeX;
-            int alignedGlobalY = ((globalSizeY + localSizeY - 1) / localSizeY) * localSizeY;
+            GpuLaunchProbe.OnLaunch();
 
-            var globalSizes = new UIntPtr[] { (UIntPtr)alignedGlobalX, (UIntPtr)alignedGlobalY };
-            var localSizes = new UIntPtr[] { (UIntPtr)localSizeX, (UIntPtr)localSizeY };
+            var globalSizes = new UIntPtr[]
+            {
+                AlignWorkSize(globalSizeX, localSizeX),
+                AlignWorkSize(globalSizeY, localSizeY)
+            };
+            var localSizes = new UIntPtr[]
+            {
+                PositiveWorkSize(localSizeX, nameof(localSizeX)),
+                PositiveWorkSize(localSizeY, nameof(localSizeY))
+            };
 
             BeginLaunch(TotalOf(globalSizes), TotalOf(localSizes));
 
@@ -526,10 +544,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 return IntPtr.Zero;
             }
 
-            int alignedGlobal = ((globalSize + localSize - 1) / localSize) * localSize;
 
-            var globalSizes = new UIntPtr[] { (UIntPtr)alignedGlobal };
-            var localSizes = new UIntPtr[] { (UIntPtr)localSize };
+            GpuLaunchProbe.OnLaunch();
+
+            var globalSizes = new UIntPtr[] { AlignWorkSize(globalSize, localSize) };
+            var localSizes = new UIntPtr[] { PositiveWorkSize(localSize, nameof(localSize)) };
 
             BeginLaunch(TotalOf(globalSizes), TotalOf(localSizes));
 
@@ -611,8 +630,31 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         private static long TotalOf(UIntPtr[] sizes)
         {
             long total = 1;
-            foreach (var size in sizes) total *= (long)(ulong)size;
+            foreach (var size in sizes)
+            {
+                ulong next = (ulong)size;
+                if (next > long.MaxValue || total > long.MaxValue / (long)next)
+                    return long.MaxValue;
+                total *= (long)next;
+            }
             return total;
+        }
+
+        internal static UIntPtr AlignWorkSize(int globalSize, int localSize)
+        {
+            if (globalSize <= 0) throw new ArgumentOutOfRangeException(nameof(globalSize));
+            ulong local = (ulong)PositiveWorkSize(localSize, nameof(localSize));
+            ulong global = (ulong)globalSize;
+            ulong aligned = checked(((global + local - 1UL) / local) * local);
+            if (UIntPtr.Size == 4 && aligned > uint.MaxValue)
+                throw new ArgumentOutOfRangeException(nameof(globalSize));
+            return (UIntPtr)aligned;
+        }
+
+        private static UIntPtr PositiveWorkSize(int value, string parameterName)
+        {
+            if (value <= 0) throw new ArgumentOutOfRangeException(parameterName);
+            return (UIntPtr)(uint)value;
         }
 
         private void EndLaunch() => EndLaunch(_context.CommandQueue);

@@ -202,6 +202,12 @@ internal static class BlasManagedAutotune
     // strategy is picked up immediately on the next call.
     private static readonly ConcurrentDictionary<ShapeProfile, StrategyChoice?> _strategyMemo = new();
 
+    // Evolutionary deployments are opt-in and must replay the complete measured configuration.
+    // The count makes the untouched hot path one volatile read; only a process that has explicitly
+    // activated an evolutionary result pays the shape-key dictionary lookup.
+    private static readonly ConcurrentDictionary<ShapeProfile, BlasManagedGemmConfiguration> _evolutionStrategyMemo = new();
+    private static int _evolutionStrategyCount;
+
     // Same #375-G13 rationale as _strategyMemo, but for the block-size TryLookup that Decide()
     // calls on every GEMM: it went straight to AutotuneCache.Lookup (a filesystem stat per call
     // even after the read+parse was memoized), which measured ~14% of a compiled Transformer's
@@ -227,6 +233,40 @@ internal static class BlasManagedAutotune
     {
         _strategyMemo.Clear();
         _blockMemo.Clear();
+        _evolutionStrategyMemo.Clear();
+        System.Threading.Volatile.Write(ref _evolutionStrategyCount, 0);
+    }
+
+    internal static void PublishEvolutionStrategy(
+        ShapeProfile shape,
+        BlasManagedGemmConfiguration configuration)
+    {
+        _evolutionStrategyMemo[shape] = configuration;
+        System.Threading.Volatile.Write(ref _evolutionStrategyCount, _evolutionStrategyMemo.Count);
+    }
+
+    internal static void RemoveEvolutionStrategy(ShapeProfile shape)
+    {
+        _evolutionStrategyMemo.TryRemove(shape, out _);
+        System.Threading.Volatile.Write(ref _evolutionStrategyCount, _evolutionStrategyMemo.Count);
+    }
+
+    internal static bool TryLookupEvolutionStrategy<T>(
+        int m,
+        int n,
+        int k,
+        bool transA,
+        bool transB,
+        bool deterministic,
+        out BlasManagedGemmConfiguration configuration)
+        where T : unmanaged
+    {
+        configuration = default;
+        if (System.Threading.Volatile.Read(ref _evolutionStrategyCount) == 0)
+            return false;
+        ShapeProfile shape = EncodeShape<T>(
+            m, n, k, transA, transB, mr: 0, nr: 0, hasEpilogue: false, deterministic);
+        return _evolutionStrategyMemo.TryGetValue(shape, out configuration);
     }
 
     public static void StoreStrategy(ShapeProfile shape, PackingMode mode, ParallelismAxis axis,

@@ -14,8 +14,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.HIP.Kernels
         };
 
         public static string GetSource() => @"
-#include <math.h>
-#include <float.h>
+#define AIDOTNET_FLOAT_MAX 3.402823466e+38F
 
 __device__ __forceinline__ float bilinear_sample(
     const float* __restrict__ src, int planeBase,
@@ -119,7 +118,7 @@ extern ""C"" __global__ __launch_bounds__(256) void roi_pool(
     int planeBase = (n * C + c) * H * W;
     bool empty = hend <= hstart || wend <= wstart;
     if (empty) { output[gid] = 0.0f; return; }
-    float best = -FLT_MAX;
+    float best = -AIDOTNET_FLOAT_MAX;
     for (int yy = hstart; yy < hend; yy++)
         for (int xx = wstart; xx < wend; xx++) {
             float v = input[planeBase + yy * W + xx];

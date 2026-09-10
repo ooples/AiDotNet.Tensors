@@ -120,6 +120,12 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public const uint CL_KERNEL_NUM_ARGS = 0x1191;
         public const uint CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE = 0x11B3;
 
+        public const uint CL_PROGRAM_BINARY_TYPE = 0x1184;
+        public const uint CL_PROGRAM_BINARY_TYPE_NONE = 0x0;
+        public const uint CL_PROGRAM_BINARY_TYPE_COMPILED_OBJECT = 0x1;
+        public const uint CL_PROGRAM_BINARY_TYPE_LIBRARY = 0x2;
+        public const uint CL_PROGRAM_BINARY_TYPE_EXECUTABLE = 0x4;
+
         #endregion
 
         #region Platform Functions
@@ -671,6 +677,34 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     return (UIntPtr)(ulong)Marshal.ReadInt64(buffer);
                 else
                     return (UIntPtr)(uint)Marshal.ReadInt32(buffer);
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
+        }
+
+        public static bool TryGetProgramBuildInfoUInt(
+            IntPtr program,
+            IntPtr device,
+            uint paramName,
+            out uint value)
+        {
+            value = 0;
+            IntPtr buffer = Marshal.AllocHGlobal(sizeof(uint));
+            try
+            {
+                int err = GetProgramBuildInfo(
+                    program,
+                    device,
+                    paramName,
+                    (UIntPtr)sizeof(uint),
+                    buffer,
+                    out UIntPtr returnedSize);
+                if (err != CL_SUCCESS || (ulong)returnedSize < sizeof(uint))
+                    return false;
+                value = unchecked((uint)Marshal.ReadInt32(buffer));
+                return true;
             }
             finally
             {

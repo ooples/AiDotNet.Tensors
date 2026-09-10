@@ -33,6 +33,22 @@ public readonly ref struct BlasOptions<T> where T : unmanaged
 
     /// <summary>0 = autotune; -1 = single-thread (deterministic); positive = pin to N.</summary>
     public int NumThreads { get; init; }
+
+    /// <summary>
+    /// Optional type-safe parallelism-axis override. A missing value lets the dispatcher choose;
+    /// <see cref="BlasManagedGemmConfiguration"/> uses this to replay the exact measured plan.
+    /// </summary>
+    public ParallelismAxis? ParallelismAxis { get; init; }
+
+    /// <summary>Explicit M blocking factor; zero selects the normal autotuned value.</summary>
+    public int Mc { get; init; }
+
+    /// <summary>Explicit N blocking factor; zero selects the normal autotuned value.</summary>
+    public int Nc { get; init; }
+
+    /// <summary>Explicit K blocking factor; zero selects the normal autotuned value.</summary>
+    public int Kc { get; init; }
+
     /// <summary>0 = derive from shape; nonzero = caller-supplied autotune key.</summary>
     public ulong AutotuneKey { get; init; }
     /// <summary>0 = use process default (64 MB).</summary>

@@ -14,7 +14,6 @@ internal static class HipOctonionKernels
     {
         return @"
 #include <hip/hip_runtime.h>
-#include <math.h>
 
 // Epsilon for division safety - must be appropriate for float32 precision
 // Float32 machine epsilon is ~1.19e-7, so use 1e-7f for safe divisions

@@ -59,9 +59,10 @@ internal static class PackAOnlyStrategy
         {
             int procs = options.NumThreads > 0 ? options.NumThreads : Environment.ProcessorCount;
             if (options.NumThreads < 0) procs = 1;
-            bool isDeterministic = BlasProvider.IsDeterministicMode;
+            bool isDeterministic = BlasProvider.IsDeterministicMode || options.Mode == BlasMode.Deterministic;
 
-            var axis = AxisSelector.Select(mAligned, nAligned, k, mr, nr, procs, isDeterministic);
+            var axis = AxisSelector.Select(
+                mAligned, nAligned, k, mr, nr, procs, isDeterministic, options.ParallelismAxis);
             if (axis == ParallelismAxis.N && nAligned >= procs * nr * 2)
                 RunNParallel(a, lda, transA, b, ldb, c, ldc, mAligned, nAligned, k, mc, kc, mr, nr, in options, procs);
             else

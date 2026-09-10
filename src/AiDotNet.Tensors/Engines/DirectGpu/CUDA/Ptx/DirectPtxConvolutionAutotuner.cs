@@ -4,11 +4,23 @@ using AiDotNet.Tensors.Helpers.Autotune;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Ptx;
 
-internal readonly record struct DirectPtxConvolutionVariant(bool IsTiled, int Tile)
+internal enum DirectPtxConvolutionAlgorithm
 {
-    internal static DirectPtxConvolutionVariant Direct => new(false, 0);
+    UnrolledDirect = 0,
+    SharedMemoryTiled = 1
+}
 
-    internal static DirectPtxConvolutionVariant Tiled(int tile) => new(true, tile);
+internal readonly record struct DirectPtxConvolutionVariant(
+    DirectPtxConvolutionAlgorithm Algorithm,
+    int Tile)
+{
+    internal bool IsTiled => Algorithm == DirectPtxConvolutionAlgorithm.SharedMemoryTiled;
+
+    internal static DirectPtxConvolutionVariant Direct =>
+        new(DirectPtxConvolutionAlgorithm.UnrolledDirect, 0);
+
+    internal static DirectPtxConvolutionVariant Tiled(int tile) =>
+        new(DirectPtxConvolutionAlgorithm.SharedMemoryTiled, tile);
 }
 
 /// <summary>

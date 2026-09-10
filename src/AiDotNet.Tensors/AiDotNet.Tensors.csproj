@@ -27,9 +27,18 @@
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
     <PackageRequireLicenseAcceptance>True</PackageRequireLicenseAcceptance>
     <LangVersion>latest</LangVersion>
+    <EvolutionProjectPath Condition="'$(EvolutionProjectPath)' == ''">$(MSBuildProjectDirectory)\..\..\..\AiDotNet.Evolution\src\AiDotNet.Evolution\AiDotNet.Evolution.csproj</EvolutionProjectPath>
     <PackageIcon>Favicon.jpg</PackageIcon>
     <PackageReadmeFile>README.md</PackageReadmeFile>
   </PropertyGroup>
+
+  <ItemGroup Condition="'$(UseLocalEvolution)' == 'true'">
+    <ProjectReference Include="$(EvolutionProjectPath)" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(UseLocalEvolution)' != 'true'">
+    <PackageReference Include="AiDotNet.Evolution" Version="0.1.0-preview.1" />
+  </ItemGroup>
 
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|AnyCPU'">
     <TreatWarningsAsErrors>True</TreatWarningsAsErrors>
@@ -134,9 +143,13 @@
          Log(double)   1M: 2,512 µs in-house vs 9,342 µs TP (4× slower)
        Don't reintroduce the package. -->
 
-  <!-- System.Text.Json is needed for net471 as it's not built-in like net8.0 -->
+  <!-- System.Text.Json is needed for net471 as it's not built-in like net8.0.
+       Pinned to 10.0.11 to match what AiDotNet.Evolution asks for on net471: it
+       declares System.Text.Json >= 10.0.11 there, so referencing 8.0.5 directly
+       wins the resolution and NuGet reports it as a downgrade (NU1605), which
+       TreatWarningsAsErrors turns into a build failure. -->
   <ItemGroup Condition="'$(TargetFramework)' == 'net471'">
-    <PackageReference Include="System.Text.Json" Version="8.0.5" />
+    <PackageReference Include="System.Text.Json" Version="10.0.11" />
     <!-- ZipArchive (System.IO.Compression) ships in mscorlib on .NET 5+ but
          needs an explicit reference on net471 — used by PtReader to parse
          the modern zip-format PyTorch checkpoint. -->
@@ -165,6 +178,18 @@
          GZip (built-in but ~3× slower decompress), no compression
          (loses 30-40% disk-footprint reduction). -->
     <PackageReference Include="K4os.Compression.LZ4" Version="1.3.8" />
+  </ItemGroup>
+
+  <!--
+    Vulkan's generated-kernel path lowers GLSL to SPIR-V at runtime through
+    shaderc_shared. Shipping the native runtime transitively keeps this a
+    user capability instead of silently requiring a developer-installed
+    Vulkan SDK. The package carries native assets for Windows, Linux, and
+    macOS across their supported x64/Arm RIDs; our existing P/Invoke surface
+    remains the only managed binding layer.
+  -->
+  <ItemGroup>
+    <PackageReference Include="Silk.NET.Shaderc.Native" Version="2.23.0" />
   </ItemGroup>
 
   <!--

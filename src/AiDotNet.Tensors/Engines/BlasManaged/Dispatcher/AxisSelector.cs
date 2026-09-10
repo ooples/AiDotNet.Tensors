@@ -6,7 +6,7 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 /// Parallelism axis enumeration. Used by <see cref="AxisSelector"/> to
 /// communicate which axis the strategy should split work along.
 /// </summary>
-internal enum ParallelismAxis : byte
+public enum ParallelismAxis : byte
 {
     /// <summary>Sequential — no parallel split (below work threshold).</summary>
     None = 0,
@@ -69,13 +69,23 @@ internal static class AxisSelector
         int m, int n, int k,
         int mr, int nr,
         int procs,
-        bool isDeterministic)
+        bool isDeterministic,
+        ParallelismAxis? requestedAxis = null)
     {
         // Universal guards run FIRST, before any forced-axis override, so a test/bench hook can
         // never route a shape that production would refuse to parallelize (procs<=1 or below the
         // work threshold) or pick an axis that violates the active mode (K-axis under determinism).
         if (procs <= 1) return ParallelismAxis.None;
         if ((long)m * n * k < ParallelWorkThreshold) return ParallelismAxis.None;
+
+        if (requestedAxis is { } requested)
+        {
+            if (!Enum.IsDefined(typeof(ParallelismAxis), requested))
+                throw new ArgumentOutOfRangeException(nameof(requestedAxis));
+            if (requested == ParallelismAxis.K && isDeterministic)
+                throw new ArgumentException("K-axis parallelism is not valid in deterministic mode.", nameof(requestedAxis));
+            return requested;
+        }
 
         // A/B test hook (#475 medium-axis routing): honor a pinned axis only AFTER the universal
         // guards above, and reject a forced K-axis in deterministic mode (the same gate the

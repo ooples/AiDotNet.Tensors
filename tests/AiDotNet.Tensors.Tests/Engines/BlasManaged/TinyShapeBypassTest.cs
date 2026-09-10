@@ -1,8 +1,6 @@
 using System;
-using System.Diagnostics;
 using AiDotNet.Tensors.Engines.BlasManaged;
 using Xunit;
-using Xunit.Abstractions;
 using BlasManagedLib = AiDotNet.Tensors.Engines.BlasManaged.BlasManaged;
 
 namespace AiDotNet.Tensors.Tests.Engines.BlasManaged;
@@ -10,24 +8,21 @@ namespace AiDotNet.Tensors.Tests.Engines.BlasManaged;
 /// <summary>
 /// Sub-issue C (#371) task C.1: verifies the tiny-shape bypass in
 /// <see cref="BlasManagedLib.Gemm{T}"/> produces bit-exact output vs the regular
-/// path and dispatches faster (skips strategy / autotune / options-switch).
+/// route and is limited to outputs that cannot form a complete SIMD tile.
 /// </summary>
 [Collection("BlasManaged-Perf-Serial")]
 public class TinyShapeBypassTest
 {
-    private readonly ITestOutputHelper _output;
-
-    public TinyShapeBypassTest(ITestOutputHelper output) { _output = output; }
-
     /// <summary>
-    /// Tiny shape (M*N*K = 32K, below the 100K bypass threshold) must produce
-    /// the same result whether routed via bypass or via the full dispatcher path.
-    /// Use PackingMode.ForcePackBoth on one side to force the non-bypass path.
+    /// A shape below the work threshold must produce the same result through the bypass and non-bypass routes.
+    /// Use PackingMode.ForcePackBoth on one side to exclude the bypass.
     /// </summary>
     [Fact]
     public void Bypass_BitExact_Vs_ForcedFullPath_FP32()
     {
-        const int M = 32, N = 32, K = 32;  // 32K work, under bypass threshold
+        // N deliberately is not a valid FP32 JIT width. Otherwise the default call tests the
+        // earlier JIT shortcut rather than the tiny-shape bypass this test is meant to isolate.
+        const int M = 8, N = 6, K = 4;  // 192 work, the documented bypass win region
         var rng = new Random(42);
         var a = new float[M * K];
         var b = new float[K * N];
@@ -36,10 +31,10 @@ public class TinyShapeBypassTest
         for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
         for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1);
 
-        // Default options → bypass fires (M*N*K=32K below threshold).
+        // Default options route through the bypass.
         BlasManagedLib.Gemm<float>(a, K, false, b, N, false, cBypass, N, M, N, K);
 
-        // ForcePackBoth forces the full dispatcher path even for tiny shapes.
+        // ForcePackBoth excludes the bypass even for tiny shapes.
         BlasManagedLib.Gemm<float>(a, K, false, b, N, false, cForcedPath, N, M, N, K,
             new BlasOptions<float> { PackingMode = PackingMode.ForcePackBoth });
 
@@ -52,7 +47,8 @@ public class TinyShapeBypassTest
     [Fact]
     public void Bypass_BitExact_Vs_ForcedFullPath_FP64()
     {
-        const int M = 32, N = 32, K = 32;
+        // N deliberately is not a valid FP64 JIT width, for the same route-isolation reason.
+        const int M = 8, N = 6, K = 4;
         var rng = new Random(42);
         var a = new double[M * K];
         var b = new double[K * N];
@@ -70,46 +66,19 @@ public class TinyShapeBypassTest
     }
 
     [Fact]
-    public void Bypass_Faster_Than_Full_Path_On_Tiny_Shape()
+    public void Bypass_IsLimitedToShapesWithoutACompleteSimdTile()
     {
-        // Tiny shape where dispatcher overhead dominates real compute. The
-        // bypass should beat the full path by a clear margin.
-        const int M = 16, N = 16, K = 16;  // 4K work, deep below threshold
-        var rng = new Random(42);
-        var a = new float[M * K];
-        var b = new float[K * N];
-        var c = new float[M * N];
-        for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
-        for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() * 2 - 1);
+        BlasOptions<float> automatic = default;
+        var forced = new BlasOptions<float> { PackingMode = PackingMode.ForcePackBoth };
 
-        const int Iters = 1000;
-
-        // Warmup both paths.
-        for (int i = 0; i < 50; i++)
-        {
-            BlasManagedLib.Gemm<float>(a, K, false, b, N, false, c, N, M, N, K);
-            BlasManagedLib.Gemm<float>(a, K, false, b, N, false, c, N, M, N, K,
-                new BlasOptions<float> { PackingMode = PackingMode.ForcePackBoth });
-        }
-
-        var sw = Stopwatch.StartNew();
-        for (int i = 0; i < Iters; i++)
-            BlasManagedLib.Gemm<float>(a, K, false, b, N, false, c, N, M, N, K);
-        sw.Stop();
-        double bypassUs = sw.Elapsed.TotalMilliseconds * 1000.0 / Iters;
-
-        sw.Restart();
-        for (int i = 0; i < Iters; i++)
-            BlasManagedLib.Gemm<float>(a, K, false, b, N, false, c, N, M, N, K,
-                new BlasOptions<float> { PackingMode = PackingMode.ForcePackBoth });
-        sw.Stop();
-        double forcedUs = sw.Elapsed.TotalMilliseconds * 1000.0 / Iters;
-
-        double speedup = forcedUs / bypassUs;
-        _output.WriteLine($"Tiny bypass: bypass={bypassUs:F2}us forced={forcedUs:F2}us speedup={speedup:F2}x");
-        Assert.True(speedup >= 2.0,
-            $"Expected bypass >=2x faster than forced full path, got {speedup:F2}x " +
-            $"(bypass={bypassUs:F2}us, forced={forcedUs:F2}us)");
+        Assert.True(BlasManagedLib.IsTinyShapeBypassEligible(
+            m: 8, n: 6, k: 4, in automatic, deterministic: true));
+        Assert.False(BlasManagedLib.IsTinyShapeBypassEligible(
+            m: 16, n: 16, k: 16, in automatic, deterministic: true));
+        Assert.False(BlasManagedLib.IsTinyShapeBypassEligible(
+            m: 8, n: 6, k: 4, in forced, deterministic: true));
+        Assert.False(BlasManagedLib.IsTinyShapeBypassEligible(
+            m: 128, n: 128, k: 128, in automatic, deterministic: true));
     }
 
     [Fact]

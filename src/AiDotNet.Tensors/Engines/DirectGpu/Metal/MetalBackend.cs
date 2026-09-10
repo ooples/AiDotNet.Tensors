@@ -4,6 +4,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
+using AiDotNet.Tensors.Engines.Compilation.Codegen;
 using static AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalNativeBindings;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
@@ -26,7 +27,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 /// The MPS library provides hand-tuned implementations of common operations.
 /// </para>
 /// </remarks>
-public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IPixelShuffleBackend
+public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IPixelShuffleBackend, INativeGpuCodegenExecutor
 {
     /// <summary>
     /// Metal MPSGraph has half/bfloat conv support but it's not wired

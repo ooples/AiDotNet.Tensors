@@ -10,6 +10,28 @@ using System.Text;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 {
+    /// <summary>How an OpenCL program reached driver-executable form.</summary>
+    public enum OpenClProgramBuildOrigin
+    {
+        /// <summary>The device driver compiled OpenCL C source during this process.</summary>
+        SourceCompilation = 0,
+        /// <summary>The driver loaded its previously compiled device-native binary.</summary>
+        NativeBinaryCache = 1
+    }
+
+    /// <summary>The OpenCL driver's reported form of a built program binary.</summary>
+    public enum OpenClProgramBinaryType
+    {
+        /// <summary>The driver did not expose a recognized binary type.</summary>
+        Unavailable = 0,
+        /// <summary>A relocatable compiled object that is not directly executable.</summary>
+        CompiledObject = 1,
+        /// <summary>A linked library that is not directly executable.</summary>
+        Library = 2,
+        /// <summary>A device executable accepted by the selected OpenCL driver.</summary>
+        Executable = 3
+    }
+
     /// <summary>
     /// OpenCL program wrapper using pure P/Invoke. No managed GPU runtime dependency.
     /// Supports disk-based binary caching to avoid recompilation on startup.
@@ -21,13 +43,87 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         private bool _disposed;
         private string _sourceHash = string.Empty;
 
+        /// <summary>Gets whether this program was compiled from source or loaded as a native binary.</summary>
+        internal OpenClProgramBuildOrigin BuildOrigin { get; }
+
+        /// <summary>Gets the driver's typed classification of the built program artifact.</summary>
+        internal OpenClProgramBinaryType BinaryType
+        {
+            get
+            {
+                if (_disposed)
+                    throw new ObjectDisposedException(nameof(DirectOpenClProgram));
+                if (!OpenClNativeBindings.TryGetProgramBuildInfoUInt(
+                        _program,
+                        _context.Device,
+                        OpenClNativeBindings.CL_PROGRAM_BINARY_TYPE,
+                        out uint binaryType))
+                {
+                    return OpenClProgramBinaryType.Unavailable;
+                }
+                return binaryType switch
+                {
+                    OpenClNativeBindings.CL_PROGRAM_BINARY_TYPE_COMPILED_OBJECT =>
+                        OpenClProgramBinaryType.CompiledObject,
+                    OpenClNativeBindings.CL_PROGRAM_BINARY_TYPE_LIBRARY =>
+                        OpenClProgramBinaryType.Library,
+                    OpenClNativeBindings.CL_PROGRAM_BINARY_TYPE_EXECUTABLE =>
+                        OpenClProgramBinaryType.Executable,
+                    _ => OpenClProgramBinaryType.Unavailable
+                };
+            }
+        }
+
+        /// <summary>Gets the byte size of the selected device's compiled program artifact.</summary>
+        internal long NativeBinarySizeBytes
+        {
+            get
+            {
+                if (_disposed)
+                    throw new ObjectDisposedException(nameof(DirectOpenClProgram));
+
+                int err = OpenClNativeBindings.GetProgramInfo(
+                    _program,
+                    OpenClNativeBindings.CL_PROGRAM_BINARY_SIZES,
+                    UIntPtr.Zero,
+                    IntPtr.Zero,
+                    out UIntPtr sizeNeeded);
+                if (err != OpenClNativeBindings.CL_SUCCESS ||
+                    (ulong)sizeNeeded < (ulong)UIntPtr.Size ||
+                    (ulong)sizeNeeded > int.MaxValue)
+                {
+                    return 0;
+                }
+
+                IntPtr sizes = Marshal.AllocHGlobal(checked((int)(ulong)sizeNeeded));
+                try
+                {
+                    err = OpenClNativeBindings.GetProgramInfo(
+                        _program,
+                        OpenClNativeBindings.CL_PROGRAM_BINARY_SIZES,
+                        sizeNeeded,
+                        sizes,
+                        out _);
+                    if (err != OpenClNativeBindings.CL_SUCCESS)
+                        return 0;
+
+                    ulong binarySize = UIntPtr.Size == 8
+                        ? unchecked((ulong)Marshal.ReadInt64(sizes))
+                        : unchecked((uint)Marshal.ReadInt32(sizes));
+                    return binarySize > long.MaxValue ? long.MaxValue : (long)binarySize;
+                }
+                finally
+                {
+                    Marshal.FreeHGlobal(sizes);
+                }
+            }
+        }
+
         /// <summary>
         /// Enable or disable binary caching. Defaults to true.
         /// Can be disabled via AIDOTNET_DISABLE_KERNEL_CACHE=1 environment variable.
         /// </summary>
         public static bool EnableBinaryCache { get; set; } = !IsEnvTrue("AIDOTNET_DISABLE_KERNEL_CACHE");
-
-        private static readonly string CacheDirectory = GetCacheDirectory();
 
         public IntPtr Handle
         {
@@ -42,6 +138,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public DirectOpenClProgram(DirectOpenClContext context, string source)
         {
             _context = context;
+            BuildOrigin = OpenClProgramBuildOrigin.SourceCompilation;
             _sourceHash = ComputeHash(source);
 
             var sources = new string[] { source };
@@ -63,6 +160,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             _context = context;
             _program = program;
             _sourceHash = sourceHash;
+            BuildOrigin = OpenClProgramBuildOrigin.NativeBinaryCache;
         }
 
         /// <summary>
@@ -112,7 +210,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             try
             {
                 byte[] binary = File.ReadAllBytes(cachePath);
-                if (binary.Length == 0) return null;
+                if (binary.Length == 0)
+                {
+                    TryDeleteInvalidCacheEntry(cachePath);
+                    return null;
+                }
 
                 var devices = new IntPtr[] { context.Device };
                 var lengths = new UIntPtr[] { (UIntPtr)binary.Length };
@@ -131,14 +233,22 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                         binaryStatus,
                         out int err);
 
-                    if (err != OpenClNativeBindings.CL_SUCCESS || program == IntPtr.Zero)
+                    if (err != OpenClNativeBindings.CL_SUCCESS ||
+                        binaryStatus[0] != OpenClNativeBindings.CL_SUCCESS ||
+                        program == IntPtr.Zero)
+                    {
+                        if (program != IntPtr.Zero)
+                            OpenClNativeBindings.ReleaseProgram(program);
+                        TryDeleteInvalidCacheEntry(cachePath);
                         return null;
+                    }
 
                     // Build the binary program (required by OpenCL spec)
                     int buildErr = OpenClNativeBindings.BuildProgram(program, 1, devices, buildOptions, IntPtr.Zero, IntPtr.Zero);
                     if (buildErr != OpenClNativeBindings.CL_SUCCESS)
                     {
                         OpenClNativeBindings.ReleaseProgram(program);
+                        TryDeleteInvalidCacheEntry(cachePath);
                         return null;
                     }
 
@@ -151,7 +261,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             }
             catch
             {
-                // Cache read failure is non-fatal
+                // A truncated or otherwise unreadable artifact must not permanently poison this key.
+                TryDeleteInvalidCacheEntry(cachePath);
                 return null;
             }
         }
@@ -172,7 +283,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (err != OpenClNativeBindings.CL_SUCCESS) return;
 
             // Allocate for binary sizes array (one per device)
-            IntPtr sizesPtr = Marshal.AllocHGlobal((int)sizeNeeded);
+            if ((ulong)sizeNeeded > int.MaxValue) return;
+            IntPtr sizesPtr = Marshal.AllocHGlobal(checked((int)(ulong)sizeNeeded));
             try
             {
                 err = OpenClNativeBindings.GetProgramInfo(
@@ -190,10 +302,10 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 else
                     binarySize = (UIntPtr)(uint)Marshal.ReadInt32(sizesPtr);
 
-                if ((ulong)binarySize == 0) return;
+                if ((ulong)binarySize == 0 || (ulong)binarySize > int.MaxValue) return;
 
                 // Allocate buffer for the binary
-                IntPtr binaryPtr = Marshal.AllocHGlobal((int)(ulong)binarySize);
+                IntPtr binaryPtr = Marshal.AllocHGlobal(checked((int)(ulong)binarySize));
                 try
                 {
                     // Get the binary: pass array of pointers to binaries
@@ -215,7 +327,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                         byte[] binary = new byte[(int)(ulong)binarySize];
                         Marshal.Copy(binaryPtr, binary, 0, binary.Length);
 
-                        string dir = Path.GetDirectoryName(cachePath) ?? CacheDirectory;
+                        string dir = Path.GetDirectoryName(cachePath) ?? GetCacheDirectory();
                         if (!Directory.Exists(dir))
                             Directory.CreateDirectory(dir);
 
@@ -224,8 +336,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                         try
                         {
                             File.WriteAllBytes(tempPath, binary);
-                            // Delete destination first for net471 compat (File.Move doesn't overwrite)
-                            try { File.Delete(cachePath); } catch { /* may not exist */ }
+                            // The artifact is deterministic for this source/options/device key. Never
+                            // delete a completed winner: File.Move is the atomic first-writer-wins commit
+                            // supported by every target framework in this package.
                             File.Move(tempPath, cachePath);
                         }
                         catch (IOException)
@@ -264,15 +377,29 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         private static string GetCachePath(string sourceHash, string buildOptions, string deviceKey = "")
         {
-            // Include build options and device info in cache key since binaries are not portable across devices/drivers
-            string optionsHash = string.IsNullOrEmpty(buildOptions) ? "default" : ComputeHash(buildOptions).Substring(0, 8);
-            string deviceSuffix = string.IsNullOrEmpty(deviceKey) ? "" : $"_{ComputeHash(deviceKey).Substring(0, 8)}";
-            return Path.Combine(CacheDirectory, $"{sourceHash.Substring(0, 16)}_{optionsHash}{deviceSuffix}.clbin");
+            // Device executables are not portable across source, compiler flags, devices, or
+            // drivers. Hash the complete identity once so the filename remains short enough for
+            // net471-era Windows paths without weakening collision resistance through truncation.
+            string cacheIdentity = string.Join("|", new[]
+            {
+                "opencl-native-binary-v2",
+                sourceHash,
+                buildOptions ?? string.Empty,
+                deviceKey ?? string.Empty
+            });
+            return Path.Combine(GetCacheDirectory(), ComputeHash(cacheIdentity) + ".clbin");
         }
 
         private static string GetDeviceCacheKey(DirectOpenClContext context)
         {
-            return $"{context.DeviceName}|{context.DriverVersion}";
+            return string.Join("|", new[]
+            {
+                context.DeviceVendor,
+                context.DeviceName,
+                context.DeviceBoardName,
+                context.DriverVersion,
+                context.OpenClVersion
+            });
         }
 
         private static string GetCacheDirectory()
@@ -283,6 +410,12 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
             string appData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
             return Path.Combine(appData, "AiDotNet", "KernelCache");
+        }
+
+        private static void TryDeleteInvalidCacheEntry(string cachePath)
+        {
+            try { File.Delete(cachePath); }
+            catch { /* another process may be replacing or reading it */ }
         }
 
         private static bool IsEnvTrue(string name)

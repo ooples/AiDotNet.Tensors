@@ -11,7 +11,6 @@ internal static class HipRwkv4Kernels
     {
         return @"
 #include <hip/hip_runtime.h>
-#include <math.h>
 
 #define RWKV4_NEG_INF (-1.0e38f)
 

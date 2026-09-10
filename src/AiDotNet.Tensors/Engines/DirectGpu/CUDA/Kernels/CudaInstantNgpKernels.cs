@@ -8,7 +8,9 @@ public static class CudaInstantNgpKernels
             "generate_spiral_indices"];
 
     public static string GetSource() => @"
-#include <math.h>
+#ifndef INFINITY
+#define INFINITY __int_as_float(0x7f800000)
+#endif
 
 __device__ __forceinline__ unsigned int instant_ngp_hash(int x, int y, int z, int tableSize)
 {

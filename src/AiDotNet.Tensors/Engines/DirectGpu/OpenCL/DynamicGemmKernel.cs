@@ -10,6 +10,19 @@ using AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 
+/// <summary>Type-safe generated GEMM source variants supported by the OpenCL compiler path.</summary>
+internal enum DynamicGemmKernelVariant
+{
+    /// <summary>Unmodified CLBlast-compatible source.</summary>
+    ClBlastBaseline = 0,
+    /// <summary>CLBlast-compatible source with XOR local-memory swizzling.</summary>
+    XorSwizzle = 1,
+    /// <summary>RDNA-tuned source with XOR swizzling and wave hints.</summary>
+    RdnaOptimized = 2,
+    /// <summary>Selects a concrete source variant from the matrix shape.</summary>
+    Adaptive = 4
+}
+
 /// <summary>
 /// Generates and compiles GEMM kernels dynamically with parameters baked in.
 /// This is how CLBlast achieves maximum performance - parameters are compile-time constants.
@@ -34,13 +47,10 @@ internal sealed class DynamicGemmKernel : IDisposable
 
     /// <summary>
     /// Kernel variant to use. Set via AIDOTNET_GEMM_VARIANT environment variable.
-    /// 0 = Original CLBlast (baseline)
-    /// 1 = XOR swizzling (eliminates LDS bank conflicts)
-    /// 2 = RDNA1 optimized (XOR swizzle + Wave32 hints)
-    /// 3 = A/B testing mode (runs both and compares)
-    /// 4 = Adaptive mode (selects best variant per size based on A/B test results)
+    /// The environment value is parsed once into <see cref="DynamicGemmKernelVariant"/>;
+    /// source generation and dispatch never branch on free-form text or untyped integers.
     /// </summary>
-    public static int KernelVariant { get; set; } = GetKernelVariant();
+    internal static DynamicGemmKernelVariant KernelVariant { get; set; } = GetKernelVariant();
 
     /// <summary>
     /// Default minimum matrix dimension for XOR swizzle variants (1 and 2).
@@ -79,12 +89,15 @@ internal sealed class DynamicGemmKernel : IDisposable
         return 256; // Default: matrices < 256 use simple kernel
     }
 
-    private static int GetKernelVariant()
+    private static DynamicGemmKernelVariant GetKernelVariant()
     {
         string? envVar = Environment.GetEnvironmentVariable("AIDOTNET_GEMM_VARIANT");
-        if (int.TryParse(envVar, out int variant) && variant >= 0 && variant <= 4)
+        if (Enum.TryParse(envVar, ignoreCase: true, out DynamicGemmKernelVariant variant) &&
+            Enum.IsDefined(typeof(DynamicGemmKernelVariant), variant))
+        {
             return variant;
-        return 4; // Default to adaptive mode (selects best variant per size)
+        }
+        return DynamicGemmKernelVariant.Adaptive;
     }
 
     /// <summary>
@@ -142,17 +155,15 @@ internal sealed class DynamicGemmKernel : IDisposable
     /// <param name="N">Matrix N dimension</param>
     /// <param name="K">Matrix K dimension</param>
     /// <returns>The effective kernel variant to use</returns>
-    public static int GetEffectiveVariant(int M, int N, int K)
+    internal static DynamicGemmKernelVariant GetEffectiveVariant(int M, int N, int K)
     {
-        // Adaptive mode (variant 4): Select best variant based on A/B test results
-        if (KernelVariant == 4)
+        if (KernelVariant == DynamicGemmKernelVariant.Adaptive)
         {
             return GetAdaptiveVariant(M, N, K);
         }
 
-        // XOR swizzle variants (1 and 2) have correctness issues for small matrices
-        // Fall back to CLBlast baseline (variant 0) for sizes < MinSwizzleSize
-        if (KernelVariant is 1 or 2)
+        if (KernelVariant is DynamicGemmKernelVariant.XorSwizzle or
+            DynamicGemmKernelVariant.RdnaOptimized)
         {
             if (M < MinSwizzleSize || N < MinSwizzleSize || K < MinSwizzleSize)
             {
@@ -160,7 +171,7 @@ internal sealed class DynamicGemmKernel : IDisposable
                 {
                     Console.WriteLine($"[DynamicGemm] Size {M}x{N}x{K} < {MinSwizzleSize}, falling back from variant {KernelVariant} to CLBlast baseline");
                 }
-                return 0; // Fall back to CLBlast baseline
+                return DynamicGemmKernelVariant.ClBlastBaseline;
             }
         }
         return KernelVariant;
@@ -176,18 +187,18 @@ internal sealed class DynamicGemmKernel : IDisposable
     /// XOR Swizzle eliminates LDS bank conflicts and is generally competitive
     /// or better for larger matrices where bank conflict overhead matters more.
     /// </remarks>
-    private static int GetAdaptiveVariant(int M, int N, int K)
+    private static DynamicGemmKernelVariant GetAdaptiveVariant(int M, int N, int K)
     {
         int minDim = Math.Min(Math.Min(M, N), K);
 
         // Below MinSwizzleSize (448): CLBlast only (correctness issues with XOR variants)
         if (minDim < MinSwizzleSize)
         {
-            return 0; // CLBlast baseline
+            return DynamicGemmKernelVariant.ClBlastBaseline;
         }
 
         // For sizes >= 448: Use XOR Swizzle (eliminates bank conflicts, competitive performance)
-        return 1; // XOR Swizzle
+        return DynamicGemmKernelVariant.XorSwizzle;
     }
 
     /// <summary>
@@ -209,6 +220,15 @@ internal sealed class DynamicGemmKernel : IDisposable
     /// Gets count of successful compilations (for diagnostics).
     /// </summary>
     public int CompilationSuccesses { get; private set; }
+
+    /// <summary>Gets how many dynamic kernels were restored from driver-native binary cache entries.</summary>
+    public int NativeBinaryCacheLoads { get; private set; }
+
+    /// <summary>Gets how the most recently selected dynamic kernel reached executable form.</summary>
+    public OpenClProgramBuildOrigin? LastProgramBuildOrigin { get; private set; }
+
+    /// <summary>Gets the driver's typed classification of the most recently selected program.</summary>
+    public OpenClProgramBinaryType? LastProgramBinaryType { get; private set; }
 
     public DynamicGemmKernel(DirectOpenClContext context)
     {
@@ -288,7 +308,7 @@ internal sealed class DynamicGemmKernel : IDisposable
     /// <returns>Compiled kernel for the configuration</returns>
     public DirectOpenClKernel GetKernelForSize(GemmConfig config, int M, int N, int K)
     {
-        int effectiveVariant = GetEffectiveVariant(M, N, K);
+        DynamicGemmKernelVariant effectiveVariant = GetEffectiveVariant(M, N, K);
         return GetKernelWithVariant(config, effectiveVariant);
     }
 
@@ -298,47 +318,53 @@ internal sealed class DynamicGemmKernel : IDisposable
     /// </summary>
     public DirectOpenClKernel GetKernel(GemmConfig config)
     {
-        return GetKernelWithVariant(config, KernelVariant);
+        DynamicGemmKernelVariant variant = KernelVariant == DynamicGemmKernelVariant.Adaptive
+            ? DynamicGemmKernelVariant.ClBlastBaseline
+            : KernelVariant;
+        return GetKernelWithVariant(config, variant);
     }
 
     /// <summary>
     /// Gets or compiles a kernel for the given configuration with a specific variant.
     /// </summary>
-    private DirectOpenClKernel GetKernelWithVariant(GemmConfig config, int variant)
+    private DirectOpenClKernel GetKernelWithVariant(
+        GemmConfig config,
+        DynamicGemmKernelVariant variant)
     {
         // Include variant in cache key to allow different kernels for same config
-        var key = $"{config.ToKey()}_v{variant}";
+        var key = $"{config.ToKey()}_v{(int)variant}";
 
         if (_cache.TryGetValue(key, out var cached))
         {
+            LastProgramBuildOrigin = cached.Program.BuildOrigin;
+            LastProgramBinaryType = cached.Program.BinaryType;
             LogDiag($"Cache HIT: {config.KernelName} variant={variant} (key={key})");
             return cached.Kernel;
         }
 
         LogDiag($"Cache MISS: Compiling {config}");
 
-        // Calculate expected local memory usage for diagnostics
-        int MWG = config.TileM;
-        int NWG = config.TileN;
-        int KWG = config.TileK;
-        // Local memory: Als[KWG][MWG+1] + Bls[KWG][NWG+1] in floats
-        int ldsBytes = (KWG * (MWG + 1) + KWG * (NWG + 1)) * sizeof(float);
-        LogDiag($"  Local memory estimate: {ldsBytes / 1024.0:F1} KB (limit: 64 KB)");
-
-        if (ldsBytes > 65536)
+        int maxWorkGroupSize = checked((int)Math.Min(_context.MaxWorkGroupSize, (ulong)int.MaxValue));
+        int maxWorkItemSizeX = GetMaximumWorkItemSize(0);
+        int maxWorkItemSizeY = GetMaximumWorkItemSize(1);
+        long localMemoryBytes = checked((long)Math.Min(_context.LocalMemSize, (ulong)long.MaxValue));
+        string? validationError = ValidateConfig(
+            config,
+            maxWorkGroupSize,
+            localMemoryBytes,
+            maxWorkItemSizeX,
+            maxWorkItemSizeY);
+        if (validationError is not null)
         {
             CompilationFailures++;
-            throw new ArgumentException($"Config {config} requires {ldsBytes / 1024.0:F1} KB LDS, exceeds 64 KB limit");
+            throw new ArgumentException($"Config {config} is invalid for this OpenCL device: {validationError}");
         }
-
-        // Calculate work group size for diagnostics
-        int workGroupSize = config.ThreadTileM * config.ThreadTileN;
-        LogDiag($"  Work group size: {config.ThreadTileM}x{config.ThreadTileN} = {workGroupSize} threads");
-        if (workGroupSize > 256)
-        {
-            CompilationFailures++;
-            throw new ArgumentException($"Config {config} requires {workGroupSize} threads/WG, exceeds 256 limit");
-        }
+        long requiredLocalMemory = EstimateLocalMemoryBytes(config);
+        long workGroupSize = (long)config.ThreadTileM * config.ThreadTileN;
+        LogDiag($"  Local memory estimate: {requiredLocalMemory / 1024.0:F1} KB " +
+                $"(device limit: {localMemoryBytes / 1024.0:F1} KB)");
+        LogDiag($"  Work group size: {config.ThreadTileM}x{config.ThreadTileN} = " +
+                $"{workGroupSize} threads (device limit: {maxWorkGroupSize})");
 
         // Generate and compile the kernel
         var sw = Stopwatch.StartNew();
@@ -355,17 +381,39 @@ internal sealed class DynamicGemmKernel : IDisposable
             throw;
         }
 
-        DirectOpenClProgram program;
-        DirectOpenClKernel kernel;
+        DirectOpenClProgram? program = null;
+        DirectOpenClKernel? kernel = null;
         string kernelEntryName = GetKernelEntryName(config);
         try
         {
-            program = new DirectOpenClProgram(_context, source);
-            program.Build(OpenClBuildOptions.OptimizationFlags);
+            program = DirectOpenClProgram.TryCreateFromCache(
+                _context, source, OpenClBuildOptions.OptimizationFlags);
+            if (program is null)
+            {
+                program = new DirectOpenClProgram(_context, source);
+                program.Build(OpenClBuildOptions.OptimizationFlags);
+            }
+            else
+            {
+                NativeBinaryCacheLoads++;
+            }
             kernel = new DirectOpenClKernel(_context, program, kernelEntryName);
+            UIntPtr kernelLimit = OpenClNativeBindings.GetKernelWorkGroupInfoSizeT(
+                kernel.Handle,
+                _context.Device,
+                OpenClNativeBindings.CL_KERNEL_WORK_GROUP_SIZE);
+            if (kernelLimit != UIntPtr.Zero && (ulong)workGroupSize > (ulong)kernelLimit)
+            {
+                throw new ArgumentException(
+                    $"Config {config} requires {workGroupSize} work-items, but the compiled " +
+                    $"kernel limit is {(ulong)kernelLimit}.",
+                    nameof(config));
+            }
         }
         catch (Exception ex)
         {
+            kernel?.Dispose();
+            program?.Dispose();
             sw.Stop();
             CompilationFailures++;
             LogDiag($"  FAILED after {sw.ElapsedMilliseconds} ms: {ex.Message}");
@@ -388,25 +436,59 @@ internal sealed class DynamicGemmKernel : IDisposable
         CompilationSuccesses++;
         LogDiag($"  SUCCESS: Compiled in {sw.ElapsedMilliseconds} ms (total cached: {_cache.Count + 1})");
 
-        _cache[key] = (program, kernel);
-        return kernel;
+        DirectOpenClKernel compiledKernel = kernel ??
+            throw new InvalidOperationException("OpenCL compilation completed without a kernel.");
+        DirectOpenClProgram compiledProgram = program ??
+            throw new InvalidOperationException("OpenCL compilation completed without a program.");
+        _cache[key] = (compiledProgram, compiledKernel);
+        LastProgramBuildOrigin = compiledProgram.BuildOrigin;
+        LastProgramBinaryType = compiledProgram.BinaryType;
+        return compiledKernel;
     }
 
     /// <summary>
     /// Validates a configuration before attempting compilation.
     /// Returns null if valid, or an error message if invalid.
     /// </summary>
-    public static string? ValidateConfig(GemmConfig config)
+    public static string? ValidateConfig(
+        GemmConfig config,
+        int maxWorkGroupSize = 256,
+        long localMemoryBytes = 64L * 1024L,
+        int maxWorkItemSizeX = int.MaxValue,
+        int maxWorkItemSizeY = int.MaxValue)
     {
+        if (maxWorkGroupSize <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maxWorkGroupSize));
+        if (localMemoryBytes <= 0)
+            throw new ArgumentOutOfRangeException(nameof(localMemoryBytes));
+        if (maxWorkItemSizeX <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maxWorkItemSizeX));
+        if (maxWorkItemSizeY <= 0)
+            throw new ArgumentOutOfRangeException(nameof(maxWorkItemSizeY));
+        if (!Enum.IsDefined(typeof(GemmKernelTemplate), config.KernelTemplate))
+            return "Kernel template is invalid";
+
         int MWG = config.TileM;
         int NWG = config.TileN;
         int KWG = config.TileK;
         int MDIMC = config.ThreadTileM;
         int NDIMC = config.ThreadTileN;
+        if (MWG <= 0 || NWG <= 0 || KWG <= 0 || MDIMC <= 0 || NDIMC <= 0 ||
+            config.VectorWidthM <= 0 || config.VectorWidthN <= 0 ||
+            config.KReg <= 0 || config.KUnroll <= 0 ||
+            config.MdimaSize <= 0 || config.NdimbSize <= 0)
+        {
+            return "GEMM geometry fields must be positive";
+        }
 
         // Check work group size
-        if (MDIMC * NDIMC > 256)
-            return $"Work group size {MDIMC}x{NDIMC}={MDIMC * NDIMC} exceeds 256";
+        long workGroupSize = (long)MDIMC * NDIMC;
+        if (workGroupSize > maxWorkGroupSize)
+            return $"Work group size {MDIMC}x{NDIMC}={workGroupSize} exceeds device limit {maxWorkGroupSize}";
+        if (MDIMC > maxWorkItemSizeX)
+            return $"Work-item X dimension {MDIMC} exceeds device limit {maxWorkItemSizeX}";
+        if (NDIMC > maxWorkItemSizeY)
+            return $"Work-item Y dimension {NDIMC} exceeds device limit {maxWorkItemSizeY}";
 
         // Check tile divisibility
         if (MWG % MDIMC != 0)
@@ -418,34 +500,10 @@ internal sealed class DynamicGemmKernel : IDisposable
         int mwi = MWG / MDIMC;
         int nwi = NWG / NDIMC;
 
-        bool isClBlastBaseline = TryGetClBlastBaselineKernel(config, out _);
-        if (isClBlastBaseline)
-        {
-            int vwm = config.VectorWidthM > 0 ? config.VectorWidthM : 1;
-            int vwn = config.VectorWidthN > 0 ? config.VectorWidthN : 1;
-            if (vwm < 1) vwm = 1;
-            if (vwn < 1) vwn = 1;
-
-            int localFloats = 0;
-            if (config.CacheA && MWG / vwm > 0)
-                localFloats += KWG * (MWG / vwm);
-            if (config.CacheB && NWG / vwn > 0)
-                localFloats += KWG * (NWG / vwn);
-
-            int ldsBytes = localFloats * sizeof(float);
-            if (ldsBytes > 65536)
-                return $"Local memory {ldsBytes / 1024.0:F1} KB exceeds 64 KB limit (CLBlast)";
-        }
-        else
-        {
-            // Check local memory
-            // For high-occupancy double-buffered kernel (MWI*NWI <= 16), we need 2x local memory
-            bool isHighOccupancy = config.UseDoubleBuffering && (mwi * nwi <= 16);
-            int bufferMultiplier = isHighOccupancy ? 2 : 1;  // Double buffer needs 2x LDS
-            int ldsBytes = bufferMultiplier * (KWG * (MWG + 1) + KWG * (NWG + 1)) * sizeof(float);
-            if (ldsBytes > 65536)
-                return $"Local memory {ldsBytes / 1024.0:F1} KB exceeds 64 KB limit (double-buffered: {isHighOccupancy})";
-        }
+        long requiredLocalMemory = EstimateLocalMemoryBytes(config);
+        if (requiredLocalMemory > localMemoryBytes)
+            return $"Local memory {requiredLocalMemory / 1024.0:F1} KB exceeds device limit " +
+                   $"{localMemoryBytes / 1024.0:F1} KB";
         if (mwi < 1 || nwi < 1)
             return $"Invalid output per thread: {mwi}x{nwi}";
 
@@ -476,6 +534,44 @@ internal sealed class DynamicGemmKernel : IDisposable
         return null;
     }
 
+    /// <summary>Calculates the generated kernel's statically allocated OpenCL local memory.</summary>
+    internal static long EstimateLocalMemoryBytes(GemmConfig config)
+    {
+        try
+        {
+            checked
+            {
+                if (TryGetClBlastBaselineKernel(config, out _))
+                {
+                    long localFloats = 0;
+                    if (config.CacheA)
+                        localFloats += (long)config.TileK * (config.TileM / config.VectorWidthM);
+                    if (config.CacheB)
+                        localFloats += (long)config.TileK * (config.TileN / config.VectorWidthN);
+                    return localFloats * sizeof(float);
+                }
+
+                long outputsPerThread =
+                    ((long)config.TileM / config.ThreadTileM) *
+                    ((long)config.TileN / config.ThreadTileN);
+                long bufferMultiplier = config.UseDoubleBuffering && outputsPerThread <= 16 ? 2L : 1L;
+                return bufferMultiplier * config.TileK *
+                       ((long)config.TileM + config.TileN + 2L) * sizeof(float);
+            }
+        }
+        catch (OverflowException)
+        {
+            return long.MaxValue;
+        }
+    }
+
+    private int GetMaximumWorkItemSize(int dimension)
+    {
+        ulong[] limits = _context.MaxWorkItemSizes;
+        ulong limit = dimension < limits.Length ? limits[dimension] : _context.MaxWorkGroupSize;
+        return checked((int)Math.Min(limit, (ulong)int.MaxValue));
+    }
+
     /// <summary>
     /// Gets diagnostic statistics about kernel compilation.
     /// </summary>
@@ -495,39 +591,42 @@ internal sealed class DynamicGemmKernel : IDisposable
     /// - Partition camping avoidance with staggered work group indices
     /// </summary>
     /// <param name="config">GEMM configuration</param>
-    /// <param name="variant">Kernel variant to use (0=CLBlast, 1=XOR Swizzle, 2=RDNA1 Opt)</param>
-    private static string GenerateKernelSource(GemmConfig config, int variant)
+    /// <param name="variant">Typed kernel-source variant.</param>
+    private static string GenerateKernelSource(
+        GemmConfig config,
+        DynamicGemmKernelVariant variant)
     {
         if (TryGetClBlastBaselineKernel(config, out int gemmK))
         {
             // Select kernel variant based on passed variant parameter
             switch (variant)
             {
-                case 1:
-                // XOR swizzling - eliminates LDS bank conflicts without padding overhead
-                {
-                    var source = ClBlastXgemmKernel.BuildSourceWithSwizzle(config, gemmK, 0x0F);
-                    if (EnableDiagnostics)
+                case DynamicGemmKernelVariant.XorSwizzle:
+                    // XOR swizzling - eliminates LDS bank conflicts without padding overhead
                     {
-                        Console.WriteLine($"[DynamicGemm] SELECTED XOR SWIZZLE kernel: {config.KernelName} GEMMK={gemmK}");
-                        Console.WriteLine($"[DynamicGemm] Swizzle defines present: LDS_SWIZZLE_A={source.Contains("LDS_SWIZZLE_A(kg, mg)")}, LDS_STRIDE_A={source.Contains("LDS_STRIDE_A")}");
-                        Console.WriteLine($"[DynamicGemm] Original pattern present: alm[kg*(MWG/VWM)={source.Contains("alm[kg*(MWG/VWM)")}");
+                        var source = ClBlastXgemmKernel.BuildSourceWithSwizzle(config, gemmK, 0x0F);
+                        if (EnableDiagnostics)
+                        {
+                            Console.WriteLine($"[DynamicGemm] SELECTED XOR SWIZZLE kernel: {config.KernelName} GEMMK={gemmK}");
+                            Console.WriteLine($"[DynamicGemm] Swizzle defines present: LDS_SWIZZLE_A={source.Contains("LDS_SWIZZLE_A(kg, mg)")}, LDS_STRIDE_A={source.Contains("LDS_STRIDE_A")}");
+                            Console.WriteLine($"[DynamicGemm] Original pattern present: alm[kg*(MWG/VWM)={source.Contains("alm[kg*(MWG/VWM)")}");
+                        }
+                        return source;
                     }
-                    return source;
-                }
 
-                case 2:
+                case DynamicGemmKernelVariant.RdnaOptimized:
                     // RDNA1 optimized - XOR swizzle + Wave32 hints
                     if (EnableDiagnostics)
                         Console.WriteLine($"[DynamicGemm] SELECTED RDNA1 OPTIMIZED kernel: {config.KernelName} GEMMK={gemmK}");
                     return ClBlastXgemmKernel.BuildSourceOptimizedRdna1(config, gemmK, 0x0F, true);
 
-                case 0:
-                default:
+                case DynamicGemmKernelVariant.ClBlastBaseline:
                     // Original CLBlast baseline (default)
                     if (EnableDiagnostics)
                         Console.WriteLine($"[DynamicGemm] SELECTED CLBlast BASELINE kernel: {config.KernelName} GEMMK={gemmK}");
                     return ClBlastXgemmKernel.BuildSource(config, gemmK);
+                default:
+                    throw new ArgumentOutOfRangeException(nameof(variant));
             }
         }
 
@@ -570,9 +669,8 @@ internal sealed class DynamicGemmKernel : IDisposable
             if (KWG % KWI != 0) KWI = 1;
         }
 
-        // Validate configuration
-        if (MDIMC * NDIMC > 256)
-            throw new ArgumentException($"Work group size {MDIMC}x{NDIMC}={MDIMC * NDIMC} exceeds maximum 256");
+        // Shape relationships are also checked before source generation. Keep these guards here
+        // because they protect divisions used to construct the source text.
         if (MWG % MDIMC != 0 || NWG % NDIMC != 0)
             throw new ArgumentException($"Tile size must be divisible by work group size");
         if (MWI < 1 || NWI < 1)
@@ -751,23 +849,21 @@ internal sealed class DynamicGemmKernel : IDisposable
 
     private static bool TryGetClBlastBaselineKernel(GemmConfig config, out int gemmK)
     {
-        gemmK = 0;
-        if (string.IsNullOrWhiteSpace(config.KernelName))
-            return false;
-
-        if (config.KernelName.StartsWith("clblast_baseline_k1", StringComparison.OrdinalIgnoreCase))
+        switch (config.KernelTemplate)
         {
-            gemmK = 1;
-            return true;
+            case GemmKernelTemplate.ClBlastBaselineK0:
+                gemmK = 0;
+                return true;
+            case GemmKernelTemplate.ClBlastBaselineK1:
+                gemmK = 1;
+                return true;
+            case GemmKernelTemplate.Tuned:
+                gemmK = 0;
+                return false;
+            default:
+                throw new ArgumentOutOfRangeException(
+                    nameof(config), config.KernelTemplate, "Unknown GEMM kernel template.");
         }
-
-        if (config.KernelName.StartsWith("clblast_baseline_k0", StringComparison.OrdinalIgnoreCase))
-        {
-            gemmK = 0;
-            return true;
-        }
-
-        return false;
     }
 
     private static string GetKernelEntryName(GemmConfig config)
@@ -2666,6 +2762,93 @@ void gemm_tuned(
         kernel.SetArg(7, beta);
 
         kernel.Execute2D(globalM, globalN, config.ThreadTileM, config.ThreadTileN);
+    }
+
+    /// <summary>
+    /// Executes one already-prepared kernel on the driver's profiling queue and returns the
+    /// device-reported command duration. This deliberately excludes source compilation, host
+    /// launch overhead, transfers, and synchronization latency.
+    /// </summary>
+    public TimeSpan ExecuteProfiled(
+        DirectOpenClKernel kernel,
+        GemmConfig config,
+        IGpuBuffer A,
+        IGpuBuffer B,
+        IGpuBuffer C,
+        int M,
+        int N,
+        int K,
+        float alpha = 1.0f,
+        float beta = 0.0f)
+    {
+        if (!_context.IsProfilingEnabled)
+            throw new NotSupportedException("The OpenCL device does not expose a profiling command queue.");
+
+        var bufA = (DirectOpenClGpuBuffer)A;
+        var bufB = (DirectOpenClGpuBuffer)B;
+        var bufC = (DirectOpenClGpuBuffer)C;
+        int globalX;
+        int globalY;
+
+        if (TryGetClBlastBaselineKernel(config, out int gemmK))
+        {
+            kernel.SetArg(0, M);
+            kernel.SetArg(1, N);
+            kernel.SetArg(2, K);
+            kernel.SetArg(3, alpha);
+            kernel.SetArg(4, beta);
+            kernel.SetArg(5, bufA.Buffer.Handle);
+            kernel.SetArg(6, bufB.Buffer.Handle);
+            kernel.SetArg(7, bufC.Buffer.Handle);
+            kernel.SetArg(8, 0);
+            kernel.SetArg(9, 0);
+            int cOne = gemmK == 1 ? N : M;
+            int cTwo = gemmK == 1 ? M : N;
+            globalX = (cOne * config.ThreadTileM) / config.TileM;
+            globalY = (cTwo * config.ThreadTileN) / config.TileN;
+        }
+        else
+        {
+            kernel.SetArg(0, bufA.Buffer.Handle);
+            kernel.SetArg(1, bufB.Buffer.Handle);
+            kernel.SetArg(2, bufC.Buffer.Handle);
+            kernel.SetArg(3, M);
+            kernel.SetArg(4, N);
+            kernel.SetArg(5, K);
+            kernel.SetArg(6, alpha);
+            kernel.SetArg(7, beta);
+            int workGroupsM = (M + config.TileM - 1) / config.TileM;
+            int workGroupsN = (N + config.TileN - 1) / config.TileN;
+            globalX = workGroupsM * config.ThreadTileM;
+            globalY = workGroupsN * config.ThreadTileN;
+        }
+
+        IntPtr kernelEvent = kernel.Execute2DProfiled(
+            globalX,
+            globalY,
+            config.ThreadTileM,
+            config.ThreadTileN);
+        if (kernelEvent == IntPtr.Zero)
+            throw new InvalidOperationException("The OpenCL profiling launch returned no event.");
+        try
+        {
+            int waitError = OpenClNativeBindings.WaitForEvents(1, new[] { kernelEvent });
+            if (waitError != OpenClNativeBindings.CL_SUCCESS)
+                throw new InvalidOperationException($"Waiting for the OpenCL profiling event failed: {waitError}.");
+            ulong started = OpenClNativeBindings.GetEventProfilingInfoULong(
+                kernelEvent, OpenClNativeBindings.CL_PROFILING_COMMAND_START);
+            ulong ended = OpenClNativeBindings.GetEventProfilingInfoULong(
+                kernelEvent, OpenClNativeBindings.CL_PROFILING_COMMAND_END);
+            if (ended <= started)
+                throw new InvalidOperationException("The OpenCL profiling event returned a non-positive duration.");
+            ulong nanoseconds = ended - started;
+            long ticks = checked((long)Math.Max(1UL, nanoseconds / 100UL));
+            return TimeSpan.FromTicks(ticks);
+        }
+        finally
+        {
+            OpenClNativeBindings.ReleaseEvent(kernelEvent);
+        }
     }
 
     /// <summary>

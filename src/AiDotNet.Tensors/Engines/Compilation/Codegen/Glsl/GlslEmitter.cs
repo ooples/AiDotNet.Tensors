@@ -16,6 +16,9 @@ namespace AiDotNet.Tensors.Engines.Compilation.Codegen.Glsl;
 /// </summary>
 public sealed class GlslEmitter : IKernelEmitter
 {
+    /// <summary>Workgroup width embedded in the GLSL layout declaration.</summary>
+    public int WorkgroupSize { get; set; } = 256;
+
     /// <inheritdoc/>
     public CodegenTarget Target => CodegenTarget.Glsl;
 
@@ -36,6 +39,8 @@ public sealed class GlslEmitter : IKernelEmitter
     /// <inheritdoc/>
     public CodegenEmitResult Emit(CodegenGraph graph, CodegenElementType dtype)
     {
+        if (WorkgroupSize <= 0)
+            return CodegenEmitResult.Decline("GLSL workgroup size must be positive.");
         var decline = GpuEmitterCommon.CheckSupport(graph, dtype, Supported);
         if (decline != null) return CodegenEmitResult.Decline(decline);
 
@@ -45,7 +50,7 @@ public sealed class GlslEmitter : IKernelEmitter
 
         var sb = new StringBuilder();
         sb.AppendLine("#version 450");
-        sb.AppendLine("layout(local_size_x = 256) in;");
+        sb.AppendLine($"layout(local_size_x = {WorkgroupSize}) in;");
         sb.AppendLine();
         int binding = 0;
         for (int i = 0; i < inputCount; i++)
@@ -79,7 +84,8 @@ public sealed class GlslEmitter : IKernelEmitter
 
         var source = sb.ToString();
         return CodegenEmitResult.Succeeded(
-            new GpuSourceKernel(graph, dtype, CodegenTarget.Glsl, source, entryPoint),
+            new GpuSourceKernel(
+                graph, dtype, CodegenTarget.Glsl, source, entryPoint, WorkgroupSize),
             source);
     }
 }

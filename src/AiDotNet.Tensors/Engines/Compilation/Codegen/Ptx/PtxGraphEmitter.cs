@@ -47,6 +47,70 @@ public sealed record PtxSplitProgram(
     long TempElements, CodegenSplitPlan Plan);
 
 /// <summary>
+/// Direct PTX plus its fixed launch geometry and graph-input binding order. The CUDA backend
+/// loads this representation as a cubin (or uses the driver JIT where explicitly allowed) and
+/// retains the resulting module for subsequent fused launches.
+/// </summary>
+public sealed class PtxCodegenKernel : CodegenKernel
+{
+    internal PtxCodegenKernel(
+        CodegenGraph graph,
+        string ptx,
+        string entryPoint,
+        uint launchBlocks,
+        uint launchBlockX,
+        uint launchBlockY,
+        int computeMajor,
+        int computeMinor,
+        IReadOnlyList<int> inputPortOrder,
+        int outputElementCount)
+        : base(CodegenElementType.Float32, graph, CodegenTarget.DirectPtx)
+    {
+        Ptx = ptx;
+        EntryPoint = entryPoint;
+        LaunchBlocks = launchBlocks;
+        LaunchBlockX = launchBlockX;
+        LaunchBlockY = launchBlockY;
+        ComputeMajor = computeMajor;
+        ComputeMinor = computeMinor;
+        InputPortOrder = inputPortOrder;
+        OutputElementCount = outputElementCount;
+    }
+
+    /// <summary>The emitted PTX representation.</summary>
+    public string Ptx { get; }
+
+    /// <summary>The PTX entry point.</summary>
+    public string EntryPoint { get; }
+
+    /// <summary>The fixed grid width emitted for this shape-specialized kernel.</summary>
+    public uint LaunchBlocks { get; }
+
+    /// <summary>The emitted block width.</summary>
+    public uint LaunchBlockX { get; }
+
+    /// <summary>The emitted block height.</summary>
+    public uint LaunchBlockY { get; }
+
+    /// <summary>CUDA compute-capability major version used during PTX emission.</summary>
+    public int ComputeMajor { get; }
+
+    /// <summary>CUDA compute-capability minor version used during PTX emission.</summary>
+    public int ComputeMinor { get; }
+
+    /// <summary>Graph input ports in the parameter order required by the PTX entry point.</summary>
+    public IReadOnlyList<int> InputPortOrder { get; }
+
+    /// <summary>The exact number of elements written by the shape-specialized kernel.</summary>
+    public int OutputElementCount { get; }
+
+    /// <inheritdoc/>
+    public override void Execute<T>(T[][] inputs, T[][] outputs) =>
+        throw new NotSupportedException(
+            "Direct PTX kernels require CudaBackend and resident CUDA buffers.");
+}
+
+/// <summary>
 /// Emits direct PTX for a <see cref="CodegenGraph"/> via the index-map layer.
 /// </summary>
 public sealed class PtxGraphEmitter : IKernelEmitter
@@ -118,14 +182,27 @@ public sealed class PtxGraphEmitter : IKernelEmitter
             return CodegenEmitResult.Decline(
                 "direct PTX emits fp32; graph asks for " + dtype);
 
-        if (!CodegenGraphToSpec.TryTranslate(graph, KernelName(graph), out var spec, out string reason))
+        if (!CodegenGraphToSpec.TryTranslate(
+                graph, KernelName(graph), out CodegenKernelSpec? spec,
+                out IReadOnlyList<int> graphNodeOrder, out string reason))
             return CodegenEmitResult.Decline("cannot express this graph as a kernel spec: " + reason);
+        if (spec is null)
+            return CodegenEmitResult.Decline("translator returned no kernel spec");
+
+        var inputPortOrder = new int[graphNodeOrder.Count];
+        for (int parameter = 0; parameter < graphNodeOrder.Count; parameter++)
+        {
+            int inputPort = IndexOf(graph.InputNodes, graphNodeOrder[parameter]);
+            if (inputPort < 0)
+                return CodegenEmitResult.Decline("translator returned a non-input parameter binding");
+            inputPortOrder[parameter] = inputPort;
+        }
 
         string ptx;
         var emitter = new PtxAffineEmitter();
         try
         {
-            ptx = emitter.Emit(spec!, ComputeMajor, ComputeMinor);
+            ptx = emitter.Emit(spec, ComputeMajor, ComputeMinor);
         }
         catch (NotSupportedException ex)
         {
@@ -138,14 +215,16 @@ public sealed class PtxGraphEmitter : IKernelEmitter
         LastLaunchBlocks = emitter.LaunchBlocks;
         LastLaunchBlockX = (uint)emitter.LaunchBlockX;
         LastLaunchBlockY = (uint)emitter.LaunchBlockY;
-        LastSplitProgram = TryEmitSplit(spec!);
+        LastSplitProgram = TryEmitSplit(spec);
 
-        // No CodegenKernel is produced here: building one means owning a CUDA context,
-        // module load and buffer binding, which belongs to the GPU execution path rather
-        // than to an emitter. The PTX is returned as source, which is what a caller
-        // needs to load it, and what the conveyor's release stage already consumes.
-        return CodegenEmitResult.Decline(
-            "PTX emitted; loading it needs a device context this emitter does not own", ptx);
+        int outputElementCount = GetElementCount(spec.Output.Shape);
+        return CodegenEmitResult.Succeeded(
+            new PtxCodegenKernel(
+                graph, ptx, spec.Name,
+                LastLaunchBlocks, LastLaunchBlockX, LastLaunchBlockY,
+                ComputeMajor, ComputeMinor,
+                inputPortOrder, outputElementCount),
+            ptx);
     }
 
     /// <summary>
@@ -189,5 +268,19 @@ public sealed class PtxGraphEmitter : IKernelEmitter
     {
         long hash = graph.ComputeContentHash();
         return "ptx_graph_" + ((ulong)hash).ToString("x16", System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    private static int IndexOf(IReadOnlyList<int> values, int value)
+    {
+        for (int i = 0; i < values.Count; i++)
+            if (values[i] == value) return i;
+        return -1;
+    }
+
+    private static int GetElementCount(IReadOnlyList<int> shape)
+    {
+        long count = 1;
+        for (int i = 0; i < shape.Count; i++) count = checked(count * shape[i]);
+        return checked((int)count);
     }
 }

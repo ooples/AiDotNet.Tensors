@@ -17,6 +17,9 @@ namespace AiDotNet.Tensors.Engines.Compilation.Codegen.Wgsl;
 /// </summary>
 public sealed class WgslEmitter : IKernelEmitter
 {
+    /// <summary>Workgroup width embedded in the WGSL entry point.</summary>
+    public int WorkgroupSize { get; set; } = 256;
+
     /// <inheritdoc/>
     public CodegenTarget Target => CodegenTarget.Wgsl;
 
@@ -38,6 +41,8 @@ public sealed class WgslEmitter : IKernelEmitter
     /// <inheritdoc/>
     public CodegenEmitResult Emit(CodegenGraph graph, CodegenElementType dtype)
     {
+        if (WorkgroupSize <= 0)
+            return CodegenEmitResult.Decline("WGSL workgroup size must be positive.");
         var decline = GpuEmitterCommon.CheckSupport(graph, dtype, Supported);
         if (decline != null) return CodegenEmitResult.Decline(decline);
 
@@ -58,7 +63,7 @@ public sealed class WgslEmitter : IKernelEmitter
         sb.AppendLine($"struct P {{ n_elements : u32 }};");
         sb.AppendLine($"@group(0) @binding({binding}) var<uniform> p : P;");
         sb.AppendLine();
-        sb.AppendLine($"@compute @workgroup_size(256) fn {entryPoint}(@builtin(global_invocation_id) id : vec3<u32>) {{");
+        sb.AppendLine($"@compute @workgroup_size({WorkgroupSize}) fn {entryPoint}(@builtin(global_invocation_id) id : vec3<u32>) {{");
         sb.AppendLine("    let gid : u32 = id.x;");
         sb.AppendLine("    if (gid >= p.n_elements) { return; }");
 
@@ -83,7 +88,8 @@ public sealed class WgslEmitter : IKernelEmitter
 
         var source = sb.ToString();
         return CodegenEmitResult.Succeeded(
-            new GpuSourceKernel(graph, dtype, CodegenTarget.Wgsl, source, entryPoint),
+            new GpuSourceKernel(
+                graph, dtype, CodegenTarget.Wgsl, source, entryPoint, WorkgroupSize),
             source);
     }
 }

@@ -11,7 +11,9 @@ internal static class HipFusedLinearCeKernels
     {
         return @"
 #include <hip/hip_runtime.h>
-#include <math.h>
+#ifndef INFINITY
+#define INFINITY __builtin_huge_valf()
+#endif
 
 // Index targets: loss_r = logsumexp(logits_r) - logits_r[target_r].
 extern ""C"" __global__ __launch_bounds__(256) void fused_linear_ce_index(
