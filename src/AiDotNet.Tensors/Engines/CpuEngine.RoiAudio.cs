@@ -744,6 +744,14 @@ public partial class CpuEngine
         }
 
         int targetLen = (int)Math.Round(waveform._shape[waveform.Rank - 1] / rate);
-        return ISTFT(newMag, newPhase, nFft, hopLength, window, center: true, length: targetLen);
+
+        // Suppressed: ISTFT records on the tape (issue #905 item 2), but TimeStretch builds its
+        // phase by an unrecorded accumulation loop above, so a recorded synthesis here would hand
+        // back a gradient that ignores everything this op actually did. TimeStretch stays in
+        // NonDifferentiableOps and its internals must agree.
+        using (new NoGradScope<T>())
+        {
+            return ISTFT(newMag, newPhase, nFft, hopLength, window, center: true, length: targetLen);
+        }
     }
 }

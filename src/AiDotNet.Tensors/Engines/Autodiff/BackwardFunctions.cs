@@ -8856,6 +8856,164 @@ internal static class BackwardFunctions<T>
     private static string Describe(object? o) => o is null ? "null" : o.GetType().Name;
 
     /// <summary>
+    /// Adjoint of <c>ISTFT</c>: maps a gradient shaped like the reconstructed waveform back onto
+    /// the magnitude and phase spectrograms it was synthesised from.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The forward is four stages, and this transposes each in reverse. Writing <c>w</c> for the
+    /// window, <c>s(f)</c> for the write offset of frame <c>f</c>, and
+    /// <c>W[j] = sum_f w[j - s(f)]^2</c> for the window-sum envelope:
+    /// </para>
+    /// <list type="number">
+    /// <item><description>
+    /// <b>Normalisation.</b> <c>y[j] = a[j] / W[j]</c> where the envelope exceeds 1e-8. <c>W</c>
+    /// depends only on the geometry, never on magnitude or phase, so its transpose is the same
+    /// division applied to the incoming gradient, under the same 1e-8 guard. Dropping that guard
+    /// would make the adjoint disagree with the forward exactly where the forward declined to
+    /// divide.
+    /// </description></item>
+    /// <item><description>
+    /// <b>Windowed overlap-add.</b> <c>a[s(f) + i] += w[i] * z_f[i] / nFft</c>, summed over frames
+    /// and skipping out-of-range writes. The transpose of a scatter-add is a gather:
+    /// <c>gz_f[i] = w[i] * gy[s(f) + i] / nFft</c>, and zero wherever the forward wrote nothing.
+    /// </description></item>
+    /// <item><description>
+    /// <b>Inverse DFT, real part.</b> <c>z_f[i] = Re( sum_k C[k] exp(+2*pi*I*k*i/nFft) )</c>. The
+    /// transpose of an unnormalised inverse transform is an unnormalised FORWARD one, so
+    /// <c>gCRe[k] = sum_i gz_f[i] cos(2*pi*k*i/nFft)</c> and
+    /// <c>gCIm[k] = -sum_i gz_f[i] sin(2*pi*k*i/nFft)</c>, which are exactly the real and
+    /// imaginary parts of <c>FFT(gz_f)</c>.
+    /// </description></item>
+    /// <item><description>
+    /// <b>Hermitian extension and the polar map.</b> The forward copied bins
+    /// <c>1 .. numFreqs-2</c> to <c>nFft-k</c> with the imaginary part negated, so each of those
+    /// bins receives two contributions while DC and Nyquist receive one. Then <c>C[k] = m
+    /// exp(I*p)</c> gives <c>dL/dm = gCRe cos(p) + gCIm sin(p)</c> and
+    /// <c>dL/dp = m * (gCIm cos(p) - gCRe sin(p))</c>.
+    /// </description></item>
+    /// </list>
+    /// <para>
+    /// This is the transpose of SYNTHESIS, which is a different operator from the analysis adjoint
+    /// in <see cref="MagnitudeStftAdjoint"/>: that one maps a spectrogram gradient onto a waveform,
+    /// this one maps a waveform gradient onto a spectrogram. The registry note on ISTFT records why
+    /// the two must not be substituted for one another.
+    /// </para>
+    /// <para>
+    /// The window is treated as a constant, as it is everywhere else in this file. It is a fixed
+    /// analysis choice rather than a learned parameter.
+    /// </para>
+    /// </remarks>
+    internal static void IstftBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var magnitude = inputs[0];
+        var phase = inputs[1];
+
+        RequireSavedState(nameof(IstftBackward), savedState, 5);
+        int nFft = SavedInt(nameof(IstftBackward), savedState, 0, "nFft");
+        int hopLength = SavedInt(nameof(IstftBackward), savedState, 1, "hopLength");
+        var window = SavedTensor(nameof(IstftBackward), savedState, 2, "window");
+        bool center = SavedBool(nameof(IstftBackward), savedState, 3, "center");
+        int outputLength = SavedInt(nameof(IstftBackward), savedState, 4, "outputLength");
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        int numFreqs = magnitude._shape[^2];
+        int numFrames = magnitude._shape[^1];
+        int batchSize = magnitude.Length / (numFreqs * numFrames);
+
+        var gradData = gradOutput.GetDataArray();
+        var magData = magnitude.GetDataArray();
+        var phaseData = phase.GetDataArray();
+        var windowData = window.GetDataArray();
+
+        var gradMagnitude = new Tensor<T>(magnitude._shape);
+        var gradPhase = new Tensor<T>(magnitude._shape);
+        var gradMagnitudeData = gradMagnitude.GetDataArray();
+        var gradPhaseData = gradPhase.GetDataArray();
+
+        var windowSum = new double[outputLength];
+        var normalisedGrad = new double[outputLength];
+
+        // Hoisted for the reason MagnitudeStftAdjoint hoists its pair: one allocation per
+        // (batch, frame) would churn thousands of short-lived vectors on long audio. Every element
+        // is rewritten below before it is read, so nothing carries over between frames.
+        var frameGradReal = new Vector<T>(nFft);
+        var frameGradImag = new Vector<T>(nFft);
+
+        for (int b = 0; b < batchSize; b++)
+        {
+            int specOffset = b * numFreqs * numFrames;
+            int outOffset = b * outputLength;
+
+            Array.Clear(windowSum, 0, windowSum.Length);
+            for (int frame = 0; frame < numFrames; frame++)
+            {
+                int writeStart = center ? (frame * hopLength) - (nFft / 2) : frame * hopLength;
+                for (int i = 0; i < nFft; i++)
+                {
+                    int outIdx = writeStart + i;
+                    if (outIdx >= 0 && outIdx < outputLength)
+                    {
+                        double w = numOps.ToDouble(windowData[i]);
+                        windowSum[outIdx] += w * w;
+                    }
+                }
+            }
+
+            for (int i = 0; i < outputLength; i++)
+            {
+                double g = numOps.ToDouble(gradData[outOffset + i]);
+                normalisedGrad[i] = windowSum[i] > 1e-8 ? g / windowSum[i] : g;
+            }
+
+            for (int frame = 0; frame < numFrames; frame++)
+            {
+                int writeStart = center ? (frame * hopLength) - (nFft / 2) : frame * hopLength;
+
+                for (int i = 0; i < nFft; i++)
+                {
+                    int outIdx = writeStart + i;
+                    double contribution = outIdx >= 0 && outIdx < outputLength
+                        ? normalisedGrad[outIdx] * numOps.ToDouble(windowData[i]) / nFft
+                        : 0.0;
+                    frameGradReal[i] = numOps.FromDouble(contribution);
+                    frameGradImag[i] = numOps.Zero;
+                }
+
+                var (adjointReal, adjointImag) =
+                    CpuEngine.UnnormalizedTransformForAdjoint<T>(frameGradReal, frameGradImag, inverse: false);
+
+                for (int k = 0; k < numFreqs; k++)
+                {
+                    double gradReal = numOps.ToDouble(adjointReal[k]);
+                    double gradImag = numOps.ToDouble(adjointImag[k]);
+
+                    if (k >= 1 && k < numFreqs - 1)
+                    {
+                        gradReal += numOps.ToDouble(adjointReal[nFft - k]);
+                        gradImag -= numOps.ToDouble(adjointImag[nFft - k]);
+                    }
+
+                    int idx = specOffset + (k * numFrames) + frame;
+                    double magnitudeValue = numOps.ToDouble(magData[idx]);
+                    double phaseValue = numOps.ToDouble(phaseData[idx]);
+                    double cosPhase = Math.Cos(phaseValue);
+                    double sinPhase = Math.Sin(phaseValue);
+
+                    gradMagnitudeData[idx] = numOps.FromDouble((gradReal * cosPhase) + (gradImag * sinPhase));
+                    gradPhaseData[idx] = numOps.FromDouble(
+                        magnitudeValue * ((gradImag * cosPhase) - (gradReal * sinPhase)));
+                }
+            }
+        }
+
+        DifferentiableOps.AccumulateGrad(grads, magnitude, gradMagnitude, engine);
+        DifferentiableOps.AccumulateGrad(grads, phase, gradPhase, engine);
+    }
+
+    /// <summary>
     /// Adjoint of <c>mag = |STFT(x)|</c> with <c>center: true</c>: maps a gradient shaped like
     /// the one-sided magnitude spectrogram back onto the waveform.
     /// </summary>

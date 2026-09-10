@@ -42304,6 +42304,15 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
+        // Synthesis is on the tape (issue #905 item 2). An STFT-consistency objective is defined
+        // ACROSS the round trip, so a severed ISTFT leaves half of it untrainable while still
+        // running - the silent failure the issue reports. outputLength is saved rather than
+        // recomputed because the caller may have supplied it verbatim.
+        DifferentiableOps.RecordBinary(
+            "ISTFT", result, magnitude, phase,
+            BackwardFunctions<T>.IstftBackward,
+            new object[] { nFft, hopLength, window, center, outputLength });
+
         return result;
     }
 
@@ -42466,11 +42475,21 @@ public partial class CpuEngine : ITensorLevelEngine
 
         for (int iter = 0; iter < iterations; iter++)
         {
-            // Reconstruct signal from magnitude and estimated phase
-            var reconstructed = ISTFT(magnitude, phase, nFft, hopLength, window, center: true, length: length);
+            // Reconstruct signal from magnitude and estimated phase.
+            //
+            // Suppressed: ISTFT records on the tape (issue #905 item 2) but GriffinLim is an
+            // iterative ALGORITHM, not a differentiable op, and stays in NonDifferentiableOps.
+            // Without this, calling it under a tape would unroll every iteration onto that tape
+            // and pin each intermediate, making the op silently contradict its own classification.
+            Tensor<T> reconstructed;
+            Tensor<T> newPhase;
+            using (new NoGradScope<T>())
+            {
+                reconstructed = ISTFT(magnitude, phase, nFft, hopLength, window, center: true, length: length);
 
-            // Re-compute STFT to get new phase estimate
-            STFT(reconstructed, nFft, hopLength, window, center: true, out _, out var newPhase);
+                // Re-compute STFT to get new phase estimate
+                STFT(reconstructed, nFft, hopLength, window, center: true, out _, out newPhase);
+            }
 
             // Apply momentum for faster convergence
             if (previousPhase != null && momentum > 0)
@@ -42498,8 +42517,11 @@ public partial class CpuEngine : ITensorLevelEngine
             previousPhase = newPhase;
         }
 
-        // Final reconstruction
-        return ISTFT(magnitude, phase, nFft, hopLength, window, center: true, length: length);
+        // Final reconstruction, suppressed for the same reason as the iterations above.
+        using (new NoGradScope<T>())
+        {
+            return ISTFT(magnitude, phase, nFft, hopLength, window, center: true, length: length);
+        }
     }
 
     /// <inheritdoc/>
