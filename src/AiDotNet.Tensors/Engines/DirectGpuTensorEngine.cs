@@ -19460,28 +19460,47 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> TensorAtan2<T>(Tensor<T> y, Tensor<T> x)
     {
         // Shape validation, and the exception it throws, belong to the one implementation on the
-        // base engine rather than being restated here.
-        if (y is null || x is null || y.Rank != x.Rank) return base.TensorAtan2(y, x);
-        for (int d = 0; d < y.Rank; d++)
+        // base engine rather than being restated here; this only decides whether the GPU kernel is
+        // applicable, and defers everything else.
+        if (SameShapeForAtan2(y, x))
         {
-            if (y._shape[d] != x._shape[d]) return base.TensorAtan2(y, x);
+            try
+            {
+                // Atan2Elementwise is declared (real, imag) and computes atan2(imag, real), so the
+                // operands cross over: our y is its imaginary part and our x is its real part.
+                var result = TryRunBinary(y, x,
+                    static (backend, yBuffer, xBuffer, output, size) => backend.Atan2Elementwise(xBuffer, yBuffer, output, size));
+                if (result != null)
+                {
+                    var output = new Tensor<T>(result, y.Shape._dims);
+                    Autodiff.DifferentiableOps.RecordBinary("TensorAtan2", output, y, x, Autodiff.BackwardFunctions<T>.Atan2Backward);
+                    return output;
+                }
+            }
+            catch { }
         }
 
-        try
-        {
-            // Atan2Elementwise is declared (real, imag) and computes atan2(imag, real), so the
-            // operands cross over: our y is its imaginary part and our x is its real part.
-            var result = TryRunBinary(y, x,
-                static (backend, yBuffer, xBuffer, output, size) => backend.Atan2Elementwise(xBuffer, yBuffer, output, size));
-            if (result != null)
-            {
-                var output = new Tensor<T>(result, y.Shape._dims);
-                Autodiff.DifferentiableOps.RecordBinary("TensorAtan2", output, y, x, Autodiff.BackwardFunctions<T>.Atan2Backward);
-                return output;
-            }
-        }
-        catch { }
         return base.TensorAtan2(y, x);
+    }
+
+    /// <summary>
+    /// Whether two operands are shaped so the element-wise atan2 kernel applies.
+    /// </summary>
+    /// <remarks>
+    /// Takes nullable parameters deliberately. Testing the callers' non-nullable arguments for null
+    /// inline would narrow them for the rest of the method, and forwarding them to the base
+    /// implementation - which is what should raise the real exception - would then warn.
+    /// </remarks>
+    private static bool SameShapeForAtan2<T>(Tensor<T>? y, Tensor<T>? x)
+    {
+        if (y is null || x is null || y.Rank != x.Rank) return false;
+
+        for (int d = 0; d < y.Rank; d++)
+        {
+            if (y._shape[d] != x._shape[d]) return false;
+        }
+
+        return true;
     }
 
     // ──────────────────────────────────────────────────────────────
