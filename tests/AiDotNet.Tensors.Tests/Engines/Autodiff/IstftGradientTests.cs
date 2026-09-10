@@ -223,6 +223,102 @@ public class IstftGradientTests
         }
     }
 
+    [Theory]
+    [InlineData(5)]
+    [InlineData(7)]
+    public void Istft_GradientMatchesFiniteDifferences_AtOddNFft(int oddNFft)
+    {
+        // The Hermitian extension is where an odd length could diverge: with nFft even, bin
+        // numFreqs-1 is Nyquist and is deliberately not mirrored, whereas with nFft odd there is no
+        // Nyquist bin and the forward still stops mirroring at numFreqs-2. The adjoint folds over
+        // exactly the range the forward mirrors, so it stays the transpose either way - but that is
+        // an argument, and every other gradcheck here runs at nFft 8, so nothing had tested it.
+        //
+        // Odd lengths also exercise the Bluestein path, since they are not powers of two. Before
+        // the transform fix in this branch the forward zero-padded to the next power of two while
+        // the adjoint did not, and these cases would have failed outright.
+        const int hop = 2;
+        const int frames = 3;
+        int numFreqs = (oddNFft / 2) + 1;
+        int outputLength = ((frames - 1) * hop) + oddNFft;
+
+        var windowData = new double[oddNFft];
+        for (int i = 0; i < oddNFft; i++)
+        {
+            windowData[i] = 0.3 + (0.1 * i);
+        }
+
+        var window = new Tensor<double>(windowData, new[] { oddNFft });
+
+        Tensor<double> BuildMagnitudes()
+        {
+            var m = new double[numFreqs * frames];
+            for (int i = 0; i < m.Length; i++)
+            {
+                m[i] = 0.4 + (0.17 * ((i * 7) % 5));
+            }
+
+            return new Tensor<double>(m, new[] { numFreqs, frames });
+        }
+
+        Tensor<double> BuildPhases()
+        {
+            var p = new double[numFreqs * frames];
+            for (int i = 0; i < p.Length; i++)
+            {
+                p[i] = -2.0 + (0.31 * ((i * 3) % 11));
+            }
+
+            return new Tensor<double>(p, new[] { numFreqs, frames });
+        }
+
+        var weightData = new double[outputLength];
+        for (int i = 0; i < outputLength; i++)
+        {
+            weightData[i] = 0.25 + (0.11 * ((i * 5) % 7));
+        }
+
+        var weights = new Tensor<double>(weightData, new[] { outputLength });
+
+        double Loss(Tensor<double> magnitude, Tensor<double> phase)
+        {
+            var reconstructed = _engine.ISTFT(magnitude, phase, oddNFft, hop, window, center: false);
+            double total = 0;
+            for (int i = 0; i < outputLength; i++)
+            {
+                total += reconstructed[i] * weights[i];
+            }
+
+            return total;
+        }
+
+        var baseMagnitude = BuildMagnitudes();
+        var basePhase = BuildPhases();
+
+        using var tape = new GradientTape<double>();
+        var output = _engine.ISTFT(baseMagnitude, basePhase, oddNFft, hop, window, center: false);
+        var loss = _engine.ReduceSum(_engine.TensorMultiply(output, weights), null);
+        var grads = tape.ComputeGradients(loss, new[] { baseMagnitude, basePhase });
+
+        const double h = 1e-6;
+        for (int j = 0; j < numFreqs * frames; j++)
+        {
+            var magPlus = BuildMagnitudes();
+            var magMinus = BuildMagnitudes();
+            magPlus[j] += h;
+            magMinus[j] -= h;
+            var magNumeric = (Loss(magPlus, BuildPhases()) - Loss(magMinus, BuildPhases())) / (2 * h);
+            Assert.Equal(magNumeric, grads[baseMagnitude][j], 1e-7);
+
+            var phasePlus = BuildPhases();
+            var phaseMinus = BuildPhases();
+            phasePlus[j] += h;
+            phaseMinus[j] -= h;
+            var phaseNumeric = (Loss(BuildMagnitudes(), phasePlus) - Loss(BuildMagnitudes(), phaseMinus)) / (2 * h);
+            Assert.Equal(phaseNumeric, grads[basePhase][j], 1e-7);
+        }
+    }
+
     [Fact]
     public void GriffinLim_StaysOffTheTape()
     {

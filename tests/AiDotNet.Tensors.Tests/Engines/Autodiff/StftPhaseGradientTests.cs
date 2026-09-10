@@ -168,29 +168,63 @@ public class StftPhaseGradientTests
         Assert.True(moved, "every waveform gradient is zero - the tape connection is severed");
     }
 
+    /// <summary>
+    /// Fixed, varied weights, so the seed gradient is not uniform.
+    /// </summary>
+    private static Tensor<double> RoundTripWeights(int length)
+    {
+        var w = new double[length];
+        for (int i = 0; i < length; i++)
+        {
+            w[i] = 0.25 + (0.11 * ((i * 5) % 7));
+        }
+
+        return new Tensor<double>(w, new[] { length });
+    }
+
     [Fact]
     public void StftPhase_AndIstft_CloseTheRoundTrip()
     {
         // Both inputs of ISTFT are now differentiable functions of the waveform, so a consistency
         // objective defined across analysis and synthesis trains end to end.
+        //
+        // The loss is built from the reconstruction ALONE. An obvious spelling of this test uses the
+        // residual (reconstructed - waveform), which is wrong here: that subtraction gives the
+        // waveform a direct edge to the loss, so its gradient stays non-zero even with the whole
+        // round trip severed. Measured with StopGradient across the chain, the residual form still
+        // reported a non-zero waveform gradient - it was passing for a reason unrelated to what it
+        // claimed. Asserting on the two intermediates as well pins each leg of the chain.
         var waveform = Waveform();
+        var weights = RoundTripWeights(SignalLength);
 
         using var tape = new GradientTape<double>();
         var magnitude = _engine.Spectrogram(waveform, NFft, HopLength, NFft, Window());
         var phase = _engine.StftPhase(waveform, NFft, HopLength, NFft, Window());
         var reconstructed = _engine.ISTFT(magnitude, phase, NFft, HopLength, Window(), center: true, SignalLength);
-        var residual = _engine.TensorSubtract(reconstructed, waveform);
-        var loss = _engine.ReduceSum(_engine.TensorMultiply(residual, residual), null);
-        var grads = tape.ComputeGradients(loss, new[] { waveform });
+        var loss = _engine.ReduceSum(_engine.TensorMultiply(reconstructed, weights), null);
+        var grads = tape.ComputeGradients(loss, new[] { waveform, magnitude, phase });
 
-        Assert.True(grads.ContainsKey(waveform), "no gradient survived the analysis-synthesis round trip");
+        AssertMoved(grads, waveform, "waveform", SignalLength);
+        AssertMoved(grads, magnitude, "magnitude", magnitude.Length);
+        AssertMoved(grads, phase, "phase", phase.Length);
+    }
 
-        var moved = false;
-        for (int j = 0; j < SignalLength; j++)
+    private static void AssertMoved(
+        System.Collections.Generic.Dictionary<Tensor<double>, Tensor<double>> grads,
+        Tensor<double> tensor,
+        string name,
+        int length)
+    {
+        Assert.True(grads.ContainsKey(tensor), $"no gradient reached {name} through the round trip");
+
+        for (int j = 0; j < length; j++)
         {
-            if (grads[waveform][j] != 0.0) { moved = true; }
+            if (grads[tensor][j] != 0.0)
+            {
+                return;
+            }
         }
 
-        Assert.True(moved, "the round-trip gradient is identically zero");
+        Assert.Fail($"every {name} gradient is zero - that leg of the round trip is severed");
     }
 }

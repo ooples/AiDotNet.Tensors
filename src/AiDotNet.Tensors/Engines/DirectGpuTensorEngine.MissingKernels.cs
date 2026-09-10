@@ -5224,21 +5224,38 @@ public partial class DirectGpuTensorEngine
             backend.ReflectPad1d(bufWave.Buffer, bufPadded.Buffer, batch, L, Lp, pad);
             var bufMag = AllocateOutputBuffer(backend, outLen);
             var bufPhase = AllocateOutputBuffer(backend, outLen);
-            backend.StftMagPhase(bufPadded.Buffer, bufWin.Buffer, bufMag.Buffer, bufPhase.Buffer, batch, Lp, nFft, hopLength, numFrames, numFreqs);
-            // Force the stft compute to finish while the intermediate `bufPadded` is still alive (it is
-            // `using` and feeds the kernel). FinishGpuOp only defers the DOWNLOAD, not the compute, so
-            // without this the padded buffer could be freed before a deferred materialization runs the
-            // kernel — a use-after-free. mag/phase still stay GPU-resident (deferred download).
-            backend.Synchronize();
-            var magArr = FinishGpuOp<T>(backend, bufMag, outLen);
-            var phaseArr = FinishGpuOp<T>(backend, bufPhase, outLen);
-            var mag = new Tensor<T>(magArr, newShape);
-            var phase = new Tensor<T>(phaseArr, (int[])newShape.Clone());
-            int origLength = waveform._shape[rank - 1];
-            // Same backward contract as the base (phase piped through ISTFT); no-op when no tape is active.
-            DifferentiableOps.RecordUnary("Spectrogram", mag, waveform,
-                BackwardFunctions<T>.SpectrogramBackward, new object[] { nFft, hopLength, win, phase, origLength });
-            return mag;
+            // FinishGpuOp takes ownership of the buffer it is handed, so these two are only safe to
+            // leave undisposed once it has returned for each. Anything before that - the kernel
+            // launch, the synchronize, or the first handoff - throws into the catch below, which
+            // falls back to the CPU path and would otherwise strand the allocations on the device.
+            // A repeatedly failing GPU path would then exhaust device memory rather than degrade.
+            bool magHandedOff = false;
+            bool phaseHandedOff = false;
+            try
+            {
+                backend.StftMagPhase(bufPadded.Buffer, bufWin.Buffer, bufMag.Buffer, bufPhase.Buffer, batch, Lp, nFft, hopLength, numFrames, numFreqs);
+                // Force the stft compute to finish while the intermediate `bufPadded` is still alive (it is
+                // `using` and feeds the kernel). FinishGpuOp only defers the DOWNLOAD, not the compute, so
+                // without this the padded buffer could be freed before a deferred materialization runs the
+                // kernel — a use-after-free. mag/phase still stay GPU-resident (deferred download).
+                backend.Synchronize();
+                var magArr = FinishGpuOp<T>(backend, bufMag, outLen);
+                magHandedOff = true;
+                var phaseArr = FinishGpuOp<T>(backend, bufPhase, outLen);
+                phaseHandedOff = true;
+                var mag = new Tensor<T>(magArr, newShape);
+                var phase = new Tensor<T>(phaseArr, (int[])newShape.Clone());
+                int origLength = waveform._shape[rank - 1];
+                // Same backward contract as the base (phase piped through ISTFT); no-op when no tape is active.
+                DifferentiableOps.RecordUnary("Spectrogram", mag, waveform,
+                    BackwardFunctions<T>.SpectrogramBackward, new object[] { nFft, hopLength, win, phase, origLength });
+                return mag;
+            }
+            finally
+            {
+                if (!magHandedOff) { bufMag.Dispose(); }
+                if (!phaseHandedOff) { bufPhase.Dispose(); }
+            }
         }
         catch (Exception) { return base.Spectrogram(waveform, nFft, hopLength, winLength, window); }
     }
@@ -5250,7 +5267,15 @@ public partial class DirectGpuTensorEngine
     public override Tensor<T> StftPhase<T>(Tensor<T> waveform, int nFft, int hopLength, int winLength, Tensor<T>? window = null)
     {
         if (waveform is null) throw new ArgumentNullException(nameof(waveform));
-        if (typeof(T) != typeof(float) || nFft <= 0 || hopLength <= 0 || !TryGetBackend(out var backend))
+
+        // IsInferenceTrace defers to the base, which is the only implementation that calls
+        // CaptureInferenceKernel. Computing here instead would produce the right tensor and add
+        // nothing to the inference graph, so a compiled replay would reuse this trace-time result
+        // in place of the live waveform and window. GroupNorm bails on the same condition for the
+        // same reason. Note GraphCaptureParityTests cannot catch this: it builds a CpuEngine, so it
+        // exercises the base path and never reaches this override.
+        if (Compilation.GraphMode.IsInferenceTrace
+            || typeof(T) != typeof(float) || nFft <= 0 || hopLength <= 0 || !TryGetBackend(out var backend))
             return base.StftPhase(waveform, nFft, hopLength, winLength, window);
         // Build the window (must be length nFft for STFT). Match CpuEngine.HannWindow exactly.
         Tensor<T> win;
@@ -5290,21 +5315,38 @@ public partial class DirectGpuTensorEngine
             backend.ReflectPad1d(bufWave.Buffer, bufPadded.Buffer, batch, L, Lp, pad);
             var bufMag = AllocateOutputBuffer(backend, outLen);
             var bufPhase = AllocateOutputBuffer(backend, outLen);
-            backend.StftMagPhase(bufPadded.Buffer, bufWin.Buffer, bufMag.Buffer, bufPhase.Buffer, batch, Lp, nFft, hopLength, numFrames, numFreqs);
-            // Finish the compute while `bufPadded` is still alive: FinishGpuOp defers only the
-            // DOWNLOAD, so without this the padded buffer could be freed before a deferred
-            // materialization runs the kernel. Same reasoning as Spectrogram above.
-            backend.Synchronize();
-            var magArr = FinishGpuOp<T>(backend, bufMag, outLen);
-            var phaseArr = FinishGpuOp<T>(backend, bufPhase, outLen);
-            var mag = new Tensor<T>(magArr, newShape);
-            var phase = new Tensor<T>(phaseArr, (int[])newShape.Clone());
-            int origLength = waveform._shape[rank - 1];
-            // Mirror of the Spectrogram contract: that one saves the phase it discards, this one
-            // saves the magnitude, which the phase adjoint needs to scale each bin by 1/|C|.
-            DifferentiableOps.RecordUnary("StftPhase", phase, waveform,
-                BackwardFunctions<T>.StftPhaseBackward, new object[] { nFft, hopLength, win, mag, origLength });
-            return phase;
+            // FinishGpuOp takes ownership of the buffer it is handed, so these two are only safe to
+            // leave undisposed once it has returned for each. Anything before that - the kernel
+            // launch, the synchronize, or the first handoff - throws into the catch below, which
+            // falls back to the CPU path and would otherwise strand the allocations on the device.
+            // A repeatedly failing GPU path would then exhaust device memory rather than degrade.
+            bool magHandedOff = false;
+            bool phaseHandedOff = false;
+            try
+            {
+                backend.StftMagPhase(bufPadded.Buffer, bufWin.Buffer, bufMag.Buffer, bufPhase.Buffer, batch, Lp, nFft, hopLength, numFrames, numFreqs);
+                // Finish the compute while `bufPadded` is still alive: FinishGpuOp defers only the
+                // DOWNLOAD, so without this the padded buffer could be freed before a deferred
+                // materialization runs the kernel. Same reasoning as Spectrogram above.
+                backend.Synchronize();
+                var magArr = FinishGpuOp<T>(backend, bufMag, outLen);
+                magHandedOff = true;
+                var phaseArr = FinishGpuOp<T>(backend, bufPhase, outLen);
+                phaseHandedOff = true;
+                var mag = new Tensor<T>(magArr, newShape);
+                var phase = new Tensor<T>(phaseArr, (int[])newShape.Clone());
+                int origLength = waveform._shape[rank - 1];
+                // Mirror of the Spectrogram contract: that one saves the phase it discards, this one
+                // saves the magnitude, which the phase adjoint needs to scale each bin by 1/|C|.
+                DifferentiableOps.RecordUnary("StftPhase", phase, waveform,
+                    BackwardFunctions<T>.StftPhaseBackward, new object[] { nFft, hopLength, win, mag, origLength });
+                return phase;
+            }
+            finally
+            {
+                if (!magHandedOff) { bufMag.Dispose(); }
+                if (!phaseHandedOff) { bufPhase.Dispose(); }
+            }
         }
         catch (Exception) { return base.StftPhase(waveform, nFft, hopLength, winLength, window); }
     }
