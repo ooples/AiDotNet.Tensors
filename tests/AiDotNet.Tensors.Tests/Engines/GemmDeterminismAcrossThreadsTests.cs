@@ -109,8 +109,17 @@ public sealed class GemmDeterminismAcrossThreadsTests
         }
         finally
         {
-            ThreadPool.SetMinThreads(minWorkers, minIo);
+            // Restore the MAXIMUM first. SetMinThreads refuses - returns false and changes nothing -
+            // when the requested minimum exceeds the current maximum, and at this point the maximum
+            // is still the small value set above. Restoring the minimum first therefore failed
+            // silently and left the pool starved for every later test in the process, since these
+            // settings are process-wide and nothing here throws to signal it.
+            //
+            // Measured on a 32-processor host with threads = 1: min went 32 -> 1, the restoring
+            // SetMinThreads returned false, and min stayed at 1 while max came back to 32767.
+            // Reversing the two restores brings min back to 32.
             ThreadPool.SetMaxThreads(workers, io);
+            ThreadPool.SetMinThreads(minWorkers, minIo);
         }
 
         return result;
