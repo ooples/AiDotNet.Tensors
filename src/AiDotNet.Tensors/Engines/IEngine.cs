@@ -3021,7 +3021,15 @@ public interface IEngine
     /// - Batch statistics
     /// - Loss averaging
     /// </para>
+    /// <para>
+    /// <b>Not usable inside a loss.</b> This returns a bare <typeparamref name="T"/>, so the result
+    /// is off the gradient tape: wrapping it back into a tensor produces a value whose gradient
+    /// connection to <paramref name="tensor"/> is already gone. Nothing throws, and the term simply
+    /// never trains. Use <see cref="ReduceMean{T}"/>, which returns a tensor and stays on the tape,
+    /// for any mean that feeds a loss; reserve this one for reporting and diagnostics.
+    /// </para>
     /// </remarks>
+    /// <seealso cref="ReduceMean{T}"/>
     T TensorMean<T>(Tensor<T> tensor);
 
     #endregion
