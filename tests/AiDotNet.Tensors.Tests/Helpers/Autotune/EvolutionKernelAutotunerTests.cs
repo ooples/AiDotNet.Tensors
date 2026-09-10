@@ -511,6 +511,49 @@ public sealed class EvolutionKernelAutotunerTests : IDisposable
         if (Directory.Exists(_temporaryCachePath)) Directory.Delete(_temporaryCachePath, recursive: true);
     }
 
+    [Fact]
+    public async Task DeactivateRemovesOnlyTheObservedSnapshotAndAllowsSafeFallback()
+    {
+        var registry = new KernelTuningDeploymentRegistry<FakeKernelConfiguration>();
+        EvolutionKernelAutotuner<FakeKernelConfiguration> tuner = CreateTuner(registry, new MemoryStore(), MeasurePassed);
+        EvolutionKernelTuningResult<FakeKernelConfiguration> result = await tuner.TuneAsync(Seeds());
+        Assert.True(tuner.Deployment.TryDeactivate(result.ActiveDeployment));
+        Assert.False(tuner.Deployment.TryGet(out _));
+        Assert.Null(tuner.Deployment.Current);
+        Assert.False(tuner.Deployment.TryDeactivate(result.ActiveDeployment));
+    }
+
+    [Fact]
+    public async Task StaleDeactivationCannotRemoveANewerValidationOfTheSameGenome()
+    {
+        var registry = new KernelTuningDeploymentRegistry<FakeKernelConfiguration>();
+        EvolutionKernelAutotuner<FakeKernelConfiguration> first = CreateTuner(registry, new MemoryStore(), MeasurePassed);
+        EvolutionKernelTuningResult<FakeKernelConfiguration> oldRun = await first.TuneAsync(Seeds());
+        KernelTuningDeploymentSnapshot<FakeKernelConfiguration> original = oldRun.ActiveDeployment;
+        var revalidated = new KernelTuningDeploymentSnapshot<FakeKernelConfiguration>(original.Identity,
+            original.Configuration, original.GenomeId, original.Measurement, original.RunStateHash,
+            original.PromotionEvidence, original.EvidenceRole);
+        first.Deployment.Publish(revalidated);
+        Assert.Equal(original.GenomeId, revalidated.GenomeId);
+        Assert.NotSame(original, revalidated);
+        Assert.False(first.Deployment.TryDeactivate(oldRun.ActiveDeployment));
+        Assert.Same(revalidated, first.Deployment.Current);
+    }
+
+    [Fact]
+    public async Task DeactivationRejectsNullAndAnotherDeploymentIdentity()
+    {
+        EvolutionKernelAutotuner<FakeKernelConfiguration> tuner = CreateTuner(
+            new KernelTuningDeploymentRegistry<FakeKernelConfiguration>(), new MemoryStore(), MeasurePassed);
+        EvolutionKernelTuningResult<FakeKernelConfiguration> result = await tuner.TuneAsync(Seeds());
+        Assert.Throws<ArgumentNullException>(() => tuner.Deployment.TryDeactivate(null!));
+        var other = new KernelTuningIdentity(new KernelId("test", "another-kernel"), Identity().Shape,
+            Identity().Device, Identity().Backend, Identity().SearchSpaceVersion, Identity().BenchmarkProtocolVersion);
+        var otherHandle = new KernelTuningDeploymentRegistry<FakeKernelConfiguration>().GetOrCreate(other);
+        Assert.Throws<InvalidOperationException>(() => otherHandle.TryDeactivate(result.ActiveDeployment));
+        Assert.Same(result.ActiveDeployment, tuner.Deployment.Current);
+    }
+
     private static EvolutionKernelAutotuner<FakeKernelConfiguration> CreateTuner(
         KernelTuningDeploymentRegistry<FakeKernelConfiguration> registry,
         IKernelTuningStore<FakeKernelConfiguration> store,
