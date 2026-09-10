@@ -33,6 +33,21 @@ public class IstftGradientTests
     private const int HopLength = 4;
     private const int NumFreqs = NFft / 2 + 1;
     private const int NumFrames = 3;
+    /// <summary>
+    /// Output length for a given centring, matching how ISTFT derives it when length is null.
+    /// </summary>
+    /// <remarks>
+    /// Centred synthesis drops the nFft of analysis padding, which is also what moves each frame
+    /// write offset back by nFft/2 and so makes the first frames write partly before sample zero.
+    /// That trimming is a distinct branch in both the forward and its adjoint, which is why both
+    /// settings are gradchecked below rather than only the simpler one.
+    /// </remarks>
+    private static int OutputLengthFor(bool center)
+    {
+        int length = ((NumFrames - 1) * HopLength) + NFft;
+        return center ? length - NFft : length;
+    }
+
     private const int OutputLength = ((NumFrames - 1) * HopLength) + NFft;
 
     /// <summary>
@@ -76,22 +91,23 @@ public class IstftGradientTests
     }
 
     /// <summary>Fixed, varied loss weights, so the seed gradient is not a uniform vector.</summary>
-    private static Tensor<double> LossWeights()
+    private static Tensor<double> LossWeights(bool center)
     {
-        var c = new double[OutputLength];
+        int length = OutputLengthFor(center);
+        var c = new double[length];
         for (int i = 0; i < c.Length; i++)
         {
             c[i] = 0.25 + (0.11 * ((i * 5) % 7));
         }
 
-        return new Tensor<double>(c, new[] { OutputLength });
+        return new Tensor<double>(c, new[] { length });
     }
 
-    private double Loss(Tensor<double> magnitude, Tensor<double> phase, Tensor<double> weights)
+    private double Loss(Tensor<double> magnitude, Tensor<double> phase, Tensor<double> weights, bool center)
     {
-        var reconstructed = _engine.ISTFT(magnitude, phase, NFft, HopLength, Window(), center: false);
+        var reconstructed = _engine.ISTFT(magnitude, phase, NFft, HopLength, Window(), center);
         double total = 0;
-        for (int i = 0; i < OutputLength; i++)
+        for (int i = 0; i < OutputLengthFor(center); i++)
         {
             total += reconstructed[i] * weights[i];
         }
@@ -99,14 +115,14 @@ public class IstftGradientTests
         return total;
     }
 
-    private (Tensor<double> Magnitude, Tensor<double> Phase) AnalyticGradients()
+    private (Tensor<double> Magnitude, Tensor<double> Phase) AnalyticGradients(bool center)
     {
         var magnitude = Magnitudes();
         var phase = Phases();
-        var weights = LossWeights();
+        var weights = LossWeights(center);
 
         using var tape = new GradientTape<double>();
-        var reconstructed = _engine.ISTFT(magnitude, phase, NFft, HopLength, Window(), center: false);
+        var reconstructed = _engine.ISTFT(magnitude, phase, NFft, HopLength, Window(), center);
         var loss = _engine.ReduceSum(_engine.TensorMultiply(reconstructed, weights), null);
         var grads = tape.ComputeGradients(loss, new[] { magnitude, phase });
 
@@ -115,11 +131,13 @@ public class IstftGradientTests
         return (grads[magnitude], grads[phase]);
     }
 
-    [Fact]
-    public void Istft_MagnitudeGradient_MatchesFiniteDifferences()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Istft_MagnitudeGradient_MatchesFiniteDifferences(bool center)
     {
-        var (analyticMagnitude, _) = AnalyticGradients();
-        var weights = LossWeights();
+        var (analyticMagnitude, _) = AnalyticGradients(center);
+        var weights = LossWeights(center);
         const double h = 1e-6;
 
         for (int j = 0; j < NumFreqs * NumFrames; j++)
@@ -129,16 +147,18 @@ public class IstftGradientTests
             plus[j] += h;
             minus[j] -= h;
 
-            var numeric = (Loss(plus, Phases(), weights) - Loss(minus, Phases(), weights)) / (2 * h);
+            var numeric = (Loss(plus, Phases(), weights, center) - Loss(minus, Phases(), weights, center)) / (2 * h);
             Assert.Equal(numeric, analyticMagnitude[j], 1e-7);
         }
     }
 
-    [Fact]
-    public void Istft_PhaseGradient_MatchesFiniteDifferences()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Istft_PhaseGradient_MatchesFiniteDifferences(bool center)
     {
-        var (_, analyticPhase) = AnalyticGradients();
-        var weights = LossWeights();
+        var (_, analyticPhase) = AnalyticGradients(center);
+        var weights = LossWeights(center);
         const double h = 1e-6;
 
         for (int j = 0; j < NumFreqs * NumFrames; j++)
@@ -148,7 +168,7 @@ public class IstftGradientTests
             plus[j] += h;
             minus[j] -= h;
 
-            var numeric = (Loss(Magnitudes(), plus, weights) - Loss(Magnitudes(), minus, weights)) / (2 * h);
+            var numeric = (Loss(Magnitudes(), plus, weights, center) - Loss(Magnitudes(), minus, weights, center)) / (2 * h);
             Assert.Equal(numeric, analyticPhase[j], 1e-7);
         }
     }
@@ -159,7 +179,7 @@ public class IstftGradientTests
         // The regression that matters. Before this change ISTFT sat in
         // OpRegistry.NonDifferentiableOps, so a loss downstream of it produced no gradient at all
         // and training proceeded quietly. A forward-only test would not have noticed.
-        var (analyticMagnitude, analyticPhase) = AnalyticGradients();
+        var (analyticMagnitude, analyticPhase) = AnalyticGradients(center: false);
 
         var magnitudeMoved = false;
         var phaseMoved = false;
@@ -201,6 +221,21 @@ public class IstftGradientTests
         {
             Assert.Equal(expected[i], withoutTape[i], 1e-12);
         }
+    }
+
+    [Fact]
+    public void GriffinLim_StaysOffTheTape()
+    {
+        // GriffinLim calls ISTFT internally and is classified non-differentiable. Now that ISTFT
+        // records, only the NoGradScope around those calls keeps that classification true - and a
+        // scope that silently stopped working would show up nowhere else, because the forward value
+        // is unaffected either way.
+        var magnitude = Magnitudes();
+
+        using var tape = new GradientTape<double>();
+        var audio = _engine.GriffinLim(magnitude, NFft, HopLength, Window(), iterations: 2, momentum: 0.0);
+
+        Assert.Null(audio.GradFn);
     }
 
     [Fact]

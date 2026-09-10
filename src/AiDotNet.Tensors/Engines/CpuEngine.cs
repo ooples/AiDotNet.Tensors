@@ -42117,8 +42117,16 @@ public partial class CpuEngine : ITensorLevelEngine
                     frameData[i] = numOps.Multiply(paddedInputData[inputOffset + start + i], windowData[i]);
                 }
 
-                // Compute FFT
-                var (realOut, imagOut) = FFTCore<T>(frameData, inverse: false);
+                // Compute FFT.
+                //
+                // UnnormalizedTransform, not FFTCore: FFTCore zero-pads a non-power-of-two length up
+                // to the next power of two, which is a different transform -- its bins sit at
+                // k/nPadded rather than k/nFft. That was already known and documented on the helper,
+                // but only the ADJOINT had been moved onto it, so at those lengths the forward and
+                // its own transpose were computing different operators. Surfaced by
+                // DifferentiableOpsGradCheckSweep, whose reflective argument synthesis produces
+                // nFft = 6. Identical call for power-of-two lengths, which is every realistic one.
+                var (realOut, imagOut) = UnnormalizedTransform<T>(frameData, inverse: false);
 
                 // Compute magnitude and phase for positive frequencies
                 int outputOffset = batchIdx * numFreqs * numFrames;
@@ -42251,8 +42259,9 @@ public partial class CpuEngine : ITensorLevelEngine
                     imagIn[nFft - k] = numOps.Negate(imagIn[k]);
                 }
 
-                // Inverse FFT
-                var (realOut, _) = FFTCore<T>(realIn, imagIn, inverse: true);
+                // Inverse FFT. UnnormalizedTransform for the same reason as the forward in STFT:
+                // exact at every length, where FFTCore silently zero-pads to a power of two.
+                var (realOut, _) = UnnormalizedTransform<T>(realIn, imagIn, inverse: true);
                 T scale = numOps.FromDouble(1.0 / nFft);
 
                 // Overlap-add.
@@ -42666,7 +42675,19 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>
-    /// Unnormalized complex inverse transform, exposed for the Spectrogram adjoint.
+    /// Real-input form of <see cref="UnnormalizedTransform{T}(Vector{T}, Vector{T}, bool)"/>.
+    /// </summary>
+    internal static (Vector<T> real, Vector<T> imag) UnnormalizedTransform<T>(Vector<T> realInput, bool inverse)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var imagInput = new Vector<T>(realInput.Length);
+        for (int i = 0; i < realInput.Length; i++)
+            imagInput[i] = numOps.Zero;
+        return UnnormalizedTransform(realInput, imagInput, inverse);
+    }
+
+    /// <summary>
+    /// Unnormalized complex transform that is exact at every length, in either direction.
     /// </summary>
     /// <remarks>
     /// Computes <c>Σ_k c[k] e^(+2πik n/N)</c> with NO 1/N factor — <see cref="FFTCore{T}(Vector{T}, Vector{T}, bool)"/>
@@ -42682,7 +42703,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// does not transpose the forward it is paired with. That is fine for the power-of-two lengths
     /// this used to see and wrong for every other one, so those route to Bluestein instead.
     /// </remarks>
-    internal static (Vector<T> real, Vector<T> imag) UnnormalizedTransformForAdjoint<T>(
+    internal static (Vector<T> real, Vector<T> imag) UnnormalizedTransform<T>(
         Vector<T> realInput, Vector<T> imagInput, bool inverse)
     {
         int n = realInput.Length;

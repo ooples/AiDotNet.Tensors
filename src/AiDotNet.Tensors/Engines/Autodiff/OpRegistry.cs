@@ -214,7 +214,7 @@ internal static class OpRegistry
 
         // Audio element-wise / linear ops — backward wired.
         "Spectrogram", "AmplitudeToDB", "ComputeDeltas", "Resample",
-        "ISTFT",
+        "ISTFT", "StftPhase",
 
         // Mel spectrogram — |STFT|^2, mel filterbank matmul and the optional dB conversion are
         // all differentiable, so the op records one node with BackwardFunctions<T>.

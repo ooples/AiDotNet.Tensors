@@ -9845,6 +9845,36 @@ public interface IEngine
     /// that returns only the magnitude half.</summary>
     Tensor<T> Spectrogram<T>(Tensor<T> waveform, int nFft, int hopLength, int winLength, Tensor<T>? window = null);
 
+    /// <summary>Phase spectrogram <c>arg STFT(x)</c>. The phase counterpart of
+    /// <see cref="Spectrogram{T}"/>, returning the half that one discards.</summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="waveform">Audio signal, <c>[..., samples]</c>.</param>
+    /// <param name="nFft">FFT size.</param>
+    /// <param name="hopLength">Samples between frames.</param>
+    /// <param name="winLength">Window length, used only when <paramref name="window"/> is null.</param>
+    /// <param name="window">Analysis window; a Hann window of <paramref name="winLength"/> when null.</param>
+    /// <returns>Wrapped phase in radians, <c>[..., nFft/2 + 1, frames]</c>, matching
+    /// <see cref="Spectrogram{T}"/> bin for bin.</returns>
+    /// <remarks>
+    /// <para>
+    /// Records on the gradient tape, which is the point of it (issue #905). <c>STFT</c> emits phase
+    /// through an <c>out</c> parameter and is deliberately unrecorded, so before this the only
+    /// differentiable analysis output was magnitude, and an objective over angles - the phase term
+    /// in a prediction vocoder - had no differentiable path to the quantity it was defined on.
+    /// </para>
+    /// <para>
+    /// Together with <see cref="Spectrogram{T}"/> this gives the complex analysis differentiably,
+    /// and pairs with <see cref="ISTFT{T}"/> to close the round trip: both of its inputs are now
+    /// reachable, and synthesis itself records.
+    /// </para>
+    /// <para>
+    /// The phase derivative scales as <c>1/|C|</c>, so bins with near-zero magnitude contribute an
+    /// unbounded gradient. Their phase is meaningless in any case, and the implementation reports
+    /// zero there rather than an infinity that would spread through the whole waveform gradient.
+    /// </para>
+    /// </remarks>
+    Tensor<T> StftPhase<T>(Tensor<T> waveform, int nFft, int hopLength, int winLength, Tensor<T>? window = null);
+
     /// <summary>
     /// Convert amplitude to dB: <c>20 · log10(max(x, minAmplitude))</c>.
     /// Matches torchaudio's <c>AmplitudeToDB</c> with

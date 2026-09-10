@@ -15,6 +15,22 @@ namespace AiDotNet.Tensors.Engines.Autodiff;
 /// [B,S]) that previously threw "Destination is too short" and silently disabled
 /// the fused compiled-training path for every transformer.
 /// </summary>
+/// <summary>
+/// Which one-sided STFT output an analysis adjoint is transposing.
+/// </summary>
+/// <remarks>
+/// Magnitude and phase share every step of the adjoint except the per-bin coefficients that seed
+/// the inverse transform, so they share one implementation and differ only by this.
+/// </remarks>
+internal enum StftAdjointTarget
+{
+    /// <summary>The magnitude <c>|C[k]|</c>.</summary>
+    Magnitude,
+
+    /// <summary>The wrapped phase <c>atan2(Im C[k], Re C[k])</c>.</summary>
+    Phase
+}
+
 internal sealed class LayerNormStateRef<T>
 {
     public Tensor<T>? Mean;
@@ -8668,6 +8684,33 @@ internal static class BackwardFunctions<T>
     }
 
     /// <summary>
+    /// Adjoint of <c>StftPhase</c>: maps a gradient shaped like the one-sided phase spectrogram
+    /// back onto the waveform.
+    /// </summary>
+    /// <remarks>
+    /// The mirror image of <see cref="SpectrogramBackward"/>. That one is handed the phase it did
+    /// not return and needs it to rebuild the complex bins; this one is handed the magnitude for
+    /// the same reason, and reads the phase straight off its own output.
+    /// </remarks>
+    internal static void StftPhaseBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var waveform = inputs[0];
+        RequireSavedState(nameof(StftPhaseBackward), savedState, 5);
+        int nFft = SavedInt(nameof(StftPhaseBackward), savedState, 0, "nFft");
+        int hopLength = SavedInt(nameof(StftPhaseBackward), savedState, 1, "hopLength");
+        var window = SavedTensor(nameof(StftPhaseBackward), savedState, 2, "window");
+        var magnitude = SavedTensor(nameof(StftPhaseBackward), savedState, 3, "magnitude");
+        int origLength = SavedInt(nameof(StftPhaseBackward), savedState, 4, "origLength");
+
+        var result = StftAnalysisAdjoint(
+            gradOutput, magnitude, output, StftAdjointTarget.Phase,
+            nFft, hopLength, window, origLength, waveform._shape);
+        DifferentiableOps.AccumulateGrad(grads, waveform, result, engine);
+    }
+
+    /// <summary>
     /// Adjoint of <c>RFFT</c>: maps a gradient shaped like the interleaved one-sided spectrum back
     /// onto the real input signal.
     /// </summary>
@@ -8721,7 +8764,7 @@ internal static class BackwardFunctions<T>
                 cImag[k] = numOps.Zero;
             }
 
-            var (re, _) = CpuEngine.UnnormalizedTransformForAdjoint<T>(cReal, cImag, inverse: true);
+            var (re, _) = CpuEngine.UnnormalizedTransform<T>(cReal, cImag, inverse: true);
 
             int outOffset = b * n;
             for (int j = 0; j < n; j++) resultData[outOffset + j] = re[j];
@@ -8780,7 +8823,7 @@ internal static class BackwardFunctions<T>
                 yImag[j] = numOps.Zero;
             }
 
-            var (re, im) = CpuEngine.UnnormalizedTransformForAdjoint<T>(yReal, yImag, inverse: false);
+            var (re, im) = CpuEngine.UnnormalizedTransform<T>(yReal, yImag, inverse: false);
 
             int outOffset = b * numFreqs * 2;
             for (int k = 0; k < numFreqs; k++)
@@ -8983,7 +9026,7 @@ internal static class BackwardFunctions<T>
                 }
 
                 var (adjointReal, adjointImag) =
-                    CpuEngine.UnnormalizedTransformForAdjoint<T>(frameGradReal, frameGradImag, inverse: false);
+                    CpuEngine.UnnormalizedTransform<T>(frameGradReal, frameGradImag, inverse: false);
 
                 for (int k = 0; k < numFreqs; k++)
                 {
@@ -9025,8 +9068,52 @@ internal static class BackwardFunctions<T>
     /// </remarks>
     private static Tensor<T> MagnitudeStftAdjoint(
         Tensor<T> gradMagnitude, Tensor<T> phase, int nFft, int hopLength,
-        Tensor<T> window, int origLength, int[] waveformShape)
+        Tensor<T> window, int origLength, int[] waveformShape) =>
+        StftAnalysisAdjoint(
+            gradMagnitude, magnitude: null, phase, StftAdjointTarget.Magnitude,
+            nFft, hopLength, window, origLength, waveformShape);
+
+    /// <summary>
+    /// Below which magnitude the phase gradient is taken to be zero.
+    /// </summary>
+    /// <remarks>
+    /// The phase derivative carries a <c>1/|C|</c> factor, so it is unbounded as the bin empties -
+    /// and at exactly zero the phase is not merely steep but undefined, which is why the forward
+    /// reports <c>atan2(0, 0) == 0</c> there. Returning zero keeps the adjoint finite. The
+    /// alternative, letting an infinity through, would poison every sample of the waveform gradient
+    /// via the inverse transform, turning one silent bin into an entirely NaN gradient.
+    /// </remarks>
+    private const double PhaseGradientMagnitudeFloor = 1e-12;
+
+    /// <summary>
+    /// Shared adjoint of a one-sided STFT analysis with <c>center: true</c>: maps a gradient shaped
+    /// like the spectrogram back onto the waveform, for either reported output.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Everything after the per-bin seed is common to both targets - the unnormalised inverse
+    /// transform, the windowing, the overlap-add onto the padded signal, and the adjoint of the
+    /// reflection padding. Only the coefficients differ, because only the outer function differs:
+    /// </para>
+    /// <list type="bullet">
+    /// <item><description>
+    /// <b>Magnitude.</b> <c>d|C|/dRe = cos(p)</c> and <c>d|C|/dIm = sin(p)</c>, so the seed is
+    /// <c>g e^(i p)</c>.
+    /// </description></item>
+    /// <item><description>
+    /// <b>Phase.</b> <c>dp/dRe = -Im/|C|^2 = -sin(p)/|C|</c> and
+    /// <c>dp/dIm = Re/|C|^2 = cos(p)/|C|</c>, so the seed is <c>(g/|C|) i e^(i p)</c> - the same
+    /// direction rotated a quarter turn and scaled by the reciprocal magnitude. That reciprocal is
+    /// the only reason <paramref name="magnitude"/> is needed, and the only reason this target has
+    /// a floor.
+    /// </description></item>
+    /// </list>
+    /// </remarks>
+    private static Tensor<T> StftAnalysisAdjoint(
+        Tensor<T> gradient, Tensor<T>? magnitude, Tensor<T> phase, StftAdjointTarget target,
+        int nFft, int hopLength, Tensor<T> window, int origLength, int[] waveformShape)
     {
+        var gradMagnitude = gradient;
         var numOps = MathHelper.GetNumericOperations<T>();
         int numFreqs = nFft / 2 + 1;
         int numFrames = gradMagnitude._shape[^1];
@@ -9037,6 +9124,20 @@ internal static class BackwardFunctions<T>
         var gradData = gradMagnitude.GetDataArray();
         var phaseData = phase.GetDataArray();
         var windowData = window.GetDataArray();
+        // Bound once, non-nullable, so the inner loop needs no null handling and no suppression.
+        // Empty for the magnitude target, which never indexes it.
+        var magnitudeData = Array.Empty<T>();
+        if (target == StftAdjointTarget.Phase)
+        {
+            if (magnitude is null)
+            {
+                throw new ArgumentNullException(
+                    nameof(magnitude),
+                    "StftAnalysisAdjoint: the phase adjoint needs the magnitudes, whose reciprocal scales every bin.");
+            }
+
+            magnitudeData = magnitude.GetDataArray();
+        }
 
         var result = new Tensor<T>(waveformShape);
         var resultData = result.GetDataArray();
@@ -9063,18 +9164,39 @@ internal static class BackwardFunctions<T>
                     cImag[k] = numOps.Zero;
                 }
 
-                // c[k] = g[k] * e^(i * phase[k]) over the reported one-sided bins.
+                // Seed the reported one-sided bins. See the remarks for the two coefficient forms.
                 for (int k = 0; k < numFreqs; k++)
                 {
-                    double g = numOps.ToDouble(gradData[specOffset + k * numFrames + frame]);
-                    double ph = numOps.ToDouble(phaseData[specOffset + k * numFrames + frame]);
-                    cReal[k] = numOps.FromDouble(g * Math.Cos(ph));
-                    cImag[k] = numOps.FromDouble(g * Math.Sin(ph));
+                    int binIndex = specOffset + (k * numFrames) + frame;
+                    double g = numOps.ToDouble(gradData[binIndex]);
+                    double ph = numOps.ToDouble(phaseData[binIndex]);
+                    double cosPhase = Math.Cos(ph);
+                    double sinPhase = Math.Sin(ph);
+
+                    double seedReal;
+                    double seedImag;
+                    if (target == StftAdjointTarget.Magnitude)
+                    {
+                        seedReal = g * cosPhase;
+                        seedImag = g * sinPhase;
+                    }
+                    else
+                    {
+                        double binMagnitude = numOps.ToDouble(magnitudeData[binIndex]);
+                        double reciprocal = binMagnitude > PhaseGradientMagnitudeFloor
+                            ? g / binMagnitude
+                            : 0.0;
+                        seedReal = -reciprocal * sinPhase;
+                        seedImag = reciprocal * cosPhase;
+                    }
+
+                    cReal[k] = numOps.FromDouble(seedReal);
+                    cImag[k] = numOps.FromDouble(seedImag);
                 }
 
                 // Unnormalized inverse transform: FFTCore only flips the twiddle sign, so this
                 // is exactly Σ_k c[k] e^(+2πik i/N) with no 1/N applied.
-                var (frameGrad, _) = CpuEngine.UnnormalizedTransformForAdjoint<T>(cReal, cImag, inverse: true);
+                var (frameGrad, _) = CpuEngine.UnnormalizedTransform<T>(cReal, cImag, inverse: true);
 
                 int start = frame * hopLength;
                 for (int i = 0; i < nFft; i++)
