@@ -28,24 +28,24 @@ public class InverseTrigGradientTests
     private readonly IEngine _engine = AiDotNetEngine.Current;
 
     /// <summary>
-    /// Tolerance for assertions that route only through the op under test.
-    /// </summary>
-    private const double ExactTolerance = 1e-9;
-
-    /// <summary>
-    /// Tolerance for assertions that compose the op under test with other engine ops.
+    /// Comparison tolerance for every double-precision assertion in this file.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// <c>AiDotNetEngine.Current</c> is <c>DirectGpuTensorEngine</c> wherever a GPU is present, and
-    /// on a device without native fp64 its elementwise kernels evaluate a <c>Tensor&lt;double&gt;</c>
-    /// in single precision. That is a property of the engine, not of these ops - a bare
-    /// <c>TensorAdd</c> of two doubles reproduces it with no inverse trigonometry involved - and the
-    /// repo's other gradient tests use the same 1e-6 for the same reason. Every derivative below is
-    /// an O(1) quantity, so a wrong formula misses by far more than this.
+    /// Loose for double, and deliberately so: <c>AiDotNetEngine.Current</c> is
+    /// <c>DirectGpuTensorEngine</c> wherever a GPU is present, and on a device without native fp64
+    /// its kernels evaluate a <c>Tensor&lt;double&gt;</c> in single precision. That is a property of
+    /// the engine rather than of these ops - a bare <c>TensorAdd</c> of two doubles reproduces it
+    /// with no inverse trigonometry involved - and the repo's other gradient tests use the same 1e-6
+    /// for the same reason. On a CPU-only run the same assertions hold with far more headroom.
+    /// </para>
+    /// <para>
+    /// It still discriminates everything these tests are for. Every value asserted below is O(1):
+    /// a wrong derivative, a swapped <c>atan2</c> operand or a collapsed quadrant misses by a
+    /// fraction of a radian, not by a part in ten million.
     /// </para>
     /// </remarks>
-    private const double ComposedTolerance = 1e-6;
+    private const double Tolerance = 1e-6;
 
     // Forward correctness
 
@@ -61,9 +61,9 @@ public class InverseTrigGradientTests
 
         for (int i = 0; i < data.Length; i++)
         {
-            Assert.Equal(Math.Asin(data[i]), asin[i], ExactTolerance);
-            Assert.Equal(Math.Acos(data[i]), acos[i], ExactTolerance);
-            Assert.Equal(Math.Atan(data[i]), atan[i], ExactTolerance);
+            Assert.Equal(Math.Asin(data[i]), asin[i], Tolerance);
+            Assert.Equal(Math.Acos(data[i]), acos[i], Tolerance);
+            Assert.Equal(Math.Atan(data[i]), atan[i], Tolerance);
         }
     }
 
@@ -79,7 +79,7 @@ public class InverseTrigGradientTests
 
         for (int i = 0; i < data.Length; i++)
         {
-            Assert.Equal(Math.Atan(data[i]), atan[i], ExactTolerance);
+            Assert.Equal(Math.Atan(data[i]), atan[i], Tolerance);
             Assert.True(Math.Abs(atan[i]) < Math.PI / 2);
         }
     }
@@ -94,7 +94,7 @@ public class InverseTrigGradientTests
 
         for (int i = 0; i < data.Length; i++)
         {
-            Assert.Equal(Math.PI / 2, sum[i], ComposedTolerance);
+            Assert.Equal(Math.PI / 2, sum[i], Tolerance);
         }
     }
 
@@ -108,7 +108,7 @@ public class InverseTrigGradientTests
 
         for (int i = 0; i < data.Length; i++)
         {
-            Assert.Equal(data[i], roundTrip[i], ComposedTolerance);
+            Assert.Equal(data[i], roundTrip[i], Tolerance);
         }
     }
 
@@ -144,7 +144,7 @@ public class InverseTrigGradientTests
 
         for (int i = 0; i < ys.Length; i++)
         {
-            Assert.Equal(Math.Atan2(ys[i], xs[i]), angle[i], ExactTolerance);
+            Assert.Equal(Math.Atan2(ys[i], xs[i]), angle[i], Tolerance);
         }
     }
 
@@ -159,8 +159,8 @@ public class InverseTrigGradientTests
 
         var angle = _engine.TensorAtan2(y, x);
 
-        Assert.Equal(3 * Math.PI / 4, angle[0], ExactTolerance);
-        Assert.Equal(-3 * Math.PI / 4, angle[1], ExactTolerance);
+        Assert.Equal(3 * Math.PI / 4, angle[0], Tolerance);
+        Assert.Equal(-3 * Math.PI / 4, angle[1], Tolerance);
         Assert.True(Math.Abs(angle[0] - Math.Atan(1.0 / -1.0)) > 1.0);
     }
 
@@ -182,7 +182,7 @@ public class InverseTrigGradientTests
 
         for (int i = 0; i < angles.Length; i++)
         {
-            Assert.Equal(angles[i], recovered[i], 1e-12);
+            Assert.Equal(angles[i], recovered[i], Tolerance);
         }
     }
 
@@ -210,7 +210,7 @@ public class InverseTrigGradientTests
         for (int i = 0; i < data.Length; i++)
         {
             var expected = 1.0 / Math.Sqrt(1.0 - (data[i] * data[i]));
-            Assert.Equal(expected, gx[i], ComposedTolerance);
+            Assert.Equal(expected, gx[i], Tolerance);
         }
     }
 
@@ -227,7 +227,7 @@ public class InverseTrigGradientTests
         for (int i = 0; i < data.Length; i++)
         {
             var expected = -1.0 / Math.Sqrt(1.0 - (data[i] * data[i]));
-            Assert.Equal(expected, gx[i], ComposedTolerance);
+            Assert.Equal(expected, gx[i], Tolerance);
         }
     }
 
@@ -244,7 +244,7 @@ public class InverseTrigGradientTests
         for (int i = 0; i < data.Length; i++)
         {
             var expected = 1.0 / (1.0 + (data[i] * data[i]));
-            Assert.Equal(expected, gx[i], ComposedTolerance);
+            Assert.Equal(expected, gx[i], Tolerance);
         }
     }
 
@@ -263,8 +263,8 @@ public class InverseTrigGradientTests
         for (int i = 0; i < ys.Length; i++)
         {
             var denominator = (xs[i] * xs[i]) + (ys[i] * ys[i]);
-            Assert.Equal(xs[i] / denominator, grads[y][i], ComposedTolerance);
-            Assert.Equal(-ys[i] / denominator, grads[x][i], ComposedTolerance);
+            Assert.Equal(xs[i] / denominator, grads[y][i], Tolerance);
+            Assert.Equal(-ys[i] / denominator, grads[x][i], Tolerance);
         }
     }
 
@@ -284,7 +284,7 @@ public class InverseTrigGradientTests
         for (int i = 0; i < data.Length; i++)
         {
             var numeric = (Math.Atan(data[i] + h) - Math.Atan(data[i] - h)) / (2 * h);
-            Assert.Equal(numeric, gx[i], ComposedTolerance);
+            Assert.Equal(numeric, gx[i], Tolerance);
         }
     }
 
@@ -334,7 +334,7 @@ public class InverseTrigGradientTests
         {
             // d/dx asin(x)^2 = 2*asin(x)/sqrt(1 - x^2)
             var expected = 2 * Math.Asin(data[i]) / Math.Sqrt(1.0 - (data[i] * data[i]));
-            Assert.Equal(expected, gx[i], ComposedTolerance);
+            Assert.Equal(expected, gx[i], Tolerance);
         }
     }
 }

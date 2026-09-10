@@ -32,22 +32,22 @@ namespace AiDotNet.Tensors.Engines;
 public partial class CpuEngine
 {
     /// <inheritdoc/>
-    public Tensor<T> TensorAsin<T>(Tensor<T> tensor) =>
+    public virtual Tensor<T> TensorAsin<T>(Tensor<T> tensor) =>
         InverseTrigUnary(tensor, "TensorAsin", Math.Asin,
             static (eng, t) => eng.TensorAsin(t), BackwardFunctions<T>.AsinBackward);
 
     /// <inheritdoc/>
-    public Tensor<T> TensorAcos<T>(Tensor<T> tensor) =>
+    public virtual Tensor<T> TensorAcos<T>(Tensor<T> tensor) =>
         InverseTrigUnary(tensor, "TensorAcos", Math.Acos,
             static (eng, t) => eng.TensorAcos(t), BackwardFunctions<T>.AcosBackward);
 
     /// <inheritdoc/>
-    public Tensor<T> TensorAtan<T>(Tensor<T> tensor) =>
+    public virtual Tensor<T> TensorAtan<T>(Tensor<T> tensor) =>
         InverseTrigUnary(tensor, "TensorAtan", Math.Atan,
             static (eng, t) => eng.TensorAtan(t), BackwardFunctions<T>.AtanBackward);
 
     /// <inheritdoc/>
-    public Tensor<T> TensorAtan2<T>(Tensor<T> y, Tensor<T> x)
+    public virtual Tensor<T> TensorAtan2<T>(Tensor<T> y, Tensor<T> x)
     {
         if (y is null) throw new ArgumentNullException(nameof(y));
         if (x is null) throw new ArgumentNullException(nameof(x));
