@@ -130,6 +130,54 @@ public class InverseTrigGradientTests
         }
     }
 
+    [Fact]
+    public void Asin_Acos_Atan_WorkForANumericTypeWithNoFastPath()
+    {
+        // The per-type dispatch has three arms: double, float, and everything else via
+        // INumericOperations. Only the first two were exercised, so the generic arm - the one that
+        // actually round-trips through ToDouble and FromDouble - went untested despite being the
+        // arm any custom numeric type lands on. decimal is the supported type furthest from a raw
+        // double[] cast, so it is the one that proves the arm works rather than merely compiles.
+        // Explicitly a CpuEngine. AiDotNetEngine.Current is DirectGpuTensorEngine where a GPU is
+        // present, and it evaluates a decimal tensor in single precision: a plain TensorAdd of
+        // 0.1234567890123456m and 1e-16m returns 0.1234568 there against 0.1234567890123457 on the
+        // CPU. That is the engine, not these ops - measured on both - but it would make this test
+        // assert fp32 accuracy for the one numeric type chosen specifically to avoid it.
+        var engine = new CpuEngine();
+        var data = new[] { -0.75m, -0.1m, 0.3m, 0.8m };
+        var x = new Tensor<decimal>(data, new[] { data.Length });
+
+        var asin = engine.TensorAsin(x);
+        var acos = engine.TensorAcos(x);
+        var atan = engine.TensorAtan(x);
+
+        for (int i = 0; i < data.Length; i++)
+        {
+            var value = (double)data[i];
+            Assert.Equal((decimal)Math.Asin(value), asin[i], 10);
+            Assert.Equal((decimal)Math.Acos(value), acos[i], 10);
+            Assert.Equal((decimal)Math.Atan(value), atan[i], 10);
+        }
+    }
+
+    [Fact]
+    public void Atan2_WorksForANumericTypeWithNoFastPath()
+    {
+        // A CpuEngine for the reason given on the sibling test above.
+        var engine = new CpuEngine();
+        var ys = new[] { 1.0m, -1.0m, 0.5m };
+        var xs = new[] { 2.0m, -1.0m, -3.0m };
+        var y = new Tensor<decimal>(ys, new[] { ys.Length });
+        var x = new Tensor<decimal>(xs, new[] { xs.Length });
+
+        var angle = engine.TensorAtan2(y, x);
+
+        for (int i = 0; i < ys.Length; i++)
+        {
+            Assert.Equal((decimal)Math.Atan2((double)ys[i], (double)xs[i]), angle[i], 10);
+        }
+    }
+
     // Four-quadrant behaviour
 
     [Fact]
