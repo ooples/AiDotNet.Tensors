@@ -19540,6 +19540,104 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return base.TensorCos(tensor);
     }
 
+    // Inverse trigonometry (issue #905). The backends already carry asin/acos/atan kernels and an
+    // element-wise atan2; these overrides put the tensor surface on them and record the same
+    // derivative the CPU path does, so a GPU graph differentiates through an angle identically.
+
+    public override Tensor<T> TensorAsin<T>(Tensor<T> tensor)
+    {
+        try
+        {
+            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Asin(input, output, size));
+            if (result != null)
+            {
+                var output = new Tensor<T>(result, tensor.Shape._dims);
+                Autodiff.DifferentiableOps.RecordUnary("TensorAsin", output, tensor, Autodiff.BackwardFunctions<T>.AsinBackward);
+                return output;
+            }
+        }
+        catch { }
+        return base.TensorAsin(tensor);
+    }
+
+    public override Tensor<T> TensorAcos<T>(Tensor<T> tensor)
+    {
+        try
+        {
+            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Acos(input, output, size));
+            if (result != null)
+            {
+                var output = new Tensor<T>(result, tensor.Shape._dims);
+                Autodiff.DifferentiableOps.RecordUnary("TensorAcos", output, tensor, Autodiff.BackwardFunctions<T>.AcosBackward);
+                return output;
+            }
+        }
+        catch { }
+        return base.TensorAcos(tensor);
+    }
+
+    public override Tensor<T> TensorAtan<T>(Tensor<T> tensor)
+    {
+        try
+        {
+            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Atan(input, output, size));
+            if (result != null)
+            {
+                var output = new Tensor<T>(result, tensor.Shape._dims);
+                Autodiff.DifferentiableOps.RecordUnary("TensorAtan", output, tensor, Autodiff.BackwardFunctions<T>.AtanBackward);
+                return output;
+            }
+        }
+        catch { }
+        return base.TensorAtan(tensor);
+    }
+
+    public override Tensor<T> TensorAtan2<T>(Tensor<T> y, Tensor<T> x)
+    {
+        // Shape validation, and the exception it throws, belong to the one implementation on the
+        // base engine rather than being restated here; this only decides whether the GPU kernel is
+        // applicable, and defers everything else.
+        if (SameShapeForAtan2(y, x))
+        {
+            try
+            {
+                // Atan2Elementwise is declared (real, imag) and computes atan2(imag, real), so the
+                // operands cross over: our y is its imaginary part and our x is its real part.
+                var result = TryRunBinary(y, x,
+                    static (backend, yBuffer, xBuffer, output, size) => backend.Atan2Elementwise(xBuffer, yBuffer, output, size));
+                if (result != null)
+                {
+                    var output = new Tensor<T>(result, y.Shape._dims);
+                    Autodiff.DifferentiableOps.RecordBinary("TensorAtan2", output, y, x, Autodiff.BackwardFunctions<T>.Atan2Backward);
+                    return output;
+                }
+            }
+            catch { }
+        }
+
+        return base.TensorAtan2(y, x);
+    }
+
+    /// <summary>
+    /// Whether two operands are shaped so the element-wise atan2 kernel applies.
+    /// </summary>
+    /// <remarks>
+    /// Takes nullable parameters deliberately. Testing the callers' non-nullable arguments for null
+    /// inline would narrow them for the rest of the method, and forwarding them to the base
+    /// implementation - which is what should raise the real exception - would then warn.
+    /// </remarks>
+    private static bool SameShapeForAtan2<T>(Tensor<T>? y, Tensor<T>? x)
+    {
+        if (y is null || x is null || y.Rank != x.Rank) return false;
+
+        for (int d = 0; d < y.Rank; d++)
+        {
+            if (y._shape[d] != x._shape[d]) return false;
+        }
+
+        return true;
+    }
+
     // ──────────────────────────────────────────────────────────────
     // GPU-accelerated scalar operations
     // ──────────────────────────────────────────────────────────────
