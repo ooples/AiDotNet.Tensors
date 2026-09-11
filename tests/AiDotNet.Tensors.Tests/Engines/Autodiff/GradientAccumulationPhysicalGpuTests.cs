@@ -15,21 +15,16 @@ public sealed class GradientAccumulationPhysicalGpuTests
     private readonly ITestOutputHelper _output;
     public GradientAccumulationPhysicalGpuTests(ITestOutputHelper output) => _output = output;
 
-    [Fact]
+    [SkippableFact]
     public void Float32Accumulation_PreservesSmallResidualOnPhysicalGpu()
     {
         using var gpu = new DirectGpuTensorEngine();
         bool required = Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_GPU_TESTS") == "1";
-        if (!gpu.IsGpuAvailable)
-        {
-            Assert.False(required, "A physical GPU was required, but none initialized.");
-            return;
-        }
-        if (gpu.TestBackend is not IGpuFp16ElementwiseBackend { SupportsFp16NativeOps: true })
-        {
-            Assert.False(required, "Native FP16 elementwise support is required for this precision comparison.");
-            return;
-        }
+        if (required) Assert.True(gpu.IsGpuAvailable, "A physical GPU was required, but none initialized.");
+        Skip.IfNot(gpu.IsGpuAvailable, "No physical GPU backend initialized.");
+        bool nativeHalf = gpu.TestBackend is IGpuFp16ElementwiseBackend { SupportsFp16NativeOps: true };
+        if (required) Assert.True(nativeHalf, "Native FP16 elementwise support is required for this precision comparison.");
+        Skip.IfNot(nativeHalf, "Native FP16 elementwise support is unavailable.");
 
         var previousEngine = AiDotNetEngine.Current;
         bool previousStrict = DirectGpuTensorEngine.ThrowOnGpuKernelFallback;

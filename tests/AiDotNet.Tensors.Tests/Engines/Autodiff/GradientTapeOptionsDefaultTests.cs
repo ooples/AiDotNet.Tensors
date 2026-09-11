@@ -91,6 +91,7 @@ public class GradientTapeOptionsDefaultTests
         Assert.Equal(
             StreamingGraphRetentionMode.ReleaseAfterBackward,
             options.StreamingGraphRetention);
+        Assert.Equal(GradientAccumulationPrecision.Float32, options.GradientAccumulationPrecision);
     }
 
     [Fact]

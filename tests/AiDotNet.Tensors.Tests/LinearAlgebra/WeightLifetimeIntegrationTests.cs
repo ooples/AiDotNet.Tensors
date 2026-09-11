@@ -28,6 +28,8 @@ public class WeightLifetimeIntegrationTests
         private readonly System.Collections.Generic.HashSet<IntPtr> _live = new();
         private int _allocationCount;
         public int FailOnAllocation { get; set; } = int.MaxValue;
+        public int FailAfterFreeAttempt { get; set; } = int.MaxValue;
+        public int FreeAttempts { get; private set; }
         public int LiveCount => _live.Count;
 
         public bool IsAvailable => true;
@@ -44,10 +46,13 @@ public class WeightLifetimeIntegrationTests
 
         public void Free(GpuOffloadHandle handle)
         {
+            FreeAttempts++;
             if (!_live.Remove(handle.HostPointer))
                 throw new InvalidOperationException("Allocation was freed through the wrong allocator.");
             Marshal.FreeHGlobal(handle.HostPointer);
             FreeCount++;
+            if (FreeAttempts == FailAfterFreeAttempt)
+                throw new IOException("Injected failure after the allocator released its handle.");
         }
 
         public void Dispose()
@@ -57,6 +62,91 @@ public class WeightLifetimeIntegrationTests
             _live.Clear();
             DisposeCount++;
         }
+    }
+
+    private sealed class ThrowingTraceListener : System.Diagnostics.TraceListener
+    {
+        public override void Write(string? message) => throw new IOException("Injected diagnostic failure.");
+        public override void WriteLine(string? message) => throw new IOException("Injected diagnostic failure.");
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Reset_AttemptsEveryFreeAndClearsHandlesWhenOneFreeThrows(bool failLogging)
+    {
+        WeightRegistry.Reset();
+        var allocator = new TrackingOffloadAllocator { FailAfterFreeAttempt = 1 };
+        using var listener = new ThrowingTraceListener();
+        try
+        {
+            var weights = new[] { new Tensor<float>(new[] { 2 }), new Tensor<float>(new[] { 3 }) };
+            WeightRegistry.ConfigureAndRegisterBatch(new GpuOffloadOptions(), weights, allocator);
+            if (failLogging) System.Diagnostics.Trace.Listeners.Add(listener);
+
+            WeightRegistry.Reset();
+
+            Assert.Equal(2, allocator.FreeAttempts);
+            Assert.Equal(2, allocator.FreeCount);
+            Assert.Equal(0, allocator.LiveCount);
+            Assert.Equal(1, allocator.DisposeCount);
+            WeightRegistry.Reset();
+            Assert.Equal(2, allocator.FreeAttempts);
+            GC.KeepAlive(weights);
+        }
+        finally
+        {
+            System.Diagnostics.Trace.Listeners.Remove(listener);
+            WeightRegistry.Reset();
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Configure_PrunesEveryDeadOwnerEvenWhenOneFreeThrows(bool failLogging)
+    {
+        WeightRegistry.Reset();
+        var allocator = new TrackingOffloadAllocator { FailAfterFreeAttempt = 1 };
+        var replacement = new TrackingOffloadAllocator();
+        using var listener = new ThrowingTraceListener();
+        try
+        {
+            WeightRegistry.Configure(new GpuOffloadOptions(), allocator);
+            WeakReference[] abandoned = RegisterAndAbandonOffloadWeights();
+            for (int attempt = 0; attempt < 5 && Array.Exists(abandoned, weak => weak.IsAlive); attempt++)
+            {
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+                GC.Collect();
+            }
+            Assert.All(abandoned, weak => Assert.False(weak.IsAlive));
+            if (failLogging) System.Diagnostics.Trace.Listeners.Add(listener);
+
+            WeightRegistry.Configure(new GpuOffloadOptions(), replacement);
+
+            Assert.Equal(2, allocator.FreeAttempts);
+            Assert.Equal(2, allocator.FreeCount);
+            Assert.Equal(0, allocator.LiveCount);
+            Assert.Equal(1, allocator.DisposeCount);
+            Assert.Same(replacement, WeightRegistry.OffloadAllocator);
+            WeightRegistry.Configure(new GpuOffloadOptions(), replacement);
+            Assert.Equal(2, allocator.FreeAttempts);
+        }
+        finally
+        {
+            System.Diagnostics.Trace.Listeners.Remove(listener);
+            WeightRegistry.Reset();
+        }
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static WeakReference[] RegisterAndAbandonOffloadWeights()
+    {
+        var first = new Tensor<float>(new[] { 2 });
+        var second = new Tensor<float>(new[] { 3 });
+        WeightRegistry.RegisterBatch(new[] { first, second }, WeightLifetime.GpuOffload);
+        return new[] { new WeakReference(first), new WeakReference(second) };
     }
 
     [Fact]

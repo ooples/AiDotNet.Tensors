@@ -499,7 +499,7 @@ public class GradientTapeStreamingTests
     }
 
     [Fact]
-    public void OppositeRetentionPolicies_RunConcurrentlyWithoutInterference()
+    public async Task OppositeRetentionPolicies_RunConcurrentlyWithoutInterference()
     {
         using var ready = new CountdownEvent(2);
         using var start = new ManualResetEventSlim(false);
@@ -515,9 +515,15 @@ public class GradientTapeStreamingTests
             ready,
             start));
 
-        ready.Wait();
-        start.Set();
-        Task.WaitAll(retained, released);
+        try
+        {
+            Assert.True(ready.Wait(TimeSpan.FromSeconds(30)),
+                "A concurrent tape worker did not reach the start barrier.");
+        }
+        finally { start.Set(); }
+        Task completion = Task.WhenAll(retained, released);
+        Assert.Same(completion, await Task.WhenAny(completion, Task.Delay(TimeSpan.FromSeconds(60))));
+        await completion;
     }
 
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
@@ -552,27 +558,36 @@ public class GradientTapeStreamingTests
         CountdownEvent ready,
         ManualResetEventSlim start)
     {
-        var engine = new CpuEngine();
-        var a = new Tensor<double>(new[] { 3 }, new Vector<double>(new double[] { 2, 3, 4 }));
-        var b = new Tensor<double>(new[] { 3 }, new Vector<double>(new double[] { 5, 6, 7 }));
-        using var tape = new GradientTape<double>(new GradientTapeOptions
+        bool signaled = false;
+        try
         {
-            Persistent = true,
-            StreamingGraphRetention = retention,
-        });
-        var loss = engine.ReduceSum(engine.TensorMultiply(a, b), null);
-        ready.Signal();
-        start.Wait();
-        tape.ComputeGradientsStreaming(loss, new[] { a, b }, (_, __) => { });
-
-        if (expectReplay)
-        {
+            var engine = new CpuEngine();
+            var a = new Tensor<double>(new[] { 3 }, new Vector<double>(new double[] { 2, 3, 4 }));
+            var b = new Tensor<double>(new[] { 3 }, new Vector<double>(new double[] { 5, 6, 7 }));
+            using var tape = new GradientTape<double>(new GradientTapeOptions
+            {
+                Persistent = true,
+                StreamingGraphRetention = retention,
+            });
+            var loss = engine.ReduceSum(engine.TensorMultiply(a, b), null);
+            ready.Signal();
+            signaled = true;
+            Assert.True(start.Wait(TimeSpan.FromSeconds(30)), "The concurrent tape start barrier was not released.");
             tape.ComputeGradientsStreaming(loss, new[] { a, b }, (_, __) => { });
+
+            if (expectReplay)
+            {
+                tape.ComputeGradientsStreaming(loss, new[] { a, b }, (_, __) => { });
+            }
+            else
+            {
+                Assert.Throws<System.InvalidOperationException>(
+                    () => tape.ComputeGradientsStreaming(loss, new[] { a, b }, (_, __) => { }));
+            }
         }
-        else
+        finally
         {
-            Assert.Throws<System.InvalidOperationException>(
-                () => tape.ComputeGradientsStreaming(loss, new[] { a, b }, (_, __) => { }));
+            if (!signaled) ready.Signal();
         }
     }
 }

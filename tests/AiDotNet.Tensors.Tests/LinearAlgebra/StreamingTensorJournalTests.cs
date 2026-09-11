@@ -14,6 +14,59 @@ namespace AiDotNet.Tensors.Tests.LinearAlgebra;
 public sealed class StreamingTensorJournalTests
 {
     [Fact]
+    public void OversizedDeferredPayload_IsRejectedBeforeMaterialization()
+    {
+        using var tensor = Tensor<double>.CreateDeferred(new[] { int.MaxValue / sizeof(double) + 1 });
+        using var journal = new StreamingTensorJournal<double>(32);
+        Assert.Null(tensor.GetLiveBackingArrayOrNull());
+
+        Assert.Throws<NotSupportedException>(() => journal.Append(tensor));
+
+        Assert.Null(tensor.GetLiveBackingArrayOrNull());
+        Assert.Equal(0, journal.Count);
+        Assert.Equal(0, journal.GetReport().DiskWriteBytes);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void FailedAppend_PoisonsOnlyWhenRangeCleanupAlsoFails(bool failCleanup)
+    {
+        bool failWrite = true;
+        var observed = new System.Collections.Generic.List<StreamingTensorJournalFileOperation>();
+        using var journal = new StreamingTensorJournal<float>(32, null, operation =>
+        {
+            observed.Add(operation);
+            if (operation == StreamingTensorJournalFileOperation.Write && failWrite)
+                throw new IOException("Injected backing-store write failure.");
+            if (operation == StreamingTensorJournalFileOperation.ReleaseRange && failCleanup)
+                throw new IOException("Injected backing-range cleanup failure.");
+        });
+        var retained = journal.Append(new Tensor<float>(new float[] { 7 }, new[] { 1 }));
+        var oversized = new Tensor<float>(Enumerable.Range(0, 16).Select(i => (float)i).ToArray(), new[] { 16 });
+
+        IOException original = Assert.Throws<IOException>(() => journal.Append(oversized));
+        Assert.Contains("write failure", original.Message);
+        Assert.Equal(new[] { StreamingTensorJournalFileOperation.Write, StreamingTensorJournalFileOperation.ReleaseRange }, observed);
+        if (failCleanup)
+        {
+            Assert.Null(retained.Segments[0].ResidentData);
+            Assert.Throws<InvalidOperationException>(() => journal.Read(retained));
+            Assert.Throws<InvalidOperationException>(() => journal.Remove(retained));
+            Assert.Throws<InvalidOperationException>(() => journal.Append(oversized));
+            Assert.Throws<InvalidOperationException>(() => journal.GetReport());
+        }
+        else
+        {
+            Assert.Equal(new[] { 7f }, journal.Read(retained).ToArray());
+            failWrite = false;
+            var recovered = journal.Append(oversized);
+            Assert.Equal(oversized.ToArray(), journal.Read(recovered).ToArray());
+            Assert.Equal(2, journal.Count);
+        }
+    }
+
+    [Fact]
     public void FloatJournal_RoundTripsBitIdenticallyAfterSpill()
     {
         using var journal = new StreamingTensorJournal<float>(maxResidentBytes: 16);
@@ -146,7 +199,7 @@ public sealed class StreamingTensorJournalTests
         Assert.Equal(new float[4], wrongShape.ToArray());
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(false, false)]
     [InlineData(false, true)]
     [InlineData(true, false)]
@@ -154,7 +207,7 @@ public sealed class StreamingTensorJournalTests
     public void Restore_InvalidatesPrimedPhysicalGpuValueCache(bool activation, bool inference)
     {
         using var gpu = new DirectGpuTensorEngine();
-        if (!RequireGpuIfRequested(gpu)) return;
+        RequireGpuIfRequested(gpu);
         bool previousStrict = DirectGpuTensorEngine.ThrowOnGpuKernelFallback;
         DirectGpuTensorEngine.ThrowOnGpuKernelFallback = true;
         try
@@ -180,11 +233,11 @@ public sealed class StreamingTensorJournalTests
         finally { DirectGpuTensorEngine.ThrowOnGpuKernelFallback = previousStrict; }
     }
 
-    [Fact]
+    [SkippableFact]
     public void ResidentCache_MutationThroughSharedViewInvalidatesSourceSnapshot()
     {
         using var gpu = new DirectGpuTensorEngine();
-        if (!RequireGpuIfRequested(gpu)) return;
+        RequireGpuIfRequested(gpu);
         bool previousStrict = DirectGpuTensorEngine.ThrowOnGpuKernelFallback;
         DirectGpuTensorEngine.ThrowOnGpuKernelFallback = true;
         try
@@ -198,11 +251,11 @@ public sealed class StreamingTensorJournalTests
         finally { DirectGpuTensorEngine.ThrowOnGpuKernelFallback = previousStrict; }
     }
 
-    private static bool RequireGpuIfRequested(DirectGpuTensorEngine gpu)
+    private static void RequireGpuIfRequested(DirectGpuTensorEngine gpu)
     {
         if (Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_GPU_TESTS") == "1")
             Assert.True(gpu.IsGpuAvailable, "A physical GPU was required, but no GPU backend initialized.");
-        return gpu.IsGpuAvailable;
+        Skip.IfNot(gpu.IsGpuAvailable, "No physical GPU backend initialized.");
     }
 
     [Fact]

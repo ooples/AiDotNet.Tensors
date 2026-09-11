@@ -2531,7 +2531,8 @@ public sealed class GradientTape<T> : IDisposable
         // A caller that compiles directly never goes through ComputeGradients, so without this the
         // compiled graph captures the constructor default instead of the data-derived engine.
         ResolveEngineFromData();
-        return new CompiledBackwardGraph<T>(_entries, loss, sources, _engine, _retainGrad);
+        return new CompiledBackwardGraph<T>(
+            _entries, loss, sources, _engine, _retainGrad, _options.GradientAccumulationPrecision);
     }
 
     /// <summary>

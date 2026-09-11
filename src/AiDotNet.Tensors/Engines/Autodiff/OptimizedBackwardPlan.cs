@@ -23,6 +23,7 @@ internal sealed class OptimizedBackwardPlan<T>
     private readonly Tensor<T> _loss;
     private readonly Tensor<T>[]? _sources;
     private readonly IEngine _engine;
+    private readonly GradientAccumulationPrecision _accumulationPrecision;
     private readonly BackwardStorageReleasePlan<T> _storageReleasePlan;
 
     /// <summary>
@@ -46,7 +47,8 @@ internal sealed class OptimizedBackwardPlan<T>
         Tensor<T>[]? sources,
         IEngine engine,
         BackwardAnalysis analysis,
-        HashSet<Tensor<T>>? retainGrad = null)
+        HashSet<Tensor<T>>? retainGrad = null,
+        GradientAccumulationPrecision accumulationPrecision = GradientAccumulationPrecision.Float32)
     {
         _entries = entries;
         _entryCount = entries.Count;
@@ -54,6 +56,7 @@ internal sealed class OptimizedBackwardPlan<T>
         _loss = loss;
         _sources = sources;
         _engine = engine;
+        _accumulationPrecision = accumulationPrecision;
         _retainGrad = retainGrad;
         _storageReleasePlan = BackwardStorageReleasePlan<T>.Create(entries, reachableIndices);
         _ = analysis; // Retained for future backward optimization passes
@@ -65,6 +68,7 @@ internal sealed class OptimizedBackwardPlan<T>
     /// </summary>
     internal Dictionary<Tensor<T>, Tensor<T>> Execute()
     {
+        using var accumulationScope = new GradientAccumulationPrecisionScope(_accumulationPrecision);
         var numOps = MathHelper.GetNumericOperations<T>();
         var cse = new BackwardCSEPass<T>(_engine);
 
@@ -364,13 +368,15 @@ internal sealed class OptimizedBackwardPlan<T>
         Tensor<T> loss,
         Tensor<T>[]? sources,
         IEngine engine,
-        HashSet<Tensor<T>>? retainGrad = null)
+        HashSet<Tensor<T>>? retainGrad = null,
+        GradientAccumulationPrecision accumulationPrecision = GradientAccumulationPrecision.Float32)
     {
         var analysis = SymbolicBackwardGraphBuilder.Analyze(entries, reachableIndices);
 
         if (!analysis.CanBenefit)
             return null;
 
-        return new OptimizedBackwardPlan<T>(entries, reachableIndices, loss, sources, engine, analysis, retainGrad);
+        return new OptimizedBackwardPlan<T>(
+            entries, reachableIndices, loss, sources, engine, analysis, retainGrad, accumulationPrecision);
     }
 }

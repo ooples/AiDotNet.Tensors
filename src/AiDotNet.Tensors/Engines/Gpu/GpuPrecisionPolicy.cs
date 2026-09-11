@@ -400,8 +400,9 @@ public static class GpuPrecisionPlanner
         IDirectGpuBackend backend,
         string operationName,
         GpuComputePreference requested,
-        string reason)
-        => CpuPlan(backend, operationName, typeof(T), requested, reason);
+        string reason,
+        GpuPrecisionOperation operation)
+        => CpuPlan(backend, operationName, typeof(T), requested, reason, operation);
 
     private static GpuComputePlan FromCapability(
         IDirectGpuBackend backend,

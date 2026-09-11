@@ -523,8 +523,12 @@ public static partial class WeightRegistry
         foreach (KeyValuePair<long, OffloadRegistration> pair in _offloadRegistrations)
         {
             if (pair.Value.Owner.TryGetTarget(out _)) continue;
-            pair.Value.Allocator.Free(pair.Value.Handle);
             deadHandles.Add(pair.Key);
+            try { pair.Value.Allocator.Free(pair.Value.Handle); }
+            catch (Exception error)
+            {
+                TraceOffloadCleanupFailure(error);
+            }
         }
         for (int i = 0; i < deadHandles.Count; i++)
             _offloadRegistrations.Remove(deadHandles[i]);
@@ -2133,7 +2137,13 @@ public static partial class WeightRegistry
         lock (_lock)
         {
             foreach (OffloadRegistration registration in _offloadRegistrations.Values)
-                registration.Allocator.Free(registration.Handle);
+            {
+                try { registration.Allocator.Free(registration.Handle); }
+                catch (Exception error)
+                {
+                    TraceOffloadCleanupFailure(error);
+                }
+            }
             _offloadRegistrations.Clear();
             _nextOffloadRegistrationHandle = 0;
             _streamingPool?.Dispose();
@@ -2165,6 +2175,19 @@ public static partial class WeightRegistry
             // precision", so the safe-unknown state has to mean null here.
             _streamingTrainingMode = null;
             _registrationsSinceSweep = 0;
+        }
+    }
+
+    private static void TraceOffloadCleanupFailure(Exception error)
+    {
+        try
+        {
+            System.Diagnostics.Trace.TraceWarning($"Failed to release an offload allocation: {error.Message}");
+        }
+        catch (Exception)
+        {
+            // Trace listeners are user-supplied. A secondary diagnostic failure
+            // must not interrupt reclamation of the remaining allocations.
         }
     }
 

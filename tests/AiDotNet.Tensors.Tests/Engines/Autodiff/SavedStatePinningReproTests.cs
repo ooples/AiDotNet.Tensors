@@ -509,7 +509,11 @@ public class SavedStatePinningReproTests
     {
         TensorPool<float>.Clear();
         var engine = new CpuEngine();
-        using var tape = new GradientTape<float>(new GradientTapeOptions { Persistent = false });
+        using var tape = new GradientTape<float>(new GradientTapeOptions
+        {
+            Persistent = false,
+            StreamingGraphRetention = StreamingGraphRetentionMode.ReleaseAfterBackward,
+        });
             var deadInput = Fixed(new[] { 2, 8 }, 0.2f, 0.03f);
             var deadGamma = Fixed(new[] { 8 }, 1f, 0.01f);
             _ = engine.RMSNorm(deadInput, deadGamma, 1e-5, out var deadRms);

@@ -24,7 +24,7 @@ public sealed class TensorGpuCachePhysicalTests
         OffsetVector,
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(ExternalWrapperKind.Array, false)]
     [InlineData(ExternalWrapperKind.Array, true)]
     [InlineData(ExternalWrapperKind.Vector, false)]
@@ -66,7 +66,7 @@ public sealed class TensorGpuCachePhysicalTests
         });
     }
 
-    [Fact]
+    [SkippableFact]
     public void ExternalWrapperCreatedAfterGpuRefresh_InheritsCurrentArrayEpoch()
     {
         WithPhysicalGpu((gpu, _) =>
@@ -88,7 +88,7 @@ public sealed class TensorGpuCachePhysicalTests
         });
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(false)]
     [InlineData(true)]
     public void CopyOnWriteDetach_CopiesButDoesNotShareExternalArrayEpoch(bool inference)
@@ -117,7 +117,7 @@ public sealed class TensorGpuCachePhysicalTests
         });
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(false)]
     [InlineData(true)]
     public void ViewCreatedAfterHostMutation_PreservesStaleParentSnapshot(bool inference)
@@ -140,7 +140,7 @@ public sealed class TensorGpuCachePhysicalTests
         });
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(InPlaceOperation.MultiplyScalar, false)]
     [InlineData(InPlaceOperation.MultiplyScalar, true)]
     [InlineData(InPlaceOperation.AddCachedOperand, false)]
@@ -182,7 +182,7 @@ public sealed class TensorGpuCachePhysicalTests
         });
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(InPlaceOperation.MultiplyScalar)]
     [InlineData(InPlaceOperation.AddCachedOperand)]
     [InlineData(InPlaceOperation.AddUncachedOperand)]
@@ -222,12 +222,47 @@ public sealed class TensorGpuCachePhysicalTests
         using (new InferenceModeScope<float>()) action();
     }
 
+    [SkippableFact]
+    public void ExplicitInvalidation_PublishesRawHostMutationAcrossRepeatedReplacement()
+    {
+        WithPhysicalGpu((gpu, _) =>
+        {
+            float[] values = { 1, 2, 3, 4 };
+            using var tensor = new Tensor<float>(values, new[] { 4 });
+            gpu.RegisterResidentParamBuffer(tensor);
+            int epoch = tensor.GpuCacheVersion;
+            IGpuBuffer original = tensor.TryGetGpuBuffer()
+                ?? throw new InvalidOperationException("The persistent buffer was not populated.");
+
+            for (int iteration = 0; iteration < 2; iteration++)
+            {
+                values[0] = 10 + iteration;
+                gpu.InvalidatePersistentTensor(tensor);
+
+                Assert.Equal(epoch, tensor.GpuCacheVersion);
+                Assert.NotEqual(IntPtr.Zero, original.Handle);
+                gpu.RegisterResidentParamBuffer(tensor);
+                IGpuBuffer current = tensor.TryGetGpuBuffer()
+                    ?? throw new InvalidOperationException("The replacement buffer was not published.");
+                Assert.NotSame(original, current);
+                // OpenCL returns retired allocations to its pool without zeroing their
+                // native handles. Exact disposal ownership is covered by the tracking
+                // backend tests; this test verifies replacement and real device values.
+                Assert.Equal(new float[] { 2 * values[0], 4, 6, 8 },
+                    gpu.TensorMultiplyScalar(tensor, 2f).ToArray());
+                // Eager reads may clear the tensor-local shortcut while keeping the
+                // persistent cache entry; retain the last published borrowed buffer.
+                original = current;
+            }
+        });
+    }
+
     private static void WithPhysicalGpu(Action<DirectGpuTensorEngine, IDirectGpuBackend> action)
     {
         using var gpu = new DirectGpuTensorEngine();
         if (Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_GPU_TESTS") == "1")
             Assert.True(gpu.IsGpuAvailable, "A physical GPU was required, but no GPU backend initialized.");
-        if (!gpu.IsGpuAvailable) return;
+        Skip.IfNot(gpu.IsGpuAvailable, "No physical GPU backend initialized.");
         var backend = gpu.TestBackend
             ?? throw new InvalidOperationException("GPU availability did not produce an initialized backend.");
         bool previousStrict = DirectGpuTensorEngine.ThrowOnGpuKernelFallback;

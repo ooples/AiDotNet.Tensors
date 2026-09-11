@@ -87,6 +87,12 @@ internal enum StreamingTensorJournalLifecycle
     Disposed,
 }
 
+internal enum StreamingTensorJournalFileOperation
+{
+    Write,
+    ReleaseRange,
+}
+
 /// <summary>A lossless tensor journal with hard-bounded resident tensor payload.</summary>
 /// <remarks>
 /// The configured budget covers the reusable typed replay tensor and resident record payload.
@@ -118,6 +124,8 @@ public sealed class StreamingTensorJournal<T> : IDisposable
     private readonly string _backingFilePath;
     private readonly HashSet<StreamingTensorJournalRecord<T>> _liveRecords = new();
     private readonly List<FreeFileRange> _freeFileRanges = new();
+    // Per-instance, internal fault seam; production journals do not allocate a callback.
+    private readonly Action<StreamingTensorJournalFileOperation>? _beforeFileOperation;
 #if NETFRAMEWORK
     // FileStream on .NET Framework has no Span-based API. One reusable bounded adapter avoids the
     // previous byte-at-a-time virtual calls without allocating per record.
@@ -184,6 +192,15 @@ public sealed class StreamingTensorJournal<T> : IDisposable
         _backingFilePath = Path.Combine(_backingDirectory, "journal.bin");
     }
 
+    internal StreamingTensorJournal(
+        long maxResidentBytes,
+        string? backingStorePath,
+        Action<StreamingTensorJournalFileOperation> beforeFileOperation)
+        : this(maxResidentBytes, backingStorePath)
+    {
+        _beforeFileOperation = beforeFileOperation ?? throw new ArgumentNullException(nameof(beforeFileOperation));
+    }
+
     /// <summary>Number of live journal records.</summary>
     public int Count
     {
@@ -248,6 +265,9 @@ public sealed class StreamingTensorJournal<T> : IDisposable
                 throw new NotSupportedException(
                     "Streaming tensor journals require a contiguous tensor. Call Contiguous() explicitly first.");
 
+            if (tensor.Length > int.MaxValue / _elementSize)
+                throw new NotSupportedException(
+                    "A journal record cannot exceed Int32.MaxValue bytes. Chunk the tensor before appending.");
             ReadOnlySpan<byte> sourceBytes = GetReadOnlyBytes(tensor);
             // One tensor owns at most one storage extent. Segmenting by the resident budget made
             // metadata grow as O(tensorBytes / budget), which was unbounded and catastrophic for a
@@ -550,6 +570,7 @@ public sealed class StreamingTensorJournal<T> : IDisposable
 
     private void WriteFileRange(long fileOffset, ReadOnlySpan<byte> source)
     {
+        _beforeFileOperation?.Invoke(StreamingTensorJournalFileOperation.Write);
         FileStream stream = BackingFile();
         stream.Seek(fileOffset, SeekOrigin.Begin);
 #if NETFRAMEWORK
@@ -610,6 +631,7 @@ public sealed class StreamingTensorJournal<T> : IDisposable
     private void ReleaseFileRange(long offset, long length)
     {
         if (offset < 0 || length <= 0) return;
+        _beforeFileOperation?.Invoke(StreamingTensorJournalFileOperation.ReleaseRange);
         int insertion = 0;
         while (insertion < _freeFileRanges.Count && _freeFileRanges[insertion].Offset < offset)
             insertion++;
@@ -684,7 +706,7 @@ public sealed class StreamingTensorJournal<T> : IDisposable
             throw new ObjectDisposedException(nameof(StreamingTensorJournal<T>));
         if (_lifecycle == StreamingTensorJournalLifecycle.Poisoned)
             throw new InvalidOperationException(
-                "The streaming tensor journal is unavailable after a backing-store failure.");
+                "The streaming tensor journal is unavailable after an append cleanup failure.");
     }
 
     private void PoisonAndReleaseAllRecords()

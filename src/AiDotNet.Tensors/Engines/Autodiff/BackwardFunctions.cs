@@ -3066,6 +3066,7 @@ internal static class BackwardFunctions<T>
         var numOps = MathHelper.GetNumericOperations<T>();
         int[] argmax = (int[])savedState[0];
         var inputGrad = TensorPool<T>.RentZeroed(inputs[0]._shape);
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
         ReadOnlySpan<T> gradData = gradOutput.AsSpan();
         Span<T> resultData = inputGrad.AsWritableSpan();
         for (int i = 0; i < argmax.Length; i++)
