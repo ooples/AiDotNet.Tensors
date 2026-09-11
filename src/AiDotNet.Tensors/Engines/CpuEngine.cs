@@ -42117,8 +42117,16 @@ public partial class CpuEngine : ITensorLevelEngine
                     frameData[i] = numOps.Multiply(paddedInputData[inputOffset + start + i], windowData[i]);
                 }
 
-                // Compute FFT
-                var (realOut, imagOut) = FFTCore<T>(frameData, inverse: false);
+                // Compute FFT.
+                //
+                // UnnormalizedTransform, not FFTCore: FFTCore zero-pads a non-power-of-two length up
+                // to the next power of two, which is a different transform -- its bins sit at
+                // k/nPadded rather than k/nFft. That was already known and documented on the helper,
+                // but only the ADJOINT had been moved onto it, so at those lengths the forward and
+                // its own transpose were computing different operators. Surfaced by
+                // DifferentiableOpsGradCheckSweep, whose reflective argument synthesis produces
+                // nFft = 6. Identical call for power-of-two lengths, which is every realistic one.
+                var (realOut, imagOut) = UnnormalizedTransform<T>(frameData, inverse: false);
 
                 // Compute magnitude and phase for positive frequencies
                 int outputOffset = batchIdx * numFreqs * numFrames;
@@ -42244,15 +42252,26 @@ public partial class CpuEngine : ITensorLevelEngine
                     imagIn[k] = numOps.FromDouble(mag * Math.Sin(ph));
                 }
 
-                // Reconstruct negative frequencies using conjugate symmetry
-                for (int k = 1; k < numFreqs - 1; k++)
+                // Reconstruct negative frequencies using conjugate symmetry.
+                //
+                // The bound is 2k < nFft, not k < numFreqs - 1. Those agree only when nFft is even,
+                // where bin nFft/2 is Nyquist and is its own conjugate so must not be mirrored. An
+                // ODD nFft has no Nyquist bin, and stopping a bin early left the top of the spectrum
+                // at zero: the inverse transform was then not of a conjugate-symmetric spectrum, its
+                // result was not real, and taking the real part discarded the difference.
+                //
+                // Measured as a STFT -> ISTFT round trip on a smooth signal, worst interior error:
+                // nFft 8 gave 4.4e-16 and nFft 16 gave 6.7e-16, against 0.055 at nFft 5 and 3.5e-3
+                // at nFft 7. IstftRoundTripTests pins all four.
+                for (int k = 1; k < numFreqs && (k * 2) < nFft; k++)
                 {
                     realIn[nFft - k] = realIn[k];
                     imagIn[nFft - k] = numOps.Negate(imagIn[k]);
                 }
 
-                // Inverse FFT
-                var (realOut, _) = FFTCore<T>(realIn, imagIn, inverse: true);
+                // Inverse FFT. UnnormalizedTransform for the same reason as the forward in STFT:
+                // exact at every length, where FFTCore silently zero-pads to a power of two.
+                var (realOut, _) = UnnormalizedTransform<T>(realIn, imagIn, inverse: true);
                 T scale = numOps.FromDouble(1.0 / nFft);
 
                 // Overlap-add.
@@ -42303,6 +42322,15 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
             }
         }
+
+        // Synthesis is on the tape (issue #905 item 2). An STFT-consistency objective is defined
+        // ACROSS the round trip, so a severed ISTFT leaves half of it untrainable while still
+        // running - the silent failure the issue reports. outputLength is saved rather than
+        // recomputed because the caller may have supplied it verbatim.
+        DifferentiableOps.RecordBinary(
+            "ISTFT", result, magnitude, phase,
+            BackwardFunctions<T>.IstftBackward,
+            new object[] { nFft, hopLength, window, center, outputLength });
 
         return result;
     }
@@ -42466,11 +42494,21 @@ public partial class CpuEngine : ITensorLevelEngine
 
         for (int iter = 0; iter < iterations; iter++)
         {
-            // Reconstruct signal from magnitude and estimated phase
-            var reconstructed = ISTFT(magnitude, phase, nFft, hopLength, window, center: true, length: length);
+            // Reconstruct signal from magnitude and estimated phase.
+            //
+            // Suppressed: ISTFT records on the tape (issue #905 item 2) but GriffinLim is an
+            // iterative ALGORITHM, not a differentiable op, and stays in NonDifferentiableOps.
+            // Without this, calling it under a tape would unroll every iteration onto that tape
+            // and pin each intermediate, making the op silently contradict its own classification.
+            Tensor<T> reconstructed;
+            Tensor<T> newPhase;
+            using (new NoGradScope<T>())
+            {
+                reconstructed = ISTFT(magnitude, phase, nFft, hopLength, window, center: true, length: length);
 
-            // Re-compute STFT to get new phase estimate
-            STFT(reconstructed, nFft, hopLength, window, center: true, out _, out var newPhase);
+                // Re-compute STFT to get new phase estimate
+                STFT(reconstructed, nFft, hopLength, window, center: true, out _, out newPhase);
+            }
 
             // Apply momentum for faster convergence
             if (previousPhase != null && momentum > 0)
@@ -42498,8 +42536,11 @@ public partial class CpuEngine : ITensorLevelEngine
             previousPhase = newPhase;
         }
 
-        // Final reconstruction
-        return ISTFT(magnitude, phase, nFft, hopLength, window, center: true, length: length);
+        // Final reconstruction, suppressed for the same reason as the iterations above.
+        using (new NoGradScope<T>())
+        {
+            return ISTFT(magnitude, phase, nFft, hopLength, window, center: true, length: length);
+        }
     }
 
     /// <inheritdoc/>
@@ -42644,7 +42685,19 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>
-    /// Unnormalized complex inverse transform, exposed for the Spectrogram adjoint.
+    /// Real-input form of <see cref="UnnormalizedTransform{T}(Vector{T}, Vector{T}, bool)"/>.
+    /// </summary>
+    internal static (Vector<T> real, Vector<T> imag) UnnormalizedTransform<T>(Vector<T> realInput, bool inverse)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var imagInput = new Vector<T>(realInput.Length);
+        for (int i = 0; i < realInput.Length; i++)
+            imagInput[i] = numOps.Zero;
+        return UnnormalizedTransform(realInput, imagInput, inverse);
+    }
+
+    /// <summary>
+    /// Unnormalized complex transform that is exact at every length, in either direction.
     /// </summary>
     /// <remarks>
     /// Computes <c>Σ_k c[k] e^(+2πik n/N)</c> with NO 1/N factor — <see cref="FFTCore{T}(Vector{T}, Vector{T}, bool)"/>
@@ -42660,7 +42713,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// does not transpose the forward it is paired with. That is fine for the power-of-two lengths
     /// this used to see and wrong for every other one, so those route to Bluestein instead.
     /// </remarks>
-    internal static (Vector<T> real, Vector<T> imag) UnnormalizedTransformForAdjoint<T>(
+    internal static (Vector<T> real, Vector<T> imag) UnnormalizedTransform<T>(
         Vector<T> realInput, Vector<T> imagInput, bool inverse)
     {
         int n = realInput.Length;

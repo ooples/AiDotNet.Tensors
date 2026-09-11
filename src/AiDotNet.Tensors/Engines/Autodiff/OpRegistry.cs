@@ -31,6 +31,7 @@ internal static class OpRegistry
         // Math
         "TensorExp", "TensorLog", "TensorSqrt", "TensorPower", "TensorPowerTensor",
         "TensorSin", "TensorCos", "TensorCosh", "TensorSinh",
+        "TensorAsin", "TensorAcos", "TensorAtan", "TensorAtan2",
         "TensorFrac", "TensorPow",
 
         // Matrix
@@ -214,6 +215,7 @@ internal static class OpRegistry
 
         // Audio element-wise / linear ops — backward wired.
         "Spectrogram", "AmplitudeToDB", "ComputeDeltas", "Resample",
+        "ISTFT", "StftPhase",
 
         // Mel spectrogram — |STFT|^2, mel filterbank matmul and the optional dB conversion are
         // all differentiable, so the op records one node with BackwardFunctions<T>.
@@ -334,17 +336,20 @@ internal static class OpRegistry
 
         // Signal processing.
         //
-        // ISTFT is synthesis (overlap-add with window-sum normalization) and is used as a
-        // reconstruction operator, not on a training path — note it is specifically NOT the
-        // adjoint of the STFT analysis, which is why BackwardFunctions has its own
-        // MagnitudeStftAdjoint rather than delegating here.
-        //
         // GriffinLim is an iterative phase-reconstruction ALGORITHM (60 fixed-point iterations
         // by default), not a single differentiable op.
         //
         // MelSpectrogram moved to DifferentiableOps — every stage of it is differentiable and
         // mel-based objectives need the gradient.
-        "ISTFT", "GriffinLim",
+        //
+        // ISTFT moved to DifferentiableOps as well (issue #905 item 2). It was classified here on
+        // the grounds that synthesis is a reconstruction operator rather than a training-path op,
+        // and that it is specifically NOT the adjoint of STFT analysis. The second point still
+        // stands and is why BackwardFunctions keeps MagnitudeStftAdjoint separate; the first did
+        // not survive contact with STFT-consistency objectives, which are defined across the
+        // round trip and need the gradient through synthesis itself. IstftBackward is the genuine
+        // transpose of overlap-add synthesis, derived there in full.
+        "GriffinLim",
 
         // Raw transforms that emit their outputs through `out` parameters. These are
         // deliberately NOT recorded: they are primitives that the recorded ops above are built

@@ -711,6 +711,11 @@ public sealed class GpuCpuAutoDifferentialTests : IClassFixture<GpuCpuAutoDiffer
         "PitchShift(Tensor<T>,Int32,Double,Int32,Int32)",
         "ReorderToNchwc(Tensor<T>,TensorLayout)",
         "Spectrogram(Tensor<T>,Int32,Int32,Int32,Tensor<T>)",
+        // Same STFT kernel as Spectrogram, keeping the other output. Covered by the StftPhaseCos
+        // and StftPhaseSin parity cases, which compare through cos and sin rather than the angle:
+        // the output is WRAPPED phase, so two correct implementations can report +pi and -pi for one
+        // angle and differ by exactly 2*pi. The generic fuzzer would read that as a failure.
+        "StftPhase(Tensor<T>,Int32,Int32,Int32,Tensor<T>)",
         "TensorArgsort(Tensor<T>,Int32,Boolean)",
         "TensorBucketize(Tensor<T>,Tensor<T>,Boolean)",
         "TensorCross(Tensor<T>,Tensor<T>,Int32)",
