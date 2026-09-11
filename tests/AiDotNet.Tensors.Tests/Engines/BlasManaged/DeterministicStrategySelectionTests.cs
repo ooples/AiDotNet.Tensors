@@ -42,8 +42,11 @@ public sealed class DeterministicStrategySelectionTests : IDisposable
     public DeterministicStrategySelectionTests()
     {
         _priorCachePath = Environment.GetEnvironmentVariable(EnvVarCachePath);
-        _priorDeterministic = BlasProvider.IsDeterministicMode;
         _priorThreadLocal = BlasProvider.GetThreadLocalDeterministicMode();
+        // IsDeterministicMode includes the thread override. Save the unmasked global
+        // value so teardown restores both independent settings without contaminating later tests.
+        BlasProvider.SetThreadLocalDeterministicMode(null);
+        _priorDeterministic = BlasProvider.IsDeterministicMode;
         _priorBackgroundAutotuner = BackgroundAutotuner.Enabled;
 
         _cacheRoot = Path.Combine(Path.GetTempPath(), "aidotnet-determinism-" + Guid.NewGuid().ToString("N"));
@@ -53,7 +56,6 @@ public sealed class DeterministicStrategySelectionTests : IDisposable
         // The background autotuner would race these cases by persisting a timed winner
         // mid-test; the point here is what a PRESENT entry does, written deterministically.
         BackgroundAutotuner.Enabled = false;
-        BlasProvider.SetThreadLocalDeterministicMode(null);
         BlasProvider.SetDeterministicMode(true);
         ClearCache();
     }
