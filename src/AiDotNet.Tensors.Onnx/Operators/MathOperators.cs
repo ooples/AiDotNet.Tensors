@@ -608,11 +608,24 @@ internal static class MathOperators
                 ctx.PutTensor(node.Output[0], input);
                 return;
             }
+            // Reject an incompatible target at import time with an ONNX-level error naming both
+            // shapes, rather than surfacing whatever the engine's add throws (or, under a lenient
+            // shape policy, not throwing at all).
+            _ = ComputeBroadcastShape(input._shape, targetShape);
             var zero = new Tensor<T>(targetShape);
             ctx.PutTensor(node.Output[0], ctx.Engine.TensorAdd(input, zero));
         }
     }
 
+    /// <summary>
+    /// NumPy / ONNX multidirectional broadcast shape of <paramref name="a"/> and <paramref name="b"/>.
+    /// </summary>
+    /// <remarks>
+    /// An extent of 1 stretches to the other extent — including 0 — so each output axis is
+    /// <c>ai == 1 ? bi : ai</c>, not <c>Math.Max(ai, bi)</c> (which turns (0, 1) into 1). Any other
+    /// mismatch is rejected here, at import time, with both shapes named; without the check a
+    /// mismatch such as [2,3] vs [3,3] was silently sized [3,3] and failed later inside the engine.
+    /// </remarks>
     private static int[] ComputeBroadcastShape(int[] a, int[] b)
     {
         int rank = Math.Max(a.Length, b.Length);
@@ -621,7 +634,11 @@ internal static class MathOperators
         {
             int ai = i < a.Length ? a[a.Length - 1 - i] : 1;
             int bi = i < b.Length ? b[b.Length - 1 - i] : 1;
-            result[rank - 1 - i] = Math.Max(ai, bi);
+            if (ai != bi && ai != 1 && bi != 1)
+                throw new InvalidDataException(
+                    $"Shapes [{string.Join(",", a)}] and [{string.Join(",", b)}] are not broadcast-compatible: " +
+                    $"axis {rank - 1 - i} has sizes {ai} and {bi} (must be equal or one must be 1).");
+            result[rank - 1 - i] = ai == 1 ? bi : ai;
         }
         return result;
     }
