@@ -4238,6 +4238,8 @@ public partial class CpuEngine : ITensorLevelEngine
         if (b.Rank == 1 && a._shape[^1] == b._shape[0])
         {
             int lastDim = b._shape[0];
+            // A zero-extent last axis means `a` is empty: nothing to add, and a.Length / 0 throws.
+            if (lastDim == 0) return;
             int outerSize = a.Length / lastDim;
             for (int outer = 0; outer < outerSize; outer++)
             {
@@ -4251,6 +4253,15 @@ public partial class CpuEngine : ITensorLevelEngine
         // General fallback: compute broadcast result and copy back.
         // This allocates a temporary — acceptable for rare arbitrary broadcast shapes.
         var result = TensorBroadcastAdd(a, b);
+        // In place cannot grow or shrink the target. Stretching one of a's size-1 axes to a larger
+        // extent already failed in CopyTo (destination too short), but stretching it to 0 produced an
+        // empty result that "copied" nothing and returned a non-empty target silently unmodified.
+        // Compared by length, not shape, so the long-standing tolerance for a result that differs
+        // from `a` only by padded leading 1s ([C] += [1,C]) is left exactly as it was.
+        if (result.Length != a.Length)
+            throw new ArgumentException(
+                $"In-place broadcast add cannot resize its target: {FormatShape(a._shape)} " +
+                $"+= {FormatShape(b._shape)} broadcasts to {FormatShape(result._shape)}.", nameof(b));
         result.Data.Span.CopyTo(aSpan);
     }
 
@@ -13073,7 +13084,8 @@ public partial class CpuEngine : ITensorLevelEngine
             int dim2 = i < shape2.Length ? shape2[shape2.Length - 1 - i] : 1;
             if (dim1 != dim2 && dim1 != 1 && dim2 != 1)
                 throw new ArgumentException($"Shapes are not broadcast-compatible at dimension {maxRank - 1 - i}: {dim1} vs {dim2}");
-            result[maxRank - 1 - i] = Math.Max(dim1, dim2);
+            // 1 stretches to the other extent, including 0 — Math.Max would turn (0, 1) into 1.
+            result[maxRank - 1 - i] = dim1 == 1 ? dim2 : dim1;
         }
         return result;
     }

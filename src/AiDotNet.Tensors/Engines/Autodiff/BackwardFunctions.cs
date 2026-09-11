@@ -2260,11 +2260,13 @@ internal static class BackwardFunctions<T>
         // Pad target shape with leading 1s to match rank
         var paddedTarget = PadShapeToRank(targetShape, gradShape.Length);
 
-        // Find axes where target has size 1 but grad has size > 1 (broadcast dims)
+        // Find axes where target has size 1 but grad does not (broadcast dims). "Does not" rather
+        // than "> 1": an axis stretched from 1 to 0 must be summed too — a sum over no positions,
+        // i.e. zero — or the zero-length gradient is later reshaped to the operand's non-empty shape.
         var reduceAxes = new List<int>();
         for (int i = 0; i < gradShape.Length; i++)
         {
-            if (paddedTarget[i] == 1 && gradShape[i] > 1)
+            if (paddedTarget[i] == 1 && gradShape[i] != 1)
                 reduceAxes.Add(i);
         }
 
