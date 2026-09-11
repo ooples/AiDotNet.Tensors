@@ -46,13 +46,34 @@ public class HybridStrategyEndToEndTests
     {
         // Store a learned entry differing from the table's default, then assert
         // SelectStrategy returns the learned strategy (precedence learned > table).
-        const int M = 200, N = 200, K = 64;  // table → Streaming on this box; learned → PackBoth
-        var shape = BlasManagedAutotune.EncodeShape<float>(M, N, K, false, false, 0, 0, false,
-            AiDotNet.Tensors.Helpers.BlasProvider.IsDeterministicMode);
-        BlasManagedAutotune.StoreStrategy(shape, PackingMode.ForcePackBoth, ParallelismAxis.M,
-            64, 64, 64, 8, BlasKernelVersion.Current);
-        var opts = default(BlasOptions<float>);
-        Assert.Equal(PackingMode.ForcePackBoth, Dispatcher.SelectStrategy<float>(M, N, K, in opts));
+        //
+        // Pinned to FAST mode: learned-cache routing is a fast-mode feature. Deterministic
+        // mode deliberately ignores the timing-derived cache and routes via
+        // StrategyDefaultTable, because a wall-clock-measured strategy would otherwise change
+        // result bits (see the determinism gate in Dispatcher.SelectStrategy and
+        // DeterministicStrategySelectionTests). This test used to inherit the ambient mode,
+        // which defaults to deterministic, so it was asserting fast-mode behaviour under
+        // determinism by accident.
+        bool? beforeThreadDet = AiDotNet.Tensors.Helpers.BlasProvider.GetThreadLocalDeterministicMode();
+        if (beforeThreadDet is not null) AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(null);
+        bool beforeDet = AiDotNet.Tensors.Helpers.BlasProvider.IsDeterministicMode;
+        try
+        {
+            AiDotNet.Tensors.Helpers.BlasProvider.SetDeterministicMode(false);
+
+            const int M = 200, N = 200, K = 64;  // table → Streaming on this box; learned → PackBoth
+            var shape = BlasManagedAutotune.EncodeShape<float>(M, N, K, false, false, 0, 0, false,
+                AiDotNet.Tensors.Helpers.BlasProvider.IsDeterministicMode);
+            BlasManagedAutotune.StoreStrategy(shape, PackingMode.ForcePackBoth, ParallelismAxis.M,
+                64, 64, 64, 8, BlasKernelVersion.Current);
+            var opts = default(BlasOptions<float>);
+            Assert.Equal(PackingMode.ForcePackBoth, Dispatcher.SelectStrategy<float>(M, N, K, in opts));
+        }
+        finally
+        {
+            AiDotNet.Tensors.Helpers.BlasProvider.SetDeterministicMode(beforeDet);
+            AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(beforeThreadDet);
+        }
     }
 
     [Fact]
@@ -60,20 +81,33 @@ public class HybridStrategyEndToEndTests
     {
         // Two transB calls of the same small shape → 2nd sighting enqueues a background
         // measurement; after a short wait the learned cache should hold a strategy.
-        const int M = 72, N = 72, K = 48;
-        var a = new double[M * K];
-        var b = new double[N * K]; // [N,K] for transB
-        var c = new double[M * N];
-        var shape = BlasManagedAutotune.EncodeShape<double>(M, N, K, false, true, 0, 0, false,
-            AiDotNet.Tensors.Helpers.BlasProvider.IsDeterministicMode);
+        // Pinned to FAST mode: background measurement is a fast-mode-only activity.
+        // Deterministic mode skips BackgroundAutotuner.Observe entirely — a timing-derived
+        // strategy would change result bits (see the determinism gate in
+        // Dispatcher.SelectStrategy) — so no learned entry would ever appear and this would
+        // fail after burning its 10s poll. The mode is pinned BEFORE the shape key is encoded,
+        // because EncodeShape mixes IsDeterministicMode into the key. This test previously
+        // inherited the ambient mode, which defaults to deterministic.
+        bool? beforeThreadDet = AiDotNet.Tensors.Helpers.BlasProvider.GetThreadLocalDeterministicMode();
+        if (beforeThreadDet is not null) AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(null);
+        bool beforeDet = AiDotNet.Tensors.Helpers.BlasProvider.IsDeterministicMode;
         // Background autotuner is disabled assembly-wide for tests; enable locally and
         // restore the PRIOR value (not unconditionally false) so global state never leaks.
         // This class is in the DisableParallelization serial collection, so the worker never
         // overlaps other tests during this window.
         bool prevEnabled = BackgroundAutotuner.Enabled;
-        BackgroundAutotuner.Enabled = true;
         try
         {
+            AiDotNet.Tensors.Helpers.BlasProvider.SetDeterministicMode(false);
+
+            const int M = 72, N = 72, K = 48;
+            var a = new double[M * K];
+            var b = new double[N * K]; // [N,K] for transB
+            var c = new double[M * N];
+            var shape = BlasManagedAutotune.EncodeShape<double>(M, N, K, false, true, 0, 0, false,
+                AiDotNet.Tensors.Helpers.BlasProvider.IsDeterministicMode);
+
+            BackgroundAutotuner.Enabled = true;
             for (int i = 0; i < 2; i++)
                 BlasManagedLib.Gemm<double>(a, K, false, b, K, true, c, N, M, N, K);
             // Poll with timeout instead of a fixed sleep — the below-normal worker may take
@@ -83,6 +117,11 @@ public class HybridStrategyEndToEndTests
                 System.Threading.Thread.Sleep(50);
             Assert.NotNull(BlasManagedAutotune.TryLookupStrategy(shape));
         }
-        finally { BackgroundAutotuner.Enabled = prevEnabled; }
+        finally
+        {
+            BackgroundAutotuner.Enabled = prevEnabled;
+            AiDotNet.Tensors.Helpers.BlasProvider.SetDeterministicMode(beforeDet);
+            AiDotNet.Tensors.Helpers.BlasProvider.SetThreadLocalDeterministicMode(beforeThreadDet);
+        }
     }
 }

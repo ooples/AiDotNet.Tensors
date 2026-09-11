@@ -53,6 +53,34 @@ internal static class Dispatcher
         // path — Streaming/PackAOnly ignore a packed B, which would silently drop it.
         if (hasPrePack) return PackingMode.ForcePackBoth;
 
+        // DETERMINISM GATE. The learned cache is populated by BackgroundAutotuner.Measure,
+        // which TIMES ForceStreaming / ForcePackAOnly / ForcePackBoth and persists whichever
+        // was fastest. Those three strategies are NOT reduction-order equivalent (Streaming
+        // reduces a transposed-B column with a vectorized-K horizontal sum; the packed paths
+        // accumulate sequentially over k), so consulting a timing-derived entry makes the
+        // RESULT BITS of a GEMM depend on what the autotuner happened to clock — on this box
+        // a persisted entry flips 10036/12288 elements of a 48x256x64 transB GEMM. That
+        // contradicts the documented contract: AiDotNetEngine.DeterministicMode promises
+        // "bit-identical results across runs on the same hardware", and AiModelBuilder turns
+        // determinism ON for every model it builds unless AllowNondeterminism() is called.
+        //
+        // A wall-clock measurement is not reproducible input, so under determinism we ignore
+        // the learned cache entirely and route via StrategyDefaultTable — a pure function of
+        // (hardware key, shape). Observe() is skipped too: determinism must not spend
+        // wall-clock measuring, nor persist an entry that nothing will ever read.
+        //
+        // Fast mode is untouched and keeps the full learned-routing benefit.
+        // Gated on BlasProvider.IsDeterministicMode ONLY — deliberately NOT on
+        // options.Mode. BlasMode.Deterministic is the enum's ZERO value, so every
+        // default-constructed BlasOptions reports Mode == Deterministic; keying off it would
+        // fire this gate at essentially every call site and make the learned cache dead code
+        // for fast-mode callers too. The two flags also mean different things: BlasMode is a
+        // per-call "bit-exact across THREAD COUNTS" knob (see BlasMode.cs), which the strategy
+        // cache does not violate in-process, whereas IsDeterministicMode is the across-RUNS
+        // switch driven by SetDeterministicMode/AiModelBuilder whose contract it does violate.
+        if (Helpers.BlasProvider.IsDeterministicMode)
+            return StrategyDefaultTable.Route(HardwareFingerprint.Key, m, n, k);
+
         // #375 hybrid layer 1 (highest precedence): learned / shipped-prewarm entry for
         // THIS shape on THIS fingerprint. KernelVersion-gated inside TryLookupStrategy.
         // Strategy routing is tile-independent → encode with mr=nr=0; the background

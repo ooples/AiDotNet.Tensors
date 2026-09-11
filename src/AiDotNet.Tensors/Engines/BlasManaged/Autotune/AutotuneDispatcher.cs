@@ -88,7 +88,25 @@ internal static class AutotuneDispatcher
         // large enough that the block choice actually matters), benchmark a set
         // of candidate (Mc, Nc, Kc) tuples and cache the measured winner. Off by
         // default — falls through to the heuristic below.
-        if ((MeasurementEnabled || ForceMeasureOnMiss) && ShouldMeasure(m, n, k))
+        // DETERMINISM GATE (narrow, and deliberately only here). This is the ONLY
+        // timing-derived branch in Decide: BlockSizeSweep.Measure clocks candidate
+        // (Mc, Nc, Kc) tuples and persists the winner. Kc sets the K-panel width and the
+        // strategies accumulate C across K-panels, so a wall-clock-chosen Kc changes the
+        // accumulation order and therefore the result bits — the same defect as the
+        // strategy cache (see Dispatcher.SelectStrategy).
+        //
+        // The rest of this method is NOT gated: with measurement off (the default — it is
+        // behind AIDOTNET_BLAS_AUTOTUNE_MEASURE=1) the cache merely memoizes
+        // FallbackToHeuristic, a pure function of the shape, so hitting or missing it yields
+        // identical bits. Bypassing that memo under determinism would be strictly worse:
+        // FallbackToHeuristic's mc depends on `procs`, so recomputing per call would make
+        // blocking vary with NumThreads — exactly what DeterministicParallelGemmContractTests
+        // pins as bit-identical.
+        //
+        // Honours the caller's explicit isDeterministic argument as well as the ambient
+        // switch; falling through to the heuristic is the safe direction for both.
+        bool skipTimedMeasurement = isDeterministic || Helpers.BlasProvider.IsDeterministicMode;
+        if ((MeasurementEnabled || ForceMeasureOnMiss) && ShouldMeasure(m, n, k) && !skipTimedMeasurement)
         {
             try
             {
