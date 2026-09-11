@@ -12794,6 +12794,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var outputShape = magnitude.Shape._dims.Take(magnitude.Rank - 2).Append(outputLength).ToArray();
             var result = DeferTensorResult<T>(backend, resultBuffer.Buffer, totalOutput, outputShape);
             resultBuffer.RelinquishOwnership();
+
+            // Same tape contract as the base engine. Without this the GPU path would compute the
+            // right waveform and record nothing, so whether a model trained would depend on which
+            // engine happened to be current - the precise failure mode issue #905 is about.
+            Autodiff.DifferentiableOps.RecordBinary(
+                "ISTFT", result, magnitude, phase,
+                Autodiff.BackwardFunctions<T>.IstftBackward,
+                new object[] { nFft, hopLength, window, center, outputLength });
+
             return result;
         }
         catch
@@ -12936,6 +12945,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
 
             IEngine engine = this;
+
+            // GriffinLim is an iterative ALGORITHM and sits in OpRegistry.NonDifferentiableOps, so
+            // none of its internals should reach the tape. Two things would otherwise put them
+            // there: ISTFT now records (issue #905 item 2), and the momentum arithmetic below is
+            // built from TensorSubtract/TensorAdd/TensorMultiplyScalar, which have always recorded
+            // -- so on this engine a tape-active GriffinLim was already accumulating nodes for the
+            // momentum path while the CPU engine recorded nothing. One scope settles both, and
+            // makes the two engines agree.
+            using var noGrad = new Autodiff.NoGradScope<T>();
+
             var phase = new Tensor<T>(DirectGpuEngine.FromFloatArray<T>(initialPhase), magnitude.Shape.ToArray());
             Tensor<T>? previousPhase = null;
             float momentumF = (float)momentum;
