@@ -114,6 +114,34 @@ reload, immutable evidence, invalid rollback and unchanged legacy behavior.
 Typed, per-store fault injection additionally verifies ordering and failed directory/ancestor barriers. Those
 tests do not simulate a power cut: native filesystem tests and the documented OS barriers define that contract.
 
+### Review verification (2026-09-11)
+
+On the original source, nine Windows cases incorrectly claimed durable receipt
+persistence (9 failed, 55 passed in the controlled contract run). After the
+directory-barrier fix, the full `Helpers.Autotune` selection passes **202 tests
+with no skips** on Windows/net10, Windows/net471 and Linux/net10. The main reviewer
+independently reviewed the native boundary and repeated all three selections,
+including actual Linux `open`/`fsync` calls in an SDK container. This is syscall,
+status and ordering evidence, not a physical power-cut experiment.
+
+```powershell
+dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj -c Release -f net10.0 --filter FullyQualifiedName~Helpers.Autotune --logger trx
+dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj -c Release -f net471 --filter FullyQualifiedName~Helpers.Autotune --logger trx
+```
+
+The typed-cache round-trip now asserts the exact loaded `KernelChoice.Variant`.
+All closed invalid-input fixture modes in the touched quarantine tests use enums.
+Defensive null cases invoke the real runtime guards through reflection, without
+null-forgiving operators or weakening the public nullable contracts. An initial
+test-only reflection lookup missed internal `CanDeploy`; the preserved
+`pr1024-root-typed-guards.trx` records that failure, and all final selections use
+the corrected lookup. No runtime guard was removed to make that test pass.
+
+Final independent reports: `pr1024-root-typed-guards-final.trx`,
+`pr1024-root-typed-net471-final.trx`, and the Linux TRX/log under
+`artifacts/pr1024-linux-root`. Linux source/cache mounts were read-only and its
+build outputs temporary; it did not overwrite the Windows build artifacts.
+
 Cross-runtime verification also exposed an existing winner-cache write failure on .NET Framework: appending a
 temporary suffix turned a usable 224-character destination into a failing 263-character path. Both cache and
 quarantine now use short unique sibling temporary filenames, retaining same-directory rename semantics. The

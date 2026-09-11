@@ -9,6 +9,11 @@ namespace AiDotNet.Tensors.Tests.Helpers.Autotune;
 
 public sealed partial class EvolutionKernelAutotunerTests
 {
+    public enum RollbackFault { SameGenome, Identity, GenomeHash, Validator }
+    public enum EvidenceField { Policy, Digest, Reason, Observed, Limit, Time }
+    public enum CodecFault { Oversize, Unicode, EmptyId, VersionChange, Exception }
+    public enum EvidenceBoundary { Spaces, TooLong, Control, Equal, Infinite, LimitNaN, UppercaseDigest }
+
     private string Journal(string suffix = "journal") => Path.Combine(_temporaryCachePath, suffix);
 
     private static void AssertNativePersistence(KernelTuningQuarantineResult<FakeKernelConfiguration> result)
@@ -143,6 +148,7 @@ public sealed partial class EvolutionKernelAutotunerTests
         var tuner = CreateTuner(new(), store, MeasurePassed);
         var run = await tuner.TuneAsync(Seeds());
         Assert.True(store.TryLoad(Identity(), new FakeKernelCodec(), out var loaded));
+        var loadedSnapshot = Assert.IsType<KernelTuningDeploymentSnapshot<FakeKernelConfiguration>>(loaded);
         using var entered = new ManualResetEventSlim();
         using var release = new ManualResetEventSlim();
         var otherHandle = new KernelTuningDeploymentRegistry<FakeKernelConfiguration>().GetOrCreate(Identity());
@@ -151,7 +157,7 @@ public sealed partial class EvolutionKernelAutotunerTests
             entered.Set();
             if (!release.Wait(TimeSpan.FromSeconds(10))) throw new TimeoutException();
         });
-        Task<bool> publication = Task.Run(() => store.TryPublish(otherHandle, loaded!, codec, true));
+        Task<bool> publication = Task.Run(() => store.TryPublish(otherHandle, loadedSnapshot, codec, true));
         try
         {
             Assert.True(entered.Wait(TimeSpan.FromSeconds(10)));
@@ -163,11 +169,11 @@ public sealed partial class EvolutionKernelAutotunerTests
     }
 
     [Theory]
-    [InlineData("same")]
-    [InlineData("identity")]
-    [InlineData("hash")]
-    [InlineData("validator")]
-    public async Task Quarantine_InvalidRollbackLeavesBuiltInFallback(string invalidity)
+    [InlineData(RollbackFault.SameGenome)]
+    [InlineData(RollbackFault.Identity)]
+    [InlineData(RollbackFault.GenomeHash)]
+    [InlineData(RollbackFault.Validator)]
+    public async Task Quarantine_InvalidRollbackLeavesBuiltInFallback(RollbackFault invalidity)
     {
         var registry = new KernelTuningDeploymentRegistry<FakeKernelConfiguration>();
         var store = new QuarantinedKernelTuningStore<FakeKernelConfiguration>(Journal());
@@ -177,11 +183,11 @@ public sealed partial class EvolutionKernelAutotunerTests
             store: store, deploymentValidator: c => !rejectPrior || c.Variant != FakeKernelVariant.Fast);
         var run = await tuner.TuneAsync(Seeds());
         var prior = Snapshot(Identity(), Seeds()[1], 0);
-        if (invalidity == "same") prior = Snapshot(Identity(), run.ActiveDeployment.Configuration, 10);
-        if (invalidity == "identity") prior = Snapshot(DifferentIdentity(), Seeds()[1], 0);
-        if (invalidity == "hash") prior = new(prior.Identity, prior.Configuration, "wrong-hash", prior.Measurement,
+        if (invalidity == RollbackFault.SameGenome) prior = Snapshot(Identity(), run.ActiveDeployment.Configuration, 10);
+        if (invalidity == RollbackFault.Identity) prior = Snapshot(DifferentIdentity(), Seeds()[1], 0);
+        if (invalidity == RollbackFault.GenomeHash) prior = new(prior.Identity, prior.Configuration, "wrong-hash", prior.Measurement,
             prior.RunStateHash, prior.PromotionEvidence, prior.EvidenceRole);
-        if (invalidity == "validator") rejectPrior = true;
+        if (invalidity == RollbackFault.Validator) rejectPrior = true;
         var result = await tuner.QuarantineAsync(run.ActiveDeployment, Regression(), prior);
         AssertNativePersistence(result);
         Assert.Null(result.RollbackDeployment);
@@ -199,8 +205,10 @@ public sealed partial class EvolutionKernelAutotunerTests
         canceled.Cancel();
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => tuner.QuarantineAsync(
             run.ActiveDeployment, Regression(), cancellationToken: canceled.Token));
-        await Assert.ThrowsAsync<ArgumentNullException>(() => tuner.QuarantineAsync(null!, Regression()));
-        await Assert.ThrowsAsync<ArgumentNullException>(() => tuner.QuarantineAsync(run.ActiveDeployment, null!));
+        await Assert.ThrowsAsync<ArgumentNullException>(() => InvokeDefensiveNullCase<Task>(
+            tuner, nameof(tuner.QuarantineAsync), null, Regression(), null, CancellationToken.None));
+        await Assert.ThrowsAsync<ArgumentNullException>(() => InvokeDefensiveNullCase<Task>(
+            tuner, nameof(tuner.QuarantineAsync), run.ActiveDeployment, null, null, CancellationToken.None));
         await Assert.ThrowsAsync<ArgumentException>(() => tuner.QuarantineAsync(Snapshot(DifferentIdentity(), Seeds()[2], 0), Regression()));
         var invalid = new KernelTuningDeploymentSnapshot<FakeKernelConfiguration>(Identity(), Seeds()[2], "bad-hash",
             run.ActiveDeployment.Measurement, "run", run.ActiveDeployment.PromotionEvidence, run.ActiveDeployment.EvidenceRole);
@@ -234,36 +242,36 @@ public sealed partial class EvolutionKernelAutotunerTests
         Assert.Throws<ArgumentException>(() => new QuarantinedKernelTuningStore<FakeKernelConfiguration>(path));
 
     [Theory]
-    [InlineData("policy")]
-    [InlineData("digest")]
-    [InlineData("reason")]
-    [InlineData("observed")]
-    [InlineData("limit")]
-    [InlineData("time")]
-    public void Quarantine_RegressionEvidenceRejectsInvalidFields(string field)
+    [InlineData(EvidenceField.Policy)]
+    [InlineData(EvidenceField.Digest)]
+    [InlineData(EvidenceField.Reason)]
+    [InlineData(EvidenceField.Observed)]
+    [InlineData(EvidenceField.Limit)]
+    [InlineData(EvidenceField.Time)]
+    public void Quarantine_RegressionEvidenceRejectsInvalidFields(EvidenceField field)
     {
         Assert.ThrowsAny<ArgumentException>(() => new KernelTuningRegressionEvidence(
-            field == "reason" ? (KernelTuningRegressionReason)99 : KernelTuningRegressionReason.Latency,
-            field == "policy" ? "bad\uD800" : "policy-v1", field == "digest" ? "bad" : new string('a', 64),
-            field == "observed" ? double.NaN : 2, field == "limit" ? -1 : 1,
-            field == "time" ? default : DateTimeOffset.UtcNow));
+            field == EvidenceField.Reason ? (KernelTuningRegressionReason)99 : KernelTuningRegressionReason.Latency,
+            field == EvidenceField.Policy ? "bad\uD800" : "policy-v1", field == EvidenceField.Digest ? "bad" : new string('a', 64),
+            field == EvidenceField.Observed ? double.NaN : 2, field == EvidenceField.Limit ? -1 : 1,
+            field == EvidenceField.Time ? default : DateTimeOffset.UtcNow));
     }
 
     [Theory]
-    [InlineData("oversize")]
-    [InlineData("unicode")]
-    [InlineData("empty-id")]
-    [InlineData("version-change")]
-    [InlineData("exception")]
-    public void Quarantine_RejectsUnboundedOrUnstableCodecs(string failure)
+    [InlineData(CodecFault.Oversize)]
+    [InlineData(CodecFault.Unicode)]
+    [InlineData(CodecFault.EmptyId)]
+    [InlineData(CodecFault.VersionChange)]
+    [InlineData(CodecFault.Exception)]
+    public void Quarantine_RejectsUnboundedOrUnstableCodecs(CodecFault failure)
     {
         var snapshot = Snapshot(Identity(), Seeds()[2], 0);
         var store = new QuarantinedKernelTuningStore<FakeKernelConfiguration>(Journal(), new FixedLoadStore(snapshot));
-        var codec = new CallbackQuarantineCodec(() => { if (failure == "exception") throw new IOException(); })
+        var codec = new CallbackQuarantineCodec(() => { if (failure == CodecFault.Exception) throw new IOException(); })
         {
-            Payload = failure == "oversize" ? new string('x', 65537) : failure == "unicode" ? "\uD800" : null,
-            EmptyId = failure == "empty-id",
-            ChangeVersion = failure == "version-change"
+            Payload = failure == CodecFault.Oversize ? new string('x', 65537) : failure == CodecFault.Unicode ? "\uD800" : null,
+            EmptyId = failure == CodecFault.EmptyId,
+            ChangeVersion = failure == CodecFault.VersionChange
         };
         Assert.False(store.TryLoad(Identity(), codec, out _));
         Assert.False(store.CanDeploy(Identity(), snapshot.Configuration, codec));
@@ -362,27 +370,28 @@ public sealed partial class EvolutionKernelAutotunerTests
     }
 
     [Theory]
-    [InlineData("spaces")]
-    [InlineData("long")]
-    [InlineData("control")]
-    [InlineData("equal")]
-    [InlineData("infinite")]
-    [InlineData("limit-nan")]
-    [InlineData("uppercase-digest")]
-    public void Quarantine_EvidenceRejectsAdditionalBoundaryValues(string field)
+    [InlineData(EvidenceBoundary.Spaces)]
+    [InlineData(EvidenceBoundary.TooLong)]
+    [InlineData(EvidenceBoundary.Control)]
+    [InlineData(EvidenceBoundary.Equal)]
+    [InlineData(EvidenceBoundary.Infinite)]
+    [InlineData(EvidenceBoundary.LimitNaN)]
+    [InlineData(EvidenceBoundary.UppercaseDigest)]
+    public void Quarantine_EvidenceRejectsAdditionalBoundaryValues(EvidenceBoundary field)
     {
-        string policy = field == "spaces" ? " " : field == "long" ? new string('x', 257) :
-            field == "control" ? "bad\nlabel" : "v1";
+        string policy = field == EvidenceBoundary.Spaces ? " " : field == EvidenceBoundary.TooLong ? new string('x', 257) :
+            field == EvidenceBoundary.Control ? "bad\nlabel" : "v1";
         Assert.ThrowsAny<ArgumentException>(() => new KernelTuningRegressionEvidence(
-            KernelTuningRegressionReason.Latency, policy, new string(field == "uppercase-digest" ? 'A' : 'a', 64),
-            field == "equal" ? 1 : field == "infinite" ? double.PositiveInfinity : 2,
-            field == "limit-nan" ? double.NaN : 1, DateTimeOffset.UtcNow));
+            KernelTuningRegressionReason.Latency, policy, new string(field == EvidenceBoundary.UppercaseDigest ? 'A' : 'a', 64),
+            field == EvidenceBoundary.Equal ? 1 : field == EvidenceBoundary.Infinite ? double.PositiveInfinity : 2,
+            field == EvidenceBoundary.LimitNaN ? double.NaN : 1, DateTimeOffset.UtcNow));
     }
 
     [Fact]
     public void Quarantine_RejectsRootAndDriveRelativePaths()
     {
-        Assert.Throws<ArgumentException>(() => new QuarantinedKernelTuningStore<FakeKernelConfiguration>(Path.GetPathRoot(Journal())!));
+        string root = Assert.IsType<string>(Path.GetPathRoot(Journal()));
+        Assert.Throws<ArgumentException>(() => new QuarantinedKernelTuningStore<FakeKernelConfiguration>(root));
         if (Path.DirectorySeparatorChar != '\\') return;
         Assert.Throws<ArgumentException>(() => new QuarantinedKernelTuningStore<FakeKernelConfiguration>("C:relative"));
         Assert.Throws<ArgumentException>(() => new QuarantinedKernelTuningStore<FakeKernelConfiguration>("\\relative"));
@@ -395,12 +404,22 @@ public sealed partial class EvolutionKernelAutotunerTests
         var store = new QuarantinedKernelTuningStore<FakeKernelConfiguration>(Journal(), new FixedLoadStore(snapshot));
         var codec = new CallbackQuarantineCodec(() => { }) { Payload = new string('\u20ac', 30000) };
         Assert.False(store.TryLoad(Identity(), codec, out _));
-        Assert.False(store.TryLoad(null!, new FakeKernelCodec(), out _));
-        Assert.False(store.TryStore(null!, new FakeKernelCodec()));
-        Assert.False(store.TryStore(snapshot, null!));
-        Assert.False(store.CanDeploy(null!, snapshot.Configuration, new FakeKernelCodec()));
+        Assert.False(InvokeDefensiveNullCase<bool>(store, nameof(store.TryLoad), null, new FakeKernelCodec(), null));
+        Assert.False(InvokeDefensiveNullCase<bool>(store, nameof(store.TryStore), null, new FakeKernelCodec()));
+        Assert.False(InvokeDefensiveNullCase<bool>(store, nameof(store.TryStore), snapshot, null));
+        Assert.False(InvokeDefensiveNullCase<bool>(store, nameof(store.CanDeploy), null, snapshot.Configuration, new FakeKernelCodec()));
         Assert.False(store.TryPublish(new KernelTuningDeploymentRegistry<FakeKernelConfiguration>().GetOrCreate(Identity()),
             snapshot, codec, true));
+    }
+
+    private static TResult InvokeDefensiveNullCase<TResult>(object instance, string methodName, params object?[] arguments)
+    {
+        // Test runtime guards without claiming null satisfies the public non-null
+        // contract. Production signatures and nullable warnings remain unchanged.
+        var method = instance.GetType().GetMethod(methodName, System.Reflection.BindingFlags.Instance |
+            System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException($"The defensive-null probe lost {methodName}.");
+        return Assert.IsAssignableFrom<TResult>(method.Invoke(instance, arguments));
     }
 
     private sealed class FailWriteQuarantineStore : IKernelTuningStore<FakeKernelConfiguration>
