@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using System.Runtime.InteropServices;
 using AiDotNet.Evolution;
 using AiDotNet.Tensors.Helpers.Autotune;
 using Xunit;
@@ -10,12 +11,24 @@ public sealed partial class EvolutionKernelAutotunerTests
 {
     private string Journal(string suffix = "journal") => Path.Combine(_temporaryCachePath, suffix);
 
+    private static void AssertNativePersistence(KernelTuningQuarantineResult<FakeKernelConfiguration> result)
+    {
+        // Only Linux currently has a verified no-overwrite rename + directory barrier.
+        // Do not infer the expected guarantee from the implementation's selected backend.
+        bool supportsDurability = RuntimeInformation.IsOSPlatform(OSPlatform.Linux) &&
+            RuntimeInformation.ProcessArchitecture is Architecture.X86 or Architecture.X64 or Architecture.Arm or Architecture.Arm64;
+        Assert.Equal(supportsDurability, result.WasPersisted);
+        if (supportsDurability) Assert.IsType<string>(result.ReceiptPath);
+        else Assert.Null(result.ReceiptPath);
+    }
+
     [Fact]
     public void TypedCachePath_StoreRoundTripsWithoutSuppressingWriteErrors()
     {
         var kernel = new KernelId(Identity().Kernel.Category, "typed-evolution-" + Identity().StableKey);
         AutotuneCache.Store(kernel, Identity().Shape, new KernelChoice { Variant = "typed-path-probe" });
-        Assert.NotNull(AutotuneCache.Lookup(kernel, Identity().Shape));
+        KernelChoice loaded = Assert.IsType<KernelChoice>(AutotuneCache.Lookup(kernel, Identity().Shape));
+        Assert.Equal("typed-path-probe", loaded.Variant);
     }
 
     private static KernelTuningRegressionEvidence Regression() => new(
@@ -32,7 +45,7 @@ public sealed partial class EvolutionKernelAutotunerTests
         var result = await tuner.QuarantineAsync(run.ActiveDeployment, Regression());
 
         Assert.True(result.WasApplied);
-        Assert.True(result.WasPersisted);
+        AssertNativePersistence(result);
         Assert.False(result.WasRollbackPersisted);
         Assert.Null(result.RollbackDeployment);
         Assert.Null(tuner.Deployment.Current);
@@ -42,19 +55,20 @@ public sealed partial class EvolutionKernelAutotunerTests
             run.ActiveDeployment.Configuration, run.ActiveDeployment.GenomeId, run.ActiveDeployment.Measurement,
             "another-run-state", run.ActiveDeployment.PromotionEvidence, run.ActiveDeployment.EvidenceRole);
         Assert.False(store.TryPublish(tuner.Deployment, anotherRun, new FakeKernelCodec(), false));
-        using var receipt = JsonDocument.Parse(File.ReadAllBytes(result.ReceiptPath!));
+        string receiptPath = Assert.Single(Directory.GetFiles(Journal(), "*.quarantine.json"));
+        using var receipt = JsonDocument.Parse(File.ReadAllBytes(receiptPath));
         var root = receipt.RootElement;
         Assert.Equal("tensor-kernel-quarantine-v1", root.GetProperty("Schema").GetString());
         Assert.Equal(run.ActiveDeployment.Identity.StableKey, root.GetProperty("Identity").GetString());
         Assert.Equal(run.ActiveDeployment.RunStateHash, root.GetProperty("RunStateHash").GetString());
         Assert.Equal(new FakeKernelCodec().Serialize(run.ActiveDeployment.Configuration),
-            Encoding.UTF8.GetString(Convert.FromBase64String(root.GetProperty("PayloadBase64").GetString()!)));
+            Encoding.UTF8.GetString(Convert.FromBase64String(Assert.IsType<string>(root.GetProperty("PayloadBase64").GetString()))));
         Assert.Equal(Regression().RawEvidenceSha256, root.GetProperty("Evidence").GetProperty("RawEvidenceSha256").GetString());
         Assert.Equal(TimeSpan.Zero, root.GetProperty("Evidence").GetProperty("ObservedAt").GetDateTimeOffset().Offset);
 
         // A different journal root has no process-local block: only the retained file can deny this load.
         Directory.CreateDirectory(Journal("fresh-process-state"));
-        File.Copy(result.ReceiptPath!, Path.Combine(Journal("fresh-process-state"), Path.GetFileName(result.ReceiptPath!)));
+        File.Copy(receiptPath, Path.Combine(Journal("fresh-process-state"), Path.GetFileName(receiptPath)));
         var fresh = CreateTuner(new(), new QuarantinedKernelTuningStore<FakeKernelConfiguration>(
             Journal("fresh-process-state"), inner), MeasurePassed);
         Assert.False(fresh.TryHydrate());
@@ -71,19 +85,20 @@ public sealed partial class EvolutionKernelAutotunerTests
         var run = await tuner.TuneAsync(Seeds());
         var prior = Snapshot(Identity(), Seeds()[1], 0);
         var result = await tuner.QuarantineAsync(run.ActiveDeployment, Regression(), prior);
-        Assert.True(result.WasPersisted);
+        AssertNativePersistence(result);
         Assert.True(result.WasRollbackPersisted);
         Assert.Same(prior, result.RollbackDeployment);
         Assert.Same(prior, tuner.Deployment.Current);
         Assert.True(CreateTuner(new(), store, MeasurePassed).TryHydrate());
 
-        byte[] original = File.ReadAllBytes(result.ReceiptPath!);
+        string receiptPath = Assert.Single(Directory.GetFiles(Journal(), "*.quarantine.json"));
+        byte[] original = File.ReadAllBytes(receiptPath);
         var stale = await tuner.QuarantineAsync(run.ActiveDeployment, Regression());
         Assert.False(stale.WasApplied);
         Assert.False(stale.WasPersisted);
         Assert.Null(stale.ReceiptPath);
         Assert.Same(prior, tuner.Deployment.Current);
-        Assert.Equal(original, File.ReadAllBytes(result.ReceiptPath!));
+        Assert.Equal(original, File.ReadAllBytes(receiptPath));
     }
 
     [Fact]
@@ -140,7 +155,7 @@ public sealed partial class EvolutionKernelAutotunerTests
         try
         {
             Assert.True(entered.Wait(TimeSpan.FromSeconds(10)));
-            Assert.True((await tuner.QuarantineAsync(run.ActiveDeployment, Regression())).WasPersisted);
+            AssertNativePersistence(await tuner.QuarantineAsync(run.ActiveDeployment, Regression()));
         }
         finally { release.Set(); }
         Assert.False(await publication);
@@ -168,7 +183,7 @@ public sealed partial class EvolutionKernelAutotunerTests
             prior.RunStateHash, prior.PromotionEvidence, prior.EvidenceRole);
         if (invalidity == "validator") rejectPrior = true;
         var result = await tuner.QuarantineAsync(run.ActiveDeployment, Regression(), prior);
-        Assert.True(result.WasPersisted);
+        AssertNativePersistence(result);
         Assert.Null(result.RollbackDeployment);
         Assert.False(result.WasRollbackPersisted);
         Assert.False(tuner.Deployment.TryGet(out _));
@@ -279,7 +294,7 @@ public sealed partial class EvolutionKernelAutotunerTests
         try
         {
             Assert.True(entered.Wait(TimeSpan.FromSeconds(10)));
-            Assert.True((await tuner.QuarantineAsync(run.ActiveDeployment, Regression())).WasPersisted);
+            AssertNativePersistence(await tuner.QuarantineAsync(run.ActiveDeployment, Regression()));
         }
         finally { release.Set(); }
         Assert.False(await hydration);
@@ -310,7 +325,7 @@ public sealed partial class EvolutionKernelAutotunerTests
         var prior = Snapshot(Identity(), Seeds()[1], 0);
         var result = await tuner.QuarantineAsync(active, Regression(), prior);
         Assert.True(result.WasApplied);
-        Assert.True(result.WasPersisted);
+        AssertNativePersistence(result);
         Assert.False(result.WasRollbackPersisted);
         Assert.Same(prior, tuner.Deployment.Current);
     }

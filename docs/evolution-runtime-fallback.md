@@ -23,7 +23,7 @@ var evidence = new KernelTuningRegressionEvidence(
     observedAt: observationTime);
 var result = await tuner.QuarantineAsync(observedSnapshot, evidence, priorValidatedSnapshot, cancellationToken);
 // WasApplied: the exact snapshot was removed and blocked in this process.
-// WasPersisted / ReceiptPath: this call retained a complete write-once regression receipt.
+// WasPersisted / ReceiptPath: all supported durability barriers succeeded for this receipt.
 // RollbackDeployment / WasRollbackPersisted: distinguish activation from winner-store persistence.
 ```
 
@@ -63,6 +63,18 @@ writes use create-new temporary files, a disk flush and a non-overwriting move. 
 incomplete or conflicting `.pending` files are left recoverable. A preexisting receipt is not falsely reported
 as this invocation's successful write. No automatic deletion, unblock or release API exists in this slice.
 
+Durable success currently requires Linux on x86, x64, ARM32 or ARM64: after the flushed file is renamed, the containing directory and its
+ancestors are synchronized, including the newly created journal path. A file flush alone does not persist its
+directory entry, as specified by the [Linux `fsync` contract](https://man7.org/linux/man-pages/man2/fsync.2.html).
+Any failed or unavailable barrier leaves `WasPersisted` false; an already visible tombstone is not removed.
+Storage must honor the operating system's flush requests.
+
+Windows, macOS and other platforms currently retain only a best-effort receipt and report `WasPersisted=false`.
+In particular, [Windows `MoveFileExW`](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexw)
+documents `MOVEFILE_WRITE_THROUGH` flushing for copy/delete moves; this implementation does not infer a
+same-volume no-overwrite rename guarantee from the flag name. A normal process restart can still see the
+best-effort tombstone, but callers must not treat it as power-loss-safe quarantine.
+
 Given cancellation arrives before mutation, when quarantine checks it, then it changes nothing. After mutation
 starts, persistence and rollback finish without cancellation so cancellation cannot interrupt the safety response.
 
@@ -99,6 +111,8 @@ The tests use deterministic fake kernel configurations and measurements: they ve
 contracts, not GPU performance or automatic detection quality. They exercise the real tuner, cache and filesystem,
 including publication barriers, stale observations, corrupt tombstones, write failures, independent journal-state
 reload, immutable evidence, invalid rollback and unchanged legacy behavior.
+Typed, per-store fault injection additionally verifies ordering and failed directory/ancestor barriers. Those
+tests do not simulate a power cut: native filesystem tests and the documented OS barriers define that contract.
 
 Cross-runtime verification also exposed an existing winner-cache write failure on .NET Framework: appending a
 temporary suffix turned a usable 224-character destination into a failing 263-character path. Both cache and
