@@ -7,7 +7,7 @@ namespace AiDotNet.Tensors.Tests.Helpers.Autotune;
 
 /// <summary>GPU-free contract tests for correctness-first typed evolutionary tuning.</summary>
 [Collection("AutotuneCacheTests")]
-public sealed class EvolutionKernelAutotunerTests : IDisposable
+public sealed partial class EvolutionKernelAutotunerTests : IDisposable
 {
     private const string CacheEnvironmentVariable = "AIDOTNET_AUTOTUNE_CACHE_PATH";
     private readonly string? _originalCachePath;

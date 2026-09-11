@@ -98,7 +98,9 @@ public sealed class KernelTuningDeployment<TConfiguration>
     /// already using the snapshot is not interrupted. A stale rejection cannot remove a newer deployment, including
     /// a newly validated snapshot of the same genome. This is an in-memory action, not a persistent quarantine:
     /// hydration or a later tuning run may publish again. Stop those producers and invalidate their cache separately
-    /// when a configuration must remain disabled across runs. No I/O or model call occurs here.
+    /// when a configuration must remain disabled across runs, or opt into
+    /// <see cref="QuarantinedKernelTuningStore{TConfiguration}"/> and use the tuner's QuarantineAsync workflow.
+    /// No I/O or model call occurs here.
     /// </remarks>
     public bool TryDeactivate(KernelTuningDeploymentSnapshot<TConfiguration> expected)
     {
