@@ -4184,9 +4184,19 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-        var aOrig = a;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
-        if (!a.IsContiguous) a = a.Contiguous();
-        var bOrig = b;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
+        // A non-contiguous target (a transpose, a strided slice) used to be swapped for a contiguous
+        // COPY here, so every kernel below added into the copy and the caller's tensor came back
+        // unchanged — an in-place op that silently did nothing. Compute into a contiguous working
+        // copy, then scatter the result back through the view's own strides. Contiguous targets —
+        // the only kind every existing caller passes — never reach this branch.
+        if (!a.IsContiguous)
+        {
+            ThrowIfInPlaceTargetAliasesItself(a);
+            var work = a.Contiguous();
+            TensorBroadcastAddInPlace(work, b);
+            a.CopyFromArray(work.ToArray());
+            return;
+        }
         if (!b.IsContiguous) b = b.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -4263,6 +4273,25 @@ public partial class CpuEngine : ITensorLevelEngine
                 $"In-place broadcast add cannot resize its target: {FormatShape(a._shape)} " +
                 $"+= {FormatShape(b._shape)} broadcasts to {FormatShape(result._shape)}.", nameof(b));
         result.Data.Span.CopyTo(aSpan);
+    }
+
+    /// <summary>
+    /// Rejects an in-place target whose logical elements share storage — a stride-0 (expanded)
+    /// axis of extent &gt; 1 — because there is no well-defined result to write back: every
+    /// position along that axis would have to hold a different sum in the same memory slot.
+    /// PyTorch rejects the same case. Materialize with <c>Contiguous()</c> first.
+    /// </summary>
+    private static void ThrowIfInPlaceTargetAliasesItself<T>(Tensor<T> target)
+    {
+        for (int axis = 0; axis < target.Rank; axis++)
+        {
+            if (target._shape[axis] > 1 && target._strides[axis] == 0)
+                throw new ArgumentException(
+                    $"Cannot write in place into a tensor of shape [{string.Join(", ", target._shape)}] whose " +
+                    $"axis {axis} has stride 0: several of its elements share one storage location (an " +
+                    "expanded/broadcast view). Call Contiguous() to materialize it before the in-place op.",
+                    "a");
+        }
     }
 
     protected static void ValidateGroupNormArguments<T>(
