@@ -2,6 +2,7 @@ using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.LinearAlgebra;
+using AiDotNet.Tensors.Tests.Engines.DirectGpu;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.Broadcasting;
@@ -296,8 +297,15 @@ public class EmptyBroadcastTests
 
 /// <summary>GPU-engine counterpart of <see cref="EmptyBroadcastTests"/>.</summary>
 [Collection("DirectGpuSerial")]
-public class EmptyBroadcastGpuTests
+public class EmptyBroadcastGpuTests : IClassFixture<DirectGpuTensorEngineTestFixture>
 {
+    private readonly DirectGpuTensorEngineTestFixture _fixture;
+
+    public EmptyBroadcastGpuTests(DirectGpuTensorEngineTestFixture fixture)
+    {
+        _fixture = fixture;
+    }
+
     /// <summary>
     /// <see cref="DirectGpuTensorEngine"/> overrides the four broadcast operators with last-axis fast
     /// paths guarded by <c>a.Length % b.Length == 0</c>, which divides by zero — outside any
@@ -308,16 +316,12 @@ public class EmptyBroadcastGpuTests
     public void GpuEngine_Float_ZeroSizeBroadcast_ReturnsEmptyResultOfBroadcastShape(
         string op, int[] shapeA, int[] shapeB, int[] expected)
     {
-        DirectGpuTensorEngine gpu;
-        try { gpu = new DirectGpuTensorEngine(); }
-        catch { Skip.If(true, "No GPU backend"); return; }
-        using (gpu)
-        {
-            Skip.IfNot(gpu.IsGpuAvailable, "No GPU available");
-            var a = EmptyBroadcastTests.Filled<float>(shapeA, i => 1f + i);
-            var b = EmptyBroadcastTests.Filled<float>(shapeB, i => 2f + i);
+        Skip.IfNot(_fixture.IsAvailable, "No GPU available");
+        var gpu = _fixture.Engine ?? throw new InvalidOperationException(
+            "Direct GPU engine was not initialized.", _fixture.InitializationException);
+        var a = EmptyBroadcastTests.Filled<float>(shapeA, i => 1f + i);
+        var b = EmptyBroadcastTests.Filled<float>(shapeB, i => 2f + i);
 
-            EmptyBroadcastTests.AssertEmptyWithShape(EmptyBroadcastTests.Apply(gpu, op, a, b), expected, "GPU " + EmptyBroadcastTests.Describe(op, shapeA, shapeB));
-        }
+        EmptyBroadcastTests.AssertEmptyWithShape(EmptyBroadcastTests.Apply(gpu, op, a, b), expected, "GPU " + EmptyBroadcastTests.Describe(op, shapeA, shapeB));
     }
 }
