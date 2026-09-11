@@ -1,6 +1,24 @@
 namespace AiDotNet.Tensors.Engines.Autodiff;
 
 /// <summary>
+/// Controls the lifetime of the recorded graph after a streaming backward pass.
+/// </summary>
+public enum StreamingGraphRetentionMode
+{
+    /// <summary>
+    /// Release activations as soon as their backward step has consumed them. This is the
+    /// memory-bounded default and makes the recorded graph unavailable for another backward.
+    /// </summary>
+    ReleaseAfterBackward = 0,
+
+    /// <summary>
+    /// Keep the recorded graph until the tape is disposed so the same deterministic graph can
+    /// be replayed. Use this for algorithms that must inspect gradients before committing updates.
+    /// </summary>
+    RetainUntilTapeDisposal = 1,
+}
+
+/// <summary>
 /// Configuration options for <see cref="GradientTape{T}"/>.
 /// Properties use init-only setters to prevent mutation of the shared <see cref="Default"/> instance.
 /// </summary>
@@ -55,6 +73,21 @@ public sealed class GradientTapeOptions
     /// When false, in-place operations are not recorded (gradients will not flow through them).
     /// </summary>
     public bool RecordInPlace { get; init; } = true;
+
+    /// <summary>
+    /// Controls whether <see cref="GradientTape{T}.ComputeGradientsStreaming"/> releases the
+    /// recorded graph after each backward or retains it for replay until tape disposal.
+    /// Defaults to <see cref="StreamingGraphRetentionMode.ReleaseAfterBackward"/>.
+    /// </summary>
+    public StreamingGraphRetentionMode StreamingGraphRetention { get; init; }
+        = StreamingGraphRetentionMode.ReleaseAfterBackward;
+
+    /// <summary>
+    /// Precision used only for fan-out gradient additions. Backward kernels continue to use the
+    /// active autocast precision. Defaults to FP32 accumulation for numerical stability.
+    /// </summary>
+    public GradientAccumulationPrecision GradientAccumulationPrecision { get; init; }
+        = GradientAccumulationPrecision.Float32;
 
     /// <summary>
     /// Whether to enable tensor hooks (RegisterHook, RetainGrad).

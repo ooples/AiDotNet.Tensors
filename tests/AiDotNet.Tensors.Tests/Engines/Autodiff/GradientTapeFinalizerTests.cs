@@ -1,6 +1,8 @@
 using System;
 using System.Threading;
+using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
@@ -24,6 +26,41 @@ public sealed class TapeGlobalStateSerialCollection { }
 [Collection("TapeGlobalStateSerial")]
 public class GradientTapeFinalizerTests
 {
+    [Fact]
+    public void RejectedConstruction_FinalizerDoesNotDisableUnrelatedLiveTape()
+    {
+        int baseline = DifferentiableOps._anyTapeActive;
+        var engine = new CpuEngine();
+        var source = new Tensor<float>(
+            new[] { 2 }, new Vector<float>(new[] { 2f, 3f }));
+        using var liveTape = new GradientTape<float>();
+        Assert.Equal(baseline + 1, DifferentiableOps._anyTapeActive);
+
+        CreateRejectedTapes();
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+
+        Assert.Equal(baseline + 1, DifferentiableOps._anyTapeActive);
+        var loss = engine.ReduceSum(engine.TensorMultiply(source, source), null);
+        var gradients = liveTape.ComputeGradients(loss, new[] { source });
+        Assert.Equal(new[] { 4f, 6f }, gradients[source].ToArray());
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(
+        System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static void CreateRejectedTapes()
+    {
+        for (int i = 0; i < 32; i++)
+        {
+            var options = new GradientTapeOptions
+            {
+                StreamingGraphRetention = (StreamingGraphRetentionMode)int.MaxValue,
+            };
+            Assert.Throws<ArgumentOutOfRangeException>(() => new GradientTape<float>(options));
+        }
+    }
+
     [Fact]
     public void UndisposedTape_DoesNotPermanentlyLeakGlobalActiveCounter()
     {

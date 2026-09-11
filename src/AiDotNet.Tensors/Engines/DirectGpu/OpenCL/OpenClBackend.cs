@@ -12079,6 +12079,10 @@ KERNEL VARIANTS (A/B testing):
         {
             if (_context == null)
                 throw new InvalidOperationException("OpenCL context not available");
+            if (size < 0) throw new ArgumentOutOfRangeException(nameof(size));
+            if (size == 0) return;
+            IntPtr inputHandle = GetPrecisionBufferHandle(input, (long)size * sizeof(float));
+            IntPtr outputHandle = GetPrecisionBufferHandle(output, (long)size * sizeof(ushort));
 
             // Prefer the cl_khr_fp16 (hardware-extension) convert kernel when present; otherwise fall back to
             // the NATIVE convert kernel, which uses only the CORE vstore_half built-in (no cl_khr_fp16). The
@@ -12096,8 +12100,8 @@ KERNEL VARIANTS (A/B testing):
                     "nor the native vstore_half convert kernel could be used).");
 
             uint arg = 0;
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            k.SetArg(arg++, inputHandle);
+            k.SetArg(arg++, outputHandle);
             k.SetArg(arg++, size);
             k.Execute1D(size, Math.Min(256, size));
         }
@@ -12106,6 +12110,10 @@ KERNEL VARIANTS (A/B testing):
         {
             if (_context == null)
                 throw new InvalidOperationException("OpenCL context not available");
+            if (size < 0) throw new ArgumentOutOfRangeException(nameof(size));
+            if (size == 0) return;
+            IntPtr inputHandle = GetPrecisionBufferHandle(input, (long)size * sizeof(ushort));
+            IntPtr outputHandle = GetPrecisionBufferHandle(output, (long)size * sizeof(float));
 
             DirectOpenClKernel? k = null;
             if (_supportsFp16 && _mixedPrecisionKernelsAvailable)
@@ -12118,8 +12126,8 @@ KERNEL VARIANTS (A/B testing):
                     "kernel nor the native vload_half convert kernel could be used).");
 
             uint arg = 0;
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            k.SetArg(arg++, inputHandle);
+            k.SetArg(arg++, outputHandle);
             k.SetArg(arg++, size);
             k.Execute1D(size, Math.Min(256, size));
         }

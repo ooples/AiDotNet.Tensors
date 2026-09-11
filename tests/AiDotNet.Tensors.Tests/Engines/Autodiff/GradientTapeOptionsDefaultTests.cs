@@ -12,6 +12,8 @@
 // behavior.
 
 using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
@@ -86,5 +88,49 @@ public class GradientTapeOptionsDefaultTests
         Assert.True(options.RecordInPlace);
         Assert.Equal(0, options.MaxEntries);
         Assert.False(options.EnableHooks);
+        Assert.Equal(
+            StreamingGraphRetentionMode.ReleaseAfterBackward,
+            options.StreamingGraphRetention);
+    }
+
+    [Fact]
+    public void StreamingGraphRetention_IsExposedByTapeWithoutMutatingDefault()
+    {
+        var options = new GradientTapeOptions
+        {
+            StreamingGraphRetention = StreamingGraphRetentionMode.RetainUntilTapeDisposal,
+        };
+
+        using var tape = new GradientTape<float>(options);
+
+        Assert.Equal(
+            StreamingGraphRetentionMode.RetainUntilTapeDisposal,
+            tape.Options.StreamingGraphRetention);
+        Assert.Equal(
+            StreamingGraphRetentionMode.ReleaseAfterBackward,
+            GradientTapeOptions.Default.StreamingGraphRetention);
+    }
+
+    [Fact]
+    public void UnknownStreamingGraphRetention_IsRejectedAtConstruction()
+    {
+        var options = new GradientTapeOptions
+        {
+            StreamingGraphRetention = (StreamingGraphRetentionMode)int.MaxValue,
+        };
+
+        Assert.Throws<System.ArgumentOutOfRangeException>(() => new GradientTape<float>(options));
+    }
+
+    [Fact]
+    public void RetainedStreamingGraph_RequiresPersistentTape()
+    {
+        var options = new GradientTapeOptions
+        {
+            Persistent = false,
+            StreamingGraphRetention = StreamingGraphRetentionMode.RetainUntilTapeDisposal,
+        };
+
+        Assert.Throws<System.ArgumentException>(() => new GradientTape<float>(options));
     }
 }

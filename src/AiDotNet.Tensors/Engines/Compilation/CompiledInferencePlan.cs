@@ -967,7 +967,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                     $"Captured-graph input {i} resident buffer (size {buf.Size}) is smaller than its host data " +
                     $"({data.Length}); cannot refresh in place.");
             cb.UploadBufferInPlace((float[])(object)data, buf);
-            inT._gpuBufferVersion = inT.Version;
+            inT._gpuBufferVersion = inT.GpuCacheVersion;
         }
     }
 

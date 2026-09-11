@@ -18,7 +18,7 @@ namespace AiDotNet.Tensors.LinearAlgebra;
 /// FSDP, the engine dispatcher) read <see cref="Tensor{T}.Lifetime"/>
 /// to pick fast paths in their kernel hot path.</para>
 /// </summary>
-public static class WeightRegistry
+public static partial class WeightRegistry
 {
     private static readonly object _lock = new();
     private static StreamingTensorPool? _streamingPool;
@@ -35,6 +35,29 @@ public static class WeightRegistry
     // UnregisterWeight doesn't leak the entry; dead targets are pruned on
     // drain. Written/read under _lock.
     private static readonly Dictionary<long, WeakReference<IStreamingDroppable>> _ownerByHandle = new();
+
+    private sealed class OffloadRegistration
+    {
+        internal OffloadRegistration(
+            IStreamingDroppable owner,
+            IGpuOffloadAllocator allocator,
+            GpuOffloadHandle handle)
+        {
+            Owner = new WeakReference<IStreamingDroppable>(owner);
+            Allocator = allocator;
+            Handle = handle;
+        }
+
+        internal WeakReference<IStreamingDroppable> Owner { get; }
+        internal IGpuOffloadAllocator Allocator { get; }
+        internal GpuOffloadHandle Handle { get; }
+    }
+
+    // Offload allocations must be freed through the allocator instance that created them. Keeping
+    // that typed ownership in the registry also lets Configure reject an allocator swap while live
+    // native handles exist. Weak owners are reclaimed opportunistically, like streaming handles.
+    private static readonly Dictionary<long, OffloadRegistration> _offloadRegistrations = new();
+    private static long _nextOffloadRegistrationHandle;
 
     // #1715: bound the set of streaming weights whose OWNER tensors hold resident _data at once.
     // Materialize hands each weight a private resident copy; the pool only accounts ITS OWN byte[]
@@ -62,60 +85,7 @@ public static class WeightRegistry
     /// well-defined on little-endian platforms (x86/x64/ARM-LE).</summary>
     public static void Configure(GpuOffloadOptions options, IGpuOffloadAllocator? offloadAllocator = null)
     {
-        if (options is null) throw new ArgumentNullException(nameof(options));
-        if (!BitConverter.IsLittleEndian)
-            throw new PlatformNotSupportedException(
-                "WeightRegistry / StreamingTensorPool requires a little-endian host. " +
-                "Big-endian platforms (legacy IBM Power, certain ARM modes) are not supported in v1.");
-        // Quiesce background prefetch workers before (possibly) disposing/swapping
-        // the pool below — same fire-and-forget-outlives-the-pool hazard Reset()
-        // guards against. Must run outside _lock (workers take _lock in their
-        // finally). See DrainInFlightPrefetches.
-        DrainInFlightPrefetches();
-        lock (_lock)
-        {
-            // #714: first reclaim entries whose owner was GC'd without UnregisterWeight. A
-            // sequentially-created-then-dropped model (test shards, long loops) leaves dead-owner
-            // entries pinned in the pool; without this sweep they would wrongly count as "live" and
-            // block the next Configure with "existing streaming pool has N registered entries" — the
-            // symptom that reddens the foundation-scale CV/diffusion model shards. Only genuinely-dead
-            // owners are reclaimed, so a real "live weights still registered" misuse still throws below.
-            PruneDeadOwnersUnlocked();
-
-            // Mid-flight guard: refuse to dispose a pool that holds live
-            // entries. Otherwise tensors registered against the old pool
-            // would silently break on Materialize.
-            if (_streamingPool is not null && _streamingPool.RegisteredEntryCount > 0)
-                throw new InvalidOperationException(
-                    $"WeightRegistry.Configure: existing streaming pool has {_streamingPool.RegisteredEntryCount} " +
-                    "registered entries. Unregister all weights first, or call Reset() to forcibly drop them.");
-            // Same for outstanding reservations from in-flight
-            // AllocateStreaming calls that haven't yet hit RegisterWeight.
-            // Swapping the pool here would orphan those reservations: the
-            // tensor still carries StreamingReservedBytes but the pool
-            // that recorded it is gone, so RegisterWeight / UnregisterWeight
-            // would later release bytes against the WRONG pool — corrupting
-            // the new pool's _reservedBytes accounting and letting later
-            // allocators overshoot the budget.
-            if (_streamingPool is not null && _streamingPool.ReservedBytes > 0)
-                throw new InvalidOperationException(
-                    $"WeightRegistry.Configure: existing streaming pool has {_streamingPool.ReservedBytes} " +
-                    "bytes of outstanding reservations from AllocateStreaming calls that haven't yet " +
-                    "called RegisterWeight (or UnregisterWeight). Complete or abandon those allocations first, " +
-                    "or call Reset() to forcibly drop them.");
-
-            // Dispose the previous allocator before swapping — otherwise its
-            // outstanding pinned/managed allocations + native context are
-            // leaked. Skip disposal when the caller passes the same instance
-            // back in (defensive: lets a caller re-Configure with new options
-            // without losing live allocations).
-            if (!ReferenceEquals(_offloadAllocator, offloadAllocator))
-                _offloadAllocator?.Dispose();
-            _options = options;
-            _offloadAllocator = offloadAllocator;
-            _streamingPool?.Dispose();
-            _streamingPool = null; // lazy-create on first Streaming registration
-        }
+        ConfigureAndRegisterBatch(options, Array.Empty<Tensor<float>>(), offloadAllocator);
     }
 
     /// <summary>The active streaming pool, lazily constructed.</summary>
@@ -178,102 +148,9 @@ public static class WeightRegistry
                 case WeightLifetime.Default:
                     return;
                 case WeightLifetime.Streaming:
-                    {
-                        // CheckedStreamingByteCount uses long arithmetic
-                        // so an oversized tensor surfaces as a clear
-                        // NotSupportedException with a chunking hint
-                        // instead of the runtime's OutOfMemoryException.
-                        // byte[] is itself bounded to ~2.15 GB, so
-                        // streaming a single tensor > 2 GB is impossible
-                        // regardless of host RAM. Helper is internal so
-                        // the overflow guard can be unit-tested directly
-                        // without faking a multi-GB tensor.
-                        // Resolve the store encoding (bf16 vs native) from the
-                        // StreamingStoreDtype policy + execution mode. bf16 halves the
-                        // registered byte[] and everything downstream (resident set,
-                        // eviction, disk) for free — the pool is byte-agnostic; only the
-                        // restore boundary widens bf16 → T (RestoreStorageFromBytes).
-                        var (encoding, stochastic) = ResolveStoreEncoding(weight);
-                        byte[] bytes;
-                        if (encoding == StreamingEncoding.Lossless)
-                        {
-                            // Lossless (byte-shuffle + LZ4) is variable-size — compress
-                            // first, then register exactly the produced bytes.
-                            bytes = SerializeLossless(weight);
-                        }
-                        else
-                        {
-                            int byteCount = encoding switch
-                            {
-                                StreamingEncoding.Bf16 => CheckedBf16ByteCount(weight.Length),
-                                StreamingEncoding.Int8 => CheckedInt8ByteCount(weight.Length, weight.Int8QuantRows),
-                                StreamingEncoding.Int4 => CheckedInt4ByteCount(weight.Length),
-                                _ => CheckedStreamingByteCount<T>(weight.Length),
-                            };
-                            bytes = new byte[byteCount];
-                            SerializeToBytes(weight, bytes, encoding, stochastic);
-                        }
-                        weight.StreamingStoreEncoding = encoding;
-                        var pool = StreamingPoolUnlocked();
-                        // If this tensor was produced by AllocateStreaming,
-                        // it carries the reservation byteCount the pool
-                        // pre-evicted on its behalf. Release the
-                        // reservation BEFORE Register so the pool's
-                        // budget check sees the same byteCount land in
-                        // _residentBytes that came out of _reservedBytes —
-                        // net-zero on the budget rather than counting
-                        // double. Tensors not produced by AllocateStreaming
-                        // have StreamingReservedBytes == 0 (no-op).
-                        long reserved = weight.StreamingReservedBytes;
-                        if (reserved > 0)
-                        {
-                            pool.ReleaseReservation(reserved);
-                            weight.StreamingReservedBytes = 0;
-                        }
-                        long handle = pool.Register(bytes);
-                        // Two-phase commit: drop storage FIRST (the operation
-                        // that can throw — non-contiguous, view, shared
-                        // refcount), then commit the handle on the tensor.
-                        // If TryDropStorageForStreaming throws after the pool
-                        // already accepted the bytes, roll the pool entry
-                        // back so we don't leak both a registered pool
-                        // entry and a tensor still in its pre-stream state
-                        // (which would lead to "handle resident but tensor
-                        // never released" + a pool entry no caller can
-                        // ever reach because StreamingPoolHandle was never
-                        // set on the tensor).
-                        //
-                        // Issue #430: lazy weights allocated via
-                        // AllocateStreaming inside OnFirstForward have their
-                        // storage captured by the very next op's autodiff
-                        // tape input list — refcount becomes 2 by the time
-                        // RegisterWeight runs. Pre-fix the strict drop threw
-                        // and broke any forward path that lazy-allocated
-                        // weights mid-Forward (PatchEmbeddingLayer in
-                        // Gemma3, DeepSeekVL, etc.). Use the non-throwing
-                        // TryDropStorageForStreaming and DEFER the drop when
-                        // refcount > 1: bind the handle anyway, mark the
-                        // tensor with StreamingDropDeferred, and let
-                        // TryFinalizeDeferredDrop retry once peer refs
-                        // release (typically end of training step).
-                        try
-                        {
-                            bool dropped = weight.TryDropStorageForStreaming(throwOnSharedRefcount: false);
-                            weight.StreamingPoolHandle = handle;
-                            weight.StreamingDropDeferred = !dropped;
-                            // Record the owner so a later pool eviction can drop
-                            // this tensor's resident _data once transparent
-                            // auto-rehydrate has paged it back in. Weak ref: a
-                            // tensor GC'd without UnregisterWeight won't leak.
-                            _ownerByHandle[handle] = new WeakReference<IStreamingDroppable>(weight);
-                        }
-                        catch
-                        {
-                            pool.Unregister(handle);
-                            throw;
-                        }
-                        return;
-                    }
+                    RegisterBatch(new[] { weight }, WeightLifetime.Streaming);
+                    TryFinalizeDeferredDrop(weight);
+                    return;
                 case WeightLifetime.GpuOffload:
                 case WeightLifetime.GpuManaged:
                 case WeightLifetime.GpuPinned:
@@ -322,6 +199,11 @@ public static class WeightRegistry
                             weight.OffloadDevicePointer = h.DevicePointer;
                             weight.OffloadOpaqueHandle = h.BackendOpaque;
                             weight.OffloadByteCount = byteCount;
+                            long registryHandle = _nextOffloadRegistrationHandle++;
+                            _offloadRegistrations.Add(
+                                registryHandle,
+                                new OffloadRegistration(weight, alloc, h));
+                            weight.OffloadRegistryHandle = registryHandle;
                         }
                         catch
                         {
@@ -586,36 +468,66 @@ public static class WeightRegistry
                 UntrackMaterializedOwner(weight.StreamingPoolHandle); // #1715
                 weight.StreamingPoolHandle = -1;
             }
-            if (weight.OffloadDevicePointer != IntPtr.Zero || weight.OffloadHostPointer != IntPtr.Zero)
+            if (weight.OffloadRegistryHandle >= 0
+                && _offloadRegistrations.TryGetValue(
+                    weight.OffloadRegistryHandle,
+                    out OffloadRegistration? registration))
             {
-                var alloc = _offloadAllocator;
-                if (alloc is not null)
-                {
-                    var scheme = weight.Lifetime == WeightLifetime.GpuManaged
-                        ? OffloadScheme.Managed : OffloadScheme.Pinned;
-                    // Reconstruct the full GpuOffloadHandle from persisted
-                    // metadata so the allocator's Free path sees the same
-                    // host / device / opaque it allocated. Host pointer is
-                    // load-bearing — Free's TryRemove keys by HostPointer.
-                    // Fall back to DevicePointer for pre-existing tensors
-                    // that don't have OffloadHostPointer set (CUDA/HIP
-                    // pinned where host==device).
-                    IntPtr host = weight.OffloadHostPointer != IntPtr.Zero
-                        ? weight.OffloadHostPointer
-                        : weight.OffloadDevicePointer;
-                    alloc.Free(new GpuOffloadHandle(
-                        host: host,
-                        device: weight.OffloadDevicePointer,
-                        bytes: weight.OffloadByteCount,
-                        scheme: scheme,
-                        opaque: weight.OffloadOpaqueHandle));
-                }
+                registration.Allocator.Free(registration.Handle);
+                _offloadRegistrations.Remove(weight.OffloadRegistryHandle);
+                weight.OffloadRegistryHandle = -1;
+                ClearOffloadMetadata(weight);
+            }
+            else if (weight.OffloadDevicePointer != IntPtr.Zero || weight.OffloadHostPointer != IntPtr.Zero)
+            {
+                // Compatibility for tensors registered by an older assembly before allocator
+                // ownership records existed. New registrations always take the branch above.
+                IGpuOffloadAllocator? allocator = _offloadAllocator;
+                if (allocator is not null)
+                    allocator.Free(CreateOffloadHandle(weight));
+                weight.OffloadRegistryHandle = -1;
+                ClearOffloadMetadata(weight);
+            }
+        }
+    }
+
+    private static GpuOffloadHandle CreateOffloadHandle<T>(Tensor<T> weight)
+    {
+        OffloadScheme scheme = weight.Lifetime == WeightLifetime.GpuManaged
+            ? OffloadScheme.Managed
+            : OffloadScheme.Pinned;
+        IntPtr host = weight.OffloadHostPointer != IntPtr.Zero
+            ? weight.OffloadHostPointer
+            : weight.OffloadDevicePointer;
+        return new GpuOffloadHandle(
+            host,
+            weight.OffloadDevicePointer,
+            weight.OffloadByteCount,
+            scheme,
+            weight.OffloadOpaqueHandle);
+    }
+
+    private static void ClearOffloadMetadata<T>(Tensor<T> weight)
+    {
                 weight.OffloadHostPointer = IntPtr.Zero;
                 weight.OffloadDevicePointer = IntPtr.Zero;
                 weight.OffloadOpaqueHandle = null;
                 weight.OffloadByteCount = 0;
-            }
+    }
+
+    private static void PruneDeadOffloadOwnersUnlocked()
+    {
+        if (_offloadRegistrations.Count == 0) return;
+
+        var deadHandles = new List<long>();
+        foreach (KeyValuePair<long, OffloadRegistration> pair in _offloadRegistrations)
+        {
+            if (pair.Value.Owner.TryGetTarget(out _)) continue;
+            pair.Value.Allocator.Free(pair.Value.Handle);
+            deadHandles.Add(pair.Key);
         }
+        for (int i = 0; i < deadHandles.Count; i++)
+            _offloadRegistrations.Remove(deadHandles[i]);
     }
 
     /// <summary>Caller must hold <see cref="_lock"/> — returns the lazy
@@ -819,10 +731,11 @@ public static class WeightRegistry
     /// and the execution-mode hint. Only float/double can be narrowed; all other types always store
     /// native. Caller holds <see cref="_lock"/>.
     /// </summary>
-    private static (byte encoding, bool stochastic) ResolveStoreEncoding<T>(Tensor<T> weight)
+    private static (byte encoding, bool stochastic) ResolveStoreEncoding<T>(Tensor<T> weight, GpuOffloadOptions? options = null)
     {
         if (typeof(T) != typeof(float) && typeof(T) != typeof(double)) return (StreamingEncoding.Native, false);
-        switch (_options.StreamingStoreDtype)
+        options ??= _options;
+        switch (options.StreamingStoreDtype)
         {
             case StreamingStoreDtype.FullPrecision: return (StreamingEncoding.Native, false);
             case StreamingStoreDtype.Bf16: return (StreamingEncoding.Bf16, false);
@@ -846,7 +759,7 @@ public static class WeightRegistry
                 //   • unknown (no declared mode — raw registry use) → full precision: don't guess.
                 return _streamingTrainingMode switch
                 {
-                    false => (ResolveAutoInferenceEncoding(weight), false), // inference → RAM-aware
+                    false => (ResolveAutoInferenceEncoding(weight, options), false), // inference → RAM-aware
                     true => (StreamingEncoding.Lossless, false),            // training → lossless
                     _ => (StreamingEncoding.Native, false),                 // unknown → full precision
                 };
@@ -863,10 +776,10 @@ public static class WeightRegistry
     /// precision-sensitive and a negligible share of the footprint. With no footprint hint the
     /// behaviour is unchanged (bf16).
     /// </summary>
-    private static byte ResolveAutoInferenceEncoding<T>(Tensor<T> weight)
+    private static byte ResolveAutoInferenceEncoding<T>(Tensor<T> weight, GpuOffloadOptions options)
     {
-        long footprint = _options.ExpectedStreamingFootprintBytes;
-        long cap = _options.StreamingPoolMaxResidentBytes;
+        long footprint = options.ExpectedStreamingFootprintBytes;
+        long cap = options.StreamingPoolMaxResidentBytes;
         // No footprint hint, or bf16 already fits, or a degenerate cap → keep bf16 (best fidelity,
         // unchanged default). footprint/2 is the whole-model resident cost at bf16.
         if (footprint <= 0 || cap <= 0 || footprint / 2 <= cap) return StreamingEncoding.Bf16;
@@ -2219,6 +2132,10 @@ public static class WeightRegistry
         DrainInFlightPrefetches();
         lock (_lock)
         {
+            foreach (OffloadRegistration registration in _offloadRegistrations.Values)
+                registration.Allocator.Free(registration.Handle);
+            _offloadRegistrations.Clear();
+            _nextOffloadRegistrationHandle = 0;
             _streamingPool?.Dispose();
             _streamingPool = null;
             // #1715: dispose the param-IO mmap store (deletes its backing file). Weights still aliasing

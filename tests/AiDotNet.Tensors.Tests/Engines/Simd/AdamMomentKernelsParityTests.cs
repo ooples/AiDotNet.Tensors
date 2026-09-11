@@ -137,4 +137,144 @@ public class AdamMomentKernelsParityTests
             if (ams) Assert.Equal(BitConverter.DoubleToInt64Bits(vmR[i]), BitConverter.DoubleToInt64Bits(vmK[i]));
         }
     }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Float_SparseAdamMatchesGpuSparseContract_BitForBitAcrossRotatingSteps(bool useAmsgrad)
+    {
+        const int n = 32;
+        const float beta1 = 0.9f;
+        const float beta2 = 0.999f;
+        const float learningRate = 1e-3f;
+        const float epsilon = 1e-8f;
+        var random = new Random(2088);
+        float[] referenceParameters = RandF(random, n);
+        float[] sparseParameters = (float[])referenceParameters.Clone();
+        var referenceFirstMoment = new float[n];
+        var sparseFirstMoment = new float[n];
+        var referenceSecondMoment = new float[n];
+        var sparseSecondMoment = new float[n];
+        var referenceMaximumMoment = new float[n];
+        var sparseMaximumMoment = new float[n];
+        int[][] indicesByStep =
+        {
+            new[] { 1, 7, 18, 31 },
+            new[] { 0, 7, 19, 30 },
+            new[] { 2, 8, 19, 29 },
+            new[] { 3, 8, 20, 28 },
+            new[] { 4, 9, 20, 27 },
+        };
+
+        for (int step = 1; step <= 5; step++)
+        {
+            int[] indices = indicesByStep[step - 1];
+            float[] sparseValues = RandF(random, indices.Length);
+            float biasCorrection1 = 1.0f - (float)Math.Pow(beta1, step);
+            float biasCorrection2 = 1.0f - (float)Math.Pow(beta2, step);
+            for (int sparsePosition = 0; sparsePosition < indices.Length; sparsePosition++)
+            {
+                int index = indices[sparsePosition];
+                float gradient = sparseValues[sparsePosition];
+                float first = FastMath
+                    ? FmaF(1.0f - beta1, gradient, beta1 * referenceFirstMoment[index])
+                    : beta1 * referenceFirstMoment[index] + (1.0f - beta1) * gradient;
+                float second = FastMath
+                    ? FmaF((1.0f - beta2) * gradient, gradient, beta2 * referenceSecondMoment[index])
+                    : beta2 * referenceSecondMoment[index] + (1.0f - beta2) * gradient * gradient;
+                referenceFirstMoment[index] = first;
+                referenceSecondMoment[index] = second;
+                float effectiveSecond = second / biasCorrection2;
+                if (useAmsgrad)
+                {
+                    referenceMaximumMoment[index] = Math.Max(referenceMaximumMoment[index], second);
+                    effectiveSecond = referenceMaximumMoment[index] / biasCorrection2;
+                }
+                referenceParameters[index] -= learningRate * (first / biasCorrection1)
+                    / (SqrtF(effectiveSecond) + epsilon);
+            }
+            AdamMomentKernels.AdamStepSparse(
+                sparseParameters, indices, sparseValues, sparseFirstMoment, sparseSecondMoment, sparseMaximumMoment,
+                beta1, beta2, 1.0f - beta1, 1.0f - beta2,
+                biasCorrection1, biasCorrection2, learningRate, epsilon, useAmsgrad);
+        }
+
+        for (int i = 0; i < n; i++)
+        {
+            Assert.Equal(FloatBits(referenceParameters[i]), FloatBits(sparseParameters[i]));
+            Assert.Equal(FloatBits(referenceFirstMoment[i]), FloatBits(sparseFirstMoment[i]));
+            Assert.Equal(FloatBits(referenceSecondMoment[i]), FloatBits(sparseSecondMoment[i]));
+            Assert.Equal(FloatBits(referenceMaximumMoment[i]), FloatBits(sparseMaximumMoment[i]));
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Double_SparseAdamUpdatesOnlyIndexedCoordinatesAcrossRotatingSteps(bool useAmsgrad)
+    {
+        const int n = 32;
+        const double beta1 = 0.9;
+        const double beta2 = 0.999;
+        const double learningRate = 1e-3;
+        const double epsilon = 1e-8;
+        var random = new Random(2089);
+        double[] referenceParameters = RandD(random, n);
+        double[] sparseParameters = (double[])referenceParameters.Clone();
+        var referenceFirstMoment = new double[n];
+        var sparseFirstMoment = new double[n];
+        var referenceSecondMoment = new double[n];
+        var sparseSecondMoment = new double[n];
+        var referenceMaximumMoment = new double[n];
+        var sparseMaximumMoment = new double[n];
+        int[][] indicesByStep =
+        {
+            new[] { 0, 9, 17, 30 },
+            new[] { 1, 9, 18, 29 },
+            new[] { 2, 10, 18, 28 },
+            new[] { 3, 10, 19, 27 },
+            new[] { 4, 11, 19, 26 },
+        };
+
+        for (int step = 1; step <= 5; step++)
+        {
+            int[] indices = indicesByStep[step - 1];
+            double[] sparseValues = RandD(random, indices.Length);
+            double biasCorrection1 = 1.0 - Math.Pow(beta1, step);
+            double biasCorrection2 = 1.0 - Math.Pow(beta2, step);
+            for (int sparsePosition = 0; sparsePosition < indices.Length; sparsePosition++)
+            {
+                int index = indices[sparsePosition];
+                double gradient = sparseValues[sparsePosition];
+                double first = FastMath
+                    ? FmaD(1.0 - beta1, gradient, beta1 * referenceFirstMoment[index])
+                    : beta1 * referenceFirstMoment[index] + (1.0 - beta1) * gradient;
+                double second = FastMath
+                    ? FmaD((1.0 - beta2) * gradient, gradient, beta2 * referenceSecondMoment[index])
+                    : beta2 * referenceSecondMoment[index] + (1.0 - beta2) * gradient * gradient;
+                referenceFirstMoment[index] = first;
+                referenceSecondMoment[index] = second;
+                double effectiveSecond = second / biasCorrection2;
+                if (useAmsgrad)
+                {
+                    referenceMaximumMoment[index] = Math.Max(referenceMaximumMoment[index], second);
+                    effectiveSecond = referenceMaximumMoment[index] / biasCorrection2;
+                }
+                referenceParameters[index] -= learningRate * (first / biasCorrection1)
+                    / (Math.Sqrt(effectiveSecond) + epsilon);
+            }
+            AdamMomentKernels.AdamStepSparse(
+                sparseParameters, indices, sparseValues, sparseFirstMoment, sparseSecondMoment, sparseMaximumMoment,
+                beta1, beta2, 1.0 - beta1, 1.0 - beta2,
+                biasCorrection1, biasCorrection2, learningRate, epsilon, useAmsgrad);
+        }
+
+        for (int i = 0; i < n; i++)
+        {
+            Assert.Equal(BitConverter.DoubleToInt64Bits(referenceParameters[i]), BitConverter.DoubleToInt64Bits(sparseParameters[i]));
+            Assert.Equal(BitConverter.DoubleToInt64Bits(referenceFirstMoment[i]), BitConverter.DoubleToInt64Bits(sparseFirstMoment[i]));
+            Assert.Equal(BitConverter.DoubleToInt64Bits(referenceSecondMoment[i]), BitConverter.DoubleToInt64Bits(sparseSecondMoment[i]));
+            Assert.Equal(BitConverter.DoubleToInt64Bits(referenceMaximumMoment[i]), BitConverter.DoubleToInt64Bits(sparseMaximumMoment[i]));
+        }
+    }
 }

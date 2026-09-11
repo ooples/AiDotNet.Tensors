@@ -43,7 +43,7 @@ public static class GpuOptimizer
     {
         if (tensor is null) return;
         tensor.MarkModified(CreateWriteSyncPoint(backend));
-        tensor._gpuBufferVersion = tensor.Version;
+        tensor._gpuBufferVersion = tensor.GpuCacheVersion;
     }
 
     private static void MarkGpuUpdated(IDirectGpuBackend backend, Tensor<float>? first, Tensor<float>? second)

@@ -57,6 +57,8 @@ public sealed class GradientTape<T> : IDisposable
     private readonly GradientTape<T>? _parent;
     private readonly TapeEntryArena<T> _entries;
     private readonly GradientTapeOptions _options;
+    private readonly bool _releaseStreamingActivations;
+    private bool _lifecycleCounterRegistered;
     private IEngine _engine;
     private bool _engineExplicitlyBound;
 
@@ -239,21 +241,24 @@ public sealed class GradientTape<T> : IDisposable
     [ThreadStatic]
     private static Tensor<T>? _cachedScalarSeed;
 
-    // Release each node's activation references during the streaming backward as the
-    // reverse walk consumes them — the standard autograd memory model (matches
-    // PyTorch's default retain_graph=False, which frees saved tensors as each node's
-    // backward completes). In reverse-topological order an output's consumers have
-    // all already run by the time its own backward runs, so releasing it there can
-    // never drop a tensor a later step needs; parameters/sources are guarded by
-    // lastUse. This is UNCONDITIONAL in production (no opt-out) — ComputeGradientsStreaming
-    // is already a one-shot, gradient-freeing backward, so retaining activations would
-    // only ever leak. The settable property is a TEST SEAM so the on-vs-off bit-identity
-    // regression test can still assert releasing never changes a gradient.
-    internal static bool ReleaseStreamingActivations { get; set; } = true;
-
     public GradientTape(GradientTapeOptions? options = null)
     {
         _options = options ?? GradientTapeOptions.Default;
+        _releaseStreamingActivations = _options.StreamingGraphRetention switch
+        {
+            StreamingGraphRetentionMode.ReleaseAfterBackward => true,
+            StreamingGraphRetentionMode.RetainUntilTapeDisposal => false,
+            _ => throw new ArgumentOutOfRangeException(
+                nameof(options),
+                _options.StreamingGraphRetention,
+                "Unknown streaming graph retention mode."),
+        };
+        if (!_options.Persistent && !_releaseStreamingActivations)
+        {
+            throw new ArgumentException(
+                "Retaining a streaming graph requires a persistent gradient tape.",
+                nameof(options));
+        }
         // Reuse cached arena if available, otherwise create new one
         _entries = _cachedArena ?? new TapeEntryArena<T>();
         _cachedArena = null; // Take ownership — will return on Dispose
@@ -322,6 +327,7 @@ public sealed class GradientTape<T> : IDisposable
         }
 
         SetCurrentTape(this);
+        _lifecycleCounterRegistered = true;
         System.Threading.Interlocked.Increment(ref DifferentiableOps._anyTapeActive);
         // Per-thread counter — used to suppress AutoTracer for THIS thread's
         // tape lifecycle without affecting unrelated inference threads. The
@@ -350,9 +356,9 @@ public sealed class GradientTape<T> : IDisposable
             throw new InvalidOperationException(
                 "This persistent GradientTape's activations were released by a prior " +
                 "ComputeGradientsStreaming call, so its recorded graph can no longer be " +
-                "reused. Record a fresh tape for the next step, or set " +
-                "GradientTape<T>.ReleaseStreamingActivations = false to keep activations " +
-                "resident when you need to record onto or differentiate the same tape again.");
+                "reused. Record a fresh tape for the next step, or construct the tape with " +
+                "StreamingGraphRetentionMode.RetainUntilTapeDisposal when the algorithm " +
+                "requires deterministic replay.");
         }
     }
 
@@ -508,8 +514,9 @@ public sealed class GradientTape<T> : IDisposable
     /// </remarks>
     /// <param name="loss">The scalar loss tensor to differentiate. Must be
     /// tape-connected (non-null <c>GradFn</c>).</param>
-    /// <param name="sources">Parameter tensors whose gradients to stream. Each is
-    /// emitted exactly once, when complete.</param>
+    /// <param name="sources">Leaf parameter tensors whose gradients to stream. Each is emitted
+    /// exactly once, when complete. Intermediate graph outputs are rejected because releasing their
+    /// gradient before their own producer runs would sever propagation to earlier ancestors.</param>
     /// <param name="onSourceGradient">Invoked as <c>(source, gradient)</c> the
     /// moment <paramref name="loss"/>'s gradient w.r.t. that source is final.</param>
     public void ComputeGradientsStreaming(
@@ -517,6 +524,27 @@ public sealed class GradientTape<T> : IDisposable
         IReadOnlyList<Tensor<T>> sources,
         Action<Tensor<T>, Tensor<T>> onSourceGradient)
     {
+        if (onSourceGradient is null) throw new ArgumentNullException(nameof(onSourceGradient));
+        ComputeGradientsStreamingTyped(loss, sources, (source, gradient) =>
+            onSourceGradient(source, MaterializeStreamingGradient(gradient)));
+    }
+
+    /// <summary>
+    /// Memory-bounded streaming backward that preserves indexed sparse embedding gradients instead
+    /// of forcing them through a full vocabulary-sized dense tensor.
+    /// </summary>
+    /// <param name="loss">The scalar tape-connected loss.</param>
+    /// <param name="sources">Leaf source tensors whose completed gradients should be emitted.</param>
+    /// <param name="onSourceGradient">
+    /// Synchronous consumer for a typed dense, sparse, or composite gradient payload.
+    /// </param>
+    public void ComputeGradientsStreamingTyped(
+        Tensor<T> loss,
+        IReadOnlyList<Tensor<T>> sources,
+        Action<Tensor<T>, StreamingSourceGradient<T>> onSourceGradient)
+    {
+        using var accumulationPrecisionScope = new GradientAccumulationPrecisionScope(
+            _options.GradientAccumulationPrecision);
         if (_disposed) throw new ObjectDisposedException(nameof(GradientTape<T>));
         ThrowIfStreamingReleased();
         ResolveEngineFromData();
@@ -524,9 +552,19 @@ public sealed class GradientTape<T> : IDisposable
         if (onSourceGradient is null) throw new ArgumentNullException(nameof(onSourceGradient));
         if (_entries.Count == 0)
             throw new InvalidOperationException("Cannot compute gradients: the tape has no recorded operations.");
-        if (loss.GradFn is null)
-            throw new InvalidOperationException(
-                "Streaming backward requires a tape-connected loss (loss.GradFn is null).");
+        GradNode<T> lossGradFn = loss.GradFn ?? throw new InvalidOperationException(
+            "Streaming backward requires a tape-connected loss (loss.GradFn is null).");
+        for (int sourceIndex = 0; sourceIndex < sources.Count; sourceIndex++)
+        {
+            Tensor<T>? source = sources[sourceIndex];
+            if (source is not null && source.GradFn is not null)
+            {
+                throw new ArgumentException(
+                    "Streaming backward sources must be leaf tensors. Use ComputeGradients when " +
+                    "requesting an intermediate graph output and one of its ancestors.",
+                    nameof(sources));
+            }
+        }
 
         int recordedEntryCount = _entries.Count;
 
@@ -537,19 +575,23 @@ public sealed class GradientTape<T> : IDisposable
         // tape entries (parity with the non-streaming graph path, which also
         // suspends — see ComputeGradients line ~306).
         var savedCurrent = _current;
+        Dictionary<Tensor<T>, Tensor<T>>? streamingGrads = null;
+        var indexedTensors = new List<Tensor<T>>();
+        BackwardStep<T>[] steps = Array.Empty<BackwardStep<T>>();
+        GradNode<T>[] nodes = Array.Empty<GradNode<T>>();
         SetCurrentTape(null);
         try
         {
             // Forward topological order; reverse is the backward execution order.
             var visited = new HashSet<GradNode<T>>();
             var topoOrder = new List<GradNode<T>>();
-            TopologicalSort(loss.GradFn!, visited, topoOrder);
+            TopologicalSort(lossGradFn, visited, topoOrder);
             int stepCount = topoOrder.Count;
 
-            var steps = new BackwardStep<T>[stepCount];
+            steps = new BackwardStep<T>[stepCount];
             // #1624: parallel node handles so each step's backward can release its
             // activation references the moment they are consumed (see below).
-            var nodes = new GradNode<T>[stepCount];
+            nodes = new GradNode<T>[stepCount];
             for (int i = 0; i < stepCount; i++)
             {
                 var node = topoOrder[stepCount - 1 - i]; // reverse for backward
@@ -574,7 +616,7 @@ public sealed class GradientTape<T> : IDisposable
             // arena slot for each activation as the reverse walk consumes it. The streaming backward walks
             // the GradFn graph (not _entries), so clearing arena slots never affects the backward itself.
             Dictionary<Tensor<T>, int>? entrySlotOfOutput = null;
-            if (ReleaseStreamingActivations)
+            if (_releaseStreamingActivations)
             {
                 int entryCount = _entries.Count;
                 entrySlotOfOutput = new Dictionary<Tensor<T>, int>(
@@ -615,8 +657,33 @@ public sealed class GradientTape<T> : IDisposable
                 list.Add(kv.Key);
             }
 
-            var grads = new Dictionary<Tensor<T>, Tensor<T>>(
+            // Use the same indexed dense + sparse accumulator contract as the ordinary backward.
+            // Without this wiring, embedding backwards assume there is no sparse consumer and
+            // allocate a full [vocabulary, dimension] dense gradient before the callback can run.
+            int gradIndexCount = 0;
+            for (int e = 0; e < _entries.Count; e++)
+            {
+                ref var entry = ref _entries[e];
+                AssignStreamingGradientIndex(entry.Output, indexedTensors, ref gradIndexCount);
+                AssignStreamingGradientIndex(entry.Input0, indexedTensors, ref gradIndexCount);
+                if (entry.InputCount >= 2)
+                    AssignStreamingGradientIndex(entry.Input1, indexedTensors, ref gradIndexCount);
+                if (entry.InputCount >= 3)
+                    AssignStreamingGradientIndex(entry.Input2, indexedTensors, ref gradIndexCount);
+                if (entry.InputsOverflow is not null)
+                {
+                    foreach (Tensor<T> input in entry.InputsOverflow)
+                        AssignStreamingGradientIndex(input, indexedTensors, ref gradIndexCount);
+                }
+            }
+            var indexedGrads = new object?[gradIndexCount];
+            var indexedSparseGrads = new object?[gradIndexCount];
+            DifferentiableOps.SetIndexedGrads(indexedGrads);
+            DifferentiableOps.SetIndexedSparseGrads(indexedSparseGrads);
+
+            streamingGrads = new Dictionary<Tensor<T>, Tensor<T>>(
                 stepCount + 1, ReferenceEqualityComparer<Tensor<T>>.Instance);
+            var grads = streamingGrads;
 
             // Seed gradient (dL/dL = 1), same construction as ComputeGradients:
             // use the loss's ACTUAL shape (which may be [] for a 0-dim scalar or
@@ -697,11 +764,31 @@ public sealed class GradientTape<T> : IDisposable
                     for (int k = 0; k < ready.Count; k++)
                     {
                         var src = ready[k];
-                        if (grads.TryGetValue(src, out var g))
+                        grads.TryGetValue(src, out Tensor<T>? denseGradient);
+                        IReadOnlyList<SparseEmbeddingGradient<T>>? sparseGradient =
+                            DifferentiableOps.GetSparseEmbeddingGradsFor(src);
+                        if (denseGradient is not null || sparseGradient is { Count: > 0 })
                         {
-                            onSourceGradient(src, g);
-                            grads.Remove(src);   // drop the dict reference …
-                            src.Grad = null;     // … and the per-tensor mirror → reclaimable
+                            try
+                            {
+                                onSourceGradient(
+                                    src,
+                                    StreamingSourceGradient<T>.Create(denseGradient, sparseGradient));
+                            }
+                            finally
+                            {
+                                // A journal, validation, or optimizer callback may throw. The
+                                // gradient is unpublished and must never remain rooted on the
+                                // trainable source after that failure.
+                                grads.Remove(src);
+                                src.Grad = null;
+                                int gradientIndex = src._gradIndex;
+                                if (gradientIndex >= 0 && gradientIndex < indexedGrads.Length)
+                                {
+                                    indexedGrads[gradientIndex] = null;
+                                    indexedSparseGrads[gradientIndex] = null;
+                                }
+                            }
                         }
                     }
                 }
@@ -722,7 +809,7 @@ public sealed class GradientTape<T> : IDisposable
                 // all already run by the time its producer's backward runs, and the
                 // node Output is never a source (sources are leaves, emitted + released
                 // above), so this never drops a tensor a later step or the optimizer needs.
-                if (ReleaseStreamingActivations)
+                if (_releaseStreamingActivations)
                 {
                     var n = nodes[i];
                     if (n is not null)
@@ -780,17 +867,54 @@ public sealed class GradientTape<T> : IDisposable
         finally
         {
             SetCurrentTape(savedCurrent);
+            // Clear every source, including ones whose callback was still pending when an earlier
+            // callback failed. Preserve the original exception by keeping cleanup non-throwing.
+            foreach (Tensor<T> source in sources)
+            {
+                if (source is null) continue;
+                streamingGrads?.Remove(source);
+                source.Grad = null;
+            }
+            DifferentiableOps.ClearIndexedGrads();
+            DifferentiableOps.ClearIndexedSparseGrads();
+            foreach (Tensor<T> indexedTensor in indexedTensors)
+                indexedTensor._gradIndex = -1;
             // Release every entry recorded before streaming began, including dead
             // entries that were absent from the GradFn traversal. Entries already
             // released while dropping activations are guarded by their ownership bit.
-            ReleaseSavedStatePins(recordedEntryCount);
-            if (!_options.Persistent)
+            // A retained persistent graph must keep the entry-owned saved-state pins as well as
+            // its node references. Releasing those pins here lets the arena recycle RMSNorm,
+            // LayerNorm, attention, and dropout state before the next replay, corrupting a graph
+            // that the typed retention mode promises remains valid. Reset/Dispose owns their
+            // eventual release. Destructive streaming and non-persistent tapes still release now.
+            if (_releaseStreamingActivations)
+            {
+                ReleaseSavedStatePins(recordedEntryCount);
+                // The destructive mode owns the complete graph cleanup even when a backward or
+                // callback fails before the reverse walk reaches every node. Leaving unprocessed
+                // nodes populated makes the permanently-consumed tape retain the activation graph.
+                for (int nodeIndex = 0; nodeIndex < nodes.Length; nodeIndex++)
+                {
+                    GradNode<T>? node = nodes[nodeIndex];
+                    if (node is null) continue;
+                    node.Output = null;
+                    node.SavedState = null;
+                    node.Backward = null;
+                    node.Input0 = null;
+                    node.Input1 = null;
+                    node.Input2 = null;
+                    node.InputsOverflow = null;
+                }
+                Array.Clear(steps, 0, steps.Length);
+                _entries.Reset();
+            }
+            else if (!_options.Persistent)
             {
                 // Non-persistent tapes drop the whole arena here, so they're safe to
                 // re-record from scratch — no consumed-guard needed.
                 _entries.Reset();
             }
-            else if (ReleaseStreamingActivations)
+            if (_options.Persistent && _releaseStreamingActivations)
             {
                 // Persistent tape whose arena/graph we just destructively released:
                 // arm the consumed-guard so any later Record/ComputeGradients fails
@@ -798,6 +922,42 @@ public sealed class GradientTape<T> : IDisposable
                 _streamingActivationsReleased = true;
             }
         }
+    }
+
+    private static void AssignStreamingGradientIndex(
+        Tensor<T>? tensor,
+        List<Tensor<T>> indexedTensors,
+        ref int nextIndex)
+    {
+        if (tensor is null || tensor._gradIndex >= 0) return;
+        tensor._gradIndex = nextIndex++;
+        indexedTensors.Add(tensor);
+    }
+
+    private Tensor<T> MaterializeStreamingGradient(StreamingSourceGradient<T> gradient)
+    {
+        Tensor<T>? dense = gradient.HasDense ? gradient.Dense : null;
+        if (gradient.HasSparseEmbedding)
+        {
+            IReadOnlyList<SparseEmbeddingGradient<T>> sparse = gradient.SparseEmbedding;
+            for (int i = 0; i < sparse.Count; i++)
+            {
+                Tensor<T> contribution = sparse[i].ToDense(_engine);
+                if (dense is null)
+                {
+                    dense = contribution;
+                }
+                else
+                {
+                    using var accumulationScope =
+                        GradientAccumulationPrecisionScope.EnterFloat32AutocastForAddition();
+                    dense = _engine.TensorAdd(dense, contribution);
+                }
+            }
+        }
+
+        return dense ?? throw new InvalidOperationException(
+            "The streaming gradient did not contain a materializable contribution.");
     }
 
     public Dictionary<Tensor<T>, Tensor<T>> ComputeGradients(
@@ -822,6 +982,8 @@ public sealed class GradientTape<T> : IDisposable
         bool createGraph,
         IReadOnlyList<KeyValuePair<Tensor<T>, Tensor<T>>>? seedOverride)
     {
+        using var accumulationPrecisionScope = new GradientAccumulationPrecisionScope(
+            _options.GradientAccumulationPrecision);
         if (_disposed)
         {
             throw new ObjectDisposedException(nameof(GradientTape<T>));
@@ -2431,7 +2593,11 @@ public sealed class GradientTape<T> : IDisposable
     /// </summary>
     ~GradientTape()
     {
-        if (!_disposed)
+        // A constructor can reject invalid typed options before this instance registers in the
+        // process-wide counter. Finalizable objects whose constructor throws are still finalized;
+        // decrementing for an instance that never incremented corrupts the gate for unrelated
+        // live tapes and makes their operations silently skip recording.
+        if (!_disposed && _lifecycleCounterRegistered)
             System.Threading.Interlocked.Decrement(ref DifferentiableOps._anyTapeActive);
     }
 
@@ -2447,7 +2613,11 @@ public sealed class GradientTape<T> : IDisposable
         // This is critical for nested tapes: an inner tape disposing must not
         // clear replay suppression that an outer tape still needs.
         Compilation.AutoTrainingCompiler.ReplayMode = _savedReplayMode;
-        System.Threading.Interlocked.Decrement(ref DifferentiableOps._anyTapeActive);
+        if (_lifecycleCounterRegistered)
+        {
+            System.Threading.Interlocked.Decrement(ref DifferentiableOps._anyTapeActive);
+            _lifecycleCounterRegistered = false;
+        }
         DifferentiableOps._threadTapeDepth--;
         SetCurrentTape(_parent);
         // AiDotNet#1340: explicitly clear the cached delegate chain's

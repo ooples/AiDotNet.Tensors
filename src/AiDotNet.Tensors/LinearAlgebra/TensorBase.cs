@@ -238,6 +238,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         var old = _storage;
         _data = fresh;
         _storage = new TensorStorage<T>(_data);
+        InvalidateGpuBindingAfterStorageReplacement();
         old.Release();
     }
 
@@ -310,6 +311,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         var old = _storage;
         _data = fresh;
         _storage = new TensorStorage<T>(_data);
+        InvalidateGpuBindingAfterStorageReplacement();
         old.Release();
     }
 
@@ -388,6 +390,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         var newStorage = new TensorStorage<T>(_data);
         newStorage.AttachMmapOwner(owner, writable); // attach BEFORE making the storage visible to anyone else
         _storage = newStorage;
+        InvalidateGpuBindingAfterStorageReplacement();
         oldStorage.Release();
     }
 
@@ -518,6 +521,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
             // changing either refcount here would steal or manufacture a tensor-owner reference.
             _storage = source._storage;
             _data = source._data;
+            InvalidateGpuBindingAfterStorageReplacement();
             return;
         }
 
@@ -530,6 +534,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         var oldStorage = _storage;
         _storage = source._storage;
         _data = source._data;
+        InvalidateGpuBindingAfterStorageReplacement();
         oldStorage.Release();
     }
 
@@ -582,7 +587,8 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// <c>false</c> on shared refcount.</param>
     /// <returns><c>true</c> when the drop succeeded (refcount 1 → 0, storage
     /// replaced with empty); <c>false</c> when refcount &gt; 1 and the caller
-    /// opted for the soft path.</returns>
+    /// opted for the soft path, or when the soft path cannot allocate its empty replacement.
+    /// A failed soft drop leaves the original storage untouched for a later retry.</returns>
     internal bool TryDropStorageForStreaming(bool throwOnSharedRefcount = false)
     {
         if (!IsContiguous || _storageOffset != 0 || IsView)
@@ -600,8 +606,25 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         // TryClaimExclusive closes that window — it succeeds only when
         // refcount was exactly 1 at the moment of the claim, and after
         // success any concurrent AddRef throws ObjectDisposedException.
-        if (!_storage.TryClaimExclusive())
+        Vector<T> replacementData;
+        TensorStorage<T> replacementStorage;
+        try
         {
+            replacementData = Vector<T>.Empty();
+            replacementStorage = new TensorStorage<T>(replacementData);
+        }
+        catch (OutOfMemoryException) when (!throwOnSharedRefcount)
+        {
+            // A deferred drop is post-commit reclamation. If even the empty replacement cannot
+            // be allocated, leave the original storage and its ownership untouched and retry on
+            // the next opportunity; an already committed registration must not report failure.
+            return false;
+        }
+        var claimedStorage = _storage;
+        replacementStorage.CopyGpuCacheTrackingFrom(claimedStorage);
+        if (!claimedStorage.TryClaimExclusive())
+        {
+            replacementStorage.Release();
             if (throwOnSharedRefcount)
                 throw new InvalidOperationException(
                     $"Streaming drop requires sole storage ownership; storage refcount is {_storage.RefCount}. " +
@@ -618,12 +641,17 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         // is already 0, Release would underflow.
         // If this tensor was aliasing a zero-copy mmap slice, the mapping is no
         // longer referenced once storage is dropped — release it now.
-        DisposeStreamingMmapOwner();
         // Drop any no-upcast quantized weight too — the pool holds the canonical bytes.
         StreamingInt8 = null;
         StreamingInt4 = null;
-        _data = Vector<T>.Empty();
-        _storage = new TensorStorage<T>(_data);
+        _data = replacementData;
+        _storage = replacementStorage;
+        InvalidateGpuBindingAfterStorageReplacement();
+        // Reclamation must not turn a successful storage swap into a failed transaction.
+        try { claimedStorage.DisposeClaimedOwners(); }
+        catch (Exception error) { System.Diagnostics.Trace.TraceWarning("Streaming storage cleanup failed: {0}", error); }
+        try { DisposeStreamingMmapOwner(); }
+        catch (Exception error) { System.Diagnostics.Trace.TraceWarning("Streaming mapping cleanup failed: {0}", error); }
         return true;
     }
 
@@ -831,6 +859,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         var oldStorage = _storage;
         _data = fresh;
         _storage = new TensorStorage<T>(_data);
+        InvalidateGpuBindingAfterStorageReplacement();
         oldStorage.Release();
     }
 
@@ -1209,6 +1238,16 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// </summary>
     public int Version => _version;
 
+    /// <summary>Storage-shared cache freshness, including writes made in inference mode.</summary>
+    internal int GpuCacheVersion => _storage.GpuCacheVersion;
+
+    private void InvalidateGpuBindingAfterStorageReplacement()
+    {
+        _gpuBuffer = null;
+        _gpuBackend = null;
+        _gpuBufferVersion = -1;
+    }
+
     /// <summary>
     /// Increments the version counter. Called by in-place operations to signal mutation.
     /// </summary>
@@ -1224,6 +1263,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// </remarks>
     internal void IncrementVersion()
     {
+        _storage.IncrementGpuCacheVersionIfTracked();
         if (Engines.Autodiff.InferenceModeFlag.IsActive)
         {
             // Inference mode: in-place mutation is legal and the
@@ -1387,6 +1427,12 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// path — element-size × Length is unsafe when T is a managed type
     /// without a stable Marshal.SizeOf.</summary>
     public long OffloadByteCount { get; internal set; }
+
+    /// <summary>
+    /// Registry-owned identity for the allocator/handle pair that created this tensor's offload
+    /// allocation. The registry, rather than the current process-wide allocator, owns the free path.
+    /// </summary>
+    internal long OffloadRegistryHandle { get; set; } = -1;
 
     /// <summary>
     /// Whether this tensor is a view into another tensor's storage.
@@ -1745,7 +1791,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         Length = expectedSize;
         if (_data.Length != expectedSize)
             throw new ArgumentException("The number of values does not match the specified shape.");
-        _storage = new TensorStorage<T>(_data);
+        _storage = new TensorStorage<T>(_data, shareExternalGpuCacheEpoch: data is T[]);
     }
 
     /// <summary>
@@ -1766,7 +1812,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         Length = expectedSize;
         if (_data.Length != expectedSize)
             throw new ArgumentException("The number of values does not match the specified shape.");
-        _storage = new TensorStorage<T>(_data);
+        _storage = new TensorStorage<T>(_data, shareExternalGpuCacheEpoch: true);
     }
 
     /// <summary>
@@ -1824,7 +1870,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         // if called on sparse tensors — use SparseTensor-specific APIs instead.
         Length = ComputeProduct(logicalShape);
         _data = values;
-        _storage = new TensorStorage<T>(_data);
+        _storage = new TensorStorage<T>(_data, shareExternalGpuCacheEpoch: true);
     }
 
     /// <summary>
@@ -1891,7 +1937,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         }
         else
         {
-            _storage = new TensorStorage<T>(_data);
+            _storage = new TensorStorage<T>(_data, shareExternalGpuCacheEpoch: true);
         }
 
         Length = totalElements;
@@ -2214,7 +2260,8 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     }
 
     /// <summary>
-    /// Gets the underlying array. For views, returns a fresh contiguous copy.
+    /// Gets the underlying array for a full contiguous CPU layout, including a full-storage view.
+    /// Offset/strided views and GPU-resident tensors return a fresh contiguous copy.
     /// NOTE: intentionally does NOT call EnsureMaterialized on the simple-
     /// layout path. Callers that pin this array for use at plan-replay time
     /// (specialization compile) must NOT force Realize at compile time —
@@ -2241,7 +2288,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         // specializations pinned the placeholder's zero-initialized state
         // and never saw the user's Execute-time input.
         //
-        // Lazy or GPU-resident tensors still go through ToArray() so the
+        // GPU-resident or non-full layouts still go through ToArray() so the
         // realized CPU snapshot is what the caller sees. That path
         // preserves the BERT-SQuAD × 100 fix: a lazy tensor whose
         // upstream hasn't run yet would have had its placeholder-filled
@@ -2267,21 +2314,19 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
 
     /// <summary>
     /// COW Stage 2 (issue #624): a READ-ONLY view of the live backing array that does
-    /// <b>not</b> privatize a copy-on-write clone. Identical data semantics to
-    /// <see cref="GetDataArray"/> (same live backing array for the simple CPU layout, a
-    /// realized <see cref="ToArray"/> snapshot for lazy/GPU/view layouts) minus the
-    /// <see cref="EnsureOwnedForWrite"/> privatization. The caller contract is
+    /// <b>not</b> privatize a copy-on-write clone. A full contiguous CPU view can also
+    /// return its shared backing array: reading it neither transfers ownership nor
+    /// grants a retained writable pin. Offset, strided, lazy, and GPU layouts return
+    /// a realized <see cref="ToArray"/> snapshot. The caller contract is
     /// <b>read-only</b>: engine ops use this for INPUT operands they only read (matmul
     /// operands, conv filters, norm gamma/beta, broadcast bias). Routing a genuine
     /// in-place write through this would corrupt a COW peer — those must keep using
-    /// <see cref="GetDataArray"/>/<see cref="AsWritableSpan"/>. For every non-COW tensor
-    /// (the overwhelming default) this is byte-for-byte identical to
-    /// <see cref="GetDataArray"/> at the same cost, so converting a read site is risk-free;
-    /// the benefit is that inference on a cloned model never privatizes its shared weights.
+    /// <see cref="AsWritableSpan"/> or the COW-aware <see cref="GetDataArray"/>.
+    /// Full-view reads remain zero-copy and cloned-model reads retain shared storage.
     /// </summary>
     internal T[] GetReadOnlyDataArray()
     {
-        var live = GetLiveBackingArrayOrNull();
+        var live = LazySource is null ? GetLiveBackingArrayOrNull() : null;
         if (live is not null)
         {
             // Same pending-GPU-download trigger as GetDataArray above — a read-only accessor still
@@ -2930,6 +2975,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
 
                 var fresh = requester._data.Clone();
                 var privateStorage = new TensorStorage<T>(fresh);
+                privateStorage.CopyGpuCacheTrackingFrom(requester._storage);
                 for (int i = 0; i < liveMembers.Count; i++)
                 {
                     var member = liveMembers[i];

@@ -20,6 +20,46 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 /// </summary>
 public class FusedAttentionTiledBackwardTests
 {
+    [Fact]
+    public void Backward_CausalFirstQuery_HasNoMaskedGradientsAndDoesNotMutateInputs()
+    {
+        var engine = new CpuEngine();
+        int[] shape = { 1, 1, 3, 2 };
+        using var q = new Tensor<float>(new float[] { 0.25f, -0.5f, 1f, 0.75f, -0.25f, 1.5f }, shape);
+        using var k = new Tensor<float>(new float[] { -0.5f, 0.25f, 0.75f, 1f, 1.5f, -0.25f }, shape);
+        using var v = new Tensor<float>(new float[] { 1f, 2f, 3f, -4f, 5f, 6f }, shape);
+        using var dO = new Tensor<float>(new float[] { 1f, -2f, 0f, 0f, 0f, 0f }, shape);
+        using var qPeer = (Tensor<float>)q.CloneShared();
+        using var kPeer = (Tensor<float>)k.CloneShared();
+        using var vPeer = (Tensor<float>)v.CloneShared();
+        using var dOPeer = (Tensor<float>)dO.CloneShared();
+        float[] qBefore = q.ToArray(), kBefore = k.ToArray(), vBefore = v.ToArray(), dOBefore = dO.ToArray();
+        int qVersion = q.Version, kVersion = k.Version, vVersion = v.Version, dOVersion = dO.Version;
+
+        var (dQ, dK, dV) = FusedAttention<float>.Backward(
+            dO, q, k, v, new FlashAttentionConfig { IsCausal = true }, engine: engine);
+
+        // Only query zero contributes to the loss, and causal query zero can see only key zero.
+        // Its softmax is identically one: Q/K receive zero gradient and V receives just dO[0].
+        AssertClose(new float[6], dQ.AsSpan().ToArray(), 1e-6f, "masked dQ");
+        AssertClose(new float[6], dK.AsSpan().ToArray(), 1e-6f, "masked dK");
+        AssertClose(new float[] { 1f, -2f, 0f, 0f, 0f, 0f }, dV.AsSpan().ToArray(), 1e-6f, "masked dV");
+        Assert.Equal(qBefore, q.ToArray());
+        Assert.Equal(kBefore, k.ToArray());
+        Assert.Equal(vBefore, v.ToArray());
+        Assert.Equal(dOBefore, dO.ToArray());
+        Assert.Equal(qBefore, qPeer.ToArray());
+        Assert.Equal(kBefore, kPeer.ToArray());
+        Assert.Equal(vBefore, vPeer.ToArray());
+        Assert.Equal(dOBefore, dOPeer.ToArray());
+        Assert.Equal(qVersion, q.Version);
+        Assert.Equal(kVersion, k.Version);
+        Assert.Equal(vVersion, v.Version);
+        Assert.Equal(dOVersion, dO.Version);
+        Assert.True(q.IsCowShared && k.IsCowShared && v.IsCowShared && dO.IsCowShared,
+            "Reading attention inputs must not detach their copy-on-write storage.");
+    }
+
     [Theory]
     [InlineData(1, 2, 16, 8)]    // tiny (full-matrix path)
     [InlineData(2, 4, 64, 16)]   // medium, multi-batch/head (full-matrix path)
@@ -189,6 +229,8 @@ public class FusedAttentionTiledBackwardTests
         for (int i = 0; i < expected.Length; i++)
         {
             float d = Math.Abs(expected[i] - actual[i]);
+            if (float.IsNaN(d) || float.IsInfinity(d))
+                Assert.Fail($"{name} has a non-finite difference at index {i}: expected {expected[i]}, actual {actual[i]}.");
             // relative tolerance for larger magnitudes
             float bound = tol * (1f + Math.Abs(expected[i]));
             if (d > bound && d > maxAbs) { maxAbs = d; worst = i; }

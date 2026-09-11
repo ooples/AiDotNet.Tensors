@@ -234,27 +234,59 @@ public sealed class StreamingTensorPool : IDisposable
     /// handle the caller stores on its <see cref="Tensor{T}"/> and uses for
     /// access through <see cref="MarkAccessed"/> / <see cref="Rehydrate{T}"/>.</summary>
     public long Register(byte[] data)
+        => RegisterReserved(data, 0);
+
+    // Transfer a lazy allocation's reservation atomically with registration. The tensor keeps
+    // ownership of its reservation until the registry publishes the returned handle.
+    internal long RegisterReserved(byte[] data, long reservedBytes)
     {
         if (data is null) throw new ArgumentNullException(nameof(data));
         lock (_lock)
         {
             ThrowIfDisposed();
+            if (reservedBytes < 0 || reservedBytes > _reservedBytes)
+                throw new ArgumentOutOfRangeException(nameof(reservedBytes));
+
             long id = _nextHandleId++;
             var entry = new Entry { Data = data, ResidentBytes = data.Length };
-            _entries[id] = entry;
-            var node = _lruOrder.AddFirst(id);
-            _lruIndex[id] = node;
-            // Use Interlocked for the long write so 32-bit hosts (net471
-            // x86) don't see torn reads from concurrent ResidentBytes
-            // accesses. Reads use Interlocked.Read for the same reason.
-            // Inside _lock, atomicity is already guaranteed for
-            // serialization, but the property accessor is lock-free.
-            Interlocked.Add(ref _residentBytes, data.Length);
-            long peak = Interlocked.Read(ref _residentBytesPeak);
-            long current = Interlocked.Read(ref _residentBytes);
-            if (current > peak) Interlocked.Exchange(ref _residentBytesPeak, current);
-            EvictIfOverBudget();
-            return id;
+            LinkedListNode<long>? node = null;
+            bool entryAdded = false;
+            bool residentBytesAdded = false;
+            bool reservationTransferred = false;
+            try
+            {
+                // Each bookkeeping operation can allocate. Track every successful mutation so an
+                // allocation or eviction failure cannot leave an unreachable entry or LRU node.
+                _entries.Add(id, entry);
+                entryAdded = true;
+                long current = Interlocked.Add(ref _residentBytes, data.Length);
+                residentBytesAdded = true;
+                node = _lruOrder.AddFirst(id);
+                _lruIndex.Add(id, node);
+                _reservedBytes -= reservedBytes;
+                reservationTransferred = true;
+
+                EvictIfOverBudget();
+
+                long peak = Interlocked.Read(ref _residentBytesPeak);
+                if (current > peak) Interlocked.Exchange(ref _residentBytesPeak, current);
+                return id;
+            }
+            catch
+            {
+                _prefetchPending.Remove(id);
+                _pendingOwnerDrops.Remove(id);
+                _lruIndex.Remove(id);
+                if (node is not null && node.List is not null)
+                    _lruOrder.Remove(node);
+                if (entryAdded)
+                    _entries.Remove(id);
+                if (residentBytesAdded)
+                    Interlocked.Add(ref _residentBytes, -entry.ResidentBytes);
+                if (reservationTransferred)
+                    _reservedBytes += reservedBytes;
+                throw;
+            }
         }
     }
 
@@ -587,10 +619,20 @@ public sealed class StreamingTensorPool : IDisposable
             // by live entries even when callers register/unregister at
             // high churn.
             _prefetchPending.Remove(handleId);
+            _pendingOwnerDrops.Remove(handleId);
             // The entry's slice of the contiguous backing file is left in place
             // (reclaimed when the whole file is deleted at Dispose). Weight handles
             // are register-once for a model, so per-unregister compaction would be
             // churn for no benefit; the file is bounded by total bytes paged out.
+        }
+    }
+
+    internal void UnregisterAndRestoreReservation(long handleId, long reservedBytes)
+    {
+        lock (_lock)
+        {
+            Unregister(handleId);
+            _reservedBytes += reservedBytes;
         }
     }
 

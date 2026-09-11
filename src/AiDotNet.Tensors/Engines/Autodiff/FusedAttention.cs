@@ -432,7 +432,9 @@ public static class FusedAttention<T>
         int[] shape = scores._shape;
         int b = shape[0], h = shape[1], sq = shape[2], sk = shape[3];
         if (!scores.IsContiguous) scores = scores.Contiguous();
-        var data = scores.GetDataArray();
+        // Scores are normally a reshape view. Array access returns a snapshot for views;
+        // the causal mask must write through the tensor's COW-aware storage instead.
+        var data = scores.AsWritableSpan();
         T negInf = numOps.FromDouble(double.NegativeInfinity);
         for (int i = 0; i < b; i++)
         {
@@ -448,6 +450,7 @@ public static class FusedAttention<T>
                 }
             }
         }
+        scores.IncrementVersion();
         return scores;
     }
 
@@ -638,7 +641,7 @@ public static class FusedAttention<T>
             int bk = Math.Min(tileBk, Sk - j0);
             var kt = SliceAxis1(numOps, kf, BH, Sk, headDim, j0, bk);                       // [BH, bk, Dh]
             var sTile = ScoresTileWithBias(engine, qf, kt, scaleT, attentionBias, B, H, Sq, bk, j0); // [BH, Sq, bk]
-            var s = sTile.GetDataArray();
+            var s = sTile.AsSpan();
             for (int row = 0; row < BH * Sq; row++)
             {
                 int b0 = row * bk;
@@ -669,8 +672,8 @@ public static class FusedAttention<T>
             var vt = SliceAxis1(numOps, vf, BH, Sk, Dv, j0, bk);                            // [BH, bk, Dv]
             var sTile = ScoresTileWithBias(engine, qf, kt, scaleT, attentionBias, B, H, Sq, bk, j0); // [BH, Sq, bk]
             var dpTile = engine.TensorBatchMatMul(dof, vt.TransposeLast2D());               // [BH, Sq, bk]
-            var s = sTile.GetDataArray();
-            var dp = dpTile.GetDataArray();
+            var s = sTile.AsSpan();
+            var dp = dpTile.AsSpan();
             for (int row = 0; row < BH * Sq; row++)
             {
                 int b0 = row * bk;
@@ -696,8 +699,8 @@ public static class FusedAttention<T>
             var vt = SliceAxis1(numOps, vf, BH, Sk, Dv, j0, bk);                            // [BH, bk, Dv]
             var sTile = ScoresTileWithBias(engine, qf, kt, scaleT, attentionBias, B, H, Sq, bk, j0); // [BH, Sq, bk]
             var dpTile = engine.TensorBatchMatMul(dof, vt.TransposeLast2D());               // [BH, Sq, bk]
-            var s = sTile.GetDataArray();
-            var dp = dpTile.GetDataArray();
+            var s = sTile.AsSpan();
+            var dp = dpTile.AsSpan();
 
             // Masked (j >= jMax) entries stay zero-init, so they contribute nothing to the
             // dV / dK / dQ GEMMs below — exactly the causal mask.
@@ -720,15 +723,15 @@ public static class FusedAttention<T>
 
             // dV_j = Σ_i P_ij · dO_i  -> [BH, bk, Dv]; keys are disjoint per tile, so write.
             var dVtile = engine.TensorBatchMatMul(pTile.TransposeLast2D(), dof);            // [BH, bk, Dv]
-            CopyTileIntoAxis1(dVfull, dVtile.GetDataArray(), BH, Sk, Dv, j0, bk);
+            CopyTileIntoAxis1(dVfull, dVtile.AsSpan(), BH, Sk, Dv, j0, bk);
             // dK_j = scale · Σ_i dS_ij · q_i -> [BH, bk, Dh]
             var dKtile = engine.TensorMultiplyScalar(
                 engine.TensorBatchMatMul(dsTile.TransposeLast2D(), qf), scaleT);            // [BH, bk, Dh]
-            CopyTileIntoAxis1(dKfull, dKtile.GetDataArray(), BH, Sk, headDim, j0, bk);
+            CopyTileIntoAxis1(dKfull, dKtile.AsSpan(), BH, Sk, headDim, j0, bk);
             // dQ_i += scale · Σ_j dS_ij · k_j -> [BH, Sq, Dh] (accumulate across tiles)
             var dQtile = engine.TensorMultiplyScalar(
                 engine.TensorBatchMatMul(dsTile, kt), scaleT);                              // [BH, Sq, Dh]
-            var dq = dQtile.GetDataArray();
+            var dq = dQtile.AsSpan();
             for (int idx = 0; idx < dQacc.Length; idx++)
                 dQacc[idx] = numOps.Add(dQacc[idx], dq[idx]);
         }
@@ -766,19 +769,20 @@ public static class FusedAttention<T>
     /// tensor into a fresh contiguous [BH, bk, D] tile.</summary>
     private static Tensor<T> SliceAxis1(INumericOperations<T> numOps, Tensor<T> src, int BH, int S, int D, int j0, int bk)
     {
-        var srcData = src.IsContiguous ? src.GetDataArray() : src.Contiguous().GetDataArray();
+        if (!src.IsContiguous) src = src.Contiguous();
+        var srcData = src.AsSpan();
         var dst = new T[BH * bk * D];
         for (int b = 0; b < BH; b++)
-            Array.Copy(srcData, (b * S + j0) * D, dst, b * bk * D, bk * D);
+            srcData.Slice((b * S + j0) * D, bk * D).CopyTo(dst.AsSpan(b * bk * D, bk * D));
         return new Tensor<T>(dst, new[] { BH, bk, D });
     }
 
     /// <summary>Writes a [BH, bk, D] tile into the [:, j0:j0+bk, :] slice of a flat [BH, S, D]
     /// destination buffer (keys are disjoint across tiles, so a copy is correct).</summary>
-    private static void CopyTileIntoAxis1(T[] dst, T[] tile, int BH, int S, int D, int j0, int bk)
+    private static void CopyTileIntoAxis1(T[] dst, ReadOnlySpan<T> tile, int BH, int S, int D, int j0, int bk)
     {
         for (int b = 0; b < BH; b++)
-            Array.Copy(tile, b * bk * D, dst, (b * S + j0) * D, bk * D);
+            tile.Slice(b * bk * D, bk * D).CopyTo(dst.AsSpan((b * S + j0) * D, bk * D));
     }
 
     /// <summary>
@@ -792,8 +796,8 @@ public static class FusedAttention<T>
         if (!P.IsContiguous) P = P.Contiguous();
         var shape = P._shape;
         int b = shape[0], h = shape[1], sq = shape[2], sk = shape[3];
-        var pData = P.GetDataArray();
-        var dpData = dP.GetDataArray();
+        var pData = P.AsSpan();
+        var dpData = dP.AsSpan();
         var dsData = new T[pData.Length];
         for (int i = 0; i < b; i++)
         {
