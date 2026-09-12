@@ -869,6 +869,26 @@ internal static class BackwardFunctions<T>
         var aT = TransposeLastTwoDims(inputs[0], engine);
         var gradBFallback = engine.TensorMatMul(aT, gradOutput);
 
+        // Reduce each gradient back to its operand's shape before accumulating.
+        //
+        // When one operand is rank-3 and the other rank-2 — e.g. a non-contiguous
+        // [1, S, K] narrow times a [K, N] weight — the batched matmul above emits a
+        // PER-BATCH [1, K, N] gradient for a [K, N] leaf. Non-contiguity is precisely what
+        // lands a caller here: TrySelectiveLinearBackward, the rank-3 fast path and the
+        // collapsed-2D path all require IsContiguous, so a Tensor.Slice narrow skips every
+        // one of them. AccumulateGrad then adds the unreduced gradient to any correctly
+        // shaped contribution to the same leaf and throws
+        // "Tensor shapes must match. Got [80, 80] and [1, 80, 80]".
+        //
+        // This sums away only the leading axes the target does not have — PyTorch's
+        // sum_to_size semantics for a shared parameter, matching what
+        // FusedLinearBackwardCore's equivalent fallback has done since #234. The gradient
+        // VALUES were already correct ([1, K, N] flattens to the same elements as [K, N]),
+        // so this is a pure rank reduction, not a numerical change. SumToShape early-returns
+        // when the shapes already match, so the common case costs one shape comparison.
+        gradAFallback = SumToShape(gradAFallback, inputs[0]._shape, engine);
+        gradBFallback = SumToShape(gradBFallback, inputs[1]._shape, engine);
+
         DifferentiableOps.AccumulateGrad(grads, inputs[0], gradAFallback, engine);
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradBFallback, engine);
     }
