@@ -24,6 +24,14 @@ namespace AiDotNet.Tensors.Helpers.Autotune;
 /// </summary>
 public static class HardwareFingerprint
 {
+    internal const int SmallCpuBucket = 0;
+    internal const int MidCpuBucket = 1;
+    internal const int LargeCpuBucket = 2;
+    internal const int VeryWideCpuBucket = 3;
+    internal const int SmallProcessorCountMaximum = 4;
+    internal const int MidProcessorCountMaximum = 16;
+    internal const int LargeProcessorCountMaximum = 64;
+
     // Lazy-computed, never changes during process lifetime.
     private static string? _cachedFingerprint;
     private static readonly object _lock = new();
@@ -99,7 +107,10 @@ public static class HardwareFingerprint
     /// </para>
     /// </summary>
     public static int BucketFor(int processorCount)
-        => processorCount <= 4 ? 0 : processorCount <= 16 ? 1 : processorCount <= 64 ? 2 : 3;
+        => processorCount <= SmallProcessorCountMaximum ? SmallCpuBucket
+         : processorCount <= MidProcessorCountMaximum ? MidCpuBucket
+         : processorCount <= LargeProcessorCountMaximum ? LargeCpuBucket
+         : VeryWideCpuBucket;
 
     private static string Compute()
     {

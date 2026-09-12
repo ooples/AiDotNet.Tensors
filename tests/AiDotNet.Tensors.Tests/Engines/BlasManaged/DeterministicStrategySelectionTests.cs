@@ -84,6 +84,40 @@ public sealed class DeterministicStrategySelectionTests : IDisposable
         { 384, 1024, 128, true },
     };
 
+    [Fact]
+    public void DisableAutotune_TransposedFloat_MatchesStreamingBits() => VerifyTransposeFallback<float>();
+
+    [Fact]
+    public void DisableAutotune_TransposedDouble_MatchesStreamingBits() => VerifyTransposeFallback<double>();
+
+    private static void VerifyTransposeFallback<T>() where T : unmanaged
+    {
+        var keyField = typeof(AiDotNet.Tensors.Helpers.Autotune.HardwareFingerprint).GetField(
+            "_cachedKeyBox", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("Hardware routing key field not found.");
+        object? priorKey = keyField.GetValue(null);
+        try
+        {
+            keyField.SetValue(null, new AiDotNet.Tensors.Helpers.Autotune.HardwareFingerprint.HwKey(
+                "avx2", "amd", AiDotNet.Tensors.Helpers.Autotune.HardwareFingerprint.VeryWideCpuBucket));
+            const int m = 48, n = 512, k = 128;
+            var random = new Random(812);
+            var a = new T[m * k];
+            var b = new T[n * k];
+            for (int i = 0; i < a.Length; i++) a[i] = (T)Convert.ChangeType(random.NextDouble() - 0.5, typeof(T));
+            for (int i = 0; i < b.Length; i++) b[i] = (T)Convert.ChangeType(random.NextDouble() - 0.5, typeof(T));
+            var expected = new T[m * n];
+            var actual = new T[m * n];
+            BlasManagedLib.Gemm<T>(a, k, false, b, k, true, expected, n, m, n, k,
+                new BlasOptions<T> { PackingMode = PackingMode.ForceStreaming });
+            BlasManagedLib.Gemm<T>(a, k, false, b, k, true, actual, n, m, n, k,
+                new BlasOptions<T> { PackingMode = PackingMode.DisableAutotune });
+            Assert.Equal(System.Runtime.InteropServices.MemoryMarshal.AsBytes(expected.AsSpan()).ToArray(),
+                System.Runtime.InteropServices.MemoryMarshal.AsBytes(actual.AsSpan()).ToArray());
+        }
+        finally { keyField.SetValue(null, priorKey); }
+    }
+
     [Theory]
     [MemberData(nameof(AffectedShapes))]
     public void DeterministicMode_PersistedStrategy_DoesNotChangeResultBits(int m, int n, int k, bool transB)

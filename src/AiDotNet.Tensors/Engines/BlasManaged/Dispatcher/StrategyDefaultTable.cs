@@ -70,7 +70,7 @@ internal static class StrategyDefaultTable
         //     is not this hardware. Thread-budget sweeps at 128/32/16 all favoured Streaming,
         //     but throttling a 128-core part is not the same machine as a real 16- or 32-core
         //     part (same L3, memory bandwidth and CCX topology), so bands 0-2 are untouched.
-        if (key.Simd == "avx2" && key.CpuBucket >= 3 && transB)
+        if (key.Simd == "avx2" && key.CpuBucket >= HardwareFingerprint.VeryWideCpuBucket && transB)
             return PackingMode.ForceStreaming;
 
         // #653: the MediumMWide bucket (m∈[128,256], wide-N, k≥256) is mis-routed to PackAOnly

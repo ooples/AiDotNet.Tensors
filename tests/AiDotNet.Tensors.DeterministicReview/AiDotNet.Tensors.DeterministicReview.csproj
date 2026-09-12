@@ -11,6 +11,7 @@
     <CopyLocalRuntimeTargetAssets>false</CopyLocalRuntimeTargetAssets>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="../AiDotNet.Tensors.Tests/Engines/BlasManaged/StrategyDefaultTableTests.cs" Link="StrategyDefaultTableTests.cs" />
     <ProjectReference Include="../../src/AiDotNet.Tensors/AiDotNet.Tensors.csproj" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
     <PackageReference Include="xunit" Version="2.9.3" />
