@@ -103,6 +103,12 @@ internal static class BackgroundAutotuner
     public static void Observe(int m, int n, int k, bool fp64, bool transA, bool transB)
     {
         if (!Enabled || !ShouldMeasureSize(m, n, k)) return;
+        // Deterministic mode never consults the learned cache (see the determinism gate in
+        // Dispatcher.SelectStrategy), so measuring for it would burn wall-clock producing an
+        // entry nothing reads. Gated HERE, in the dispatch-path entry point, rather than
+        // inside Measure() — so MeasureNowForTest and the offline pre-warm pipeline keep
+        // working regardless of the ambient mode.
+        if (BlasProvider.IsDeterministicMode) return;
         var id = new SightingTracker.ShapeId(m, n, k, fp64, transA, transB);
         if (!_tracker.RecordAndShouldMeasure(id)) return;
         EnsureStarted();

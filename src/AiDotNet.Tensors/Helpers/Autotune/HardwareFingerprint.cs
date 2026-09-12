@@ -24,6 +24,14 @@ namespace AiDotNet.Tensors.Helpers.Autotune;
 /// </summary>
 public static class HardwareFingerprint
 {
+    internal const int SmallCpuBucket = 0;
+    internal const int MidCpuBucket = 1;
+    internal const int LargeCpuBucket = 2;
+    internal const int VeryWideCpuBucket = 3;
+    internal const int SmallProcessorCountMaximum = 4;
+    internal const int MidProcessorCountMaximum = 16;
+    internal const int LargeProcessorCountMaximum = 64;
+
     // Lazy-computed, never changes during process lifetime.
     private static string? _cachedFingerprint;
     private static readonly object _lock = new();
@@ -87,11 +95,22 @@ public static class HardwareFingerprint
     }
 
     /// <summary>
-    /// Core-count band for routing: 0 = ≤4 (small), 1 = 5–16 (mid), 2 = &gt;16 (large).
-    /// Separates the amd-avx2-cpu16 vs amd-avx2-cpu32 collision (#375 G1).
+    /// Core-count band for routing: 0 = ≤4 (small), 1 = 5–16 (mid), 2 = 17–64 (large),
+    /// 3 = &gt;64 (very large).
+    /// <para>
+    /// Band 2 separates the amd-avx2-cpu16 vs amd-avx2-cpu32 collision (#375 G1). Band 3 was
+    /// split out of it because band 2 previously meant "everything above 16", lumping the
+    /// 32-thread Ryzen that <see cref="Engines.BlasManaged.StrategyDefaultTable"/>'s band-2
+    /// entries were calibrated on together with 128-thread parts whose measured optimum
+    /// differs. Splitting the band lets a very-wide machine carry its own routing instead of
+    /// overwriting a calibration taken on a much narrower one.
+    /// </para>
     /// </summary>
     public static int BucketFor(int processorCount)
-        => processorCount <= 4 ? 0 : processorCount <= 16 ? 1 : 2;
+        => processorCount <= SmallProcessorCountMaximum ? SmallCpuBucket
+         : processorCount <= MidProcessorCountMaximum ? MidCpuBucket
+         : processorCount <= LargeProcessorCountMaximum ? LargeCpuBucket
+         : VeryWideCpuBucket;
 
     private static string Compute()
     {
