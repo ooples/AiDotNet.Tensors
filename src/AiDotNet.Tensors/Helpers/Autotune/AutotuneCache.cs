@@ -256,7 +256,9 @@ public static class AutotuneCache
         // paths share a filesystem (they do, same directory), so concurrent
         // readers see either the old file or the new file — never a half-written
         // one.
-        string tmpPath = finalPath + ".tmp-" + Environment.CurrentManagedThreadId + "-" + Guid.NewGuid().ToString("N");
+        // Do not append to the already-long canonical winner filename: on .NET Framework a valid
+        // final path can otherwise become an unusable temporary path. Keep the unique temp on the same volume.
+        string tmpPath = Path.Combine(directory, ".autotune-" + Guid.NewGuid().ToString("N") + ".tmp");
         try
         {
             File.WriteAllText(tmpPath, json);
