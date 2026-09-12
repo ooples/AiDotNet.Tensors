@@ -47,9 +47,31 @@ internal static class StrategyDefaultTable
     /// Route a shape to a packing strategy via the seed table for the given hardware key.
     /// Falls back to a conservative default for unmapped keys; never throws.
     /// </summary>
-    internal static PackingMode Route(HardwareFingerprint.HwKey key, int m, int n, int k)
+    internal static PackingMode Route(
+        HardwareFingerprint.HwKey key, int m, int n, int k,
+        bool transA = false, bool transB = false)
     {
         var bucket = Bucket(m, n, k);
+
+        // Very-wide avx2 (>64T, band 3) + TRANSPOSED-B: Streaming.
+        //
+        // Measured on x64-amd-avx2-cpu128 (PR #1034), interleaved and rotated, median of 7 x
+        // min-of-N: Streaming won EVERY transposed shape in a 17-shape sweep spanning 786K to
+        // 1.07G work and all eight shape buckets, by 1.12x-3.22x over whichever packed strategy
+        // this table previously selected. Worst offenders were 128x768x768 (3.22x),
+        // 48x512x128 (3.09x), 96x1024x512 (2.66x) and 128^3 (2.68x).
+        //
+        // Scoped deliberately narrowly:
+        //   * transB only -- the sweep varied transB, and the UNTRANSPOSED optimum is different
+        //     and sometimes opposite (512x2048x512 untransposed wants PackBoth, with Streaming
+        //     ~3.0x slower). Untransposed shapes fall through to the band-2 routing below,
+        //     unchanged. transA-only shapes were not measured and are left alone.
+        //   * band 3 only -- band 2's entries were calibrated on a 32-thread Ryzen (#464) which
+        //     is not this hardware. Thread-budget sweeps at 128/32/16 all favoured Streaming,
+        //     but throttling a 128-core part is not the same machine as a real 16- or 32-core
+        //     part (same L3, memory bandwidth and CCX topology), so bands 0-2 are untouched.
+        if (key.Simd == "avx2" && key.CpuBucket >= 3 && transB)
+            return PackingMode.ForceStreaming;
 
         // #653: the MediumMWide bucket (m∈[128,256], wide-N, k≥256) is mis-routed to PackAOnly
         // for NON-transposed shapes (they reach this transposed-calibrated table via

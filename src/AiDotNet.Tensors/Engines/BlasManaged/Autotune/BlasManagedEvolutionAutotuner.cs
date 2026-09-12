@@ -96,7 +96,12 @@ public static class BlasManagedEvolutionAutotuner
             CpuParallelSettings.MaxDegreeOfParallelism));
         ParallelismAxis heuristicAxis = AxisSelector.Select(
             m, n, k, mr: 4, nr: 8, processorCount, deterministic);
-        PackingMode heuristicMode = StrategyDefaultTable.Route(HardwareFingerprint.Key, m, n, k);
+        // Transpose flags threaded through so the heuristic SEED matches the strategy
+        // production would actually route this shape to. Without them a transposed shape is
+        // seeded from the untransposed route, which on a >64T avx2 box is a strategy measured
+        // up to 3.2x slower -- the search would start from a config production never uses.
+        PackingMode heuristicMode = StrategyDefaultTable.Route(
+            HardwareFingerprint.Key, m, n, k, transA, transB);
         var seeds = new List<BlasManagedGemmConfiguration>();
         var seen = new HashSet<BlasManagedGemmConfiguration>();
         ShapeProfile shape = BlasManagedAutotune.EncodeShape<T>(

@@ -87,11 +87,19 @@ public static class HardwareFingerprint
     }
 
     /// <summary>
-    /// Core-count band for routing: 0 = ≤4 (small), 1 = 5–16 (mid), 2 = &gt;16 (large).
-    /// Separates the amd-avx2-cpu16 vs amd-avx2-cpu32 collision (#375 G1).
+    /// Core-count band for routing: 0 = ≤4 (small), 1 = 5–16 (mid), 2 = 17–64 (large),
+    /// 3 = &gt;64 (very large).
+    /// <para>
+    /// Band 2 separates the amd-avx2-cpu16 vs amd-avx2-cpu32 collision (#375 G1). Band 3 was
+    /// split out of it because band 2 previously meant "everything above 16", lumping the
+    /// 32-thread Ryzen that <see cref="Engines.BlasManaged.StrategyDefaultTable"/>'s band-2
+    /// entries were calibrated on together with 128-thread parts whose measured optimum
+    /// differs. Splitting the band lets a very-wide machine carry its own routing instead of
+    /// overwriting a calibration taken on a much narrower one.
+    /// </para>
     /// </summary>
     public static int BucketFor(int processorCount)
-        => processorCount <= 4 ? 0 : processorCount <= 16 ? 1 : 2;
+        => processorCount <= 4 ? 0 : processorCount <= 16 ? 1 : processorCount <= 64 ? 2 : 3;
 
     private static string Compute()
     {

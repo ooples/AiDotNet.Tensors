@@ -79,7 +79,7 @@ internal static class Dispatcher
         // cache does not violate in-process, whereas IsDeterministicMode is the across-RUNS
         // switch driven by SetDeterministicMode/AiModelBuilder whose contract it does violate.
         if (Helpers.BlasProvider.IsDeterministicMode)
-            return StrategyDefaultTable.Route(HardwareFingerprint.Key, m, n, k);
+            return StrategyDefaultTable.Route(HardwareFingerprint.Key, m, n, k, transA, transB);
 
         // #375 hybrid layer 1 (highest precedence): learned / shipped-prewarm entry for
         // THIS shape on THIS fingerprint. KernelVersion-gated inside TryLookupStrategy.
@@ -102,7 +102,10 @@ internal static class Dispatcher
         // for unmeasured shapes and encodes the measured per-hardware wins (e.g. cpu16
         // routes 512×512×64 / 128³ to Streaming, cpu32 to blocking). The learned cache
         // (Phase 2) and background autotuner (Phase 3) refine this per fingerprint.
-        return StrategyDefaultTable.Route(HardwareFingerprint.Key, m, n, k);
+        // Transpose flags are threaded through so the cold-start route matches the
+        // deterministic route above: the >64T avx2 transposed-B entry is measured, and a
+        // fast-mode cold start should not begin on a strategy we know is up to 3.2x slower.
+        return StrategyDefaultTable.Route(HardwareFingerprint.Key, m, n, k, transA, transB);
     }
 
     /// <summary>
