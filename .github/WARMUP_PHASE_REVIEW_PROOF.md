@@ -38,6 +38,7 @@ and 33 new phase/checkpoint controls. No skipped tests or widened tolerances.
 | Final source, net10 | 73 | 0 | 0 |
 | Final source, net8 | 73 | 0 | 0 |
 | Final source, net471 | 73 | 0 | 0 |
+| Independent final source replay, net10 | 73 | 0 | 0 |
 
 The 18 published-package failures are 12 numerical/validation controls plus six
 new legacy-eager wire-format controls that the older reader correctly rejects.
@@ -56,8 +57,9 @@ was changed.
 All final three-framework builds completed with zero errors and zero warnings.
 Net10 execution took 133 ms, net8 201 ms and net471 761 ms (test execution times,
 excluding discovery/startup). The first 67-case net10 snapshot was independently
-reviewed and replayed before the separate six-case legacy-eager addition; that
-earlier independent replay is not represented as a final 73-case replay.
+reviewed and replayed before the separate six-case legacy-eager addition. A
+second independent review covered the final two-file production diff and the
+six added cases; its exact-hash final net10 replay passed all 73 cases in 131 ms.
 
 TRX files retained locally:
 
@@ -66,6 +68,7 @@ TRX files retained locally:
 - `artifacts/warmup-legacy-after/results/warmup-final-net10.trx`
 - `artifacts/warmup-legacy-after/results/warmup-legacy-after-net8.trx`
 - `artifacts/warmup-legacy-after/results/warmup-legacy-after-net471.trx`
+- `artifacts/warmup-legacy-after/results/warmup-final-root-independent.trx`
 
 ## Reproduction
 
