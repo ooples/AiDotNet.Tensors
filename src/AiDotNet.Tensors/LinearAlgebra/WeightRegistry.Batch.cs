@@ -101,7 +101,9 @@ public static partial class WeightRegistry
         for (int i = 0; i < weights.Count; i++)
         {
             Tensor<T> weight = weights[i] ?? throw new ArgumentException("A weight cannot be null.", nameof(weights));
-            if (!seen.Add(weight) || weight.Length == 0) continue;
+            // Empty streaming tensors still own a registered (empty) payload. Only GPU
+            // offload skips them, since a zero-byte device allocation has no backing.
+            if (!seen.Add(weight) || (weight.Length == 0 && lifetime == WeightLifetime.GpuOffload)) continue;
             bool registered = weight.StreamingPoolHandle >= 0 || weight.OffloadRegistryHandle >= 0
                 || weight.OffloadHostPointer != IntPtr.Zero;
             if (registered)
