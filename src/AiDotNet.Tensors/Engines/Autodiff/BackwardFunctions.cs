@@ -3088,14 +3088,16 @@ internal static class BackwardFunctions<T>
         var numOps = MathHelper.GetNumericOperations<T>();
         int[] argmax = (int[])savedState[0];
         var inputGrad = TensorPool<T>.RentZeroed(inputs[0]._shape);
-        var gradData = gradOutput.GetDataArray();
-        var resultData = inputGrad.GetDataArray();
+        if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
+        ReadOnlySpan<T> gradData = gradOutput.AsSpan();
+        Span<T> resultData = inputGrad.AsWritableSpan();
         for (int i = 0; i < argmax.Length; i++)
         {
             int idx = argmax[i];
             if (idx >= 0 && idx < resultData.Length)
                 resultData[idx] = numOps.Add(resultData[idx], gradData[i]);
         }
+        inputGrad.IncrementVersion();
         DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGrad, engine);
     }
 

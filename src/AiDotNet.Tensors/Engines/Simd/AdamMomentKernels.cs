@@ -200,6 +200,69 @@ internal static class AdamMomentKernels
         }
     }
 
+    /// <summary>
+    /// FP32 Adam over a sorted unique sparse gradient. Only indexed coordinates are touched, matching
+    /// the native CUDA/HIP/OpenCL/Metal/Vulkan/WebGPU sparse-optimizer contract.
+    /// </summary>
+    internal static void AdamStepSparse(
+        Span<float> param, ReadOnlySpan<int> indices, ReadOnlySpan<float> values,
+        Span<float> m, Span<float> v,
+        float beta1, float beta2, float oneMinusBeta1, float oneMinusBeta2,
+        float bc1, float bc2, float lr, float eps)
+    {
+        AdamStepSparse(
+            param, indices, values, m, v, Span<float>.Empty,
+            beta1, beta2, oneMinusBeta1, oneMinusBeta2,
+            bc1, bc2, lr, eps, useAmsgrad: false);
+    }
+
+    /// <summary>
+    /// FP32 Adam/AMSGrad over a sorted unique sparse gradient. AMSGrad stores the raw running
+    /// second-moment maximum and applies bias correction in the denominator, matching every GPU
+    /// sparse backend.
+    /// </summary>
+    internal static void AdamStepSparse(
+        Span<float> param, ReadOnlySpan<int> indices, ReadOnlySpan<float> values,
+        Span<float> m, Span<float> v, Span<float> vMax,
+        float beta1, float beta2, float oneMinusBeta1, float oneMinusBeta2,
+        float bc1, float bc2, float lr, float eps, bool useAmsgrad)
+    {
+        ValidateSparseArguments(param.Length, indices, values.Length, m.Length, v.Length, vMax.Length, useAmsgrad);
+        for (int sparsePosition = 0; sparsePosition < indices.Length; sparsePosition++)
+        {
+            int i = indices[sparsePosition];
+            float g = values[sparsePosition];
+            float mNew;
+            float vNew;
+            if (FastMath)
+            {
+                mNew = FmaTail(oneMinusBeta1, g, beta1 * m[i]);
+                vNew = FmaTail(oneMinusBeta2 * g, g, beta2 * v[i]);
+            }
+            else
+            {
+                mNew = beta1 * m[i] + oneMinusBeta1 * g;
+                vNew = beta2 * v[i] + oneMinusBeta2 * g * g;
+            }
+            m[i] = mNew;
+            v[i] = vNew;
+            float mHat = mNew / bc1;
+            float vHatEff;
+            if (useAmsgrad)
+            {
+                float previous = vMax[i];
+                float maximum = vNew > previous ? vNew : previous;
+                vMax[i] = maximum;
+                vHatEff = maximum / bc2;
+            }
+            else
+            {
+                vHatEff = vNew / bc2;
+            }
+            param[i] -= lr * mHat / (SqrtF(vHatEff) + eps);
+        }
+    }
+
     /// <summary>fp64 Adam/AMSGrad step, in place over <paramref name="param"/>/<paramref name="m"/>/<paramref name="v"/> (and <paramref name="vMax"/> when <paramref name="useAmsgrad"/>).</summary>
     internal static unsafe void AdamStep(
         Span<double> param, ReadOnlySpan<double> grad, Span<double> m, Span<double> v, Span<double> vMax,
@@ -293,6 +356,89 @@ internal static class AdamMomentKernels
                 }
                 pParam[i] -= lr * mHat / (Math.Sqrt(vHatEff) + eps);
             }
+        }
+    }
+
+    /// <summary>FP64 counterpart to the sparse FP32 Adam kernel.</summary>
+    internal static void AdamStepSparse(
+        Span<double> param, ReadOnlySpan<int> indices, ReadOnlySpan<double> values,
+        Span<double> m, Span<double> v,
+        double beta1, double beta2, double oneMinusBeta1, double oneMinusBeta2,
+        double bc1, double bc2, double lr, double eps)
+    {
+        AdamStepSparse(
+            param, indices, values, m, v, Span<double>.Empty,
+            beta1, beta2, oneMinusBeta1, oneMinusBeta2,
+            bc1, bc2, lr, eps, useAmsgrad: false);
+    }
+
+    /// <summary>FP64 counterpart to the sparse FP32 Adam/AMSGrad kernel.</summary>
+    internal static void AdamStepSparse(
+        Span<double> param, ReadOnlySpan<int> indices, ReadOnlySpan<double> values,
+        Span<double> m, Span<double> v, Span<double> vMax,
+        double beta1, double beta2, double oneMinusBeta1, double oneMinusBeta2,
+        double bc1, double bc2, double lr, double eps, bool useAmsgrad)
+    {
+        ValidateSparseArguments(param.Length, indices, values.Length, m.Length, v.Length, vMax.Length, useAmsgrad);
+        for (int sparsePosition = 0; sparsePosition < indices.Length; sparsePosition++)
+        {
+            int i = indices[sparsePosition];
+            double g = values[sparsePosition];
+            double mNew;
+            double vNew;
+            if (FastMath)
+            {
+                mNew = FmaTail(oneMinusBeta1, g, beta1 * m[i]);
+                vNew = FmaTail(oneMinusBeta2 * g, g, beta2 * v[i]);
+            }
+            else
+            {
+                mNew = beta1 * m[i] + oneMinusBeta1 * g;
+                vNew = beta2 * v[i] + oneMinusBeta2 * g * g;
+            }
+            m[i] = mNew;
+            v[i] = vNew;
+            double mHat = mNew / bc1;
+            double vHatEff;
+            if (useAmsgrad)
+            {
+                double previous = vMax[i];
+                double maximum = vNew > previous ? vNew : previous;
+                vMax[i] = maximum;
+                vHatEff = maximum / bc2;
+            }
+            else
+            {
+                vHatEff = vNew / bc2;
+            }
+            param[i] -= lr * mHat / (Math.Sqrt(vHatEff) + eps);
+        }
+    }
+
+    private static void ValidateSparseArguments(
+        int parameterLength,
+        ReadOnlySpan<int> indices,
+        int valueCount,
+        int firstMomentLength,
+        int secondMomentLength,
+        int maximumMomentLength,
+        bool useAmsgrad)
+    {
+        if (indices.Length != valueCount)
+            throw new ArgumentException("Sparse Adam indices and values must have the same length.");
+        if (firstMomentLength != parameterLength || secondMomentLength != parameterLength)
+            throw new ArgumentException("Sparse Adam moments must match the parameter length.");
+        if (useAmsgrad && maximumMomentLength != parameterLength)
+            throw new ArgumentException("Sparse AMSGrad maximum moments must match the parameter length.");
+        int previous = -1;
+        for (int i = 0; i < indices.Length; i++)
+        {
+            int index = indices[i];
+            if (index <= previous || index < 0 || index >= parameterLength)
+                throw new ArgumentException(
+                    "Sparse Adam indices must be sorted, unique, and inside the parameter extent.",
+                    nameof(indices));
+            previous = index;
         }
     }
 }

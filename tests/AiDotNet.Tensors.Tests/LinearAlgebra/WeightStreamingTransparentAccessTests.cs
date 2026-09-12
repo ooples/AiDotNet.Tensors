@@ -3,6 +3,7 @@
 using System;
 using System.IO;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -68,6 +69,23 @@ public class WeightStreamingTransparentAccessTests : IDisposable
 
         // Side effect: the tensor is now resident again.
         Assert.Equal(expected.Length, t.DataVector.Length);
+    }
+
+    [Fact]
+    public void ParameterBufferCopyFrom_OnDroppedStreamingWeight_UsesLogicalTensorCopy()
+    {
+        float[] expected = { 1.5f, -2.25f, 3.125f, 4.0f, 5.5f, -6.75f };
+        var parameter = new Tensor<float>(expected, new[] { 2, 3 })
+        {
+            Lifetime = WeightLifetime.Streaming,
+        };
+        WeightRegistry.RegisterWeight(parameter);
+        Assert.Equal(0, parameter.DataVector.Length);
+
+        var buffer = new ParameterBuffer<float>(new[] { new[] { 2, 3 } });
+        buffer.CopyFrom(new[] { parameter });
+
+        Assert.Equal(expected, buffer.AsVector().ToArray());
     }
 
     [Fact]

@@ -9,6 +9,22 @@ namespace AiDotNet.Tensors.Tests.Engines.Gpu;
 
 public sealed class GpuPrecisionPolicyTests
 {
+    [Theory]
+    [InlineData(GpuPrecisionOperation.MatMul)]
+    [InlineData(GpuPrecisionOperation.MatMulTransposed)]
+    [InlineData(GpuPrecisionOperation.BatchMatMul)]
+    public void CpuFallback_PreservesTheRequestedOperation(GpuPrecisionOperation operation)
+    {
+        var backend = CreateBackend(Fp32());
+        GpuComputePlan plan = GpuPrecisionPlanner.CpuFallback<float>(backend,
+            nameof(CpuFallback_PreservesTheRequestedOperation), GpuComputePreference.Float16,
+            "Injected GPU failure", operation);
+        Assert.Equal(operation, plan.OperationKind);
+        Assert.Equal(GpuExecutionRoute.Cpu, plan.Route);
+        Assert.Equal(GpuComputePreference.Float16, plan.RequestedPreference);
+        Assert.Equal("Injected GPU failure", plan.FallbackReason);
+    }
+
     [Fact]
     public void CublasDefaultAlgorithmMatchesTheNativeHeaderValue()
         => Assert.Equal(-1, CuBlasNative.CUBLAS_GEMM_DEFAULT);

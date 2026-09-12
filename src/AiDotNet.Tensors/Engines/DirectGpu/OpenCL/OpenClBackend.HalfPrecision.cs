@@ -41,13 +41,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public void Hgemm(IGpuBuffer aFp16, IGpuBuffer bFp16, IGpuBuffer cFp16,
             int m, int n, int k)
             => DispatchHalfGemm(HalfPrecisionGemmKernels.Fp16In16fOutKernelName,
-                aFp16, bFp16, cFp16, m, n, k);
+                aFp16, bFp16, cFp16, m, n, k, GpuScalarType.Float16);
 
         /// <inheritdoc/>
         public void GemmFp16In32fOut(IGpuBuffer aFp16, IGpuBuffer bFp16, IGpuBuffer cFp32,
             int m, int n, int k)
             => DispatchHalfGemm(HalfPrecisionGemmKernels.Fp16In32fOutKernelName,
-                aFp16, bFp16, cFp32, m, n, k);
+                aFp16, bFp16, cFp32, m, n, k, GpuScalarType.Float32);
 
         /// <inheritdoc/>
         /// <remarks>
@@ -122,7 +122,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         }
 
         private void DispatchHalfGemm(string kernelName, IGpuBuffer a, IGpuBuffer b, IGpuBuffer c,
-            int m, int n, int k)
+            int m, int n, int k, GpuScalarType outputType)
         {
             if (a is null) throw new ArgumentNullException(nameof(a));
             if (b is null) throw new ArgumentNullException(nameof(b));
@@ -139,10 +139,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
             const int ts = HalfPrecisionGemmKernels.TileSize;
 
+            IntPtr aHandle = GetPrecisionBufferHandle(a, (long)m * k * sizeof(ushort));
+            IntPtr bHandle = GetPrecisionBufferHandle(b, (long)k * n * sizeof(ushort));
+            IntPtr cHandle = GetPrecisionBufferHandle(c, (long)m * n * (outputType == GpuScalarType.Float16 ? sizeof(ushort) : sizeof(float)));
             uint arg = 0;
-            kernel.SetArg(arg++, ((DirectOpenClGpuBuffer)a).Buffer.Handle);
-            kernel.SetArg(arg++, ((DirectOpenClGpuBuffer)b).Buffer.Handle);
-            kernel.SetArg(arg++, ((DirectOpenClGpuBuffer)c).Buffer.Handle);
+            kernel.SetArg(arg++, aHandle);
+            kernel.SetArg(arg++, bHandle);
+            kernel.SetArg(arg++, cHandle);
             kernel.SetArg(arg++, m);
             kernel.SetArg(arg++, n);
             kernel.SetArg(arg++, k);
@@ -170,10 +173,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
             const int ts = HalfPrecisionGemmKernels.TileSize;
 
+            IntPtr aHandle = GetPrecisionBufferHandle(a, (long)mo * kc * sizeof(ushort));
+            IntPtr bHandle = GetPrecisionBufferHandle(b, (long)kc * no * sizeof(ushort));
+            IntPtr cHandle = GetPrecisionBufferHandle(c, (long)mo * no * (gradOutHalf ? sizeof(ushort) : sizeof(float)));
             uint arg = 0;
-            kernel.SetArg(arg++, ((DirectOpenClGpuBuffer)a).Buffer.Handle);
-            kernel.SetArg(arg++, ((DirectOpenClGpuBuffer)b).Buffer.Handle);
-            kernel.SetArg(arg++, ((DirectOpenClGpuBuffer)c).Buffer.Handle);
+            kernel.SetArg(arg++, aHandle);
+            kernel.SetArg(arg++, bHandle);
+            kernel.SetArg(arg++, cHandle);
             kernel.SetArg(arg++, mo);
             kernel.SetArg(arg++, no);
             kernel.SetArg(arg++, kc);
@@ -225,9 +231,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         if (elems > int.MaxValue)
             throw new NotSupportedException($"FP16 im2col work size {elems} exceeds the 1-D dispatch limit.");
 
+        IntPtr inputHandle = GetPrecisionBufferHandle(input, checked((long)batch * channels * height * width * sizeof(float)));
+        IntPtr outputHandle = GetPrecisionBufferHandle(outputHalf, elems * sizeof(ushort));
         uint arg = 0;
-        kernel.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
-        kernel.SetArg(arg++, ((DirectOpenClGpuBuffer)outputHalf).Buffer.Handle);
+        kernel.SetArg(arg++, inputHandle);
+        kernel.SetArg(arg++, outputHandle);
         kernel.SetArg(arg++, batch);
         kernel.SetArg(arg++, channels);
         kernel.SetArg(arg++, height);

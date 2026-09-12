@@ -122,6 +122,12 @@ internal sealed class ActivationCacheEntry : IDisposable
     // (half the bytes). A consumer/backward read re-inflates it to FP32 via TryUpcastActivationFp32.
     public bool IsFp16 { get; }
     public int ElementCount { get; }
+    private int _hostVersion;
+    public int HostVersion
+    {
+        get => Volatile.Read(ref _hostVersion);
+        set => Volatile.Write(ref _hostVersion, value);
+    }
 
     // 5-arg overload preserved for reflection-based callers (test helpers like
     // EvictActivationsCreatedAfterLifetimeTests.GetActivationCacheEntryCtor
@@ -131,12 +137,18 @@ internal sealed class ActivationCacheEntry : IDisposable
     // moment the FP16 storage params are added to the canonical ctor.
     public ActivationCacheEntry(IGpuBuffer buffer, int[] shape, long timestamp, IDirectGpuBackend backend,
         long managedBytes)
-        : this(buffer, shape, timestamp, backend, managedBytes, isFp16: false, elementCount: 0)
+        : this(buffer, shape, timestamp, backend, managedBytes, isFp16: false, elementCount: 0, hostVersion: 0)
     {
     }
 
     public ActivationCacheEntry(IGpuBuffer buffer, int[] shape, long timestamp, IDirectGpuBackend backend,
         long managedBytes, bool isFp16, int elementCount)
+        : this(buffer, shape, timestamp, backend, managedBytes, isFp16, elementCount, hostVersion: 0)
+    {
+    }
+
+    public ActivationCacheEntry(IGpuBuffer buffer, int[] shape, long timestamp, IDirectGpuBackend backend,
+        long managedBytes, bool isFp16, int elementCount, int hostVersion)
     {
         Buffer = buffer;
         Shape = shape;
@@ -146,6 +158,7 @@ internal sealed class ActivationCacheEntry : IDisposable
         ThreadId = System.Environment.CurrentManagedThreadId;
         IsFp16 = isFp16;
         ElementCount = elementCount;
+        HostVersion = hostVersion;
     }
 
     public void Dispose()
@@ -259,13 +272,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // Version tracking for invalidation
     private readonly ConcurrentDictionary<object, int> _tensorVersions = new();
 
-    // Host-tensor Version stamped onto each PERSISTENT weight/bias buffer at the moment it was uploaded.
+    // Shared-storage GpuCacheVersion stamped onto each PERSISTENT weight/bias buffer when uploaded.
     // The persistent cache is keyed by the host backing array, but a weight is commonly registered at
     // construction (with random INIT values) and then loaded IN PLACE by SetParameters — which bumps the
-    // tensor Version but shares the same backing array, so the cache key does not change. Without a version
+    // storage GpuCacheVersion but shares the same backing array, so the cache key does not change. Without a version
     // gate the reader would keep serving the stale random buffer (a real GGUF decoder loaded under the GPU
     // engine produced pure garbage this way). GetWeightBufferPreferResident compares the tensor's current
-    // Version to this stamp and re-uploads on a mismatch, mirroring the resident _gpuBuffer version gate so
+    // GpuCacheVersion to this stamp and re-uploads on a mismatch, mirroring the resident _gpuBuffer version gate so
     // an explicit InvalidatePersistentTensor is no longer required for correctness.
     private readonly ConcurrentDictionary<object, int> _persistentWeightHostVersion = new();
 
@@ -530,7 +543,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var data = t.GetDataArray();
         if (buf.Size < data.Length) return;
         cb.UploadBufferInPlace((float[])(object)data, buf);
-        t._gpuBufferVersion = t.Version;
+        t._gpuBufferVersion = t.GpuCacheVersion;
     }
 
     /// <summary>Binds <paramref name="t"/> to a STABLE resident GPU buffer (uploading its current host data),
@@ -547,7 +560,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             && existing.Handle != System.IntPtr.Zero && existing.Size >= data.Length)
         {
             cb.UploadBufferInPlace((float[])(object)data, existing);
-            t._gpuBufferVersion = t.Version;
+            t._gpuBufferVersion = t.GpuCacheVersion;
             return;
         }
         // Release the previous allocation before overwriting it. The reuse branch above already returned for a
@@ -558,7 +571,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var buf = cb.AllocateBuffer((float[])(object)data); // sync upload — OK in the non-capturing pre-pass
         t._gpuBuffer = buf;
         t._gpuBackend = cb;
-        t._gpuBufferVersion = t.Version;
+        t._gpuBufferVersion = t.GpuCacheVersion;
     }
 
     /// <summary>Downloads <paramref name="t"/>'s resident GPU buffer (which a replayed graph just wrote) into a
@@ -678,7 +691,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// registers a downconvert (FP16→FP32) host materializer so CPU reads stay correct.</summary>
     internal void BindResidentBufferFp16<T>(Tensor<T> t, IGpuBuffer buf, IDirectGpuBackend backend, int elementCount)
     {
-        t._gpuBuffer = buf; t._gpuBackend = backend; t._gpuBufferVersion = t.Version;
+        t._gpuBuffer = buf; t._gpuBackend = backend; t._gpuBufferVersion = t.GpuCacheVersion;
         var arr = t.GetBackingArrayForCacheLookupUnsafe();
         if (arr is null) return;
         _fp16ResidentArrays[arr] = elementCount;
@@ -710,6 +723,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var arr = t.GetBackingArrayForCacheLookupUnsafe();
         if (arr is null || !_fp16ResidentArrays.TryGetValue(arr, out count)) return null;
         if (t._gpuBuffer is null || t._gpuBuffer.Handle == System.IntPtr.Zero) return null;
+        if (!ResidentStepActive && t._gpuBufferVersion != t.GpuCacheVersion)
+        {
+            _fp16ResidentArrays.TryRemove(arr, out _);
+            count = 0;
+            return null;
+        }
         return t._gpuBuffer;
     }
 
@@ -761,7 +780,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             else { using var bbuf = GetResidentOrPersistentInputBuffer(cb, b); bHalf = Fp32InputToFp16Stable(cb, bbuf.Buffer, len, aArr); }
             cb.Fp16Add(aHalf, bHalf, aHalf, len);
             ResidentSyncCheck("AddInPlace");
-            a._gpuBufferVersion = a.Version; // a stays FP16-resident + tagged
+            a._gpuBufferVersion = a.GpuCacheVersion; // a stays FP16-resident + tagged
             return true;
         }
         catch (Exception ex) { AliasDiag($"Fp16AddInPlace FELLBACK: {ex.GetType().Name}: {ex.Message}"); return false; }
@@ -789,7 +808,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             else { using var bbuf = GetResidentOrPersistentInputBuffer(cb, b); biasHalf = Fp32InputToFp16Stable(cb, bbuf.Buffer, b.Length, aArr); }
             cb.Fp16BroadcastAddChannel(aHalf, biasHalf, n, c, hw);
             ResidentSyncCheck("BroadcastAddInPlace");
-            a._gpuBufferVersion = a.Version;
+            a._gpuBufferVersion = a.GpuCacheVersion;
             return true;
         }
         catch (Exception ex) { AliasDiag($"Fp16BroadcastAddInPlace FELLBACK: {ex.GetType().Name}: {ex.Message}"); return false; }
@@ -1469,6 +1488,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (!tensor.IsContiguous || tensor._storageOffset != 0)
             tensor = (Tensor<T>)tensor.Contiguous();
 
+        int hostVersion = tensor.GpuCacheVersion;
+
         // Fast path: tensor already has a GPU buffer from a previous GPU operation
         // AND nothing has mutated the tensor's CPU data since that upload (Version
         // bumps on IncrementVersion). If Version mismatched, the cached buffer
@@ -1481,7 +1502,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // mismatch (the path below) would orphan a deferred materializer registered by BindResidentBuffer →
             // a later host read fires it on a recycled buffer = #226 "buffer released before materialization".
             if (tensor._gpuBuffer.Handle != IntPtr.Zero
-                && (ResidentStepActive || (tensor._gpuBufferVersion == tensor.Version && IsCachedGpuBufferLive(tensor, backend))))
+                && (ResidentStepActive || (tensor._gpuBufferVersion == hostVersion && IsCachedGpuBufferLive(tensor, backend))))
                 return new OwnedBuffer(tensor._gpuBuffer, ownsBuffer: false);
 
             // Stale snapshot — also clear any matching activation-cache entry so
@@ -1509,38 +1530,50 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var backingArray = tensor.GetBackingArrayForCacheLookupUnsafe();
         if (backingArray is not null)
         {
-            // Check caches using the raw array reference (no download triggered)
-            var cached = TryGetCachedBuffer(backingArray);
-            if (cached != null)
-                return new OwnedBuffer(cached, ownsBuffer: false);
+            // Persistent tensors use the same host-version gate as the dedicated weight path.
+            // A raw array-key lookup is insufficient because journal restore and host mutation
+            // retain the array identity while advancing the storage's GPU-cache epoch.
+            if (_persistentBufferCache.TryGetValue(backingArray, out var persistentEntry))
+                return GetOrCacheWeightBuffer(backend, backingArray, persistentEntry.Role, hostVersion);
 
+            bool staleActivation = false;
             lock (_activationCacheLock)
             {
-                if (_activationCache.TryGetValue(backingArray, out var activationEntry) &&
-                    ReferenceEquals(activationEntry.Backend, backend))
+                if (_activationCache.TryGetValue(backingArray, out var activationEntry))
                 {
-                    return new OwnedBuffer(activationEntry.Buffer, ownsBuffer: false);
+                    if (ReferenceEquals(activationEntry.Backend, backend)
+                        && activationEntry.HostVersion == hostVersion)
+                        return new OwnedBuffer(activationEntry.Buffer, ownsBuffer: false);
+                    staleActivation = true;
                 }
             }
+            if (staleActivation)
+                InvalidateActivationCacheEntry(backingArray);
         }
         else
         {
             // GPU-resident tensor with no backing array — check activation cache by vector key
             var vector = tensor.DataVector;
+            bool staleActivation = false;
             lock (_activationCacheLock)
             {
-                if (_activationCache.TryGetValue(vector, out var activationEntry) &&
-                    ReferenceEquals(activationEntry.Backend, backend))
+                if (_activationCache.TryGetValue(vector, out var activationEntry))
                 {
-                    return new OwnedBuffer(activationEntry.Buffer, ownsBuffer: false);
+                    if (ReferenceEquals(activationEntry.Backend, backend)
+                        && activationEntry.HostVersion == hostVersion)
+                        return new OwnedBuffer(activationEntry.Buffer, ownsBuffer: false);
+                    staleActivation = true;
                 }
             }
+            if (staleActivation)
+                InvalidateActivationCacheEntry(vector);
         }
 
         // Not in any cache — materialize the CPU value for upload through the read-only
         // tensor accessor. GetDataArray() is a writable escape and therefore detaches a
         // copy-on-write clone even though an upload only reads the operand.
-        return GetOrAllocateBuffer(backend, tensor.GetReadOnlyDataArray());
+        float[] floatData = DirectGpuEngine.ToFloatArray(tensor.GetReadOnlyDataArray());
+        return new OwnedBuffer(backend.AllocateBuffer(floatData), ownsBuffer: true);
     }
 
     /// <summary>
@@ -1781,6 +1814,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     private OwnedBuffer UploadTensor<T>(IDirectGpuBackend backend, Tensor<T> tensor)
     {
+        int hostVersion = tensor.GpuCacheVersion;
         // Fast path: tensor has a GPU buffer from a previous GPU operation, and
         // the tensor's CPU-side Version hasn't advanced since the upload. Stale-
         // version case is handled by GetOrAllocateBuffer(Tensor<T>) above —
@@ -1789,12 +1823,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (tensor._gpuBuffer is not null && ReferenceEquals(tensor._gpuBackend, backend))
         {
             if (tensor._gpuBuffer.Handle != IntPtr.Zero
-                && (ResidentStepActive || (tensor._gpuBufferVersion == tensor.Version && IsCachedGpuBufferLive(tensor, backend))))
+                && (ResidentStepActive || (tensor._gpuBufferVersion == hostVersion && IsCachedGpuBufferLive(tensor, backend))))
                 return new OwnedBuffer(tensor._gpuBuffer, ownsBuffer: false);   // compiled step: buffers pinned, don't orphan aliases
 
             var staleArray = tensor.GetBackingArrayForCacheLookupUnsafe();
             if (staleArray is not null)
                 InvalidateActivationCacheEntry(staleArray);
+            InvalidateActivationCacheEntry(tensor.DataVector);
             tensor._gpuBuffer = null;
             tensor._gpuBackend = null;
             tensor._gpuBufferVersion = -1;
@@ -1804,19 +1839,25 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var backingArray = tensor.GetBackingArrayForCacheLookupUnsafe();
         if (backingArray is not null)
         {
-            var cached = TryGetCachedBuffer(backingArray);
-            if (cached != null) return new OwnedBuffer(cached, ownsBuffer: false);
+            if (_persistentBufferCache.TryGetValue(backingArray, out var persistentEntry))
+                return GetOrCacheWeightBuffer(backend, backingArray, persistentEntry.Role, hostVersion);
 
             bool upcastNeeded2 = false;
+            bool staleActivation = false;
             lock (_activationCacheLock)
             {
-                if (_activationCache.TryGetValue(backingArray, out var entry) &&
-                    ReferenceEquals(entry.Backend, backend))
+                if (_activationCache.TryGetValue(backingArray, out var entry))
                 {
-                    if (entry.IsFp16) upcastNeeded2 = true;  // #558: re-inflate before returning
-                    else return new OwnedBuffer(entry.Buffer, ownsBuffer: false);
+                    if (!ReferenceEquals(entry.Backend, backend) || entry.HostVersion != hostVersion)
+                        staleActivation = true;
+                    else if (entry.IsFp16)
+                        upcastNeeded2 = true;  // #558: re-inflate before returning
+                    else
+                        return new OwnedBuffer(entry.Buffer, ownsBuffer: false);
                 }
             }
+            if (staleActivation)
+                InvalidateActivationCacheEntry(backingArray);
             if (upcastNeeded2)
             {
                 if (s_fp16FwdStore && TryTransientUpcastFp16(backingArray, backend, out var transient))
@@ -1825,7 +1866,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 lock (_activationCacheLock)
                 {
                     if (_activationCache.TryGetValue(backingArray, out var e2) &&
-                        ReferenceEquals(e2.Backend, backend) && !e2.IsFp16)
+                        ReferenceEquals(e2.Backend, backend) && !e2.IsFp16 && e2.HostVersion == hostVersion)
                         return new OwnedBuffer(e2.Buffer, ownsBuffer: false);
                 }
             }
@@ -1853,15 +1894,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // Also set the tensor's _gpuBuffer so future operations find it directly.
             tensor._gpuBuffer = owned.Buffer;
             tensor._gpuBackend = backend;
-            tensor._gpuBufferVersion = tensor.Version;
+            tensor._gpuBufferVersion = tensor.GpuCacheVersion;
             var backingArray = tensor.GetBackingArrayForCacheLookupUnsafe();
             if (backingArray is not null)
             {
-                CacheActivation(backingArray, owned.Buffer, tensor.Shape.ToArray(), backend);
+                CacheActivation(backingArray, owned.Buffer, tensor.Shape.ToArray(), backend, hostVersion: tensor.GpuCacheVersion);
             }
             else
             {
-                CacheActivation(tensor.DataVector, owned.Buffer, tensor.Shape.ToArray(), backend);
+                CacheActivation(tensor.DataVector, owned.Buffer, tensor.Shape.ToArray(), backend, hostVersion: tensor.GpuCacheVersion);
             }
         }
         return owned.Buffer;
@@ -1936,11 +1977,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// The result data array serves as the cache key.
     /// Thread-safe: uses lock to coordinate with cache lookups.
     /// </summary>
-    private void CacheActivation<T>(T[] resultData, IGpuBuffer buffer, int[] shape, IDirectGpuBackend backend)
-        => CacheActivation((object)resultData, buffer, shape, backend);
+    private void CacheActivation<T>(T[] resultData, IGpuBuffer buffer, int[] shape, IDirectGpuBackend backend,
+        int hostVersion = 0)
+        => CacheActivation((object)resultData, buffer, shape, backend, hostVersion: hostVersion);
 
     private void CacheActivation(object cacheKey, IGpuBuffer buffer, int[] shape, IDirectGpuBackend backend,
-        bool isFp16 = false, int elementCount = 0)
+        bool isFp16 = false, int elementCount = 0, int hostVersion = 0)
     {
         // Approximate managed-heap footprint of the key array this entry pins
         // (product(shape) * 4 bytes; activation backing arrays are float[]). Bounds
@@ -1994,8 +2036,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
             var timestamp = System.Threading.Interlocked.Increment(ref _activationCacheTimestamp);
             var entry = isFp16
-                ? new ActivationCacheEntry(buffer, shape, timestamp, backend, managedBytes: managedBytes, isFp16: true, elementCount: elementCount)
-                : new ActivationCacheEntry(buffer, shape, timestamp, backend, managedBytes);
+                ? new ActivationCacheEntry(buffer, shape, timestamp, backend, managedBytes: managedBytes, isFp16: true, elementCount: elementCount, hostVersion: hostVersion)
+                : new ActivationCacheEntry(buffer, shape, timestamp, backend, managedBytes, isFp16: false, elementCount: 0, hostVersion: hostVersion);
             bool added = false;
             try
             {
@@ -2092,7 +2134,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // is unchanged by the FP16 swap, so the managed-heap retention it pins is too.
             // Dropping it would make RemoveActivationCacheEntry decrement 0 against the
             // insert-time add and drift _currentActivationManagedBytes upward.
-            _activationCache[key] = new ActivationCacheEntry(fp16, e.Shape, e.Timestamp, e.Backend, managedBytes: e.ManagedBytes, isFp16: true, elementCount: elementCount);
+            _activationCache[key] = new ActivationCacheEntry(fp16, e.Shape, e.Timestamp, e.Backend, managedBytes: e.ManagedBytes, isFp16: true, elementCount: elementCount, hostVersion: e.HostVersion);
             System.Threading.Interlocked.Add(ref _currentActivationCacheBytes, fp16.SizeInBytes - e.Buffer.SizeInBytes);
             old = e;
         }
@@ -2147,7 +2189,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
             catch { return false; }
             // Same ManagedBytes carry-through as the FP16 compress swap above.
-            _activationCache[key] = new ActivationCacheEntry(fp32, e.Shape, e.Timestamp, e.Backend, managedBytes: e.ManagedBytes, isFp16: false, elementCount: e.ElementCount);
+            _activationCache[key] = new ActivationCacheEntry(fp32, e.Shape, e.Timestamp, e.Backend, managedBytes: e.ManagedBytes, isFp16: false, elementCount: e.ElementCount, hostVersion: e.HostVersion);
             System.Threading.Interlocked.Add(ref _currentActivationCacheBytes, fp32.SizeInBytes - e.Buffer.SizeInBytes);
             old = e;
         }
@@ -2211,7 +2253,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return true;
     }
 
-    private bool TryReplacePersistentBuffer<T>(T[] data, IGpuBuffer buffer)
+    private bool TryReplacePersistentBuffer<T>(T[] data, IGpuBuffer buffer, int hostVersion)
     {
         lock (_persistentBufferLock)
         {
@@ -2224,11 +2266,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 Version = nextVersion
             };
 
-            if (_persistentBufferCache.TryRemove(data, out var removed))
-                removed.Dispose();
+            // All persistent-cache publishers hold this lock. Retire exactly the
+            // observed entry instead of removing and then overwriting a second slot.
+            if (!ReferenceEquals(existing.Buffer, buffer))
+                _retiredWeightBuffers.Add(existing.Buffer);
 
             _persistentBufferCache[data] = replacement;
             _tensorVersions[data] = nextVersion;
+            _persistentWeightHostVersion[data] = hostVersion;
             return true;
         }
     }
@@ -2552,7 +2597,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // fallback, losing the 1.8× whole-step capture). So in the resident step trust the device buffer
             // unconditionally; the #649 stale-weight gate still guards the eager/eval inference path.
             bool versionTracked = weights._gpuBuffer != null;
-            if (ResidentStepActive || !versionTracked || weights._gpuBufferVersion == weights.Version)
+            if (ResidentStepActive || !versionTracked || weights._gpuBufferVersion == weights.GpuCacheVersion)
                 return new OwnedBuffer(resident, ownsBuffer: false);
         }
         return GetOrCacheWeightBufferVersionAware(backend, weights, role);
@@ -2564,19 +2609,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// as a persistent buffer at construction (random init), then <c>SetParameters</c> loads the real
     /// weights into the same backing array — bumping Version via the indexer/SetFlat/CopyFromArray paths —
     /// but the cache key (the array) is unchanged, so a version-blind lookup would return the stale
-    /// construction-time buffer. This compares the current Version to the stamp recorded at upload and
+    /// construction-time buffer. This compares the current GpuCacheVersion to the stamp recorded at upload and
     /// re-uploads on a mismatch, so correctness no longer depends on the layer also calling
     /// <see cref="InvalidatePersistentTensor{T}"/>. Raw-span writes (AsWritableSpan) that bypass the
     /// version bump still require an explicit invalidate, per the documented Tensor mutation contract.
     /// </summary>
-    /// <summary>Sentinel for <see cref="GetOrCacheWeightBuffer{T}(IDirectGpuBackend,T[],PersistentTensorRole,int)"/>:
-    /// skip the host-Version staleness gate (legacy version-blind behavior for non-weight callers).</summary>
-    private const int NoHostVersionGate = -1;
-
     private OwnedBuffer GetOrCacheWeightBufferVersionAware<T>(IDirectGpuBackend backend, Tensor<T> weights, PersistentTensorRole role)
         // Thin wrapper: the version gate itself lives in the shared persistent-cache lookup below, so EVERY
-        // persistent-weight read path that passes the host Tensor.Version gets the same in-place-load
-        // protection — not just this one (CodeRabbit #821). We hold the Version at read time.
+        // persistent-weight read path that passes the shared Tensor.GpuCacheVersion gets the same in-place-load
+        // protection — not just this one (CodeRabbit #821). We hold the storage epoch at read time.
         // READ-ONLY accessor: GetDataArray is write-intent and calls EnsureOwnedForWrite, so using
         // it to key this cache PRIVATISED every copy-on-write clone as a side effect of looking up
         // its buffer. A cloned model therefore got fresh arrays, missed the cache, and uploaded a
@@ -2585,7 +2626,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // reused -- until a genuine write privatises the storage, which is exactly when a
         // re-upload is correct. This is the read/write split GetDataArray's own remarks call
         // "Stage 2"; weights are an input operand the GPU only reads.
-        => GetOrCacheWeightBuffer(backend, weights.GetReadOnlyDataArray(), role, weights.Version);
+        => GetOrCacheWeightBuffer(backend, weights.GetReadOnlyDataArray(), role, weights.GpuCacheVersion);
 
     /// <summary>
     /// Gets a GPU buffer for weight/bias tensor, auto-caching if not already persistent.
@@ -2593,15 +2634,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// so subsequent calls reuse the same GPU buffer without re-uploading.
     /// Thread-safe: uses lock to coordinate with cache invalidation.
     /// <para>
-    /// SHARED version gate: when <paramref name="hostVersion"/> is not <see cref="NoHostVersionGate"/>, a
-    /// cached buffer is served only if it was uploaded at that same host <see cref="Tensor{T}.Version"/>. An
-    /// in-place weight load (indexer / SetFlat / CopyFromArray) bumps Version WITHOUT changing the backing
+    /// SHARED version gate: every caller supplies <paramref name="hostVersion"/>. A
+    /// tracked buffer is served only if uploaded at that same storage <see cref="Tensor{T}.GpuCacheVersion"/>. An
+    /// in-place weight load (indexer / SetFlat / CopyFromArray) bumps GpuCacheVersion WITHOUT changing the backing
     /// array (the cache key), so a version-blind hit would keep serving the stale construction-time buffer
     /// (a real GGUF-decoder-under-GPU garbage bug). Callers reading persistent WEIGHTS pass the tensor's
-    /// Version; version-blind callers (activations/inputs, which are not in-place-loaded) pass the sentinel.
+    /// GpuCacheVersion. Persistent buffers are never published without a storage epoch.
     /// </para>
     /// </summary>
-    private OwnedBuffer GetOrCacheWeightBuffer<T>(IDirectGpuBackend backend, T[] data, PersistentTensorRole role, int hostVersion = NoHostVersionGate)
+    private OwnedBuffer GetOrCacheWeightBuffer<T>(IDirectGpuBackend backend, T[] data, PersistentTensorRole role, int hostVersion)
     {
         // A synchronize is illegal inside CUDA graph capture (it aborts the capture, CUDA-900). This path is
         // reachable during capture via TryAliasResidentOutput on a nonresident source under ResidentStepActive,
@@ -2623,8 +2664,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // Persistent-cache lookup WITH the shared version gate.
             if (_persistentBufferCache.TryGetValue(data, out var existing))
             {
-                bool valid = hostVersion == NoHostVersionGate
-                    || (_persistentWeightHostVersion.TryGetValue(data, out int stamped) && stamped == hostVersion);
+                bool valid = _persistentWeightHostVersion.TryGetValue(data, out int stamped)
+                    && stamped == hostVersion;
                 if (valid)
                     return new OwnedBuffer(existing.Buffer, ownsBuffer: false);
 
@@ -2639,12 +2680,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // Not cached (or just invalidated) - upload and cache for future use.
             float[] floatData = DirectGpuEngine.ToFloatArray(data);
             IGpuBuffer gpuBuffer = backend.AllocateBuffer(floatData);
-            if (hostVersion != NoHostVersionGate && !capturing)
+            if (!capturing)
                 backend.Synchronize();
 
-            // Insert via TryAdd, not a direct set: RegisterPersistentTensor adds lock-free (it does not take
-            // _persistentBufferLock), so a concurrent register could have populated this key while we uploaded.
-            // If so, dispose our buffer and alias the existing one rather than overwrite-and-leak it.
+            // Keep insertion ownership explicit, including any reentrant registration during upload.
             var entry = new GpuBufferCacheEntry(gpuBuffer, role);
             if (!_persistentBufferCache.TryAdd(data, entry))
             {
@@ -2658,30 +2697,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return new OwnedBuffer(gpuBuffer, ownsBuffer: true);
             }
             _tensorVersions.TryAdd(data, 0);
-            if (hostVersion != NoHostVersionGate)
-                _persistentWeightHostVersion[data] = hostVersion;
+            _persistentWeightHostVersion[data] = hostVersion;
             return new OwnedBuffer(gpuBuffer, ownsBuffer: false);
         }
-    }
-
-    /// <summary>
-    /// Gets a GPU buffer for weight/bias Memory&lt;T&gt; data, auto-caching if not already persistent.
-    /// Uses MemoryMarshal.TryGetArray to extract underlying array for cache lookup and efficient upload.
-    /// </summary>
-    private OwnedBuffer GetOrCacheWeightBuffer<T>(IDirectGpuBackend backend, ReadOnlyMemory<T> memory, PersistentTensorRole role)
-    {
-        // Try to get the underlying array for cache-friendly behavior
-        if (MemoryMarshal.TryGetArray(memory, out ArraySegment<T> segment) &&
-            segment.Offset == 0 && segment.Count == segment.Array!.Length)
-        {
-            // Memory is backed by a full array - use the array-based overload for caching
-            return GetOrCacheWeightBuffer(backend, segment.Array, role);
-        }
-
-        // Memory is a slice or not array-backed - upload without caching
-        // (We can't cache slices reliably since the key would be the slice, not the source)
-        float[] floatData = DirectGpuEngine.ToFloatArray(memory.ToArray());
-        return new OwnedBuffer(backend.AllocateBuffer(floatData), ownsBuffer: true);
     }
 
     /// <summary>
@@ -2896,7 +2914,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var dst = (Half[])arr;
             for (int i = 0; i < cn; i++) dst[i] = (Half)fdata[i];
         });
-        CacheActivation(oKey, oBuf, o.Shape._dims, backend, isFp16: true, elementCount: n);
+        CacheActivation(oKey, oBuf, o.Shape._dims, backend, isFp16: true, elementCount: n,
+            hostVersion: o.GpuCacheVersion);
         return true;
     }
 
@@ -2908,18 +2927,23 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (param is null || typeof(T) != typeof(float) || !TryGetBackend(out var backend)) return;
         var arr = param.GetBackingArrayForCacheLookupUnsafe();
         if (arr is not float[] farr) return;
-        lock (_persistentBufferLock)
+
+        int hostVersion = param.GpuCacheVersion;
+        PersistentTensorRole role = _persistentBufferCache.TryGetValue(arr, out var current)
+            ? current.Role
+            : PersistentTensorRole.Weights;
+        var resident = GetOrCacheWeightBuffer(backend, farr, role, hostVersion);
+        if (resident.OwnsBuffer)
         {
-            if (_persistentBufferCache.TryGetValue(arr, out var existing))
-            {
-                param._gpuBuffer = existing.Buffer; param._gpuBackend = backend; param._gpuBufferVersion = param.Version;
-                return;
-            }
-            var buf = backend.AllocateBuffer(farr);
-            _persistentBufferCache[arr] = new GpuBufferCacheEntry(buf, PersistentTensorRole.Weights);
-            _tensorVersions.TryAdd(arr, 0);
-            param._gpuBuffer = buf; param._gpuBackend = backend; param._gpuBufferVersion = param.Version;
+            // A concurrent remove can make the shared helper return an uncached owner.
+            // Do not bind that ephemeral allocation as a supposedly persistent parameter.
+            resident.Dispose();
+            return;
         }
+
+        param._gpuBuffer = resident.Buffer;
+        param._gpuBackend = backend;
+        param._gpuBufferVersion = hostVersion;
     }
 
     /// <summary>Resident FP16 training (#633): forward down-cast of FP32 input <paramref name="x"/> (an optimizer-
@@ -2943,7 +2967,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // host cast (MixedPrecisionCast.CastToFp16) over the fresh host array — identical to the pre-resident
             // behavior. Without this gate the stale resident buffer masks host param mutations (the forward output
             // stops tracking weight changes), which broke the standalone/host-optimizer mixed-precision paths.
-            if (x._gpuBuffer is not null && ReferenceEquals(x._gpuBackend, backend) && x._gpuBufferVersion == x.Version)
+            if (x._gpuBuffer is not null && ReferenceEquals(x._gpuBackend, backend) && x._gpuBufferVersion == x.GpuCacheVersion)
             {
                 var persistent = xarr is not null ? TryGetCachedBuffer(xarr) : null;
                 if ((persistent is not null && ReferenceEquals(persistent, x._gpuBuffer))
@@ -2990,7 +3014,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (!reused)
             {
                 InvalidateActivationCacheEntry(o.DataVector);
-                CacheActivation(oArr, halfBuf, o._shape, backend, isFp16: true, elementCount: n);
+                CacheActivation(oArr, halfBuf, o._shape, backend, isFp16: true, elementCount: n,
+                    hostVersion: o.GpuCacheVersion);
             }
             o._gpuBuffer = null; o._gpuBackend = null; o._gpuBufferVersion = -1;
             return true;
@@ -3277,7 +3302,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var cArr = src.GetBackingArrayForCacheLookupUnsafe();
             if (cArr is not null && src.IsContiguous && !Helpers.DeferredArrayMaterializer.IsPending(cArr))
             {
-                try { srcBuf = GetOrCacheWeightBuffer(backend, src.GetDataArray(), PersistentTensorRole.Weights, src.Version).Buffer; }
+                try { srcBuf = GetOrCacheWeightBuffer(backend, src.GetDataArray(), PersistentTensorRole.Weights, src.GpuCacheVersion).Buffer; }
                 catch { srcBuf = null; }
             }
         }
@@ -3285,7 +3310,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             bool capturing = backend is Engines.DirectGpu.CUDA.CudaBackend cbk && cbk.IsStreamCapturing();
             bool hasBuf = src._gpuBuffer is not null;
-            bool verMatch = hasBuf && src._gpuBufferVersion == src.Version;
+            bool verMatch = hasBuf && src._gpuBufferVersion == src.GpuCacheVersion;
             var srcArr2 = src.GetBackingArrayForCacheLookupUnsafe();
             string realProducer = (srcArr2 is not null && s_producerOf.TryGetValue(srcArr2, out var rp)) ? rp : "<untagged/host>";
             AliasDiag($"skip: src not resident PRODUCER={realProducer} consumer={s_currentForwardOp} shape=[{string.Join(",", src._shape)}] hasBuf={hasBuf} capturing={capturing}");
@@ -3302,7 +3327,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // truth; if src's buffer is later evicted, the consumer cleanly falls back to a re-upload.
         dest._gpuBuffer = srcBuf;
         dest._gpuBackend = backend;
-        dest._gpuBufferVersion = dest.Version;
+        dest._gpuBufferVersion = dest.GpuCacheVersion;
 
         // Host reads of dest (the loss scalar, a debug checksum, a host op) download from the borrowed buffer.
         var capturedBuf = srcBuf;
@@ -3331,8 +3356,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <paramref name="elementCount"/>.
     /// </param>
     /// <param name="elementCount">Number of elements that will be written.</param>
-    private void DownloadGpuBufferInto<T>(IDirectGpuBackend backend, OwnedBuffer outputBuffer, T[] destination, int elementCount)
+    private void DownloadGpuBufferInto<T>(IDirectGpuBackend backend, OwnedBuffer outputBuffer,
+        Tensor<T> destinationTensor, T[] destination, int elementCount)
     {
+        destinationTensor.IncrementVersion();
+        int hostVersion = destinationTensor.GpuCacheVersion;
         Helpers.DeferredArrayMaterializer.Remove(destination);
         RemoveActivationCacheEntry(destination);
 
@@ -3357,8 +3385,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             Array.Copy(converted, (T[])arr, Math.Min(converted.Length, ((T[])arr).Length));
         });
 
-        if (!TryReplacePersistentBuffer(destination, outputBuffer.Buffer))
-            CacheActivation(destination, outputBuffer.Buffer, new[] { elementCount }, backend);
+        if (!TryReplacePersistentBuffer(destination, outputBuffer.Buffer, hostVersion))
+            CacheActivation(destination, outputBuffer.Buffer, new[] { elementCount }, backend,
+                hostVersion: hostVersion);
+        outputBuffer.RelinquishOwnership();
     }
 
     /// <summary>
@@ -3391,7 +3421,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // the freshly-allocated GPU buffer as stale and re-uploads from an
         // empty CPU backing array, zeroing out downstream ops that reference
         // the deferred result (e.g. StopGradient → TensorMultiply chain).
-        tensor._gpuBufferVersion = tensor.Version;
+        tensor._gpuBufferVersion = tensor.GpuCacheVersion;
 
         // Register materializer keyed by the vector — when GetDataArray() is called,
         // it allocates the backing array and then TryMaterialize(vector) downloads from GPU.
@@ -3455,7 +3485,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         // Cache the GPU buffer so GetOrAllocateBuffer finds it
         // Use the vector as cache key since there's no backing array yet
-        CacheActivation(vector, outputBuffer, shape, backend);
+        CacheActivation(vector, outputBuffer, shape, backend, hostVersion: tensor.GpuCacheVersion);
 
         return tensor;
     }
@@ -4345,7 +4375,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (ScratchPoolingActive)
             return RentActionScratch(backend, length);
         var buf = backend.AllocateBuffer(length);
-        if (arr is not null) CacheActivation(arr, buf, t._shape, backend);
+        if (arr is not null) CacheActivation(arr, buf, t._shape, backend, hostVersion: t.GpuCacheVersion);
         return buf;
     }
 
@@ -4353,7 +4383,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // a deferred materializer keeps host reads correct. Used by the compiled-step resident op paths.
     internal void BindResidentBuffer<T>(Tensor<T> t, IGpuBuffer buf, IDirectGpuBackend backend)
     {
-        t._gpuBuffer = buf; t._gpuBackend = backend; t._gpuBufferVersion = t.Version;
+        int hostVersion = t.GpuCacheVersion;
+        t._gpuBuffer = buf; t._gpuBackend = backend; t._gpuBufferVersion = hostVersion;
         var arr = t.GetBackingArrayForCacheLookupUnsafe();
         if (arr is null) return;
 
@@ -4369,7 +4400,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // dictionary re-key: it preserves the buffer, timestamp, byte accounting, and GPU residency,
         // and adds no device synchronization or host transfer to the hot path.
         var displacedEntry = RekeyActivationCacheForResidentBinding(
-            t, arr, buf, backend, out var previousVectorKey);
+            t, arr, buf, backend, hostVersion, out var previousVectorKey);
 
         // Bind is an authoritative overwrite of this tensor's resident value. Supersede either
         // historical key rather than relying on Register's intentional first-write-wins behavior;
@@ -4411,6 +4442,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         object arrayKey,
         IGpuBuffer buffer,
         IDirectGpuBackend backend,
+        int hostVersion,
         out object? previousVectorKey)
     {
         previousVectorKey = null;
@@ -4420,7 +4452,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (_activationCache.TryGetValue(arrayKey, out var arrayEntry)
             && ReferenceEquals(arrayEntry.Buffer, buffer)
             && ReferenceEquals(arrayEntry.Backend, backend))
+        {
+            arrayEntry.HostVersion = hostVersion;
             return null;
+        }
 
         // Only a tensor that acquired its host array after a zero-allocation GPU result can need
         // migration. Resolve the old identity after the common path has returned.
@@ -4431,7 +4466,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (_activationCache.TryGetValue(arrayKey, out arrayEntry)
                 && ReferenceEquals(arrayEntry.Buffer, buffer)
                 && ReferenceEquals(arrayEntry.Backend, backend))
+            {
+                arrayEntry.HostVersion = hostVersion;
                 return null;
+            }
 
             if (!_activationCache.TryGetValue(vectorKey, out var vectorEntry)
                 || !ReferenceEquals(vectorEntry.Buffer, buffer)
@@ -4455,6 +4493,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     _activationCache.TryAdd(arrayKey, displaced);
                 return null;
             }
+
+            owner.HostVersion = hostVersion;
 
             if (!_activationCache.TryAdd(arrayKey, owner))
             {
@@ -4557,21 +4597,30 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// propagate residency through metadata-only views (Reshape) during the resident step.</summary>
     private IGpuBuffer? ResolveResidentBufferNoUpload<T>(IDirectGpuBackend backend, Tensor<T> t, int need)
     {
+        bool residentStep = ResidentStepActive;
+        int hostVersion = residentStep ? 0 : t.GpuCacheVersion;
+        // During capture the device is authoritative. Eager consumers must instead reject
+        // snapshots superseded by a host write, including writes through another storage view.
         if (t._gpuBuffer is not null && ReferenceEquals(t._gpuBackend, backend)
-            && t._gpuBuffer.Handle != System.IntPtr.Zero && t._gpuBuffer.Size >= need)
+            && t._gpuBuffer.Handle != System.IntPtr.Zero && t._gpuBuffer.Size >= need
+            && (residentStep || (t._gpuBufferVersion == hostVersion && IsCachedGpuBufferLive(t, backend))))
             return t._gpuBuffer;
         var resident = t.TryGetGpuBuffer();
-        if (resident is not null && resident.Handle != System.IntPtr.Zero && resident.Size >= need)
+        if (resident is not null && resident.Handle != System.IntPtr.Zero && resident.Size >= need
+            && (residentStep || t._gpuBuffer is null))
             return resident;
         var arr = t.GetBackingArrayForCacheLookupUnsafe();
         if (arr is not null)
         {
             var cached = TryGetCachedBuffer(arr);
-            if (cached is not null && cached.Handle != System.IntPtr.Zero && cached.Size >= need)
+            if (cached is not null && cached.Handle != System.IntPtr.Zero && cached.Size >= need
+                && (residentStep || (_persistentWeightHostVersion.TryGetValue(arr, out var stamped)
+                    && stamped == hostVersion)))
                 return cached;
             lock (_activationCacheLock)
                 if (_activationCache.TryGetValue(arr, out var e) && ReferenceEquals(e.Backend, backend) && !e.IsFp16
-                    && e.Buffer.Handle != System.IntPtr.Zero && e.Buffer.Size >= need)
+                    && e.Buffer.Handle != System.IntPtr.Zero && e.Buffer.Size >= need
+                    && (residentStep || e.HostVersion == hostVersion))
                     return e.Buffer;
         }
         return null;
@@ -4891,7 +4940,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 + $"outBufElems={outBuf.Size} tableElems={tableBuf.Size} idxBufElems={_cachedEmbIndexBuffer.Size} impliedV={tableBuf.Size/embeddingDim}");
             backend.Embedding(_cachedEmbIndexBuffer, tableBuf, outBuf, numIndices, embeddingDim);
             ResidentSyncCheck("Embedding");
-            output._gpuBuffer = outBuf; output._gpuBackend = backend; output._gpuBufferVersion = output.Version;
+            output._gpuBuffer = outBuf; output._gpuBackend = backend; output._gpuBufferVersion = output.GpuCacheVersion;
             var oArr = output.GetBackingArrayForCacheLookupUnsafe();
             if (oArr is not null && s_currentForwardOp is not null) if (s_producerDiagEnabled && s_producerOf.Count < ProducerDiagCap) s_producerOf[oArr] = s_currentForwardOp;
             return true;
@@ -5128,7 +5177,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     op(backend, bufferA.Buffer, bufferB.Buffer, output.Buffer, left.Length);
                 }
 
-                DownloadGpuBufferInto(backend, output, destinationArray, left.Length);
+                DownloadGpuBufferInto(backend, output, destination, destinationArray, left.Length);
                 Gpu.GpuPrecisionDiagnostics.Publish(precisionPlan);
                 return true;
             }
@@ -5184,7 +5233,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             try
             {
                 op(backend, bufferA.Buffer, output.Buffer, ToFloatScalar(scalar), input.Length);
-                DownloadGpuBufferInto(backend, output, destinationArray, input.Length);
+                DownloadGpuBufferInto(backend, output, destination, destinationArray, input.Length);
                 return true;
             }
             catch
@@ -6486,6 +6535,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 // _gpuBufferVersion to the new Version and registers the host-read materializer).
                 a.IncrementVersion();
                 BindResidentBuffer(a, aResident, backend);
+                if (!ResidentStepActive) StampInPlaceGpuBuffer(a, backend, aResident);
                 return true;
             }
             catch (Exception rex)
@@ -6516,12 +6566,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return false;
 
         var aData = a.GetDataArray();
-        var bData = b.GetDataArray();
+        var bData = b.GetReadOnlyDataArray();
         if (aData.Length != bData.Length)
             return false;
 
-        using var bufferA = GetOrAllocateBuffer(backend, aData);
-        using var bufferB = GetOrAllocateBuffer(backend, bData);
+        using var bufferA = GetOrAllocateBuffer(backend, a);
+        using var bufferB = GetOrAllocateBuffer(backend, b);
 
         // A cached buffer (persistent/activation cache, keyed by the array
         // reference) can be SMALLER than the logical array when a pooled
@@ -6550,7 +6600,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // the next GPU op shouldn't trigger a CPU→GPU re-upload via
         // GetOrAllocateBuffer's staleness check.
         a.IncrementVersion();
-        a._gpuBufferVersion = a.Version;
+        StampInPlaceGpuBuffer(a, backend, bufferA.Buffer);
         return true;
     }
 
@@ -6577,7 +6627,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return TryRunUnaryInPlaceResident(tensor, op);
 
         var data = tensor.GetDataArray();
-        using var buffer = GetOrAllocateBuffer(backend, data);
+        using var buffer = GetOrAllocateBuffer(backend, tensor);
 
         // See TryRunBinaryInPlace: a stale cached buffer can be smaller than the
         // logical array when a pooled backing array is reused at a larger shape.
@@ -6595,8 +6645,34 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Version + sync _gpuBufferVersion so subsequent GPU ops reuse
         // the freshly-written buffer instead of re-uploading.
         tensor.IncrementVersion();
-        tensor._gpuBufferVersion = tensor.Version;
+        StampInPlaceGpuBuffer(tensor, backend, buffer.Buffer);
         return true;
+    }
+
+    /// <summary>
+    /// Marks the exact buffer written by an eager in-place kernel as current. Updating its existing
+    /// cache owner avoids a needless re-upload on the next operation without certifying an unrelated
+    /// tensor field or cache entry. This path performs no allocation, upload, or synchronization.
+    /// </summary>
+    private void StampInPlaceGpuBuffer<T>(Tensor<T> tensor, IDirectGpuBackend backend, IGpuBuffer buffer)
+    {
+        int hostVersion = tensor.GpuCacheVersion;
+        if (ReferenceEquals(tensor._gpuBuffer, buffer) && ReferenceEquals(tensor._gpuBackend, backend))
+            tensor._gpuBufferVersion = hostVersion;
+
+        object cacheKey = (object?)tensor.GetBackingArrayForCacheLookupUnsafe() ?? tensor.DataVector;
+        lock (_persistentBufferLock)
+        {
+            if (_persistentBufferCache.TryGetValue(cacheKey, out var persistent)
+                && ReferenceEquals(persistent.Buffer, buffer))
+                _persistentWeightHostVersion[cacheKey] = hostVersion;
+        }
+        lock (_activationCacheLock)
+        {
+            if (_activationCache.TryGetValue(cacheKey, out var activation)
+                && ReferenceEquals(activation.Buffer, buffer) && ReferenceEquals(activation.Backend, backend))
+                activation.HostVersion = hostVersion;
+        }
     }
 
     /// <summary>
@@ -6655,12 +6731,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // On a cache HIT the entry already maps this same (now in-place-modified) buffer, and
         // re-caching would TryAdd-fail and Dispose the live buffer (ActivationCacheEntry.Dispose
         // frees Buffer), so DO NOT re-cache a hit.
-        if (owned.OwnsBuffer)
-            CacheActivation(cacheKey, buf, tensor.Shape._dims, backend);
         tensor.IncrementVersion();
+        if (owned.OwnsBuffer)
+            CacheActivation(cacheKey, buf, tensor.Shape._dims, backend,
+                hostVersion: tensor.GpuCacheVersion);
         // Pin the buffer to the tensor + (re)register the deferred materializer so the final CPU
         // read downloads the kernel's output after Execute() instead of the stale pre-op data.
         BindResidentBuffer(tensor, buf, backend);
+        if (!ResidentStepActive) StampInPlaceGpuBuffer(tensor, backend, buf);
         return true;
     }
 
@@ -7191,7 +7269,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 $"Got: {role}. Use UploadToGpu for other tensor types.", nameof(role))
         };
         // Persistent-weight read: pass the host Version so an in-place weight load re-uploads (shared gate).
-        var ownedBuffer = GetOrCacheWeightBuffer(backend, tensor.GetDataArray(), persistentRole, tensor.Version);
+        var ownedBuffer = GetOrCacheWeightBuffer(backend, tensor.GetDataArray(), persistentRole, tensor.GpuCacheVersion);
 
         // Propagate ownership: if cache owns buffer, GpuTensor shouldn't dispose;
         // if we own buffer (race condition fallback), GpuTensor should take ownership
@@ -12382,43 +12460,36 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (key is null)
             return;
 
-        if (!_persistentBufferCache.TryGetValue(key, out var entry))
-            return;
-
-        // The UPLOAD SOURCE is a different question from the cache key. The identity accessor never
-        // fires a pending deferred GPU->CPU download (DeferredArrayMaterializer), so a tensor whose
-        // latest value still lives on the device would re-upload its STALE host bytes. The read-only
-        // data accessor materialises that download without privatising a COW clone, and for the simple
-        // CPU layout the cache can hit on it hands back the very array used as the key. Resolve it
-        // BEFORE disposing the old buffer, so a failed materialisation leaves the cache entry intact.
-        T[] hostData = tensor.GetReadOnlyDataArray();
-
-        try
+        lock (_persistentBufferLock)
         {
-            // Dispose old buffer
-            entry.Buffer.Dispose();
+            if (!_persistentBufferCache.ContainsKey(key)) return;
 
-            // Upload new data
-            float[] floatData = DirectGpuEngine.ToFloatArray(hostData);
-            IGpuBuffer newBuffer = backend.AllocateBuffer(floatData);
-            backend.Synchronize();
-
-            // Update cache entry with new buffer
-            var newEntry = new GpuBufferCacheEntry(newBuffer, entry.Role);
-            newEntry.Version = entry.Version + 1;
-
-            _persistentBufferCache[key] = newEntry;
-            _tensorVersions[key] = newEntry.Version;
-            // Re-stamp with the host Version this fresh buffer matches, so the version-aware weight reader
-            // does not needlessly re-upload it again on the next read.
-            _persistentWeightHostVersion[key] = tensor.Version;
-        }
-        catch
-        {
-            // On failure, remove from cache - operations will fall back to CPU
-            _persistentBufferCache.TryRemove(key, out _);
-            _tensorVersions.TryRemove(key, out _);
-            _persistentWeightHostVersion.TryRemove(key, out _);
+            // Materialize deferred input while the old buffer is still live. Cache
+            // maintenance must never detach a COW alias just to read its value.
+            T[] hostData = tensor.GetReadOnlyDataArray();
+            IGpuBuffer? replacement = null;
+            try
+            {
+                replacement = backend.AllocateBuffer(DirectGpuEngine.ToFloatArray(hostData));
+                backend.Synchronize();
+                if (!TryReplacePersistentBuffer(key, replacement, tensor.GpuCacheVersion))
+                    throw new InvalidOperationException("The persistent cache entry disappeared during replacement.");
+                replacement = null; // Ownership transferred to the persistent cache.
+            }
+            catch
+            {
+                try { replacement?.Dispose(); }
+                finally
+                {
+                    // An explicit invalidation may follow a raw-span write with no epoch
+                    // increment. Even if replacement disposal also fails, the old
+                    // snapshot must not remain eligible for cache hits.
+                    if (_persistentBufferCache.TryRemove(key, out var failedEntry))
+                        _retiredWeightBuffers.Add(failedEntry.Buffer);
+                    _tensorVersions.TryRemove(key, out _);
+                    _persistentWeightHostVersion.TryRemove(key, out _);
+                }
+            }
         }
     }
 
@@ -15788,7 +15859,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // on-device for CUDA-graph capture. Without it, the first consumer re-uploads and the chain collapses.
         output._gpuBuffer = outBuf;
         output._gpuBackend = backend;
-        output._gpuBufferVersion = output.Version;
+        output._gpuBufferVersion = output.GpuCacheVersion;
         return true;
     }
 
@@ -18648,10 +18719,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // deliberately omits this gate for capture-time metadata views, so using it here could
         // execute eager arithmetic against a stale pre-mutation buffer.
         if (a._gpuBuffer is null || !ReferenceEquals(a._gpuBackend, backend)
-            || a._gpuBufferVersion != a.Version || !IsCachedGpuBufferLive(a, backend)
+            || a._gpuBufferVersion != a.GpuCacheVersion || !IsCachedGpuBufferLive(a, backend)
             || a._gpuBuffer.Handle == System.IntPtr.Zero || a._gpuBuffer.Size < a.Length
             || b._gpuBuffer is null || !ReferenceEquals(b._gpuBackend, backend)
-            || b._gpuBufferVersion != b.Version || !IsCachedGpuBufferLive(b, backend)
+            || b._gpuBufferVersion != b.GpuCacheVersion || !IsCachedGpuBufferLive(b, backend)
             || b._gpuBuffer.Handle == System.IntPtr.Zero || b._gpuBuffer.Size < b.Length)
             return null;
         var residentA = a._gpuBuffer;
@@ -20109,7 +20180,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 Gpu.GpuPrecisionDiagnostics.Publish(Gpu.GpuPrecisionPlanner.CpuFallback<T>(
                     backend, "TensorMatMul.NDx2D", ndPlan.RequestedPreference,
-                    $"GPU route failed with {ex.GetType().Name}: {ex.Message}"));
+                    $"GPU route failed with {ex.GetType().Name}: {ex.Message}", ndPlan.OperationKind));
                 return base.TensorMatMul(a, b);
             }
         }
@@ -20166,7 +20237,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 Gpu.GpuPrecisionDiagnostics.Publish(Gpu.GpuPrecisionPlanner.CpuFallback<T>(
                     backend, "TensorMatMul.NDxND", batchPlan.RequestedPreference,
-                    $"GPU route failed with {ex.GetType().Name}: {ex.Message}"));
+                    $"GPU route failed with {ex.GetType().Name}: {ex.Message}", batchPlan.OperationKind));
                 return base.TensorMatMul(a, b);
             }
         }
@@ -20257,7 +20328,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             Gpu.GpuPrecisionDiagnostics.Publish(Gpu.GpuPrecisionPlanner.CpuFallback<T>(
                 backend, "TensorMatMul.Rank2", rank2Plan.RequestedPreference,
-                $"GPU route failed with {ex.GetType().Name}: {ex.Message}"));
+                $"GPU route failed with {ex.GetType().Name}: {ex.Message}", rank2Plan.OperationKind));
             return base.TensorMatMul(a, b);
         }
     }
@@ -20305,7 +20376,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             Gpu.GpuPrecisionDiagnostics.Publish(Gpu.GpuPrecisionPlanner.CpuFallback<T>(
                 backend, "TensorMatMulTransposed", plan.RequestedPreference,
-                $"GPU route failed with {ex.GetType().Name}: {ex.Message}"));
+                $"GPU route failed with {ex.GetType().Name}: {ex.Message}", plan.OperationKind));
             return base.TensorMatMulTransposed(a, b);
         }
     }
@@ -20418,7 +20489,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             Gpu.GpuPrecisionDiagnostics.Publish(Gpu.GpuPrecisionPlanner.CpuFallback<T>(
                 backend, "BatchMatMul", plan.RequestedPreference,
-                $"GPU route failed with {ex.GetType().Name}: {ex.Message}"));
+                $"GPU route failed with {ex.GetType().Name}: {ex.Message}", plan.OperationKind));
             if (ThrowOnGpuKernelFallback) throw;
             return base.BatchMatMul(a, b);
         }
@@ -20626,14 +20697,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     else
                     {
                         outBuf = backend.AllocateBuffer(output.Length);
-                        if (arr is not null) CacheActivation(arr, outBuf, output._shape, backend);
+                        if (arr is not null)
+                            CacheActivation(arr, outBuf, output._shape, backend,
+                                hostVersion: output.GpuCacheVersion);
                     }
                 }
                 backend.Permute(bufIn.Buffer, outBuf, tensor.Shape._dims, axes);
                 ResidentSyncCheck("Permute");
                 output._gpuBuffer = outBuf;
                 output._gpuBackend = backend;
-                output._gpuBufferVersion = output.Version;
+                output._gpuBufferVersion = output.GpuCacheVersion;
                 if (arr is not null)
                 {
                     var capBuf = outBuf; var capBackend = backend;
@@ -20652,7 +20725,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var bufOut = AllocateOutputBuffer(backend, tensor.Length);
                 backend.Permute(bufIn.Buffer, bufOut.Buffer, tensor.Shape._dims, axes);
                 var dst = output.GetDataArray();
-                DownloadGpuBufferInto(backend, bufOut, dst, output.Length);
+                DownloadGpuBufferInto(backend, bufOut, output, dst, output.Length);
             }
         }
         catch (Exception)
@@ -21807,7 +21880,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             ops.FromFloatSpan(new ReadOnlySpan<float>(result), tensor.AsWritableSpan());
             // Version-counter contract — same rationale as TryRunUnaryInPlace.
             tensor.IncrementVersion();
-            tensor._gpuBufferVersion = tensor.Version;
+            tensor._gpuBufferVersion = tensor.GpuCacheVersion;
             return;
         }
         catch { }
@@ -23357,7 +23430,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                         ? (ulong)(uint)seed.Value
                         : (ulong)System.Threading.Interlocked.Increment(ref _gpuRngSeed);
                     b.GenerateRandomUniform(go.Buffer, destination.Length, ToFloatScalar(min), ToFloatScalar(max), gpuSeed);
-                    DownloadGpuBufferInto(b, go, destinationArray, destination.Length);
+                    DownloadGpuBufferInto(b, go, destination, destinationArray, destination.Length);
                     return;
                 }
                 catch
@@ -23411,7 +23484,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                         ToFloatScalar(mean),
                         ToFloatScalar(stddev),
                         (ulong)System.Threading.Interlocked.Increment(ref _gpuRngSeed));
-                    DownloadGpuBufferInto(b, go, destinationArray, destination.Length);
+                    DownloadGpuBufferInto(b, go, destination, destinationArray, destination.Length);
                     return;
                 }
                 catch
@@ -25800,7 +25873,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var tensor = Tensor<Complex<T>>.CreateGpuResident(shape, deviceType);
         tensor._gpuBuffer = outputBuffer;
         tensor._gpuBackend = backend;
-        tensor._gpuBufferVersion = tensor.Version;
+        tensor._gpuBufferVersion = tensor.GpuCacheVersion;
         tensor._gpuBufferIsSplitComplex = true;
 
         var vector = tensor.DataVector;
@@ -25826,7 +25899,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         tensor._gpuMaterializerCallback = materialize;
         tensor._gpuMaterializerKey = vector;
         Helpers.DeferredArrayMaterializer.Register(vector, materialize);
-        CacheActivation(vector, outputBuffer, shape, backend);
+        CacheActivation(vector, outputBuffer, shape, backend, hostVersion: tensor.GpuCacheVersion);
         return tensor;
     }
 
@@ -25869,7 +25942,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             && tensor._gpuBuffer.Handle != IntPtr.Zero
             && ReferenceEquals(tensor._gpuBackend, backend)
             && (ResidentStepActive
-                || (tensor._gpuBufferVersion == tensor.Version
+                || (tensor._gpuBufferVersion == tensor.GpuCacheVersion
                     && IsCachedGpuBufferLive(tensor, backend))))
         {
             IGpuBuffer? real = null;

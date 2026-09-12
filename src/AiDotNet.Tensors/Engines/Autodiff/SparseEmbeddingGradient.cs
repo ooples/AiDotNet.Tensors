@@ -22,9 +22,10 @@ namespace AiDotNet.Tensors.Engines.Autodiff;
 /// indices they belong to. The dense [vocabSize, embeddingDim] tensor is
 /// recoverable on demand via <see cref="ToDense(IEngine)"/>, but optimizers and
 /// downstream consumers that understand the sparse representation can skip that
-/// materialization and instead apply scatter-style updates directly to the
-/// accessed rows, cutting both the per-step allocation and the per-step memory
-/// traffic from <c>O(vocabSize * embeddingDim)</c> to <c>O(numIndices * embeddingDim)</c>.
+/// materialization. Gradient storage then scales as <c>O(numIndices * embeddingDim)</c>.
+/// Optimizer traffic also scales with the accessed rows only when its update contract permits
+/// untouched moments and weights to remain unchanged. Dense-equivalent Adam/AMSGrad updates may
+/// still traverse the full table, even when a compact gradient avoids its dense allocation.
 /// </para>
 /// <para>
 /// Duplicate indices are NOT pre-aggregated here. Both the dense

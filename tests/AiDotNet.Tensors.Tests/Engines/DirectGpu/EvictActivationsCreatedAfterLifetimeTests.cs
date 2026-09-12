@@ -194,7 +194,7 @@ public class EvictActivationsCreatedAfterLifetimeTests
             new[]
             {
                 typeof(object), typeof(IGpuBuffer), typeof(int[]), typeof(IDirectGpuBackend),
-                typeof(bool), typeof(int)
+                typeof(bool), typeof(int), typeof(int)
             },
             null) ?? throw new InvalidOperationException("DirectGpuTensorEngine CacheActivation method was not found.");
         object activationCache = activationCacheField.GetValue(engine)
@@ -215,7 +215,7 @@ public class EvictActivationsCreatedAfterLifetimeTests
         });
         cacheActivation.Invoke(engine, new object[]
         {
-            vectorKey, buffer, new[] { 1, 4 }, backend, false, 0
+            vectorKey, buffer, new[] { 1, 4 }, backend, false, 0, 0
         });
 
         Assert.Equal(new[] { 3f, 5f, 7f, 11f }, tensor.ToArray());
@@ -274,7 +274,7 @@ public class EvictActivationsCreatedAfterLifetimeTests
             new[]
             {
                 typeof(object), typeof(IGpuBuffer), typeof(int[]), typeof(IDirectGpuBackend),
-                typeof(bool), typeof(int)
+                typeof(bool), typeof(int), typeof(int)
             },
             null) ?? throw new InvalidOperationException("DirectGpuTensorEngine CacheActivation method was not found.");
         object activationCache = activationCacheField.GetValue(engine)
@@ -296,7 +296,7 @@ public class EvictActivationsCreatedAfterLifetimeTests
         });
         cacheActivation.Invoke(engine, new object[]
         {
-            vectorKey, residentBuffer, new[] { 1, 4 }, backend, false, 0
+            vectorKey, residentBuffer, new[] { 1, 4 }, backend, false, 0, 0
         });
         Assert.Equal(new[] { 2f, 3f, 5f, 7f }, tensor.ToArray());
         object arrayKey = tensor.GetBackingArrayForCacheLookupUnsafe()
@@ -306,7 +306,7 @@ public class EvictActivationsCreatedAfterLifetimeTests
 
         cacheActivation.Invoke(engine, new object[]
         {
-            arrayKey, displacedBuffer, new[] { 1, 4 }, backend, false, 0
+            arrayKey, displacedBuffer, new[] { 1, 4 }, backend, false, 0, 0
         });
         bool staleMaterializerRan = false;
         AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.Register(
