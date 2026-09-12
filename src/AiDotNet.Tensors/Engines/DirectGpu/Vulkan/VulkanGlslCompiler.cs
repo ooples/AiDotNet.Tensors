@@ -16,8 +16,17 @@ internal sealed class VulkanGlslCompiler : IDisposable
     private IntPtr _options;
     private readonly ConcurrentDictionary<string, uint[]> _cache = new(StringComparer.Ordinal);
     private bool _available;
+    private volatile string? _lastError;
 
     public bool IsAvailable => _available;
+
+    /// <summary>
+    /// The reason the most recent compile attempt failed, or <see langword="null"/> when the
+    /// last attempt succeeded. shaderc's diagnostics used to be written to
+    /// <see cref="System.Diagnostics.Debug"/> and discarded in Release builds, which made a
+    /// genuine GLSL syntax error indistinguishable from a missing libshaderc.
+    /// </summary>
+    public string? LastError => _lastError;
 
     public VulkanGlslCompiler()
     {
@@ -58,7 +67,10 @@ internal sealed class VulkanGlslCompiler : IDisposable
     public uint[]? CompileToSpirv(string glslSource, string entryPoint = "main")
     {
         if (!_available)
+        {
+            _lastError = "libshaderc is unavailable: shaderc_compiler_initialize failed or the native library could not be loaded.";
             return null;
+        }
 
         if (_cache.TryGetValue(glslSource, out var cached))
             return cached;
@@ -76,14 +88,18 @@ internal sealed class VulkanGlslCompiler : IDisposable
                 _options);
 
             if (result == IntPtr.Zero)
+            {
+                _lastError = "shaderc_compile_into_spv returned no result handle.";
                 return null;
+            }
 
             int status = ShadercNativeBindings.shaderc_result_get_compilation_status(result);
             if (status != ShadercNativeBindings.shaderc_compilation_status_success)
             {
                 IntPtr errPtr = ShadercNativeBindings.shaderc_result_get_error_message(result);
                 string errorMsg = errPtr != IntPtr.Zero ? Marshal.PtrToStringAnsi(errPtr) ?? "Unknown error" : "Unknown error";
-                System.Diagnostics.Debug.WriteLine($"[VulkanGlslCompiler] GLSL compilation failed: {errorMsg}");
+                _lastError = $"GLSL compilation failed (shaderc status {status}): {errorMsg}";
+                System.Diagnostics.Debug.WriteLine($"[VulkanGlslCompiler] {_lastError}");
                 return null;
             }
 
@@ -91,7 +107,10 @@ internal sealed class VulkanGlslCompiler : IDisposable
             IntPtr bytesPtr = ShadercNativeBindings.shaderc_result_get_bytes(result);
 
             if (bytesPtr == IntPtr.Zero || (int)byteLength == 0)
+            {
+                _lastError = "shaderc reported success but produced an empty SPIR-V module.";
                 return null;
+            }
 
             int byteCount = (int)byteLength;
             int wordCount = byteCount / sizeof(uint);
@@ -100,6 +119,7 @@ internal sealed class VulkanGlslCompiler : IDisposable
             Marshal.Copy(bytesPtr, bytes, 0, byteCount);
             Buffer.BlockCopy(bytes, 0, spirv, 0, byteCount);
 
+            _lastError = null;
             _cache.TryAdd(glslSource, spirv);
             return spirv;
         }
@@ -119,7 +139,10 @@ internal sealed class VulkanGlslCompiler : IDisposable
         if (spirv is null)
             return null;
 
-        return VulkanShaderModule.Create(spirv);
+        var module = VulkanShaderModule.Create(spirv);
+        if (module is null)
+            _lastError = "vkCreateShaderModule failed for the compiled SPIR-V module.";
+        return module;
     }
 
     public void Dispose()

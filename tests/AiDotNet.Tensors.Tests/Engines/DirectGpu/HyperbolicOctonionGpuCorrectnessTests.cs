@@ -493,14 +493,16 @@ public class HyperbolicOctonionGpuCorrectnessTests : IDisposable
                           w4=weights[wOff+4],w5=weights[wOff+5],w6=weights[wOff+6],w7=weights[wOff+7];
                     float g0=gradOutput[goOff],g1=gradOutput[goOff+1],g2=gradOutput[goOff+2],g3=gradOutput[goOff+3],
                           g4=gradOutput[goOff+4],g5=gradOutput[goOff+5],g6=gradOutput[goOff+6],g7=gradOutput[goOff+7];
+                    // dL/da = conj(w) * g. Forward is r = w * a, so the a-Jacobian is the
+                    // LEFT-multiplication matrix L_w and its transpose is L_conj(w).
                     ga[0]+=g0*w0+g1*w1+g2*w2+g3*w3+g4*w4+g5*w5+g6*w6+g7*w7;
-                    ga[1]+=g0*(-w1)+g1*w0+g2*(-w3)+g3*w2+g4*(-w5)+g5*w4+g6*w7+g7*(-w6);
-                    ga[2]+=g0*(-w2)+g1*w3+g2*w0+g3*(-w1)+g4*(-w6)+g5*(-w7)+g6*w4+g7*w5;
-                    ga[3]+=g0*(-w3)+g1*(-w2)+g2*w1+g3*w0+g4*(-w7)+g5*w6+g6*(-w5)+g7*w4;
-                    ga[4]+=g0*(-w4)+g1*w5+g2*w6+g3*w7+g4*w0+g5*(-w1)+g6*(-w2)+g7*(-w3);
-                    ga[5]+=g0*(-w5)+g1*(-w4)+g2*w7+g3*(-w6)+g4*w1+g5*w0+g6*w3+g7*(-w2);
-                    ga[6]+=g0*(-w6)+g1*(-w7)+g2*(-w4)+g3*w5+g4*w2+g5*(-w3)+g6*w0+g7*w1;
-                    ga[7]+=g0*(-w7)+g1*w6+g2*(-w5)+g3*(-w4)+g4*w3+g5*w2+g6*(-w1)+g7*w0;
+                    ga[1]+=g0*(-w1)+g1*w0+g2*w3+g3*(-w2)+g4*w5+g5*(-w4)+g6*(-w7)+g7*w6;
+                    ga[2]+=g0*(-w2)+g1*(-w3)+g2*w0+g3*w1+g4*w6+g5*w7+g6*(-w4)+g7*(-w5);
+                    ga[3]+=g0*(-w3)+g1*w2+g2*(-w1)+g3*w0+g4*w7+g5*(-w6)+g6*w5+g7*(-w4);
+                    ga[4]+=g0*(-w4)+g1*(-w5)+g2*(-w6)+g3*(-w7)+g4*w0+g5*w1+g6*w2+g7*w3;
+                    ga[5]+=g0*(-w5)+g1*w4+g2*(-w7)+g3*w6+g4*(-w1)+g5*w0+g6*(-w3)+g7*w2;
+                    ga[6]+=g0*(-w6)+g1*w7+g2*w4+g3*(-w5)+g4*(-w2)+g5*w3+g6*w0+g7*(-w1);
+                    ga[7]+=g0*(-w7)+g1*(-w6)+g2*w5+g3*w4+g4*(-w3)+g5*(-w2)+g6*w1+g7*w0;
                 }
                 for (int c = 0; c < 8; c++) cpuGradInput[giOff + c] = ga[c];
             }
@@ -542,14 +544,16 @@ public class HyperbolicOctonionGpuCorrectnessTests : IDisposable
                           a4=input[inOff+4],a5=input[inOff+5],a6=input[inOff+6],a7=input[inOff+7];
                     float g0=gradOutput[goOff],g1=gradOutput[goOff+1],g2=gradOutput[goOff+2],g3=gradOutput[goOff+3],
                           g4=gradOutput[goOff+4],g5=gradOutput[goOff+5],g6=gradOutput[goOff+6],g7=gradOutput[goOff+7];
+                    // dL/dw = g * conj(a). Forward is r = w * a, so the w-Jacobian is the
+                    // RIGHT-multiplication matrix R_a and its transpose is R_conj(a).
                     gw[0]+=g0*a0+g1*a1+g2*a2+g3*a3+g4*a4+g5*a5+g6*a6+g7*a7;
-                    gw[1]+=g0*(-a1)+g1*a0+g2*a3+g3*(-a2)+g4*a5+g5*(-a4)+g6*(-a7)+g7*a6;
-                    gw[2]+=g0*(-a2)+g1*(-a3)+g2*a0+g3*a1+g4*a6+g5*a7+g6*(-a4)+g7*(-a5);
-                    gw[3]+=g0*(-a3)+g1*a2+g2*(-a1)+g3*a0+g4*a7+g5*(-a6)+g6*a5+g7*(-a4);
-                    gw[4]+=g0*(-a4)+g1*(-a5)+g2*(-a6)+g3*(-a7)+g4*a0+g5*a1+g6*a2+g7*a3;
-                    gw[5]+=g0*(-a5)+g1*a4+g2*(-a7)+g3*a6+g4*(-a1)+g5*a0+g6*(-a3)+g7*a2;
-                    gw[6]+=g0*(-a6)+g1*a7+g2*a4+g3*(-a5)+g4*(-a2)+g5*a3+g6*a0+g7*(-a1);
-                    gw[7]+=g0*(-a7)+g1*(-a6)+g2*a5+g3*a4+g4*(-a3)+g5*(-a2)+g6*a1+g7*a0;
+                    gw[1]+=g0*(-a1)+g1*a0+g2*(-a3)+g3*a2+g4*(-a5)+g5*a4+g6*a7+g7*(-a6);
+                    gw[2]+=g0*(-a2)+g1*a3+g2*a0+g3*(-a1)+g4*(-a6)+g5*(-a7)+g6*a4+g7*a5;
+                    gw[3]+=g0*(-a3)+g1*(-a2)+g2*a1+g3*a0+g4*(-a7)+g5*a6+g6*(-a5)+g7*a4;
+                    gw[4]+=g0*(-a4)+g1*a5+g2*a6+g3*a7+g4*a0+g5*(-a1)+g6*(-a2)+g7*(-a3);
+                    gw[5]+=g0*(-a5)+g1*(-a4)+g2*a7+g3*(-a6)+g4*a1+g5*a0+g6*a3+g7*(-a2);
+                    gw[6]+=g0*(-a6)+g1*(-a7)+g2*(-a4)+g3*a5+g4*a2+g5*(-a3)+g6*a0+g7*a1;
+                    gw[7]+=g0*(-a7)+g1*a6+g2*(-a5)+g3*(-a4)+g4*a3+g5*a2+g6*(-a1)+g7*a0;
                 }
                 for (int c = 0; c < 8; c++) cpuGradWeights[gwOff + c] = gw[c];
             }
@@ -611,6 +615,58 @@ public class HyperbolicOctonionGpuCorrectnessTests : IDisposable
                 $"Numerical gradient at weight[{wIdx}] is {numericalGrad}");
             Assert.True(MathF.Abs(numericalGrad - analyticGrad[wIdx]) < gradTol,
                 $"Gradient mismatch at weight[{wIdx}]: numerical={numericalGrad:G6}, analytic(GPU)={analyticGrad[wIdx]:G6}, diff={MathF.Abs(numericalGrad - analyticGrad[wIdx]):G6}");
+        }
+    }
+
+    /// <summary>
+    /// Finite-difference check for the INPUT gradient. The weight-gradient check above
+    /// existed, but nothing pinned the input gradient to ground truth: the only other
+    /// coverage compared the GPU kernel against a hand-copied duplicate of the kernel's
+    /// own sign table, so an incorrect table agreed with itself and passed. Differentiating
+    /// the forward numerically is independent of both, and is what catches a wrong Jacobian.
+    /// </summary>
+    [SkippableFact]
+    public void OctonionLinearBackwardInput_NumericalGradientCheck()
+    {
+        SkipIfNoGpu();
+        const int B = 2, I = 2, O = 2;
+        const float eps = 1e-3f;
+        const float gradTol = 0.05f;
+        var input = RandomFloats(B * I * 8, 42, scale: 0.3f);
+        var weights = RandomFloats(O * I * 8, 99, scale: 0.1f);
+        var biases = new float[O * 8];
+
+        // L = ||out||^2 / 2  =>  dL/dOutput = out
+        var output = CpuOctonionLinearForward(input, weights, biases, B, I, O);
+        var gradOutput = (float[])output.Clone();
+
+        using var gpuGo = _vulkan!.AllocateBuffer(gradOutput);
+        using var gpuIn = _vulkan.AllocateBuffer(input);
+        using var gpuW = _vulkan.AllocateBuffer(weights);
+        using var gpuGi = _vulkan.AllocateBuffer(B * I * 8);
+        _vulkan.OctonionLinearBackwardInput(gpuGo, gpuIn, gpuW, gpuGi, B, I, O);
+        var analyticGrad = _vulkan.DownloadBuffer(gpuGi);
+
+        for (int aIdx = 0; aIdx < Math.Min(16, input.Length); aIdx++)
+        {
+            var aPlus = (float[])input.Clone();
+            var aMinus = (float[])input.Clone();
+            aPlus[aIdx] += eps;
+            aMinus[aIdx] -= eps;
+            var outPlus = CpuOctonionLinearForward(aPlus, weights, biases, B, I, O);
+            var outMinus = CpuOctonionLinearForward(aMinus, weights, biases, B, I, O);
+            float lossPlus = 0, lossMinus = 0;
+            for (int j = 0; j < outPlus.Length; j++)
+            {
+                lossPlus += outPlus[j] * outPlus[j] / 2;
+                lossMinus += outMinus[j] * outMinus[j] / 2;
+            }
+            float numericalGrad = (lossPlus - lossMinus) / (2 * eps);
+
+            Assert.True(!float.IsNaN(numericalGrad) && !float.IsInfinity(numericalGrad),
+                $"Numerical gradient at input[{aIdx}] is {numericalGrad}");
+            Assert.True(MathF.Abs(numericalGrad - analyticGrad[aIdx]) < gradTol,
+                $"Gradient mismatch at input[{aIdx}]: numerical={numericalGrad:G6}, analytic(GPU)={analyticGrad[aIdx]:G6}, diff={MathF.Abs(numericalGrad - analyticGrad[aIdx]):G6}");
         }
     }
 }

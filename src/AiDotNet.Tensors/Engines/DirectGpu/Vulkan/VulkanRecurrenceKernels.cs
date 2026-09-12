@@ -221,9 +221,9 @@ layout(set=0,binding=4) readonly buffer Cb{float C[];};layout(set=0,binding=5) r
 layout(set=0,binding=6) buffer Ob{float outputValue[];};layout(set=0,binding=7) buffer Hb{float hState[];};
 layout(push_constant) uniform PC{uint batch;uint time;uint model;uint experts;uint state;};
 void main(){int be=int(gl_GlobalInvocationID.x);if(be>=int(batch*experts))return;int b=be/int(experts),e=be%int(experts),hb=be*int(state);
- for(int s=0;s<int(state);s++)hState[hb+s]=0.0;for(int t=0;t<int(time);t++){int xb=(b*int(time)+t)*int(model),mi=(b*int(time)+t)*int(experts)+e;float active=mask[mi];
-  for(int s=0;s<int(state);s++){float next=A[e*int(state)+s]*hState[hb+s];int bb=(e*int(state)+s)*int(model);for(int d=0;d<int(model);d++)next+=B[bb+d]*X[xb+d];hState[hb+s]=active*next;}
-  int yb=((b*int(time)+t)*int(experts)+e)*int(model);for(int d=0;d<int(model);d++){float y=D[e*int(model)+d]*X[xb+d];int cb=(e*int(model)+d)*int(state);for(int s=0;s<int(state);s++)y+=C[cb+s]*hState[hb+s];outputValue[yb+d]=active*y;}}
+ for(int s=0;s<int(state);s++)hState[hb+s]=0.0;for(int t=0;t<int(time);t++){int xb=(b*int(time)+t)*int(model),mi=(b*int(time)+t)*int(experts)+e;float gate=mask[mi];
+  for(int s=0;s<int(state);s++){float next=A[e*int(state)+s]*hState[hb+s];int bb=(e*int(state)+s)*int(model);for(int d=0;d<int(model);d++)next+=B[bb+d]*X[xb+d];hState[hb+s]=gate*next;}
+  int yb=((b*int(time)+t)*int(experts)+e)*int(model);for(int d=0;d<int(model);d++){float y=D[e*int(model)+d]*X[xb+d];int cb=(e*int(model)+d)*int(state);for(int s=0;s<int(state);s++)y+=C[cb+s]*hState[hb+s];outputValue[yb+d]=gate*y;}}
 }";
 
     public static string Mamba2Ssd => Header + @"

@@ -126,9 +126,17 @@ public sealed class DirectPtxDenseLinearBackendTests
         Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
         bool? previousGate = DirectPtxFeatureGate.TestOverride;
         bool previousExperiment = DirectPtxFeatureGate.FusedLinearExperimentOverride;
+        // The M=16 FP16 Tensor-Core route is admitted by the MIXED-precision experiment
+        // flag, not the fused-linear one — see CudaBackend.DirectPtx.Fp16TensorCoreLinear.cs
+        // lines 53 and 161. PtxFusedLinearGeluFp16M16Kernel.IsPromotedShape is hardcoded
+        // to false, so that flag is the only way 512/2048 clears the performance gate.
+        // Without it the gate rejects first and the extent contract below is unreachable.
+        bool previousMixedExperiment =
+            DirectPtxFeatureGate.MixedPrecisionLinearExperimentOverride;
         bool previousDeterministic = AiDotNetEngine.DeterministicMode;
         DirectPtxFeatureGate.TestOverride = true;
         DirectPtxFeatureGate.FusedLinearExperimentOverride = true;
+        DirectPtxFeatureGate.MixedPrecisionLinearExperimentOverride = true;
         AiDotNetEngine.SetDeterministicMode(false);
         try
         {
@@ -250,6 +258,7 @@ public sealed class DirectPtxDenseLinearBackendTests
         finally
         {
             AiDotNetEngine.SetDeterministicMode(previousDeterministic);
+            DirectPtxFeatureGate.MixedPrecisionLinearExperimentOverride = previousMixedExperiment;
             DirectPtxFeatureGate.FusedLinearExperimentOverride = previousExperiment;
             DirectPtxFeatureGate.TestOverride = previousGate;
         }

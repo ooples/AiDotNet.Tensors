@@ -216,6 +216,20 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     }
 
     /// <summary>
+    /// Records why the most recent <see cref="GetOrCreateGlslPipeline"/> call returned
+    /// <see langword="null"/>. Without it every caller reported "install libshaderc",
+    /// which is wrong whenever the real cause is a GLSL compile error or a Vulkan
+    /// object-creation failure on a host where libshaderc is present and working.
+    /// </summary>
+    private string? _lastGlslPipelineError;
+
+    /// <summary>
+    /// Describes the most recent GLSL pipeline-creation failure.
+    /// </summary>
+    internal string GlslPipelineFailureReason =>
+        _lastGlslPipelineError ?? "no GLSL pipeline failure has been recorded";
+
+    /// <summary>
     /// Gets or creates a compute pipeline from a GLSL source string using runtime compilation.
     /// </summary>
     private VulkanComputePipeline? GetOrCreateGlslPipeline(string glslSource, int bindingCount, uint pushConstantSize = 0)
@@ -231,18 +245,42 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         if (_glslPipelineCache.TryGetValue(cacheKey, out var cached))
             return cached;
 
-        if (_glslCompiler is null || !_glslCompiler.IsAvailable)
+        if (_glslCompiler is null)
+        {
+            _lastGlslPipelineError = "the runtime GLSL compiler was never constructed";
             return null;
+        }
+
+        if (!_glslCompiler.IsAvailable)
+        {
+            _lastGlslPipelineError =
+                _glslCompiler.LastError ?? "libshaderc is unavailable on this host";
+            return null;
+        }
 
         var shader = _glslCompiler.CompileToShaderModule(glslSource);
         if (shader is null)
+        {
+            _lastGlslPipelineError =
+                _glslCompiler.LastError
+                ?? "the GLSL source failed to compile to a SPIR-V shader module";
             return null;
+        }
 
         try
         {
             var pipeline = VulkanComputePipeline.Create(shader, bindingCount, pushConstantSize);
-            if (pipeline is not null)
-                _glslPipelineCache.TryAdd(cacheKey, pipeline);
+            if (pipeline is null)
+            {
+                _lastGlslPipelineError =
+                    $"Vulkan rejected the compute pipeline for a {bindingCount}-binding, " +
+                    $"{pushConstantSize}-byte push-constant layout; " +
+                    $"{_glslPipelineCache.Count} GLSL pipelines are already live on this device";
+                return null;
+            }
+
+            _lastGlslPipelineError = null;
+            _glslPipelineCache.TryAdd(cacheKey, pipeline);
             return pipeline;
         }
         finally
@@ -276,7 +314,8 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         {
             // No CPU fallback for in-place ops: the caller should handle this
             // by catching and routing to a managed path.
-            throw new System.InvalidOperationException("Vulkan in-place pipeline creation failed.");
+            throw new System.InvalidOperationException(
+                $"Vulkan in-place pipeline creation failed: {GlslPipelineFailureReason}.");
         }
         var vb = AsVulkan(buffer);
         var threadRes = _device.AcquireThreadResources();
@@ -297,7 +336,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         var pipeline = GetOrCreateGlslPipeline(glslSource, 2, pushConstantSize);
         if (pipeline is null)
             throw new InvalidOperationException(
-                "Vulkan GLSL pipeline unavailable. Install libshaderc or use another GPU backend.");
+                $"Vulkan GLSL pipeline unavailable: {GlslPipelineFailureReason}.");
         var vbA = AsVulkan(A);
         var vbB = AsVulkan(B);
         var threadRes = _device.AcquireThreadResources();
@@ -323,7 +362,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         var pipeline = GetOrCreateGlslPipeline(glslSource, 3, pushConstantSize);
         if (pipeline is null)
             throw new InvalidOperationException(
-                "Vulkan GLSL pipeline unavailable. Install libshaderc or use another GPU backend.");
+                $"Vulkan GLSL pipeline unavailable: {GlslPipelineFailureReason}.");
         var vbA = AsVulkan(A);
         var vbB = AsVulkan(B);
         var vbC = AsVulkan(C);
@@ -351,7 +390,8 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         uint pushConstantSize = (uint)(pushConstants.Length * sizeof(uint));
         var pipeline = GetOrCreateGlslPipeline(glslSource, buffers.Length, pushConstantSize);
         if (pipeline is null)
-            throw new InvalidOperationException("Failed to create GLSL recurrence pipeline.");
+            throw new InvalidOperationException(
+                $"Failed to create the GLSL recurrence pipeline: {GlslPipelineFailureReason}.");
         var storages = new VulkanBuffer[buffers.Length];
         for (int i = 0; i < buffers.Length; i++) storages[i] = AsVulkan(buffers[i]).Storage;
         var threadRes = _device.AcquireThreadResources();
@@ -402,7 +442,8 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         if (dispatchSize <= 0) return;
         var pipeline = GetOrCreateGlslPipeline(glslSource, 4, pushConstantSize);
         if (pipeline is null)
-            throw new InvalidOperationException("Vulkan GLSL pipeline unavailable - install libshaderc for runtime compilation.");
+            throw new InvalidOperationException(
+                $"Vulkan GLSL pipeline unavailable: {GlslPipelineFailureReason}.");
         var vbA = AsVulkan(A); var vbB = AsVulkan(B); var vbC = AsVulkan(C); var vbD = AsVulkan(D);
         var threadRes = _device.AcquireThreadResources();
         lock (_computeLock)
