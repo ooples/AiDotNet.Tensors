@@ -74,7 +74,7 @@ public static class FlashAttention<T> where T : unmanaged
         double? scale = null, bool isCausal = false, int queryOffset = 0,
         Tensor<T>? attentionBias = null)
     {
-        ValidateInputs(query, key, value, attentionBias, queryOffset,
+        ValidateInputs(query, key, value, attentionBias, queryOffset, isCausal,
             out int batchProduct, out int Sq, out int Sk, out int headDim, out int Dv,
             out int[] prefixShape, out int[] biasPrefixShape, out int[] biasPrefixStrides);
 
@@ -168,7 +168,7 @@ public static class FlashAttention<T> where T : unmanaged
         if (output is null) throw new ArgumentNullException(nameof(output));
         if (logsumexp is null) throw new ArgumentNullException(nameof(logsumexp));
 
-        ValidateInputs(query, key, value, attentionBias, queryOffset,
+        ValidateInputs(query, key, value, attentionBias, queryOffset, isCausal,
             out int batchProduct, out int Sq, out int Sk, out int headDim, out int Dv,
             out int[] prefixShape, out int[] biasPrefixShape, out int[] biasPrefixStrides);
 
@@ -363,7 +363,7 @@ public static class FlashAttention<T> where T : unmanaged
     /// </summary>
     private static void ValidateInputs(
         Tensor<T> query, Tensor<T> key, Tensor<T> value, Tensor<T>? attentionBias,
-        int queryOffset,
+        int queryOffset, bool isCausal,
         out int batchProduct, out int Sq, out int Sk, out int headDim, out int Dv,
         out int[] prefixShape, out int[] biasPrefixShape, out int[] biasPrefixStrides)
     {
@@ -389,8 +389,10 @@ public static class FlashAttention<T> where T : unmanaged
             throw new ArgumentException($"query/key headDim mismatch: {headDim} vs {key._shape[kRank - 1]}.", nameof(key));
         if (value._shape[vRank - 2] != Sk)
             throw new ArgumentException($"key/value seq len mismatch: {Sk} vs {value._shape[vRank - 2]}.", nameof(value));
-        if (queryOffset < 0 || queryOffset + Sq > Sk)
-            throw new ArgumentException($"queryOffset={queryOffset} + Sq={Sq} must be <= Sk={Sk}.", nameof(queryOffset));
+        // Ordinary noncausal attention has independent query/memory lengths. Causal
+        // or explicitly offset calls retain cached-window bounds, without overflow.
+        if (queryOffset < 0 || ((isCausal || queryOffset != 0) && queryOffset > Sk - Sq))
+            throw new ArgumentException($"queryOffset={queryOffset} must be nonnegative and, for causal attention or a nonzero offset, queryOffset + Sq={Sq} must be <= Sk={Sk}.", nameof(queryOffset));
 
         // Build the shared prefix shape and verify q/k/v share it.
         prefixShape = new int[qRank - 2];
