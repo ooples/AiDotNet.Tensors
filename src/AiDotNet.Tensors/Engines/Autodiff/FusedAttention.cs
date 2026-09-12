@@ -229,12 +229,13 @@ public static class FusedAttention<T>
 
         // KV-cache / query-offset support (issue #198 gap D): when the
         // caller supplies a queryOffset, q_i must attend to keys
-        // k_j where j <= queryOffset + i. We validate queryOffset fits
-        // within the KV history here; the mask itself is built below.
+        // k_j where j <= queryOffset + i. Causal attention or an explicit
+        // nonzero offset denotes a window into KV history. Ordinary noncausal
+        // queries may outnumber memory tokens. Subtraction avoids overflow.
         int queryOffset = config.QueryOffset;
-        if (queryOffset < 0 || queryOffset + query._shape[2] > key._shape[2])
+        if (queryOffset < 0 || ((config.IsCausal || queryOffset != 0) && queryOffset > key._shape[2] - query._shape[2]))
             throw new ArgumentException(
-                $"queryOffset={queryOffset} + seqQ={query._shape[2]} must be <= seqKV={key._shape[2]}.",
+                $"queryOffset={queryOffset} must be nonnegative and, for causal attention or a nonzero offset, queryOffset + seqQ={query._shape[2]} must be <= seqKV={key._shape[2]}.",
                 nameof(config));
 
         // FlashAttention-2 block-tiled dispatch: O(seqLen) memory, uses

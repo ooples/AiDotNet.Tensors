@@ -55,9 +55,11 @@ public static class FlashAttention2
         int Dv = value._shape[3];
         if (key._shape[3] != headDim) throw new ArgumentException("query/key headDim mismatch.");
         if (value._shape[2] != Sk) throw new ArgumentException("key/value seq len mismatch.");
-        if (queryOffset < 0 || queryOffset + Sq > Sk)
+        // Noncausal cross-attention has independent query/memory lengths. Keep
+        // cached-window bounds for causal or explicitly offset calls, without overflow.
+        if (queryOffset < 0 || ((isCausal || queryOffset != 0) && queryOffset > Sk - Sq))
             throw new ArgumentException(
-                $"queryOffset={queryOffset} + Sq={Sq} must be <= Sk={Sk}.", nameof(queryOffset));
+                $"queryOffset={queryOffset} must be nonnegative and, for causal attention or a nonzero offset, queryOffset + Sq={Sq} must be <= Sk={Sk}.", nameof(queryOffset));
 
         double scaleVal = scale ?? 1.0 / Math.Sqrt(headDim);
         float scaleF = (float)scaleVal;

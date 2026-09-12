@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFrameworks>net10.0;net8.0;net471</TargetFrameworks>
+    <AssemblyName>AiDotNet.Tensors.Tests</AssemblyName>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <IsTestProject>true</IsTestProject>
+    <IsPackable>false</IsPackable>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+    <_GetChildProjectCopyToOutputDirectoryItems>false</_GetChildProjectCopyToOutputDirectoryItems>
+    <GenerateRuntimeConfigDevFile>true</GenerateRuntimeConfigDevFile>
+    <AutoGenerateBindingRedirects>true</AutoGenerateBindingRedirects>
+    <GenerateBindingRedirectsOutputType>true</GenerateBindingRedirectsOutputType>
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../src/AiDotNet.Tensors/AiDotNet.Tensors.csproj" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+    <Compile Include="../AiDotNet.Tensors.Tests/Engines/Autodiff/FusedAttentionRectangularTests.cs" />
+    <Compile Include="../AiDotNet.Tensors.Tests/Engines/Autodiff/FusedAttentionTests.cs" />
+    <Compile Include="../AiDotNet.Tensors.Tests/Engines/Autodiff/FusedAttentionAuditTests.cs" />
+    <Compile Include="../AiDotNet.Tensors.Tests/Engines/Autodiff/FusedAttentionFp32PrecisionTests.cs" />
+    <Compile Include="../AiDotNet.Tensors.Tests/Engines/Autodiff/FusedAttentionTiledBackwardTests.cs" />
+    <Compile Include="../AiDotNet.Tensors.Tests/Engines/Autodiff/FlashAttention2Tests.cs" />
+    <Compile Include="../AiDotNet.Tensors.Tests/Engines/Autodiff/FlashAttentionGenericTests.cs" />
+    <None Include="xunit.runner.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+  <Target Name="CopyLegacyManagedRuntime" AfterTargets="Build" Condition="'$(TargetFramework)' == 'net471'">
+    <Copy SourceFiles="@(RuntimeCopyLocalItems)"
+          DestinationFiles="@(RuntimeCopyLocalItems->'$(TargetDir)%(DestinationSubDirectory)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true" />
+  </Target>
+</Project>
