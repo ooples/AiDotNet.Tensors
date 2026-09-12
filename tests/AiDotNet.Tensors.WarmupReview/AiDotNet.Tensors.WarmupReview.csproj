@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFrameworks>net10.0;net8.0;net471</TargetFrameworks>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <IsTestProject>true</IsTestProject>
+    <IsPackable>false</IsPackable>
+    <AssemblyName>AiDotNet.Tensors.Tests</AssemblyName>
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <DefineConstants Condition="'$(UsePublishedTensors)' == 'true'">$(DefineConstants);PUBLISHED_TENSORS</DefineConstants>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" PrivateAssets="all" />
+    <PackageReference Include="AiDotNet.Tensors" Version="0.130.2" Condition="'$(UsePublishedTensors)' == 'true'" />
+    <ProjectReference Include="../../src/AiDotNet.Tensors/AiDotNet.Tensors.csproj" Condition="'$(UsePublishedTensors)' != 'true'" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="../AiDotNet.Tensors.Tests/Engines/Compilation/LrScheduleTests.cs" Link="LrScheduleTests.cs" />
+    <Compile Include="../AiDotNet.Tensors.Tests/Engines/Compilation/LinearWarmupPhaseContractTests.cs" Link="LinearWarmupPhaseContractTests.cs" />
+  </ItemGroup>
+</Project>

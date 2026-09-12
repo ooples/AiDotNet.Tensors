@@ -10,7 +10,9 @@ internal enum FusedLrScheduleKind
     Step = 6,
     Cyclic = 7,
     LinearWarmupCosine = 8,
-    LinearWarmupDecay = 9
+    LinearWarmupDecay = 9,
+    LinearWarmupPhasedDecay = 10,
+    LinearWarmupLegacyEagerDecay = 11
 }
 
 internal sealed class FusedLrScheduleCheckpoint
@@ -54,6 +56,8 @@ internal sealed class FusedLrScheduleCheckpoint
             FusedLrScheduleKind.Cyclic => (2, 1),
             FusedLrScheduleKind.LinearWarmupCosine => (2, 2),
             FusedLrScheduleKind.LinearWarmupDecay => (3, 3),
+            FusedLrScheduleKind.LinearWarmupPhasedDecay => (3, 3),
+            FusedLrScheduleKind.LinearWarmupLegacyEagerDecay => (3, 3),
             _ => throw new System.IO.InvalidDataException(
                 $"Unknown serialized LR schedule kind {(int)Kind}."),
         };
@@ -61,6 +65,10 @@ internal sealed class FusedLrScheduleCheckpoint
             throw new System.IO.InvalidDataException(
                 $"Serialized LR schedule kind {Kind} requires at least {reqD} double(s) and {reqI} int(s); " +
                 $"got {Doubles.Length} double(s) and {Ints.Length} int(s).");
+        if ((Kind == FusedLrScheduleKind.LinearWarmupPhasedDecay || Kind == FusedLrScheduleKind.LinearWarmupLegacyEagerDecay)
+            && (Ints[0] < 0 || !Enum.IsDefined(typeof(WarmupDecayMode), Ints[2])
+                || (Ints[2] != (int)WarmupDecayMode.Constant && Ints[1] < Ints[0])))
+            throw new System.IO.InvalidDataException("Serialized phased warmup has invalid steps or decay mode.");
     }
 
     private sealed class RestoredLrSchedule : LrSchedule
@@ -90,19 +98,31 @@ internal sealed class FusedLrScheduleCheckpoint
                 FusedLrScheduleKind.Cyclic => Cyclic(s),
                 FusedLrScheduleKind.LinearWarmupCosine => LinearWarmupCosine(s),
                 FusedLrScheduleKind.LinearWarmupDecay => LinearWarmupDecay(s),
+                FusedLrScheduleKind.LinearWarmupPhasedDecay => LinearWarmupPhasedDecay(s),
+                FusedLrScheduleKind.LinearWarmupLegacyEagerDecay => s == 1 ? _d[1] : LinearWarmupDecay(s),
                 _ => throw new NotSupportedException($"Unsupported serialized LR schedule kind '{_kind}'."),
             };
         }
 
-        // Faithful restore of LinearWarmupLr.GetLr — must stay bit-identical to that eager formula
-        // (FusedLrScheduleMappingTests). _d = [lrMax, warmupInitLr, endLr]; _i = [warmupSteps,
-        // totalSteps(normalized), (int)WarmupDecayMode].
+        // Kind 9 preserves the historical floor DURING warmup, even after the
+        // public factory is corrected. Existing saved runs must not change trajectory.
+        // _d = [lrMax, warmupInitLr, endLr]; _i = [warmupSteps, totalSteps, decayMode].
         private double LinearWarmupDecay(int step)
         {
             double lrMax = _d[0], warmupInit = _d[1], endLr = _d[2];
             int warmup = _i[0];
             if (step <= 1) return warmup > 0 ? warmupInit : lrMax;
             double raw = LinearWarmupRaw(step - 1, lrMax, warmupInit, endLr, warmup, _i[1], (WarmupDecayMode)_i[2]);
+            return raw > endLr ? raw : endLr;
+        }
+
+        private double LinearWarmupPhasedDecay(int step)
+        {
+            double lrMax = _d[0], warmupInit = _d[1], endLr = _d[2];
+            int warmup = _i[0];
+            if (step <= 1) return warmup > 0 ? warmupInit : lrMax;
+            double raw = LinearWarmupRaw(step - 1, lrMax, warmupInit, endLr, warmup, _i[1], (WarmupDecayMode)_i[2]);
+            if (step - 1 < warmup) return raw;
             return raw > endLr ? raw : endLr;
         }
 
