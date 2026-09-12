@@ -22,6 +22,15 @@ internal static class Avx2Streaming
     internal const int Fp64ColumnTileWidth = 4;
     internal const int Fp32ColumnTileWidth = 8;
 
+    /// <summary>
+    /// Routes the FP32 NT (transB) case to the reduction-order-canonical kernel
+    /// (<c>RunFp32NtSequentialK</c>) instead of the lane-partitioned dot form. Default OFF:
+    /// the dot form is the shipped path, and this exists so the canonical variant can be
+    /// A/B'd for bit-equality against the packed strategies and for throughput before
+    /// either becomes the default. Test/bench only; does not change production routing.
+    /// </summary>
+    internal static bool s_ntSequentialK;
+
 #if NET5_0_OR_GREATER
     /// <summary>Runtime support gate.</summary>
     public static bool IsSupported => Avx2.IsSupported && Fma.IsSupported;
@@ -153,6 +162,19 @@ internal static class Avx2Streaming
             // kernel for the WHOLE GEMM (no SIMD at all — the top compiled-plan compute
             // frame on an AVX2 box). Vectorize it as an 8-wide FMA dot product, 4 output
             // columns per inner pass so one A-row load feeds four B-row FMAs.
+            //
+            // s_ntSequentialK (default OFF): route to the reduction-order-canonical
+            // variant instead. RunFp32Nt's dot form accumulates over K-LANES and collapses
+            // with a pairwise horizontal sum, which is a different summation order from the
+            // packed strategies (and from this file's own untransposed path), so the
+            // transposed Streaming result is not bit-identical to PackBoth/PackAOnly.
+            // RunFp32NtSequentialK reproduces the canonical order exactly. Flagged so the
+            // two can be A/B'd for both bits and throughput before either becomes default.
+            if (s_ntSequentialK)
+            {
+                RunFp32NtSequentialK(a, lda, b, ldb, c, ldc, m, n, k);
+                return;
+            }
             RunFp32Nt(a, lda, b, ldb, c, ldc, m, n, k);
             return;
         }
@@ -319,6 +341,159 @@ internal static class Avx2Streaming
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// Reduction-order-canonical NT kernel (transB=true, transA=false).
+    ///
+    /// <para>
+    /// Computes the SAME arithmetic sequence as the packed strategies and as this file's
+    /// untransposed path: for each output element, an uninterrupted ascending-k chain of
+    /// <see cref="Fma.MultiplyAdd"/> into an accumulator seeded from C. That is what makes
+    /// the result bit-identical to <c>PackBothStrategy</c> — the packed microkernel
+    /// (<c>Avx2Fp32_8x8.Run</c>) likewise loads C into its accumulators and never restarts
+    /// them at a K-panel boundary, so no blocking term appears here either.
+    /// </para>
+    ///
+    /// <para>
+    /// The layout problem: the canonical order needs, at a fixed k, the eight B values for
+    /// consecutive j — but under transB those are strided by ldb. Rather than eat a gather
+    /// per k, load eight K-contiguous B rows (which transB gives for free) and transpose the
+    /// 8x8 block in-register, yielding eight j-major vectors covering eight k-steps. That is
+    /// ~2 shuffle ops per FMA-vector and keeps every B read contiguous.
+    /// </para>
+    /// </summary>
+    private static unsafe void RunFp32NtSequentialK(
+        ReadOnlySpan<float> a, int lda,
+        ReadOnlySpan<float> b, int ldb,
+        Span<float> c, int ldc,
+        int m, int n, int k)
+    {
+        // Transpose ONCE per (j0, k-block) into an L1-resident tile and reuse it across all m
+        // rows, instead of re-transposing per (j0, i) pair. The transposed B block is
+        // independent of i, so the original per-row transpose was redundant by a factor of m
+        // (up to 384x on the shapes this targets).
+        //
+        // KB = 256 -> the tile is 256 * 8 * 4B = 8 KB, comfortably L1-resident alongside the
+        // A row and C tile.
+        const int KB = 256;
+        int nVec = (n / 8) * 8;
+        float* bt = stackalloc float[KB * 8];
+
+        fixed (float* aPtr = a)
+        fixed (float* bPtr = b)
+        fixed (float* cPtr = c)
+        {
+            for (int j0 = 0; j0 < nVec; j0 += 8)
+            {
+                for (int k0 = 0; k0 < k; k0 += KB)
+                {
+                    int kb = Math.Min(KB, k - k0);
+
+                    // ── Build the reusable j-major tile: bt[t*8 + lane] = B[j0+lane, k0+t] ──
+                    int t = 0;
+                    for (; t + 8 <= kb; t += 8)
+                    {
+                        Vector256<float> r0 = Avx.LoadVector256(bPtr + (j0 + 0) * ldb + k0 + t);
+                        Vector256<float> r1 = Avx.LoadVector256(bPtr + (j0 + 1) * ldb + k0 + t);
+                        Vector256<float> r2 = Avx.LoadVector256(bPtr + (j0 + 2) * ldb + k0 + t);
+                        Vector256<float> r3 = Avx.LoadVector256(bPtr + (j0 + 3) * ldb + k0 + t);
+                        Vector256<float> r4 = Avx.LoadVector256(bPtr + (j0 + 4) * ldb + k0 + t);
+                        Vector256<float> r5 = Avx.LoadVector256(bPtr + (j0 + 5) * ldb + k0 + t);
+                        Vector256<float> r6 = Avx.LoadVector256(bPtr + (j0 + 6) * ldb + k0 + t);
+                        Vector256<float> r7 = Avx.LoadVector256(bPtr + (j0 + 7) * ldb + k0 + t);
+
+                        Transpose8x8(ref r0, ref r1, ref r2, ref r3, ref r4, ref r5, ref r6, ref r7);
+
+                        Avx.Store(bt + (t + 0) * 8, r0);
+                        Avx.Store(bt + (t + 1) * 8, r1);
+                        Avx.Store(bt + (t + 2) * 8, r2);
+                        Avx.Store(bt + (t + 3) * 8, r3);
+                        Avx.Store(bt + (t + 4) * 8, r4);
+                        Avx.Store(bt + (t + 5) * 8, r5);
+                        Avx.Store(bt + (t + 6) * 8, r6);
+                        Avx.Store(bt + (t + 7) * 8, r7);
+                    }
+                    for (; t < kb; t++)
+                    {
+                        for (int lane = 0; lane < 8; lane++)
+                            bt[t * 8 + lane] = bPtr[(j0 + lane) * ldb + k0 + t];
+                    }
+
+                    // ── Reuse the tile for every row ──
+                    // Per (i, j0) the chain is still an uninterrupted ascending-k FMA sequence
+                    // seeded from C and stored back, so successive k-blocks continue the same
+                    // accumulation exactly as PackBoth continues across its K-panels. Bit
+                    // equality does not depend on KB.
+                    for (int i = 0; i < m; i++)
+                    {
+                        float* aRow = aPtr + i * lda + k0;
+                        Vector256<float> acc = Avx.LoadVector256(cPtr + i * ldc + j0);
+                        for (int tt = 0; tt < kb; tt++)
+                        {
+                            acc = Fma.MultiplyAdd(
+                                Vector256.Create(aRow[tt]),
+                                Avx.LoadVector256(bt + tt * 8),
+                                acc);
+                        }
+                        Avx.Store(cPtr + i * ldc + j0, acc);
+                    }
+                }
+            }
+
+            // N-tail (n % 8): scalar lanes, but still an ascending-k FMA chain seeded from C
+            // so these columns match the packed path too.
+            for (int j = nVec; j < n; j++)
+            {
+                float* bj = bPtr + j * ldb;
+                for (int i = 0; i < m; i++)
+                {
+                    float* aRow = aPtr + i * lda;
+                    Vector128<float> acc = Vector128.CreateScalar(cPtr[i * ldc + j]);
+                    for (int kk = 0; kk < k; kk++)
+                    {
+                        acc = Fma.MultiplyAddScalar(
+                            Vector128.CreateScalar(aRow[kk]),
+                            Vector128.CreateScalar(bj[kk]),
+                            acc);
+                    }
+                    cPtr[i * ldc + j] = acc.ToScalar();
+                }
+            }
+        }
+    }
+
+    /// <summary>In-register 8x8 FP32 transpose (3 stages of unpack/permute).</summary>
+    private static void Transpose8x8(
+        ref Vector256<float> r0, ref Vector256<float> r1, ref Vector256<float> r2, ref Vector256<float> r3,
+        ref Vector256<float> r4, ref Vector256<float> r5, ref Vector256<float> r6, ref Vector256<float> r7)
+    {
+        Vector256<float> t0 = Avx.UnpackLow(r0, r1);
+        Vector256<float> t1 = Avx.UnpackHigh(r0, r1);
+        Vector256<float> t2 = Avx.UnpackLow(r2, r3);
+        Vector256<float> t3 = Avx.UnpackHigh(r2, r3);
+        Vector256<float> t4 = Avx.UnpackLow(r4, r5);
+        Vector256<float> t5 = Avx.UnpackHigh(r4, r5);
+        Vector256<float> t6 = Avx.UnpackLow(r6, r7);
+        Vector256<float> t7 = Avx.UnpackHigh(r6, r7);
+
+        Vector256<float> s0 = Avx.Shuffle(t0, t2, 0x44);
+        Vector256<float> s1 = Avx.Shuffle(t0, t2, 0xEE);
+        Vector256<float> s2 = Avx.Shuffle(t1, t3, 0x44);
+        Vector256<float> s3 = Avx.Shuffle(t1, t3, 0xEE);
+        Vector256<float> s4 = Avx.Shuffle(t4, t6, 0x44);
+        Vector256<float> s5 = Avx.Shuffle(t4, t6, 0xEE);
+        Vector256<float> s6 = Avx.Shuffle(t5, t7, 0x44);
+        Vector256<float> s7 = Avx.Shuffle(t5, t7, 0xEE);
+
+        r0 = Avx.Permute2x128(s0, s4, 0x20);
+        r1 = Avx.Permute2x128(s1, s5, 0x20);
+        r2 = Avx.Permute2x128(s2, s6, 0x20);
+        r3 = Avx.Permute2x128(s3, s7, 0x20);
+        r4 = Avx.Permute2x128(s0, s4, 0x31);
+        r5 = Avx.Permute2x128(s1, s5, 0x31);
+        r6 = Avx.Permute2x128(s2, s6, 0x31);
+        r7 = Avx.Permute2x128(s3, s7, 0x31);
     }
 
     /// <summary>FP64 mirror of <see cref="RunFp32Nt"/> (Vector256&lt;double&gt;, 4 lanes).</summary>
