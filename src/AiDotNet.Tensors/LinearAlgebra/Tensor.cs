@@ -2507,7 +2507,10 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
 
             if (dim1 == dim2 || dim1 == 1 || dim2 == 1)
             {
-                broadcastShape[maxRank - 1 - i] = Math.Max(dim1, dim2);
+                // An extent of 1 stretches to the OTHER extent — including 0. Math.Max(dim1, dim2)
+                // agrees with that for every pair of positive extents but turns (0, 1) into 1, which
+                // sized [0,2,2,2] + [1,2,1,1] as eight elements drawn from an operand with none.
+                broadcastShape[maxRank - 1 - i] = dim1 == 1 ? dim2 : dim1;
             }
             else
             {

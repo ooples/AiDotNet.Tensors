@@ -74,7 +74,9 @@ internal static class ArithOperators
                         throw new InvalidDataException(
                             $"MatMul batch shapes aren't broadcast-compatible: " +
                             $"a.shape=[{string.Join(",", a._shape)}] b.shape=[{string.Join(",", b._shape)}].");
-                    batchShape[i] = Math.Max(aDim, bDim);
+                    // 1 stretches to the other extent, including 0 — Math.Max would turn (0, 1) into 1
+                    // and size an empty batch as one matrix.
+                    batchShape[i] = aDim == 1 ? bDim : aDim;
                 }
                 int totalBatch = 1;
                 for (int i = 0; i < maxBatchRank; i++) totalBatch *= batchShape[i];

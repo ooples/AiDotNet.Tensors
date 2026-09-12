@@ -16846,6 +16846,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return base.TensorBroadcastMultiply(a, b);
         }
 
+        // An empty operand belongs to the CPU base, which returns the (empty) broadcast-shaped result
+        // or rejects an incompatible pair. There is no kernel to launch for an empty result, and the
+        // last-axis fast paths below divide a.Length by a zero inner extent.
+        if (a.Length == 0 || b.Length == 0)
+            return base.TensorBroadcastMultiply(a, b);
+
         Tensor<T> RecordGpuResult(Tensor<T> output)
         {
             Autodiff.DifferentiableOps.RecordBinary(
@@ -22418,6 +22424,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
             return base.TensorBroadcastAdd(a, b);
 
+        // An empty operand belongs to the CPU base, which returns the (empty) broadcast-shaped result
+        // or rejects an incompatible pair. There is no kernel to launch for an empty result, and the
+        // last-axis fast path's a.Length % b.Length divides by zero on an empty right operand.
+        if (a.Length == 0 || b.Length == 0)
+            return base.TensorBroadcastAdd(a, b);
+
         Tensor<T> RecordGpuResult(Tensor<T> output)
         {
             Autodiff.DifferentiableOps.RecordBinary(
@@ -22521,6 +22533,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
             return base.TensorBroadcastSubtract(a, b);
 
+        // An empty operand belongs to the CPU base, which returns the (empty) broadcast-shaped result
+        // or rejects an incompatible pair. There is no kernel to launch for an empty result, and the
+        // last-axis fast path's a.Length % b.Length divides by zero on an empty right operand.
+        if (a.Length == 0 || b.Length == 0)
+            return base.TensorBroadcastSubtract(a, b);
+
         Tensor<T> RecordGpuResult(Tensor<T> output)
         {
             Autodiff.DifferentiableOps.RecordBinary(
@@ -22583,6 +22601,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> TensorBroadcastDivide<T>(Tensor<T> a, Tensor<T> b)
     {
         if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
+            return base.TensorBroadcastDivide(a, b);
+
+        // An empty operand belongs to the CPU base, which returns the (empty) broadcast-shaped result
+        // or rejects an incompatible pair. There is no kernel to launch for an empty result, and the
+        // last-axis fast path's a.Length % b.Length divides by zero on an empty right operand.
+        if (a.Length == 0 || b.Length == 0)
             return base.TensorBroadcastDivide(a, b);
 
         Tensor<T> RecordGpuResult(Tensor<T> output)
