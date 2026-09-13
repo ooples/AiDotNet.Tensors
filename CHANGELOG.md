@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.131.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.130.3...v0.131.0) (2026-09-13)
+
+
+### Features
+
+* add differentiable tensor asin, acos, atan and atan2 ([#1019](https://github.com/ooples/AiDotNet.Tensors/issues/1019)) ([6ab238a](https://github.com/ooples/AiDotNet.Tensors/commit/6ab238ac7f6d80a50be20b68efcbba70da37db94))
+* **autotune:** persist quarantine and restore validated deployments ([#1024](https://github.com/ooples/AiDotNet.Tensors/issues/1024)) ([cbbc0c0](https://github.com/ooples/AiDotNet.Tensors/commit/cbbc0c03d40afd3d09b1ee194da856d15f04be95))
+* integrate evolutionary kernel autotuning ([#1011](https://github.com/ooples/AiDotNet.Tensors/issues/1011)) ([67ceb6e](https://github.com/ooples/AiDotNet.Tensors/commit/67ceb6ed328a7764d7ee45864d32188fd659e363))
+* make istft differentiable and add stftphase ([#1021](https://github.com/ooples/AiDotNet.Tensors/issues/1021)) ([a93cb60](https://github.com/ooples/AiDotNet.Tensors/commit/a93cb606f6947d59c45ff805cd042060ced66272))
+
+
+### Bug Fixes
+
+* **autodiff:** reduce the rank-3 weight gradient to its rank-2 leaf ([#1037](https://github.com/ooples/AiDotNet.Tensors/issues/1037)) ([87adda3](https://github.com/ooples/AiDotNet.Tensors/commit/87adda331fdc48ed2d08426709166e8d4cfe7e53))
+* **broadcast:** follow NumPy's rule for zero-size extents across engine, autodiff and ONNX ([#1033](https://github.com/ooples/AiDotNet.Tensors/issues/1033)) ([16344d2](https://github.com/ooples/AiDotNet.Tensors/commit/16344d25a0eb32c2257e5d1056d0e5bfb346cb8c))
+* **gpu:** preserve lazy activation ownership ([#1020](https://github.com/ooples/AiDotNet.Tensors/issues/1020)) ([cba12d7](https://github.com/ooples/AiDotNet.Tensors/commit/cba12d7e42ce01d43e3f0a0d4d5980cd68dafe77))
+* preserve streaming transactions and GPU cache coherence ([#1029](https://github.com/ooples/AiDotNet.Tensors/issues/1029)) ([1c71f40](https://github.com/ooples/AiDotNet.Tensors/commit/1c71f4091acc39196b8d9604f555a265b110a30c))
+
 ## [0.130.3](https://github.com/ooples/AiDotNet.Tensors/compare/v0.130.2...v0.130.3) (2026-09-08)
 
 
