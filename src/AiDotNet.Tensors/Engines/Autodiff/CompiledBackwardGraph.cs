@@ -55,6 +55,7 @@ public sealed class CompiledBackwardGraph<T>
     private readonly int _entryCount;
 
     private readonly IEngine _engine;
+    private readonly GradientAccumulationPrecision _accumulationPrecision;
 
     /// <summary>
     /// Optional reference to the owning tape's RetainGrad set. When non-null,
@@ -75,7 +76,8 @@ public sealed class CompiledBackwardGraph<T>
         Tensor<T> loss,
         Tensor<T>[]? sources,
         IEngine engine,
-        HashSet<Tensor<T>>? retainGrad = null)
+        HashSet<Tensor<T>>? retainGrad = null,
+        GradientAccumulationPrecision accumulationPrecision = GradientAccumulationPrecision.Float32)
     {
         // Arena reference is shared with the owning tape. Safe because:
         // 1. CompiledBackwardGraph is created inside ComputeGradients which holds the tape
@@ -86,6 +88,7 @@ public sealed class CompiledBackwardGraph<T>
         _loss = loss;
         _sources = sources;
         _engine = engine;
+        _accumulationPrecision = accumulationPrecision;
         _retainGrad = retainGrad;
 
         // Dead node elimination: find which entries are reachable from loss
@@ -132,6 +135,7 @@ public sealed class CompiledBackwardGraph<T>
     /// </summary>
     internal Dictionary<Tensor<T>, Tensor<T>> Execute(Tensor<T>? currentLoss)
     {
+        using var accumulationScope = new GradientAccumulationPrecisionScope(_accumulationPrecision);
         var loss = currentLoss ?? _loss;
         if (loss is null)
             throw new InvalidOperationException(
@@ -148,7 +152,7 @@ public sealed class CompiledBackwardGraph<T>
         if (Optimization.TensorCodecOptions.Current.EnableAlgebraicBackward)
         {
             var optimized = OptimizedBackwardPlan<T>.TryCreate(
-                _entries, _reachableEntryIndices, loss, _sources, _engine, _retainGrad);
+                _entries, _reachableEntryIndices, loss, _sources, _engine, _retainGrad, _accumulationPrecision);
             if (optimized is not null)
                 return optimized.Execute();
         }
@@ -458,8 +462,8 @@ internal static class BackwardInputBuffers<T>
     /// </summary>
     internal static void Clear()
     {
-        if (_buf1 is not null) _buf1[0] = null!;
-        if (_buf2 is not null) { _buf2[0] = null!; _buf2[1] = null!; }
-        if (_buf3 is not null) { _buf3[0] = null!; _buf3[1] = null!; _buf3[2] = null!; }
+        if (_buf1 is not null) Array.Clear(_buf1, 0, _buf1.Length);
+        if (_buf2 is not null) Array.Clear(_buf2, 0, _buf2.Length);
+        if (_buf3 is not null) Array.Clear(_buf3, 0, _buf3.Length);
     }
 }

@@ -84,8 +84,25 @@ jobs:
 
     - name: Install POCL (CPU OpenCL device) + ICD loader
       run: |
-        sudo apt-get update
-        sudo apt-get install -y ocl-icd-opencl-dev pocl-opencl-icd clinfo
+        # Drop the third-party apt sources the runner image ships with, before updating.
+        #
+        # None of them provide the packages below - those come from the Ubuntu archives - but
+        # `apt-get update` exits 100 if ANY configured source fails, and this step runs under
+        # `bash -e`, so one unrelated mirror hiccup kills the shard before a single test runs.
+        # That happened on run 34491921445: dl.google.com/linux/chrome-stable served a
+        # Packages.gz whose size disagreed with its own Release file ("Mirror sync in progress"),
+        # and tape-grad-6 went red on PR #1017 with nothing in its log but an apt error.
+        #
+        # The parity step below is deliberately `continue-on-error` because POCL is not reliable
+        # enough on hosted runners to gate on. Setup failing the job anyway contradicts that: it
+        # reports a problem with the change under test when the problem is a Google mirror.
+        #
+        # Removed by name rather than globbing `*.list`, so a runner image that keeps the Ubuntu
+        # archive in a `.list` file is not left with no sources at all. `rm -f` is a no-op when
+        # they are absent.
+        sudo rm -f /etc/apt/sources.list.d/google-chrome.list                    /etc/apt/sources.list.d/microsoft-prod.list
+        sudo apt-get update -o Acquire::Retries=3
+        sudo apt-get install -y -o Acquire::Retries=3 ocl-icd-opencl-dev pocl-opencl-icd clinfo
         echo "=== clinfo: OpenCL platforms/devices ==="
         clinfo || echo "::warning::clinfo failed — POCL may not be registered."
 

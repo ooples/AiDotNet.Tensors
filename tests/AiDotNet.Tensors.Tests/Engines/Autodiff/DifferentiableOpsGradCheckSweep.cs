@@ -242,6 +242,14 @@ public class DifferentiableOpsGradCheckSweep
         ["IRFFT"] = r => [SafeTensor([2 * (8 / 2 + 1)], r), 8],
         ["Spectrogram"] = r => [SafeTensor([64], r), 16, 4, 16, HannWindowFor(16)],
 
+        // StftPhase needs a waveform, not noise. Its output is WRAPPED phase, so finite differences
+        // across the atan2 branch cut measure a 2*pi jump rather than a derivative -- with
+        // SafeTensor input the numerical gradient came back as 3.14158e6, which is exactly
+        // 2*pi / (2*eps). A signal with every bin strongly excited keeps each bin away from the cut
+        // under a 1e-6 perturbation. Same nFft/hop/window coupling as Spectrogram, whose bins these
+        // must match one for one.
+        ["StftPhase"] = _ => [WellExcitedWaveform(64), 16, 4, 16, HannWindowFor(16)],
+
         // --- reductions with explicit axes. ReduceMax is overloaded 3-param / 4-param
         //     (the latter with `out int[] maxIndices`), hence the arity-keyed pair. ---
         ["ReduceMax/3"] = r => [SafeTensor([2, 3], r), new[] { 1 }, false],
@@ -397,6 +405,23 @@ public class DifferentiableOpsGradCheckSweep
         if (t == typeof(double?)) return "double?";
         if (t.IsGenericType) return t.Name + "<" + string.Join(",", t.GetGenericArguments().Select(TypeToken)) + ">";
         return t.Name;
+    }
+
+    /// <summary>
+    /// A deterministic waveform whose every STFT bin carries real energy.
+    /// </summary>
+    /// <remarks>
+    /// Phase is only well conditioned where the magnitude is not near zero -- its derivative carries
+    /// a 1/|C| factor -- and it is only finite-difference-checkable where the wrapped value stays
+    /// clear of the branch cut. Two incommensurate tones over a DC offset satisfy both, which
+    /// uniform noise in [0.35, 0.95] does not.
+    /// </remarks>
+    private static Tensor<double> WellExcitedWaveform(int n)
+    {
+        var t = new Tensor<double>([n]);
+        for (int i = 0; i < n; i++)
+            t[i] = 0.6 + Math.Sin(0.37 * i) + 0.4 * Math.Cos(1.13 * i);
+        return t;
     }
 
     /// <summary>Hann window of exactly nFft samples, matching CpuEngine's own definition.</summary>

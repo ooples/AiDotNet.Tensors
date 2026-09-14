@@ -544,16 +544,17 @@ public sealed class ParameterBuffer<T>
             {
                 contiguous = param.IsContiguous ? param : param.Contiguous();
             }
-            var srcData = contiguous.DataVector;
-            var src = srcData.AsSpan().Slice(contiguous._storageOffset, contiguous.Length);
             int expectedSize = 1;
             foreach (int d in _shapes[i]) expectedSize *= d;
-            if (src.Length != expectedSize)
+            if (contiguous.Length != expectedSize)
                 throw new ArgumentException(
-                    $"Parameter {i} length ({src.Length}) does not match expected shape size. " +
+                    $"Parameter {i} length ({contiguous.Length}) does not match expected shape size. " +
                     "Ensure parameter tensors match the shapes provided at buffer construction.");
-            var denseDst = bufferSpan.Slice(_offsets[i], contiguous.Length);
-            src.CopyTo(denseDst);
+            var denseDst = bufferSpan.Slice(_offsets[i], expectedSize);
+            // Tensor.CopyTo owns logical-offset and streaming-materialization semantics. Reading
+            // DataVector and then applying _storageOffset again breaks when a streaming provider
+            // returns a vector already scoped to the logical tensor.
+            contiguous.CopyTo(denseDst);
         }
     }
 

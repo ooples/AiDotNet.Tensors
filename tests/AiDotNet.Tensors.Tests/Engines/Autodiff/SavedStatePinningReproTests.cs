@@ -508,12 +508,12 @@ public class SavedStatePinningReproTests
     public void StreamingBackward_ReleasesSavedStateForExecutedAndDeadEntries()
     {
         TensorPool<float>.Clear();
-        bool previousReleaseSetting = GradientTape<float>.ReleaseStreamingActivations;
-        GradientTape<float>.ReleaseStreamingActivations = true;
-        try
+        var engine = new CpuEngine();
+        using var tape = new GradientTape<float>(new GradientTapeOptions
         {
-            var engine = new CpuEngine();
-            using var tape = new GradientTape<float>(new GradientTapeOptions { Persistent = false });
+            Persistent = false,
+            StreamingGraphRetention = StreamingGraphRetentionMode.ReleaseAfterBackward,
+        });
             var deadInput = Fixed(new[] { 2, 8 }, 0.2f, 0.03f);
             var deadGamma = Fixed(new[] { 8 }, 1f, 0.01f);
             _ = engine.RMSNorm(deadInput, deadGamma, 1e-5, out var deadRms);
@@ -532,11 +532,6 @@ public class SavedStatePinningReproTests
 
             Assert.True(emitted);
             Assert.False(liveRms._pinnedByTape);
-            AssertReleasedAndPoolable(deadRms, "streaming dead-entry cleanup");
-        }
-        finally
-        {
-            GradientTape<float>.ReleaseStreamingActivations = previousReleaseSetting;
-        }
+        AssertReleasedAndPoolable(deadRms, "streaming dead-entry cleanup");
     }
 }

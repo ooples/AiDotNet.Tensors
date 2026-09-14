@@ -2750,6 +2750,71 @@ public interface IEngine
     Tensor<T> TensorCos<T>(Tensor<T> tensor);
 
     /// <summary>
+    /// Computes the element-wise arcsine of a tensor.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="tensor">The input tensor, with elements in [-1, 1].</param>
+    /// <returns>A tensor with asin(x) in radians for each element, in [-pi/2, pi/2].</returns>
+    /// <remarks>
+    /// <para>
+    /// Unlike the <c>Asin</c> overloads over spans and vectors, this records on the gradient tape,
+    /// so a loss defined over the recovered angle trains the tensor it came from. The derivative
+    /// 1/sqrt(1 - x^2) is unbounded at the endpoints; an input that reaches exactly -1 or 1 yields
+    /// an infinite gradient, which is a property of the function rather than of this implementation.
+    /// </para>
+    /// </remarks>
+    Tensor<T> TensorAsin<T>(Tensor<T> tensor);
+
+    /// <summary>
+    /// Computes the element-wise arccosine of a tensor.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="tensor">The input tensor, with elements in [-1, 1].</param>
+    /// <returns>A tensor with acos(x) in radians for each element, in [0, pi].</returns>
+    /// <remarks>
+    /// <para>
+    /// Records on the gradient tape. Common in geometric losses, where the angle between two unit
+    /// vectors is the arccosine of their dot product. The same endpoint caveat as
+    /// <see cref="TensorAsin{T}"/> applies, and it bites more often here: two nearly parallel unit
+    /// vectors have a dot product near 1.
+    /// </para>
+    /// </remarks>
+    Tensor<T> TensorAcos<T>(Tensor<T> tensor);
+
+    /// <summary>
+    /// Computes the element-wise arctangent of a tensor.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="tensor">The input tensor.</param>
+    /// <returns>A tensor with atan(x) in radians for each element, in (-pi/2, pi/2).</returns>
+    /// <remarks>
+    /// <para>
+    /// Records on the gradient tape. Its derivative 1/(1 + x^2) is finite everywhere and bounded by
+    /// 1, which makes it the well-behaved member of the three - it is used as a soft clamp and in
+    /// Cauchy-family losses precisely because of that.
+    /// </para>
+    /// </remarks>
+    Tensor<T> TensorAtan<T>(Tensor<T> tensor);
+
+    /// <summary>
+    /// Computes the element-wise four-quadrant arctangent of <paramref name="y"/> over
+    /// <paramref name="x"/>.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="y">The numerator tensor.</param>
+    /// <param name="x">The denominator tensor, the same shape as <paramref name="y"/>.</param>
+    /// <returns>A tensor with atan2(y, x) in radians for each element pair, in (-pi, pi].</returns>
+    /// <remarks>
+    /// <para>
+    /// The differentiable counterpart of <c>NativeAtan2</c>, which is registered as
+    /// non-differentiable. Use this one wherever a phase or a heading feeds a loss: partial
+    /// derivatives are x/(x^2 + y^2) and -y/(x^2 + y^2), both undefined only at the origin, where
+    /// the angle itself is undefined.
+    /// </para>
+    /// </remarks>
+    Tensor<T> TensorAtan2<T>(Tensor<T> y, Tensor<T> x);
+
+    /// <summary>
     /// Performs trilinear interpolation on a 3D grid.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
@@ -2956,7 +3021,15 @@ public interface IEngine
     /// - Batch statistics
     /// - Loss averaging
     /// </para>
+    /// <para>
+    /// <b>Not usable inside a loss.</b> This returns a bare <typeparamref name="T"/>, so the result
+    /// is off the gradient tape: wrapping it back into a tensor produces a value whose gradient
+    /// connection to <paramref name="tensor"/> is already gone. Nothing throws, and the term simply
+    /// never trains. Use <see cref="ReduceMean{T}"/>, which returns a tensor and stays on the tape,
+    /// for any mean that feeds a loss; reserve this one for reporting and diagnostics.
+    /// </para>
     /// </remarks>
+    /// <seealso cref="ReduceMean{T}"/>
     T TensorMean<T>(Tensor<T> tensor);
 
     #endregion
@@ -9844,6 +9917,36 @@ public interface IEngine
     /// <summary>Magnitude spectrogram |STFT(x)|. Thin wrapper over STFT
     /// that returns only the magnitude half.</summary>
     Tensor<T> Spectrogram<T>(Tensor<T> waveform, int nFft, int hopLength, int winLength, Tensor<T>? window = null);
+
+    /// <summary>Phase spectrogram <c>arg STFT(x)</c>. The phase counterpart of
+    /// <see cref="Spectrogram{T}"/>, returning the half that one discards.</summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="waveform">Audio signal, <c>[..., samples]</c>.</param>
+    /// <param name="nFft">FFT size.</param>
+    /// <param name="hopLength">Samples between frames.</param>
+    /// <param name="winLength">Window length, used only when <paramref name="window"/> is null.</param>
+    /// <param name="window">Analysis window; a Hann window of <paramref name="winLength"/> when null.</param>
+    /// <returns>Wrapped phase in radians, <c>[..., nFft/2 + 1, frames]</c>, matching
+    /// <see cref="Spectrogram{T}"/> bin for bin.</returns>
+    /// <remarks>
+    /// <para>
+    /// Records on the gradient tape, which is the point of it (issue #905). <c>STFT</c> emits phase
+    /// through an <c>out</c> parameter and is deliberately unrecorded, so before this the only
+    /// differentiable analysis output was magnitude, and an objective over angles - the phase term
+    /// in a prediction vocoder - had no differentiable path to the quantity it was defined on.
+    /// </para>
+    /// <para>
+    /// Together with <see cref="Spectrogram{T}"/> this gives the complex analysis differentiably,
+    /// and pairs with <see cref="ISTFT{T}"/> to close the round trip: both of its inputs are now
+    /// reachable, and synthesis itself records.
+    /// </para>
+    /// <para>
+    /// The phase derivative scales as <c>1/|C|</c>, so bins with near-zero magnitude contribute an
+    /// unbounded gradient. Their phase is meaningless in any case, and the implementation reports
+    /// zero there rather than an infinity that would spread through the whole waveform gradient.
+    /// </para>
+    /// </remarks>
+    Tensor<T> StftPhase<T>(Tensor<T> waveform, int nFft, int hopLength, int winLength, Tensor<T>? window = null);
 
     /// <summary>
     /// Convert amplitude to dB: <c>20 · log10(max(x, minAmplitude))</c>.

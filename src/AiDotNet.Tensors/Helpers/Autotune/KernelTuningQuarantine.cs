@@ -74,7 +74,7 @@ public sealed class KernelTuningQuarantineResult<TConfiguration> where TConfigur
     public bool WasApplied { get; }
     /// <summary>Gets whether this invocation durably retained a complete regression receipt.</summary>
     public bool WasPersisted { get; }
-    /// <summary>Gets the write-once receipt path, or null when no complete receipt was persisted.</summary>
+    /// <summary>Gets the durably retained receipt path, or null, including for best-effort-only writes.</summary>
     public string? ReceiptPath { get; }
     /// <summary>Gets the supplied prior snapshot published by this operation, or null if none was published.</summary>
     public KernelTuningDeploymentSnapshot<TConfiguration>? RollbackDeployment { get; }
@@ -92,6 +92,8 @@ public sealed class KernelTuningQuarantineResult<TConfiguration> where TConfigur
 /// admission, but already active handles and simultaneous cross-process publication are not revoked atomically.
 /// Filesystem aliases, hostile journal tampering and automatic drift detection are outside this contract.
 /// Failed writes retain a process-local block; they do not establish restart safety. Dispatch reads remain I/O-free.
+/// Durable publication currently requires Linux x86/x64/ARM32/ARM64 file/directory synchronization. Other platforms retain a
+/// best-effort tombstone but report persistence failure. Storage must honor the operating system's barriers.
 /// </remarks>
 public sealed class QuarantinedKernelTuningStore<TConfiguration> : IKernelTuningStore<TConfiguration>
     where TConfiguration : notnull
@@ -99,10 +101,18 @@ public sealed class QuarantinedKernelTuningStore<TConfiguration> : IKernelTuning
     private readonly string _directory;
     private readonly QuarantineJournalState _state;
     private readonly IKernelTuningStore<TConfiguration> _inner;
+    private readonly IQuarantineCommitOperations _commitOperations;
 
     /// <summary>Creates the explicit journal directory; initialization failures are reported to the caller.</summary>
     public QuarantinedKernelTuningStore(string journalDirectory, IKernelTuningStore<TConfiguration>? inner = null)
+        : this(journalDirectory, inner, QuarantineReceiptCommit.Native)
     {
+    }
+
+    internal QuarantinedKernelTuningStore(string journalDirectory, IKernelTuningStore<TConfiguration>? inner,
+        IQuarantineCommitOperations commitOperations)
+    {
+        _commitOperations = commitOperations ?? throw new ArgumentNullException(nameof(commitOperations));
         if (string.IsNullOrWhiteSpace(journalDirectory) || !Path.IsPathRooted(journalDirectory) ||
             (Path.DirectorySeparatorChar == '\\' && !journalDirectory.StartsWith("\\\\", StringComparison.Ordinal) &&
              (journalDirectory.Length < 3 || journalDirectory[1] != ':' ||
@@ -197,8 +207,15 @@ public sealed class QuarantinedKernelTuningStore<TConfiguration> : IKernelTuning
         }
         byte[] receipt = JsonSerializer.SerializeToUtf8Bytes(new
         {
-            Schema = "tensor-kernel-quarantine-v1", entry.Key, entry.Identity, entry.CodecId,
-            entry.CodecVersion, entry.GenomeId, entry.PayloadBase64, expected.RunStateHash, Evidence = evidence
+            Schema = "tensor-kernel-quarantine-v1",
+            entry.Key,
+            entry.Identity,
+            entry.CodecId,
+            entry.CodecVersion,
+            entry.GenomeId,
+            entry.PayloadBase64,
+            expected.RunStateHash,
+            Evidence = evidence
         });
         bool persisted;
         KernelTuningDeploymentSnapshot<TConfiguration>? rollback = null;
@@ -247,19 +264,20 @@ public sealed class QuarantinedKernelTuningStore<TConfiguration> : IKernelTuning
 
     private string RecordPath(string key) => Path.Combine(_directory, key + ".quarantine.json");
 
-    private static bool TryWriteReceipt(string path, byte[] receipt)
+    private bool TryWriteReceipt(string path, byte[] receipt)
     {
         // Conservative status: a preexisting or corrupt receipt is still blocking, but is not this write's success.
         try
         {
-            string pending = Path.Combine(Path.GetDirectoryName(path)!, ".quarantine-" + Guid.NewGuid().ToString("N") + ".pending");
+            string? directory = Path.GetDirectoryName(path);
+            if (string.IsNullOrEmpty(directory)) return false;
+            string pending = Path.Combine(directory, ".quarantine-" + Guid.NewGuid().ToString("N") + ".pending");
             using (var stream = new FileStream(pending, FileMode.CreateNew, FileAccess.Write, FileShare.None))
             {
                 stream.Write(receipt, 0, receipt.Length);
                 stream.Flush(true);
             }
-            File.Move(pending, path);
-            return true;
+            return QuarantineReceiptCommit.TryCommit(pending, path, _commitOperations);
         }
         catch { return false; }
     }

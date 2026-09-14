@@ -20,6 +20,67 @@ internal sealed class TensorStorage<T>
 {
     private readonly Vector<T> _data;
     private int _refCount;
+    private int _gpuCacheVersion;
+    private bool _trackGpuCacheVersion;
+    private ExternalArrayGpuCacheEpoch? _externalArrayGpuCacheEpoch;
+
+    // Independently constructed zero-copy wrappers can share one array without sharing a
+    // TensorStorage. Their GPU cache key is still that array, so they must share its epoch.
+    // Keep the weak table off ordinary shape-owned allocation and mutation paths.
+    private sealed class ExternalArrayGpuCacheEpoch
+    {
+        internal int Version;
+        internal bool IsTracked;
+    }
+
+    private static class ExternalArrayGpuCacheEpochs
+    {
+        internal static readonly ConditionalWeakTable<T[], ExternalArrayGpuCacheEpoch> Table = new();
+    }
+
+    // Shared by ordinary tensor views, separate from the per-tensor autodiff version.
+    // CPU-only tensors retain the inference fast path: no atomic counter on mutation.
+    internal int GpuCacheVersion
+    {
+        get
+        {
+            if (_externalArrayGpuCacheEpoch is { } external)
+            {
+                if (!Volatile.Read(ref external.IsTracked)) Volatile.Write(ref external.IsTracked, true);
+                return Volatile.Read(ref external.Version);
+            }
+            if (!Volatile.Read(ref _trackGpuCacheVersion)) Volatile.Write(ref _trackGpuCacheVersion, true);
+            return Volatile.Read(ref _gpuCacheVersion);
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal void IncrementGpuCacheVersionIfTracked()
+    {
+        if (_externalArrayGpuCacheEpoch is { } external)
+        {
+            if (Volatile.Read(ref external.IsTracked)) Interlocked.Increment(ref external.Version);
+            return;
+        }
+        if (Volatile.Read(ref _trackGpuCacheVersion)) Interlocked.Increment(ref _gpuCacheVersion);
+    }
+
+    internal void CopyGpuCacheTrackingFrom(TensorStorage<T> source)
+    {
+        // COW replacement owns a different array. Copy the snapshot, never the external
+        // epoch object, or writes to the detached clone would invalidate its former peers.
+        if (source._externalArrayGpuCacheEpoch is { } external)
+        {
+            _gpuCacheVersion = Volatile.Read(ref external.Version);
+            _trackGpuCacheVersion = Volatile.Read(ref external.IsTracked);
+        }
+        else
+        {
+            _gpuCacheVersion = Volatile.Read(ref source._gpuCacheVersion);
+            _trackGpuCacheVersion = Volatile.Read(ref source._trackGpuCacheVersion);
+        }
+        _externalArrayGpuCacheEpoch = null;
+    }
 
     // Streaming-pool zero-copy mmap alias (PR #604, CodeRabbit-Major): when
     // WeightRegistry.TryAliasZeroCopy installs an MmapTensorMemoryManager as
@@ -96,10 +157,27 @@ internal sealed class TensorStorage<T>
     /// Creates a new storage wrapping an existing Vector (zero-copy).
     /// </summary>
     /// <exception cref="ArgumentNullException">Thrown when data is null.</exception>
-    internal TensorStorage(Vector<T> data)
+    internal TensorStorage(Vector<T> data, bool shareExternalGpuCacheEpoch = false)
     {
         _data = data ?? throw new ArgumentNullException(nameof(data));
         _refCount = 1;
+        if (shareExternalGpuCacheEpoch
+            && data.TryGetBackingArraySegmentForReadOnlyAccess(out var externalArray, out _)
+            && externalArray is not null)
+        {
+            _externalArrayGpuCacheEpoch = ExternalArrayGpuCacheEpochs.Table.GetValue(
+                externalArray, static _ => new ExternalArrayGpuCacheEpoch());
+        }
+        // GPU result arrays can be cached before their wrapping Tensor exists.
+        // Tag that storage while its deferred download is still registered.
+        if (Helpers.DeferredArrayMaterializer.HasPendingMaterializations)
+        {
+            _trackGpuCacheVersion = Helpers.DeferredArrayMaterializer.IsPending(data)
+                || (data.GetBackingArrayForReadOnlyAccess() is { } array
+                    && Helpers.DeferredArrayMaterializer.IsPending(array));
+            if (_trackGpuCacheVersion && _externalArrayGpuCacheEpoch is { } external)
+                Volatile.Write(ref external.IsTracked, true);
+        }
     }
 
     /// <summary>
@@ -196,14 +274,16 @@ internal sealed class TensorStorage<T>
     internal bool TryClaimExclusive()
     {
         // CAS 1 → 0. Succeeds only when no other ref exists.
-        if (Interlocked.CompareExchange(ref _refCount, 0, 1) != 1) return false;
-        // Sole-claim succeeded → no other ref exists → dispose the mmap
-        // owner too. Caller is about to abandon this storage.
+        return Interlocked.CompareExchange(ref _refCount, 0, 1) == 1;
+    }
+
+    /// <summary>Releases resources only after the caller has installed replacement storage.</summary>
+    internal void DisposeClaimedOwners()
+    {
         var owner = Interlocked.Exchange(ref _mmapOwner, null);
-        owner?.Dispose();
         var gpuOwner = Interlocked.Exchange(ref _gpuBufferOwner, null);
-        gpuOwner?.Dispose();
-        return true;
+        try { owner?.Dispose(); }
+        finally { gpuOwner?.Dispose(); }
     }
 
     /// <summary>

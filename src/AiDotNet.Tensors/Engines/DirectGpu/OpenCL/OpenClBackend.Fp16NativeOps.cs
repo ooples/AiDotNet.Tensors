@@ -42,10 +42,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (!EnsureFp16NativeOpKernels() || !_kernelCache.TryGetValue(Fp16NativeOpKernels.AddKernelName, out var k))
                 throw new NotSupportedException("FP16-native op kernels are not available on this OpenCL device.");
 
+            IntPtr aHandle = GetPrecisionBufferHandle(a, (long)n * sizeof(ushort));
+            IntPtr bHandle = GetPrecisionBufferHandle(b, (long)n * sizeof(ushort));
+            IntPtr outputHandle = GetPrecisionBufferHandle(output, (long)n * sizeof(ushort));
             uint arg = 0;
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)a).Buffer.Handle);
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)b).Buffer.Handle);
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            k.SetArg(arg++, aHandle);
+            k.SetArg(arg++, bHandle);
+            k.SetArg(arg++, outputHandle);
             k.SetArg(arg++, n);
             k.Execute1D(n, Math.Min(256, n));
         }
@@ -60,9 +63,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (!EnsureFp16NativeOpKernels() || !_kernelCache.TryGetValue(Fp16NativeOpKernels.SoftmaxKernelName, out var k))
                 throw new NotSupportedException("FP16-native op kernels are not available on this OpenCL device.");
 
+            IntPtr inputHandle = GetPrecisionBufferHandle(input, (long)rows * cols * sizeof(ushort));
+            IntPtr outputHandle = GetPrecisionBufferHandle(output, (long)rows * cols * sizeof(ushort));
             uint arg = 0;
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            k.SetArg(arg++, inputHandle);
+            k.SetArg(arg++, outputHandle);
             k.SetArg(arg++, rows);
             k.SetArg(arg++, cols);
             int local = Fp16NativeOpKernels.RowReduceLocalSize;
@@ -91,13 +96,19 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             var varBuf = varFp32 ?? (tmpVar = AllocateBuffer(rows));
             try
             {
+                IntPtr inputHandle = GetPrecisionBufferHandle(input, (long)rows * cols * sizeof(ushort));
+                IntPtr gammaHandle = GetPrecisionBufferHandle(gamma, (long)cols * sizeof(ushort));
+                IntPtr betaHandle = GetPrecisionBufferHandle(beta, (long)cols * sizeof(ushort));
+                IntPtr outputHandle = GetPrecisionBufferHandle(output, (long)rows * cols * sizeof(ushort));
+                IntPtr meanHandle = GetPrecisionBufferHandle(meanBuf, (long)rows * sizeof(float));
+                IntPtr varHandle = GetPrecisionBufferHandle(varBuf, (long)rows * sizeof(float));
                 uint arg = 0;
-                k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
-                k.SetArg(arg++, ((DirectOpenClGpuBuffer)gamma).Buffer.Handle);
-                k.SetArg(arg++, ((DirectOpenClGpuBuffer)beta).Buffer.Handle);
-                k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
-                k.SetArg(arg++, ((DirectOpenClGpuBuffer)meanBuf).Buffer.Handle);
-                k.SetArg(arg++, ((DirectOpenClGpuBuffer)varBuf).Buffer.Handle);
+                k.SetArg(arg++, inputHandle);
+                k.SetArg(arg++, gammaHandle);
+                k.SetArg(arg++, betaHandle);
+                k.SetArg(arg++, outputHandle);
+                k.SetArg(arg++, meanHandle);
+                k.SetArg(arg++, varHandle);
                 k.SetArg(arg++, rows);
                 k.SetArg(arg++, cols);
                 k.SetArg(arg++, eps);
@@ -120,9 +131,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (!EnsureFp16NativeOpKernels() || !_kernelCache.TryGetValue(kernelName, out var k))
                 throw new NotSupportedException("FP16-native op kernels are not available on this OpenCL device.");
 
+            IntPtr inputHandle = GetPrecisionBufferHandle(input, (long)n * sizeof(ushort));
+            IntPtr outputHandle = GetPrecisionBufferHandle(output, (long)n * sizeof(ushort));
             uint arg = 0;
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
+            k.SetArg(arg++, inputHandle);
+            k.SetArg(arg++, outputHandle);
             k.SetArg(arg++, n);
             k.Execute1D(n, Math.Min(256, n));
         }

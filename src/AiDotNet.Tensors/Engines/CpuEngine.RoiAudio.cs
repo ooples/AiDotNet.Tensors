@@ -392,6 +392,31 @@ public partial class CpuEngine
         return mag;
     }
 
+    /// <inheritdoc/>
+    public virtual Tensor<T> StftPhase<T>(Tensor<T> waveform, int nFft, int hopLength, int winLength, Tensor<T>? window = null)
+    {
+        if (waveform == null) throw new ArgumentNullException(nameof(waveform));
+        if (GraphMode.IsInferenceTrace)
+        {
+            Tensor<T>[] inputs = window is null ? new[] { waveform } : new[] { waveform, window };
+            return CaptureInferenceKernel(
+                inputs,
+                engine => engine.StftPhase(waveform, nFft, hopLength, winLength, window));
+        }
+
+        // The mirror of Spectrogram: same STFT, the other output kept, and the discarded half
+        // saved for the backward, which needs the magnitudes to scale each bin by 1/|C|.
+        var win = window ?? HannWindow<T>(winLength);
+        STFT(waveform, nFft, hopLength, win, center: true,
+            out var mag, out var phase);
+        int origLength = waveform._shape[waveform.Rank - 1];
+        DifferentiableOps.RecordUnary(
+            "StftPhase", phase, waveform,
+            BackwardFunctions<T>.StftPhaseBackward,
+            new object[] { nFft, hopLength, win, mag, origLength });
+        return phase;
+    }
+
     private static Tensor<T> HannWindow<T>(int n)
     {
         var ops = MathHelper.GetNumericOperations<T>();
@@ -744,6 +769,14 @@ public partial class CpuEngine
         }
 
         int targetLen = (int)Math.Round(waveform._shape[waveform.Rank - 1] / rate);
-        return ISTFT(newMag, newPhase, nFft, hopLength, window, center: true, length: targetLen);
+
+        // Suppressed: ISTFT records on the tape (issue #905 item 2), but TimeStretch builds its
+        // phase by an unrecorded accumulation loop above, so a recorded synthesis here would hand
+        // back a gradient that ignores everything this op actually did. TimeStretch stays in
+        // NonDifferentiableOps and its internals must agree.
+        using (new NoGradScope<T>())
+        {
+            return ISTFT(newMag, newPhase, nFft, hopLength, window, center: true, length: targetLen);
+        }
     }
 }

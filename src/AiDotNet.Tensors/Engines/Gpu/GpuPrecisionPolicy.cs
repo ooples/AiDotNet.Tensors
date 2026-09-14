@@ -255,11 +255,13 @@ public sealed class GpuComputePlan
         GpuScalarType outputStorage,
         GpuPrecisionImplementation? implementation,
         bool reducesStorageBytes,
-        string? fallbackReason)
+        string? fallbackReason,
+        GpuPrecisionOperation operationKind = GpuPrecisionOperation.General)
     {
         Route = route;
         Backend = backend;
         Operation = operation;
+        OperationKind = operationKind;
         PublicType = publicType;
         RequestedPreference = requestedPreference;
         ComputeFormat = computeFormat;
@@ -278,6 +280,8 @@ public sealed class GpuComputePlan
     public string Backend { get; }
     /// <summary>Gets the operation name.</summary>
     public string Operation { get; }
+    /// <summary>Gets the typed operation family, without parsing a diagnostic name.</summary>
+    public GpuPrecisionOperation OperationKind { get; }
     /// <summary>Gets the caller-visible tensor element type.</summary>
     public Type PublicType { get; }
     /// <summary>Gets the requested compute preference.</summary>
@@ -344,10 +348,10 @@ public static class GpuPrecisionPlanner
         {
             var exact = FindPreserving(capabilities, sourceType);
             if (exact is not null)
-                return FromCapability(backend, operationName, typeof(T), requested, exact, null);
+                return FromCapability(backend, operationName, typeof(T), requested, exact, null, operation);
 
             return CpuPlan(backend, operationName, typeof(T), requested,
-                $"{backend.BackendName} has no {sourceType} {operation} route required by PreserveInputType.");
+                $"{backend.BackendName} has no {sourceType} {operation} route required by PreserveInputType.", operation);
         }
 
         var desired = requested == GpuComputePreference.Auto
@@ -359,7 +363,7 @@ public static class GpuPrecisionPlanner
             string? conversionReason = requested == GpuComputePreference.Auto && sourceType != desired
                 ? $"SpeedFirst Auto converts public {sourceType} through {desired}."
                 : null;
-            return FromCapability(backend, operationName, typeof(T), requested, selected, conversionReason);
+            return FromCapability(backend, operationName, typeof(T), requested, selected, conversionReason, operation);
         }
 
         if (policy.FallbackBehavior == GpuPrecisionFallbackBehavior.Throw)
@@ -372,12 +376,12 @@ public static class GpuPrecisionPlanner
             if (selected is not null)
             {
                 return FromCapability(backend, operationName, typeof(T), requested, selected,
-                    $"Requested {desired} is unavailable for {operation}; using {selected.ComputeFormat}.");
+                    $"Requested {desired} is unavailable for {operation}; using {selected.ComputeFormat}.", operation);
             }
         }
 
         return CpuPlan(backend, operationName, typeof(T), requested,
-            $"{backend.BackendName} exposes no eligible GPU precision for {operation}.");
+            $"{backend.BackendName} exposes no eligible GPU precision for {operation}.", operation);
     }
 
     internal static IReadOnlyList<GpuPrecisionCapability> GetCapabilities(
@@ -396,8 +400,9 @@ public static class GpuPrecisionPlanner
         IDirectGpuBackend backend,
         string operationName,
         GpuComputePreference requested,
-        string reason)
-        => CpuPlan(backend, operationName, typeof(T), requested, reason);
+        string reason,
+        GpuPrecisionOperation operation)
+        => CpuPlan(backend, operationName, typeof(T), requested, reason, operation);
 
     private static GpuComputePlan FromCapability(
         IDirectGpuBackend backend,
@@ -405,7 +410,8 @@ public static class GpuPrecisionPlanner
         Type publicType,
         GpuComputePreference requested,
         GpuPrecisionCapability capability,
-        string? fallbackReason)
+        string? fallbackReason,
+        GpuPrecisionOperation operation)
         => new(
             GpuExecutionRoute.Gpu,
             backend.BackendName,
@@ -419,14 +425,15 @@ public static class GpuPrecisionPlanner
             capability.OutputStorage,
             capability.Implementation,
             capability.ReducesStorageBytes,
-            fallbackReason);
+            fallbackReason, operation);
 
     private static GpuComputePlan CpuPlan(
         IDirectGpuBackend backend,
         string operationName,
         Type publicType,
         GpuComputePreference requested,
-        string reason)
+        string reason,
+        GpuPrecisionOperation operation = GpuPrecisionOperation.General)
         => new(
             GpuExecutionRoute.Cpu,
             backend.BackendName,
@@ -440,7 +447,7 @@ public static class GpuPrecisionPlanner
             ScalarTypeFor(publicType),
             null,
             false,
-            reason);
+            reason, operation);
 
     private static GpuPrecisionCapability? Find(
         IReadOnlyList<GpuPrecisionCapability> capabilities,

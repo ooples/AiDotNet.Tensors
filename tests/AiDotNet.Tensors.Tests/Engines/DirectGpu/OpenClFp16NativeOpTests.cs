@@ -56,7 +56,8 @@ public sealed class OpenClFp16NativeOpTests : IClassFixture<OpenClBackendTestFix
     private IGpuBuffer ToFp16(float[] x)
     {
         using var f32 = Backend.AllocateBuffer(x);
-        var f16 = Backend.AllocateBuffer(x.Length); // over-allocated as floats; harmless
+        var f16 = Backend.AllocateByteBuffer(checked(x.Length * sizeof(ushort)));
+        Assert.Equal((long)x.Length * sizeof(ushort), f16.SizeInBytes);
         Backend.ConvertToFp16(f32, f16, x.Length);
         return f16;
     }
@@ -97,7 +98,7 @@ public sealed class OpenClFp16NativeOpTests : IClassFixture<OpenClBackendTestFix
         }
 
         using var inB = ToFp16(x);
-        using var outB = Backend.AllocateBuffer(n);
+        using var outB = Backend.AllocateByteBuffer(checked(n * sizeof(ushort)));
         Backend.Fp16Gelu(inB, outB, n);
         AssertClose(expected, FromFp16(outB, n), absTol: 3e-2, relTol: 4e-2);
     }
@@ -114,7 +115,7 @@ public sealed class OpenClFp16NativeOpTests : IClassFixture<OpenClBackendTestFix
         for (int i = 0; i < n; i++) { float xi = ToFp16AndBack(x[i]); expected[i] = xi > 0 ? xi : 0; }
 
         using var inB = ToFp16(x);
-        using var outB = Backend.AllocateBuffer(n);
+        using var outB = Backend.AllocateByteBuffer(checked(n * sizeof(ushort)));
         Backend.Fp16Relu(inB, outB, n);
         AssertClose(expected, FromFp16(outB, n), absTol: 1e-3, relTol: 1e-3);
     }
@@ -132,7 +133,7 @@ public sealed class OpenClFp16NativeOpTests : IClassFixture<OpenClBackendTestFix
 
         using var aB = ToFp16(a);
         using var bB = ToFp16(b);
-        using var outB = Backend.AllocateBuffer(n);
+        using var outB = Backend.AllocateByteBuffer(checked(n * sizeof(ushort)));
         Backend.Fp16Add(aB, bB, outB, n);
         AssertClose(expected, FromFp16(outB, n), absTol: 2e-2, relTol: 2e-2);
     }
