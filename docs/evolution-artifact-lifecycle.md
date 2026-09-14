@@ -38,7 +38,7 @@ var configuration = lifecycle.Select(observedEnvelope); // dispatch using this s
 
 ## Maintained verification gate
 
-`tests/AiDotNet.Tensors.Autotune.Tests` references the real production project and links the complete existing autotune test directory. It builds independently of unrelated CLI/generator/GPU-heavy test suites; the original full-suite project and CI are unchanged.
+`tests/AiDotNet.Tensors.Autotune.Tests` references the real production project and links the complete existing autotune test directory. It builds independently of unrelated CLI/generator/GPU-heavy test suites; the original full-suite project and CI are unchanged. Its coverage settings measure the autotune namespace only, avoiding unrelated whole-library instrumentation overhead.
 
 ```powershell
 dotnet test tests/AiDotNet.Tensors.Autotune.Tests/AiDotNet.Tensors.Autotune.Tests.csproj -c Release -f net10.0 -p:GeneratePackageOnBuild=false --logger "trx;LogFileName=lifecycle.trx"

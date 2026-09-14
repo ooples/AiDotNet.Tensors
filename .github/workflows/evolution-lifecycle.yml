@@ -56,6 +56,7 @@ jobs:
           -p:GeneratePackageOnBuild=false
           --logger "trx;LogFileName=lifecycle.trx"
           --results-directory evidence --blame-hang-timeout 3m
+          --settings tests/AiDotNet.Tensors.Autotune.Tests/autotune.runsettings
           --collect:"XPlat Code Coverage"
       - uses: actions/upload-artifact@v4
         if: always()

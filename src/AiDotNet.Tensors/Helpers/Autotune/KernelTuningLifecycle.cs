@@ -225,7 +225,7 @@ public sealed class KernelTuningLifecycle<TConfiguration> where TConfiguration :
             });
             KernelTuningArtifactReceipt receipt;
             try { receipt = _registry.RetainEvidence(bytes); }
-            catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+            catch (Exception error) when (error is IOException or InvalidDataException or UnauthorizedAccessException)
             {
                 tuner.Deployment.TryDeactivate(observed);
                 lock (_gate) _evidenceFailure = true; // No reload/retune after evidence loss; operator intervention is required.
@@ -238,7 +238,7 @@ public sealed class KernelTuningLifecycle<TConfiguration> where TConfiguration :
             if (priorArtifactId is not null)
             {
                 try { prior = _registry.Load(priorArtifactId, envelope, _codec); }
-                catch (Exception error) when (error is IOException or UnauthorizedAccessException or ArgumentException or JsonException)
+                catch (Exception error) when (error is IOException or InvalidDataException or UnauthorizedAccessException or ArgumentException or JsonException)
                 { /* An unavailable prior must not prevent quarantine of the observed regression. */ }
             }
             var result = await tuner.QuarantineAsync(observed, evidence, prior, cancellationToken).ConfigureAwait(false);
