@@ -1,0 +1,65 @@
+name: Evolution lifecycle source integration
+
+on:
+  pull_request:
+    paths:
+      - 'src/AiDotNet.Tensors/Helpers/Autotune/**'
+      - 'src/AiDotNet.Tensors/AiDotNet.Tensors.csproj'
+      - 'tests/AiDotNet.Tensors.Tests/Helpers/Autotune/**'
+      - 'tests/AiDotNet.Tensors.Autotune.Tests/**'
+      - '.github/workflows/evolution-lifecycle.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: evolution-lifecycle-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lifecycle:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            framework: net10.0
+          - os: ubuntu-latest
+            framework: net8.0
+          - os: windows-latest
+            framework: net471
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: tensors
+      - uses: actions/checkout@v4
+        with:
+          repository: ooples/AiDotNet.Evolution
+          ref: 255feb24369702a32ea9db7a3f8a0b7a847d2762
+          path: evolution
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            10.0.x
+            8.0.x
+      - name: Build and test maintained autotune suite against pinned source dependency
+        shell: pwsh
+        working-directory: tensors
+        run: >-
+          dotnet test tests/AiDotNet.Tensors.Autotune.Tests/AiDotNet.Tensors.Autotune.Tests.csproj
+          -c Release -f ${{ matrix.framework }}
+          -p:UseLocalEvolution=true
+          -p:EvolutionProjectPath=${{ github.workspace }}/evolution/src/AiDotNet.Evolution/AiDotNet.Evolution.csproj
+          -p:GeneratePackageOnBuild=false
+          --logger "trx;LogFileName=lifecycle.trx"
+          --results-directory evidence --blame-hang-timeout 3m
+          --collect:"XPlat Code Coverage"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lifecycle-${{ matrix.os }}-${{ matrix.framework }}
+          path: tensors/evidence
+          if-no-files-found: error

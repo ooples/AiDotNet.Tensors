@@ -175,7 +175,7 @@ public sealed class QuarantinedKernelTuningStore<TConfiguration> : IKernelTuning
 
     internal bool TryPublish(KernelTuningDeployment<TConfiguration> deployment,
         KernelTuningDeploymentSnapshot<TConfiguration> snapshot, IEvolutionGenomeCodec<TConfiguration> codec,
-        bool onlyIfEmpty)
+        bool onlyIfEmpty, bool compareExpected = false, KernelTuningDeploymentSnapshot<TConfiguration>? expected = null)
     {
         try
         {
@@ -184,6 +184,7 @@ public sealed class QuarantinedKernelTuningStore<TConfiguration> : IKernelTuning
             lock (_state.Gate)
             {
                 if (!IsAdmitted(entry.Key)) return false;
+                if (compareExpected) return deployment.TryReplace(expected, snapshot);
                 if (onlyIfEmpty) return deployment.TryPublishIfEmpty(snapshot);
                 deployment.Publish(snapshot);
                 return true;
