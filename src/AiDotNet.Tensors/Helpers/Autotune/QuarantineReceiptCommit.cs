@@ -84,7 +84,7 @@ internal static class QuarantineReceiptCommit
         // fsync(file) does not persist the directory entry created by rename.
         // Include ancestors: the journal directory itself may have just been created.
         // A failed barrier leaves the visible tombstone intact but cannot claim durability.
-        while (!string.IsNullOrEmpty(directory))
+        while (directory is not null && directory.Length != 0)
         {
             if (!operations.FlushDirectory(directory)) return false;
             directory = Path.GetDirectoryName(directory);
