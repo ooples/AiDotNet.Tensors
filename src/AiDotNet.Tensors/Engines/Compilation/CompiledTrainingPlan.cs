@@ -846,7 +846,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             bool streamCapturing =
                 backend is Engines.DirectGpu.CUDA.CudaBackend cuda && cuda.IsStreamCapturing();
             if (resident is not null &&
-                (streamCapturing || gradient._gpuBufferVersion == gradient.Version))
+                (streamCapturing || gradient._gpuBufferVersion == gradient.GpuCacheVersion))
             {
                 gpuGradients[p] = resident;
                 continue;
@@ -1730,7 +1730,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var data = inT.GetDataArray();                 // host backing (T==float on the graph path)
         if (buf.Size < data.Length) return;
         cb.UploadBufferInPlace((float[])(object)data, buf);
-        inT._gpuBufferVersion = inT.Version;
+        inT._gpuBufferVersion = inT.GpuCacheVersion;
     }
 
     private void RunGpuStepBodyForCapture(Engines.DirectGpu.CUDA.CudaBackend cb)
@@ -3414,7 +3414,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     // mirroring the per-tensor GPU path so eval/forward see the fresh resident weights.
                     for (int p = 0; p < paramCount; p++)
                     {
-                        _parameters[p]._gpuBufferVersion = _parameters[p].Version;
+                        _parameters[p]._gpuBufferVersion = _parameters[p].GpuCacheVersion;
                         if (_engine is Engines.DirectGpuTensorEngine rebindEngine && gpuParam[p] is { } gpBind && gpuBackends[p] is { } beBind)
                             rebindEngine.BindResidentBuffer(_parameters[p], gpBind, beBind);
                     }
@@ -3589,7 +3589,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     // ~weight-size GPU leak that OOMs the eval at d256/L4+. A later CPU SetParameters legitimately
                     // re-bumps Version (without this device write) → mismatch returns → correct re-upload. Harmless
                     // to capture (the gate's ResidentStepActive branch already covers it).
-                    _parameters[p]._gpuBufferVersion = _parameters[p].Version;
+                    _parameters[p]._gpuBufferVersion = _parameters[p].GpuCacheVersion;
 
                     // RE-ARM the device→host deferred download so the NEXT host-side read of this parameter
                     // re-downloads the freshly-updated weights. The eager forward reads its weight operand via
@@ -4259,7 +4259,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     // backing (which the on-device update never touched). Without this the grouped
                     // (per-layer-LR) GPU path — the path the Transformer's Noam/warmup schedule
                     // takes — trains against frozen weights: loss flat, weights drift, accuracy = chance.
-                    _parameters[p]._gpuBufferVersion = _parameters[p].Version;
+                    _parameters[p]._gpuBufferVersion = _parameters[p].GpuCacheVersion;
                     continue;
                 }
 

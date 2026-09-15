@@ -120,10 +120,16 @@ public sealed class EvolutionKernelAutotuner<TConfiguration>
     public bool TryHydrate()
     {
         KernelTuningDeploymentSnapshot<TConfiguration>? current = _deployment.Current;
-        if (current is not null) return CanDeploy(current.Configuration);
+        if (current is not null)
+        {
+            bool admitted = CanDeploy(current.Configuration);
+            if (!admitted && _store is QuarantinedKernelTuningStore<TConfiguration>)
+                _deployment.TryDeactivate(current);
+            return admitted;
+        }
         if (!TryLoadValidSnapshot(out KernelTuningDeploymentSnapshot<TConfiguration>? snapshot) ||
             snapshot is null) return false;
-        if (_deployment.TryPublishIfEmpty(snapshot)) return true;
+        if (TryPublish(snapshot, onlyIfEmpty: true)) return true;
 
         current = _deployment.Current;
         return current is not null && CanDeploy(current.Configuration);
@@ -173,12 +179,52 @@ public sealed class EvolutionKernelAutotuner<TConfiguration>
     {
         try
         {
-            return _deploymentValidator(configuration);
+            return _deploymentValidator(configuration) &&
+                (_store is not QuarantinedKernelTuningStore<TConfiguration> quarantine ||
+                 quarantine.CanDeploy(_identity, configuration, _codec));
         }
         catch
         {
             return false;
         }
+    }
+
+    private bool TryPublish(KernelTuningDeploymentSnapshot<TConfiguration> snapshot, bool onlyIfEmpty = false)
+    {
+        if (_store is QuarantinedKernelTuningStore<TConfiguration> quarantine)
+            return quarantine.TryPublish(_deployment, snapshot, _codec, onlyIfEmpty);
+        if (onlyIfEmpty) return _deployment.TryPublishIfEmpty(snapshot);
+        _deployment.Publish(snapshot);
+        return true;
+    }
+
+    /// <summary>Persistently quarantines an exact observed deployment and optionally restores a validated prior snapshot.</summary>
+    /// <remarks>
+    /// Requires an explicitly configured <see cref="QuarantinedKernelTuningStore{TConfiguration}"/>.
+    /// The caller supplies genuine regression evidence and retains the raw artifact named by its digest.
+    /// Stale observations cannot remove newer deployments. Invalid or quarantined rollback candidates leave the
+    /// handle empty for built-in fallback. Cancellation is honored before mutation; once deactivated, receipt
+    /// persistence and rollback finish without cancellation. Check the result before claiming restart safety.
+    /// This does not cancel in-flight dispatch, detect drift automatically or validate the raw evidence itself.
+    /// </remarks>
+    public async Task<KernelTuningQuarantineResult<TConfiguration>> QuarantineAsync(
+        KernelTuningDeploymentSnapshot<TConfiguration> expected,
+        KernelTuningRegressionEvidence evidence,
+        KernelTuningDeploymentSnapshot<TConfiguration>? priorValidatedSnapshot = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (expected is null) throw new ArgumentNullException(nameof(expected));
+        if (evidence is null) throw new ArgumentNullException(nameof(evidence));
+        if (!string.Equals(expected.Identity.StableKey, _identity.StableKey, StringComparison.Ordinal))
+            throw new ArgumentException("The observed snapshot has a different tuning identity.", nameof(expected));
+        if (_store is not QuarantinedKernelTuningStore<TConfiguration> quarantine)
+            throw new InvalidOperationException("Persistent quarantine requires QuarantinedKernelTuningStore.");
+        using IDisposable deviceLease = await KernelTuningCoordinator.EnterAsync(
+            _identity.Device, cancellationToken).ConfigureAwait(false);
+        if (priorValidatedSnapshot is not null &&
+            (!string.Equals(priorValidatedSnapshot.Identity.StableKey, _identity.StableKey, StringComparison.Ordinal) ||
+             !CanDeploy(priorValidatedSnapshot.Configuration))) priorValidatedSnapshot = null;
+        return quarantine.Quarantine(_deployment, expected, _codec, evidence, priorValidatedSnapshot, cancellationToken);
     }
 
     /// <summary>Runs tuning during an explicit offline or startup workflow.</summary>
@@ -287,13 +333,15 @@ public sealed class EvolutionKernelAutotuner<TConfiguration>
                     run, incumbent, proposed, existing, false, false);
             }
 
-            _deployment.Publish(incumbent);
+            if (!TryPublish(incumbent))
+                throw new InvalidOperationException("The replay incumbent was denied by the deployment policy.");
             bool incumbentPersisted = TryPersist(incumbent);
             return new EvolutionKernelTuningResult<TConfiguration>(
                 run, incumbent, proposed, incumbent, false, incumbentPersisted);
         }
 
-        _deployment.Publish(proposed);
+        if (!TryPublish(proposed))
+            throw new InvalidOperationException("The proposed winner was denied by the deployment policy.");
         bool persisted = TryPersist(proposed);
         return new EvolutionKernelTuningResult<TConfiguration>(
             run, incumbent, proposed, proposed, true, persisted);

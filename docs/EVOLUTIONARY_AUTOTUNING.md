@@ -48,6 +48,11 @@ Evolution runs only in an explicit offline, startup, or caller-admitted idle wor
 pre-resolved `KernelTuningDeployment<TConfiguration>`; its hit path is one volatile reference read and a typed
 assignment, with no filesystem access, parsing, reflection, hashing, or search.
 
+An opt-in `QuarantinedKernelTuningStore<TConfiguration>` adds persistent admission checks off the dispatch path.
+`QuarantineAsync` deactivates an exact observed failing snapshot, retains structured regression evidence, and can
+restore a caller-retained validated prior snapshot. See [quarantine and rollback](evolution-runtime-fallback.md)
+for failure handling, producer coordination and the remaining automatic-monitoring limitations.
+
 ## Integrated domains
 
 - `GemmAutoTuner.CreateEvolutionTuner` searches actual typed `GemmConfig` code-generation and launch fields. The

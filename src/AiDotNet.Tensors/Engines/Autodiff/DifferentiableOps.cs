@@ -627,6 +627,11 @@ internal static class DifferentiableOps
         // fast path engages ONLY here (the dedicated, non-aliased gradient leaf) and never hijacks forward
         // in-place ops on aliased activations (that hijack threw CUDA-700). No-op for non-DirectGpu engines.
         using var _gradAccumScope = (engine as AiDotNet.Tensors.Engines.DirectGpuTensorEngine)?.EnterGradAccumulation();
+        // FP32 accumulation is narrower than FP32 backward: only the addition which combines
+        // fan-out contributions overrides autocast. The backward kernels that produced each
+        // contribution retain their configured FP16/BF16/FP8 precision.
+        using var _accumulationPrecisionScope =
+            GradientAccumulationPrecisionScope.EnterFloat32AutocastForAddition();
 
         // Higher-order AD: in-place add records a "TensorAddInPlace"
         // entry whose saved input is a *clone* of the existing gradient,

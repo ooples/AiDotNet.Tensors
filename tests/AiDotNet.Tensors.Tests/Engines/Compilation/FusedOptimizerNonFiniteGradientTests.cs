@@ -113,7 +113,7 @@ public class FusedOptimizerNonFiniteGradientTests
         for (int i = 0; i < data.Length; i++) data[i] = value;
         tensor._gpuBuffer = new MockGpuBuffer(data);
         tensor._gpuBackend = backend;
-        tensor._gpuBufferVersion = tensor.Version;
+        tensor._gpuBufferVersion = tensor.GpuCacheVersion;
     }
 
     private static Tensor<float>[] GetPlanGradients(ICompiledTrainingPlan<float> plan)

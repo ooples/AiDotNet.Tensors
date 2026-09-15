@@ -14,6 +14,32 @@ namespace AiDotNet.Tensors.Tests.LinearAlgebra;
 public class StreamingTensorPoolTests
 {
     [Fact]
+    public void Register_EvictionFailureRollsBackEntryAndRestoresReservation()
+    {
+        string directory = Path.Combine(Path.GetTempPath(), "aidotnet-register-rollback-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            using var pool = new StreamingTensorPool(new GpuOffloadOptions
+            {
+                StreamingPoolMaxResidentBytes = 96,
+                StreamingBackingStorePath = directory,
+            });
+            var original = new byte[64];
+            original[0] = 42;
+            long existing = pool.Register(original);
+            pool.ReserveBytes(32);
+            string backing = Assert.Single(Directory.GetDirectories(directory));
+            Directory.Delete(backing); // Empty, test-owned directory; force the first disk write to fail.
+            Assert.ThrowsAny<IOException>(() => pool.RegisterReserved(new byte[64], 32));
+            Assert.Equal(1, pool.RegisteredEntryCount);
+            Assert.Equal(64, pool.ResidentBytes);
+            Assert.Equal(32, pool.ReservedBytes);
+            Assert.Equal(42, pool.Rehydrate(existing)[0]);
+        }
+        finally { if (Directory.Exists(directory)) Directory.Delete(directory, recursive: true); }
+    }
+
+    [Fact]
     public void Register_StaysResident_BelowBudget()
     {
         var dir = Path.Combine(Path.GetTempPath(), "aidotnet-stream-test-" + Guid.NewGuid().ToString("N"));

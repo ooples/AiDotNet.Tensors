@@ -4184,9 +4184,19 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-        var aOrig = a;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
-        if (!a.IsContiguous) a = a.Contiguous();
-        var bOrig = b;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
+        // A non-contiguous target (a transpose, a strided slice) used to be swapped for a contiguous
+        // COPY here, so every kernel below added into the copy and the caller's tensor came back
+        // unchanged — an in-place op that silently did nothing. Compute into a contiguous working
+        // copy, then scatter the result back through the view's own strides. Contiguous targets —
+        // the only kind every existing caller passes — never reach this branch.
+        if (!a.IsContiguous)
+        {
+            ThrowIfInPlaceTargetAliasesItself(a);
+            var work = a.Contiguous();
+            TensorBroadcastAddInPlace(work, b);
+            a.CopyFromArray(work.ToArray());
+            return;
+        }
         if (!b.IsContiguous) b = b.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -4238,6 +4248,8 @@ public partial class CpuEngine : ITensorLevelEngine
         if (b.Rank == 1 && a._shape[^1] == b._shape[0])
         {
             int lastDim = b._shape[0];
+            // A zero-extent last axis means `a` is empty: nothing to add, and a.Length / 0 throws.
+            if (lastDim == 0) return;
             int outerSize = a.Length / lastDim;
             for (int outer = 0; outer < outerSize; outer++)
             {
@@ -4251,7 +4263,35 @@ public partial class CpuEngine : ITensorLevelEngine
         // General fallback: compute broadcast result and copy back.
         // This allocates a temporary — acceptable for rare arbitrary broadcast shapes.
         var result = TensorBroadcastAdd(a, b);
+        // In place cannot grow or shrink the target. Stretching one of a's size-1 axes to a larger
+        // extent already failed in CopyTo (destination too short), but stretching it to 0 produced an
+        // empty result that "copied" nothing and returned a non-empty target silently unmodified.
+        // Compared by length, not shape, so the long-standing tolerance for a result that differs
+        // from `a` only by padded leading 1s ([C] += [1,C]) is left exactly as it was.
+        if (result.Length != a.Length)
+            throw new ArgumentException(
+                $"In-place broadcast add cannot resize its target: {FormatShape(a._shape)} " +
+                $"+= {FormatShape(b._shape)} broadcasts to {FormatShape(result._shape)}.", nameof(b));
         result.Data.Span.CopyTo(aSpan);
+    }
+
+    /// <summary>
+    /// Rejects an in-place target whose logical elements share storage — a stride-0 (expanded)
+    /// axis of extent &gt; 1 — because there is no well-defined result to write back: every
+    /// position along that axis would have to hold a different sum in the same memory slot.
+    /// PyTorch rejects the same case. Materialize with <c>Contiguous()</c> first.
+    /// </summary>
+    private static void ThrowIfInPlaceTargetAliasesItself<T>(Tensor<T> target)
+    {
+        for (int axis = 0; axis < target.Rank; axis++)
+        {
+            if (target._shape[axis] > 1 && target._strides[axis] == 0)
+                throw new ArgumentException(
+                    $"Cannot write in place into a tensor of shape [{string.Join(", ", target._shape)}] whose " +
+                    $"axis {axis} has stride 0: several of its elements share one storage location (an " +
+                    "expanded/broadcast view). Call Contiguous() to materialize it before the in-place op.",
+                    "a");
+        }
     }
 
     protected static void ValidateGroupNormArguments<T>(
@@ -13073,7 +13113,8 @@ public partial class CpuEngine : ITensorLevelEngine
             int dim2 = i < shape2.Length ? shape2[shape2.Length - 1 - i] : 1;
             if (dim1 != dim2 && dim1 != 1 && dim2 != 1)
                 throw new ArgumentException($"Shapes are not broadcast-compatible at dimension {maxRank - 1 - i}: {dim1} vs {dim2}");
-            result[maxRank - 1 - i] = Math.Max(dim1, dim2);
+            // 1 stretches to the other extent, including 0 — Math.Max would turn (0, 1) into 1.
+            result[maxRank - 1 - i] = dim1 == 1 ? dim2 : dim1;
         }
         return result;
     }

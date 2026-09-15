@@ -97,11 +97,11 @@ public sealed class OpenClHalfPrecisionGemmTests : IClassFixture<OpenClBackendTe
         var aFp32 = Backend.AllocateBuffer(a);
         var bFp32 = Backend.AllocateBuffer(b);
 
-        // FP16 buffers hold M*K / K*N halfs (2 bytes each). Allocating that many
-        // floats over-allocates (4 bytes each) which is harmless and mirrors the
-        // CUDA engine path's AllocateOutputBuffer(M*K) sizing.
-        var aFp16 = Backend.AllocateBuffer(m * k);
-        var bFp16 = Backend.AllocateBuffer(k * n);
+        // Use the actual half-width allocation made by the precision planner.
+        var aFp16 = Backend.AllocateByteBuffer(checked(m * k * sizeof(ushort)));
+        var bFp16 = Backend.AllocateByteBuffer(checked(k * n * sizeof(ushort)));
+        Assert.Equal((long)m * k * sizeof(ushort), aFp16.SizeInBytes);
+        Assert.Equal((long)k * n * sizeof(ushort), bFp16.SizeInBytes);
         Backend.ConvertToFp16(aFp32, aFp16, m * k);
         Backend.ConvertToFp16(bFp32, bFp16, k * n);
 
@@ -166,8 +166,7 @@ public sealed class OpenClHalfPrecisionGemmTests : IClassFixture<OpenClBackendTe
         var expected = CpuReferenceFromFp16(a, b, m, n, k);
 
         var (aFp16, bFp16) = UploadFp16Inputs(a, b, m, n, k);
-        // FP16 output buffer (M*N halfs); over-allocate as floats.
-        using var cFp16 = Backend.AllocateBuffer(m * n);
+        using var cFp16 = Backend.AllocateByteBuffer(checked(m * n * sizeof(ushort)));
         // Convert the FP16 result back to FP32 for comparison.
         using var cFp32 = Backend.AllocateBuffer(m * n);
         try
