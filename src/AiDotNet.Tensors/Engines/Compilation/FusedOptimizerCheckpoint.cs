@@ -65,6 +65,14 @@ internal sealed class FusedLrScheduleCheckpoint
             throw new System.IO.InvalidDataException(
                 $"Serialized LR schedule kind {Kind} requires at least {reqD} double(s) and {reqI} int(s); " +
                 $"got {Doubles.Length} double(s) and {Ints.Length} int(s).");
+        // No schedule stores a non-finite sentinel, and a restored NaN or infinity would flow straight from
+        // GetLr into the optimizer update and poison every parameter it touches.
+        for (int i = 0; i < reqD; i++)
+        {
+            if (double.IsNaN(Doubles[i]) || double.IsInfinity(Doubles[i]))
+                throw new System.IO.InvalidDataException(
+                    $"Serialized LR schedule kind {Kind} contains a non-finite value at double {i}.");
+        }
         if ((Kind == FusedLrScheduleKind.LinearWarmupPhasedDecay || Kind == FusedLrScheduleKind.LinearWarmupLegacyEagerDecay)
             && (Ints[0] < 0 || !Enum.IsDefined(typeof(WarmupDecayMode), Ints[2])
                 || (Ints[2] != (int)WarmupDecayMode.Constant && Ints[1] < Ints[0])))

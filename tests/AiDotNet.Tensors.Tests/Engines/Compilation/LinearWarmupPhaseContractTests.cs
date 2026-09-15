@@ -208,6 +208,34 @@ public sealed class LinearWarmupPhaseContractTests
         Assert.Throws<InvalidDataException>(() => RoundTrip(captured).ToSchedule());
     }
 
+    [Theory]
+    [InlineData(double.NaN)]
+    [InlineData(double.PositiveInfinity)]
+    [InlineData(double.NegativeInfinity)]
+    public void NonFiniteRequiredValuesAreRejectedForEveryScheduleKind(double value)
+    {
+        // Required doubles per kind, as Validate declares them; each position of each kind is poisoned in turn.
+        var required = new (FusedLrScheduleKind Kind, int Doubles)[]
+        {
+            (FusedLrScheduleKind.Constant, 1), (FusedLrScheduleKind.NoamScaled, 2), (FusedLrScheduleKind.Cosine, 2),
+            (FusedLrScheduleKind.OneCycleResolved, 3), (FusedLrScheduleKind.Exponential, 2), (FusedLrScheduleKind.Step, 2),
+            (FusedLrScheduleKind.Cyclic, 2), (FusedLrScheduleKind.LinearWarmupCosine, 2), (FusedLrScheduleKind.LinearWarmupDecay, 3),
+            (FusedLrScheduleKind.LinearWarmupPhasedDecay, 3), (FusedLrScheduleKind.LinearWarmupLegacyEagerDecay, 3)
+        };
+        foreach (var (kind, doubles) in required)
+        {
+            var valid = new FusedLrScheduleCheckpoint(kind, new[] { 0.5, 0.25, 0.125 }, new[] { 4, 8, 1 });
+            _ = RoundTrip(valid).ToSchedule(); // The finite payload itself restores.
+            for (int index = 0; index < doubles; index++)
+            {
+                var values = new[] { 0.5, 0.25, 0.125 };
+                values[index] = value;
+                var poisoned = new FusedLrScheduleCheckpoint(kind, values, new[] { 4, 8, 1 });
+                Assert.Throws<InvalidDataException>(() => RoundTrip(poisoned).ToSchedule());
+            }
+        }
+    }
+
     [Fact]
     public void UnknownScheduleKindsFailClosed()
     {
