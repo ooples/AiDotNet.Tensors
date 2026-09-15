@@ -105,8 +105,8 @@ public abstract class LrSchedule
     /// over <paramref name="warmupSteps"/> steps, then a Constant / Linear / Cosine
     /// decay to <paramref name="endLr"/> per <paramref name="decayMode"/>. This is the
     /// fused-path image of <c>AiDotNet.LearningRateSchedulers.LinearWarmupScheduler</c>:
-    /// its per-step sequence is bit-identical to that eager scheduler's per-batch LR
-    /// (batch 1 = ctor <c>warmupInitLr</c>; batch n = <c>max(endLr, ComputeLearningRate(n-1))</c>),
+    /// its per-step sequence uses the warmup ramp without applying the decay floor
+    /// until warmup has finished (with no warmup, the first batch starts at <paramref name="lrMax"/>),
     /// so the warmup recipe runs on the captured fast path instead of the eager tape.
     /// Unlike <see cref="LinearWarmupCosine"/> (warmup→cosine only, floor 0), this honors
     /// a non-zero warmup-init, all three decay modes, and a non-zero end LR.
@@ -117,6 +117,15 @@ public abstract class LrSchedule
         WarmupDecayMode decayMode = WarmupDecayMode.Constant,
         double endLr = 0.0)
         => new LinearWarmupLr(lrMax, warmupSteps, totalSteps, warmupInitLr, decayMode, endLr);
+
+    // Friend-assembly checkpoint bridge for AiDotNet's historical eager scheduler.
+    // Its zero-warmup initial rate differs from historical fused kind 9, so it
+    // requires its own built-in representation rather than a custom adapter.
+    internal static LrSchedule LegacyEagerLinearWarmup(
+        double lrMax, int warmupSteps, int totalSteps,
+        double warmupInitLr, WarmupDecayMode decayMode, double endLr)
+        => new LinearWarmupLr(lrMax, warmupSteps, totalSteps, warmupInitLr, decayMode, endLr,
+            LinearWarmupSemantics.LegacyEager);
 
     /// <summary>
     /// Noam schedule from "Attention Is All You Need" (Vaswani et al. 2017,
@@ -355,6 +364,12 @@ internal sealed class LinearWarmupCosineLr : LrSchedule
             new[] { _warmup, _total });
 }
 
+internal enum LinearWarmupSemantics
+{
+    Phased,
+    LegacyEager
+}
+
 internal sealed class LinearWarmupLr : LrSchedule
 {
     private readonly double _lrMax;
@@ -363,9 +378,11 @@ internal sealed class LinearWarmupLr : LrSchedule
     private readonly double _warmupInitLr;
     private readonly WarmupDecayMode _decayMode;
     private readonly double _endLr;
+    private readonly LinearWarmupSemantics _semantics;
 
     public LinearWarmupLr(double lrMax, int warmupSteps, int totalSteps,
-        double warmupInitLr, WarmupDecayMode decayMode, double endLr)
+        double warmupInitLr, WarmupDecayMode decayMode, double endLr,
+        LinearWarmupSemantics semantics = LinearWarmupSemantics.Phased)
     {
         if (warmupSteps < 0) throw new ArgumentOutOfRangeException(nameof(warmupSteps));
         if (!Enum.IsDefined(typeof(WarmupDecayMode), decayMode))
@@ -380,19 +397,19 @@ internal sealed class LinearWarmupLr : LrSchedule
         _warmupInitLr = warmupInitLr;
         _decayMode = decayMode;
         _endLr = endLr;
+        _semantics = semantics;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public override double GetLr(int step)
     {
-        // The eager LinearWarmupScheduler reports its ctor value (warmupInitLr) on
-        // batch 1 (unfloored), then on batch n>=2 reports max(endLr, ComputeLearningRate(n-1))
-        // — _currentStep is (batch - 1) and Step() floors with _minLearningRate = endLr.
-        // The 1-indexed fused step maps batch n → GetLr(n); reproduce both branches so the
-        // per-step LR is bit-identical to the eager replay (FusedLrScheduleMappingTests).
+        // The 1-indexed optimizer step maps to the eager scheduler's zero-indexed
+        // completed-step count. The decay endpoint is a floor for the decay phase,
+        // not for warmup: flooring the ramp can jump from warmupInitLr to endLr.
         if (step <= 1)
-            return _warmupSteps > 0 ? _warmupInitLr : _lrMax;
+            return _semantics == LinearWarmupSemantics.LegacyEager || _warmupSteps > 0 ? _warmupInitLr : _lrMax;
         double raw = ComputeRaw(step - 1);
+        if (_semantics == LinearWarmupSemantics.Phased && step - 1 < _warmupSteps) return raw;
         return raw > _endLr ? raw : _endLr;
     }
 
@@ -421,7 +438,10 @@ internal sealed class LinearWarmupLr : LrSchedule
     // parameter set (incl. warmupInitLr, endLr and the decay mode) so the restored LR sequence is
     // bit-identical. _totalSteps is already the ctor-normalized value.
     internal override FusedLrScheduleCheckpoint? TryCaptureCheckpoint()
-        => new(FusedLrScheduleKind.LinearWarmupDecay,
+        // Keep old kind 9 for restoring the original floored-warmup trajectory.
+        => new(_semantics == LinearWarmupSemantics.LegacyEager
+                ? FusedLrScheduleKind.LinearWarmupLegacyEagerDecay
+                : FusedLrScheduleKind.LinearWarmupPhasedDecay,
             new[] { _lrMax, _warmupInitLr, _endLr },
             new[] { _warmupSteps, _totalSteps, (int)_decayMode });
 }
