@@ -27,23 +27,17 @@ public sealed class LinearWarmupPhaseContractTests
         var legacy = new FusedLrScheduleCheckpoint((FusedLrScheduleKind)legacyEagerWireKind,
             new[] { 1.0, 0.2, 0.9 }, new[] { warmup, 8, (int)mode });
         var restored = RoundTrip(legacy).ToSchedule();
-#if !PUBLISHED_TENSORS
         var factory = LrSchedule.LegacyEagerLinearWarmup(1.0, warmup, 8, 0.2, mode, 0.9);
-#endif
         for (int step = 0; step <= 10; step++)
         {
             double expected = step == 0 ? 0.2 : Math.Max(0.9, ExpectedRate(step, warmup, 8, mode, 0.9));
             Assert.Equal(expected, restored.GetLr(step + 1), 14);
-#if !PUBLISHED_TENSORS
             Assert.Equal(expected, factory.GetLr(step + 1), 14);
-#endif
         }
         var recaptured = Assert.IsType<FusedLrScheduleCheckpoint>(restored.TryCaptureCheckpoint());
         Assert.Equal(legacyEagerWireKind, (int)recaptured.Kind);
-#if !PUBLISHED_TENSORS
         Assert.Equal(FusedLrScheduleKind.LinearWarmupLegacyEagerDecay,
             Assert.IsType<FusedLrScheduleCheckpoint>(factory.TryCaptureCheckpoint()).Kind);
-#endif
         Assert.Equal(0.2, RoundTrip(recaptured).ToSchedule().GetLr(1));
     }
 
