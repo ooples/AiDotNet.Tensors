@@ -138,9 +138,21 @@ public sealed class EvolutionKernelAutotuner<TConfiguration>
         var existing = _deployment.Current;
         if (!CanDeploy(loaded.Configuration) || existing is not null && !CanDeploy(existing.Configuration))
             throw new InvalidOperationException("Artifact or active incumbent is outside deployment policy.");
-        var replay = await _finalistEvaluator.ReplayAsync(_identity, loaded.Configuration, existing, cancellationToken).ConfigureAwait(false)
+        // HAND THE EVALUATOR A DETACHED INCUMBENT. TConfiguration is only required to be non-null, the
+        // evaluator is injected, and nothing here can require immutability. An evaluator that mutated
+        // the active configuration and returned it would satisfy the comparison below trivially --
+        // both sides would serialize the same mutated object -- while the deployment's stored GenomeId
+        // and evidence no longer described what is actually deployed.
+        string? activeGenome = existing is null ? null : _codec.Serialize(existing.Configuration);
+        KernelTuningDeploymentSnapshot<TConfiguration>? detached = existing is null ? null : new(
+            existing.Identity, _codec.Deserialize(activeGenome!), existing.GenomeId, existing.Measurement,
+            existing.RunStateHash, existing.PromotionEvidence, existing.EvidenceRole);
+        var replay = await _finalistEvaluator.ReplayAsync(_identity, loaded.Configuration, detached, cancellationToken).ConfigureAwait(false)
             ?? throw new InvalidOperationException("The finalist evaluator returned no replay evidence.");
         cancellationToken.ThrowIfCancellationRequested();
+        // The active configuration must still be the one whose identity the deployment records.
+        if (existing is not null && EvolutionHash.Compute(_codec.Serialize(existing.Configuration)) != existing.GenomeId)
+            throw new InvalidOperationException("The active deployment configuration changed during replay.");
         ValidateReplayIncumbent(existing, replay.IncumbentConfiguration);
         if (_codec.Id != codecId || _codec.VersionHash != codecVersion ||
             EvolutionHash.Compute(_codec.Serialize(loaded.Configuration)) != loaded.GenomeId)

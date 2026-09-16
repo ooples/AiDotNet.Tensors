@@ -32,15 +32,15 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v4
         with:
           path: tensors
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v4
         with:
           repository: ooples/AiDotNet.Evolution
           ref: 255feb24369702a32ea9db7a3f8a0b7a847d2762
           path: evolution
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
         with:
           dotnet-version: |
             10.0.x
@@ -58,7 +58,7 @@ jobs:
           --results-directory evidence --blame-hang-timeout 3m
           --settings tests/AiDotNet.Tensors.Autotune.Tests/autotune.runsettings
           --collect:"XPlat Code Coverage"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: lifecycle-${{ matrix.os }}-${{ matrix.framework }}

@@ -286,6 +286,21 @@ public sealed partial class EvolutionKernelAutotunerTests
             Assert.Equal(1, lifecycle.AdmittedRetunes);
         }
         finally { idle.Release.TrySetResult(true); }
+
+        // The abandoned work keeps the only slot until it settles, and releasing it must GIVE THAT
+        // SLOT BACK. Without this the test would pass just as happily if the slot leaked forever.
+        // The released gate is the signal: the blocked work resumes there, and its continuation is
+        // what releases the slot. The tuner itself never reaches replay, because the deadline that
+        // abandoned it has already cancelled the token TuneAsync runs under.
+        Assert.Same(idle.Resumed.Task, await Task.WhenAny(idle.Resumed.Task, Task.Delay(TimeSpan.FromSeconds(5))));
+        KernelTuningRetuneStatus readmitted = KernelTuningRetuneStatus.Busy;
+        for (int attempt = 0; attempt < 50 && readmitted == KernelTuningRetuneStatus.Busy; attempt++)
+        {
+            readmitted = await lifecycle.RetunePendingAsync(FreshTuner, Seeds(), new ImmediateIdleGate());
+            if (readmitted == KernelTuningRetuneStatus.Busy) await Task.Delay(TimeSpan.FromMilliseconds(20));
+        }
+        Assert.NotEqual(KernelTuningRetuneStatus.Busy, readmitted);
+        Assert.Equal(2, lifecycle.AdmittedRetunes);
     }
 
     [Fact]
@@ -320,8 +335,14 @@ public sealed partial class EvolutionKernelAutotunerTests
     {
         internal TaskCompletionSource<bool> Entered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         internal TaskCompletionSource<bool> Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        /// <summary>Completes when the blocked work resumes, which is when the slot starts coming back.</summary>
+        internal TaskCompletionSource<bool> Resumed { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public async ValueTask WaitUntilIdleAsync(KernelTuningIdentity identity, CancellationToken cancellationToken = default)
-        { Entered.TrySetResult(true); await Release.Task.ConfigureAwait(false); }
+        {
+            Entered.TrySetResult(true);
+            try { await Release.Task.ConfigureAwait(false); }
+            finally { Resumed.TrySetResult(true); }
+        }
     }
 
     private sealed class ImmediateIdleGate : IKernelTuningIdleGate

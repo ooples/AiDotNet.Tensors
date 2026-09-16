@@ -12,8 +12,40 @@ namespace AiDotNet.Tensors.Helpers.Autotune;
 /// </remarks>
 public sealed class KernelTuningLifecycle<TConfiguration> where TConfiguration : notnull
 {
+    // One retune at a time, by design: abandoned work keeps the slot until it settles, so the
+    // capacity is part of the controller's contract rather than a tuning knob.
+    private const int ConcurrentOperationCapacity = 1;
+
+    // The retuning search runs single threaded with one proposal in flight so an admitted retune
+    // consumes exactly the budget it was admitted for.
+    private const int RetuneDegreeOfParallelism = 1;
+    private const int RetuneProposalBatchSize = 1;
+
+    /// <summary>The schema version of the retained regression-evidence document.</summary>
+    private const int RegressionEvidenceSchemaVersion = 1;
+
+    /// <summary>The length of a hex SHA-256 digest, the only artifact id shape this controller records.</summary>
+    private const int DigestLength = 64;
+
+    /// <summary>The versioned identity of the latency policy that produced a regression receipt.</summary>
+    private const string LatencyPolicyVersion = "kernel-lifecycle-p95-ms-v1";
+
+    /// <summary>
+    /// Whether the controller's own retuning deadline stopped the work rather than the caller.
+    /// </summary>
+    /// <remarks>
+    /// The deadline source is LINKED to the caller's token, so "cancellation requested" alone cannot
+    /// tell the two apart. Caller cancellation is the caller's to observe as an exception; the
+    /// internal deadline is a documented outcome of this method and must be reported as a status.
+    /// </remarks>
+    private static bool InternalDeadlineElapsed(CancellationTokenSource deadline, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return deadline.IsCancellationRequested;
+    }
+
     private readonly object _gate = new();
-    private readonly SemaphoreSlim _operation = new(1, 1);
+    private readonly SemaphoreSlim _operation = new(ConcurrentOperationCapacity, ConcurrentOperationCapacity);
     private readonly KernelTuningArtifactRegistry<TConfiguration> _registry;
     private readonly IEvolutionGenomeCodec<TConfiguration> _codec;
     private readonly KernelTuningLifecyclePolicy _policy;
@@ -124,7 +156,8 @@ public sealed class KernelTuningLifecycle<TConfiguration> where TConfiguration :
                 {
                     RunId = "retune-" + Guid.NewGuid().ToString("N"), MaxEvaluationAttempts = _policy.EvaluationsPerRetune,
                     MaxProposals = _policy.ProposalsPerRetune, MaxGenerations = _policy.ProposalsPerRetune,
-                    MaxDegreeOfParallelism = 1, ProposalBatchSize = 1, TimeLimit = _policy.Timeout,
+                    MaxDegreeOfParallelism = RetuneDegreeOfParallelism, ProposalBatchSize = RetuneProposalBatchSize,
+                    TimeLimit = _policy.Timeout,
                     EvaluationTimeout = _policy.Timeout, EvaluationGracePeriod = _policy.GracePeriod
                 };
                 var next = factory(requested, options) ?? throw new InvalidOperationException("Retuning factory returned no tuner.");
@@ -146,13 +179,21 @@ public sealed class KernelTuningLifecycle<TConfiguration> where TConfiguration :
                     cancellationToken.ThrowIfCancellationRequested();
                     return KernelTuningRetuneStatus.Abandoned;
                 }
-                var completed = await work.ConfigureAwait(false);
-                deadline.Token.ThrowIfCancellationRequested();
+                (EvolutionKernelAutotuner<TConfiguration> Tuner, EvolutionKernelTuningResult<TConfiguration> Result) completed;
+                try { completed = await work.ConfigureAwait(false); }
+                catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+                {
+                    // The internal deadline stopped the tuner before the grace timer expired. That is
+                    // abandoned work, which this method documents as a status; only the CALLER's
+                    // cancellation propagates as an exception.
+                    return KernelTuningRetuneStatus.Abandoned;
+                }
+                if (InternalDeadlineElapsed(deadline, cancellationToken)) return KernelTuningRetuneStatus.Abandoned;
                 var approval = _promotion.Options.SnapshotAndValidate(requested.Identity.Device.Kind);
                 var artifact = _registry.Register(completed.Result.ActiveDeployment, requested, _codec);
                 if (completed.Result.WasPromoted && !approval.QualifiesForPromotion(completed.Result.ProposedWinner.PromotionEvidence) ||
                     _promotion.RequireDurableArtifact && !artifact.IsDurable) return KernelTuningRetuneStatus.Rejected;
-                deadline.Token.ThrowIfCancellationRequested();
+                if (InternalDeadlineElapsed(deadline, cancellationToken)) return KernelTuningRetuneStatus.Abandoned;
                 lock (_gate)
                 {
                     if (_epoch != epoch || _evidenceFailure) return KernelTuningRetuneStatus.Stale;
@@ -216,10 +257,10 @@ public sealed class KernelTuningLifecycle<TConfiguration> where TConfiguration :
             }
             byte[] bytes = JsonSerializer.SerializeToUtf8Bytes(new
             {
-                SchemaVersion = 1, Envelope = envelope.StableKey, observed.GenomeId, observed.RunStateHash,
+                SchemaVersion = RegressionEvidenceSchemaVersion, Envelope = envelope.StableKey, observed.GenomeId, observed.RunStateHash,
                 ObservedAtUtc = observedAt.ToUniversalTime(),
                 Windows = _violatingWindows.Select(window => new { ObservedAtUtc = window.At, SampleTicks = window.Ticks }).ToArray(),
-                RequestedPriorArtifactId = priorArtifactId is { Length: > 64 } ? "[invalid digest]" : priorArtifactId,
+                RequestedPriorArtifactId = priorArtifactId is { Length: > DigestLength } ? "[invalid digest]" : priorArtifactId,
                 BaselineP95Ticks = observed.Measurement.Timing.P95.Ticks, _policy.MaximumP95RegressionRatio,
                 _policy.ConsecutiveBreaches, _policy.MonitoringSamples
             });
@@ -232,7 +273,7 @@ public sealed class KernelTuningLifecycle<TConfiguration> where TConfiguration :
                 throw;
             }
             var evidence = new KernelTuningRegressionEvidence(KernelTuningRegressionReason.Latency,
-                "kernel-lifecycle-p95-ms-v1", receipt.ArtifactId, timing.P95.TotalMilliseconds,
+                LatencyPolicyVersion, receipt.ArtifactId, timing.P95.TotalMilliseconds,
                 threshold, observedAt);
             KernelTuningDeploymentSnapshot<TConfiguration>? prior = null;
             if (priorArtifactId is not null)

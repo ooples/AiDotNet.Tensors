@@ -58,7 +58,17 @@ public sealed class KernelTuningArtifactRegistry<TConfiguration> where TConfigur
 {
     private readonly string _directory;
     private const int MaximumBytes = 4 * 1024 * 1024;
-    private static readonly JsonSerializerOptions JsonOptions = new() { MaxDepth = 32 };
+
+    // The artifact protocol, named once. The schema version and the JSON depth are each read back on
+    // the load path, and a format change that edited only one of the two literals would write files
+    // this same registry then refuses -- or, worse, accepts under the wrong contract.
+    private const int ArtifactSchemaVersion = 1;
+    private const int MaximumJsonDepth = 32;
+
+    /// <summary>The fixed timestamp written into every artifact so identical evidence hashes identically.</summary>
+    private static readonly DateTime CanonicalRecordedAtUtc = new(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+
+    private static readonly JsonSerializerOptions JsonOptions = new() { MaxDepth = MaximumJsonDepth };
 
     /// <summary>Creates a registry in an explicitly selected absolute directory.</summary>
     public KernelTuningArtifactRegistry(string directory)
@@ -86,10 +96,10 @@ public sealed class KernelTuningArtifactRegistry<TConfiguration> where TConfigur
             if (value.Length > MaximumBytes || strictUtf8.GetByteCount(value) > MaximumBytes)
                 throw new InvalidDataException("Kernel artifact field exceeds its byte bound.");
         // Wall time is not part of artifact identity; registering the same evidence is idempotent.
-        choice.RecordedAtUtc = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        choice.RecordedAtUtc = CanonicalRecordedAtUtc;
         byte[] bytes = JsonSerializer.SerializeToUtf8Bytes(new ArtifactDocument
         {
-            SchemaVersion = 1, EnvelopeKey = envelope.StableKey, RuntimeSha256 = envelope.RuntimeSha256,
+            SchemaVersion = ArtifactSchemaVersion, EnvelopeKey = envelope.StableKey, RuntimeSha256 = envelope.RuntimeSha256,
             CompilerSha256 = envelope.CompilerSha256, DatasetSha256 = envelope.DatasetSha256,
             WorkloadSha256 = envelope.WorkloadSha256, Choice = choice
         }, JsonOptions);
@@ -111,11 +121,11 @@ public sealed class KernelTuningArtifactRegistry<TConfiguration> where TConfigur
         if (codec is null) throw new ArgumentNullException(nameof(codec));
         byte[] bytes = Read(artifactId);
         string codecId = codec.Id, codecVersion = codec.VersionHash;
-        using var parsed = JsonDocument.Parse(bytes, new JsonDocumentOptions { MaxDepth = 32 });
+        using var parsed = JsonDocument.Parse(bytes, new JsonDocumentOptions { MaxDepth = MaximumJsonDepth });
         KernelArtifactEncoding.RequireUniqueProperties(parsed.RootElement);
         var document = JsonSerializer.Deserialize<ArtifactDocument>(bytes, JsonOptions)
             ?? throw new InvalidDataException("Missing kernel artifact.");
-        if (document.SchemaVersion != 1 || document.EnvelopeKey != envelope.StableKey ||
+        if (document.SchemaVersion != ArtifactSchemaVersion || document.EnvelopeKey != envelope.StableKey ||
             document.RuntimeSha256 != envelope.RuntimeSha256 || document.CompilerSha256 != envelope.CompilerSha256 ||
             document.DatasetSha256 != envelope.DatasetSha256 || document.WorkloadSha256 != envelope.WorkloadSha256 ||
             !AutotuneCacheKernelTuningStore<TConfiguration>.TryDecode(envelope.Identity, codec, document.Choice, out var snapshot) ||
