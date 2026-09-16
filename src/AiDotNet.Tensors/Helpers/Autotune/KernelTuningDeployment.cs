@@ -120,6 +120,13 @@ public sealed class KernelTuningDeployment<TConfiguration>
         return Interlocked.CompareExchange(ref _current, snapshot, null) is null;
     }
 
+    internal bool TryReplace(KernelTuningDeploymentSnapshot<TConfiguration>? expected,
+        KernelTuningDeploymentSnapshot<TConfiguration> snapshot)
+    {
+        ValidateIdentity(snapshot);
+        return ReferenceEquals(Interlocked.CompareExchange(ref _current, snapshot, expected), expected);
+    }
+
     private void ValidateIdentity(KernelTuningDeploymentSnapshot<TConfiguration> snapshot)
     {
         if (snapshot is null) throw new ArgumentNullException(nameof(snapshot));
@@ -212,6 +219,17 @@ public sealed class AutotuneCacheKernelTuningStore<TConfiguration> : IKernelTuni
         try
         {
             KernelChoice? choice = AutotuneCache.Lookup(CacheKernel(identity), identity.Shape);
+            return TryDecode(identity, codec, choice, out snapshot);
+        }
+        catch { return false; }
+    }
+
+    internal static bool TryDecode(KernelTuningIdentity identity, IEvolutionGenomeCodec<TConfiguration> codec,
+        KernelChoice? choice, out KernelTuningDeploymentSnapshot<TConfiguration>? snapshot)
+    {
+        snapshot = null;
+        try
+        {
             if (choice is null || !string.Equals(choice.Variant, Variant, StringComparison.Ordinal) ||
                 choice.Parameters is null ||
                 !TryGet(choice.Parameters, IdentityKey, out string persistedIdentity) ||
@@ -328,6 +346,13 @@ public sealed class AutotuneCacheKernelTuningStore<TConfiguration> : IKernelTuni
         KernelTuningDeploymentSnapshot<TConfiguration> snapshot,
         IEvolutionGenomeCodec<TConfiguration> codec)
     {
+        KernelChoice choice = Encode(snapshot, codec);
+        return AutotuneCache.TryStore(CacheKernel(snapshot.Identity), snapshot.Identity.Shape, choice);
+    }
+
+    internal static KernelChoice Encode(KernelTuningDeploymentSnapshot<TConfiguration> snapshot,
+        IEvolutionGenomeCodec<TConfiguration> codec)
+    {
         if (snapshot is null) throw new ArgumentNullException(nameof(snapshot));
         if (codec is null) throw new ArgumentNullException(nameof(codec));
         KernelTuningMeasurement measurement = snapshot.Measurement;
@@ -379,16 +404,13 @@ public sealed class AutotuneCacheKernelTuningStore<TConfiguration> : IKernelTuni
         if (!string.Equals(EvolutionHash.Compute(parameters[GenomePayloadKey]), snapshot.GenomeId, StringComparison.Ordinal))
             throw new InvalidOperationException("The snapshot genome id does not match its canonical payload.");
 
-        return AutotuneCache.TryStore(
-            CacheKernel(snapshot.Identity),
-            snapshot.Identity.Shape,
-            new KernelChoice
+        return new KernelChoice
             {
                 Variant = Variant,
                 Parameters = parameters,
                 MeasuredGflops = measurement.BillionsOfWorkUnitsPerSecond,
                 MeasuredTimeMs = measurement.Timing.Median.TotalMilliseconds
-            });
+            };
     }
 
     private static KernelTuningResourceMetric<T> ResourceMetric<T>(

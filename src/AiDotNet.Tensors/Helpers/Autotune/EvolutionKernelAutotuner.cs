@@ -115,6 +115,65 @@ public sealed class EvolutionKernelAutotuner<TConfiguration>
 
     internal int MaximumProposals => _engineOptions.MaxProposals;
     internal int MaximumEvaluationAttempts => _engineOptions.MaxEvaluationAttempts;
+    internal KernelTuningIdentity Identity => _identity;
+    internal bool SupportsQuarantine => _store is QuarantinedKernelTuningStore<TConfiguration>;
+
+    /// <summary>Freshly compares a retained artifact with the active implementation before explicit application-policy promotion.</summary>
+    /// <remarks>Registry integrity alone never authorizes deployment. Replay must honor cancellation and its backend resource limits.</remarks>
+    public async Task<KernelTuningArtifactPromotion<TConfiguration>> PromoteArtifactAsync(
+        KernelTuningArtifactRegistry<TConfiguration> registry, string artifactId,
+        KernelTuningApplicabilityEnvelope envelope, KernelTuningArtifactPromotionPolicy policy,
+        CancellationToken cancellationToken = default)
+    {
+        if (registry is null) throw new ArgumentNullException(nameof(registry));
+        if (envelope is null) throw new ArgumentNullException(nameof(envelope));
+        if (policy is null) throw new ArgumentNullException(nameof(policy));
+        if (envelope.Identity.StableKey != _identity.StableKey)
+            throw new ArgumentException("Applicability identity differs from the tuner.", nameof(envelope));
+        KernelTuningOptions promotion = policy.Options.SnapshotAndValidate(_identity.Device.Kind);
+        cancellationToken.ThrowIfCancellationRequested();
+        string codecId = _codec.Id, codecVersion = _codec.VersionHash;
+        var loaded = registry.Load(artifactId, envelope, _codec);
+        using IDisposable lease = await KernelTuningCoordinator.EnterAsync(_identity.Device, cancellationToken).ConfigureAwait(false);
+        var existing = _deployment.Current;
+        if (!CanDeploy(loaded.Configuration) || existing is not null && !CanDeploy(existing.Configuration))
+            throw new InvalidOperationException("Artifact or active incumbent is outside deployment policy.");
+        // HAND THE EVALUATOR A DETACHED INCUMBENT. TConfiguration is only required to be non-null, the
+        // evaluator is injected, and nothing here can require immutability. An evaluator that mutated
+        // the active configuration and returned it would satisfy the comparison below trivially --
+        // both sides would serialize the same mutated object -- while the deployment's stored GenomeId
+        // and evidence no longer described what is actually deployed.
+        string? activeGenome = existing is null ? null : _codec.Serialize(existing.Configuration);
+        KernelTuningDeploymentSnapshot<TConfiguration>? detached = existing is null ? null : new(
+            existing.Identity, _codec.Deserialize(activeGenome!), existing.GenomeId, existing.Measurement,
+            existing.RunStateHash, existing.PromotionEvidence, existing.EvidenceRole);
+        var replay = await _finalistEvaluator.ReplayAsync(_identity, loaded.Configuration, detached, cancellationToken).ConfigureAwait(false)
+            ?? throw new InvalidOperationException("The finalist evaluator returned no replay evidence.");
+        cancellationToken.ThrowIfCancellationRequested();
+        // The active configuration must still be the one whose identity the deployment records.
+        if (existing is not null && EvolutionHash.Compute(_codec.Serialize(existing.Configuration)) != existing.GenomeId)
+            throw new InvalidOperationException("The active deployment configuration changed during replay.");
+        ValidateReplayIncumbent(existing, replay.IncumbentConfiguration);
+        if (_codec.Id != codecId || _codec.VersionHash != codecVersion ||
+            EvolutionHash.Compute(_codec.Serialize(loaded.Configuration)) != loaded.GenomeId)
+            throw new InvalidOperationException("Artifact configuration or codec changed during replay.");
+        if (!CanDeploy(loaded.Configuration) || !CanDeploy(replay.IncumbentConfiguration))
+            throw new InvalidOperationException("Replay configuration was denied by deployment policy.");
+        var proposed = CreateReplaySnapshot(loaded.Configuration, replay.CandidateMeasurement, replay.Evidence,
+            loaded.RunStateHash, KernelTuningEvidenceRole.Candidate);
+        var evidence = registry.Register(proposed, envelope, _codec);
+        if (!promotion.QualifiesForPromotion(replay.Evidence) || policy.RequireDurableArtifact && !evidence.IsDurable)
+            return new(existing, proposed, evidence, false, false);
+        cancellationToken.ThrowIfCancellationRequested();
+        // A stale decision cannot overwrite a deployment changed outside this tuner's device lease.
+        if (!ReferenceEquals(_deployment.Current, existing))
+            return new(_deployment.Current, proposed, evidence, false, false);
+        bool published = _store is QuarantinedKernelTuningStore<TConfiguration> quarantine
+            ? quarantine.TryPublish(_deployment, proposed, _codec, onlyIfEmpty: false, compareExpected: true, expected: existing)
+            : _deployment.TryReplace(existing, proposed);
+        if (!published) return new(_deployment.Current, proposed, evidence, false, false);
+        return new(proposed, proposed, evidence, true, TryPersist(proposed));
+    }
 
     /// <summary>Hydrates a locally persisted winner after fully validating its typed payload and evidence.</summary>
     public bool TryHydrate()

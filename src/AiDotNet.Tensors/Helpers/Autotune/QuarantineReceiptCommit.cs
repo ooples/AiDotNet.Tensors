@@ -66,10 +66,25 @@ internal static class QuarantineReceiptCommit
         // it protects ordinary restarts, but cannot promise power-loss safety.
         if (mode == QuarantineCommitMode.Unsupported) return false;
 
+        return FlushAncestors(directory, operations);
+    }
+
+    internal static bool TryConfirmDurable(string destination, IQuarantineCommitOperations operations)
+    {
+        if (operations.Mode != QuarantineCommitMode.LinuxDirectorySync) return false;
+        string? directory = Path.GetDirectoryName(destination);
+        if (string.IsNullOrEmpty(directory) || !Path.IsPathRooted(directory)) return false;
+        using (var file = new FileStream(destination, FileMode.Open, FileAccess.ReadWrite, FileShare.Read))
+            file.Flush(flushToDisk: true);
+        return FlushAncestors(directory, operations);
+    }
+
+    private static bool FlushAncestors(string? directory, IQuarantineCommitOperations operations)
+    {
         // fsync(file) does not persist the directory entry created by rename.
         // Include ancestors: the journal directory itself may have just been created.
         // A failed barrier leaves the visible tombstone intact but cannot claim durability.
-        while (!string.IsNullOrEmpty(directory))
+        while (directory is not null && directory.Length != 0)
         {
             if (!operations.FlushDirectory(directory)) return false;
             directory = Path.GetDirectoryName(directory);
