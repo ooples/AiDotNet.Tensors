@@ -1048,7 +1048,7 @@ public static partial class BlasManaged
         if (s_forwardPackBothBlocking && strategy == PackingMode.DisableAutotune)
         {
             var packBothProbe = new BlasOptions<T> { PackingMode = PackingMode.Auto };
-            PackingMode effStrategy = Dispatcher.SelectStrategy(m, n, k, packBothProbe);
+            PackingMode effStrategy = Dispatcher.SelectStrategy(m, n, k, transA, transB, packBothProbe);
             if (effStrategy == PackingMode.ForcePackAOnly && transB) effStrategy = PackingMode.ForcePackBoth;
             effectivePackBoth = effStrategy == PackingMode.ForcePackBoth;
         }
@@ -1210,7 +1210,7 @@ public static partial class BlasManaged
                 // are already populated from the heuristic above.
                 {
                     var defaultedOptions = new BlasOptions<T> { PackingMode = PackingMode.Auto };
-                    PackingMode fallback = Dispatcher.SelectStrategy(m, n, k, defaultedOptions);
+                    PackingMode fallback = Dispatcher.SelectStrategy(m, n, k, transA, transB, defaultedOptions);
                     if (fallback == PackingMode.ForcePackAOnly && transB)
                         fallback = PackingMode.ForcePackBoth;
                     switch (fallback)

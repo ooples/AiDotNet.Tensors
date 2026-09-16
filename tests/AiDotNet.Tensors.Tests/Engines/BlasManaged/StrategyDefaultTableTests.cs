@@ -12,7 +12,55 @@ public class StrategyDefaultTableTests
         var key = HardwareFingerprint.Key;
         Assert.False(string.IsNullOrEmpty(key.Simd));
         Assert.False(string.IsNullOrEmpty(key.Vendor));
-        Assert.True(key.CpuBucket >= 0 && key.CpuBucket <= 2);
+        // Upper bound raised 2 -> 3 in PR #1034: band 2 used to mean "everything above 16
+        // threads", which lumped the 32-thread Ryzen its routing was calibrated on together
+        // with 64+-thread parts that measure differently. See BucketFor.
+        Assert.True(key.CpuBucket >= 0 && key.CpuBucket <= 3);
+    }
+
+    [Fact]
+    public void CpuBucket_SeparatesVeryWideMachinesFromTheRyzenBand()
+    {
+        Assert.Equal(0, HardwareFingerprint.BucketFor(4));
+        Assert.Equal(1, HardwareFingerprint.BucketFor(16));
+        Assert.Equal(2, HardwareFingerprint.BucketFor(32));
+        Assert.Equal(2, HardwareFingerprint.BucketFor(64));
+        Assert.Equal(3, HardwareFingerprint.BucketFor(65));
+        Assert.Equal(3, HardwareFingerprint.BucketFor(128));
+    }
+
+    [Theory]
+    // Band 3 (>64T) avx2 with a TRANSPOSED B routes to Streaming. Measured on
+    // x64-amd-avx2-cpu128: Streaming won all 17 transposed shapes swept, by 1.12x-3.22x.
+    [InlineData(512, 512, 64)]
+    [InlineData(128, 128, 128)]
+    [InlineData(48, 1024, 256)]
+    [InlineData(96, 1024, 512)]
+    [InlineData(128, 768, 768)]
+    [InlineData(49, 512, 512)]
+    public void Route_VeryWideAvx2_TransposedB_PrefersStreaming(int m, int n, int k)
+    {
+        var key = new HardwareFingerprint.HwKey("avx2", "amd", 3);
+        Assert.Equal(
+            PackingMode.ForceStreaming,
+            StrategyDefaultTable.Route(key, m, n, k, transA: false, transB: true));
+    }
+
+    [Theory]
+    // The UNTRANSPOSED routing for band 3 is deliberately identical to band 2. The sweep
+    // showed untransposed optima differ and sometimes oppose the transposed ones
+    // (512x2048x512 untransposed wants PackBoth; Streaming is ~3.0x slower there).
+    [InlineData(512, 2048, 512)]
+    [InlineData(256, 256, 256)]
+    [InlineData(128, 128, 128)]
+    [InlineData(512, 512, 64)]
+    public void Route_VeryWideAvx2_Untransposed_IsUnchangedFromLargeBand(int m, int n, int k)
+    {
+        var band2 = new HardwareFingerprint.HwKey("avx2", "amd", 2);
+        var band3 = new HardwareFingerprint.HwKey("avx2", "amd", 3);
+        Assert.Equal(
+            StrategyDefaultTable.Route(band2, m, n, k),
+            StrategyDefaultTable.Route(band3, m, n, k));
     }
 
     [Fact]
