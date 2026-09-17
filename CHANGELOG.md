@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.132.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.131.0...v0.132.0) (2026-09-17)
+
+
+### Features
+
+* **autotune:** deliver US-25 artifact promotion and bounded retuning ([#1030](https://github.com/ooples/AiDotNet.Tensors/issues/1030)) ([94aeab8](https://github.com/ooples/AiDotNet.Tensors/commit/94aeab898c8d6d59e0a25d9aa50f269414483a79))
+
+
+### Bug Fixes
+
+* **blas:** ignore the timed autotune cache in deterministic mode ([#1034](https://github.com/ooples/AiDotNet.Tensors/issues/1034)) ([d976f6c](https://github.com/ooples/AiDotNet.Tensors/commit/d976f6cd93648c3dc3397a8ef3e10120bef45b4c))
+
 ## [0.131.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.130.3...v0.131.0) (2026-09-16)
 
 
