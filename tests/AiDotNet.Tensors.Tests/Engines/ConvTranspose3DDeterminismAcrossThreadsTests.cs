@@ -7,9 +7,13 @@ using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines;
 
-/// <summary>Serialised: these tests mutate the process-wide <c>CpuParallelSettings.MaxDegreeOfParallelism</c>.</summary>
-[CollectionDefinition("ConvTranspose3DDeterminismSerial", DisableParallelization = true)]
-public sealed class ConvTranspose3DDeterminismSerialCollection { }
+/// <summary>
+/// Serialised: these tests mutate the process-wide <c>CpuParallelSettings.MaxDegreeOfParallelism</c>.
+/// Shared with <see cref="ConvTranspose2DDeterminismAcrossThreadsTests"/>, which mutates the same
+/// global — two classes in two collections would be free to run concurrently and fight over it.
+/// </summary>
+[CollectionDefinition("ConvTransposeDeterminismSerial", DisableParallelization = true)]
+public sealed class ConvTransposeDeterminismSerialCollection { }
 
 /// <summary>
 /// <c>ConvTranspose3D</c> and its kernel gradient must return bit-identical results whatever the
@@ -29,7 +33,7 @@ public sealed class ConvTranspose3DDeterminismSerialCollection { }
 /// surfaced: intermittently, only on loaded shared CI, never on an idle machine. A tolerance here would pass
 /// against the exact defect the test exists to catch.</para>
 /// </summary>
-[Collection("ConvTranspose3DDeterminismSerial")]
+[Collection("ConvTransposeDeterminismSerial")]
 public sealed class ConvTranspose3DDeterminismAcrossThreadsTests : IDisposable
 {
     // The engine is pinned to CPU because the partitioning under test is CpuEngine's. PR #333's
@@ -37,16 +41,24 @@ public sealed class ConvTranspose3DDeterminismAcrossThreadsTests : IDisposable
     // this would otherwise silently exercise a different implementation and assert nothing.
     private readonly IEngine _priorEngine;
     private readonly int _priorMaxDop;
+    private readonly bool _priorDeterministicReductions;
 
     public ConvTranspose3DDeterminismAcrossThreadsTests()
     {
         _priorEngine = AiDotNetEngine.Current;
         AiDotNetEngine.Current = new CpuEngine();
         _priorMaxDop = CpuParallelSettings.MaxDegreeOfParallelism;
+
+        // Pinned off, not merely assumed off. CpuParallelSettings.DeterministicReductions runs every
+        // non-deterministicSafe loop SERIALLY, which would make this whole class pass without the
+        // parallel path ever executing — a dead control that agrees with the unfixed engine.
+        _priorDeterministicReductions = CpuParallelSettings.DeterministicReductions;
+        CpuParallelSettings.DeterministicReductions = false;
     }
 
     public void Dispose()
     {
+        CpuParallelSettings.DeterministicReductions = _priorDeterministicReductions;
         CpuParallelSettings.MaxDegreeOfParallelism = _priorMaxDop;
         AiDotNetEngine.Current = _priorEngine;
     }
@@ -152,7 +164,7 @@ public sealed class ConvTranspose3DDeterminismAcrossThreadsTests : IDisposable
     /// </remarks>
     private static Tensor<float> Fill(int[] shape, int seed)
     {
-        var rng = new Random(seed);
+        var rng = RandomHelper.CreateSeededRandom(seed);
         var tensor = new Tensor<float>(shape);
         for (var i = 0; i < tensor.Length; i++)
         {

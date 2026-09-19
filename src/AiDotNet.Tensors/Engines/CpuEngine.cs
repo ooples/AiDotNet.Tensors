@@ -17865,27 +17865,38 @@ public partial class CpuEngine : ITensorLevelEngine
             for (int i = 0; i < outputData.Length; i++)
                 outputData[i] = numOps.Zero;
 
-            // Use thread-local accumulation to avoid lock contention
-            var lockObj = new object();
-            CpuParallelSettings.ParallelForOrSerial(0, batch * inChannels,
+            // PARTITIONED BY OUTPUT, NOT BY INPUT -- the same change, and for the same reason, as
+            // ConvTranspose3D below. This generic branch is the one non-float, non-double element
+            // types take; float and double are served by the gather-shaped paths above, which are
+            // already deterministic. Parallelising over (b, ic) does NOT partition the destination:
+            // outputIdx depends on oc and not on ic, so every task needed its own full-size
+            // accumulator and those accumulators were merged under a lock -- in whatever order the
+            // tasks happened to finish. Addition is not associative in any of these element types,
+            // so the same call could return different bits from one run to the next and different
+            // bits again on a host with a different core count, at a cost of one whole output
+            // buffer PER TASK.
+            //
+            // The (b, oc) pairs own DISJOINT regions of outputData, so each task accumulates
+            // straight into it: no per-task buffer, no lock, no merge. For a fixed output element
+            // the contributions still arrive in (ic, ih, iw, kh, kw) order, which is exactly the
+            // order the serial path used, so the result is bit-identical to it and not merely
+            // self-consistent.
+            CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels,
                 (long)batch * inChannels * height * width,
-                // Initialize thread-local storage
-                () => new T[batch * outChannels * outputHeight * outputWidth],
-                // Body
-                (idx, state, localOutput) =>
+                boc =>
                 {
-                    int b = idx / inChannels;
-                    int ic = idx % inChannels;
+                    int b = boc / outChannels;
+                    int oc = boc % outChannels;
 
-                    for (int ih = 0; ih < height; ih++)
+                    for (int ic = 0; ic < inChannels; ic++)
                     {
-                        for (int iw = 0; iw < width; iw++)
+                        for (int ih = 0; ih < height; ih++)
                         {
-                            int inputIdx = ((b * inChannels + ic) * height + ih) * width + iw;
-                            T inputVal = inputData[inputIdx];
-
-                            for (int oc = 0; oc < outChannels; oc++)
+                            for (int iw = 0; iw < width; iw++)
                             {
+                                int inputIdx = ((b * inChannels + ic) * height + ih) * width + iw;
+                                T inputVal = inputData[inputIdx];
+
                                 for (int kh = 0; kh < kernelHeight; kh++)
                                 {
                                     for (int kw = 0; kw < kernelWidth; kw++)
@@ -17897,26 +17908,17 @@ public partial class CpuEngine : ITensorLevelEngine
                                         {
                                             int outputIdx = ((b * outChannels + oc) * outputHeight + oh) * outputWidth + ow;
                                             int kernelIdx = ((ic * outChannels + oc) * kernelHeight + kh) * kernelWidth + kw;
-                                            localOutput[outputIdx] = numOps.Add(localOutput[outputIdx], numOps.Multiply(inputVal, kernelData[kernelIdx]));
+                                            outputData[outputIdx] = numOps.Add(outputData[outputIdx], numOps.Multiply(inputVal, kernelData[kernelIdx]));
                                         }
                                     }
                                 }
                             }
                         }
                     }
-                    return localOutput;
                 },
-                // Merge thread-local results
-                (localOutput) =>
-                {
-                    lock (lockObj)
-                    {
-                        for (int i = 0; i < outputData.Length; i++)
-                        {
-                            outputData[i] = numOps.Add(outputData[i], localOutput[i]);
-                        }
-                    }
-                });
+                // Bit-reproducible across thread counts by construction -- see the note above -- so
+                // DeterministicReductions no longer has to serialize it to get that guarantee.
+                deterministicSafe: true);
         }
 
         var convTransResult = TensorAllocator.Rent<T>([batch, outChannels, outputHeight, outputWidth], outputData);
@@ -22214,7 +22216,13 @@ public partial class CpuEngine : ITensorLevelEngine
                         }
                     }
                 }
-            });
+            },
+            // Now that each output element's reduction is done start to finish by one task, in an
+            // order fixed by the data, this loop meets the deterministicSafe contract: it is already
+            // bit-reproducible across thread counts, so DeterministicReductions no longer has to
+            // serialize it to get that guarantee. Leaving it false would make deterministic mode
+            // pay for a problem that the partitioning above has removed.
+            deterministicSafe: true);
 
         var ct3dResult = TensorAllocator.Rent<T>([batch, outChannels, outDepth, outHeight, outWidth], outputData);
         DifferentiableOps.RecordBinary("ConvTranspose3D", ct3dResult, inputOrig, kernelOrig, BackwardFunctions<T>.ConvTranspose3DBackward, new object[] { stride, padding });
@@ -22319,7 +22327,10 @@ public partial class CpuEngine : ITensorLevelEngine
                         }
                     }
                 }
-            });
+            },
+            // Bit-reproducible across thread counts by construction now -- see the note on the
+            // forward above -- so it no longer needs deterministic mode's serial fallback.
+            deterministicSafe: true);
 
         return TensorAllocator.Rent<T>(kernelShape, gradKernelData);
     }
