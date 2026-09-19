@@ -174,6 +174,66 @@ public sealed class FusedAttentionRectangularTests
         Assert.Throws<ArgumentException>(() => FlashAttention<float>.Forward(query, key, key, isCausal: causal, queryOffset: offset));
     }
 
+    // An offset only positions the causal window: every kernel read of it is
+    // behind an `isCausal` test. A noncausal offset that happens to fit inside
+    // the memory length used to be accepted and then ignored, so the caller got
+    // unwindowed attention and no diagnostic. It is now rejected at every entry.
+    [Fact]
+    public void NoncausalOffsetThatFits_IsRejectedRatherThanIgnored()
+    {
+        var query = new Tensor<float>(new[] { 1, 1, 2, 2 });
+        var key = new Tensor<float>(new[] { 1, 1, 3, 2 });
+        var rank3Query = new Tensor<float>(new[] { 1, 2, 2 });
+        var rank3Key = new Tensor<float>(new[] { 1, 3, 2 });
+        Assert.Throws<ArgumentException>(() => FusedAttention<float>.Forward(rank3Query, rank3Key, rank3Key,
+            new FlashAttentionConfig { IsCausal = false, QueryOffset = 1 }, engine: new CpuEngine()));
+        Assert.Throws<ArgumentException>(() =>
+            FlashAttention2.Forward(query, key, key, isCausal: false, queryOffset: 1));
+        Assert.Throws<ArgumentException>(() =>
+            FlashAttention<float>.Forward(query, key, key, isCausal: false, queryOffset: 1));
+        // The same offset with causal masking on is legal here (1 + 2 <= 3),
+        // so the rejection above is about the missing window, not the bound.
+        FlashAttention2.Forward(query, key, key, isCausal: true, queryOffset: 1);
+    }
+
+    // The tiled backward accepts isCausal/queryOffset and the same q/k/v shapes
+    // as the forward but validated none of them, so a window the forward would
+    // have refused could still reach the gradient kernels.
+    [Theory]
+    [InlineData(-1, false)]
+    [InlineData(1, false)]
+    [InlineData(2, true)]
+    [InlineData(int.MaxValue, true)]
+    public void TiledBackward_RejectsWindowsTheForwardWouldRefuse(int offset, bool causal)
+    {
+        var query = Data(new[] { 1, 1, 2, 2 }, 0.7);
+        var key = Data(new[] { 1, 1, 3, 2 }, 1.1);
+        var value = Data(new[] { 1, 1, 3, 2 }, 1.9);
+        var (output, logSumExp) = FlashAttention2.Forward(query, key, value);
+        var upstream = Data(output.Shape.ToArray(), 2.3);
+        Assert.Throws<ArgumentException>(() => FlashAttention2.Backward(
+            upstream, query, key, value, output, logSumExp,
+            blockSizeQ: 4, blockSizeKV: 4, scale: null, isCausal: causal, queryOffset: offset));
+    }
+
+    [Fact]
+    public void TiledBackward_RejectsMismatchedShapes()
+    {
+        var query = Data(new[] { 1, 1, 2, 2 }, 0.7);
+        var key = Data(new[] { 1, 1, 3, 2 }, 1.1);
+        var value = Data(new[] { 1, 1, 3, 2 }, 1.9);
+        var (output, logSumExp) = FlashAttention2.Forward(query, key, value);
+        var upstream = Data(output.Shape.ToArray(), 2.3);
+        var wideKey = Data(new[] { 1, 1, 3, 4 }, 1.1);
+        var shortValue = Data(new[] { 1, 1, 2, 2 }, 1.9);
+        Assert.Throws<ArgumentException>(() => FlashAttention2.Backward(
+            upstream, query, wideKey, value, output, logSumExp, blockSizeQ: 4, blockSizeKV: 4));
+        Assert.Throws<ArgumentException>(() => FlashAttention2.Backward(
+            upstream, query, key, shortValue, output, logSumExp, blockSizeQ: 4, blockSizeKV: 4));
+        Assert.Throws<ArgumentOutOfRangeException>(() => FlashAttention2.Backward(
+            upstream, query, key, value, output, logSumExp, blockSizeQ: 0, blockSizeKV: 4));
+    }
+
     private static (Tensor<float>, Tensor<float>, Tensor<float>) GenericBackward(
         Tensor<float> upstream, Tensor<float> query, Tensor<float> key, Tensor<float> value)
     {

@@ -62,7 +62,13 @@ public sealed class FlashAttentionConfig
     /// For KV-cache / autoregressive inference where Q is a slice (often
     /// length 1 at decode time) and K/V represent the full past-plus-
     /// current context. Causal mask honours the offset so the query
-    /// token correctly attends to every past key.</summary>
+    /// token correctly attends to every past key.
+    /// <para>Only meaningful together with <see cref="IsCausal"/>: the offset
+    /// positions the causal window, and noncausal attention already sees every
+    /// key. A nonzero offset with <see cref="IsCausal"/> false is rejected
+    /// rather than silently ignored. When causal, it must satisfy
+    /// <c>QueryOffset + seqQ &lt;= seqKV</c>; when noncausal, seqQ and seqKV are
+    /// independent and queries may outnumber memory tokens.</para></summary>
     public int QueryOffset { get; set; }
 
     /// <summary>Dropout rate applied to the post-softmax weights. Null
@@ -227,15 +233,27 @@ public static class FusedAttention<T>
                 $"key and value must share sequence length (axis 2): key[2]={key._shape[2]}, " +
                 $"value[2]={value._shape[2]}.");
 
-        // KV-cache / query-offset support (issue #198 gap D): when the
-        // caller supplies a queryOffset, q_i must attend to keys
-        // k_j where j <= queryOffset + i. Causal attention or an explicit
-        // nonzero offset denotes a window into KV history. Ordinary noncausal
-        // queries may outnumber memory tokens. Subtraction avoids overflow.
+        // KV-cache / query-offset support (issue #198 gap D): when the caller
+        // supplies a queryOffset, q_i must attend to keys k_j where
+        // j <= queryOffset + i. That window is only ever consulted on the causal
+        // path -- BuildCausalBias and ApplyCausalMask both run under IsCausal, and
+        // every kernel read of the offset is likewise causal-gated -- so the bound
+        // belongs to causal attention, and ordinary noncausal queries may outnumber
+        // memory tokens. A noncausal offset is silently ignored by the kernels, so
+        // it is reported here rather than accepted as a no-op.
         int queryOffset = config.QueryOffset;
-        if (queryOffset < 0 || ((config.IsCausal || queryOffset != 0) && queryOffset > key._shape[2] - query._shape[2]))
+        if (queryOffset < 0)
             throw new ArgumentException(
-                $"queryOffset={queryOffset} must be nonnegative and, for causal attention or a nonzero offset, queryOffset + seqQ={query._shape[2]} must be <= seqKV={key._shape[2]}.",
+                $"QueryOffset={queryOffset} must be nonnegative.", nameof(config));
+        if (!config.IsCausal && queryOffset != 0)
+            throw new ArgumentException(
+                $"QueryOffset={queryOffset} is only meaningful when IsCausal is true; noncausal " +
+                "attention ignores the offset, so set IsCausal = true or QueryOffset = 0.",
+                nameof(config));
+        // Subtraction rather than queryOffset + seqQ, which overflows for a large offset.
+        if (config.IsCausal && queryOffset > key._shape[2] - query._shape[2])
+            throw new ArgumentException(
+                $"QueryOffset={queryOffset} + seqQ={query._shape[2]} must be <= seqKV={key._shape[2]} for causal attention.",
                 nameof(config));
 
         // FlashAttention-2 block-tiled dispatch: O(seqLen) memory, uses

@@ -64,7 +64,11 @@ public static class FlashAttention<T> where T : unmanaged
     /// <param name="blockSizeKV">Col-block size. Default 64.</param>
     /// <param name="scale">Softmax scale. Null → <c>1/sqrt(D)</c>.</param>
     /// <param name="isCausal">Apply upper-triangular mask (queryOffset-aware).</param>
-    /// <param name="queryOffset">For KV-cache decode.</param>
+    /// <param name="queryOffset">Position of the query block inside KV history,
+    /// for KV-cache decode. Only meaningful with <paramref name="isCausal"/>:
+    /// it positions the causal window, must satisfy queryOffset + Sq &lt;= Sk,
+    /// and a nonzero value without causal masking is rejected rather than
+    /// silently ignored. Noncausal Sq and Sk are independent.</param>
     /// <param name="attentionBias">Optional additive bias with last
     /// two dims <c>[Sq, Sk]</c>; leading dims broadcast NumPy-style
     /// against query's leading dims.</param>
@@ -389,10 +393,19 @@ public static class FlashAttention<T> where T : unmanaged
             throw new ArgumentException($"query/key headDim mismatch: {headDim} vs {key._shape[kRank - 1]}.", nameof(key));
         if (value._shape[vRank - 2] != Sk)
             throw new ArgumentException($"key/value seq len mismatch: {Sk} vs {value._shape[vRank - 2]}.", nameof(value));
-        // Ordinary noncausal attention has independent query/memory lengths. Causal
-        // or explicitly offset calls retain cached-window bounds, without overflow.
-        if (queryOffset < 0 || ((isCausal || queryOffset != 0) && queryOffset > Sk - Sq))
-            throw new ArgumentException($"queryOffset={queryOffset} must be nonnegative and, for causal attention or a nonzero offset, queryOffset + Sq={Sq} must be <= Sk={Sk}.", nameof(queryOffset));
+        // queryOffset positions the query block inside KV history, and every kernel
+        // read of it sits behind an `isCausal` test -- noncausal attention ignores
+        // it entirely. So the window bound belongs to the causal path, and ordinary
+        // noncausal attention may have more queries than memory tokens. A noncausal
+        // caller who supplies an offset is silently getting no window at all, which
+        // is reported rather than ignored.
+        if (queryOffset < 0)
+            throw new ArgumentException($"queryOffset={queryOffset} must be nonnegative.", nameof(queryOffset));
+        if (!isCausal && queryOffset != 0)
+            throw new ArgumentException($"queryOffset={queryOffset} is only meaningful for causal attention, which is off here; noncausal attention ignores the offset, so pass isCausal: true or queryOffset: 0.", nameof(queryOffset));
+        // Subtraction rather than queryOffset + Sq, which overflows for a large offset.
+        if (isCausal && queryOffset > Sk - Sq)
+            throw new ArgumentException($"queryOffset={queryOffset} + Sq={Sq} must be <= Sk={Sk} for causal attention.", nameof(queryOffset));
 
         // Build the shared prefix shape and verify q/k/v share it.
         prefixShape = new int[qRank - 2];

@@ -32,7 +32,11 @@ public static class FlashAttention2
     /// <param name="blockSizeKV">Col-block size. Default 64.</param>
     /// <param name="scale">Softmax scale. Null → 1/sqrt(headDim).</param>
     /// <param name="isCausal">Apply upper-triangular mask (queryOffset-aware).</param>
-    /// <param name="queryOffset">For KV-cache decode.</param>
+    /// <param name="queryOffset">Position of the query block inside KV history,
+    /// for KV-cache decode. Only meaningful with <paramref name="isCausal"/>:
+    /// it positions the causal window, must satisfy queryOffset + Sq &lt;= Sk,
+    /// and a nonzero value without causal masking is rejected rather than
+    /// silently ignored. Noncausal Sq and Sk are independent.</param>
     /// <param name="attentionBias">Optional additive bias
     /// <c>[B, H, Sq, Sk]</c> or broadcastable.</param>
     public static (Tensor<float> Output, float[] LogSumExp) Forward(
@@ -55,11 +59,7 @@ public static class FlashAttention2
         int Dv = value._shape[3];
         if (key._shape[3] != headDim) throw new ArgumentException("query/key headDim mismatch.");
         if (value._shape[2] != Sk) throw new ArgumentException("key/value seq len mismatch.");
-        // Noncausal cross-attention has independent query/memory lengths. Keep
-        // cached-window bounds for causal or explicitly offset calls, without overflow.
-        if (queryOffset < 0 || ((isCausal || queryOffset != 0) && queryOffset > Sk - Sq))
-            throw new ArgumentException(
-                $"queryOffset={queryOffset} must be nonnegative and, for causal attention or a nonzero offset, queryOffset + Sq={Sq} must be <= Sk={Sk}.", nameof(queryOffset));
+        ValidateWindow(Sq, Sk, isCausal, queryOffset);
 
         double scaleVal = scale ?? 1.0 / Math.Sqrt(headDim);
         float scaleF = (float)scaleVal;
@@ -204,6 +204,31 @@ public static class FlashAttention2
     }
 
     /// <summary>
+    /// Shared query/memory window contract for <see cref="Forward"/> and
+    /// <see cref="Backward"/>, so the pair cannot drift apart.
+    /// </summary>
+    private static void ValidateWindow(int Sq, int Sk, bool isCausal, int queryOffset)
+    {
+        // Every kernel read of queryOffset sits behind an `isCausal` test, so the
+        // window bound belongs to the causal path and ordinary noncausal attention
+        // may have more queries than memory tokens. A noncausal caller who supplies
+        // an offset is silently getting no window, which is reported, not ignored.
+        if (queryOffset < 0)
+            throw new ArgumentException(
+                $"queryOffset={queryOffset} must be nonnegative.", nameof(queryOffset));
+        if (!isCausal && queryOffset != 0)
+            throw new ArgumentException(
+                $"queryOffset={queryOffset} is only meaningful for causal attention, which is off here; " +
+                "noncausal attention ignores the offset, so pass isCausal: true or queryOffset: 0.",
+                nameof(queryOffset));
+        // Subtraction rather than queryOffset + Sq, which overflows for a large offset.
+        if (isCausal && queryOffset > Sk - Sq)
+            throw new ArgumentException(
+                $"queryOffset={queryOffset} + Sq={Sq} must be <= Sk={Sk} for causal attention.",
+                nameof(queryOffset));
+    }
+
+    /// <summary>
     /// Tiled backward using the saved <paramref name="logsumexp"/> from
     /// <see cref="Forward"/> — recomputes P per block (O(blockSize²)
     /// memory) rather than materialising the whole attention matrix.
@@ -222,11 +247,18 @@ public static class FlashAttention2
         if (value is null) throw new ArgumentNullException(nameof(value));
         if (output is null) throw new ArgumentNullException(nameof(output));
         if (logsumexp is null) throw new ArgumentNullException(nameof(logsumexp));
+        if (blockSizeQ <= 0) throw new ArgumentOutOfRangeException(nameof(blockSizeQ));
+        if (blockSizeKV <= 0) throw new ArgumentOutOfRangeException(nameof(blockSizeKV));
 
         int B = query._shape[0], H = query._shape[1];
         int Sq = query._shape[2], headDim = query._shape[3];
         int Sk = key._shape[2];
         int Dv = value._shape[3];
+        // Backward shares the forward contract: a shape or window that the forward
+        // would have rejected must not reach these kernels through the gradient.
+        if (key._shape[3] != headDim) throw new ArgumentException("query/key headDim mismatch.");
+        if (value._shape[2] != Sk) throw new ArgumentException("key/value seq len mismatch.");
+        ValidateWindow(Sq, Sk, isCausal, queryOffset);
         double scaleVal = scale ?? 1.0 / Math.Sqrt(headDim);
         float scaleF = (float)scaleVal;
 
