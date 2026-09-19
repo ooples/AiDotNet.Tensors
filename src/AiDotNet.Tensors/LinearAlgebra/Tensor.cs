@@ -4751,6 +4751,12 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         var floatData = Engines.DirectGpu.DirectGpuEngine.ToFloatArray(logicalData);
         _gpuBuffer = backend.AllocateBuffer(floatData);
         _gpuBackend = backend;
+        // Both layout markers describe the buffer being ATTACHED, so state them rather than letting
+        // whatever the previous buffer was carry over. ToFloatArray produces the ordinary
+        // one-float-per-element encoding: neither an interleaved-vs-split-complex plane pair nor raw
+        // int32 bits. See the note on the same pair in Gpu() below.
+        _gpuBufferIsSplitComplex = false;
+        _gpuBufferContainsRawInt32 = false;
         _gpuDeviceIndex = deviceInfo.Index;
         _device = deviceInfo.Type;
 
@@ -4799,6 +4805,14 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         var floatData = Engines.DirectGpu.DirectGpuEngine.ToFloatArray(logicalData);
         _gpuBuffer = backend.AllocateBuffer(floatData);
         _gpuBackend = backend;
+        // Both layout markers describe the buffer being ATTACHED, so state them rather than letting
+        // whatever the previous buffer was carry over. ToFloatArray above is the ordinary
+        // one-float-per-element encoding, NOT raw int32 bits: for a Tensor<int> that came from
+        // FromGpuBuffer(bufferContainsRawInt32: true) and has since been brought home, a marker left
+        // set here would make GetOrAllocateInt32IndexBuffer hand this float buffer to a raw-int32
+        // consumer unconverted, and index 3 would arrive as 0x40400000.
+        _gpuBufferIsSplitComplex = false;
+        _gpuBufferContainsRawInt32 = false;
         // Tag the freshly-uploaded buffer with the CURRENT tensor version. The buffer was just filled from this
         // tensor's host data, so it IS in sync — but every version-gated resident-buffer consumer
         // (GetOrAllocateBuffer / GetWeightBufferPreferResident: `_gpuBufferVersion == GpuCacheVersion`) leaves
@@ -4854,6 +4868,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (_gpuBufferIsSplitComplex)
         {
             _gpuBufferIsSplitComplex = false;
+            _gpuBufferContainsRawInt32 = false;
             _device = TensorDevice.CPU;
             return this;
         }
@@ -4889,6 +4904,10 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             }
         }
 
+        // The host is authoritative again and the buffer above is no longer the source of truth, so
+        // the markers that described its encoding must not survive into the next upload.
+        _gpuBufferIsSplitComplex = false;
+        _gpuBufferContainsRawInt32 = false;
         _device = TensorDevice.CPU;
         return this;
     }

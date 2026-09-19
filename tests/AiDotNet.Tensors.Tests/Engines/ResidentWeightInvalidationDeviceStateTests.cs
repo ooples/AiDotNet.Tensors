@@ -143,4 +143,53 @@ public sealed class ResidentWeightInvalidationDeviceStateTests
         Assert.False(weights._gpuBufferIsSplitComplex);
         Assert.Equal(TensorDevice.CPU, weights.Device);
     }
+
+    /// <summary>
+    /// The second marker on the same buffer, with the same lifetime and the same failure mode.
+    /// <c>_gpuBufferContainsRawInt32</c> says the DEVICE buffer holds raw int32 index bits instead of
+    /// the usual one-float-per-element encoding — the only thing that reads it,
+    /// <c>DirectGpuTensorEngine.GetOrAllocateInt32IndexBuffer</c>, forwards such a buffer to its
+    /// consumer UNCONVERTED rather than routing it through <c>ConvertNumericIndicesToInt32</c>.
+    /// Invalidation drops the buffer, so a marker left set arms that shortcut against whatever comes
+    /// next: index 3 would reach the kernel as 0x40400000.
+    /// </summary>
+    [Fact]
+    public void InvalidatingAResidentWeightBufferClearsTheRawInt32Marker()
+    {
+        using var gpu = new DirectGpuTensorEngine();
+        var indices = new Tensor<int>([8]);
+        indices._gpuBufferContainsRawInt32 = true;
+
+        gpu.InvalidateResidentWeightBuffer(indices);
+
+        Assert.False(indices._gpuBufferContainsRawInt32);
+    }
+
+    /// <summary>
+    /// Storage replacement, which is the path CodeRabbit's finding named. Unlike
+    /// <c>InvalidateResidentWeightBuffer</c>, <c>RebindStorageFrom</c> leaves <c>_device</c> untouched,
+    /// so the tensor stays GPU-resident with no buffer — and that is exactly the state
+    /// <c>GetOrAllocateInt32IndexBuffer</c> branches on: <c>HasResidentIndexStorage</c> is satisfied by
+    /// <c>IsGpuResident</c> alone, and the raw-int32 shortcut is taken before anything re-examines the
+    /// buffer. The marker therefore has to die with the storage it described, not with the device flag.
+    /// </summary>
+    /// <remarks>
+    /// Asserted on the marker rather than by calling the consumer because the consumer needs a live
+    /// backend; this pins the precondition it reads, on any box, with no GPU.
+    /// </remarks>
+    [Fact]
+    public void ReplacingStorageClearsTheRawInt32Marker()
+    {
+        var indices = new Tensor<int>([8]);
+        var replacement = new Tensor<int>([8]);
+        for (int i = 0; i < replacement.Length; i++)
+        {
+            replacement[i] = i;
+        }
+
+        indices._gpuBufferContainsRawInt32 = true;
+        indices.RebindStorageFrom(replacement);
+
+        Assert.False(indices._gpuBufferContainsRawInt32);
+    }
 }

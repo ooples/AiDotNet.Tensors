@@ -1522,8 +1522,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             tensor._gpuBuffer = null;
             tensor._gpuBackend = null;
             tensor._gpuBufferVersion = -1;
-            // The split-complex layout flag belongs to the buffer being dropped here.
+            // Both layout flags belong to the buffer being dropped here: the split-complex plane
+            // pair, and the raw-int32 encoding GetOrAllocateInt32IndexBuffer consumes unconverted.
             tensor._gpuBufferIsSplitComplex = false;
+            tensor._gpuBufferContainsRawInt32 = false;
         }
 
         // Get the backing array reference WITHOUT triggering materialization.
@@ -1647,6 +1649,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // re-armed against the next ordinary interleaved upload and GetOrAllocateSplitComplexBuffers
         // would read that buffer's first half as real and its second as imaginary.
         tensor._gpuBufferIsSplitComplex = false;
+        // The raw-int32 marker dies with the buffer for the same reason: it says the dropped buffer
+        // held index bits rather than one float per element, and GetOrAllocateInt32IndexBuffer
+        // forwards such a buffer to its consumer UNCONVERTED.
+        tensor._gpuBufferContainsRawInt32 = false;
         // ...and say so. Device and buffer are set together by Tensor.Gpu() and cleared together by
         // Tensor.Cpu(); leaving _device on a GPU after dropping the buffer produces a tensor that claims
         // GPU residency while nothing holds its data. That state is host-authoritative by this method's
@@ -1859,8 +1865,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             tensor._gpuBuffer = null;
             tensor._gpuBackend = null;
             tensor._gpuBufferVersion = -1;
-            // The split-complex layout flag belongs to the buffer being dropped here.
+            // Both layout flags belong to the buffer being dropped here: the split-complex plane
+            // pair, and the raw-int32 encoding GetOrAllocateInt32IndexBuffer consumes unconverted.
             tensor._gpuBufferIsSplitComplex = false;
+            tensor._gpuBufferContainsRawInt32 = false;
         }
 
         // Check caches without triggering CPU materialization
