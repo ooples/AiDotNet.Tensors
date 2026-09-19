@@ -1522,6 +1522,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             tensor._gpuBuffer = null;
             tensor._gpuBackend = null;
             tensor._gpuBufferVersion = -1;
+            // The split-complex layout flag belongs to the buffer being dropped here.
+            tensor._gpuBufferIsSplitComplex = false;
         }
 
         // Get the backing array reference WITHOUT triggering materialization.
@@ -1640,6 +1642,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         tensor._gpuBuffer = null;
         tensor._gpuBackend = null;
         tensor._gpuBufferVersion = -1;
+        // The split-complex flag describes the layout of the buffer just dropped, so it dies with
+        // it — exactly as Tensor.Cpu() clears it on the way back to the host. Left set, it would be
+        // re-armed against the next ordinary interleaved upload and GetOrAllocateSplitComplexBuffers
+        // would read that buffer's first half as real and its second as imaginary.
+        tensor._gpuBufferIsSplitComplex = false;
         // ...and say so. Device and buffer are set together by Tensor.Gpu() and cleared together by
         // Tensor.Cpu(); leaving _device on a GPU after dropping the buffer produces a tensor that claims
         // GPU residency while nothing holds its data. That state is host-authoritative by this method's
@@ -1852,6 +1859,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             tensor._gpuBuffer = null;
             tensor._gpuBackend = null;
             tensor._gpuBufferVersion = -1;
+            // The split-complex layout flag belongs to the buffer being dropped here.
+            tensor._gpuBufferIsSplitComplex = false;
         }
 
         // Check caches without triggering CPU materialization

@@ -1246,6 +1246,12 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         _gpuBuffer = null;
         _gpuBackend = null;
         _gpuBufferVersion = -1;
+        // The split-complex flag describes the LAYOUT of the buffer just dropped
+        // ([real plane][imaginary plane] rather than one element per slot), so it
+        // must not outlive it: a later upload allocates an ordinary interleaved
+        // buffer, and a stale marker would make GetOrAllocateSplitComplexBuffers
+        // read its first half as real and its second as imaginary.
+        _gpuBufferIsSplitComplex = false;
     }
 
     /// <summary>

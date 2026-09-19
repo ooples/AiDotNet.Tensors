@@ -116,8 +116,31 @@ public sealed class ResidentWeightInvalidationDeviceStateTests
         var backing = weights.GetCpuBackingForContiguousWrite(out int offset);
 
         Assert.NotNull(backing);
+        float[] cpuBacking = backing;
         Assert.True(
-            offset + weights.Length <= backing!.Length,
-            $"backing too small: offset={offset}, length={weights.Length}, backing={backing.Length}");
+            offset + weights.Length <= cpuBacking.Length,
+            $"backing too small: offset={offset}, length={weights.Length}, backing={cpuBacking.Length}");
+    }
+
+    /// <summary>
+    /// The split-complex marker records that the DEVICE buffer holds a
+    /// <c>[real plane][imaginary plane]</c> layout rather than one element per slot, so it describes the
+    /// buffer and not the tensor. Invalidation drops the buffer, and nothing on the way back up —
+    /// <c>Tensor.Gpu()</c> included — ever clears the marker, so leaving it set here arms it against the
+    /// next ordinary interleaved upload: <c>GetOrAllocateSplitComplexBuffers</c> would then read that
+    /// buffer's first half as the real plane and its second as the imaginary one. Needs no GPU: the
+    /// marker is plain tensor state and the assertion is about who owns it.
+    /// </summary>
+    [Fact]
+    public void InvalidatingAResidentWeightBufferClearsTheSplitComplexMarker()
+    {
+        using var gpu = new DirectGpuTensorEngine();
+        var weights = Weights(16, 8, 0.25f);
+        weights._gpuBufferIsSplitComplex = true;
+
+        gpu.InvalidateResidentWeightBuffer(weights);
+
+        Assert.False(weights._gpuBufferIsSplitComplex);
+        Assert.Equal(TensorDevice.CPU, weights.Device);
     }
 }
