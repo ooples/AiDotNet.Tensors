@@ -22156,29 +22156,37 @@ public partial class CpuEngine : ITensorLevelEngine
         var outputData = new T[batch * outChannels * outDepth * outHeight * outWidth];
         var inputData = input.GetDataArray();
         var kernelData = kernel.GetDataArray();
-        var mergeLock = new object();
-
-        // Use Parallel.For with true per-task local accumulators to avoid race conditions
+        // PARTITIONED BY OUTPUT, NOT BY INPUT. The previous form parallelised over (b, ic), gave
+        // every task a full-size accumulator, and merged those accumulators under a lock -- so the
+        // order the partial sums were added in was whatever order the tasks happened to finish in.
+        // Floating-point addition is not associative, so the same call could return different bits
+        // from one run to the next, and different bits again on a host with a different core count.
+        // It also cost one whole output buffer PER TASK.
+        //
+        // outputIdx depends on (b, oc, od, oh, ow) and NOT on ic, so the (b, oc) pairs own DISJOINT
+        // regions of outputData. Each task therefore accumulates straight into outputData with no
+        // per-task buffer, no lock and no merge, and the result is bit-identical whatever the degree
+        // of parallelism and whatever order the tasks complete in. The parallel extent becomes
+        // batch*outChannels in place of batch*inChannels.
         CpuParallelSettings.ParallelForOrSerial(
-            0, batch * inChannels,
+            0, batch * outChannels,
             outputData.Length,
-            () => new T[outputData.Length], // localInit: create per-task buffer
-            (bic, state, localOutput) =>
+            boc =>
             {
-                int b = bic / inChannels;
-                int ic = bic % inChannels;
+                int b = boc / outChannels;
+                int oc = boc % outChannels;
 
-                for (int id = 0; id < inDepth; id++)
+                for (int ic = 0; ic < inChannels; ic++)
                 {
-                    for (int ih = 0; ih < inHeight; ih++)
+                    for (int id = 0; id < inDepth; id++)
                     {
-                        for (int iw = 0; iw < inWidth; iw++)
+                        for (int ih = 0; ih < inHeight; ih++)
                         {
-                            int inputIdx = (((b * inChannels + ic) * inDepth + id) * inHeight + ih) * inWidth + iw;
-                            T inputVal = inputData[inputIdx];
-
-                            for (int oc = 0; oc < outChannels; oc++)
+                            for (int iw = 0; iw < inWidth; iw++)
                             {
+                                int inputIdx = (((b * inChannels + ic) * inDepth + id) * inHeight + ih) * inWidth + iw;
+                                T inputVal = inputData[inputIdx];
+
                                 for (int kd = 0; kd < kD; kd++)
                                 {
                                     int od = id * strideD - padD + kd;
@@ -22197,25 +22205,13 @@ public partial class CpuEngine : ITensorLevelEngine
                                             int kernelIdx = (((ic * outChannels + oc) * kD + kd) * kH + kh) * kW + kw;
                                             int outputIdx = (((b * outChannels + oc) * outDepth + od) * outHeight + oh) * outWidth + ow;
 
-                                            localOutput[outputIdx] = numOps.Add(localOutput[outputIdx],
+                                            outputData[outputIdx] = numOps.Add(outputData[outputIdx],
                                                 numOps.Multiply(inputVal, kernelData[kernelIdx]));
                                         }
                                     }
                                 }
                             }
                         }
-                    }
-                }
-                return localOutput;
-            },
-            localOutput =>
-            {
-                // localFinally: merge per-task results under lock
-                lock (mergeLock)
-                {
-                    for (int i = 0; i < outputData.Length; i++)
-                    {
-                        outputData[i] = numOps.Add(outputData[i], localOutput[i]);
                     }
                 }
             });
@@ -22270,29 +22266,32 @@ public partial class CpuEngine : ITensorLevelEngine
         var inputData = input.GetFlattenedData();
         var gradOutputData = gradOutput.GetFlattenedData();
 
-        // Use Parallel.For with localInit/localFinally for thread-safe accumulation
-        var mergeLock = new object();
-
+        // PARTITIONED BY THE GRADIENT, NOT BY THE INPUT -- the same change, and for the same reason,
+        // as the forward above: a completion-ordered merge of per-task accumulators made the result
+        // depend on task timing and on the host's core count, and cost one whole gradient buffer per
+        // task. kernelIdx depends on (ic, oc, kd, kh, kw) and NOT on b, so the (ic, oc) pairs own
+        // DISJOINT regions of gradKernelData and each task can accumulate straight into it. The
+        // batch reduction that the merge used to perform now runs as the innermost-but-one loop, in
+        // ascending b, which is an order fixed by the data rather than by the scheduler.
         CpuParallelSettings.ParallelForOrSerial(
-            0, batch * inChannels,
+            0, inChannels * outChannels,
             gradKernelData.Length,
-            () => new T[gradKernelData.Length], // localInit: create per-task buffer
-            (bic, state, localGradKernel) =>
+            icoc =>
             {
-                int b = bic / inChannels;
-                int ic = bic % inChannels;
+                int ic = icoc / outChannels;
+                int oc = icoc % outChannels;
 
-                for (int id = 0; id < inDepth; id++)
+                for (int b = 0; b < batch; b++)
                 {
-                    for (int ih = 0; ih < inHeight; ih++)
+                    for (int id = 0; id < inDepth; id++)
                     {
-                        for (int iw = 0; iw < inWidth; iw++)
+                        for (int ih = 0; ih < inHeight; ih++)
                         {
-                            int inputIdx = (((b * inChannels + ic) * inDepth + id) * inHeight + ih) * inWidth + iw;
-                            T inputVal = inputData[inputIdx];
-
-                            for (int oc = 0; oc < outChannels; oc++)
+                            for (int iw = 0; iw < inWidth; iw++)
                             {
+                                int inputIdx = (((b * inChannels + ic) * inDepth + id) * inHeight + ih) * inWidth + iw;
+                                T inputVal = inputData[inputIdx];
+
                                 for (int kd = 0; kd < kD; kd++)
                                 {
                                     int od = id * strideD - padD + kd;
@@ -22311,26 +22310,13 @@ public partial class CpuEngine : ITensorLevelEngine
                                             int gradOutputIdx = (((b * outChannels + oc) * outDepth + od) * outHeight + oh) * outWidth + ow;
                                             int kernelIdx = (((ic * outChannels + oc) * kD + kd) * kH + kh) * kW + kw;
 
-                                            localGradKernel[kernelIdx] = numOps.Add(localGradKernel[kernelIdx],
+                                            gradKernelData[kernelIdx] = numOps.Add(gradKernelData[kernelIdx],
                                                 numOps.Multiply(inputVal, gradOutputData[gradOutputIdx]));
                                         }
                                     }
                                 }
                             }
                         }
-                    }
-                }
-
-                return localGradKernel;
-            },
-            localGradKernel =>
-            {
-                // localFinally: merge per-task results under lock
-                lock (mergeLock)
-                {
-                    for (int i = 0; i < gradKernelData.Length; i++)
-                    {
-                        gradKernelData[i] = numOps.Add(gradKernelData[i], localGradKernel[i]);
                     }
                 }
             });
