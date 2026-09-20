@@ -1,5 +1,6 @@
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.LinearAlgebra;
+using AiDotNet.Tensors.Tests.Engines.DirectGpu;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines;
@@ -94,6 +95,37 @@ public sealed class ResidentWeightInvalidationDeviceStateTests
         Assert.Null(weights.TryGetGpuBuffer());
 
         // ...so the tensor must stop claiming to live on a GPU. This is what fails before the fix.
+        Assert.Equal(TensorDevice.CPU, weights.Device);
+        Assert.False(weights.IsGpuResident);
+    }
+
+    /// <summary>
+    /// THE SAME REGRESSION, WITH NO GPU. The arm above is a <see cref="SkippableFactAttribute"/> gated on
+    /// <c>IsGpuAvailable</c>, so on CI — which has no device — it skips, and the invariant it guards ships
+    /// unverified; codecov measured 22% of this PR's diff hit for exactly that reason. Nothing in
+    /// <c>InvalidateResidentWeightBuffer</c> touches hardware: it drops a deferred-download registration,
+    /// clears the cache entries and nulls four fields. Only the PRECONDITION needed a device, and
+    /// <c>Tensor.FromGpuBuffer</c> establishes it against the mock backend — <c>DeviceType</c> is
+    /// <see cref="TensorDevice.OpenCL"/>, so the tensor reports a GPU device while holding a buffer,
+    /// which is the state the production path starts from.
+    /// </summary>
+    [Fact]
+    public void InvalidatingAMockResidentWeightBufferLeavesTheTensorBindable()
+    {
+        var state = new MockBackendState();
+        var backend = MockDirectGpuBackend.Create(state);
+        var buffer = new MockGpuBuffer(new float[16 * 8]);
+        var weights = Tensor<float>.FromGpuBuffer(backend, buffer, new[] { 16, 8 });
+
+        // The precondition, asserted rather than assumed: a silently-CPU tensor here would make the
+        // rest of this test vacuous, which is how the hardware arm would have to be read on CI.
+        Assert.NotEqual(TensorDevice.CPU, weights.Device);
+        Assert.NotNull(weights.TryGetGpuBuffer());
+
+        using var gpu = new DirectGpuTensorEngine();
+        gpu.InvalidateResidentWeightBuffer(weights);
+
+        Assert.Null(weights.TryGetGpuBuffer());
         Assert.Equal(TensorDevice.CPU, weights.Device);
         Assert.False(weights.IsGpuResident);
     }
