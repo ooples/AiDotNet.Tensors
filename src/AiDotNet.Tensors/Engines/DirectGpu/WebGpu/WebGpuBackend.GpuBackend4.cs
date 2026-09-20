@@ -501,7 +501,7 @@ public sealed partial class WebGpuBackend
         // Every element here is an octonion occupying 8 contiguous slots, so a real-valued GEMM
         // over (batch x features) is both the wrong arithmetic and the wrong extent. Dispatch the
         // octonion Jacobian kernel, one invocation per (batch, inputFeature), as Vulkan and Metal do.
-        int totalPairs = batchSize * inputFeatures;
+        int totalPairs = checked(batchSize * inputFeatures);
         var uniforms = new float[]
         {
             BitConverter.Int32BitsToSingle(batchSize),
@@ -516,7 +516,7 @@ public sealed partial class WebGpuBackend
     public void OctonionLinearBackwardWeights(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gradWeights,
         int batchSize, int inputFeatures, int outputFeatures)
     {
-        int totalPairs = outputFeatures * inputFeatures;
+        int totalPairs = checked(outputFeatures * inputFeatures);
         var uniforms = new float[]
         {
             BitConverter.Int32BitsToSingle(batchSize),
@@ -533,14 +533,20 @@ public sealed partial class WebGpuBackend
         // gradBiases[o] = sum_b gradOutput[b, o], summed component-wise. The bias gradient needs no
         // octonion product, but it does need the 8 components: each output feature is 8 contiguous
         // floats, so every extent and offset below is scaled by 8.
+        // BiasGradSource reduces grad_output[(n * channels + c) * spatial + s] over n and s. With
+        // spatial = 1 and channels = outputFeatures * 8 that is exactly sum_b gradOutput[b * components + c],
+        // in one dispatch: a Copy/Add loop would block on 2 * batchSize GPU submissions and allocate a
+        // temporary buffer per batch element. Same call shape as LocallyConnectedConv2DBackwardBias.
         int components = checked(outputFeatures * 8);
-        Fill(gradBiases, 0f, components);
-        for (int b = 0; b < batchSize; b++)
+        var uniforms = new float[]
         {
-            using var slice = (WebGpuBuffer)AllocateBuffer(components);
-            Copy(gradOutput, b * components, slice, 0, components);
-            Add(gradBiases, slice, gradBiases, components);
-        }
+            BitConverter.Int32BitsToSingle(batchSize),
+            BitConverter.Int32BitsToSingle(components),
+            BitConverter.Int32BitsToSingle(1),
+            0
+        };
+        Dispatch2BufferAsync("OctonionLinearBackwardBiases", WebGpuKernels.BiasGradSource, "bias_grad",
+            gradOutput, gradBiases, uniforms, components).GetAwaiter().GetResult();
     }
 
     #endregion
