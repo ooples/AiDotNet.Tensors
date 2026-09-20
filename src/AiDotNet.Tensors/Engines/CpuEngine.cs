@@ -30641,8 +30641,11 @@ public partial class CpuEngine : ITensorLevelEngine
             var graphValue = numQueriesPerKV == 1
                 ? value
                 : TensorRepeatInterleave(value, numQueriesPerKV, 1);
+            // Same KV-cache offset the eager path below applies, so tracing and eager execution
+            // cannot disagree numerically: queryOffset 0 here would have made a traced decode
+            // step attend to the first cached key only.
             var graphMask = isCausal
-                ? CreateCausalAttentionMaskForGraph(batch, numQHeads, seqQ, seqK, queryOffset: 0)
+                ? CreateCausalAttentionMaskForGraph(batch, numQHeads, seqQ, seqK, seqK - seqQ)
                 : null;
             return ScaledDotProductAttention(
                 query, graphKey, graphValue, graphMask, scale, out attentionWeights);
@@ -30674,6 +30677,14 @@ public partial class CpuEngine : ITensorLevelEngine
 
             for (int qi = 0; qi < seqQ; qi++)
             {
+                // Causal with a KV-cache offset: query row qi sits at absolute key position
+                // qi + (seqK - seqQ), matching ScaledDotProductAttentionGqa above, the
+                // scaled_dot_product_attention kernel of every backend, and the PTX attention
+                // family. seqQ == seqK makes the offset zero and ordinary self-attention is
+                // unchanged; a shorter query block is a KV-cache decode, where masking on the
+                // bare qi would hide all but the first key of the cache.
+                int qPos = qi + (seqK - seqQ);
+
                 // Compute attention scores: Q @ K^T * scale
                 var scores = new T[seqK];
                 T maxScore = negInf;
@@ -30681,7 +30692,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 for (int ki = 0; ki < seqK; ki++)
                 {
                     // Causal mask
-                    if (isCausal && ki > qi)
+                    if (isCausal && ki > qPos)
                     {
                         scores[ki] = negInf;
                         continue;
@@ -30705,7 +30716,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 T sumExp = numOps.Zero;
                 for (int ki = 0; ki < seqK; ki++)
                 {
-                    if (isCausal && ki > qi)
+                    if (isCausal && ki > qPos)
                     {
                         weightsData[wOffset + qi * seqK + ki] = numOps.Zero;
                         continue;

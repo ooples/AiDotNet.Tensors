@@ -561,6 +561,12 @@ extern ""C"" __global__ __launch_bounds__(256) void grouped_query_attention(
     int kBase = (b * numKVHeads + kvh) * seqK * headDim;
     int vBase = (b * numKVHeads + kvh) * seqK * headDim;
 
+    // Causal with a KV-cache offset: query row qi is at absolute position qi + (seqK - seqQ),
+    // matching scaled_dot_product_attention above and ScaledDotProductAttentionGqa on the CPU
+    // engine. seqQ == seqK makes the offset zero and prefill is unchanged; a decode step
+    // (seqQ = 1 < seqK) attends to the whole cached prefix rather than to key 0 alone.
+    int qPos = qi + (seqK - seqQ);
+
     // Per-thread online softmax
     float rowMax = -INFINITY;
     float rowSum = 0.0f;
@@ -577,7 +583,10 @@ extern ""C"" __global__ __launch_bounds__(256) void grouped_query_attention(
     for (int kvStart = 0; kvStart < seqK; kvStart += ATTN_BC) {
         int tileSize = min(ATTN_BC, seqK - kvStart);
 
-        if (isCausal && kvStart > qBase + ATTN_BR - 1) break;
+        // The last query of this block sits at absolute position qBase + ATTN_BR - 1 + (seqK - seqQ),
+        // so no later tile can be visible to any thread. Written from block-uniform terms rather than
+        // from the per-thread qPos: this break precedes __syncthreads() below and must not diverge.
+        if (isCausal && kvStart > qBase + ATTN_BR - 1 + (seqK - seqQ)) break;
 
         // Cooperative load K, V tiles
         for (int i = threadIdx.x; i < tileSize * headDim; i += ATTN_BR) {
@@ -595,7 +604,7 @@ extern ""C"" __global__ __launch_bounds__(256) void grouped_query_attention(
         if (qi < seqQ) {
             for (int t = 0; t < tileSize; t++) {
                 int ki = kvStart + t;
-                if (isCausal && ki > qi) continue;
+                if (isCausal && ki > qPos) continue;
 
                 // Q dot K — Q from registers, K from shared memory
                 float score = 0.0f;
@@ -630,7 +639,7 @@ extern ""C"" __global__ __launch_bounds__(256) void grouped_query_attention(
             int wOffset = bqh * seqQ * seqK + qi * seqK;
             int qOffset = bqh * seqQ * headDim + qi * headDim;
             for (int ki = 0; ki < seqK; ki++) {
-                if (isCausal && ki > qi) {
+                if (isCausal && ki > qPos) {
                     attentionWeights[wOffset + ki] = 0.0f;
                     continue;
                 }
