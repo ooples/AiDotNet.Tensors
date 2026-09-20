@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.132.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.131.0...v0.132.0) (2026-09-20)
+
+
+### Features
+
+* **autotune:** deliver US-25 artifact promotion and bounded retuning ([#1030](https://github.com/ooples/AiDotNet.Tensors/issues/1030)) ([94aeab8](https://github.com/ooples/AiDotNet.Tensors/commit/94aeab898c8d6d59e0a25d9aa50f269414483a79))
+
+
+### Bug Fixes
+
+* align grouped query attention causal mask with the kv-cache offset ([#1042](https://github.com/ooples/AiDotNet.Tensors/issues/1042)) ([b9f0f7a](https://github.com/ooples/AiDotNet.Tensors/commit/b9f0f7a613b314a2761d5d12b04293f4f3232adf))
+* **attention:** make the query-offset contract total for rectangular noncausal attention ([#1035](https://github.com/ooples/AiDotNet.Tensors/issues/1035)) ([f1d6387](https://github.com/ooples/AiDotNet.Tensors/commit/f1d63878316ee287c254625ef964aff55230c76d))
+* **blas:** ignore the timed autotune cache in deterministic mode ([#1034](https://github.com/ooples/AiDotNet.Tensors/issues/1034)) ([d976f6c](https://github.com/ooples/AiDotNet.Tensors/commit/d976f6cd93648c3dc3397a8ef3e10120bef45b4c))
+* correct transposed octonion linear backward jacobian tables ([#1041](https://github.com/ooples/AiDotNet.Tensors/issues/1041)) ([026da97](https://github.com/ooples/AiDotNet.Tensors/commit/026da97b96e856d952438c7557ae0d13bf06d1b5))
+* **gpu:** return a tensor to the CPU when its resident buffer is invalidated ([#1039](https://github.com/ooples/AiDotNet.Tensors/issues/1039)) ([c68b163](https://github.com/ooples/AiDotNet.Tensors/commit/c68b1633a7780acf948c6bccf98aae46636bc00c))
+* make convtranspose3d bit-identical across thread budgets ([#1040](https://github.com/ooples/AiDotNet.Tensors/issues/1040)) ([8fca226](https://github.com/ooples/AiDotNet.Tensors/commit/8fca226e81601a5e32cb8be440b6e1f028f06c8a))
+
 ## [0.131.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.130.3...v0.131.0) (2026-09-16)
 
 
