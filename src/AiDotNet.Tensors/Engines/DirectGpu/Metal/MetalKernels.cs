@@ -5032,13 +5032,13 @@ kernel void octonion_linear_backward_input(
         float g0=gradOutput[goOff],g1=gradOutput[goOff+1],g2=gradOutput[goOff+2],g3=gradOutput[goOff+3],
               g4=gradOutput[goOff+4],g5=gradOutput[goOff+5],g6=gradOutput[goOff+6],g7=gradOutput[goOff+7];
         ga0+=g0*w0+g1*w1+g2*w2+g3*w3+g4*w4+g5*w5+g6*w6+g7*w7;
-        ga1+=g0*(-w1)+g1*w0+g2*(-w3)+g3*w2+g4*(-w5)+g5*w4+g6*w7+g7*(-w6);
-        ga2+=g0*(-w2)+g1*w3+g2*w0+g3*(-w1)+g4*(-w6)+g5*(-w7)+g6*w4+g7*w5;
-        ga3+=g0*(-w3)+g1*(-w2)+g2*w1+g3*w0+g4*(-w7)+g5*w6+g6*(-w5)+g7*w4;
-        ga4+=g0*(-w4)+g1*w5+g2*w6+g3*w7+g4*w0+g5*(-w1)+g6*(-w2)+g7*(-w3);
-        ga5+=g0*(-w5)+g1*(-w4)+g2*w7+g3*(-w6)+g4*w1+g5*w0+g6*w3+g7*(-w2);
-        ga6+=g0*(-w6)+g1*(-w7)+g2*(-w4)+g3*w5+g4*w2+g5*(-w3)+g6*w0+g7*w1;
-        ga7+=g0*(-w7)+g1*w6+g2*(-w5)+g3*(-w4)+g4*w3+g5*w2+g6*(-w1)+g7*w0;
+        ga1+=g0*(-w1)+g1*w0+g2*w3+g3*(-w2)+g4*w5+g5*(-w4)+g6*(-w7)+g7*w6;
+        ga2+=g0*(-w2)+g1*(-w3)+g2*w0+g3*w1+g4*w6+g5*w7+g6*(-w4)+g7*(-w5);
+        ga3+=g0*(-w3)+g1*w2+g2*(-w1)+g3*w0+g4*w7+g5*(-w6)+g6*w5+g7*(-w4);
+        ga4+=g0*(-w4)+g1*(-w5)+g2*(-w6)+g3*(-w7)+g4*w0+g5*w1+g6*w2+g7*w3;
+        ga5+=g0*(-w5)+g1*w4+g2*(-w7)+g3*w6+g4*(-w1)+g5*w0+g6*(-w3)+g7*w2;
+        ga6+=g0*(-w6)+g1*w7+g2*w4+g3*(-w5)+g4*(-w2)+g5*w3+g6*w0+g7*(-w1);
+        ga7+=g0*(-w7)+g1*(-w6)+g2*w5+g3*w4+g4*(-w3)+g5*(-w2)+g6*w1+g7*w0;
     }
     uint giOff = (b * inputFeatures + i) * 8;
     gradInput[giOff]=ga0; gradInput[giOff+1]=ga1; gradInput[giOff+2]=ga2; gradInput[giOff+3]=ga3;
@@ -5102,13 +5102,13 @@ kernel void octonion_linear_backward_weights(
         float g0=gradOutput[goOff],g1=gradOutput[goOff+1],g2=gradOutput[goOff+2],g3=gradOutput[goOff+3],
               g4=gradOutput[goOff+4],g5=gradOutput[goOff+5],g6=gradOutput[goOff+6],g7=gradOutput[goOff+7];
         gw0+=g0*a0+g1*a1+g2*a2+g3*a3+g4*a4+g5*a5+g6*a6+g7*a7;
-        gw1+=g0*(-a1)+g1*a0+g2*a3+g3*(-a2)+g4*a5+g5*(-a4)+g6*(-a7)+g7*a6;
-        gw2+=g0*(-a2)+g1*(-a3)+g2*a0+g3*a1+g4*a6+g5*a7+g6*(-a4)+g7*(-a5);
-        gw3+=g0*(-a3)+g1*a2+g2*(-a1)+g3*a0+g4*a7+g5*(-a6)+g6*a5+g7*(-a4);
-        gw4+=g0*(-a4)+g1*(-a5)+g2*(-a6)+g3*(-a7)+g4*a0+g5*a1+g6*a2+g7*a3;
-        gw5+=g0*(-a5)+g1*a4+g2*(-a7)+g3*a6+g4*(-a1)+g5*a0+g6*(-a3)+g7*a2;
-        gw6+=g0*(-a6)+g1*a7+g2*a4+g3*(-a5)+g4*(-a2)+g5*a3+g6*a0+g7*(-a1);
-        gw7+=g0*(-a7)+g1*(-a6)+g2*a5+g3*a4+g4*(-a3)+g5*(-a2)+g6*a1+g7*a0;
+        gw1+=g0*(-a1)+g1*a0+g2*(-a3)+g3*a2+g4*(-a5)+g5*a4+g6*a7+g7*(-a6);
+        gw2+=g0*(-a2)+g1*a3+g2*a0+g3*(-a1)+g4*(-a6)+g5*(-a7)+g6*a4+g7*a5;
+        gw3+=g0*(-a3)+g1*(-a2)+g2*a1+g3*a0+g4*(-a7)+g5*a6+g6*(-a5)+g7*a4;
+        gw4+=g0*(-a4)+g1*a5+g2*a6+g3*a7+g4*a0+g5*(-a1)+g6*(-a2)+g7*(-a3);
+        gw5+=g0*(-a5)+g1*(-a4)+g2*a7+g3*(-a6)+g4*a1+g5*a0+g6*a3+g7*(-a2);
+        gw6+=g0*(-a6)+g1*(-a7)+g2*(-a4)+g3*a5+g4*a2+g5*(-a3)+g6*a0+g7*a1;
+        gw7+=g0*(-a7)+g1*a6+g2*(-a5)+g3*(-a4)+g4*a3+g5*a2+g6*(-a1)+g7*a0;
     }
     uint gwOff = (o * inputFeatures + i) * 8;
     gradWeights[gwOff]=gw0; gradWeights[gwOff+1]=gw1; gradWeights[gwOff+2]=gw2; gradWeights[gwOff+3]=gw3;

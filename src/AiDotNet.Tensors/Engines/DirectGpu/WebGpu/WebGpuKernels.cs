@@ -5119,6 +5119,94 @@ fn octonion_linear_forward(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 }
 ";
+    /// <summary>
+    /// Octonion linear backward (input gradient). Column c of the Jacobian of r = w * a with
+    /// respect to a, contracted with the incoming gradient. Buffers: 0=gradOutput [B*O*8],
+    /// 1=weights [O*I*8], 2=gradInput [B*I*8]. One invocation per (batch, inputFeature).
+    /// </summary>
+    public const string OctonionLinearBackwardInputSource = @"
+@group(0) @binding(0) var<storage, read> grad_out: array<f32>;
+@group(0) @binding(1) var<storage, read> wt: array<f32>;
+@group(0) @binding(2) var<storage, read_write> grad_in: array<f32>;
+
+struct Params { batch_size: u32, input_features: u32, output_features: u32, }
+@group(0) @binding(3) var<uniform> params: Params;
+
+@compute @workgroup_size(256)
+fn octonion_linear_backward_input(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let tid = gid.x;
+    let total = params.batch_size * params.input_features;
+    if (tid >= total) { return; }
+    let b = tid / params.input_features;
+    let i = tid % params.input_features;
+    var ga0 = 0.0; var ga1 = 0.0; var ga2 = 0.0; var ga3 = 0.0;
+    var ga4 = 0.0; var ga5 = 0.0; var ga6 = 0.0; var ga7 = 0.0;
+    for (var o: u32 = 0u; o < params.output_features; o = o + 1u) {
+        let go = (b * params.output_features + o) * 8u;
+        let wo = (o * params.input_features + i) * 8u;
+        let w0=wt[wo]; let w1=wt[wo+1u]; let w2=wt[wo+2u]; let w3=wt[wo+3u];
+        let w4=wt[wo+4u]; let w5=wt[wo+5u]; let w6=wt[wo+6u]; let w7=wt[wo+7u];
+        let g0=grad_out[go]; let g1=grad_out[go+1u]; let g2=grad_out[go+2u]; let g3=grad_out[go+3u];
+        let g4=grad_out[go+4u]; let g5=grad_out[go+5u]; let g6=grad_out[go+6u]; let g7=grad_out[go+7u];
+        ga0 = ga0 + g0*w0+g1*w1+g2*w2+g3*w3+g4*w4+g5*w5+g6*w6+g7*w7;
+        ga1 = ga1 + g0*(-w1)+g1*w0+g2*w3+g3*(-w2)+g4*w5+g5*(-w4)+g6*(-w7)+g7*w6;
+        ga2 = ga2 + g0*(-w2)+g1*(-w3)+g2*w0+g3*w1+g4*w6+g5*w7+g6*(-w4)+g7*(-w5);
+        ga3 = ga3 + g0*(-w3)+g1*w2+g2*(-w1)+g3*w0+g4*w7+g5*(-w6)+g6*w5+g7*(-w4);
+        ga4 = ga4 + g0*(-w4)+g1*(-w5)+g2*(-w6)+g3*(-w7)+g4*w0+g5*w1+g6*w2+g7*w3;
+        ga5 = ga5 + g0*(-w5)+g1*w4+g2*(-w7)+g3*w6+g4*(-w1)+g5*w0+g6*(-w3)+g7*w2;
+        ga6 = ga6 + g0*(-w6)+g1*w7+g2*w4+g3*(-w5)+g4*(-w2)+g5*w3+g6*w0+g7*(-w1);
+        ga7 = ga7 + g0*(-w7)+g1*(-w6)+g2*w5+g3*w4+g4*(-w3)+g5*(-w2)+g6*w1+g7*w0;
+    }
+    let gi = (b * params.input_features + i) * 8u;
+    grad_in[gi]=ga0; grad_in[gi+1u]=ga1; grad_in[gi+2u]=ga2; grad_in[gi+3u]=ga3;
+    grad_in[gi+4u]=ga4; grad_in[gi+5u]=ga5; grad_in[gi+6u]=ga6; grad_in[gi+7u]=ga7;
+}
+";
+
+    /// <summary>
+    /// Octonion linear backward (weight gradient). Column c of the Jacobian of r = w * a with
+    /// respect to w, contracted with the incoming gradient. Buffers: 0=gradOutput [B*O*8],
+    /// 1=input [B*I*8], 2=gradWeights [O*I*8]. One invocation per (outputFeature, inputFeature).
+    /// </summary>
+    public const string OctonionLinearBackwardWeightsSource = @"
+@group(0) @binding(0) var<storage, read> grad_out: array<f32>;
+@group(0) @binding(1) var<storage, read> inp: array<f32>;
+@group(0) @binding(2) var<storage, read_write> grad_wt: array<f32>;
+
+struct Params { batch_size: u32, input_features: u32, output_features: u32, }
+@group(0) @binding(3) var<uniform> params: Params;
+
+@compute @workgroup_size(256)
+fn octonion_linear_backward_weights(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let tid = gid.x;
+    let total = params.output_features * params.input_features;
+    if (tid >= total) { return; }
+    let o = tid / params.input_features;
+    let i = tid % params.input_features;
+    var gw0 = 0.0; var gw1 = 0.0; var gw2 = 0.0; var gw3 = 0.0;
+    var gw4 = 0.0; var gw5 = 0.0; var gw6 = 0.0; var gw7 = 0.0;
+    for (var b: u32 = 0u; b < params.batch_size; b = b + 1u) {
+        let ii = (b * params.input_features + i) * 8u;
+        let go = (b * params.output_features + o) * 8u;
+        let a0=inp[ii]; let a1=inp[ii+1u]; let a2=inp[ii+2u]; let a3=inp[ii+3u];
+        let a4=inp[ii+4u]; let a5=inp[ii+5u]; let a6=inp[ii+6u]; let a7=inp[ii+7u];
+        let g0=grad_out[go]; let g1=grad_out[go+1u]; let g2=grad_out[go+2u]; let g3=grad_out[go+3u];
+        let g4=grad_out[go+4u]; let g5=grad_out[go+5u]; let g6=grad_out[go+6u]; let g7=grad_out[go+7u];
+        gw0 = gw0 + g0*a0+g1*a1+g2*a2+g3*a3+g4*a4+g5*a5+g6*a6+g7*a7;
+        gw1 = gw1 + g0*(-a1)+g1*a0+g2*(-a3)+g3*a2+g4*(-a5)+g5*a4+g6*a7+g7*(-a6);
+        gw2 = gw2 + g0*(-a2)+g1*a3+g2*a0+g3*(-a1)+g4*(-a6)+g5*(-a7)+g6*a4+g7*a5;
+        gw3 = gw3 + g0*(-a3)+g1*(-a2)+g2*a1+g3*a0+g4*(-a7)+g5*a6+g6*(-a5)+g7*a4;
+        gw4 = gw4 + g0*(-a4)+g1*a5+g2*a6+g3*a7+g4*a0+g5*(-a1)+g6*(-a2)+g7*(-a3);
+        gw5 = gw5 + g0*(-a5)+g1*(-a4)+g2*a7+g3*(-a6)+g4*a1+g5*a0+g6*a3+g7*(-a2);
+        gw6 = gw6 + g0*(-a6)+g1*(-a7)+g2*(-a4)+g3*a5+g4*a2+g5*(-a3)+g6*a0+g7*a1;
+        gw7 = gw7 + g0*(-a7)+g1*a6+g2*(-a5)+g3*(-a4)+g4*a3+g5*a2+g6*(-a1)+g7*a0;
+    }
+    let gwo = (o * params.input_features + i) * 8u;
+    grad_wt[gwo]=gw0; grad_wt[gwo+1u]=gw1; grad_wt[gwo+2u]=gw2; grad_wt[gwo+3u]=gw3;
+    grad_wt[gwo+4u]=gw4; grad_wt[gwo+5u]=gw5; grad_wt[gwo+6u]=gw6; grad_wt[gwo+7u]=gw7;
+}
+";
+
 
     /// <summary>
     /// Octonion element-wise multiply kernel.

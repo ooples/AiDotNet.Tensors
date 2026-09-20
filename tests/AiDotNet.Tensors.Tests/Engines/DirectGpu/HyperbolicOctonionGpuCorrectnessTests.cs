@@ -6,6 +6,7 @@ using System;
 using System.Linq;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.DirectGpu;
+using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
@@ -59,7 +60,7 @@ public class HyperbolicOctonionGpuCorrectnessTests : IDisposable
 
     private static float[] RandomFloats(int count, int seed, float scale = 1f)
     {
-        var rng = new Random(seed);
+        var rng = RandomHelper.CreateSeededRandom(seed);
         return Enumerable.Range(0, count).Select(_ => (float)(rng.NextDouble() * 2 - 1) * scale).ToArray();
     }
 
@@ -68,7 +69,7 @@ public class HyperbolicOctonionGpuCorrectnessTests : IDisposable
     /// </summary>
     private static float[] RandomPoincarePoints(int batchSize, int dim, float curvature, int seed)
     {
-        var rng = new Random(seed);
+        var rng = RandomHelper.CreateSeededRandom(seed);
         float maxRadius = 0.9f / MathF.Sqrt(curvature); // Stay well inside the ball
         var data = new float[batchSize * dim];
         for (int b = 0; b < batchSize; b++)
@@ -493,14 +494,18 @@ public class HyperbolicOctonionGpuCorrectnessTests : IDisposable
                           w4=weights[wOff+4],w5=weights[wOff+5],w6=weights[wOff+6],w7=weights[wOff+7];
                     float g0=gradOutput[goOff],g1=gradOutput[goOff+1],g2=gradOutput[goOff+2],g3=gradOutput[goOff+3],
                           g4=gradOutput[goOff+4],g5=gradOutput[goOff+5],g6=gradOutput[goOff+6],g7=gradOutput[goOff+7];
+                    // Column c of the Jacobian of r = w * a with respect to a: the coefficient of
+                    // a_c in each output component r_r, summed against g_r. This is the mirror of the
+                    // weight-gradient table in OctonionLinearBackwardWeights_GpuMatchesCpu, and the two
+                    // had been transposed into each other.
                     ga[0]+=g0*w0+g1*w1+g2*w2+g3*w3+g4*w4+g5*w5+g6*w6+g7*w7;
-                    ga[1]+=g0*(-w1)+g1*w0+g2*(-w3)+g3*w2+g4*(-w5)+g5*w4+g6*w7+g7*(-w6);
-                    ga[2]+=g0*(-w2)+g1*w3+g2*w0+g3*(-w1)+g4*(-w6)+g5*(-w7)+g6*w4+g7*w5;
-                    ga[3]+=g0*(-w3)+g1*(-w2)+g2*w1+g3*w0+g4*(-w7)+g5*w6+g6*(-w5)+g7*w4;
-                    ga[4]+=g0*(-w4)+g1*w5+g2*w6+g3*w7+g4*w0+g5*(-w1)+g6*(-w2)+g7*(-w3);
-                    ga[5]+=g0*(-w5)+g1*(-w4)+g2*w7+g3*(-w6)+g4*w1+g5*w0+g6*w3+g7*(-w2);
-                    ga[6]+=g0*(-w6)+g1*(-w7)+g2*(-w4)+g3*w5+g4*w2+g5*(-w3)+g6*w0+g7*w1;
-                    ga[7]+=g0*(-w7)+g1*w6+g2*(-w5)+g3*(-w4)+g4*w3+g5*w2+g6*(-w1)+g7*w0;
+                    ga[1]+=g0*(-w1)+g1*w0+g2*w3+g3*(-w2)+g4*w5+g5*(-w4)+g6*(-w7)+g7*w6;
+                    ga[2]+=g0*(-w2)+g1*(-w3)+g2*w0+g3*w1+g4*w6+g5*w7+g6*(-w4)+g7*(-w5);
+                    ga[3]+=g0*(-w3)+g1*w2+g2*(-w1)+g3*w0+g4*w7+g5*(-w6)+g6*w5+g7*(-w4);
+                    ga[4]+=g0*(-w4)+g1*(-w5)+g2*(-w6)+g3*(-w7)+g4*w0+g5*w1+g6*w2+g7*w3;
+                    ga[5]+=g0*(-w5)+g1*w4+g2*(-w7)+g3*w6+g4*(-w1)+g5*w0+g6*(-w3)+g7*w2;
+                    ga[6]+=g0*(-w6)+g1*w7+g2*w4+g3*(-w5)+g4*(-w2)+g5*w3+g6*w0+g7*(-w1);
+                    ga[7]+=g0*(-w7)+g1*(-w6)+g2*w5+g3*w4+g4*(-w3)+g5*(-w2)+g6*w1+g7*w0;
                 }
                 for (int c = 0; c < 8; c++) cpuGradInput[giOff + c] = ga[c];
             }
@@ -542,14 +547,18 @@ public class HyperbolicOctonionGpuCorrectnessTests : IDisposable
                           a4=input[inOff+4],a5=input[inOff+5],a6=input[inOff+6],a7=input[inOff+7];
                     float g0=gradOutput[goOff],g1=gradOutput[goOff+1],g2=gradOutput[goOff+2],g3=gradOutput[goOff+3],
                           g4=gradOutput[goOff+4],g5=gradOutput[goOff+5],g6=gradOutput[goOff+6],g7=gradOutput[goOff+7];
+                    // Column c of the Jacobian of r = w * a with respect to w: the coefficient of
+                    // w_c in each output component r_r, summed against g_r. The arbiter for these
+                    // rows is OctonionLinearForward_NumericalGradientCheck below, which differentiates
+                    // CpuOctonionLinearForward numerically and never consults this table.
                     gw[0]+=g0*a0+g1*a1+g2*a2+g3*a3+g4*a4+g5*a5+g6*a6+g7*a7;
-                    gw[1]+=g0*(-a1)+g1*a0+g2*a3+g3*(-a2)+g4*a5+g5*(-a4)+g6*(-a7)+g7*a6;
-                    gw[2]+=g0*(-a2)+g1*(-a3)+g2*a0+g3*a1+g4*a6+g5*a7+g6*(-a4)+g7*(-a5);
-                    gw[3]+=g0*(-a3)+g1*a2+g2*(-a1)+g3*a0+g4*a7+g5*(-a6)+g6*a5+g7*(-a4);
-                    gw[4]+=g0*(-a4)+g1*(-a5)+g2*(-a6)+g3*(-a7)+g4*a0+g5*a1+g6*a2+g7*a3;
-                    gw[5]+=g0*(-a5)+g1*a4+g2*(-a7)+g3*a6+g4*(-a1)+g5*a0+g6*(-a3)+g7*a2;
-                    gw[6]+=g0*(-a6)+g1*a7+g2*a4+g3*(-a5)+g4*(-a2)+g5*a3+g6*a0+g7*(-a1);
-                    gw[7]+=g0*(-a7)+g1*(-a6)+g2*a5+g3*a4+g4*(-a3)+g5*(-a2)+g6*a1+g7*a0;
+                    gw[1]+=g0*(-a1)+g1*a0+g2*(-a3)+g3*a2+g4*(-a5)+g5*a4+g6*a7+g7*(-a6);
+                    gw[2]+=g0*(-a2)+g1*a3+g2*a0+g3*(-a1)+g4*(-a6)+g5*(-a7)+g6*a4+g7*a5;
+                    gw[3]+=g0*(-a3)+g1*(-a2)+g2*a1+g3*a0+g4*(-a7)+g5*a6+g6*(-a5)+g7*a4;
+                    gw[4]+=g0*(-a4)+g1*a5+g2*a6+g3*a7+g4*a0+g5*(-a1)+g6*(-a2)+g7*(-a3);
+                    gw[5]+=g0*(-a5)+g1*(-a4)+g2*a7+g3*(-a6)+g4*a1+g5*a0+g6*a3+g7*(-a2);
+                    gw[6]+=g0*(-a6)+g1*(-a7)+g2*(-a4)+g3*a5+g4*a2+g5*(-a3)+g6*a0+g7*a1;
+                    gw[7]+=g0*(-a7)+g1*a6+g2*(-a5)+g3*(-a4)+g4*a3+g5*a2+g6*(-a1)+g7*a0;
                 }
                 for (int c = 0; c < 8; c++) cpuGradWeights[gwOff + c] = gw[c];
             }
@@ -574,7 +583,12 @@ public class HyperbolicOctonionGpuCorrectnessTests : IDisposable
         SkipIfNoGpu();
         const int B = 2, I = 2, O = 2;
         const float eps = 1e-3f;
-        const float gradTol = 0.05f; // Finite difference tolerance
+        // Bracketed by measurement, not guessed. With the kernels correct the worst element of this
+        // check lands at 2.4E-06 (weights) / 3.5E-06 (input); with the backward Jacobian tables
+        // transposed it lands at 1.2E-01 / 4.6E-02. 1E-03 sits ~300x above the float32 finite-
+        // difference floor and ~50x below the defect. The previous 0.05f was inside the input
+        // defect's own magnitude, so that arm could not fail against the bug it guards.
+        const float gradTol = 1e-3f;
         var input = RandomFloats(B * I * 8, 42, scale: 0.3f);
         var weights = RandomFloats(O * I * 8, 99, scale: 0.1f);
         var biases = new float[O * 8];
@@ -591,7 +605,10 @@ public class HyperbolicOctonionGpuCorrectnessTests : IDisposable
         var analyticGrad = _vulkan.DownloadBuffer(gpuGw);
 
         // Compare against numerical gradient via finite differences
-        for (int wIdx = 0; wIdx < Math.Min(16, weights.Length); wIdx++)
+        float worstDiff = 0f;
+        int worstIdx = -1;
+        float worstNumerical = 0f;
+        for (int wIdx = 0; wIdx < weights.Length; wIdx++)
         {
             var wPlus = (float[])weights.Clone();
             var wMinus = (float[])weights.Clone();
@@ -609,8 +626,91 @@ public class HyperbolicOctonionGpuCorrectnessTests : IDisposable
 
             Assert.True(!float.IsNaN(numericalGrad) && !float.IsInfinity(numericalGrad),
                 $"Numerical gradient at weight[{wIdx}] is {numericalGrad}");
-            Assert.True(MathF.Abs(numericalGrad - analyticGrad[wIdx]) < gradTol,
-                $"Gradient mismatch at weight[{wIdx}]: numerical={numericalGrad:G6}, analytic(GPU)={analyticGrad[wIdx]:G6}, diff={MathF.Abs(numericalGrad - analyticGrad[wIdx]):G6}");
+
+            float diff = MathF.Abs(numericalGrad - analyticGrad[wIdx]);
+            if (diff > worstDiff)
+            {
+                worstDiff = diff;
+                worstIdx = wIdx;
+                worstNumerical = numericalGrad;
+            }
         }
+
+        // Asserted on the worst element rather than element-by-element, because the first element is
+        // gw0 — the one row the two octonion backward tables share — so an abort there reported a
+        // clean 2E-07 while later rows were out by 1E-01.
+        Assert.True(worstDiff < gradTol,
+            $"Gradient mismatch at weight[{worstIdx}]: numerical={worstNumerical:G6}, " +
+            $"analytic(GPU)={(worstIdx >= 0 ? analyticGrad[worstIdx] : 0f):G6}, diff={worstDiff:G6}");
+    }
+
+    /// <summary>
+    /// The same independent arbiter for the INPUT gradient. Without it the input kernel and the
+    /// CPU table in <see cref="OctonionLinearBackwardInput_GpuMatchesCpu"/> can agree with each other
+    /// and still both be wrong — which is exactly how the two backward tables came to be transposed
+    /// into each other. Finite differences consult only the forward pass.
+    /// </summary>
+    [SkippableFact]
+    public void OctonionLinearBackwardInput_NumericalGradientCheck()
+    {
+        SkipIfNoGpu();
+        const int B = 2, I = 2, O = 2;
+        const float eps = 1e-3f;
+        // Bracketed by measurement, not guessed. With the kernels correct the worst element of this
+        // check lands at 2.4E-06 (weights) / 3.5E-06 (input); with the backward Jacobian tables
+        // transposed it lands at 1.2E-01 / 4.6E-02. 1E-03 sits ~300x above the float32 finite-
+        // difference floor and ~50x below the defect. The previous 0.05f was inside the input
+        // defect's own magnitude, so that arm could not fail against the bug it guards.
+        const float gradTol = 1e-3f;
+        var input = RandomFloats(B * I * 8, 42, scale: 0.3f);
+        var weights = RandomFloats(O * I * 8, 99, scale: 0.1f);
+        var biases = new float[O * 8];
+
+        var output = CpuOctonionLinearForward(input, weights, biases, B, I, O);
+        var gradOutput = (float[])output.Clone(); // dLoss/dOutput = output (for L = ||out||^2 / 2)
+
+        using var gpuGo = _vulkan!.AllocateBuffer(gradOutput);
+        using var gpuIn = _vulkan.AllocateBuffer(input);
+        using var gpuW = _vulkan.AllocateBuffer(weights);
+        using var gpuGi = _vulkan.AllocateBuffer(B * I * 8);
+        _vulkan.OctonionLinearBackwardInput(gpuGo, gpuIn, gpuW, gpuGi, B, I, O);
+        var analyticGrad = _vulkan.DownloadBuffer(gpuGi);
+
+        float worstDiff = 0f;
+        int worstIdx = -1;
+        float worstNumerical = 0f;
+        for (int xIdx = 0; xIdx < input.Length; xIdx++)
+        {
+            var xPlus = (float[])input.Clone();
+            var xMinus = (float[])input.Clone();
+            xPlus[xIdx] += eps;
+            xMinus[xIdx] -= eps;
+            var outPlus = CpuOctonionLinearForward(xPlus, weights, biases, B, I, O);
+            var outMinus = CpuOctonionLinearForward(xMinus, weights, biases, B, I, O);
+            float lossPlus = 0, lossMinus = 0;
+            for (int j = 0; j < outPlus.Length; j++)
+            {
+                lossPlus += outPlus[j] * outPlus[j] / 2;
+                lossMinus += outMinus[j] * outMinus[j] / 2;
+            }
+            float numericalGrad = (lossPlus - lossMinus) / (2 * eps);
+
+            Assert.True(!float.IsNaN(numericalGrad) && !float.IsInfinity(numericalGrad),
+                $"Numerical gradient at input[{xIdx}] is {numericalGrad}");
+
+            float diff = MathF.Abs(numericalGrad - analyticGrad[xIdx]);
+            if (diff > worstDiff)
+            {
+                worstDiff = diff;
+                worstIdx = xIdx;
+                worstNumerical = numericalGrad;
+            }
+        }
+
+        // Asserted on the worst element rather than element-by-element so the failure message
+        // reports the largest deviation instead of whichever index happens to come first.
+        Assert.True(worstDiff < gradTol,
+            $"Gradient mismatch at input[{worstIdx}]: numerical={worstNumerical:G6}, " +
+            $"analytic(GPU)={(worstIdx >= 0 ? analyticGrad[worstIdx] : 0f):G6}, diff={worstDiff:G6}");
     }
 }
