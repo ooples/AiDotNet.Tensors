@@ -1522,6 +1522,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             tensor._gpuBuffer = null;
             tensor._gpuBackend = null;
             tensor._gpuBufferVersion = -1;
+            // Both layout flags belong to the buffer being dropped here: the split-complex plane
+            // pair, and the raw-int32 encoding GetOrAllocateInt32IndexBuffer consumes unconverted.
+            tensor._gpuBufferIsSplitComplex = false;
+            tensor._gpuBufferContainsRawInt32 = false;
         }
 
         // Get the backing array reference WITHOUT triggering materialization.
@@ -1640,6 +1644,34 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         tensor._gpuBuffer = null;
         tensor._gpuBackend = null;
         tensor._gpuBufferVersion = -1;
+        // The split-complex flag describes the layout of the buffer just dropped, so it dies with
+        // it — exactly as Tensor.Cpu() clears it on the way back to the host. Left set, it would be
+        // re-armed against the next ordinary interleaved upload and GetOrAllocateSplitComplexBuffers
+        // would read that buffer's first half as real and its second as imaginary.
+        tensor._gpuBufferIsSplitComplex = false;
+        // The raw-int32 marker dies with the buffer for the same reason: it says the dropped buffer
+        // held index bits rather than one float per element, and GetOrAllocateInt32IndexBuffer
+        // forwards such a buffer to its consumer UNCONVERTED.
+        tensor._gpuBufferContainsRawInt32 = false;
+        // ...and say so. Device and buffer are set together by Tensor.Gpu() and cleared together by
+        // Tensor.Cpu(); leaving _device on a GPU after dropping the buffer produces a tensor that claims
+        // GPU residency while nothing holds its data. That state is host-authoritative by this method's
+        // own contract (the caller just updated the host weights in place, and the next forward
+        // re-uploads them), but it is invisible to both GPU predicates in CompiledTrainingPlan and
+        // rejected by the CPU one:
+        //   - ConfigureOptimizer derives hasGpuParams from TryGetGpuBuffer() is not null  -> false,
+        //     so it configures the CPU fused closures;
+        //   - the per-parameter dispatch needs TryGetGpuBuffer() AND _gpuBackend           -> false,
+        //     so the parameter falls to the CPU branch;
+        //   - BindCpuOptimizerTensor then throws on Device != TensorDevice.CPU
+        //     ("A fused CPU optimizer cannot stage tensor shape [...] from device CUDA without an
+        //     attached backend buffer").
+        // Nothing catches that at configure time, so it surfaces mid-training from a plan that has
+        // already stepped successfully — the unrecoverable "Fused compiled training has already run
+        // successfully, but the current step cannot engage the fused path". Reached from ordinary
+        // training because CompiledTapeTrainingStep marks every parameter with p.Gpu() whenever
+        // AIDOTNET_GPU_RESIDENT_PARAMS != "0", which is the default.
+        tensor.Device = TensorDevice.CPU;
         // ALSO drop the PERSISTENT weight-buffer cache entry (keyed by the backing array). This is
         // the cache the tape forward's weight read (GetWeightBufferPreferResident → GetOrCacheWeightBuffer)
         // returns — and it does so WITHOUT a version re-check, so after an in-place optimizer update it
@@ -1833,6 +1865,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             tensor._gpuBuffer = null;
             tensor._gpuBackend = null;
             tensor._gpuBufferVersion = -1;
+            // Both layout flags belong to the buffer being dropped here: the split-complex plane
+            // pair, and the raw-int32 encoding GetOrAllocateInt32IndexBuffer consumes unconverted.
+            tensor._gpuBufferIsSplitComplex = false;
+            tensor._gpuBufferContainsRawInt32 = false;
         }
 
         // Check caches without triggering CPU materialization

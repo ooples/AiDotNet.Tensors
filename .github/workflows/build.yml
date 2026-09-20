@@ -74,7 +74,19 @@ jobs:
         AIDOTNET_GPU_DIAGNOSTICS_DUMP: ./coverage/gpu-diagnostics.txt
       run: |
         # Coverage Exclude: GPU backends (can't run in CI) PLUS the hand-vectorized numerical
-        # kernels (Engines.Simd.* / Engines.BlasManaged.*). Coverlet line-instruments every
+        # kernels (Engines.Simd.* / Engines.BlasManaged.*).
+        #
+        # The DirectGpuTensorEngine entry is measured, not a coverage dodge. With it removed, that
+        # one type instruments 52,540 coverable lines against a 200,261-line total -- a ~36%
+        # inflation of this job's denominator, almost none of which a GPU-less runner can reach
+        # (DirectGpuTensorEngine.cs alone is 33,306 lines of kernel dispatch). Project coverage
+        # would fall roughly 8-12 points, far past COVERAGE_REGRESSION_TOLERANCE=1.0. Coverlet
+        # filters key on assembly+type only, so the few CPU-reachable device-state helpers
+        # (InvalidateResidentWeightBuffer and friends) cannot be split out of the same partial
+        # type -- which is also why codecov/patch reads structurally low on PRs touching them.
+        # Widening instrumentation does not fix that; it needs a GPU CI job or a type split.
+        #
+        # Coverlet line-instruments every
         # iteration of those tight AVX/GEMM inner loops, which made GEMM-heavy training/leak tests
         # 40x+ slower under coverage (a single 4-layer-transformer leak test: ~6s -> ~4m26s, tipping
         # past the hang timeout under CI CPU contention). Excluding them drops that test to ~28s and

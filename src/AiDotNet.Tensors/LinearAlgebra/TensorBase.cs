@@ -1246,6 +1246,20 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         _gpuBuffer = null;
         _gpuBackend = null;
         _gpuBufferVersion = -1;
+        // The split-complex flag describes the LAYOUT of the buffer just dropped
+        // ([real plane][imaginary plane] rather than one element per slot), so it
+        // must not outlive it: a later upload allocates an ordinary interleaved
+        // buffer, and a stale marker would make GetOrAllocateSplitComplexBuffers
+        // read its first half as real and its second as imaginary.
+        _gpuBufferIsSplitComplex = false;
+        // Same argument, same lifetime, different marker: this one says the buffer just dropped held
+        // RAW int32 bits rather than the usual one-float-per-element encoding. Only
+        // Tensor<int>.FromGpuBuffer ever sets it, and only GetOrAllocateInt32IndexBuffer reads it —
+        // to hand the buffer to a raw-int32 consumer UNCONVERTED. A rebind leaves _device alone, so
+        // the tensor stays GPU-resident with no buffer; the next GetOrAllocateBuffer uploads an
+        // ordinary float-format one, and a marker that outlived its buffer would route those floats
+        // to that consumer as though their bit patterns were indices.
+        _gpuBufferContainsRawInt32 = false;
     }
 
     /// <summary>
