@@ -3060,6 +3060,34 @@ public static class OpParityRegistry
             }
         };
 
+        // Rectangular CAUSAL GroupedQueryAttention — a KV-cache decode step: one query against a
+        // 5-long cache. Every other GQA case here is square and non-causal, so the causal branch of
+        // the grouped_query_attention kernels was unreachable from parity; a backend still masking on
+        // the bare query index would attend to key 0 alone and diverge from the CPU engine. The CPU
+        // side is pinned independently of any implementation by GqaRectangularCausalAlignmentTests,
+        // so agreement here is not two implementations agreeing on the same mistake.
+        var gqDecode = OpInput.Rand(2913, new[] { 1, 4, 1, 8 });
+        var gkDecode = OpInput.Rand(2914, new[] { 1, 2, 5, 8 });
+        var gvDecode = OpInput.Rand(2915, new[] { 1, 2, 5, 8 });
+        yield return new OpCase("GroupedQueryAttention[q1,4,1,8;kv1,2,5,8;causal]", "attention",
+            e => e.GroupedQueryAttention(gqDecode.F(), gkDecode.F(), gvDecode.F(), 2, null, true, out _),
+            e => e.GroupedQueryAttention(gqDecode.D(), gkDecode.D(), gvDecode.D(), 2, null, true, out _),
+            ParityTol.Accum(1e-3), opMethod: "GroupedQueryAttention")
+        {
+            GraphCaptureExpectation = GraphCaptureExpectation.Required,
+            TensorOutputContract = TensorOutputContract.HomogeneousMultiple,
+            RunFloatOutputs = e =>
+            {
+                var output = e.GroupedQueryAttention(gqDecode.F(), gkDecode.F(), gvDecode.F(), 2, null, true, out var weights);
+                return new[] { output, weights };
+            },
+            RunDoubleOutputs = e =>
+            {
+                var output = e.GroupedQueryAttention(gqDecode.D(), gkDecode.D(), gvDecode.D(), 2, null, true, out var weights);
+                return new[] { output, weights };
+            }
+        };
+
         yield return new OpCase("ScaledDotProductAttentionGqa[q1,4,4,8;kv1,2,4,8;softcap1.5]", "attention",
             e => e.ScaledDotProductAttentionGqa(gq.F(), gk.F(), gv.F(), 0.35355339059, false, 1.5),
             e => e.ScaledDotProductAttentionGqa(gq.D(), gk.D(), gv.D(), 0.35355339059, false, 1.5),

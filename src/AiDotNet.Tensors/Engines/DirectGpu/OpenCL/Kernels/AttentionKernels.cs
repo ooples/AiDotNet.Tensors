@@ -553,6 +553,12 @@ __kernel void grouped_query_attention(
     const int oOffset = bqh * seqQ * headDim + qi * headDim;
     const int wOffset = bqh * seqQ * seqK + qi * seqK;
 
+    // Causal with a KV-cache offset: query row qi is at absolute position qi + (seqK - seqQ),
+    // matching scaled_dot_product_attention above and ScaledDotProductAttentionGqa on the CPU
+    // engine. seqQ == seqK makes the offset zero and prefill is unchanged; a decode step
+    // (seqQ = 1 < seqK) attends to the whole cached prefix rather than to key 0 alone.
+    const int qPos = qi + (seqK - seqQ);
+
     // Compute attention scores and softmax (only thread d=0 does this)
     if (d == 0) {
         float maxScore = NEGATIVE_INFINITY;
@@ -560,7 +566,7 @@ __kernel void grouped_query_attention(
 
         // Compute scores and find max
         for (int ki = 0; ki < seqK; ki++) {
-            if (isCausal && ki > qi) {
+            if (isCausal && ki > qPos) {
                 scores[ki] = NEGATIVE_INFINITY;
                 continue;
             }
