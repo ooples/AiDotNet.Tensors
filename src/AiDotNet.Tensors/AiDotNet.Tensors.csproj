@@ -37,7 +37,11 @@
   </ItemGroup>
 
   <ItemGroup Condition="'$(UseLocalEvolution)' != 'true'">
-    <PackageReference Include="AiDotNet.Evolution" Version="0.1.0-preview.1" />
+    <!-- Stable, not 0.1.0-preview.1: NuGet fails `pack` with NU5104 ("a stable
+         release of a package should not have a prerelease dependency") when a
+         stable Tensors release depends on a prerelease, which blocked the
+         v0.131.0 and v0.132.0 release pipelines at the Pack NuGet job. -->
+    <PackageReference Include="AiDotNet.Evolution" Version="0.1.0" />
   </ItemGroup>
 
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|AnyCPU'">
@@ -145,12 +149,13 @@
        Don't reintroduce the package. -->
 
   <!-- System.Text.Json is needed for net471 as it's not built-in like net8.0.
-       Pinned to 10.0.11 to match what AiDotNet.Evolution asks for on net471: it
-       declares System.Text.Json >= 10.0.11 there, so referencing 8.0.5 directly
-       wins the resolution and NuGet reports it as a downgrade (NU1605), which
-       TreatWarningsAsErrors turns into a build failure. -->
+       Pinned to 10.0.12 to match what AiDotNet.Evolution asks for on net471: it
+       declares System.Text.Json >= 10.0.12 there, so referencing anything older
+       directly wins the resolution and NuGet reports it as a downgrade (NU1605),
+       which TreatWarningsAsErrors turns into a build failure. Keep this at or
+       above whatever the referenced AiDotNet.Evolution requires. -->
   <ItemGroup Condition="'$(TargetFramework)' == 'net471'">
-    <PackageReference Include="System.Text.Json" Version="10.0.11" />
+    <PackageReference Include="System.Text.Json" Version="10.0.12" />
     <!-- ZipArchive (System.IO.Compression) ships in mscorlib on .NET 5+ but
          needs an explicit reference on net471 — used by PtReader to parse
          the modern zip-format PyTorch checkpoint. -->
