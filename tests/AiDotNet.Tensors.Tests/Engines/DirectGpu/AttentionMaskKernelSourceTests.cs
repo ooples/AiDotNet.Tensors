@@ -42,6 +42,13 @@ public sealed class AttentionMaskKernelSourceTests
         Assert.Contains("maskData[maskOffset + queryIndex * seqK + keyIndex] == 0.0", source);
     }
 
+    // WebGpuKernels.cs opens with `#if NET7_0_OR_GREATER` -- the WebGPU backend is Blazor
+    // WebAssembly only -- so on net471 the type is not compiled into the assembly at all and this
+    // test failed with "Kernel source type not found", not with a wrong kernel source. The
+    // condition mirrors the source file's own; it is not a tolerance on the assertions, which are
+    // unchanged and still run in full on every framework that has the type. The CUDA, HIP, OpenCL,
+    // Metal and Vulkan kernel sources above carry no such guard and stay unconditional.
+#if NET7_0_OR_GREATER
     [Fact]
     public void WebGpuAttentionKernel_IndexesSharedOrFullBooleanMasks()
     {
@@ -52,6 +59,7 @@ public sealed class AttentionMaskKernelSourceTests
         Assert.Contains("attention_params.boolean_mask_mode == 2u", source);
         Assert.Contains("attention_bias[mask_base + q_pos * attention_params.seq_k + k_pos] == 0.0", source);
     }
+#endif
 
     private static string GetStaticString(string typeName, string memberName)
     {
