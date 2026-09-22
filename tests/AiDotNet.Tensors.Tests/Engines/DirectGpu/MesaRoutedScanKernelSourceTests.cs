@@ -25,16 +25,16 @@ public sealed class MesaRoutedScanKernelSourceTests
     }
 
     [Theory]
-    [InlineData("AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanRecurrenceKernels", "MesaScan", "RoutedDiagonalSsmScan")]
-    [InlineData("AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuRecurrenceKernels", "MesaScan", "RoutedDiagonalSsmScan")]
-    public void ShaderSources_ContainWoodburyAndMaskedRecurrence(string typeName,string mesaMember,string routedMember)
+    [InlineData("AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanRecurrenceKernels", "MesaScan", "RoutedDiagonalSsmScan", "isActive")]
+    [InlineData("AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuRecurrenceKernels", "MesaScan", "RoutedDiagonalSsmScan", "active")]
+    public void ShaderSources_ContainWoodburyAndMaskedRecurrence(string typeName,string mesaMember,string routedMember,string maskVariable)
     {
         string mesa=GetStaticString(typeName,mesaMember),routed=GetStaticString(typeName,routedMember);
         Assert.Contains("denom",mesa,StringComparison.Ordinal);
         Assert.Contains("covariance",mesa,StringComparison.OrdinalIgnoreCase);
         Assert.Contains("mask",routed,StringComparison.Ordinal);
-        Assert.Contains("active*next",routed,StringComparison.Ordinal);
-        Assert.Contains("active*y",routed,StringComparison.Ordinal);
+        Assert.Contains(maskVariable+"*next",routed,StringComparison.Ordinal);
+        Assert.Contains(maskVariable+"*y",routed,StringComparison.Ordinal);
     }
 
     private static string GetStaticString(string typeName,string memberName)
