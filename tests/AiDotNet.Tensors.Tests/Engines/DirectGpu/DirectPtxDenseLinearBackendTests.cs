@@ -126,9 +126,11 @@ public sealed class DirectPtxDenseLinearBackendTests
         Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
         bool? previousGate = DirectPtxFeatureGate.TestOverride;
         bool previousExperiment = DirectPtxFeatureGate.FusedLinearExperimentOverride;
+        bool previousMixedExperiment = DirectPtxFeatureGate.MixedPrecisionLinearExperimentOverride;
         bool previousDeterministic = AiDotNetEngine.DeterministicMode;
         DirectPtxFeatureGate.TestOverride = true;
         DirectPtxFeatureGate.FusedLinearExperimentOverride = true;
+        DirectPtxFeatureGate.MixedPrecisionLinearExperimentOverride = true;
         AiDotNetEngine.SetDeterministicMode(false);
         try
         {
@@ -250,6 +252,7 @@ public sealed class DirectPtxDenseLinearBackendTests
         finally
         {
             AiDotNetEngine.SetDeterministicMode(previousDeterministic);
+            DirectPtxFeatureGate.MixedPrecisionLinearExperimentOverride = previousMixedExperiment;
             DirectPtxFeatureGate.FusedLinearExperimentOverride = previousExperiment;
             DirectPtxFeatureGate.TestOverride = previousGate;
         }
