@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.132.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.132.0...v0.132.1) (2026-09-24)
+
+
+### Bug Fixes
+
+* **deps:** depend on the stable aidotnet.evolution so releases can pack ([#1043](https://github.com/ooples/AiDotNet.Tensors/issues/1043)) ([e07fd0b](https://github.com/ooples/AiDotNet.Tensors/commit/e07fd0b3a37b2cdcf6bbeeac9fa4ada3d26d3273))
+
 ## [0.132.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.131.0...v0.132.0) (2026-09-20)
 
 
