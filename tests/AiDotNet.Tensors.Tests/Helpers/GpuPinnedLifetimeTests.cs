@@ -230,9 +230,9 @@ public class GpuPinnedLifetimeTests
     {
         // Regression for post-training eval on GPU-resident model weights:
         // a successful on-device optimizer step mutates param/m/v in place.
-        // Their resident GPU buffer version must be synced to the bumped
-        // tensor Version so later inference reuses the live device buffers
-        // instead of re-uploading fresh host arrays on every forward pass.
+        // The storage-wide GPU cache epoch differs from the per-tensor autodiff
+        // Version. Both advance, and the live device buffer must match the
+        // storage epoch so later inference does not upload stale host data.
         var priorEngine = AiDotNet.Tensors.Engines.AiDotNetEngine.Current;
         var gpu = new AiDotNet.Tensors.Engines.DirectGpuTensorEngine();
         AiDotNet.Tensors.Engines.AiDotNetEngine.Current = gpu;
@@ -256,6 +256,9 @@ public class GpuPinnedLifetimeTests
                 int mVersion = m.Version;
                 int vVersion = v.Version;
                 int gVersion = g.Version;
+                int pCacheVersion = p.GpuCacheVersion;
+                int mCacheVersion = m.GpuCacheVersion;
+                int vCacheVersion = v.GpuCacheVersion;
 
                 bool ran = AiDotNet.Tensors.Engines.Gpu.GpuOptimizer.TryAdamStep(
                     p, g, m, v,
@@ -269,9 +272,12 @@ public class GpuPinnedLifetimeTests
                 Assert.True(v.Version > vVersion, "Adam v-state Version should advance after an in-place GPU Adam step.");
                 Assert.Equal(gVersion, g.Version);
 
-                Assert.Equal(p.Version, p._gpuBufferVersion);
-                Assert.Equal(m.Version, m._gpuBufferVersion);
-                Assert.Equal(v.Version, v._gpuBufferVersion);
+                Assert.True(p.GpuCacheVersion > pCacheVersion);
+                Assert.True(m.GpuCacheVersion > mCacheVersion);
+                Assert.True(v.GpuCacheVersion > vCacheVersion);
+                Assert.Equal(p.GpuCacheVersion, p._gpuBufferVersion);
+                Assert.Equal(m.GpuCacheVersion, m._gpuBufferVersion);
+                Assert.Equal(v.GpuCacheVersion, v._gpuBufferVersion);
 
                 Assert.NotNull(p.LastWriteSync);
                 Assert.NotNull(m.LastWriteSync);
