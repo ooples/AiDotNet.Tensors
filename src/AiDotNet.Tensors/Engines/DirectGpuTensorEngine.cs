@@ -22900,9 +22900,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorAddScalar<T>(Tensor<T> tensor, T scalar)
     {
-        // Under a tape the kernel runs and records the SAME node CpuEngine records; only a non-float tape stays
-        // on the CPU, because the kernel converts the scalar to float and double training must stay exact.
-        if (IsTapeActive<T>() && typeof(T) != typeof(float)) return base.TensorAddScalar(tensor, scalar);
+        // Under a tape the kernel runs and records the SAME node CpuEngine records. Non-float stays on the CPU,
+        // tape or not: the kernel converts the scalar to float, which silently cost double callers precision
+        // (TensorDivideScalar was already float-only for the same reason).
+        if (typeof(T) != typeof(float)) return base.TensorAddScalar(tensor, scalar);
         if (TryGetBackend(out var backend))
         {
             try
@@ -22921,9 +22922,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorSubtractScalar<T>(Tensor<T> tensor, T scalar)
     {
-        // Under a tape the kernel runs and records the SAME node CpuEngine records; only a non-float tape stays
-        // on the CPU, because the kernel converts the scalar to float and double training must stay exact.
-        if (IsTapeActive<T>() && typeof(T) != typeof(float)) return base.TensorSubtractScalar(tensor, scalar);
+        // Under a tape the kernel runs and records the SAME node CpuEngine records. Non-float stays on the CPU,
+        // tape or not: the kernel converts the scalar to float, which silently cost double callers precision
+        // (TensorDivideScalar was already float-only for the same reason).
+        if (typeof(T) != typeof(float)) return base.TensorSubtractScalar(tensor, scalar);
         if (TryGetBackend(out var backend))
         {
             try
