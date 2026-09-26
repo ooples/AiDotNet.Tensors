@@ -2478,6 +2478,14 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        // On the GPU engine build gradOutput/n on the device: gradOutput[0] below is a blocking readback.
+        if (engine is DirectGpuTensorEngine gpu
+            && gpu.TryScaleByDeviceScalar<T>(null, inputs[0]._shape, gradOutput, 1f / inputs[0].Length) is { } deviceGrad)
+        {
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceGrad, engine);
+            return;
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         T scale = numOps.Divide(gradOutput[0], numOps.FromDouble(inputs[0].Length));
         // Use RentUninitialized to go through TensorArena (cache-hot reuse)
@@ -2682,8 +2690,16 @@ internal static class BackwardFunctions<T>
         var numOps = MathHelper.GetNumericOperations<T>();
         var predictions = inputs[0];
         var targets = inputs[1];
-        T scale = numOps.FromDouble(2.0 * numOps.ToDouble(gradOutput[0]) / predictions.Length);
         var diff = engine.TensorSubtract(predictions, targets);
+        // On the GPU engine scale by the upstream gradient on the device: gradOutput[0] is a blocking readback.
+        if (engine is DirectGpuTensorEngine gpu
+            && gpu.TryScaleByDeviceScalar(diff, diff._shape, gradOutput, 2f / predictions.Length) is { } deviceGrad)
+        {
+            DifferentiableOps.AccumulateGrad(grads, predictions, deviceGrad, engine);
+            return;
+        }
+
+        T scale = numOps.FromDouble(2.0 * numOps.ToDouble(gradOutput[0]) / predictions.Length);
         var grad = engine.TensorMultiplyScalar(diff, scale);
         DifferentiableOps.AccumulateGrad(grads, predictions, grad, engine);
     }

@@ -4742,6 +4742,56 @@ public partial class DirectGpuTensorEngine
         }
     }
 
+    /// <summary>
+    /// <c>factor * scalar[0] * tensor</c> — or, with a null <paramref name="tensor"/>, <c>factor * scalar[0]</c> filled
+    /// to <paramref name="shape"/> — computed without reading the one-element <paramref name="scalar"/> on the host.
+    /// </summary>
+    /// <remarks>
+    /// Loss and mean backwards scaled their result by <c>gradOutput[0]</c>: an indexer read of a device-resident
+    /// upstream gradient, i.e. a blocking device-to-host sync in every backward pass (once per SAMPLE in the
+    /// per-sample time-series models). Here the scale stays on the device: fill or scale into a stream-ordered
+    /// temporary, then one broadcast multiply by the scalar buffer (inner extent 1). The kernel's operands are
+    /// __restrict__, hence the temporary rather than an in-place multiply. Null when the device path cannot run.
+    /// </remarks>
+    internal Tensor<T>? TryScaleByDeviceScalar<T>(Tensor<T>? tensor, int[] shape, Tensor<T> scalar, float factor)
+    {
+        if (typeof(T) != typeof(float) || Compilation.GraphMode.IsActive || scalar.Length != 1
+            || !TryGetBackend(out var backend))
+            return null;
+        try
+        {
+            int n = 1; for (int k = 0; k < shape.Length; k++) n = checked(n * shape[k]);
+            if (tensor is not null && tensor.Length != n) return null;
+            var s = scalar.IsContiguous ? scalar : (Tensor<T>)scalar.Contiguous();
+            using var bufS = GetOrAllocateBuffer(backend, s);
+            bool hasTensor = tensor is not null;
+            var bufT = default(OwnedBuffer);
+            if (hasTensor)
+            {
+                var c = tensor!.IsContiguous ? tensor : (Tensor<T>)tensor.Contiguous();
+                bufT = GetOrAllocateBuffer(backend, c);
+            }
+            try
+            {
+                return DispatchDeferredGpuOp<T>(backend, n, (int[])shape.Clone(), output =>
+                {
+                    using var scaled = backend.AllocateBuffer(n);
+                    if (hasTensor) backend.Scale(bufT.Buffer, scaled, factor, n);
+                    else backend.Fill(scaled, factor, n);
+                    backend.BroadcastMultiplyLastAxis(scaled, bufS.Buffer, output, n, 1);
+                });
+            }
+            finally
+            {
+                if (hasTensor) bufT.Dispose();
+            }
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
     /// <inheritdoc/>
     public override Tensor<T> TensorSliceScatter<T>(Tensor<T> tensor, Tensor<T> source, int dim, int start, int length)
     {

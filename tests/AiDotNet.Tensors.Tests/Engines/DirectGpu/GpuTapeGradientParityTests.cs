@@ -318,6 +318,48 @@ public class GpuTapeGradientParityTests : IDisposable
             }
         });
 
+    /// <summary>
+    /// Mean and MSE-loss backwards scaled by <c>gradOutput[0]</c> — a blocking readback of the resident upstream
+    /// gradient in every backward pass. On the GPU engine they must now read nothing back and still match CPU.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData("MeanBackward")]
+    [InlineData("MSELossBackward")]
+    public void Scalar_scaled_backwards_do_not_read_the_upstream_gradient_back(string backward)
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu!)
+        {
+            IEngine engine = gpu!;
+            AiDotNetEngine.Current = engine;
+            var predictions = Rand([5, 8], seed: 37);
+            var targets = Rand([5, 8], seed: 38);
+            var hostUpstream = new Tensor<float>([1]); hostUpstream[0] = 0.83f;
+            var residentUpstream = engine.TensorAddScalar(hostUpstream, 0f);
+            Tensor<float>[] inputs = backward == "MeanBackward" ? [predictions] : [predictions, targets];
+            BackwardFunction<float> fn = backward == "MeanBackward"
+                ? BackwardFunctions<float>.MeanBackward
+                : BackwardFunctions<float>.MSELossBackward;
+            _ = engine.TensorAdd(predictions, targets);          // upload both inputs outside the count
+
+            var cpuGrads = new Dictionary<Tensor<float>, Tensor<float>>();
+            fn(hostUpstream, inputs, hostUpstream, [], new CpuEngine(), cpuGrads);
+
+            AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Reset();
+            var gpuGrads = new Dictionary<Tensor<float>, Tensor<float>>();
+            fn(residentUpstream, inputs, residentUpstream, [], engine, gpuGrads);
+            long launches = AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Count;
+            long readbacks = AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Readbacks;
+            _out.WriteLine($"{backward} on GPU: launches={launches} readbacks={readbacks}");
+
+            Assert.True(launches >= 1, $"{backward} launched nothing on the GPU engine.");
+            Assert.Equal(0, readbacks);
+            var expected = cpuGrads[predictions];
+            var actual = gpuGrads[predictions];
+            for (int i = 0; i < expected.Length; i++) Assert.Equal(expected[i], actual[i], 5);
+        }
+    }
+
     [SkippableFact]
     public void TensorAddScalar_gradients_match_cpu() =>
         AssertGradientParity("TensorAddScalar", Rand([4, 16], seed: 26), static (e, t) => e.TensorAddScalar(t, 0.75f),
