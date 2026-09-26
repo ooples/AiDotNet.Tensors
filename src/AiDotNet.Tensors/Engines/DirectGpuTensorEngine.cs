@@ -25910,27 +25910,48 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.TensorLogSoftmax<T>(Tensor<T> tensor, int axis)
     {
-        if (IsTapeActive<T>()) return base.TensorLogSoftmax(tensor, axis);
+        // No IsTapeActive bail: the GPU result records the same LogSoftmax tape node as CpuEngine, so training keeps
+        // it on the device. The previous GPU path computed log(softmax(x)), which underflows to log(0) = -inf for any
+        // entry more than ~88 below its row maximum in float32 (a routine situation for LM logits); it is now the
+        // stable x - max - log(sum(exp(x - max))), composed from IDirectGpuBackend kernels available on all backends.
         if (typeof(T) == typeof(float) && TryGetBackend(out var backend))
         {
             try
             {
                 int rank = tensor.Rank;
                 int normalizedAxis = axis < 0 ? rank + axis : axis;
-                if (normalizedAxis == rank - 1)
+                if (normalizedAxis == rank - 1 && tensor.Length > 0)
                 {
                     int features = tensor.Shape._dims[normalizedAxis];
                     int outerSize = tensor.Length / features;
-                    using var input = GetOrAllocateBuffer(backend, tensor);
+                    var source = tensor.IsContiguous ? tensor : (Tensor<T>)tensor.Contiguous();
+                    using var input = GetOrAllocateBuffer(backend, source);
                     var output = AllocateOutputBuffer(backend, tensor.Length);
                     bool handedOff = false;
                     try
                     {
-                        using var probabilities = backend.AllocateBuffer(tensor.Length);
-                        backend.Softmax(input.Buffer, probabilities, outerSize, features);
-                        backend.Log(probabilities, output.Buffer, tensor.Length);
+                        // Per-ROW values are expanded across the row with TileAxis and subtracted elementwise:
+                        // BroadcastSubLast broadcasts along the last axis (one value per COLUMN), and the per-row
+                        // broadcast kernels are only on the optional IGpuBatchExecution interface.
+                        using var rowMax = backend.AllocateBuffer(outerSize);
+                        using var rowValues = backend.AllocateBuffer(tensor.Length);
+                        using var shifted = backend.AllocateBuffer(tensor.Length);
+                        using var expShifted = backend.AllocateBuffer(tensor.Length);
+                        using var rowSum = backend.AllocateBuffer(outerSize);
+                        using var logSum = backend.AllocateBuffer(outerSize);
+                        backend.MaxAxis(input.Buffer, rowMax, outerSize, features);
+                        backend.TileAxis(rowMax, rowValues, outerSize, 1, 1, features);
+                        backend.Subtract(input.Buffer, rowValues, shifted, tensor.Length);
+                        backend.Exp(shifted, expShifted, tensor.Length);
+                        backend.SumAxis(expShifted, rowSum, outerSize, features);
+                        backend.Log(rowSum, logSum, outerSize);
+                        backend.TileAxis(logSum, rowValues, outerSize, 1, 1, features);
+                        backend.Subtract(shifted, rowValues, output.Buffer, tensor.Length);
                         handedOff = true;
-                        return DeferTensorResult<T>(backend, output.Buffer, tensor.Length, tensor.Shape.ToArray());
+                        var result = DeferTensorResult<T>(backend, output.Buffer, tensor.Length, tensor.Shape.ToArray());
+                        Autodiff.DifferentiableOps.RecordUnary("LogSoftmax", result, tensor,
+                            Autodiff.BackwardFunctions<T>.LogSoftmaxBackward);
+                        return result;
                     }
                     finally
                     {
@@ -25942,7 +25963,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         return base.TensorLogSoftmax(tensor,axis);
     }
-
     Tensor<T> IEngine.TensorSoftmaxBackward<T>(Tensor<T> softmaxOutput, Tensor<T> gradOutput, int axis)
     {
         if (typeof(T)==typeof(float) && TryGetBackend(out var b))

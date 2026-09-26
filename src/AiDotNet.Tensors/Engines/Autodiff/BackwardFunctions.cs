@@ -3055,6 +3055,23 @@ internal static class BackwardFunctions<T>
     {
         // d(log_softmax)/dx = gradOutput - softmax * sum(gradOutput)
         // softmax = exp(log_softmax) = exp(output)
+        if (engine.SupportsGpu && inputs[0].Rank >= 1)
+        {
+            // Device path: the host loop below reads every element through the indexer, which on a GPU engine
+            // downloads the upstream gradient and the output. Same math with engine ops, no per-element access.
+            // The row sums are tiled explicitly because the GPU engine's elementwise ops take equal shapes.
+            int lastAxis = inputs[0].Rank - 1;
+            var softmaxOnDevice = engine.TensorExp(output);
+            var rowSums = engine.ReduceSum(gradOutput, new[] { lastAxis }, keepDims: true);
+            var tileMultiples = new int[inputs[0].Rank];
+            for (int i = 0; i < tileMultiples.Length; i++) tileMultiples[i] = 1;
+            tileMultiples[lastAxis] = inputs[0].Shape[lastAxis];
+            var dxOnDevice = engine.TensorSubtract(gradOutput,
+                engine.TensorMultiply(softmaxOnDevice, engine.TensorTile(rowSums, tileMultiples)));
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], dxOnDevice, engine);
+            return;
+        }
+
         var softmax = engine.TensorExp(output);
         // For each row, compute sum(gradOutput) and subtract softmax * sum
         // This is a per-row operation. Use engine ops for the computation.
