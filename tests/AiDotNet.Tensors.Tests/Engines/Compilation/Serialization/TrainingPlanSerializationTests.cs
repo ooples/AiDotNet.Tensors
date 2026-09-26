@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Linq;
 using System.Threading.Tasks;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Compilation;
@@ -392,6 +393,106 @@ public class TrainingPlanSerializationTests
 
         original.Dispose();
         loaded.Dispose();
+    }
+
+    [Theory]
+    [MemberData(nameof(SupportedFloatOptimizerCheckpointCases))]
+    public void ExportImportOptimizerState_IntoAFreshPlan_ContinuesTheTrajectoryExactly(OptimizerType optimizer)
+    {
+        // A caller checkpointing fused training cannot save the plan (it is rebuilt from the model on resume),
+        // only the optimizer state. Export it, rebuild a plan over the same weights, import, and the next step
+        // must be the step the original plan would have taken.
+        var engine = new CpuEngine();
+        var weight = CreateTensor(new[] { 3, 2 }, seed: 71);
+        var original = CompileLinearPlan(engine, weight);
+        ConfigureCheckpointOptimizer(original, optimizer);
+        for (int i = 0; i < 5; i++) original.Step();
+
+        byte[]? state = original.ExportOptimizerState();
+        Assert.NotNull(state);
+        var savedWeight = weight.AsSpan().ToArray();
+
+        original.Step();
+        var expectedWeight = weight.AsSpan().ToArray();
+
+        var resumedWeight = CreateTensor(new[] { 3, 2 }, seed: 0);
+        savedWeight.AsSpan().CopyTo(resumedWeight.AsWritableSpan());
+        var resumed = CompileLinearPlan(engine, resumedWeight);
+        resumed.ImportOptimizerState(state!);
+        AssertOptimizerCheckpointEqual(DecodeExported(state!), CaptureCheckpoint(resumed), optimizer.ToString());
+        resumed.Step();
+        AssertEqual(expectedWeight, resumedWeight.AsSpan().ToArray(), 0f, $"weights after import ({optimizer})");
+
+        original.Dispose();
+        resumed.Dispose();
+    }
+
+    [Fact]
+    public void ExportImportOptimizerState_WithoutImport_AFreshAdamPlanTakesADifferentStep()
+    {
+        // Guards the test above against passing vacuously: restarting Adam (zero moments, step 1) from the
+        // same weights must move them differently from continuing it at step 6.
+        var engine = new CpuEngine();
+        var weight = CreateTensor(new[] { 3, 2 }, seed: 71);
+        var original = CompileLinearPlan(engine, weight);
+        ConfigureCheckpointOptimizer(original, OptimizerType.Adam);
+        for (int i = 0; i < 5; i++) original.Step();
+        var savedWeight = weight.AsSpan().ToArray();
+        original.Step();
+        var continued = weight.AsSpan().ToArray();
+
+        var restartedWeight = CreateTensor(new[] { 3, 2 }, seed: 0);
+        savedWeight.AsSpan().CopyTo(restartedWeight.AsWritableSpan());
+        var restarted = CompileLinearPlan(engine, restartedWeight);
+        ConfigureCheckpointOptimizer(restarted, OptimizerType.Adam);
+        restarted.Step();
+
+        Assert.NotEqual(continued, restartedWeight.AsSpan().ToArray());
+        original.Dispose();
+        restarted.Dispose();
+    }
+
+    [Fact]
+    public void ExportOptimizerState_WithNoOptimizerConfigured_ReturnsNull()
+    {
+        var engine = new CpuEngine();
+        var plan = CompileLinearPlan(engine, CreateTensor(new[] { 3, 2 }, seed: 3));
+        Assert.Null(plan.ExportOptimizerState());
+        plan.Dispose();
+    }
+
+    [Fact]
+    public void ImportOptimizerState_RejectsForeignTruncatedAndMismatchedPayloads()
+    {
+        var engine = new CpuEngine();
+        var source = CompileLinearPlan(engine, CreateTensor(new[] { 3, 2 }, seed: 5));
+        ConfigureCheckpointOptimizer(source, OptimizerType.Adam);
+        source.Step();
+        byte[] state = source.ExportOptimizerState()!;
+
+        var target = CompileLinearPlan(engine, CreateTensor(new[] { 3, 2 }, seed: 6));
+        Assert.Throws<ArgumentNullException>(() => target.ImportOptimizerState(null!));
+        Assert.Throws<InvalidDataException>(() => target.ImportOptimizerState(new byte[] { 1, 2, 3, 4, 5, 6, 7, 8 }));
+        Assert.Throws<InvalidDataException>(() => target.ImportOptimizerState(state.Take(state.Length / 2).ToArray()));
+
+        // Same format, different parameter count: two parameters against a one-parameter plan.
+        var twoParam = CompileTwoParameterLinearPlan(
+            engine, CreateTensor(new[] { 3, 2 }, seed: 7), CreateTensor(new[] { 2 }, seed: 8));
+        ConfigureCheckpointOptimizer(twoParam, OptimizerType.Adam);
+        twoParam.Step();
+        Assert.Throws<InvalidDataException>(() => target.ImportOptimizerState(twoParam.ExportOptimizerState()!));
+
+        source.Dispose();
+        target.Dispose();
+        twoParam.Dispose();
+    }
+
+    private static FusedOptimizerCheckpoint DecodeExported(byte[] state)
+    {
+        using var reader = new BinaryReader(new MemoryStream(state));
+        reader.ReadInt32();
+        reader.ReadInt32();
+        return FusedOptimizerCheckpointSerializer.Read(reader)!;
     }
 
     private static Tensor<float> CreateTensor(int[] shape, int seed)

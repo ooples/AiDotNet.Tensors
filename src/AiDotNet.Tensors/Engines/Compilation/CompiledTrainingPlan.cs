@@ -5192,6 +5192,55 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     }
 
     /// <inheritdoc/>
+    public byte[]? ExportOptimizerState()
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(CompiledTrainingPlan<T>));
+        var checkpoint = CaptureFusedOptimizerCheckpoint();
+        if (checkpoint is null) return null;
+
+        using var stream = new MemoryStream();
+        using (var writer = new BinaryWriter(stream))
+        {
+            writer.Write(OptimizerStateMagic);
+            writer.Write(OptimizerStateVersion);
+            FusedOptimizerCheckpointSerializer.Write(writer, checkpoint);
+        }
+        return stream.ToArray();
+    }
+
+    /// <inheritdoc/>
+    public void ImportOptimizerState(byte[] state)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(CompiledTrainingPlan<T>));
+        if (state is null) throw new ArgumentNullException(nameof(state));
+
+        FusedOptimizerCheckpoint? checkpoint;
+        try
+        {
+            using var reader = new BinaryReader(new MemoryStream(state, writable: false));
+            if (reader.ReadInt32() != OptimizerStateMagic)
+                throw new InvalidDataException("The payload is not compiled optimizer state (bad magic).");
+            int version = reader.ReadInt32();
+            if (version != OptimizerStateVersion)
+                throw new InvalidDataException(
+                    $"Compiled optimizer state version {version} is not supported (expected {OptimizerStateVersion}).");
+            checkpoint = FusedOptimizerCheckpointSerializer.Read(reader);
+        }
+        catch (EndOfStreamException ex)
+        {
+            throw new InvalidDataException("Compiled optimizer state is truncated.", ex);
+        }
+
+        if (checkpoint is null)
+            throw new InvalidDataException("Compiled optimizer state payload contains no optimizer.");
+        RestoreFusedOptimizerCheckpoint(checkpoint);
+    }
+
+    // "AOPT": identifies an ExportOptimizerState payload so a wrong byte array fails loudly on import.
+    private const int OptimizerStateMagic = 0x54504F41;
+    private const int OptimizerStateVersion = 1;
+
+    /// <inheritdoc/>
     public bool IsCompatibleWith(PlanCompatibilityInfo info)
     {
         return info.GetIncompatibilityReason<T>() is null;
