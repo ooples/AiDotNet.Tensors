@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.132.2](https://github.com/ooples/AiDotNet.Tensors/compare/v0.132.1...v0.132.2) (2026-09-26)
+
+
+### Bug Fixes
+
+* **compilation:** record the saved state graph-mode backwards read ([#1047](https://github.com/ooples/AiDotNet.Tensors/issues/1047)) ([0cb0459](https://github.com/ooples/AiDotNet.Tensors/commit/0cb0459d7f8a579be91b5ee872b39054369a853f))
+
+
+### Performance
+
+* **gpu:** keep the GLA scan and matmul-transposed/fused-linear backwards on the device during training ([#1050](https://github.com/ooples/AiDotNet.Tensors/issues/1050)) ([29e61a1](https://github.com/ooples/AiDotNet.Tensors/commit/29e61a14dd060316362f1715d4fb37dde778af3e))
+* **gpu:** single-launch tile / concat / last-axis slice and batched IRFFT (up to ~100,000x) ([#1048](https://github.com/ooples/AiDotNet.Tensors/issues/1048)) ([3be2431](https://github.com/ooples/AiDotNet.Tensors/commit/3be24314144ce39a0d5cc9f4b09bbd6ef78db98b))
+
 ## [0.132.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.132.0...v0.132.1) (2026-09-24)
 
 
