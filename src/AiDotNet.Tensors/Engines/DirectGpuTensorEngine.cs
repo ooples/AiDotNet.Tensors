@@ -24134,9 +24134,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                                 int tensorAxis = tensor.Shape._dims[normAxis];
                                 int slice = tensorAxis * inner;
                                 using var input = GetOrAllocateBuffer(backend, tensor);
-                                for (int o = 0; o < outer; o++)
-                                    backend.Copy(input.Buffer, o * slice, outBuf.Buffer,
-                                        (o * axisTotal + axisOffset) * inner, slice);
+                                if (outer == 1)
+                                    backend.Copy(input.Buffer, 0, outBuf.Buffer, axisOffset * inner, slice);
+                                else
+                                    // ONE launch per input: row o of the [outer, slice] input goes to columns
+                                    // [axisOffset*inner, +slice) of row o of the [outer, axisTotal*inner] output.
+                                    // Copy2DStrided is on IDirectGpuBackend, so it is recorded/capturable like Copy.
+                                    backend.Copy2DStrided(input.Buffer, outBuf.Buffer, outer, slice,
+                                        axisTotal * inner, axisOffset * inner);
                                 axisOffset += tensorAxis;
                             }
                             int[] outShape = (int[])a.Shape._dims.Clone();
@@ -24190,6 +24195,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             output = backend.AllocateBuffer(total);
             int segment = length[tensor.Rank - 1];
             int rows = total / segment;
+            if (TryLastAxisOnlySlice(backend, input, output, tensor, start, length, rows, segment))
+            {
+                var fast = DeferTensorResult<T>(backend, output, total, (int[])length.Clone());
+                handedOff = true;
+                return fast;
+            }
             var sourceStrides = new int[tensor.Rank];
             sourceStrides[tensor.Rank - 1] = 1;
             for (int d = tensor.Rank - 2; d >= 0; d--)
@@ -24221,6 +24232,47 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             if (!handedOff) output?.Dispose();
         }
+    }
+
+    /// <summary>
+    /// Fast path of <see cref="TryDeviceRectSlice{T}"/> for the common case where only the LAST axis is narrowed
+    /// (every leading axis taken in full): the source is a [rows, D] matrix and the result is columns
+    /// [start, start + width). Uses O(width) single-launch kernels instead of one device copy per row:
+    /// width 1 is one strided gather; start 0 is one row-prefix copy; otherwise each column is gathered
+    /// (width launches) into a [width, rows] buffer and transposed once into [rows, width]. All of these are
+    /// IDirectGpuBackend kernels, so the fast path stays recordable.
+    /// </summary>
+    private static bool TryLastAxisOnlySlice<T>(IDirectGpuBackend backend, IGpuBuffer input, IGpuBuffer output,
+        Tensor<T> tensor, int[] start, int[] length, int rows, int width)
+    {
+        int rank = tensor.Rank;
+        for (int d = 0; d < rank - 1; d++)
+            if (start[d] != 0 || length[d] != tensor.Shape._dims[d]) return false;
+        int full = tensor.Shape._dims[rank - 1];
+        int first = start[rank - 1];
+        if (rows == 1 || width == full) return false;   // already a single contiguous copy in the general path
+        if (width == 1)
+        {
+            backend.StridedGather(input, output, first, full, rows);
+            return true;
+        }
+
+        if (first == 0)
+        {
+            backend.CopyRows(input, output, full, width, rows, width);
+            return true;
+        }
+
+        using var columns = backend.AllocateBuffer(width * rows);
+        using var column = backend.AllocateBuffer(rows);
+        for (int j = 0; j < width; j++)
+        {
+            backend.StridedGather(input, column, first + j, full, rows);
+            backend.Copy(column, 0, columns, j * rows, rows);
+        }
+
+        backend.Transpose(columns, output, width, rows);
+        return true;
     }
 
     private Tensor<T>? TryDeviceSliceAxis<T>(Tensor<T> tensor, int axis, int index)
@@ -24546,9 +24598,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // device-to-host-to-device round trip.
             using var input = GetOrAllocateBuffer(backend, tensor);
             output = backend.AllocateBuffer(total);
-            for (int o = 0; o < outer; o++)
-                for (int r = 0; r < repeats; r++)
-                    backend.Copy(input.Buffer, o * block, output, (o * repeats + r) * block, block);
+            // ONE launch. Viewing the tiled axis and everything after it as a single `block` on a size-1
+            // axis turns the kernel's per-element repeat into this op's block repeat:
+            // output[o, r, :] = input[o, :] for r < repeats. The previous loop issued outer*repeats device
+            // copies -- 50.3M one-element copies to tile a [1024, 1] ReduceSum gradient to [1024, 49152].
+            backend.TileAxis(input.Buffer, output, outer, 1, block, repeats);
 
             var outShape = (int[])tensor.Shape._dims.Clone();
             outShape[tiledAxis] = checked(outShape[tiledAxis] * repeats);
