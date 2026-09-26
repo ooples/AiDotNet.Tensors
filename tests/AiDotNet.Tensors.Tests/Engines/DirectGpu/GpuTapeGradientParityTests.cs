@@ -149,6 +149,48 @@ public class GpuTapeGradientParityTests : IDisposable
         AssertGradientParity("TensorCosh", Rand([4, 16], seed: 21, lo: -2.0, hi: 2.0),
             static (e, t) => e.TensorCosh(t));
 
+    /// <summary>
+    /// Transpose only moves data, so its gradient is exact on both engines and the divergence probe cannot
+    /// show the device ran; the residency counter checks the gradient, and the next test pins the engagement.
+    /// </summary>
+    [SkippableFact]
+    public void TensorTranspose_gradients_match_cpu() =>
+        AssertGradientParity("TensorTranspose", Rand([6, 10], seed: 24),
+            static (e, t) => e.TensorTranspose(t),
+            probe: Engagement.UseResidencyCounter);
+
+    /// <summary>
+    /// Under a recording tape the transpose must launch its kernel and download nothing. It used to bail to
+    /// CpuEngine whenever a tape was active — every training-time transpose went through the host (seen in
+    /// AutoformerModel training: DirectGpuTensorEngine.TensorTranspose -> CpuEngine.TensorTranspose).
+    /// </summary>
+    [SkippableFact]
+    public void TensorTranspose_stays_on_the_device_while_a_tape_records()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu!)
+        {
+            IEngine engine = gpu!;
+            AiDotNetEngine.Current = engine;
+            var x = Rand([6, 10], seed: 25);
+            using var tape = new GradientTape<float>();
+            _ = engine.TensorAdd(x, x);                       // upload x and warm the path outside the count
+            AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Reset();
+
+            var y = engine.TensorTranspose(x);
+
+            long launches = AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Count;
+            long readbacks = AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Readbacks;
+            _out.WriteLine($"TensorTranspose under tape: launches={launches} readbacks={readbacks}");
+            Assert.True(launches >= 1, "TensorTranspose launched no GPU kernel while a tape was recording — it ran on the CPU.");
+            Assert.Equal(0, readbacks);
+            Assert.Equal(new[] { 10, 6 }, y.Shape.ToArray());
+            for (int r = 0; r < 6; r++)
+                for (int c = 0; c < 10; c++)
+                    Assert.Equal(x[r, c], y[c, r]);
+        }
+    }
+
     [SkippableFact]
     public void TensorSinh_gradients_match_cpu() =>
         AssertGradientParity("TensorSinh", Rand([4, 16], seed: 22, lo: -2.0, hi: 2.0),

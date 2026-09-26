@@ -103,7 +103,6 @@ public class TapeBailAuditTests
         "AdaptiveAvgPool2D",
         "ReduceSum",
         "TensorWhere",
-        "TensorTranspose",
         "BatchNorm",
         "Conv3D",
         "ConvTranspose2D",
@@ -184,6 +183,8 @@ public class TapeBailAuditTests
         // cost guard, so they live in TapeCostGuardOnly instead.
         "TensorSelectScatter",
         "TensorSliceScatter",
+        // Records TransposeBackward on both device paths; see GpuTapeGradientParityTests.TensorTranspose_*.
+        "TensorTranspose",
     };
 
     private static string[] GpuEngineSources(string root)

@@ -20611,8 +20611,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // written and rows ≥ 1 of B stayed uninitialized. Fixed in
         // CudaBackend.Transpose with a real 2D launch
         // (gridX = ceil(cols/16), gridY = ceil(rows/16)).
-        if (IsTapeActive<T>())
-            return base.TensorTranspose(tensor);
+        // No tape bail: the transpose kernel runs during training too, and the result records the SAME node
+        // CpuEngine records (TransposeBackward, no saved state). Bailing here sent every training-time transpose
+        // through the host — a download, a CPU copy and a re-upload per call.
         if (!TryGetBackend(out var backend))
             return base.TensorTranspose(tensor);
         if (tensor.Rank != 2)
@@ -20642,6 +20643,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                         backend.Transpose(inResid, rOutBuf, rows, cols);
                         ResidentSyncCheck("TransposeResident");
                         BindResidentBuffer(rOut, rOutBuf, backend);
+                        Autodiff.DifferentiableOps.RecordUnary("TensorTranspose", rOut, tensor, Autodiff.BackwardFunctions<T>.TransposeBackward);
                         return rOut;
                     }
                 }
@@ -20649,7 +20651,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var bufIn = GetOrAllocateBuffer(backend, tensor);
             var bufOut = AllocateOutputBuffer(backend, tensor.Length);
             backend.Transpose(bufIn.Buffer, bufOut.Buffer, rows, cols);
-            return DeferTensorResult<T>(backend, bufOut.Buffer, tensor.Length, new[] { cols, rows });
+            var transposed = DeferTensorResult<T>(backend, bufOut.Buffer, tensor.Length, new[] { cols, rows });
+            Autodiff.DifferentiableOps.RecordUnary("TensorTranspose", transposed, tensor, Autodiff.BackwardFunctions<T>.TransposeBackward);
+            return transposed;
         }
         catch (Exception)
         {
