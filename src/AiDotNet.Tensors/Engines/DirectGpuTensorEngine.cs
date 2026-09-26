@@ -24225,6 +24225,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         catch (Exception ex) when (ex is not OutOfMemoryException)
         {
+            if (ThrowOnGpuKernelFallback) throw;
             System.Diagnostics.Trace.TraceWarning($"GPU rectangular slice fallback: {ex.GetType().Name}: {ex.Message}");
             return null;
         }
@@ -24263,8 +24264,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return true;
         }
 
-        using var columns = backend.AllocateBuffer(width * rows);
-        using var column = backend.AllocateBuffer(rows);
+        // The column gather costs 2 * width + 1 launches plus two scratch buffers, against one copy per row
+        // on the general path. Take it only when it issues fewer launches: [4, 1000] narrowed to 1000 - 1
+        // columns would otherwise run 2001 launches where the general path runs 4.
+        if (2L * width + 1 >= rows) return false;
+
+        // Scratch buffers are read by kernels still queued when this method returns. CUDA's legacy
+        // synchronous allocator frees on the host, so a plain using-dispose could hand the memory to the
+        // next allocation before Transpose runs; the stream-ordered scratch defers the release until then.
+        using var columns = AllocateStreamOrderedScratch(backend, width * rows);
+        using var column = AllocateStreamOrderedScratch(backend, rows);
         for (int j = 0; j < width; j++)
         {
             backend.StridedGather(input, column, first + j, full, rows);
@@ -24274,6 +24283,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         backend.Transpose(columns, output, width, rows);
         return true;
     }
+
+    private static IGpuBuffer AllocateStreamOrderedScratch(IDirectGpuBackend backend, int size) =>
+        backend is DirectGpu.CUDA.CudaBackend cuda
+            ? cuda.AllocateStreamOrderedScratchBuffer(size)
+            : backend.AllocateBuffer(size);
 
     private Tensor<T>? TryDeviceSliceAxis<T>(Tensor<T> tensor, int axis, int index)
     {
@@ -24626,6 +24640,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (IsTapeActive<T>()) return base.TensorSlice(tensor, start, length);
         if (TryDeviceRectSlice(tensor, start, length) is { } resident) return resident;
+        if (ThrowOnGpuKernelFallback)
+            throw new NotSupportedException("TensorSlice has no eligible GPU route for the selected input.");
         return base.TensorSlice(tensor,start,length);
     }
 

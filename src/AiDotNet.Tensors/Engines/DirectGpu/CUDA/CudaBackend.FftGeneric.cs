@@ -326,6 +326,13 @@ public sealed partial class CudaBackend
         new DeferredFftScratchBuffer(this, AllocateByteBuffer(size));
 
     /// <summary>
+    /// Scratch for engine-level multi-launch sequences whose kernels are still queued when the caller
+    /// disposes the buffer. Same release guarantee as the FFT scratch: stream-ordered on the async
+    /// allocator, event-gated out of the reuse pool on the legacy allocator.
+    /// </summary>
+    internal IGpuBuffer AllocateStreamOrderedScratchBuffer(int size) => AllocateFftScratchBuffer(size);
+
+    /// <summary>
     /// Gives every temporary FFT allocation stream-safe RAII semantics. The normal async
     /// allocator releases in stream order; the legacy allocator records an event and keeps
     /// the buffer out of its reuse pool until all preceding FFT work has completed.

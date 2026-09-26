@@ -482,6 +482,13 @@ __kernel void copy_rows(__global const float* src, __global float* dst, int srcR
     int i = gid % copyLen; int r = gid / copyLen;
     dst[r * dstRowLen + i] = src[r * srcRowLen + i];
 }
+// dst[row, destColOffset + col] = src[row, col] for a [numRows, srcCols] source (concatenate along the last
+// axis). Launched 2D as (srcCols, numRows); the global size can be rounded up past either extent.
+__kernel void copy_2d_strided(__global const float* src, __global float* dst, int numRows, int srcCols, int destTotalCols, int destColOffset) {
+    int col = get_global_id(0); int row = get_global_id(1);
+    if (col >= srcCols || row >= numRows) return;
+    dst[row * destTotalCols + destColOffset + col] = src[row * srcCols + col];
+}
 // Initialize padded index rows (stored as float): idx[r*P + i] = (i < L) ? i : -1.
 __kernel void iota_pad(__global float* idx, int L, int P, int numRows) {
     int gid = get_global_id(0); if (gid >= numRows * P) return;
@@ -679,7 +686,7 @@ __kernel void next_after(__global const float* a, __global const float* b, __glo
             "diag_kernel", "extract_diag_kernel", "triangular_mask",
             "masked_fill_kernel", "index_select", "take_along_dim",
             "cross3", "ldexp_kernel", "kron2d", "search_sorted", "next_after", "index_write", "cdist", "pdist",
-            "histc", "bitonic_step", "copy_rows", "iota_pad", "rwkv7_forward", "hsoftmax_paths",
+            "histc", "bitonic_step", "copy_rows", "copy_2d_strided", "iota_pad", "rwkv7_forward", "hsoftmax_paths",
             "isin", "unfold", "copy_block_2d", "scatter_reduce", "zeta_kernel", "polygamma_kernel", "reflect_pad_1d", "stft_mag_phase", "phase_vocoder", "build_spectrum", "istft_from_spectrum", "istft_normalize", "shifted_diff", "histogramdd", "masks_to_boxes", "pairwise_iou", "logical_op", "logical_not", "gridsample_backward_input", "gridsample_backward_grid"
         };
     }

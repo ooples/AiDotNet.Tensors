@@ -1027,7 +1027,7 @@ public partial class DirectGpuTensorEngine
     internal Tensor<T>? IrfftAdjointGpu<T>(Tensor<T> gradOutput, int numFreqs, int nFft, int outputLength, int[] inputShape)
     {
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend)) return null;
-        if (outputLength <= 0 || nFft <= 0 || numFreqs <= 0) return null;
+        if (outputLength <= 0 || nFft <= 0 || numFreqs <= 0 || (nFft & (nFft - 1)) != 0) return null;
         if (gradOutput.Length % outputLength != 0) return null;
         int batch = gradOutput.Length / outputLength;
         if (batch <= 0) return null;
@@ -1268,8 +1268,14 @@ public partial class DirectGpuTensorEngine
         int interleavedLength = input._shape[^1];
         int numFreqs = interleavedLength / 2;
         int nFft = (numFreqs - 1) * 2;
-        if (numFreqs < 2 || outputLength > nFft)
+        // BatchedFFT is radix-2 on every backend and does not reject other lengths (CUDA/HIP take a truncated
+        // log2 and run too few stages), so a non-power-of-two transform must use the CPU path.
+        if (numFreqs < 2 || outputLength > nFft || (nFft & (nFft - 1)) != 0)
+        {
+            if (ThrowOnGpuKernelFallback)
+                throw new NotSupportedException("IRFFT has no eligible GPU route for this transform length.");
             return base.IRFFT(input, outputLength);
+        }
         int batchSize = input.Length / interleavedLength;
         var outputShape = input.Shape.ToArray();
         outputShape[^1] = outputLength;

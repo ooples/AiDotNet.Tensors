@@ -32,6 +32,25 @@ public sealed class ShapeCopyLaunchCountTests : IClassFixture<DirectGpuTensorEng
         return t;
     }
 
+    /// <summary>
+    /// Runs a GPU call with CPU fallback turned into an exception. IsAvailable only proves a device exists;
+    /// without this, an op that found no GPU route would return the CPU result and the comparison would pass
+    /// without exercising the path under test.
+    /// </summary>
+    private static TResult OnGpuOnly<TResult>(Func<TResult> gpuCall)
+    {
+        bool saved = DirectGpuTensorEngine.ThrowOnGpuKernelFallback;
+        try
+        {
+            DirectGpuTensorEngine.ThrowOnGpuKernelFallback = true;
+            return gpuCall();
+        }
+        finally
+        {
+            DirectGpuTensorEngine.ThrowOnGpuKernelFallback = saved;
+        }
+    }
+
     private static void AssertSame(Tensor<float> expected, Tensor<float> actual)
     {
         Assert.Equal(expected.Shape.ToArray(), actual.Shape.ToArray());
@@ -55,7 +74,7 @@ public sealed class ShapeCopyLaunchCountTests : IClassFixture<DirectGpuTensorEng
     {
         Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
         var x = Rand(shape, 1);
-        AssertSame(_cpu.TensorTile(x, multiples), Gpu.TensorTile(x, multiples));
+        AssertSame(_cpu.TensorTile(x, multiples), OnGpuOnly(() => Gpu.TensorTile(x, multiples)));
     }
 
     public static IEnumerable<object[]> ConcatCases() =>
@@ -71,7 +90,19 @@ public sealed class ShapeCopyLaunchCountTests : IClassFixture<DirectGpuTensorEng
     {
         Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
         var inputs = Enumerable.Range(0, count).Select(i => Rand(shape, 10 + i)).ToArray();
-        AssertSame(_cpu.TensorConcatenate(inputs, axis), Gpu.TensorConcatenate(inputs, axis));
+        AssertSame(_cpu.TensorConcatenate(inputs, axis), OnGpuOnly(() => Gpu.TensorConcatenate(inputs, axis)));
+    }
+
+    /// <summary>
+    /// Inputs of different lengths along the concat axis with outer > 1: each input has its own source width
+    /// and advances the destination column offset by a different amount, which equal-shape cases never test.
+    /// </summary>
+    [SkippableFact]
+    public void Concatenate_UnequalAxisLengths_MatchesCpu()
+    {
+        Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
+        var inputs = new[] { Rand([4, 2, 6], 20), Rand([4, 5, 6], 21), Rand([4, 3, 6], 22) };
+        AssertSame(_cpu.TensorConcatenate(inputs, 1), OnGpuOnly(() => Gpu.TensorConcatenate(inputs, 1)));
     }
 
     public static IEnumerable<object[]> NarrowCases() =>
@@ -81,6 +112,7 @@ public sealed class ShapeCopyLaunchCountTests : IClassFixture<DirectGpuTensorEng
         [new[] { 6, 7, 10 }, 0, 4],       // start 0           -> row-prefix copy
         [new[] { 6, 7, 10 }, 3, 5],       // start > 0, width > 1 -> column gathers + transpose
         [new[] { 6, 7, 10 }, 0, 10],      // full width        -> general path
+        [new[] { 4, 10 }, 2, 7],          // 2 * width + 1 >= rows -> general per-row path (fewer launches)
     ];
 
     [SkippableTheory]
@@ -90,7 +122,7 @@ public sealed class ShapeCopyLaunchCountTests : IClassFixture<DirectGpuTensorEng
         Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
         var x = Rand(shape, 3);
         int last = shape.Length - 1;
-        AssertSame(_cpu.TensorNarrow(x, last, start, length), Gpu.TensorNarrow(x, last, start, length));
+        AssertSame(_cpu.TensorNarrow(x, last, start, length), OnGpuOnly(() => Gpu.TensorNarrow(x, last, start, length)));
     }
 
     public static IEnumerable<object[]> IrfftCases() =>
@@ -112,7 +144,7 @@ public sealed class ShapeCopyLaunchCountTests : IClassFixture<DirectGpuTensorEng
         Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
         var spectrum = Rand([.. batchShape, numFreqs * 2], 5);
         var expected = _cpu.IRFFT(spectrum, outputLength).ToArray();
-        var actual = Gpu.IRFFT(spectrum, outputLength);
+        var actual = OnGpuOnly(() => Gpu.IRFFT(spectrum, outputLength));
         Assert.Equal([.. batchShape, outputLength], actual.Shape.ToArray());
         var a = actual.ToArray();
         double scale = expected.Max(Math.Abs);
@@ -126,6 +158,22 @@ public sealed class ShapeCopyLaunchCountTests : IClassFixture<DirectGpuTensorEng
         Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
         var x = Rand([6, 7, 10], 4);
         int[] start = [1, 2, 3], length = [3, 4, 5];
-        AssertSame(_cpu.TensorSlice(x, start, length), Gpu.TensorSlice(x, start, length));
+        AssertSame(_cpu.TensorSlice(x, start, length), OnGpuOnly(() => Gpu.TensorSlice(x, start, length)));
+    }
+
+    /// <summary>
+    /// BatchedFFT is radix-2 only, so a non-power-of-two transform (numFreqs 4 gives nFft 6) must take the CPU
+    /// path rather than run too few GPU stages. Deliberately unguarded: the CPU fallback is the behavior under test.
+    /// </summary>
+    [SkippableFact]
+    public void Irfft_NonPowerOfTwoLength_FallsBackAndMatchesCpu()
+    {
+        Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
+        var spectrum = Rand([2, 8], 6);
+        var expected = _cpu.IRFFT(spectrum, 6).ToArray();
+        var actual = Gpu.IRFFT(spectrum, 6).ToArray();
+        Assert.Equal(expected.Length, actual.Length);
+        for (int i = 0; i < actual.Length; i++)
+            Assert.True(Math.Abs(actual[i] - expected[i]) <= 1e-5, $"element {i}: expected {expected[i]}, got {actual[i]}");
     }
 }
