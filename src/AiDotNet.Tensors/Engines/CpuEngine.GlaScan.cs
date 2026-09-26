@@ -355,7 +355,8 @@ public partial class CpuEngine
         });
     }
 
-    private static void GlaScanBackward<T>(
+    // internal: the GPU engine's GlaScan tape node falls back to this when its device backward is unavailable.
+    internal static void GlaScanBackward<T>(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output, object[] savedState,
         IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {

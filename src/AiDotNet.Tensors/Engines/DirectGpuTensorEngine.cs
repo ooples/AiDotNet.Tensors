@@ -10351,10 +10351,64 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // Fused GLA scan (#1464). The GPU kernel is the inference fast path; when a tape is
     // active (or T is not float, or no backend), defer to the differentiable CpuEngine path
     // which records the BPTT backward — same precedent as FlashAttention / MlpForward.
+    /// <summary>
+    /// GPU-executed BPTT backward of the fused GLA scan: dQ/dK/dV [batch, seqLen, modelDim] and dGate
+    /// [batch, seqLen, numHeads] via backend.GlaScanBackward (gradient buffers pre-zeroed; the kernel accumulates).
+    /// Returns null when the GPU path is unavailable so the caller falls back to the managed backward.
+    /// </summary>
+    internal Tensor<T>[]? GlaScanBackwardGpu<T>(Tensor<T> gradOutput, Tensor<T>[] inputs, int numHeads)
+    {
+        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend)) return null;
+        var q = inputs[0];
+        int batch = q.Shape._dims[0], seqLen = q.Shape._dims[1], modelDim = q.Shape._dims[2];
+        int headDim = modelDim / numHeads;
+        int n = batch * seqLen * modelDim, ng = batch * seqLen * numHeads;
+        var gradBuffers = new OwnedBuffer[4];
+        int allocated = 0;
+        try
+        {
+            var g = gradOutput.IsContiguous ? gradOutput : (Tensor<T>)gradOutput.Contiguous();
+            using var dOut = GetOrAllocateBuffer(backend, g);
+            using var qB = GetOrAllocateBuffer(backend, inputs[0]);
+            using var kB = GetOrAllocateBuffer(backend, inputs[1]);
+            using var vB = GetOrAllocateBuffer(backend, inputs[2]);
+            using var gB = GetOrAllocateBuffer(backend, inputs[3]);
+            for (; allocated < 4; allocated++)
+                gradBuffers[allocated] = AllocateOutputBuffer(backend, allocated < 3 ? n : ng);
+            for (int i = 0; i < 4; i++) backend.Fill(gradBuffers[i].Buffer, 0f, i < 3 ? n : ng);
+            backend.GlaScanBackward(dOut.Buffer, qB.Buffer, kB.Buffer, vB.Buffer, gB.Buffer,
+                gradBuffers[0].Buffer, gradBuffers[1].Buffer, gradBuffers[2].Buffer, gradBuffers[3].Buffer,
+                batch, seqLen, modelDim, numHeads, headDim);
+            var result = new Tensor<T>[4];
+            for (int i = 0; i < 4; i++)
+            {
+                result[i] = DeferTensorResult<T>(backend, gradBuffers[i].Buffer, i < 3 ? n : ng,
+                    i < 3 ? new[] { batch, seqLen, modelDim } : new[] { batch, seqLen, numHeads });
+                gradBuffers[i].RelinquishOwnership();
+            }
+
+            return result;
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            System.Diagnostics.Trace.TraceWarning($"GPU GLA backward fallback: {ex.GetType().Name}: {ex.Message}");
+            if (ThrowOnGpuKernelFallback) throw;
+            return null;
+        }
+        finally
+        {
+            for (int i = 0; i < allocated; i++) gradBuffers[i].Dispose();
+        }
+    }
+
     public override Tensor<T> GlaScanForward<T>(
         Tensor<T> qProj, Tensor<T> kProj, Tensor<T> vProj, Tensor<T> gate, int numHeads)
     {
-        if (Compilation.GraphMode.IsActive || IsTapeActive<T>() ||
+        // Deliberately does NOT bail on IsTapeActive (same as RFFT/IRFFT): the tape node is recorded below with a
+        // GPU-executed backward (backend.GlaScanBackward, on all six backends). Bailing sent every TRAINING step's
+        // scan -- forward and BPTT backward -- to the managed CPU recurrence with device<->host copies around it,
+        // which was the largest cost of an LM training step on the GPU engine (~2/3 of step time).
+        if (Compilation.GraphMode.IsActive ||
             typeof(T) != typeof(float) || !TryGetBackend(out var backend))
             return base.GlaScanForward(qProj, kProj, vProj, gate, numHeads);
         if (qProj.Rank != 3 || numHeads < 1)
@@ -10395,6 +10449,22 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var result = DeferTensorResult<T>(backend, outB.Buffer, batch * seqLen * modelDim,
                 new[] { batch, seqLen, modelDim });
             outB.RelinquishOwnership();
+            Autodiff.DifferentiableOps.RecordIfActive<T>(
+                "GlaScan", result, new[] { qProj, kProj, vProj, gate },
+                static (gradOutput, inputs, output, savedState, engine, grads) =>
+                {
+                    int heads = (int)savedState[0];
+                    if (engine is DirectGpuTensorEngine gpu
+                        && gpu.GlaScanBackwardGpu(gradOutput, inputs, heads) is { } gpuGrads)
+                    {
+                        for (int i = 0; i < 4; i++)
+                            Autodiff.DifferentiableOps.AccumulateGrad(grads, inputs[i], gpuGrads[i], engine);
+                        return;
+                    }
+
+                    CpuEngine.GlaScanBackward(gradOutput, inputs, output, savedState, engine, grads);
+                },
+                savedState: new object[] { numHeads });
             return result;
         }
         catch
