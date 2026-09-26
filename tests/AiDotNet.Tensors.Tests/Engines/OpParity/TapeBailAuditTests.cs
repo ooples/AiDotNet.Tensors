@@ -94,6 +94,8 @@ public class TapeBailAuditTests
         "AvgPool2D",
         "FlashAttention",
         "GroupedQueryAttention",
+        // FLOAT now records on the device (GpuTapeGradientParityTests.LayerNorm_*); the non-float tape still bails because
+        // the FP16 half-store branch saves INVERSE std where LayerNormBackward expects variance. Remove once that holds.
         "LayerNorm",
         "RMSNorm",
         "GroupNorm",

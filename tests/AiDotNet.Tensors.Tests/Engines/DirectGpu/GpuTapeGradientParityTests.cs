@@ -251,6 +251,27 @@ public class GpuTapeGradientParityTests : IDisposable
         }
     }
 
+    private static readonly Tensor<float> LnGamma = Rand([10], seed: 31, lo: 0.5, hi: 1.5);
+    private static readonly Tensor<float> LnBeta = Rand([10], seed: 32);
+
+    /// <summary>
+    /// LayerNorm's backward consumes the forward's per-row mean and variance, so a wrong saved state (the GPU
+    /// kernel's variance slot holds INVERSE std until converted) shows up as a gradient mismatch, not rounding.
+    /// </summary>
+    [SkippableFact]
+    public void LayerNorm_gradients_match_cpu() =>
+        AssertGradientParity("LayerNorm", Rand([6, 10], seed: 33, lo: -2.0, hi: 2.0),
+            static (e, t) => e.LayerNorm(t, LnGamma, LnBeta, 1e-5, out _, out _));
+
+    [SkippableFact]
+    public void LayerNorm_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("LayerNorm", static (e, t) => e.LayerNorm(t, LnGamma, LnBeta, 1e-5, out _, out _),
+            static (x, y) =>
+            {
+                var expected = new CpuEngine().LayerNorm(x, LnGamma, LnBeta, 1e-5, out _, out _);
+                for (int i = 0; i < expected.Length; i++) Assert.Equal(expected[i], y[i], 4);
+            });
+
     [SkippableFact]
     public void TensorAddScalar_gradients_match_cpu() =>
         AssertGradientParity("TensorAddScalar", Rand([4, 16], seed: 26), static (e, t) => e.TensorAddScalar(t, 0.75f),

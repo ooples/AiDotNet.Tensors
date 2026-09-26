@@ -20921,7 +20921,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> LayerNorm<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
         ValidateLayerNormArguments(input, gamma, beta);
-        if (IsTapeActive<T>()) return base.LayerNorm(input, gamma, beta, epsilon, out mean, out variance);
+        // A float tape runs the kernel and records CpuEngine's node below: the FP32 path already produces the
+        // per-row mean and (converted) variance LayerNormBackward saves. Only a non-float tape stays on the CPU —
+        // the FP16 half-store branch leaves INVERSE std in its variance slot, which that backward cannot take.
+        if (IsTapeActive<T>() && typeof(T) != typeof(float)) return base.LayerNorm(input, gamma, beta, epsilon, out mean, out variance);
         if (!TryGetBackend(out var backend) || input.Rank < 2)
             return base.LayerNorm(input, gamma, beta, epsilon, out mean, out variance);
 
@@ -21005,6 +21008,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             mean = DeferTensorResult<T>(backend, bufMean.Buffer, outerSize, batchShape);
             variance = DeferTensorResult<T>(backend, bufVar.Buffer, outerSize, batchShape);
             ownershipTransferred = true;
+            Autodiff.DifferentiableOps.RecordIfActive("LayerNorm", result, new[] { input, gamma, beta },
+                Autodiff.BackwardFunctions<T>.LayerNormBackward, new object[] { mean, variance, epsilon });
             return result;
         }
         catch (Exception)
