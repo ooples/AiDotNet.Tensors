@@ -17,7 +17,7 @@ using AiDotNet.Tensors.Helpers;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
-public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IMultiTensorGpuOptimizerBackend, AiDotNet.Tensors.Engines.Gpu.IGpuHalfPrecisionBackend, IPixelShuffleBackend, INativeGpuCodegenExecutor
+public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IMultiTensorGpuOptimizerBackend, AiDotNet.Tensors.Engines.Gpu.IGpuHalfPrecisionBackend, IPixelShuffleBackend, INativeGpuCodegenExecutor
 {
     // During teardown the CUDA driver/context may already be destroyed, so calling driver
     // APIs (cuCtxPushCurrent / cuMemFree / cuCtxPopCurrent / cuCtxDestroy / cuModuleUnload)
@@ -1699,6 +1699,26 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IntPtr devicePtr = AllocDeviceMemoryWithRetry(byteSize);
         CuBlasNative.CheckCudaResult(CuBlasNative.cuMemsetD32(devicePtr, 0, (ulong)size), "cuMemsetD32");
         return new CudaGpuBuffer(_cudaContext, devicePtr, size, _bufferPool.Return);
+    }
+
+    /// <inheritdoc/>
+    public IGpuBuffer AllocateBufferUninitialized(int size)
+    {
+        if (!IsAvailable)
+            throw new InvalidOperationException("CUDA backend is not available.");
+        if (size <= 0)
+            throw new ArgumentOutOfRangeException(nameof(size), "Buffer size must be positive.");
+        GpuBufferSizeGuard.EnsureFits("CUDA", (long)size * sizeof(float), MaxBufferAllocBytes, DeviceName);
+        RecordDirectPtxEvidenceDeviceAllocation(checked((long)size * sizeof(float)));
+        // Only the stream-ordered allocator skips the fill: the legacy path's pooled buffers are recycled across
+        // the null stream, so keep its zeroing (and everything else about it) exactly as AllocateBuffer does.
+        if (!_asyncAlloc)
+            return AllocateBuffer(size);
+        using var _ = PushContext();
+        if (TryRentAsyncBuffer(size) is { } reused)
+            return reused;
+        var p = AllocDeviceMemoryAsync((ulong)size * sizeof(float));
+        return new CudaGpuBuffer(_cudaContext, p, size, returnToPool: ReturnAsyncBuffer, asyncFreeStream: _stream);
     }
 
     public IGpuBuffer AllocateByteBuffer(int size)

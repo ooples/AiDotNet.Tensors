@@ -2754,6 +2754,21 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <summary>
     /// Allocates a new output buffer (always owned, never cached).
     /// </summary>
+    /// <summary>
+    /// As <see cref="AllocateOutputBuffer"/>, but the buffer is NOT zero-filled when the backend supports it — for
+    /// outputs the following kernel writes in full (elementwise maps, GEMM with beta = 0). See
+    /// <see cref="IUninitializedGpuAllocation"/> for why, and for what must never use it.
+    /// </summary>
+    private static OwnedBuffer AllocateFullyWrittenOutputBuffer(IDirectGpuBackend backend, int size)
+    {
+        var eng = s_residentScratchEngine;
+        if (eng is not null && eng.ScratchPoolingActive)
+            return new OwnedBuffer(eng.RentActionScratchOrAllocate(backend, size), ownsBuffer: false);
+        return backend is IUninitializedGpuAllocation uninitialized
+            ? new OwnedBuffer(uninitialized.AllocateBufferUninitialized(size), ownsBuffer: true)
+            : new OwnedBuffer(backend.AllocateBuffer(size), ownsBuffer: true);
+    }
+
     private static OwnedBuffer AllocateOutputBuffer(IDirectGpuBackend backend, int size)
     {
         // PR #638 capture-determinism: inside a compiled action during the resident step, draw from the engine's
@@ -3679,7 +3694,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         Gpu.GpuComputePlan precisionPlan)
     {
         using var bufferA = GetOrAllocateBuffer(backend, input);
-        var bufferB = AllocateOutputBuffer(backend, input.Length);
+        var bufferB = AllocateFullyWrittenOutputBuffer(backend, input.Length);
         try
         {
             if (precisionPlan.InputStorage == Gpu.GpuScalarType.Float16)
@@ -3937,7 +3952,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         using var bufferA = GetOrAllocateBuffer(backend, left);
         using var bufferB = GetOrAllocateBuffer(backend, right);
-        var bufferC = AllocateOutputBuffer(backend, left.Length);
+        var bufferC = AllocateFullyWrittenOutputBuffer(backend, left.Length);
         try
         {
             if (precisionPlan.InputStorage == Gpu.GpuScalarType.Float16)
@@ -20154,7 +20169,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         using var bufferA = GetOrAllocateBuffer(backend, a);
         using var bufferB = GetOrAllocateBuffer(backend, b);
-        var bufferOut = AllocateOutputBuffer(backend, checked(m * n));
+        var bufferOut = AllocateFullyWrittenOutputBuffer(backend, checked(m * n));
         try
         {
             if (plan.InputStorage == Gpu.GpuScalarType.Float16)
@@ -20206,7 +20221,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         using var bufferA = GetOrAllocateBuffer(backend, a);
         using var bufferB = GetOrAllocateBuffer(backend, b);
         var outputLength = checked(batchCount * m * n);
-        var bufferOut = AllocateOutputBuffer(backend, outputLength);
+        var bufferOut = AllocateFullyWrittenOutputBuffer(backend, outputLength);
         try
         {
             backend.BatchedGemm(bufferA.Buffer, bufferB.Buffer, bufferOut.Buffer, m, n, k, batchCount);

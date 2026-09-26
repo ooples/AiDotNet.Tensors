@@ -55,6 +55,25 @@ public class CudaStreamOrderedReuseTests
     }
 
     [SkippableFact]
+    public void An_uninitialized_allocation_skips_the_fill()
+    {
+        // The whole point: an output the next kernel overwrites must not pay a memset (about a launch on WDDM).
+        // Reusing the previous owner's buffer makes that observable — its contents survive.
+        Skip.IfNot(TryCuda(out var engine, out var cuda), "CUDA backend not available.");
+        using (engine!)
+        {
+            var first = cuda!.AllocateBuffer(53);
+            cuda.Fill(first, 7f, 53);
+            var address = first.Handle;
+            first.Dispose();
+
+            using var second = cuda.AllocateBufferUninitialized(53);
+            Assert.Equal(address, second.Handle);
+            Assert.All(cuda.DownloadBuffer(second), v => Assert.Equal(7f, v));
+        }
+    }
+
+    [SkippableFact]
     public void Reuse_is_ordered_after_queued_work_that_still_reads_the_old_contents()
     {
         // A kernel queued BEFORE the dispose reads the old buffer; the new owner then overwrites it. Stream order must
