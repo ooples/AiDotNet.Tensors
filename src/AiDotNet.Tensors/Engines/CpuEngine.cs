@@ -7555,7 +7555,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (positions._shape.Length != 2 || positions._shape[1] != 3)
             throw new ArgumentException("Positions must be 2D tensor of shape [N, 3]", nameof(positions));
         var outputShape = new[] { positions._shape[0], grid._shape[3] };
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_grid = grid; var c_positions = positions; return scope.RecordBinary(LazyNodeType.Custom, "TensorTrilinearInterpolate", grid, positions, outputShape, (eng, output) => { var r = eng.TensorTrilinearInterpolate(c_grid, c_positions); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.TrilinearInterpolateBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_grid = grid; var c_positions = positions; return scope.RecordBinary(LazyNodeType.Custom, "TensorTrilinearInterpolate", grid, positions, outputShape, (eng, output) => { var r = eng.TensorTrilinearInterpolate(c_grid, c_positions); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.TrilinearInterpolateBackward, savedState: new object[] { c_positions }); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorTrilinearInterpolate", outputShape); if (ac is not null) return ac.Execute(); }
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -23452,7 +23452,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (order < 1)
             throw new ArgumentOutOfRangeException(nameof(order), order, "Order must be at least 1.");
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_order = order; var c_axis = axis; return scope.RecordUnary(LazyNodeType.Custom, "TaylorSoftmax", input, input._shape, (eng, output) => { var r = eng.TaylorSoftmax(c_input, c_order, c_axis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.SoftmaxBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_order = order; var c_axis = axis; return scope.RecordUnary(LazyNodeType.Custom, "TaylorSoftmax", input, input._shape, (eng, output) => { var r = eng.TaylorSoftmax(c_input, c_order, c_axis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.TaylorSoftmaxBackward, savedState: new object[] { c_order, c_axis }); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TaylorSoftmax", input._shape); if (ac is not null) return ac.Execute(); }
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -23624,7 +23624,7 @@ public partial class CpuEngine : ITensorLevelEngine
     public Tensor<T> Sparsemax<T>(Tensor<T> input, int axis = -1)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_axis = axis; return scope.RecordUnary(LazyNodeType.Custom, "Sparsemax", input, input._shape, (eng, output) => { var r = eng.Sparsemax(c_input, c_axis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.SparsemaxBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_axis = axis; return scope.RecordUnary(LazyNodeType.Custom, "Sparsemax", input, input._shape, (eng, output) => { var r = eng.Sparsemax(c_input, c_axis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.SparsemaxBackward, savedState: new object[] { c_axis }); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("Sparsemax", input._shape); if (ac is not null) return ac.Execute(); }
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -32008,7 +32008,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (indices == null)
             throw new ArgumentNullException(nameof(indices));
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var cs = source; var ci = indices; var cd = dim; var co = outputSize; return scope.RecordUnary(LazyNodeType.Custom, "ScatterSoftmax", source, source._shape, (eng, output) => { var r = eng.ScatterSoftmax(cs, ci, cd, co); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.ScatterSoftmaxBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var cs = source; var ci = indices; var cd = dim; var co = outputSize; return scope.RecordUnary(LazyNodeType.Custom, "ScatterSoftmax", source, source._shape, (eng, output) => { var r = eng.ScatterSoftmax(cs, ci, cd, co); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.ScatterSoftmaxBackward, savedState: new object[] { ci }); } }
 
         { var ac = AutoTracer.TryGetCompiledPlan<T>("ScatterSoftmax", source._shape); if (ac is not null) return ac.Execute(); }
 
@@ -35493,7 +35493,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var outputShape = new int[tensor._shape.Length];
         Array.Copy(tensor._shape, outputShape, tensor._shape.Length);
         outputShape[axis] *= repeats;
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_tensor = tensor; var c_repeats = repeats; var c_axis = axis; return scope.RecordUnary(LazyNodeType.Custom, "TensorRepeatElements", tensor, outputShape, (eng, output) => { var r = eng.TensorRepeatElements(c_tensor, c_repeats, c_axis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.RepeatElementsBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_tensor = tensor; var c_repeats = repeats; var c_axis = axis; return scope.RecordUnary(LazyNodeType.Custom, "TensorRepeatElements", tensor, outputShape, (eng, output) => { var r = eng.TensorRepeatElements(c_tensor, c_repeats, c_axis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.RepeatElementsBackward, savedState: new object[] { c_repeats, c_axis }); } }
 
         var result = AutoTensorCache.RentOrAllocate<T>(outputShape);
 
@@ -36294,7 +36294,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (indices == null) throw new ArgumentNullException(nameof(indices));
         if (updates == null) throw new ArgumentNullException(nameof(updates));
         GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_destination = destination; var c_indices = indices; var c_updates = updates; var c_axis = axis; return scope.RecordBinary(LazyNodeType.Custom, "TensorScatterAdd", destination, updates, destination._shape, (eng, output) => { var r = eng.TensorScatterAdd(c_destination, c_indices, c_updates, c_axis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.ScatterAddBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_destination = destination; var c_indices = indices; var c_updates = updates; var c_axis = axis; return scope.RecordBinary(LazyNodeType.Custom, "TensorScatterAdd", destination, updates, destination._shape, (eng, output) => { var r = eng.TensorScatterAdd(c_destination, c_indices, c_updates, c_axis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.ScatterAddBackward, savedState: new object[] { c_indices, c_axis }); } }
 
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
 
@@ -47864,7 +47864,7 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentException("Complex tensors must have even length (interleaved re/im).");
         var ops = MathHelper.GetNumericOperations<T>();
         int pairs = a.Length / 2;
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c = a; return scope.RecordUnary(LazyNodeType.Custom, "ComplexMagnitude", a, new[] { pairs }, (eng, output) => { var r = eng.TensorComplexMagnitude(c); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.ComplexMagnitudeBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c = a; return scope.RecordUnary(LazyNodeType.Custom, "ComplexMagnitude", a, new[] { pairs }, (eng, output) => { var r = eng.TensorComplexMagnitude(c); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.ComplexMagnitudeBackward, savedState: new object[] { c }); } }
 
         var result = new Tensor<T>(new[] { pairs });
 
@@ -51240,7 +51240,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (logProbs.Rank != 3)
             throw new ArgumentException("logProbs must be 3D [T, N, C].");
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var clp = logProbs; var ct = targets; var cil = inputLengths; var ctl = targetLengths; var cb = blank; var outShape = new[] { logProbs._shape[1] }; return scope.RecordUnary(LazyNodeType.Custom, "CTCLoss", logProbs, outShape, (eng, output) => { var r = eng.TensorCTCLoss(clp, ct, cil, ctl, cb); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.CTCLossBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var clp = logProbs; var ct = targets; var cil = inputLengths; var ctl = targetLengths; var cb = blank; var outShape = new[] { logProbs._shape[1] }; return scope.RecordUnary(LazyNodeType.Custom, "CTCLoss", logProbs, outShape, (eng, output) => { var r = eng.TensorCTCLoss(clp, ct, cil, ctl, cb); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.CTCLossBackward, savedState: new object[] { clp, ct, cil, ctl, cb }); } }
 
         var ops = MathHelper.GetNumericOperations<T>();
         int maxT = logProbs._shape[0];
