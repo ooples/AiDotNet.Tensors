@@ -4855,6 +4855,73 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     internal void RestoreFusedOptimizerCheckpoint(FusedOptimizerCheckpoint checkpoint)
     {
         if (checkpoint is null) throw new ArgumentNullException(nameof(checkpoint));
+        ValidateCheckpointEnums(checkpoint);
+        if (checkpoint.Parameters.Length != _parameters.Length)
+            throw new InvalidDataException(
+                $"Optimizer checkpoint has {checkpoint.Parameters.Length} parameter states but plan has {_parameters.Length} parameters.");
+
+        // Restoring reconfigures the optimizer before per-parameter state sizes can be checked against the freshly
+        // allocated buffers, so a payload that fails part-way must not leave a half-restored plan behind: put the
+        // previous optimizer back (or none, if there was none) and report the payload as invalid.
+        var previous = CaptureFusedOptimizerCheckpoint();
+        var previousMomentMode = _momentStorageMode;
+        var previousBlockSize = _int8MomentBlockSize;
+        var previousMaxGradNorm = _maxGradNorm;
+        try
+        {
+            RestoreFusedOptimizerCheckpointCore(checkpoint);
+        }
+        catch (Exception ex) when (ex is InvalidDataException || ex is ArgumentException || ex is OverflowException)
+        {
+            if (previous is not null)
+            {
+                RestoreFusedOptimizerCheckpointCore(previous);
+            }
+            else
+            {
+                ClearFusedOptimizer();
+                _momentStorageMode = previousMomentMode;
+                _int8MomentBlockSize = previousBlockSize;
+                _maxGradNorm = previousMaxGradNorm;
+            }
+
+            if (ex is InvalidDataException) throw;
+            throw new InvalidDataException($"Optimizer checkpoint does not fit this plan: {ex.Message}", ex);
+        }
+    }
+
+    /// <summary>Rejects enum values no writer can produce, as corrupt data rather than an unsupported optimizer.</summary>
+    private static void ValidateCheckpointEnums(FusedOptimizerCheckpoint checkpoint)
+    {
+        if (!Enum.IsDefined(typeof(OptimizerType), checkpoint.OptimizerType))
+            throw new InvalidDataException($"Optimizer checkpoint names an unknown optimizer type {(int)checkpoint.OptimizerType}.");
+        if (!Enum.IsDefined(typeof(FusedMomentStorageMode), checkpoint.MomentStorageMode))
+            throw new InvalidDataException($"Optimizer checkpoint names an unknown moment storage mode {(int)checkpoint.MomentStorageMode}.");
+        if (checkpoint.GroupOptimizerTypes is { } groupTypes)
+        {
+            foreach (var type in groupTypes)
+            {
+                if (!Enum.IsDefined(typeof(OptimizerType), type))
+                    throw new InvalidDataException($"Optimizer checkpoint names an unknown group optimizer type {(int)type}.");
+            }
+        }
+    }
+
+    /// <summary>Releases the configured fused optimizer so the plan steps without one, as before configuration.</summary>
+    private void ClearFusedOptimizer()
+    {
+        foreach (var buf in _gpuOptimizerBuffers)
+            buf.Dispose();
+        _gpuOptimizerBuffers.Clear();
+        ReturnPooledMoments(_optimizerRuntimeState);
+        _optimizerRuntimeState = null;
+        _optimizerUpdate = null;
+        _optimizerStep = 0;
+        InvalidateCapturedStepGraph();
+    }
+
+    private void RestoreFusedOptimizerCheckpointCore(FusedOptimizerCheckpoint checkpoint)
+    {
         if (checkpoint.Parameters.Length != _parameters.Length)
             throw new InvalidDataException(
                 $"Optimizer checkpoint has {checkpoint.Parameters.Length} parameter states but plan has {_parameters.Length} parameters.");
@@ -4985,16 +5052,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             {
                 case FusedMomentStorageMode.BFloat16:
                     if (state.MBFloat16 is not null)
-                        ReplaceGpuByteStateBuffer(rt.GpuM!, p, backend, UShortArrayToBytes(state.MBFloat16));
+                        ReplaceGpuByteStateBuffer(rt.GpuM!, p, backend, UShortArrayToBytes(state.MBFloat16), sizeof(ushort));
                     if (state.VBFloat16 is not null)
-                        ReplaceGpuByteStateBuffer(rt.GpuV!, p, backend, UShortArrayToBytes(state.VBFloat16));
+                        ReplaceGpuByteStateBuffer(rt.GpuV!, p, backend, UShortArrayToBytes(state.VBFloat16), sizeof(ushort));
                     break;
 
                 case FusedMomentStorageMode.Int8BlockQuantized:
                     if (state.MQuantized is not null)
-                        ReplaceGpuByteStateBuffer(rt.GpuM!, p, backend, state.MQuantized);
+                        ReplaceGpuByteStateBuffer(rt.GpuM!, p, backend, state.MQuantized, sizeof(byte));
                     if (state.VQuantized is not null)
-                        ReplaceGpuByteStateBuffer(rt.GpuV!, p, backend, state.VQuantized);
+                        ReplaceGpuByteStateBuffer(rt.GpuV!, p, backend, state.VQuantized, sizeof(byte));
                     if (state.MScales is not null)
                         ReplaceGpuFloatStateBuffer(rt.GpuMScales!, p, backend, ToFloatArray(state.MScales));
                     if (state.VScales is not null)
@@ -5034,6 +5101,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         float[] data)
     {
         var old = buffers[index];
+        if (old is not null && old.Size != data.Length)
+            throw new InvalidDataException(
+                $"Optimizer checkpoint state length mismatch for parameter {index}: checkpoint={data.Length}, plan={old.Size}.");
         if (old is not null)
         {
             _gpuOptimizerBuffers.Remove(old);
@@ -5048,8 +5118,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         Engines.DirectGpu.IGpuBuffer?[] buffers,
         int index,
         Engines.DirectGpu.IDirectGpuBackend backend,
-        byte[] data)
+        byte[] data,
+        int bytesPerElement)
     {
+        // Checked against the size capture writes (parameter length x bytes per element), not the buffer's reported
+        // size, which a backend may round up for alignment.
+        long expectedBytes = checked((long)_parameters[index].Length * bytesPerElement);
+        if (data.Length != expectedBytes)
+            throw new InvalidDataException(
+                $"Optimizer checkpoint state byte length mismatch for parameter {index}: checkpoint={data.Length}, plan={expectedBytes}.");
         var old = buffers[index];
         if (old is not null)
         {

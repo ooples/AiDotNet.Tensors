@@ -487,6 +487,75 @@ public class TrainingPlanSerializationTests
         twoParam.Dispose();
     }
 
+    [Fact]
+    public void ImportOptimizerState_UnknownOptimizerType_IsInvalidData()
+    {
+        var engine = new CpuEngine();
+        var source = CompileLinearPlan(engine, CreateTensor(new[] { 3, 2 }, seed: 5));
+        ConfigureCheckpointOptimizer(source, OptimizerType.Adam);
+        source.Step();
+        byte[] state = source.ExportOptimizerState()!;
+
+        // Layout: magic (4), version (4), has-optimizer flag (1), then the optimizer type as an int32.
+        BitConverter.GetBytes(9999).CopyTo(state, 9);
+        var target = CompileLinearPlan(engine, CreateTensor(new[] { 3, 2 }, seed: 6));
+        Assert.Throws<InvalidDataException>(() => target.ImportOptimizerState(state));
+        Assert.Null(target.ExportOptimizerState());
+
+        source.Dispose();
+        target.Dispose();
+    }
+
+    [Fact]
+    public void ImportOptimizerState_StateSizeMismatch_LeavesTheConfiguredOptimizerUntouched()
+    {
+        // Same parameter COUNT, different parameter SIZE: the mismatch only surfaces after the optimizer has been
+        // reconfigured, so the import must roll back rather than leave a half-restored plan.
+        var engine = new CpuEngine();
+        var foreign = CompileLinearPlan(engine, CreateTensor(new[] { 4, 2 }, seed: 5));
+        ConfigureCheckpointOptimizer(foreign, OptimizerType.Adam);
+        foreign.Step();
+        byte[] foreignState = foreign.ExportOptimizerState()!;
+
+        var weight = CreateTensor(new[] { 3, 2 }, seed: 71);
+        var target = CompileLinearPlan(engine, weight);
+        ConfigureCheckpointOptimizer(target, OptimizerType.SGDMomentum);
+        for (int i = 0; i < 3; i++) target.Step();
+        var before = CaptureCheckpoint(target);
+
+        Assert.Throws<InvalidDataException>(() => target.ImportOptimizerState(foreignState));
+        AssertOptimizerCheckpointEqual(before, CaptureCheckpoint(target), "after a rejected import");
+
+        // And it still trains as if nothing happened: compare against a twin that never saw the bad payload.
+        var twinWeight = CreateTensor(new[] { 3, 2 }, seed: 71);
+        var twin = CompileLinearPlan(engine, twinWeight);
+        ConfigureCheckpointOptimizer(twin, OptimizerType.SGDMomentum);
+        for (int i = 0; i < 3; i++) twin.Step();
+        target.Step();
+        twin.Step();
+        AssertEqual(twinWeight.AsSpan().ToArray(), weight.AsSpan().ToArray(), 0f, "weights after a rejected import");
+
+        foreign.Dispose();
+        target.Dispose();
+        twin.Dispose();
+    }
+
+    [Fact]
+    public void ImportOptimizerState_StateSizeMismatch_OnAPlanWithNoOptimizer_LeavesItWithout()
+    {
+        var engine = new CpuEngine();
+        var foreign = CompileLinearPlan(engine, CreateTensor(new[] { 4, 2 }, seed: 5));
+        ConfigureCheckpointOptimizer(foreign, OptimizerType.Adam);
+        foreign.Step();
+
+        var target = CompileLinearPlan(engine, CreateTensor(new[] { 3, 2 }, seed: 6));
+        Assert.Throws<InvalidDataException>(() => target.ImportOptimizerState(foreign.ExportOptimizerState()!));
+        Assert.Null(target.ExportOptimizerState());
+
+        foreign.Dispose();
+        target.Dispose();
+    }
+
     private static FusedOptimizerCheckpoint DecodeExported(byte[] state)
     {
         using var reader = new BinaryReader(new MemoryStream(state));
