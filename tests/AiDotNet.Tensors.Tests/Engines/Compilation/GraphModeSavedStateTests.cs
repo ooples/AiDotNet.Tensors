@@ -24,20 +24,37 @@ public class GraphModeSavedStateTests
         return t;
     }
 
+private static Tensor<double> EagerGradient(
+        IEngine engine, int[] paramShape, Func<int, double> values, Func<IEngine, Tensor<double>, Tensor<double>> op)
+    {
+        var x = Filled(paramShape, values);
+        using var tape = new GradientTape<double>();
+        var y = op(engine, x);
+        var w = Filled(y._shape, i => 0.5 + 0.25 * (i % 5));
+        var loss = engine.ReduceSum(engine.TensorMultiply(y, w), null);
+        return tape.ComputeGradients(loss, sources: new[] { x })[x];
+    }
+
+    private static void AssertSameGradient(Tensor<double> eager, Tensor<double>? compiled, string step)
+    {
+        Assert.NotNull(compiled);
+        if (compiled is null) return;
+        Assert.Equal(eager.Length, compiled.Length);
+        for (int i = 0; i < eager.Length; i++)
+            Assert.True(Math.Abs(eager[i] - compiled[i]) < 1e-9,
+                $"{step}: grad[{i}] eager={eager[i]:R} compiled={compiled[i]:R}");
+    }
+
+    /// <summary>
+    /// Replays the compiled plan twice: once at the traced values, then again after the parameter
+    /// changes in place. Each replay's gradient must match a fresh eager gradient at the same
+    /// values, so a backward that kept saved state from an earlier replay cannot pass.
+    /// </summary>
     private static void AssertCompiledGradientMatchesEager(
         int[] paramShape, Func<int, double> init, Func<IEngine, Tensor<double>, Tensor<double>> op)
     {
         var engine = new CpuEngine();
-
-        var xE = Filled(paramShape, init);
-        Tensor<double> eager;
-        using (var tape = new GradientTape<double>())
-        {
-            var y = op(engine, xE);
-            var w = Filled(y._shape, i => 0.5 + 0.25 * (i % 5));
-            var loss = engine.ReduceSum(engine.TensorMultiply(y, w), null);
-            eager = tape.ComputeGradients(loss, sources: new[] { xE })[xE];
-        }
+        Func<int, double> changed = i => init(i) + 0.05 * ((i % 3) + 1);
 
         var xF = Filled(paramShape, init);
         ICompiledTrainingPlan<double> plan;
@@ -52,13 +69,12 @@ public class GraphModeSavedStateTests
         {
             plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.0f);
             plan.Step();
-        }
-        var compiled = xF.Grad ?? throw new InvalidOperationException("The compiled step produced no gradient.");
+            AssertSameGradient(EagerGradient(engine, paramShape, init, op), xF.Grad, "first replay");
 
-        Assert.Equal(eager.Length, compiled.Length);
-        for (int i = 0; i < eager.Length; i++)
-            Assert.True(Math.Abs(eager[i] - compiled[i]) < 1e-9,
-                $"grad[{i}] eager={eager[i]:R} compiled={compiled[i]:R}");
+            for (int i = 0; i < xF.Length; i++) xF[i] = changed(i);
+            plan.Step();
+            AssertSameGradient(EagerGradient(engine, paramShape, changed, op), xF.Grad, "replay after the parameter changed");
+        }
     }
 
     [Fact]
@@ -119,4 +135,11 @@ public class GraphModeSavedStateTests
     public void ReduceLogVariance_CompiledBackward_MatchesEager()
         => AssertCompiledGradientMatchesEager(new[] { 3, 5 }, i => 0.1 * i + 0.05 * (i % 3),
             (e, x) => e.ReduceLogVariance(x, new[] { 1 }, false, 1e-8));
+    [Fact]
+    public void TrilinearInterpolate_CompiledBackward_MatchesEager()
+    {
+        var positions = new Tensor<double>(new[] { 0.5, 1.25, 0.75, 1.5, 0.25, 1.75, 0.9, 0.9, 0.3 }, new[] { 3, 3 });
+        AssertCompiledGradientMatchesEager(new[] { 3, 3, 3, 2 }, i => 0.1 * (i % 7) - 0.2,
+            (e, x) => e.TensorTrilinearInterpolate(x, positions));
+    }
 }
