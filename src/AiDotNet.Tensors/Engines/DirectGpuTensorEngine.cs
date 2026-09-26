@@ -4646,7 +4646,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// cache by backing array), big enough for `need`, WITHOUT uploading or allocating. Returns null when not
     /// resident. Capture-safe (unlike GetResidentOrPersistentInputBuffer, which may upload/allocate). Used to
     /// propagate residency through metadata-only views (Reshape) during the resident step.</summary>
-    private IGpuBuffer? ResolveResidentBufferNoUpload<T>(IDirectGpuBackend backend, Tensor<T> t, int need)
+    /// <param name="includePersistentWeightCache">False when the caller will WRITE the resolved buffer in place.
+    /// A persistent weight-cache entry is an uploaded COPY of a host-authoritative tensor (a weight a GPU inference
+    /// pass cached), not that tensor's residency: mutating it and binding the tensor to it leaves the result only in
+    /// a deferred download, which the host-authoritative post-optimizer invalidation then discards.</param>
+    private IGpuBuffer? ResolveResidentBufferNoUpload<T>(IDirectGpuBackend backend, Tensor<T> t, int need, bool includePersistentWeightCache = true)
     {
         bool residentStep = ResidentStepActive;
         int hostVersion = residentStep ? 0 : t.GpuCacheVersion;
@@ -4663,7 +4667,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var arr = t.GetBackingArrayForCacheLookupUnsafe();
         if (arr is not null)
         {
-            var cached = TryGetCachedBuffer(arr);
+            var cached = includePersistentWeightCache ? TryGetCachedBuffer(arr) : null;
             if (cached is not null && cached.Handle != System.IntPtr.Zero && cached.Size >= need
                 && (residentStep || (_persistentWeightHostVersion.TryGetValue(arr, out var stamped)
                     && stamped == hostVersion)))
@@ -6571,7 +6575,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // comment identifies as making this safe.
         if (!Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
             && a.IsContiguous && b.IsContiguous && a.Length == b.Length
-            && ResolveResidentBufferNoUpload(backend, a, a.Length) is { } aResident
+            // The target must be resident in its OWN right (bound buffer / activation), never via a persistent
+            // weight-cache copy: after a GPU inference pass cached a weight, `weight -= update` used to write that
+            // copy, bind the weight to it and leave the host stale behind a deferred download -- which the
+            // optimizer's post-step invalidation (host treated as authoritative) dropped, so every update was lost
+            // (a float network trained after a GPU Predict never moved). The host path below uses the same cached
+            // buffer and downloads the result synchronously, keeping host and cache coherent.
+            && ResolveResidentBufferNoUpload(backend, a, a.Length, includePersistentWeightCache: false) is { } aResident
             && ResolveResidentBufferNoUpload(backend, b, b.Length) is { } bResident
             && !ReferenceEquals(aResident, bResident)
             && aResident.Handle != bResident.Handle
