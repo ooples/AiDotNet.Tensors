@@ -105,4 +105,18 @@ public class GraphModeSavedStateTests
         AssertCompiledGradientMatchesEager(new[] { 6 }, i => 0.3 * i - 0.5,
             (e, x) => e.ScatterSoftmax(x, indices, 0, 3));
     }
+
+    [Fact]
+    public void MaskedFillBitMask_CompiledBackward_MatchesEager()
+    {
+        var mask = new Tensor<Bit>(new[] { 3, 4 });
+        for (int i = 0; i < mask.Length; i++) mask[i] = i % 3 == 0;
+        AssertCompiledGradientMatchesEager(new[] { 3, 4 }, i => 0.1 * i,
+            (e, x) => e.TensorMaskedFill(x, mask, 0.0));
+    }
+
+    [Fact]
+    public void ReduceLogVariance_CompiledBackward_MatchesEager()
+        => AssertCompiledGradientMatchesEager(new[] { 3, 5 }, i => 0.1 * i + 0.05 * (i % 3),
+            (e, x) => e.ReduceLogVariance(x, new[] { 1 }, false, 1e-8));
 }

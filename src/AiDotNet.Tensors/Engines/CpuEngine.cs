@@ -33199,7 +33199,7 @@ public partial class CpuEngine : ITensorLevelEngine
             : axes;
         var normalizedAxes = ValidateAndNormalizeAxes(effectiveAxes, input.Rank);
         var outputShape = GetReductionOutputShape(input._shape, normalizedAxes, keepDims);
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_axes = effectiveAxes; var c_keepDims = keepDims; var c_epsilon = epsilon; return scope.RecordUnary(LazyNodeType.Custom, "ReduceLogVariance", input, outputShape, (eng, output) => { var r = eng.ReduceLogVariance(c_input, c_axes, c_keepDims, c_epsilon); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.ReduceLogVarianceBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_axes = effectiveAxes; var c_keepDims = keepDims; var c_epsilon = epsilon; var cSaved = new object[3]; return scope.RecordUnary(LazyNodeType.Custom, "ReduceLogVariance", input, outputShape, (eng, output) => { var r = eng.ReduceLogVariance(c_input, c_axes, c_keepDims, c_epsilon); DirectGpuTensorEngine.CopyResultInto(eng, r, output); using (new NoGradScope<T>()) { var ops = MathHelper.GetNumericOperations<T>(); var v = eng.ReduceVariance(c_input, c_axes, c_keepDims); var vd = v.AsSpan(); var vpe = new T[vd.Length]; T ep = ops.FromDouble(c_epsilon); for (int i = 0; i < vd.Length; i++) vpe[i] = ops.Add(vd[i], ep); cSaved[0] = c_axes; cSaved[1] = eng.ReduceMean(c_input, c_axes, c_keepDims); cSaved[2] = TensorAllocator.Rent<T>(v._shape, vpe); } }, BackwardFunctions<T>.ReduceLogVarianceBackward, savedState: cSaved); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("ReduceLogVariance", outputShape); if (ac is not null) return ac.Execute(); }
 
         var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
@@ -39101,7 +39101,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!tensor._shape.SequenceEqual(mask._shape))
             throw new ArgumentException($"Tensor shape [{string.Join(", ", tensor._shape)}] must match mask shape [{string.Join(", ", mask._shape)}].");
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ct = tensor; var cm = mask; var cv = value; return scope.RecordUnary(LazyNodeType.Custom, "MaskedFill", tensor, tensor._shape, (eng, output) => { var r = eng.TensorMaskedFill(ct, cm, cv); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.MaskedFillBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ct = tensor; var cm = mask; var cv = value; var cSaved = new object[1]; return scope.RecordUnary(LazyNodeType.Custom, "MaskedFill", tensor, tensor._shape, (eng, output) => { var r = eng.TensorMaskedFill(ct, cm, cv); DirectGpuTensorEngine.CopyResultInto(eng, r, output); var ms = cm.AsSpan(); var mb = new bool[ms.Length]; for (int i = 0; i < ms.Length; i++) mb[i] = (bool)ms[i]; cSaved[0] = mb; }, BackwardFunctions<T>.MaskedFillBackward, savedState: cSaved); } }
 
         { var ac = AutoTracer.TryGetCompiledPlan<T>("MaskedFill", tensor._shape); if (ac is not null) return ac.Execute(); }
 
