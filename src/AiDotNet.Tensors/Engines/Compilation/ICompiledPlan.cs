@@ -652,6 +652,37 @@ public interface ICompiledTrainingPlan<T> : IDisposable
     Task SaveAsync(Stream stream, CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Exports the state of the fused optimizer configured on this plan: per-parameter moments, the
+    /// optimizer step (Adam's bias-correction step), LR schedule position, scalar accumulators, moment
+    /// storage mode and hyperparameters. Returns <c>null</c> when no optimizer is configured.
+    /// </summary>
+    /// <returns>An opaque payload for <see cref="ImportOptimizerState"/>, or <c>null</c>.</returns>
+    /// <remarks>
+    /// <para>
+    /// A fused optimizer keeps its state inside the plan, not in the caller's optimizer object, so a
+    /// caller that checkpoints training must export it here; saving only the optimizer object records
+    /// an empty state and a resumed run restarts the optimizer. The payload uses the same format as the
+    /// optimizer section of <see cref="SaveAsync"/>, without the traced graph or parameter data, so it
+    /// is small and does not depend on the plan's shapes beyond the parameter count.
+    /// </para>
+    /// <para>
+    /// <b>BINARY/SOURCE-BREAKING CHANGE WARNING:</b> same rationale as <see cref="SaveAsync"/> — no DIM
+    /// polyfill on net471.
+    /// </para>
+    /// </remarks>
+    byte[]? ExportOptimizerState();
+
+    /// <summary>
+    /// Restores fused optimizer state produced by <see cref="ExportOptimizerState"/>, reconfiguring the
+    /// plan's optimizer from it. The next <see cref="Step"/> continues the exported trajectory exactly.
+    /// </summary>
+    /// <param name="state">A payload from <see cref="ExportOptimizerState"/>.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="state"/> is <c>null</c>.</exception>
+    /// <exception cref="InvalidDataException">The payload is corrupt, empty, or was exported from a plan
+    /// with a different parameter count or per-parameter state size.</exception>
+    void ImportOptimizerState(byte[] state);
+
+    /// <summary>
     /// Returns true when this plan's on-disk format, tensor-codec version,
     /// element type, and hardware fingerprint all match the current runtime.
     /// </summary>
