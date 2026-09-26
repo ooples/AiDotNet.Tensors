@@ -95,7 +95,21 @@ internal static class DeferredArrayMaterializer
         {
             Interlocked.Decrement(ref _pendingCount);
             Interlocked.Increment(ref _materializeCount); // a real DtoH download is about to run
-            pending.Callback(array);
+            try
+            {
+                pending.Callback(array);
+            }
+            catch
+            {
+                // The download did not happen, so the device copy is still the only valid one: put the
+                // registration back before propagating. Dropping it left the host array permanently stale and
+                // no longer marked pending. Seen when a host read runs during CUDA-graph capture (the download's
+                // stream sync is illegal there, CUDA 900): the capture is abandoned and training continues eagerly,
+                // but every later read of that array silently returned its pre-capture contents.
+                if (_pendingMaterializations.TryAdd(array, pending))
+                    Interlocked.Increment(ref _pendingCount);
+                throw;
+            }
             return true;
         }
         return false;

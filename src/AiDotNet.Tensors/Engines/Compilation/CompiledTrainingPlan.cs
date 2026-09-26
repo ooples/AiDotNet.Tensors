@@ -289,6 +289,35 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// optimizer wiring) or a forward-action rebuild — otherwise replay would launch
     /// kernels against freed or stale buffers.
     /// </summary>
+    /// <summary>
+    /// Rolls back the device bindings an abandoned capture attempt left on the plan's own intermediates. The warm
+    /// pass and the aborted capture run the step body on the compiled capture path, which binds gradient buffers,
+    /// the loss-gradient seed and forward outputs to device buffers with synced versions. The eager path that takes
+    /// over writes those tensors on the HOST (it zeroes gradients with a raw clear that does not bump the version),
+    /// so the stale device copies stayed "current": the optimizer consumed device gradients that were never cleared
+    /// again (they accumulated across steps) and consumers read capture-step forward values. Measured on an AdamW
+    /// FeedForward: MSE bottomed out and then rose while the graph-off run converged. Parameters are not touched:
+    /// their device buffers are authoritative (the fused optimizer updates them in place).
+    /// </summary>
+    private void DetachCapturePathBindings()
+    {
+        foreach (var g in _preAllocatedGrads) DetachDeviceBinding(g);
+        foreach (var g in _gradients) DetachDeviceBinding(g);
+        DetachDeviceBinding(_lossGradSeed);
+        if (_forwardSteps != null)
+            foreach (var step in _forwardSteps) DetachDeviceBinding(step.OutputBuffer);
+    }
+
+    private static void DetachDeviceBinding(Tensor<T>? t)
+    {
+        if (t?._gpuBuffer is null) return;
+        var key = t.GetBackingArrayForCacheLookupUnsafe();
+        if (key is not null) Helpers.DeferredArrayMaterializer.Remove(key);
+        t._gpuBuffer = null;
+        t._gpuBackend = null;
+        t._gpuBufferVersion = -1;
+    }
+
     private void InvalidateCapturedStepGraph()
     {
         if (_stepGraphExec != IntPtr.Zero
@@ -1667,6 +1696,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         // back NOW rather than aborting this step (PR #581 review: a one-off capture hiccup
                         // shouldn't kill a training run when every later step would succeed eagerly anyway).
                         _graphStepDisabled = true;
+                        DetachCapturePathBindings();
                         if (_graphHasEmbedding) gte.EmbeddingIndexExternallyManaged = false;
                         gte.ResumeActivationEviction();
                         _graphEvictionSuspended = false;
@@ -1684,6 +1714,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         // buffer non-evictable, silently defeating AIDOTNET_GPU_OFFLOAD and risking OOM. The
                         // _graphEvictionSuspended flag also gates Dispose, so clearing it prevents a double-resume.
                         _graphStepDisabled = true;
+                        DetachCapturePathBindings();
                         gte.ResumeActivationEviction();
                         _graphEvictionSuspended = false;
                         return StepEager();
