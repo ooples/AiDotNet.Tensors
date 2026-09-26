@@ -17,6 +17,9 @@ internal sealed class DDIMStepFusionPattern : IFusionPattern
 {
     public string Name => "DDIMStep";
 
+    /// <inheritdoc />
+    public bool IsDifferentiable => false;   // the fused sampler step has no backward
+
     public bool TryFuse(
         IReadOnlyList<ILazyNode> nodes, int index,
         IReadOnlyDictionary<ILazyNode, int> consumerCounts,

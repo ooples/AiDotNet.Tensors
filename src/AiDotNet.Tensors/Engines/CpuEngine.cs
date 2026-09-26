@@ -23976,8 +23976,8 @@ public partial class CpuEngine : ITensorLevelEngine
                         try
                         {
                             DirectGpuTensorEngine.CopyResultInto(eng, r, output);
-                            freshMean.AsSpan().CopyTo(capturedMean.AsWritableSpan());
-                            freshVar.AsSpan().CopyTo(capturedVar.AsWritableSpan());
+                            DirectGpuTensorEngine.CopyResultInto(eng, freshMean, capturedMean);
+                            DirectGpuTensorEngine.CopyResultInto(eng, freshVar, capturedVar);
                         }
                         finally
                         {
@@ -26873,8 +26873,8 @@ public partial class CpuEngine : ITensorLevelEngine
                     {
                         var r = eng.GroupNorm(ci, cn, cg, cb, ce, out var freshMean, out var freshVar);
                         DirectGpuTensorEngine.CopyResultInto(eng, r, output);
-                        freshMean.AsSpan().CopyTo(capturedGNMean.AsWritableSpan());
-                        freshVar.AsSpan().CopyTo(capturedGNVar.AsWritableSpan());
+                        DirectGpuTensorEngine.CopyResultInto(eng, freshMean, capturedGNMean);
+                        DirectGpuTensorEngine.CopyResultInto(eng, freshVar, capturedGNVar);
                     },
                     // SavedState order per #178 fix above: numGroups must come first so
                     // GroupNormBackward reads savedState[0] as int (not as Tensor).
@@ -27535,7 +27535,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     {
                         var r = eng.RMSNorm(ci, cg, ce, out var freshRms);
                         DirectGpuTensorEngine.CopyResultInto(eng, r, output);
-                        freshRms.AsSpan().CopyTo(capturedRms.AsWritableSpan());
+                        DirectGpuTensorEngine.CopyResultInto(eng, freshRms, capturedRms);
                     },
                     BackwardFunctions<T>.RMSNormBackward, new object[] { rms, epsilon });
                 eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
@@ -29434,7 +29434,7 @@ public partial class CpuEngine : ITensorLevelEngine
                             capturedQuery, capturedKey, capturedValue,
                             capturedScale, capturedIsCausal, out var freshStats, capturedBias);
                         DirectGpuTensorEngine.CopyResultInto(eng, freshOut, output);
-                        freshStats.AsSpan().CopyTo(capturedStats.AsWritableSpan());
+                        DirectGpuTensorEngine.CopyResultInto(eng, freshStats, capturedStats);
                     },
                     BackwardFunctions<T>.FlashAttentionBackward,
                     capturedBias is null
@@ -31628,7 +31628,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         DirectGpuTensorEngine.CopyResultInto(eng, r, output);
                         if (capturedCounts is not null && freshCounts is not null
                             && capturedCounts.Length == freshCounts.Length)
-                            freshCounts.AsSpan().CopyTo(capturedCounts.AsWritableSpan());
+                            DirectGpuTensorEngine.CopyResultInto(eng, freshCounts, capturedCounts);
                     },
                     BackwardFunctions<T>.ScatterMeanBackward, new object[] { indices, dim });
                 eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
@@ -41588,7 +41588,10 @@ public partial class CpuEngine : ITensorLevelEngine
         // Compute shape for output (last dim becomes 2 * numFreqs for interleaved complex)
         var outputShape = input.Shape.ToArray();
         outputShape[^1] = numFreqs * 2; // Interleaved real/imag
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; return scope.RecordUnary(LazyNodeType.Custom, "RFFT", input, outputShape, (eng, output) => { var r = eng.RFFT(c_input); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, null); } }
+        // Compiled-training graph node. It records the SAME adjoint backward as the tape path below: with a null
+        // backward, every gradient stopped at the transform in a compiled training plan (measured: a spectral-gate
+        // FFN's parameters received no update at all, while eager training moved every one of them).
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; return scope.RecordUnary(LazyNodeType.Custom, "RFFT", input, outputShape, (eng, output) => { var r = eng.RFFT(c_input); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.RFFTAdjointBackward, new object[] { n, nFft }); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("RFFT", outputShape); if (ac is not null) return ac.Execute(); }
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -41665,7 +41668,21 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var outputShape = input.Shape.ToArray();
         outputShape[^1] = outputLength;
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_outputLength = outputLength; return scope.RecordUnary(LazyNodeType.Custom, "IRFFT", input, outputShape, (eng, output) => { var r = eng.IRFFT(c_input, c_outputLength); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, null); } }
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope is not null)
+            {
+                // Same saved state as the tape record below (see RFFT: a null backward dropped every gradient
+                // through the transform in compiled training). nFft is derived exactly as the eager path does.
+                int gNumFreqs = input._shape[^1] / 2;
+                int gNfft = Math.Max(Math.Max((gNumFreqs - 1) * 2, outputLength), 1);
+                var c_input = input; var c_outputLength = outputLength;
+                return scope.RecordUnary(LazyNodeType.Custom, "IRFFT", input, outputShape,
+                    (eng, output) => { var r = eng.IRFFT(c_input, c_outputLength); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
+                    BackwardFunctions<T>.IRFFTAdjointBackward, new object[] { gNumFreqs, gNfft, outputLength });
+            }
+        }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("IRFFT", outputShape); if (ac is not null) return ac.Execute(); }
 
         var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
@@ -43793,8 +43810,8 @@ public partial class CpuEngine : ITensorLevelEngine
                     {
                         var r = eng.InstanceNorm(ci, cg, cb, ce, out var freshMean, out var freshVar);
                         DirectGpuTensorEngine.CopyResultInto(eng, r, output);
-                        freshMean.AsSpan().CopyTo(capturedINMean.AsWritableSpan());
-                        freshVar.AsSpan().CopyTo(capturedINVar.AsWritableSpan());
+                        DirectGpuTensorEngine.CopyResultInto(eng, freshMean, capturedINMean);
+                        DirectGpuTensorEngine.CopyResultInto(eng, freshVar, capturedINVar);
                     },
                     BackwardFunctions<T>.InstanceNormBackward, new object[] { mean, variance, epsilon });
                 eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
@@ -44009,7 +44026,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     {
                         var r = eng.Dropout(ci, cdr, ct, out var freshMask);
                         DirectGpuTensorEngine.CopyResultInto(eng, r, output);
-                        freshMask.AsSpan().CopyTo(capturedMask.AsWritableSpan());
+                        DirectGpuTensorEngine.CopyResultInto(eng, freshMask, capturedMask);
                     },
                     BackwardFunctions<T>.DropoutBackward, new object[] { mask, dropoutRate });
                 eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());

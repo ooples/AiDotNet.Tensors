@@ -45,7 +45,7 @@ internal sealed class ForwardCSEPass : ICpuOptimizationPass
                 var dst = step.OutputBuffer;
                 result.Add(new CompiledStep<T>(
                     "CSE_Copy",
-                    (eng, output) => src.AsSpan().CopyTo(output.AsWritableSpan()),
+                    (eng, output) => AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CopyResultInto(eng, src, output),
                     dst,
                     step.Inputs,
                     null,

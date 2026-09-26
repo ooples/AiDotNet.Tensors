@@ -3297,6 +3297,25 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (eng is DirectGpuTensorEngine gpu && gpu.TryAliasResidentOutput(src, dest))
         { AliasDiag("OK aliased"); return; }
         AliasDiag(eng is DirectGpuTensorEngine ? "FELLBACK host-copy" : "not-gpu-engine");
+        // The host copy below makes dest's HOST data authoritative, so every device-side copy of dest is stale from
+        // here on and must go: its bound buffer and pending download (the next read would run that download over the
+        // fresh host values), and any activation- or persistent-cache entry keyed by its backing array (those lookups
+        // have no version check and would keep serving the old device values to the next GPU consumer). Measured in
+        // compiled training: the replayed GPU RMSNorm read a trace-time rms buffer (dW 4461 vs -0.134), and a GELU fed
+        // by a replayed broadcast add kept reading the trace-time input, so the forward froze after the first step.
+        if (eng is DirectGpuTensorEngine destEngine)
+        {
+            if (dest.IsGpuResident) dest.Cpu();   // device-resident proper: return it to the host before overwriting
+            destEngine.InvalidateResidentWeightBuffer(dest);
+        }
+        else if (dest._gpuBuffer is not null || dest.HasPendingGpuData)
+        {
+            var staleKey = dest.GetBackingArrayForCacheLookupUnsafe();
+            if (staleKey is not null) Helpers.DeferredArrayMaterializer.Remove(staleKey);
+            dest._gpuBuffer = null;
+            dest._gpuBackend = null;
+            dest._gpuBufferVersion = -1;
+        }
         var destination = dest.AsWritableSpan();
         if (src.IsContiguous)
             src.AsSpan().CopyTo(destination);

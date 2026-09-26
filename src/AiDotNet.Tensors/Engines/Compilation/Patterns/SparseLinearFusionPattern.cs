@@ -17,6 +17,9 @@ internal sealed class SparseLinearFusionPattern : IFusionPattern
 {
     public string Name => "SparseLinear";
 
+    /// <inheritdoc />
+    public bool IsDifferentiable => false;   // the CSR fused node has no backward
+
     public bool TryFuse(
         IReadOnlyList<ILazyNode> nodes, int index,
         IReadOnlyDictionary<ILazyNode, int> consumerCounts,

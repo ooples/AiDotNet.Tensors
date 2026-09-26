@@ -155,7 +155,7 @@ internal sealed class FusedGroupNormActivationOp<T> : ICompiledOp<T>
                     var gnResult = eng.GroupNorm(input, numGroups, gamma, beta, epsilon,
                         out tmpMean, out tmpVariance);
                     var reluResult = eng.ReLU(gnResult);
-                    reluResult.AsSpan().CopyTo(output.AsWritableSpan());
+                    AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CopyResultInto(eng, reluResult, output);
                     mean = tmpMean;
                     variance = tmpVariance;
                     break;
@@ -163,7 +163,7 @@ internal sealed class FusedGroupNormActivationOp<T> : ICompiledOp<T>
                 default: // Identity
                     var gnId = eng.GroupNorm(input, numGroups, gamma, beta, epsilon,
                         out tmpMean, out tmpVariance);
-                    gnId.AsSpan().CopyTo(output.AsWritableSpan());
+                    AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CopyResultInto(eng, gnId, output);
                     mean = tmpMean;
                     variance = tmpVariance;
                     break;

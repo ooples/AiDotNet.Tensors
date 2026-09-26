@@ -22,6 +22,9 @@ internal sealed class LoRAFusionPattern : IFusionPattern
 {
     public string Name => "LoRA";
 
+    /// <inheritdoc />
+    public bool IsDifferentiable => false;   // the fused LoRA node has no backward
+
     public bool TryFuse(
         IReadOnlyList<ILazyNode> nodes, int index,
         IReadOnlyDictionary<ILazyNode, int> consumerCounts,

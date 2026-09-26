@@ -5515,7 +5515,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             }
         }
 
-        var compiler = new LazyGraphCompiler();
+        var compiler = new LazyGraphCompiler(forTraining: true);
         var optimized = compiler.Compile(scope.Nodes);
 
         // Collect all forward steps
