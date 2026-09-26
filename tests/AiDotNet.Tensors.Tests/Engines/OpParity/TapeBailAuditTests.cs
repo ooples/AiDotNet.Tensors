@@ -108,9 +108,6 @@ public class TapeBailAuditTests
         "ConvTranspose2D",
         "TensorGather",
         "Upsample",
-        "TensorAddScalar",
-        "TensorSubtractScalar",
-        "TensorDivideScalar",
         "TensorMaskedFill",
         "TensorStack",
         "TensorDiagonal",
@@ -185,6 +182,10 @@ public class TapeBailAuditTests
         "TensorSliceScatter",
         // Records TransposeBackward on both device paths; see GpuTapeGradientParityTests.TensorTranspose_*.
         "TensorTranspose",
+        // Record Add/Subtract/DivideScalarBackward on the float device path; double stays exact on the CPU.
+        "TensorAddScalar",
+        "TensorSubtractScalar",
+        "TensorDivideScalar",
     };
 
     private static string[] GpuEngineSources(string root)

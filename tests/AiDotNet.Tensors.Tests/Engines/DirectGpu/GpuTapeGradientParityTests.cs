@@ -160,12 +160,13 @@ public class GpuTapeGradientParityTests : IDisposable
             probe: Engagement.UseResidencyCounter);
 
     /// <summary>
-    /// Under a recording tape the transpose must launch its kernel and download nothing. It used to bail to
-    /// CpuEngine whenever a tape was active — every training-time transpose went through the host (seen in
-    /// AutoformerModel training: DirectGpuTensorEngine.TensorTranspose -> CpuEngine.TensorTranspose).
+    /// Under a recording tape each of these must launch its kernel and download nothing. Every one used to bail
+    /// to CpuEngine whenever a tape was active, so every training-time call went through the host (seen in
+    /// AutoformerModel training: DirectGpuTensorEngine.TensorTranspose -> CpuEngine.TensorTranspose). Their
+    /// gradients are exact on both engines, so this residency check is what proves the device path ran.
     /// </summary>
-    [SkippableFact]
-    public void TensorTranspose_stays_on_the_device_while_a_tape_records()
+    private void AssertStaysOnDeviceUnderTape(string opName, Func<IEngine, Tensor<float>, Tensor<float>> op,
+        Action<Tensor<float>, Tensor<float>> checkResult)
     {
         Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
         using (gpu!)
@@ -177,19 +178,56 @@ public class GpuTapeGradientParityTests : IDisposable
             _ = engine.TensorAdd(x, x);                       // upload x and warm the path outside the count
             AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Reset();
 
-            var y = engine.TensorTranspose(x);
+            var y = op(engine, x);
 
             long launches = AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Count;
             long readbacks = AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Readbacks;
-            _out.WriteLine($"TensorTranspose under tape: launches={launches} readbacks={readbacks}");
-            Assert.True(launches >= 1, "TensorTranspose launched no GPU kernel while a tape was recording — it ran on the CPU.");
+            _out.WriteLine($"{opName} under tape: launches={launches} readbacks={readbacks}");
+            Assert.True(launches >= 1, $"{opName} launched no GPU kernel while a tape was recording — it ran on the CPU.");
             Assert.Equal(0, readbacks);
+            checkResult(x, y);
+        }
+    }
+
+    [SkippableFact]
+    public void TensorTranspose_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("TensorTranspose", static (e, t) => e.TensorTranspose(t), static (x, y) =>
+        {
             Assert.Equal(new[] { 10, 6 }, y.Shape.ToArray());
             for (int r = 0; r < 6; r++)
                 for (int c = 0; c < 10; c++)
                     Assert.Equal(x[r, c], y[c, r]);
-        }
-    }
+        });
+
+    [SkippableFact]
+    public void TensorAddScalar_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("TensorAddScalar", static (e, t) => e.TensorAddScalar(t, 0.75f),
+            static (x, y) => { for (int i = 0; i < x.Length; i++) Assert.Equal(x[i] + 0.75f, y[i], 6); });
+
+    [SkippableFact]
+    public void TensorSubtractScalar_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("TensorSubtractScalar", static (e, t) => e.TensorSubtractScalar(t, 0.75f),
+            static (x, y) => { for (int i = 0; i < x.Length; i++) Assert.Equal(x[i] - 0.75f, y[i], 6); });
+
+    [SkippableFact]
+    public void TensorDivideScalar_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("TensorDivideScalar", static (e, t) => e.TensorDivideScalar(t, 1.7f),
+            static (x, y) => { for (int i = 0; i < x.Length; i++) Assert.Equal(x[i] / 1.7f, y[i], 5); });
+
+    [SkippableFact]
+    public void TensorAddScalar_gradients_match_cpu() =>
+        AssertGradientParity("TensorAddScalar", Rand([4, 16], seed: 26), static (e, t) => e.TensorAddScalar(t, 0.75f),
+            probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void TensorSubtractScalar_gradients_match_cpu() =>
+        AssertGradientParity("TensorSubtractScalar", Rand([4, 16], seed: 27), static (e, t) => e.TensorSubtractScalar(t, 0.75f),
+            probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void TensorDivideScalar_gradients_match_cpu() =>
+        AssertGradientParity("TensorDivideScalar", Rand([4, 16], seed: 28), static (e, t) => e.TensorDivideScalar(t, 1.7f),
+            probe: Engagement.UseResidencyCounter);
 
     [SkippableFact]
     public void TensorSinh_gradients_match_cpu() =>

@@ -22900,7 +22900,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorAddScalar<T>(Tensor<T> tensor, T scalar)
     {
-        if (IsTapeActive<T>()) return base.TensorAddScalar(tensor, scalar);
+        // Under a tape the kernel runs and records the SAME node CpuEngine records; only a non-float tape stays
+        // on the CPU, because the kernel converts the scalar to float and double training must stay exact.
+        if (IsTapeActive<T>() && typeof(T) != typeof(float)) return base.TensorAddScalar(tensor, scalar);
         if (TryGetBackend(out var backend))
         {
             try
@@ -22908,7 +22910,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 using var bufIn = GetOrAllocateBuffer(backend, tensor);
                 var bufOut = AllocateOutputBuffer(backend, tensor.Length);
                 backend.AddScalar(bufIn.Buffer, bufOut.Buffer, Convert.ToSingle(scalar), tensor.Length);
-                return DeferTensorResult<T>(backend, bufOut.Buffer, tensor.Length, tensor.Shape.ToArray());
+                var sum = DeferTensorResult<T>(backend, bufOut.Buffer, tensor.Length, tensor.Shape.ToArray());
+                Autodiff.DifferentiableOps.RecordUnary("TensorAddScalar", sum, tensor, Autodiff.BackwardFunctions<T>.AddScalarBackward);
+                return sum;
             }
             catch { }
         }
@@ -22917,7 +22921,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorSubtractScalar<T>(Tensor<T> tensor, T scalar)
     {
-        if (IsTapeActive<T>()) return base.TensorSubtractScalar(tensor, scalar);
+        // Under a tape the kernel runs and records the SAME node CpuEngine records; only a non-float tape stays
+        // on the CPU, because the kernel converts the scalar to float and double training must stay exact.
+        if (IsTapeActive<T>() && typeof(T) != typeof(float)) return base.TensorSubtractScalar(tensor, scalar);
         if (TryGetBackend(out var backend))
         {
             try
@@ -22925,7 +22931,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 using var bufIn = GetOrAllocateBuffer(backend, tensor);
                 var bufOut = AllocateOutputBuffer(backend, tensor.Length);
                 backend.SubScalar(bufIn.Buffer, bufOut.Buffer, Convert.ToSingle(scalar), tensor.Length);
-                return DeferTensorResult<T>(backend, bufOut.Buffer, tensor.Length, tensor.Shape.ToArray());
+                var difference = DeferTensorResult<T>(backend, bufOut.Buffer, tensor.Length, tensor.Shape.ToArray());
+                Autodiff.DifferentiableOps.RecordUnary("TensorSubtractScalar", difference, tensor, Autodiff.BackwardFunctions<T>.SubtractScalarBackward);
+                return difference;
             }
             catch { }
         }
@@ -22934,7 +22942,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorDivideScalar<T>(Tensor<T> tensor, T scalar)
     {
-        if (IsTapeActive<T>()) return base.TensorDivideScalar(tensor, scalar);
+        // Already float-only below; under a tape it now records CpuEngine's node (saved state: the scalar).
         if (typeof(T) == typeof(float) && TryGetBackend(out var backend))
         {
             try
@@ -22948,7 +22956,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     backend.Fill(denominator, Convert.ToSingle(scalar), tensor.Length);
                     backend.Divide(input.Buffer, denominator, output.Buffer, tensor.Length);
                     handedOff = true;
-                    return DeferTensorResult<T>(backend, output.Buffer, tensor.Length, tensor.Shape.ToArray());
+                    var quotient = DeferTensorResult<T>(backend, output.Buffer, tensor.Length, tensor.Shape.ToArray());
+                    Autodiff.DifferentiableOps.RecordUnary("TensorDivideScalar", quotient, tensor,
+                        Autodiff.BackwardFunctions<T>.DivideScalarBackward, new object[] { scalar! });
+                    return quotient;
                 }
                 finally
                 {
