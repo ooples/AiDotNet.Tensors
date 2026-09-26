@@ -214,6 +214,43 @@ public class GpuTapeGradientParityTests : IDisposable
         AssertStaysOnDeviceUnderTape("TensorDivideScalar", static (e, t) => e.TensorDivideScalar(t, 1.7f),
             static (x, y) => { for (int i = 0; i < x.Length; i++) Assert.Equal(x[i] / 1.7f, y[i], 5); });
 
+    /// <summary>
+    /// NarrowBackward on the GPU engine must build the input gradient on the device from a resident gradOutput:
+    /// no readback, at least one launch, and the same values CpuEngine produces. It used to read gradOutput
+    /// through a host span and return a host tensor (seen per sample in AutoformerModel training).
+    /// </summary>
+    [SkippableFact]
+    public void NarrowBackward_builds_the_input_gradient_on_the_device()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu!)
+        {
+            IEngine engine = gpu!;
+            AiDotNetEngine.Current = engine;
+            var input = Rand([3, 7, 4], seed: 29);
+            var hostGrad = Rand([3, 2, 4], seed: 30);
+            var residentGrad = engine.TensorAddScalar(hostGrad, 0f);   // a device-resident gradOutput
+            var saved = new object[] { 1, 3, 2 };                        // dim 1, start 3, length 2
+
+            var cpuGrads = new Dictionary<Tensor<float>, Tensor<float>>();
+            BackwardFunctions<float>.NarrowBackward(hostGrad, [input], hostGrad, saved, new CpuEngine(), cpuGrads);
+
+            AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Reset();
+            var gpuGrads = new Dictionary<Tensor<float>, Tensor<float>>();
+            BackwardFunctions<float>.NarrowBackward(residentGrad, [input], residentGrad, saved, engine, gpuGrads);
+            long launches = AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Count;
+            long readbacks = AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Readbacks;
+            _out.WriteLine($"NarrowBackward on GPU: launches={launches} readbacks={readbacks}");
+
+            Assert.True(launches >= 1, "NarrowBackward launched nothing on the GPU engine — it built the gradient on the host.");
+            Assert.Equal(0, readbacks);
+            var expected = cpuGrads[input];
+            var actual = gpuGrads[input];
+            Assert.Equal(expected.Shape.ToArray(), actual.Shape.ToArray());
+            for (int i = 0; i < expected.Length; i++) Assert.Equal(expected[i], actual[i]);
+        }
+    }
+
     [SkippableFact]
     public void TensorAddScalar_gradients_match_cpu() =>
         AssertGradientParity("TensorAddScalar", Rand([4, 16], seed: 26), static (e, t) => e.TensorAddScalar(t, 0.75f),

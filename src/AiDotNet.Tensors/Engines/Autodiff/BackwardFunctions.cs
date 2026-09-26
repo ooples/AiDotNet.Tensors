@@ -2640,6 +2640,16 @@ internal static class BackwardFunctions<T>
         int start = (int)savedState[1];
         int length = (int)savedState[2];
         var inShape = inputs[0]._shape;
+
+        // On the GPU engine keep the gradient on the device: the host slab copy below reads gradOutput through a
+        // span (a download of a resident gradient) and returns a host tensor, per narrow, per backward.
+        if (engine is DirectGpuTensorEngine gpu
+            && gpu.TryNarrowBackwardOnDevice(gradOutput, inShape, dim, start, length) is { } deviceGrad)
+        {
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceGrad, engine);
+            return;
+        }
+
         var inputGrad = TensorPool<T>.RentZeroed(inShape);
 
         int outerSize = 1, innerSize = 1;

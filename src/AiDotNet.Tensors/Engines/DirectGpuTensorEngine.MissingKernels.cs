@@ -4702,6 +4702,46 @@ public partial class DirectGpuTensorEngine
         }
     }
 
+    /// <summary>
+    /// The adjoint of <c>TensorNarrow</c> on the device: a zero tensor of <paramref name="inputShape"/> with
+    /// <paramref name="gradOutput"/> copied into positions [start, start+length) of <paramref name="dim"/>.
+    /// </summary>
+    /// <remarks>
+    /// NarrowBackward built this with host spans, so a resident gradient was DOWNLOADED on every narrow in the
+    /// graph and the input gradient came back as a host tensor — which then kept the grad-accumulation in-place
+    /// add off its resident path too (measured in AutoformerModel training: RentZeroed + DtoH per sample). Here
+    /// the output is zero-filled on the device and each contiguous outer slab is one device-to-device copy: no
+    /// host array, no upload, no download. Null when the device path cannot take it, so the caller falls back.
+    /// </remarks>
+    internal Tensor<T>? TryNarrowBackwardOnDevice<T>(Tensor<T> gradOutput, int[] inputShape, int dim, int start, int length)
+    {
+        if (typeof(T) != typeof(float) || Compilation.GraphMode.IsActive || !TryGetBackend(out var backend))
+            return null;
+        try
+        {
+            int rank = inputShape.Length;
+            int n = 1; for (int k = 0; k < rank; k++) n *= inputShape[k];
+            int dimSize = inputShape[dim];
+            int outerSize = 1; for (int k = 0; k < dim; k++) outerSize *= inputShape[k];
+            int innerSize = 1; for (int k = dim + 1; k < rank; k++) innerSize *= inputShape[k];
+            int copyLength = checked(length * innerSize);
+            if (gradOutput.Length != checked(outerSize * copyLength)) return null;
+            var source = gradOutput.IsContiguous ? gradOutput : (Tensor<T>)gradOutput.Contiguous();
+            using var bufSrc = GetOrAllocateBuffer(backend, source);
+            return DispatchDeferredGpuOp<T>(backend, n, (int[])inputShape.Clone(), output =>
+            {
+                backend.Fill(output, 0f, n);
+                for (int outer = 0; outer < outerSize; outer++)
+                    backend.Copy(bufSrc.Buffer, outer * copyLength,
+                        output, checked((outer * dimSize + start) * innerSize), copyLength);
+            });
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
     /// <inheritdoc/>
     public override Tensor<T> TensorSliceScatter<T>(Tensor<T> tensor, Tensor<T> source, int dim, int start, int length)
     {
