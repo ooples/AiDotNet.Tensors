@@ -2343,7 +2343,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // no buffer we are about to free can have an outstanding download, regardless of its key. Eviction
         // only fires under real VRAM pressure (the count cap is huge), so this broader drain is rare, not
         // per-step. Not reached during capture (eviction is suspended while the stream is capturing).
-        Helpers.DeferredArrayMaterializer.MaterializeAll(swallowErrors: true);
+        //
+        // That blanket drain downloaded EVERY pending result on the thread — including the half this eviction
+        // keeps — to cover a cache key that differed from its materializer key. Every path that both caches and
+        // registers now uses one key (FinishGpuOp's array, the split-complex/fp16 result keys; BindResidentBuffer
+        // re-keys its cache entry to the array it registers), and DeferTensorResult results are owned by their
+        // tensors and never enter this cache. So the per-entry IsPending check below materializes exactly the
+        // entries being freed, and nothing else.
 
         // Find threshold using Array.Sort on timestamps (avoids LINQ allocation)
         var timestamps = new long[entries.Length];
