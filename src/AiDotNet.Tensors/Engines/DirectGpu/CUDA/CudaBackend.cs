@@ -201,6 +201,29 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     private const int MaxPooledBuffersPerSize = 4;
     private readonly GpuBufferPool<CudaGpuBuffer> _bufferPool =
         new GpuBufferPool<CudaGpuBuffer>(MaxPooledBuffersPerSize, MaxPooledBufferElements);
+
+    // Host-side reuse for the STREAM-ORDERED allocator. Every stream-ordered buffer used to cost three driver calls —
+    // cuMemAllocAsync, cuMemsetD8Async and, on dispose, cuMemFreeAsync — about 13 us together on this box, as much as
+    // the kernel launch it served; small-tensor training issues thousands per step. A disposed buffer now returns to
+    // the pool under a _stream affinity and the next same-size request reuses it (one memset, no alloc/free). This is
+    // safe for the reason #609 made the allocator stream-ordered: every use of these buffers is ordered on _stream, so
+    // a reuse is ordered after all earlier work, and an overflow still frees with cuMemFreeAsync (ReleaseCore). Never
+    // during a backend capture: a captured graph keeps using a buffer's address after the host lets go of it.
+    private GpuBufferPoolAffinity AsyncPoolAffinity => GpuBufferPoolAffinity.ForNativeQueue(_stream);
+
+    private void ReturnAsyncBuffer(CudaGpuBuffer buffer)
+    {
+        if (_backendStreamCaptureActive)
+            buffer.Release();
+        else
+            _bufferPool.Return(buffer, AsyncPoolAffinity);
+    }
+
+    private CudaGpuBuffer? TryRentAsyncBuffer(int size)
+    {
+        if (_backendStreamCaptureActive || _stream == IntPtr.Zero) return null;
+        return _bufferPool.TryRent(size, AsyncPoolAffinity, out var pooled) ? pooled : null;
+    }
     // Event-based deferred buffer free (#555 / #226). A buffer evicted mid-step may still
     // be referenced by an in-flight async kernel; returning it to the pool (for reuse OR a
     // real cuMemFree when the bucket is full) before that kernel finishes is the CUDA-700
@@ -1643,6 +1666,14 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         using var _ = PushContext();
         if (_asyncAlloc)
         {
+            if (TryRentAsyncBuffer(size) is { } reused)
+            {
+                // Same zero-initialised contract as a fresh allocation, ordered on _stream after the previous user.
+                CuBlasNative.CheckCudaResult(
+                    CudaNativeBindings.cuMemsetD8Async(reused.Handle, 0, (ulong)size * sizeof(float), _stream),
+                    "cuMemsetD8Async(reused)");
+                return reused;
+            }
             var p = AllocDeviceMemoryAsync((ulong)size * sizeof(float));
             // STREAM-ORDERED-ALLOCATION HAZARD FIX (see AllocateBuffer(float[]) above): p was allocated on
             // _stream via cuMemAllocAsync, so the zero-init MUST also be issued on _stream. The legacy
@@ -1654,7 +1685,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             CuBlasNative.CheckCudaResult(
                 CudaNativeBindings.cuMemsetD8Async(p, 0, (ulong)size * sizeof(float), _stream),
                 "cuMemsetD8Async");
-            return new CudaGpuBuffer(_cudaContext, p, size, returnToPool: null, asyncFreeStream: _stream);
+            return new CudaGpuBuffer(_cudaContext, p, size, returnToPool: ReturnAsyncBuffer, asyncFreeStream: _stream);
         }
         if (_bufferPool.TryRent(size, out var pooled) && pooled != null)
         {
@@ -1722,6 +1753,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             // As in the sync-path reclamation: a failed sync is a real (often sticky) error, so throw
             // with its real name rather than let it masquerade as the cuMemAllocAsync OOM below.
             // Trim is best-effort.
+            // Buffers parked in the host-side reuse pool are still allocated as far as the driver knows; release
+            // them first (stream-ordered frees) so the sync + trim below can hand their memory to this request.
+            _bufferPool.DrainAll();
             CuBlasNative.CheckCudaResult(CudaNativeBindings.cuCtxSynchronize(), "cuCtxSynchronize (async-pool OOM reclamation)");
             if (_asyncMemPool != IntPtr.Zero)
             {
