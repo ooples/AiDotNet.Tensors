@@ -908,6 +908,10 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         // Float32 + 2D fast paths: A: [M,K], B: [N,K] (stored row-major), gradC: [M,N].
+        // CPU-only (!engine.SupportsGpu), like MatMulBackward: on a GPU engine this path called GetDataArray() on
+        // device tensors -- a download per operand -- and ran the GEMMs with host SimdGemm, so every eager GPU
+        // training step's transposed-matmul backward (e.g. a tied LM head) ran on the CPU. The engine path below
+        // keeps it on the device. It used to be skipped only during a resident CUDA-graph step.
         // Same gating story as MatMulBackward — both fast paths bypass engine
         // recording, so they're behind the no-active-tape gate to preserve
         // higher-order AD. Rentals also live inside the gate.
@@ -916,7 +920,7 @@ internal static class BackwardFunctions<T>
             && GradientTape<T>.Current is null
             // PR #638 A1: during CUDA-graph capture the CPU fast path's GetDataArray() downloads resident grads
             // (CUDA-900). Skip it so the engine fallback (resident Reshape/Transpose/MatMul) keeps grads resident.
-            && !(engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine { ResidentStepActive: true }))
+            && !engine.SupportsGpu)
         {
             var dCArr = (gradOutput as Tensor<float>)?.GetDataArray();
             var aArr = (inputs[0] as Tensor<float>)?.GetDataArray();
@@ -4240,7 +4244,7 @@ internal static class BackwardFunctions<T>
             && GradientTape<T>.Current is null
             // PR #638 A1: skip the GetDataArray()-downloading CPU fast path during CUDA-graph capture → use the
             // resident engine fallback (ReluBackward/Transpose/MatMul/ReduceSum are all resident in the step).
-            && !(engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine { ResidentStepActive: true })
+            && !engine.SupportsGpu
             && (long)inputs[0]._shape[0] * inputs[0]._shape[1] * inputs[1]._shape[1] >= FusedReluFastPathMinWork)
         {
             int M = inputs[0]._shape[0]; // batch
@@ -4448,7 +4452,7 @@ internal static class BackwardFunctions<T>
         if (typeof(T) == typeof(float) && inputs[0].Rank == 2 && GradientTape<T>.Current is null
             // PR #638: skip the GetDataArray()-downloading fast path during CUDA-graph capture (route to the
             // resident engine fallback) — capture-safety for Sigmoid/Tanh/GELU/Swish FFN backward, not just ReLU.
-            && !(engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine { ResidentStepActive: true })
+            && !engine.SupportsGpu
             && (long)inputs[0]._shape[0] * inputs[0]._shape[1] * inputs[1]._shape[1] >= FusedLinearActivationFastPathMinWork)
         {
             FusedLinearActivationBackwardCore(
@@ -4468,7 +4472,7 @@ internal static class BackwardFunctions<T>
         if (typeof(T) == typeof(float) && inputs[0].Rank == 2 && GradientTape<T>.Current is null
             // PR #638: skip the GetDataArray()-downloading fast path during CUDA-graph capture (route to the
             // resident engine fallback) — capture-safety for Sigmoid/Tanh/GELU/Swish FFN backward, not just ReLU.
-            && !(engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine { ResidentStepActive: true })
+            && !engine.SupportsGpu
             && (long)inputs[0]._shape[0] * inputs[0]._shape[1] * inputs[1]._shape[1] >= FusedLinearActivationFastPathMinWork)
         {
             FusedLinearActivationBackwardCore(
@@ -4489,7 +4493,7 @@ internal static class BackwardFunctions<T>
         if (typeof(T) == typeof(float) && inputs[0].Rank == 2 && GradientTape<T>.Current is null
             // PR #638: skip the GetDataArray()-downloading fast path during CUDA-graph capture (route to the
             // resident engine fallback) — capture-safety for Sigmoid/Tanh/GELU/Swish FFN backward, not just ReLU.
-            && !(engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine { ResidentStepActive: true })
+            && !engine.SupportsGpu
             && (long)inputs[0]._shape[0] * inputs[0]._shape[1] * inputs[1]._shape[1] >= FusedLinearActivationFastPathMinWork)
         {
             FusedLinearActivationBackwardCore(
@@ -4510,7 +4514,7 @@ internal static class BackwardFunctions<T>
         if (typeof(T) == typeof(float) && inputs[0].Rank == 2 && GradientTape<T>.Current is null
             // PR #638: skip the GetDataArray()-downloading fast path during CUDA-graph capture (route to the
             // resident engine fallback) — capture-safety for Sigmoid/Tanh/GELU/Swish FFN backward, not just ReLU.
-            && !(engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine { ResidentStepActive: true })
+            && !engine.SupportsGpu
             && (long)inputs[0]._shape[0] * inputs[0]._shape[1] * inputs[1]._shape[1] >= FusedLinearActivationFastPathMinWork)
         {
             FusedLinearActivationBackwardCore(
@@ -6012,7 +6016,7 @@ internal static class BackwardFunctions<T>
             && gradOutput.IsContiguous && GradientTape<T>.Current is null
             // PR #638 A1: skip the GetDataArray()-downloading CPU fast path during CUDA-graph capture → resident
             // engine fallback (Reshape/TensorTranspose/TensorMatMul/ReduceSum are all resident in the step).
-            && !(engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine { ResidentStepActive: true }))
+            && !engine.SupportsGpu)
         {
             int M = inputs[0]._shape[0]; // batch
             int K = inputs[0]._shape[1]; // in_features
@@ -6109,7 +6113,7 @@ internal static class BackwardFunctions<T>
             && gradOutput.IsContiguous && GradientTape<T>.Current is null
             // PR #638: skip the GetDataArray()-downloading double fast path during CUDA-graph capture (a resident
             // T=double step would otherwise invalidate capture) → resident engine fallback below.
-            && !(engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine { ResidentStepActive: true }))
+            && !engine.SupportsGpu)
         {
             int M = inputs[0]._shape[0]; // batch
             int K = inputs[0]._shape[1]; // in_features

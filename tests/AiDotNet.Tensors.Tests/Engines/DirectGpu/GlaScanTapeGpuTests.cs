@@ -72,3 +72,58 @@ public sealed class GlaScanTapeGpuTests : IClassFixture<DirectGpuTensorEngineTes
         }
     }
 }
+
+/// <summary>
+/// MatMulTransposedBackward (and the fused linear-activation backwards) took a CPU fast path whenever no tape was
+/// recording -- i.e. always during backward -- unless a resident CUDA-graph step was active. On the GPU engine in
+/// eager training that path downloaded both operands and the upstream gradient and ran host SimdGemm. They are now
+/// CPU-engine-only (like MatMulBackward), so on the GPU engine the gradients are computed on the device. The
+/// residency assertion is what distinguishes the paths: both produce numerically equal gradients.
+/// </summary>
+[Collection("VulkanGlobalState")]
+public sealed class MatMulTransposedTapeGpuTests : IClassFixture<DirectGpuTensorEngineTestFixture>
+{
+    private readonly DirectGpuTensorEngineTestFixture _fixture;
+
+    public MatMulTransposedTapeGpuTests(DirectGpuTensorEngineTestFixture fixture) => _fixture = fixture;
+
+    [SkippableFact]
+    public void Backward_StaysOnDevice_AndMatchesCpu()
+    {
+        Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
+        var gpu = _fixture.Engine!;
+        var cpu = new CpuEngine();
+        var rng = new Random(9);
+        Tensor<float> R(params int[] s)
+        {
+            var t = new Tensor<float>(s);
+            for (int i = 0; i < t.Length; i++) t[i] = (float)(rng.NextDouble() - 0.5);
+            return t;
+        }
+
+        // M*K*N = 512*256*1024 = 134M MACs: above the fast path's machine-dependent SimdGemm.ParallelWorkThreshold,
+        // so the old CPU path would engage (a smaller shape fell under it and made this test unable to fail).
+        var a = R(512, 256);
+        var b = R(1024, 256);
+        var r = R(512, 1024);
+        Dictionary<Tensor<float>, Tensor<float>> Grads(IEngine e)
+        {
+            using var tape = new GradientTape<float>();
+            var loss = e.ReduceSum(e.TensorMultiply(e.TensorMatMulTransposed(a, b), r), [0, 1], keepDims: false);
+            return tape.ComputeGradients(loss, [a, b]);
+        }
+
+        var expected = Grads(cpu);
+        var actual = Grads(gpu);
+        foreach (var (t, name) in new[] { (a, "dA"), (b, "dB") })
+        {
+            var g = actual[t];
+            Assert.True(g.IsGpuResident || g.HasPendingGpuData, $"{name} was computed on the host (CPU fast path)");
+            var e = expected[t].ToArray();
+            var x = g.ToArray();
+            double scale = Math.Max(e.Max(Math.Abs), 1e-6);
+            for (int i = 0; i < e.Length; i++)
+                Assert.True(Math.Abs(e[i] - x[i]) <= 1e-4 * scale, $"{name}[{i}]: cpu {e[i]}, gpu {x[i]}");
+        }
+    }
+}
