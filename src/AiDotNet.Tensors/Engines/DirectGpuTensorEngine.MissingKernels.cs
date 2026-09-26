@@ -1027,7 +1027,7 @@ public partial class DirectGpuTensorEngine
     internal Tensor<T>? IrfftAdjointGpu<T>(Tensor<T> gradOutput, int numFreqs, int nFft, int outputLength, int[] inputShape)
     {
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend)) return null;
-        if (outputLength <= 0 || nFft <= 0 || numFreqs <= 0) return null;
+        if (outputLength <= 0 || nFft <= 0 || numFreqs <= 0 || (nFft & (nFft - 1)) != 0) return null;
         if (gradOutput.Length % outputLength != 0) return null;
         int batch = gradOutput.Length / outputLength;
         if (batch <= 0) return null;
@@ -1268,8 +1268,14 @@ public partial class DirectGpuTensorEngine
         int interleavedLength = input._shape[^1];
         int numFreqs = interleavedLength / 2;
         int nFft = (numFreqs - 1) * 2;
-        if (numFreqs < 2 || outputLength > nFft)
+        // BatchedFFT is radix-2 on every backend and does not reject other lengths (CUDA/HIP take a truncated
+        // log2 and run too few stages), so a non-power-of-two transform must use the CPU path.
+        if (numFreqs < 2 || outputLength > nFft || (nFft & (nFft - 1)) != 0)
+        {
+            if (ThrowOnGpuKernelFallback)
+                throw new NotSupportedException("IRFFT has no eligible GPU route for this transform length.");
             return base.IRFFT(input, outputLength);
+        }
         int batchSize = input.Length / interleavedLength;
         var outputShape = input.Shape.ToArray();
         outputShape[^1] = outputLength;
@@ -1283,21 +1289,39 @@ public partial class DirectGpuTensorEngine
             using var allImag = backend.AllocateBuffer(batchSize * numFreqs);
             backend.DeinterleaveComplex(inputBuffer.Buffer, allReal, allImag, batchSize * numFreqs);
 
-            // The transform itself stays per-signal: IDirectGpuBackend exposes BatchedFFT (full complex)
-            // but no batched IRFFT, and backend.IRFFT reconstructs the conjugate-symmetric half-spectrum
-            // internally — a symmetry expansion that CopyRows cannot express (it needs reversed indexing).
-            // Each iteration is now 4 bulk calls rather than 2*numFreqs+2, so the per-bin copies are gone.
-            using var real = backend.AllocateBuffer(numFreqs);
-            using var imag = backend.AllocateBuffer(numFreqs);
-            using var signal = backend.AllocateBuffer(nFft);
-            for (int batch = 0; batch < batchSize; batch++)
+            // Batched: a FIXED number of launches regardless of batchSize. The previous loop ran four launches
+            // PER SIGNAL (copy real, copy imag, per-signal IRFFT, copy out) because the backend has no batched
+            // IRFFT -- 4096 launches for 1024 signals. The conjugate-symmetric expansion that per-signal IRFFT did
+            // internally is a GATHER: full[b, k] = half[b, k] for k <= nFft/2 and conj(half[b, nFft - k]) above,
+            // so one index gather per component (plus a sign flip of the mirrored imaginary part) builds every
+            // full spectrum, and one BatchedFFT inverse transforms them all. Taking the real part afterwards also
+            // discards the imaginary part of the DC and Nyquist bins, exactly as a real inverse transform does.
+            int fullCount = batchSize * nFft;
+            var gatherIndex = new int[fullCount];
+            var imagSign = new float[fullCount];
+            for (int b = 0; b < batchSize; b++)
             {
-                int rowBase = batch * numFreqs;
-                backend.Copy(allReal, rowBase, real, 0, numFreqs);
-                backend.Copy(allImag, rowBase, imag, 0, numFreqs);
-                backend.IRFFT(real, imag, signal, nFft);
-                backend.Copy(signal, 0, output, batch * outputLength, outputLength);
+                int rowHalf = b * numFreqs, rowFull = b * nFft;
+                for (int k = 0; k < nFft; k++)
+                {
+                    bool mirrored = k > nFft / 2;
+                    gatherIndex[rowFull + k] = rowHalf + (mirrored ? nFft - k : k);
+                    imagSign[rowFull + k] = mirrored ? -1f : 1f;
+                }
             }
+
+            using var indexBuffer = backend.AllocateIntBuffer(gatherIndex);
+            using var signBuffer = backend.AllocateBuffer(imagSign);
+            using var fullReal = backend.AllocateBuffer(fullCount);
+            using var fullImagRaw = backend.AllocateBuffer(fullCount);
+            using var fullImag = backend.AllocateBuffer(fullCount);
+            using var timeReal = backend.AllocateBuffer(fullCount);
+            using var timeImag = backend.AllocateBuffer(fullCount);
+            backend.Gather(allReal, indexBuffer, fullReal, fullCount, 1);
+            backend.Gather(allImag, indexBuffer, fullImagRaw, fullCount, 1);
+            backend.Multiply(fullImagRaw, signBuffer, fullImag, fullCount);
+            backend.BatchedFFT(fullReal, fullImag, timeReal, timeImag, batchSize, nFft, inverse: true);
+            backend.CopyRows(timeReal, output, nFft, outputLength, batchSize, outputLength);
             backend.Synchronize();
         });
 
