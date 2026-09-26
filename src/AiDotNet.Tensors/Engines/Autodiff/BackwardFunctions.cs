@@ -483,6 +483,16 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
+        // On the GPU engine use the device kernel: the host loop below reads every output element back
+        // (GetFlat on a resident tensor) and re-uploads the derivative for the multiply. All engine kernels now use
+        // this function's convention (the alpha branch at exactly x == 0, as PyTorch does).
+        if (engine is DirectGpuTensorEngine)
+        {
+            var deviceGrad = engine.EluBackward(gradOutput, inputs[0], output, (double)savedState[0]);
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceGrad, engine);
+            return;
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         var alpha = numOps.FromDouble((double)savedState[0]);
         var derivative = TensorPool<T>.RentZeroed(output._shape);

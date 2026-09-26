@@ -111,7 +111,7 @@ extern ""C"" __global__ __launch_bounds__(256) void elu_backward(
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     float x = input[idx];
-    gradInput[idx] = x >= 0.0f ? gradOutput[idx] : gradOutput[idx] * (output[idx] + alpha);
+    gradInput[idx] = x > 0.0f ? gradOutput[idx] : gradOutput[idx] * (output[idx] + alpha);
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void silu(const float* input, float* output, int size)

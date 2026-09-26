@@ -360,6 +360,54 @@ public class GpuTapeGradientParityTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// ELU's derivative has a kink at 0 when alpha != 1. The tape backward (like PyTorch) takes the alpha branch at
+    /// exactly 0; the CPU engine op and the CUDA/HIP/WebGPU kernels took 1 while OpenCL took alpha. All must agree
+    /// now, at the one point random data never lands on — and the tape backward must run on the device.
+    /// </summary>
+    [SkippableFact]
+    public void ELU_backward_agrees_at_zero_across_engines_and_stays_on_the_device()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu!)
+        {
+            IEngine engine = gpu!;
+            AiDotNetEngine.Current = engine;
+            const double alpha = 0.5;
+            var x = new Tensor<float>([2, 4]);
+            float[] values = [-2f, -0.5f, 0f, 0f, 0.25f, 1f, -1e-3f, 3f];
+            for (int i = 0; i < values.Length; i++) x[i] = values[i];
+            var cpu = new CpuEngine();
+            var y = cpu.ELU(x, alpha);
+            var g = Rand([2, 4], seed: 39, lo: 0.5, hi: 1.5);
+
+            var cpuGrads = new Dictionary<Tensor<float>, Tensor<float>>();
+            BackwardFunctions<float>.ELUBackward(g, [x], y, [alpha], cpu, cpuGrads);
+            var cpuOp = cpu.EluBackward(g, x, y, alpha);
+
+            var residentG = engine.TensorAddScalar(g, 0f);
+            _ = engine.TensorAdd(x, y);                                   // upload x and y outside the count
+            AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Reset();
+            var gpuGrads = new Dictionary<Tensor<float>, Tensor<float>>();
+            BackwardFunctions<float>.ELUBackward(residentG, [x], y, [alpha], engine, gpuGrads);
+            long launches = AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Count;
+            long readbacks = AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Readbacks;
+            _out.WriteLine($"ELUBackward on GPU: launches={launches} readbacks={readbacks}");
+            Assert.True(launches >= 1, "ELUBackward launched nothing on the GPU engine.");
+            Assert.Equal(0, readbacks);
+
+            var gpuOp = engine.EluBackward(g, x, y, alpha);
+            for (int i = 0; i < values.Length; i++)
+            {
+                float expected = values[i] > 0 ? g[i] : g[i] * (y[i] + (float)alpha);   // PyTorch convention
+                Assert.Equal(expected, cpuGrads[x][i], 5);
+                Assert.Equal(expected, gpuGrads[x][i], 5);
+                Assert.Equal(expected, cpuOp[i], 5);
+                Assert.Equal(expected, gpuOp[i], 5);
+            }
+        }
+    }
+
     [SkippableFact]
     public void TensorAddScalar_gradients_match_cpu() =>
         AssertGradientParity("TensorAddScalar", Rand([4, 16], seed: 26), static (e, t) => e.TensorAddScalar(t, 0.75f),
