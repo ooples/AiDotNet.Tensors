@@ -1888,6 +1888,11 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             // Buffers parked in the host-side reuse pool are still allocated as far as the driver knows; release
             // them first (stream-ordered frees) so the sync + trim below can hand their memory to this request.
             _bufferPool.DrainAll();
+            // GPU results are owned by their tensors and freed by the buffer finalizer once unreachable; the GC
+            // cannot see device memory, so collect now, run those finalizers, and free what they queued.
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            DrainPendingFinalizerFrees();
             CuBlasNative.CheckCudaResult(CudaNativeBindings.cuCtxSynchronize(), "cuCtxSynchronize (async-pool OOM reclamation)");
             if (_asyncMemPool != IntPtr.Zero)
             {

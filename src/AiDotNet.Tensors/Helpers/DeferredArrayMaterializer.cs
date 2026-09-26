@@ -1,7 +1,6 @@
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Threading;
 
 namespace AiDotNet.Tensors.Helpers;
@@ -15,14 +14,25 @@ namespace AiDotNet.Tensors.Helpers;
 /// </summary>
 internal static class DeferredArrayMaterializer
 {
-    private readonly struct Pending
+    private sealed class Pending
     {
         public readonly Action<object> Callback;
         public readonly int ThreadId;
         public Pending(Action<object> callback, int threadId) { Callback = callback; ThreadId = threadId; }
     }
 
-    private static readonly ConcurrentDictionary<object, Pending> _pendingMaterializations = new();
+    // WEAKLY keyed. This used to be a ConcurrentDictionary, which strongly rooted every key (a result's vector or
+    // array) and, through the callback's closure, the result's GPU buffer - so nothing deferred could ever be
+    // collected, and every free had to download first "in case someone reads it". With weak keys, a result nobody
+    // references any more takes its pending download and its buffer with it (the buffer's own finalizer frees it,
+    // stream-ordered), while a result somebody still holds is materialized on its first host read exactly as before.
+    // Keys are compared by reference, as they were (neither arrays nor vectors override Equals).
+    private static readonly ConditionalWeakTable<object, Pending> _pendingMaterializations = new();
+    private static readonly object _gate = new();
+
+    // Per-thread weak list of this thread's registered keys, for the thread-scoped bulk drain (MaterializeAll).
+    [ThreadStatic] private static List<WeakReference<object>>? t_registeredKeys;
+    [ThreadStatic] private static int t_registrationsSincePrune;
 
     /// <summary>
     /// Lock-free fast-path indicator. Incremented by <see cref="Register"/>, decremented
@@ -71,8 +81,39 @@ internal static class DeferredArrayMaterializer
         // THIS thread's entries — downloading another thread's buffer in a bulk drain
         // would read a GPU buffer that thread's kernel is still writing (shared queue) →
         // CL_INVALID_MEM_OBJECT or a GPU driver fault. See MaterializeAll.
-        if (!_pendingMaterializations.TryAdd(array, new Pending(materializeCallback, Environment.CurrentManagedThreadId)))
+        bool added;
+        lock (_gate)
+        {
+            // First registration wins, as with the previous TryAdd.
+            added = !_pendingMaterializations.TryGetValue(array, out _);
+            if (added) _pendingMaterializations.Add(array, new Pending(materializeCallback, Environment.CurrentManagedThreadId));
+        }
+        if (!added)
+        {
             Interlocked.Decrement(ref _pendingCount);
+            return;
+        }
+        var keys = t_registeredKeys ??= new List<WeakReference<object>>();
+        keys.Add(new WeakReference<object>(array));
+        if (++t_registrationsSincePrune >= 4096)
+        {
+            t_registrationsSincePrune = 0;
+            keys.RemoveAll(static w => !w.TryGetTarget(out var k) || !IsPending(k));
+        }
+    }
+
+    private static bool TryTake(object array, out Pending? pending)
+    {
+        lock (_gate)
+        {
+            if (_pendingMaterializations.TryGetValue(array, out pending))
+            {
+                _pendingMaterializations.Remove(array);
+                return true;
+            }
+        }
+        pending = null;
+        return false;
     }
 
     /// <summary>
@@ -91,7 +132,7 @@ internal static class DeferredArrayMaterializer
         if (Volatile.Read(ref _pendingCount) == 0)
             return false;
 
-        if (_pendingMaterializations.TryRemove(array, out var pending))
+        if (TryTake(array, out var pending) && pending is not null)
         {
             Interlocked.Decrement(ref _pendingCount);
             Interlocked.Increment(ref _materializeCount); // a real DtoH download is about to run
@@ -107,7 +148,7 @@ internal static class DeferredArrayMaterializer
     internal static bool IsPending(object array)
     {
         if (Volatile.Read(ref _pendingCount) == 0) return false;
-        return _pendingMaterializations.ContainsKey(array);
+        return _pendingMaterializations.TryGetValue(array, out _);
     }
 
     /// <summary>
@@ -115,7 +156,7 @@ internal static class DeferredArrayMaterializer
     /// </summary>
     internal static void Remove(object array)
     {
-        if (_pendingMaterializations.TryRemove(array, out _))
+        if (TryTake(array, out _))
             Interlocked.Decrement(ref _pendingCount);
     }
 
@@ -141,31 +182,25 @@ internal static class DeferredArrayMaterializer
     /// </remarks>
     internal static void MaterializeAll(bool swallowErrors = true)
     {
-        if (_pendingMaterializations.IsEmpty)
-            return;
-
         // THREAD-SCOPED drain. Only fire the callbacks registered on the CURRENT thread.
         // A bulk drain at scope/engine teardown previously fired EVERY thread's pending
-        // download — so one parallel test exiting its GPU scope would DownloadBuffer
+        // download - so one parallel test exiting its GPU scope would DownloadBuffer
         // another concurrent test's IN-FLIGHT buffer (the registry + GPU queue are shared
         // process-wide). That cross-thread read of a buffer a kernel is still writing
         // surfaced as "Failed to read OpenCL buffer: -38" and, when the GPU driver faulted,
-        // a hard process kill (no managed/native exception to catch). Each thread flushes
-        // only its OWN deferred tensors here; on-demand access (TryMaterialize for a specific
-        // array) still works from any thread, and other threads flush at their own scope exit.
-        int callerThreadId = Environment.CurrentManagedThreadId;
-        var keys = _pendingMaterializations.Keys.ToArray();
+        // a hard process kill. Each thread flushes only its OWN deferred tensors (the
+        // per-thread weak key list); keys whose tensors were collected are simply gone -
+        // nobody can read them.
+        var keys = t_registeredKeys;
+        if (keys is null || keys.Count == 0)
+            return;
+        var snapshot = keys.ToArray();
+        keys.Clear();
         List<Exception>? failures = null;
-        foreach (var key in keys)
+        foreach (var weak in snapshot)
         {
-            // Only claim entries owned by this thread (TryGetValue first to check the owner
-            // without removing other threads' entries).
-            if (!_pendingMaterializations.TryGetValue(key, out var pending))
-                continue;
-            if (pending.ThreadId != callerThreadId)
-                continue;
-            if (!_pendingMaterializations.TryRemove(key, out pending))
-                continue;
+            if (!weak.TryGetTarget(out var key)) continue;
+            if (!TryTake(key, out var pending) || pending is null) continue;
             Interlocked.Decrement(ref _pendingCount);
 
             try { pending.Callback(key); }

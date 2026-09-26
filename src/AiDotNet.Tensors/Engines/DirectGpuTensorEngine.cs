@@ -3534,12 +3534,32 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
         });
 
-        // Cache the GPU buffer so GetOrAllocateBuffer finds it
-        // Use the vector as cache key since there's no backing array yet
-        CacheActivation(vector, outputBuffer, shape, backend, hostVersion: tensor.GpuCacheVersion);
-
+        // The tensor OWNS its result buffer: consumers resolve it through tensor._gpuBuffer (views carry it, and a
+        // GPU-resident tensor is live by construction), a host read materializes it through the registration above,
+        // and once the tensor is unreachable the weakly-keyed registration and the buffer go with it — the buffer's
+        // finalizer frees it stream-ordered, with NO download. It used to be entered in the activation cache as well,
+        // which strongly owned it, so the cache had to materialize (download) every result before it could free it:
+        // at every tape dispose and every pressure eviction, plus the cache bookkeeping on every op.
+        NoteOwnedResultAllocation(outputBuffer.SizeInBytes);
         return tensor;
     }
+
+    // The GC cannot see device memory. Owned results are small managed objects pinning large device buffers, so
+    // after a VRAM-proportional volume of result allocations run a cheap gen-0 collection: intermediates die young,
+    // their buffers' finalizers queue stream-ordered frees, and the next op drains them. (A failed allocation also
+    // reclaims — see CudaBackend.AllocDeviceMemoryAsync.)
+    private long _ownedResultBytesSinceCollect;
+
+    private void NoteOwnedResultAllocation(long bytes)
+    {
+        long threshold = OwnedResultCollectThresholdBytes;
+        if (System.Threading.Interlocked.Add(ref _ownedResultBytesSinceCollect, bytes) < threshold) return;
+        System.Threading.Interlocked.Exchange(ref _ownedResultBytesSinceCollect, 0);
+        GC.Collect(0, GCCollectionMode.Optimized, blocking: false);
+    }
+
+    private long OwnedResultCollectThresholdBytes =>
+        _directGpu is { } dg && dg.GlobalMemoryBytes > 0 ? Math.Max(256L << 20, dg.GlobalMemoryBytes / 16) : 256L << 20;
 
     /// <summary>
     /// Materializes a deferred download if the given array was returned from a GPU op
