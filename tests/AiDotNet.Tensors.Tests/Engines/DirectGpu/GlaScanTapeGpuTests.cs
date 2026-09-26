@@ -30,12 +30,26 @@ public sealed class GlaScanTapeGpuTests : IClassFixture<DirectGpuTensorEngineTes
     }
 
     private static (Tensor<float> Out, Dictionary<Tensor<float>, Tensor<float>> Grads) Run(
-        IEngine engine, Tensor<float>[] inputs, Tensor<float> r, int numHeads)
+        IEngine engine, Tensor<float>[] inputs, Tensor<float> r, int numHeads, bool expectOnDevice = false)
     {
         using var tape = new GradientTape<float>();
         var output = engine.GlaScanForward(inputs[0], inputs[1], inputs[2], inputs[3], numHeads);
+        // Checked before anything reads the output: a host read materializes it, and a CPU fallback returns
+        // numerically equal values, so only residency distinguishes the device scan from the managed recurrence.
+        if (expectOnDevice)
+            Assert.True(output.IsGpuResident || output.HasPendingGpuData,
+                "GlaScanForward ran on the host (CPU fallback) under an active tape");
         var loss = engine.ReduceSum(engine.TensorMultiply(output, r), [0, 1, 2], keepDims: false);
-        return (output, tape.ComputeGradients(loss, inputs));
+        var grads = tape.ComputeGradients(loss, inputs);
+        if (expectOnDevice)
+        {
+            string[] names = ["dQ", "dK", "dV", "dGate"];
+            for (int i = 0; i < inputs.Length; i++)
+                if (grads.TryGetValue(inputs[i], out var g))
+                    Assert.True(g.IsGpuResident || g.HasPendingGpuData,
+                        $"{names[i]} was computed on the host instead of backend.GlaScanBackward");
+        }
+        return (output, grads);
     }
 
     private static void AssertClose(Tensor<float> expected, Tensor<float> actual, string name)
@@ -61,7 +75,7 @@ public sealed class GlaScanTapeGpuTests : IClassFixture<DirectGpuTensorEngineTes
         var r = Rand(shape, 5);
 
         var (cpuOut, cpuGrads) = Run(cpu, inputs, r, numHeads);
-        var (gpuOut, gpuGrads) = Run(gpu, inputs, r, numHeads);
+        var (gpuOut, gpuGrads) = Run(gpu, inputs, r, numHeads, expectOnDevice: true);
 
         AssertClose(cpuOut, gpuOut, "output");
         string[] names = ["dQ", "dK", "dV", "dGate"];
