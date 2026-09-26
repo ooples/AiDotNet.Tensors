@@ -293,6 +293,31 @@ public class GpuTapeGradientParityTests : IDisposable
             }
         });
 
+    /// <summary>
+    /// ReduceSum's gradient is a broadcast of gradOutput (exact on both engines), so a DOUBLE recording — the
+    /// general path composing permute/reshape that also recorded — would show up as exactly 2x here.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(0)]    // general path (non-innermost axis)
+    [InlineData(1)]    // IEngine innermost-axis kernel
+    [InlineData(-1)]   // full reduction
+    public void ReduceSum_gradients_match_cpu(int axis) =>
+        AssertGradientParity($"ReduceSum[{axis}]", Rand([6, 10], seed: 36),
+            (e, t) => axis < 0 ? e.ReduceSum(t, null, keepDims: true) : e.ReduceSum(t, new[] { axis }, keepDims: true),
+            probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void ReduceSum_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("ReduceSum", static (e, t) => e.ReduceSum(t, new[] { 0 }, keepDims: false), static (x, y) =>
+        {
+            Assert.Equal(new[] { 10 }, y.Shape.ToArray());
+            for (int c = 0; c < 10; c++)
+            {
+                float sum = 0; for (int r = 0; r < 6; r++) sum += x[r, c];
+                Assert.Equal(sum, y[c], 4);
+            }
+        });
+
     [SkippableFact]
     public void TensorAddScalar_gradients_match_cpu() =>
         AssertGradientParity("TensorAddScalar", Rand([4, 16], seed: 26), static (e, t) => e.TensorAddScalar(t, 0.75f),

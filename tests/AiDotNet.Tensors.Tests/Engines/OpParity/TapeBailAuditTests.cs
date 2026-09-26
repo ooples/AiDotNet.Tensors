@@ -103,7 +103,6 @@ public class TapeBailAuditTests
         "Dropout",
         "Embedding",
         "AdaptiveAvgPool2D",
-        "ReduceSum",
         "TensorWhere",
         "BatchNorm",
         "Conv3D",
@@ -188,6 +187,8 @@ public class TapeBailAuditTests
         "TensorAddScalar",
         "TensorSubtractScalar",
         "TensorDivideScalar",
+        // Records ReduceSumBackward on every float device path; the general path suppresses its inner recording.
+        "ReduceSum",
     };
 
     private static string[] GpuEngineSources(string root)

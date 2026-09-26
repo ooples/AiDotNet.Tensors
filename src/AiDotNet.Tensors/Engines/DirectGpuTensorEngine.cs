@@ -16617,8 +16617,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     public override Tensor<T> ReduceSum<T>(Tensor<T> tensor, int[]? axes = null, bool keepDims = false)
     {
-        if (IsTapeActive<T>()) return base.ReduceSum(tensor, axes, keepDims);
-        if (!TryGetBackend(out var backend))
+        // No tape bail: every device path below records CpuEngine's node (ReduceSumBackward with the same
+        // axes/keepDims saved state), so reductions stay on the GPU during training. Non-float goes to the exact
+        // CPU path, tape or not — the kernels compute in float.
+        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend))
             return base.ReduceSum(tensor, axes, keepDims);
 
         // If axes is null, reduce all dimensions
@@ -16647,6 +16649,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
                         var result = DeferTensorResult<T>(backend, output.Buffer, 1, outputShape);
                         handedOff = true;
+                        var allAxes = new int[tensor.Rank];
+                        for (int ax = 0; ax < tensor.Rank; ax++) allAxes[ax] = ax;
+                        Autodiff.DifferentiableOps.RecordUnary("ReduceSum", result, tensor,
+                            Autodiff.BackwardFunctions<T>.ReduceSumBackward, new object[] { allAxes, keepDims });
                         return result;
                     }
                     finally
@@ -16670,7 +16676,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         try
         {
-            return ReduceAxisGpu(tensor, normalizedAxes, keepDims, backend, ReduceOperation.Sum);
+            // The general path may compose engine ops (permute/reshape); suppress their recording so the result has
+            // exactly ONE producer node — the ReduceSum below — and gradients are not counted twice.
+            Tensor<T> reduced;
+            using (new Autodiff.NoGradScope<T>())
+                reduced = ReduceAxisGpu(tensor, normalizedAxes, keepDims, backend, ReduceOperation.Sum);
+            Autodiff.DifferentiableOps.RecordUnary("ReduceSum", reduced, tensor,
+                Autodiff.BackwardFunctions<T>.ReduceSumBackward, new object[] { normalizedAxes, keepDims });
+            return reduced;
         }
         catch
         {
@@ -23635,7 +23648,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.ReduceSum<T>(Tensor<T> tensor, int[]? axes, bool keepDims)
     {
-        if (IsTapeActive<T>()) return base.ReduceSum(tensor, axes, keepDims);
+        // No tape bail: the innermost-axis kernel below records CpuEngine's node, and everything else defers to
+        // the public override, which records its own.
         // GPU fast path only valid when the reduce axis is the INNERMOST.
         // backend.SumAxis treats the buffer as [N, reduceSize] and sums
         // each row — that math only matches the requested reduction when
@@ -23674,7 +23688,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                         for (int i = 0, j = 0; i < rank; i++)
                             if (i != axis) outShape[j++] = tensor.Shape._dims[i];
                     }
-                    return DeferTensorResult<T>(b, go, outerSize, outShape);
+                    var summed = DeferTensorResult<T>(b, go, outerSize, outShape);
+                    Autodiff.DifferentiableOps.RecordUnary("ReduceSum", summed, tensor,
+                        Autodiff.BackwardFunctions<T>.ReduceSumBackward, new object[] { new[] { axis }, keepDims });
+                    return summed;
                 }
             }
             catch { }
