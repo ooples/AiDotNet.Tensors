@@ -24179,7 +24179,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.TensorConcatenate<T>(Tensor<T>[] tensors, int axis)
     {
-        if (IsTapeActive<T>()) return base.TensorConcatenate(tensors, axis);
+        // No tape bail: the device path records the node CpuEngine.Concat records (ConcatenateBackward, saved
+        // axis), so the copies stay on the GPU during training instead of materialising every input on the host.
         // GPU concat along any axis, composed from offset device-to-device
         // copies via IDirectGpuBackend.Copy. The previous path used IGpuBatchExecution.ConcatAxis,
         // which (a) only handled the LAST axis — so the UNet decoder's channel concat (NCHW axis=1)
@@ -24241,7 +24242,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                             int[] outShape = (int[])a.Shape._dims.Clone();
                             outShape[normAxis] = axisTotal;
                             handedOff = true;
-                            return DeferTensorResult<T>(backend, outBuf.Buffer, total, outShape);
+                            var concatenated = DeferTensorResult<T>(backend, outBuf.Buffer, total, outShape);
+                            Autodiff.DifferentiableOps.RecordIfActive("Concat", concatenated, tensors,
+                                Autodiff.BackwardFunctions<T>.ConcatenateBackward, new object[] { normAxis });
+                            return concatenated;
                         }
                         finally
                         {
@@ -24936,7 +24940,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.Concat<T>(IReadOnlyList<Tensor<T>> tensors, int axis)
     {
-        if (IsTapeActive<T>()) return base.Concat(tensors, axis);
+        // No tape bail: the float path below goes through TensorConcatenate, which records the node itself, and
+        // every other case reaches base.Concat, which records too.
         // Reuse the resident all-axis implementation above. It composes offset device copies
         // from IDirectGpuBackend instead of depending on the optional IGpuBatchExecution
         // surface, and therefore works on OpenCL as well as the other native backends.

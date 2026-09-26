@@ -272,6 +272,27 @@ public class GpuTapeGradientParityTests : IDisposable
                 for (int i = 0; i < expected.Length; i++) Assert.Equal(expected[i], y[i], 4);
             });
 
+    private static readonly Tensor<float> ConcatTail = Rand([6, 3], seed: 34);
+
+    /// <summary>Concat only moves data (exact on both engines), so the residency counter proves the device ran.</summary>
+    [SkippableFact]
+    public void Concat_gradients_match_cpu() =>
+        AssertGradientParity("Concat", Rand([6, 10], seed: 35),
+            static (e, t) => e.Concat(new[] { t, ConcatTail }, -1),
+            probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void Concat_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("Concat", static (e, t) => e.Concat(new[] { t, ConcatTail }, 1), static (x, y) =>
+        {
+            Assert.Equal(new[] { 6, 13 }, y.Shape.ToArray());
+            for (int r = 0; r < 6; r++)
+            {
+                for (int c = 0; c < 10; c++) Assert.Equal(x[r, c], y[r, c]);
+                for (int c = 0; c < 3; c++) Assert.Equal(ConcatTail[r, c], y[r, 10 + c]);
+            }
+        });
+
     [SkippableFact]
     public void TensorAddScalar_gradients_match_cpu() =>
         AssertGradientParity("TensorAddScalar", Rand([4, 16], seed: 26), static (e, t) => e.TensorAddScalar(t, 0.75f),
