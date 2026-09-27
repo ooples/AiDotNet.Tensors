@@ -73,58 +73,21 @@ public class TapeBailAuditTests
         // scattered positions, so d/d(input) must be zero there — a mask the reused recording did not
         // reproduce. Signature matching was not enough: only the gradient is wrong, the forward is perfect,
         // so forward parity could never surface it. Needs its own GPU-side backward, not a reused one.
-        "Scatter",
 
         // CUDA now provides where_select, so Sparsemax's non-tape device path is complete. It still bails under
         // a tape because this composite forward does not record a backward; returning the resident result as-is
         // would silently drop the input gradient. Remove this entry when that recording is implemented.
-        "Sparsemax",
 
         // The direct-GPU fused loss has inference kernels but no backend backward contract. Its override now
         // throws NotSupportedException under a tape rather than silently downloading resident logits through
         // CpuEngine. Remove this entry when a tape-compatible GPU backward is implemented.
-        "FusedLinearCrossEntropyWithLogits",
 
         // Existing debt that lived in DirectGpuTensorEngine partial files the original single-file audit did
         // not scan. These are deliberately baselined now that the audit covers the complete partial class;
         // each one needs its CpuEngine saved-state/backward contract verified by a gradient test before its
         // tape bail can be removed safely. New names still fail the audit, and this baseline must only shrink.
-        "FusedLinear",
-        "MaxPool2D",
-        "AvgPool2D",
-        "FlashAttention",
-        "GroupedQueryAttention",
         // FLOAT now records on the device (GpuTapeGradientParityTests.LayerNorm_*); the non-float tape still bails because
         // the FP16 half-store branch saves INVERSE std where LayerNormBackward expects variance. Remove once that holds.
-        "LayerNorm",
-        "RMSNorm",
-        "GroupNorm",
-        "InstanceNorm",
-        "Dropout",
-        "Embedding",
-        "AdaptiveAvgPool2D",
-        "TensorWhere",
-        "BatchNorm",
-        "Conv3D",
-        "ConvTranspose2D",
-        "TensorGather",
-        "Upsample",
-        "TensorMaskedFill",
-        "TensorStack",
-        "TensorDiagonal",
-        "PixelShuffle",
-        "TensorSetSlice",
-        "FusedLinearReLU",
-        "FusedLinearSigmoid",
-        "FusedLinearTanh",
-        "FusedLinearGELU",
-        "FusedLinearSwish",
-        "PadNd",
-        "TensorClampMin",
-        "TensorClampMax",
-        "TensorMaskedScatter",
-        "TensorIndexCopy",
-        "TensorIndexFill",
 
         // NOT fixable, and NOT pending — these are here because the audit matches on op NAME and cannot
         // tell overloads apart. CpuEngine records a backward for TensorMax/TensorMin(tensor, TENSOR), while
@@ -133,8 +96,6 @@ public class TapeBailAuditTests
         // second operand that does not exist — silently wrong gradients rather than a crash. Bailing changes
         // nothing here: the CPU path produces no gradient for the scalar form either. (That the scalar
         // overloads are non-differentiable at all is a separate question, not this audit's.)
-        "TensorMax",
-        "TensorMin",
     };
 
     /// <summary>
@@ -160,6 +121,48 @@ public class TapeBailAuditTests
         // call and broke ResidentIndices_WriteOperationsStayOnDeviceAndPreserveOrdering.
         "TensorPut",
         "TensorScatterReduce",
+        // Encodes the bool condition as the byte[] 0/1 WhereBackward reads. The kernel runs and the node is
+        // recorded either way; only that host copy is skipped when nothing will consume it.
+        "TensorWhere",
+        // Under a tape these materialise the pre-activation the backward needs, through the unfused matmul and
+        // bias-add, and record one node in the override. Inference uses the fused kernel, which never exposes it.
+        "FusedLinear",
+        "FusedLinearReLU",
+        "FusedLinearSigmoid",
+        "FusedLinearTanh",
+        "FusedLinearGELU",
+        "FusedLinearSwish",
+        // Under a tape the pool also keeps its argmax indices resident for the backward; inference never needs
+        // them. The node is recorded in the override either way.
+        "MaxPool2D",
+        // The tape check only keeps training off the resident CUDA-graph capture path, which binds its output without
+        // recording; under a tape the eager kernel path runs and records the node.
+        "ConvTranspose2D",
+        // The Bit-mask overload builds a device 0/1 copy of the mask for the backward only when taping; reading the
+        // mask on the host instead downloaded a resident mask on every call.
+        "TensorMaskedFill",
+        // The index overload copies the target ids to the host for the backward only when taping (resident ids
+        // would otherwise download on every inference call); both overloads record the node.
+        "FusedLinearCrossEntropyWithLogits",
+        // The (tensor, tensor) overloads skip only their unrecorded fast path under a tape; the recording path still runs
+        // the device kernel and saves the operand clones MaxBackward/MinBackward read. The (tensor, scalar) overloads
+        // record ClampMin/ClampMax unconditionally.
+        "TensorMax",
+        "TensorMin",
+    };
+
+    /// <summary>
+    /// Norms whose kernels compute in FP32. Under a tape, only a NON-FLOAT step stays on CpuEngine, so double
+    /// training keeps its precision (a double finite-difference gradcheck cannot resolve an FP32 forward); float runs
+    /// the kernel and records. The tape check is therefore not a residency bail, and
+    /// <c>Non_float_precision_guards_gate_only_non_float</c> holds every entry to exactly that form.
+    /// </summary>
+    private static readonly string[] NonFloatStaysOnCpuUnderTape =
+    {
+        "LayerNorm",
+        "GroupNorm",
+        "InstanceNorm",
+        "RMSNorm",
     };
 
     /// <summary>Ops already fixed — they must never regress to bailing.</summary>
@@ -189,6 +192,28 @@ public class TapeBailAuditTests
         "TensorDivideScalar",
         // Records ReduceSumBackward on every float device path; the general path suppresses its inner recording.
         "ReduceSum",
+        "PixelShuffle",
+        "TensorStack",
+        "TensorDiagonal",
+        "Upsample",
+        "TensorGather",
+        "TensorClampMin",
+        "TensorClampMax",
+        "Embedding",
+        "AdaptiveAvgPool2D",
+        "PadNd",
+        "TensorIndexCopy",
+        "TensorIndexFill",
+        "TensorMaskedScatter",
+        "TensorSetSlice",
+        "AvgPool2D",
+        "Dropout",
+        "BatchNorm",
+        "Conv3D",
+        "FlashAttention",
+        "GroupedQueryAttention",
+        "Scatter",
+        "Sparsemax",
     };
 
     private static string[] GpuEngineSources(string root)
@@ -203,11 +228,15 @@ public class TapeBailAuditTests
             "CpuEngine*.cs",
             SearchOption.TopDirectoryOnly);
 
-    private static Dictionary<string, (bool HasKernel, bool Bails, bool Records)> ScanGpuOverrides(
-        IEnumerable<string> gpuSources)
+    private static readonly TimeSpan RegexTimeout = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// Every GPU override's name and its body with line comments stripped, one entry per overload.
+    /// </summary>
+    private static IEnumerable<(string Name, string Text)> GpuOverrideBodies(IEnumerable<string> gpuSources)
     {
-        var methodRe = new Regex(@"(?:Tensor<T> IEngine\.|public override Tensor<T> |void IEngine\.)([A-Za-z0-9_]+)<T>\s*\(");
-        var result = new Dictionary<string, (bool, bool, bool)>();
+        var methodRe = new Regex(@"(?:Tensor<T> IEngine\.|public override Tensor<T> |void IEngine\.)([A-Za-z0-9_]+)<T>\s*\(",
+            RegexOptions.None, RegexTimeout);
 
         foreach (string gpuSrc in gpuSources)
         {
@@ -247,34 +276,43 @@ public class TapeBailAuditTests
                         int c = l.IndexOf("//", StringComparison.Ordinal);
                         return c >= 0 ? l.Substring(0, c) : l;
                     }));
-
-                bool hasKernel = Regex.IsMatch(text, @"\bbackend\.[A-Za-z0-9_]+\(");
-
-                // Any mention of the tape check in code counts as gating the GPU path. This stays
-                // deliberately CONSERVATIVE rather than trying to classify the bail syntactically, because
-                // the real forms defeat every cheap rule:
-                //   - `if (IsTapeActive<T>()) return base.Op(..);`               early return
-                //   - `if (IsTapeActive<T>()) throw new NotSupportedException(..)` FusedLinearCrossEntropy
-                //   - `if (!IsTapeActive<T>() && ..) { <gpu path> }`             inverted gate, falls
-                //     through to a base call at the end — TensorDiagonal, ConvTranspose2D
-                // A "leads to return base." rule excuses the last two silently, and "records somewhere in
-                // the method" excuses TensorGather, which bails at the top and records further down under
-                // the label "Gather" in a branch only reachable when no tape is active.
-                //
-                // The legitimate use — guarding work needed ONLY when taping, so inference pays nothing —
-                // is handled by the explicit TapeCostGuardOnly allowlist instead, which
-                // Cost_guard_ops_actually_record verifies really does record.
-                bool bails = Regex.IsMatch(text, @"\bIsTapeActive\s*<");
-                // An op can appear more than once (overloads); kernel/bail status ORs across them.
-                // Whether THIS method records, so the allowlist check can be scoped to the body that
-                // carries the tape check rather than to the whole file set.
-                bool records = Regex.IsMatch(text, @"DifferentiableOps\.Record[A-Za-z]*\(");
-
-                if (result.TryGetValue(name, out var prev))
-                    result[name] = (prev.Item1 || hasKernel, prev.Item2 || bails, prev.Item3 || records);
-                else
-                    result[name] = (hasKernel, bails, records);
+                yield return (name, text);
             }
+        }
+    }
+
+    private static Dictionary<string, (bool HasKernel, bool Bails, bool Records)> ScanGpuOverrides(
+        IEnumerable<string> gpuSources)
+    {
+        var result = new Dictionary<string, (bool, bool, bool)>();
+        foreach (var (name, text) in GpuOverrideBodies(gpuSources))
+        {
+            bool hasKernel = Regex.IsMatch(text, @"\bbackend\.[A-Za-z0-9_]+\(", RegexOptions.None, RegexTimeout);
+
+            // Any mention of the tape check in code counts as gating the GPU path. This stays
+            // deliberately CONSERVATIVE rather than trying to classify the bail syntactically, because
+            // the real forms defeat every cheap rule:
+            //   - `if (IsTapeActive<T>()) return base.Op(..);`               early return
+            //   - `if (IsTapeActive<T>()) throw new NotSupportedException(..)` FusedLinearCrossEntropy
+            //   - `if (!IsTapeActive<T>() && ..) { <gpu path> }`             inverted gate, falls
+            //     through to a base call at the end — TensorDiagonal, ConvTranspose2D
+            // A "leads to return base." rule excuses the last two silently, and "records somewhere in
+            // the method" excuses TensorGather, which bails at the top and records further down under
+            // the label "Gather" in a branch only reachable when no tape is active.
+            //
+            // The legitimate use — guarding work needed ONLY when taping, so inference pays nothing —
+            // is handled by the explicit TapeCostGuardOnly allowlist instead, which
+            // Cost_guard_ops_actually_record verifies really does record.
+            bool bails = Regex.IsMatch(text, @"\bIsTapeActive\s*<", RegexOptions.None, RegexTimeout);
+            // An op can appear more than once (overloads); kernel/bail status ORs across them.
+            // Whether THIS method records, so the allowlist check can be scoped to the body that
+            // carries the tape check rather than to the whole file set.
+            bool records = Regex.IsMatch(text, @"DifferentiableOps\.Record[A-Za-z]*\(", RegexOptions.None, RegexTimeout);
+
+            if (result.TryGetValue(name, out var prev))
+                result[name] = (prev.Item1 || hasKernel, prev.Item2 || bails, prev.Item3 || records);
+            else
+                result[name] = (hasKernel, bails, records);
         }
         return result;
     }
@@ -316,6 +354,7 @@ public class TapeBailAuditTests
             if (!info.Bails || !info.HasKernel) continue;
             if (!withBackward.Contains(name)) continue;          // no backward to record — bail is correct
             if (TapeCostGuardOnly.Contains(name)) continue;      // guards work, not a fallback
+            if (NonFloatStaysOnCpuUnderTape.Contains(name)) continue;   // float runs; non-float keeps precision
             if (KnownUnfixed.Contains(name)) continue;           // tracked, pending verification
             violations.Add(name);
         }
@@ -340,7 +379,14 @@ public class TapeBailAuditTests
         string root = RepoRoot();
         var overrides = ScanGpuOverrides(GpuEngineSources(root));
 
-        var regressed = MustNotBail.Where(op => overrides.TryGetValue(op, out var i) && i.Bails).ToList();
+        // A MISSING override must fail too: if one is deleted or renamed, the op falls back to CpuEngine under a
+        // tape and the bail check below, which only inspects overrides it finds, would silently pass.
+        var missing = MustNotBail.Where(op => !overrides.ContainsKey(op)).ToList();
+        Assert.True(missing.Count == 0,
+            "MustNotBail lists ops with no GPU override, so nothing guards them any more; restore the override or "
+            + "remove the entry: " + string.Join(", ", missing));
+
+        var regressed = MustNotBail.Where(op => overrides[op].Bails).ToList();
 
         _out.WriteLine($"checked: {string.Join(", ", MustNotBail)}");
         Assert.True(regressed.Count == 0,
@@ -404,6 +450,45 @@ public class TapeBailAuditTests
             "These ops are allowlisted as using the tape check only to guard work, but their own override "
             + "never records a tape node — so the check IS a bail and the entry is wrong: "
             + string.Join(", ", notRecording));
+    }
+
+    /// <summary>
+    /// A NonFloatStaysOnCpuUnderTape entry is excused only because its tape check sends NON-FLOAT steps to the CPU.
+    /// Every tape check in its overrides must carry the non-float condition, and the float path must record, or
+    /// the entry would be hiding a real bail.
+    /// </summary>
+    [Fact]
+    public void Non_float_precision_guards_gate_only_non_float()
+    {
+        var bodies = GpuOverrideBodies(GpuEngineSources(RepoRoot()))
+            .Where(b => NonFloatStaysOnCpuUnderTape.Contains(b.Name))
+            .ToList();
+        var guard = new Regex(@"\bIsTapeActive\s*<T>\(\)\s*&&\s*typeof\(T\)\s*!=\s*typeof\(float\)", RegexOptions.None,
+            RegexTimeout);
+        var anyTapeCheck = new Regex(@"\bIsTapeActive\s*<", RegexOptions.None, RegexTimeout);
+        var records = new Regex(@"DifferentiableOps\.Record[A-Za-z]*\(", RegexOptions.None, RegexTimeout);
+
+        foreach (string op in NonFloatStaysOnCpuUnderTape)
+        {
+            var mine = bodies.Where(b => b.Name == op).ToList();
+            Assert.True(mine.Count > 0, $"{op} has no GPU override; remove it from NonFloatStaysOnCpuUnderTape.");
+
+            // The float tape path must record, checked per entry point rather than "somewhere in the op": the public
+            // override records itself, and every IEngine overload either records or hands float to that override.
+            // (Behaviour — a float gradient through both entry points on a real device — is asserted by
+            // GpuTapeGradientParityTests.Norm_float_records_through_both_entry_points; this audit cannot run GPU code.)
+            var publicOverrides = mine.Where(b => b.Text.Contains("public override")).ToList();
+            Assert.True(publicOverrides.Count > 0 && publicOverrides.All(b => records.IsMatch(b.Text)),
+                $"{op}'s public override does not record a tape node on its float path.");
+            var floatHandOff = new Regex($@"typeof\(T\)\s*==\s*typeof\(float\)\)\s*return\s+{op}\(", RegexOptions.None, RegexTimeout);
+            foreach (var (_, text) in mine.Where(b => !b.Text.Contains("public override")))
+                Assert.True(records.IsMatch(text) || floatHandOff.IsMatch(text),
+                    $"{op}'s IEngine overload neither records nor hands float to the recording override.");
+            foreach (var (_, text) in mine)
+                Assert.True(anyTapeCheck.Matches(text).Count == guard.Matches(text).Count,
+                    $"{op} has a tape check that is not the non-float guard, i.e. a real bail.");
+        }
+        _out.WriteLine($"checked: {string.Join(", ", NonFloatStaysOnCpuUnderTape)}");
     }
 }
 #endif

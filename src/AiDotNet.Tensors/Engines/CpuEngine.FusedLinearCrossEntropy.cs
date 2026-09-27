@@ -340,7 +340,7 @@ public partial class CpuEngine
     }
 
     // Index-target backward. dlogits[r,v] = (softmax(logits)[r,v] - [v == id_r]) · g/N.
-    private static void FusedLinearCrossEntropyIndexBackward<T>(
+    internal static void FusedLinearCrossEntropyIndexBackward<T>(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output, object[] savedState,
         IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
@@ -349,6 +349,15 @@ public partial class CpuEngine
         var bias = inputs[2];
         var ids = (int[])savedState[0];
         int vocab = (int)savedState[1];
+
+        if (engine is DirectGpuTensorEngine gpu && gpu.TryFusedLinearCrossEntropyBackwardOnDevice(
+                gradOutput, hidden, weight, bias, ids, null, out var deviceHidden, out var deviceWeight, out var deviceBias))
+        {
+            DifferentiableOps.AccumulateGrad(grads, hidden, deviceHidden, engine);
+            DifferentiableOps.AccumulateGrad(grads, weight, deviceWeight, engine);
+            DifferentiableOps.AccumulateGrad(grads, bias, deviceBias, engine);
+            return;
+        }
 
         int n = hidden.Shape[0];
         var ops = MathHelper.GetNumericOperations<T>();
@@ -427,7 +436,7 @@ public partial class CpuEngine
         }
     }
 
-    private static void FusedLinearCrossEntropyBackward<T>(
+    internal static void FusedLinearCrossEntropyBackward<T>(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output, object[] savedState,
         IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
@@ -435,6 +444,15 @@ public partial class CpuEngine
         var weight = inputs[1];
         var bias = inputs[2];
         var target = inputs[3];
+
+        if (engine is DirectGpuTensorEngine gpu && gpu.TryFusedLinearCrossEntropyBackwardOnDevice(
+                gradOutput, hidden, weight, bias, null, target, out var deviceHidden, out var deviceWeight, out var deviceBias))
+        {
+            DifferentiableOps.AccumulateGrad(grads, hidden, deviceHidden, engine);
+            DifferentiableOps.AccumulateGrad(grads, weight, deviceWeight, engine);
+            DifferentiableOps.AccumulateGrad(grads, bias, deviceBias, engine);
+            return;
+        }
 
         int n = hidden.Shape[0];
         int d = hidden.Shape[1];

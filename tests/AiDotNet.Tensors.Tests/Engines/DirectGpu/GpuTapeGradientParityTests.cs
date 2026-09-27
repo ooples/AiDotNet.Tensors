@@ -144,6 +144,38 @@ public class GpuTapeGradientParityTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// The FORWARD computed while a tape records matches CpuEngine's. Gradient parity alone cannot see a wrong taped
+    /// forward whenever the backward reads saved state (a pre-activation) rather than the output, so ops with a
+    /// separate taped forward path need this too.
+    /// </summary>
+    private void AssertTapedForwardMatchesCpu(string opName, Tensor<float> x,
+        Func<IEngine, Tensor<float>, Tensor<float>> op, double tol = 1e-4)
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu!)
+        {
+            float[] ForwardUnderTape(IEngine engine)
+            {
+                AiDotNetEngine.Current = engine;
+                using var tape = new GradientTape<float>();
+                var y = op(engine, x);
+                var values = new float[y.Length];
+                for (int i = 0; i < values.Length; i++) values[i] = y[i];
+                return values;
+            }
+
+            var cpu = ForwardUnderTape(new CpuEngine());
+            var device = ForwardUnderTape(gpu);
+            Assert.Equal(cpu.Length, device.Length);
+            double maxRel = 0;
+            for (int i = 0; i < cpu.Length; i++)
+                maxRel = Math.Max(maxRel, Math.Abs(cpu[i] - device[i]) / Math.Max(1.0, Math.Abs(cpu[i])));
+            _out.WriteLine($"{opName,-14} taped forward maxRel={maxRel:E3}");
+            Assert.True(maxRel <= tol, $"{opName}: taped GPU forward diverged from CPU (maxRel={maxRel:E3}).");
+        }
+    }
+
     [SkippableFact]
     public void TensorCosh_gradients_match_cpu() =>
         AssertGradientParity("TensorCosh", Rand([4, 16], seed: 21, lo: -2.0, hi: 2.0),
@@ -188,6 +220,773 @@ public class GpuTapeGradientParityTests : IDisposable
             checkResult(x, y);
         }
     }
+
+    [SkippableFact]
+    public void PixelShuffle_gradients_match_cpu() =>
+        // A pure permutation is exact on both engines, so engagement is shown by device residency, not divergence.
+        AssertGradientParity("PixelShuffle", Rand([2, 8, 3, 4], seed: 41),
+            static (e, t) => e.PixelShuffle(t, 2), probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void PixelShuffle_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("PixelShuffle",
+            static (e, t) => e.PixelShuffle(e.Reshape(t, new[] { 1, 4, 3, 5 }), 2),
+            static (_, y) => Assert.Equal(new[] { 1, 1, 6, 10 }, y.Shape.ToArray()));
+
+    private static readonly Tensor<float> StackOther = Rand([6, 10], seed: 42);
+
+    [SkippableFact]
+    public void TensorStack_gradients_match_cpu() =>
+        // Stacking copies; exact on both engines, so engagement is shown by device residency.
+        AssertGradientParity("TensorStack", Rand([6, 10], seed: 43),
+            static (e, t) => e.TensorStack(new[] { t, StackOther, t }, -1), probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void TensorStack_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("TensorStack", static (e, t) => e.TensorStack(new[] { t, t }, 0),
+            static (_, y) => Assert.Equal(new[] { 2, 6, 10 }, y.Shape.ToArray()));
+
+    [SkippableFact]
+    public void TensorDiagonal_gradients_match_cpu() =>
+        // Rectangular on purpose: the diagonal is min(rows, cols) long and the gradient keeps the input shape.
+        AssertGradientParity("TensorDiagonal", Rand([6, 10], seed: 44),
+            static (e, t) => e.TensorDiagonal(t), probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void TensorDiagonal_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("TensorDiagonal", static (e, t) => e.TensorDiagonal(t), static (x, y) =>
+        {
+            Assert.Equal(new[] { 6 }, y.Shape.ToArray());
+            for (int i = 0; i < 6; i++) Assert.Equal(x[i, i], y[i]);
+        });
+
+    [SkippableFact]
+    public void Upsample_through_IEngine_gradients_match_cpu() =>
+        // Called through IEngine on purpose: that explicit implementation is the one that used to bail.
+        AssertGradientParity("Upsample", Rand([1, 2, 3, 4], seed: 45),
+            static (e, t) => ((IEngine)e).Upsample(t, 2, 2), probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void Upsample_through_IEngine_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("Upsample",
+            static (e, t) => ((IEngine)e).Upsample(e.Reshape(t, new[] { 1, 1, 6, 10 }), 2, 2),
+            static (_, y) => Assert.Equal(new[] { 1, 1, 12, 20 }, y.Shape.ToArray()));
+
+    // 2-D indices on purpose: the backward's device ScatterAdd mis-shaped an unflattened index set.
+    private static readonly Tensor<int> GatherIndices = new(new[] { 0, 5, 2, 2, 4, 1 }, new[] { 2, 3 });
+
+    [SkippableFact]
+    public void TensorGather_gradients_match_cpu() =>
+        AssertGradientParity("TensorGather", Rand([6, 10], seed: 46),
+            static (e, t) => e.TensorGather(t, GatherIndices, 0), probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void TensorGather_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("TensorGather", static (e, t) => e.TensorGather(t, GatherIndices, 0),
+            static (x, y) =>
+            {
+                Assert.Equal(new[] { 6, 10 }, y.Shape.ToArray());          // CpuEngine's fast-path shape
+                for (int c = 0; c < 10; c++) Assert.Equal(x[5, c], y[1, c]);
+            });
+
+    private static Tensor<bool> BoolMask()
+    {
+        var mask = new Tensor<bool>(new[] { 6, 10 });
+        for (int i = 0; i < mask.Length; i++) mask[i] = i % 3 == 0;
+        return mask;
+    }
+
+    private static Tensor<Bit> BitMask()
+    {
+        var mask = new Tensor<Bit>(new[] { 6, 10 });
+        for (int i = 0; i < mask.Length; i++) mask[i] = i % 3 == 0;
+        return mask;
+    }
+
+    [SkippableFact]
+    public void TensorMaskedFill_bool_mask_gradients_match_cpu() =>
+        AssertGradientParity("MaskedFill(bool)", Rand([6, 10], seed: 47),
+            static (e, t) => e.TensorMaskedFill(t, BoolMask(), -2f), probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void TensorMaskedFill_bit_mask_gradients_match_cpu() =>
+        AssertGradientParity("MaskedFill(Bit)", Rand([6, 10], seed: 48),
+            static (e, t) => e.TensorMaskedFill(t, BitMask(), -2f), probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void TensorMaskedFill_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("TensorMaskedFill", static (e, t) => e.TensorMaskedFill(t, BoolMask(), -2f),
+            static (x, y) => { Assert.Equal(-2f, y[0, 0]); Assert.Equal(x[0, 1], y[0, 1]); });
+
+    // GatherIndices repeats row 2, so the backward must ACCUMULATE into a table row, not overwrite it.
+    [SkippableFact]
+    public void Embedding_gradients_match_cpu() =>
+        AssertGradientParity("Embedding", Rand([6, 10], seed: 83),
+            static (e, t) => e.Embedding(GatherIndices, t), probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void Embedding_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("Embedding", static (e, t) => e.Embedding(GatherIndices, t),
+            static (x, y) => { Assert.Equal(new[] { 2, 3, 10 }, y.Shape.ToArray()); Assert.Equal(x[5, 3], y[0, 1, 3]); });
+    // 6 -> 4 rows and 5 -> 3 columns give OVERLAPPING windows of unequal length, which is where a separable
+    // device backward could drift from the host loop's per-window accumulation.
+    [SkippableFact]
+    public void AdaptiveAvgPool2D_gradients_match_cpu() =>
+        AssertGradientParity("AdaptiveAvgPool2D", Rand([6, 10], seed: 89),
+            static (e, t) => e.AdaptiveAvgPool2D(t.Reshape(new[] { 1, 2, 6, 5 }), 4, 3),
+            probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void AdaptiveAvgPool2D_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("AdaptiveAvgPool2D",
+            static (e, t) => e.AdaptiveAvgPool2D(t.Reshape(new[] { 1, 2, 6, 5 }), 4, 3),
+            static (x, y) => Assert.Equal(new[] { 1, 2, 4, 3 }, y.Shape.ToArray()));
+    // Constant mode drops the fill positions; Reflect and Circular fold several output cells onto one input cell,
+    // so the device scatter-add must accumulate them exactly as the host loop does.
+    [SkippableTheory]
+    [InlineData(PadMode.Constant)]
+    [InlineData(PadMode.Reflect)]
+    [InlineData(PadMode.Replicate)]
+    [InlineData(PadMode.Circular)]
+    public void PadNd_gradients_match_cpu(PadMode mode) =>
+        AssertGradientParity($"PadNd({mode})", Rand([6, 10], seed: 103),
+            (e, t) => e.PadNd(t, new[] { 3, 2, 1, 4 }, mode, 0.5f), probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void PadNd_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("PadNd", static (e, t) => e.PadNd(t, new[] { 3, 2, 1, 4 }, PadMode.Constant, 0.5f),
+            static (x, y) => { Assert.Equal(new[] { 11, 15 }, y.Shape.ToArray()); Assert.Equal(0.5f, y[0, 0]); Assert.Equal(x[0, 0], y[1, 3]); });
+    private static readonly Tensor<int> ColumnIndices = new(new[] { 1, 4, 7 }, new[] { 3 });
+
+    [SkippableFact]
+    public void TensorIndexCopy_destination_gradients_match_cpu() =>
+        AssertGradientParity("IndexCopy(dest)", Rand([6, 10], seed: 107),
+            static (e, t) => e.TensorIndexCopy(t, 1, ColumnIndices, Rand([6, 3], seed: 109)),
+            probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void TensorIndexCopy_source_gradients_match_cpu() =>
+        AssertGradientParity("IndexCopy(source)", Rand([6, 3], seed: 113),
+            static (e, t) => e.TensorIndexCopy(Rand([6, 10], seed: 127), 1, ColumnIndices, t),
+            probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void TensorIndexFill_gradients_match_cpu() =>
+        AssertGradientParity("IndexFill", Rand([6, 10], seed: 131),
+            static (e, t) => e.TensorIndexFill(t, 1, ColumnIndices, -3f), probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void TensorIndexCopy_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("TensorIndexCopy",
+            static (e, t) => e.TensorIndexCopy(t, 1, ColumnIndices, Rand([6, 3], seed: 137)),
+            static (x, y) => Assert.Equal(x[0, 0], y[0, 0]));
+
+    [SkippableFact]
+    public void TensorIndexFill_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("TensorIndexFill", static (e, t) => e.TensorIndexFill(t, 1, ColumnIndices, -3f),
+            static (x, y) => { Assert.Equal(-3f, y[0, 1]); Assert.Equal(x[0, 0], y[0, 0]); });
+    // BitMask has 20 trues; a 25-element source leaves a tail the forward never reads, whose gradient must be 0.
+    [SkippableFact]
+    public void TensorMaskedScatter_destination_gradients_match_cpu() =>
+        AssertGradientParity("MaskedScatter(dest)", Rand([6, 10], seed: 139),
+            static (e, t) => e.TensorMaskedScatter(t, BitMask(), Rand([25], seed: 149)),
+            probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void TensorMaskedScatter_source_gradients_match_cpu() =>
+        AssertGradientParity("MaskedScatter(source)", Rand([25], seed: 151),
+            static (e, t) => e.TensorMaskedScatter(Rand([6, 10], seed: 157), BitMask(), t),
+            probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void TensorMaskedScatter_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("TensorMaskedScatter",
+            static (e, t) => e.TensorMaskedScatter(t, BitMask(), Rand([25], seed: 163)),
+            static (x, y) => Assert.Equal(x[0, 1], y[0, 1]));
+    [SkippableFact]
+    public void TensorSetSlice_destination_gradients_match_cpu() =>
+        AssertGradientParity("SetSlice(dest)", Rand([6, 10], seed: 167),
+            static (e, t) => e.TensorSetSlice(t, Rand([2, 4], seed: 173), new[] { 3, 5 }),
+            probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void TensorSetSlice_source_gradients_match_cpu() =>
+        AssertGradientParity("SetSlice(source)", Rand([2, 4], seed: 179),
+            static (e, t) => e.TensorSetSlice(Rand([6, 10], seed: 181), t, new[] { 3, 5 }),
+            probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void TensorSetSlice_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("TensorSetSlice",
+            static (e, t) => e.TensorSetSlice(t, Rand([2, 4], seed: 191), new[] { 3, 5 }),
+            static (x, y) => Assert.Equal(x[0, 0], y[0, 0]));
+    private static readonly Tensor<float> LinearWeight = Rand([10, 4], seed: 193);
+    private static readonly Tensor<float> LinearBias = Rand([4], seed: 197);
+
+    public enum FusedLinearVariant { Generic, ReLU, Sigmoid, Tanh, GELU, Swish }
+
+    private static Tensor<float> RunFusedLinear(IEngine e, Tensor<float> x, FusedLinearVariant variant) => variant switch
+    {
+        FusedLinearVariant.Generic => e.FusedLinear(x, LinearWeight, LinearBias, FusedActivationType.ReLU),
+        FusedLinearVariant.ReLU => e.FusedLinearReLU(x, LinearWeight, LinearBias),
+        FusedLinearVariant.Sigmoid => e.FusedLinearSigmoid(x, LinearWeight, LinearBias),
+        FusedLinearVariant.Tanh => e.FusedLinearTanh(x, LinearWeight, LinearBias),
+        FusedLinearVariant.GELU => e.FusedLinearGELU(x, LinearWeight, LinearBias),
+        _ => e.FusedLinearSwish(x, LinearWeight, LinearBias),
+    };
+
+    [SkippableTheory]
+    [InlineData(FusedLinearVariant.Generic)]
+    [InlineData(FusedLinearVariant.ReLU)]
+    [InlineData(FusedLinearVariant.Sigmoid)]
+    [InlineData(FusedLinearVariant.Tanh)]
+    [InlineData(FusedLinearVariant.GELU)]
+    [InlineData(FusedLinearVariant.Swish)]
+    public void FusedLinear_gradients_match_cpu(FusedLinearVariant variant) =>
+        AssertGradientParity($"FusedLinear({variant})", Rand([6, 10], seed: 199),
+            (e, t) => RunFusedLinear(e, t, variant), probe: Engagement.UseResidencyCounter);
+
+    [SkippableTheory]
+    [InlineData(FusedLinearVariant.Generic)]
+    [InlineData(FusedLinearVariant.ReLU)]
+    [InlineData(FusedLinearVariant.Sigmoid)]
+    [InlineData(FusedLinearVariant.Tanh)]
+    [InlineData(FusedLinearVariant.GELU)]
+    [InlineData(FusedLinearVariant.Swish)]
+    public void FusedLinear_stays_on_the_device_while_a_tape_records(FusedLinearVariant variant) =>
+        AssertStaysOnDeviceUnderTape($"FusedLinear({variant})", (e, t) => RunFusedLinear(e, t, variant),
+            static (x, y) => Assert.Equal(new[] { 6, 4 }, y.Shape.ToArray()));
+    // The generic FusedLinear across every activation it takes on the device under a tape.
+    [SkippableTheory]
+    [InlineData(FusedActivationType.None)]
+    [InlineData(FusedActivationType.ReLU)]
+    [InlineData(FusedActivationType.Sigmoid)]
+    [InlineData(FusedActivationType.Tanh)]
+    [InlineData(FusedActivationType.GELU)]
+    [InlineData(FusedActivationType.Swish)]
+    [InlineData(FusedActivationType.LeakyReLU)]   // no CPU-matching kernel: goes through ActivationRegistry
+    [InlineData(FusedActivationType.Mish)]
+    public void FusedLinear_generic_activation_gradients_match_cpu(FusedActivationType activation) =>
+        AssertGradientParity($"FusedLinear({activation})", Rand([6, 10], seed: 211),
+            (e, t) => e.FusedLinear(t, LinearWeight, LinearBias, activation), probe: Engagement.UseResidencyCounter);
+
+    [SkippableTheory]
+    [InlineData(FusedActivationType.None)]
+    [InlineData(FusedActivationType.ReLU)]
+    [InlineData(FusedActivationType.Sigmoid)]
+    [InlineData(FusedActivationType.Tanh)]
+    [InlineData(FusedActivationType.GELU)]
+    [InlineData(FusedActivationType.Swish)]
+    [InlineData(FusedActivationType.LeakyReLU)]
+    [InlineData(FusedActivationType.Mish)]
+    public void FusedLinear_generic_activation_taped_forward_matches_cpu(FusedActivationType activation) =>
+        AssertTapedForwardMatchesCpu($"FusedLinear({activation})", Rand([6, 10], seed: 223),
+            (e, t) => e.FusedLinear(t, LinearWeight, LinearBias, activation));
+
+    [SkippableTheory]
+    [InlineData(FusedLinearVariant.ReLU)]
+    [InlineData(FusedLinearVariant.Sigmoid)]
+    [InlineData(FusedLinearVariant.Tanh)]
+    [InlineData(FusedLinearVariant.GELU)]
+    [InlineData(FusedLinearVariant.Swish)]
+    public void FusedLinear_named_variant_taped_forward_matches_cpu(FusedLinearVariant variant) =>
+        AssertTapedForwardMatchesCpu($"FusedLinear({variant})", Rand([6, 10], seed: 227),
+            (e, t) => RunFusedLinear(e, t, variant));
+
+    [SkippableTheory]
+    [InlineData(FusedActivationType.None)]
+    [InlineData(FusedActivationType.Sigmoid)]
+    [InlineData(FusedActivationType.GELU)]
+    public void FusedLinear_generic_activation_stays_on_the_device_while_a_tape_records(FusedActivationType activation) =>
+        AssertStaysOnDeviceUnderTape($"FusedLinear({activation})",
+            (e, t) => e.FusedLinear(t, LinearWeight, LinearBias, activation),
+            static (x, y) => Assert.Equal(new[] { 6, 4 }, y.Shape.ToArray()));
+    // [6,10] viewed as [1,2,5,6]; pool 3 stride 2 with padding exercises windows that cover 1, 2, 4 and 6 real cells.
+    [SkippableTheory]
+    [InlineData(0, false)]
+    [InlineData(1, false)]
+    [InlineData(1, true)]
+    public void AvgPool2D_gradients_match_cpu(int padding, bool countIncludePad) =>
+        AssertGradientParity($"AvgPool2D(p{padding},{countIncludePad})", Rand([6, 10], seed: 229),
+            (e, t) => e.AvgPool2D(t.Reshape(new[] { 1, 2, 5, 6 }), 3, 2, padding, countIncludePad),
+            probe: Engagement.UseResidencyCounter);
+
+    [SkippableTheory]
+    [InlineData(1, false)]
+    [InlineData(1, true)]
+    public void AvgPool2D_taped_forward_matches_cpu(int padding, bool countIncludePad) =>
+        AssertTapedForwardMatchesCpu($"AvgPool2D(p{padding},{countIncludePad})", Rand([6, 10], seed: 233),
+            (e, t) => e.AvgPool2D(t.Reshape(new[] { 1, 2, 5, 6 }), 3, 2, padding, countIncludePad));
+
+    [SkippableFact]
+    public void AvgPool2D_int_array_overload_gradients_match_cpu() =>
+        AssertGradientParity("AvgPool2D(int[])", Rand([6, 10], seed: 239),
+            static (e, t) => e.AvgPool2D(t.Reshape(new[] { 1, 2, 5, 6 }), new[] { 2, 3 }, new[] { 1, 2 }),
+            probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void AvgPool2D_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("AvgPool2D",
+            static (e, t) => e.AvgPool2D(t.Reshape(new[] { 1, 2, 5, 6 }), 3, 2, 1),
+            static (x, y) => Assert.Equal(new[] { 1, 2, 3, 3 }, y.Shape.ToArray()));
+    // Rand is continuous, so no window has a tie and the winner (hence the routed gradient) is unambiguous.
+    [SkippableTheory]
+    [InlineData(0)]
+    [InlineData(1)]
+    public void MaxPool2D_gradients_match_cpu(int padding) =>
+        AssertGradientParity($"MaxPool2D(p{padding})", Rand([6, 10], seed: 241),
+            (e, t) => e.MaxPool2D(t.Reshape(new[] { 1, 2, 5, 6 }), 3, 2, padding), probe: Engagement.UseResidencyCounter);
+
+    [SkippableTheory]
+    [InlineData(0)]
+    [InlineData(1)]
+    public void MaxPool2D_taped_forward_matches_cpu(int padding) =>
+        AssertTapedForwardMatchesCpu($"MaxPool2D(p{padding})", Rand([6, 10], seed: 251),
+            (e, t) => e.MaxPool2D(t.Reshape(new[] { 1, 2, 5, 6 }), 3, 2, padding));
+
+    [SkippableFact]
+    public void MaxPool2D_padded_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("MaxPool2D",
+            static (e, t) => e.MaxPool2D(t.Reshape(new[] { 1, 2, 5, 6 }), 3, 2, 1),
+            static (x, y) => Assert.Equal(new[] { 1, 2, 3, 3 }, y.Shape.ToArray()));
+    /// <summary>
+    /// Dropout draws a different mask on each engine, so CPU parity cannot apply. Its gradient is still pinned by the
+    /// forward it ran: y = x * m elementwise, so d(sum w*y)/dx = w * m = w * y / x wherever x is not near zero.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void Dropout_gradient_matches_the_mask_its_forward_applied(bool training)
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu!)
+        {
+            IEngine engine = gpu!;
+            AiDotNetEngine.Current = engine;
+            var x = Rand([6, 10], seed: 257);
+            using var tape = new GradientTape<float>();
+            var y = engine.Dropout(x, 0.4, training, out _);
+            var weight = new Tensor<float>(y.Shape.ToArray());
+            for (int i = 0; i < weight.Length; i++) weight[i] = 0.13f + 0.017f * (i % 11);
+            var loss = engine.ReduceSum(engine.TensorMultiply(y, weight), null);
+            var grads = tape.ComputeGradients(loss, new[] { x });
+            Assert.True(grads.TryGetValue(x, out var g) && g is not null, "Dropout recorded no tape node.");
+
+            int dropped = 0, checkedCells = 0;
+            for (int i = 0; i < x.Length; i++)
+            {
+                if (Math.Abs(x[i]) < 1e-3f) continue;
+                float applied = y[i] / x[i];
+                if (applied == 0f) dropped++;
+                Assert.Equal(weight[i] * applied, g[i], 4);
+                checkedCells++;
+            }
+            _out.WriteLine($"Dropout(training={training}): checked {checkedCells}, dropped {dropped}");
+            Assert.True(checkedCells > 50, "too few cells were checkable");
+            if (training) Assert.InRange(dropped, 1, checkedCells - 1);   // a real mask, not all-keep or all-drop
+            else Assert.Equal(0, dropped);
+        }
+    }
+
+    [SkippableFact]
+    public void Dropout_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("Dropout", static (e, t) => e.Dropout(t, 0.4, true, out _),
+            static (x, y) => Assert.Equal(x.Shape.ToArray(), y.Shape.ToArray()));
+    /// <summary>
+    /// The norm kernels compute in FP32, so under a tape a DOUBLE forward stays on CpuEngine and keeps its precision:
+    /// it is bit-identical to the CPU's. (A double finite-difference gradcheck taken under the tape, as
+    /// ConvGroupNormGradCheck does, cannot resolve an FP32 forward.) The backward still runs through the engine's
+    /// norm-backward kernels, as it did before, hence the 1e-6 gradient bound. Float runs on the device; the float
+    /// tests above cover that path.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData("LayerNorm")]
+    [InlineData("GroupNorm")]
+    [InlineData("InstanceNorm")]
+    [InlineData("RMSNorm")]
+    public void Norms_keep_double_precision_under_a_tape(string op)
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu!)
+        {
+            (double[] Forward, double[] Grad) Run(IEngine engine)
+            {
+                AiDotNetEngine.Current = engine;
+                var x = new Tensor<double>(new[] { 2, 4, 3, 5 });
+                for (int i = 0; i < x.Length; i++) x[i] = Math.Sin(0.41 * i) + 0.05 * (i % 7);
+                var gamma = new Tensor<double>(op is "LayerNorm" or "RMSNorm" ? new[] { 5 } : new[] { 4 });
+                var beta = new Tensor<double>(gamma.Shape.ToArray());
+                for (int i = 0; i < gamma.Length; i++) { gamma[i] = 0.8 + 0.03 * i; beta[i] = 0.01 * i; }
+                using var tape = new GradientTape<double>();
+                var y = op switch
+                {
+                    "LayerNorm" => engine.LayerNorm(x, gamma, beta, 1e-5, out _, out _),
+                    "GroupNorm" => engine.GroupNorm(x, 2, gamma, beta, 1e-5, out _, out _),
+                    "InstanceNorm" => engine.InstanceNorm(x, gamma, beta, 1e-5, out _, out _),
+                    _ => engine.RMSNorm(x, gamma, 1e-5, out _),
+                };
+                var weight = new Tensor<double>(y.Shape.ToArray());
+                for (int i = 0; i < weight.Length; i++) weight[i] = 0.13 + 0.017 * (i % 11);
+                var loss = engine.ReduceSum(engine.TensorMultiply(y, weight), null);
+                var g = tape.ComputeGradients(loss, new[] { x })[x];
+                var forward = new double[y.Length];
+                for (int i = 0; i < forward.Length; i++) forward[i] = y[i];
+                var flat = new double[g.Length];
+                for (int i = 0; i < flat.Length; i++) flat[i] = g[i];
+                return (forward, flat);
+            }
+
+            var cpu = Run(new CpuEngine());
+            var device = Run(gpu!);
+            double forwardDiff = 0, gradDiff = 0;
+            for (int i = 0; i < cpu.Forward.Length; i++) forwardDiff = Math.Max(forwardDiff, Math.Abs(cpu.Forward[i] - device.Forward[i]));
+            for (int i = 0; i < cpu.Grad.Length; i++) gradDiff = Math.Max(gradDiff, Math.Abs(cpu.Grad[i] - device.Grad[i]));
+            _out.WriteLine($"{op}<double> under tape: forwardDiff={forwardDiff:E3} gradDiff={gradDiff:E3}");
+            Assert.Equal(0.0, forwardDiff);
+            Assert.True(gradDiff < 1e-6, $"{op}<double> gradient lost precision (maxAbs={gradDiff:E3})");
+        }
+    }    private static readonly Tensor<float> NormGamma = Rand([2], seed: 263);
+    private static readonly Tensor<float> NormBeta = Rand([2], seed: 269);
+
+    // [6,10] viewed as [3,2,2,5]: 3 samples, 2 channels, 2x5 positions. Gradient flows through the batch statistics.
+    [SkippableFact]
+    public void BatchNorm_gradients_match_cpu() =>
+        AssertGradientParity("BatchNorm", Rand([6, 10], seed: 271),
+            static (e, t) => e.BatchNorm(t.Reshape(new[] { 3, 2, 2, 5 }), NormGamma, NormBeta, 1e-5, out _, out _));
+
+    [SkippableFact]
+    public void BatchNorm_taped_forward_matches_cpu() =>
+        AssertTapedForwardMatchesCpu("BatchNorm", Rand([6, 10], seed: 277),
+            static (e, t) => e.BatchNorm(t.Reshape(new[] { 3, 2, 2, 5 }), NormGamma, NormBeta, 1e-5, out _, out _));
+
+    // Rank 3 is ONE unbatched [channels, height, width] sample under CpuEngine's rule. The device path used to read
+    // it as [batch, channels, length] and normalise the wrong axis.
+    [SkippableFact]
+    public void BatchNorm_rank3_unbatched_gradients_match_cpu() =>
+        AssertGradientParity("BatchNorm(rank3)", Rand([6, 10], seed: 281),
+            static (e, t) => e.BatchNorm(t.Reshape(new[] { 2, 5, 6 }), NormGamma, NormBeta, 1e-5, out _, out _));
+
+    [SkippableFact]
+    public void BatchNorm_rank3_unbatched_taped_forward_matches_cpu() =>
+        AssertTapedForwardMatchesCpu("BatchNorm(rank3)", Rand([6, 10], seed: 283),
+            static (e, t) => e.BatchNorm(t.Reshape(new[] { 2, 5, 6 }), NormGamma, NormBeta, 1e-5, out _, out _));
+    [SkippableFact]
+    public void BatchNorm_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("BatchNorm",
+            static (e, t) => e.BatchNorm(t.Reshape(new[] { 3, 2, 2, 5 }), NormGamma, NormBeta, 1e-5, out _, out _),
+            static (x, y) => Assert.Equal(new[] { 3, 2, 2, 5 }, y.Shape.ToArray()));
+    public enum NormKind { Group, Instance, Rms }
+
+    private static Tensor<float> RunNorm(IEngine e, Tensor<float> t, NormKind kind) => kind switch
+    {
+        NormKind.Group => e.GroupNorm(t.Reshape(new[] { 3, 4, 5 }), 2, Rand([4], seed: 293), Rand([4], seed: 307),
+            1e-5, out _, out _),
+        NormKind.Instance => e.InstanceNorm(t.Reshape(new[] { 3, 2, 2, 5 }), NormGamma, NormBeta, 1e-5, out _, out _),
+        _ => e.RMSNorm(t, Rand([10], seed: 311), 1e-5, out _),
+    };
+
+    [SkippableTheory]
+    [InlineData(NormKind.Group)]
+    [InlineData(NormKind.Instance)]
+    [InlineData(NormKind.Rms)]
+    public void Norm_gradients_match_cpu(NormKind kind) =>
+        AssertGradientParity($"{kind}Norm", Rand([6, 10], seed: 313), (e, t) => RunNorm(e, t, kind));
+
+    [SkippableTheory]
+    [InlineData(NormKind.Group)]
+    [InlineData(NormKind.Instance)]
+    [InlineData(NormKind.Rms)]
+    public void Norm_taped_forward_matches_cpu(NormKind kind) =>
+        AssertTapedForwardMatchesCpu($"{kind}Norm", Rand([6, 10], seed: 317), (e, t) => RunNorm(e, t, kind));
+
+    [SkippableTheory]
+    [InlineData(NormKind.Group)]
+    [InlineData(NormKind.Instance)]
+    [InlineData(NormKind.Rms)]
+    public void Norm_stays_on_the_device_while_a_tape_records(NormKind kind) =>
+        AssertStaysOnDeviceUnderTape($"{kind}Norm", (e, t) => RunNorm(e, t, kind),
+            static (x, y) => Assert.Equal(x.Length, y.Length));
+    private static readonly Tensor<float> Conv3DKernel = Rand([3, 2, 2, 2, 2], seed: 331);
+    private static readonly Tensor<float> ConvTransposeKernel = Rand([2, 3, 3, 3], seed: 337);
+
+    // [6,10] viewed as [1,2,3,2,5]: one sample, 2 channels, a 3x2x5 volume; padding 1 so edges are exercised.
+    [SkippableFact]
+    public void Conv3D_gradients_match_cpu() =>
+        AssertGradientParity("Conv3D", Rand([6, 10], seed: 347),
+            static (e, t) => e.Conv3D(t.Reshape(new[] { 1, 2, 3, 2, 5 }), Conv3DKernel, 1, 1, 1));
+
+    [SkippableFact]
+    public void Conv3D_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("Conv3D",
+            static (e, t) => e.Conv3D(t.Reshape(new[] { 1, 2, 3, 2, 5 }), Conv3DKernel, 1, 1, 1),
+            static (x, y) => Assert.Equal(new[] { 1, 3, 4, 3, 6 }, y.Shape.ToArray()));
+
+    // [6,10] viewed as [1,2,5,6]; stride 2 with padding exercises the overlap and cropping in the transpose.
+    [SkippableFact]
+    public void ConvTranspose2D_gradients_match_cpu() =>
+        AssertGradientParity("ConvTranspose2D", Rand([6, 10], seed: 349),
+            static (e, t) => e.ConvTranspose2D(t.Reshape(new[] { 1, 2, 5, 6 }), ConvTransposeKernel,
+                new[] { 2, 2 }, new[] { 1, 1 }, new[] { 0, 0 }));
+
+    [SkippableFact]
+    public void ConvTranspose2D_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("ConvTranspose2D",
+            static (e, t) => e.ConvTranspose2D(t.Reshape(new[] { 1, 2, 5, 6 }), ConvTransposeKernel,
+                new[] { 2, 2 }, new[] { 1, 1 }, new[] { 0, 0 }),
+            static (x, y) => Assert.Equal(new[] { 1, 3, 9, 11 }, y.Shape.ToArray()));
+    // [6,10] is exactly a [1,4,5,3] query: 1 batch, 4 heads, 5 positions, head dim 3.
+    private static readonly Tensor<float> AttnKey = Rand([1, 4, 5, 3], seed: 353);
+    private static readonly Tensor<float> AttnValue = Rand([1, 4, 5, 3], seed: 359);
+    private static readonly Tensor<float> GqaKey = Rand([1, 2, 5, 3], seed: 367);
+    private static readonly Tensor<float> GqaValue = Rand([1, 2, 5, 3], seed: 373);
+
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void FlashAttention_gradients_match_cpu(bool causal) =>
+        AssertGradientParity($"FlashAttention(causal={causal})", Rand([6, 10], seed: 379),
+            (e, t) => e.FlashAttention(t.Reshape(new[] { 1, 4, 5, 3 }), AttnKey, AttnValue, null, causal, out _));
+
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void FlashAttention_taped_forward_matches_cpu(bool causal) =>
+        AssertTapedForwardMatchesCpu($"FlashAttention(causal={causal})", Rand([6, 10], seed: 383),
+            (e, t) => e.FlashAttention(t.Reshape(new[] { 1, 4, 5, 3 }), AttnKey, AttnValue, null, causal, out _));
+
+    [SkippableFact]
+    public void FlashAttention_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("FlashAttention",
+            static (e, t) => e.FlashAttention(t.Reshape(new[] { 1, 4, 5, 3 }), AttnKey, AttnValue, null, false, out _),
+            static (x, y) => Assert.Equal(new[] { 1, 4, 5, 3 }, y.Shape.ToArray()));
+
+    // 4 query heads sharing 2 key/value heads, so each KV head's gradient sums over two query heads.
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void GroupedQueryAttention_gradients_match_cpu(bool causal) =>
+        AssertGradientParity($"GQA(causal={causal})", Rand([6, 10], seed: 389),
+            (e, t) => e.GroupedQueryAttention(t.Reshape(new[] { 1, 4, 5, 3 }), GqaKey, GqaValue, 2, null, causal, out _));
+
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void GroupedQueryAttention_taped_forward_matches_cpu(bool causal) =>
+        AssertTapedForwardMatchesCpu($"GQA(causal={causal})", Rand([6, 10], seed: 397),
+            (e, t) => e.GroupedQueryAttention(t.Reshape(new[] { 1, 4, 5, 3 }), GqaKey, GqaValue, 2, null, causal, out _));
+
+    [SkippableFact]
+    public void GroupedQueryAttention_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("GroupedQueryAttention",
+            static (e, t) => e.GroupedQueryAttention(t.Reshape(new[] { 1, 4, 5, 3 }), GqaKey, GqaValue, 2, null, false, out _),
+            static (x, y) => Assert.Equal(new[] { 1, 4, 5, 3 }, y.Shape.ToArray()));
+    // The bail here was restored once after d(input) came out wrong, so BOTH operands are pinned.
+    [SkippableFact]
+    public void Scatter_input_gradients_match_cpu() =>
+        AssertGradientParity("Scatter(input)", Rand([6, 10], seed: 401),
+            static (e, t) => e.Scatter(t, ColumnIndices, Rand([6, 3], seed: 409), 1),
+            probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void Scatter_values_gradients_match_cpu() =>
+        AssertGradientParity("Scatter(values)", Rand([6, 3], seed: 419),
+            static (e, t) => e.Scatter(Rand([6, 10], seed: 421), ColumnIndices, t, 1),
+            probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void Scatter_negative_axis_gradients_match_cpu() =>
+        AssertGradientParity("Scatter(axis -1)", Rand([6, 10], seed: 431),
+            static (e, t) => e.Scatter(t, ColumnIndices, Rand([6, 3], seed: 433), -1),
+            probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void Scatter_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("Scatter",
+            static (e, t) => e.Scatter(t, ColumnIndices, Rand([6, 3], seed: 439), 1),
+            static (x, y) => Assert.Equal(x[0, 0], y[0, 0]));
+    // Rand in [-1,1] over 10 columns leaves several entries per row outside the support, so the gradient's
+    // support mask and its per-row mean correction are both exercised.
+    [SkippableFact]
+    public void Sparsemax_gradients_match_cpu() =>
+        AssertGradientParity("Sparsemax", Rand([6, 10], seed: 443),
+            static (e, t) => e.Sparsemax(t, -1));
+
+    [SkippableFact]
+    public void Sparsemax_taped_forward_matches_cpu() =>
+        AssertTapedForwardMatchesCpu("Sparsemax", Rand([6, 10], seed: 449), static (e, t) => e.Sparsemax(t, -1));
+
+    [SkippableFact]
+    public void Sparsemax_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("Sparsemax", static (e, t) => e.Sparsemax(t, -1),
+            static (x, y) => { for (int r = 0; r < 6; r++) { float s = 0; for (int c = 0; c < 10; c++) s += y[r, c]; Assert.Equal(1f, s, 4); } });
+    // Fused LM head: hidden [6,10] (N=6, d=10), weight [10,7], bias [7] over a 7-word vocabulary.
+    private static readonly Tensor<float> HeadWeight = Rand([10, 7], seed: 457);
+    private static readonly Tensor<float> HeadBias = Rand([7], seed: 461);
+    private static readonly Tensor<int> HeadTargetIds = new(new[] { 0, 3, 6, 2, 2, 5 }, new[] { 6 });
+
+    private static Tensor<float> SoftTargets()
+    {
+        // Rows summing to 1, as the dense backward's (softmax - target) form assumes.
+        var t = new Tensor<float>(new[] { 6, 7 });
+        for (int r = 0; r < 6; r++)
+        {
+            float sum = 0;
+            for (int v = 0; v < 7; v++) { t[r, v] = 1f + ((r * 7 + v) % 5); sum += t[r, v]; }
+            for (int v = 0; v < 7; v++) t[r, v] /= sum;
+        }
+        return t;
+    }
+
+    [SkippableFact]
+    public void FusedLinearCrossEntropy_index_hidden_gradients_match_cpu() =>
+        AssertGradientParity("FusedLinearCE(ids, hidden)", Rand([6, 10], seed: 463),
+            static (e, t) => e.FusedLinearCrossEntropyWithLogits(t, HeadWeight, HeadBias, HeadTargetIds));
+
+    [SkippableFact]
+    public void FusedLinearCrossEntropy_index_weight_gradients_match_cpu() =>
+        AssertGradientParity("FusedLinearCE(ids, weight)", Rand([10, 7], seed: 467),
+            static (e, t) => e.FusedLinearCrossEntropyWithLogits(Rand([6, 10], seed: 479), t, HeadBias, HeadTargetIds));
+
+    [SkippableFact]
+    public void FusedLinearCrossEntropy_dense_hidden_gradients_match_cpu() =>
+        AssertGradientParity("FusedLinearCE(dense, hidden)", Rand([6, 10], seed: 487),
+            static (e, t) => e.FusedLinearCrossEntropyWithLogits(t, HeadWeight, HeadBias, SoftTargets()));
+
+    [SkippableFact]
+    public void FusedLinearCrossEntropy_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("FusedLinearCrossEntropy",
+            static (e, t) => e.FusedLinearCrossEntropyWithLogits(t, HeadWeight, HeadBias, SoftTargets()),
+            static (x, y) => Assert.Equal(new[] { 1 }, y.Shape.ToArray()));
+    // The scalar overloads recorded no node on EITHER engine, so parity alone would pass with both gradients
+    // missing; GradientOf asserts a gradient reached the input first.
+    [SkippableFact]
+    public void TensorMax_scalar_gradients_match_cpu() =>
+        AssertGradientParity("TensorMax(x, s)", WithBoundTies(Rand([6, 10], seed: 491)),
+            static (e, t) => e.TensorMax(t, 0.1f), probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void TensorMin_scalar_gradients_match_cpu() =>
+        AssertGradientParity("TensorMin(x, s)", WithBoundTies(Rand([6, 10], seed: 499)),
+            static (e, t) => e.TensorMin(t, 0.1f), probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void TensorMax_binary_gradients_match_cpu() =>
+        AssertGradientParity("TensorMax(a, b)", Rand([6, 10], seed: 503),
+            static (e, t) => e.TensorMax(t, Rand([6, 10], seed: 509)), probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void TensorMax_binary_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("TensorMax(a, b)", static (e, t) => e.TensorMax(t, Rand([6, 10], seed: 521)),
+            static (x, y) => Assert.Equal(new[] { 6, 10 }, y.Shape.ToArray()));
+    [SkippableFact]
+    public void TensorMax_scalar_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("TensorMax", static (e, t) => e.TensorMax(t, 0.1f),
+            static (x, y) => Assert.Equal(Math.Max(x[0, 0], 0.1f), y[0, 0]));
+    /// <summary>
+    /// The norms keep only NON-float on the CPU under a tape, so the float path must run AND record through both the
+    /// IEngine entry point and the public override: a gradient must reach the input and agree with the CPU's.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData("LayerNorm", false)]
+    [InlineData("LayerNorm", true)]
+    [InlineData("GroupNorm", false)]
+    [InlineData("GroupNorm", true)]
+    [InlineData("InstanceNorm", false)]
+    [InlineData("InstanceNorm", true)]
+    [InlineData("RMSNorm", false)]
+    [InlineData("RMSNorm", true)]
+    public void Norm_float_records_through_both_entry_points(string op, bool throughPublicOverride) =>
+        AssertGradientParity($"{op}(public={throughPublicOverride})", Rand([6, 10], seed: 523), (e, t) =>
+        {
+            var x = t.Reshape(new[] { 3, 4, 1, 5 });
+            var gamma4 = Rand([4], seed: 541);
+            var beta4 = Rand([4], seed: 547);
+            var gamma5 = Rand([5], seed: 557);
+            var beta5 = Rand([5], seed: 563);
+            if (throughPublicOverride && e is DirectGpuTensorEngine gpu)
+                return op switch
+                {
+                    "LayerNorm" => gpu.LayerNorm(x, gamma5, beta5, 1e-5, out _, out _),
+                    "GroupNorm" => gpu.GroupNorm(x, 2, gamma4, beta4, 1e-5, out _, out _),
+                    "InstanceNorm" => gpu.InstanceNorm(x, gamma4, beta4, 1e-5, out _, out _),
+                    _ => gpu.RMSNorm(x, gamma5, 1e-5, out _),
+                };
+            return op switch
+            {
+                "LayerNorm" => e.LayerNorm(x, gamma5, beta5, 1e-5, out _, out _),
+                "GroupNorm" => e.GroupNorm(x, 2, gamma4, beta4, 1e-5, out _, out _),
+                "InstanceNorm" => e.InstanceNorm(x, gamma4, beta4, 1e-5, out _, out _),
+                _ => e.RMSNorm(x, gamma5, 1e-5, out _),
+            };
+        });
+    // Duplicate indices: position 0 and 2 both write column 1, and the later write wins, so source/values column 0
+    // never reaches the output and must get ZERO gradient on both engines (the backward runs on the device).
+    private static readonly Tensor<int> DuplicateColumnIndices = new(new[] { 1, 4, 1 }, new[] { 3 });
+
+    [SkippableFact]
+    public void TensorIndexCopy_duplicate_indices_source_gradients_match_cpu() =>
+        AssertGradientParity("IndexCopy(dup, source)", Rand([6, 3], seed: 569),
+            static (e, t) => e.TensorIndexCopy(Rand([6, 10], seed: 571), 1, DuplicateColumnIndices, t),
+            probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void Scatter_duplicate_indices_values_gradients_match_cpu() =>
+        AssertGradientParity("Scatter(dup, values)", Rand([6, 3], seed: 577),
+            static (e, t) => e.Scatter(Rand([6, 10], seed: 587), DuplicateColumnIndices, t, 1),
+            probe: Engagement.UseResidencyCounter);
+    [SkippableFact]
+    public void TensorClampMin_gradients_match_cpu() =>
+        AssertGradientParity("ClampMin", Rand([6, 10], seed: 73),
+            static (e, t) => e.TensorClampMin(t, 0.1f), probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void TensorClampMax_gradients_match_cpu() =>
+        AssertGradientParity("ClampMax", Rand([6, 10], seed: 79),
+            static (e, t) => e.TensorClampMax(t, 0.1f), probe: Engagement.UseResidencyCounter);
+
+    // Inputs EXACTLY at the bound: the host keeps the gradient there (>= / <=), so the device predicate's
+    // equality term is what these pin. Random inputs never land on 0.1f, so the tests above cannot see it.
+    [SkippableFact]
+    public void TensorClampMin_passes_the_gradient_at_the_bound() =>
+        AssertGradientParity("ClampMin(ties)", WithBoundTies(Rand([6, 10], seed: 97)),
+            static (e, t) => e.TensorClampMin(t, 0.1f), probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void TensorClampMax_passes_the_gradient_at_the_bound() =>
+        AssertGradientParity("ClampMax(ties)", WithBoundTies(Rand([6, 10], seed: 101)),
+            static (e, t) => e.TensorClampMax(t, 0.1f), probe: Engagement.UseResidencyCounter);
+
+    private static Tensor<float> WithBoundTies(Tensor<float> x)
+    {
+        for (int i = 0; i < x.Length; i += 7) x[i] = 0.1f;
+        return x;
+    }
+    [SkippableFact]
+    public void TensorClampMin_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("TensorClampMin", static (e, t) => e.TensorClampMin(t, 0.1f),
+            static (x, y) => Assert.Equal(Math.Max(x[0, 0], 0.1f), y[0, 0]));
+
+    [SkippableFact]
+    public void TensorClampMax_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("TensorClampMax", static (e, t) => e.TensorClampMax(t, 0.1f),
+            static (x, y) => Assert.Equal(Math.Min(x[0, 0], 0.1f), y[0, 0]));
+    [SkippableFact]
+    public void TensorWhere_bool_condition_gradients_match_cpu() =>
+        AssertGradientParity("Where(bool)", Rand([6, 10], seed: 53),
+            static (e, t) => ((IEngine)e).TensorWhere(BoolMask(), t, Rand([6, 10], seed: 59)),
+            probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void TensorWhere_bit_condition_gradients_match_cpu() =>
+        AssertGradientParity("Where(Bit)", Rand([6, 10], seed: 61),
+            static (e, t) => e.TensorWhere(BitMask(), Rand([6, 10], seed: 67), t),
+            probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void TensorWhere_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("TensorWhere",
+            static (e, t) => ((IEngine)e).TensorWhere(BoolMask(), t, Rand([6, 10], seed: 71)),
+            static (x, y) => Assert.Equal(x[0, 0], y[0, 0]));
 
     [SkippableFact]
     public void TensorTranspose_stays_on_the_device_while_a_tape_records() =>
