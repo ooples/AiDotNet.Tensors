@@ -319,6 +319,23 @@ public class GpuTapeGradientParityTests : IDisposable
         AssertGradientParity("ClampMax", Rand([6, 10], seed: 79),
             static (e, t) => e.TensorClampMax(t, 0.1f), probe: Engagement.UseResidencyCounter);
 
+    // Inputs EXACTLY at the bound: the host keeps the gradient there (>= / <=), so the device predicate's
+    // equality term is what these pin. Random inputs never land on 0.1f, so the tests above cannot see it.
+    [SkippableFact]
+    public void TensorClampMin_passes_the_gradient_at_the_bound() =>
+        AssertGradientParity("ClampMin(ties)", WithBoundTies(Rand([6, 10], seed: 97)),
+            static (e, t) => e.TensorClampMin(t, 0.1f), probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void TensorClampMax_passes_the_gradient_at_the_bound() =>
+        AssertGradientParity("ClampMax(ties)", WithBoundTies(Rand([6, 10], seed: 101)),
+            static (e, t) => e.TensorClampMax(t, 0.1f), probe: Engagement.UseResidencyCounter);
+
+    private static Tensor<float> WithBoundTies(Tensor<float> x)
+    {
+        for (int i = 0; i < x.Length; i += 7) x[i] = 0.1f;
+        return x;
+    }
     [SkippableFact]
     public void TensorClampMin_stays_on_the_device_while_a_tape_records() =>
         AssertStaysOnDeviceUnderTape("TensorClampMin", static (e, t) => e.TensorClampMin(t, 0.1f),
