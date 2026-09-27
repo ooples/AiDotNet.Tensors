@@ -32,7 +32,8 @@ internal static class PlanFormatConstants
     /// Version 6 records the complete ordered mutable-input tensor ID list for
     /// inference plans. Earlier versions retained only the first input slot.
     /// Version 7 adds LAMB's trust-ratio clip and bias-correction switch to the fused-optimizer extras. Version 6
-    /// plans do not contain them and must be rejected rather than shifting every field that follows.
+    /// plans do not contain them and must be rejected rather than shifting every field that follows. It also adds the
+    /// int8 moment-storage minimum quantized length (smaller parameters keep fp32 moments).
     /// </remarks>
     internal const ushort CurrentFormatVersion = 7;
 

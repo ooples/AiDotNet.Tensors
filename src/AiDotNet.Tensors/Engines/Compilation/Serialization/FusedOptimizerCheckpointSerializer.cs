@@ -18,6 +18,8 @@ internal static class FusedOptimizerCheckpointSerializer
         writer.Write(checkpoint.WeightDecay);
         writer.Write((int)checkpoint.MomentStorageMode);
         writer.Write(checkpoint.Int8MomentBlockSize);
+        // Which parameters hold int8 rather than fp32 moments (format version 7).
+        writer.Write(checkpoint.Int8MinQuantizedLength);
         writer.Write(checkpoint.MaxGradNorm);
         WriteExtras(writer, checkpoint.Extras);
         WriteLrSchedules(writer, checkpoint.Schedules);
@@ -49,6 +51,7 @@ internal static class FusedOptimizerCheckpointSerializer
             WeightDecay = reader.ReadSingle(),
             MomentStorageMode = (FusedMomentStorageMode)reader.ReadInt32(),
             Int8MomentBlockSize = reader.ReadInt32(),
+            Int8MinQuantizedLength = reader.ReadInt32(),
             MaxGradNorm = reader.ReadDouble(),
             Extras = ReadExtras(reader),
             Schedules = ReadLrSchedules(reader),

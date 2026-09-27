@@ -1110,6 +1110,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         public FusedOptimizerExtras Extras = new FusedOptimizerExtras();
         public FusedMomentStorageMode MomentStorageMode;
         public int Int8MomentBlockSize;
+        public int Int8MinQuantizedLength;
         public FusedOptimizerRuntimeScalars Scalars = new FusedOptimizerRuntimeScalars();
         public float[][]? MFloat;
         public float[][]? VFloat;
@@ -1158,6 +1159,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // the Adam-family m/v state owned by the fused optimizer closure.
     private FusedMomentStorageMode _momentStorageMode = FusedMomentStorageMode.Float32;
     private int _int8MomentBlockSize = 2048;
+    private int _int8MinQuantizedLength = DefaultInt8MinQuantizedLength;
+
+    /// <summary>
+    /// Tensors with fewer elements than this keep fp32 Adam moments under int8 moment storage: bitsandbytes'
+    /// <c>min_8bit_size</c> (Dettmers et al., "8-bit Optimizers via Block-wise Quantization", ICLR 2022). Small
+    /// tensors (biases, norms) cost almost nothing in fp32 and are where quantization error hurts most.
+    /// </summary>
+    public const int DefaultInt8MinQuantizedLength = 4096;
 
     // Return a prior configuration's fp32 Adam m/v/vMax buffers to the cross-arena
     // persistent pool so the NEXT ConfigureOptimizer* re-rents them instead of
@@ -1196,7 +1205,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// path. Supported only for Adam without weight decay. Last request wins
     /// against <see cref="RequestBf16MomentStorage"/>.
     /// </summary>
-    public void RequestInt8MomentStorage(bool enabled, int blockSize = 2048)
+    public void RequestInt8MomentStorage(bool enabled, int blockSize = 2048,
+        int minQuantizedLength = DefaultInt8MinQuantizedLength)
     {
         if (!enabled)
         {
@@ -1205,7 +1215,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         }
         if (blockSize <= 0)
             throw new ArgumentOutOfRangeException(nameof(blockSize), "Block size must be positive.");
+        if (minQuantizedLength < 0)
+            throw new ArgumentOutOfRangeException(nameof(minQuantizedLength), "Minimum quantized length must be >= 0.");
         _int8MomentBlockSize = blockSize;
+        _int8MinQuantizedLength = minQuantizedLength;
         _momentStorageMode = FusedMomentStorageMode.Int8BlockQuantized;
     }
 
@@ -2793,7 +2806,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     _gpuOptimizerBuffers.Add(vBufBf16);
                     gpuMomentStorage[p] = FusedMomentStorageMode.BFloat16;
                 }
-                else if (useInt8Moments)
+                else if (useInt8Moments && lengths[p] >= _int8MinQuantizedLength)
                 {
                     if (paramBackend is not Engines.DirectGpu.ICompressedMomentGpuOptimizerBackend)
                         throw new NotSupportedException(
@@ -2873,7 +2886,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 mScales[p] = Array.Empty<double>();
                 vScales[p] = Array.Empty<double>();
             }
-            else if (useInt8Moments)
+            else if (useInt8Moments && lengths[p] >= _int8MinQuantizedLength)
             {
                 m[p] = Array.Empty<float>();
                 v[p] = Array.Empty<float>();
@@ -2977,6 +2990,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 : useInt8Moments ? FusedMomentStorageMode.Int8BlockQuantized
                 : FusedMomentStorageMode.Float32,
             Int8MomentBlockSize = _int8MomentBlockSize,
+            Int8MinQuantizedLength = _int8MinQuantizedLength,
             Scalars = scalarState,
             MFloat = m,
             VFloat = v,
@@ -3650,7 +3664,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                 fixed (ushort* pMb = mB[p], pVb = vB[p])
                                     FusedOptimizer.AdamUpdateBf16Simd(pParam, pGrad, pMb, pVb, len,
                                         lr, b1, b2, epsVal, _optimizerStep);
-                            else if (useInt8Moments)
+                            else if (useInt8Moments && mQuant[p].Length != 0)
                                 fixed (byte* pMq = mQuant[p], pVq = vQuant[p])
                                 fixed (double* pMs = mScales[p], pVs = vScales[p])
                                     FusedOptimizer.AdamUpdateInt8BlockQuantized(
@@ -3948,7 +3962,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     _gpuOptimizerBuffers.Add(vBufBf16);
                     gpuMomentStorage[p] = FusedMomentStorageMode.BFloat16;
                 }
-                else if (useInt8Moments)
+                else if (useInt8Moments && lengths[p] >= _int8MinQuantizedLength)
                 {
                     if (paramBackend is not Engines.DirectGpu.ICompressedMomentGpuOptimizerBackend)
                         throw new NotSupportedException(
@@ -4021,7 +4035,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 mScales[p] = Array.Empty<double>();
                 vScales[p] = Array.Empty<double>();
             }
-            else if (useInt8Moments)
+            else if (useInt8Moments && lengths[p] >= _int8MinQuantizedLength)
             {
                 m[p] = Array.Empty<float>();
                 v[p] = Array.Empty<float>();
@@ -4081,6 +4095,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 : useInt8Moments ? FusedMomentStorageMode.Int8BlockQuantized
                 : FusedMomentStorageMode.Float32,
             Int8MomentBlockSize = _int8MomentBlockSize,
+            Int8MinQuantizedLength = _int8MinQuantizedLength,
             MFloat = m,
             VFloat = v,
             VMaxFloat = vMax,
@@ -4289,7 +4304,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                 fixed (ushort* pMb = mB[p], pVb = vB[p])
                                     FusedOptimizer.AdamUpdateBf16Simd(pParam, pGrad, pMb, pVb, len,
                                         lr, b1, b2, epsVal, _optimizerStep);
-                            else if (useInt8Moments)
+                            else if (useInt8Moments && mQuant[p].Length != 0)
                                 fixed (byte* pMq = mQuant[p], pVq = vQuant[p])
                                 fixed (double* pMs = mScales[p], pVs = vScales[p])
                                     FusedOptimizer.AdamUpdateInt8BlockQuantized(
@@ -4527,6 +4542,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             Extras = new FusedOptimizerExtras(),
             MomentStorageMode = FusedMomentStorageMode.Float32,
             Int8MomentBlockSize = _int8MomentBlockSize,
+            Int8MinQuantizedLength = _int8MinQuantizedLength,
             MDouble = m,
             VDouble = v,
             VMaxDouble = vMax,
@@ -4721,6 +4737,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             Extras = new FusedOptimizerExtras(),
             MomentStorageMode = FusedMomentStorageMode.Float32,
             Int8MomentBlockSize = _int8MomentBlockSize,
+            Int8MinQuantizedLength = _int8MinQuantizedLength,
             MDouble = m,
             VDouble = v,
             VMaxDouble = vMax,
@@ -4833,6 +4850,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             WeightDecay = rt.WeightDecay,
             MomentStorageMode = rt.MomentStorageMode,
             Int8MomentBlockSize = rt.Int8MomentBlockSize,
+            Int8MinQuantizedLength = rt.Int8MinQuantizedLength,
             MaxGradNorm = _maxGradNorm,
             Extras = CloneFusedOptimizerExtras(rt.Extras),
             Schedules = schedules,
@@ -4867,6 +4885,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var previous = CaptureFusedOptimizerCheckpoint();
         var previousMomentMode = _momentStorageMode;
         var previousBlockSize = _int8MomentBlockSize;
+        var previousMinQuantizedLength = _int8MinQuantizedLength;
         var previousMaxGradNorm = _maxGradNorm;
         try
         {
@@ -4887,6 +4906,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 ClearFusedOptimizer();
                 _momentStorageMode = previousMomentMode;
                 _int8MomentBlockSize = previousBlockSize;
+                _int8MinQuantizedLength = previousMinQuantizedLength;
                 _maxGradNorm = previousMaxGradNorm;
             }
 
@@ -4935,6 +4955,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
         _momentStorageMode = checkpoint.MomentStorageMode;
         _int8MomentBlockSize = checkpoint.Int8MomentBlockSize;
+        _int8MinQuantizedLength = checkpoint.Int8MinQuantizedLength;
         _maxGradNorm = checkpoint.MaxGradNorm;
 
         var schedules = new LrSchedule[checkpoint.Schedules.Length];
