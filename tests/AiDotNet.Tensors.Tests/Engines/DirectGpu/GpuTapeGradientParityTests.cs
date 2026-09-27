@@ -353,6 +353,24 @@ public class GpuTapeGradientParityTests : IDisposable
     public void TensorIndexFill_stays_on_the_device_while_a_tape_records() =>
         AssertStaysOnDeviceUnderTape("TensorIndexFill", static (e, t) => e.TensorIndexFill(t, 1, ColumnIndices, -3f),
             static (x, y) => { Assert.Equal(-3f, y[0, 1]); Assert.Equal(x[0, 0], y[0, 0]); });
+    // BitMask has 20 trues; a 25-element source leaves a tail the forward never reads, whose gradient must be 0.
+    [SkippableFact]
+    public void TensorMaskedScatter_destination_gradients_match_cpu() =>
+        AssertGradientParity("MaskedScatter(dest)", Rand([6, 10], seed: 139),
+            static (e, t) => e.TensorMaskedScatter(t, BitMask(), Rand([25], seed: 149)),
+            probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void TensorMaskedScatter_source_gradients_match_cpu() =>
+        AssertGradientParity("MaskedScatter(source)", Rand([25], seed: 151),
+            static (e, t) => e.TensorMaskedScatter(Rand([6, 10], seed: 157), BitMask(), t),
+            probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void TensorMaskedScatter_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("TensorMaskedScatter",
+            static (e, t) => e.TensorMaskedScatter(t, BitMask(), Rand([25], seed: 163)),
+            static (x, y) => Assert.Equal(x[0, 1], y[0, 1]));
     [SkippableFact]
     public void TensorClampMin_gradients_match_cpu() =>
         AssertGradientParity("ClampMin", Rand([6, 10], seed: 73),

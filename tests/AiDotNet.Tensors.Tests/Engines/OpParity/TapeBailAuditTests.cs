@@ -110,7 +110,6 @@ public class TapeBailAuditTests
         "FusedLinearTanh",
         "FusedLinearGELU",
         "FusedLinearSwish",
-        "TensorMaskedScatter",
 
         // NOT fixable, and NOT pending — these are here because the audit matches on op NAME and cannot
         // tell overloads apart. CpuEngine records a backward for TensorMax/TensorMin(tensor, TENSOR), while
@@ -191,6 +190,7 @@ public class TapeBailAuditTests
         "PadNd",
         "TensorIndexCopy",
         "TensorIndexFill",
+        "TensorMaskedScatter",
     };
 
     private static string[] GpuEngineSources(string root)
