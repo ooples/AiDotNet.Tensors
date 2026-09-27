@@ -1628,13 +1628,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     public void InvalidateResidentWeightBuffer<T>(LinearAlgebra.Tensor<T> tensor)
     {
-        // Contract: the caller just wrote the HOST weights in place, so the host is authoritative. A DEVICE-OWNED
-        // weight (moved with Gpu()/To()) keeps its buffer and receives the host data in place: compiled plans and
-        // fused optimizers bind that buffer once and keep using it, so detaching it orphaned every later update.
-        // (A caller whose update ran ON the device must not call this at all — the device already holds the value.)
-        if (Helpers.ResidentHostMirror.TryUploadHostIntoResident(tensor))
-            return;
-
         // DROP (do not materialize) any pending deferred device->host download FIRST. The host
         // weight array was just updated IN PLACE by the CPU-side optimizer, so a pending download
         // holds STALE pre-step device data; letting InvalidateGpuCacheForTensor force-materialize it

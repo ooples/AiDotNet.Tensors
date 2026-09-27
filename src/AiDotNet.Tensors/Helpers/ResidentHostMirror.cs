@@ -82,36 +82,4 @@ internal static class ResidentHostMirror
         DeferredArrayMaterializer.Register(key, tensor._gpuMaterializerCallback!);
         return true;
     }
-
-    /// <summary>
-    /// The HOST copy was just written in place and is authoritative. For a device-owned tensor (moved with
-    /// Gpu()/To()), upload it INTO the existing device buffer and keep the buffer attached: compiled plans and fused
-    /// optimizers bind that buffer once and keep reading and writing it, so detaching it orphaned every later
-    /// update. Any pending download is stale by definition and is dropped first.
-    /// </summary>
-    /// <returns>false when the tensor is not device-owned (the caller keeps its detach behaviour).</returns>
-    internal static bool TryUploadHostIntoResident<T>(Tensor<T> tensor)
-    {
-        if (tensor._device == TensorDevice.CPU || !HasContiguousResidentBuffer(tensor)) return false;
-        var array = tensor.GetBackingArrayForCacheLookupUnsafe() as T[];
-        if (array is null) return false;
-        DeferredArrayMaterializer.Remove(array);
-
-        var slice = new T[tensor.Length];
-        Array.Copy(array, tensor._storageOffset, slice, 0, tensor.Length);
-        var host = DirectGpuEngine.ToFloatArray(slice);
-        var backend = tensor._gpuBackend!;
-        var buffer = tensor._gpuBuffer!;
-        if (backend is Engines.DirectGpu.CUDA.CudaBackend cuda)
-        {
-            cuda.UploadBufferInPlace(host, buffer);
-        }
-        else
-        {
-            using var staging = backend.AllocateBuffer(host);
-            backend.Copy(staging, buffer, host.Length);
-        }
-        tensor._gpuBufferVersion = tensor.GpuCacheVersion;
-        return true;
-    }
 }

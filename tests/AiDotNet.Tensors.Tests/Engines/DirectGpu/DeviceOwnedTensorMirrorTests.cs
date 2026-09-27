@@ -7,8 +7,9 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 
 /// <summary>
 /// Pins the contract for a tensor moved to the device with <see cref="Tensor{T}.Gpu()"/> — a GPU-resident training
-/// parameter. The device buffer holds the authoritative value; a device-side write reaches host reads; a host-side
-/// write reaches the device WITHOUT detaching the buffer that compiled plans and fused optimizers keep writing.
+/// parameter: it is placed on the dispatcher's backend, and a device-side write reaches host reads, each aliased view
+/// into its own slice. (A host-side write followed by InvalidateResidentWeightBuffer detaches the buffer and returns the
+/// tensor to the CPU - see ResidentWeightInvalidationDeviceStateTests.)
 /// </summary>
 /// <remarks>
 /// Measured failure these guard (plain MLP, NeuralNetwork.Train on the GPU engine): the fused optimizer updated
@@ -83,29 +84,6 @@ public class DeviceOwnedTensorMirrorTests : IDisposable
             // b's registration must not displace a's pending download, and neither may land on the other's slice.
             Assert.All(a.ToArray(), v => Assert.Equal(5f, v));
             Assert.All(b.ToArray(), v => Assert.Equal(7f, v));
-        }
-    }
-
-    [SkippableFact]
-    public void A_host_write_reaches_the_device_without_detaching_the_buffer()
-    {
-        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
-        using (gpu)
-        {
-            AiDotNetEngine.Current = gpu;
-            var t = Filled([64], 1f).Gpu();
-            var backend = gpu.GetBackend()!;
-            var buffer = t.TryGetGpuBuffer()!;
-
-            // What an eager host-side optimizer does: write the live backing array in place, then invalidate.
-            var host = t.GetBackingArrayForCacheLookupUnsafe()!;
-            for (int i = 0; i < 64; i++) host[i] = 9f;
-            gpu.InvalidateResidentWeightBuffer(t);
-
-            Assert.Same(buffer, t.TryGetGpuBuffer());
-            Assert.True(t.IsGpuResident);
-            var device = backend.DownloadBuffer(buffer);
-            for (int i = 0; i < 64; i++) Assert.Equal(9f, device[i]);
         }
     }
 
