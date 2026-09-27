@@ -1486,6 +1486,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// for chained GPU operations. This is the primary method for GPU-resident pipelines.
     /// </summary>
     /// <summary>
+    /// Tensor.Contiguous() hook: a contiguous device copy of a permuted view of device-only data, or false (the
+    /// caller walks it on the host). Not during a compiled/captured step or lazy graph recording.
+    /// </summary>
+    internal bool TryContiguousOnDevice<T>(Tensor<T> view, out Tensor<T> result)
+    {
+        result = null!;
+        if (ResidentStepActive || Compilation.GraphMode.IsActive || !TryGetBackend(out var backend)) return false;
+        if (backend is Engines.DirectGpu.CUDA.CudaBackend cuda && cuda.IsStreamCapturing()) return false;
+        if (!TryPermuteViewOnDevice(backend, view, out var permuted)) return false;
+        result = DeferTensorResult<T>(backend, permuted.Buffer, view.Length, view.Shape.ToArray());
+        return true;
+    }
+
+    /// <summary>
     /// Materializes a strided view whose strides are a permutation of a contiguous row-major base (what
     /// TensorPermute / Transpose return) into a fresh device buffer with the backend's Permute kernel, when the
     /// base's only current copy is a cached device buffer. Returns false for anything else (the host path handles it).
@@ -1498,10 +1512,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var dims = view._shape;
         var strides = view._strides;
         if (rank < 2 || strides is null || strides.Length != rank) return false;
-        object key = (object?)view.GetBackingArrayForCacheLookupUnsafe() ?? view.DataVector;
-        if (!Helpers.DeferredArrayMaterializer.IsPending(key)) return false;   // host copy current: host path is fine
-        if (!_activationCache.TryGetValue(key, out var entry) || !ReferenceEquals(entry.Backend, backend) || entry.IsFp16)
-            return false;
+        // The device data can be keyed by the backing array or (a lazily allocated result) by the data vector; a view
+        // of a vector-keyed result can still report a backing array, so try both.
+        ActivationCacheEntry? entry = null;
+        foreach (var key in new object?[] { view.GetBackingArrayForCacheLookupUnsafe(), view.DataVector })
+        {
+            if (key is null || !Helpers.DeferredArrayMaterializer.IsPending(key)) continue;
+            if (_activationCache.TryGetValue(key, out var candidate) && ReferenceEquals(candidate.Backend, backend) && !candidate.IsFp16)
+            {
+                entry = candidate;
+                break;
+            }
+        }
+        if (entry is null) return false;   // host copy current, or not cached: the host path handles it
 
         // Base axis order = view axes by descending stride; the view is a pure permutation iff those strides are the
         // row-major strides of the reordered shape (size-1 axes may carry any stride).
@@ -1644,6 +1667,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                         && activationEntry.HostVersion == hostVersion)
                         return new OwnedBuffer(activationEntry.Buffer, ownsBuffer: false);
                     staleActivation = true;
+                }
+                // A view of a lazily allocated (vector-keyed) result can report a backing array that is not the cache
+                // key; its data vector still is. Missing it here downloaded the result to re-upload it.
+                if (Helpers.DeferredArrayMaterializer.IsPending(tensor.DataVector)
+                    && _activationCache.TryGetValue(tensor.DataVector, out var vectorEntry)
+                    && ReferenceEquals(vectorEntry.Backend, backend) && !vectorEntry.IsFp16
+                    && vectorEntry.Buffer.Size >= tensor.Length)
+                {
+                    return new OwnedBuffer(vectorEntry.Buffer, ownsBuffer: false);
                 }
             }
             if (staleActivation)

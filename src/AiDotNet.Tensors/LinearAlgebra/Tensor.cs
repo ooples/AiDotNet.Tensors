@@ -416,6 +416,14 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             catch { }
         }
 
+        // A permuted view of a tensor whose only current copy is on the GPU: permute on the device (and record the
+        // same Contiguous node) instead of downloading the base to walk it here -- the host walk made every
+        // permute's backward (and any other Contiguous caller) a device-to-host-to-device round trip.
+        if (!IsContiguous && _storageOffset == 0
+            && Engines.AiDotNetEngine.Current is Engines.DirectGpuTensorEngine gpuEngine
+            && gpuEngine.TryContiguousOnDevice(this, out var onDevice))
+            return FinalizeContiguousCopy(onDevice);
+
         // Arena-aware output: every element is written below (bulk copy or odometer
         // walk), so an uninitialized pooled/arena buffer is safe — and this makes the
         // materialization reuse across fused-training steps instead of GC-allocating a
