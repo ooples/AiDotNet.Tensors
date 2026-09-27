@@ -1486,6 +1486,57 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// for chained GPU operations. This is the primary method for GPU-resident pipelines.
     /// </summary>
     /// <summary>
+    /// Materializes a strided view whose strides are a permutation of a contiguous row-major base (what
+    /// TensorPermute / Transpose return) into a fresh device buffer with the backend's Permute kernel, when the
+    /// base's only current copy is a cached device buffer. Returns false for anything else (the host path handles it).
+    /// </summary>
+    private bool TryPermuteViewOnDevice<T>(IDirectGpuBackend backend, Tensor<T> view, out OwnedBuffer result)
+    {
+        result = default;
+        if (typeof(T) != typeof(float) || view._storageOffset != 0) return false;
+        int rank = view._shape.Length;
+        var dims = view._shape;
+        var strides = view._strides;
+        if (rank < 2 || strides is null || strides.Length != rank) return false;
+        object key = (object?)view.GetBackingArrayForCacheLookupUnsafe() ?? view.DataVector;
+        if (!Helpers.DeferredArrayMaterializer.IsPending(key)) return false;   // host copy current: host path is fine
+        if (!_activationCache.TryGetValue(key, out var entry) || !ReferenceEquals(entry.Backend, backend) || entry.IsFp16)
+            return false;
+
+        // Base axis order = view axes by descending stride; the view is a pure permutation iff those strides are the
+        // row-major strides of the reordered shape (size-1 axes may carry any stride).
+        var order = new int[rank];
+        for (int i = 0; i < rank; i++) order[i] = i;
+        Array.Sort(order, (p, q) => strides[q].CompareTo(strides[p]));
+        var baseShape = new int[rank];
+        long expected = 1;
+        for (int k = rank - 1; k >= 0; k--)
+        {
+            int axis = order[k];
+            if (dims[axis] != 1 && strides[axis] != expected) return false;
+            baseShape[k] = dims[axis];
+            expected *= dims[axis];
+        }
+        if (expected != view.Length || entry.Buffer.Size < view.Length) return false;
+        var permutation = new int[rank];
+        for (int k = 0; k < rank; k++) permutation[order[k]] = k;   // output axis j reads base axis permutation[j]
+
+        var output = AllocateOutputBuffer(backend, view.Length);
+        try
+        {
+            backend.Permute(entry.Buffer, output.Buffer, baseShape, permutation);
+        }
+        catch (Exception ex)
+        {
+            output.Dispose();
+            GpuLaunchProbe.OnFallback("PermuteViewOnDevice", ex);
+            return false;
+        }
+        result = output;
+        return true;
+    }
+
+    /// <summary>
     /// Throws when <paramref name="tensor"/> is a released step intermediate. Its <c>_gpuBuffer</c> field can still
     /// name a buffer object the pool has since re-rented to another tensor, so using it as an input would silently
     /// read someone else's data.
@@ -1525,6 +1576,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Contiguous() below would download the whole flat array to slice this view on the host.
         if (tensor._storageOffset != 0 && TryResolveDeviceParameterView(backend, tensor, out var parameterView))
             return new OwnedBuffer(parameterView, ownsBuffer: false);
+        // A permuted view of a tensor whose data is only on the device: permute on the device. Contiguous() below
+        // would download the base, permute it on the host and upload the result.
+        if (!tensor.IsContiguous && TryPermuteViewOnDevice(backend, tensor, out var permuted))
+            return permuted;
         if (!tensor.IsContiguous || tensor._storageOffset != 0)
             tensor = (Tensor<T>)tensor.Contiguous();
 
@@ -3272,6 +3327,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             arr = flat;   // a view into the flat ParameterBuffer: authority belongs to the flat array
         return arr is not null && Helpers.DeferredArrayMaterializer.IsPending(arr) && _persistentBufferCache.ContainsKey(arr);
     }
+
+    /// <summary>True when <paramref name="t"/> is a view into a larger flat array (a ParameterBuffer parameter).</summary>
+    internal static bool IsFlatParameterView(Tensor<float> t) => TryGetFlatParameterView(t, out _, out _);
 
     /// <summary>
     /// True when <paramref name="t"/> is a contiguous view at a non-zero offset into a larger flat array (the shape of a
@@ -12600,16 +12658,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (headDim <= 0 || seqLen <= 0 || (headDim & 1) != 0)
             throw new ArgumentException("RoPE requires positive seqLen and an even headDim.", nameof(input));
 
-        var contiguousInput = input.IsContiguous ? input : (Tensor<T>)input.Contiguous();
-        int rows = contiguousInput.Length / headDim;
+        int rows = input.Length / headDim;
 
-        // input is an activation (upload if host, reuse if resident); cos/sin are constant caches that stay
+        // input is an activation (upload if host, reuse if resident; a permuted view of a resident tensor is
+        // permuted on the device -- Contiguous() here used to download it); cos/sin are constant caches that stay
         // resident across every layer/step via the weight-buffer cache, so they upload exactly once.
-        using var inputBuffer = GetOrAllocateBuffer(backend, contiguousInput);
+        using var inputBuffer = GetOrAllocateBuffer(backend, input);
         using var cosBuffer = GetWeightBufferPreferResident(backend, cos, PersistentTensorRole.Weights);
         using var sinBuffer = GetWeightBufferPreferResident(backend, sin, PersistentTensorRole.Weights);
 
-        var outputBuffer = backend.AllocateBuffer(contiguousInput.Length);
+        var outputBuffer = backend.AllocateBuffer(input.Length);
         backend.RopeInterleaved(inputBuffer.Buffer, cosBuffer.Buffer, sinBuffer.Buffer, outputBuffer,
             rows, headDim, seqLen, startPosition);
 
@@ -22862,6 +22920,26 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // Shape metadata ops — no GPU compute, override for full coverage
     public override Tensor<T> Reshape<T>(Tensor<T> tensor, int[] newShape)
     {
+        if (tensor is null) throw new ArgumentNullException(nameof(tensor));
+        if (newShape is null) throw new ArgumentNullException(nameof(newShape));
+        // Reshaping a permuted view (head merge: permute then reshape) needs a contiguous copy. The base made it on
+        // the host (download, permute, upload); when the view's base is device-only, permute on the device and
+        // record the same Reshape node the base records, so autograd is unchanged.
+        if (!tensor.IsContiguous && typeof(T) == typeof(float)
+            && !Compilation.GraphMode.IsActive && AiDotNet.Tensors.Engines.Compilation.AutoTracer.TryGetCompiledPlan<T>("Reshape", tensor._shape) is null
+            && TryGetBackend(out var permuteBackend) && TryPermuteViewOnDevice(permuteBackend, tensor, out var permuted))
+        {
+            var contiguous = DeferTensorResult<T>(permuteBackend, permuted.Buffer, tensor.Length, tensor.Shape.ToArray());
+            Tensor<T> reshaped;
+            using (Autodiff.DifferentiableOps.SuppressTensorViewRecording())
+                reshaped = contiguous.Reshape(newShape);
+            var originalShape = tensor.Shape.ToArray();
+            Autodiff.DifferentiableOps.RecordUnary("Reshape", reshaped, tensor,
+                Autodiff.BackwardFunctions<T>.ReshapeBackward, new object[] { originalShape });
+            var tracedInput = tensor; var tracedShape = newShape;
+            AiDotNet.Tensors.Engines.Compilation.AutoTracer.RecordOp("Reshape", reshaped, eng => eng.Reshape(tracedInput, tracedShape));
+            return reshaped;
+        }
         var result = base.Reshape(tensor, newShape);
         // PR #638 A1: a reshape is a metadata-only view (same flat buffer, new shape). When the input is resident
         // (e.g. the backward reshape's gradOutput), propagate that GPU buffer to the reshaped output so the grad

@@ -732,7 +732,7 @@ internal static class DifferentiableOps
                 // isolates a contribution already owned by another slot.
                 var stored = needsOutOfPlace
                     ? grad
-                    : TakeAccumulatorBuffer(tensor, GradForInPlace());
+                    : TakeAccumulatorBuffer(tensor, GradForInPlace(), engine);
                 _indexedGrads[idx] = stored;
                 tensor.Grad = stored;
             }
@@ -776,7 +776,7 @@ internal static class DifferentiableOps
         {
             var stored = needsOutOfPlace
                 ? grad
-                : TakeAccumulatorBuffer(tensor, GradForInPlace());
+                : TakeAccumulatorBuffer(tensor, GradForInPlace(), engine);
             grads[tensor] = stored;
             tensor.Grad = stored;
         }
@@ -853,7 +853,8 @@ internal static class DifferentiableOps
 
     private static Tensor<T> TakeAccumulatorBuffer<T>(
         Tensor<T> destination,
-        Tensor<T> contribution)
+        Tensor<T> contribution,
+        IEngine engine)
     {
         var owners = GetAccumulatorOwners<T>();
         if (!owners.ContainsKey(contribution))
@@ -864,9 +865,20 @@ internal static class DifferentiableOps
 
         // This contribution is borrowed by another destination. Use dedicated,
         // non-arena storage for the exceptional copy so its lifetime is not tied
-        // to recyclable backward scratch.
-        var owned = new Tensor<T>(contribution._shape);
-        contribution.CopyTo(owned.AsWritableSpan());
+        // to recyclable backward scratch. A contribution still on the device is copied
+        // there (a fresh engine result is dedicated storage too); the host copy downloaded
+        // it only for the next GPU op to upload it again (17 such round trips per step on
+        // an LM's backward).
+        Tensor<T> owned;
+        if (engine.SupportsGpu && contribution.HasPendingGpuData)
+        {
+            owned = engine.TensorMultiplyScalar(contribution, AiDotNet.Tensors.Helpers.MathHelper.GetNumericOperations<T>().One);
+        }
+        else
+        {
+            owned = new Tensor<T>(contribution._shape);
+            contribution.CopyTo(owned.AsWritableSpan());
+        }
         owners[owned] = destination;
         return owned;
     }

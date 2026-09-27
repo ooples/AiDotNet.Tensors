@@ -208,4 +208,46 @@ public sealed class GpuTapeIntermediateReleaseTests : IClassFixture<DirectGpuTen
         for (int i = 0; i < g.Length; i++)
             Assert.True(Math.Abs(g[i] - expected[i]) < 1e-3f, $"dL/dw[{i}] ten tapes later: gpu {g[i]} cpu {expected[i]}");
     }
+    [SkippableFact]
+    public void SharedGradientContribution_IsCopiedOnTheDevice()
+    {
+        // z = x + y hands the SAME upstream gradient to x and to y; the second destination gets its own copy. That
+        // copy was made on the host (download, then an upload at the next GPU op) even when the gradient was
+        // device-resident.
+        Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
+        IEngine gpu = _fixture.Engine!;
+        var x = Rand(new[] { 64, 48 }, 5);
+        var y = Rand(new[] { 64, 48 }, 6);
+        bool savedCapture = GpuLaunchProbe.CaptureReadbackSites;
+        Dictionary<Tensor<float>, Tensor<float>> grads;
+        long readbackBytes;
+        string sites;
+        try
+        {
+            GpuLaunchProbe.CaptureReadbackSites = true;
+            using var tape = new GradientTape<float>();
+            var z = gpu.TensorAdd(gpu.TensorTanh(x), gpu.TensorTanh(y));
+            var loss = gpu.ReduceSum(gpu.TensorMultiply(z, z), new[] { 0, 1 }, keepDims: false);
+            GpuLaunchProbe.Reset();
+            grads = tape.ComputeGradients(loss, new[] { x, y });
+            readbackBytes = GpuLaunchProbe.ReadbackBytes;
+            sites = string.Join("; ", GpuLaunchProbe.ReadbackSites);
+        }
+        finally
+        {
+            GpuLaunchProbe.CaptureReadbackSites = savedCapture;
+        }
+        Assert.True(readbackBytes <= 64, $"backward read back {readbackBytes} bytes: {sites}");
+
+        // d/dx sum((tanh x + tanh y)^2) = 2 (tanh x + tanh y)(1 - tanh^2 x), and symmetrically for y.
+        var gx = grads[x].ToArray();
+        var gy = grads[y].ToArray();
+        for (int i = 0; i < gx.Length; i++)
+        {
+            double tx = Math.Tanh(x[i]), ty = Math.Tanh(y[i]);
+            double ex = 2 * (tx + ty) * (1 - tx * tx), ey = 2 * (tx + ty) * (1 - ty * ty);
+            Assert.True(Math.Abs(gx[i] - ex) < 1e-4 && Math.Abs(gy[i] - ey) < 1e-4,
+                $"[{i}] dx {gx[i]} vs {ex}, dy {gy[i]} vs {ey}");
+        }
+    }
 }

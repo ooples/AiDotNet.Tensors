@@ -160,7 +160,11 @@ public static class GpuOptimizer
         if (mBuf is null || vBuf is null) { GpuLaunchProbe.OnFallback("TryAdamWStep-moments-not-device-resident", null); return false; }
         // A host-authoritative parameter (eager training) is moved onto the device once and kept there, as PyTorch
         // keeps parameters on the GPU; its host copy is downloaded only when read.
-        var pBuf = param.TryGetGpuBuffer() ?? gpuEngine.AcquireParameterBuffer(param, out _);
+        // A ParameterBuffer view is always updated through its flat array's device buffer -- the one a host read
+        // downloads and forwards read -- never through a buffer some other path bound to this tensor object.
+        var pBuf = DirectGpuTensorEngine.IsFlatParameterView(param)
+            ? gpuEngine.AcquireParameterBuffer(param, out _)
+            : param.TryGetGpuBuffer() ?? gpuEngine.AcquireParameterBuffer(param, out _);
         if (pBuf is null) { GpuLaunchProbe.OnFallback("TryAdamWStep-parameter-not-placeable", null); return false; }
 
         backend.AdamWUpdate(pBuf, gBuf, mBuf, vBuf,
