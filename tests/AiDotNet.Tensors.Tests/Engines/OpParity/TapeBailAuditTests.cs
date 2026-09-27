@@ -103,7 +103,6 @@ public class TapeBailAuditTests
         "Dropout",
         "Embedding",
         "AdaptiveAvgPool2D",
-        "TensorWhere",
         "BatchNorm",
         "Conv3D",
         "ConvTranspose2D",
@@ -154,6 +153,9 @@ public class TapeBailAuditTests
         // call and broke ResidentIndices_WriteOperationsStayOnDeviceAndPreserveOrdering.
         "TensorPut",
         "TensorScatterReduce",
+        // Encodes the bool condition as the byte[] 0/1 WhereBackward reads. The kernel runs and the node is
+        // recorded either way; only that host copy is skipped when nothing will consume it.
+        "TensorWhere",
     };
 
     /// <summary>Ops already fixed — they must never regress to bailing.</summary>

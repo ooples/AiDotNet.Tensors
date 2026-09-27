@@ -287,6 +287,24 @@ public class GpuTapeGradientParityTests : IDisposable
             static (x, y) => { Assert.Equal(-2f, y[0, 0]); Assert.Equal(x[0, 1], y[0, 1]); });
 
     [SkippableFact]
+    public void TensorWhere_bool_condition_gradients_match_cpu() =>
+        AssertGradientParity("Where(bool)", Rand([6, 10], seed: 53),
+            static (e, t) => ((IEngine)e).TensorWhere(BoolMask(), t, Rand([6, 10], seed: 59)),
+            probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void TensorWhere_bit_condition_gradients_match_cpu() =>
+        AssertGradientParity("Where(Bit)", Rand([6, 10], seed: 61),
+            static (e, t) => e.TensorWhere(BitMask(), Rand([6, 10], seed: 67), t),
+            probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void TensorWhere_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("TensorWhere",
+            static (e, t) => ((IEngine)e).TensorWhere(BoolMask(), t, Rand([6, 10], seed: 71)),
+            static (x, y) => Assert.Equal(x[0, 0], y[0, 0]));
+
+    [SkippableFact]
     public void TensorTranspose_stays_on_the_device_while_a_tape_records() =>
         AssertStaysOnDeviceUnderTape("TensorTranspose", static (e, t) => e.TensorTranspose(t), static (x, y) =>
         {
