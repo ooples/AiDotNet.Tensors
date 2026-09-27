@@ -149,6 +149,280 @@ public class GpuTapeGradientParityTests : IDisposable
         AssertGradientParity("TensorCosh", Rand([4, 16], seed: 21, lo: -2.0, hi: 2.0),
             static (e, t) => e.TensorCosh(t));
 
+    /// <summary>
+    /// Transpose only moves data, so its gradient is exact on both engines and the divergence probe cannot
+    /// show the device ran; the residency counter checks the gradient, and the next test pins the engagement.
+    /// </summary>
+    [SkippableFact]
+    public void TensorTranspose_gradients_match_cpu() =>
+        AssertGradientParity("TensorTranspose", Rand([6, 10], seed: 24),
+            static (e, t) => e.TensorTranspose(t),
+            probe: Engagement.UseResidencyCounter);
+
+    /// <summary>
+    /// Under a recording tape each of these must launch its kernel and download nothing. Every one used to bail
+    /// to CpuEngine whenever a tape was active, so every training-time call went through the host (seen in
+    /// AutoformerModel training: DirectGpuTensorEngine.TensorTranspose -> CpuEngine.TensorTranspose). Their
+    /// gradients are exact on both engines, so this residency check is what proves the device path ran.
+    /// </summary>
+    private void AssertStaysOnDeviceUnderTape(string opName, Func<IEngine, Tensor<float>, Tensor<float>> op,
+        Action<Tensor<float>, Tensor<float>> checkResult)
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu!)
+        {
+            IEngine engine = gpu!;
+            AiDotNetEngine.Current = engine;
+            var x = Rand([6, 10], seed: 25);
+            using var tape = new GradientTape<float>();
+            _ = engine.TensorAdd(x, x);                       // upload x and warm the path outside the count
+            AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Reset();
+
+            var y = op(engine, x);
+
+            long launches = AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Count;
+            long readbacks = AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Readbacks;
+            _out.WriteLine($"{opName} under tape: launches={launches} readbacks={readbacks}");
+            Assert.True(launches >= 1, $"{opName} launched no GPU kernel while a tape was recording — it ran on the CPU.");
+            Assert.Equal(0, readbacks);
+            checkResult(x, y);
+        }
+    }
+
+    [SkippableFact]
+    public void TensorTranspose_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("TensorTranspose", static (e, t) => e.TensorTranspose(t), static (x, y) =>
+        {
+            Assert.Equal(new[] { 10, 6 }, y.Shape.ToArray());
+            for (int r = 0; r < 6; r++)
+                for (int c = 0; c < 10; c++)
+                    Assert.Equal(x[r, c], y[c, r]);
+        });
+
+    [SkippableFact]
+    public void TensorAddScalar_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("TensorAddScalar", static (e, t) => e.TensorAddScalar(t, 0.75f),
+            static (x, y) => { for (int i = 0; i < x.Length; i++) Assert.Equal(x[i] + 0.75f, y[i], 6); });
+
+    [SkippableFact]
+    public void TensorSubtractScalar_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("TensorSubtractScalar", static (e, t) => e.TensorSubtractScalar(t, 0.75f),
+            static (x, y) => { for (int i = 0; i < x.Length; i++) Assert.Equal(x[i] - 0.75f, y[i], 6); });
+
+    [SkippableFact]
+    public void TensorDivideScalar_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("TensorDivideScalar", static (e, t) => e.TensorDivideScalar(t, 1.7f),
+            static (x, y) => { for (int i = 0; i < x.Length; i++) Assert.Equal(x[i] / 1.7f, y[i], 5); });
+
+    /// <summary>
+    /// NarrowBackward on the GPU engine must build the input gradient on the device from a resident gradOutput:
+    /// no readback, at least one launch, and the same values CpuEngine produces. It used to read gradOutput
+    /// through a host span and return a host tensor (seen per sample in AutoformerModel training).
+    /// </summary>
+    [SkippableFact]
+    public void NarrowBackward_builds_the_input_gradient_on_the_device()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu!)
+        {
+            IEngine engine = gpu!;
+            AiDotNetEngine.Current = engine;
+            var input = Rand([3, 7, 4], seed: 29);
+            var hostGrad = Rand([3, 2, 4], seed: 30);
+            var residentGrad = engine.TensorAddScalar(hostGrad, 0f);   // a device-resident gradOutput
+            var saved = new object[] { 1, 3, 2 };                        // dim 1, start 3, length 2
+
+            var cpuGrads = new Dictionary<Tensor<float>, Tensor<float>>();
+            BackwardFunctions<float>.NarrowBackward(hostGrad, [input], hostGrad, saved, new CpuEngine(), cpuGrads);
+
+            AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Reset();
+            var gpuGrads = new Dictionary<Tensor<float>, Tensor<float>>();
+            BackwardFunctions<float>.NarrowBackward(residentGrad, [input], residentGrad, saved, engine, gpuGrads);
+            long launches = AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Count;
+            long readbacks = AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Readbacks;
+            _out.WriteLine($"NarrowBackward on GPU: launches={launches} readbacks={readbacks}");
+
+            Assert.True(launches >= 1, "NarrowBackward launched nothing on the GPU engine — it built the gradient on the host.");
+            Assert.Equal(0, readbacks);
+            var expected = cpuGrads[input];
+            var actual = gpuGrads[input];
+            Assert.Equal(expected.Shape.ToArray(), actual.Shape.ToArray());
+            for (int i = 0; i < expected.Length; i++) Assert.Equal(expected[i], actual[i]);
+        }
+    }
+
+    private static readonly Tensor<float> LnGamma = Rand([10], seed: 31, lo: 0.5, hi: 1.5);
+    private static readonly Tensor<float> LnBeta = Rand([10], seed: 32);
+
+    /// <summary>
+    /// LayerNorm's backward consumes the forward's per-row mean and variance, so a wrong saved state (the GPU
+    /// kernel's variance slot holds INVERSE std until converted) shows up as a gradient mismatch, not rounding.
+    /// </summary>
+    [SkippableFact]
+    public void LayerNorm_gradients_match_cpu() =>
+        AssertGradientParity("LayerNorm", Rand([6, 10], seed: 33, lo: -2.0, hi: 2.0),
+            static (e, t) => e.LayerNorm(t, LnGamma, LnBeta, 1e-5, out _, out _));
+
+    [SkippableFact]
+    public void LayerNorm_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("LayerNorm", static (e, t) => e.LayerNorm(t, LnGamma, LnBeta, 1e-5, out _, out _),
+            static (x, y) =>
+            {
+                var expected = new CpuEngine().LayerNorm(x, LnGamma, LnBeta, 1e-5, out _, out _);
+                for (int i = 0; i < expected.Length; i++) Assert.Equal(expected[i], y[i], 4);
+            });
+
+    private static readonly Tensor<float> ConcatTail = Rand([6, 3], seed: 34);
+
+    /// <summary>Concat only moves data (exact on both engines), so the residency counter proves the device ran.</summary>
+    [SkippableFact]
+    public void Concat_gradients_match_cpu() =>
+        AssertGradientParity("Concat", Rand([6, 10], seed: 35),
+            static (e, t) => e.Concat(new[] { t, ConcatTail }, -1),
+            probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void Concat_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("Concat", static (e, t) => e.Concat(new[] { t, ConcatTail }, 1), static (x, y) =>
+        {
+            Assert.Equal(new[] { 6, 13 }, y.Shape.ToArray());
+            for (int r = 0; r < 6; r++)
+            {
+                for (int c = 0; c < 10; c++) Assert.Equal(x[r, c], y[r, c]);
+                for (int c = 0; c < 3; c++) Assert.Equal(ConcatTail[r, c], y[r, 10 + c]);
+            }
+        });
+
+    /// <summary>
+    /// ReduceSum's gradient is a broadcast of gradOutput (exact on both engines), so a DOUBLE recording — the
+    /// general path composing permute/reshape that also recorded — would show up as exactly 2x here.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(0)]    // general path (non-innermost axis)
+    [InlineData(1)]    // IEngine innermost-axis kernel
+    [InlineData(-1)]   // full reduction
+    public void ReduceSum_gradients_match_cpu(int axis) =>
+        AssertGradientParity($"ReduceSum[{axis}]", Rand([6, 10], seed: 36),
+            (e, t) => axis < 0 ? e.ReduceSum(t, null, keepDims: true) : e.ReduceSum(t, new[] { axis }, keepDims: true),
+            probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void ReduceSum_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("ReduceSum", static (e, t) => e.ReduceSum(t, new[] { 0 }, keepDims: false), static (x, y) =>
+        {
+            Assert.Equal(new[] { 10 }, y.Shape.ToArray());
+            for (int c = 0; c < 10; c++)
+            {
+                float sum = 0; for (int r = 0; r < 6; r++) sum += x[r, c];
+                Assert.Equal(sum, y[c], 4);
+            }
+        });
+
+    /// <summary>
+    /// Mean and MSE-loss backwards scaled by <c>gradOutput[0]</c> — a blocking readback of the resident upstream
+    /// gradient in every backward pass. On the GPU engine they must now read nothing back and still match CPU.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData("MeanBackward")]
+    [InlineData("MSELossBackward")]
+    public void Scalar_scaled_backwards_do_not_read_the_upstream_gradient_back(string backward)
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu!)
+        {
+            IEngine engine = gpu!;
+            AiDotNetEngine.Current = engine;
+            var predictions = Rand([5, 8], seed: 37);
+            var targets = Rand([5, 8], seed: 38);
+            var hostUpstream = new Tensor<float>([1]); hostUpstream[0] = 0.83f;
+            var residentUpstream = engine.TensorAddScalar(hostUpstream, 0f);
+            Tensor<float>[] inputs = backward == "MeanBackward" ? [predictions] : [predictions, targets];
+            BackwardFunction<float> fn = backward == "MeanBackward"
+                ? BackwardFunctions<float>.MeanBackward
+                : BackwardFunctions<float>.MSELossBackward;
+            _ = engine.TensorAdd(predictions, targets);          // upload both inputs outside the count
+
+            var cpuGrads = new Dictionary<Tensor<float>, Tensor<float>>();
+            fn(hostUpstream, inputs, hostUpstream, [], new CpuEngine(), cpuGrads);
+
+            AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Reset();
+            var gpuGrads = new Dictionary<Tensor<float>, Tensor<float>>();
+            fn(residentUpstream, inputs, residentUpstream, [], engine, gpuGrads);
+            long launches = AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Count;
+            long readbacks = AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Readbacks;
+            _out.WriteLine($"{backward} on GPU: launches={launches} readbacks={readbacks}");
+
+            Assert.True(launches >= 1, $"{backward} launched nothing on the GPU engine.");
+            Assert.Equal(0, readbacks);
+            var expected = cpuGrads[predictions];
+            var actual = gpuGrads[predictions];
+            for (int i = 0; i < expected.Length; i++) Assert.Equal(expected[i], actual[i], 5);
+        }
+    }
+
+    /// <summary>
+    /// ELU's derivative has a kink at 0 when alpha != 1. The tape backward (like PyTorch) takes the alpha branch at
+    /// exactly 0; the CPU engine op and the CUDA/HIP/WebGPU kernels took 1 while OpenCL took alpha. All must agree
+    /// now, at the one point random data never lands on — and the tape backward must run on the device.
+    /// </summary>
+    [SkippableFact]
+    public void ELU_backward_agrees_at_zero_across_engines_and_stays_on_the_device()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu!)
+        {
+            IEngine engine = gpu!;
+            AiDotNetEngine.Current = engine;
+            const double alpha = 0.5;
+            var x = new Tensor<float>([2, 4]);
+            float[] values = [-2f, -0.5f, 0f, 0f, 0.25f, 1f, -1e-3f, 3f];
+            for (int i = 0; i < values.Length; i++) x[i] = values[i];
+            var cpu = new CpuEngine();
+            var y = cpu.ELU(x, alpha);
+            var g = Rand([2, 4], seed: 39, lo: 0.5, hi: 1.5);
+
+            var cpuGrads = new Dictionary<Tensor<float>, Tensor<float>>();
+            BackwardFunctions<float>.ELUBackward(g, [x], y, [alpha], cpu, cpuGrads);
+            var cpuOp = cpu.EluBackward(g, x, y, alpha);
+
+            var residentG = engine.TensorAddScalar(g, 0f);
+            _ = engine.TensorAdd(x, y);                                   // upload x and y outside the count
+            AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Reset();
+            var gpuGrads = new Dictionary<Tensor<float>, Tensor<float>>();
+            BackwardFunctions<float>.ELUBackward(residentG, [x], y, [alpha], engine, gpuGrads);
+            long launches = AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Count;
+            long readbacks = AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.Readbacks;
+            _out.WriteLine($"ELUBackward on GPU: launches={launches} readbacks={readbacks}");
+            Assert.True(launches >= 1, "ELUBackward launched nothing on the GPU engine.");
+            Assert.Equal(0, readbacks);
+
+            var gpuOp = engine.EluBackward(g, x, y, alpha);
+            for (int i = 0; i < values.Length; i++)
+            {
+                float expected = values[i] > 0 ? g[i] : g[i] * (y[i] + (float)alpha);   // PyTorch convention
+                Assert.Equal(expected, cpuGrads[x][i], 5);
+                Assert.Equal(expected, gpuGrads[x][i], 5);
+                Assert.Equal(expected, cpuOp[i], 5);
+                Assert.Equal(expected, gpuOp[i], 5);
+            }
+        }
+    }
+
+    [SkippableFact]
+    public void TensorAddScalar_gradients_match_cpu() =>
+        AssertGradientParity("TensorAddScalar", Rand([4, 16], seed: 26), static (e, t) => e.TensorAddScalar(t, 0.75f),
+            probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void TensorSubtractScalar_gradients_match_cpu() =>
+        AssertGradientParity("TensorSubtractScalar", Rand([4, 16], seed: 27), static (e, t) => e.TensorSubtractScalar(t, 0.75f),
+            probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void TensorDivideScalar_gradients_match_cpu() =>
+        AssertGradientParity("TensorDivideScalar", Rand([4, 16], seed: 28), static (e, t) => e.TensorDivideScalar(t, 1.7f),
+            probe: Engagement.UseResidencyCounter);
+
     [SkippableFact]
     public void TensorSinh_gradients_match_cpu() =>
         AssertGradientParity("TensorSinh", Rand([4, 16], seed: 22, lo: -2.0, hi: 2.0),

@@ -2754,6 +2754,21 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <summary>
     /// Allocates a new output buffer (always owned, never cached).
     /// </summary>
+    /// <summary>
+    /// As <see cref="AllocateOutputBuffer"/>, but the buffer is NOT zero-filled when the backend supports it — for
+    /// outputs the following kernel writes in full (elementwise maps, GEMM with beta = 0). See
+    /// <see cref="IUninitializedGpuAllocation"/> for why, and for what must never use it.
+    /// </summary>
+    private static OwnedBuffer AllocateFullyWrittenOutputBuffer(IDirectGpuBackend backend, int size)
+    {
+        var eng = s_residentScratchEngine;
+        if (eng is not null && eng.ScratchPoolingActive)
+            return new OwnedBuffer(eng.RentActionScratchOrAllocate(backend, size), ownsBuffer: false);
+        return backend is IUninitializedGpuAllocation uninitialized
+            ? new OwnedBuffer(uninitialized.AllocateBufferUninitialized(size), ownsBuffer: true)
+            : new OwnedBuffer(backend.AllocateBuffer(size), ownsBuffer: true);
+    }
+
     private static OwnedBuffer AllocateOutputBuffer(IDirectGpuBackend backend, int size)
     {
         // PR #638 capture-determinism: inside a compiled action during the resident step, draw from the engine's
@@ -3679,7 +3694,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         Gpu.GpuComputePlan precisionPlan)
     {
         using var bufferA = GetOrAllocateBuffer(backend, input);
-        var bufferB = AllocateOutputBuffer(backend, input.Length);
+        var bufferB = AllocateFullyWrittenOutputBuffer(backend, input.Length);
         try
         {
             if (precisionPlan.InputStorage == Gpu.GpuScalarType.Float16)
@@ -3937,7 +3952,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         using var bufferA = GetOrAllocateBuffer(backend, left);
         using var bufferB = GetOrAllocateBuffer(backend, right);
-        var bufferC = AllocateOutputBuffer(backend, left.Length);
+        var bufferC = AllocateFullyWrittenOutputBuffer(backend, left.Length);
         try
         {
             if (precisionPlan.InputStorage == Gpu.GpuScalarType.Float16)
@@ -14068,7 +14083,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.LayerNorm<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
         ValidateLayerNormArguments(input, gamma, beta);
-        if (IsTapeActive<T>()) return base.LayerNorm(input, gamma, beta, epsilon, out mean, out variance);
+        // Float forwards to the public override, which runs the kernel and records the tape node itself; only a
+        // non-float tape stays on the CPU (the non-float device branch below records nothing).
+        if (IsTapeActive<T>() && typeof(T) != typeof(float)) return base.LayerNorm(input, gamma, beta, epsilon, out mean, out variance);
         // AiDotNet#1331: under GraphMode, the base CpuEngine.LayerNorm has the
         // lazy-graph recording branch that emits a backward node for the
         // compiled plan. The GPU eager path below would silently bypass
@@ -16615,8 +16632,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     public override Tensor<T> ReduceSum<T>(Tensor<T> tensor, int[]? axes = null, bool keepDims = false)
     {
-        if (IsTapeActive<T>()) return base.ReduceSum(tensor, axes, keepDims);
-        if (!TryGetBackend(out var backend))
+        // No tape bail: every device path below records CpuEngine's node (ReduceSumBackward with the same
+        // axes/keepDims saved state), so reductions stay on the GPU during training. Non-float goes to the exact
+        // CPU path, tape or not — the kernels compute in float.
+        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend))
             return base.ReduceSum(tensor, axes, keepDims);
 
         // If axes is null, reduce all dimensions
@@ -16645,6 +16664,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
                         var result = DeferTensorResult<T>(backend, output.Buffer, 1, outputShape);
                         handedOff = true;
+                        var allAxes = new int[tensor.Rank];
+                        for (int ax = 0; ax < tensor.Rank; ax++) allAxes[ax] = ax;
+                        Autodiff.DifferentiableOps.RecordUnary("ReduceSum", result, tensor,
+                            Autodiff.BackwardFunctions<T>.ReduceSumBackward, new object[] { allAxes, keepDims });
                         return result;
                     }
                     finally
@@ -16668,7 +16691,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         try
         {
-            return ReduceAxisGpu(tensor, normalizedAxes, keepDims, backend, ReduceOperation.Sum);
+            // The general path may compose engine ops (permute/reshape); suppress their recording so the result has
+            // exactly ONE producer node — the ReduceSum below — and gradients are not counted twice.
+            Tensor<T> reduced;
+            using (new Autodiff.NoGradScope<T>())
+                reduced = ReduceAxisGpu(tensor, normalizedAxes, keepDims, backend, ReduceOperation.Sum);
+            Autodiff.DifferentiableOps.RecordUnary("ReduceSum", reduced, tensor,
+                Autodiff.BackwardFunctions<T>.ReduceSumBackward, new object[] { normalizedAxes, keepDims });
+            return reduced;
         }
         catch
         {
@@ -20139,7 +20169,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         using var bufferA = GetOrAllocateBuffer(backend, a);
         using var bufferB = GetOrAllocateBuffer(backend, b);
-        var bufferOut = AllocateOutputBuffer(backend, checked(m * n));
+        var bufferOut = AllocateFullyWrittenOutputBuffer(backend, checked(m * n));
         try
         {
             if (plan.InputStorage == Gpu.GpuScalarType.Float16)
@@ -20191,7 +20221,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         using var bufferA = GetOrAllocateBuffer(backend, a);
         using var bufferB = GetOrAllocateBuffer(backend, b);
         var outputLength = checked(batchCount * m * n);
-        var bufferOut = AllocateOutputBuffer(backend, outputLength);
+        var bufferOut = AllocateFullyWrittenOutputBuffer(backend, outputLength);
         try
         {
             backend.BatchedGemm(bufferA.Buffer, bufferB.Buffer, bufferOut.Buffer, m, n, k, batchCount);
@@ -20611,8 +20641,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // written and rows ≥ 1 of B stayed uninitialized. Fixed in
         // CudaBackend.Transpose with a real 2D launch
         // (gridX = ceil(cols/16), gridY = ceil(rows/16)).
-        if (IsTapeActive<T>())
-            return base.TensorTranspose(tensor);
+        // No tape bail: the transpose kernel runs during training too, and the result records the SAME node
+        // CpuEngine records (TransposeBackward, no saved state). Bailing here sent every training-time transpose
+        // through the host — a download, a CPU copy and a re-upload per call.
         if (!TryGetBackend(out var backend))
             return base.TensorTranspose(tensor);
         if (tensor.Rank != 2)
@@ -20642,6 +20673,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                         backend.Transpose(inResid, rOutBuf, rows, cols);
                         ResidentSyncCheck("TransposeResident");
                         BindResidentBuffer(rOut, rOutBuf, backend);
+                        Autodiff.DifferentiableOps.RecordUnary("TensorTranspose", rOut, tensor, Autodiff.BackwardFunctions<T>.TransposeBackward);
                         return rOut;
                     }
                 }
@@ -20649,7 +20681,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var bufIn = GetOrAllocateBuffer(backend, tensor);
             var bufOut = AllocateOutputBuffer(backend, tensor.Length);
             backend.Transpose(bufIn.Buffer, bufOut.Buffer, rows, cols);
-            return DeferTensorResult<T>(backend, bufOut.Buffer, tensor.Length, new[] { cols, rows });
+            var transposed = DeferTensorResult<T>(backend, bufOut.Buffer, tensor.Length, new[] { cols, rows });
+            Autodiff.DifferentiableOps.RecordUnary("TensorTranspose", transposed, tensor, Autodiff.BackwardFunctions<T>.TransposeBackward);
+            return transposed;
         }
         catch (Exception)
         {
@@ -20917,7 +20951,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> LayerNorm<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
         ValidateLayerNormArguments(input, gamma, beta);
-        if (IsTapeActive<T>()) return base.LayerNorm(input, gamma, beta, epsilon, out mean, out variance);
+        // A float tape runs the kernel and records CpuEngine's node below: the FP32 path already produces the
+        // per-row mean and (converted) variance LayerNormBackward saves. Only a non-float tape stays on the CPU —
+        // the FP16 half-store branch leaves INVERSE std in its variance slot, which that backward cannot take.
+        if (IsTapeActive<T>() && typeof(T) != typeof(float)) return base.LayerNorm(input, gamma, beta, epsilon, out mean, out variance);
         if (!TryGetBackend(out var backend) || input.Rank < 2)
             return base.LayerNorm(input, gamma, beta, epsilon, out mean, out variance);
 
@@ -21001,6 +21038,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             mean = DeferTensorResult<T>(backend, bufMean.Buffer, outerSize, batchShape);
             variance = DeferTensorResult<T>(backend, bufVar.Buffer, outerSize, batchShape);
             ownershipTransferred = true;
+            Autodiff.DifferentiableOps.RecordIfActive("LayerNorm", result, new[] { input, gamma, beta },
+                Autodiff.BackwardFunctions<T>.LayerNormBackward, new object[] { mean, variance, epsilon });
             return result;
         }
         catch (Exception)
@@ -22896,15 +22935,30 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorAddScalar<T>(Tensor<T> tensor, T scalar)
     {
-        if (IsTapeActive<T>()) return base.TensorAddScalar(tensor, scalar);
+        // Under a tape the kernel runs and records the SAME node CpuEngine records. Non-float stays on the CPU,
+        // tape or not: the kernel converts the scalar to float, which silently cost double callers precision
+        // (TensorDivideScalar was already float-only for the same reason).
+        if (typeof(T) != typeof(float)) return base.TensorAddScalar(tensor, scalar);
         if (TryGetBackend(out var backend))
         {
             try
             {
                 using var bufIn = GetOrAllocateBuffer(backend, tensor);
                 var bufOut = AllocateOutputBuffer(backend, tensor.Length);
-                backend.AddScalar(bufIn.Buffer, bufOut.Buffer, Convert.ToSingle(scalar), tensor.Length);
-                return DeferTensorResult<T>(backend, bufOut.Buffer, tensor.Length, tensor.Shape.ToArray());
+                bool handedOff = false;
+                try
+                {
+                    backend.AddScalar(bufIn.Buffer, bufOut.Buffer, Convert.ToSingle(scalar), tensor.Length);
+                    var sum = DeferTensorResult<T>(backend, bufOut.Buffer, tensor.Length, tensor.Shape.ToArray());
+                    handedOff = true;
+                    Autodiff.DifferentiableOps.RecordUnary("TensorAddScalar", sum, tensor, Autodiff.BackwardFunctions<T>.AddScalarBackward);
+                    return sum;
+                }
+                finally
+                {
+                    // An owned output that never reached the deferred result would otherwise leak on the CPU fallback.
+                    if (!handedOff) bufOut.Dispose();
+                }
             }
             catch { }
         }
@@ -22913,15 +22967,30 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorSubtractScalar<T>(Tensor<T> tensor, T scalar)
     {
-        if (IsTapeActive<T>()) return base.TensorSubtractScalar(tensor, scalar);
+        // Under a tape the kernel runs and records the SAME node CpuEngine records. Non-float stays on the CPU,
+        // tape or not: the kernel converts the scalar to float, which silently cost double callers precision
+        // (TensorDivideScalar was already float-only for the same reason).
+        if (typeof(T) != typeof(float)) return base.TensorSubtractScalar(tensor, scalar);
         if (TryGetBackend(out var backend))
         {
             try
             {
                 using var bufIn = GetOrAllocateBuffer(backend, tensor);
                 var bufOut = AllocateOutputBuffer(backend, tensor.Length);
-                backend.SubScalar(bufIn.Buffer, bufOut.Buffer, Convert.ToSingle(scalar), tensor.Length);
-                return DeferTensorResult<T>(backend, bufOut.Buffer, tensor.Length, tensor.Shape.ToArray());
+                bool handedOff = false;
+                try
+                {
+                    backend.SubScalar(bufIn.Buffer, bufOut.Buffer, Convert.ToSingle(scalar), tensor.Length);
+                    var difference = DeferTensorResult<T>(backend, bufOut.Buffer, tensor.Length, tensor.Shape.ToArray());
+                    handedOff = true;
+                    Autodiff.DifferentiableOps.RecordUnary("TensorSubtractScalar", difference, tensor, Autodiff.BackwardFunctions<T>.SubtractScalarBackward);
+                    return difference;
+                }
+                finally
+                {
+                    // An owned output that never reached the deferred result would otherwise leak on the CPU fallback.
+                    if (!handedOff) bufOut.Dispose();
+                }
             }
             catch { }
         }
@@ -22930,7 +22999,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorDivideScalar<T>(Tensor<T> tensor, T scalar)
     {
-        if (IsTapeActive<T>()) return base.TensorDivideScalar(tensor, scalar);
+        // Already float-only below; under a tape it now records CpuEngine's node (saved state: the scalar).
         if (typeof(T) == typeof(float) && TryGetBackend(out var backend))
         {
             try
@@ -22944,7 +23013,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     backend.Fill(denominator, Convert.ToSingle(scalar), tensor.Length);
                     backend.Divide(input.Buffer, denominator, output.Buffer, tensor.Length);
                     handedOff = true;
-                    return DeferTensorResult<T>(backend, output.Buffer, tensor.Length, tensor.Shape.ToArray());
+                    var quotient = DeferTensorResult<T>(backend, output.Buffer, tensor.Length, tensor.Shape.ToArray());
+                    Autodiff.DifferentiableOps.RecordUnary("TensorDivideScalar", quotient, tensor,
+                        Autodiff.BackwardFunctions<T>.DivideScalarBackward, new object[] { scalar! });
+                    return quotient;
                 }
                 finally
                 {
@@ -23611,7 +23683,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.ReduceSum<T>(Tensor<T> tensor, int[]? axes, bool keepDims)
     {
-        if (IsTapeActive<T>()) return base.ReduceSum(tensor, axes, keepDims);
+        // No tape bail: the innermost-axis kernel below records CpuEngine's node, and everything else defers to
+        // the public override, which records its own.
         // GPU fast path only valid when the reduce axis is the INNERMOST.
         // backend.SumAxis treats the buffer as [N, reduceSize] and sums
         // each row — that math only matches the requested reduction when
@@ -23650,7 +23723,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                         for (int i = 0, j = 0; i < rank; i++)
                             if (i != axis) outShape[j++] = tensor.Shape._dims[i];
                     }
-                    return DeferTensorResult<T>(b, go, outerSize, outShape);
+                    var summed = DeferTensorResult<T>(b, go, outerSize, outShape);
+                    Autodiff.DifferentiableOps.RecordUnary("ReduceSum", summed, tensor,
+                        Autodiff.BackwardFunctions<T>.ReduceSumBackward, new object[] { new[] { axis }, keepDims });
+                    return summed;
                 }
             }
             catch { }
@@ -24155,7 +24231,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.TensorConcatenate<T>(Tensor<T>[] tensors, int axis)
     {
-        if (IsTapeActive<T>()) return base.TensorConcatenate(tensors, axis);
+        // No tape bail: the device path records the node CpuEngine.Concat records (ConcatenateBackward, saved
+        // axis), so the copies stay on the GPU during training instead of materialising every input on the host.
         // GPU concat along any axis, composed from offset device-to-device
         // copies via IDirectGpuBackend.Copy. The previous path used IGpuBatchExecution.ConcatAxis,
         // which (a) only handled the LAST axis — so the UNet decoder's channel concat (NCHW axis=1)
@@ -24217,7 +24294,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                             int[] outShape = (int[])a.Shape._dims.Clone();
                             outShape[normAxis] = axisTotal;
                             handedOff = true;
-                            return DeferTensorResult<T>(backend, outBuf.Buffer, total, outShape);
+                            var concatenated = DeferTensorResult<T>(backend, outBuf.Buffer, total, outShape);
+                            Autodiff.DifferentiableOps.RecordIfActive("Concat", concatenated, tensors,
+                                Autodiff.BackwardFunctions<T>.ConcatenateBackward, new object[] { normAxis });
+                            return concatenated;
                         }
                         finally
                         {
@@ -24912,7 +24992,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.Concat<T>(IReadOnlyList<Tensor<T>> tensors, int axis)
     {
-        if (IsTapeActive<T>()) return base.Concat(tensors, axis);
+        // No tape bail: the float path below goes through TensorConcatenate, which records the node itself, and
+        // every other case reaches base.Concat, which records too.
         // Reuse the resident all-axis implementation above. It composes offset device copies
         // from IDirectGpuBackend instead of depending on the optional IGpuBatchExecution
         // surface, and therefore works on OpenCL as well as the other native backends.

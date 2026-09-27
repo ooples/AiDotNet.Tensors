@@ -43643,7 +43643,9 @@ public partial class CpuEngine : ITensorLevelEngine
         for (int i = 0; i < result.Length; i++)
         {
             double x = numOps.ToDouble(iData[i]);
-            double deriv = x >= 0 ? 1.0 : numOps.ToDouble(oData[i]) + alpha;
+            // PyTorch convention (and every other backend's once aligned): the alpha branch at exactly x == 0,
+            // matching BackwardFunctions.ELUBackward so the tape and the engine op agree.
+            double deriv = x > 0 ? 1.0 : numOps.ToDouble(oData[i]) + alpha;
             result[i] = numOps.FromDouble(numOps.ToDouble(gData[i]) * deriv);
         }
         return new Tensor<T>(result, gradOutput.Shape.ToArray());

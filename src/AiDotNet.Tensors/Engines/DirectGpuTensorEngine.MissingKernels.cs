@@ -4702,6 +4702,100 @@ public partial class DirectGpuTensorEngine
         }
     }
 
+    /// <summary>
+    /// The adjoint of <c>TensorNarrow</c> on the device: a zero tensor of <paramref name="inputShape"/> with
+    /// <paramref name="gradOutput"/> copied into positions [start, start+length) of <paramref name="dim"/>.
+    /// </summary>
+    /// <remarks>
+    /// NarrowBackward built this with host spans, so a resident gradient was DOWNLOADED on every narrow in the
+    /// graph and the input gradient came back as a host tensor — which then kept the grad-accumulation in-place
+    /// add off its resident path too (measured in AutoformerModel training: RentZeroed + DtoH per sample). Here
+    /// the output is zero-filled on the device and each contiguous outer slab is one device-to-device copy: no
+    /// host array, no upload, no download. Null when the device path cannot take it, so the caller falls back.
+    /// </remarks>
+    internal Tensor<T>? TryNarrowBackwardOnDevice<T>(Tensor<T> gradOutput, int[] inputShape, int dim, int start, int length)
+    {
+        if (typeof(T) != typeof(float) || Compilation.GraphMode.IsActive || !TryGetBackend(out var backend))
+            return null;
+        try
+        {
+            int rank = inputShape.Length;
+            int n = 1; for (int k = 0; k < rank; k++) n *= inputShape[k];
+            int dimSize = inputShape[dim];
+            int outerSize = 1; for (int k = 0; k < dim; k++) outerSize *= inputShape[k];
+            int innerSize = 1; for (int k = dim + 1; k < rank; k++) innerSize *= inputShape[k];
+            int copyLength = checked(length * innerSize);
+            if (gradOutput.Length != checked(outerSize * copyLength)) return null;
+            var source = gradOutput.IsContiguous ? gradOutput : (Tensor<T>)gradOutput.Contiguous();
+            using var bufSrc = GetOrAllocateBuffer(backend, source);
+            return DispatchDeferredGpuOp<T>(backend, n, (int[])inputShape.Clone(), output =>
+            {
+                backend.Fill(output, 0f, n);
+                for (int outer = 0; outer < outerSize; outer++)
+                    backend.Copy(bufSrc.Buffer, outer * copyLength,
+                        output, checked((outer * dimSize + start) * innerSize), copyLength);
+            });
+        }
+        catch (Exception)
+        {
+            if (ThrowOnGpuKernelFallback) throw;
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// <c>factor * scalar[0] * tensor</c> — or, with a null <paramref name="tensor"/>, <c>factor * scalar[0]</c> filled
+    /// to <paramref name="shape"/> — computed without reading the one-element <paramref name="scalar"/> on the host.
+    /// </summary>
+    /// <remarks>
+    /// Loss and mean backwards scaled their result by <c>gradOutput[0]</c>: an indexer read of a device-resident
+    /// upstream gradient, i.e. a blocking device-to-host sync in every backward pass (once per SAMPLE in the
+    /// per-sample time-series models). Here the scale stays on the device: fill or scale into a stream-ordered
+    /// temporary, then one broadcast multiply by the scalar buffer (inner extent 1). The kernel's operands are
+    /// __restrict__, hence the temporary rather than an in-place multiply. Null when the device path cannot run.
+    /// </remarks>
+    internal Tensor<T>? TryScaleByDeviceScalar<T>(Tensor<T>? tensor, int[] shape, Tensor<T> scalar, float factor)
+    {
+        if (typeof(T) != typeof(float) || Compilation.GraphMode.IsActive || scalar.Length != 1
+            || !TryGetBackend(out var backend))
+            return null;
+        try
+        {
+            int n = 1; for (int k = 0; k < shape.Length; k++) n = checked(n * shape[k]);
+            if (tensor is not null && tensor.Length != n) return null;
+            var s = scalar.IsContiguous ? scalar : (Tensor<T>)scalar.Contiguous();
+            using var bufS = GetOrAllocateBuffer(backend, s);
+            bool hasTensor = tensor is not null;
+            var bufT = default(OwnedBuffer);
+            if (hasTensor)
+            {
+                var c = tensor!.IsContiguous ? tensor : (Tensor<T>)tensor.Contiguous();
+                bufT = GetOrAllocateBuffer(backend, c);
+            }
+            try
+            {
+                return DispatchDeferredGpuOp<T>(backend, n, (int[])shape.Clone(), output =>
+                {
+                    // Read by the broadcast multiply still queued when this callback returns: stream-ordered
+                    // scratch keeps it out of the reuse pool until that work completes.
+                    using var scaled = AllocateStreamOrderedScratch(backend, n);
+                    if (hasTensor) backend.Scale(bufT.Buffer, scaled, factor, n);
+                    else backend.Fill(scaled, factor, n);
+                    backend.BroadcastMultiplyLastAxis(scaled, bufS.Buffer, output, n, 1);
+                });
+            }
+            finally
+            {
+                if (hasTensor) bufT.Dispose();
+            }
+        }
+        catch (Exception)
+        {
+            if (ThrowOnGpuKernelFallback) throw;
+            return null;
+        }
+    }
+
     /// <inheritdoc/>
     public override Tensor<T> TensorSliceScatter<T>(Tensor<T> tensor, Tensor<T> source, int dim, int start, int length)
     {

@@ -17,7 +17,7 @@ using AiDotNet.Tensors.Helpers;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
-public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IMultiTensorGpuOptimizerBackend, AiDotNet.Tensors.Engines.Gpu.IGpuHalfPrecisionBackend, IPixelShuffleBackend, INativeGpuCodegenExecutor
+public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpuBackend, IFusedAdvancedKernels, ICompressedMomentGpuOptimizerBackend, IMultiTensorGpuOptimizerBackend, AiDotNet.Tensors.Engines.Gpu.IGpuHalfPrecisionBackend, IPixelShuffleBackend, INativeGpuCodegenExecutor
 {
     // During teardown the CUDA driver/context may already be destroyed, so calling driver
     // APIs (cuCtxPushCurrent / cuMemFree / cuCtxPopCurrent / cuCtxDestroy / cuModuleUnload)
@@ -201,6 +201,29 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     private const int MaxPooledBuffersPerSize = 4;
     private readonly GpuBufferPool<CudaGpuBuffer> _bufferPool =
         new GpuBufferPool<CudaGpuBuffer>(MaxPooledBuffersPerSize, MaxPooledBufferElements);
+
+    // Host-side reuse for the STREAM-ORDERED allocator. Every stream-ordered buffer used to cost three driver calls —
+    // cuMemAllocAsync, cuMemsetD8Async and, on dispose, cuMemFreeAsync — about 13 us together on this box, as much as
+    // the kernel launch it served; small-tensor training issues thousands per step. A disposed buffer now returns to
+    // the pool under a _stream affinity and the next same-size request reuses it (one memset, no alloc/free). This is
+    // safe for the reason #609 made the allocator stream-ordered: every use of these buffers is ordered on _stream, so
+    // a reuse is ordered after all earlier work, and an overflow still frees with cuMemFreeAsync (ReleaseCore). Never
+    // during a backend capture: a captured graph keeps using a buffer's address after the host lets go of it.
+    private GpuBufferPoolAffinity AsyncPoolAffinity => GpuBufferPoolAffinity.ForNativeQueue(_stream);
+
+    private void ReturnAsyncBuffer(CudaGpuBuffer buffer)
+    {
+        if (_backendStreamCaptureActive)
+            buffer.Release();
+        else
+            _bufferPool.Return(buffer, AsyncPoolAffinity);
+    }
+
+    private CudaGpuBuffer? TryRentAsyncBuffer(int size)
+    {
+        if (_backendStreamCaptureActive || _stream == IntPtr.Zero) return null;
+        return _bufferPool.TryRent(size, AsyncPoolAffinity, out var pooled) ? pooled : null;
+    }
     // Event-based deferred buffer free (#555 / #226). A buffer evicted mid-step may still
     // be referenced by an in-flight async kernel; returning it to the pool (for reuse OR a
     // real cuMemFree when the bucket is full) before that kernel finishes is the CUDA-700
@@ -212,6 +235,119 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     private bool _supportsCooperativeLaunch;
     private int _multiProcessorCount;
     private readonly CudaPinnedBufferPool _pinnedPool = new();
+
+    // Staged host->device uploads. AllocateBuffer(float[]) used to copy from the pageable managed array and then
+    // cuStreamSynchronize(_stream) before releasing the pin — every upload waited for ALL queued work (~40-56 us on an
+    // idle RTX 3080, milliseconds when another process shares the GPU). Now the data is copied into a page-locked
+    // staging slot, the DMA is enqueued on _stream, and the slot is held until an event recorded after the copy
+    // completes (polled without blocking, like _deferredFrees). The managed array is free the moment the host memcpy
+    // returns. Bounded: once MaxStagedUploadBytes are in flight, the oldest slot is waited on before staging more.
+    private readonly object _stagedUploadLock = new();
+    private readonly Queue<(IntPtr Pinned, int Bytes, CudaEvent Event)> _stagedUploads = new();
+    private long _stagedUploadBytesInFlight;
+    private CudaEvent? _lastStagedUploadEvent;
+
+    /// <summary>
+    /// Orders <paramref name="stream"/> after ALL work already queued on _stream. Staged uploads are not the only
+    /// such work: allocating a buffer can queue its zero-fill (cuMemsetD8Async) on _stream, and an upload the caller
+    /// then queues on its own stream could land first and be zeroed afterwards. Every public method that enqueues onto
+    /// a caller-supplied stream calls this first. It records one reusable event on _stream and makes the caller's
+    /// stream wait on it: a GPU-side wait, no host block. A wait binds to the event's most recent record, so reusing
+    /// the event is safe.
+    /// </summary>
+    private void OrderAfterStagedUploads(IGpuStream stream)
+    {
+        if (stream is not CudaStream cudaStream || cudaStream.Handle == _stream) return;
+        // Callers reach this from GpuStreamScheduler.Dispatch, which invokes launch delegates without making the
+        // backend context current; the event calls below need it on this thread.
+        EnsureContextCurrent();
+        lock (_stagedUploadLock)
+        {
+            if (_streamOrderEvent == IntPtr.Zero)
+            {
+                CuBlasNative.CheckCudaResult(
+                    CudaNativeBindings.cuEventCreate(out _streamOrderEvent, CudaNativeBindings.CU_EVENT_DISABLE_TIMING),
+                    "cuEventCreate(stream order)");
+            }
+            CuBlasNative.CheckCudaResult(
+                CudaNativeBindings.cuEventRecord(_streamOrderEvent, _stream), "cuEventRecord(stream order)");
+            CuBlasNative.CheckCudaResult(
+                CudaNativeBindings.cuStreamWaitEvent(cudaStream.Handle, _streamOrderEvent, 0),
+                "cuStreamWaitEvent(stream order)");
+        }
+    }
+
+    // Reused by OrderAfterStagedUploads; destroyed with the backend.
+    private IntPtr _streamOrderEvent;
+    private const long MaxStagedUploadBytes = 64L * 1024 * 1024;
+    private const long MaxStagedUploadSingleBytes = 16L * 1024 * 1024;
+
+    private void DrainStagedUploads(bool blockAll)
+    {
+        lock (_stagedUploadLock)
+        {
+            while (_stagedUploads.Count > 0)
+            {
+                var (pinned, bytes, evt) = _stagedUploads.Peek();
+                if (!evt.IsComplete)
+                {
+                    if (!blockAll) break;
+                    evt.Synchronize();
+                }
+                _stagedUploads.Dequeue();
+                _stagedUploadBytesInFlight -= bytes;
+                _pinnedPool.Return(pinned, bytes);
+                if (ReferenceEquals(_lastStagedUploadEvent, evt)) _lastStagedUploadEvent = null;
+                evt.Dispose();
+            }
+        }
+    }
+
+    private unsafe bool TryStageUpload(IntPtr destination, float[] data, ulong byteSize)
+    {
+        if (_backendStreamCaptureActive || _defaultStream is null || (long)byteSize > MaxStagedUploadSingleBytes)
+            return false;
+        int bytes = checked((int)byteSize);
+        DrainStagedUploads(blockAll: false);
+        lock (_stagedUploadLock)
+        {
+            // Bound pinned memory: wait on the OLDEST in-flight slot(s) only when the cap would be exceeded.
+            while (_stagedUploads.Count > 0 && _stagedUploadBytesInFlight + bytes > MaxStagedUploadBytes)
+            {
+                var (pinnedOld, bytesOld, evtOld) = _stagedUploads.Dequeue();
+                evtOld.Synchronize();
+                _stagedUploadBytesInFlight -= bytesOld;
+                _pinnedPool.Return(pinnedOld, bytesOld);
+                if (ReferenceEquals(_lastStagedUploadEvent, evtOld)) _lastStagedUploadEvent = null;
+                evtOld.Dispose();
+            }
+        }
+
+        var pinned = _pinnedPool.Rent(bytes);
+        try
+        {
+            fixed (float* src = data)
+                Buffer.MemoryCopy(src, (void*)pinned, bytes, bytes);
+            CuBlasNative.CheckCudaResult(
+                CudaNativeBindings.cuMemcpyHtoDAsync(destination, pinned, byteSize, _stream),
+                "cuMemcpyHtoDAsync(staged upload)");
+            var evt = new CudaEvent(this, _defaultStream, enableTiming: false);   // recorded after the copy on _stream
+            lock (_stagedUploadLock)
+            {
+                _stagedUploads.Enqueue((pinned, bytes, evt));
+                _stagedUploadBytesInFlight += bytes;
+                _lastStagedUploadEvent = evt;
+            }
+            return true;
+        }
+        catch
+        {
+            // The copy may already be queued; only a completed stream may hand the slot back.
+            try { CudaNativeBindings.cuStreamSynchronize(_stream); } catch { }
+            _pinnedPool.Return(pinned, bytes);
+            throw;
+        }
+    }
     private IntPtr _wmmaModule;
     private int _ccMajor;
     private int _ccMinor;
@@ -1382,7 +1518,22 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         // (but reusable) bytes. Drawing weights from the same pool removes that sync/async split.
         if (_asyncAlloc)
         {
-            var pAsync = AllocDeviceMemoryAsync(byteSize);
+            // Reuse a pooled stream-ordered buffer when one fits, and stage the copy so it does not block the host.
+            var target = TryRentAsyncBuffer(size)
+                ?? new CudaGpuBuffer(_cudaContext, AllocDeviceMemoryAsync(byteSize), size,
+                    returnToPool: ReturnAsyncBuffer, asyncFreeStream: _stream);
+            try
+            {
+                if (TryStageUpload(target.Handle, data, byteSize))
+                    return target;
+            }
+            catch
+            {
+                target.Dispose();
+                throw;
+            }
+
+            var pAsync = target.Handle;
             try
             {
                 unsafe
@@ -1407,8 +1558,8 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
                     }
                 }
             }
-            catch { CuBlasNative.cuMemFreeAsync(pAsync, _stream); throw; }
-            return new CudaGpuBuffer(_cudaContext, pAsync, size, returnToPool: null, asyncFreeStream: _stream);
+            catch { target.Dispose(); throw; }
+            return target;
         }
         if (_bufferPool.TryRent(size, out var pooled) && pooled != null)
         {
@@ -1643,6 +1794,14 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         using var _ = PushContext();
         if (_asyncAlloc)
         {
+            if (TryRentAsyncBuffer(size) is { } reused)
+            {
+                // Same zero-initialised contract as a fresh allocation, ordered on _stream after the previous user.
+                CuBlasNative.CheckCudaResult(
+                    CudaNativeBindings.cuMemsetD8Async(reused.Handle, 0, (ulong)size * sizeof(float), _stream),
+                    "cuMemsetD8Async(reused)");
+                return reused;
+            }
             var p = AllocDeviceMemoryAsync((ulong)size * sizeof(float));
             // STREAM-ORDERED-ALLOCATION HAZARD FIX (see AllocateBuffer(float[]) above): p was allocated on
             // _stream via cuMemAllocAsync, so the zero-init MUST also be issued on _stream. The legacy
@@ -1654,7 +1813,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             CuBlasNative.CheckCudaResult(
                 CudaNativeBindings.cuMemsetD8Async(p, 0, (ulong)size * sizeof(float), _stream),
                 "cuMemsetD8Async");
-            return new CudaGpuBuffer(_cudaContext, p, size, returnToPool: null, asyncFreeStream: _stream);
+            return new CudaGpuBuffer(_cudaContext, p, size, returnToPool: ReturnAsyncBuffer, asyncFreeStream: _stream);
         }
         if (_bufferPool.TryRent(size, out var pooled) && pooled != null)
         {
@@ -1668,6 +1827,26 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         IntPtr devicePtr = AllocDeviceMemoryWithRetry(byteSize);
         CuBlasNative.CheckCudaResult(CuBlasNative.cuMemsetD32(devicePtr, 0, (ulong)size), "cuMemsetD32");
         return new CudaGpuBuffer(_cudaContext, devicePtr, size, _bufferPool.Return);
+    }
+
+    /// <inheritdoc/>
+    public IGpuBuffer AllocateBufferUninitialized(int size)
+    {
+        if (!IsAvailable)
+            throw new InvalidOperationException("CUDA backend is not available.");
+        if (size <= 0)
+            throw new ArgumentOutOfRangeException(nameof(size), "Buffer size must be positive.");
+        GpuBufferSizeGuard.EnsureFits("CUDA", (long)size * sizeof(float), MaxBufferAllocBytes, DeviceName);
+        RecordDirectPtxEvidenceDeviceAllocation(checked((long)size * sizeof(float)));
+        // Only the stream-ordered allocator skips the fill: the legacy path's pooled buffers are recycled across
+        // the null stream, so keep its zeroing (and everything else about it) exactly as AllocateBuffer does.
+        if (!_asyncAlloc)
+            return AllocateBuffer(size);
+        using var _ = PushContext();
+        if (TryRentAsyncBuffer(size) is { } reused)
+            return reused;
+        var p = AllocDeviceMemoryAsync((ulong)size * sizeof(float));
+        return new CudaGpuBuffer(_cudaContext, p, size, returnToPool: ReturnAsyncBuffer, asyncFreeStream: _stream);
     }
 
     public IGpuBuffer AllocateByteBuffer(int size)
@@ -1722,6 +1901,9 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
             // As in the sync-path reclamation: a failed sync is a real (often sticky) error, so throw
             // with its real name rather than let it masquerade as the cuMemAllocAsync OOM below.
             // Trim is best-effort.
+            // Buffers parked in the host-side reuse pool are still allocated as far as the driver knows; release
+            // them first (stream-ordered frees) so the sync + trim below can hand their memory to this request.
+            _bufferPool.DrainAll();
             CuBlasNative.CheckCudaResult(CudaNativeBindings.cuCtxSynchronize(), "cuCtxSynchronize (async-pool OOM reclamation)");
             if (_asyncMemPool != IntPtr.Zero)
             {
@@ -4792,6 +4974,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     /// <inheritdoc/>
     public unsafe void UploadBufferAsync(float[] data, IGpuBuffer buffer, IGpuStream stream)
     {
+        OrderAfterStagedUploads(stream);
         if (data == null) throw new ArgumentNullException(nameof(data));
         if (buffer == null) throw new ArgumentNullException(nameof(buffer));
         if (stream == null) throw new ArgumentNullException(nameof(stream));
@@ -4882,6 +5065,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     /// <inheritdoc/>
     public unsafe void UploadBufferAsync(ReadOnlySpan<float> data, IGpuBuffer buffer, IGpuStream stream)
     {
+        OrderAfterStagedUploads(stream);
         if (buffer == null) throw new ArgumentNullException(nameof(buffer));
         if (stream == null) throw new ArgumentNullException(nameof(stream));
         if (data.Length > buffer.Size)
@@ -4917,6 +5101,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     /// <inheritdoc/>
     public unsafe void DownloadBufferAsync(IGpuBuffer buffer, float[] destination, IGpuStream stream)
     {
+        OrderAfterStagedUploads(stream);
         if (buffer == null) throw new ArgumentNullException(nameof(buffer));
         if (destination == null) throw new ArgumentNullException(nameof(destination));
         if (stream == null) throw new ArgumentNullException(nameof(stream));
@@ -4954,6 +5139,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     /// <inheritdoc/>
     public IGpuBuffer AllocateBufferAsync(float[] data, IGpuStream stream)
     {
+        OrderAfterStagedUploads(stream);
         var buffer = AllocateBuffer(data.Length);
         UploadBufferAsync(data, buffer, stream);
         return buffer;
@@ -4962,6 +5148,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     /// <inheritdoc/>
     public void CopyBufferAsync(IGpuBuffer source, IGpuBuffer destination, int size, IGpuStream stream)
     {
+        OrderAfterStagedUploads(stream);
         if (source == null) throw new ArgumentNullException(nameof(source));
         if (destination == null) throw new ArgumentNullException(nameof(destination));
         if (stream == null) throw new ArgumentNullException(nameof(stream));
@@ -4989,6 +5176,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public void GemmAsync(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K,
         float alpha, float beta, IGpuStream stream)
     {
+        OrderAfterStagedUploads(stream);
         if (!IsAvailable)
             throw new InvalidOperationException("CUDA backend is not available.");
 
@@ -5033,6 +5221,7 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
     public void FusedGemmBiasActivationAsync(IGpuBuffer A, IGpuBuffer B, IGpuBuffer bias, IGpuBuffer output,
         int M, int N, int K, FusedActivationType activation, IGpuStream stream)
     {
+        OrderAfterStagedUploads(stream);
         if (!IsAvailable)
             throw new InvalidOperationException("CUDA backend is not available.");
 
@@ -16973,6 +17162,13 @@ public sealed partial class CudaBackend : IAsyncGpuBackend, IFusedAdvancedKernel
         // them while both handles are still alive, before pool/stream teardown.
         DisposeDirectPtxRuntime();
 
+        // In-flight staged uploads still own pinned slots; wait for them before the pool frees its memory.
+        try { DrainStagedUploads(blockAll: true); } catch { }
+        if (_streamOrderEvent != IntPtr.Zero)
+        {
+            try { CudaNativeBindings.cuEventDestroy(_streamOrderEvent); } catch { }
+            _streamOrderEvent = IntPtr.Zero;
+        }
         _pinnedPool.Dispose();
         _bufferPool.Dispose();
 

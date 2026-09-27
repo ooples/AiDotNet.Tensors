@@ -94,6 +94,8 @@ public class TapeBailAuditTests
         "AvgPool2D",
         "FlashAttention",
         "GroupedQueryAttention",
+        // FLOAT now records on the device (GpuTapeGradientParityTests.LayerNorm_*); the non-float tape still bails because
+        // the FP16 half-store branch saves INVERSE std where LayerNormBackward expects variance. Remove once that holds.
         "LayerNorm",
         "RMSNorm",
         "GroupNorm",
@@ -101,17 +103,12 @@ public class TapeBailAuditTests
         "Dropout",
         "Embedding",
         "AdaptiveAvgPool2D",
-        "ReduceSum",
         "TensorWhere",
-        "TensorTranspose",
         "BatchNorm",
         "Conv3D",
         "ConvTranspose2D",
         "TensorGather",
         "Upsample",
-        "TensorAddScalar",
-        "TensorSubtractScalar",
-        "TensorDivideScalar",
         "TensorMaskedFill",
         "TensorStack",
         "TensorDiagonal",
@@ -184,6 +181,14 @@ public class TapeBailAuditTests
         // cost guard, so they live in TapeCostGuardOnly instead.
         "TensorSelectScatter",
         "TensorSliceScatter",
+        // Records TransposeBackward on both device paths; see GpuTapeGradientParityTests.TensorTranspose_*.
+        "TensorTranspose",
+        // Record Add/Subtract/DivideScalarBackward on the float device path; double stays exact on the CPU.
+        "TensorAddScalar",
+        "TensorSubtractScalar",
+        "TensorDivideScalar",
+        // Records ReduceSumBackward on every float device path; the general path suppresses its inner recording.
+        "ReduceSum",
     };
 
     private static string[] GpuEngineSources(string root)
