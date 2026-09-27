@@ -1,0 +1,8 @@
+{
+  "noiseFloor": 0.15,
+  "cases": {
+    "mlp:cpu": {
+      "windows-x64-16cpu-cpu": 3.41
+    }
+  }
+}
