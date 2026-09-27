@@ -6513,7 +6513,16 @@ public partial class CpuEngine : ITensorLevelEngine
                 var capturedA = a;
                 var capturedB = b;
                 return scope.RecordBinary(LazyNodeType.Divide, "TensorDivide", a, b, a._shape,
-                    (eng, output) => { MathHelper.GetNumericOperations<T>().Divide(capturedA.AsSpan(), capturedB.AsSpan(), output.AsWritableSpan()); },
+                    (eng, output) =>
+                    {
+                        // Device divide into output's stable buffer on the resident compiled step; else the host
+                        // write, which bumps the version so a cached device copy of the output is not reused.
+                        if (eng is DirectGpuTensorEngine dGpu && dGpu.TryBinaryResidentInto(output, capturedA, capturedB,
+                                static (be, ia, ib, o, n) => be.Divide(ia, ib, o, n), "Divide"))
+                            return;
+                        MathHelper.GetNumericOperations<T>().Divide(capturedA.AsSpan(), capturedB.AsSpan(), output.AsWritableSpan());
+                        output.IncrementVersion();
+                    },
                     BackwardFunctions<T>.DivideBackward);
             }
         }

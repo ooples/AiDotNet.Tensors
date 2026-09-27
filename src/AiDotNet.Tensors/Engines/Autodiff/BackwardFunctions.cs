@@ -2407,6 +2407,16 @@ internal static class BackwardFunctions<T>
         // ~halved by skipping the redundant clear.
         if (grad.Length == 1)
         {
+            // A device-resident scalar (the loss gradient of a compiled GPU step) is broadcast on the device. Reading
+            // it with GetFlat was a sync + download per step, and the host-filled result made the accumulation into
+            // the device gradient take the host path (a download of the whole gradient).
+            if (engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine
+                && (grad.HasPendingGpuData || grad._gpuBuffer is not null))
+            {
+                var ones = new int[targetShape.Length];
+                for (int i = 0; i < ones.Length; i++) ones[i] = 1;
+                return engine.TensorBroadcastTo(engine.Reshape(grad, ones), targetShape);
+            }
             var result = TensorAllocator.RentUninitialized<T>(targetShape);
             engine.TensorFill(result, grad.GetFlat(0));
             return result;

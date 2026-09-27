@@ -5216,6 +5216,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 _lnStatsScratch[arr] = stats;
             }
             backend.LayerNorm(bufIn.Buffer, outBuf, bufGamma.Buffer, bufBeta.Buffer, stats.mean, stats.var, outerSize, normSize, (float)epsilon);
+            // The kernel saves 1/sqrt(var + eps); the backward (LayerNormBackward) takes the VARIANCE, like the CPU
+            // path's out-parameter. Handing it the inverse std-dev gave wrong gradients on every resident step
+            // (measured: dW[0] -0.0019 vs -0.0174). Convert in place: var = 1/invStd^2 - eps.
+            backend.Multiply(stats.var, stats.var, stats.var, outerSize);
+            backend.Reciprocal(stats.var, stats.var, outerSize);
+            backend.AddScalar(stats.var, stats.var, -(float)epsilon, outerSize);
             ResidentSyncCheck("LayerNorm");
             BindResidentBuffer(output, outBuf, backend);
             var meanT = new Tensor<T>(new T[outerSize], new[] { outerSize });
@@ -5400,6 +5406,34 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <summary>GPU-RESIDENT elementwise multiply (same-shape a*b) for the compiled step via backend.Multiply
     /// into the destination's stable buffer — no host CpuEngine.TensorMultiplyInto (DtoH download = CUDA-900
     /// that aborts capture). Same-shape only (broadcasting falls back). Returns false to fall back.</summary>
+    /// <summary>
+    /// Resident-step elementwise binary op written into <paramref name="output"/>'s stable device buffer (same
+    /// contract as <see cref="TryMultiplyResidentInto{T}"/>, with the kernel as a parameter). False off the resident
+    /// step or for shapes it does not cover; the caller then runs its host path.
+    /// </summary>
+    internal bool TryBinaryResidentInto<T>(Tensor<T> output, Tensor<T> a, Tensor<T> b,
+        Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, IGpuBuffer, int> op, string opName)
+    {
+        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (!TryGetBackend(out var backend)) return false;
+        if (!a.IsContiguous || !b.IsContiguous || a.Length != output.Length || b.Length != a.Length) return false;
+        try
+        {
+            using var bufA = GetResidentOrPersistentInputBuffer(backend, a);
+            using var bufB = GetResidentOrPersistentInputBuffer(backend, b);
+            var outBuf = GetOrCreateResidentBuffer(backend, output, output.Length);
+            op(backend, bufA.Buffer, bufB.Buffer, outBuf, output.Length);
+            ResidentSyncCheck(opName);
+            BindResidentBuffer(output, outBuf, backend);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            AliasDiag($"{opName}-resident FELLBACK: {ex.GetType().Name}: {ex.Message}");
+            return false;
+        }
+    }
+
     internal bool TryMultiplyResidentInto<T>(Tensor<T> output, Tensor<T> a, Tensor<T> b)
     {
         if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
@@ -7130,6 +7164,26 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return false;
 
         op(backend, bufferA.Buffer, bufferB.Buffer, aData.Length);
+
+        // `a` can be bound to a device buffer of its own that is not the one resolved from its backing array (the
+        // compiled resident step binds its gradient accumulators that way). The op above did not touch it, yet the
+        // version sync below declared it current: every later device read of `a` -- and a host read, through the
+        // bound buffer's pending download -- saw the pre-op values. Measured: a compiled step whose ReduceSum
+        // backward produced a host contribution trained with all-zero gradients. Mirror the result into the bound
+        // buffer (ordered before the download, whose stream sync covers it), or drop a binding that cannot hold it.
+        if (a._gpuBuffer is { } bound && !ReferenceEquals(bound, bufferA.Buffer) && bound.Handle != bufferA.Buffer.Handle)
+        {
+            if (ReferenceEquals(a._gpuBackend, backend) && bound.Handle != System.IntPtr.Zero && bound.Size >= aData.Length)
+            {
+                backend.Copy(bufferA.Buffer, bound, aData.Length);
+            }
+            else
+            {
+                Helpers.DeferredArrayMaterializer.Remove(aData);
+                a._gpuBuffer = null;
+                a._gpuBackend = null;
+            }
+        }
 
         // Download result back into a's backing array
         float[] resultFloat = backend.DownloadBuffer(bufferA.Buffer);

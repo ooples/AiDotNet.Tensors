@@ -4804,11 +4804,20 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (IsGpuResident)
             return this;
 
-        var directGpu = Engines.Engine.DirectGpu;
-        if (directGpu is null || !directGpu.IsAvailable || directGpu.Backend is null)
-            return this;
-
-        var backend = directGpu.Backend;
+        // Upload through the CURRENT GPU engine's backend when there is one. The process-wide DirectGpu backend is
+        // a different instance with its own stream: a tensor moved there (AiDotNet's fused path moves every
+        // parameter this way) is then read and written by the engine's kernels on one stream and by the fused
+        // optimizer on the other, with nothing ordering the two. Measured on an LM compiled step: the optimizer
+        // read the gradients before the global-norm clip's scale kernels had run (update norm 2.80, max 1.0).
+        Engines.DirectGpu.IDirectGpuBackend? backend =
+            Engines.AiDotNetEngine.Current is Engines.DirectGpuTensorEngine currentGpu ? currentGpu.GetBackend() : null;
+        if (backend is null)
+        {
+            var directGpu = Engines.Engine.DirectGpu;
+            if (directGpu is null || !directGpu.IsAvailable || directGpu.Backend is null)
+                return this;
+            backend = directGpu.Backend;
+        }
         var logicalData = IsContiguous ? GetDataArray() : GetFlattenedData();
         var floatData = Engines.DirectGpu.DirectGpuEngine.ToFloatArray(logicalData);
         _gpuBuffer = backend.AllocateBuffer(floatData);

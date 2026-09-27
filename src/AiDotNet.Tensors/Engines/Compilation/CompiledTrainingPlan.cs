@@ -74,6 +74,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // reaches ~71% GPU util at the default batch (vs ~12% launch-bound without capture).
     private static readonly bool s_graphStepEnabled =
         System.Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") != "0";
+    // Device-resident uncaptured step (StepResident): the capture body run as ordinary launches whenever the
+    // captured graph is not in use (warmup, capture disabled, or capture failed). AIDOTNET_COMPILED_RESIDENT_STEP=0
+    // restores the host-centric StepEager for those steps.
+    private static readonly bool s_residentStepEnabled =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_COMPILED_RESIDENT_STEP") != "0";
     // Graph capture is default-on (s_graphStepEnabled), but the hardcoded-path
     // %TEMP%/aidotnet_graphstep_diag.txt writes must NOT run for ordinary
     // production compiles. Gate those behind a separate explicit opt-in so a
@@ -83,6 +88,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private IntPtr _stepGraphExec;
     private long _graphStepCalls;
     private bool _graphStepDisabled;
+    /// <summary>Set when <see cref="TryRunResidentBody"/> threw; later steps use StepEager.</summary>
+    private bool _residentStepFailed;
     private bool _graphEvictionSuspended;   // eviction suspended for the graph lifetime (resumed on Dispose)
     private int _graphEagerFwd;              // # leading forward steps run EAGERLY outside the captured graph (0 in capture mode)
     private bool _graphHasEmbedding;         // first forward step is the embedding → captured INSIDE the graph as an
@@ -273,6 +280,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             foreach (var buf in _residentGradBuffers) buf?.Dispose();
             _residentGradBuffers = null;
         }
+        _clipSumSq?.Dispose();
+        _clipTmp?.Dispose();
+        _clipSumSq = null;
+        _clipTmp = null;
 
         // Free the captured training-step graph, if any.
         InvalidateCapturedStepGraph();
@@ -1729,7 +1740,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         if (_graphHasEmbedding) gte.EmbeddingIndexExternallyManaged = false;
                         gte.ResumeActivationEviction();
                         _graphEvictionSuspended = false;
-                        return StepEager();
+                        return StepResidentOrEager();
                     }
                     finally
                     {
@@ -1746,7 +1757,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         DetachCapturePathBindings();
                         gte.ResumeActivationEviction();
                         _graphEvictionSuspended = false;
-                        return StepEager();
+                        return StepResidentOrEager();
                     }
                     _stepGraphExec = exec;
                     cb.LaunchCapturedGraph(exec);   // executes THIS step on the just-uploaded indices
@@ -1760,6 +1771,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     // compute stream — ordered after the captured backward, before the optimizer reads them.
                     if (_maxGradNorm > 0.0 && !TryClipGradientsGlobalL2Gpu(_gradients, _maxGradNorm))
                         ClipGradientsGlobalL2(_gradients, _maxGradNorm);
+                    CommitHostOptimizerGradients();
                     _optimizerUpdate?.Invoke();
                     return _lossOutput;
                 }
@@ -1776,11 +1788,120 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 RefreshLossFromCapturedGraph(gte);
                 if (_maxGradNorm > 0.0 && !TryClipGradientsGlobalL2Gpu(_gradients, _maxGradNorm))
                     ClipGradientsGlobalL2(_gradients, _maxGradNorm);
+                CommitHostOptimizerGradients();
                 _optimizerUpdate?.Invoke();
                 return _lossOutput;
             }
         }
+        return StepResidentOrEager();
+    }
+
+    /// <summary>
+    /// Runs the step on the device-resident body (<see cref="TryRunResidentBody"/>) when the plan can (float, CUDA, an all-GPU action set, no
+    /// checkpointing or FP16 hetero order), else <see cref="StepEager"/>.
+    /// </summary>
+    /// <remarks>
+    /// StepEager is host-centric: it zeroes the gradient accumulators with a host clear, so every accumulation of a
+    /// device gradient into them downloaded it (measured on an LM: ~1 GB/step), and forward results were copied
+    /// into their plan buffers on the host. The capture body keeps accumulators, seed and forward buffers on the
+    /// device, but it only ran inside CUDA-graph capture -- so a plan whose capture failed (or before capture)
+    /// paid the host round-trips on every step.
+    /// </remarks>
+    private Tensor<T> StepResidentOrEager()
+    {
+        if (s_residentStepEnabled && !_residentStepFailed && _graphStepEligible && typeof(T) == typeof(float)
+            && _checkpointing is null && _fp16HeteroOrder is null
+            && _engine is Engines.DirectGpuTensorEngine gte
+            && gte.GetBackend() is Engines.DirectGpu.CUDA.CudaBackend cb)
+        {
+            // Eviction is suspended for THIS step only -- the resident branches require it while they borrow cached
+            // buffers -- and the step's activations are released at the end, as StepEager does. Holding the
+            // suspension for the plan's lifetime (the graph path's contract) leaked it process-wide whenever a plan
+            // was not disposed: measured as 223 failures / 100 CUDA 700s across a broad test run that passes clean
+            // without the resident step.
+            gte.SuspendActivationEviction();
+            long snapshot = gte.ActivationCacheTimestampSnapshot();
+            bool ran = false;
+            try
+            {
+                if (TryRunResidentBody(gte, cb))
+                {
+                    ran = true;
+                    RefreshLossFromCapturedGraph(gte);
+                    if (_maxGradNorm > 0.0 && !TryClipGradientsGlobalL2Gpu(_gradients, _maxGradNorm))
+                        ClipGradientsGlobalL2(_gradients, _maxGradNorm);
+                    CommitHostOptimizerGradients();
+                    _optimizerUpdate?.Invoke();
+                    return _lossOutput;
+                }
+            }
+            finally
+            {
+                gte.ResumeActivationEviction();
+                if (ran)
+                {
+                    // Forward outputs borrow the buffers of the results they alias; those are this step's
+                    // activations and are released next. Drop the borrowed bindings first (the outputs are
+                    // recomputed next step, and the loss was already copied to the host), so nothing is left
+                    // pointing at a released buffer. Gradients, seed and loss-gradient destination own their
+                    // buffers and are protected.
+                    if (_forwardSteps != null)
+                        foreach (var step in _forwardSteps)
+                            if (!ReferenceEquals(step.OutputBuffer, _lossGradDest)) DetachDeviceBinding(step.OutputBuffer);
+                    gte.EvictActivationsCreatedAfter(snapshot, BuildStepEvictionProtectSet(), materializePending: false);
+                    gte.ReclaimGpuMemoryUnderPressure();
+                }
+            }
+        }
         return StepEager();
+    }
+
+    /// <summary>
+    /// One uncaptured, device-resident forward + backward: the capture body (forward, device grad-zero and loss-grad
+    /// reseed, backward) as ordinary launches. The caller then clips and updates as after a graph replay. False when
+    /// the body threw; the plan then uses StepEager from here on. Only the body is retried that way -- nothing has
+    /// been applied to the parameters yet.
+    /// </summary>
+    private bool TryRunResidentBody(Engines.DirectGpuTensorEngine gte, Engines.DirectGpu.CUDA.CudaBackend cb)
+    {
+        using var _autocast = AiDotNet.Tensors.Engines.Gpu.AutocastScope.EnableFromEnvironment();
+        try
+        {
+            using (gte.EnterCompiledCapturePath())
+            {
+                // Uncaptured: the embedding uploads this step's indices inline (no externally managed buffer).
+                if (_graphHasEmbedding) gte.EmbeddingIndexExternallyManaged = false;
+                RunGpuStepBodyForCapture(cb);
+            }
+            return true;
+        }
+        catch (Exception ex)
+        {
+            // The body binds step buffers to the device; StepEager writes them on the host, so the stale device
+            // copies must go (see DetachCapturePathBindings).
+            _residentStepFailed = true;
+            DetachCapturePathBindings();
+            if (_graphHasEmbedding) gte.EmbeddingIndexExternallyManaged = false;
+            Engines.DirectGpu.GpuLaunchProbe.OnFallback("CompiledTrainingPlan.StepResident", ex);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// After a device-resident step body (uncaptured or a graph launch): a parameter without a device buffer is
+    /// updated by the host optimizer, which reads its gradient's host array through a pinned pointer -- not through
+    /// the pending download the body left. Commits those gradients first; otherwise the update reads the previous
+    /// step's host values (measured: Adam on host parameters left the loss exactly flat).
+    /// </summary>
+    private void CommitHostOptimizerGradients()
+    {
+        if (_optimizerUpdate is null) return;
+        for (int p = 0; p < _gradients.Length; p++)
+        {
+            var gradient = _gradients[p];
+            if (gradient is not null && gradient.HasPendingGpuData && _parameters[p].TryGetGpuBuffer() is null)
+                _ = gradient.AsSpan();
+        }
     }
 
     /// <summary>
@@ -1864,23 +1985,36 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 cb.Fill(seedResident, 1f, _lossGradSeed.Length);
             }
         }
+        // Every device write below leaves the host copy stale, so each written tensor is re-bound (re-arming its
+        // pending download). Without that, a host read -- or a host-path op that reads the accumulator, like an
+        // in-place add whose contribution is not resident -- saw the PREVIOUS step's values: measured as gradients
+        // exactly doubling on the second uncaptured step. Host bookkeeping only, so it is capture-safe.
         if (_genericGradIndices != null)
         {
             for (int i = 0; i < _genericGradIndices.Length; i++)
             {
                 int idx = _genericGradIndices[i];
                 if (_preAllocatedGrads[idx].TryGetGpuBuffer() is { } gb)
+                {
                     cb.MemsetBuffer(gb, 0, (long)_preAllocatedGrads[idx].Length * esz);
+                    residentEngine?.BindResidentBuffer(_preAllocatedGrads[idx], gb, cb);
+                }
             }
         }
         else
         {
             for (int i = 0; i < _preAllocatedGrads.Length; i++)
                 if (_preAllocatedGrads[i].TryGetGpuBuffer() is { } gb)
+                {
                     cb.MemsetBuffer(gb, 0, (long)_preAllocatedGrads[i].Length * esz);
+                    residentEngine?.BindResidentBuffer(_preAllocatedGrads[i], gb, cb);
+                }
         }
         if (_lossGradSeed.TryGetGpuBuffer() is { } seedBuf && _lossGradDest?.TryGetGpuBuffer() is { } destBuf)
+        {
             cb.CopyBufferDtoD(seedBuf, destBuf, (long)_lossGradSeed.Length * esz);
+            residentEngine?.BindResidentBuffer(_lossGradDest, destBuf, cb);
+        }
 
         var bwd = _backwardActions;
         // PR #638 A0: extend the forward's capture-invalidation probe into the backward. The forward is fully
@@ -5910,7 +6044,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 var output = step.OutputBuffer;
                 var exec = step.Execute;
                 var opName = step.OpName;
-                allForwardActions.Add(eng => { Engines.DirectGpuTensorEngine.s_currentForwardOp = opName; exec(eng, output); Engines.DirectGpuTensorEngine.TagProducer(output, opName); });
+                allForwardActions.Add(eng =>
+                {
+                    Engines.DirectGpuTensorEngine.s_currentForwardOp = opName;
+                    exec(eng, output);
+                    // A node that wrote its output on the host must bump the version, or a device copy cached for
+                    // the previous step's value keeps being served to the next GPU consumer (several replay
+                    // closures write the host span directly). Device-bound outputs sync their own version.
+                    if (output._gpuBuffer is null && !output.HasPendingGpuData) output.IncrementVersion();
+                    Engines.DirectGpuTensorEngine.TagProducer(output, opName);
+                });
                 genericForwardCount++;  // engine-dispatched (GPU-pure on a GPU engine)
             }
         }
@@ -8119,7 +8262,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         return true;
     }
 
-    private static bool TryClipGradientsGlobalL2Gpu(Tensor<T>[] gradients, double maxNorm)
+    private bool TryClipGradientsGlobalL2Gpu(Tensor<T>[] gradients, double maxNorm)
     {
         // The CUDA reduction/scale path is float-typed. For a Tensor<double> (or any
         // non-float T) it would reinterpret the buffer as float and corrupt the
@@ -8133,16 +8276,30 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var g = gradients[p];
             if (g == null) continue;
             if (g.TryGetGpuBuffer() is null || g._gpuBackend is not Engines.DirectGpu.CUDA.CudaBackend gcb)
+            {
+                Engines.DirectGpu.GpuLaunchProbe.OnFallback("TryClipGradientsGlobalL2Gpu-gradient-not-device-resident", null);
                 return false;
+            }
             cb ??= gcb;
             if (!ReferenceEquals(g._gpuBackend, cb)) return false; // grads split across backends — bail
         }
         if (cb is null) return true; // all-null grads: nothing to clip
 
-        // sumSq accumulator + a 1-element scratch, both device-resident. Tiny pool allocations (reused).
-        var sumSq = cb.AllocateBuffer(1);   // AllocateBuffer(int) zero-inits
-        var tmp = cb.AllocateBuffer(1);
-        try
+        // sumSq accumulator + a 1-element scratch, both device-resident and OWNED BY THE PLAN. They were allocated
+        // and disposed per call: disposal returns a buffer to the pool at once, while the scale kernels that read
+        // sumSq were still queued, so the next allocation could overwrite the scale before it was applied.
+        // Measured on an LM compiled step: the clip left the gradients unclipped (update norm 2.80 against a max
+        // of 1.0) unless something synchronized the stream first.
+        if (_clipScratchBackend is not null && !ReferenceEquals(_clipScratchBackend, cb))
+        {
+            _clipSumSq?.Dispose();
+            _clipTmp?.Dispose();
+            _clipSumSq = null;
+            _clipTmp = null;
+        }
+        _clipScratchBackend = cb;
+        var sumSq = _clipSumSq ??= cb.AllocateBuffer(1);
+        var tmp = _clipTmp ??= cb.AllocateBuffer(1);
         {
             // total sumSq = Σ_p Σ_i grad_p[i]^2. NOTE: ReduceSumOfSquares ACCUMULATES into its output
             // (the non-deterministic kernel does atomicAdd; the deterministic one Fill-zeros then writes),
@@ -8174,15 +8331,19 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 var buf = g.TryGetGpuBuffer();
                 if (buf is null) continue;
                 cb.ScaleByDeviceScalar(buf, sumSq, g.Length);
+                // The scale is a device write: re-arm the host copy's pending download, or a host reader whose copy
+                // was already materialized (a host optimizer, for one) keeps the UNCLIPPED values. Measured on an LM
+                // compiled step with SGD: every parameter moved 2.8x the clipped amount.
+                (_engine as Engines.DirectGpuTensorEngine)?.BindResidentBuffer(g, buf, cb);
             }
-        }
-        finally
-        {
-            (sumSq as IDisposable)?.Dispose();
-            (tmp as IDisposable)?.Dispose();
         }
         return true;
     }
+
+    // Plan-owned scratch for TryClipGradientsGlobalL2Gpu (see there); released in Dispose.
+    private Engines.DirectGpu.IGpuBuffer? _clipSumSq;
+    private Engines.DirectGpu.IGpuBuffer? _clipTmp;
+    private Engines.DirectGpu.CUDA.CudaBackend? _clipScratchBackend;
 
     private static void TensorMatMulGemvFloat(float[] matrix, float[] vector, float[] output, int rows, int cols)
     {
