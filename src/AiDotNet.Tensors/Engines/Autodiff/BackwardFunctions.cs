@@ -7535,6 +7535,13 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var mask = (Tensor<Bit>)savedState[0];
+        if (inputs.Length >= 2 && engine is DirectGpuTensorEngine gpu
+            && gpu.TryMaskedScatterBackwardOnDevice(gradOutput, mask, inputs[1]._shape) is { } device)
+        {
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], device.InputGrad, engine);
+            DifferentiableOps.AccumulateGrad(grads, inputs[1], device.SourceGrad, engine);
+            return;
+        }
         var ops = MathHelper.GetNumericOperations<T>();
 
         // dL/d(input): copy gradOutput into a fresh tensor, then zero masked positions.

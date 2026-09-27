@@ -4455,7 +4455,7 @@ public partial class DirectGpuTensorEngine
         if (mask is null) throw new ArgumentNullException(nameof(mask));
         if (source is null) throw new ArgumentNullException(nameof(source));
         GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
-        if (typeof(T) != typeof(float) || IsTapeActive<T>() || Compilation.GraphMode.IsActive
+        if (typeof(T) != typeof(float) || Compilation.GraphMode.IsActive
             || !ShapesEqual(tensor._shape, mask._shape) || tensor.Length > 16_777_216
             || !TryGetBackend(out var backend) || backend is not INonzeroBackend compaction)
             return base.TensorMaskedScatter(tensor, mask, source);
@@ -4465,36 +4465,25 @@ public partial class DirectGpuTensorEngine
             int n = tensor.Length;
             var ct = tensor.IsContiguous ? tensor : (Tensor<T>)tensor.Contiguous();
             var cs = source.IsContiguous ? source : (Tensor<T>)source.Contiguous();
-            bool countKnown = TryCountHostMask(cm, out int count);
-            if (countKnown && count > source.Length)
+            if (TryCountHostMask(cm, out int hostCount) && hostCount > source.Length)
                 throw new ArgumentException("source has fewer elements than mask-true count", nameof(source));
-            using var maskBuffer = GetOrAllocateBuffer(backend, cm);
-            using var strideBuffer = backend.AllocateIntBuffer(new[] { 1 });
-            using var indexCapacity = AllocateOutputBuffer(backend, n);
-            using var countBuffer = AllocateOutputBuffer(backend, 1);
-            compaction.Nonzero(maskBuffer.Buffer, strideBuffer, indexCapacity.Buffer,
-                countBuffer.Buffer, n, rank: 1);
-            if (!countKnown)
-                count = checked((int)DownloadScalar(backend, countBuffer.Buffer));
-            if (count < 0 || count > n)
-                throw new InvalidOperationException(
-                    $"GPU masked-scatter returned invalid count {count} for input length {n}.");
+            using var bufIdx = CompactMaskPositions(backend, compaction, cm, n, out int count);
             if (count > source.Length)
                 throw new ArgumentException("source has fewer elements than mask-true count", nameof(source));
 
             using var bufIn = GetOrAllocateBuffer(backend, ct);
-            if (count == 0)
-                return DispatchDeferredGpuOp<T>(backend, n, (int[])tensor._shape.Clone(), output =>
-                    backend.Copy(bufIn.Buffer, output, n));
-
             using var bufSrc = GetOrAllocateBuffer(backend, cs);
-            using var bufIdx = ConvertNumericIndicesToInt32(backend, indexCapacity.Buffer, count);
-            return DispatchDeferredGpuOp<T>(backend, n, (int[])tensor._shape.Clone(), output =>
+            var result = DispatchDeferredGpuOp<T>(backend, n, (int[])tensor._shape.Clone(), output =>
             {
                 backend.Copy(bufIn.Buffer, output, n);
-                backend.IndexWrite(output, bufIdx.Buffer, bufSrc.Buffer, 0f, mode: 0,
-                    outerSize: 1, idxAxis: count, innerSize: 1, dstAxis: n);
+                if (bufIdx is { } positions)
+                    backend.IndexWrite(output, positions.Buffer, bufSrc.Buffer, 0f, mode: 0,
+                        outerSize: 1, idxAxis: count, innerSize: 1, dstAxis: n);
             });
+            // Same node and saved state CpuEngine records.
+            Autodiff.DifferentiableOps.RecordBinary("TensorMaskedScatter", result, tensor, source,
+                Autodiff.BackwardFunctions<T>.MaskedScatterBackward, savedState: new object[] { mask });
+            return result;
         }
         catch (ArgumentException ex) when (ex.ParamName == nameof(source)) { throw; }
         catch (Exception)
@@ -4504,6 +4493,72 @@ public partial class DirectGpuTensorEngine
         }
     }
 
+    /// <summary>
+    /// Flat positions of the mask's true elements, in row-major order, as an int32 device buffer (null when
+    /// there are none). The count comes from the host mask when it is on the host, so a resident mask is the
+    /// only case that reads the count back.
+    /// </summary>
+    private OwnedBuffer? CompactMaskPositions(IDirectGpuBackend backend, INonzeroBackend compaction,
+        Tensor<Bit> mask, int n, out int count)
+    {
+        bool countKnown = TryCountHostMask(mask, out count);
+        using var maskBuffer = GetOrAllocateBuffer(backend, mask);
+        using var strideBuffer = backend.AllocateIntBuffer(new[] { 1 });
+        using var indexCapacity = AllocateOutputBuffer(backend, n);
+        using var countBuffer = AllocateOutputBuffer(backend, 1);
+        compaction.Nonzero(maskBuffer.Buffer, strideBuffer, indexCapacity.Buffer,
+            countBuffer.Buffer, n, rank: 1);
+        if (!countKnown)
+            count = checked((int)DownloadScalar(backend, countBuffer.Buffer));
+        if (count < 0 || count > n)
+            throw new InvalidOperationException(
+                $"GPU masked-scatter returned invalid count {count} for input length {n}.");
+        return count == 0 ? null : ConvertNumericIndicesToInt32(backend, indexCapacity.Buffer, count);
+    }
+
+    /// <summary>
+    /// masked_scatter backward on the device: the input gradient is <paramref name="gradOutput"/> with the masked
+    /// positions zeroed, and the source gradient gathers <paramref name="gradOutput"/> at those positions into the
+    /// first <c>count</c> source elements (the rest stay zero). Null when the device path cannot take it.
+    /// </summary>
+    internal (Tensor<T> InputGrad, Tensor<T> SourceGrad)? TryMaskedScatterBackwardOnDevice<T>(
+        Tensor<T> gradOutput, Tensor<Bit> mask, int[] sourceShape)
+    {
+        int n = gradOutput.Length;
+        if (typeof(T) != typeof(float) || Compilation.GraphMode.IsActive || mask.Length != n || n > 16_777_216
+            || !TryGetBackend(out var backend) || backend is not INonzeroBackend compaction
+            || backend is not IResidentIndexBackend indexBackend)
+            return null;
+        try
+        {
+            int sourceLength = 1;
+            for (int i = 0; i < sourceShape.Length; i++) sourceLength = checked(sourceLength * sourceShape[i]);
+            var cm = mask.IsContiguous ? mask : (Tensor<Bit>)mask.Contiguous();
+            var upstream = gradOutput.IsContiguous ? gradOutput : (Tensor<T>)gradOutput.Contiguous();
+            using var bufIdx = CompactMaskPositions(backend, compaction, cm, n, out int count);
+            if (count > sourceLength) return null;
+            using var bufG = GetOrAllocateBuffer(backend, upstream);
+            var inputGrad = DispatchDeferredGpuOp<T>(backend, n, (int[])gradOutput._shape.Clone(), output =>
+            {
+                backend.Copy(bufG.Buffer, output, n);
+                if (bufIdx is { } positions)
+                    backend.IndexWrite(output, positions.Buffer, bufG.Buffer, 0f, mode: 1,
+                        outerSize: 1, idxAxis: count, innerSize: 1, dstAxis: n);
+            });
+            var sourceGrad = DispatchDeferredGpuOp<T>(backend, sourceLength, (int[])sourceShape.Clone(), output =>
+            {
+                backend.Fill(output, 0f, sourceLength);
+                if (bufIdx is { } positions)
+                    indexBackend.IndexSelect(bufG.Buffer, positions.Buffer, output, 1, n, count, 1);
+            });
+            return (inputGrad, sourceGrad);
+        }
+        catch (Exception)
+        {
+            if (ThrowOnGpuKernelFallback) throw;
+            return null;
+        }
+    }
     /// <inheritdoc/>
     public override Tensor<T> TensorScatterReduce<T>(
         Tensor<T> tensor, int dim, Tensor<int> indices, Tensor<T> source, ScatterReduceMode mode, bool includeSelf = true)
