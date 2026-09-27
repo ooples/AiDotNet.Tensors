@@ -11528,9 +11528,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // a tape entry with FlashAttentionBackward so gradient flow to Q,
         // K, V works. Keeping `public override` makes the IEngine dispatch
         // reach this method instead of CpuEngine's implicit-interface impl.
-        if (IsTapeActive<T>())
-            return base.FlashAttention(query, key, value, scale, isCausal, out softmaxStats, attentionBias);
-
         if (!TryGetBackend(out var backend))
             return base.FlashAttention(query, key, value, scale, isCausal, out softmaxStats, attentionBias);
 
@@ -11558,6 +11555,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             out Tensor<T> directResult, out Tensor<T> directSoftmaxStats))
         {
             softmaxStats = directSoftmaxStats;
+            RecordFlashAttention(directResult, query, key, value, softmaxStats, scale ?? 1.0 / Math.Sqrt(headDim), isCausal, attentionBias);
             return directResult;
         }
 #endif
@@ -11591,6 +11589,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     BindResidentBuffer(outT, outBufR, backend);
                     BindResidentBuffer(statsT, statsBufR, backend);
                     softmaxStats = statsT;
+                    RecordFlashAttention(outT, query, key, value, softmaxStats, scale ?? 1.0 / Math.Sqrt(headDim), isCausal, attentionBias);
                     return outT;
                 }
             }
@@ -11623,6 +11622,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             softmaxStats = DeferTensorResult<T>(backend, statsBuffer.Buffer,
                 batch * heads * seqQ, new[] { batch, heads, seqQ });
             faHanded = true;
+            RecordFlashAttention(result, query, key, value, softmaxStats, scale ?? 1.0 / Math.Sqrt(headDim), isCausal, attentionBias);
             return result;
         }
         catch
@@ -11642,6 +11642,21 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // pure admission rules independently testable while excluding only this
     // hardware bridge; the GPU suite executes this method on supported hosts.
     [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
+    /// <summary>
+    /// Records the node CpuEngine records for FlashAttention: the per-row log-sum-exp stats, the scale as a double, the
+    /// causal flag, and the bias only when there is one (a missing entry is the only null the saved-state serializer
+    /// can carry). Every device path produces stats in that same LSE layout, and the backward runs this engine's
+    /// FlashAttentionBackward, which falls back to the CPU only for inputs the device forward never takes.
+    /// </summary>
+    private static void RecordFlashAttention<T>(Tensor<T> result, Tensor<T> query, Tensor<T> key, Tensor<T> value,
+        Tensor<T> softmaxStats, double scale, bool isCausal, Tensor<T>? attentionBias)
+    {
+        var saved = attentionBias is null
+            ? new object[] { softmaxStats, scale, isCausal }
+            : new object[] { softmaxStats, scale, isCausal, attentionBias };
+        Autodiff.DifferentiableOps.RecordIfActive("FlashAttention", result, new[] { query, key, value },
+            Autodiff.BackwardFunctions<T>.FlashAttentionBackward, saved);
+    }
     private bool TryDirectPtxFlashAttention<T>(
         Tensor<T> query,
         Tensor<T> key,
@@ -11832,14 +11847,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         bool isCausal,
         out Tensor<T> attentionWeights)
     {
-        // Same rationale as FusedLinear / FusedConv2D: when a tape is
-        // active, defer to the base CpuEngine path which decomposes
-        // into recorded primitives. The fused GPU kernel below bypasses
-        // DifferentiableOps, so taking it during training would
-        // silently disconnect this op from autograd.
-        if (IsTapeActive<T>())
-            return base.GroupedQueryAttention(query, key, value, numQueriesPerKV, scale, isCausal, out attentionWeights);
-
         if (!TryGetBackend(out var backend))
             return base.GroupedQueryAttention(query, key, value, numQueriesPerKV, scale, isCausal, out attentionWeights);
 
@@ -11875,6 +11882,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 batch * numQHeads * seqQ * seqK, new[] { batch, numQHeads, seqQ, seqK });
             outputBuffer.RelinquishOwnership();
             attnWeightsBuffer.RelinquishOwnership();
+            // Same node and saved state CpuEngine records: the softmax weights, the query-per-KV ratio and the
+            // scale as a double. The backward runs this engine's GroupedQueryAttentionBackward.
+            Autodiff.DifferentiableOps.RecordIfActive("GroupedQueryAttention", result, new[] { query, key, value },
+                Autodiff.BackwardFunctions<T>.GroupedQueryAttentionBackward,
+                new object[] { attentionWeights, numQueriesPerKV, scale ?? (1.0 / Math.Sqrt(headDim)) });
             return result;
         }
         catch
@@ -21378,13 +21390,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> Conv3D<T>(Tensor<T> input, Tensor<T> kernel, int stride, int padding, int dilation)
     {
-        // Tape-active: use the recording CPU base path so the conv (and its
-        // kernel gradient) participate in autodiff (see MaxPool2D). The GPU path
-        // returns an untracked tensor — frozen training for 3D convs (UNet3D,
-        // VoxelCNN, video models) otherwise.
-        if (IsTapeActive<T>()) return base.Conv3D(input, kernel, stride, padding, dilation);
-
-        if (!TryGetBackend(out var backend) || input.Rank < 5)
+        if (!TryGetBackend(out var backend) || input.Rank < 5 || kernel.Rank < 5)
             return base.Conv3D(input, kernel, stride, padding, dilation);
 
         try
@@ -21407,11 +21413,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 stride, stride, stride,
                 padding, padding, padding,
                 dilation, dilation, dilation);
-            return DeferTensorResult<T>(backend, bufOut.Buffer, batch * outChannels * outD * outH * outW,
+            var result = DeferTensorResult<T>(backend, bufOut.Buffer, batch * outChannels * outD * outH * outW,
                 new[] { batch, outChannels, outD, outH, outW });
+            // Same node and saved state CpuEngine records (its int overload expands to per-axis arrays); the
+            // backward runs this engine's device Conv3DBackwardInput/Kernel. Without it the GPU result was untracked
+            // and 3D-conv weights (UNet3D, VoxelCNN, video models) trained as frozen.
+            Autodiff.DifferentiableOps.RecordBinary("Conv3D", result, input, kernel, Autodiff.BackwardFunctions<T>.Conv3DBackward,
+                new object[] { new[] { stride, stride, stride }, new[] { padding, padding, padding },
+                    new[] { dilation, dilation, dilation } });
+            return result;
         }
         catch (Exception)
         {
+            if (ThrowOnGpuKernelFallback) throw;
             return base.Conv3D(input, kernel, stride, padding, dilation);
         }
     }
@@ -23376,12 +23390,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var filled = DispatchDeferredGpuOp<T>(backend, tensor.Length, tensor.Shape.ToArray(), output =>
                 backend.MaskedFillKernel(inputBuffer.Buffer, maskBuffer.Buffer, output,
                     Convert.ToSingle(value), tensor.Length));
-            // The same node CpuEngine records for a Bit mask: MaskedFillBackward's bool[] branch.
-            var maskSpan = contiguousMask.AsSpan();
-            var maskBools = new bool[maskSpan.Length];
-            for (int i = 0; i < maskSpan.Length; i++) maskBools[i] = (bool)maskSpan[i];
-            Autodiff.DifferentiableOps.RecordUnary("TensorMaskedFill", filled, tensor,
-                Autodiff.BackwardFunctions<T>.MaskedFillBackward, new object[] { maskBools });
+            // Only a tape needs the mask again, and reading a resident Bit mask's span DOWNLOADS it — which every
+            // call used to do. Instead derive the mask as a 0/1 Tensor<T> on the device (the same kernel filling 1
+            // over zeros) and hand it to MaskedFillBackward's Tensor<T> branch, which stays on the device too.
+            if (IsTapeActive<T>())
+            {
+                int n = tensor.Length;
+                var maskAsValues = DispatchDeferredGpuOp<T>(backend, n, tensor.Shape.ToArray(), output =>
+                {
+                    backend.Fill(output, 0f, n);
+                    backend.MaskedFillKernel(output, maskBuffer.Buffer, output, 1f, n);
+                });
+                Autodiff.DifferentiableOps.RecordUnary("TensorMaskedFill", filled, tensor,
+                    Autodiff.BackwardFunctions<T>.MaskedFillBackward, new object[] { maskAsValues });
+            }
             return filled;
         }
         catch

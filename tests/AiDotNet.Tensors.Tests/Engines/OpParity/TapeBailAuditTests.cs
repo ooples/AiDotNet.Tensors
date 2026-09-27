@@ -89,12 +89,8 @@ public class TapeBailAuditTests
         // not scan. These are deliberately baselined now that the audit covers the complete partial class;
         // each one needs its CpuEngine saved-state/backward contract verified by a gradient test before its
         // tape bail can be removed safely. New names still fail the audit, and this baseline must only shrink.
-        "FlashAttention",
-        "GroupedQueryAttention",
         // FLOAT now records on the device (GpuTapeGradientParityTests.LayerNorm_*); the non-float tape still bails because
         // the FP16 half-store branch saves INVERSE std where LayerNormBackward expects variance. Remove once that holds.
-        "Conv3D",
-        "ConvTranspose2D",
 
         // NOT fixable, and NOT pending — these are here because the audit matches on op NAME and cannot
         // tell overloads apart. CpuEngine records a backward for TensorMax/TensorMin(tensor, TENSOR), while
@@ -144,6 +140,12 @@ public class TapeBailAuditTests
         // Under a tape the pool also keeps its argmax indices resident for the backward; inference never needs
         // them. The node is recorded in the override either way.
         "MaxPool2D",
+        // The tape check only keeps training off the resident CUDA-graph capture path, which binds its output without
+        // recording; under a tape the eager kernel path runs and records the node.
+        "ConvTranspose2D",
+        // The Bit-mask overload builds a device 0/1 copy of the mask for the backward only when taping; reading the
+        // mask on the host instead downloaded a resident mask on every call.
+        "TensorMaskedFill",
     };
 
     /// <summary>
@@ -192,7 +194,6 @@ public class TapeBailAuditTests
         "TensorDiagonal",
         "Upsample",
         "TensorGather",
-        "TensorMaskedFill",
         "TensorClampMin",
         "TensorClampMax",
         "Embedding",
@@ -205,6 +206,9 @@ public class TapeBailAuditTests
         "AvgPool2D",
         "Dropout",
         "BatchNorm",
+        "Conv3D",
+        "FlashAttention",
+        "GroupedQueryAttention",
     };
 
     private static string[] GpuEngineSources(string root)

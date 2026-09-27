@@ -706,6 +706,80 @@ public class GpuTapeGradientParityTests : IDisposable
     public void Norm_stays_on_the_device_while_a_tape_records(NormKind kind) =>
         AssertStaysOnDeviceUnderTape($"{kind}Norm", (e, t) => RunNorm(e, t, kind),
             static (x, y) => Assert.Equal(x.Length, y.Length));
+    private static readonly Tensor<float> Conv3DKernel = Rand([3, 2, 2, 2, 2], seed: 331);
+    private static readonly Tensor<float> ConvTransposeKernel = Rand([2, 3, 3, 3], seed: 337);
+
+    // [6,10] viewed as [1,2,3,2,5]: one sample, 2 channels, a 3x2x5 volume; padding 1 so edges are exercised.
+    [SkippableFact]
+    public void Conv3D_gradients_match_cpu() =>
+        AssertGradientParity("Conv3D", Rand([6, 10], seed: 347),
+            static (e, t) => e.Conv3D(t.Reshape(new[] { 1, 2, 3, 2, 5 }), Conv3DKernel, 1, 1, 1));
+
+    [SkippableFact]
+    public void Conv3D_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("Conv3D",
+            static (e, t) => e.Conv3D(t.Reshape(new[] { 1, 2, 3, 2, 5 }), Conv3DKernel, 1, 1, 1),
+            static (x, y) => Assert.Equal(new[] { 1, 3, 4, 3, 6 }, y.Shape.ToArray()));
+
+    // [6,10] viewed as [1,2,5,6]; stride 2 with padding exercises the overlap and cropping in the transpose.
+    [SkippableFact]
+    public void ConvTranspose2D_gradients_match_cpu() =>
+        AssertGradientParity("ConvTranspose2D", Rand([6, 10], seed: 349),
+            static (e, t) => e.ConvTranspose2D(t.Reshape(new[] { 1, 2, 5, 6 }), ConvTransposeKernel,
+                new[] { 2, 2 }, new[] { 1, 1 }, new[] { 0, 0 }));
+
+    [SkippableFact]
+    public void ConvTranspose2D_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("ConvTranspose2D",
+            static (e, t) => e.ConvTranspose2D(t.Reshape(new[] { 1, 2, 5, 6 }), ConvTransposeKernel,
+                new[] { 2, 2 }, new[] { 1, 1 }, new[] { 0, 0 }),
+            static (x, y) => Assert.Equal(new[] { 1, 3, 9, 11 }, y.Shape.ToArray()));
+    // [6,10] is exactly a [1,4,5,3] query: 1 batch, 4 heads, 5 positions, head dim 3.
+    private static readonly Tensor<float> AttnKey = Rand([1, 4, 5, 3], seed: 353);
+    private static readonly Tensor<float> AttnValue = Rand([1, 4, 5, 3], seed: 359);
+    private static readonly Tensor<float> GqaKey = Rand([1, 2, 5, 3], seed: 367);
+    private static readonly Tensor<float> GqaValue = Rand([1, 2, 5, 3], seed: 373);
+
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void FlashAttention_gradients_match_cpu(bool causal) =>
+        AssertGradientParity($"FlashAttention(causal={causal})", Rand([6, 10], seed: 379),
+            (e, t) => e.FlashAttention(t.Reshape(new[] { 1, 4, 5, 3 }), AttnKey, AttnValue, null, causal, out _));
+
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void FlashAttention_taped_forward_matches_cpu(bool causal) =>
+        AssertTapedForwardMatchesCpu($"FlashAttention(causal={causal})", Rand([6, 10], seed: 383),
+            (e, t) => e.FlashAttention(t.Reshape(new[] { 1, 4, 5, 3 }), AttnKey, AttnValue, null, causal, out _));
+
+    [SkippableFact]
+    public void FlashAttention_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("FlashAttention",
+            static (e, t) => e.FlashAttention(t.Reshape(new[] { 1, 4, 5, 3 }), AttnKey, AttnValue, null, false, out _),
+            static (x, y) => Assert.Equal(new[] { 1, 4, 5, 3 }, y.Shape.ToArray()));
+
+    // 4 query heads sharing 2 key/value heads, so each KV head's gradient sums over two query heads.
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void GroupedQueryAttention_gradients_match_cpu(bool causal) =>
+        AssertGradientParity($"GQA(causal={causal})", Rand([6, 10], seed: 389),
+            (e, t) => e.GroupedQueryAttention(t.Reshape(new[] { 1, 4, 5, 3 }), GqaKey, GqaValue, 2, null, causal, out _));
+
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void GroupedQueryAttention_taped_forward_matches_cpu(bool causal) =>
+        AssertTapedForwardMatchesCpu($"GQA(causal={causal})", Rand([6, 10], seed: 397),
+            (e, t) => e.GroupedQueryAttention(t.Reshape(new[] { 1, 4, 5, 3 }), GqaKey, GqaValue, 2, null, causal, out _));
+
+    [SkippableFact]
+    public void GroupedQueryAttention_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("GroupedQueryAttention",
+            static (e, t) => e.GroupedQueryAttention(t.Reshape(new[] { 1, 4, 5, 3 }), GqaKey, GqaValue, 2, null, false, out _),
+            static (x, y) => Assert.Equal(new[] { 1, 4, 5, 3 }, y.Shape.ToArray()));
     [SkippableFact]
     public void TensorClampMin_gradients_match_cpu() =>
         AssertGradientParity("ClampMin", Rand([6, 10], seed: 73),
