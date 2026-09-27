@@ -11646,11 +11646,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
     }
 
-#if NET5_0_OR_GREATER
-    // The hosted CI runners do not expose an NVIDIA Driver API device. Keep the
-    // pure admission rules independently testable while excluding only this
-    // hardware bridge; the GPU suite executes this method on supported hosts.
-    [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
     /// <summary>
     /// Records the node CpuEngine records for FlashAttention: the per-row log-sum-exp stats, the scale as a double, the
     /// causal flag, and the bias only when there is one (a missing entry is the only null the saved-state serializer
@@ -11666,6 +11661,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         Autodiff.DifferentiableOps.RecordIfActive("FlashAttention", result, new[] { query, key, value },
             Autodiff.BackwardFunctions<T>.FlashAttentionBackward, saved);
     }
+
+#if NET5_0_OR_GREATER
+    // The hosted CI runners do not expose an NVIDIA Driver API device. Keep the
+    // pure admission rules independently testable while excluding only this
+    // hardware bridge; the GPU suite executes this method on supported hosts.
+    [System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]
     private bool TryDirectPtxFlashAttention<T>(
         Tensor<T> query,
         Tensor<T> key,
