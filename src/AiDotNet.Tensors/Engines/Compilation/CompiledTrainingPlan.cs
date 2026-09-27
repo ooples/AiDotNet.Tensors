@@ -289,6 +289,63 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// optimizer wiring) or a forward-action rebuild — otherwise replay would launch
     /// kernels against freed or stale buffers.
     /// </summary>
+    /// <summary>
+    /// Keeps THIS plan on the eager step even where whole-step CUDA-graph capture is enabled process-wide. The
+    /// environment switch is read once per process, so this is how a single test process compares a captured plan
+    /// against an eager one (the parity oracle for capture).
+    /// </summary>
+    /// <summary>
+    /// Undoes what the capture pre-pass did to the step's gradient state when capture fails, so the eager fallback
+    /// runs this step exactly as if capture had never been attempted.
+    /// </summary>
+    /// <remarks>
+    /// The pre-pass binds every gradient accumulator (and the loss-gradient seed) to a device buffer and runs a
+    /// forward + backward into them. The eager step zeroes only the HOST gradient arrays, but with both operands now
+    /// resident its in-place accumulations ran on the never-zeroed device buffers, while the optimizer read the host
+    /// arrays that never received them. So a failed capture did not just cost the speed-up: it corrupted the
+    /// gradients of that step and every later one (measured: the captured plan's loss diverged from the eager plan's
+    /// from the capture step on, and a 1024-3x1024-10 MLP stopped learning after three steps).
+    /// </remarks>
+    private void RollBackCaptureResidency(Engines.DirectGpuTensorEngine engine)
+    {
+        void Unbind(Tensor<T>? t)
+        {
+            if (t is null || t._gpuBuffer is null) return;
+            // Drop the pending device->host download FIRST: its device data is the pre-pass's, and letting it fire
+            // (or letting the cache invalidation below force it) would overwrite the host gradient.
+            if (t.GetBackingArrayForCacheLookupUnsafe() is { } backing)
+                Helpers.DeferredArrayMaterializer.Remove(backing);
+            Helpers.DeferredArrayMaterializer.Remove(t.DataVector);
+            engine.InvalidateGpuCacheForTensor(t);
+            t._gpuBuffer = null;
+            t._gpuBackend = null;
+            t._gpuBufferVersion = -1;
+        }
+        for (int i = 0; i < _preAllocatedGrads.Length; i++) Unbind(_preAllocatedGrads[i]);
+        Unbind(_lossGradSeed);
+        Unbind(_lossGradDest);
+    }
+
+    /// <summary>
+    /// A graph launch runs no host code, so the loss it just wrote on the device never re-arms its host download: the
+    /// caller's read of the returned loss saw the capture step's value on every replay (the training itself was right
+    /// - the weights matched an eager run exactly - but every reported loss after capture was the same number).
+    /// </summary>
+    private void RearmLossDownload(Engines.DirectGpuTensorEngine engine, Engines.DirectGpu.CUDA.CudaBackend backend)
+    {
+        if (_lossOutput._gpuBuffer is { } lossBuffer)
+            engine.BindResidentBuffer(_lossOutput, lossBuffer, backend);
+    }
+
+    /// <summary>Test hook: the next capture attempt runs the pre-pass and then fails, like a capture-unsafe op.</summary>
+    internal bool FailNextCaptureForTesting { get; set; }
+
+    internal void DisableGraphStep()
+    {
+        InvalidateCapturedStepGraph();
+        _graphStepDisabled = true;
+    }
+
     private void InvalidateCapturedStepGraph()
     {
         if (_stepGraphExec != IntPtr.Zero
@@ -297,8 +354,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             cb.DestroyCapturedGraph(_stepGraphExec);
         }
+        bool hadGraph = _stepGraphExec != IntPtr.Zero;
         _stepGraphExec = IntPtr.Zero;
         _graphStepCalls = 0;
+        // The eager step accumulates into HOST gradient arrays; leaving the accumulators bound to the capture's
+        // device buffers made its in-place adds land on never-zeroed device memory (gradients piled up across steps).
+        if (hadGraph && _engine is Engines.DirectGpuTensorEngine gRoll)
+            RollBackCaptureResidency(gRoll);
         // Balance the graph-lifetime eviction suspension (Step()): once the captured graph is gone,
         // the buffers no longer need stable pointers, so re-enable normal activation eviction.
         if (_graphEvictionSuspended && _engine is Engines.DirectGpuTensorEngine gEvict)
@@ -1633,6 +1695,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         // VRAM every step (a 488-step epoch OOM'd; the 76-step canary survived). Instance-scoped
                         // (not thread-local): op execution fans out to the BLAS pool threads.
                         using var _cap = gte.EnterCompiledCapturePath();
+                        if (FailNextCaptureForTesting)
+                        {
+                            FailNextCaptureForTesting = false;
+                            RunGpuStepBodyForCapture(cb);   // the pre-pass runs, as it does before a real failure
+                            throw new InvalidOperationException("capture failure forced for testing");
+                        }
                         if (_graphHasEmbedding) gte.EmbeddingIndexExternallyManaged = false;
                         RefreshGraphInputInPlace(cb);
                         RunGpuStepBodyForCapture(cb);
@@ -1656,6 +1724,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         if (_graphHasEmbedding) gte.EmbeddingIndexExternallyManaged = false;
                         gte.ResumeActivationEviction();
                         _graphEvictionSuspended = false;
+                        RollBackCaptureResidency(gte);
                         return StepEager();
                     }
                     finally
@@ -1672,10 +1741,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         _graphStepDisabled = true;
                         gte.ResumeActivationEviction();
                         _graphEvictionSuspended = false;
+                        RollBackCaptureResidency(gte);
                         return StepEager();
                     }
                     _stepGraphExec = exec;
                     cb.LaunchCapturedGraph(exec);   // executes THIS step on the just-uploaded indices
+                    RearmLossDownload(gte, cb);
                     // The optimizer update is run eagerly (NOT captured): its closure
                     // increments _optimizerStep and re-evaluates lrSchedule.GetLr +
                     // Adam/AdamW bias-correction each step, and bakes those scalars into
@@ -1697,6 +1768,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 if (_graphHasEmbedding) gte.RefreshGraphEmbeddingIndicesNow();   // upload step-N indices (registered action)
                 RefreshGraphInputInPlace(cb);
                 cb.LaunchCapturedGraph(_stepGraphExec);
+                RearmLossDownload(gte, cb);
                 if (_maxGradNorm > 0.0 && !TryClipGradientsGlobalL2Gpu(_gradients, _maxGradNorm))
                     ClipGradientsGlobalL2(_gradients, _maxGradNorm);
                 _optimizerUpdate?.Invoke();
@@ -3040,7 +3112,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // below) — otherwise a later LaunchCapturedGraph would replay against freed/stale device
             // pointers. No-op when no graph is captured (the CPU and on-device optimizer paths are
             // normally mutually exclusive; this is the requested safety net).
-            if (_stepGraphExec != IntPtr.Zero) InvalidateCapturedStepGraph();
+            // Only when this update writes weights on the HOST. When every parameter is updated on the device (the
+            // resident fused path), the graph's pointers stay valid; retiring it here destroyed every graph right after
+            // its first launch, so the plan cycled warm-up -> capture -> destroy and never replayed.
+            if (_stepGraphExec != IntPtr.Zero && Array.Exists(gpuParam, g => g is null)) InvalidateCapturedStepGraph();
             // Issue #348: read lr from the schedule each step. PyTorch's
             // LRScheduler.step() pays managed-code dispatch overhead per
             // step; here it's an inlined Math.Cos / Math.Pow.
@@ -4119,7 +4194,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // #739 review: retire any captured on-device step graph before this CPU fused optimizer
             // invalidates resident weight buffers below — else a later LaunchCapturedGraph replays
             // against freed/stale device pointers. No-op when no graph is captured.
-            if (_stepGraphExec != IntPtr.Zero) InvalidateCapturedStepGraph();
+            // Only when this update writes weights on the HOST (see the ungrouped closure).
+            if (_stepGraphExec != IntPtr.Zero && Array.Exists(gpuParam, g => g is null)) InvalidateCapturedStepGraph();
             // Resolve each group's lr ONCE per step. PyTorch does N kernel
             // launches for N groups; we do one schedule eval per group and
             // one fused-kernel call per parameter.

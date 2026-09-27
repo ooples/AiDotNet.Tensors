@@ -224,6 +224,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </summary>
     private Tensor<T> FinalizeReshapeLikeView(Tensor<T> view, string opName)
     {
+        CarryResidencyToShapeOnlyView(view);
         if (!IsDifferentiableRecordingActive)
             return view;
 
@@ -237,6 +238,30 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     }
 
     /// <summary>Attaches inverse-permutation gradients to a storage view.</summary>
+    /// <summary>
+    /// A shape-only view (same storage, same offset, both contiguous, same length) has the SAME bytes as its source,
+    /// so it carries the source's device buffer. Without this a reshape of a GPU result was a host-only object: a
+    /// consumer that needed its device buffer (CopyResultInto aliasing, an in-place op, a GEMM operand) could not
+    /// find it and downloaded the data instead — a per-op host round-trip in eager training, and a CUDA 900 that
+    /// aborted whole-step graph capture (the MSE loss is ReduceMean(...).Reshape([1])). Sharing the IGpuBuffer
+    /// reference is lifetime-safe: the buffer is freed by its own finalizer once nothing references it, so the view
+    /// keeps it alive for as long as the view is reachable.
+    /// </summary>
+    private void CarryResidencyToShapeOnlyView(Tensor<T> view)
+    {
+        if (_gpuBuffer is null || view._gpuBuffer is not null) return;
+        if (!IsContiguous || !view.IsContiguous || view._storageOffset != _storageOffset || view.Length != Length) return;
+        if (!ReferenceEquals(view._storage, _storage)) return;
+        view._gpuBuffer = _gpuBuffer;
+        view._gpuBackend = _gpuBackend;
+        view._gpuBufferIsSplitComplex = _gpuBufferIsSplitComplex;
+        view._gpuBufferContainsRawInt32 = _gpuBufferContainsRawInt32;
+        view._device = _device;
+        view._gpuDeviceIndex = _gpuDeviceIndex;
+        // Same storage => same GpuCacheVersion; carry "current" only if the source's buffer was current.
+        view._gpuBufferVersion = _gpuBufferVersion == GpuCacheVersion ? view.GpuCacheVersion : -1;
+    }
+
     private Tensor<T> FinalizePermuteView(Tensor<T> view, int[] permutation)
     {
         if (!IsDifferentiableRecordingActive)
