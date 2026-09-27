@@ -501,6 +501,34 @@ public class GpuTapeGradientParityTests : IDisposable
         AssertStaysOnDeviceUnderTape($"FusedLinear({activation})",
             (e, t) => e.FusedLinear(t, LinearWeight, LinearBias, activation),
             static (x, y) => Assert.Equal(new[] { 6, 4 }, y.Shape.ToArray()));
+    // [6,10] viewed as [1,2,5,6]; pool 3 stride 2 with padding exercises windows that cover 1, 2, 4 and 6 real cells.
+    [SkippableTheory]
+    [InlineData(0, false)]
+    [InlineData(1, false)]
+    [InlineData(1, true)]
+    public void AvgPool2D_gradients_match_cpu(int padding, bool countIncludePad) =>
+        AssertGradientParity($"AvgPool2D(p{padding},{countIncludePad})", Rand([6, 10], seed: 229),
+            (e, t) => e.AvgPool2D(t.Reshape(new[] { 1, 2, 5, 6 }), 3, 2, padding, countIncludePad),
+            probe: Engagement.UseResidencyCounter);
+
+    [SkippableTheory]
+    [InlineData(1, false)]
+    [InlineData(1, true)]
+    public void AvgPool2D_taped_forward_matches_cpu(int padding, bool countIncludePad) =>
+        AssertTapedForwardMatchesCpu($"AvgPool2D(p{padding},{countIncludePad})", Rand([6, 10], seed: 233),
+            (e, t) => e.AvgPool2D(t.Reshape(new[] { 1, 2, 5, 6 }), 3, 2, padding, countIncludePad));
+
+    [SkippableFact]
+    public void AvgPool2D_int_array_overload_gradients_match_cpu() =>
+        AssertGradientParity("AvgPool2D(int[])", Rand([6, 10], seed: 239),
+            static (e, t) => e.AvgPool2D(t.Reshape(new[] { 1, 2, 5, 6 }), new[] { 2, 3 }, new[] { 1, 2 }),
+            probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void AvgPool2D_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("AvgPool2D",
+            static (e, t) => e.AvgPool2D(t.Reshape(new[] { 1, 2, 5, 6 }), 3, 2, 1),
+            static (x, y) => Assert.Equal(new[] { 1, 2, 3, 3 }, y.Shape.ToArray()));
     [SkippableFact]
     public void TensorClampMin_gradients_match_cpu() =>
         AssertGradientParity("ClampMin", Rand([6, 10], seed: 73),

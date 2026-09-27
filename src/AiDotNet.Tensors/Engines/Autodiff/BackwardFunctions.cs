@@ -1360,8 +1360,12 @@ internal static class BackwardFunctions<T>
     {
         var poolSize = (int[])savedState[0];
         var stride = (int[])savedState[1];
+        // [2] padding and [3] divisor rule. Absent on nodes from the int[] overload, which has no padding, and on
+        // plans serialized before they were saved; those replay the old unpadded gradient.
+        var padding = savedState.Length > 2 ? savedState[2] as int[] : null;
+        bool countIncludePad = savedState.Length > 3 && savedState[3] is true;
 
-        var grad = engine.AvgPool2DBackward(gradOutput, inputs[0]._shape, poolSize, stride);
+        var grad = engine.AvgPool2DBackward(gradOutput, inputs[0]._shape, poolSize, stride, padding, countIncludePad);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 

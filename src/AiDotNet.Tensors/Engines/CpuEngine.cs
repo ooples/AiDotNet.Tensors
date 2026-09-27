@@ -1,4 +1,4 @@
-﻿#pragma warning disable CS0618 // SimdGemm.Sgemm/Dgemm (no-trans shims) are [Obsolete] — internal call sites pending migration to BlasManaged.Gemm<T> in later K tasks.
+#pragma warning disable CS0618 // SimdGemm.Sgemm/Dgemm (no-trans shims) are [Obsolete] — internal call sites pending migration to BlasManaged.Gemm<T> in later K tasks.
 using System;
 using System.Buffers;
 using System.Runtime.CompilerServices;
@@ -9211,7 +9211,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// pool step and by GAP blocks in various CV architectures. Saves
     /// ~40 µs per call by skipping the intermediate alloc+CopyTo.
     /// </summary>
-    public void AvgPool2DInto<T>(Tensor<T> output, Tensor<T> input, int poolSize, int stride = 0, int padding = 0)
+    public void AvgPool2DInto<T>(Tensor<T> output, Tensor<T> input, int poolSize, int stride = 0, int padding = 0,
+        bool countIncludePad = false)
     {
         if (output == null) throw new ArgumentNullException(nameof(output));
         if (input == null) throw new ArgumentNullException(nameof(input));
@@ -9237,7 +9238,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 srcF.GetDataArray(), dstF.GetDataArray(),
                 batch, channels, height, width, outputHeight, outputWidth,
                 poolSize, poolSize, stride, stride, padding, padding,
-                countIncludePad: false);
+                countIncludePad: countIncludePad);
             return;
         }
 
@@ -9271,7 +9272,7 @@ public partial class CpuEngine : ITensorLevelEngine
                                 count++;
                             }
                         }
-                        outArr[outputBase + oh * oW + ow] = count > 0 ? sum / count : 0f;
+                        outArr[outputBase + oh * oW + ow] = count > 0 ? sum / (countIncludePad ? ps * ps : count) : 0f;
                     }
             };
             // Issue #319 / PR #343 review: route through LightweightParallel
@@ -9320,7 +9321,7 @@ public partial class CpuEngine : ITensorLevelEngine
                                 count++;
                             }
                         }
-                        outArrD[outputBase + oh * oW + ow] = count > 0 ? sum / count : 0.0;
+                        outArrD[outputBase + oh * oW + ow] = count > 0 ? sum / (countIncludePad ? ps * ps : count) : 0.0;
                     }
             };
             CpuParallelSettings.ParallelForOrSerial(0, bc, (long)bc * h * w, poolKernel);
@@ -9353,14 +9354,15 @@ public partial class CpuEngine : ITensorLevelEngine
                         }
                     }
                     outputData[outputBaseOffset + oh * outputWidth + ow] = count > 0
-                        ? numOps.Divide(sum, numOps.FromDouble(count))
+                        ? numOps.Divide(sum, numOps.FromDouble(countIncludePad ? poolSize * poolSize : count))
                         : numOps.Zero;
                 }
         });
     }
 
     /// <inheritdoc/>
-    public virtual Tensor<T> AvgPool2D<T>(Tensor<T> input, int poolSize, int stride = 0, int padding = 0)
+    public virtual Tensor<T> AvgPool2D<T>(Tensor<T> input, int poolSize, int stride = 0, int padding = 0,
+        bool countIncludePad = false)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
 
@@ -9375,13 +9377,14 @@ public partial class CpuEngine : ITensorLevelEngine
                 var outShape = new[] { input._shape[0], input._shape[1], oh, ow };
                 var captured = input;
                 int ps = poolSize, s = stride, p = padding;
+                bool cip = countIncludePad;
                 return scope.RecordUnary(LazyNodeType.Custom, "AvgPool2D", input, outShape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng) cpuEng.AvgPool2DInto(output, captured, ps, s, p);
-                        else { var r = eng.AvgPool2D(captured, ps, s, p); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
+                        if (eng is CpuEngine cpuEng) cpuEng.AvgPool2DInto(output, captured, ps, s, p, cip);
+                        else { var r = eng.AvgPool2D(captured, ps, s, p, cip); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
-                    BackwardFunctions<T>.AvgPool2DBackward, new object[] { new[] { poolSize, poolSize }, new[] { st, st } });
+                    BackwardFunctions<T>.AvgPool2DBackward, AvgPool2DSavedState(poolSize, st, padding, countIncludePad));
             }
         }
 
@@ -9394,15 +9397,12 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"AvgPool2D requires a 4D tensor [batch, channels, height, width]. Got rank {input.Rank}.");
         }
         if (poolSize <= 0) throw new ArgumentException("Pool size must be positive.");
+        if (padding < 0) throw new ArgumentException("Padding must be non-negative.", nameof(padding));
 
         if (stride == 0) stride = poolSize; // Default stride equals pool size
 
-        var numOps = MathHelper.GetNumericOperations<T>();
-        int batch = input._shape[0];
-        int channels = input._shape[1];
         int height = input._shape[2];
         int width = input._shape[3];
-
         int outputHeight = (height + 2 * padding - poolSize) / stride + 1;
         int outputWidth = (width + 2 * padding - poolSize) / stride + 1;
 
@@ -9413,121 +9413,26 @@ public partial class CpuEngine : ITensorLevelEngine
                 $"Ensure poolSize={poolSize}, stride={stride}, padding={padding} are compatible with input size {height}x{width}.");
         }
 
-        var outputShape = new[] { batch, channels, outputHeight, outputWidth };
-        var result = AutoTensorCache.RentOrAllocate<T>(outputShape);
-
-        // NCHWc8 float fast path: one SIMD add per source cell, one FMA per
-        // output cell for the divide. count_include_pad=0 is the engine's
-        // default (pad cells excluded from the average).
-        if (typeof(T) == typeof(float)
-            && input.Layout == LinearAlgebra.TensorLayout.Nchwc8
-            && channels % Simd.NchwcPool.CBlock == 0)
-        {
-            var srcF = (Tensor<float>)(object)input;
-            var dstF = (Tensor<float>)(object)result;
-            dstF.Layout = LinearAlgebra.TensorLayout.Nchwc8;
-            Simd.NchwcPool.AvgPoolNchwc8(
-                srcF.GetDataArray(), dstF.GetDataArray(),
-                batch, channels, height, width, outputHeight, outputWidth,
-                poolSize, poolSize, stride, stride, padding, padding,
-                countIncludePad: false);
-            return result;
-        }
-
-        // Float fast path: direct array access, no virtual dispatch
-        if (typeof(T) == typeof(float) && input.GetDataArray() is float[] inArr && result.GetDataArray() is float[] outArr)
-        {
-            int bc = batch * channels;
-            int h = height, w = width, oH = outputHeight, oW = outputWidth;
-            int ps = poolSize, st = stride, pd = padding;
-
-            // Use sequential loop when work per task is too small (spatial < 1024)
-            // Parallel.For overhead (thread dispatch) exceeds computation for tiny spatial
-            Action<int> poolKernel = idx =>
-            {
-                int inputBase = idx * h * w;
-                int outputBase = idx * oH * oW;
-
-                for (int oh = 0; oh < oH; oh++)
-                {
-                    for (int ow = 0; ow < oW; ow++)
-                    {
-                        float sum = 0f;
-                        int count = 0;
-
-                        int ihStart = oh * st - pd;
-                        int iwStart = ow * st - pd;
-                        int khStart = ihStart < 0 ? -ihStart : 0;
-                        int kwStart = iwStart < 0 ? -iwStart : 0;
-                        int khEnd = Math.Min(ps, h - ihStart);
-                        int kwEnd = Math.Min(ps, w - iwStart);
-
-                        for (int kh = khStart; kh < khEnd; kh++)
-                        {
-                            int rowOff = inputBase + (ihStart + kh) * w + iwStart;
-                            for (int kw = kwStart; kw < kwEnd; kw++)
-                            {
-                                sum += inArr[rowOff + kw];
-                                count++;
-                            }
-                        }
-
-                        outArr[outputBase + oh * oW + ow] = count > 0 ? sum / count : 0f;
-                    }
-                }
-            };
-
-            if (h * w >= 1024)
-                CpuParallelSettings.ParallelForOrSerial(0, bc, (long)bc * h * w, poolKernel);
-            else
-                for (int idx = 0; idx < bc; idx++) poolKernel(idx);
-            DifferentiableOps.RecordUnary("AvgPool2D", result, inputOrig, BackwardFunctions<T>.AvgPool2DBackward,
-                new object[] { new[] { poolSize, poolSize }, new[] { stride, stride } });
-            AutoTracer.RecordOp("AvgPool2D", result, eng => eng.AvgPool2D(inputOrig, poolSize, stride, padding));
-            return result;
-        }
-
-        var inputData = input.GetDataArray();
-        var outputData = result.GetDataArray();
-
-        CpuParallelSettings.ParallelForOrSerial(0, batch * channels, outputData.Length, idx =>
-        {
-            int b = idx / channels;
-            int c = idx % channels;
-            int inputBaseOffset = (b * channels + c) * height * width;
-            int outputBaseOffset = (b * channels + c) * outputHeight * outputWidth;
-
-            for (int oh = 0; oh < outputHeight; oh++)
-            {
-                for (int ow = 0; ow < outputWidth; ow++)
-                {
-                    T sum = numOps.Zero;
-                    int count = 0;
-
-                    for (int kh = 0; kh < poolSize; kh++)
-                    {
-                        int ih = oh * stride + kh - padding;
-                        if (ih < 0 || ih >= height) continue;
-                        for (int kw = 0; kw < poolSize; kw++)
-                        {
-                            int iw = ow * stride + kw - padding;
-                            if (iw < 0 || iw >= width) continue;
-                            sum = numOps.Add(sum, inputData[inputBaseOffset + ih * width + iw]);
-                            count++;
-                        }
-                    }
-
-                    outputData[outputBaseOffset + oh * outputWidth + ow] =
-                        count > 0 ? numOps.Divide(sum, numOps.FromDouble(count)) : numOps.Zero;
-                }
-            }
-        });
+        // One kernel set (NCHWc8, float, double, generic) lives in AvgPool2DInto. This method used to carry its own
+        // copies, and the NCHWc8 copy returned before recording, so that layout silently had no gradient.
+        var result = AutoTensorCache.RentOrAllocate<T>(new[] { input._shape[0], input._shape[1], outputHeight, outputWidth });
+        AvgPool2DInto(result, input, poolSize, stride, padding, countIncludePad);
 
         DifferentiableOps.RecordUnary("AvgPool2D", result, inputOrig, BackwardFunctions<T>.AvgPool2DBackward,
-            new object[] { new[] { poolSize, poolSize }, new[] { stride, stride } });
-        AutoTracer.RecordOp("AvgPool2D", result, eng => eng.AvgPool2D(inputOrig, poolSize, stride, padding));
+            AvgPool2DSavedState(poolSize, stride, padding, countIncludePad));
+        int recordedStride = stride;
+        AutoTracer.RecordOp("AvgPool2D", result,
+            eng => eng.AvgPool2D(inputOrig, poolSize, recordedStride, padding, countIncludePad));
         return result;
     }
+
+    /// <summary>
+    /// Saved state for <see cref="BackwardFunctions{T}.AvgPool2DBackward"/>: pool size and stride, then the padding
+    /// and divisor rule. The backward needs both: a padded window spreads its gradient only over the cells it read,
+    /// divided by the same count the forward divided by.
+    /// </summary>
+    internal static object[] AvgPool2DSavedState(int poolSize, int stride, int padding, bool countIncludePad) =>
+        new object[] { new[] { poolSize, poolSize }, new[] { stride, stride }, new[] { padding, padding }, countIncludePad };
 
     /// <inheritdoc/>
     /// <summary>
@@ -17082,18 +16987,20 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public virtual Tensor<T> AvgPool2DBackward<T>(Tensor<T> gradOutput, int[] inputShape, int[] poolSize, int[] stride)
+    public virtual Tensor<T> AvgPool2DBackward<T>(Tensor<T> gradOutput, int[] inputShape, int[] poolSize, int[] stride,
+        int[]? padding = null, bool countIncludePad = false)
     {
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
+        var pad = padding ?? new[] { 0, 0 };
 
-        // gradOutput's spatial size is a FUNCTION of inputShape, poolSize and stride, and
+        // gradOutput's spatial size is a FUNCTION of inputShape, poolSize, stride and padding, and
         // was previously read straight off gradOutput and trusted. An inconsistent one made
-        // the window walk `oh * stride + ph` past the end of the input and throw
-        // IndexOutOfRangeException from inside a parallel loop -- an unvalidated precondition
-        // reported as an internal error instead of a bad argument.
+        // the window walk past the end of the input and throw IndexOutOfRangeException from
+        // inside a parallel loop -- an unvalidated precondition reported as an internal error
+        // instead of a bad argument.
         ConvBackwardShapeGuard.ValidateGradOutputSpatial(
             "AvgPool2DBackward", gradOutput._shape, inputShape, poolSize,
-            stride, null, null, spatialRank: 2);
+            stride, pad, null, spatialRank: 2);
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
@@ -17104,6 +17011,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         int poolH = poolSize[0], poolW = poolSize[1];
         int strideH = stride[0], strideW = stride[1];
+        int padH = pad[0], padW = pad[1];
 
         int outputHeight = gradOutput._shape[2];
         int outputWidth = gradOutput._shape[3];
@@ -17112,109 +17020,105 @@ public partial class CpuEngine : ITensorLevelEngine
         var gradInputData = result.GetDataArray();
         var gradOutputData = gradOutput.GetFlattenedData();
 
+        // Each output cell spreads its gradient over the input cells its window READ (padded cells were never
+        // read), divided by the same count the forward divided by: the full window when padding is counted, else
+        // the cells actually covered. With no padding both counts are the full window.
+        // Parallelize over (batch, channel): each pair writes only into its disjoint input slab, so distinct
+        // tasks never collide (within-pair overlap stays serial).
         if (typeof(T) == typeof(float))
         {
             var fGradIn = (float[])(object)gradInputData;
             var fGradOut = (float[])(object)gradOutputData;
-            float invPoolArea = 1f / (poolH * poolW);
             Array.Clear(fGradIn, 0, fGradIn.Length);
-            // Parallelize over (batch, channel): each pair scatters only into its disjoint
-            // [(b*channels+c)*height*width, ...) input slab, so batch=1 still saturates cores.
             CpuParallelSettings.ParallelForOrSerial(0, batch * channels, fGradIn.Length, p =>
             {
+                int inputBaseOffset = p * height * width;
+                int outputBaseOffset = p * outputHeight * outputWidth;
+                for (int oh = 0; oh < outputHeight; oh++)
                 {
-                    int inputBaseOffset = p * height * width;
-                    int outputBaseOffset = p * outputHeight * outputWidth;
-                    for (int oh = 0; oh < outputHeight; oh++)
+                    int ihStart = oh * strideH - padH;
+                    int khStart = Math.Max(0, -ihStart), khEnd = Math.Min(poolH, height - ihStart);
+                    for (int ow = 0; ow < outputWidth; ow++)
                     {
-                        for (int ow = 0; ow < outputWidth; ow++)
+                        int iwStart = ow * strideW - padW;
+                        int kwStart = Math.Max(0, -iwStart), kwEnd = Math.Min(poolW, width - iwStart);
+                        int covered = Math.Max(0, khEnd - khStart) * Math.Max(0, kwEnd - kwStart);
+                        if (covered == 0) continue;
+                        float grad = fGradOut[outputBaseOffset + oh * outputWidth + ow]
+                            * (1f / (countIncludePad ? poolH * poolW : covered));
+                        for (int kh = khStart; kh < khEnd; kh++)
                         {
-                            float grad = fGradOut[outputBaseOffset + oh * outputWidth + ow] * invPoolArea;
-                            for (int kh = 0; kh < poolH; kh++)
-                            {
-                                int ih = oh * strideH + kh;
-                                for (int kw = 0; kw < poolW; kw++)
-                                {
-                                    int iw = ow * strideW + kw;
-                                    fGradIn[inputBaseOffset + ih * width + iw] += grad;
-                                }
-                            }
+                            int row = inputBaseOffset + (ihStart + kh) * width + iwStart;
+                            for (int kw = kwStart; kw < kwEnd; kw++) fGradIn[row + kw] += grad;
                         }
                     }
                 }
             }, deterministicSafe: true);
+            return result;
         }
-        else if (typeof(T) == typeof(double))
+
+        if (typeof(T) == typeof(double))
         {
             var dGradIn = (double[])(object)gradInputData;
             var dGradOut = (double[])(object)gradOutputData;
-            double invPoolArea = 1.0 / (poolH * poolW);
             Array.Clear(dGradIn, 0, dGradIn.Length);
             CpuParallelSettings.ParallelForOrSerial(0, batch * channels, dGradIn.Length, p =>
             {
+                int inputBaseOffset = p * height * width;
+                int outputBaseOffset = p * outputHeight * outputWidth;
+                for (int oh = 0; oh < outputHeight; oh++)
                 {
-                    int inputBaseOffset = p * height * width;
-                    int outputBaseOffset = p * outputHeight * outputWidth;
-                    for (int oh = 0; oh < outputHeight; oh++)
+                    int ihStart = oh * strideH - padH;
+                    int khStart = Math.Max(0, -ihStart), khEnd = Math.Min(poolH, height - ihStart);
+                    for (int ow = 0; ow < outputWidth; ow++)
                     {
-                        for (int ow = 0; ow < outputWidth; ow++)
+                        int iwStart = ow * strideW - padW;
+                        int kwStart = Math.Max(0, -iwStart), kwEnd = Math.Min(poolW, width - iwStart);
+                        int covered = Math.Max(0, khEnd - khStart) * Math.Max(0, kwEnd - kwStart);
+                        if (covered == 0) continue;
+                        double grad = dGradOut[outputBaseOffset + oh * outputWidth + ow]
+                            * (1.0 / (countIncludePad ? poolH * poolW : covered));
+                        for (int kh = khStart; kh < khEnd; kh++)
                         {
-                            double grad = dGradOut[outputBaseOffset + oh * outputWidth + ow] * invPoolArea;
-                            for (int kh = 0; kh < poolH; kh++)
-                            {
-                                int ih = oh * strideH + kh;
-                                for (int kw = 0; kw < poolW; kw++)
-                                {
-                                    int iw = ow * strideW + kw;
-                                    dGradIn[inputBaseOffset + ih * width + iw] += grad;
-                                }
-                            }
+                            int row = inputBaseOffset + (ihStart + kh) * width + iwStart;
+                            for (int kw = kwStart; kw < kwEnd; kw++) dGradIn[row + kw] += grad;
                         }
                     }
                 }
             }, deterministicSafe: true);
+            return result;
         }
-        else
+
+        for (int i = 0; i < gradInputData.Length; i++) gradInputData[i] = numOps.Zero;
+        CpuParallelSettings.ParallelForOrSerial(0, batch * channels, gradInputData.Length, p =>
         {
-            T poolArea = numOps.FromDouble(poolH * poolW);
-
-            // Initialize to zero
-            for (int i = 0; i < gradInputData.Length; i++)
-                gradInputData[i] = numOps.Zero;
-
-            // Parallelize over (batch, channel): each pair writes only into its disjoint
-            // input slab, so distinct tasks never collide (within-pair overlap stays serial).
-            CpuParallelSettings.ParallelForOrSerial(0, batch * channels, gradInputData.Length, p =>
+            int inputBaseOffset = p * height * width;
+            int outputBaseOffset = p * outputHeight * outputWidth;
+            for (int oh = 0; oh < outputHeight; oh++)
             {
+                int ihStart = oh * strideH - padH;
+                int khStart = Math.Max(0, -ihStart), khEnd = Math.Min(poolH, height - ihStart);
+                for (int ow = 0; ow < outputWidth; ow++)
                 {
-                    int inputBaseOffset = p * height * width;
-                    int outputBaseOffset = p * outputHeight * outputWidth;
-
-                    for (int oh = 0; oh < outputHeight; oh++)
+                    int iwStart = ow * strideW - padW;
+                    int kwStart = Math.Max(0, -iwStart), kwEnd = Math.Min(poolW, width - iwStart);
+                    int covered = Math.Max(0, khEnd - khStart) * Math.Max(0, kwEnd - kwStart);
+                    if (covered == 0) continue;
+                    int divisor = countIncludePad ? poolH * poolW : covered;
+                    T grad = numOps.Divide(gradOutputData[outputBaseOffset + oh * outputWidth + ow],
+                        numOps.FromDouble(divisor));
+                    for (int kh = khStart; kh < khEnd; kh++)
                     {
-                        for (int ow = 0; ow < outputWidth; ow++)
-                        {
-                            T grad = numOps.Divide(gradOutputData[outputBaseOffset + oh * outputWidth + ow], poolArea);
-
-                            for (int kh = 0; kh < poolH; kh++)
-                            {
-                                int ih = oh * strideH + kh;
-                                for (int kw = 0; kw < poolW; kw++)
-                                {
-                                    int iw = ow * strideW + kw;
-                                    int gradInIdx = inputBaseOffset + ih * width + iw;
-                                    gradInputData[gradInIdx] = numOps.Add(gradInputData[gradInIdx], grad);
-                                }
-                            }
-                        }
+                        int row = inputBaseOffset + (ihStart + kh) * width + iwStart;
+                        for (int kw = kwStart; kw < kwEnd; kw++)
+                            gradInputData[row + kw] = numOps.Add(gradInputData[row + kw], grad);
                     }
                 }
-            }, deterministicSafe: true);
-        }
+            }
+        }, deterministicSafe: true);
 
         return result;
     }
-
     /// <summary>
     /// Write-through DepthwiseConv2D for MobileNet / EfficientNet inference.
     /// Computes directly into the provided output buffer, skipping the

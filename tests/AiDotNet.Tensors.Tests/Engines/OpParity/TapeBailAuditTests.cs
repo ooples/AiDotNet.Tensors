@@ -90,7 +90,6 @@ public class TapeBailAuditTests
         // each one needs its CpuEngine saved-state/backward contract verified by a gradient test before its
         // tape bail can be removed safely. New names still fail the audit, and this baseline must only shrink.
         "MaxPool2D",
-        "AvgPool2D",
         "FlashAttention",
         "GroupedQueryAttention",
         // FLOAT now records on the device (GpuTapeGradientParityTests.LayerNorm_*); the non-float tape still bails because
@@ -193,6 +192,7 @@ public class TapeBailAuditTests
         "TensorIndexFill",
         "TensorMaskedScatter",
         "TensorSetSlice",
+        "AvgPool2D",
     };
 
     private static string[] GpuEngineSources(string root)

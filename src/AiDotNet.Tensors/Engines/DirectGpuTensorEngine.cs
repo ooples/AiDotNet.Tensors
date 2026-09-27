@@ -8828,19 +8828,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// GPU-accelerated 2D average pooling operation.
     /// Uses GPU kernels for efficient parallel computation of average values within pooling windows.
     /// </summary>
-    public override Tensor<T> AvgPool2D<T>(Tensor<T> input, int poolSize, int stride = 0, int padding = 0)
+    public override Tensor<T> AvgPool2D<T>(Tensor<T> input, int poolSize, int stride = 0, int padding = 0,
+        bool countIncludePad = false)
     {
         if (stride == 0) stride = poolSize;
 
-        // Tape-active: use the recording CPU base path (see MaxPool2D).
-        if (IsTapeActive<T>()) return base.AvgPool2D(input, poolSize, stride, padding);
-
         if (!TryGetBackend(out var backend))
-            return base.AvgPool2D(input, poolSize, stride, padding);
+            return base.AvgPool2D(input, poolSize, stride, padding, countIncludePad);
 
         // Expected input shape: [batch, channels, height, width]
-        if (input.Rank != 4)
-            return base.AvgPool2D(input, poolSize, stride, padding);
+        if (input.Rank != 4 || padding < 0)
+            return base.AvgPool2D(input, poolSize, stride, padding, countIncludePad);
 
         int batch = input.Shape._dims[0];
         int channels = input.Shape._dims[1];
@@ -8852,7 +8850,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int outWidth = (inWidth + 2 * padding - poolSize) / stride + 1;
 
         if (outHeight <= 0 || outWidth <= 0)
-            return base.AvgPool2D(input, poolSize, stride, padding);
+            return base.AvgPool2D(input, poolSize, stride, padding, countIncludePad);
 
         using var inputBuffer = GetOrAllocateBuffer(backend, input);
         // #642: lazy FinishGpuOp (deferred-correct). The earlier deferred crash was the
@@ -8867,17 +8865,21 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 outHeight, outWidth,
                 poolSize, poolSize,
                 stride, stride, padding, padding,
-                countIncludePad: true);
+                countIncludePad: countIncludePad);
 
             int outputSize = batch * channels * outHeight * outWidth;
             var result = DeferTensorResult<T>(backend, outputBuffer.Buffer, outputSize,
                 new[] { batch, channels, outHeight, outWidth });
             handedOff = true;
+            // Same node and saved state CpuEngine records, padding and divisor rule included.
+            Autodiff.DifferentiableOps.RecordUnary("AvgPool2D", result, input, Autodiff.BackwardFunctions<T>.AvgPool2DBackward,
+                AvgPool2DSavedState(poolSize, stride, padding, countIncludePad));
             return result;
         }
-        catch
+        catch (Exception)
         {
-            return base.AvgPool2D(input, poolSize, stride, padding);
+            if (ThrowOnGpuKernelFallback) throw;
+            return base.AvgPool2D(input, poolSize, stride, padding, countIncludePad);
         }
         finally
         {
@@ -8890,11 +8892,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     public override Tensor<T> AvgPool2D<T>(Tensor<T> input, int[] poolSize, int[] stride)
     {
-        // Defer to CpuEngine when a tape is active so AvgPool2DBackward
-        // is recorded against the correct primitive path; also avoids the
-        // CUDA kernel-launch crash (0xC0000005) on the int[] overload
-        // surfaced by AvgPool2D_IntArrayOverload_ProducesNonZeroInputGradient.
-        if (IsTapeActive<T>()) return base.AvgPool2D(input, poolSize, stride);
+        // The 0xC0000005 launch crash AvgPool2D_IntArrayOverload_ProducesNonZeroInputGradient surfaced was the
+        // CudaBackend kernel-arg mismatch fixed in AvgPool2DBackward (see its remarks), so a tape no longer needs
+        // to route around this kernel.
         if (!TryGetBackend(out var backend))
             return base.AvgPool2D(input, poolSize, stride);
 
@@ -8928,10 +8928,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var result = DeferTensorResult<T>(backend, outputBuffer.Buffer, outputSize,
                 new[] { batch, channels, outHeight, outWidth });
             outputBuffer.RelinquishOwnership();
+            // Same node and saved state CpuEngine records for this overload (no padding).
+            Autodiff.DifferentiableOps.RecordUnary("AvgPool2D", result, input, Autodiff.BackwardFunctions<T>.AvgPool2DBackward,
+                new object[] { (int[])poolSize.Clone(), (int[])stride.Clone() });
             return result;
         }
-        catch
+        catch (Exception)
         {
+            if (ThrowOnGpuKernelFallback) throw;
             return base.AvgPool2D(input, poolSize, stride);
         }
     }
@@ -8950,13 +8954,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// signature; HIP / OpenCL / Vulkan / Metal / WebGpu were already
     /// passing the full 15-arg layout.
     /// </remarks>
-    public override Tensor<T> AvgPool2DBackward<T>(Tensor<T> gradOutput, int[] inputShape, int[] poolSize, int[] stride)
+    public override Tensor<T> AvgPool2DBackward<T>(Tensor<T> gradOutput, int[] inputShape, int[] poolSize, int[] stride,
+        int[]? padding = null, bool countIncludePad = false)
     {
+        var pad = padding ?? new[] { 0, 0 };
         if (!TryGetBackend(out var backend))
-            return base.AvgPool2DBackward(gradOutput, inputShape, poolSize, stride);
+            return base.AvgPool2DBackward(gradOutput, inputShape, poolSize, stride, padding, countIncludePad);
 
-        if (gradOutput.Rank != 4 || inputShape.Length != 4)
-            return base.AvgPool2DBackward(gradOutput, inputShape, poolSize, stride);
+        if (gradOutput.Rank != 4 || inputShape.Length != 4 || pad.Length != 2)
+            return base.AvgPool2DBackward(gradOutput, inputShape, poolSize, stride, padding, countIncludePad);
 
         int batch = inputShape[0];
         int channels = inputShape[1];
@@ -8974,17 +8980,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 batch, channels, inHeight, inWidth,
                 outHeight, outWidth,
                 poolSize[0], poolSize[1],
-                stride[0], stride[1], 0, 0,
-                countIncludePad: true);
+                stride[0], stride[1], pad[0], pad[1],
+                countIncludePad: countIncludePad);
 
             int inputSize = batch * channels * inHeight * inWidth;
             var result = DeferTensorResult<T>(backend, gradInputBuffer.Buffer, inputSize, inputShape);
             gradInputBuffer.RelinquishOwnership();
             return result;
         }
-        catch
+        catch (Exception)
         {
-            return base.AvgPool2DBackward(gradOutput, inputShape, poolSize, stride);
+            if (ThrowOnGpuKernelFallback) throw;
+            return base.AvgPool2DBackward(gradOutput, inputShape, poolSize, stride, padding, countIncludePad);
         }
     }
 
