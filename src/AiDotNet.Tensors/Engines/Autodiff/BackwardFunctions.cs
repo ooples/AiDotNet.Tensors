@@ -5664,7 +5664,8 @@ internal static class BackwardFunctions<T>
         // Axis scatter with 1-D indices is index_copy, so the device helpers proven there apply unchanged.
         if (engine is DirectGpuTensorEngine gpu && savedState[0] is Tensor<int> { Rank: 1 } deviceIndices
             && gpu.TryIndexWriteInputGradOnDevice(gradOutput, axis, deviceIndices) is { } deviceInputGrad
-            && gpu.TryIndexCopySourceGradOnDevice(gradOutput, axis, deviceIndices) is { } deviceValuesGrad
+            && gpu.TryIndexCopySourceGradOnDevice(gradOutput, axis, deviceIndices,
+                OverwrittenIndexPositions(indices)) is { } deviceValuesGrad
             && deviceValuesGrad.Length == inputs[1].Length)
         {
             DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceInputGrad, engine);
@@ -5707,7 +5708,36 @@ internal static class BackwardFunctions<T>
 
         // dL/dvalues = gather from gradOutput at indices
         var gradValues = engine.Gather(gradOutput, new Tensor<int>(new[] { indices.Length }, new Vector<int>(indices)), axis);
+        var overwritten = OverwrittenIndexPositions(indices);
+        if (overwritten.Length > 0)
+        {
+            // Last write wins in the forward, so an overwritten values entry never reached the output.
+            gradValues = gradValues.IsContiguous ? gradValues.Clone() : gradValues.Contiguous();
+            var gv = gradValues.AsWritableSpan();
+            int k = indices.Length, rowsBefore = 1, rowsAfter = 1;
+            for (int d = 0; d < axis; d++) rowsBefore *= gradValues._shape[d];
+            for (int d = axis + 1; d < gradValues.Rank; d++) rowsAfter *= gradValues._shape[d];
+            var zero = MathHelper.GetNumericOperations<T>().Zero;
+            for (int outer = 0; outer < rowsBefore; outer++)
+                foreach (int j in overwritten)
+                    for (int inner = 0; inner < rowsAfter; inner++)
+                        gv[(outer * k + j) * rowsAfter + inner] = zero;
+        }
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradValues, engine);
+    }
+
+    /// <summary>
+    /// Positions j whose write an index_copy / scatter overwrites with a LATER duplicate (indices[j'] == indices[j],
+    /// j' &gt; j). The forward is last-write-wins, so those source entries never reach the output and their gradient is
+    /// zero. Empty when the indices are distinct, which is the common case.
+    /// </summary>
+    internal static int[] OverwrittenIndexPositions(int[] indices)
+    {
+        var seen = new HashSet<int>();
+        var overwritten = new List<int>();
+        for (int j = indices.Length - 1; j >= 0; j--)
+            if (!seen.Add(indices[j])) overwritten.Add(j);
+        return overwritten.ToArray();
     }
 
     /// <summary>d(cosh(x))/dx = sinh(x)</summary>
@@ -7385,7 +7415,8 @@ internal static class BackwardFunctions<T>
                 return;
             }
             // Source gradient on the device too, or fall through so the host computes both consistently.
-            if (gpu.TryIndexCopySourceGradOnDevice(gradOutput, axis, indices) is { } deviceSourceGrad)
+            if (gpu.TryIndexCopySourceGradOnDevice(gradOutput, axis, indices,
+                    OverwrittenIndexPositions(indices.GetFlattenedData())) is { } deviceSourceGrad)
             {
                 DifferentiableOps.AccumulateGrad(grads, input, deviceInputGrad, engine);
                 DifferentiableOps.AccumulateGrad(grads, inputs[1], deviceSourceGrad, engine);
@@ -7432,11 +7463,14 @@ internal static class BackwardFunctions<T>
         var srcGrad = new Tensor<T>(source._shape);
         var sd = srcGrad.AsWritableSpan();
         var go = gradOutput.AsSpan();
+        var overwritten = new HashSet<int>(OverwrittenIndexPositions(idx.ToArray()));
         for (int outer = 0; outer < outerSize; outer++)
             for (int i = 0; i < idx.Length; i++)
             {
                 int target = idx[i];
                 if (target < 0 || target >= axisSize) continue;
+                if (overwritten.Contains(i)) continue;   // a later duplicate overwrote this entry
+
                 for (int inner = 0; inner < innerSize; inner++)
                 {
                     int goPos = outer * axisSize * innerSize + target * innerSize + inner;

@@ -919,6 +919,21 @@ public class GpuTapeGradientParityTests : IDisposable
                 _ => e.RMSNorm(x, gamma5, 1e-5, out _),
             };
         });
+    // Duplicate indices: position 0 and 2 both write column 1, and the later write wins, so source/values column 0
+    // never reaches the output and must get ZERO gradient on both engines (the backward runs on the device).
+    private static readonly Tensor<int> DuplicateColumnIndices = new(new[] { 1, 4, 1 }, new[] { 3 });
+
+    [SkippableFact]
+    public void TensorIndexCopy_duplicate_indices_source_gradients_match_cpu() =>
+        AssertGradientParity("IndexCopy(dup, source)", Rand([6, 3], seed: 569),
+            static (e, t) => e.TensorIndexCopy(Rand([6, 10], seed: 571), 1, DuplicateColumnIndices, t),
+            probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void Scatter_duplicate_indices_values_gradients_match_cpu() =>
+        AssertGradientParity("Scatter(dup, values)", Rand([6, 3], seed: 577),
+            static (e, t) => e.Scatter(Rand([6, 10], seed: 587), DuplicateColumnIndices, t, 1),
+            probe: Engagement.UseResidencyCounter);
     [SkippableFact]
     public void TensorClampMin_gradients_match_cpu() =>
         AssertGradientParity("ClampMin", Rand([6, 10], seed: 73),

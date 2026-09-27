@@ -4862,9 +4862,12 @@ public partial class DirectGpuTensorEngine
 
     /// <summary>
     /// Source gradient of index_copy on the device: <paramref name="gradOutput"/> gathered along
-    /// <paramref name="axis"/> at <paramref name="indices"/>. Null when the device path cannot take it.
+    /// <paramref name="axis"/> at <paramref name="indices"/>, with the <paramref name="overwritten"/> positions (a later
+    /// duplicate index replaced their write; the forward is last-write-wins) zeroed. Null when the device path cannot
+    /// take it.
     /// </summary>
-    internal Tensor<T>? TryIndexCopySourceGradOnDevice<T>(Tensor<T> gradOutput, int axis, Tensor<int> indices)
+    internal Tensor<T>? TryIndexCopySourceGradOnDevice<T>(Tensor<T> gradOutput, int axis, Tensor<int> indices,
+        int[] overwritten)
     {
         if (!TryIndexAxisGeometry(gradOutput, axis, indices, out int outer, out int axisSize, out int inner)
             || !TryGetBackend(out var backend) || backend is not IResidentIndexBackend indexBackend)
@@ -4878,8 +4881,16 @@ public partial class DirectGpuTensorEngine
             shape[ax] = indices.Length;
             using var bufG = GetOrAllocateBuffer(backend, upstream);
             using var bufIdx = GetOrAllocateInt32IndexBuffer(backend, ci);
+            using var bufOverwritten = overwritten.Length == 0
+                ? default
+                : new OwnedBuffer(backend.AllocateIntBuffer(overwritten), ownsBuffer: true);
             return DispatchDeferredGpuOp<T>(backend, checked(outer * indices.Length * inner), shape, output =>
-                indexBackend.IndexSelect(bufG.Buffer, bufIdx.Buffer, output, outer, axisSize, indices.Length, inner));
+            {
+                indexBackend.IndexSelect(bufG.Buffer, bufIdx.Buffer, output, outer, axisSize, indices.Length, inner);
+                if (overwritten.Length > 0)
+                    backend.IndexWrite(output, bufOverwritten.Buffer, output, 0f, mode: 1,
+                        outer, overwritten.Length, inner, indices.Length);
+            });
         }
         catch (Exception)
         {
@@ -5316,6 +5327,10 @@ public partial class DirectGpuTensorEngine
                         throw new IndexOutOfRangeException(
                             $"indices[{i}]={indexData[i]} out of range for axis size {dstAxis}");
             }
+            // Duplicate indices: the CPU writes them in order (last wins); the device kernel's order is unspecified.
+            // Keep the result, and the gradient that assumes last-write-wins, defined by taking the CPU path.
+            if (!HasResidentIndexStorage(ci) && Autodiff.BackwardFunctions<T>.OverwrittenIndexPositions(ci.GetDataArray()).Length > 0)
+                return base.TensorIndexCopy(tensor, axis, indices, source);
             using var bufIn = GetOrAllocateBuffer(backend, ct);
             using var bufSrc = GetOrAllocateBuffer(backend, cs);
             using var bufIdx = GetOrAllocateInt32IndexBuffer(backend, ci);
@@ -7589,6 +7604,9 @@ public partial class DirectGpuTensorEngine
             if (values.Length != outerSize * indices.Length * innerSize)
                 return base.Scatter(input, indices, values, axis);
             var contiguousIndices = indices.IsContiguous ? indices : (Tensor<int>)indices.Contiguous();
+            if (!HasResidentIndexStorage(contiguousIndices)
+                && Autodiff.BackwardFunctions<T>.OverwrittenIndexPositions(contiguousIndices.GetDataArray()).Length > 0)
+                return base.Scatter(input, indices, values, axis);   // duplicates: see TensorIndexCopy
             if (!HasResidentIndexStorage(contiguousIndices))
             {
                 var indexData = contiguousIndices.GetDataArray();
