@@ -32,6 +32,8 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
     private readonly bool _isDirectGpuAvailable;
     private const float Tolerance = 1e-5f;
     private const float RelativeTolerance = 1e-4f;
+    // Calls to ops that DirectGpuTensorEngine overrides only as explicit IEngine implementations go through
+    // ((IEngine)gpu): on the concrete type they bind to the inherited CpuEngine method and compare the CPU with itself.
     private DirectGpuTensorEngine Gpu => _directGpuFixture.Engine ?? throw new InvalidOperationException(
         "Direct GPU engine was not initialized.", _directGpuFixture.InitializationException);
 
@@ -1943,13 +1945,13 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
         IEngine gpu = gpuEngine;
 
         cpu.STFT(input, nFft, hopLength, window, center: true, out var expectedMagnitude, out var expectedPhase);
-        gpu.STFT(input, nFft, hopLength, window, center: true, out var magnitude, out var phase);
+        ((IEngine)gpu).STFT(input, nFft, hopLength, window, center: true, out var magnitude, out var phase);
 
         Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(magnitude.DataVector));
         Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(phase.DataVector));
 
         var expectedOutput = cpu.ISTFT(expectedMagnitude, expectedPhase, nFft, hopLength, window, center: true);
-        var output = gpu.ISTFT(magnitude, phase, nFft, hopLength, window, center: true);
+        var output = ((IEngine)gpu).ISTFT(magnitude, phase, nFft, hopLength, window, center: true);
 
         Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(magnitude.DataVector));
         Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(phase.DataVector));
@@ -1979,7 +1981,7 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
         IEngine gpu = gpuEngine;
 
         var expected = cpu.MelSpectrogram(input, 16000, nFft, hopLength, nMels, 0f, 8000f, window, true);
-        var actual = gpu.MelSpectrogram(input, 16000, nFft, hopLength, nMels, 0f, 8000f, window, true);
+        var actual = ((IEngine)gpu).MelSpectrogram(input, 16000, nFft, hopLength, nMels, 0f, 8000f, window, true);
 
         Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(actual.DataVector));
         Assert.Equal(expected.Shape.ToArray(), actual.Shape.ToArray());
@@ -2003,8 +2005,8 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
         var imag1D = new Tensor<float>(Enumerable.Range(0, 3 * 8)
             .Select(i => DeterministicValue(i + 801)).ToArray(), new[] { 3, 8 });
         cpu.FFT(real1D, imag1D, out var expectedReal1D, out var expectedImag1D);
-        gpu.FFT(real1D, imag1D, out var actualReal1D, out var actualImag1D);
-        gpu.IFFT(actualReal1D, actualImag1D, out var recoveredReal1D, out var recoveredImag1D);
+        ((IEngine)gpu).FFT(real1D, imag1D, out var actualReal1D, out var actualImag1D);
+        ((IEngine)gpu).IFFT(actualReal1D, actualImag1D, out var recoveredReal1D, out var recoveredImag1D);
 
         Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(actualReal1D.DataVector));
         Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(actualImag1D.DataVector));
@@ -2020,8 +2022,8 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
         var imag2D = new Tensor<float>(Enumerable.Range(0, 2 * 4 * 4)
             .Select(i => DeterministicValue(i + 1001)).ToArray(), new[] { 2, 4, 4 });
         cpu.FFT2D(real2D, imag2D, out var expectedReal2D, out var expectedImag2D);
-        gpu.FFT2D(real2D, imag2D, out var actualReal2D, out var actualImag2D);
-        gpu.IFFT2D(actualReal2D, actualImag2D, out var recoveredReal2D, out var recoveredImag2D);
+        ((IEngine)gpu).FFT2D(real2D, imag2D, out var actualReal2D, out var actualImag2D);
+        ((IEngine)gpu).IFFT2D(actualReal2D, actualImag2D, out var recoveredReal2D, out var recoveredImag2D);
 
         Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(actualReal2D.DataVector));
         Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(actualImag2D.DataVector));
@@ -2055,11 +2057,11 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
             .Select(i => 0.5f - 0.5f * MathF.Cos(2f * MathF.PI * i / nFft)).ToArray(), new[] { nFft });
         var gpuEngine = Gpu;
         IEngine gpu = gpuEngine;
-        gpu.STFT(input, nFft, hopLength, window, center: true, out var magnitude, out _);
+        ((IEngine)gpu).STFT(input, nFft, hopLength, window, center: true, out var magnitude, out _);
 
-        var first = gpu.GriffinLim(magnitude, nFft, hopLength, window,
+        var first = ((IEngine)gpu).GriffinLim(magnitude, nFft, hopLength, window,
             iterations: 2, momentum: 0.5, length: null);
-        var second = gpu.GriffinLim(magnitude, nFft, hopLength, window,
+        var second = ((IEngine)gpu).GriffinLim(magnitude, nFft, hopLength, window,
             iterations: 2, momentum: 0.5, length: null);
 
         Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(magnitude.DataVector));
@@ -2387,7 +2389,7 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
                 30f, 31f,
                 40f, 41f,
             }, new[] { 5, 2 }), 0f);
-            var embedded = gpu.Embedding(indices, embeddingTable);
+            var embedded = ((IEngine)gpu).Embedding(indices, embeddingTable);
             var interfaceEmbedded = engine.Embedding(indices, embeddingTable);
 
             Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
@@ -2662,7 +2664,7 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
         var filledGradOutput = new Tensor<float>(input.Shape.ToArray());
         gpu.TensorFill(filledGradOutput, 1f);
         GpuLaunchProbe.Reset();
-        var publicGradInput = gpu.LayerNormBackward(
+        var publicGradInput = ((IEngine)gpu).LayerNormBackward(
             filledGradOutput, input, gamma, expectedMean, expectedVariance, 1e-5,
             out var publicGradGamma, out var publicGradBeta);
         var expectedPublicGradInput = cpu.LayerNormBackward(

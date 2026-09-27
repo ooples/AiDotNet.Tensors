@@ -21,7 +21,9 @@ public class Parity210GpuCorrectnessTests : IClassFixture<DirectGpuTensorEngineT
     private readonly bool _available;
     private readonly CpuEngine _cpu = new();
     private const float Tolerance = 1e-4f;
-    private DirectGpuTensorEngine Gpu => _fixture.Engine ?? throw new InvalidOperationException(
+    // Typed as IEngine on purpose: most GPU overrides are explicit IEngine implementations, so a call on the
+    // concrete DirectGpuTensorEngine binds to the inherited CpuEngine method and the test compares the CPU with itself.
+    private IEngine Gpu => _fixture.Engine ?? throw new InvalidOperationException(
         "Direct GPU engine was not initialized.", _fixture.InitializationException);
 
     public Parity210GpuCorrectnessTests(DirectGpuTensorEngineTestFixture fixture)
