@@ -11927,6 +11927,53 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
+    /// <summary>True when the class gather/scatter kernels compiled (both are needed for a differentiable gather).</summary>
+    internal bool HasClassGatherKernels =>
+        _kernelCache.ContainsKey("gather_class_values") && _kernelCache.ContainsKey("scatter_class_grad");
+
+    /// <summary>output[r] = values[r * numClasses + round(classIndices[r])], 0 for an out-of-range or NaN class.</summary>
+    internal unsafe void GatherClassValues(IGpuBuffer values, IGpuBuffer classIndices, IGpuBuffer output, int rows, int numClasses)
+    {
+        if (!_kernelCache.TryGetValue("gather_class_values", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: gather_class_values");
+        if (rows <= 0) return;
+
+        using var _ = PushContext();
+        uint grid = (uint)((rows + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr valuesPtr = values.Handle;
+        IntPtr classPtr = classIndices.Handle;
+        IntPtr outputPtr = output.Handle;
+        void** args = stackalloc void*[5];
+        args[0] = &valuesPtr;
+        args[1] = &classPtr;
+        args[2] = &outputPtr;
+        args[3] = &rows;
+        args[4] = &numClasses;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
+    /// <summary>grad[r, c] = gradOutput[r] where c == round(classIndices[r]), 0 elsewhere (every element written).</summary>
+    internal unsafe void ScatterClassGrad(IGpuBuffer gradOutput, IGpuBuffer classIndices, IGpuBuffer grad, int rows, int numClasses)
+    {
+        if (!_kernelCache.TryGetValue("scatter_class_grad", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: scatter_class_grad");
+        long total = (long)rows * numClasses;
+        if (total <= 0) return;
+
+        using var _ = PushContext();
+        uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr gradOutPtr = gradOutput.Handle;
+        IntPtr classPtr = classIndices.Handle;
+        IntPtr gradPtr = grad.Handle;
+        void** args = stackalloc void*[5];
+        args[0] = &gradOutPtr;
+        args[1] = &classPtr;
+        args[2] = &gradPtr;
+        args[3] = &rows;
+        args[4] = &numClasses;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
     public unsafe float L2Norm(IGpuBuffer A, int size)
     {
         if (!_kernelCache.TryGetValue("l2_norm_squared", out var kernel))

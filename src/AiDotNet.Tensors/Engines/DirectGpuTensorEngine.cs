@@ -20635,6 +20635,58 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return base.TensorRound(tensor);
     }
 
+    public override Tensor<T> TensorGatherClassValues<T>(Tensor<T> values, Tensor<T> classIndices)
+    {
+        if (values is null) throw new ArgumentNullException(nameof(values));
+        if (classIndices is null) throw new ArgumentNullException(nameof(classIndices));
+        int numClasses = ValidateClassGather(values, classIndices, out int rows);
+        // GraphMode records through the base (TryGetBackend refuses there); the recorded node replays onto this path.
+        if (typeof(T) == typeof(float) && rows > 0 && TryGetBackend(out var backend)
+            && backend is DirectGpu.CUDA.CudaBackend cuda && cuda.HasClassGatherKernels)
+        {
+            try
+            {
+                using var valuesBuffer = GetOrAllocateBuffer(backend, values.IsContiguous ? values : values.Contiguous());
+                using var classBuffer = GetOrAllocateBuffer(backend, classIndices.IsContiguous ? classIndices : classIndices.Contiguous());
+                var result = DispatchDeferredGpuOp<T>(backend, rows, (int[])classIndices._shape.Clone(), output =>
+                    cuda.GatherClassValues(valuesBuffer.Buffer, classBuffer.Buffer, output, rows, numClasses));
+                Autodiff.DifferentiableOps.RecordUnary("TensorGatherClassValues", result, values,
+                    Autodiff.BackwardFunctions<T>.GatherClassValuesBackward, new object[] { classIndices, numClasses });
+                return result;
+            }
+            catch (Exception ex) when (ex is not ArgumentException)
+            {
+                GpuLaunchProbe.OnFallback("TensorGatherClassValues", ex);
+            }
+        }
+        return base.TensorGatherClassValues(values, classIndices);
+    }
+
+    internal override Tensor<T> ScatterClassValuesGrad<T>(Tensor<T> gradOutput, Tensor<T> classIndices, int[] valuesShape)
+    {
+        int numClasses = valuesShape[valuesShape.Length - 1];
+        long total = 1;
+        foreach (var d in valuesShape) total *= d;
+        int rows = numClasses > 0 ? (int)(total / numClasses) : 0;
+        if (typeof(T) == typeof(float) && total > 0 && total <= int.MaxValue
+            && gradOutput.Length == rows && classIndices.Length == rows
+            && TryGetBackend(out var backend) && backend is DirectGpu.CUDA.CudaBackend cuda && cuda.HasClassGatherKernels)
+        {
+            try
+            {
+                using var gradBuffer = GetOrAllocateBuffer(backend, gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous());
+                using var classBuffer = GetOrAllocateBuffer(backend, classIndices.IsContiguous ? classIndices : classIndices.Contiguous());
+                return DispatchDeferredGpuOp<T>(backend, (int)total, (int[])valuesShape.Clone(), output =>
+                    cuda.ScatterClassGrad(gradBuffer.Buffer, classBuffer.Buffer, output, rows, numClasses));
+            }
+            catch (Exception ex)
+            {
+                GpuLaunchProbe.OnFallback("ScatterClassValuesGrad", ex);
+            }
+        }
+        return base.ScatterClassValuesGrad(gradOutput, classIndices, valuesShape);
+    }
+
     public override Tensor<T> TensorSign<T>(Tensor<T> tensor)
     {
         try

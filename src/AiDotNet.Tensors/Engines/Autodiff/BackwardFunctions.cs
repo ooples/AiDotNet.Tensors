@@ -1748,6 +1748,22 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, logP, gradLogP, engine);
     }
 
+    /// <summary>
+    /// Backward for <see cref="IEngine.TensorGatherClassValues{T}"/>: scatters gradOutput[r] to
+    /// grad_values[r, class[r]]. The class indices (savedState[0]) are read at backward time -- the same live tensor
+    /// the forward gathered from -- so a compiled replay scatters against the current targets.
+    /// </summary>
+    internal static void GatherClassValuesBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var classIndices = (Tensor<T>)savedState[0];
+        var values = inputs[0];
+        var cpu = engine as CpuEngine ?? new CpuEngine();
+        var gradValues = cpu.ScatterClassValuesGrad(gradOutput, classIndices, values._shape);
+        DifferentiableOps.AccumulateGrad(grads, values, gradValues, engine);
+    }
+
     /// <summary>GeGLU backward: dispatches to engine.GeGLUBackward(gradOutput, input, dim).</summary>
     internal static void GeGLUBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,

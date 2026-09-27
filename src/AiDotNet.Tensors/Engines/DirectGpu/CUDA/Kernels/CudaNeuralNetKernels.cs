@@ -724,6 +724,34 @@ extern ""C"" __global__ __launch_bounds__(256) void clamp(
     output[idx] = isnan(x) ? x : fmaxf(fminf(x, maxVal), minVal);
 }
 
+// Class-index gather for sparse cross-entropy: out[r] = values[r, round(cls[r])], or 0 when the class is outside
+// [0, C) (an ignored target) or NaN. The class indices are read on the device each launch, so a replayed graph
+// always gathers against the current targets.
+extern ""C"" __global__ __launch_bounds__(256) void gather_class_values(
+    const float* values, const float* cls, float* output, int rows, int numClasses)
+{
+    int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= rows) return;
+    float cf = cls[r];
+    int c = isnan(cf) ? -1 : (int)rintf(cf);
+    output[r] = (c >= 0 && c < numClasses) ? values[(long long)r * numClasses + c] : 0.0f;
+}
+
+// Backward of gather_class_values: grad[r, c] = gradOut[r] when c == round(cls[r]), else 0. Writes every element,
+// so the output needs no separate zero fill; each thread owns one element, so no atomics.
+extern ""C"" __global__ __launch_bounds__(256) void scatter_class_grad(
+    const float* gradOut, const float* cls, float* grad, int rows, int numClasses)
+{
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    long long total = (long long)rows * numClasses;
+    if (i >= total) return;
+    int r = (int)(i / numClasses);
+    int c = (int)(i - (long long)r * numClasses);
+    float cf = cls[r];
+    int t = isnan(cf) ? -1 : (int)rintf(cf);
+    grad[i] = (t == c) ? gradOut[r] : 0.0f;
+}
+
 extern ""C"" __global__ __launch_bounds__(256) void l2_norm_squared(const float* input, float* output, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -2775,6 +2803,8 @@ extern ""C"" __global__ __launch_bounds__(256) void adaptive_avgpool_backward(
                 "contrastive_loss_backward",
                 // Utilities
                 "clamp",
+                "gather_class_values",
+                "scatter_class_grad",
                 "l2_norm_squared",
                 "scale",
                 "copy_buffer",

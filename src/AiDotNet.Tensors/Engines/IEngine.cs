@@ -6321,6 +6321,20 @@ public interface IEngine
     Tensor<T> TensorEmbeddingLookupFromFloatIndices<T>(Tensor<T> embeddings, Tensor<T> floatIndices);
 
     /// <summary>
+    /// Gathers one value per row by class index: <c>out[r] = values[r, round(classIndices[r])]</c> over the LAST axis
+    /// of <paramref name="values"/>, and 0 where the class is outside <c>[0, C)</c> or NaN (an ignored target, e.g.
+    /// the -1 sentinel). This is the differentiable core of a class-index cross-entropy / NLL loss -- O(rows) instead
+    /// of a one-hot multiply over every class. The gradient scatters back to the gathered positions only.
+    /// </summary>
+    /// <typeparam name="T">Numeric type.</typeparam>
+    /// <param name="values">Values of shape [..., C] (typically log-probabilities).</param>
+    /// <param name="classIndices">Class indices stored as values, one per row of <paramref name="values"/>
+    /// (Length == values.Length / C). Captured BY REFERENCE under <see cref="Compilation.GraphMode"/>, so a compiled
+    /// plan re-reads them on every replay and the gradient scatters against the same, current targets.</param>
+    /// <returns>A tensor shaped like <paramref name="classIndices"/>.</returns>
+    Tensor<T> TensorGatherClassValues<T>(Tensor<T> values, Tensor<T> classIndices);
+
+    /// <summary>
     /// Performs embedding lookup backward pass - scatters gradients back to embedding table.
     /// </summary>
     /// <typeparam name="TValue">The numeric type of gradient and embedding values.</typeparam>

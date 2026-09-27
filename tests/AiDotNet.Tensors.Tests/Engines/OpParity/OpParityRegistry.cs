@@ -3420,6 +3420,9 @@ public static class OpParityRegistry
             e => e.TensorIndexFill(m.D(), 0, new Tensor<int>(new[] { 1, 3 }, new[] { 2 }), 0.5), ParityTol.Exact, opMethod: "TensorIndexFill",
             graphCaptureExpectation: GraphCaptureExpectation.HeterogeneousInput);
 
+        yield return new OpCase("TensorGatherClassValues[2,3,4;cls6]", "index",
+            e => e.TensorGatherClassValues(OpInput.Rand(2021, new[] { 2, 3, 4 }).F(), OpInput.FixedFrom(new double[] { 0, 3, -1, 4, 1, 2 }, new[] { 2, 3 }).F()),
+            e => e.TensorGatherClassValues(OpInput.Rand(2021, new[] { 2, 3, 4 }).D(), OpInput.FixedFrom(new double[] { 0, 3, -1, 4, 1, 2 }, new[] { 2, 3 }).D()), ParityTol.Exact, opMethod: "TensorGatherClassValues");
         yield return new OpCase("TensorEmbeddingLookupFromFloatIndices[10,8;idx4]", "index",
             e => e.TensorEmbeddingLookupFromFloatIndices(OpInput.Rand(2020, new[] { 10, 8 }).F(), OpInput.FixedFrom(new double[] { 1, 3, 0, 5 }, new[] { 4 }).F()),
             e => e.TensorEmbeddingLookupFromFloatIndices(OpInput.Rand(2020, new[] { 10, 8 }).D(), OpInput.FixedFrom(new double[] { 1, 3, 0, 5 }, new[] { 4 }).D()), ParityTol.Exact, opMethod: "TensorEmbeddingLookupFromFloatIndices");

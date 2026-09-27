@@ -35175,6 +35175,92 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    public virtual Tensor<T> TensorGatherClassValues<T>(Tensor<T> values, Tensor<T> classIndices)
+    {
+        if (values == null) throw new ArgumentNullException(nameof(values));
+        if (classIndices == null) throw new ArgumentNullException(nameof(classIndices));
+        int numClasses = ValidateClassGather(values, classIndices, out int rows);
+        var outputShape = (int[])classIndices._shape.Clone();
+
+        if (GraphMode.IsActive)
+        {
+            var scope = GraphMode.Current;
+            if (scope != null)
+            {
+                // Both tensors captured by reference: every replay gathers against the CURRENT class indices (a
+                // trace-time snapshot would train every step on the first batch's targets).
+                var capturedValues = values;
+                var capturedClasses = classIndices;
+                return scope.RecordBinary(
+                    LazyNodeType.Custom,
+                    "TensorGatherClassValues",
+                    values, classIndices, outputShape,
+                    (eng, output) => DirectGpuTensorEngine.CopyResultInto(eng, eng.TensorGatherClassValues(capturedValues, capturedClasses), output),
+                    BackwardFunctions<T>.GatherClassValuesBackward,
+                    new object[] { capturedClasses, numClasses });
+            }
+        }
+
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var valuesData = (values.IsContiguous ? values : values.Contiguous()).GetReadOnlyDataArray();
+        var classData = (classIndices.IsContiguous ? classIndices : classIndices.Contiguous()).GetReadOnlyDataArray();
+        var result = new Tensor<T>(outputShape);
+        var resultData = result.GetDataArray();
+        for (int r = 0; r < rows; r++)
+        {
+            int c = ClassIndexOf(numOps.ToDouble(classData[r]), numClasses);
+            resultData[r] = c >= 0 ? valuesData[(long)r * numClasses + c] : numOps.Zero;
+        }
+        DifferentiableOps.RecordUnary("TensorGatherClassValues", result, values,
+            BackwardFunctions<T>.GatherClassValuesBackward, new object[] { classIndices, numClasses });
+        return result;
+    }
+
+    /// <summary>
+    /// Backward of <see cref="TensorGatherClassValues{T}"/>: a [..., C] tensor holding <c>gradOutput[r]</c> at
+    /// <c>[r, round(classIndices[r])]</c> and 0 elsewhere (ignored rows get no gradient).
+    /// </summary>
+    internal virtual Tensor<T> ScatterClassValuesGrad<T>(Tensor<T> gradOutput, Tensor<T> classIndices, int[] valuesShape)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        int numClasses = valuesShape[valuesShape.Length - 1];
+        var grad = new Tensor<T>((int[])valuesShape.Clone());
+        var gradData = grad.GetDataArray();
+        var upstream = (gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous()).GetReadOnlyDataArray();
+        var classData = (classIndices.IsContiguous ? classIndices : classIndices.Contiguous()).GetReadOnlyDataArray();
+        for (int r = 0; r < classData.Length; r++)
+        {
+            int c = ClassIndexOf(numOps.ToDouble(classData[r]), numClasses);
+            if (c >= 0) gradData[(long)r * numClasses + c] = upstream[r];
+        }
+        return grad;
+    }
+
+    /// <summary>Validates a class gather and returns C (the last axis of <paramref name="values"/>).</summary>
+    private protected static int ValidateClassGather<T>(Tensor<T> values, Tensor<T> classIndices, out int rows)
+    {
+        if (values.Rank == 0)
+            throw new ArgumentException("TensorGatherClassValues requires values of rank >= 1 ([..., C]), got a scalar.", nameof(values));
+        int numClasses = values._shape[values.Rank - 1];
+        if (numClasses <= 0)
+            throw new ArgumentException($"TensorGatherClassValues requires a class axis of size > 0, got {numClasses}.", nameof(values));
+        rows = values.Length / numClasses;
+        if (classIndices.Length != rows)
+            throw new ArgumentException(
+                $"TensorGatherClassValues expects one class index per row: values [{string.Join(", ", values._shape)}] has {rows} rows, " +
+                $"classIndices [{string.Join(", ", classIndices._shape)}] has {classIndices.Length} elements.", nameof(classIndices));
+        return numClasses;
+    }
+
+    /// <summary>The rounded class (banker's rounding, like the CUDA kernel's rintf), or -1 when ignored.</summary>
+    private protected static int ClassIndexOf(double value, int numClasses)
+    {
+        if (double.IsNaN(value)) return -1;
+        double rounded = Math.Round(value);
+        return rounded >= 0 && rounded < numClasses ? (int)rounded : -1;
+    }
+
+    /// <inheritdoc/>
     public Tensor<T> TensorEmbeddingLookupFromFloatIndices<T>(Tensor<T> embeddings, Tensor<T> floatIndices)
     {
         if (embeddings == null) throw new ArgumentNullException(nameof(embeddings));
