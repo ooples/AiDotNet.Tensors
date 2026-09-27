@@ -393,8 +393,8 @@ internal static class FusedOptimizer
 
             for (int i = start; i < end; i++)
             {
-                float oldM = mHasHistory ? ((int)mQuant[i] - 128) * oldMScale : 0f;
-                float oldV = vHasHistory ? vQuant[i] * oldVScale : 0f;
+                float oldM = mHasHistory ? DynamicQuantizationCodebook.Signed[mQuant[i]] * oldMScale : 0f;
+                float oldV = vHasHistory ? DynamicQuantizationCodebook.Unsigned[vQuant[i]] * oldVScale : 0f;
                 float g = grad[i];
                 float newM = beta1 * oldM + oneMinusBeta1 * g;
                 float newV = beta2 * oldV + oneMinusBeta2 * g * g;
@@ -402,15 +402,17 @@ internal static class FusedOptimizer
                 maxAbsV = MathF.Max(maxAbsV, MathF.Abs(newV));
             }
 
-            float newMScale = MathF.Max(maxAbsM / 127f, 1e-10f);
-            float newVScale = MathF.Max(maxAbsV / 255f, 1e-10f);
+            // Block-wise dynamic quantization (Dettmers et al.): scale = block absmax, value = nearest codebook entry.
+            // Linear /127 and /255 rounded small second moments to zero and exploded the update.
+            float newMScale = MathF.Max(maxAbsM, 1e-30f);
+            float newVScale = MathF.Max(maxAbsV, 1e-30f);
             mScales[block] = newMScale;
             vScales[block] = newVScale;
 
             for (int i = start; i < end; i++)
             {
-                float oldM = mHasHistory ? ((int)mQuant[i] - 128) * oldMScale : 0f;
-                float oldV = vHasHistory ? vQuant[i] * oldVScale : 0f;
+                float oldM = mHasHistory ? DynamicQuantizationCodebook.Signed[mQuant[i]] * oldMScale : 0f;
+                float oldV = vHasHistory ? DynamicQuantizationCodebook.Unsigned[vQuant[i]] * oldVScale : 0f;
                 float g = grad[i];
                 float newM = beta1 * oldM + oneMinusBeta1 * g;
                 float newV = beta2 * oldV + oneMinusBeta2 * g * g;
@@ -418,14 +420,8 @@ internal static class FusedOptimizer
                 float vHat = newV / bc2;
                 param[i] -= lr * mHat / (MathF.Sqrt(vHat) + eps);
 
-                int qM = (int)Math.Round(newM / newMScale, MidpointRounding.ToEven);
-                if (qM < -127) qM = -127;
-                else if (qM > 127) qM = 127;
-                int qV = (int)Math.Round(newV / newVScale, MidpointRounding.ToEven);
-                if (qV < 0) qV = 0;
-                else if (qV > 255) qV = 255;
-                mQuant[i] = (byte)(qM + 128);
-                vQuant[i] = (byte)qV;
+                mQuant[i] = DynamicQuantizationCodebook.Encode(newM / newMScale, DynamicQuantizationCodebook.Signed);
+                vQuant[i] = DynamicQuantizationCodebook.Encode(newV / newVScale, DynamicQuantizationCodebook.Unsigned);
             }
         }
     }

@@ -366,8 +366,27 @@ public sealed class CompressedMomentGpuOptimizerTests :
                 bc1, bc2, blockSize, length, numBlocks);
         }
 
-        AssertClose(SimulateInt8Adam(initial, grad, 4, lr, beta1, beta2, eps, blockSize),
-            backend.DownloadBuffer(param), length, 2e-3f, $"{kind} int8 Adam");
+        // Reference: the production host implementation, run on the same inputs. Parameters alone are a weak check
+        // (they move ~0.025 over four steps, so a loose tolerance hid a wrong encoder); the quantized state is the
+        // precise signal, so every scale and every stored byte must agree too.
+        var refParam = (float[])initial.Clone();
+        var refM = new byte[length];
+        var refV = new byte[length];
+        var refMScales = new float[numBlocks];
+        var refVScales = new float[numBlocks];
+        for (int step = 1; step <= 4; step++)
+        {
+            float bc1 = 1f - MathF.Pow(beta1, step);
+            float bc2 = 1f - MathF.Pow(beta2, step);
+            CompressedMomentHostFallback.Adam8Bit(refParam, grad, refM, refV, refMScales, refVScales,
+                lr, beta1, beta2, eps, 1f - beta1, 1f - beta2, bc1, bc2, blockSize, length, numBlocks);
+        }
+
+        AssertClose(refParam, backend.DownloadBuffer(param), length, 1e-6f, $"{kind} int8 Adam parameters");
+        AssertClose(refMScales, backend.DownloadBuffer(mScales), numBlocks, 1e-6f, $"{kind} int8 Adam m scales");
+        AssertClose(refVScales, backend.DownloadBuffer(vScales), numBlocks, 1e-6f, $"{kind} int8 Adam v scales");
+        Assert.Equal(refM, backend.DownloadByteBuffer(mQuant, length));
+        Assert.Equal(refV, backend.DownloadByteBuffer(vQuant, length));
     }
 
     private static AcquiredBackend TryCreate(BackendKind kind)
@@ -652,79 +671,6 @@ public sealed class CompressedMomentGpuOptimizerTests :
                 v[i] = Bf16FromFloat(newV);
                 float update = lr * (newM / bc1) / (MathF.Sqrt(newV / bc2) + eps);
                 param[i] -= update;
-            }
-        }
-
-        return param;
-    }
-
-    private static float[] SimulateInt8Adam(
-        float[] initialParam,
-        float[] grad,
-        int steps,
-        float lr,
-        float beta1,
-        float beta2,
-        float eps,
-        int blockSize)
-    {
-        var param = (float[])initialParam.Clone();
-        var mQuant = new byte[param.Length];
-        var vQuant = new byte[param.Length];
-        int numBlocks = (param.Length + blockSize - 1) / blockSize;
-        var mScales = new float[numBlocks];
-        var vScales = new float[numBlocks];
-
-        for (int step = 1; step <= steps; step++)
-        {
-            float oneMinusBeta1 = 1f - beta1;
-            float oneMinusBeta2 = 1f - beta2;
-            float bc1 = 1f - MathF.Pow(beta1, step);
-            float bc2 = 1f - MathF.Pow(beta2, step);
-            bool firstStep = step == 1;
-
-            for (int block = 0; block < numBlocks; block++)
-            {
-                int start = block * blockSize;
-                int end = Math.Min(start + blockSize, param.Length);
-                float oldMScale = firstStep ? 0f : mScales[block];
-                float oldVScale = firstStep ? 0f : vScales[block];
-                float maxM = 0f;
-                float maxV = 0f;
-
-                for (int i = start; i < end; i++)
-                {
-                    float oldM = firstStep ? 0f : (mQuant[i] - 128) * oldMScale;
-                    float oldV = firstStep ? 0f : vQuant[i] * oldVScale;
-                    float newM = beta1 * oldM + oneMinusBeta1 * grad[i];
-                    float newV = beta2 * oldV + oneMinusBeta2 * grad[i] * grad[i];
-                    maxM = MathF.Max(maxM, MathF.Abs(newM));
-                    maxV = MathF.Max(maxV, MathF.Abs(newV));
-                }
-
-                float newMScale = MathF.Max(maxM / 127f, 1e-10f);
-                float newVScale = MathF.Max(maxV / 255f, 1e-10f);
-                mScales[block] = newMScale;
-                vScales[block] = newVScale;
-
-                for (int i = start; i < end; i++)
-                {
-                    float oldM = firstStep ? 0f : (mQuant[i] - 128) * oldMScale;
-                    float oldV = firstStep ? 0f : vQuant[i] * oldVScale;
-                    float newM = beta1 * oldM + oneMinusBeta1 * grad[i];
-                    float newV = beta2 * oldV + oneMinusBeta2 * grad[i] * grad[i];
-                    param[i] -= lr * (newM / bc1) / (MathF.Sqrt(newV / bc2) + eps);
-
-                    int qm = (int)Math.Round(newM / newMScale, MidpointRounding.ToEven);
-                    if (qm < -127) qm = -127;
-                    if (qm > 127) qm = 127;
-                    mQuant[i] = (byte)(qm + 128);
-
-                    int qv = (int)Math.Round(newV / newVScale, MidpointRounding.ToEven);
-                    if (qv < 0) qv = 0;
-                    if (qv > 255) qv = 255;
-                    vQuant[i] = (byte)qv;
-                }
             }
         }
 

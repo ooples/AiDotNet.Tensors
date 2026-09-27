@@ -16,7 +16,7 @@ internal static class OptimizerKernels
     /// </summary>
     public static string GetSource()
     {
-        return @"
+        return Compilation.DynamicQuantizationCodebook.KernelPrelude(Compilation.DynamicQuantizationCodebook.KernelLanguage.OpenCl) + @"
 // ===========================================================================
 // OPTIMIZER KERNELS
 // ===========================================================================
@@ -293,8 +293,8 @@ __kernel void adam8bit_update(
     float locM = 0.0f;
     float locV = 0.0f;
     for (int i = start + tid; i < endIdx; i += 256) {
-        float m_i = firstStep ? 0.0f : (float)((int)mQ[i] - 128) * mScale;
-        float v_i = firstStep ? 0.0f : (float)((int)vQ[i]) * vScale;
+        float m_i = firstStep ? 0.0f : adam8_dec_s(mQ[i]) * mScale;
+        float v_i = firstStep ? 0.0f : adam8_dec_u(vQ[i]) * vScale;
         float g = gradient[i];
         float newM = beta1 * m_i + oneMinusBeta1 * g;
         float newV = beta2 * v_i + oneMinusBeta2 * (g * g);
@@ -314,10 +314,10 @@ __kernel void adam8bit_update(
         barrier(CLK_LOCAL_MEM_FENCE);
     }
 
-    float newMScale = sMaxM[0] / 127.0f;
-    if (newMScale < 1e-10f) newMScale = 1e-10f;
-    float newVScale = sMaxV[0] / 255.0f;
-    if (newVScale < 1e-10f) newVScale = 1e-10f;
+    // Block-wise dynamic quantization: scale = block absmax, value = nearest codebook entry (linear /127 and
+    // /255 rounded small second moments to zero and exploded the update).
+    float newMScale = fmax(sMaxM[0], 1e-30f);
+    float newVScale = fmax(sMaxV[0], 1e-30f);
     if (tid == 0) {
         mScales[blk] = newMScale;
         vScales[blk] = newVScale;
@@ -325,8 +325,8 @@ __kernel void adam8bit_update(
     barrier(CLK_LOCAL_MEM_FENCE);
 
     for (int i = start + tid; i < endIdx; i += 256) {
-        float m_i = firstStep ? 0.0f : (float)((int)mQ[i] - 128) * mScale;
-        float v_i = firstStep ? 0.0f : (float)((int)vQ[i]) * vScale;
+        float m_i = firstStep ? 0.0f : adam8_dec_s(mQ[i]) * mScale;
+        float v_i = firstStep ? 0.0f : adam8_dec_u(vQ[i]) * vScale;
         float g = gradient[i];
         float newM = beta1 * m_i + oneMinusBeta1 * g;
         float newV = beta2 * v_i + oneMinusBeta2 * (g * g);
@@ -335,15 +335,8 @@ __kernel void adam8bit_update(
         float vHat = newV / biasCorrection2;
         param[i] = param[i] - learningRate * mHat / (sqrt(vHat) + epsilon);
 
-        int qm = (int)rint(newM / newMScale);
-        if (qm < -127) qm = -127;
-        if (qm > 127) qm = 127;
-        mQ[i] = (uchar)(qm + 128);
-
-        int qv = (int)rint(newV / newVScale);
-        if (qv < 0) qv = 0;
-        if (qv > 255) qv = 255;
-        vQ[i] = (uchar)qv;
+        mQ[i] = (uchar)adam8_enc_s(newM / newMScale);
+        vQ[i] = (uchar)adam8_enc_u(newV / newVScale);
     }
 }
 

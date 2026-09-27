@@ -1215,7 +1215,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private static void InitializeAdam8BitCpuState(
         byte[] mQuant, byte[] vQuant, double[] mScales, double[] vScales)
     {
-        for (int i = 0; i < mQuant.Length; i++) mQuant[i] = 128;
+        // m starts at zero: the signed dynamic codebook's zero entry (byte 128 was zero only in the old linear encoding).
+        for (int i = 0; i < mQuant.Length; i++) mQuant[i] = DynamicQuantizationCodebook.SignedZeroIndex;
         for (int i = 0; i < vQuant.Length; i++) vQuant[i] = 0;
         for (int i = 0; i < mScales.Length; i++) mScales[i] = 1e-10;
         for (int i = 0; i < vScales.Length; i++) vScales[i] = 1e-10;
@@ -1242,11 +1243,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             localVQuant = backend.AllocateByteBuffer(length);
 
             var mInitial = new byte[length];
-            for (int i = 0; i < mInitial.Length; i++) mInitial[i] = 128;
+            for (int i = 0; i < mInitial.Length; i++) mInitial[i] = DynamicQuantizationCodebook.SignedZeroIndex;
             backend.UploadByteBuffer(localMQuant, mInitial);
             // V quant uses zero-point 0, so its zero state is all-zero bytes. AllocateByteBuffer leaves
-            // device memory uninitialized (e.g. cuMemAlloc), so upload zeros explicitly — M was seeded to
-            // its 128 zero-point above but V was left as garbage until this fix.
+            // device memory uninitialized (e.g. cuMemAlloc), so upload zeros explicitly: M was seeded to
+            // the codebook's zero entry above, and V's zero entry is byte 0.
             backend.UploadByteBuffer(localVQuant, new byte[length]);
 
             var initialScales = new float[blockCount];
