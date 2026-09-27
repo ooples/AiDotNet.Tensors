@@ -3073,47 +3073,53 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
-    /// <summary>LogSoftmax backward</summary>
+    /// <summary>LogSoftmax backward along the saved axis (savedState[0]; the last axis when nothing was saved).</summary>
+    /// <remarks>
+    /// d(log_softmax)/dx = g - softmax * sum_axis(g). It used to reduce over the LAST axis unconditionally while the
+    /// forward accepts any axis, so a log-softmax over a non-last axis (e.g. a class axis of 1 in [N, C, L]) received
+    /// the gradient of a different function.
+    /// </remarks>
     internal static void LogSoftmaxBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        // d(log_softmax)/dx = gradOutput - softmax * sum(gradOutput)
-        // softmax = exp(log_softmax) = exp(output)
-        if (engine.SupportsGpu && inputs[0].Rank >= 1)
+        int rank = inputs[0].Rank;
+        int axis = savedState is { Length: > 0 } && savedState[0] is int saved ? saved : rank - 1;
+        if (axis < 0) axis += rank;
+        if (engine.SupportsGpu && rank >= 1)
         {
             // Device path: the host loop below reads every element through the indexer, which on a GPU engine
             // downloads the upstream gradient and the output. Same math with engine ops, no per-element access.
-            // The row sums are tiled explicitly because the GPU engine's elementwise ops take equal shapes.
-            int lastAxis = inputs[0].Rank - 1;
+            // The sums are tiled explicitly because the GPU engine's elementwise ops take equal shapes.
             var softmaxOnDevice = engine.TensorExp(output);
-            var rowSums = engine.ReduceSum(gradOutput, new[] { lastAxis }, keepDims: true);
-            var tileMultiples = new int[inputs[0].Rank];
+            var axisSums = engine.ReduceSum(gradOutput, new[] { axis }, keepDims: true);
+            var tileMultiples = new int[rank];
             for (int i = 0; i < tileMultiples.Length; i++) tileMultiples[i] = 1;
-            tileMultiples[lastAxis] = inputs[0].Shape[lastAxis];
+            tileMultiples[axis] = inputs[0].Shape[axis];
             var dxOnDevice = engine.TensorSubtract(gradOutput,
-                engine.TensorMultiply(softmaxOnDevice, engine.TensorTile(rowSums, tileMultiples)));
+                engine.TensorMultiply(softmaxOnDevice, engine.TensorTile(axisSums, tileMultiples)));
             DifferentiableOps.AccumulateGrad(grads, inputs[0], dxOnDevice, engine);
             return;
         }
 
         var softmax = engine.TensorExp(output);
-        // For each row, compute sum(gradOutput) and subtract softmax * sum
-        // This is a per-row operation. Use engine ops for the computation.
         var numOps = MathHelper.GetNumericOperations<T>();
-        int lastDim = inputs[0].Shape[^1];
-        int outerSize = inputs[0].Length / lastDim;
+        int axisSize = inputs[0].Shape[axis];
+        int innerSize = 1;
+        for (int i = axis + 1; i < rank; i++) innerSize *= inputs[0].Shape[i];
+        int outerSize = inputs[0].Length / (axisSize * innerSize);
         var dx = TensorPool<T>.RentZeroed(inputs[0]._shape);
 
         for (int outer = 0; outer < outerSize; outer++)
+        for (int inner = 0; inner < innerSize; inner++)
         {
-            int offset = outer * lastDim;
+            int offset = outer * axisSize * innerSize + inner;
             T sumGrad = numOps.Zero;
-            for (int d = 0; d < lastDim; d++)
-                sumGrad = numOps.Add(sumGrad, gradOutput[offset + d]);
-            for (int d = 0; d < lastDim; d++)
-                dx[offset + d] = numOps.Subtract(gradOutput[offset + d],
-                    numOps.Multiply(softmax[offset + d], sumGrad));
+            for (int d = 0; d < axisSize; d++)
+                sumGrad = numOps.Add(sumGrad, gradOutput[offset + d * innerSize]);
+            for (int d = 0; d < axisSize; d++)
+                dx[offset + d * innerSize] = numOps.Subtract(gradOutput[offset + d * innerSize],
+                    numOps.Multiply(softmax[offset + d * innerSize], sumGrad));
         }
         DifferentiableOps.AccumulateGrad(grads, inputs[0], dx, engine);
     }

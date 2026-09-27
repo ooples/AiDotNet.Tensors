@@ -38607,7 +38607,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var capturedAxis = axis;
                 return scope.RecordUnary(LazyNodeType.Custom, "LogSoftmax", tensor, tensor._shape,
                     (eng, output) => { var r = eng.TensorLogSoftmax(captured, capturedAxis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
-                    BackwardFunctions<T>.LogSoftmaxBackward);
+                    BackwardFunctions<T>.LogSoftmaxBackward, new object[] { capturedAxis });
             }
         }
 
@@ -38628,7 +38628,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 LogSoftmaxFloatFastPtr((float*)pinIn.Pointer, (float*)pinOut.Pointer, outerSize, axisSize);
             }
             DifferentiableOps.RecordUnary("LogSoftmax", result, tensor,
-                BackwardFunctions<T>.LogSoftmaxBackward);
+                BackwardFunctions<T>.LogSoftmaxBackward, new object[] { axis });
             if (AutoTracer.ShouldRecord) { var c = tensor; var ca = axis; AutoTracer.RecordOp("LogSoftmax", result, eng => eng.TensorLogSoftmax(c, ca)); }
             return result;
         }
@@ -38661,7 +38661,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 CpuParallelSettings.ParallelForOrSerial(0, outerSz, (long)outerSz * axisSz, rowKernel);
             }
             DifferentiableOps.RecordUnary("LogSoftmax", resultD, tensor,
-                BackwardFunctions<T>.LogSoftmaxBackward);
+                BackwardFunctions<T>.LogSoftmaxBackward, new object[] { axis });
             if (AutoTracer.ShouldRecord) { var c = tensor; var ca = axis; AutoTracer.RecordOp("LogSoftmax", resultD, eng => eng.TensorLogSoftmax(c, ca)); }
             return resultD;
         }
@@ -38706,7 +38706,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var logSoftmaxResult = TensorAllocator.Rent<T>(tensor._shape, outputData);
         DifferentiableOps.RecordUnary("LogSoftmax", logSoftmaxResult, tensor,
-            BackwardFunctions<T>.LogSoftmaxBackward);
+            BackwardFunctions<T>.LogSoftmaxBackward, new object[] { axis });
         if (AutoTracer.ShouldRecord) { var c = tensor; var ca = axis; AutoTracer.RecordOp("LogSoftmax", logSoftmaxResult, eng => eng.TensorLogSoftmax(c, ca)); }
         return logSoftmaxResult;
     }

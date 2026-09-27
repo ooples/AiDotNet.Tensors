@@ -26051,7 +26051,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                         handedOff = true;
                         var result = DeferTensorResult<T>(backend, output.Buffer, tensor.Length, tensor.Shape.ToArray());
                         Autodiff.DifferentiableOps.RecordUnary("LogSoftmax", result, tensor,
-                            Autodiff.BackwardFunctions<T>.LogSoftmaxBackward);
+                            Autodiff.BackwardFunctions<T>.LogSoftmaxBackward, new object[] { normalizedAxis });
                         return result;
                     }
                     finally
