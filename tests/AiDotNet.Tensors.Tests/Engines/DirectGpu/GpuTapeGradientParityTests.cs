@@ -372,6 +372,23 @@ public class GpuTapeGradientParityTests : IDisposable
             static (e, t) => e.TensorMaskedScatter(t, BitMask(), Rand([25], seed: 163)),
             static (x, y) => Assert.Equal(x[0, 1], y[0, 1]));
     [SkippableFact]
+    public void TensorSetSlice_destination_gradients_match_cpu() =>
+        AssertGradientParity("SetSlice(dest)", Rand([6, 10], seed: 167),
+            static (e, t) => e.TensorSetSlice(t, Rand([2, 4], seed: 173), new[] { 3, 5 }),
+            probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void TensorSetSlice_source_gradients_match_cpu() =>
+        AssertGradientParity("SetSlice(source)", Rand([2, 4], seed: 179),
+            static (e, t) => e.TensorSetSlice(Rand([6, 10], seed: 181), t, new[] { 3, 5 }),
+            probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void TensorSetSlice_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("TensorSetSlice",
+            static (e, t) => e.TensorSetSlice(t, Rand([2, 4], seed: 191), new[] { 3, 5 }),
+            static (x, y) => Assert.Equal(x[0, 0], y[0, 0]));
+    [SkippableFact]
     public void TensorClampMin_gradients_match_cpu() =>
         AssertGradientParity("ClampMin", Rand([6, 10], seed: 73),
             static (e, t) => e.TensorClampMin(t, 0.1f), probe: Engagement.UseResidencyCounter);
