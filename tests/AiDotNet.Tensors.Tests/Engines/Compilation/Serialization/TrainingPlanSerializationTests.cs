@@ -123,6 +123,8 @@ public class TrainingPlanSerializationTests
     [Theory]
     [InlineData(3)]
     [InlineData(4)]
+    [InlineData(5)]
+    [InlineData(6)]
     public async Task Load_LegacyTrainingPlan_IsRejectedAfterOptimizerPayloadChanges(int legacyVersion)
     {
         await Task.Yield();

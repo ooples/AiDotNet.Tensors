@@ -2277,8 +2277,11 @@ public interface IDirectGpuBackend : IDisposable
     /// <param name="weightDecay">Weight decay coefficient.</param>
     /// <param name="step">Current optimization step (for bias correction).</param>
     /// <param name="size">Number of parameters.</param>
+    /// <param name="maxTrustRatio">Upper clip of the layer-wise trust ratio; 0 (default) disables it.</param>
+    /// <param name="biasCorrection">Divide the moments by <c>1 - beta^t</c> (default <c>true</c>, as in the paper).</param>
     void LambUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
-        float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size);
+        float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size,
+        float maxTrustRatio = 0f, bool biasCorrection = true);
 
     /// <summary>
     /// Vanilla SGD optimizer update (no momentum).

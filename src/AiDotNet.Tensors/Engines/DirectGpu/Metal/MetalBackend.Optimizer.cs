@@ -220,14 +220,12 @@ public sealed partial class MetalBackend
     /// LAMB (Layer-wise Adaptive Moments) update.
     /// </summary>
     public void LambUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
-        float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
-    {
-        ThrowIfDisposed();
-        if (size <= 0) return;
-        DispatchResidentMetal("lamb_update_serial", 1, new[] { param, gradient, m, v },
-            (uint)size, (uint)step, unchecked((uint)SingleToInt32BitsCompat(learningRate)), unchecked((uint)SingleToInt32BitsCompat(beta1)),
-            unchecked((uint)SingleToInt32BitsCompat(beta2)), unchecked((uint)SingleToInt32BitsCompat(epsilon)), unchecked((uint)SingleToInt32BitsCompat(weightDecay)));
-    }
+        float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size,
+        float maxTrustRatio = 0f, bool biasCorrection = true)
+        // The trust ratio needs two whole-tensor norms, so it is computed between an element-wise phase and the
+        // update rather than in one kernel (the old kernel was always passed a ratio of 1, i.e. it ran AdamW).
+        => GpuLamb.Step(this, param, gradient, m, v, learningRate, beta1, beta2, epsilon, weightDecay, step, size,
+            maxTrustRatio, biasCorrection);
 
     /// <summary>
     /// Adadelta optimizer update.

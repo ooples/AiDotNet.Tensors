@@ -3703,7 +3703,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                             break;
                         case OptimizerType.LAMB:
                             FusedOptimizer.LAMBUpdateSimd(pParam, pGrad, pM, pV, len,
-                                lr, b1, b2, epsVal, wd, _optimizerStep);
+                                lr, b1, b2, epsVal, wd, _optimizerStep, extras.LambMaxTrustRatio, !extras.LambDisableBiasCorrection);
                             break;
                         case OptimizerType.RMSprop:
                             if (wd != 0f)
@@ -4337,7 +4337,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                             break;
                         case OptimizerType.LAMB:
                             FusedOptimizer.LAMBUpdateSimd(pParam, pGrad, pM, pV, len,
-                                lr, b1, b2, epsVal, wd, _optimizerStep);
+                                lr, b1, b2, epsVal, wd, _optimizerStep, extras.LambMaxTrustRatio, !extras.LambDisableBiasCorrection);
                             break;
                         case OptimizerType.RMSprop:
                             if (wd != 0f)
@@ -5322,7 +5322,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
     // "AOPT": identifies an ExportOptimizerState payload so a wrong byte array fails loudly on import.
     private const int OptimizerStateMagic = 0x54504F41;
-    private const int OptimizerStateVersion = 1;
+    // 2: the optimizer extras gained LAMB's trust-ratio clip and bias-correction switch (plan format 7).
+    private const int OptimizerStateVersion = 2;
 
     /// <inheritdoc/>
     public bool IsCompatibleWith(PlanCompatibilityInfo info)

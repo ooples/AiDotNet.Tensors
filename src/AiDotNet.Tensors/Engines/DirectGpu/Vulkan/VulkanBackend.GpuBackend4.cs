@@ -127,13 +127,12 @@ public sealed unsafe partial class VulkanBackend
     }
 
     public void LambUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
-        float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
-    {
-        ValidateOptimizerStep(step);
-        DispatchOptimizer(VulkanOptimizerKernels.Lamb, 1, new[] { param, gradient, m, v },
-            (uint)size, (uint)step, FloatBits(learningRate), FloatBits(beta1), FloatBits(beta2),
-            FloatBits(epsilon), FloatBits(weightDecay));
-    }
+        float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size,
+        float maxTrustRatio = 0f, bool biasCorrection = true)
+        // The trust ratio needs two whole-tensor norms, so it is computed between an element-wise phase and the
+        // update rather than in one kernel (the old kernel was always passed a ratio of 1, i.e. it ran AdamW).
+        => GpuLamb.Step(this, param, gradient, m, v, learningRate, beta1, beta2, epsilon, weightDecay, step, size,
+            maxTrustRatio, biasCorrection);
 
     public void AdadeltaUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer accumGrad, IGpuBuffer accumUpdate,
         float rho, float epsilon, float weightDecay, int size)

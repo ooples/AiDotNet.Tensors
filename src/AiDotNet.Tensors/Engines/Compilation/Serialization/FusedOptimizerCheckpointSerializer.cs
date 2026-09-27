@@ -101,6 +101,10 @@ internal static class FusedOptimizerCheckpointSerializer
         writer.Write(extras.LbfgsMemorySize);
         writer.Write(extras.TrustRegionRadius);
         writer.Write(extras.AdmmRho);
+        // LAMB's trust-ratio clip and bias-correction switch select the step LAMB takes, so a round trip that dropped
+        // them would restore a different optimizer (format version 7).
+        writer.Write(extras.LambMaxTrustRatio);
+        writer.Write(extras.LambDisableBiasCorrection);
     }
 
     private static FusedOptimizerExtras ReadExtras(BinaryReader reader)
@@ -128,6 +132,8 @@ internal static class FusedOptimizerCheckpointSerializer
             LbfgsMemorySize = reader.ReadInt32(),
             TrustRegionRadius = reader.ReadSingle(),
             AdmmRho = reader.ReadSingle(),
+            LambMaxTrustRatio = reader.ReadSingle(),
+            LambDisableBiasCorrection = reader.ReadBoolean(),
         };
 
     private static void WriteLrSchedules(BinaryWriter writer, FusedLrScheduleCheckpoint[] schedules)

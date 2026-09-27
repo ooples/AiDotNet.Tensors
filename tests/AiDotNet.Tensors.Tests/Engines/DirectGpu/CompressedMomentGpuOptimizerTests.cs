@@ -1,3 +1,4 @@
+using System.Linq;
 // Copyright (c) AiDotNet. All rights reserved.
 
 using System;
@@ -387,6 +388,57 @@ public sealed class CompressedMomentGpuOptimizerTests :
         AssertClose(refVScales, backend.DownloadBuffer(vScales), numBlocks, 1e-6f, $"{kind} int8 Adam v scales");
         Assert.Equal(refM, backend.DownloadByteBuffer(mQuant, length));
         Assert.Equal(refV, backend.DownloadByteBuffer(vQuant, length));
+    }
+
+    [SkippableTheory]
+    [MemberData(nameof(Backends))]
+    public void Lamb_MatchesCpuKernel_WithTrustRatioClipAndBiasCorrectionSwitch(BackendKind kind)
+    {
+        // GPU LAMB used to pass a constant trust ratio of 1 (AdamW). It must now match the CPU kernel exactly in every
+        // configuration, and the trust ratio must actually take effect.
+        var acquired = _backends.Get(kind);
+        var backend = RequireReady(kind, acquired);
+
+        const int length = 53;
+        const float lr = 0.01f, beta1 = 0.9f, beta2 = 0.999f, eps = 1e-6f, weightDecay = 0.01f;
+        var initial = Vector(length, 0.25f, -0.0075f);
+        var grad = Gradient(length);
+
+        foreach (var (maxTrust, biasCorrection) in new[] { (0f, true), (1.5f, true), (0f, false), (1.5f, false) })
+        {
+            float[] expected = CpuLamb(initial, grad, 4, lr, beta1, beta2, eps, weightDecay, maxTrust, biasCorrection);
+            using var param = backend.AllocateBuffer((float[])initial.Clone());
+            using var g = backend.AllocateBuffer(grad);
+            using var m = backend.AllocateBuffer(new float[length]);
+            using var v = backend.AllocateBuffer(new float[length]);
+            for (int step = 1; step <= 4; step++)
+                backend.LambUpdate(param, g, m, v, lr, beta1, beta2, eps, weightDecay, step, length, maxTrust, biasCorrection);
+            AssertClose(expected, backend.DownloadBuffer(param), length, 1e-5f,
+                $"{kind} LAMB (maxTrust={maxTrust}, biasCorrection={biasCorrection})");
+        }
+
+        // Not vacuous: with this setup the unclipped trust ratio is far from 1, so LAMB differs from its ratio-1 (AdamW)
+        // degeneration that the old kernels computed.
+        float[] lamb = CpuLamb(initial, grad, 4, lr, beta1, beta2, eps, weightDecay, 0f, true);
+        float[] ratioOne = CpuLamb(initial, grad, 4, lr, beta1, beta2, eps, weightDecay, 1e-30f, true);
+        Assert.True(Enumerable.Range(0, length).Max(i => Math.Abs(lamb[i] - ratioOne[i])) > 1e-4f,
+            "the trust ratio must change the step, or matching the CPU kernel proves nothing about it");
+    }
+
+    private static unsafe float[] CpuLamb(float[] initial, float[] grad, int steps, float lr, float beta1, float beta2,
+        float eps, float weightDecay, float maxTrust, bool biasCorrection)
+    {
+        var p = (float[])initial.Clone();
+        var g = (float[])grad.Clone();
+        var m = new float[p.Length];
+        var v = new float[p.Length];
+        fixed (float* pp = p, pg = g, pm = m, pv = v)
+        {
+            for (int step = 1; step <= steps; step++)
+                FusedOptimizer.LAMBUpdateSimd(pp, pg, pm, pv, p.Length, lr, beta1, beta2, eps, weightDecay, step,
+                    maxTrust, biasCorrection);
+        }
+        return p;
     }
 
     private static AcquiredBackend TryCreate(BackendKind kind)
