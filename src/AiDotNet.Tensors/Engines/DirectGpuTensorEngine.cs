@@ -453,9 +453,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     internal void SuspendActivationEviction() => System.Threading.Interlocked.Increment(ref _evictionSuspendDepth);
     internal void ResumeActivationEviction()
     {
-        if (System.Threading.Interlocked.Decrement(ref _evictionSuspendDepth) < 0)
+        int depth = System.Threading.Interlocked.Decrement(ref _evictionSuspendDepth);
+        if (depth < 0)
+        {
             System.Threading.Interlocked.Increment(ref _evictionSuspendDepth); // clamp at 0
+            depth = 0;
+        }
+        // Run a weight-cache invalidation that was requested while a captured graph pinned the buffers.
+        if (depth == 0 && System.Threading.Interlocked.Exchange(ref _pendingWeightCacheInvalidation, 0) == 1)
+            InvalidateAllWeightCaches();
     }
+
+    // Set when InvalidateAllWeightCaches is called while eviction is suspended (see there).
+    private int _pendingWeightCacheInvalidation;
 
     // ───────────────────────────────────────────────────────────────────────────────────────────
     // #1650 PUBLIC inference CUDA-graph capture API. ForwardUNet (the diffusion eager GPU forward to
@@ -6578,9 +6588,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// Runs a binary GPU operation in-place on tensor a: a = op(a, b).
     /// Uploads a and b to GPU, runs kernel with a's buffer as output, downloads back.
     /// </summary>
+    /// <summary>True for element types the GPU paths convert to float buffers (real scalars); false for e.g. Complex&lt;T&gt;.</summary>
+    private static bool IsFloatConvertible<T>()
+        => !(typeof(T).IsGenericType && typeof(T).GetGenericTypeDefinition() == typeof(Complex<>));
+
     private bool TryRunBinaryInPlace<T>(Tensor<T> a, Tensor<T> b, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, int> op)
     {
-        if (!TryGetBackend(out var backend))
+        // Element types without a float device representation (e.g. Complex<T>) belong to the base implementation.
+        // Gradient accumulation for complex tensors reached the host path below and threw converting to float.
+        if (!IsFloatConvertible<T>() || !TryGetBackend(out var backend))
             return false;
 
         // GPU-RESIDENT compiled-step path (PR #638 A2): the dominant backward host-traffic is grad accumulation
@@ -6716,7 +6732,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     private bool TryRunUnaryInPlace<T>(Tensor<T> tensor, Action<IDirectGpuBackend, IGpuBuffer, int> op)
     {
-        if (!TryGetBackend(out var backend))
+        if (!IsFloatConvertible<T>() || !TryGetBackend(out var backend))
             return false;
 
         // Same correctness problem as TryRunBinaryInPlace: GetDataArray() hands back a DETACHED COPY for a
@@ -7461,6 +7477,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     public void InvalidateAllWeightCaches()
     {
+        // While eviction is suspended a captured CUDA graph may reference persistent-cache buffers (the capture path
+        // aliases constant inputs -- e.g. a regression target -- to persistent entries). Disposing them here freed
+        // memory the graph kept reading on every replay: measured, the first replayed training step reported a loss
+        // of 0.4132 for parameters whose true loss was 0.4238, and the trajectory drifted from the graph-off run.
+        // Defer the invalidation until the last suspension ends; a host weight write retires the graph (and so
+        // resumes eviction) before it would need fresh device weights.
+        if (EvictionSuspended)
+        {
+            System.Threading.Interlocked.Exchange(ref _pendingWeightCacheInvalidation, 1);
+            return;
+        }
         lock (_persistentBufferLock)
         {
             foreach (var entry in _persistentBufferCache.Values)
@@ -14540,7 +14567,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // would silently lose its precision (a double finite-difference gradcheck cannot resolve it). Float runs
         // and records on the device.
         if (IsTapeActive<T>() && typeof(T) != typeof(float)) return base.RMSNorm(input, gamma, epsilon, out rms);
-        if (Compilation.GraphMode.IsActive) return base.RMSNorm(input, gamma, epsilon, out rms);
+        // Graph traces and anomaly mode take the base path (it records the graph node / checks every op).
+        if (Compilation.GraphMode.IsActive || Autodiff.AnomalyModeScope.IsActive) return base.RMSNorm(input, gamma, epsilon, out rms);
         if (!TryGetBackend(out var backend))
             return base.RMSNorm(input, gamma, epsilon, out rms);
         if (typeof(T) == typeof(float))
@@ -14572,6 +14600,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             rms = DeferTensorResult<T>(backend, saveRmsBuffer.Buffer, batchSize, rmsShape);
             outputBuffer.RelinquishOwnership();
             saveRmsBuffer.RelinquishOwnership();
+            Autodiff.DifferentiableOps.RecordIfActive("RMSNorm", result, new[] { input, gamma },
+                Autodiff.BackwardFunctions<T>.RMSNormBackward, new object[] { rms, epsilon });
             return result;
         }
         catch
@@ -16791,14 +16821,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 if (gradOutput.Length != outerSize)
                     return base.ReduceMeanBackward(gradOutput, inputShape, axes);
 
+                // Capture-safe: no per-call allocation or memset (both abort a CUDA-graph capture, which then fell back
+                // to the host implementation and its device-to-host download -- CUDA 900 -- so a compiled training step
+                // with a mean loss could never be captured). The ones vector is the engine's stable cached buffer
+                // (created and filled outside capture, by the warm pass), and the outer product lands directly in the
+                // output, which is then scaled in place.
+                var ones = GetCachedOnesBuffer(backend, reduceCount);
+                if (ones is null)
+                    return base.ReduceMeanBackward(gradOutput, inputShape, axes);
                 using var gradient = GetOrAllocateBuffer(backend, gradOutput);
-                using var ones = backend.AllocateBuffer(reduceCount);
-                using var expanded = backend.AllocateBuffer(inputSize);
-                backend.Fill(ones, 1f, reduceCount);
                 return DispatchDeferredGpuOp<T>(backend, inputSize, (int[])inputShape.Clone(), output =>
                 {
-                    backend.OuterProduct(gradient.Buffer, ones, expanded, outerSize, reduceCount);
-                    backend.Scale(expanded, output, 1f / reduceCount, inputSize);
+                    backend.OuterProduct(gradient.Buffer, ones, output, outerSize, reduceCount);
+                    backend.Scale(output, output, 1f / reduceCount, inputSize);
                 });
             }
             catch { }
@@ -26720,8 +26755,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             backend.SplitComplexMultiply(aRBuf.Buffer, aIBuf.Buffer, bRBuf.Buffer, bIBuf.Buffer,
                 oRBuf.Buffer, oIBuf.Buffer, n);
 
-            return PackAndDeferSplitComplexResult<T>(backend,
-                oRBuf.Buffer, oIBuf.Buffer, n, a._shape);
+            return RecordComplexResult("NativeComplexMultiply", new[] { a, b }, Autodiff.ComplexBackwardFunctions<T>.MultiplyBackward, null, PackAndDeferSplitComplexResult<T>(backend,
+                oRBuf.Buffer, oIBuf.Buffer, n, a._shape));
         }
         catch { return base.NativeComplexMultiply(a, b); }
     }
@@ -27024,8 +27059,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
             backend.SplitComplexConjugate(aRBuf.Buffer, aIBuf.Buffer, oRBuf.Buffer, oIBuf.Buffer, n);
 
-            return PackAndDeferSplitComplexResult<T>(backend,
-                oRBuf.Buffer, oIBuf.Buffer, n, a._shape);
+            return RecordComplexResult("NativeComplexConjugate", new[] { a }, Autodiff.ComplexBackwardFunctions<T>.ConjugateBackward, null, PackAndDeferSplitComplexResult<T>(backend,
+                oRBuf.Buffer, oIBuf.Buffer, n, a._shape));
         }
         catch { return base.NativeComplexConjugate(a); }
     }
@@ -27136,10 +27171,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
             backend.SplitComplexScale(aRBuf.Buffer, aIBuf.Buffer, oRBuf.Buffer, oIBuf.Buffer, scalarF, n);
 
-            return PackAndDeferSplitComplexResult<T>(backend,
-                oRBuf.Buffer, oIBuf.Buffer, n, a._shape);
+            return RecordComplexResult("NativeComplexScale", new[] { a }, Autodiff.ComplexBackwardFunctions<T>.ScaleBackward, new object[] { (object?)scalar ?? throw new ArgumentNullException(nameof(scalar)) }, PackAndDeferSplitComplexResult<T>(backend,
+                oRBuf.Buffer, oIBuf.Buffer, n, a._shape));
         }
         catch { return base.NativeComplexScale(a, scalar); }
+    }
+
+    /// <summary>Records a native complex op's tape node from its device result (complex autodiff; see
+    /// <see cref="Autodiff.ComplexBackwardFunctions{T}"/>). No-op without an active complex tape.</summary>
+    private static Tensor<Complex<T>> RecordComplexResult<T>(string name, Tensor<Complex<T>>[] inputs,
+        Autodiff.BackwardFunction<Complex<T>> backward, object[]? savedState, Tensor<Complex<T>> result)
+    {
+        Autodiff.DifferentiableOps.RecordIfActive(name, result, inputs, backward, savedState);
+        return result;
     }
 
     public override Tensor<Complex<T>> NativeComplexAdd<T>(Tensor<Complex<T>> a, Tensor<Complex<T>> b)
@@ -27166,8 +27210,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             backend.SplitComplexAdd(aRBuf.Buffer, aIBuf.Buffer, bRBuf.Buffer, bIBuf.Buffer,
                 oRBuf.Buffer, oIBuf.Buffer, n);
 
-            return PackAndDeferSplitComplexResult<T>(backend,
-                oRBuf.Buffer, oIBuf.Buffer, n, a._shape);
+            return RecordComplexResult("NativeComplexAdd", new[] { a, b }, Autodiff.ComplexBackwardFunctions<T>.AddBackward, null, PackAndDeferSplitComplexResult<T>(backend,
+                oRBuf.Buffer, oIBuf.Buffer, n, a._shape));
         }
         catch { return base.NativeComplexAdd(a, b); }
     }
@@ -27198,8 +27242,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             else
                 backend.FFT(inRBuf.Buffer, inIBuf.Buffer, outRBuf.Buffer, outIBuf.Buffer, fftSize, inverse: false);
 
-            return PackAndDeferSplitComplexResult<T>(backend,
-                outRBuf.Buffer, outIBuf.Buffer, n, input._shape);
+            return RecordComplexResult("NativeComplexFFTComplex", new[] { input }, Autodiff.ComplexBackwardFunctions<T>.FftBackward, new object[] { input._shape[input._shape.Length - 1] }, PackAndDeferSplitComplexResult<T>(backend,
+                outRBuf.Buffer, outIBuf.Buffer, n, input._shape));
         }
         catch { return base.NativeComplexFFTComplex(input); }
     }
@@ -27257,8 +27301,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             backend.SplitComplexCrossSpectral(xRBuf.Buffer, xIBuf.Buffer, yRBuf.Buffer, yIBuf.Buffer,
                 oRBuf.Buffer, oIBuf.Buffer, n);
 
-            return PackAndDeferSplitComplexResult<T>(backend,
-                oRBuf.Buffer, oIBuf.Buffer, n, x._shape);
+            return RecordComplexResult("NativeComplexCrossSpectral", new[] { x, y }, Autodiff.ComplexBackwardFunctions<T>.CrossSpectralBackward, null, PackAndDeferSplitComplexResult<T>(backend,
+                oRBuf.Buffer, oIBuf.Buffer, n, x._shape));
         }
         catch { return base.NativeComplexCrossSpectral(x, y); }
     }
@@ -27355,8 +27399,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             else
                 backend.FFT(inRBuf.Buffer, inIBuf.Buffer, outRBuf.Buffer, outIBuf.Buffer, fftSize, inverse: true);
 
-            return PackAndDeferSplitComplexResult<T>(backend,
-                outRBuf.Buffer, outIBuf.Buffer, n, input._shape);
+            return RecordComplexResult("NativeComplexIFFT", new[] { input }, Autodiff.ComplexBackwardFunctions<T>.IfftBackward, new object[] { input._shape[input._shape.Length - 1] }, PackAndDeferSplitComplexResult<T>(backend,
+                outRBuf.Buffer, outIBuf.Buffer, n, input._shape));
         }
         catch { return base.NativeComplexIFFT(input); }
     }

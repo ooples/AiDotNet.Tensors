@@ -318,6 +318,30 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         t._gpuBufferVersion = -1;
     }
 
+    /// <summary>
+    /// A graph launch writes the loss on the device only; the host copy (what callers read as the step's loss) is a
+    /// deferred download that caches after its first read, so without this every graph step reported an older loss
+    /// (measured: the capture step repeated the previous step's value). Downloads the scalar loss and makes the host
+    /// copy current, clearing any stale pending download first.
+    /// </summary>
+    private static long s_graphReplays;
+
+    /// <summary>Process-wide count of replayed (not freshly captured) CUDA-graph training steps. Diagnostics/tests:
+    /// a plan that recaptures every warmup cycle instead of replaying never advances this.</summary>
+    internal static long GraphReplayCount => System.Threading.Interlocked.Read(ref s_graphReplays);
+
+    private void RefreshLossFromCapturedGraph(Engines.DirectGpuTensorEngine gte)
+    {
+        if (typeof(T) != typeof(float)) return;
+        var fresh = gte.DownloadResidentBuffer(_lossOutput);
+        if (fresh is null) return;
+        var key = _lossOutput.GetBackingArrayForCacheLookupUnsafe();
+        if (key is not null) Helpers.DeferredArrayMaterializer.Remove(key);
+        var dst = _lossOutput.AsWritableSpan();
+        int n = Math.Min(dst.Length, fresh.Length);
+        for (int i = 0; i < n; i++) dst[i] = (T)(object)fresh[i];
+    }
+
     private void InvalidateCapturedStepGraph()
     {
         if (_stepGraphExec != IntPtr.Zero
@@ -349,6 +373,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// </summary>
     private void MarkHostWeightMutated(int p)
     {
+        // A host-side weight write invalidates the parameter's resident device buffer (below), which a captured step
+        // graph references: retire the graph here, where the mutation actually happens. (It used to be retired at the
+        // top of every optimizer update, even when every parameter was updated on the device and the graph stayed
+        // valid -- so a graph was captured every warmup cycle and never replayed.)
+        if (_stepGraphExec != IntPtr.Zero) InvalidateCapturedStepGraph();
         _parameters[p].IncrementVersion();
         (_engine as Engines.DirectGpuTensorEngine)?.InvalidateResidentWeightBuffer(_parameters[p]);
     }
@@ -1721,6 +1750,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     }
                     _stepGraphExec = exec;
                     cb.LaunchCapturedGraph(exec);   // executes THIS step on the just-uploaded indices
+                    RefreshLossFromCapturedGraph(gte);
                     // The optimizer update is run eagerly (NOT captured): its closure
                     // increments _optimizerStep and re-evaluates lrSchedule.GetLr +
                     // Adam/AdamW bias-correction each step, and bakes those scalars into
@@ -1742,6 +1772,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 if (_graphHasEmbedding) gte.RefreshGraphEmbeddingIndicesNow();   // upload step-N indices (registered action)
                 RefreshGraphInputInPlace(cb);
                 cb.LaunchCapturedGraph(_stepGraphExec);
+                System.Threading.Interlocked.Increment(ref s_graphReplays);
+                RefreshLossFromCapturedGraph(gte);
                 if (_maxGradNorm > 0.0 && !TryClipGradientsGlobalL2Gpu(_gradients, _maxGradNorm))
                     ClipGradientsGlobalL2(_gradients, _maxGradNorm);
                 _optimizerUpdate?.Invoke();
@@ -3086,7 +3118,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // below) — otherwise a later LaunchCapturedGraph would replay against freed/stale device
             // pointers. No-op when no graph is captured (the CPU and on-device optimizer paths are
             // normally mutually exclusive; this is the requested safety net).
-            if (_stepGraphExec != IntPtr.Zero) InvalidateCapturedStepGraph();
+            // Graph retirement happens in MarkHostWeightMutated, i.e. only if this update writes a weight on the host.
             // Issue #348: read lr from the schedule each step. PyTorch's
             // LRScheduler.step() pays managed-code dispatch overhead per
             // step; here it's an inlined Math.Cos / Math.Pow.
@@ -4166,7 +4198,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // #739 review: retire any captured on-device step graph before this CPU fused optimizer
             // invalidates resident weight buffers below — else a later LaunchCapturedGraph replays
             // against freed/stale device pointers. No-op when no graph is captured.
-            if (_stepGraphExec != IntPtr.Zero) InvalidateCapturedStepGraph();
+            // Graph retirement happens in MarkHostWeightMutated, i.e. only if this update writes a weight on the host.
             // Resolve each group's lr ONCE per step. PyTorch does N kernel
             // launches for N groups; we do one schedule eval per group and
             // one fused-kernel call per parameter.

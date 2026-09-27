@@ -1396,4 +1396,9 @@ public class GpuTapeGradientParityTests : IDisposable
         AssertGradientParity("Gather", Rand(new[] { 10, 6 }, 24), (e, table) =>
             e.TensorGather(table, new Tensor<int>(new[] { 7 }, new Vector<int>(new[] { 3, 0, 9, 3, 5, 1, 3 })), 0),
             probe: Engagement.UseResidencyCounter, mustNotBail: "TensorGather");
+
+    [SkippableFact]
+    public void TensorClampMax_gradients_match_cpu() =>
+        AssertGradientParity("ClampMax", Rand(new[] { 64 }, 25), (e, t) => e.TensorMultiply(e.TensorClampMax(t, -0.1f), t),
+            probe: Engagement.UseResidencyCounter, mustNotBail: "TensorClampMax");
 }

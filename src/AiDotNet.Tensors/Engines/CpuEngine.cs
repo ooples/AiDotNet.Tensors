@@ -49440,7 +49440,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var (batchCount, fftSize) = GetBatchedFFTDims(input._shape);
         ValidatePowerOfTwo(fftSize, nameof(input));
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; return scope.RecordUnary(LazyNodeType.Custom, "NativeComplexIFFT", input, input._shape, (eng, output) => { var r = eng.NativeComplexIFFT(ci); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, null); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; return scope.RecordUnary(LazyNodeType.Custom, "NativeComplexIFFT", input, input._shape, (eng, output) => { var r = eng.NativeComplexIFFT(ci); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, Autodiff.ComplexBackwardFunctions<T>.IfftBackward, new object[] { input._shape[input._shape.Length - 1] }); } }
         { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexIFFT", input._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -49461,6 +49461,10 @@ public partial class CpuEngine : ITensorLevelEngine
                     ops.Divide(slice[i].Imaginary, scale));
         }
 
+        // Complex autodiff: previously nothing was recorded, so no gradient flowed through this op.
+
+        DifferentiableOps.RecordIfActive("NativeComplexIFFT", result, new[] { input }, Autodiff.ComplexBackwardFunctions<T>.IfftBackward, new object[] { input._shape[input._shape.Length - 1] });
+
         { var ci2 = input; AutoTracer.RecordOp("NativeComplexIFFT", result, eng => eng.NativeComplexIFFT(ci2)); }
         return result;
     }
@@ -49472,7 +49476,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var (batchCount, fftSize) = GetBatchedFFTDims(input._shape);
         ValidatePowerOfTwo(fftSize, nameof(input));
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; return scope.RecordUnary(LazyNodeType.Custom, "NativeComplexFFTComplex", input, input._shape, (eng, output) => { var r = eng.NativeComplexFFTComplex(ci); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, null); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; return scope.RecordUnary(LazyNodeType.Custom, "NativeComplexFFTComplex", input, input._shape, (eng, output) => { var r = eng.NativeComplexFFTComplex(ci); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, Autodiff.ComplexBackwardFunctions<T>.FftBackward, new object[] { input._shape[input._shape.Length - 1] }); } }
         { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexFFTComplex", input._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -49488,6 +49492,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
             for (int i = 0; i < fftSize; i++) result[offset + i] = slice[i];
         }
+
+        // Complex autodiff: previously nothing was recorded, so no gradient flowed through this op.
+
+        DifferentiableOps.RecordIfActive("NativeComplexFFTComplex", result, new[] { input }, Autodiff.ComplexBackwardFunctions<T>.FftBackward, new object[] { input._shape[input._shape.Length - 1] });
 
         { var ci = input; AutoTracer.RecordOp("NativeComplexFFTComplex", result, eng => eng.NativeComplexFFTComplex(ci)); }
         return result;
@@ -49604,7 +49612,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (a.Length != b.Length)
             throw new ArgumentException($"Tensor lengths must match: {a.Length} vs {b.Length}");
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; var cb = b; return scope.RecordBinary(LazyNodeType.Custom, "NativeComplexMultiply", a, b, a._shape, (eng, output) => { var r = eng.NativeComplexMultiply(ca, cb); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, null); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; var cb = b; return scope.RecordBinary(LazyNodeType.Custom, "NativeComplexMultiply", a, b, a._shape, (eng, output) => { var r = eng.NativeComplexMultiply(ca, cb); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, Autodiff.ComplexBackwardFunctions<T>.MultiplyBackward, null); } }
         { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexMultiply", a._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -49637,6 +49645,10 @@ public partial class CpuEngine : ITensorLevelEngine
                     ops.Add(ops.Multiply(ar, bi), ops.Multiply(ai, br)));
             }
         }
+
+        // Complex autodiff: previously nothing was recorded, so no gradient flowed through this op.
+
+        DifferentiableOps.RecordIfActive("NativeComplexMultiply", result, new[] { a, b }, Autodiff.ComplexBackwardFunctions<T>.MultiplyBackward, null);
 
         { var ca2 = a; var cb2 = b; AutoTracer.RecordOp("NativeComplexMultiply", result, eng => eng.NativeComplexMultiply(ca2, cb2)); }
         return result;
@@ -50022,7 +50034,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a is null) throw new ArgumentNullException(nameof(a));
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; return scope.RecordUnary(LazyNodeType.Custom, "NativeComplexConjugate", a, a._shape, (eng, output) => { var r = eng.NativeComplexConjugate(ca); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, null); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; return scope.RecordUnary(LazyNodeType.Custom, "NativeComplexConjugate", a, a._shape, (eng, output) => { var r = eng.NativeComplexConjugate(ca); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, Autodiff.ComplexBackwardFunctions<T>.ConjugateBackward, null); } }
         { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexConjugate", a._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -50048,6 +50060,10 @@ public partial class CpuEngine : ITensorLevelEngine
             for (int i = 0; i < n; i++)
                 result[i] = new Complex<T>(a[i].Real, ops.Negate(a[i].Imaginary));
         }
+
+        // Complex autodiff: previously nothing was recorded, so no gradient flowed through this op.
+
+        DifferentiableOps.RecordIfActive("NativeComplexConjugate", result, new[] { a }, Autodiff.ComplexBackwardFunctions<T>.ConjugateBackward, null);
 
         { var ca2 = a; AutoTracer.RecordOp("NativeComplexConjugate", result, eng => eng.NativeComplexConjugate(ca2)); }
         return result;
@@ -50211,7 +50227,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a is null) throw new ArgumentNullException(nameof(a));
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; var cs = scalar; return scope.RecordUnary(LazyNodeType.Custom, "NativeComplexScale", a, a._shape, (eng, output) => { var r = eng.NativeComplexScale(ca, cs); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, null); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; var cs = scalar; return scope.RecordUnary(LazyNodeType.Custom, "NativeComplexScale", a, a._shape, (eng, output) => { var r = eng.NativeComplexScale(ca, cs); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, Autodiff.ComplexBackwardFunctions<T>.ScaleBackward, new object[] { (object?)scalar ?? throw new ArgumentNullException(nameof(scalar)) }); } }
         { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexScale", a._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -50240,6 +50256,10 @@ public partial class CpuEngine : ITensorLevelEngine
                     ops.Multiply(a[i].Imaginary, scalar));
         }
 
+        // Complex autodiff: previously nothing was recorded, so no gradient flowed through this op.
+
+        DifferentiableOps.RecordIfActive("NativeComplexScale", result, new[] { a }, Autodiff.ComplexBackwardFunctions<T>.ScaleBackward, new object[] { (object?)scalar ?? throw new ArgumentNullException(nameof(scalar)) });
+
         { var ca2 = a; var cs2 = scalar; AutoTracer.RecordOp("NativeComplexScale", result, eng => eng.NativeComplexScale(ca2, cs2)); }
         return result;
     }
@@ -50252,7 +50272,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (x.Length != y.Length)
             throw new ArgumentException($"Tensor lengths must match: {x.Length} vs {y.Length}");
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var cx = x; var cy = y; return scope.RecordBinary(LazyNodeType.Custom, "NativeComplexCrossSpectral", x, y, x._shape, (eng, output) => { var r = eng.NativeComplexCrossSpectral(cx, cy); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, null); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var cx = x; var cy = y; return scope.RecordBinary(LazyNodeType.Custom, "NativeComplexCrossSpectral", x, y, x._shape, (eng, output) => { var r = eng.NativeComplexCrossSpectral(cx, cy); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, Autodiff.ComplexBackwardFunctions<T>.CrossSpectralBackward, null); } }
         { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexCrossSpectral", x._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -50286,6 +50306,10 @@ public partial class CpuEngine : ITensorLevelEngine
                     ops.Subtract(ops.Multiply(xi, yr), ops.Multiply(xr, yi)));
             }
         }
+
+        // Complex autodiff: previously nothing was recorded, so no gradient flowed through this op.
+
+        DifferentiableOps.RecordIfActive("NativeComplexCrossSpectral", result, new[] { x, y }, Autodiff.ComplexBackwardFunctions<T>.CrossSpectralBackward, null);
 
         { var cx2 = x; var cy2 = y; AutoTracer.RecordOp("NativeComplexCrossSpectral", result, eng => eng.NativeComplexCrossSpectral(cx2, cy2)); }
         return result;
@@ -50857,7 +50881,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (a.Length != b.Length)
             throw new ArgumentException($"Tensor lengths must match: {a.Length} vs {b.Length}");
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; var cb = b; return scope.RecordBinary(LazyNodeType.Custom, "NativeComplexAdd", a, b, a._shape, (eng, output) => { var r = eng.NativeComplexAdd(ca, cb); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, null); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; var cb = b; return scope.RecordBinary(LazyNodeType.Custom, "NativeComplexAdd", a, b, a._shape, (eng, output) => { var r = eng.NativeComplexAdd(ca, cb); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, Autodiff.ComplexBackwardFunctions<T>.AddBackward, null); } }
         { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexAdd", a._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -50887,6 +50911,10 @@ public partial class CpuEngine : ITensorLevelEngine
                     ops.Add(a[i].Real, b[i].Real),
                     ops.Add(a[i].Imaginary, b[i].Imaginary));
         }
+
+        // Complex autodiff: previously nothing was recorded, so no gradient flowed through this op.
+
+        DifferentiableOps.RecordIfActive("NativeComplexAdd", result, new[] { a, b }, Autodiff.ComplexBackwardFunctions<T>.AddBackward, null);
 
         { var ca2 = a; var cb2 = b; AutoTracer.RecordOp("NativeComplexAdd", result, eng => eng.NativeComplexAdd(ca2, cb2)); }
         return result;

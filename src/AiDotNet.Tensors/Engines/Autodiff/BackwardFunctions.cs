@@ -6829,16 +6829,12 @@ internal static class BackwardFunctions<T>
             DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceGrad, engine);
             return;
         }
-        var ops = MathHelper.GetNumericOperations<T>();
         var input = inputs[0];
-        var grad = new Tensor<T>(input._shape);
-        var src = input.AsSpan();
-        var gsrc = gradOutput.AsSpan();
-        var dst = grad.AsWritableSpan();
-        var zero = ops.Zero;
-        for (int i = 0; i < src.Length; i++)
-            dst[i] = ops.GreaterThanOrEquals(src[i], min) ? gsrc[i] : zero;
-        DifferentiableOps.AccumulateGrad(grads, input, grad, engine);
+        // grad * (x >= min) as engine ops: grad - grad * (x < min). Exactly the pass-through rule of the former host
+        // loop (including at x == min), but it stays on the device on the GPU engine instead of reading both
+        // tensors back to the host every backward.
+        var clamped = engine.TensorMultiply(gradOutput, engine.TensorLessThan(input, min));
+        DifferentiableOps.AccumulateGrad(grads, input, engine.TensorSubtract(gradOutput, clamped), engine);
     }
 
     /// <summary>ClampMax backward: gradient passes only where x &lt;= max.</summary>
@@ -6853,16 +6849,10 @@ internal static class BackwardFunctions<T>
             DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceGrad, engine);
             return;
         }
-        var ops = MathHelper.GetNumericOperations<T>();
         var input = inputs[0];
-        var grad = new Tensor<T>(input._shape);
-        var src = input.AsSpan();
-        var gsrc = gradOutput.AsSpan();
-        var dst = grad.AsWritableSpan();
-        var zero = ops.Zero;
-        for (int i = 0; i < src.Length; i++)
-            dst[i] = ops.LessThanOrEquals(src[i], max) ? gsrc[i] : zero;
-        DifferentiableOps.AccumulateGrad(grads, input, grad, engine);
+        // grad * (x <= max) = grad - grad * (x > max), on the device (see ClampMinBackward).
+        var clamped = engine.TensorMultiply(gradOutput, engine.TensorGreaterThan(input, max));
+        DifferentiableOps.AccumulateGrad(grads, input, engine.TensorSubtract(gradOutput, clamped), engine);
     }
 
     // =====================================================================
