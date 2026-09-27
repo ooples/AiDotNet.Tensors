@@ -8529,13 +8529,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (stride == 0) stride = poolSize;
 
-        // Keep both values and argmax positions resident for the common no-padding
-        // training path. The legacy base path exposes argmax as a CLR array and must
-        // download the complete index buffer before it can record backward.
-        if (IsTapeActive<T>() && padding == 0)
-            return MaxPool2DWithTensorIndices(
-                input, new[] { poolSize, poolSize }, new[] { stride, stride }, out _);
-        if (IsTapeActive<T>()) return base.MaxPool2D(input, poolSize, stride, padding);
+        // Under a tape, also keep the argmax positions resident: the backward routes by them, and inference never
+        // needs them. The kernel's indices point at real input cells, so padding changes nothing downstream.
+        if (IsTapeActive<T>())
+        {
+            var poolDims = new[] { poolSize, poolSize };
+            var strideDims = new[] { stride, stride };
+            if (TryMaxPool2DWithTensorIndicesOnDevice(input, poolDims, strideDims, padding) is not { } taped)
+                return base.MaxPool2D(input, poolSize, stride, padding);
+            Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
+            Autodiff.DifferentiableOps.RecordUnary("MaxPool2D", taped.Result, input,
+                Autodiff.BackwardFunctions<T>.MaxPool2DTensorIndicesBackward,
+                new object[] { taped.Indices, poolDims, strideDims });
+            return taped.Result;
+        }
 
         if (!TryGetBackend(out var backend))
             return base.MaxPool2D(input, poolSize, stride, padding);
@@ -8697,18 +8704,38 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         Compilation.GraphMode.ThrowIfInferenceUnsupported(
             Compilation.GraphCaptureLimitation.HeterogeneousOutput);
 
-        if (!TryGetBackend(out var backend) || input.Rank != 4
-            || poolSize is not { Length: 2 } || stride is not { Length: 2 })
+        if (TryMaxPool2DWithTensorIndicesOnDevice(input, poolSize, stride, padding: 0) is not { } pooled)
             return base.MaxPool2DWithTensorIndices(input, poolSize, stride, out maxIndices);
+
+        maxIndices = pooled.Indices;
+        Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
+        Autodiff.DifferentiableOps.RecordUnary("MaxPool2D", pooled.Result, input,
+            Autodiff.BackwardFunctions<T>.MaxPool2DTensorIndicesBackward,
+            new object[] { maxIndices, poolSize, stride });
+        return pooled.Result;
+    }
+
+    /// <summary>
+    /// MaxPool2D on the device that also keeps each window's winner resident, as a flat index into its input plane.
+    /// Padding is applied by the kernel, whose indices always name real cells. Null when the device path cannot
+    /// take it, so the caller falls back to base.
+    /// </summary>
+    private (Tensor<T> Result, Tensor<int> Indices)? TryMaxPool2DWithTensorIndicesOnDevice<T>(
+        Tensor<T> input, int[] poolSize, int[] stride, int padding)
+    {
+        if (!TryGetBackend(out var backend) || input.Rank != 4 || padding < 0
+            || poolSize is not { Length: 2 } || stride is not { Length: 2 }
+            || padding >= poolSize[0] || padding >= poolSize[1])
+            return null;
 
         int batch = input.Shape._dims[0];
         int channels = input.Shape._dims[1];
         int inHeight = input.Shape._dims[2];
         int inWidth = input.Shape._dims[3];
-        int outHeight = (inHeight - poolSize[0]) / stride[0] + 1;
-        int outWidth = (inWidth - poolSize[1]) / stride[1] + 1;
+        int outHeight = (inHeight + 2 * padding - poolSize[0]) / stride[0] + 1;
+        int outWidth = (inWidth + 2 * padding - poolSize[1]) / stride[1] + 1;
         if (outHeight <= 0 || outWidth <= 0)
-            return base.MaxPool2DWithTensorIndices(input, poolSize, stride, out maxIndices);
+            return null;
 
         int outputSize = checked(batch * channels * outHeight * outWidth);
         using var inputBuffer = GetOrAllocateBuffer(backend, input);
@@ -8718,30 +8745,24 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             backend.MaxPool2D(inputBuffer.Buffer, outputBuffer.Buffer, indicesBuffer.Buffer,
                 batch, channels, inHeight, inWidth, outHeight, outWidth,
-                poolSize[0], poolSize[1], stride[0], stride[1], 0, 0);
+                poolSize[0], poolSize[1], stride[0], stride[1], padding, padding);
 
             var outputShape = new[] { batch, channels, outHeight, outWidth };
             var result = DeferTensorResult<T>(
                 backend, outputBuffer.Buffer, outputSize, outputShape);
             outputBuffer.RelinquishOwnership();
-            maxIndices = Tensor<int>.FromGpuBuffer(
+            var indices = Tensor<int>.FromGpuBuffer(
                 backend, indicesBuffer.Buffer, outputShape, GpuTensorRole.Intermediate,
                 ownsBuffer: true, bufferContainsRawInt32: true);
             indicesBuffer.RelinquishOwnership();
-
-            Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
-            Autodiff.DifferentiableOps.RecordUnary("MaxPool2D", result, input,
-                Autodiff.BackwardFunctions<T>.MaxPool2DTensorIndicesBackward,
-                new object[] { maxIndices, poolSize, stride });
-            return result;
+            return (result, indices);
         }
-        catch
+        catch (Exception)
         {
             if (ThrowOnGpuKernelFallback) throw;
-            return base.MaxPool2DWithTensorIndices(input, poolSize, stride, out maxIndices);
+            return null;
         }
     }
-
     /// <summary>
     /// GPU-accelerated backward pass for 2D max pooling.
     /// Propagates gradients back through the max pooling operation using stored indices.

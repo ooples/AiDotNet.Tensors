@@ -529,6 +529,26 @@ public class GpuTapeGradientParityTests : IDisposable
         AssertStaysOnDeviceUnderTape("AvgPool2D",
             static (e, t) => e.AvgPool2D(t.Reshape(new[] { 1, 2, 5, 6 }), 3, 2, 1),
             static (x, y) => Assert.Equal(new[] { 1, 2, 3, 3 }, y.Shape.ToArray()));
+    // Rand is continuous, so no window has a tie and the winner (hence the routed gradient) is unambiguous.
+    [SkippableTheory]
+    [InlineData(0)]
+    [InlineData(1)]
+    public void MaxPool2D_gradients_match_cpu(int padding) =>
+        AssertGradientParity($"MaxPool2D(p{padding})", Rand([6, 10], seed: 241),
+            (e, t) => e.MaxPool2D(t.Reshape(new[] { 1, 2, 5, 6 }), 3, 2, padding), probe: Engagement.UseResidencyCounter);
+
+    [SkippableTheory]
+    [InlineData(0)]
+    [InlineData(1)]
+    public void MaxPool2D_taped_forward_matches_cpu(int padding) =>
+        AssertTapedForwardMatchesCpu($"MaxPool2D(p{padding})", Rand([6, 10], seed: 251),
+            (e, t) => e.MaxPool2D(t.Reshape(new[] { 1, 2, 5, 6 }), 3, 2, padding));
+
+    [SkippableFact]
+    public void MaxPool2D_padded_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("MaxPool2D",
+            static (e, t) => e.MaxPool2D(t.Reshape(new[] { 1, 2, 5, 6 }), 3, 2, 1),
+            static (x, y) => Assert.Equal(new[] { 1, 2, 3, 3 }, y.Shape.ToArray()));
     [SkippableFact]
     public void TensorClampMin_gradients_match_cpu() =>
         AssertGradientParity("ClampMin", Rand([6, 10], seed: 73),

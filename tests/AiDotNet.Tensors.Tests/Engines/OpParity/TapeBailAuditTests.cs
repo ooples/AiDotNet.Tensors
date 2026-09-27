@@ -89,7 +89,6 @@ public class TapeBailAuditTests
         // not scan. These are deliberately baselined now that the audit covers the complete partial class;
         // each one needs its CpuEngine saved-state/backward contract verified by a gradient test before its
         // tape bail can be removed safely. New names still fail the audit, and this baseline must only shrink.
-        "MaxPool2D",
         "FlashAttention",
         "GroupedQueryAttention",
         // FLOAT now records on the device (GpuTapeGradientParityTests.LayerNorm_*); the non-float tape still bails because
@@ -148,6 +147,9 @@ public class TapeBailAuditTests
         "FusedLinearTanh",
         "FusedLinearGELU",
         "FusedLinearSwish",
+        // Under a tape the pool also keeps its argmax indices resident for the backward; inference never needs
+        // them. The node is recorded in the override either way.
+        "MaxPool2D",
     };
 
     /// <summary>Ops already fixed — they must never regress to bailing.</summary>
