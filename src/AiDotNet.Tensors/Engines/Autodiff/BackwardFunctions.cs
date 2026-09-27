@@ -1691,6 +1691,17 @@ internal static class BackwardFunctions<T>
             }
         }
 
+        // Dense device scatter when no sparse-gradient consumer is wired for this parameter: reads the ids on the
+        // device, so neither the ids nor the upstream gradient is downloaded, and the [V, E] result stays resident
+        // for accumulation with the other uses of a tied table.
+        if (engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine deFloat
+            && !DifferentiableOps.IsSparseEmbeddingGradWired(inputs[0])
+            && deFloat.TryEmbeddingBackwardFromFloatIds(gradOutput, capturedFloatIdx, vocabSize, embeddingDim) is { } deviceTableGrad)
+        {
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceTableGrad, engine);
+            return;
+        }
+
         // Materialise fresh int indices for this Step. The float input may
         // have been overwritten between forward and backward — that's the
         // whole reason this op exists — so the int[] we build here MUST

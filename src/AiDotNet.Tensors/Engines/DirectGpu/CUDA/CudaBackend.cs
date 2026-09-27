@@ -11927,6 +11927,79 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
+    /// <summary>True when the float-id embedding gather/scatter kernels (atomic and deterministic) compiled.</summary>
+    internal bool HasFloatIdEmbeddingKernels =>
+        _kernelCache.ContainsKey("embedding_forward_float_ids") && _kernelCache.ContainsKey("embedding_backward_float_ids")
+        && _kernelCache.ContainsKey("embedding_float_ids_links") && _kernelCache.ContainsKey("embedding_backward_float_ids_det");
+
+    /// <summary>output[i, d] = table[round(ids[i]), d]; 0 for an id outside [0, vocabSize) or NaN.</summary>
+    internal unsafe void EmbeddingFromFloatIds(IGpuBuffer ids, IGpuBuffer table, IGpuBuffer output, int numIndices, int embeddingDim, int vocabSize)
+        => LaunchFloatIdEmbedding("embedding_forward_float_ids", ids, table, output, numIndices, embeddingDim, vocabSize);
+
+    /// <summary>gradTable[round(ids[i]), d] += gradOutput[i, d] with atomicAdd; gradTable must be zeroed by the caller.</summary>
+    internal unsafe void EmbeddingBackwardFromFloatIds(IGpuBuffer gradOutput, IGpuBuffer ids, IGpuBuffer gradTable, int numIndices, int embeddingDim, int vocabSize)
+        => LaunchFloatIdEmbedding("embedding_backward_float_ids", gradOutput, ids, gradTable, numIndices, embeddingDim, vocabSize);
+
+    /// <summary>
+    /// Bit-deterministic form of <see cref="EmbeddingBackwardFromFloatIds"/>: each id's positions are summed in
+    /// ascending order by one thread (no atomics). <paramref name="links"/> is int scratch of 2 * numIndices
+    /// elements; gradTable must be zeroed by the caller.
+    /// </summary>
+    internal unsafe void EmbeddingBackwardFromFloatIdsDeterministic(IGpuBuffer gradOutput, IGpuBuffer ids, IGpuBuffer links,
+        IGpuBuffer gradTable, int numIndices, int embeddingDim, int vocabSize)
+    {
+        if (!_kernelCache.TryGetValue("embedding_float_ids_links", out var linkKernel))
+            throw new InvalidOperationException("CUDA kernel not found: embedding_float_ids_links");
+        if (!_kernelCache.TryGetValue("embedding_backward_float_ids_det", out var sumKernel))
+            throw new InvalidOperationException("CUDA kernel not found: embedding_backward_float_ids_det");
+        long total = (long)numIndices * embeddingDim;
+        if (total <= 0) return;
+
+        using var _ = PushContext();
+        IntPtr gradOutPtr = gradOutput.Handle;
+        IntPtr idsPtr = ids.Handle;
+        IntPtr linksPtr = links.Handle;
+        IntPtr tablePtr = gradTable.Handle;
+        void** linkArgs = stackalloc void*[3];
+        linkArgs[0] = &idsPtr;
+        linkArgs[1] = &linksPtr;
+        linkArgs[2] = &numIndices;
+        LaunchKernel(linkKernel, (uint)((numIndices + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, linkArgs);
+
+        void** sumArgs = stackalloc void*[7];
+        sumArgs[0] = &gradOutPtr;
+        sumArgs[1] = &idsPtr;
+        sumArgs[2] = &linksPtr;
+        sumArgs[3] = &tablePtr;
+        sumArgs[4] = &numIndices;
+        sumArgs[5] = &embeddingDim;
+        sumArgs[6] = &vocabSize;
+        LaunchKernel(sumKernel, (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, sumArgs);
+    }
+
+    private unsafe void LaunchFloatIdEmbedding(string name, IGpuBuffer first, IGpuBuffer second, IGpuBuffer output,
+        int numIndices, int embeddingDim, int vocabSize)
+    {
+        if (!_kernelCache.TryGetValue(name, out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: " + name);
+        long total = (long)numIndices * embeddingDim;
+        if (total <= 0) return;
+
+        using var _ = PushContext();
+        uint grid = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
+        IntPtr firstPtr = first.Handle;
+        IntPtr secondPtr = second.Handle;
+        IntPtr outputPtr = output.Handle;
+        void** args = stackalloc void*[6];
+        args[0] = &firstPtr;
+        args[1] = &secondPtr;
+        args[2] = &outputPtr;
+        args[3] = &numIndices;
+        args[4] = &embeddingDim;
+        args[5] = &vocabSize;
+        LaunchKernel(kernel, grid, DefaultBlockSize, args);
+    }
+
     /// <summary>True when the class gather/scatter kernels compiled (both are needed for a differentiable gather).</summary>
     internal bool HasClassGatherKernels =>
         _kernelCache.ContainsKey("gather_class_values") && _kernelCache.ContainsKey("scatter_class_grad");

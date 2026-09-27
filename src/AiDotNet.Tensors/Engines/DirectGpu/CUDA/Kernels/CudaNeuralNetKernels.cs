@@ -737,6 +737,77 @@ extern ""C"" __global__ __launch_bounds__(256) void gather_class_values(
     output[r] = (c >= 0 && c < numClasses) ? values[(long long)r * numClasses + c] : 0.0f;
 }
 
+// Embedding gather with FLOAT token ids (rounded on the device): out[i, d] = table[round(ids[i]), d], 0 for an id
+// outside [0, vocab) or NaN. One thread per output element (coalesced), and the ids are read on the device, so the
+// lookup needs no host conversion, works on device-resident ids, and replays against the current ids.
+extern ""C"" __global__ __launch_bounds__(256) void embedding_forward_float_ids(
+    const float* ids, const float* table, float* output, int numIndices, int embeddingDim, int vocabSize)
+{
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long long)numIndices * embeddingDim) return;
+    int row = (int)(i / embeddingDim);
+    int d = (int)(i - (long long)row * embeddingDim);
+    float f = ids[row];
+    int id = isnan(f) ? -1 : (int)rintf(f);
+    output[i] = (id >= 0 && id < vocabSize) ? table[(long long)id * embeddingDim + d] : 0.0f;
+}
+
+// Backward of embedding_forward_float_ids: gradTable[round(ids[i]), d] += gradOut[i, d] (gradTable pre-zeroed).
+// atomicAdd, so repeated ids accumulate; not bit-deterministic across runs (GpuDeterminism routes elsewhere).
+extern ""C"" __global__ __launch_bounds__(256) void embedding_backward_float_ids(
+    const float* gradOutput, const float* ids, float* gradTable, int numIndices, int embeddingDim, int vocabSize)
+{
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long long)numIndices * embeddingDim) return;
+    int row = (int)(i / embeddingDim);
+    int d = (int)(i - (long long)row * embeddingDim);
+    float f = ids[row];
+    int id = isnan(f) ? -1 : (int)rintf(f);
+    if (id >= 0 && id < vocabSize) atomicAdd(&gradTable[(long long)id * embeddingDim + d], gradOutput[i]);
+}
+
+// Deterministic float-id embedding backward, pass 1: for each id position i, links[i] = the next position j > i with
+// the same id (or -1), and links[numIndices + i] = 1 when i is the id's FIRST position. O(numIndices^2) id compares.
+extern ""C"" __global__ __launch_bounds__(256) void embedding_float_ids_links(
+    const float* ids, int* links, int numIndices)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= numIndices) return;
+    float fi = ids[i];
+    int id = isnan(fi) ? -1 : (int)rintf(fi);
+    int next = -1, first = 1;
+    for (int j = 0; j < numIndices; j++)
+    {
+        float fj = ids[j];
+        int other = isnan(fj) ? -1 : (int)rintf(fj);
+        if (other != id) continue;
+        if (j < i) first = 0;
+        else if (j > i) { next = j; break; }
+    }
+    links[i] = next;
+    links[numIndices + i] = first;
+}
+
+// Pass 2: one thread per (first position, d) sums gradOut over that id's positions in ascending order and writes the
+// table row -- a fixed summation order and no atomics, so the result is bit-identical run to run. gradTable is
+// pre-zeroed (rows of ids that do not occur stay zero).
+extern ""C"" __global__ __launch_bounds__(256) void embedding_backward_float_ids_det(
+    const float* gradOutput, const float* ids, const int* links, float* gradTable,
+    int numIndices, int embeddingDim, int vocabSize)
+{
+    long long t = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= (long long)numIndices * embeddingDim) return;
+    int i = (int)(t / embeddingDim);
+    int d = (int)(t - (long long)i * embeddingDim);
+    if (links[numIndices + i] == 0) return;
+    float f = ids[i];
+    int id = isnan(f) ? -1 : (int)rintf(f);
+    if (id < 0 || id >= vocabSize) return;
+    float sum = 0.0f;
+    for (int j = i; j >= 0; j = links[j]) sum += gradOutput[(long long)j * embeddingDim + d];
+    gradTable[(long long)id * embeddingDim + d] = sum;
+}
+
 // Backward of gather_class_values: grad[r, c] = gradOut[r] when c == round(cls[r]), else 0. Writes every element,
 // so the output needs no separate zero fill; each thread owns one element, so no atomics.
 extern ""C"" __global__ __launch_bounds__(256) void scatter_class_grad(
@@ -2805,6 +2876,10 @@ extern ""C"" __global__ __launch_bounds__(256) void adaptive_avgpool_backward(
                 "clamp",
                 "gather_class_values",
                 "scatter_class_grad",
+                "embedding_forward_float_ids",
+                "embedding_backward_float_ids",
+                "embedding_float_ids_links",
+                "embedding_backward_float_ids_det",
                 "l2_norm_squared",
                 "scale",
                 "copy_buffer",

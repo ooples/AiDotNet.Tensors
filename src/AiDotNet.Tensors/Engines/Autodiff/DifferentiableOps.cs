@@ -129,6 +129,13 @@ internal static class DifferentiableOps
     /// materialization — but the canonical path is sparse-only.
     /// </para>
     /// </remarks>
+    /// <summary>True when the current backward pass collects sparse embedding gradients for <paramref name="param"/>.</summary>
+    internal static bool IsSparseEmbeddingGradWired<T>(Tensor<T> param)
+    {
+        int idx = param._gradIndex;
+        return idx >= 0 && _indexedSparseGrads is not null && idx < _indexedSparseGrads.Length;
+    }
+
     internal static void AccumulateSparseEmbeddingGrad<T>(Tensor<T> param, SparseEmbeddingGradient<T> grad)
     {
         if (param is null) throw new ArgumentNullException(nameof(param));

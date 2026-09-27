@@ -20805,13 +20805,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorClamp<T>(Tensor<T> tensor, T min, T max)
     {
-        // ClampBackward unpacks savedState[0]/savedState[1] as boxed double,
-        // matching the CpuEngine.TensorClamp recording path. Defer to base
-        // when tape is active so the boxed-double contract is preserved and
-        // the public override doesn't have to duplicate the double-box logic.
-        if (IsTapeActive<T>()) return base.TensorClamp(tensor, min, max);
-
-        if (!TryGetBackend(out var backend))
+        // No bail on a plain tape: the device result records the same Clamp node as the CPU path (ClampBackward
+        // reads savedState as boxed doubles). The bail downloaded the input of every clamp in a training step.
+        // Graph traces and anomaly mode keep the base path.
+        if (Compilation.GraphMode.IsActive || Autodiff.AnomalyModeScope.IsActive || !TryGetBackend(out var backend))
             return base.TensorClamp(tensor, min, max);
 
         try
@@ -20821,7 +20818,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var bufferA = GetOrAllocateBuffer(backend, tensor);
             var bufferOut = AllocateOutputBuffer(backend, tensor.Length);
             backend.Clamp(bufferA.Buffer, bufferOut.Buffer, minF, maxF, tensor.Length);
-            return DeferTensorResult<T>(backend, bufferOut.Buffer, tensor.Length, tensor.Shape.ToArray());
+            var result = DeferTensorResult<T>(backend, bufferOut.Buffer, tensor.Length, tensor.Shape.ToArray());
+            var numOps = MathHelper.GetNumericOperations<T>();
+            Autodiff.DifferentiableOps.RecordUnary("Clamp", result, tensor,
+                Autodiff.BackwardFunctions<T>.ClampBackward, new object[] { numOps.ToDouble(min), numOps.ToDouble(max) });
+            return result;
         }
         catch (Exception)
         {
@@ -23808,6 +23809,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // tape or not: the kernel converts the scalar to float, which silently cost double callers precision
         // (TensorDivideScalar was already float-only for the same reason).
         if (typeof(T) != typeof(float)) return base.TensorAddScalar(tensor, scalar);
+        // A plain tape records the same node as the CPU path (the gradient is the identity), so no bail -- the bail
+        // downloaded the input. Graph traces and anomaly mode keep the base path.
+        if (Compilation.GraphMode.IsActive || Autodiff.AnomalyModeScope.IsActive) return base.TensorAddScalar(tensor, scalar);
         if (TryGetBackend(out var backend))
         {
             try
@@ -23840,6 +23844,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // tape or not: the kernel converts the scalar to float, which silently cost double callers precision
         // (TensorDivideScalar was already float-only for the same reason).
         if (typeof(T) != typeof(float)) return base.TensorSubtractScalar(tensor, scalar);
+        // A plain tape records the same node as the CPU path (the gradient is the identity), so no bail -- the bail
+        // downloaded the input. Graph traces and anomaly mode keep the base path.
+        if (Compilation.GraphMode.IsActive || Autodiff.AnomalyModeScope.IsActive) return base.TensorSubtractScalar(tensor, scalar);
         if (TryGetBackend(out var backend))
         {
             try
