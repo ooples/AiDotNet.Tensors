@@ -641,6 +641,36 @@ public class GpuTapeGradientParityTests : IDisposable
             Assert.True(gradDiff < 1e-4, $"double LayerNorm gradient diverged from CPU (maxAbs={gradDiff:E3})");
         }
     }
+    private static readonly Tensor<float> NormGamma = Rand([2], seed: 263);
+    private static readonly Tensor<float> NormBeta = Rand([2], seed: 269);
+
+    // [6,10] viewed as [3,2,2,5]: 3 samples, 2 channels, 2x5 positions. Gradient flows through the batch statistics.
+    [SkippableFact]
+    public void BatchNorm_gradients_match_cpu() =>
+        AssertGradientParity("BatchNorm", Rand([6, 10], seed: 271),
+            static (e, t) => e.BatchNorm(t.Reshape(new[] { 3, 2, 2, 5 }), NormGamma, NormBeta, 1e-5, out _, out _));
+
+    [SkippableFact]
+    public void BatchNorm_taped_forward_matches_cpu() =>
+        AssertTapedForwardMatchesCpu("BatchNorm", Rand([6, 10], seed: 277),
+            static (e, t) => e.BatchNorm(t.Reshape(new[] { 3, 2, 2, 5 }), NormGamma, NormBeta, 1e-5, out _, out _));
+
+    // Rank 3 is ONE unbatched [channels, height, width] sample under CpuEngine's rule. The device path used to read
+    // it as [batch, channels, length] and normalise the wrong axis.
+    [SkippableFact]
+    public void BatchNorm_rank3_unbatched_gradients_match_cpu() =>
+        AssertGradientParity("BatchNorm(rank3)", Rand([6, 10], seed: 281),
+            static (e, t) => e.BatchNorm(t.Reshape(new[] { 2, 5, 6 }), NormGamma, NormBeta, 1e-5, out _, out _));
+
+    [SkippableFact]
+    public void BatchNorm_rank3_unbatched_taped_forward_matches_cpu() =>
+        AssertTapedForwardMatchesCpu("BatchNorm(rank3)", Rand([6, 10], seed: 283),
+            static (e, t) => e.BatchNorm(t.Reshape(new[] { 2, 5, 6 }), NormGamma, NormBeta, 1e-5, out _, out _));
+    [SkippableFact]
+    public void BatchNorm_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("BatchNorm",
+            static (e, t) => e.BatchNorm(t.Reshape(new[] { 3, 2, 2, 5 }), NormGamma, NormBeta, 1e-5, out _, out _),
+            static (x, y) => Assert.Equal(new[] { 3, 2, 2, 5 }, y.Shape.ToArray()));
     [SkippableFact]
     public void TensorClampMin_gradients_match_cpu() =>
         AssertGradientParity("ClampMin", Rand([6, 10], seed: 73),

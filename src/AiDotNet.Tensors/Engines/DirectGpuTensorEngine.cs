@@ -14666,16 +14666,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.BatchNormBackward<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> gamma, Tensor<T> mean, Tensor<T> variance, double epsilon, out Tensor<T> gradGamma, out Tensor<T> gradBeta)
     {
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || !TryGetBackend(out var backend) || input.Rank < 2)
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || !TryGetBackend(out var backend)
+            || !TryBatchNormLayout(input._shape, gamma.Length, out int batch, out int channels, out int spatialSize))
             return base.BatchNormBackward(gradOutput, input, gamma, mean, variance, epsilon, out gradGamma, out gradBeta);
 
         try
         {
-            int channels = gamma.Length;
-            int batch = input.Shape._dims[0];
-            if (channels <= 0 || batch <= 0 || input.Length % (batch * channels) != 0)
-                return base.BatchNormBackward(gradOutput, input, gamma, mean, variance, epsilon, out gradGamma, out gradBeta);
-            int spatialSize = input.Length / (batch * channels);
 
             using var gradOutBuffer = GetOrAllocateBuffer(backend, gradOutput);
             using var inputBuffer = GetOrAllocateBuffer(backend, input);
@@ -20971,10 +20967,31 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // GPU-accelerated normalization (BatchNorm, LayerNorm, GroupNorm, InstanceNorm, RMSNorm)
     // ──────────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// The [batch, channels, spatial] view the batchnorm kernels take, under CpuEngine.BatchNorm's layout rule: rank 2
+    /// is [batch, features], rank 3 is ONE unbatched [channels, height, width] sample, rank 4 is [batch, channels,
+    /// height, width]. False for any other rank, or when the channel axis does not match gamma, so the caller falls
+    /// back to the CPU. (Reading rank 3 as [batch, channels, length] normalised the wrong axis against the wrong
+    /// gamma and disagreed with the CPU forward and backward.)
+    /// </summary>
+    private static bool TryBatchNormLayout(int[] shape, int gammaLength, out int batch, out int channels, out int spatial)
+    {
+        batch = channels = spatial = 0;
+        switch (shape.Length)
+        {
+            case 2: batch = shape[0]; channels = shape[1]; spatial = 1; break;
+            case 3: batch = 1; channels = shape[0]; spatial = shape[1] * shape[2]; break;
+            case 4: batch = shape[0]; channels = shape[1]; spatial = shape[2] * shape[3]; break;
+            default: return false;
+        }
+        return channels == gammaLength && batch > 0 && spatial > 0;
+    }
     public override Tensor<T> BatchNorm<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
-        if (IsTapeActive<T>()) return base.BatchNorm(input, gamma, beta, epsilon, out mean, out variance);
-        if (!TryGetBackend(out var backend) || input.Rank < 2)
+        // The batchnorm kernels compute in FP32, so only float runs on the device; double keeps CpuEngine's
+        // precision rather than silently rounding through FP32.
+        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend)
+            || !TryBatchNormLayout(input._shape, gamma.Length, out int batch, out int channels, out int spatial))
             return base.BatchNorm(input, gamma, beta, epsilon, out mean, out variance);
 
         // Issue #226 fix + leak-on-partial-alloc fix: buffers flowing
@@ -20994,9 +21011,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         bool ownershipTransferred = false;
         try
         {
-            int batch = input.Shape._dims[0];
-            int channels = input.Shape._dims[1];
-            int spatial = input.Length / (batch * channels);
             using var bufIn = GetOrAllocateBuffer(backend, input);
             using var bufGamma = GetOrAllocateBuffer(backend, gamma);
             using var bufBeta = GetOrAllocateBuffer(backend, beta);
@@ -21021,6 +21035,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             backend.SubScalar(bufSaveInvVar.Buffer, bufSaveInvVar.Buffer, (float)epsilon, channels);
             variance = DeferTensorResult<T>(backend, bufSaveInvVar.Buffer, channels, new[] { channels });
             ownershipTransferred = true;
+            // Same node and saved state CpuEngine records: batch mean and TRUE variance per channel.
+            Autodiff.DifferentiableOps.RecordIfActive("BatchNorm", result, new[] { input, gamma, beta },
+                Autodiff.BackwardFunctions<T>.BatchNormBackward, new object[] { mean, variance, epsilon });
             return result;
         }
         catch (Exception)
@@ -21031,6 +21048,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 bufSaveMean.Dispose();
                 bufSaveInvVar.Dispose();
             }
+            if (ThrowOnGpuKernelFallback) throw;
             return base.BatchNorm(input, gamma, beta, epsilon, out mean, out variance);
         }
     }
