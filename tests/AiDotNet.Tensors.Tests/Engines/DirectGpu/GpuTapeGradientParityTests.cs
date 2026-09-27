@@ -780,6 +780,30 @@ public class GpuTapeGradientParityTests : IDisposable
         AssertStaysOnDeviceUnderTape("GroupedQueryAttention",
             static (e, t) => e.GroupedQueryAttention(t.Reshape(new[] { 1, 4, 5, 3 }), GqaKey, GqaValue, 2, null, false, out _),
             static (x, y) => Assert.Equal(new[] { 1, 4, 5, 3 }, y.Shape.ToArray()));
+    // The bail here was restored once after d(input) came out wrong, so BOTH operands are pinned.
+    [SkippableFact]
+    public void Scatter_input_gradients_match_cpu() =>
+        AssertGradientParity("Scatter(input)", Rand([6, 10], seed: 401),
+            static (e, t) => e.Scatter(t, ColumnIndices, Rand([6, 3], seed: 409), 1),
+            probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void Scatter_values_gradients_match_cpu() =>
+        AssertGradientParity("Scatter(values)", Rand([6, 3], seed: 419),
+            static (e, t) => e.Scatter(Rand([6, 10], seed: 421), ColumnIndices, t, 1),
+            probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void Scatter_negative_axis_gradients_match_cpu() =>
+        AssertGradientParity("Scatter(axis -1)", Rand([6, 10], seed: 431),
+            static (e, t) => e.Scatter(t, ColumnIndices, Rand([6, 3], seed: 433), -1),
+            probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void Scatter_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("Scatter",
+            static (e, t) => e.Scatter(t, ColumnIndices, Rand([6, 3], seed: 439), 1),
+            static (x, y) => Assert.Equal(x[0, 0], y[0, 0]));
     [SkippableFact]
     public void TensorClampMin_gradients_match_cpu() =>
         AssertGradientParity("ClampMin", Rand([6, 10], seed: 73),

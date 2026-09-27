@@ -5661,6 +5661,17 @@ internal static class BackwardFunctions<T>
             : (int[])savedState[0];
         var axis = (int)savedState[1];
 
+        // Axis scatter with 1-D indices is index_copy, so the device helpers proven there apply unchanged.
+        if (engine is DirectGpuTensorEngine gpu && savedState[0] is Tensor<int> { Rank: 1 } deviceIndices
+            && gpu.TryIndexWriteInputGradOnDevice(gradOutput, axis, deviceIndices) is { } deviceInputGrad
+            && gpu.TryIndexCopySourceGradOnDevice(gradOutput, axis, deviceIndices) is { } deviceValuesGrad
+            && deviceValuesGrad.Length == inputs[1].Length)
+        {
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceInputGrad, engine);
+            DifferentiableOps.AccumulateGrad(grads, inputs[1], deviceValuesGrad.Reshape(inputs[1]._shape), engine);
+            return;
+        }
+
         // dL/dinput = gradOutput with scattered positions zeroed.
         //
         // FRESH allocation, NOT gradOutput.Clone(): Clone() shares gradOutput's TensorStorage

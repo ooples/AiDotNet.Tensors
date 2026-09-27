@@ -73,7 +73,6 @@ public class TapeBailAuditTests
         // scattered positions, so d/d(input) must be zero there — a mask the reused recording did not
         // reproduce. Signature matching was not enough: only the gradient is wrong, the forward is perfect,
         // so forward parity could never surface it. Needs its own GPU-side backward, not a reused one.
-        "Scatter",
 
         // CUDA now provides where_select, so Sparsemax's non-tape device path is complete. It still bails under
         // a tape because this composite forward does not record a backward; returning the resident result as-is
@@ -209,6 +208,7 @@ public class TapeBailAuditTests
         "Conv3D",
         "FlashAttention",
         "GroupedQueryAttention",
+        "Scatter",
     };
 
     private static string[] GpuEngineSources(string root)

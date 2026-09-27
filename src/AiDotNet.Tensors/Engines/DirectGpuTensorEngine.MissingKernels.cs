@@ -7481,14 +7481,11 @@ public partial class DirectGpuTensorEngine
         if (values is null) throw new ArgumentNullException(nameof(values));
         GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
         int normalizedAxis = axis < 0 ? axis + input.Rank : axis;
-        // Tape bail RESTORED after a gradient test caught a real defect. Recording the node here with
-        // CpuEngine's ScatterBackward produced d(values) exactly correct but d(input) wrong by 3.14e-01
-        // — not rounding. Scatter OVERWRITES input at the scattered positions, so d/d(input) must be ZERO
-        // there and 1 elsewhere; that mask depends on the indices, and reusing the CPU recording did not
-        // reproduce it against the GPU result. Signature matching was NOT sufficient here: the forward is
-        // correct and only the gradient is wrong, so forward parity would never have caught it.
-        // Re-attempt only with a gradient test proving BOTH operands, not by inspection.
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+        // Scatter OVERWRITES input at the scattered positions, so d/d(input) is zero there and 1 elsewhere, and
+        // d/d(values) gathers the upstream gradient at them. An earlier recording got d(input) wrong by 3.14e-01;
+        // this one saves the NORMALISED axis the backward indexes with and runs the same device helpers as
+        // index_copy, and GpuTapeGradientParityTests proves BOTH operands against the CPU.
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || normalizedAxis < 0 || normalizedAxis >= input.Rank || !TryGetBackend(out var backend))
             return base.Scatter(input, indices, values, axis);
         try
@@ -7521,7 +7518,8 @@ public partial class DirectGpuTensorEngine
                 backend.IndexWrite(output, indexBuffer.Buffer, valuesBuffer.Buffer, 0f, mode: 0,
                     outerSize, indices.Length, innerSize, axisSize);
             });
-
+            Autodiff.DifferentiableOps.RecordBinary("Scatter", scatterResult, input, values,
+                Autodiff.BackwardFunctions<T>.ScatterBackward, new object[] { indices, normalizedAxis });
             return scatterResult;
         }
         catch
