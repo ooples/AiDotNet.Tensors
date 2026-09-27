@@ -4748,6 +4748,80 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <summary>
+    /// Input gradient of index_copy / index_fill on the device: <paramref name="gradOutput"/> with the positions the
+    /// forward overwrote along <paramref name="axis"/> set to zero, using the same IndexWrite kernel as the forward.
+    /// Null when the device path cannot take it, so the caller falls back to the host loop.
+    /// </summary>
+    internal Tensor<T>? TryIndexWriteInputGradOnDevice<T>(Tensor<T> gradOutput, int axis, Tensor<int> indices)
+    {
+        if (!TryIndexAxisGeometry(gradOutput, axis, indices, out int outer, out int axisSize, out int inner)
+            || !TryGetBackend(out var backend))
+            return null;
+        try
+        {
+            int n = gradOutput.Length;
+            var upstream = gradOutput.IsContiguous ? gradOutput : (Tensor<T>)gradOutput.Contiguous();
+            var ci = indices.IsContiguous ? indices : (Tensor<int>)indices.Contiguous();
+            using var bufG = GetOrAllocateBuffer(backend, upstream);
+            using var bufIdx = GetOrAllocateInt32IndexBuffer(backend, ci);
+            return DispatchDeferredGpuOp<T>(backend, n, (int[])gradOutput._shape.Clone(), output =>
+            {
+                backend.Copy(bufG.Buffer, output, n);
+                backend.IndexWrite(output, bufIdx.Buffer, bufG.Buffer, 0f, mode: 1,
+                    outer, indices.Length, inner, axisSize);
+            });
+        }
+        catch (Exception)
+        {
+            if (ThrowOnGpuKernelFallback) throw;
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Source gradient of index_copy on the device: <paramref name="gradOutput"/> gathered along
+    /// <paramref name="axis"/> at <paramref name="indices"/>. Null when the device path cannot take it.
+    /// </summary>
+    internal Tensor<T>? TryIndexCopySourceGradOnDevice<T>(Tensor<T> gradOutput, int axis, Tensor<int> indices)
+    {
+        if (!TryIndexAxisGeometry(gradOutput, axis, indices, out int outer, out int axisSize, out int inner)
+            || !TryGetBackend(out var backend) || backend is not IResidentIndexBackend indexBackend)
+            return null;
+        try
+        {
+            int ax = axis < 0 ? axis + gradOutput.Rank : axis;
+            var upstream = gradOutput.IsContiguous ? gradOutput : (Tensor<T>)gradOutput.Contiguous();
+            var ci = indices.IsContiguous ? indices : (Tensor<int>)indices.Contiguous();
+            var shape = (int[])gradOutput._shape.Clone();
+            shape[ax] = indices.Length;
+            using var bufG = GetOrAllocateBuffer(backend, upstream);
+            using var bufIdx = GetOrAllocateInt32IndexBuffer(backend, ci);
+            return DispatchDeferredGpuOp<T>(backend, checked(outer * indices.Length * inner), shape, output =>
+                indexBackend.IndexSelect(bufG.Buffer, bufIdx.Buffer, output, outer, axisSize, indices.Length, inner));
+        }
+        catch (Exception)
+        {
+            if (ThrowOnGpuKernelFallback) throw;
+            return null;
+        }
+    }
+
+    private static bool TryIndexAxisGeometry<T>(Tensor<T> tensor, int axis, Tensor<int> indices,
+        out int outer, out int axisSize, out int inner)
+    {
+        outer = axisSize = inner = 0;
+        int rank = tensor.Rank;
+        int ax = axis < 0 ? axis + rank : axis;
+        if (typeof(T) != typeof(float) || Compilation.GraphMode.IsActive || ax < 0 || ax >= rank
+            || indices.Rank != 1)
+            return false;
+        outer = 1; for (int k = 0; k < ax; k++) outer *= tensor._shape[k];
+        inner = 1; for (int k = ax + 1; k < rank; k++) inner *= tensor._shape[k];
+        axisSize = tensor._shape[ax];
+        return true;
+    }
+
+    /// <summary>
     /// PadNd backward on the device: every output gradient element is scatter-added into the input offset the
     /// forward read it from (<see cref="Autodiff.BackwardFunctions{T}.PadNdSourceMap"/>, shared with the host
     /// loop). Constant-mode fill positions are routed to one extra dump slot past the end, which is dropped.
@@ -5071,7 +5145,7 @@ public partial class DirectGpuTensorEngine
         if (source is null) throw new ArgumentNullException(nameof(source));
         int rank = tensor.Rank;
         int ax = axis < 0 ? axis + rank : axis;
-        if (typeof(T) != typeof(float) || IsTapeActive<T>() || Compilation.GraphMode.IsActive
+        if (typeof(T) != typeof(float) || Compilation.GraphMode.IsActive
             || ax < 0 || ax >= rank || indices.Rank != 1 || !TryGetBackend(out var backend))
             return base.TensorIndexCopy(tensor, axis, indices, source);
         try
@@ -5099,12 +5173,16 @@ public partial class DirectGpuTensorEngine
             using var bufIn = GetOrAllocateBuffer(backend, ct);
             using var bufSrc = GetOrAllocateBuffer(backend, cs);
             using var bufIdx = GetOrAllocateInt32IndexBuffer(backend, ci);
-            return DispatchDeferredGpuOp<T>(backend, n, (int[])tensor._shape.Clone(), output =>
+            var result = DispatchDeferredGpuOp<T>(backend, n, (int[])tensor._shape.Clone(), output =>
             {
                 backend.Copy(bufIn.Buffer, output, n);
                 backend.IndexWrite(output, bufIdx.Buffer, bufSrc.Buffer, 0f, mode: 0,
                     outerSize, idxAxis, innerSize, dstAxis);
             });
+            // Same node and saved state CpuEngine records.
+            Autodiff.DifferentiableOps.RecordBinary("TensorIndexCopy", result, tensor, source,
+                Autodiff.BackwardFunctions<T>.IndexCopyBackward, savedState: new object[] { axis, indices });
+            return result;
         }
         catch (Exception)
         {
@@ -5122,7 +5200,7 @@ public partial class DirectGpuTensorEngine
         if (indices is null) throw new ArgumentNullException(nameof(indices));
         int rank = tensor.Rank;
         int ax = axis < 0 ? axis + rank : axis;
-        if (typeof(T) != typeof(float) || IsTapeActive<T>() || Compilation.GraphMode.IsActive
+        if (typeof(T) != typeof(float) || Compilation.GraphMode.IsActive
             || ax < 0 || ax >= rank || indices.Rank != 1 || !TryGetBackend(out var backend))
             return base.TensorIndexFill(tensor, axis, indices, value);
         try
@@ -5144,12 +5222,15 @@ public partial class DirectGpuTensorEngine
             }
             using var bufIn = GetOrAllocateBuffer(backend, ct);
             using var bufIdx = GetOrAllocateInt32IndexBuffer(backend, ci);
-            return DispatchDeferredGpuOp<T>(backend, n, (int[])tensor._shape.Clone(), output =>
+            var result = DispatchDeferredGpuOp<T>(backend, n, (int[])tensor._shape.Clone(), output =>
             {
                 backend.Copy(bufIn.Buffer, output, n);
                 backend.IndexWrite(output, bufIdx.Buffer, bufIn.Buffer, fill, mode: 1,
                     outerSize, idxAxis, innerSize, dstAxis);
             });
+            Autodiff.DifferentiableOps.RecordUnary("TensorIndexFill", result, tensor,
+                Autodiff.BackwardFunctions<T>.IndexFillBackward, savedState: new object[] { axis, indices });
+            return result;
         }
         catch (Exception)
         {

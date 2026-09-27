@@ -7361,6 +7361,22 @@ internal static class BackwardFunctions<T>
         var indices = (Tensor<int>)savedState[1];
         var input = inputs[0];
         var ops = MathHelper.GetNumericOperations<T>();
+        if (engine is DirectGpuTensorEngine gpu
+            && gpu.TryIndexWriteInputGradOnDevice(gradOutput, axis, indices) is { } deviceInputGrad)
+        {
+            if (inputs.Length < 2)
+            {
+                DifferentiableOps.AccumulateGrad(grads, input, deviceInputGrad, engine);
+                return;
+            }
+            // Source gradient on the device too, or fall through so the host computes both consistently.
+            if (gpu.TryIndexCopySourceGradOnDevice(gradOutput, axis, indices) is { } deviceSourceGrad)
+            {
+                DifferentiableOps.AccumulateGrad(grads, input, deviceInputGrad, engine);
+                DifferentiableOps.AccumulateGrad(grads, inputs[1], deviceSourceGrad, engine);
+                return;
+            }
+        }
 
         // dL/d(input): clone gradOutput, zero the overwritten positions.
             // FRESH allocation, NOT gradOutput.Clone(). Clone() shares gradOutput's TensorStorage
@@ -7429,6 +7445,12 @@ internal static class BackwardFunctions<T>
         var indices = (Tensor<int>)savedState[1];
         var input = inputs[0];
         var ops = MathHelper.GetNumericOperations<T>();
+        if (engine is DirectGpuTensorEngine gpu
+            && gpu.TryIndexWriteInputGradOnDevice(gradOutput, axis, indices) is { } deviceGrad)
+        {
+            DifferentiableOps.AccumulateGrad(grads, input, deviceGrad, engine);
+            return;
+        }
             // FRESH allocation, NOT gradOutput.Clone(). Clone() shares gradOutput's TensorStorage
             // copy-on-write; the write below privatises it, but the privatised buffer is pool-backed and
             // gets recycled once the backward scope ends — while the grads dictionary still holds a

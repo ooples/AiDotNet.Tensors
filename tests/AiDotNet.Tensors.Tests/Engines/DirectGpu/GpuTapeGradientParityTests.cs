@@ -324,6 +324,35 @@ public class GpuTapeGradientParityTests : IDisposable
     public void PadNd_stays_on_the_device_while_a_tape_records() =>
         AssertStaysOnDeviceUnderTape("PadNd", static (e, t) => e.PadNd(t, new[] { 3, 2, 1, 4 }, PadMode.Constant, 0.5f),
             static (x, y) => { Assert.Equal(new[] { 11, 15 }, y.Shape.ToArray()); Assert.Equal(0.5f, y[0, 0]); Assert.Equal(x[0, 0], y[1, 3]); });
+    private static readonly Tensor<int> ColumnIndices = new(new[] { 1, 4, 7 }, new[] { 3 });
+
+    [SkippableFact]
+    public void TensorIndexCopy_destination_gradients_match_cpu() =>
+        AssertGradientParity("IndexCopy(dest)", Rand([6, 10], seed: 107),
+            static (e, t) => e.TensorIndexCopy(t, 1, ColumnIndices, Rand([6, 3], seed: 109)),
+            probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void TensorIndexCopy_source_gradients_match_cpu() =>
+        AssertGradientParity("IndexCopy(source)", Rand([6, 3], seed: 113),
+            static (e, t) => e.TensorIndexCopy(Rand([6, 10], seed: 127), 1, ColumnIndices, t),
+            probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void TensorIndexFill_gradients_match_cpu() =>
+        AssertGradientParity("IndexFill", Rand([6, 10], seed: 131),
+            static (e, t) => e.TensorIndexFill(t, 1, ColumnIndices, -3f), probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void TensorIndexCopy_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("TensorIndexCopy",
+            static (e, t) => e.TensorIndexCopy(t, 1, ColumnIndices, Rand([6, 3], seed: 137)),
+            static (x, y) => Assert.Equal(x[0, 0], y[0, 0]));
+
+    [SkippableFact]
+    public void TensorIndexFill_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("TensorIndexFill", static (e, t) => e.TensorIndexFill(t, 1, ColumnIndices, -3f),
+            static (x, y) => { Assert.Equal(-3f, y[0, 1]); Assert.Equal(x[0, 0], y[0, 0]); });
     [SkippableFact]
     public void TensorClampMin_gradients_match_cpu() =>
         AssertGradientParity("ClampMin", Rand([6, 10], seed: 73),
