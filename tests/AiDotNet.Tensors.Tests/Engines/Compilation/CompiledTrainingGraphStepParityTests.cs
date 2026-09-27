@@ -68,8 +68,8 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
     /// </summary>
     private static void FeedBatch(Tensor<float> x, Tensor<float> y, int step)
     {
-        Rand([Batch, Inputs], 100 + step, 1f).AsSpan().CopyTo(x.AsWritableSpan());
-        Rand([Batch, Outputs], 200 + step, 1f).AsSpan().CopyTo(y.AsWritableSpan());
+        Rand(x.Shape.ToArray(), 100 + step, 1f).AsSpan().CopyTo(x.AsWritableSpan());
+        Rand(y.Shape.ToArray(), 200 + step, 1f).AsSpan().CopyTo(y.AsWritableSpan());
     }
 
     private sealed class Run
@@ -298,6 +298,170 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                     }
                 }
             }
+        }
+    }
+
+    /// <summary>
+    /// The same ground truth on the CPU engine, which AiDotNet's compiled training step uses whenever no GPU is
+    /// selected: every step's plan gradient (plus the L2 term) must equal a fresh GradientTape's on that step's batch.
+    /// </summary>
+    [Theory]
+    [InlineData(false, 0.0)]
+    [InlineData(true, 0.0)]
+    [InlineData(true, 0.05)]
+    public void Every_cpu_step_computes_the_tape_gradient(bool composedMse, double l2)
+    {
+        var prior = AiDotNetEngine.Current;
+        var cpu = new CpuEngine();
+        try
+        {
+            AiDotNetEngine.Current = cpu;
+            var x = Rand([Batch, Inputs], 1, 1f);
+            var y = Rand([Batch, Outputs], 2, 1f);
+            var parameters = new[] { Rand([Inputs, Hidden], 3, 0.3f), new Tensor<float>([Hidden]), Rand([Hidden, Outputs], 4, 0.3f), new Tensor<float>([Outputs]) };
+
+            ICompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.EnableTraining(parameters))
+            {
+                Loss(cpu, x, y, parameters, composedMse);
+                plan = scope.CompileTraining(parameters);
+            }
+            using (plan)
+            {
+                plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2f);
+                plan.SetL2Regularization(l2);
+                var gradients = (Tensor<float>[])typeof(CompiledTrainingPlan<float>)
+                    .GetField("_gradients", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(plan)!;
+                // Reference Adam (Kingma & Ba, PyTorch defaults) on the tape gradients: the plan's weights must follow it.
+                var m = parameters.Select(t => new double[t.Length]).ToArray();
+                var v = parameters.Select(t => new double[t.Length]).ToArray();
+                for (int s = 0; s < Steps; s++)
+                {
+                    FeedBatch(x, y, s);
+                    var expected = CpuTapeGradients(x, y, parameters, composedMse);
+                    var expectedWeights = new double[parameters.Length][];
+                    for (int p = 0; p < parameters.Length; p++)
+                    {
+                        var theta = parameters[p].ToArray();
+                        for (int i = 0; i < expected[p].Length; i++) expected[p][i] += (float)l2 * theta[i];
+                        expectedWeights[p] = new double[theta.Length];
+                        for (int i = 0; i < theta.Length; i++)
+                        {
+                            m[p][i] = 0.9 * m[p][i] + 0.1 * expected[p][i];
+                            v[p][i] = 0.999 * v[p][i] + 0.001 * expected[p][i] * expected[p][i];
+                            double mHat = m[p][i] / (1 - Math.Pow(0.9, s + 1)), vHat = v[p][i] / (1 - Math.Pow(0.999, s + 1));
+                            expectedWeights[p][i] = theta[i] - 1e-2 * mHat / (Math.Sqrt(vHat) + 1e-8);
+                        }
+                    }
+                    plan.Step();
+                    for (int p = 0; p < parameters.Length; p++)
+                    {
+                        var w = parameters[p].ToArray();
+                        for (int i = 0; i < w.Length; i++)
+                            Assert.True(Math.Abs(w[i] - expectedWeights[p][i]) <= 1e-4,
+                                $"step {s}, param {p}[{i}]: plan weight {w[i]} != reference Adam {expectedWeights[p][i]}");
+                        var actual = gradients[p].ToArray();
+                        double diff = 0, norm = 0;
+                        for (int i = 0; i < expected[p].Length; i++)
+                        {
+                            double d = actual[i] - expected[p][i];
+                            diff += d * d; norm += (double)expected[p][i] * expected[p][i];
+                        }
+                        Assert.True(Math.Sqrt(diff) <= 1e-3 * Math.Sqrt(norm) + 1e-6,
+                            $"step {s}, param {p}: |plan - tape| = {Math.Sqrt(diff):G4}, |tape| = {Math.Sqrt(norm):G4}");
+                    }
+                }
+            }
+        }
+        finally
+        {
+            AiDotNetEngine.Current = prior;
+        }
+    }
+
+    /// <summary>
+    /// A training loop recompiles when the batch shape changes (the short last batch of an epoch). The new plan must
+    /// continue the optimizer - moments, step count - or Adam restarts from step 1 every epoch. Reference: one Adam
+    /// trajectory across both batch sizes.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void A_plan_for_a_new_batch_shape_continues_the_previous_plans_optimizer(bool onGpu)
+    {
+        var prior = AiDotNetEngine.Current;
+        DirectGpuTensorEngine? gpu = null;
+        if (onGpu) Skip.IfNot(TryGpu(out gpu) && gpu is not null, "GPU backend did not resolve.");
+        IEngine engine = onGpu ? gpu! : new CpuEngine();
+        try
+        {
+            AiDotNetEngine.Current = engine;
+            var parameters = new[] { Rand([Inputs, Hidden], 3, 0.3f), new Tensor<float>([Hidden]), Rand([Hidden, Outputs], 4, 0.3f), new Tensor<float>([Outputs]) };
+            if (onGpu) foreach (var p in parameters) p.Gpu();
+            ICompiledTrainingPlan<float> Compile(Tensor<float> x, Tensor<float> y)
+            {
+                using var scope = GraphMode.EnableTraining(parameters);
+                Loss(engine, x, y, parameters, composedMse: true);
+                return scope.CompileTraining(parameters);
+            }
+            var m = parameters.Select(t => new double[t.Length]).ToArray();
+            var v = parameters.Select(t => new double[t.Length]).ToArray();
+            int t = 0;
+            void StepAndCheck(ICompiledTrainingPlan<float> plan, Tensor<float> x, Tensor<float> y, int s)
+            {
+                FeedBatch(x, y, s);
+                var g = CpuTapeGradients(x, y, parameters, composedMse: true);
+                t++;
+                var expected = new double[parameters.Length][];
+                for (int p = 0; p < parameters.Length; p++)
+                {
+                    var theta = parameters[p].ToArray();
+                    expected[p] = new double[theta.Length];
+                    for (int i = 0; i < theta.Length; i++)
+                    {
+                        m[p][i] = 0.9 * m[p][i] + 0.1 * g[p][i];
+                        v[p][i] = 0.999 * v[p][i] + 0.001 * g[p][i] * g[p][i];
+                        expected[p][i] = theta[i] - 1e-2 * (m[p][i] / (1 - Math.Pow(0.9, t))) / (Math.Sqrt(v[p][i] / (1 - Math.Pow(0.999, t))) + 1e-8);
+                    }
+                }
+                plan.Step();
+                for (int p = 0; p < parameters.Length; p++)
+                {
+                    var w = parameters[p].ToArray();
+                    for (int i = 0; i < w.Length; i++)
+                        Assert.True(Math.Abs(w[i] - expected[p][i]) <= 1e-4,
+                            $"step {t}, param {p}[{i}]: plan weight {w[i]} != reference Adam {expected[p][i]}");
+                }
+            }
+
+            var xFull = Rand([Batch, Inputs], 1, 1f);
+            var yFull = Rand([Batch, Outputs], 2, 1f);
+            var xTail = Rand([Batch / 2 + 3, Inputs], 5, 1f);
+            var yTail = Rand([Batch / 2 + 3, Outputs], 6, 1f);
+            using var full = Compile(xFull, yFull);
+            full.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2f);
+            for (int s = 0; s < 3; s++) StepAndCheck(full, xFull, yFull, s);
+
+            using var tail = Compile(xTail, yTail);
+            tail.ContinueOptimizerFrom(full);
+            StepAndCheck(tail, xTail, yTail, 3);
+
+            // And back: the full-batch plan continues from the tail plan's state, not its own stale one. Enough steps
+            // for a GPU plan to warm up, capture and replay after the restore.
+            full.ContinueOptimizerFrom(tail);
+            for (int s = 4; s < 10; s++) StepAndCheck(full, xFull, yFull, s);
+            if (onGpu && gpu!.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend
+                && Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") != "0")
+            {
+                var exec = (IntPtr)typeof(CompiledTrainingPlan<float>)
+                    .GetField("_stepGraphExec", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(full)!;
+                Assert.True(exec != IntPtr.Zero, "the restored plan never captured a graph, so the replay path went untested");
+            }
+        }
+        finally
+        {
+            AiDotNetEngine.Current = prior;
+            gpu?.Dispose();
         }
     }
 

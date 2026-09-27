@@ -466,6 +466,18 @@ public interface ICompiledTrainingPlan<T> : IDisposable
     void SetL2Regularization(double strength);
 
     /// <summary>
+    /// Continues <paramref name="previous"/>'s optimizer in this plan: its configuration, step count, LR schedule
+    /// position, gradient clip, L2 strength and every per-parameter moment. Both plans must train the same parameter
+    /// tensors in the same order. A training loop recompiles when the batch shape changes - most commonly the smaller
+    /// last batch of an epoch - and a freshly configured plan would otherwise restart the optimizer from zero moments
+    /// and step 1, so the run silently trains a different trajectory from the eager optimizer it stands in for.
+    /// </summary>
+    /// <exception cref="ArgumentException">The plans train different parameters, or <paramref name="previous"/>
+    /// is not a plan this library compiled.</exception>
+    /// <exception cref="InvalidOperationException"><paramref name="previous"/> has no configured optimizer.</exception>
+    void ContinueOptimizerFrom(ICompiledTrainingPlan<T> previous);
+
+    /// <summary>
     /// Requests bfloat16 storage for the Adam/AdamW moment state (m, v) on the
     /// float fused path (#1745). Halves resident optimizer-state memory while
     /// keeping the fp32 update math, so large models can stay on the fused fast

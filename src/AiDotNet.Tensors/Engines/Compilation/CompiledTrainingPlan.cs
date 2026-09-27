@@ -1374,6 +1374,27 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         _l2Regularization = (float)strength;
     }
 
+    /// <inheritdoc/>
+    public void ContinueOptimizerFrom(ICompiledTrainingPlan<T> previous)
+    {
+        if (previous is null) throw new ArgumentNullException(nameof(previous));
+        if (ReferenceEquals(previous, this)) return;
+        if (previous is not CompiledTrainingPlan<T> source)
+            throw new ArgumentException($"Cannot continue the optimizer of a {previous.GetType().Name}.", nameof(previous));
+        if (source._parameters.Length != _parameters.Length)
+            throw new ArgumentException(
+                $"The previous plan trains {source._parameters.Length} parameters, this one {_parameters.Length}.", nameof(previous));
+        for (int p = 0; p < _parameters.Length; p++)
+        {
+            if (!ReferenceEquals(source._parameters[p], _parameters[p]))
+                throw new ArgumentException($"Parameter {p} is a different tensor in the previous plan.", nameof(previous));
+        }
+        var checkpoint = source.CaptureFusedOptimizerCheckpoint()
+            ?? throw new InvalidOperationException("The previous plan has no configured optimizer to continue.");
+        RestoreFusedOptimizerCheckpoint(checkpoint);
+        _l2Regularization = source._l2Regularization;
+    }
+
     // grad += strength * param for every parameter, before clipping (see SetL2Regularization). On the device when both
     // the gradient and the parameter are resident (the captured / resident path) - one launch per parameter - else on
     // the host arrays the optimizer binds.
@@ -5313,16 +5334,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         };
 
     private static float[]? CopyNonEmpty(float[][]? arrays, int index)
-        => arrays is not null && arrays[index].Length != 0 ? (float[])arrays[index].Clone() : null;
+        => arrays?[index] is { Length: > 0 } slot ? (float[])slot.Clone() : null;   // a device-resident parameter has no host slot
 
     private static double[]? CopyNonEmpty(double[][]? arrays, int index)
-        => arrays is not null && arrays[index].Length != 0 ? (double[])arrays[index].Clone() : null;
+        => arrays?[index] is { Length: > 0 } slot ? (double[])slot.Clone() : null;   // a device-resident parameter has no host slot
 
     private static ushort[]? CopyNonEmpty(ushort[][]? arrays, int index)
-        => arrays is not null && arrays[index].Length != 0 ? (ushort[])arrays[index].Clone() : null;
+        => arrays?[index] is { Length: > 0 } slot ? (ushort[])slot.Clone() : null;   // a device-resident parameter has no host slot
 
     private static byte[]? CopyNonEmpty(byte[][]? arrays, int index)
-        => arrays is not null && arrays[index].Length != 0 ? (byte[])arrays[index].Clone() : null;
+        => arrays?[index] is { Length: > 0 } slot ? (byte[])slot.Clone() : null;   // a device-resident parameter has no host slot
 
     private static void CopyInto(float[][]? destination, int index, float[]? source)
     {
