@@ -25626,7 +25626,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.Upsample<T>(Tensor<T> input, int scaleH, int scaleW)
     {
-        if (IsTapeActive<T>()) return base.Upsample(input, scaleH, scaleW);
+        // Under a tape the kernel runs and records the same UpsampleBackward node the public override and
+        // CpuEngine record; UpsampleBackward has its own device path.
         if (typeof(T)==typeof(float) && TryGetBackend(out var b) && input.Rank==4 && scaleH==scaleW)
         {
             try
@@ -25635,8 +25636,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 int oh=ih*scaleH,ow=iw*scaleW;
                 int total=ba*ch*oh*ow;
                 var gi=UploadTensorRaw(b, input);
-                return DispatchDeferredGpuOp<T>(b,total,new[]{ba,ch,oh,ow},
+                var upsampled = DispatchDeferredGpuOp<T>(b,total,new[]{ba,ch,oh,ow},
                     output => b.NearestNeighborUpsample(gi,output,ba*ch,ih,iw,scaleH));
+                Autodiff.DifferentiableOps.RecordUnary("Upsample", upsampled, input,
+                    Autodiff.BackwardFunctions<T>.UpsampleBackward, savedState: new object[] { scaleH, scaleW });
+                return upsampled;
             }
             catch { }
         }

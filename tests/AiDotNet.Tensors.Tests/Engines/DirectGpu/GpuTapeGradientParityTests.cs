@@ -229,6 +229,18 @@ public class GpuTapeGradientParityTests : IDisposable
         });
 
     [SkippableFact]
+    public void Upsample_through_IEngine_gradients_match_cpu() =>
+        // Called through IEngine on purpose: that explicit implementation is the one that used to bail.
+        AssertGradientParity("Upsample", Rand([1, 2, 3, 4], seed: 45),
+            static (e, t) => ((IEngine)e).Upsample(t, 2, 2), probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void Upsample_through_IEngine_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("Upsample",
+            static (e, t) => ((IEngine)e).Upsample(e.Reshape(t, new[] { 1, 1, 6, 10 }), 2, 2),
+            static (_, y) => Assert.Equal(new[] { 1, 1, 12, 20 }, y.Shape.ToArray()));
+
+    [SkippableFact]
     public void TensorTranspose_stays_on_the_device_while_a_tape_records() =>
         AssertStaysOnDeviceUnderTape("TensorTranspose", static (e, t) => e.TensorTranspose(t), static (x, y) =>
         {
