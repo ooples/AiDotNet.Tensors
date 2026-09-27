@@ -92,8 +92,10 @@ jobs:
         # past the hang timeout under CI CPU contention). Excluding them drops that test to ~28s and
         # the whole suite by most of an hour. Line coverage of hand-emitted SIMD intrinsics is not
         # meaningful anyway, and those kernels are exercised by every numerical test regardless.
+        # PyTorchParity / PyTorchParityGpu measure the absolute distance to PyTorch parity (#1055). They are red
+        # by design until parity is reached, so they run in parity.yml's nightly lane, not as a PR gate.
         dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --no-build --verbosity normal --framework net10.0 \
-          --filter "Category!=Benchmark&Category!=Performance" \
+          --filter "Category!=Benchmark&Category!=Performance&Category!=PyTorchParity&Category!=PyTorchParityGpu" \
           --blame-hang --blame-hang-timeout 600s --blame-crash \
           --collect:"XPlat Code Coverage" \
           --results-directory ./coverage \
