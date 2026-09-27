@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.133.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.132.1...v0.133.0) (2026-09-27)
+
+
+### Features
+
+* **compilation:** export and import a compiled plan's fused optimizer state ([#1051](https://github.com/ooples/AiDotNet.Tensors/issues/1051)) ([b922a2b](https://github.com/ooples/AiDotNet.Tensors/commit/b922a2bcad820fe8d424ccd6723870133f8ceafb))
+
+
+### Bug Fixes
+
+* **compilation:** record the saved state graph-mode backwards read ([#1047](https://github.com/ooples/AiDotNet.Tensors/issues/1047)) ([0cb0459](https://github.com/ooples/AiDotNet.Tensors/commit/0cb0459d7f8a579be91b5ee872b39054369a853f))
+
+
+### Performance
+
+* **gpu:** keep the GLA scan and matmul-transposed/fused-linear backwards on the device during training ([#1050](https://github.com/ooples/AiDotNet.Tensors/issues/1050)) ([29e61a1](https://github.com/ooples/AiDotNet.Tensors/commit/29e61a14dd060316362f1715d4fb37dde778af3e))
+* **gpu:** keep the remaining tape-bailing ops on the device ([#1053](https://github.com/ooples/AiDotNet.Tensors/issues/1053)) ([0cfdd72](https://github.com/ooples/AiDotNet.Tensors/commit/0cfdd72df9766a30dfb142d7a7d9bf16881b6769))
+* **gpu:** keep training on the device — tape-time residency, device backwards, pooled/uninitialized/staged CUDA memory ([#1052](https://github.com/ooples/AiDotNet.Tensors/issues/1052)) ([ba3c2fd](https://github.com/ooples/AiDotNet.Tensors/commit/ba3c2fd8043a8beeea75de990bed5054842c021c))
+* **gpu:** single-launch tile / concat / last-axis slice and batched IRFFT (up to ~100,000x) ([#1048](https://github.com/ooples/AiDotNet.Tensors/issues/1048)) ([3be2431](https://github.com/ooples/AiDotNet.Tensors/commit/3be24314144ce39a0d5cc9f4b09bbd6ef78db98b))
+
 ## [0.132.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.132.0...v0.132.1) (2026-09-24)
 
 
