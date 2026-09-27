@@ -147,4 +147,72 @@ public sealed class ResidentCompiledStepTests : IClassFixture<DirectGpuTensorEng
             AiDotNetEngine.Current = previous;
         }
     }
+
+    /// <summary>
+    /// A compiled plan records its ops through the CPU base (GraphMode), so it took the CPU path's backward for RFFT,
+    /// IRFFT and the GLA scan -- managed transforms / a managed BPTT recurrence with host copies on every compiled
+    /// GPU step (measured on an LM: ~60% of the step waiting on downloads) -- while eager GPU steps recorded device
+    /// backwards. The shared backward functions now run the device path on the GPU engine.
+    /// </summary>
+    [SkippableFact]
+    public void CompiledSpectralAndScanStep_BackwardStaysOnDevice_AndMatchesCpu()
+    {
+        Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
+        const int b = 2, s = 16, d = 8, heads = 2;
+        float[] Run(IEngine e, out long readback, out string sites)
+        {
+            var previous = AiDotNetEngine.Current;
+            AiDotNetEngine.Current = e;
+            try
+            {
+                var x = Filled(new[] { b, s, d }, 11, 0.5f);
+                var q = Filled(new[] { b, s, d }, 12, 0.5f);
+                var k = Filled(new[] { b, s, d }, 13, 0.5f);
+                var g = Filled(new[] { b, s, heads }, 14, 0.5f);
+                var r = Filled(new[] { b, s, d }, 15, 1f);
+                if (e is DirectGpuTensorEngine) { x = x.Gpu(); q = q.Gpu(); k = k.Gpu(); }
+                ICompiledTrainingPlan<float> plan;
+                using (var scope = GraphMode.Enable())
+                {
+                    // Spectral mixing along the sequence (RFFT -> IRFFT), then the gated linear-attention scan.
+                    var xt = e.TensorPermute(x, new[] { 0, 2, 1 });
+                    var mixed = e.TensorPermute(e.IRFFT(e.TensorMultiplyScalar(e.RFFT(xt), 0.5f), s), new[] { 0, 2, 1 });
+                    var gate = e.TensorSigmoid(g);
+                    var y = e.GlaScanForward(e.TensorTanh(q), e.TensorTanh(k), mixed, gate, heads);
+                    e.ReduceSum(e.TensorMultiply(y, r), null);
+                    plan = scope.CompileTraining(new[] { x, q, k });
+                }
+                using (plan)
+                {
+                    plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.0f);
+                    plan.Step();
+                    bool savedCapture = GpuLaunchProbe.CaptureReadbackSites;
+                    try
+                    {
+                        GpuLaunchProbe.CaptureReadbackSites = true;
+                        GpuLaunchProbe.Reset();
+                        plan.Step();
+                        readback = GpuLaunchProbe.ReadbackBytes;
+                        sites = string.Join("; ", GpuLaunchProbe.ReadbackSites);
+                    }
+                    finally
+                    {
+                        GpuLaunchProbe.CaptureReadbackSites = savedCapture;
+                    }
+                    return x.Grad!.ToArray().Concat(q.Grad!.ToArray()).Concat(k.Grad!.ToArray()).ToArray();
+                }
+            }
+            finally
+            {
+                AiDotNetEngine.Current = previous;
+            }
+        }
+
+        var cpu = Run(new CpuEngine(), out _, out _);
+        var gpu = Run(_fixture.Engine!, out long gpuReadback, out string gpuSites);
+        Assert.True(gpuReadback <= 64, $"a compiled spectral + scan step read back {gpuReadback} bytes: {gpuSites}");
+        Assert.Equal(cpu.Length, gpu.Length);
+        for (int i = 0; i < cpu.Length; i++)
+            Assert.True(Math.Abs(cpu[i] - gpu[i]) <= 1e-3f * Math.Max(1f, Math.Abs(cpu[i])), $"grad[{i}] cpu {cpu[i]} gpu {gpu[i]}");
+    }
 }

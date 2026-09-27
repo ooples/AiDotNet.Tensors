@@ -9076,6 +9076,16 @@ internal static class BackwardFunctions<T>
         int nFft = SavedInt(nameof(RFFTAdjointBackward), savedState, 1, "nFft");
         int numFreqs = nFft / 2 + 1;
 
+        // Device adjoint when the backward runs on the GPU engine. A compiled plan records this function from the
+        // CPU base (GraphMode), so without this every compiled GPU step ran the transform on the host: a download,
+        // a managed FFT per row, an upload (measured: ~26% of an LM's compiled step).
+        if (engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine gpuRfft
+            && gpuRfft.RfftAdjointGpu(gradOutput, n, nFft, input._shape) is { } deviceGrad)
+        {
+            DifferentiableOps.AccumulateGrad(grads, input, deviceGrad, engine);
+            return;
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradData = gradOutput.GetDataArray();
         int batchSize = gradOutput.Length / (numFreqs * 2);
@@ -9138,6 +9148,15 @@ internal static class BackwardFunctions<T>
         int numFreqs = SavedInt(nameof(IRFFTAdjointBackward), savedState, 0, "numFreqs");
         int nFft = SavedInt(nameof(IRFFTAdjointBackward), savedState, 1, "nFft");
         int outputLength = SavedInt(nameof(IRFFTAdjointBackward), savedState, 2, "outputLength");
+
+        // Device adjoint on the GPU engine (see RFFTAdjointBackward: the compiled plan records this CPU-path
+        // function and replays it on the GPU engine).
+        if (engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine gpuIrfft
+            && gpuIrfft.IrfftAdjointGpu(gradOutput, numFreqs, nFft, outputLength, input._shape) is { } deviceGrad)
+        {
+            DifferentiableOps.AccumulateGrad(grads, input, deviceGrad, engine);
+            return;
+        }
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradData = gradOutput.GetDataArray();
