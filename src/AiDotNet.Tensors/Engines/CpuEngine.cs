@@ -8969,6 +8969,15 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // When tape is active, use WithIndices variant so backward can access max indices
         var tape = GradientTape<T>.Current;
+        if (tape is not null && padding > 0)
+        {
+            // MaxPool2DWithIndices has no padding, so the padded pool took this branch and silently pooled the
+            // UNPADDED input: a smaller output than the same call without a tape.
+            var padded = MaxPool2DPaddedWithTensorIndices(input, poolSize, stride, padding, out var paddedIndices);
+            DifferentiableOps.RecordUnary("MaxPool2D", padded, inputOrig, BackwardFunctions<T>.MaxPool2DTensorIndicesBackward,
+                new object[] { paddedIndices, new[] { poolSize, poolSize }, new[] { stride, stride } });
+            return padded;
+        }
         if (tape is not null)
         {
             var resultWithIdx = MaxPool2DWithIndices(input, new[] { poolSize, poolSize }, new[] { stride, stride }, out var maxIndices);
@@ -16859,33 +16868,102 @@ public partial class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> MaxPool2DBackwardWithTensorIndices<T>(
         Tensor<T> gradOutput, Tensor<int> maxIndices, int[] inputShape, int[] poolSize, int[] stride)
     {
+        if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
         if (maxIndices == null) throw new ArgumentNullException(nameof(maxIndices));
         if (inputShape == null || inputShape.Length != 4)
             throw new ArgumentException("Input shape must have four elements [batch, channels, height, width].", nameof(inputShape));
+        if (gradOutput.Rank != 4)
+            throw new ArgumentException("Output gradient must be rank 4 [batch, channels, height, width].", nameof(gradOutput));
         if (maxIndices.Length != gradOutput.Length)
             throw new ArgumentException("Max-index tensor must have one element per output gradient.", nameof(maxIndices));
 
-        int batch = inputShape[0];
-        int channels = inputShape[1];
-        int inputWidth = inputShape[3];
-        int outputHeight = gradOutput._shape[2];
-        int outputWidth = gradOutput._shape[3];
-        var flatIndices = maxIndices.GetDataArray();
-        var coordinateIndices = new int[batch, channels, outputHeight, outputWidth, 2];
-        int flat = 0;
-        for (int b = 0; b < batch; b++)
-            for (int c = 0; c < channels; c++)
-                for (int oh = 0; oh < outputHeight; oh++)
-                    for (int ow = 0; ow < outputWidth; ow++)
-                    {
-                        int spatial = flatIndices[flat++];
-                        coordinateIndices[b, c, oh, ow, 0] = spatial / inputWidth;
-                        coordinateIndices[b, c, oh, ow, 1] = spatial % inputWidth;
-                    }
+        // Routing is by the saved index alone, so this needs neither the window geometry nor the padding: a padded
+        // forward's indices already point at real input cells. (Converting to coordinates and going through
+        // MaxPool2DBackward re-validated the output size against an UNPADDED window and rejected every padded pool.)
+        int planes = checked(inputShape[0] * inputShape[1]);
+        int planeSize = checked(inputShape[2] * inputShape[3]);
+        int outPlane = checked(gradOutput._shape[2] * gradOutput._shape[3]);
+        if (gradOutput._shape[0] * gradOutput._shape[1] != planes)
+            throw new ArgumentException("Output gradient batch and channels must match the input shape.", nameof(gradOutput));
 
-        return MaxPool2DBackward(gradOutput, coordinateIndices, inputShape, poolSize, stride);
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var result = AutoTensorCache.RentOrAllocate<T>(inputShape);
+        var gradIn = result.GetDataArray();
+        for (int i = 0; i < gradIn.Length; i++) gradIn[i] = numOps.Zero;
+        var gradOut = gradOutput.GetFlattenedData();
+        var flatIndices = maxIndices.GetFlattenedData();
+        for (int p = 0; p < planes; p++)
+        {
+            int inBase = p * planeSize, outBase = p * outPlane;
+            for (int o = 0; o < outPlane; o++)
+            {
+                int spatial = flatIndices[outBase + o];
+                if ((uint)spatial >= (uint)planeSize)
+                    throw new ArgumentException(
+                        $"Max index {spatial} at output {outBase + o} is outside the {inputShape[2]}x{inputShape[3]} input plane.",
+                        nameof(maxIndices));
+                gradIn[inBase + spatial] = numOps.Add(gradIn[inBase + spatial], gradOut[outBase + o]);
+            }
+        }
+        return result;
     }
 
+    /// <summary>
+    /// Padded MaxPool2D forward that also returns each window's winner as a flat index into its input plane (the
+    /// convention MaxPool2DBackwardWithTensorIndices and the GPU kernel use). Padded cells never win: a window's
+    /// first real cell seeds the max and a later cell replaces it only when strictly greater, as the kernel does.
+    /// </summary>
+    internal Tensor<T> MaxPool2DPaddedWithTensorIndices<T>(Tensor<T> input, int poolSize, int stride, int padding,
+        out Tensor<int> maxIndices)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var source = input.IsContiguous ? input : input.Contiguous();
+        int batch = source._shape[0], channels = source._shape[1];
+        int height = source._shape[2], width = source._shape[3];
+        int outputHeight = (height + 2 * padding - poolSize) / stride + 1;
+        int outputWidth = (width + 2 * padding - poolSize) / stride + 1;
+        var outputShape = new[] { batch, channels, outputHeight, outputWidth };
+        var result = new Tensor<T>(outputShape);
+        var indices = new int[result.Length];
+        var inData = source.GetFlattenedData();
+        var outData = result.GetDataArray();
+        int planeSize = height * width, outPlane = outputHeight * outputWidth;
+        CpuParallelSettings.ParallelForOrSerial(0, batch * channels, outData.Length, p =>
+        {
+            int inBase = p * planeSize, outBase = p * outPlane;
+            for (int oh = 0; oh < outputHeight; oh++)
+                for (int ow = 0; ow < outputWidth; ow++)
+                {
+                    int best = -1;
+                    T bestValue = numOps.Zero;
+                    for (int kh = 0; kh < poolSize; kh++)
+                    {
+                        int ih = oh * stride - padding + kh;
+                        if (ih < 0 || ih >= height) continue;
+                        for (int kw = 0; kw < poolSize; kw++)
+                        {
+                            int iw = ow * stride - padding + kw;
+                            if (iw < 0 || iw >= width) continue;
+                            T value = inData[inBase + ih * width + iw];
+                            if (best < 0 || numOps.GreaterThan(value, bestValue))
+                            {
+                                best = ih * width + iw;
+                                bestValue = value;
+                            }
+                        }
+                    }
+                    // A window entirely inside the padding read no real cell, so there is no winner to route a
+                    // gradient to. PyTorch refuses padding > pool/2 for the same reason.
+                    if (best < 0)
+                        throw new ArgumentException(
+                            $"MaxPool2D window ({oh},{ow}) lies entirely in the padding (padding {padding} >= pool {poolSize}).");
+                    outData[outBase + oh * outputWidth + ow] = bestValue;
+                    indices[outBase + oh * outputWidth + ow] = best;
+                }
+        });
+        maxIndices = new Tensor<int>(indices, outputShape);
+        return result;
+    }
     /// <inheritdoc/>
     public virtual Tensor<T> AvgPool2D<T>(Tensor<T> input, int[] poolSize, int[] stride)
     {
