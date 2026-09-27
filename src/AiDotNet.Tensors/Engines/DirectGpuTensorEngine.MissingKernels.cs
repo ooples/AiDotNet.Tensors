@@ -337,29 +337,35 @@ public partial class DirectGpuTensorEngine
     Tensor<T> IEngine.TensorMax<T>(Tensor<T> tensor, T value)
     {
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
-        if (typeof(T) != typeof(float) || IsTapeActive<T>() || Compilation.GraphMode.IsActive ||
-            !TryGetBackend(out var backend))
+        if (typeof(T) != typeof(float) || Compilation.GraphMode.IsActive || !TryGetBackend(out var backend))
             return base.TensorMax(tensor, value);
 
         using var input = GetOrAllocateBuffer(backend, tensor);
         using var scalar = backend.AllocateBuffer(tensor.Length);
         backend.Fill(scalar, Convert.ToSingle(value), tensor.Length);
-        return DispatchDeferredGpuOp<T>(backend, tensor.Length, tensor.Shape.ToArray(), output =>
+        var result = DispatchDeferredGpuOp<T>(backend, tensor.Length, tensor.Shape.ToArray(), output =>
             backend.Max(input.Buffer, scalar, output, tensor.Length));
+        // Same node CpuEngine records: this is TensorClampMin, whose backward also runs on the device.
+        Autodiff.DifferentiableOps.RecordUnary("TensorMax", result, tensor, Autodiff.BackwardFunctions<T>.ClampMinBackward,
+            savedState: new[] { (object?)value ?? throw new InvalidOperationException("TensorMax value must not be null") });
+        return result;
     }
 
     Tensor<T> IEngine.TensorMin<T>(Tensor<T> tensor, T value)
     {
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
-        if (typeof(T) != typeof(float) || IsTapeActive<T>() || Compilation.GraphMode.IsActive ||
-            !TryGetBackend(out var backend))
+        if (typeof(T) != typeof(float) || Compilation.GraphMode.IsActive || !TryGetBackend(out var backend))
             return base.TensorMin(tensor, value);
 
         using var input = GetOrAllocateBuffer(backend, tensor);
         using var scalar = backend.AllocateBuffer(tensor.Length);
         backend.Fill(scalar, Convert.ToSingle(value), tensor.Length);
-        return DispatchDeferredGpuOp<T>(backend, tensor.Length, tensor.Shape.ToArray(), output =>
+        var result = DispatchDeferredGpuOp<T>(backend, tensor.Length, tensor.Shape.ToArray(), output =>
             backend.Min(input.Buffer, scalar, output, tensor.Length));
+        // Same node CpuEngine records: this is TensorClampMax, whose backward also runs on the device.
+        Autodiff.DifferentiableOps.RecordUnary("TensorMin", result, tensor, Autodiff.BackwardFunctions<T>.ClampMaxBackward,
+            savedState: new[] { (object?)value ?? throw new InvalidOperationException("TensorMin value must not be null") });
+        return result;
     }
 
     Tensor<T> IEngine.RasterizeGaussians<T>(

@@ -7918,6 +7918,10 @@ public partial class CpuEngine : ITensorLevelEngine
             dest[i] = numOps.GreaterThan(tVal, value) ? tVal : value;
         }
 
+        // max(x, s) IS clamp(x, min: s), so it takes TensorClampMin's backward and saved state. This overload
+        // recorded nothing, so a scalar floor severed the gradient on every engine.
+        DifferentiableOps.RecordUnary("TensorMax", result, tensorOrig, BackwardFunctions<T>.ClampMinBackward,
+            savedState: new[] { (object?)value ?? throw new InvalidOperationException("TensorMax value must not be null") });
         return result;
     }
 
@@ -8010,6 +8014,9 @@ public partial class CpuEngine : ITensorLevelEngine
             dest[i] = numOps.LessThan(tVal, value) ? tVal : value;
         }
 
+        // min(x, s) IS clamp(x, max: s): TensorClampMax's backward and saved state.
+        DifferentiableOps.RecordUnary("TensorMin", result, tensorOrig, BackwardFunctions<T>.ClampMaxBackward,
+            savedState: new[] { (object?)value ?? throw new InvalidOperationException("TensorMin value must not be null") });
         return result;
     }
 

@@ -857,6 +857,31 @@ public class GpuTapeGradientParityTests : IDisposable
         AssertStaysOnDeviceUnderTape("FusedLinearCrossEntropy",
             static (e, t) => e.FusedLinearCrossEntropyWithLogits(t, HeadWeight, HeadBias, SoftTargets()),
             static (x, y) => Assert.Equal(new[] { 1 }, y.Shape.ToArray()));
+    // The scalar overloads recorded no node on EITHER engine, so parity alone would pass with both gradients
+    // missing; GradientOf asserts a gradient reached the input first.
+    [SkippableFact]
+    public void TensorMax_scalar_gradients_match_cpu() =>
+        AssertGradientParity("TensorMax(x, s)", WithBoundTies(Rand([6, 10], seed: 491)),
+            static (e, t) => e.TensorMax(t, 0.1f), probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void TensorMin_scalar_gradients_match_cpu() =>
+        AssertGradientParity("TensorMin(x, s)", WithBoundTies(Rand([6, 10], seed: 499)),
+            static (e, t) => e.TensorMin(t, 0.1f), probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void TensorMax_binary_gradients_match_cpu() =>
+        AssertGradientParity("TensorMax(a, b)", Rand([6, 10], seed: 503),
+            static (e, t) => e.TensorMax(t, Rand([6, 10], seed: 509)), probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void TensorMax_binary_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("TensorMax(a, b)", static (e, t) => e.TensorMax(t, Rand([6, 10], seed: 521)),
+            static (x, y) => Assert.Equal(new[] { 6, 10 }, y.Shape.ToArray()));
+    [SkippableFact]
+    public void TensorMax_scalar_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("TensorMax", static (e, t) => e.TensorMax(t, 0.1f),
+            static (x, y) => Assert.Equal(Math.Max(x[0, 0], 0.1f), y[0, 0]));
     [SkippableFact]
     public void TensorClampMin_gradients_match_cpu() =>
         AssertGradientParity("ClampMin", Rand([6, 10], seed: 73),

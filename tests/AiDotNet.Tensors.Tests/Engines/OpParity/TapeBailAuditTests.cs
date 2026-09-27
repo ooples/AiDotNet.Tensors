@@ -96,8 +96,6 @@ public class TapeBailAuditTests
         // second operand that does not exist — silently wrong gradients rather than a crash. Bailing changes
         // nothing here: the CPU path produces no gradient for the scalar form either. (That the scalar
         // overloads are non-differentiable at all is a separate question, not this audit's.)
-        "TensorMax",
-        "TensorMin",
     };
 
     /// <summary>
@@ -146,6 +144,11 @@ public class TapeBailAuditTests
         // The index overload copies the target ids to the host for the backward only when taping (resident ids
         // would otherwise download on every inference call); both overloads record the node.
         "FusedLinearCrossEntropyWithLogits",
+        // The (tensor, tensor) overloads skip only their unrecorded fast path under a tape; the recording path still runs
+        // the device kernel and saves the operand clones MaxBackward/MinBackward read. The (tensor, scalar) overloads
+        // record ClampMin/ClampMax unconditionally.
+        "TensorMax",
+        "TensorMin",
     };
 
     /// <summary>
