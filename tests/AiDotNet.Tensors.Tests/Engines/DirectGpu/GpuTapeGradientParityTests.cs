@@ -882,6 +882,43 @@ public class GpuTapeGradientParityTests : IDisposable
     public void TensorMax_scalar_stays_on_the_device_while_a_tape_records() =>
         AssertStaysOnDeviceUnderTape("TensorMax", static (e, t) => e.TensorMax(t, 0.1f),
             static (x, y) => Assert.Equal(Math.Max(x[0, 0], 0.1f), y[0, 0]));
+    /// <summary>
+    /// The norms keep only NON-float on the CPU under a tape, so the float path must run AND record through both the
+    /// IEngine entry point and the public override: a gradient must reach the input and agree with the CPU's.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData("LayerNorm", false)]
+    [InlineData("LayerNorm", true)]
+    [InlineData("GroupNorm", false)]
+    [InlineData("GroupNorm", true)]
+    [InlineData("InstanceNorm", false)]
+    [InlineData("InstanceNorm", true)]
+    [InlineData("RMSNorm", false)]
+    [InlineData("RMSNorm", true)]
+    public void Norm_float_records_through_both_entry_points(string op, bool throughPublicOverride) =>
+        AssertGradientParity($"{op}(public={throughPublicOverride})", Rand([6, 10], seed: 523), (e, t) =>
+        {
+            var x = t.Reshape(new[] { 3, 4, 1, 5 });
+            var gamma4 = Rand([4], seed: 541);
+            var beta4 = Rand([4], seed: 547);
+            var gamma5 = Rand([5], seed: 557);
+            var beta5 = Rand([5], seed: 563);
+            if (throughPublicOverride && e is DirectGpuTensorEngine gpu)
+                return op switch
+                {
+                    "LayerNorm" => gpu.LayerNorm(x, gamma5, beta5, 1e-5, out _, out _),
+                    "GroupNorm" => gpu.GroupNorm(x, 2, gamma4, beta4, 1e-5, out _, out _),
+                    "InstanceNorm" => gpu.InstanceNorm(x, gamma4, beta4, 1e-5, out _, out _),
+                    _ => gpu.RMSNorm(x, gamma5, 1e-5, out _),
+                };
+            return op switch
+            {
+                "LayerNorm" => e.LayerNorm(x, gamma5, beta5, 1e-5, out _, out _),
+                "GroupNorm" => e.GroupNorm(x, 2, gamma4, beta4, 1e-5, out _, out _),
+                "InstanceNorm" => e.InstanceNorm(x, gamma4, beta4, 1e-5, out _, out _),
+                _ => e.RMSNorm(x, gamma5, 1e-5, out _),
+            };
+        });
     [SkippableFact]
     public void TensorClampMin_gradients_match_cpu() =>
         AssertGradientParity("ClampMin", Rand([6, 10], seed: 73),

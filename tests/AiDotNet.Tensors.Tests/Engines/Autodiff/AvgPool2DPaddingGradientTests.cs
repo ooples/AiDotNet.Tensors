@@ -15,8 +15,13 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 /// parameter (<c>countIncludePad</c>). Average pooling is linear, so a finite difference in double is exact up to
 /// rounding and makes a tight oracle for the gradient.
 /// </remarks>
-public class AvgPool2DPaddingGradientTests
+public class AvgPool2DPaddingGradientTests : IDisposable
 {
+    // These tests set the process-wide engine; restore it so later tests see the engine they expect.
+    private readonly IEngine _previousEngine = AiDotNetEngine.Current;
+
+    public void Dispose() => AiDotNetEngine.Current = _previousEngine;
+
     [Fact]
     public void Forward_divides_by_covered_cells_by_default_and_by_the_full_window_when_padding_counts()
     {

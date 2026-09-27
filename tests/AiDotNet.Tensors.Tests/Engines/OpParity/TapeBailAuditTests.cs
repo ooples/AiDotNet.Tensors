@@ -379,7 +379,14 @@ public class TapeBailAuditTests
         string root = RepoRoot();
         var overrides = ScanGpuOverrides(GpuEngineSources(root));
 
-        var regressed = MustNotBail.Where(op => overrides.TryGetValue(op, out var i) && i.Bails).ToList();
+        // A MISSING override must fail too: if one is deleted or renamed, the op falls back to CpuEngine under a
+        // tape and the bail check below, which only inspects overrides it finds, would silently pass.
+        var missing = MustNotBail.Where(op => !overrides.ContainsKey(op)).ToList();
+        Assert.True(missing.Count == 0,
+            "MustNotBail lists ops with no GPU override, so nothing guards them any more; restore the override or "
+            + "remove the entry: " + string.Join(", ", missing));
+
+        var regressed = MustNotBail.Where(op => overrides[op].Bails).ToList();
 
         _out.WriteLine($"checked: {string.Join(", ", MustNotBail)}");
         Assert.True(regressed.Count == 0,
@@ -465,7 +472,18 @@ public class TapeBailAuditTests
         {
             var mine = bodies.Where(b => b.Name == op).ToList();
             Assert.True(mine.Count > 0, $"{op} has no GPU override; remove it from NonFloatStaysOnCpuUnderTape.");
-            Assert.True(mine.Any(b => records.IsMatch(b.Text)), $"{op}'s float path records no tape node.");
+
+            // The float tape path must record, checked per entry point rather than "somewhere in the op": the public
+            // override records itself, and every IEngine overload either records or hands float to that override.
+            // (Behaviour — a float gradient through both entry points on a real device — is asserted by
+            // GpuTapeGradientParityTests.Norm_float_records_through_both_entry_points; this audit cannot run GPU code.)
+            var publicOverrides = mine.Where(b => b.Text.Contains("public override")).ToList();
+            Assert.True(publicOverrides.Count > 0 && publicOverrides.All(b => records.IsMatch(b.Text)),
+                $"{op}'s public override does not record a tape node on its float path.");
+            var floatHandOff = new Regex($@"typeof\(T\)\s*==\s*typeof\(float\)\)\s*return\s+{op}\(", RegexOptions.None, RegexTimeout);
+            foreach (var (_, text) in mine.Where(b => !b.Text.Contains("public override")))
+                Assert.True(records.IsMatch(text) || floatHandOff.IsMatch(text),
+                    $"{op}'s IEngine overload neither records nor hands float to the recording override.");
             foreach (var (_, text) in mine)
                 Assert.True(anyTapeCheck.Matches(text).Count == guard.Matches(text).Count,
                     $"{op} has a tape check that is not the non-float guard, i.e. a real bail.");

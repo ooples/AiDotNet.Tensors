@@ -8761,15 +8761,16 @@ public interface IEngine
     Tensor<T> TensorMaxPool2D<T>(Tensor<T> input, int poolSize, int stride = 0, int padding = 0);
 
     /// <summary>
-    /// Alias for <see cref="AvgPool2D{T}(Tensor{T}, int, int, int)"/> with Tensor prefix for API consistency.
+    /// Alias for <see cref="AvgPool2D{T}(Tensor{T}, int, int, int, bool)"/> with Tensor prefix for API consistency.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
     /// <param name="input">4D input tensor [batch, channels, height, width].</param>
     /// <param name="poolSize">Pooling window size.</param>
     /// <param name="stride">Stride. If 0, defaults to poolSize.</param>
     /// <param name="padding">Zero-padding size.</param>
+    /// <param name="countIncludePad">Divisor rule for windows that overlap the padding, as in AvgPool2D.</param>
     /// <returns>Pooled tensor.</returns>
-    Tensor<T> TensorAvgPool2D<T>(Tensor<T> input, int poolSize, int stride = 0, int padding = 0);
+    Tensor<T> TensorAvgPool2D<T>(Tensor<T> input, int poolSize, int stride = 0, int padding = 0, bool countIncludePad = false);
 
     /// <summary>
     /// Alias for <see cref="Conv2D{T}(Tensor{T}, Tensor{T}, int, int, int)"/> with Tensor prefix for API consistency.

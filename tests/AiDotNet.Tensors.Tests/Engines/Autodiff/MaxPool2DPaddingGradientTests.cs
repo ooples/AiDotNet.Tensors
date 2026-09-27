@@ -10,8 +10,13 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 /// input cell that won its window; away from ties that is the exact derivative, so a finite difference in double
 /// is a tight oracle. Inputs are distinct so no window has a tie.
 /// </summary>
-public class MaxPool2DPaddingGradientTests
+public class MaxPool2DPaddingGradientTests : IDisposable
 {
+    // These tests set the process-wide engine; restore it so later tests see the engine they expect.
+    private readonly IEngine _previousEngine = AiDotNetEngine.Current;
+
+    public void Dispose() => AiDotNetEngine.Current = _previousEngine;
+
     [Theory]
     [InlineData(0)]
     [InlineData(1)]

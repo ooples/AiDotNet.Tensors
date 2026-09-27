@@ -18933,10 +18933,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return MaxPool2D(input, poolSize, stride, padding);
     }
 
-    public override Tensor<T> TensorAvgPool2D<T>(Tensor<T> input, int poolSize, int stride, int padding)
+    public override Tensor<T> TensorAvgPool2D<T>(Tensor<T> input, int poolSize, int stride, int padding,
+        bool countIncludePad)
     {
         // GPU dispatch already handled by the existing AvgPool2D method override
-        return AvgPool2D(input, poolSize, stride, padding);
+        return AvgPool2D(input, poolSize, stride, padding, countIncludePad);
     }
 
     public override Tensor<T> TensorConv2D<T>(Tensor<T> input, Tensor<T> kernel, int stride, int padding, int dilation)

@@ -24,11 +24,17 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels
 // copy of a cell), and a plain read-modify-write drops all but one of the racing contributions.
 inline void pooling_atomic_add_float(__global volatile float* addr, float val)
 {
-    union { unsigned int u; float f; } expected, next;
-    do {
-        expected.f = *addr;
-        next.f = expected.f + val;
-    } while (atomic_cmpxchg((__global volatile unsigned int*)addr, expected.u, next.u) != expected.u);
+    // Every access to the cell is atomic: the seed comes from an atomic read (or with 0), and each failed
+    // exchange hands back the value it found, which becomes the next expectation. A plain float read here
+    // would race the other work-items' exchanges.
+    __global volatile unsigned int* bits = (__global volatile unsigned int*)addr;
+    unsigned int expected = atomic_or(bits, 0u);
+    for (;;) {
+        unsigned int next = as_uint(as_float(expected) + val);
+        unsigned int found = atomic_cmpxchg(bits, expected, next);
+        if (found == expected) break;
+        expected = found;
+    }
 }
 
 // Max Pooling 2D with optional indices for backward pass

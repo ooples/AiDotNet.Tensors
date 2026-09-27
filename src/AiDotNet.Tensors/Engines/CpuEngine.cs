@@ -8914,6 +8914,11 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"MaxPool2D requires a 4D tensor [batch, channels, height, width]. Got rank {input.Rank}.");
         }
         if (poolSize <= 0) throw new ArgumentException("Pool size must be positive.");
+        // A window lying entirely in the padding reads no input cell: the untaped kernels wrote MinValue there and
+        // the taped path (which must name a winner to route the gradient to) threw, so the same call behaved
+        // differently with and without a tape. Reject it up front, as PyTorch rejects padding > pool/2.
+        if (padding < 0 || padding >= poolSize)
+            throw new ArgumentException($"Padding must be in [0, poolSize); got padding={padding}, poolSize={poolSize}.", nameof(padding));
 
         if (stride == 0) stride = poolSize; // Default stride equals pool size
 
@@ -9222,7 +9227,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
     /// <summary>
     /// Write-through AvgPool2D: same dispatch as
-    /// <see cref="AvgPool2D{T}(Tensor{T}, int, int, int)"/> but writes into
+    /// <see cref="AvgPool2D{T}(Tensor{T}, int, int, int, bool)"/> but writes into
     /// the provided output tensor. Used by ResNet's final global-average-
     /// pool step and by GAP blocks in various CV architectures. Saves
     /// ~40 µs per call by skipping the intermediate alloc+CopyTo.
@@ -16899,19 +16904,23 @@ public partial class CpuEngine : ITensorLevelEngine
         for (int i = 0; i < gradIn.Length; i++) gradIn[i] = numOps.Zero;
         var gradOut = gradOutput.GetFlattenedData();
         var flatIndices = maxIndices.GetFlattenedData();
-        for (int p = 0; p < planes; p++)
+        // Validate every index first, so a bad one surfaces as an ArgumentException rather than from inside the
+        // parallel loop; then scatter per plane. Plane p writes only [p*planeSize, (p+1)*planeSize), so planes are
+        // independent, and each plane is walked serially, so accumulation order is fixed.
+        for (int o = 0; o < flatIndices.Length; o++)
+            if ((uint)flatIndices[o] >= (uint)planeSize)
+                throw new ArgumentException(
+                    $"Max index {flatIndices[o]} at output {o} is outside the {inputShape[2]}x{inputShape[3]} input plane.",
+                    nameof(maxIndices));
+        CpuParallelSettings.ParallelForOrSerial(0, planes, gradIn.Length, p =>
         {
             int inBase = p * planeSize, outBase = p * outPlane;
             for (int o = 0; o < outPlane; o++)
             {
-                int spatial = flatIndices[outBase + o];
-                if ((uint)spatial >= (uint)planeSize)
-                    throw new ArgumentException(
-                        $"Max index {spatial} at output {outBase + o} is outside the {inputShape[2]}x{inputShape[3]} input plane.",
-                        nameof(maxIndices));
-                gradIn[inBase + spatial] = numOps.Add(gradIn[inBase + spatial], gradOut[outBase + o]);
+                int target = inBase + flatIndices[outBase + o];
+                gradIn[target] = numOps.Add(gradIn[target], gradOut[outBase + o]);
             }
-        }
+        }, deterministicSafe: true);
         return result;
     }
 
@@ -17076,6 +17085,8 @@ public partial class CpuEngine : ITensorLevelEngine
         int[]? padding = null, bool countIncludePad = false)
     {
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
+        if (padding is not null && (padding.Length != 2 || padding[0] < 0 || padding[1] < 0))
+            throw new ArgumentException("padding must be two non-negative values [height, width].", nameof(padding));
         var pad = padding ?? new[] { 0, 0 };
 
         // gradOutput's spatial size is a FUNCTION of inputShape, poolSize, stride and padding, and
@@ -45173,9 +45184,10 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public virtual Tensor<T> TensorAvgPool2D<T>(Tensor<T> input, int poolSize, int stride = 0, int padding = 0)
+    public virtual Tensor<T> TensorAvgPool2D<T>(Tensor<T> input, int poolSize, int stride = 0, int padding = 0,
+        bool countIncludePad = false)
     {
-        return AvgPool2D(input, poolSize, stride, padding);
+        return AvgPool2D(input, poolSize, stride, padding, countIncludePad);
     }
 
     /// <inheritdoc/>
