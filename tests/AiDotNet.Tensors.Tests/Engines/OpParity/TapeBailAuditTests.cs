@@ -101,7 +101,6 @@ public class TapeBailAuditTests
         "GroupNorm",
         "InstanceNorm",
         "Dropout",
-        "Embedding",
         "AdaptiveAvgPool2D",
         "BatchNorm",
         "Conv3D",
@@ -191,6 +190,7 @@ public class TapeBailAuditTests
         "TensorMaskedFill",
         "TensorClampMin",
         "TensorClampMax",
+        "Embedding",
     };
 
     private static string[] GpuEngineSources(string root)

@@ -286,6 +286,16 @@ public class GpuTapeGradientParityTests : IDisposable
         AssertStaysOnDeviceUnderTape("TensorMaskedFill", static (e, t) => e.TensorMaskedFill(t, BoolMask(), -2f),
             static (x, y) => { Assert.Equal(-2f, y[0, 0]); Assert.Equal(x[0, 1], y[0, 1]); });
 
+    // GatherIndices repeats row 2, so the backward must ACCUMULATE into a table row, not overwrite it.
+    [SkippableFact]
+    public void Embedding_gradients_match_cpu() =>
+        AssertGradientParity("Embedding", Rand([6, 10], seed: 83),
+            static (e, t) => e.Embedding(GatherIndices, t), probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void Embedding_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("Embedding", static (e, t) => e.Embedding(GatherIndices, t),
+            static (x, y) => { Assert.Equal(new[] { 2, 3, 10 }, y.Shape.ToArray()); Assert.Equal(x[5, 3], y[0, 1, 3]); });
     [SkippableFact]
     public void TensorClampMin_gradients_match_cpu() =>
         AssertGradientParity("ClampMin", Rand([6, 10], seed: 73),

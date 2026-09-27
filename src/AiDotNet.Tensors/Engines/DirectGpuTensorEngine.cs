@@ -15730,7 +15730,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         Compilation.GraphMode.ThrowIfInferenceUnsupported(
             Compilation.GraphCaptureLimitation.HeterogeneousInput);
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || !TryGetBackend(out var backend))
             return base.Embedding(indices, embeddingTable);
 
@@ -15767,7 +15767,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var result = DeferTensorResult<T>(backend, outputBuffer.Buffer, numIndices * embeddingDim, outputShape);
                 outputBuffer.RelinquishOwnership();
                 outputHandedOff = true;
-                return result;
+                return RecordEmbedding(result, indices, embeddingTable, vocabSize, embeddingDim);
             }
             finally
             {
@@ -21515,7 +21515,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         Compilation.GraphMode.ThrowIfInferenceUnsupported(
             Compilation.GraphCaptureLimitation.HeterogeneousInput);
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || !TryGetBackend(out var backend))
             return base.Embedding(indices, embeddingTable);
 
@@ -21555,16 +21555,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 if (isDeferredRecording)
                 {
                     outputHandedOff = true;
-                    return Tensor<T>.FromGpuBuffer(
+                    return RecordEmbedding(Tensor<T>.FromGpuBuffer(
                         backend,
                         bufOut.Buffer,
                         outShape,
                         GpuTensorRole.Activation,
-                        ownsBuffer: bufOut.OwnsBuffer);
+                        ownsBuffer: bufOut.OwnsBuffer), indices, embeddingTable, vocabSize, embeddingDim);
                 }
 
                 outputHandedOff = true;
-                return DeferTensorResult<T>(backend, bufOut.Buffer, numIndices * embeddingDim, outShape);
+                return RecordEmbedding(DeferTensorResult<T>(backend, bufOut.Buffer, numIndices * embeddingDim, outShape),
+                    indices, embeddingTable, vocabSize, embeddingDim);
             }
             finally
             {
@@ -21577,6 +21578,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (ThrowOnGpuKernelFallback) throw;
             return base.Embedding(indices, embeddingTable);
         }
+    }
+
+    /// <summary>
+    /// Records the node CpuEngine records for Embedding — same backward, same saved indices and sizes — so a
+    /// taped lookup keeps the gather on the device and its gradient takes the GPU EmbeddingBackward.
+    /// </summary>
+    private static Tensor<T> RecordEmbedding<T>(Tensor<T> result, Tensor<int> indices, Tensor<T> embeddingTable,
+        int vocabSize, int embeddingDim)
+    {
+        Autodiff.DifferentiableOps.RecordUnary("Embedding", result, embeddingTable,
+            Autodiff.BackwardFunctions<T>.EmbeddingBackward, new object[] { indices, vocabSize, embeddingDim });
+        return result;
     }
 
     // ──────────────────────────────────────────────────────────────
