@@ -22343,6 +22343,33 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorMSELoss<T>(Tensor<T> predictions, Tensor<T> targets)
     {
+        if (predictions is null) throw new ArgumentNullException(nameof(predictions));
+        if (targets is null) throw new ArgumentNullException(nameof(targets));
+        // Composed from device ops the tape records -- mean((p - t)^2) = sum((p - t)^2) / n -- so the loss and its
+        // gradient stay on the device, training or not. Under a tape both GPU implementations (this override and
+        // the explicit IEngine one, which IEngine callers reach) used to run the CPU base, downloading the
+        // predictions and targets every training step; the fused MseLoss kernel is reachable only through
+        // IGpuBatchExecution (Vulkan).
+        if (typeof(T) == typeof(float) && !Compilation.GraphMode.IsActive
+            && predictions.Length == targets.Length && predictions.Length > 0
+            && ShapesMatch(predictions.Shape._dims, targets.Shape._dims) && TryGetBackend(out _))
+        {
+            try
+            {
+                IEngine e = this;
+                var diff = e.TensorSubtract(predictions, targets);
+                var squared = e.TensorMultiply(diff, diff);
+                var allAxes = new int[squared.Rank];
+                for (int i = 0; i < allAxes.Length; i++) allAxes[i] = i;
+                var total = e.ReduceSum(squared, allAxes, keepDims: false);
+                var mean = e.TensorMultiplyScalar(total, (T)(object)(1f / predictions.Length));
+                return mean.Rank == 1 && mean.Length == 1 ? mean : e.Reshape(mean, new[] { 1 });
+            }
+            catch (Exception ex)
+            {
+                GpuLaunchProbe.OnFallback("TensorMSELoss", ex);
+            }
+        }
         if (IsTapeActive<T>()) return base.TensorMSELoss(predictions, targets);
         if (!TryGetBatchBackend(out var bb))
             return base.TensorMSELoss(predictions, targets);
