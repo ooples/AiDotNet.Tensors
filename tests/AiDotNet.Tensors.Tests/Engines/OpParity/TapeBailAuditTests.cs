@@ -89,7 +89,6 @@ public class TapeBailAuditTests
         // not scan. These are deliberately baselined now that the audit covers the complete partial class;
         // each one needs its CpuEngine saved-state/backward contract verified by a gradient test before its
         // tape bail can be removed safely. New names still fail the audit, and this baseline must only shrink.
-        "FusedLinear",
         "MaxPool2D",
         "AvgPool2D",
         "FlashAttention",
@@ -104,11 +103,6 @@ public class TapeBailAuditTests
         "BatchNorm",
         "Conv3D",
         "ConvTranspose2D",
-        "FusedLinearReLU",
-        "FusedLinearSigmoid",
-        "FusedLinearTanh",
-        "FusedLinearGELU",
-        "FusedLinearSwish",
 
         // NOT fixable, and NOT pending — these are here because the audit matches on op NAME and cannot
         // tell overloads apart. CpuEngine records a backward for TensorMax/TensorMin(tensor, TENSOR), while
@@ -147,6 +141,14 @@ public class TapeBailAuditTests
         // Encodes the bool condition as the byte[] 0/1 WhereBackward reads. The kernel runs and the node is
         // recorded either way; only that host copy is skipped when nothing will consume it.
         "TensorWhere",
+        // Under a tape these materialise the pre-activation the backward needs, through the unfused matmul and
+        // bias-add, and record one node in the override. Inference uses the fused kernel, which never exposes it.
+        "FusedLinear",
+        "FusedLinearReLU",
+        "FusedLinearSigmoid",
+        "FusedLinearTanh",
+        "FusedLinearGELU",
+        "FusedLinearSwish",
     };
 
     /// <summary>Ops already fixed — they must never regress to bailing.</summary>

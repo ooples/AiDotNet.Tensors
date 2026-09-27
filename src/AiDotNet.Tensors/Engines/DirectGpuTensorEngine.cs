@@ -6902,20 +6902,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (activationParams is not null)
             return base.FusedLinear(input, weights, bias, activation, activationParams);
 
-        // When a tape is active, defer to the base (CpuEngine) tape-aware
-        // path which decomposes into TensorMatMul + TensorBroadcastAdd and
-        // collapses them into a single recorded "FusedLinear" entry. The
-        // GPU fused kernels below bypass tape recording (they call
-        // backend.GemmBiasRelu / etc directly without going through
-        // DifferentiableOps), so taking them during training would
-        // silently disconnect this op from autograd. The inner
-        // TensorMatMul + TensorBroadcastAdd dispatch via virtual on
-        // `this`, so they still hit the DirectGpu GPU path for the
-        // forward — only the SINGLE-CALL fused kernel is given up.
-        // Pure-inference callers (no tape) still get the full fused
-        // kernel speedup.
+        // Under a tape the fused kernels below cannot be used: they return only the activated output, and the
+        // backward needs the pre-activation. The base path keeps the matmul on the device but applies the
+        // activation IN PLACE ON THE HOST, which read the result back twice per call. Build the same node on the
+        // device instead, with the saved state CpuEngine records.
         if (IsTapeActive<T>())
-            return base.FusedLinear(input, weights, bias, activation);
+        {
+            if (TryFusedLinearForwardUnderTape(input, weights, bias, activation) is not { } taped)
+                return base.FusedLinear(input, weights, bias, activation);
+            var fusedInputs = bias is not null ? new[] { input, weights, bias } : new[] { input, weights };
+            Autodiff.DifferentiableOps.RecordIfActive("FusedLinear", taped.Result, fusedInputs,
+                Autodiff.BackwardFunctions<T>.FusedLinearWithActivationBackward,
+                activation != FusedActivationType.None ? new object[] { activation, taped.PreActivation } : null);
+            return taped.Result;
+        }
 
         if (!TryGetBackend(out var backend))
             return base.FusedLinear(input, weights, bias, activation);
@@ -7166,6 +7166,60 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         ApplyGpuActivation(backend, result, size, activation);
         return result;
     }
+
+    /// <summary>
+    /// Taped FusedLinear forward on the device, returning the activated result and the pre-activation the backward
+    /// needs. The pre-activation comes from the engine's own TensorMatMul and TensorBroadcastAdd, so it is exactly
+    /// what the unfused chain computes (FusedLinearGradientTests holds the fused gradients to it), run WITHOUT
+    /// recording because the caller records the whole op as one node. Activations with a CPU-matching device
+    /// kernel run it directly; any other goes through the same ActivationRegistry handler CpuEngine applies.
+    /// Null when the device path cannot take it, so the caller falls back to base.
+    /// </summary>
+    private (Tensor<T> Result, Tensor<T> PreActivation)? TryFusedLinearForwardUnderTape<T>(Tensor<T> input,
+        Tensor<T> weights, Tensor<T>? bias, FusedActivationType activation)
+    {
+        if (typeof(T) != typeof(float) || Compilation.GraphMode.IsActive || input.Rank < 2 || weights.Rank != 2
+            || !TryGetBackend(out var backend))
+            return null;
+        try
+        {
+            using (new Autodiff.NoGradScope<T>())
+            {
+                var preActivation = TensorMatMul(input, weights);
+                if (bias is not null) preActivation = TensorBroadcastAdd(preActivation, bias);
+                if (activation == FusedActivationType.None)
+                    return (preActivation, preActivation);
+
+                if (!HasCpuMatchingDeviceKernel(activation))
+                {
+                    var handler = ActivationRegistry.Get(activation);
+                    return handler is null ? null : (handler.Apply(this, preActivation), preActivation);
+                }
+
+                int n = preActivation.Length;
+                using var preBuffer = GetOrAllocateBuffer(backend, preActivation);
+                var result = DispatchDeferredGpuOp<T>(backend, n, (int[])preActivation._shape.Clone(), output =>
+                    ApplyGpuActivation(backend, preBuffer.Buffer, output, n, activation));
+                return (result, preActivation);
+            }
+        }
+        catch (Exception)
+        {
+            if (ThrowOnGpuKernelFallback) throw;
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Activations whose device kernel computes the same function as CpuEngine's default-parameter activation, so a
+    /// taped forward on the device and the CPU-defined backward agree. Each is pinned by a gradient-parity test.
+    /// </summary>
+    private static bool HasCpuMatchingDeviceKernel(FusedActivationType activation) => activation switch
+    {
+        FusedActivationType.ReLU or FusedActivationType.Sigmoid or FusedActivationType.Tanh
+            or FusedActivationType.GELU or FusedActivationType.Swish => true,
+        _ => false,
+    };
 
     private static void ApplyGpuActivation(IDirectGpuBackend backend, IGpuBuffer input, IGpuBuffer output, int size, FusedActivationType activation)
     {
@@ -25878,13 +25932,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> FusedLinearReLU<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
     {
-        // FusedLinearGradientTests asserts the fused path produces gradients
-        // equal-to-3-decimals with the unfused TensorMatMul + TensorBroadcastAdd
-        // + ReLU chain. The CpuEngine fused path delegates to those same ops
-        // before collapsing the tape, so the precision matches. The GPU
-        // Gemm+BiasAdd+ReLU chain diverges enough to fail the 3-decimal
-        // assertion. Defer to base when the tape is active.
-        if (IsTapeActive<T>()) return base.FusedLinearReLU(input, weight, bias);
+        // Under a tape, build the pre-activation with the SAME TensorMatMul + TensorBroadcastAdd the unfused chain
+        // uses (FusedLinearGradientTests holds the fused gradients to the unfused ones), not the Gemm+BiasAdd below.
+        if (IsTapeActive<T>())
+        {
+            if (TryFusedLinearForwardUnderTape(input, weight, bias, FusedActivationType.ReLU) is not { } taped)
+                return base.FusedLinearReLU(input, weight, bias);
+            Autodiff.DifferentiableOps.RecordIfActive("FusedLinearReLU", taped.Result, new[] { input, weight, bias },
+                Autodiff.BackwardFunctions<T>.FusedMatMulAddReLUBackward, new object[] { taped.PreActivation });
+            return taped.Result;
+        }
         try
         {
             if (TryGetBackend(out var backend) && input.Shape.Length == 2 && weight.Shape.Length == 2
@@ -25910,7 +25967,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> FusedLinearSigmoid<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
     {
-        if (IsTapeActive<T>()) return base.FusedLinearSigmoid(input, weight, bias);
+        if (IsTapeActive<T>())
+        {
+            if (TryFusedLinearForwardUnderTape(input, weight, bias, FusedActivationType.Sigmoid) is not { } taped)
+                return base.FusedLinearSigmoid(input, weight, bias);
+            Autodiff.DifferentiableOps.RecordIfActive("FusedLinearSigmoid", taped.Result, new[] { input, weight, bias },
+                Autodiff.BackwardFunctions<T>.FusedMatMulAddSigmoidBackward, null);
+            return taped.Result;
+        }
         try
         {
             if (TryGetBackend(out var backend) && input.Shape.Length == 2 && weight.Shape.Length == 2
@@ -25931,7 +25995,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> FusedLinearTanh<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
     {
-        if (IsTapeActive<T>()) return base.FusedLinearTanh(input, weight, bias);
+        if (IsTapeActive<T>())
+        {
+            if (TryFusedLinearForwardUnderTape(input, weight, bias, FusedActivationType.Tanh) is not { } taped)
+                return base.FusedLinearTanh(input, weight, bias);
+            Autodiff.DifferentiableOps.RecordIfActive("FusedLinearTanh", taped.Result, new[] { input, weight, bias },
+                Autodiff.BackwardFunctions<T>.FusedMatMulAddTanhBackward, null);
+            return taped.Result;
+        }
         try
         {
             if (TryGetBackend(out var backend) && input.Shape.Length == 2 && weight.Shape.Length == 2
@@ -25952,7 +26023,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> FusedLinearGELU<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
     {
-        if (IsTapeActive<T>()) return base.FusedLinearGELU(input, weight, bias);
+        if (IsTapeActive<T>())
+        {
+            if (TryFusedLinearForwardUnderTape(input, weight, bias, FusedActivationType.GELU) is not { } taped)
+                return base.FusedLinearGELU(input, weight, bias);
+            Autodiff.DifferentiableOps.RecordIfActive("FusedLinearGELU", taped.Result, new[] { input, weight, bias },
+                Autodiff.BackwardFunctions<T>.FusedMatMulAddGELUBackward, new object[] { taped.PreActivation });
+            return taped.Result;
+        }
         try
         {
             if (TryGetBackend(out var backend) && input.Shape.Length == 2 && weight.Shape.Length == 2
@@ -25973,7 +26051,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> FusedLinearSwish<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
     {
-        if (IsTapeActive<T>()) return base.FusedLinearSwish(input, weight, bias);
+        if (IsTapeActive<T>())
+        {
+            if (TryFusedLinearForwardUnderTape(input, weight, bias, FusedActivationType.Swish) is not { } taped)
+                return base.FusedLinearSwish(input, weight, bias);
+            Autodiff.DifferentiableOps.RecordIfActive("FusedLinearSwish", taped.Result, new[] { input, weight, bias },
+                Autodiff.BackwardFunctions<T>.FusedMatMulAddSwishBackward, new object[] { taped.PreActivation });
+            return taped.Result;
+        }
         try
         {
             if (TryGetBackend(out var backend) && input.Shape.Length == 2 && weight.Shape.Length == 2

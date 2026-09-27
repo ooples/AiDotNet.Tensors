@@ -144,6 +144,38 @@ public class GpuTapeGradientParityTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// The FORWARD computed while a tape records matches CpuEngine's. Gradient parity alone cannot see a wrong taped
+    /// forward whenever the backward reads saved state (a pre-activation) rather than the output, so ops with a
+    /// separate taped forward path need this too.
+    /// </summary>
+    private void AssertTapedForwardMatchesCpu(string opName, Tensor<float> x,
+        Func<IEngine, Tensor<float>, Tensor<float>> op, double tol = 1e-4)
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu!)
+        {
+            float[] ForwardUnderTape(IEngine engine)
+            {
+                AiDotNetEngine.Current = engine;
+                using var tape = new GradientTape<float>();
+                var y = op(engine, x);
+                var values = new float[y.Length];
+                for (int i = 0; i < values.Length; i++) values[i] = y[i];
+                return values;
+            }
+
+            var cpu = ForwardUnderTape(new CpuEngine());
+            var device = ForwardUnderTape(gpu);
+            Assert.Equal(cpu.Length, device.Length);
+            double maxRel = 0;
+            for (int i = 0; i < cpu.Length; i++)
+                maxRel = Math.Max(maxRel, Math.Abs(cpu[i] - device[i]) / Math.Max(1.0, Math.Abs(cpu[i])));
+            _out.WriteLine($"{opName,-14} taped forward maxRel={maxRel:E3}");
+            Assert.True(maxRel <= tol, $"{opName}: taped GPU forward diverged from CPU (maxRel={maxRel:E3}).");
+        }
+    }
+
     [SkippableFact]
     public void TensorCosh_gradients_match_cpu() =>
         AssertGradientParity("TensorCosh", Rand([4, 16], seed: 21, lo: -2.0, hi: 2.0),
@@ -388,6 +420,87 @@ public class GpuTapeGradientParityTests : IDisposable
         AssertStaysOnDeviceUnderTape("TensorSetSlice",
             static (e, t) => e.TensorSetSlice(t, Rand([2, 4], seed: 191), new[] { 3, 5 }),
             static (x, y) => Assert.Equal(x[0, 0], y[0, 0]));
+    private static readonly Tensor<float> LinearWeight = Rand([10, 4], seed: 193);
+    private static readonly Tensor<float> LinearBias = Rand([4], seed: 197);
+
+    public enum FusedLinearVariant { Generic, ReLU, Sigmoid, Tanh, GELU, Swish }
+
+    private static Tensor<float> RunFusedLinear(IEngine e, Tensor<float> x, FusedLinearVariant variant) => variant switch
+    {
+        FusedLinearVariant.Generic => e.FusedLinear(x, LinearWeight, LinearBias, FusedActivationType.ReLU),
+        FusedLinearVariant.ReLU => e.FusedLinearReLU(x, LinearWeight, LinearBias),
+        FusedLinearVariant.Sigmoid => e.FusedLinearSigmoid(x, LinearWeight, LinearBias),
+        FusedLinearVariant.Tanh => e.FusedLinearTanh(x, LinearWeight, LinearBias),
+        FusedLinearVariant.GELU => e.FusedLinearGELU(x, LinearWeight, LinearBias),
+        _ => e.FusedLinearSwish(x, LinearWeight, LinearBias),
+    };
+
+    [SkippableTheory]
+    [InlineData(FusedLinearVariant.Generic)]
+    [InlineData(FusedLinearVariant.ReLU)]
+    [InlineData(FusedLinearVariant.Sigmoid)]
+    [InlineData(FusedLinearVariant.Tanh)]
+    [InlineData(FusedLinearVariant.GELU)]
+    [InlineData(FusedLinearVariant.Swish)]
+    public void FusedLinear_gradients_match_cpu(FusedLinearVariant variant) =>
+        AssertGradientParity($"FusedLinear({variant})", Rand([6, 10], seed: 199),
+            (e, t) => RunFusedLinear(e, t, variant), probe: Engagement.UseResidencyCounter);
+
+    [SkippableTheory]
+    [InlineData(FusedLinearVariant.Generic)]
+    [InlineData(FusedLinearVariant.ReLU)]
+    [InlineData(FusedLinearVariant.Sigmoid)]
+    [InlineData(FusedLinearVariant.Tanh)]
+    [InlineData(FusedLinearVariant.GELU)]
+    [InlineData(FusedLinearVariant.Swish)]
+    public void FusedLinear_stays_on_the_device_while_a_tape_records(FusedLinearVariant variant) =>
+        AssertStaysOnDeviceUnderTape($"FusedLinear({variant})", (e, t) => RunFusedLinear(e, t, variant),
+            static (x, y) => Assert.Equal(new[] { 6, 4 }, y.Shape.ToArray()));
+    // The generic FusedLinear across every activation it takes on the device under a tape.
+    [SkippableTheory]
+    [InlineData(FusedActivationType.None)]
+    [InlineData(FusedActivationType.ReLU)]
+    [InlineData(FusedActivationType.Sigmoid)]
+    [InlineData(FusedActivationType.Tanh)]
+    [InlineData(FusedActivationType.GELU)]
+    [InlineData(FusedActivationType.Swish)]
+    [InlineData(FusedActivationType.LeakyReLU)]   // no CPU-matching kernel: goes through ActivationRegistry
+    [InlineData(FusedActivationType.Mish)]
+    public void FusedLinear_generic_activation_gradients_match_cpu(FusedActivationType activation) =>
+        AssertGradientParity($"FusedLinear({activation})", Rand([6, 10], seed: 211),
+            (e, t) => e.FusedLinear(t, LinearWeight, LinearBias, activation), probe: Engagement.UseResidencyCounter);
+
+    [SkippableTheory]
+    [InlineData(FusedActivationType.None)]
+    [InlineData(FusedActivationType.ReLU)]
+    [InlineData(FusedActivationType.Sigmoid)]
+    [InlineData(FusedActivationType.Tanh)]
+    [InlineData(FusedActivationType.GELU)]
+    [InlineData(FusedActivationType.Swish)]
+    [InlineData(FusedActivationType.LeakyReLU)]
+    [InlineData(FusedActivationType.Mish)]
+    public void FusedLinear_generic_activation_taped_forward_matches_cpu(FusedActivationType activation) =>
+        AssertTapedForwardMatchesCpu($"FusedLinear({activation})", Rand([6, 10], seed: 223),
+            (e, t) => e.FusedLinear(t, LinearWeight, LinearBias, activation));
+
+    [SkippableTheory]
+    [InlineData(FusedLinearVariant.ReLU)]
+    [InlineData(FusedLinearVariant.Sigmoid)]
+    [InlineData(FusedLinearVariant.Tanh)]
+    [InlineData(FusedLinearVariant.GELU)]
+    [InlineData(FusedLinearVariant.Swish)]
+    public void FusedLinear_named_variant_taped_forward_matches_cpu(FusedLinearVariant variant) =>
+        AssertTapedForwardMatchesCpu($"FusedLinear({variant})", Rand([6, 10], seed: 227),
+            (e, t) => RunFusedLinear(e, t, variant));
+
+    [SkippableTheory]
+    [InlineData(FusedActivationType.None)]
+    [InlineData(FusedActivationType.Sigmoid)]
+    [InlineData(FusedActivationType.GELU)]
+    public void FusedLinear_generic_activation_stays_on_the_device_while_a_tape_records(FusedActivationType activation) =>
+        AssertStaysOnDeviceUnderTape($"FusedLinear({activation})",
+            (e, t) => e.FusedLinear(t, LinearWeight, LinearBias, activation),
+            static (x, y) => Assert.Equal(new[] { 6, 4 }, y.Shape.ToArray()));
     [SkippableFact]
     public void TensorClampMin_gradients_match_cpu() =>
         AssertGradientParity("ClampMin", Rand([6, 10], seed: 73),
