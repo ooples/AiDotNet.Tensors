@@ -23162,7 +23162,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (mask is null) throw new ArgumentNullException(nameof(mask));
         Compilation.GraphMode.ThrowIfInferenceUnsupported(
             Compilation.GraphCaptureLimitation.HeterogeneousInput);
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+        // Under a tape the kernel runs and records CpuEngine's MaskedFillBackward node.
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || !tensor._shape.SequenceEqual(mask._shape) || !TryGetBackend(out var backend))
             return base.TensorMaskedFill(tensor, mask, value);
 
@@ -23190,7 +23191,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (mask is null) throw new ArgumentNullException(nameof(mask));
         Compilation.GraphMode.ThrowIfInferenceUnsupported(
             Compilation.GraphCaptureLimitation.HeterogeneousInput);
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+        // Under a tape the kernel runs and records CpuEngine's MaskedFillBackward node.
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || !tensor._shape.SequenceEqual(mask._shape) || !TryGetBackend(out var backend))
             return base.TensorMaskedFill(tensor, mask, value);
 
@@ -23204,9 +23206,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 : (Tensor<Bit>)mask.Contiguous();
             using var inputBuffer = GetOrAllocateBuffer(backend, contiguousTensor);
             using var maskBuffer = GetOrAllocateBuffer(backend, contiguousMask);
-            return DispatchDeferredGpuOp<T>(backend, tensor.Length, tensor.Shape.ToArray(), output =>
+            var filled = DispatchDeferredGpuOp<T>(backend, tensor.Length, tensor.Shape.ToArray(), output =>
                 backend.MaskedFillKernel(inputBuffer.Buffer, maskBuffer.Buffer, output,
                     Convert.ToSingle(value), tensor.Length));
+            // The same node CpuEngine records for a Bit mask: MaskedFillBackward's bool[] branch.
+            var maskSpan = contiguousMask.AsSpan();
+            var maskBools = new bool[maskSpan.Length];
+            for (int i = 0; i < maskSpan.Length; i++) maskBools[i] = (bool)maskSpan[i];
+            Autodiff.DifferentiableOps.RecordUnary("TensorMaskedFill", filled, tensor,
+                Autodiff.BackwardFunctions<T>.MaskedFillBackward, new object[] { maskBools });
+            return filled;
         }
         catch
         {

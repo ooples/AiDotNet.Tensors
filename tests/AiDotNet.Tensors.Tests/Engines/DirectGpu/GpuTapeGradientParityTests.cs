@@ -257,6 +257,35 @@ public class GpuTapeGradientParityTests : IDisposable
                 for (int c = 0; c < 10; c++) Assert.Equal(x[5, c], y[1, c]);
             });
 
+    private static Tensor<bool> BoolMask()
+    {
+        var mask = new Tensor<bool>(new[] { 6, 10 });
+        for (int i = 0; i < mask.Length; i++) mask[i] = i % 3 == 0;
+        return mask;
+    }
+
+    private static Tensor<Bit> BitMask()
+    {
+        var mask = new Tensor<Bit>(new[] { 6, 10 });
+        for (int i = 0; i < mask.Length; i++) mask[i] = i % 3 == 0;
+        return mask;
+    }
+
+    [SkippableFact]
+    public void TensorMaskedFill_bool_mask_gradients_match_cpu() =>
+        AssertGradientParity("MaskedFill(bool)", Rand([6, 10], seed: 47),
+            static (e, t) => e.TensorMaskedFill(t, BoolMask(), -2f), probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void TensorMaskedFill_bit_mask_gradients_match_cpu() =>
+        AssertGradientParity("MaskedFill(Bit)", Rand([6, 10], seed: 48),
+            static (e, t) => e.TensorMaskedFill(t, BitMask(), -2f), probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void TensorMaskedFill_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("TensorMaskedFill", static (e, t) => e.TensorMaskedFill(t, BoolMask(), -2f),
+            static (x, y) => { Assert.Equal(-2f, y[0, 0]); Assert.Equal(x[0, 1], y[0, 1]); });
+
     [SkippableFact]
     public void TensorTranspose_stays_on_the_device_while_a_tape_records() =>
         AssertStaysOnDeviceUnderTape("TensorTranspose", static (e, t) => e.TensorTranspose(t), static (x, y) =>
