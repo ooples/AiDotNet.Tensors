@@ -16675,7 +16675,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     backend.Scale(expanded, output, 1f / reduceCount, inputSize);
                 });
             }
-            catch { }
+            catch (Exception ex)
+            {
+                // Never silent: the CPU fallback below reads gradOutput on the host, which is a CUDA 900 inside a
+                // graph capture and a device round trip everywhere else.
+                AliasDiag($"ReduceMeanBackward device path FELLBACK: {ex.GetType().Name}: {ex.Message}");
+            }
         }
         return base.ReduceMeanBackward(gradOutput, inputShape, axes);
     }

@@ -364,6 +364,9 @@ internal static class CudaNativeBindings
     [DllImport(CudaLibrary, EntryPoint = "cuStreamIsCapturing")]
     public static extern CudaResult cuStreamIsCapturing(IntPtr stream, out int captureStatus);
 
+    [DllImport(CudaLibrary, EntryPoint = "cuMemsetD32Async")]
+    public static extern CudaResult cuMemsetD32Async(IntPtr dstDevice, uint ui, ulong n, IntPtr stream);
+
     [DllImport(CudaLibrary, EntryPoint = "cuMemsetD8Async")]
     public static extern CudaResult cuMemsetD8Async(IntPtr dstDevice, byte uc, ulong n, IntPtr stream);
 

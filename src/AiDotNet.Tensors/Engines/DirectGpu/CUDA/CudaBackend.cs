@@ -1809,7 +1809,9 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
 
         ulong byteSize = (ulong)size * sizeof(float);
         IntPtr devicePtr = AllocDeviceMemoryWithRetry(byteSize);
-        CuBlasNative.CheckCudaResult(CuBlasNative.cuMemsetD32(devicePtr, 0, (ulong)size), "cuMemsetD32");
+        // Stream-ordered: a synchronous cuMemset runs on the legacy stream, which is illegal while _stream is being
+        // captured (CUDA 906) and serializes the device everywhere else.
+        CuBlasNative.CheckCudaResult(CudaNativeBindings.cuMemsetD32Async(devicePtr, 0, (ulong)size, _stream), "cuMemsetD32Async");
         return new CudaGpuBuffer(_cudaContext, devicePtr, size, _bufferPool.Return);
     }
 
@@ -8751,7 +8753,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         using var _ = PushContext();
         ulong byteSize = (ulong)size * sizeof(int);
         CuBlasNative.CheckCudaResult(CuBlasNative.cuMemAlloc(out IntPtr devicePtr, byteSize), "cuMemAlloc(int)");
-        CuBlasNative.CheckCudaResult(CuBlasNative.cuMemsetD32(devicePtr, 0, (ulong)size), "cuMemsetD32(int)");
+        CuBlasNative.CheckCudaResult(CudaNativeBindings.cuMemsetD32Async(devicePtr, 0, (ulong)size, _stream), "cuMemsetD32Async(int)");
         return new CudaGpuBuffer(_cudaContext, devicePtr, size);
     }
 
@@ -9540,9 +9542,12 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         // cuMemsetD32 sets 32-bit values (net471 compatible conversion)
         byte[] bytes = BitConverter.GetBytes(value);
         uint bits = BitConverter.ToUInt32(bytes, 0);
+        // Stream-ordered on _stream. The synchronous cuMemsetD32 ran on the legacy stream: inside a whole-step graph
+        // capture that is CUDA 906 (it would make the legacy stream wait on the capturing one), which threw out of
+        // ReduceMeanBackward's device path, sent it to the CPU fallback, and aborted the capture with a host read.
         CuBlasNative.CheckCudaResult(
-            CuBlasNative.cuMemsetD32(buffer.Handle, bits, (ulong)size),
-            "cuMemsetD32");
+            CudaNativeBindings.cuMemsetD32Async(buffer.Handle, bits, (ulong)size, _stream),
+            "cuMemsetD32Async");
         GpuLaunchProbe.OnLaunch();   // device-side memset IS GPU work
     }
 
@@ -10505,8 +10510,8 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     {
         using var _ = PushContext();
         CuBlasNative.CheckCudaResult(
-            CuBlasNative.cuMemcpyDtoD(destination.Handle, source.Handle, (nuint)(size * sizeof(float))),
-            "cuMemcpyDtoD (CopyBuffer)");
+            CudaNativeBindings.cuMemcpyDtoDAsync(destination.Handle, source.Handle, (ulong)size * sizeof(float), _stream),
+            "cuMemcpyDtoDAsync (CopyBuffer)");
         GpuLaunchProbe.OnLaunch();   // device-side copy IS GPU work — see the note on the 3-arg Copy
     }
 

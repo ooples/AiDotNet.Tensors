@@ -2080,20 +2080,33 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             {
                 int idx = _genericGradIndices[i];
                 Array.Clear(gradArrays[idx], 0, _preAllocatedGrads[idx].Length);
+                _preAllocatedGrads[idx].IncrementVersion();   // see the note on the full clear below
             }
         }
         else
         {
             // First call: clear everything (safe fallback)
             for (int i = 0; i < gradArrays.Length; i++)
+            {
                 Array.Clear(gradArrays[i], 0, _preAllocatedGrads[i].Length);
+                // A raw clear does not bump the version, so a device copy of this slot cached during the previous
+                // step (a backward op uploads it to read it as an upstream gradient) still looked current, and the
+                // in-place accumulation - which prefers a resident operand - added onto LAST step's gradient on the
+                // device. Measured: two back-to-back gradient passes at identical weights disagreed by 22% in the
+                // gradient of (pred - y) for ReduceMean((pred - y)^2); it also made every captured-step comparison
+                // against this "eager" reference meaningless.
+                _preAllocatedGrads[i].IncrementVersion();
+            }
         }
 
         // Re-seed loss gradient — direct Array.Copy
         var seedArr = _cachedLossGradSeedArray;
         var destArr = _cachedLossGradDestArray;
         if (seedArr != null && destArr != null)
+        {
             Array.Copy(seedArr, destArr, seedArr.Length);
+            _lossGradDest?.IncrementVersion();   // same reason as the gradient clear above
+        }
 
         long t2 = _profileStepEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
 

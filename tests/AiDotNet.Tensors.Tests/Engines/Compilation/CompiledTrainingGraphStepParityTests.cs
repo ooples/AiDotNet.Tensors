@@ -68,7 +68,7 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         public bool ReplayedAGraph;
     }
 
-    private static Run Train(DirectGpuTensorEngine gpu, bool capture, bool failCapture = false)
+    private static Run Train(DirectGpuTensorEngine gpu, bool capture, bool failCapture = false, bool composedMse = false)
     {
         var x = Rand([Batch, Inputs], 1, 1f);
         var y = Rand([Batch, Outputs], 2, 1f);
@@ -85,7 +85,16 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         {
             var h = gpu.FusedLinear(x, w1, b1, FusedActivationType.ReLU);
             var pred = gpu.FusedLinear(h, w2, b2, FusedActivationType.None);
-            gpu.TensorMSELoss(pred, y);
+            if (composedMse)
+            {
+                // AiDotNet's MeanSquaredErrorLoss.ComputeTapeLoss: mean over all axes of (pred - y)^2.
+                var diff = gpu.TensorSubtract(pred, y);
+                gpu.ReduceMean(gpu.TensorMultiply(diff, diff), new[] { 0, 1 }, keepDims: false);
+            }
+            else
+            {
+                gpu.TensorMSELoss(pred, y);
+            }
             plan = scope.CompileTraining(parameters);
         }
 
@@ -174,4 +183,124 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                         $"param {p}[{i}]: after a failed capture {failed.FinalWeights[p][i]} != eager {eager.FinalWeights[p][i]}");
         }
     }
+
+    /// <summary>
+    /// The same oracle with AiDotNet's MSE composition (ReduceMean over (pred - y)^2), which is what
+    /// NeuralNetwork.Train records. Its ReduceMeanBackward has to stay on the device inside the capture (a synchronous
+    /// Fill made it fall to the CPU there - CUDA 906), and its x*x backward exposed the eager step's stale gradient
+    /// accumulation (see Every_step_computes_the_tape_gradient).
+    /// </summary>
+    [SkippableFact]
+    public void A_captured_step_with_a_composed_mean_loss_trains_exactly_like_the_eager_step()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend,
+                "Whole-step graph capture is CUDA-only.");
+            Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "0",
+                "Graph capture is disabled for this process.");
+
+            var eager = Train(gpu, capture: false, composedMse: true);
+            var captured = Train(gpu, capture: true, composedMse: true);
+            _output.WriteLine("eager    " + string.Join(" ", eager.Losses.Select(l => l.ToString("G6"))));
+            _output.WriteLine("captured " + string.Join(" ", captured.Losses.Select(l => l.ToString("G6"))));
+
+            Assert.True(eager.Losses[^1] < 0.7 * eager.Losses[0], "the eager reference did not learn");
+            for (int s = 0; s < Steps; s++)
+                Assert.True(Math.Abs(eager.Losses[s] - captured.Losses[s]) <= 1e-5 * Math.Max(1, Math.Abs(eager.Losses[s])),
+                    $"step {s}: captured loss {captured.Losses[s]:G6} != eager {eager.Losses[s]:G6}");
+            for (int p = 0; p < eager.FinalWeights.Length; p++)
+                for (int i = 0; i < eager.FinalWeights[p].Length; i++)
+                    Assert.True(Math.Abs(eager.FinalWeights[p][i] - captured.FinalWeights[p][i]) <= 1e-5f,
+                        $"param {p}[{i}]: captured {captured.FinalWeights[p][i]} != eager {eager.FinalWeights[p][i]}");
+            Assert.True(captured.ReplayedAGraph, "the captured plan is not replaying a graph after warm-up");
+        }
+    }
+
+    /// <summary>
+    /// Ground truth, independent of every GPU path: at each step the compiled plan's parameter gradients must equal a
+    /// CPU-engine GradientTape's gradients at the same weights and batch. "Captured equals eager" is not enough on its
+    /// own - the eager step used to accumulate each step's gradient onto the previous step's cached device copy, so
+    /// both sides of that comparison were wrong together.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public void Every_step_computes_the_tape_gradient(bool capture, bool composedMse)
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            var x = Rand([Batch, Inputs], 1, 1f);
+            var y = Rand([Batch, Outputs], 2, 1f);
+            var parameters = new[] { Rand([Inputs, Hidden], 3, 0.3f), new Tensor<float>([Hidden]), Rand([Hidden, Outputs], 4, 0.3f), new Tensor<float>([Outputs]) };
+            foreach (var p in parameters) p.Gpu();
+
+            ICompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.EnableTraining(parameters))
+            {
+                Loss(gpu, x, y, parameters, composedMse);
+                plan = scope.CompileTraining(parameters);
+            }
+            using (plan)
+            {
+                var concrete = (CompiledTrainingPlan<float>)plan;
+                if (!capture) concrete.DisableGraphStep();
+                plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2f);
+                var gradients = (Tensor<float>[])typeof(CompiledTrainingPlan<float>)
+                    .GetField("_gradients", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(concrete)!;
+                for (int s = 0; s < Steps; s++)
+                {
+                    var expected = CpuTapeGradients(x, y, parameters, composedMse);
+                    plan.Step();
+                    for (int p = 0; p < parameters.Length; p++)
+                    {
+                        var actual = gradients[p].TryGetGpuBuffer() is { } buffer
+                            ? gpu.GetBackend()!.DownloadBuffer(buffer)
+                            : gradients[p].ToArray();
+                        double diff = 0, norm = 0;
+                        for (int i = 0; i < expected[p].Length; i++)
+                        {
+                            double d = actual[i] - expected[p][i];
+                            diff += d * d; norm += (double)expected[p][i] * expected[p][i];
+                        }
+                        Assert.True(Math.Sqrt(diff) <= 1e-3 * Math.Sqrt(norm) + 1e-6,
+                            $"step {s}, param {p}: |plan - tape| = {Math.Sqrt(diff):G4}, |tape| = {Math.Sqrt(norm):G4}");
+                    }
+                }
+            }
+        }
+    }
+
+    private static Tensor<float> Loss(IEngine e, Tensor<float> x, Tensor<float> y, Tensor<float>[] w, bool composedMse)
+    {
+        var h = e.FusedLinear(x, w[0], w[1], FusedActivationType.ReLU);
+        var pred = e.FusedLinear(h, w[2], w[3], FusedActivationType.None);
+        if (!composedMse) return e.TensorMSELoss(pred, y);
+        var diff = e.TensorSubtract(pred, y);
+        return e.ReduceMean(e.TensorMultiply(diff, diff), new[] { 0, 1 }, keepDims: false);
+    }
+
+    private static float[][] CpuTapeGradients(Tensor<float> x, Tensor<float> y, Tensor<float>[] parameters, bool composedMse)
+    {
+        var prior = AiDotNetEngine.Current;
+        var cpu = new CpuEngine();
+        try
+        {
+            AiDotNetEngine.Current = cpu;
+            Tensor<float> Copy(Tensor<float> t) => new Tensor<float>(t.ToArray(), t.Shape.ToArray());
+            var w = parameters.Select(Copy).ToArray();
+            using var tape = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<float>();
+            var loss = Loss(cpu, Copy(x), Copy(y), w, composedMse);
+            var grads = tape.ComputeGradients(loss, w);
+            return w.Select(p => grads[p].ToArray()).ToArray();
+        }
+        finally { AiDotNetEngine.Current = prior; }
+    }
 }
+
