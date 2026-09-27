@@ -258,6 +258,9 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     private void OrderAfterStagedUploads(IGpuStream stream)
     {
         if (stream is not CudaStream cudaStream || cudaStream.Handle == _stream) return;
+        // Callers reach this from GpuStreamScheduler.Dispatch, which invokes launch delegates without making the
+        // backend context current; the event calls below need it on this thread.
+        EnsureContextCurrent();
         lock (_stagedUploadLock)
         {
             if (_streamOrderEvent == IntPtr.Zero)
