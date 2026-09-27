@@ -254,6 +254,7 @@ public sealed unsafe partial class VulkanBackend
 
     public IGpuBuffer AllocateBuffer(float[] data)
     {
+        GpuLaunchProbe.OnUpload(data, sizeof(float), "Vulkan");
         EnsureInitialized();
         if (data is null)
             throw new ArgumentNullException(nameof(data));
@@ -275,7 +276,7 @@ public sealed unsafe partial class VulkanBackend
 
     public float[] DownloadBuffer(IGpuBuffer buffer)
     {
-        GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float));
+        GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float), "Vulkan");
         EnsureInitialized();
         var vb = AsVulkan(buffer);
         if (_transfer is null)
@@ -288,7 +289,7 @@ public sealed unsafe partial class VulkanBackend
 
     public void DownloadBuffer(IGpuBuffer buffer, float[] destination)
     {
-        GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float));
+        GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float), "Vulkan");
         EnsureInitialized();
         if (destination.Length < buffer.Size)
             throw new ArgumentException($"Destination array length ({destination.Length}) is less than buffer size ({buffer.Size}).", nameof(destination));
@@ -301,6 +302,7 @@ public sealed unsafe partial class VulkanBackend
 
     public byte[] DownloadByteBuffer(IGpuBuffer buffer, int byteCount)
     {
+        GpuLaunchProbe.OnReadback(byteCount, "Vulkan");
         EnsureInitialized();
         if (byteCount < 0)
             throw new ArgumentOutOfRangeException(nameof(byteCount), "Byte count must be non-negative.");
@@ -321,6 +323,7 @@ public sealed unsafe partial class VulkanBackend
 
     public void UploadByteBuffer(IGpuBuffer buffer, byte[] data)
     {
+        GpuLaunchProbe.OnUpload(data, sizeof(byte), "Vulkan");
         EnsureInitialized();
         if (data is null)
             throw new ArgumentNullException(nameof(data));
@@ -374,6 +377,7 @@ public sealed unsafe partial class VulkanBackend
 
     public IGpuBuffer AllocateIntBuffer(int[] data)
     {
+        GpuLaunchProbe.OnUpload(data, sizeof(int), "Vulkan");
         EnsureInitialized();
         if (data is null)
             throw new ArgumentNullException(nameof(data));
@@ -1086,6 +1090,7 @@ void main() {
 
     public void Synchronize()
     {
+        GpuLaunchProbe.OnSynchronize("Vulkan");
         if (_initialized && !_disposed)
             _device.WaitIdle();
     }

@@ -1385,6 +1385,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe IGpuBuffer AllocateBuffer(float[] data)
     {
+        GpuLaunchProbe.OnUpload(data, sizeof(float), "HIP");
         IntPtr devicePtr = IntPtr.Zero;
         var size = (UIntPtr)(data.Length * sizeof(float));
         // Issue #285: per-allocation cap check before hipMalloc.
@@ -1474,7 +1475,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void DownloadBuffer(IGpuBuffer buffer, float[] destination)
     {
-        GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float));
+        GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float), "HIP");
         var hipBuffer = (HipGpuBuffer)buffer;
         var size = (UIntPtr)(hipBuffer.Size * sizeof(float));
 
@@ -1491,6 +1492,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe byte[] DownloadByteBuffer(IGpuBuffer buffer, int byteCount)
     {
+        GpuLaunchProbe.OnReadback(byteCount, "HIP");
         if (buffer is null)
             throw new ArgumentNullException(nameof(buffer));
         if (byteCount < 0)
@@ -1517,6 +1519,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void UploadByteBuffer(IGpuBuffer buffer, byte[] data)
     {
+        GpuLaunchProbe.OnUpload(data, sizeof(byte), "HIP");
         if (buffer is null)
             throw new ArgumentNullException(nameof(buffer));
         if (data is null)
@@ -5813,6 +5816,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     /// <inheritdoc/>
     public void UploadIntBufferInPlace(int[] data, IGpuBuffer buffer)
     {
+        GpuLaunchProbe.OnUpload(data, sizeof(int), "HIP");
         if (data is null) throw new ArgumentNullException(nameof(data));
         if (buffer is null) throw new ArgumentNullException(nameof(buffer));
         if (data.Length > buffer.Size)
@@ -5839,6 +5843,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public IGpuBuffer AllocateIntBuffer(int[] data)
     {
+        GpuLaunchProbe.OnUpload(data, sizeof(int), "HIP");
         IntPtr devicePtr = IntPtr.Zero;
         var size = data.Length;
         var sizeBytes = (UIntPtr)(size * sizeof(int));
@@ -10245,6 +10250,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public void Synchronize()
     {
+        GpuLaunchProbe.OnSynchronize("HIP");
         if (_stream != IntPtr.Zero)
         {
             var result = HipNativeBindings.hipStreamSynchronize(_stream);

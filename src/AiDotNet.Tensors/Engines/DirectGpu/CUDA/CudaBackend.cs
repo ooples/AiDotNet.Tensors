@@ -1496,6 +1496,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
 
     public IGpuBuffer AllocateBuffer(float[] data)
     {
+        GpuLaunchProbe.OnUpload(data, sizeof(float), "CUDA");
         if (!IsAvailable)
             throw new InvalidOperationException("CUDA backend is not available.");
         AuditSyncIO("HtoD-alloc", (long)data.Length * sizeof(float));
@@ -1968,7 +1969,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
 
     public void DownloadBuffer(IGpuBuffer buffer, float[] destination)
     {
-        GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float));
+        GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float), "CUDA");
         // #226: never issue a device→host copy from a released buffer. After CudaGpuBuffer.Release
         // the device pointer is zeroed; cuMemcpyDtoH from a null/freed pointer is an ILLEGAL memory
         // access that corrupts the CUDA context — every subsequent driver call then fails with error
@@ -2015,6 +2016,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
 
     public byte[] DownloadByteBuffer(IGpuBuffer buffer, int byteCount)
     {
+        GpuLaunchProbe.OnReadback(byteCount, "CUDA");
         if (byteCount < 0)
             throw new ArgumentOutOfRangeException(nameof(byteCount), "Byte count must be non-negative.");
         if (byteCount > buffer.SizeInBytes)
@@ -2025,6 +2027,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
 
     public void UploadByteBuffer(IGpuBuffer buffer, byte[] data)
     {
+        GpuLaunchProbe.OnUpload(data, sizeof(byte), "CUDA");
         if (data is null)
             throw new ArgumentNullException(nameof(data));
         if (data.LongLength > buffer.SizeInBytes)
@@ -4887,6 +4890,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
 
     public void Synchronize()
     {
+        GpuLaunchProbe.OnSynchronize("CUDA");
         if (!IsAvailable)
             return;
 
@@ -5044,6 +5048,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     /// step so the per-step path has no <c>cuMemAlloc</c> (which is synchronous and serializes the step).</summary>
     public unsafe void UploadIntBufferInPlace(int[] data, IGpuBuffer buffer)
     {
+        GpuLaunchProbe.OnUpload(data, sizeof(int), "CUDA");
         if (data == null) throw new ArgumentNullException(nameof(data));
         if (buffer == null) throw new ArgumentNullException(nameof(buffer));
         if (!IsAvailable)
@@ -8768,6 +8773,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
 
     public IGpuBuffer AllocateIntBuffer(int[] data)
     {
+        GpuLaunchProbe.OnUpload(data, sizeof(int), "CUDA");
         if (!IsAvailable)
             throw new InvalidOperationException("CUDA backend is not available.");
         if (data is null)

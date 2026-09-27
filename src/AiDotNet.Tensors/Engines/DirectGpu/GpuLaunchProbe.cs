@@ -60,6 +60,114 @@ internal static class GpuLaunchProbe
             entry => $"{entry.Value}x {entry.Key}"));
 
     /// <summary>Records one device-to-host transfer at a backend download choke point.</summary>
+    // ---------------------------------------------------------------------------------------------
+    // Scoped residency accounting (issue #1058). The process-wide counters above say THAT data left the
+    // device; a GpuResidencyScope says which transfers happened inside one piece of work, in which direction,
+    // how many bytes, and (when asked) which engine operation caused each. Every backend's transfer primitives
+    // report here, so the count holds whichever of the engine's call sites triggered the crossing.
+    // ---------------------------------------------------------------------------------------------
+
+    private static int _activeScopes;
+    private static readonly object _processScopeGate = new();
+    private static readonly System.Collections.Generic.List<Diagnostics.GpuResidencyScope> _processScopes = new();
+
+    [System.ThreadStatic]
+    private static Diagnostics.GpuResidencyScope? _threadScope;
+
+    internal static void EnterScope(Diagnostics.GpuResidencyScope scope)
+    {
+        if (scope.ProcessWide)
+        {
+            lock (_processScopeGate) _processScopes.Add(scope);
+        }
+        else
+        {
+            scope.Previous = _threadScope;
+            _threadScope = scope;
+        }
+
+        Interlocked.Increment(ref _activeScopes);
+    }
+
+    internal static void ExitScope(Diagnostics.GpuResidencyScope scope)
+    {
+        if (scope.ProcessWide)
+        {
+            lock (_processScopeGate) _processScopes.Remove(scope);
+        }
+        else if (ReferenceEquals(_threadScope, scope))
+        {
+            _threadScope = scope.Previous;
+        }
+
+        Interlocked.Decrement(ref _activeScopes);
+    }
+
+    /// <summary>A host-to-device copy of <paramref name="byteCount"/> bytes.</summary>
+    public static void OnUpload(long byteCount, string backend)
+        => RecordScoped(Diagnostics.GpuTransferKind.HostToDevice, byteCount, backend);
+
+    /// <summary>A host-to-device copy of <paramref name="data"/>. Takes the array rather than its length so a
+    /// caller's null check after this call still sees the parameter as non-null.</summary>
+    public static void OnUpload(System.Array? data, int elementSize, string backend)
+        => OnUpload(data is null ? 0 : (long)data.Length * elementSize, backend);
+
+    /// <summary>The host blocked until the device drained its queue.</summary>
+    public static void OnSynchronize(string backend)
+        => RecordScoped(Diagnostics.GpuTransferKind.Synchronize, 0, backend);
+
+    private static void RecordScoped(Diagnostics.GpuTransferKind kind, long bytes, string backend)
+    {
+        if (Volatile.Read(ref _activeScopes) == 0) return;
+
+        string? operation = null;
+        bool resolved = false;
+        for (var scope = _threadScope; scope is not null; scope = scope.Previous)
+        {
+            if (scope.CaptureOperations && !resolved) { operation = FindEngineOperation(); resolved = true; }
+            scope.Add(new Diagnostics.GpuTransferEvent(kind, bytes, backend, scope.CaptureOperations ? operation : null));
+        }
+
+        Diagnostics.GpuResidencyScope[] processScopes;
+        lock (_processScopeGate)
+        {
+            if (_processScopes.Count == 0) return;
+            processScopes = _processScopes.ToArray();
+        }
+
+        foreach (var scope in processScopes)
+        {
+            if (scope.CaptureOperations && !resolved) { operation = FindEngineOperation(); resolved = true; }
+            scope.Add(new Diagnostics.GpuTransferEvent(kind, bytes, backend, scope.CaptureOperations ? operation : null));
+        }
+    }
+
+    /// <summary>The outermost engine method on the stack: the operation the caller actually asked for.</summary>
+    private static string? FindEngineOperation()
+    {
+        string? outermost = null;
+        foreach (var frame in new StackTrace(2, false).GetFrames() ?? System.Array.Empty<StackFrame>())
+        {
+            var method = frame.GetMethod();
+            var type = method?.DeclaringType;
+            if (type is null || method is null) continue;
+            string name = type.Name;
+            int tick = name.IndexOf('`');
+            if (tick >= 0) name = name.Substring(0, tick);
+            if (name is "DirectGpuTensorEngine" or "CpuEngine" or "DirectGpuEngine")
+                outermost = $"{name}.{method.Name}";
+        }
+
+        return outermost;
+    }
+
+    /// <summary>A device-to-host copy of <paramref name="byteCount"/> bytes.</summary>
+    public static void OnReadback(long byteCount, string backend)
+    {
+        RecordScoped(Diagnostics.GpuTransferKind.DeviceToHost, byteCount, backend);
+        OnReadback(byteCount);
+    }
+
     public static void OnReadback(long byteCount)
     {
         Interlocked.Increment(ref _readbacks);

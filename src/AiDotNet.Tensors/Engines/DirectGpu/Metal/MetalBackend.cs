@@ -488,6 +488,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
     /// </summary>
     public IGpuBuffer AllocateBuffer(float[] data)
     {
+        GpuLaunchProbe.OnUpload(data, sizeof(float), "Metal");
         ThrowIfDisposed();
 
         if (data is null || data.Length == 0)
@@ -522,7 +523,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
     /// </summary>
     public float[] DownloadBuffer(IGpuBuffer buffer)
     {
-        GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float));
+        GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float), "Metal");
         ThrowIfDisposed();
 
         if (buffer is not MetalGpuBuffer metalBuffer)
@@ -540,7 +541,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
     /// </summary>
     public void DownloadBuffer(IGpuBuffer buffer, float[] destination)
     {
-        GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float));
+        GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float), "Metal");
         ThrowIfDisposed();
 
         if (buffer is not MetalGpuBuffer metalBuffer)
@@ -556,6 +557,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
     /// </summary>
     public byte[] DownloadByteBuffer(IGpuBuffer buffer, int byteCount)
     {
+        GpuLaunchProbe.OnReadback(byteCount, "Metal");
         ThrowIfDisposed();
 
         if (buffer is not MetalGpuBuffer metalBuffer)
@@ -578,6 +580,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
     /// </summary>
     public void UploadByteBuffer(IGpuBuffer buffer, byte[] data)
     {
+        GpuLaunchProbe.OnUpload(data, sizeof(byte), "Metal");
         ThrowIfDisposed();
 
         if (data is null)
@@ -682,6 +685,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
     /// <inheritdoc/>
     public void UploadIntBufferInPlace(int[] data, IGpuBuffer buffer)
     {
+        GpuLaunchProbe.OnUpload(data, sizeof(int), "Metal");
         ThrowIfDisposed();
         if (data is null) throw new ArgumentNullException(nameof(data));
         if (buffer is not MetalGpuBuffer metalBuffer)
@@ -698,6 +702,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
 
     public IGpuBuffer AllocateIntBuffer(int[] data)
     {
+        GpuLaunchProbe.OnUpload(data, sizeof(int), "Metal");
         ThrowIfDisposed();
 
         if (data is null || data.Length == 0)

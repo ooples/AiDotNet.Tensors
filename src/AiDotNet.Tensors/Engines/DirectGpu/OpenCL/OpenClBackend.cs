@@ -1305,6 +1305,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         public IGpuBuffer AllocateBuffer(float[] data)
         {
+            GpuLaunchProbe.OnUpload(data, sizeof(float), "OpenCL");
             if (_context == null)
                 throw new InvalidOperationException("OpenCL context not available");
 
@@ -1351,20 +1352,21 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         public float[] DownloadBuffer(IGpuBuffer buffer)
         {
-            GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float));
+            GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float), "OpenCL");
             var openClBuffer = (DirectOpenClGpuBuffer)buffer;
             return openClBuffer.Download();
         }
 
         public void DownloadBuffer(IGpuBuffer buffer, float[] destination)
         {
-            GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float));
+            GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float), "OpenCL");
             var openClBuffer = (DirectOpenClGpuBuffer)buffer;
             openClBuffer.Download(destination);
         }
 
         public byte[] DownloadByteBuffer(IGpuBuffer buffer, int byteCount)
         {
+            GpuLaunchProbe.OnReadback(byteCount, "OpenCL");
             if (byteCount < 0)
                 throw new ArgumentOutOfRangeException(nameof(byteCount), "Byte count must be non-negative.");
             if (buffer is not DirectOpenClGpuByteBuffer byteBuffer)
@@ -1383,6 +1385,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         public void UploadByteBuffer(IGpuBuffer buffer, byte[] data)
         {
+            GpuLaunchProbe.OnUpload(data, sizeof(byte), "OpenCL");
             if (data is null)
                 throw new ArgumentNullException(nameof(data));
             if (buffer is not DirectOpenClGpuByteBuffer byteBuffer)
@@ -4698,6 +4701,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         public void Synchronize()
         {
+            GpuLaunchProbe.OnSynchronize("OpenCL");
             _context?.Finish();
         }
 
@@ -8630,6 +8634,7 @@ KERNEL VARIANTS (A/B testing):
         /// <inheritdoc/>
         public void UploadIntBufferInPlace(int[] data, IGpuBuffer buffer)
         {
+            GpuLaunchProbe.OnUpload(data, sizeof(int), "OpenCL");
             if (data is null) throw new ArgumentNullException(nameof(data));
             if (buffer is null) throw new ArgumentNullException(nameof(buffer));
             // Mirror AllocateIntBuffer: the OpenCL backend stores int buffers as the reinterpreted
@@ -8643,6 +8648,7 @@ KERNEL VARIANTS (A/B testing):
 
         public IGpuBuffer AllocateIntBuffer(int[] data)
         {
+            GpuLaunchProbe.OnUpload(data, sizeof(int), "OpenCL");
             if (_context == null)
                 throw new InvalidOperationException("OpenCL context not available");
 

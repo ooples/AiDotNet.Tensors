@@ -167,6 +167,7 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
     /// <inheritdoc/>
     public void UploadIntBufferInPlace(int[] data, IGpuBuffer buffer)
     {
+        GpuLaunchProbe.OnUpload(data, sizeof(int), "WebGPU");
         ThrowIfNotInitialized();
         if (data is null) throw new ArgumentNullException(nameof(data));
         if (buffer is not WebGpuBuffer webGpuBuffer)
@@ -197,6 +198,7 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
     /// <returns>A new GPU buffer containing the data.</returns>
     public IGpuBuffer AllocateBuffer(float[] data)
     {
+        GpuLaunchProbe.OnUpload(data, sizeof(float), "WebGPU");
         ThrowIfNotInitialized();
         // Issue #285: per-allocation cap check.
         GpuBufferSizeGuard.EnsureFits("WebGPU", (long)data.Length * sizeof(float), MaxBufferAllocBytes, DeviceName);

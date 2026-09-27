@@ -999,6 +999,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     /// <inheritdoc/>
     public void UploadIntBufferInPlace(int[] data, IGpuBuffer buffer)
     {
+        GpuLaunchProbe.OnUpload(data, sizeof(int), "Vulkan");
         EnsureInitialized();
         if (data is null) throw new ArgumentNullException(nameof(data));
         if (buffer is null) throw new ArgumentNullException(nameof(buffer));

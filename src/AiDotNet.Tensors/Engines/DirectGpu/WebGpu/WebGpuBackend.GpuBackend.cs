@@ -44,14 +44,14 @@ public sealed partial class WebGpuBackend
 
     public float[] DownloadBuffer(IGpuBuffer buffer)
     {
-        GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float));
+        GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float), "WebGPU");
         EnsureInitialized();
         return DownloadBufferData(buffer);
     }
 
     public void DownloadBuffer(IGpuBuffer buffer, float[] destination)
     {
-        GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float));
+        GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float), "WebGPU");
         EnsureInitialized();
         var data = DownloadBufferData(buffer);
         Array.Copy(data, destination, Math.Min(data.Length, destination.Length));
@@ -59,6 +59,7 @@ public sealed partial class WebGpuBackend
 
     public byte[] DownloadByteBuffer(IGpuBuffer buffer, int byteCount)
     {
+        GpuLaunchProbe.OnReadback(byteCount, "WebGPU");
         EnsureInitialized();
         if (byteCount < 0)
             throw new ArgumentOutOfRangeException(nameof(byteCount), "Byte count must be non-negative.");
@@ -74,6 +75,7 @@ public sealed partial class WebGpuBackend
 
     public void UploadByteBuffer(IGpuBuffer buffer, byte[] data)
     {
+        GpuLaunchProbe.OnUpload(data, sizeof(byte), "WebGPU");
         EnsureInitialized();
         if (data is null)
             throw new ArgumentNullException(nameof(data));
@@ -135,6 +137,7 @@ public sealed partial class WebGpuBackend
 
     public IGpuBuffer AllocateIntBuffer(int[] data)
     {
+        GpuLaunchProbe.OnUpload(data, sizeof(int), "WebGPU");
         EnsureInitialized();
         if (data is null)
             throw new ArgumentNullException(nameof(data));

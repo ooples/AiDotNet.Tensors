@@ -1,0 +1,11 @@
+{
+  "_note": "Host/device crossings in one warmed-up MLP training step, per backend and operation. Counts may only fall; an operation not listed may not cross at all.",
+  "mlp": {
+    "CUDA": {
+      "DeviceToHost DirectGpuTensorEngine.EvictActivationsCreatedAfter": 29,
+      "DeviceToHost DirectGpuTensorEngine.InvalidateGpuCacheForTensor": 4,
+      "DeviceToHost DirectGpuTensorEngine.AiDotNet.Tensors.Engines.IEngine.ReduceMean": 1,
+      "HostToDevice DirectGpuTensorEngine.AiDotNet.Tensors.Engines.IEngine.ReduceMeanBackward": 1
+    }
+  }
+}
