@@ -3547,7 +3547,40 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // which strongly owned it, so the cache had to materialize (download) every result before it could free it:
         // at every tape dispose and every pressure eviction, plus the cache bookkeeping on every op.
         NoteOwnedResultAllocation(outputBuffer.SizeInBytes);
+        if (TrackOwnedResultBytes) TrackOwnedResult(outputBuffer);
         return tensor;
+    }
+
+    // DIAGNOSTIC (off by default, zero cost when off): the device bytes held by live tensor-owned results. Owned results
+    // are not in the activation cache, so CurrentActivationCacheBytes alone stopped measuring resident activation memory
+    // when results took ownership of their buffers; memory tests add this to it. Weak references only - tracking must not
+    // extend any result's lifetime.
+    internal static volatile bool TrackOwnedResultBytes;
+    private readonly List<(WeakReference<IGpuBuffer> Buffer, long Bytes)> _trackedOwnedResults = new();
+
+    private void TrackOwnedResult(IGpuBuffer buffer)
+    {
+        lock (_trackedOwnedResults) _trackedOwnedResults.Add((new WeakReference<IGpuBuffer>(buffer), buffer.SizeInBytes));
+    }
+
+    /// <summary>Device bytes of tracked owned results that are still alive and not yet freed.</summary>
+    internal long LiveOwnedResultBytes
+    {
+        get
+        {
+            long total = 0;
+            lock (_trackedOwnedResults)
+            {
+                _trackedOwnedResults.RemoveAll(e => !e.Buffer.TryGetTarget(out var b) || b.Handle == IntPtr.Zero);
+                foreach (var e in _trackedOwnedResults) total += e.Bytes;
+            }
+            return total;
+        }
+    }
+
+    internal void ResetOwnedResultTracking()
+    {
+        lock (_trackedOwnedResults) _trackedOwnedResults.Clear();
     }
 
     // The GC cannot see device memory. Owned results are small managed objects pinning large device buffers, so

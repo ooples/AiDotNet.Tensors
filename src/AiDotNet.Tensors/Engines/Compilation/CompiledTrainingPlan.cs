@@ -1364,6 +1364,43 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// (<c>NeuralNetworkBase.TrainWithTape</c>) applies the same clip
     /// independently — both paths agree when given the same threshold.
     /// </remarks>
+    private float _l2Regularization;
+
+    /// <inheritdoc/>
+    public void SetL2Regularization(double strength)
+    {
+        if (double.IsNaN(strength) || double.IsInfinity(strength) || strength < 0)
+            throw new ArgumentOutOfRangeException(nameof(strength), strength, "L2 strength must be finite and >= 0.");
+        _l2Regularization = (float)strength;
+    }
+
+    // grad += strength * param for every parameter, before clipping (see SetL2Regularization). On the device when both
+    // the gradient and the parameter are resident (the captured / resident path) - one launch per parameter - else on
+    // the host arrays the optimizer binds.
+    private void ApplyL2Regularization()
+    {
+        if (_l2Regularization == 0f) return;
+        var engine = _engine as Engines.DirectGpuTensorEngine;
+        var backend = engine?.GetBackend();
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var strength = numOps.FromDouble(_l2Regularization);
+        for (int p = 0; p < _parameters.Length; p++)
+        {
+            var grad = _gradients[p];
+            if (grad is null) continue;
+            var param = _parameters[p];
+            if (typeof(T) == typeof(float) && backend is not null
+                && grad.TryGetGpuBuffer() is { } gradBuffer && param.TryGetGpuBuffer() is { } paramBuffer)
+            {
+                backend.AddScaled(gradBuffer, paramBuffer, gradBuffer, 1f, _l2Regularization, grad.Length);
+                continue;
+            }
+            var g = grad.AsWritableSpan();
+            var w = param.AsSpan();
+            for (int i = 0; i < g.Length; i++) g[i] = numOps.Add(g[i], numOps.Multiply(strength, w[i]));
+        }
+    }
+
     public void SetMaxGradNorm(double maxNorm)
     {
         if (double.IsNaN(maxNorm) || double.IsInfinity(maxNorm) || maxNorm < 0)
@@ -1765,6 +1802,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     // capture step. Its kernels enqueue (in order) after the graph launch.
                     // GPU-resident grad clip (if enabled): scales the device grad buffers in place on the
                     // compute stream — ordered after the captured backward, before the optimizer reads them.
+                    ApplyL2Regularization();
                     if (_maxGradNorm > 0.0 && !TryClipGradientsGlobalL2Gpu(_gradients, _maxGradNorm))
                         ClipGradientsGlobalL2(_gradients, _maxGradNorm);
                     _optimizerUpdate?.Invoke();
@@ -1780,6 +1818,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 RefreshGraphInputInPlace(cb);
                 cb.LaunchCapturedGraph(_stepGraphExec);
                 RearmLossDownload(gte, cb);
+                ApplyL2Regularization();
                 if (_maxGradNorm > 0.0 && !TryClipGradientsGlobalL2Gpu(_gradients, _maxGradNorm))
                     ClipGradientsGlobalL2(_gradients, _maxGradNorm);
                 _optimizerUpdate?.Invoke();
@@ -2254,6 +2293,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // every traced tensor) and not using arr.Length (which is the
         // pool-padded backing-array length whose tail bytes Array.Clear
         // leaves uninitialised).
+        ApplyL2Regularization();   // before clipping, as the flat optimizer path orders it
         if (_maxGradNorm > 0.0)
         {
             // Prefer the fully GPU-resident clip when grads are CUDA-resident — it scales the device grad

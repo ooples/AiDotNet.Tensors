@@ -240,11 +240,14 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
     /// both sides of that comparison were wrong together.
     /// </summary>
     [SkippableTheory]
-    [InlineData(false, false)]
-    [InlineData(false, true)]
-    [InlineData(true, false)]
-    [InlineData(true, true)]
-    public void Every_step_computes_the_tape_gradient(bool capture, bool composedMse)
+    [InlineData(false, false, 0.0)]
+    [InlineData(false, true, 0.0)]
+    [InlineData(true, false, 0.0)]
+    [InlineData(true, true, 0.0)]
+    // L2 regularization (AiDotNet's optimizer default is 0.01): the plan must add strength * theta to each gradient.
+    [InlineData(false, true, 0.05)]
+    [InlineData(true, true, 0.05)]
+    public void Every_step_computes_the_tape_gradient(bool capture, bool composedMse, double l2)
     {
         Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
         using (gpu)
@@ -266,12 +269,18 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                 var concrete = (CompiledTrainingPlan<float>)plan;
                 if (!capture) concrete.DisableGraphStep();
                 plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2f);
+                plan.SetL2Regularization(l2);
                 var gradients = (Tensor<float>[])typeof(CompiledTrainingPlan<float>)
                     .GetField("_gradients", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(concrete)!;
                 for (int s = 0; s < Steps; s++)
                 {
                     FeedBatch(x, y, s);
                     var expected = CpuTapeGradients(x, y, parameters, composedMse);
+                    for (int p = 0; p < parameters.Length; p++)
+                    {
+                        var theta = parameters[p].ToArray();   // the pre-step weights the L2 term is taken at
+                        for (int i = 0; i < expected[p].Length; i++) expected[p][i] += (float)l2 * theta[i];
+                    }
                     plan.Step();
                     for (int p = 0; p < parameters.Length; p++)
                     {

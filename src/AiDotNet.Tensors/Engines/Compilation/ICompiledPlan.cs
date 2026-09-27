@@ -459,6 +459,13 @@ public interface ICompiledTrainingPlan<T> : IDisposable
     void SetMaxGradNorm(double maxNorm);
 
     /// <summary>
+    /// Adds <c>strength * parameter</c> to every parameter gradient each step, BEFORE gradient clipping and the
+    /// optimizer update - L2 regularization in the order AiDotNet's optimizers apply it to a flat gradient (which is
+    /// not the order of a coupled optimizer weight decay, applied after clipping). 0 disables it.
+    /// </summary>
+    void SetL2Regularization(double strength);
+
+    /// <summary>
     /// Requests bfloat16 storage for the Adam/AdamW moment state (m, v) on the
     /// float fused path (#1745). Halves resident optimizer-state memory while
     /// keeping the fp32 update math, so large models can stay on the fused fast
