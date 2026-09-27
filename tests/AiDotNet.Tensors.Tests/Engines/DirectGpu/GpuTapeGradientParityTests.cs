@@ -593,13 +593,18 @@ public class GpuTapeGradientParityTests : IDisposable
         AssertStaysOnDeviceUnderTape("Dropout", static (e, t) => e.Dropout(t, 0.4, true, out _),
             static (x, y) => Assert.Equal(x.Shape.ToArray(), y.Shape.ToArray()));
     /// <summary>
-    /// Non-float LayerNorm under a tape used to fall back to CpuEngine. It now runs the FP32 kernel and records the
-    /// same node, so a double gradient agrees with the CPU's to FP32 accuracy, through both entry points.
+    /// The norm kernels compute in FP32, so under a tape a DOUBLE forward stays on CpuEngine and keeps its precision:
+    /// it is bit-identical to the CPU's. (A double finite-difference gradcheck taken under the tape, as
+    /// ConvGroupNormGradCheck does, cannot resolve an FP32 forward.) The backward still runs through the engine's
+    /// norm-backward kernels, as it did before, hence the 1e-6 gradient bound. Float runs on the device; the float
+    /// tests above cover that path.
     /// </summary>
     [SkippableTheory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public void LayerNorm_double_gradients_match_cpu_to_fp32_accuracy(bool throughIEngine)
+    [InlineData("LayerNorm")]
+    [InlineData("GroupNorm")]
+    [InlineData("InstanceNorm")]
+    [InlineData("RMSNorm")]
+    public void Norms_keep_double_precision_under_a_tape(string op)
     {
         Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
         using (gpu!)
@@ -607,15 +612,19 @@ public class GpuTapeGradientParityTests : IDisposable
             (double[] Forward, double[] Grad) Run(IEngine engine)
             {
                 AiDotNetEngine.Current = engine;
-                var x = new Tensor<double>(new[] { 6, 10 });
+                var x = new Tensor<double>(new[] { 2, 4, 3, 5 });
                 for (int i = 0; i < x.Length; i++) x[i] = Math.Sin(0.41 * i) + 0.05 * (i % 7);
-                var gamma = new Tensor<double>(new[] { 10 });
-                var beta = new Tensor<double>(new[] { 10 });
-                for (int i = 0; i < 10; i++) { gamma[i] = 0.8 + 0.03 * i; beta[i] = 0.01 * i; }
+                var gamma = new Tensor<double>(op is "LayerNorm" or "RMSNorm" ? new[] { 5 } : new[] { 4 });
+                var beta = new Tensor<double>(gamma.Shape.ToArray());
+                for (int i = 0; i < gamma.Length; i++) { gamma[i] = 0.8 + 0.03 * i; beta[i] = 0.01 * i; }
                 using var tape = new GradientTape<double>();
-                var y = throughIEngine || engine is CpuEngine and not DirectGpuTensorEngine
-                    ? engine.LayerNorm(x, gamma, beta, 1e-5, out _, out _)
-                    : ((DirectGpuTensorEngine)engine).LayerNorm(x, gamma, beta, 1e-5, out _, out _);
+                var y = op switch
+                {
+                    "LayerNorm" => engine.LayerNorm(x, gamma, beta, 1e-5, out _, out _),
+                    "GroupNorm" => engine.GroupNorm(x, 2, gamma, beta, 1e-5, out _, out _),
+                    "InstanceNorm" => engine.InstanceNorm(x, gamma, beta, 1e-5, out _, out _),
+                    _ => engine.RMSNorm(x, gamma, 1e-5, out _),
+                };
                 var weight = new Tensor<double>(y.Shape.ToArray());
                 for (int i = 0; i < weight.Length; i++) weight[i] = 0.13 + 0.017 * (i % 11);
                 var loss = engine.ReduceSum(engine.TensorMultiply(y, weight), null);
@@ -632,16 +641,11 @@ public class GpuTapeGradientParityTests : IDisposable
             double forwardDiff = 0, gradDiff = 0;
             for (int i = 0; i < cpu.Forward.Length; i++) forwardDiff = Math.Max(forwardDiff, Math.Abs(cpu.Forward[i] - device.Forward[i]));
             for (int i = 0; i < cpu.Grad.Length; i++) gradDiff = Math.Max(gradDiff, Math.Abs(cpu.Grad[i] - device.Grad[i]));
-            _out.WriteLine($"LayerNorm<double> ieng={throughIEngine} forwardDiff={forwardDiff:E3} gradDiff={gradDiff:E3}");
-            // The inputs are host tensors, so a bit-identical FORWARD means LayerNorm itself ran on the CPU in double;
-            // the FP32 kernel cannot reproduce it. (The gradient is no signal: the multiply and reduce around it run
-            // on the device either way.)
-            Assert.True(forwardDiff > 0, "forward bit-identical to the CPU: LayerNorm fell back to CpuEngine");
-            Assert.True(forwardDiff < 1e-4, $"double LayerNorm forward diverged from CPU (maxAbs={forwardDiff:E3})");
-            Assert.True(gradDiff < 1e-4, $"double LayerNorm gradient diverged from CPU (maxAbs={gradDiff:E3})");
+            _out.WriteLine($"{op}<double> under tape: forwardDiff={forwardDiff:E3} gradDiff={gradDiff:E3}");
+            Assert.Equal(0.0, forwardDiff);
+            Assert.True(gradDiff < 1e-6, $"{op}<double> gradient lost precision (maxAbs={gradDiff:E3})");
         }
-    }
-    private static readonly Tensor<float> NormGamma = Rand([2], seed: 263);
+    }    private static readonly Tensor<float> NormGamma = Rand([2], seed: 263);
     private static readonly Tensor<float> NormBeta = Rand([2], seed: 269);
 
     // [6,10] viewed as [3,2,2,5]: 3 samples, 2 channels, 2x5 positions. Gradient flows through the batch statistics.
@@ -671,6 +675,37 @@ public class GpuTapeGradientParityTests : IDisposable
         AssertStaysOnDeviceUnderTape("BatchNorm",
             static (e, t) => e.BatchNorm(t.Reshape(new[] { 3, 2, 2, 5 }), NormGamma, NormBeta, 1e-5, out _, out _),
             static (x, y) => Assert.Equal(new[] { 3, 2, 2, 5 }, y.Shape.ToArray()));
+    public enum NormKind { Group, Instance, Rms }
+
+    private static Tensor<float> RunNorm(IEngine e, Tensor<float> t, NormKind kind) => kind switch
+    {
+        NormKind.Group => e.GroupNorm(t.Reshape(new[] { 3, 4, 5 }), 2, Rand([4], seed: 293), Rand([4], seed: 307),
+            1e-5, out _, out _),
+        NormKind.Instance => e.InstanceNorm(t.Reshape(new[] { 3, 2, 2, 5 }), NormGamma, NormBeta, 1e-5, out _, out _),
+        _ => e.RMSNorm(t, Rand([10], seed: 311), 1e-5, out _),
+    };
+
+    [SkippableTheory]
+    [InlineData(NormKind.Group)]
+    [InlineData(NormKind.Instance)]
+    [InlineData(NormKind.Rms)]
+    public void Norm_gradients_match_cpu(NormKind kind) =>
+        AssertGradientParity($"{kind}Norm", Rand([6, 10], seed: 313), (e, t) => RunNorm(e, t, kind));
+
+    [SkippableTheory]
+    [InlineData(NormKind.Group)]
+    [InlineData(NormKind.Instance)]
+    [InlineData(NormKind.Rms)]
+    public void Norm_taped_forward_matches_cpu(NormKind kind) =>
+        AssertTapedForwardMatchesCpu($"{kind}Norm", Rand([6, 10], seed: 317), (e, t) => RunNorm(e, t, kind));
+
+    [SkippableTheory]
+    [InlineData(NormKind.Group)]
+    [InlineData(NormKind.Instance)]
+    [InlineData(NormKind.Rms)]
+    public void Norm_stays_on_the_device_while_a_tape_records(NormKind kind) =>
+        AssertStaysOnDeviceUnderTape($"{kind}Norm", (e, t) => RunNorm(e, t, kind),
+            static (x, y) => Assert.Equal(x.Length, y.Length));
     [SkippableFact]
     public void TensorClampMin_gradients_match_cpu() =>
         AssertGradientParity("ClampMin", Rand([6, 10], seed: 73),

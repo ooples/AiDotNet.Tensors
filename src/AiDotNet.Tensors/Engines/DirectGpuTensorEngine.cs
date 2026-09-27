@@ -14165,8 +14165,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.LayerNorm<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
         ValidateLayerNormArguments(input, gamma, beta);
-        // Float forwards to the public override, which runs the kernel and records the tape node itself; the
-        // non-float branch below computes the same mean and true variance on the device and records the same node.
+        // Float forwards to the public override, which runs the kernel and records the tape node itself.
+        // Non-float stays on CpuEngine under a tape: the norm kernels compute in FP32, so a double training step
+        // would silently lose its precision (a double finite-difference gradcheck cannot resolve it). Float runs
+        // and records on the device.
+        if (IsTapeActive<T>() && typeof(T) != typeof(float)) return base.LayerNorm(input, gamma, beta, epsilon, out mean, out variance);
         // AiDotNet#1331: under GraphMode, the base CpuEngine.LayerNorm has the
         // lazy-graph recording branch that emits a backward node for the
         // compiled plan. The GPU eager path below would silently bypass
@@ -14238,8 +14241,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             outputBuffer.RelinquishOwnership();
             saveMeanBuffer.RelinquishOwnership();
             trueVarBuffer.RelinquishOwnership();
-            Autodiff.DifferentiableOps.RecordIfActive("LayerNorm", result, new[] { input, gamma, beta },
-                Autodiff.BackwardFunctions<T>.LayerNormBackward, new object[] { mean, variance, epsilon });
             return result;
         }
         catch (Exception)
@@ -14454,7 +14455,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.RMSNorm<T>(Tensor<T> input, Tensor<T> gamma, double epsilon, out Tensor<T> rms)
     {
-        if (IsTapeActive<T>()) return base.RMSNorm(input, gamma, epsilon, out rms);
+        // Non-float stays on CpuEngine under a tape: the norm kernels compute in FP32, so a double training step
+        // would silently lose its precision (a double finite-difference gradcheck cannot resolve it). Float runs
+        // and records on the device.
+        if (IsTapeActive<T>() && typeof(T) != typeof(float)) return base.RMSNorm(input, gamma, epsilon, out rms);
         if (Compilation.GraphMode.IsActive) return base.RMSNorm(input, gamma, epsilon, out rms);
         if (!TryGetBackend(out var backend))
             return base.RMSNorm(input, gamma, epsilon, out rms);
@@ -14479,8 +14483,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             backend.Synchronize();
             var result = DeferTensorResult<T>(backend, outputBuffer.Buffer,
                 input.Length, input.Shape.ToArray());
-            rms = DeferTensorResult<T>(backend, saveRmsBuffer.Buffer,
-                batchSize, new[] { batchSize });
+            // Shaped like CpuEngine's rms: the leading (non-normalised) dims, [1] when there are none.
+            int batchDims = input.Rank - gamma.Rank;
+            var rmsShape = new int[Math.Max(1, batchDims)];
+            if (batchDims <= 0) rmsShape[0] = 1;
+            for (int i = 0; i < batchDims; i++) rmsShape[i] = input.Shape._dims[i];
+            rms = DeferTensorResult<T>(backend, saveRmsBuffer.Buffer, batchSize, rmsShape);
             outputBuffer.RelinquishOwnership();
             saveRmsBuffer.RelinquishOwnership();
             return result;
@@ -14539,7 +14547,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.GroupNorm<T>(Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
-        if (IsTapeActive<T>()) return base.GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
+        // Non-float stays on CpuEngine under a tape: the norm kernels compute in FP32, so a double training step
+        // would silently lose its precision (a double finite-difference gradcheck cannot resolve it). Float runs
+        // and records on the device.
+        if (IsTapeActive<T>() && typeof(T) != typeof(float)) return base.GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
         if (Compilation.GraphMode.IsActive) return base.GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
         if (!TryGetBackend(out var backend))
             return base.GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
@@ -14602,7 +14613,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.InstanceNorm<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
-        if (IsTapeActive<T>()) return base.InstanceNorm(input, gamma, beta, epsilon, out mean, out variance);
+        // Non-float stays on CpuEngine under a tape: the norm kernels compute in FP32, so a double training step
+        // would silently lose its precision (a double finite-difference gradcheck cannot resolve it). Float runs
+        // and records on the device.
+        if (IsTapeActive<T>() && typeof(T) != typeof(float)) return base.InstanceNorm(input, gamma, beta, epsilon, out mean, out variance);
         if (Compilation.GraphMode.IsActive) return base.InstanceNorm(input, gamma, beta, epsilon, out mean, out variance);
         if (!TryGetBackend(out var backend))
             return base.InstanceNorm(input, gamma, beta, epsilon, out mean, out variance);
@@ -21056,10 +21070,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> LayerNorm<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
         ValidateLayerNormArguments(input, gamma, beta);
-        // Under a tape every type takes the FP32 kernel path below, which converts the variance slot and records
-        // CpuEngine's node. The FP16 half-store branch is skipped then: it leaves INVERSE std in its variance slot,
-        // which LayerNormBackward cannot take, and records nothing.
-        bool taping = IsTapeActive<T>();
+        // Non-float stays on CpuEngine under a tape: the norm kernels compute in FP32, so a double training step
+        // would silently lose its precision (a double finite-difference gradcheck cannot resolve it). Float runs
+        // and records on the device.
+        if (IsTapeActive<T>() && typeof(T) != typeof(float)) return base.LayerNorm(input, gamma, beta, epsilon, out mean, out variance);
         if (!TryGetBackend(out var backend) || input.Rank < 2)
             return base.LayerNorm(input, gamma, beta, epsilon, out mean, out variance);
 
@@ -21095,7 +21109,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // Runs on ANY backend that ships the FP16-native kernels (IGpuHalfPrecisionBackend.SupportsFp16NativeOps):
             // the store plumbing (ResolveToFp16 / FinishGpuOpHalfStore) is now backend-agnostic, so the
             // half-resident memory win is no longer CUDA-only. Backends without the kernels use the FP32 path below.
-            if (typeof(T) == typeof(Half) && s_fp16FwdStore && !taping
+            if (typeof(T) == typeof(Half) && s_fp16FwdStore
                 && backend is IGpuHalfPrecisionBackend hpL && hpL.SupportsFp16NativeOps)
             {
                 IGpuBuffer? hInOwned = null, hGOwned = null, hBOwned = null, hOut = null;
@@ -21163,7 +21177,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (gamma is null) throw new ArgumentNullException(nameof(gamma));
         if (beta is null) throw new ArgumentNullException(nameof(beta));
         ValidateGroupNormArguments(input, numGroups, gamma, beta);
-        if (IsTapeActive<T>()) return base.GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
+        // Non-float stays on CpuEngine under a tape: the norm kernels compute in FP32, so a double training step
+        // would silently lose its precision (a double finite-difference gradcheck cannot resolve it). Float runs
+        // and records on the device.
+        if (IsTapeActive<T>() && typeof(T) != typeof(float)) return base.GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
         if (!TryGetBackend(out var backend) || input.Rank < 2)
             return base.GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
 
@@ -21196,6 +21213,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             mean = DeferTensorResult<T>(backend, bufMean.Buffer, batch * numGroups, new[] { batch, numGroups });
             variance = DeferTensorResult<T>(backend, bufVar.Buffer, batch * numGroups, new[] { batch, numGroups });
             ownershipTransferred = true;
+            // Same node and saved state CpuEngine records: per-(sample, group) mean and TRUE variance.
+            Autodiff.DifferentiableOps.RecordIfActive("GroupNorm", result, new[] { input, gamma, beta },
+                Autodiff.BackwardFunctions<T>.GroupNormBackward, new object[] { numGroups, mean, variance, epsilon });
             return result;
         }
         catch (Exception)
@@ -21204,13 +21224,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 bufOut.Dispose(); bufMean.Dispose(); bufVar.Dispose();
             }
+            if (ThrowOnGpuKernelFallback) throw;
             return base.GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
         }
     }
 
     public override Tensor<T> InstanceNorm<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
-        if (IsTapeActive<T>()) return base.InstanceNorm(input, gamma, beta, epsilon, out mean, out variance);
+        // Non-float stays on CpuEngine under a tape: the norm kernels compute in FP32, so a double training step
+        // would silently lose its precision (a double finite-difference gradcheck cannot resolve it). Float runs
+        // and records on the device.
+        if (IsTapeActive<T>() && typeof(T) != typeof(float)) return base.InstanceNorm(input, gamma, beta, epsilon, out mean, out variance);
         if (!TryGetBackend(out var backend) || input.Rank < 4)
             return base.InstanceNorm(input, gamma, beta, epsilon, out mean, out variance);
 
@@ -21238,6 +21262,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             mean = DeferTensorResult<T>(backend, bufMean.Buffer, batch * channels, new[] { batch, channels });
             variance = DeferTensorResult<T>(backend, bufVar.Buffer, batch * channels, new[] { batch, channels });
             ownershipTransferred = true;
+            // Same node and saved state CpuEngine records: per-(sample, channel) mean and TRUE variance.
+            Autodiff.DifferentiableOps.RecordIfActive("InstanceNorm", result, new[] { input, gamma, beta },
+                Autodiff.BackwardFunctions<T>.InstanceNormBackward, new object[] { mean, variance, epsilon });
             return result;
         }
         catch (Exception)
@@ -21246,13 +21273,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 bufOut.Dispose(); bufMean.Dispose(); bufVar.Dispose();
             }
+            if (ThrowOnGpuKernelFallback) throw;
             return base.InstanceNorm(input, gamma, beta, epsilon, out mean, out variance);
         }
     }
 
     public override Tensor<T> RMSNorm<T>(Tensor<T> input, Tensor<T> gamma, double epsilon, out Tensor<T> rms)
     {
-        if (IsTapeActive<T>()) return base.RMSNorm(input, gamma, epsilon, out rms);
+        // Non-float stays on CpuEngine under a tape: the norm kernels compute in FP32, so a double training step
+        // would silently lose its precision (a double finite-difference gradcheck cannot resolve it). Float runs
+        // and records on the device.
+        if (IsTapeActive<T>() && typeof(T) != typeof(float)) return base.RMSNorm(input, gamma, epsilon, out rms);
         if (!TryGetBackend(out var backend) || input.Rank < 2)
             return base.RMSNorm(input, gamma, epsilon, out rms);
 
@@ -21275,8 +21306,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             backend.RmsNorm(bufIn.Buffer, bufOut.Buffer, bufGamma.Buffer, bufRms.Buffer,
                 outerSize, normSize, (float)epsilon);
             var result = DeferTensorResult<T>(backend, bufOut.Buffer, input.Length, input.Shape.ToArray());
-            rms = DeferTensorResult<T>(backend, bufRms.Buffer, outerSize, new[] { outerSize });
+            // Shaped like CpuEngine's rms: the leading (non-normalised) dims, [1] when there are none.
+            int batchDims = input.Rank - gamma.Rank;
+            var rmsShape = new int[Math.Max(1, batchDims)];
+            if (batchDims <= 0) rmsShape[0] = 1;
+            for (int i = 0; i < batchDims; i++) rmsShape[i] = input.Shape._dims[i];
+            rms = DeferTensorResult<T>(backend, bufRms.Buffer, outerSize, rmsShape);
             ownershipTransferred = true;
+            Autodiff.DifferentiableOps.RecordIfActive("RMSNorm", result, new[] { input, gamma },
+                Autodiff.BackwardFunctions<T>.RMSNormBackward, new object[] { rms, epsilon });
             return result;
         }
         catch (Exception)
@@ -21285,6 +21323,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 bufOut.Dispose(); bufRms.Dispose();
             }
+            if (ThrowOnGpuKernelFallback) throw;
             return base.RMSNorm(input, gamma, epsilon, out rms);
         }
     }
