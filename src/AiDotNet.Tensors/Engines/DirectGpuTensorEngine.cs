@@ -2530,6 +2530,40 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
     }
 
+    // Device memory held only by unreachable managed objects -- results handed to tensor lifetime, and buffers other
+    // paths leave to their finalizers -- is released when the GC runs. The materialize-then-free contract downloaded
+    // ~4 GB per training step into managed arrays, and that allocation churn kept the GC (and so the finalizers)
+    // running; with the downloads gone a GPU training loop allocates almost nothing managed, the GC stops, and dead
+    // buffers pile up on the device (measured: the HRE LM step degraded from 0.3 s to 37-137 s; collecting after
+    // every step held it at 0.28 s).
+    private long _freeBytesAtLastReclaim = -1;
+
+    /// <summary>
+    /// Called when an outermost tape ends. Reclaims finalizer-owned device memory when free device memory has
+    /// fallen by more than max(1/16 of the device, 256 MiB) since the last reclaim, or is below 15% of the device.
+    /// One cuMemGetInfo when nothing is due; a collection (cheap: the managed heap of a GPU loop is small) when it is.
+    /// </summary>
+    internal void ReclaimDetachedResultsOverBudget()
+    {
+        if (!TryGetBackend(out var backend) || backend is not Engines.DirectGpu.CUDA.CudaBackend cuda) return;
+        if (!cuda.TryGetDeviceMemory(out ulong free, out ulong total)) return;
+        long freeNow = (long)free;
+        long last = System.Threading.Interlocked.Read(ref _freeBytesAtLastReclaim);
+        bool pressured = (double)free / total < 0.15;
+        if (last < 0 || freeNow > last)
+        {
+            // First call, or memory came back (another process freed, or a reclaim ran): new reference point.
+            System.Threading.Interlocked.Exchange(ref _freeBytesAtLastReclaim, freeNow);
+            if (!pressured) return;
+            last = freeNow;
+        }
+        long growthAllowance = Math.Max((long)(total / 16), 256L << 20);
+        if (last - freeNow < growthAllowance && !pressured) return;
+        cuda.ReclaimNow();
+        if (cuda.TryGetDeviceMemory(out ulong afterFree, out _))
+            System.Threading.Interlocked.Exchange(ref _freeBytesAtLastReclaim, (long)afterFree);
+    }
+
     /// <summary>
     /// Evicts this thread's activation-cache entries created after <paramref name="snapshot"/> (except
     /// <paramref name="protect"/>), handling entries whose only valid copy is on the device per <paramref name="mode"/>.

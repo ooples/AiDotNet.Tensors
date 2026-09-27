@@ -2752,8 +2752,10 @@ public sealed class GradientTape<T> : IDisposable
             // step on a 26.8M-parameter LM). Reading one afterwards throws a clear error; Retain(tensor) keeps one.
             _snapshotEngine.EvictActivationsCreatedAfter(_activationSnapshot, _keptKeys,
                 Engines.ActivationReleaseMode.Release);
-            // What the caller keeps (loss, gradients, retained tensors) now lives as long as its tensor.
+            // What the caller keeps (loss, gradients, retained tensors) now lives as long as its tensor; earlier
+            // steps' kept results that are no longer referenced are reclaimed once they add up (see the engine).
             if (_keptKeys is not null) _snapshotEngine.DetachToTensorLifetime(_keptKeys);
+            _snapshotEngine.ReclaimDetachedResultsOverBudget();
         }
 
         // A tape may be disposed before backward, or after a cleanup path that

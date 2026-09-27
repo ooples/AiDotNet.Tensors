@@ -1722,6 +1722,28 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     private int _reclaimBackoffSteps = 1;
 
     /// <summary>
+    /// Unconditionally releases device memory held only by unreachable managed objects: runs the pending
+    /// finalizers (which free or enqueue their buffers) and drains the completed deferred frees back to the pool.
+    /// </summary>
+    /// <summary>Free and total device memory (cuMemGetInfo), or false when unavailable.</summary>
+    internal bool TryGetDeviceMemory(out ulong free, out ulong total)
+    {
+        free = 0; total = 0;
+        if (!IsAvailable) return false;
+        using (PushContext())
+            return CudaNativeBindings.cuMemGetInfo(out free, out total) == CudaResult.Success && total > 0;
+    }
+
+    internal void ReclaimNow()
+    {
+        if (!IsAvailable) return;
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+        DrainDeferredFrees(blockOldest: false);
+    }
+
+    /// <summary>
     /// Allocates device memory with an OOM-recovery retry. If the driver reports
     /// out-of-memory, drain the buffer pool — a real <c>cuMemFree</c> of every
     /// retained-for-reuse buffer — and retry the allocation once. The pool holds
