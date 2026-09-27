@@ -215,6 +215,20 @@ public class GpuTapeGradientParityTests : IDisposable
             static (_, y) => Assert.Equal(new[] { 2, 6, 10 }, y.Shape.ToArray()));
 
     [SkippableFact]
+    public void TensorDiagonal_gradients_match_cpu() =>
+        // Rectangular on purpose: the diagonal is min(rows, cols) long and the gradient keeps the input shape.
+        AssertGradientParity("TensorDiagonal", Rand([6, 10], seed: 44),
+            static (e, t) => e.TensorDiagonal(t), probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void TensorDiagonal_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("TensorDiagonal", static (e, t) => e.TensorDiagonal(t), static (x, y) =>
+        {
+            Assert.Equal(new[] { 6 }, y.Shape.ToArray());
+            for (int i = 0; i < 6; i++) Assert.Equal(x[i, i], y[i]);
+        });
+
+    [SkippableFact]
     public void TensorTranspose_stays_on_the_device_while_a_tape_records() =>
         AssertStaysOnDeviceUnderTape("TensorTranspose", static (e, t) => e.TensorTranspose(t), static (x, y) =>
         {

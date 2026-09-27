@@ -5927,6 +5927,11 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var inputShape = inputs[0]._shape;
+        if (engine is DirectGpuTensorEngine gpu && gpu.TryDiagonalBackwardOnDevice(gradOutput, inputShape) is { } deviceGrad)
+        {
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceGrad, engine);
+            return;
+        }
         var grad = new Tensor<T>(inputShape); // zero
         int diagLen = gradOutput.Length;
         for (int i = 0; i < diagLen; i++)

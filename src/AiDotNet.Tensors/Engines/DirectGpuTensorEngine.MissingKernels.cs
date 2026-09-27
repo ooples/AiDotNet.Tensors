@@ -4744,6 +4744,37 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <summary>
+    /// The adjoint of <c>TensorDiagonal</c> on the device: a zero [rows, cols] matrix with
+    /// <paramref name="gradOutput"/> scattered onto its main diagonal (stride cols + 1). Null when the
+    /// device path cannot take it, so the caller falls back to the host loop.
+    /// </summary>
+    internal Tensor<T>? TryDiagonalBackwardOnDevice<T>(Tensor<T> gradOutput, int[] inputShape)
+    {
+        if (typeof(T) != typeof(float) || Compilation.GraphMode.IsActive || inputShape.Length != 2
+            || !TryGetBackend(out var backend))
+            return null;
+        try
+        {
+            int rows = inputShape[0], columns = inputShape[1];
+            int n = Math.Min(rows, columns);
+            if (gradOutput.Length != n) return null;
+            int total = checked(rows * columns);
+            var source = gradOutput.IsContiguous ? gradOutput : (Tensor<T>)gradOutput.Contiguous();
+            using var bufSrc = GetOrAllocateBuffer(backend, source);
+            return DispatchDeferredGpuOp<T>(backend, total, new[] { rows, columns }, output =>
+            {
+                backend.Fill(output, 0f, total);
+                backend.StridedScatter(bufSrc.Buffer, output, offset: 0, stride: columns + 1, count: n);
+            });
+        }
+        catch (Exception)
+        {
+            if (ThrowOnGpuKernelFallback) throw;
+            return null;
+        }
+    }
+
+    /// <summary>
     /// <c>factor * scalar[0] * tensor</c> — or, with a null <paramref name="tensor"/>, <c>factor * scalar[0]</c> filled
     /// to <paramref name="shape"/> — computed without reading the one-element <paramref name="scalar"/> on the host.
     /// </summary>

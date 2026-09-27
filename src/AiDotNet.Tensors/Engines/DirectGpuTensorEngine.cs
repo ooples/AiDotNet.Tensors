@@ -23849,7 +23849,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.TensorDiagonal<T>(Tensor<T> tensor)
     {
-        if (!IsTapeActive<T>() && !Compilation.GraphMode.IsActive && typeof(T) == typeof(float)
+        // Under a tape the gather runs and records CpuEngine's DiagonalBackward node, whose device path
+        // (TryDiagonalBackwardOnDevice) scatters the gradient back without a host round trip.
+        if (!Compilation.GraphMode.IsActive && typeof(T) == typeof(float)
             && tensor.Rank == 2 && tensor.IsContiguous && TryGetBackend(out var backend))
         {
             try
@@ -23861,7 +23863,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 try
                 {
                     backend.StridedGather(input, output, offset: 0, stride: columns + 1, count: n);
-                    return DeferTensorResult<T>(backend, output, n, new[] { n });
+                    var diagonal = DeferTensorResult<T>(backend, output, n, new[] { n });
+                    Autodiff.DifferentiableOps.RecordUnary("TensorDiagonal", diagonal, tensor,
+                        Autodiff.BackwardFunctions<T>.DiagonalBackward);
+                    return diagonal;
                 }
                 catch
                 {
