@@ -549,6 +549,49 @@ public class GpuTapeGradientParityTests : IDisposable
         AssertStaysOnDeviceUnderTape("MaxPool2D",
             static (e, t) => e.MaxPool2D(t.Reshape(new[] { 1, 2, 5, 6 }), 3, 2, 1),
             static (x, y) => Assert.Equal(new[] { 1, 2, 3, 3 }, y.Shape.ToArray()));
+    /// <summary>
+    /// Dropout draws a different mask on each engine, so CPU parity cannot apply. Its gradient is still pinned by the
+    /// forward it ran: y = x * m elementwise, so d(sum w*y)/dx = w * m = w * y / x wherever x is not near zero.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void Dropout_gradient_matches_the_mask_its_forward_applied(bool training)
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu!)
+        {
+            IEngine engine = gpu!;
+            AiDotNetEngine.Current = engine;
+            var x = Rand([6, 10], seed: 257);
+            using var tape = new GradientTape<float>();
+            var y = engine.Dropout(x, 0.4, training, out _);
+            var weight = new Tensor<float>(y.Shape.ToArray());
+            for (int i = 0; i < weight.Length; i++) weight[i] = 0.13f + 0.017f * (i % 11);
+            var loss = engine.ReduceSum(engine.TensorMultiply(y, weight), null);
+            var grads = tape.ComputeGradients(loss, new[] { x });
+            Assert.True(grads.TryGetValue(x, out var g) && g is not null, "Dropout recorded no tape node.");
+
+            int dropped = 0, checkedCells = 0;
+            for (int i = 0; i < x.Length; i++)
+            {
+                if (Math.Abs(x[i]) < 1e-3f) continue;
+                float applied = y[i] / x[i];
+                if (applied == 0f) dropped++;
+                Assert.Equal(weight[i] * applied, g[i], 4);
+                checkedCells++;
+            }
+            _out.WriteLine($"Dropout(training={training}): checked {checkedCells}, dropped {dropped}");
+            Assert.True(checkedCells > 50, "too few cells were checkable");
+            if (training) Assert.InRange(dropped, 1, checkedCells - 1);   // a real mask, not all-keep or all-drop
+            else Assert.Equal(0, dropped);
+        }
+    }
+
+    [SkippableFact]
+    public void Dropout_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("Dropout", static (e, t) => e.Dropout(t, 0.4, true, out _),
+            static (x, y) => Assert.Equal(x.Shape.ToArray(), y.Shape.ToArray()));
     [SkippableFact]
     public void TensorClampMin_gradients_match_cpu() =>
         AssertGradientParity("ClampMin", Rand([6, 10], seed: 73),

@@ -97,7 +97,6 @@ public class TapeBailAuditTests
         "RMSNorm",
         "GroupNorm",
         "InstanceNorm",
-        "Dropout",
         "BatchNorm",
         "Conv3D",
         "ConvTranspose2D",
@@ -195,6 +194,7 @@ public class TapeBailAuditTests
         "TensorMaskedScatter",
         "TensorSetSlice",
         "AvgPool2D",
+        "Dropout",
     };
 
     private static string[] GpuEngineSources(string root)

@@ -15657,7 +15657,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.Dropout<T>(Tensor<T> input, double dropoutRate, bool training, out Tensor<T> mask)
     {
-        if (IsTapeActive<T>()) return base.Dropout(input, dropoutRate, training, out mask);
         if (Compilation.GraphMode.IsActive) return base.Dropout(input, dropoutRate, training, out mask);
         return Dropout(input, dropoutRate, training, out mask);
     }
@@ -21900,7 +21899,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> Dropout<T>(Tensor<T> input, double dropoutRate, bool training, out Tensor<T> mask)
     {
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive)
+        if (Compilation.GraphMode.IsActive)
             return base.Dropout(input, dropoutRate, training, out mask);
         if (!TryGetBackend(out var backend))
             return base.Dropout(input, dropoutRate, training, out mask);
@@ -21916,6 +21915,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 mask = DispatchDeferredGpuOp<T>(backend, input.Length, input.Shape.ToArray(),
                     output => backend.Fill(output, 1f, input.Length));
+                RecordDropout(result, input, mask, dropoutRate);
                 return result;
             }
             catch
@@ -21941,6 +21941,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             outputHandedOff = true;
             mask = DeferTensorResult<T>(backend, maskBuffer, size, input.Shape.ToArray());
             maskHandedOff = true;
+            RecordDropout(result, input, mask, dropoutRate);
             return result;
         }
         finally
@@ -21949,6 +21950,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (!maskHandedOff) maskBuffer?.Dispose();
         }
     }
+
+    /// <summary>
+    /// Records the node CpuEngine records for Dropout. The saved mask is the one THIS backend's kernel wrote, and the
+    /// backward resolves to this engine's DropoutBackward, which reads masks in the same backend's convention.
+    /// </summary>
+    private static void RecordDropout<T>(Tensor<T> result, Tensor<T> input, Tensor<T> mask, double dropoutRate) =>
+        Autodiff.DifferentiableOps.RecordUnary("Dropout", result, input, Autodiff.BackwardFunctions<T>.DropoutBackward,
+            new object[] { mask, dropoutRate });
 
     public override Tensor<T> Upsample<T>(Tensor<T> input, int scaleH, int scaleW)
     {
