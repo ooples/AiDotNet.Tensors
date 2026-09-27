@@ -67,9 +67,21 @@ public partial class DirectGpuTensorEngine
         if (padAxes > input.Rank)
             throw new ArgumentException($"pad covers {padAxes} axes but input has only {input.Rank}.", nameof(pad));
 
-        if (typeof(T) != typeof(float) || !input.IsContiguous || IsTapeActive<T>()
+        if (typeof(T) != typeof(float) || !input.IsContiguous
             || Compilation.GraphMode.IsActive || !TryGetBackend(out var backend))
             return base.PadNd(input, pad, mode, value);
+
+        var result = PadNdOnDevice(backend, input, pad, mode, value, padAxes);
+        // Same node and saved state CpuEngine records; an empty output has nothing to differentiate.
+        if (result.Length > 0)
+            Autodiff.DifferentiableOps.RecordUnary("PadNd", result, input,
+                Autodiff.BackwardFunctions<T>.PadNdBackward, new object[] { (int[])pad.Clone(), mode });
+        return result;
+    }
+
+    private Tensor<T> PadNdOnDevice<T>(IDirectGpuBackend backend, Tensor<T> input, int[] pad, PadMode mode, T value,
+        int padAxes)
+    {
 
         var before = new int[input.Rank];
         var after = new int[input.Rank];

@@ -8212,34 +8212,50 @@ internal static class BackwardFunctions<T>
         var pad = (int[])savedState[0];
         var mode = (PadMode)savedState[1];
 
+        var gradOutputShape = gradOutput._shape;
+        if (engine is DirectGpuTensorEngine gpu
+            && gpu.TryPadNdBackwardOnDevice(gradOutput, input._shape, pad, mode) is { } deviceGrad)
+        {
+            DifferentiableOps.AccumulateGrad(grads, input, deviceGrad, engine);
+            return;
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradInput = new Tensor<T>(input._shape);
-        int rank = input.Rank;
-        var before = new int[rank]; var after = new int[rank];
-        int padAxes = pad.Length / 2;
-        for (int i = 0; i < padAxes; i++)
-        {
-            int axis = rank - 1 - i;
-            before[axis] = pad[i * 2];
-            after[axis] = pad[i * 2 + 1];
-        }
-        var outShape = gradOutput._shape;
-        var inStride = new int[rank]; var outStride = new int[rank];
-        inStride[rank - 1] = 1; outStride[rank - 1] = 1;
-        for (int i = rank - 2; i >= 0; i--)
-        {
-            inStride[i] = inStride[i + 1] * input._shape[i + 1];
-            outStride[i] = outStride[i + 1] * outShape[i + 1];
-        }
+        var sourceMap = PadNdSourceMap(input._shape, gradOutputShape, pad, mode);
         var gout = gradOutput.AsSpan();
         var gin = gradInput.AsWritableSpan();
-
-        // Walk every output element once. When the inverse coord maps to
-        // an in-range input position — either directly (middle region)
-        // or via boundary mapping (reflect/replicate/circular) — add the
-        // gradient to the source. Constant mode discards out-of-range.
-        var outIdx = new int[rank];
         for (int k = 0; k < gout.Length; k++)
+        {
+            int inOff = sourceMap[k];
+            if (inOff >= 0) gin[inOff] = numOps.Add(gin[inOff], gout[k]);
+        }
+        DifferentiableOps.AccumulateGrad(grads, input, gradInput, engine);
+    }
+
+    /// <summary>
+    /// For every element of a PadNd output (row-major over <paramref name="outShape"/>), the flat input offset it
+    /// was read from, or -1 where Constant mode wrote the fill value. Uses the forward's boundary map for
+    /// Reflect/Replicate/Circular, so summing the output gradient into these offsets is the exact backward.
+    /// Shared by the host backward and the device one, which must agree element for element.
+    /// </summary>
+    internal static int[] PadNdSourceMap(int[] inShape, int[] outShape, int[] pad, PadMode mode)
+    {
+        int rank = inShape.Length;
+        var before = new int[rank];
+        int padAxes = pad.Length / 2;
+        for (int i = 0; i < padAxes; i++)
+            before[rank - 1 - i] = pad[i * 2];
+        var inStride = new int[rank];
+        inStride[rank - 1] = 1;
+        for (int i = rank - 2; i >= 0; i--)
+            inStride[i] = inStride[i + 1] * inShape[i + 1];
+        int outLength = 1;
+        for (int i = 0; i < rank; i++) outLength = checked(outLength * outShape[i]);
+
+        var map = new int[outLength];
+        var outIdx = new int[rank];
+        for (int k = 0; k < outLength; k++)
         {
             int tmp = k;
             for (int i = rank - 1; i >= 0; i--) { outIdx[i] = tmp % outShape[i]; tmp /= outShape[i]; }
@@ -8248,7 +8264,7 @@ internal static class BackwardFunctions<T>
             for (int i = 0; i < rank; i++)
             {
                 int local = outIdx[i] - before[i];
-                int extent = input._shape[i];
+                int extent = inShape[i];
                 if (local < 0 || local >= extent)
                 {
                     if (mode == PadMode.Constant) { drop = true; break; }
@@ -8276,10 +8292,9 @@ internal static class BackwardFunctions<T>
                 }
                 inOff += local * inStride[i];
             }
-            if (drop) continue;
-            gin[inOff] = numOps.Add(gin[inOff], gout[k]);
+            map[k] = drop ? -1 : inOff;
         }
-        DifferentiableOps.AccumulateGrad(grads, input, gradInput, engine);
+        return map;
     }
 
     /// <summary>

@@ -110,7 +110,6 @@ public class TapeBailAuditTests
         "FusedLinearTanh",
         "FusedLinearGELU",
         "FusedLinearSwish",
-        "PadNd",
         "TensorMaskedScatter",
         "TensorIndexCopy",
         "TensorIndexFill",
@@ -191,6 +190,7 @@ public class TapeBailAuditTests
         "TensorClampMax",
         "Embedding",
         "AdaptiveAvgPool2D",
+        "PadNd",
     };
 
     private static string[] GpuEngineSources(string root)

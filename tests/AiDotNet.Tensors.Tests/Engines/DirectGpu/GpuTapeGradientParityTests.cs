@@ -309,6 +309,21 @@ public class GpuTapeGradientParityTests : IDisposable
         AssertStaysOnDeviceUnderTape("AdaptiveAvgPool2D",
             static (e, t) => e.AdaptiveAvgPool2D(t.Reshape(new[] { 1, 2, 6, 5 }), 4, 3),
             static (x, y) => Assert.Equal(new[] { 1, 2, 4, 3 }, y.Shape.ToArray()));
+    // Constant mode drops the fill positions; Reflect and Circular fold several output cells onto one input cell,
+    // so the device scatter-add must accumulate them exactly as the host loop does.
+    [SkippableTheory]
+    [InlineData(PadMode.Constant)]
+    [InlineData(PadMode.Reflect)]
+    [InlineData(PadMode.Replicate)]
+    [InlineData(PadMode.Circular)]
+    public void PadNd_gradients_match_cpu(PadMode mode) =>
+        AssertGradientParity($"PadNd({mode})", Rand([6, 10], seed: 103),
+            (e, t) => e.PadNd(t, new[] { 3, 2, 1, 4 }, mode, 0.5f), probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void PadNd_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("PadNd", static (e, t) => e.PadNd(t, new[] { 3, 2, 1, 4 }, PadMode.Constant, 0.5f),
+            static (x, y) => { Assert.Equal(new[] { 11, 15 }, y.Shape.ToArray()); Assert.Equal(0.5f, y[0, 0]); Assert.Equal(x[0, 0], y[1, 3]); });
     [SkippableFact]
     public void TensorClampMin_gradients_match_cpu() =>
         AssertGradientParity("ClampMin", Rand([6, 10], seed: 73),

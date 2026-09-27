@@ -4748,6 +4748,44 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <summary>
+    /// PadNd backward on the device: every output gradient element is scatter-added into the input offset the
+    /// forward read it from (<see cref="Autodiff.BackwardFunctions{T}.PadNdSourceMap"/>, shared with the host
+    /// loop). Constant-mode fill positions are routed to one extra dump slot past the end, which is dropped.
+    /// Null when the device path cannot take it, so the caller falls back to the host loop.
+    /// </summary>
+    internal Tensor<T>? TryPadNdBackwardOnDevice<T>(Tensor<T> gradOutput, int[] inputShape, int[] pad, PadMode mode)
+    {
+        if (typeof(T) != typeof(float) || Compilation.GraphMode.IsActive || inputShape.Length == 0
+            || !TryGetBackend(out var backend))
+            return null;
+        try
+        {
+            int n = 1;
+            for (int i = 0; i < inputShape.Length; i++) n = checked(n * inputShape[i]);
+            var map = Autodiff.BackwardFunctions<T>.PadNdSourceMap(inputShape, gradOutput._shape, pad, mode);
+            if (map.Length != gradOutput.Length || n == 0) return null;
+            for (int k = 0; k < map.Length; k++)
+                if (map[k] < 0) map[k] = n;
+            var upstream = gradOutput.IsContiguous ? gradOutput : (Tensor<T>)gradOutput.Contiguous();
+            using var bufG = GetOrAllocateBuffer(backend, upstream);
+            using var bufMap = new OwnedBuffer(backend.AllocateIntBuffer(map), ownsBuffer: true);
+            int outLength = map.Length;
+            return DispatchDeferredGpuOp<T>(backend, n, (int[])inputShape.Clone(), output =>
+            {
+                using var accumulator = AllocateStreamOrderedScratch(backend, checked(n + 1));
+                backend.Fill(accumulator, 0f, n + 1);
+                backend.ScatterAdd(bufG.Buffer, bufMap.Buffer, accumulator, outLength, n + 1);
+                backend.Copy(accumulator, output, n);
+            });
+        }
+        catch (Exception)
+        {
+            if (ThrowOnGpuKernelFallback) throw;
+            return null;
+        }
+    }
+
+    /// <summary>
     /// AdaptiveAvgPool2D backward on the device. Adaptive average pooling is separable — each output cell averages
     /// a row window times a column window, and its area is the product of the two lengths — so the input gradient
     /// of every [H, W] plane is <c>A_Hᵀ · dY · A_W</c>, where <c>A_H[oh, ih] = 1 / hLen(oh)</c> inside the window and
