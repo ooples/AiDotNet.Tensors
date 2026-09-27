@@ -592,6 +592,55 @@ public class GpuTapeGradientParityTests : IDisposable
     public void Dropout_stays_on_the_device_while_a_tape_records() =>
         AssertStaysOnDeviceUnderTape("Dropout", static (e, t) => e.Dropout(t, 0.4, true, out _),
             static (x, y) => Assert.Equal(x.Shape.ToArray(), y.Shape.ToArray()));
+    /// <summary>
+    /// Non-float LayerNorm under a tape used to fall back to CpuEngine. It now runs the FP32 kernel and records the
+    /// same node, so a double gradient agrees with the CPU's to FP32 accuracy, through both entry points.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void LayerNorm_double_gradients_match_cpu_to_fp32_accuracy(bool throughIEngine)
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu!)
+        {
+            (double[] Forward, double[] Grad) Run(IEngine engine)
+            {
+                AiDotNetEngine.Current = engine;
+                var x = new Tensor<double>(new[] { 6, 10 });
+                for (int i = 0; i < x.Length; i++) x[i] = Math.Sin(0.41 * i) + 0.05 * (i % 7);
+                var gamma = new Tensor<double>(new[] { 10 });
+                var beta = new Tensor<double>(new[] { 10 });
+                for (int i = 0; i < 10; i++) { gamma[i] = 0.8 + 0.03 * i; beta[i] = 0.01 * i; }
+                using var tape = new GradientTape<double>();
+                var y = throughIEngine || engine is CpuEngine and not DirectGpuTensorEngine
+                    ? engine.LayerNorm(x, gamma, beta, 1e-5, out _, out _)
+                    : ((DirectGpuTensorEngine)engine).LayerNorm(x, gamma, beta, 1e-5, out _, out _);
+                var weight = new Tensor<double>(y.Shape.ToArray());
+                for (int i = 0; i < weight.Length; i++) weight[i] = 0.13 + 0.017 * (i % 11);
+                var loss = engine.ReduceSum(engine.TensorMultiply(y, weight), null);
+                var g = tape.ComputeGradients(loss, new[] { x })[x];
+                var forward = new double[y.Length];
+                for (int i = 0; i < forward.Length; i++) forward[i] = y[i];
+                var flat = new double[g.Length];
+                for (int i = 0; i < flat.Length; i++) flat[i] = g[i];
+                return (forward, flat);
+            }
+
+            var cpu = Run(new CpuEngine());
+            var device = Run(gpu!);
+            double forwardDiff = 0, gradDiff = 0;
+            for (int i = 0; i < cpu.Forward.Length; i++) forwardDiff = Math.Max(forwardDiff, Math.Abs(cpu.Forward[i] - device.Forward[i]));
+            for (int i = 0; i < cpu.Grad.Length; i++) gradDiff = Math.Max(gradDiff, Math.Abs(cpu.Grad[i] - device.Grad[i]));
+            _out.WriteLine($"LayerNorm<double> ieng={throughIEngine} forwardDiff={forwardDiff:E3} gradDiff={gradDiff:E3}");
+            // The inputs are host tensors, so a bit-identical FORWARD means LayerNorm itself ran on the CPU in double;
+            // the FP32 kernel cannot reproduce it. (The gradient is no signal: the multiply and reduce around it run
+            // on the device either way.)
+            Assert.True(forwardDiff > 0, "forward bit-identical to the CPU: LayerNorm fell back to CpuEngine");
+            Assert.True(forwardDiff < 1e-4, $"double LayerNorm forward diverged from CPU (maxAbs={forwardDiff:E3})");
+            Assert.True(gradDiff < 1e-4, $"double LayerNorm gradient diverged from CPU (maxAbs={gradDiff:E3})");
+        }
+    }
     [SkippableFact]
     public void TensorClampMin_gradients_match_cpu() =>
         AssertGradientParity("ClampMin", Rand([6, 10], seed: 73),

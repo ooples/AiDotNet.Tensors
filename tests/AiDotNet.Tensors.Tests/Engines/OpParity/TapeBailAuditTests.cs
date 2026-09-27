@@ -93,7 +93,6 @@ public class TapeBailAuditTests
         "GroupedQueryAttention",
         // FLOAT now records on the device (GpuTapeGradientParityTests.LayerNorm_*); the non-float tape still bails because
         // the FP16 half-store branch saves INVERSE std where LayerNormBackward expects variance. Remove once that holds.
-        "LayerNorm",
         "RMSNorm",
         "GroupNorm",
         "InstanceNorm",
@@ -149,6 +148,9 @@ public class TapeBailAuditTests
         // Under a tape the pool also keeps its argmax indices resident for the backward; inference never needs
         // them. The node is recorded in the override either way.
         "MaxPool2D",
+        // Under a tape the FP16 half-store fast path is skipped (its variance slot holds INVERSE std, which the
+        // backward cannot take); the FP32 kernel still runs and the node is recorded.
+        "LayerNorm",
     };
 
     /// <summary>Ops already fixed — they must never regress to bailing.</summary>

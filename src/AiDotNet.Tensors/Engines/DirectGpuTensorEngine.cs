@@ -14165,9 +14165,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.LayerNorm<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
         ValidateLayerNormArguments(input, gamma, beta);
-        // Float forwards to the public override, which runs the kernel and records the tape node itself; only a
-        // non-float tape stays on the CPU (the non-float device branch below records nothing).
-        if (IsTapeActive<T>() && typeof(T) != typeof(float)) return base.LayerNorm(input, gamma, beta, epsilon, out mean, out variance);
+        // Float forwards to the public override, which runs the kernel and records the tape node itself; the
+        // non-float branch below computes the same mean and true variance on the device and records the same node.
         // AiDotNet#1331: under GraphMode, the base CpuEngine.LayerNorm has the
         // lazy-graph recording branch that emits a backward node for the
         // compiled plan. The GPU eager path below would silently bypass
@@ -14239,10 +14238,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             outputBuffer.RelinquishOwnership();
             saveMeanBuffer.RelinquishOwnership();
             trueVarBuffer.RelinquishOwnership();
+            Autodiff.DifferentiableOps.RecordIfActive("LayerNorm", result, new[] { input, gamma, beta },
+                Autodiff.BackwardFunctions<T>.LayerNormBackward, new object[] { mean, variance, epsilon });
             return result;
         }
-        catch
+        catch (Exception)
         {
+            if (ThrowOnGpuKernelFallback) throw;
             return base.LayerNorm(input, gamma, beta, epsilon, out mean, out variance);
         }
     }
@@ -21036,10 +21038,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> LayerNorm<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
         ValidateLayerNormArguments(input, gamma, beta);
-        // A float tape runs the kernel and records CpuEngine's node below: the FP32 path already produces the
-        // per-row mean and (converted) variance LayerNormBackward saves. Only a non-float tape stays on the CPU —
-        // the FP16 half-store branch leaves INVERSE std in its variance slot, which that backward cannot take.
-        if (IsTapeActive<T>() && typeof(T) != typeof(float)) return base.LayerNorm(input, gamma, beta, epsilon, out mean, out variance);
+        // Under a tape every type takes the FP32 kernel path below, which converts the variance slot and records
+        // CpuEngine's node. The FP16 half-store branch is skipped then: it leaves INVERSE std in its variance slot,
+        // which LayerNormBackward cannot take, and records nothing.
+        bool taping = IsTapeActive<T>();
         if (!TryGetBackend(out var backend) || input.Rank < 2)
             return base.LayerNorm(input, gamma, beta, epsilon, out mean, out variance);
 
@@ -21075,7 +21077,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // Runs on ANY backend that ships the FP16-native kernels (IGpuHalfPrecisionBackend.SupportsFp16NativeOps):
             // the store plumbing (ResolveToFp16 / FinishGpuOpHalfStore) is now backend-agnostic, so the
             // half-resident memory win is no longer CUDA-only. Backends without the kernels use the FP32 path below.
-            if (typeof(T) == typeof(Half) && s_fp16FwdStore
+            if (typeof(T) == typeof(Half) && s_fp16FwdStore && !taping
                 && backend is IGpuHalfPrecisionBackend hpL && hpL.SupportsFp16NativeOps)
             {
                 IGpuBuffer? hInOwned = null, hGOwned = null, hBOwned = null, hOut = null;
