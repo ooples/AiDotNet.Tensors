@@ -937,7 +937,9 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>
-        /// SIMD Clamp: min(max(x, lo), hi) using AVX.Max/Min.
+        /// SIMD Clamp: min(max(x, lo), hi) using AVX.Max/Min. NaN propagates, as in torch.clamp: MAXPS/MINPS return
+        /// their SECOND operand when either is NaN, so x goes second. With x first (as before) a NaN became lo in the
+        /// vector body while the scalar tail kept it NaN, so the result depended on the element's position.
         /// </summary>
         [MethodImpl(HotInline)]
         public static unsafe void ClampUnsafe(float* input, float* output, int length, float lo, float hi)
@@ -951,10 +953,10 @@ namespace AiDotNet.Tensors.Engines.Simd
                 int simdLength = length & ~31;
                 for (; i < simdLength; i += 32)
                 {
-                    Avx.Store(output + i, Avx.Min(Avx.Max(Avx.LoadVector256(input + i), vLo), vHi));
-                    Avx.Store(output + i + 8, Avx.Min(Avx.Max(Avx.LoadVector256(input + i + 8), vLo), vHi));
-                    Avx.Store(output + i + 16, Avx.Min(Avx.Max(Avx.LoadVector256(input + i + 16), vLo), vHi));
-                    Avx.Store(output + i + 24, Avx.Min(Avx.Max(Avx.LoadVector256(input + i + 24), vLo), vHi));
+                    Avx.Store(output + i, Avx.Min(vHi, Avx.Max(vLo, Avx.LoadVector256(input + i))));
+                    Avx.Store(output + i + 8, Avx.Min(vHi, Avx.Max(vLo, Avx.LoadVector256(input + i + 8))));
+                    Avx.Store(output + i + 16, Avx.Min(vHi, Avx.Max(vLo, Avx.LoadVector256(input + i + 16))));
+                    Avx.Store(output + i + 24, Avx.Min(vHi, Avx.Max(vLo, Avx.LoadVector256(input + i + 24))));
                 }
             }
             if (Avx.IsSupported && length - i >= 8)
@@ -963,7 +965,7 @@ namespace AiDotNet.Tensors.Engines.Simd
                 var vHi = Vector256.Create(hi);
                 int simdLength = i + ((length - i) & ~7);
                 for (; i < simdLength; i += 8)
-                    Avx.Store(output + i, Avx.Min(Avx.Max(Avx.LoadVector256(input + i), vLo), vHi));
+                    Avx.Store(output + i, Avx.Min(vHi, Avx.Max(vLo, Avx.LoadVector256(input + i))));
             }
 #endif
             for (; i < length; i++)

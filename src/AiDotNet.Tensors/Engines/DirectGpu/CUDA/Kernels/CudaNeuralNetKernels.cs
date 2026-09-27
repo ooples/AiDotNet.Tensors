@@ -719,7 +719,9 @@ extern ""C"" __global__ __launch_bounds__(256) void clamp(
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
-    output[idx] = fmaxf(fminf(input[idx], maxVal), minVal);
+    float x = input[idx];
+    // NaN propagates, as in torch.clamp (fminf/fmaxf return the non-NaN operand, which turned NaN into maxVal).
+    output[idx] = isnan(x) ? x : fmaxf(fminf(x, maxVal), minVal);
 }
 
 extern ""C"" __global__ __launch_bounds__(256) void l2_norm_squared(const float* input, float* output, int size)
