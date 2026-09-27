@@ -6729,6 +6729,12 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var min = (T)savedState[0];
+        if (min is float minBound && engine is DirectGpuTensorEngine gpu
+            && gpu.TryOneSidedClampBackwardOnDevice(gradOutput, inputs[0], minBound, lowerBound: true) is { } deviceGrad)
+        {
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceGrad, engine);
+            return;
+        }
         var ops = MathHelper.GetNumericOperations<T>();
         var input = inputs[0];
         var grad = new Tensor<T>(input._shape);
@@ -6747,6 +6753,12 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var max = (T)savedState[0];
+        if (max is float maxBound && engine is DirectGpuTensorEngine gpu
+            && gpu.TryOneSidedClampBackwardOnDevice(gradOutput, inputs[0], maxBound, lowerBound: false) is { } deviceGrad)
+        {
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceGrad, engine);
+            return;
+        }
         var ops = MathHelper.GetNumericOperations<T>();
         var input = inputs[0];
         var grad = new Tensor<T>(input._shape);

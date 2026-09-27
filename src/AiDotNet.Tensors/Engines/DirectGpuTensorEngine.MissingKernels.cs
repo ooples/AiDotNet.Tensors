@@ -2045,8 +2045,7 @@ public partial class DirectGpuTensorEngine
     public override Tensor<T> TensorClampMin<T>(Tensor<T> tensor, T min)
     {
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
-        // Tape-active defers to base (preserves the boxed-double backward contract, like TensorClamp).
-        if (IsTapeActive<T>() || !TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.TensorClampMin(tensor, min);
 
         try
@@ -2056,8 +2055,11 @@ public partial class DirectGpuTensorEngine
             using var bufA = GetOrAllocateBuffer(backend, tensor);
             var bufOut = AllocateOutputBuffer(backend, tensor.Length);
             backend.Clamp(bufA.Buffer, bufOut.Buffer, minF, float.PositiveInfinity, tensor.Length);
-            var result = FinishGpuOp<T>(backend, bufOut, tensor.Length);
-            return new Tensor<T>(result, tensor.Shape._dims);
+            var result = new Tensor<T>(FinishGpuOp<T>(backend, bufOut, tensor.Length), tensor.Shape._dims);
+            // Same node and boxed bound CpuEngine records, so the backward sees an identical saved state.
+            Autodiff.DifferentiableOps.RecordUnary("TensorClampMin", result, tensor,
+                Autodiff.BackwardFunctions<T>.ClampMinBackward, savedState: new[] { (object?)min ?? throw new InvalidOperationException("Clamp min must not be null") });
+            return result;
         }
         catch (Exception) { return base.TensorClampMin(tensor, min); }
     }
@@ -2066,7 +2068,7 @@ public partial class DirectGpuTensorEngine
     public override Tensor<T> TensorClampMax<T>(Tensor<T> tensor, T max)
     {
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
-        if (IsTapeActive<T>() || !TryGetBackend(out var backend))
+        if (!TryGetBackend(out var backend))
             return base.TensorClampMax(tensor, max);
 
         try
@@ -2076,8 +2078,10 @@ public partial class DirectGpuTensorEngine
             using var bufA = GetOrAllocateBuffer(backend, tensor);
             var bufOut = AllocateOutputBuffer(backend, tensor.Length);
             backend.Clamp(bufA.Buffer, bufOut.Buffer, float.NegativeInfinity, maxF, tensor.Length);
-            var result = FinishGpuOp<T>(backend, bufOut, tensor.Length);
-            return new Tensor<T>(result, tensor.Shape._dims);
+            var result = new Tensor<T>(FinishGpuOp<T>(backend, bufOut, tensor.Length), tensor.Shape._dims);
+            Autodiff.DifferentiableOps.RecordUnary("TensorClampMax", result, tensor,
+                Autodiff.BackwardFunctions<T>.ClampMaxBackward, savedState: new[] { (object?)max ?? throw new InvalidOperationException("Clamp max must not be null") });
+            return result;
         }
         catch (Exception) { return base.TensorClampMax(tensor, max); }
     }
@@ -4734,6 +4738,47 @@ public partial class DirectGpuTensorEngine
                 for (int outer = 0; outer < outerSize; outer++)
                     backend.Copy(bufSrc.Buffer, outer * copyLength,
                         output, checked((outer * dimSize + start) * innerSize), copyLength);
+            });
+        }
+        catch (Exception)
+        {
+            if (ThrowOnGpuKernelFallback) throw;
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Backward of a one-sided clamp: <paramref name="gradOutput"/> where the input passed the bound
+    /// (<c>x &gt;= bound</c> for a lower bound, <c>x &lt;= bound</c> for an upper one), zero elsewhere. Built as
+    /// strict-compare + equality so a NaN input gets zero, matching the host loop's comparison. Null when
+    /// the device path cannot take it, so the caller falls back to the host loop.
+    /// </summary>
+    internal Tensor<T>? TryOneSidedClampBackwardOnDevice<T>(Tensor<T> gradOutput, Tensor<T> input, float bound,
+        bool lowerBound)
+    {
+        if (typeof(T) != typeof(float) || Compilation.GraphMode.IsActive
+            || gradOutput.Length != input.Length || !TryGetBackend(out var backend))
+            return null;
+        try
+        {
+            int n = input.Length;
+            var source = input.IsContiguous ? input : (Tensor<T>)input.Contiguous();
+            var upstream = gradOutput.IsContiguous ? gradOutput : (Tensor<T>)gradOutput.Contiguous();
+            using var bufX = GetOrAllocateBuffer(backend, source);
+            using var bufG = GetOrAllocateBuffer(backend, upstream);
+            return DispatchDeferredGpuOp<T>(backend, n, input._shape.ToArray(), output =>
+            {
+                using var bounds = AllocateStreamOrderedScratch(backend, n);
+                using var pass = AllocateStreamOrderedScratch(backend, n);
+                using var equal = AllocateStreamOrderedScratch(backend, n);
+                backend.Fill(bounds, bound, n);
+                if (lowerBound) backend.GreaterThan(bufX.Buffer, bounds, pass, n);
+                else backend.LessThan(bufX.Buffer, bounds, pass, n);
+                backend.Equal(bufX.Buffer, bounds, equal, n);
+                // Strict and equal are disjoint, so their sum is the 0/1 predicate.
+                backend.Add(pass, equal, pass, n);
+                backend.Fill(bounds, 0f, n);
+                backend.Where(pass, bufG.Buffer, bounds, output, n);
             });
         }
         catch (Exception)

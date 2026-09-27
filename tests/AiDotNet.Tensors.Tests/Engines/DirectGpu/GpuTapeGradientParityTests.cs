@@ -287,6 +287,25 @@ public class GpuTapeGradientParityTests : IDisposable
             static (x, y) => { Assert.Equal(-2f, y[0, 0]); Assert.Equal(x[0, 1], y[0, 1]); });
 
     [SkippableFact]
+    public void TensorClampMin_gradients_match_cpu() =>
+        AssertGradientParity("ClampMin", Rand([6, 10], seed: 73),
+            static (e, t) => e.TensorClampMin(t, 0.1f), probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void TensorClampMax_gradients_match_cpu() =>
+        AssertGradientParity("ClampMax", Rand([6, 10], seed: 79),
+            static (e, t) => e.TensorClampMax(t, 0.1f), probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void TensorClampMin_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("TensorClampMin", static (e, t) => e.TensorClampMin(t, 0.1f),
+            static (x, y) => Assert.Equal(Math.Max(x[0, 0], 0.1f), y[0, 0]));
+
+    [SkippableFact]
+    public void TensorClampMax_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("TensorClampMax", static (e, t) => e.TensorClampMax(t, 0.1f),
+            static (x, y) => Assert.Equal(Math.Min(x[0, 0], 0.1f), y[0, 0]));
+    [SkippableFact]
     public void TensorWhere_bool_condition_gradients_match_cpu() =>
         AssertGradientParity("Where(bool)", Rand([6, 10], seed: 53),
             static (e, t) => ((IEngine)e).TensorWhere(BoolMask(), t, Rand([6, 10], seed: 59)),

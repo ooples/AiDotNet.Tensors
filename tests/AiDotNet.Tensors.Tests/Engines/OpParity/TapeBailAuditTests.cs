@@ -113,8 +113,6 @@ public class TapeBailAuditTests
         "FusedLinearGELU",
         "FusedLinearSwish",
         "PadNd",
-        "TensorClampMin",
-        "TensorClampMax",
         "TensorMaskedScatter",
         "TensorIndexCopy",
         "TensorIndexFill",
@@ -191,6 +189,8 @@ public class TapeBailAuditTests
         "Upsample",
         "TensorGather",
         "TensorMaskedFill",
+        "TensorClampMin",
+        "TensorClampMax",
     };
 
     private static string[] GpuEngineSources(string root)
