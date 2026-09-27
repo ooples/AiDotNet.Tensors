@@ -5068,6 +5068,70 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <summary>
+    /// Backward of the fused linear + cross-entropy head on the device: recompute logits = hidden·W + b, take the
+    /// row softmax, subtract the target (a one-hot by index, or the dense target), scale by gradOutput[0] / N without
+    /// reading it on the host, then dHidden = dLogits·Wᵀ, dWeight = hiddenᵀ·dLogits and dBias = column sums.
+    /// Exactly one of <paramref name="targetIds"/> and <paramref name="denseTarget"/> is given. False when the device
+    /// path cannot take it, so the caller runs the host version.
+    /// </summary>
+    internal bool TryFusedLinearCrossEntropyBackwardOnDevice<T>(Tensor<T> gradOutput, Tensor<T> hidden,
+        Tensor<T> weight, Tensor<T> bias, int[]? targetIds, Tensor<T>? denseTarget,
+        out Tensor<T> gradHidden, out Tensor<T> gradWeight, out Tensor<T> gradBias)
+    {
+        gradHidden = gradWeight = gradBias = hidden;
+        if (typeof(T) != typeof(float) || Compilation.GraphMode.IsActive || hidden.Rank != 2 || weight.Rank != 2
+            || (targetIds is null) == (denseTarget is null) || !TryGetBackend(out var backend))
+            return false;
+        try
+        {
+            int n = hidden._shape[0], vocab = weight._shape[1];
+            int total = checked(n * vocab);
+            var logitShape = new[] { n, vocab };
+            using (new Autodiff.NoGradScope<T>())
+            {
+                var probabilities = Softmax(TensorBroadcastAdd(TensorMatMul(hidden, weight), bias), -1);
+                Tensor<T> difference;
+                if (targetIds is not null)
+                {
+                    // probabilities[r, id_r] -= 1 as one scatter-add of -1 at the flat target positions.
+                    var positions = new int[n];
+                    var minusOnes = new float[n];
+                    for (int r = 0; r < n; r++)
+                    {
+                        positions[r] = r * vocab + targetIds[r];
+                        minusOnes[r] = -1f;
+                    }
+                    var source = probabilities.IsContiguous ? probabilities : (Tensor<T>)probabilities.Contiguous();
+                    using var probabilityBuffer = GetOrAllocateBuffer(backend, source);
+                    using var positionBuffer = new OwnedBuffer(backend.AllocateIntBuffer(positions), ownsBuffer: true);
+                    using var minusOneBuffer = new OwnedBuffer(backend.AllocateBuffer(minusOnes), ownsBuffer: true);
+                    difference = DispatchDeferredGpuOp<T>(backend, total, logitShape, output =>
+                    {
+                        backend.Copy(probabilityBuffer.Buffer, output, total);
+                        backend.ScatterAdd(minusOneBuffer.Buffer, positionBuffer.Buffer, output, n, total);
+                    });
+                }
+                else
+                {
+                    difference = TensorSubtract(probabilities, denseTarget ?? probabilities);
+                }
+
+                if (TryScaleByDeviceScalar(difference, logitShape, gradOutput, 1f / n) is not { } dLogits)
+                    return false;
+                gradHidden = TensorMatMulTransposed(dLogits, weight);
+                gradWeight = TensorMatMul(TensorTranspose(hidden), dLogits);
+                gradBias = ReduceSum(dLogits, new[] { 0 }, keepDims: false);
+            }
+            return true;
+        }
+        catch (Exception)
+        {
+            if (ThrowOnGpuKernelFallback) throw;
+            return false;
+        }
+    }
+
+    /// <summary>
     /// <c>factor * scalar[0] * tensor</c> — or, with a null <paramref name="tensor"/>, <c>factor * scalar[0]</c> filled
     /// to <paramref name="shape"/> — computed without reading the one-element <paramref name="scalar"/> on the host.
     /// </summary>

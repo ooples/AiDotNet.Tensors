@@ -11426,7 +11426,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (targetIds is null) throw new ArgumentNullException(nameof(targetIds));
         Compilation.GraphMode.ThrowIfInferenceUnsupported(
             Compilation.GraphCaptureLimitation.HeterogeneousInput);
-        if (Compilation.GraphMode.IsActive || IsTapeActive<T>())
+        if (Compilation.GraphMode.IsActive)
             return base.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, targetIds);
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend))
             return base.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, targetIds);
@@ -11458,6 +11458,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 hB.Buffer, wB.Buffer, bB.Buffer, tB.Buffer, loss.Buffer, n, d, vocab);
             var result = DeferTensorResult<T>(backend, loss.Buffer, 1, new[] { 1 });
             loss.RelinquishOwnership();
+            // Same node CpuEngine records, labels saved as a host COPY (supervision, not a tape input). Reading
+            // resident ids here costs one [N] int download per taped step; the logits never leave the device.
+            if (IsTapeActive<T>())
+                Autodiff.DifferentiableOps.RecordIfActive("FusedLinearCrossEntropy", result, new[] { hidden, weight, bias },
+                    CpuEngine.FusedLinearCrossEntropyIndexBackward<T>,
+                    savedState: new object[] { (int[])targetIds.GetDataArray().Clone(), vocab });
             return result;
         }
         catch
@@ -11479,7 +11485,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (weight is null) throw new ArgumentNullException(nameof(weight));
         if (bias is null) throw new ArgumentNullException(nameof(bias));
         if (target is null) throw new ArgumentNullException(nameof(target));
-        if (Compilation.GraphMode.IsActive || IsTapeActive<T>())
+        if (Compilation.GraphMode.IsActive)
             return base.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, target);
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend))
             return base.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, target);
@@ -11504,10 +11510,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 hB.Buffer, wB.Buffer, bB.Buffer, tB.Buffer, loss.Buffer, n, d, vocab);
             var result = DeferTensorResult<T>(backend, loss.Buffer, 1, new[] { 1 });
             loss.RelinquishOwnership();
+            Autodiff.DifferentiableOps.RecordIfActive("FusedLinearCrossEntropy", result, new[] { hidden, weight, bias, target },
+                CpuEngine.FusedLinearCrossEntropyBackward<T>, savedState: null);
             return result;
         }
-        catch
+        catch (Exception)
         {
+            if (ThrowOnGpuKernelFallback) throw;
             return base.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, target);
         }
     }

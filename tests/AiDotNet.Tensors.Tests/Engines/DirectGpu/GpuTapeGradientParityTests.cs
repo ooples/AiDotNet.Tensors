@@ -819,6 +819,44 @@ public class GpuTapeGradientParityTests : IDisposable
     public void Sparsemax_stays_on_the_device_while_a_tape_records() =>
         AssertStaysOnDeviceUnderTape("Sparsemax", static (e, t) => e.Sparsemax(t, -1),
             static (x, y) => { for (int r = 0; r < 6; r++) { float s = 0; for (int c = 0; c < 10; c++) s += y[r, c]; Assert.Equal(1f, s, 4); } });
+    // Fused LM head: hidden [6,10] (N=6, d=10), weight [10,7], bias [7] over a 7-word vocabulary.
+    private static readonly Tensor<float> HeadWeight = Rand([10, 7], seed: 457);
+    private static readonly Tensor<float> HeadBias = Rand([7], seed: 461);
+    private static readonly Tensor<int> HeadTargetIds = new(new[] { 0, 3, 6, 2, 2, 5 }, new[] { 6 });
+
+    private static Tensor<float> SoftTargets()
+    {
+        // Rows summing to 1, as the dense backward's (softmax - target) form assumes.
+        var t = new Tensor<float>(new[] { 6, 7 });
+        for (int r = 0; r < 6; r++)
+        {
+            float sum = 0;
+            for (int v = 0; v < 7; v++) { t[r, v] = 1f + ((r * 7 + v) % 5); sum += t[r, v]; }
+            for (int v = 0; v < 7; v++) t[r, v] /= sum;
+        }
+        return t;
+    }
+
+    [SkippableFact]
+    public void FusedLinearCrossEntropy_index_hidden_gradients_match_cpu() =>
+        AssertGradientParity("FusedLinearCE(ids, hidden)", Rand([6, 10], seed: 463),
+            static (e, t) => e.FusedLinearCrossEntropyWithLogits(t, HeadWeight, HeadBias, HeadTargetIds));
+
+    [SkippableFact]
+    public void FusedLinearCrossEntropy_index_weight_gradients_match_cpu() =>
+        AssertGradientParity("FusedLinearCE(ids, weight)", Rand([10, 7], seed: 467),
+            static (e, t) => e.FusedLinearCrossEntropyWithLogits(Rand([6, 10], seed: 479), t, HeadBias, HeadTargetIds));
+
+    [SkippableFact]
+    public void FusedLinearCrossEntropy_dense_hidden_gradients_match_cpu() =>
+        AssertGradientParity("FusedLinearCE(dense, hidden)", Rand([6, 10], seed: 487),
+            static (e, t) => e.FusedLinearCrossEntropyWithLogits(t, HeadWeight, HeadBias, SoftTargets()));
+
+    [SkippableFact]
+    public void FusedLinearCrossEntropy_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("FusedLinearCrossEntropy",
+            static (e, t) => e.FusedLinearCrossEntropyWithLogits(t, HeadWeight, HeadBias, SoftTargets()),
+            static (x, y) => Assert.Equal(new[] { 1 }, y.Shape.ToArray()));
     [SkippableFact]
     public void TensorClampMin_gradients_match_cpu() =>
         AssertGradientParity("ClampMin", Rand([6, 10], seed: 73),

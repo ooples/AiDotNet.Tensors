@@ -81,7 +81,6 @@ public class TapeBailAuditTests
         // The direct-GPU fused loss has inference kernels but no backend backward contract. Its override now
         // throws NotSupportedException under a tape rather than silently downloading resident logits through
         // CpuEngine. Remove this entry when a tape-compatible GPU backward is implemented.
-        "FusedLinearCrossEntropyWithLogits",
 
         // Existing debt that lived in DirectGpuTensorEngine partial files the original single-file audit did
         // not scan. These are deliberately baselined now that the audit covers the complete partial class;
@@ -144,6 +143,9 @@ public class TapeBailAuditTests
         // The Bit-mask overload builds a device 0/1 copy of the mask for the backward only when taping; reading the
         // mask on the host instead downloaded a resident mask on every call.
         "TensorMaskedFill",
+        // The index overload copies the target ids to the host for the backward only when taping (resident ids
+        // would otherwise download on every inference call); both overloads record the node.
+        "FusedLinearCrossEntropyWithLogits",
     };
 
     /// <summary>
