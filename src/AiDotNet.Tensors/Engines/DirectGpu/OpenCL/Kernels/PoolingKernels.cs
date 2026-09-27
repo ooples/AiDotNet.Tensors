@@ -18,6 +18,19 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels
 // POOLING KERNELS
 // ===========================================================================
 
+// Float add that is atomic on OpenCL 1.x, which has no native float atomics: retry a compare-exchange on the
+// value's bit pattern until no other work-item changed it in between. The backward scatters below need it
+// because several outputs can route to the SAME input cell (overlapping max-pool windows, every upsampled
+// copy of a cell), and a plain read-modify-write drops all but one of the racing contributions.
+inline void pooling_atomic_add_float(__global volatile float* addr, float val)
+{
+    union { unsigned int u; float f; } expected, next;
+    do {
+        expected.f = *addr;
+        next.f = expected.f + val;
+    } while (atomic_cmpxchg((__global volatile unsigned int*)addr, expected.u, next.u) != expected.u);
+}
+
 // Max Pooling 2D with optional indices for backward pass
 __kernel void maxpool2d(
     __global const float* input,
@@ -99,10 +112,8 @@ __kernel void maxpool2d_backward(
     int iw = maxIdx % inWidth;
     int inputIdx = ((b * channels + c) * inHeight + ih) * inWidth + iw;
 
-    // Atomic add for thread safety when multiple outputs map to same input
-    // Note: OpenCL 1.x doesn't have native atomic float add, so we use a workaround
-    // This is serialized but correct; for production, use OpenCL 2.0 atomics if available
-    gradInput[inputIdx] += grad;
+    // Overlapping windows can share a winner, so this must accumulate atomically.
+    pooling_atomic_add_float(&gradInput[inputIdx], grad);
 }
 
 // Average Pooling 2D
@@ -505,8 +516,8 @@ __kernel void maxpool3d_backward(
     int inputIdx = ((b * channels + c) * inDepth + id) * inHeight * inWidth
                  + ih * inWidth + iw;
 
-    // Note: This is not atomic - for production use OpenCL 2.0 atomics
-    gradInput[inputIdx] += grad;
+    // Overlapping windows can share a winner, so this must accumulate atomically.
+    pooling_atomic_add_float(&gradInput[inputIdx], grad);
 }
 
 // Average Pooling 3D
@@ -716,8 +727,8 @@ __kernel void nearest_upsample3d_backward(
     int inputIdx = ((b * channels + c) * inDepth + id) * inHeight * inWidth
                  + ih * inWidth + iw;
 
-    // Note: This is not atomic - for production use OpenCL 2.0 atomics
-    gradInput[inputIdx] += gradOutput[outIdx];
+    // Every one of the scaleD*scaleH*scaleW copies of this cell adds here concurrently.
+    pooling_atomic_add_float(&gradInput[inputIdx], gradOutput[outIdx]);
 }
 
 // ===========================================================================
