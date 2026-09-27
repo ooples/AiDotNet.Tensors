@@ -117,6 +117,23 @@ public sealed class CompiledTrainingOpStalenessProbeTests : IClassFixture<Direct
                 return SpectralFfn(e, x, op);
             // Ops whose graph node used to carry no backward (now a tape-replay backward): the parameter must still
             // receive the eager gradient through them.
+            // Normalisations whose replayed graph node refreshes saved statistics (mean/var) for the backward. x is
+            // read as NCHW [2, 2, 6, 4] (C = 2).
+            case "batchnorm":
+            case "groupnorm":
+            case "instancenorm":
+            {
+                var g = new Tensor<float>([H]); var bta = new Tensor<float>([H]);
+                for (int i = 0; i < H; i++) { g[i] = 1f + 0.3f * i; bta[i] = 0.1f * i; }
+                return op switch
+                {
+                    "batchnorm" => e.BatchNorm(x, g, bta, 1e-5, out _, out _),
+                    "groupnorm" => e.GroupNorm(x, 1, g, bta, 1e-5, out _, out _),
+                    _ => e.InstanceNorm(x, g, bta, 1e-5, out _, out _),
+                };
+            }
+            case "flashattn":   // q = x, k = x * 0.5, v = x^2 over [B, H, S, M]; saves softmax statistics for backward
+                return e.FlashAttention(x, e.TensorMultiplyScalar(x, 0.5f), e.TensorMultiply(x, x), null, true, out _);
             case "layernorm":
             {
                 var g = new Tensor<float>([M]); var bta = new Tensor<float>([M]);
@@ -283,7 +300,7 @@ public sealed class CompiledTrainingOpStalenessProbeTests : IClassFixture<Direct
 
     public static IEnumerable<object[]> Cases()
     {
-        foreach (var op in new[] { "rope", "clampmin", "clampmax", "divide", "outer5d", "permute", "glascan", "rmsnorm", "bdivide", "layernorm", "reducestd", "lerp", "addscaled", "softmaxrows", "fft", "spectralffn", "g:norm", "g:hidden", "g:gate", "g:cre", "g:bcast", "g:sign", "linear_gelu", "fusedlinear", "linear_sigmoid", "gelu", "mm", "mm3fan", "mmleft", "reshape", "v1", "v2", "v3", "mm2", "f1", "f2", "f3", "f4", "f5", "f6", "f5i", "f5j", "f5k", "f5s", "f5d", "bornattn", "born:featq", "born:vaug", "born:scanqk", "born:scan", "born:num", "born:den", "sffn:spec", "sffn:swap", "sffn:y" })
+        foreach (var op in new[] { "rope", "clampmin", "clampmax", "divide", "outer5d", "permute", "glascan", "rmsnorm", "bdivide", "batchnorm", "groupnorm", "instancenorm", "flashattn", "layernorm", "reducestd", "lerp", "addscaled", "softmaxrows", "fft", "spectralffn", "g:norm", "g:hidden", "g:gate", "g:cre", "g:bcast", "g:sign", "linear_gelu", "fusedlinear", "linear_sigmoid", "gelu", "mm", "mm3fan", "mmleft", "reshape", "v1", "v2", "v3", "mm2", "f1", "f2", "f3", "f4", "f5", "f6", "f5i", "f5j", "f5k", "f5s", "f5d", "bornattn", "born:featq", "born:vaug", "born:scanqk", "born:scan", "born:num", "born:den", "sffn:spec", "sffn:swap", "sffn:y" })
         {
             yield return new object[] { op, false };
             yield return new object[] { op, true };

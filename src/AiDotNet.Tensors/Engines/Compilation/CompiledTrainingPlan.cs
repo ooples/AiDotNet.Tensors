@@ -5985,9 +5985,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 {
                     // PR #638 A0: tag the producing op so the capture-path invalidation log can name it.
                     Engines.DirectGpuTensorEngine.s_currentBackwardOp = stepCopy.OpName;
-                    // No gradient reached this step's output (it does not feed the loss): nothing to propagate. The
-                    // previous fallback borrowed an ARBITRARY gradient buffer (gradAcc.Values.First()) and pushed it
-                    // back through the step, accumulating garbage into the step's inputs.
+                    // Defensive: gradMap pre-allocates a buffer for every traced tensor, so the output normally has an
+                    // entry. If it ever does not, there is nothing to propagate -- the previous fallback borrowed an
+                    // ARBITRARY gradient buffer (gradAcc.Values.First()) and would have pushed it through the step.
                     if (!gradAcc.TryGetValue(stepCopy.OutputBuffer, out var gradOut))
                         return;
                     stepCopy.BackwardFn(gradOut, stepCopy.Inputs, stepCopy.OutputBuffer,
