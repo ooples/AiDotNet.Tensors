@@ -240,6 +240,23 @@ public class GpuTapeGradientParityTests : IDisposable
             static (e, t) => ((IEngine)e).Upsample(e.Reshape(t, new[] { 1, 1, 6, 10 }), 2, 2),
             static (_, y) => Assert.Equal(new[] { 1, 1, 12, 20 }, y.Shape.ToArray()));
 
+    // 2-D indices on purpose: the backward's device ScatterAdd mis-shaped an unflattened index set.
+    private static readonly Tensor<int> GatherIndices = new(new[] { 0, 5, 2, 2, 4, 1 }, new[] { 2, 3 });
+
+    [SkippableFact]
+    public void TensorGather_gradients_match_cpu() =>
+        AssertGradientParity("TensorGather", Rand([6, 10], seed: 46),
+            static (e, t) => e.TensorGather(t, GatherIndices, 0), probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void TensorGather_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("TensorGather", static (e, t) => e.TensorGather(t, GatherIndices, 0),
+            static (x, y) =>
+            {
+                Assert.Equal(new[] { 6, 10 }, y.Shape.ToArray());          // CpuEngine's fast-path shape
+                for (int c = 0; c < 10; c++) Assert.Equal(x[5, c], y[1, c]);
+            });
+
     [SkippableFact]
     public void TensorTranspose_stays_on_the_device_while_a_tape_records() =>
         AssertStaysOnDeviceUnderTape("TensorTranspose", static (e, t) => e.TensorTranspose(t), static (x, y) =>

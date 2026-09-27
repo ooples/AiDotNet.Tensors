@@ -2179,6 +2179,19 @@ internal static class BackwardFunctions<T>
         var indices = (Tensor<int>)savedState[0];
         var axis = (int)savedState[1];
 
+        // An axis-0 gather with multi-dimensional indices: flatten the indices to [count] and the gradient to
+        // [count, source.shape[1..]] before scattering. The forward's own output shape varies by path (the CPU fast
+        // path flattens, the general path keeps indices.shape), so the trailing shape is taken from the SOURCE. The
+        // device ScatterAdd only swaps axis 0 for the source extent, so an unflattened 2-D index set gave
+        // [rows, indices.shape[1..], rest] (180 elements for a 60-element source) instead of the source's shape.
+        if (axis == 0 && indices.Rank > 1)
+        {
+            int count = indices.Length;
+            var flatShape = new[] { count }.Concat(inputs[0]._shape.Skip(1)).ToArray();
+            gradOutput = engine.Reshape(gradOutput, flatShape);
+            indices = indices.Reshape(new[] { count });
+        }
+
         // Sparse-grad fast path mirroring TensorEmbeddingLookupBackward: when the input
         // is a 2-D table (rank-2 axis-0 gather is structurally identical to an embedding
         // lookup over [vocab, dim]), record the gradient as a SparseEmbeddingGradient

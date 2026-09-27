@@ -21460,7 +21460,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         Compilation.GraphMode.ThrowIfInferenceUnsupported(
             Compilation.GraphCaptureLimitation.HeterogeneousInput);
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+        // Under a tape the kernel runs and records CpuEngine's GatherBackward node (saved state: indices, axis).
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || !TryGetBackend(out var backend) || axis != 0)
             return base.TensorGather(source, indices, axis);
 
@@ -21483,6 +21484,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
             using var bufSrc = GetOrAllocateBuffer(backend, contiguousSource);
             using var bufIdx = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices);
+            // Matches CpuEngine's rank-2 axis-0 fast path, which also flattens multi-dimensional indices.
             int[] outShape = source.Rank >= 2
                 ? new[] { numIndices }.Concat(source.Shape._dims.Skip(1)).ToArray()
                 : new[] { numIndices };
