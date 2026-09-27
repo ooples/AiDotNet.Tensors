@@ -1790,8 +1790,47 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// its current host contents, OUTSIDE capture, and sync its buffer-version so a captured read is a
     /// cache hit. Called before each graph REPLAY (SetInput already wrote this step's batch into the
     /// host tensor). No-op until the input has a resident buffer (the pre-residency pass allocates it).</summary>
+    // Every tensor the graph reads that it does not produce and does not own as a parameter: the batch input, the
+    // TARGET, masks, any caller-fed tensor. Each is bound to a stable device buffer in the capture pre-pass and
+    // re-uploaded before every launch. Refreshing only the primary input left the target at the capture step's batch,
+    // so a replayed graph trained on one frozen target forever (AiDotNet's NeuralNetwork.Train: reported loss -> 0 on
+    // random targets while the real fit got worse than eager). Uploaded unconditionally, like the input always was:
+    // callers write batches through a host span, which does not bump the version.
+    private Tensor<T>[]? _graphExternalLeaves;
+
+    private Tensor<T>[] GraphExternalLeaves()
+    {
+        if (_graphExternalLeaves is { } cached) return cached;
+        var produced = new HashSet<Tensor<T>>();
+        var owned = new HashSet<Tensor<T>>();
+        foreach (var p in _parameters) owned.Add(p);
+        if (_forwardSteps is not null)
+            foreach (var step in _forwardSteps) produced.Add(step.OutputBuffer);
+        var leaves = new List<Tensor<T>>();
+        var seen = new HashSet<Tensor<T>>();
+        if (_forwardSteps is not null)
+            foreach (var step in _forwardSteps)
+                foreach (var input in step.Inputs)
+                    if (input is not null && input.IsContiguous && input.Length > 0
+                        && !produced.Contains(input) && !owned.Contains(input) && seen.Add(input))
+                        leaves.Add(input);
+        return _graphExternalLeaves = leaves.ToArray();
+    }
+
     private void RefreshGraphInputInPlace(Engines.DirectGpu.CUDA.CudaBackend cb)
     {
+        if (!_graphHasEmbedding)
+        {
+            foreach (var leaf in GraphExternalLeaves())
+            {
+                if (ReferenceEquals(leaf, _compiledInputTensor)) continue;   // refreshed below, as before
+                if (leaf._gpuBuffer is not { } leafBuffer || !ReferenceEquals(leaf._gpuBackend, cb)) continue;
+                var leafData = leaf.GetDataArray();
+                if (leafBuffer.Size < leafData.Length) continue;
+                cb.UploadBufferInPlace((float[])(object)leafData, leafBuffer);
+                leaf._gpuBufferVersion = leaf.GpuCacheVersion;
+            }
+        }
         // In-graph embedding design: for an embedding-first plan there is NO float input to refresh (the gather
         // happens on-device inside the captured graph; only the small index buffer is refreshed, via
         // RefreshGraphEmbeddingIndicesNow). _compiledInputTensor stays set for SetInput/SetInputs API
@@ -1814,6 +1853,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // (the pre-pass's persistent EnsureResidentBuffer allocs must NOT be pooled).
         var de = engine as Engines.DirectGpuTensorEngine;
         de?.SetCurrentScratchAction(-1);
+        // Pre-pass only (allocation is illegal inside the capture): give every external leaf a stable device buffer
+        // holding its current data, so the captured ops read it through that buffer and replays can refresh it.
+        if (de is not null && !_graphHasEmbedding && !cb.IsStreamCapturing())
+            foreach (var leaf in GraphExternalLeaves())
+                de.EnsureResidentInput(leaf);
         _preForwardParamTransform?.Invoke();
         var fwd = _forwardActions;
         // The whole forward (INCLUDING the embedding, which gathers on-device from the externally-refreshed stable

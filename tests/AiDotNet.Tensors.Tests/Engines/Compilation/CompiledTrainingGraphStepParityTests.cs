@@ -61,6 +61,17 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         return t;
     }
 
+    /// <summary>
+    /// A different batch every step, written into the plan's persistent input and target through a host span - exactly
+    /// how AiDotNet's compiled training step feeds each batch. A replayed graph must see it: with the target frozen at
+    /// the capture step's batch, the model memorized that one batch (reported loss -> 0 while the real fit got worse).
+    /// </summary>
+    private static void FeedBatch(Tensor<float> x, Tensor<float> y, int step)
+    {
+        Rand([Batch, Inputs], 100 + step, 1f).AsSpan().CopyTo(x.AsWritableSpan());
+        Rand([Batch, Outputs], 200 + step, 1f).AsSpan().CopyTo(y.AsWritableSpan());
+    }
+
     private sealed class Run
     {
         public double[] Losses = Array.Empty<double>();
@@ -106,7 +117,10 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2f);
             var losses = new double[Steps];
             for (int s = 0; s < Steps; s++)
+            {
+                FeedBatch(x, y, s);
                 losses[s] = plan.Step().ToArray()[0];
+            }
             var exec = (IntPtr)typeof(CompiledTrainingPlan<float>)
                 .GetField("_stepGraphExec", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(concrete)!;
             return new Run
@@ -136,7 +150,7 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             _output.WriteLine("captured " + string.Join(" ", captured.Losses.Select(l => l.ToString("G6"))));
 
             // The eager plan must actually learn, or agreeing with it proves nothing.
-            Assert.True(eager.Losses[^1] < 0.7 * eager.Losses[0], "the eager reference did not learn");
+            Assert.True(eager.Losses.Skip(Steps / 2).Average() < eager.Losses.Take(Steps / 2).Average(), "the eager reference did not learn");
             Assert.False(eager.ReplayedAGraph, "the eager reference captured a graph");
             // A capture that fails falls back to eager and would agree trivially.
             Assert.True(captured.ReplayedAGraph, "the captured plan is not replaying a graph after warm-up");
@@ -207,7 +221,7 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             _output.WriteLine("eager    " + string.Join(" ", eager.Losses.Select(l => l.ToString("G6"))));
             _output.WriteLine("captured " + string.Join(" ", captured.Losses.Select(l => l.ToString("G6"))));
 
-            Assert.True(eager.Losses[^1] < 0.7 * eager.Losses[0], "the eager reference did not learn");
+            Assert.True(eager.Losses.Skip(Steps / 2).Average() < eager.Losses.Take(Steps / 2).Average(), "the eager reference did not learn");
             for (int s = 0; s < Steps; s++)
                 Assert.True(Math.Abs(eager.Losses[s] - captured.Losses[s]) <= 1e-5 * Math.Max(1, Math.Abs(eager.Losses[s])),
                     $"step {s}: captured loss {captured.Losses[s]:G6} != eager {eager.Losses[s]:G6}");
@@ -256,6 +270,7 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                     .GetField("_gradients", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(concrete)!;
                 for (int s = 0; s < Steps; s++)
                 {
+                    FeedBatch(x, y, s);
                     var expected = CpuTapeGradients(x, y, parameters, composedMse);
                     plan.Step();
                     for (int p = 0; p < parameters.Length; p++)
