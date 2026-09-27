@@ -488,6 +488,36 @@ public class TrainingPlanSerializationTests
     }
 
     [Fact]
+    public void RestoringAnUnsupportedOptimizerCombination_RollsBackAndKeepsTrainingLikeATwin()
+    {
+        // int8 moments with SGDMomentum passes enum validation but is rejected by ConfigureOptimizer only after the
+        // live optimizer's buffers are released. The restore must put the previous optimizer back intact.
+        var engine = new CpuEngine();
+        var weight = CreateTensor(new[] { 3, 2 }, seed: 71);
+        var plan = CompileLinearPlan(engine, weight);
+        ConfigureCheckpointOptimizer(plan, OptimizerType.Adam);
+        var twinWeight = CreateTensor(new[] { 3, 2 }, seed: 71);
+        var twin = CompileLinearPlan(engine, twinWeight);
+        ConfigureCheckpointOptimizer(twin, OptimizerType.Adam);
+        for (int i = 0; i < 3; i++) { plan.Step(); twin.Step(); }
+
+        var before = CaptureCheckpoint(plan);
+        var unsupported = CaptureCheckpoint(plan);
+        unsupported.OptimizerType = OptimizerType.SGDMomentum;
+        unsupported.MomentStorageMode = FusedMomentStorageMode.Int8BlockQuantized;
+        var concrete = Assert.IsType<CompiledTrainingPlan<float>>(plan);
+        Assert.Throws<NotSupportedException>(() => concrete.RestoreFusedOptimizerCheckpoint(unsupported));
+
+        AssertOptimizerCheckpointEqual(before, CaptureCheckpoint(plan), "after the failed restore");
+        plan.Step();
+        twin.Step();
+        AssertEqual(twinWeight.AsSpan().ToArray(), weight.AsSpan().ToArray(), 0f, "step after the failed restore");
+
+        plan.Dispose();
+        twin.Dispose();
+    }
+
+    [Fact]
     public void ImportOptimizerState_UnknownOptimizerType_IsInvalidData()
     {
         var engine = new CpuEngine();

@@ -4871,7 +4871,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         {
             RestoreFusedOptimizerCheckpointCore(checkpoint);
         }
-        catch (Exception ex) when (ex is InvalidDataException || ex is ArgumentException || ex is OverflowException)
+        // Every failure rolls back, not only data errors: an enum-valid but unsupported combination (int8 moments
+        // with SGDMomentum, or weight decay with int8 moments) throws NotSupportedException from ConfigureOptimizer
+        // AFTER the live GPU buffers are disposed and the moments returned to the arena, and without a rollback the
+        // old update closure would keep writing into memory the plan no longer owns.
+        catch (Exception ex)
         {
             if (previous is not null)
             {
@@ -4885,7 +4889,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 _maxGradNorm = previousMaxGradNorm;
             }
 
-            if (ex is InvalidDataException) throw;
+            // A defined-but-unsupported optimizer keeps its NotSupportedException contract; anything else is a
+            // payload that does not fit this plan.
+            if (ex is InvalidDataException || ex is NotSupportedException) throw;
             throw new InvalidDataException($"Optimizer checkpoint does not fit this plan: {ex.Message}", ex);
         }
     }
