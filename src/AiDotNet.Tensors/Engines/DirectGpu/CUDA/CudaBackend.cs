@@ -1996,7 +1996,9 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         // the race with no effect on the GPU-resident training hot path.
         AuditSyncIO("DtoH-download", (long)buffer.Size * sizeof(float));
         LogCaptureBlockerIfCapturing("DtoH-download", (long)buffer.Size * sizeof(float));
+        long probeStart = GpuLaunchProbe.CaptureReadbackSites ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamSynchronize(_stream), "cuStreamSynchronize(download)");
+        long probeSynced = probeStart != 0 ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
 
         ulong byteSize = (ulong)(buffer.Size * sizeof(float));
 
@@ -2009,6 +2011,8 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
                     "cuMemcpyDtoH");
             }
         }
+        if (probeStart != 0)
+            GpuLaunchProbe.OnReadbackTiming(probeSynced - probeStart, System.Diagnostics.Stopwatch.GetTimestamp() - probeSynced);
         // PR #638 A0: attribute this DtoH to the op that issued it (no-op outside a download-trace window).
         AiDotNet.Tensors.Engines.DirectGpu.GpuMemoryTracker.OnDownload((long)byteSize);
     }

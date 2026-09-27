@@ -29,6 +29,7 @@ internal static class GpuLaunchProbe
     private static int _captureReadbackSites;
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> _missedNames = new();
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, int> _readbackSites = new();
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> _readbackSiteBytes = new();
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, int> _fallbacks = new();
 
     /// <summary>Total kernel launches observed since the last <see cref="Reset"/> (lock-free read).</summary>
@@ -57,7 +58,22 @@ internal static class GpuLaunchProbe
     public static string[] ReadbackSites => System.Linq.Enumerable.ToArray(
         System.Linq.Enumerable.Select(
             System.Linq.Enumerable.OrderBy(_readbackSites, entry => entry.Key),
-            entry => $"{entry.Value}x {entry.Key}"));
+            entry => $"{entry.Value}x {(_readbackSiteBytes.TryGetValue(entry.Key, out long b) ? b : 0):N0} B {entry.Key}"));
+
+    private static long _readbackSyncTicks;
+    private static long _readbackCopyTicks;
+
+    /// <summary>Stopwatch ticks the (site-capturing) readbacks spent waiting for the stream, then copying.</summary>
+    public static (double SyncSeconds, double CopySeconds) ReadbackSeconds =>
+        (Interlocked.Read(ref _readbackSyncTicks) / (double)Stopwatch.Frequency,
+         Interlocked.Read(ref _readbackCopyTicks) / (double)Stopwatch.Frequency);
+
+    /// <summary>Accumulates a readback's stream-wait and copy time (only measured while sites are captured).</summary>
+    public static void OnReadbackTiming(long syncTicks, long copyTicks)
+    {
+        Interlocked.Add(ref _readbackSyncTicks, syncTicks);
+        Interlocked.Add(ref _readbackCopyTicks, copyTicks);
+    }
 
     /// <summary>Records one device-to-host transfer at a backend download choke point.</summary>
     public static void OnReadback(long byteCount)
@@ -87,7 +103,17 @@ internal static class GpuLaunchProbe
             var site = frame is null || method is null
                 ? "unknown"
                 : $"{method.DeclaringType?.FullName}.{method.Name}:{frame.GetFileLineNumber()}";
+            // A deferred download is triggered by whoever first reads the host array, often far from the op that
+            // produced the tensor (the engine frame is then just the materializer callback). Name the first caller
+            // outside this assembly too, so a site says both which op's result and which consumer forced it.
+            var external = frames is null ? null : System.Linq.Enumerable.FirstOrDefault(frames, candidate =>
+                candidate.GetMethod()?.DeclaringType?.Assembly is { } asm && asm != typeof(GpuLaunchProbe).Assembly
+                && asm != typeof(object).Assembly);
+            var externalMethod = external?.GetMethod();
+            if (externalMethod is not null)
+                site += $" <- {externalMethod.DeclaringType?.Name}.{externalMethod.Name}";
             _readbackSites.AddOrUpdate(site, 1, static (_, count) => count + 1);
+            _readbackSiteBytes.AddOrUpdate(site, byteCount, (_, total) => total + byteCount);
         }
     }
 
@@ -142,6 +168,9 @@ internal static class GpuLaunchProbe
         Interlocked.Exchange(ref _readbackBytes, 0);
         _missedNames.Clear();
         _readbackSites.Clear();
+        _readbackSiteBytes.Clear();
+        Interlocked.Exchange(ref _readbackSyncTicks, 0);
+        Interlocked.Exchange(ref _readbackCopyTicks, 0);
         _fallbacks.Clear();
         return Interlocked.Exchange(ref _count, 0);
     }
