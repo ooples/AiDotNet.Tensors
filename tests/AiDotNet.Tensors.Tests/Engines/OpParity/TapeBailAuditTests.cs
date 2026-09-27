@@ -189,6 +189,8 @@ public class TapeBailAuditTests
         "TensorDivideScalar",
         // Records ReduceSumBackward on every float device path; the general path suppresses its inner recording.
         "ReduceSum",
+        // Records ReduceMeanBackward (normalized axes) on both device paths; its backward is resident too.
+        "ReduceMean",
     };
 
     private static string[] GpuEngineSources(string root)

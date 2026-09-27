@@ -319,6 +319,40 @@ public class GpuTapeGradientParityTests : IDisposable
         });
 
     /// <summary>
+    /// ReduceMean used to bail to the CPU under any tape, so every mean-reduced loss (MSE among them) downloaded
+    /// its whole prediction each training step. Its gradient is gradOutput / count broadcast back, exact enough on
+    /// both engines that a double recording would show up as 2x.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(0, true)]     // general path (non-innermost axis)
+    [InlineData(1, true)]     // IEngine innermost-axis kernel
+    [InlineData(1, false)]
+    [InlineData(-1, true)]    // full reduction
+    [InlineData(-1, false)]   // full reduction to a scalar: the MSE loss shape
+    public void ReduceMean_gradients_match_cpu(int axis, bool keepDims) =>
+        AssertGradientParity($"ReduceMean[{axis},{keepDims}]", Rand([6, 10], seed: 37),
+            (e, t) => axis < 0 ? e.ReduceMean(t, null!, keepDims) : e.ReduceMean(t, new[] { axis }, keepDims),
+            probe: Engagement.UseResidencyCounter);
+
+    [SkippableTheory]
+    [InlineData(0)]
+    [InlineData(1)]
+    public void ReduceMean_stays_on_the_device_while_a_tape_records(int axis) =>
+        AssertStaysOnDeviceUnderTape($"ReduceMean[{axis}]", (e, t) => e.ReduceMean(t, new[] { axis }, keepDims: false), (x, y) =>
+        {
+            int rows = 6, cols = 10;
+            int outLen = axis == 0 ? cols : rows;
+            Assert.Equal(new[] { outLen }, y.Shape.ToArray());
+            for (int o = 0; o < outLen; o++)
+            {
+                float sum = 0;
+                if (axis == 0) for (int r = 0; r < rows; r++) sum += x[r, o];
+                else for (int c = 0; c < cols; c++) sum += x[o, c];
+                Assert.Equal(sum / (axis == 0 ? rows : cols), y[o], 4);
+            }
+        });
+
+    /// <summary>
     /// Mean and MSE-loss backwards scaled by <c>gradOutput[0]</c> — a blocking readback of the resident upstream
     /// gradient in every backward pass. On the GPU engine they must now read nothing back and still match CPU.
     /// </summary>

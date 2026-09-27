@@ -18,7 +18,23 @@ internal static class DeferredArrayMaterializer
     {
         public readonly Action<object> Callback;
         public readonly int ThreadId;
+        // 0 = pending, 1 = taken (materialized, removed, drained, or a losing duplicate). Exactly one party flips
+        // it, and that party owns the _pendingCount decrement.
+        private int _state;
         public Pending(Action<object> callback, int threadId) { Callback = callback; ThreadId = threadId; }
+
+        public bool TryClaim()
+        {
+            if (Interlocked.Exchange(ref _state, 1) != 0) return false;
+            Interlocked.Decrement(ref _pendingCount);
+            GC.SuppressFinalize(this);
+            return true;
+        }
+
+        // The key (a result nobody references any more) was collected, so the table dropped this entry without
+        // anyone taking it. Keep _pendingCount exact: an inflated count disables the zero fast path in
+        // TryMaterialize and sends EVERY host read in the process through the table.
+        ~Pending() => TryClaim();
     }
 
     // WEAKLY keyed. This used to be a ConcurrentDictionary, which strongly rooted every key (a result's vector or
@@ -27,8 +43,10 @@ internal static class DeferredArrayMaterializer
     // references any more takes its pending download and its buffer with it (the buffer's own finalizer frees it,
     // stream-ordered), while a result somebody still holds is materialized on its first host read exactly as before.
     // Keys are compared by reference, as they were (neither arrays nor vectors override Equals).
+    // Lock-free: ConditionalWeakTable is thread-safe, and ownership of an entry is decided by Pending.TryClaim. (A
+    // global lock here serialized every host read of every tensor across all threads - parallel CPU loops spent
+    // a third of a training step spinning in Monitor.Enter_Slowpath on it.)
     private static readonly ConditionalWeakTable<object, Pending> _pendingMaterializations = new();
-    private static readonly object _gate = new();
 
     // Per-thread weak list of this thread's registered keys, for the thread-scoped bulk drain (MaterializeAll).
     [ThreadStatic] private static List<WeakReference<object>>? t_registeredKeys;
@@ -81,16 +99,11 @@ internal static class DeferredArrayMaterializer
         // THIS thread's entries — downloading another thread's buffer in a bulk drain
         // would read a GPU buffer that thread's kernel is still writing (shared queue) →
         // CL_INVALID_MEM_OBJECT or a GPU driver fault. See MaterializeAll.
-        bool added;
-        lock (_gate)
+        // First registration wins, as with the previous TryAdd: GetValue stores `mine` only if the key is absent.
+        var mine = new Pending(materializeCallback, Environment.CurrentManagedThreadId);
+        if (!ReferenceEquals(_pendingMaterializations.GetValue(array, _ => mine), mine))
         {
-            // First registration wins, as with the previous TryAdd.
-            added = !_pendingMaterializations.TryGetValue(array, out _);
-            if (added) _pendingMaterializations.Add(array, new Pending(materializeCallback, Environment.CurrentManagedThreadId));
-        }
-        if (!added)
-        {
-            Interlocked.Decrement(ref _pendingCount);
+            mine.TryClaim(); // the duplicate never became pending: undo the increment above
             return;
         }
         var keys = t_registeredKeys ??= new List<WeakReference<object>>();
@@ -102,15 +115,13 @@ internal static class DeferredArrayMaterializer
         }
     }
 
+    // Claims the entry (and its _pendingCount decrement) for the caller; false when absent or already claimed.
     private static bool TryTake(object array, out Pending? pending)
     {
-        lock (_gate)
+        if (_pendingMaterializations.TryGetValue(array, out pending) && pending.TryClaim())
         {
-            if (_pendingMaterializations.TryGetValue(array, out pending))
-            {
-                _pendingMaterializations.Remove(array);
-                return true;
-            }
+            _pendingMaterializations.Remove(array);
+            return true;
         }
         pending = null;
         return false;
@@ -134,7 +145,6 @@ internal static class DeferredArrayMaterializer
 
         if (TryTake(array, out var pending) && pending is not null)
         {
-            Interlocked.Decrement(ref _pendingCount);
             Interlocked.Increment(ref _materializeCount); // a real DtoH download is about to run
             pending.Callback(array);
             return true;
@@ -156,8 +166,7 @@ internal static class DeferredArrayMaterializer
     /// </summary>
     internal static void Remove(object array)
     {
-        if (TryTake(array, out _))
-            Interlocked.Decrement(ref _pendingCount);
+        TryTake(array, out _);
     }
 
     /// <summary>
@@ -201,7 +210,6 @@ internal static class DeferredArrayMaterializer
         {
             if (!weak.TryGetTarget(out var key)) continue;
             if (!TryTake(key, out var pending) || pending is null) continue;
-            Interlocked.Decrement(ref _pendingCount);
 
             try { pending.Callback(key); }
             catch (InvalidOperationException) when (swallowErrors)

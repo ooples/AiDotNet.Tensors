@@ -16391,13 +16391,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     public override Tensor<T> ReduceMean<T>(Tensor<T> input, int[] axes, bool keepDims)
     {
-        var safeAxes = axes ?? Array.Empty<int>();
-        if (IsTapeActive<T>()) return base.ReduceMean(input, safeAxes, keepDims);
-        if (!TryGetBackend(out var backend))
-            return base.ReduceMean(input, safeAxes, keepDims);
-
-        // Validate and normalize axes
-        if (safeAxes.Length == 0)
+        // No tape bail: the device path records CpuEngine's node (ReduceMeanBackward, normalized axes), whose
+        // backward is itself resident (IEngine.ReduceMeanBackward). The bail made every mean-reduced loss - MSE,
+        // among others - download its whole prediction and reduce on the CPU, on every training step.
+        // Null or empty axes mean "reduce every axis", as in CpuEngine. Non-float keeps the exact CPU path.
+        var safeAxes = axes is null || axes.Length == 0 ? AllAxes(input.Rank) : axes;
+        if (typeof(T) != typeof(float) || input.Rank == 0 || !TryGetBackend(out var backend))
             return base.ReduceMean(input, safeAxes, keepDims);
 
         // Normalize negative axes
@@ -16410,12 +16409,26 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         try
         {
-            return ReduceAxisGpu(input, normalizedAxes, keepDims, backend, ReduceOperation.Mean);
+            // ReduceAxisGpu may compose engine ops; suppress their recording so the result has exactly one
+            // producer node, the ReduceMean below.
+            Tensor<T> reduced;
+            using (new Autodiff.NoGradScope<T>())
+                reduced = ReduceAxisGpu(input, normalizedAxes, keepDims, backend, ReduceOperation.Mean);
+            Autodiff.DifferentiableOps.RecordUnary("ReduceMean", reduced, input,
+                Autodiff.BackwardFunctions<T>.ReduceMeanBackward, new object[] { normalizedAxes, keepDims });
+            return reduced;
         }
         catch
         {
             return base.ReduceMean(input, safeAxes, keepDims);
         }
+    }
+
+    private static int[] AllAxes(int rank)
+    {
+        var all = new int[rank];
+        for (int i = 0; i < rank; i++) all[i] = i;
+        return all;
     }
 
     /// <summary>
@@ -23745,13 +23758,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.ReduceMean<T>(Tensor<T> input, int[] axes, bool keepDims)
     {
-        if (IsTapeActive<T>()) return base.ReduceMean(input, axes, keepDims);
+        // No tape bail: the innermost-axis fast path records the same node as the public override (which
+        // everything else here defers to), so a mean inside training stays on the device.
         // Same axis-must-be-innermost constraint as ReduceSum: backend.MeanAxis
         // treats the buffer as [N, reduceSize] rows; correct only when the
         // reduce axis is contiguous (axis == rank - 1). For middle/outer
         // axes the row-major strides scatter reduce elements across the
         // buffer, so MeanAxis would silently reduce the wrong axis.
-        if (typeof(T)==typeof(float) && TryGetBackend(out var b) && axes.Length == 1)
+        if (typeof(T)==typeof(float) && TryGetBackend(out var b) && axes is { Length: 1 })
         {
             try
             {
@@ -23777,7 +23791,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                         for (int i = 0, j = 0; i < rank; i++)
                             if (i != axis) outShape[j++] = input.Shape._dims[i];
                     }
-                    return DeferTensorResult<T>(b, go, outerSize, outShape);
+                    var meanResult = DeferTensorResult<T>(b, go, outerSize, outShape);
+                    Autodiff.DifferentiableOps.RecordUnary("ReduceMean", meanResult, input,
+                        Autodiff.BackwardFunctions<T>.ReduceMeanBackward, new object[] { new[] { axis }, keepDims });
+                    return meanResult;
                 }
             }
             catch { }
