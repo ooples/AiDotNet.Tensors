@@ -77,7 +77,6 @@ public class TapeBailAuditTests
         // CUDA now provides where_select, so Sparsemax's non-tape device path is complete. It still bails under
         // a tape because this composite forward does not record a backward; returning the resident result as-is
         // would silently drop the input gradient. Remove this entry when that recording is implemented.
-        "Sparsemax",
 
         // The direct-GPU fused loss has inference kernels but no backend backward contract. Its override now
         // throws NotSupportedException under a tape rather than silently downloading resident logits through
@@ -209,6 +208,7 @@ public class TapeBailAuditTests
         "FlashAttention",
         "GroupedQueryAttention",
         "Scatter",
+        "Sparsemax",
     };
 
     private static string[] GpuEngineSources(string root)

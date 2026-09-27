@@ -804,6 +804,21 @@ public class GpuTapeGradientParityTests : IDisposable
         AssertStaysOnDeviceUnderTape("Scatter",
             static (e, t) => e.Scatter(t, ColumnIndices, Rand([6, 3], seed: 439), 1),
             static (x, y) => Assert.Equal(x[0, 0], y[0, 0]));
+    // Rand in [-1,1] over 10 columns leaves several entries per row outside the support, so the gradient's
+    // support mask and its per-row mean correction are both exercised.
+    [SkippableFact]
+    public void Sparsemax_gradients_match_cpu() =>
+        AssertGradientParity("Sparsemax", Rand([6, 10], seed: 443),
+            static (e, t) => e.Sparsemax(t, -1));
+
+    [SkippableFact]
+    public void Sparsemax_taped_forward_matches_cpu() =>
+        AssertTapedForwardMatchesCpu("Sparsemax", Rand([6, 10], seed: 449), static (e, t) => e.Sparsemax(t, -1));
+
+    [SkippableFact]
+    public void Sparsemax_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("Sparsemax", static (e, t) => e.Sparsemax(t, -1),
+            static (x, y) => { for (int r = 0; r < 6; r++) { float s = 0; for (int c = 0; c < 10; c++) s += y[r, c]; Assert.Equal(1f, s, 4); } });
     [SkippableFact]
     public void TensorClampMin_gradients_match_cpu() =>
         AssertGradientParity("ClampMin", Rand([6, 10], seed: 73),

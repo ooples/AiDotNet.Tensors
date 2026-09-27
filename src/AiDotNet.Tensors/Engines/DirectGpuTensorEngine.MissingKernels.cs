@@ -3226,11 +3226,10 @@ public partial class DirectGpuTensorEngine
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
         int normalizedAxis = axis < 0 ? axis + input.Rank : axis;
-        // CUDA now provides where_select, so the non-tape device path is complete. Keep the tape bail until
-        // Sparsemax records its composite backward; returning an unrecorded resident result during training
-        // would silently drop the input gradient.
+        // The device path records CpuEngine's node below; SparsemaxBackward reads only the output and has a device
+        // implementation.
         if (typeof(T) != typeof(float) || normalizedAxis != input.Rank - 1
-            || input.Length == 0 || !input.IsContiguous || IsTapeActive<T>()
+            || input.Length == 0 || !input.IsContiguous
             || Compilation.GraphMode.IsActive || !TryGetBackend(out var backend)
             || (backend is DirectGpu.CUDA.CudaBackend cudaBackend && !cudaBackend.HasWhereSelectKernel))
             return base.Sparsemax(input, axis);
@@ -3242,13 +3241,15 @@ public partial class DirectGpuTensorEngine
         using var inputBuffer = GetOrAllocateBuffer(backend, input);
         var (sortedValues, sortedIndices) = BitonicSortRowsToBuffers(
             backend, inputBuffer.Buffer, rows, columns, descending: true);
+        var rowOps = backend as IGpuBatchExecution;
         using (sortedValues)
         using (sortedIndices)
         using (var cumulative = backend.AllocateBuffer(length))
+        using (var shifted = backend.AllocateBuffer(length))
         using (var current = backend.AllocateBuffer(1))
         using (var update = backend.AllocateBuffer(1))
         using (var sum = backend.AllocateBuffer(1))
-        using (var shifted = backend.AllocateBuffer(length))
+        using (var expandedThresholds = backend.AllocateBuffer(length))
         using (var denominators = backend.AllocateBuffer(
             Enumerable.Range(1, columns).Select(i => (float)i).ToArray()))
         using (var candidates = backend.AllocateBuffer(length))
@@ -3256,21 +3257,30 @@ public partial class DirectGpuTensorEngine
         using (var falseCandidates = backend.AllocateBuffer(length))
         using (var maskedCandidates = backend.AllocateBuffer(length))
         using (var thresholds = backend.AllocateBuffer(rows))
-        using (var expandedThresholds = backend.AllocateBuffer(length))
         using (var shiftedInput = backend.AllocateBuffer(length))
         {
             var sparsemaxResult = DispatchDeferredGpuOp<T>(backend, length, (int[])input._shape.Clone(), output =>
             {
-                for (int row = 0; row < rows; row++)
+                // One row-wise prefix sum where the backend has it. The element-by-element fallback costs 4 launches per
+                // element (305 for a 6x10 input), which now that a tape keeps Sparsemax on the device would make training
+                // launch-bound; backends without CumSumAxis (OpenCL today) still take it.
+                if (rowOps is not null)
                 {
-                    int rowOffset = row * columns;
-                    backend.Copy(sortedValues.Buffer, rowOffset, cumulative, rowOffset, 1);
-                    for (int column = 1; column < columns; column++)
+                    rowOps.CumSumAxis(sortedValues.Buffer, cumulative, rows, columns);
+                }
+                else
+                {
+                    for (int row = 0; row < rows; row++)
                     {
-                        backend.Copy(cumulative, rowOffset + column - 1, current, 0, 1);
-                        backend.Copy(sortedValues.Buffer, rowOffset + column, update, 0, 1);
-                        backend.Add(current, update, sum, 1);
-                        backend.Copy(sum, 0, cumulative, rowOffset + column, 1);
+                        int rowOffset = row * columns;
+                        backend.Copy(sortedValues.Buffer, rowOffset, cumulative, rowOffset, 1);
+                        for (int column = 1; column < columns; column++)
+                        {
+                            backend.Copy(cumulative, rowOffset + column - 1, current, 0, 1);
+                            backend.Copy(sortedValues.Buffer, rowOffset + column, update, 0, 1);
+                            backend.Add(current, update, sum, 1);
+                            backend.Copy(sum, 0, cumulative, rowOffset + column, 1);
+                        }
                     }
                 }
 
@@ -3280,13 +3290,24 @@ public partial class DirectGpuTensorEngine
                 backend.Fill(falseCandidates, float.NegativeInfinity, length);
                 backend.Where(supportMask, candidates, falseCandidates, maskedCandidates, length);
                 backend.MaxAxis(maskedCandidates, thresholds, rows, columns);
-                for (int row = 0; row < rows; row++)
-                    for (int column = 0; column < columns; column++)
-                        backend.Copy(thresholds, row, expandedThresholds, row * columns + column, 1);
-                backend.Subtract(inputBuffer.Buffer, expandedThresholds, shiftedInput, length);
+                if (rowOps is not null)
+                {
+                    // z - tau_row as one broadcast: negate the per-row thresholds and add them across each row.
+                    rowOps.ScalarMinusTensor(thresholds, thresholds, 0f, rows);
+                    rowOps.BroadcastAddFirst(thresholds, inputBuffer.Buffer, shiftedInput, rows, columns);
+                }
+                else
+                {
+                    for (int row = 0; row < rows; row++)
+                        for (int column = 0; column < columns; column++)
+                            backend.Copy(thresholds, row, expandedThresholds, row * columns + column, 1);
+                    backend.Subtract(inputBuffer.Buffer, expandedThresholds, shiftedInput, length);
+                }
                 backend.Relu(shiftedInput, output, length);
             });
 
+            Autodiff.DifferentiableOps.RecordUnary("Sparsemax", sparsemaxResult, input,
+                Autodiff.BackwardFunctions<T>.SparsemaxBackward, new object[] { normalizedAxis });
             return sparsemaxResult;
         }
     }
