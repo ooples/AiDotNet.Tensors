@@ -4748,6 +4748,66 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <summary>
+    /// AdaptiveAvgPool2D backward on the device. Adaptive average pooling is separable — each output cell averages
+    /// a row window times a column window, and its area is the product of the two lengths — so the input gradient
+    /// of every [H, W] plane is <c>A_Hᵀ · dY · A_W</c>, where <c>A_H[oh, ih] = 1 / hLen(oh)</c> inside the window and
+    /// zero outside (likewise <c>A_W</c>). Overlapping windows add, exactly as the host loop's accumulation does.
+    /// Null when the device path cannot take it, so the caller falls back to the host loop.
+    /// </summary>
+    internal Tensor<T>? TryAdaptiveAvgPool2DBackwardOnDevice<T>(Tensor<T> gradOutput, int[] inputShape,
+        int outH, int outW)
+    {
+        if (typeof(T) != typeof(float) || Compilation.GraphMode.IsActive || inputShape.Length != 4
+            || !TryGetBackend(out var backend))
+            return null;
+        try
+        {
+            int planes = checked(inputShape[0] * inputShape[1]);
+            int inH = inputShape[2], inW = inputShape[3];
+            if (gradOutput.Length != checked(planes * outH * outW)) return null;
+            var upstream = gradOutput.IsContiguous ? gradOutput : (Tensor<T>)gradOutput.Contiguous();
+            using var bufG = GetOrAllocateBuffer(backend, upstream);
+            using var rowPool = new OwnedBuffer(backend.AllocateBuffer(AdaptivePoolMatrix(inH, outH)), ownsBuffer: true);
+            using var colPool = new OwnedBuffer(backend.AllocateBuffer(AdaptivePoolMatrix(inW, outW)), ownsBuffer: true);
+            int total = checked(planes * inH * inW);
+            return DispatchDeferredGpuOp<T>(backend, total, (int[])inputShape.Clone(), output =>
+            {
+                using var right = AllocateStreamOrderedScratch(backend, checked(planes * outH * inW));
+                using var rightT = AllocateStreamOrderedScratch(backend, checked(planes * inW * outH));
+                using var planesT = AllocateStreamOrderedScratch(backend, total);
+                // dY · A_W : [planes*outH, outW] x [outW, inW]
+                backend.Gemm(bufG.Buffer, colPool.Buffer, right, planes * outH, inW, outW);
+                // (A_Hᵀ · R)ᵀ = Rᵀ · A_H per plane, so transpose, multiply by A_H, transpose back.
+                backend.BatchedTranspose(right, rightT, planes, outH, inW);
+                backend.Gemm(rightT, rowPool.Buffer, planesT, planes * inW, inH, outH);
+                backend.BatchedTranspose(planesT, output, planes, inW, inH);
+            });
+        }
+        catch (Exception)
+        {
+            if (ThrowOnGpuKernelFallback) throw;
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Row-major [outSize, inSize] pooling matrix of adaptive average pooling along one axis: row o holds
+    /// 1 / windowLength over [floor(o*in/out), ceil((o+1)*in/out)), the same window CpuEngine uses.
+    /// </summary>
+    private static float[] AdaptivePoolMatrix(int inSize, int outSize)
+    {
+        var matrix = new float[checked(outSize * inSize)];
+        for (int o = 0; o < outSize; o++)
+        {
+            int start = (int)Math.Floor((double)o * inSize / outSize);
+            int end = (int)Math.Ceiling((double)(o + 1) * inSize / outSize);
+            float weight = 1f / (end - start);
+            for (int i = start; i < end; i++) matrix[o * inSize + i] = weight;
+        }
+        return matrix;
+    }
+
+    /// <summary>
     /// Backward of a one-sided clamp: <paramref name="gradOutput"/> where the input passed the bound
     /// (<c>x &gt;= bound</c> for a lower bound, <c>x &lt;= bound</c> for an upper one), zero elsewhere. Built as
     /// strict-compare + equality so a NaN input gets zero, matching the host loop's comparison. Null when

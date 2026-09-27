@@ -16330,7 +16330,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.AdaptiveAvgPool2D<T>(Tensor<T> input, int outputHeight, int outputWidth)
     {
-        if (IsTapeActive<T>()) return base.AdaptiveAvgPool2D(input, outputHeight, outputWidth);
         if (!TryGetBackend(out var backend))
             return base.AdaptiveAvgPool2D(input, outputHeight, outputWidth);
 
@@ -16345,10 +16344,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             int inWidth = input.Shape._dims[3];
 
             using var inputBuffer = GetOrAllocateBuffer(backend, input);
-            return DispatchDeferredGpuOp<T>(backend, batch * channels * outputHeight * outputWidth,
+            var result = DispatchDeferredGpuOp<T>(backend, batch * channels * outputHeight * outputWidth,
                 new[] { batch, channels, outputHeight, outputWidth }, output =>
                     backend.AdaptiveAvgPool2D(inputBuffer.Buffer, output, batch, channels,
                         inHeight, inWidth, outputHeight, outputWidth));
+            // Same node and saved state as CpuEngine and the public override.
+            Autodiff.DifferentiableOps.RecordUnary("AdaptiveAvgPool2D", result, input,
+                Autodiff.BackwardFunctions<T>.AdaptiveAvgPool2DBackward,
+                savedState: new object[] { outputHeight, outputWidth });
+            return result;
         }
         catch
         {

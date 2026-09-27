@@ -296,6 +296,19 @@ public class GpuTapeGradientParityTests : IDisposable
     public void Embedding_stays_on_the_device_while_a_tape_records() =>
         AssertStaysOnDeviceUnderTape("Embedding", static (e, t) => e.Embedding(GatherIndices, t),
             static (x, y) => { Assert.Equal(new[] { 2, 3, 10 }, y.Shape.ToArray()); Assert.Equal(x[5, 3], y[0, 1, 3]); });
+    // 6 -> 4 rows and 5 -> 3 columns give OVERLAPPING windows of unequal length, which is where a separable
+    // device backward could drift from the host loop's per-window accumulation.
+    [SkippableFact]
+    public void AdaptiveAvgPool2D_gradients_match_cpu() =>
+        AssertGradientParity("AdaptiveAvgPool2D", Rand([6, 10], seed: 89),
+            static (e, t) => e.AdaptiveAvgPool2D(t.Reshape(new[] { 1, 2, 6, 5 }), 4, 3),
+            probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void AdaptiveAvgPool2D_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("AdaptiveAvgPool2D",
+            static (e, t) => e.AdaptiveAvgPool2D(t.Reshape(new[] { 1, 2, 6, 5 }), 4, 3),
+            static (x, y) => Assert.Equal(new[] { 1, 2, 4, 3 }, y.Shape.ToArray()));
     [SkippableFact]
     public void TensorClampMin_gradients_match_cpu() =>
         AssertGradientParity("ClampMin", Rand([6, 10], seed: 73),
