@@ -24896,7 +24896,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.TensorStack<T>(Tensor<T>[] tensors, int axis)
     {
-        if (IsTapeActive<T>()) return base.TensorStack(tensors, axis);
+        // Under a tape the kernel runs and records CpuEngine's StackBackward node. Its saved axis is the
+        // NORMALISED one: StackBackward indexes the gradient's shape with it directly, so a negative axis breaks.
         if (typeof(T) == typeof(float) && tensors is { Length: > 0 } && TryGetBackend(out var backend))
         {
             int rank = tensors[0].Rank;
@@ -24928,6 +24929,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     for (int d = normalizedAxis; d < rank; d++) outShape[d + 1] = tensors[0].Shape._dims[d];
                     var result = DeferTensorResult<T>(backend, output, total, outShape);
                     handedOff = true;
+                    Autodiff.DifferentiableOps.RecordIfActive("TensorStack", result, (Tensor<T>[])tensors.Clone(),
+                        Autodiff.BackwardFunctions<T>.StackBackward, savedState: new object[] { normalizedAxis });
                     return result;
                 }
                 catch (Exception ex) when (ex is not OutOfMemoryException)

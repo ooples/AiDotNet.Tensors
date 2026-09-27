@@ -201,6 +201,19 @@ public class GpuTapeGradientParityTests : IDisposable
             static (e, t) => e.PixelShuffle(e.Reshape(t, new[] { 1, 4, 3, 5 }), 2),
             static (_, y) => Assert.Equal(new[] { 1, 1, 6, 10 }, y.Shape.ToArray()));
 
+    private static readonly Tensor<float> StackOther = Rand([6, 10], seed: 42);
+
+    [SkippableFact]
+    public void TensorStack_gradients_match_cpu() =>
+        // Stacking copies; exact on both engines, so engagement is shown by device residency.
+        AssertGradientParity("TensorStack", Rand([6, 10], seed: 43),
+            static (e, t) => e.TensorStack(new[] { t, StackOther, t }, -1), probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void TensorStack_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("TensorStack", static (e, t) => e.TensorStack(new[] { t, t }, 0),
+            static (_, y) => Assert.Equal(new[] { 2, 6, 10 }, y.Shape.ToArray()));
+
     [SkippableFact]
     public void TensorTranspose_stays_on_the_device_while_a_tape_records() =>
         AssertStaysOnDeviceUnderTape("TensorTranspose", static (e, t) => e.TensorTranspose(t), static (x, y) =>
