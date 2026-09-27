@@ -24985,7 +24985,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (destination is null) throw new ArgumentNullException(nameof(destination));
         if (source is null) throw new ArgumentNullException(nameof(source));
         if (start is null) throw new ArgumentNullException(nameof(start));
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || !destination.IsContiguous || source.Rank != destination.Rank
             || start.Length != destination.Rank || !TryGetBackend(out var backend))
             return base.TensorSetSlice(destination, source, start);
@@ -25004,7 +25004,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             int rowCount = source.Length / rowSize;
             using var destBuffer = GetOrAllocateBuffer(backend, destination);
             using var sourceBuffer = GetOrAllocateBuffer(backend, contiguousSource);
-            return DispatchDeferredGpuOp<T>(backend, destination.Length, destination.Shape.ToArray(), output =>
+            var result = DispatchDeferredGpuOp<T>(backend, destination.Length, destination.Shape.ToArray(), output =>
             {
                 backend.Copy(destBuffer.Buffer, output, destination.Length);
                 for (int row = 0; row < rowCount; row++)
@@ -25022,9 +25022,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     backend.Copy(sourceBuffer.Buffer, row * rowSize, output, destinationOffset, rowSize);
                 }
             });
+            // Same node and saved state CpuEngine records; SetSliceBackward runs through engine slice ops.
+            Autodiff.DifferentiableOps.RecordBinary("TensorSetSlice", result, destination, source,
+                Autodiff.BackwardFunctions<T>.SetSliceBackward, new object[] { (int[])start.Clone() });
+            return result;
         }
         catch (Exception)
         {
+            if (ThrowOnGpuKernelFallback) throw;
             return base.TensorSetSlice(destination, source, start);
         }
     }

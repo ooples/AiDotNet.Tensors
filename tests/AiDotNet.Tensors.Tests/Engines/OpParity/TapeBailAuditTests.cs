@@ -104,7 +104,6 @@ public class TapeBailAuditTests
         "BatchNorm",
         "Conv3D",
         "ConvTranspose2D",
-        "TensorSetSlice",
         "FusedLinearReLU",
         "FusedLinearSigmoid",
         "FusedLinearTanh",
@@ -191,6 +190,7 @@ public class TapeBailAuditTests
         "TensorIndexCopy",
         "TensorIndexFill",
         "TensorMaskedScatter",
+        "TensorSetSlice",
     };
 
     private static string[] GpuEngineSources(string root)
