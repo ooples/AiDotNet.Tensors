@@ -1,5 +1,6 @@
 using System;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -16,7 +17,9 @@ public class GpuFusedKernelCorrectnessTests : IClassFixture<DirectGpuTensorEngin
     private readonly CpuEngine _cpu = new();
     private readonly DirectGpuTensorEngineTestFixture _fixture;
     private const float Tolerance = 1e-4f;
-    private DirectGpuTensorEngine Gpu => _fixture.Engine ?? throw new InvalidOperationException(
+    // Typed as IEngine on purpose: most GPU overrides are explicit IEngine implementations, so a call on the
+    // concrete DirectGpuTensorEngine binds to the inherited CpuEngine method and the test compares the CPU with itself.
+    private IEngine Gpu => _fixture.Engine ?? throw new InvalidOperationException(
         "Direct GPU engine was not initialized.", _fixture.InitializationException);
 
     public GpuFusedKernelCorrectnessTests(DirectGpuTensorEngineTestFixture fixture)
@@ -510,6 +513,35 @@ public class GpuFusedKernelCorrectnessTests : IClassFixture<DirectGpuTensorEngin
         var cpuResult = _cpu.TensorSumOfSquares(input);
         var gpuResult = Gpu.TensorSumOfSquares(input);
         AssertClose(cpuResult, gpuResult, 1e-1f);
+    }
+
+    /// <summary>
+    /// The GPU path went through IGpuBatchExecution, which only Vulkan implements, so on CUDA/OpenCL/HIP the value
+    /// above was computed by the CPU base after downloading the whole tensor. A device-resident input must be
+    /// reduced on the device with only the scalar read back.
+    /// </summary>
+    [SkippableFact]
+    public void TensorSumOfSquares_OnResidentInput_ReadsBackOnlyTheScalar()
+    {
+        SkipIfNoGpu();
+        var input = RandomTensor(new[] { 4096 }, 110);
+        var expected = _cpu.TensorSumOfSquares(input);
+        var resident = Gpu.TensorMultiplyScalar(input, 1f);   // a deferred GPU result: lives on the device
+        bool savedCapture = GpuLaunchProbe.CaptureReadbackSites;
+        try
+        {
+            GpuLaunchProbe.CaptureReadbackSites = true;
+            GpuLaunchProbe.Reset();
+            var got = Gpu.TensorSumOfSquares(resident);
+            Assert.True(GpuLaunchProbe.ReadbackBytes <= 16,
+                $"sum of squares read back {GpuLaunchProbe.ReadbackBytes} bytes: " + string.Join("; ", GpuLaunchProbe.ReadbackSites));
+            Assert.Empty(GpuLaunchProbe.Fallbacks);
+            AssertClose(expected, got, 1e-1f);
+        }
+        finally
+        {
+            GpuLaunchProbe.CaptureReadbackSites = savedCapture;
+        }
     }
 
     [SkippableFact]

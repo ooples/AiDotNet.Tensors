@@ -24127,8 +24127,22 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     T IEngine.TensorSumOfSquares<T>(Tensor<T> tensor)
     {
-        if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb))
-        { try { var gi=UploadTensorRaw(bb, tensor); using var go=bb.AllocateBuffer(1); bb.Fill(go,0f,1); bb.ReduceSumOfSquares(gi,go,tensor.Length); return (T)(object)bb.DownloadBuffer(go)[0]; } catch{} }
+        // Composed from IDirectGpuBackend primitives (Multiply + the parallel full reduction Sum), which every
+        // backend implements; only the scalar comes back. It used the fused ReduceSumOfSquares through
+        // IGpuBatchExecution, which only Vulkan implements, so on CUDA/OpenCL/HIP every call took the CPU base and
+        // downloaded the whole tensor (e.g. every gradient, every step, in global-norm clipping).
+        if (typeof(T) == typeof(float) && tensor.Length > 0 && TryGetBackend(out var backend))
+        {
+            try
+            {
+                var source = tensor.IsContiguous ? tensor : (Tensor<T>)tensor.Contiguous();
+                using var input = GetOrAllocateBuffer(backend, source);
+                using var squares = backend.AllocateBuffer(tensor.Length);
+                backend.Multiply(input.Buffer, input.Buffer, squares, tensor.Length);
+                return (T)(object)backend.Sum(squares, tensor.Length);
+            }
+            catch (Exception ex) { GpuLaunchProbe.OnFallback("TensorSumOfSquares", ex); }
+        }
         return base.TensorSumOfSquares(tensor);
     }
 
