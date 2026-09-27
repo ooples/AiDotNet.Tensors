@@ -96,7 +96,7 @@ public class GpuTapeGradientParityTests : IDisposable
 
     private void AssertGradientParity(string opName, Tensor<float> x,
         Func<IEngine, Tensor<float>, Tensor<float>> op, double tol = 1e-4,
-        Engagement probe = Engagement.ExpectDivergence)
+        Engagement probe = Engagement.ExpectDivergence, string? mustNotBail = null)
     {
         Skip.IfNot(TryGpu(out var gpu) && gpu is not null,
             $"GPU backend did not resolve, so {opName} would have been compared against itself. Copy the "
@@ -110,7 +110,14 @@ public class GpuTapeGradientParityTests : IDisposable
             // were GPU-resident and had to be downloaded — direct evidence the device path ran, independent
             // of whether the numbers happen to match the CPU exactly.
             AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.ResetMaterializeCount();
+            var bails = DirectGpuTensorEngine.EnableTapeBailStats();
+            if (mustNotBail is not null) bails.TryRemove(mustNotBail, out _);
             var gpuGrad = GradientOf(gpu, x, op);
+            // Engagement of the FORWARD: a bail under the tape means the op still ran on the host. (Divergence alone
+            // cannot show this when the backward runs a GPU kernel either way.)
+            if (mustNotBail is not null)
+                Assert.False(bails.TryGetValue(mustNotBail, out long bailed) && bailed > 0,
+                    $"{opName}: the GPU forward still deferred to the host under the tape ({mustNotBail} bailed).");
             long materialisations = AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.MaterializeCount;
 
             Assert.Equal(cpuGrad.Length, gpuGrad.Length);
@@ -1349,4 +1356,38 @@ public class GpuTapeGradientParityTests : IDisposable
     // Sparsemax has NO test here on purpose: its bail was restored because the GPU path throws
     // InvalidOperationException("CUDA kernel not found: where_select"). Add the test back together with
     // the where_select kernel.
+
+    // Ops that used to defer to the host whenever a tape was active (LM training step work-list, measured with
+    // AIDOTNET_TAPE_BAIL_STATS). They now record their tape node from the device result; the CPU gradient is the
+    // reference and bit-identity would mean the GPU path still did not run.
+
+    [SkippableFact]
+    public void RMSNorm_gradients_match_cpu() =>
+        AssertGradientParity("RMSNorm", Rand(new[] { 6, 16 }, 21), (e, t) =>
+        {
+            var gamma = new Tensor<float>(new[] { 16 });
+            for (int i = 0; i < 16; i++) gamma[i] = 0.5f + 0.05f * i;
+            return e.RMSNorm(t, gamma, 1e-6, out _);
+        }, mustNotBail: "RMSNorm");
+
+    [SkippableFact]
+    public void ApplyRoPEInterleaved_gradients_match_cpu() =>
+        AssertGradientParity("RoPE", Rand(new[] { 2, 2, 5, 8 }, 22), (e, t) =>
+        {
+            var cos = new Tensor<float>(new[] { 5, 4 });
+            var sin = new Tensor<float>(new[] { 5, 4 });
+            for (int p = 0; p < 5; p++)
+                for (int i = 0; i < 4; i++)
+                {
+                    double ang = p * Math.Pow(10000.0, -2.0 * i / 8);
+                    cos[p, i] = (float)Math.Cos(ang);
+                    sin[p, i] = (float)Math.Sin(ang);
+                }
+            return e.ApplyRoPEInterleaved(t, cos, sin);
+        }, probe: Engagement.UseResidencyCounter, mustNotBail: "ApplyRoPEInterleaved");
+
+    [SkippableFact]
+    public void TensorClampMin_gradients_match_cpu() =>
+        AssertGradientParity("ClampMin", Rand(new[] { 64 }, 23), (e, t) => e.TensorMultiply(e.TensorClampMin(t, 0.1f), t),
+            probe: Engagement.UseResidencyCounter, mustNotBail: "TensorClampMin");
 }

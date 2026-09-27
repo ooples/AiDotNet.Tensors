@@ -5382,7 +5382,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // AIDOTNET_TAPE_BAIL_STATS=1: count, per op, how often a GPU op saw an active tape (most then defer to the
     // host implementation) and print the table at process exit -- the work-list for making a training step
     // device-resident. Null (zero cost) when the variable is unset.
-    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, long>? s_tapeBailStats = CreateTapeBailStats();
+    private static System.Collections.Concurrent.ConcurrentDictionary<string, long>? s_tapeBailStats = CreateTapeBailStats();
+
+    /// <summary>Test hook: turns the tape-bail counters on (idempotent) and returns them.</summary>
+    internal static System.Collections.Concurrent.ConcurrentDictionary<string, long> EnableTapeBailStats()
+        => s_tapeBailStats ??= new System.Collections.Concurrent.ConcurrentDictionary<string, long>();
 
     private static System.Collections.Concurrent.ConcurrentDictionary<string, long>? CreateTapeBailStats()
     {
@@ -14490,13 +14494,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.ApplyRoPEInterleaved<T>(Tensor<T> input, Tensor<T> cos, Tensor<T> sin, int startPosition)
     {
-        if (IsTapeActive<T>()) return base.ApplyRoPEInterleaved(input, cos, sin, startPosition);
-        if (Compilation.GraphMode.IsActive) return base.ApplyRoPEInterleaved(input, cos, sin, startPosition);
+        // No bail on an active tape: the device result records the same tape node (inverse-rotation backward, which
+        // itself runs this GPU kernel) as the CPU path. Bailing sent every training step's RoPE to the host.
+        if (Compilation.GraphMode.IsActive || Autodiff.AnomalyModeScope.IsActive) return base.ApplyRoPEInterleaved(input, cos, sin, startPosition);
         if (typeof(T) != typeof(float)) return base.ApplyRoPEInterleaved(input, cos, sin, startPosition);
         if (!TryGetBackend(out _)) return base.ApplyRoPEInterleaved(input, cos, sin, startPosition);
         try
         {
-            return ApplyRoPEInterleavedGpu(input, cos, sin, startPosition);
+            var rotated = ApplyRoPEInterleavedGpu(input, cos, sin, startPosition);
+            Autodiff.DifferentiableOps.RecordIfActive("ApplyRoPEInterleaved", rotated, new[] { input },
+                Autodiff.BackwardFunctions<T>.ApplyRoPEInterleavedBackward, new object[] { cos, sin, startPosition });
+            return rotated;
         }
         catch
         {
@@ -21359,6 +21367,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // would silently lose its precision (a double finite-difference gradcheck cannot resolve it). Float runs
         // and records on the device.
         if (IsTapeActive<T>() && typeof(T) != typeof(float)) return base.RMSNorm(input, gamma, epsilon, out rms);
+        // An active tape no longer sends RMSNorm to the host: the device result records the same tape node as the
+        // CPU path, and its backward dispatches to the GPU RMSNormBackward kernel. (Graph traces and anomaly mode
+        // still take the base path, which records the graph node / checks every op.)
+        if (Compilation.GraphMode.IsActive || Autodiff.AnomalyModeScope.IsActive) return base.RMSNorm(input, gamma, epsilon, out rms);
         if (!TryGetBackend(out var backend) || input.Rank < 2)
             return base.RMSNorm(input, gamma, epsilon, out rms);
 

@@ -2051,7 +2051,9 @@ public partial class DirectGpuTensorEngine
     public override Tensor<T> TensorClampMin<T>(Tensor<T> tensor, T min)
     {
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
-        if (!TryGetBackend(out var backend))
+        // Graph traces / anomaly mode take the base path. Under a plain tape the device result records the same
+        // tape node as the CPU path (ClampMinBackward, boxed T bound), instead of sending the op to the host.
+        if (Compilation.GraphMode.IsActive || Autodiff.AnomalyModeScope.IsActive || !TryGetBackend(out var backend))
             return base.TensorClampMin(tensor, min);
 
         try
@@ -2074,7 +2076,7 @@ public partial class DirectGpuTensorEngine
     public override Tensor<T> TensorClampMax<T>(Tensor<T> tensor, T max)
     {
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
-        if (!TryGetBackend(out var backend))
+        if (Compilation.GraphMode.IsActive || Autodiff.AnomalyModeScope.IsActive || !TryGetBackend(out var backend))
             return base.TensorClampMax(tensor, max);
 
         try

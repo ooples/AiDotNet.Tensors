@@ -2831,6 +2831,23 @@ public sealed class NoGradScope<T> : IDisposable
     internal static void IncrementSuppressionCount() => _suppressionCount++;
 
     /// <summary>
+    /// Temporarily lifts no-grad suppression on this thread and returns the previous count for
+    /// <see cref="RestoreSuppression"/>. Used where code that legitimately needs a tape runs inside a no-grad
+    /// region: the optimizer update runs under <see cref="NoGradScope{T}"/> (its arithmetic must not be recorded),
+    /// but a second-order / line-search optimizer re-evaluates the loss and gradients through
+    /// <see cref="TapeStepContext{T}.Reevaluate"/>, which must record normally.
+    /// </summary>
+    internal static int SuspendSuppression()
+    {
+        int saved = _suppressionCount;
+        _suppressionCount = 0;
+        return saved;
+    }
+
+    /// <summary>Restores the count saved by <see cref="SuspendSuppression"/>.</summary>
+    internal static void RestoreSuppression(int saved) => _suppressionCount = saved;
+
+    /// <summary>
     /// Pair to <see cref="IncrementSuppressionCount"/>. Must not be
     /// called without a matching increment or the counter will go
     /// negative and <see cref="IsSuppressed"/> will report the wrong
