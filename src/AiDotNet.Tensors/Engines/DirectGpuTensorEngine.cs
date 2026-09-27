@@ -21693,8 +21693,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         Compilation.GraphMode.ThrowIfInferenceUnsupported(
             Compilation.GraphCaptureLimitation.HeterogeneousInput);
-        // Under a tape the kernel runs and records CpuEngine's GatherBackward node (saved state: indices, axis).
-        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+        // No bail on a plain tape: the device result below records the same Gather node (GatherBackward) as the
+        // CPU path. The tape bail made that record dead code and sent every training step's embedding lookup (the
+        // [V, E] table read) to the host. Graph traces and anomaly mode keep the base path.
+        if (Compilation.GraphMode.IsActive || Autodiff.AnomalyModeScope.IsActive || typeof(T) != typeof(float)
             || !TryGetBackend(out var backend) || axis != 0)
             return base.TensorGather(source, indices, axis);
 

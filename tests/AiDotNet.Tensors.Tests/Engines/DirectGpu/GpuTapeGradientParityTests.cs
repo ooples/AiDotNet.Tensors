@@ -1390,4 +1390,10 @@ public class GpuTapeGradientParityTests : IDisposable
     public void TensorClampMin_gradients_match_cpu() =>
         AssertGradientParity("ClampMin", Rand(new[] { 64 }, 23), (e, t) => e.TensorMultiply(e.TensorClampMin(t, 0.1f), t),
             probe: Engagement.UseResidencyCounter, mustNotBail: "TensorClampMin");
+
+    [SkippableFact]
+    public void TensorGather_embedding_gradients_match_cpu() =>
+        AssertGradientParity("Gather", Rand(new[] { 10, 6 }, 24), (e, table) =>
+            e.TensorGather(table, new Tensor<int>(new[] { 7 }, new Vector<int>(new[] { 3, 0, 9, 3, 5, 1, 3 })), 0),
+            probe: Engagement.UseResidencyCounter, mustNotBail: "TensorGather");
 }
