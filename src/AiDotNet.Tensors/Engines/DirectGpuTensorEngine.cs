@@ -1628,6 +1628,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     public void InvalidateResidentWeightBuffer<T>(LinearAlgebra.Tensor<T> tensor)
     {
+        // Contract: the caller just wrote the HOST weights in place, so the host is authoritative. A DEVICE-OWNED
+        // weight (moved with Gpu()/To()) keeps its buffer and receives the host data in place: compiled plans and
+        // fused optimizers bind that buffer once and keep using it, so detaching it orphaned every later update.
+        // (A caller whose update ran ON the device must not call this at all — the device already holds the value.)
+        if (Helpers.ResidentHostMirror.TryUploadHostIntoResident(tensor))
+            return;
+
         // DROP (do not materialize) any pending deferred device->host download FIRST. The host
         // weight array was just updated IN PLACE by the CPU-side optimizer, so a pending download
         // holds STALE pre-step device data; letting InvalidateGpuCacheForTensor force-materialize it
@@ -4505,6 +4512,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // #3 FP16-act: this array now holds FP32 — drop any stale FP16 tag (a pooled array reused FP16→FP32).
         if (Fp16ActEnabled) _fp16ResidentArrays.TryRemove(arr, out _);
         if (s_currentForwardOp is not null) if (s_producerDiagEnabled && s_producerOf.Count < ProducerDiagCap) s_producerOf[arr] = s_currentForwardOp;
+        // Arm the host download through the per-backing-array mirror: it copies each resident view into ITS slice
+        // and covers every view sharing the array. (A per-tensor callback here copied to index 0 of the array -
+        // onto another parameter when this tensor is a view into a shared parameter buffer - and, since
+        // registration is per array, displaced the other views' pending downloads.)
+        if (Helpers.ResidentHostMirror.ArmDownload(t))
+            return;
         var capBuf = buf; var capBackend = backend;
         Helpers.DeferredArrayMaterializer.Register(arr, a =>
         {

@@ -4759,7 +4759,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         _gpuBufferContainsRawInt32 = false;
         _gpuDeviceIndex = deviceInfo.Index;
         _device = deviceInfo.Type;
-
+        _gpuBufferVersion = GpuCacheVersion; // filled from the current host data, so in sync (see Gpu())
+        Helpers.ResidentHostMirror.Attach(this);
         return this;
     }
 
@@ -4796,11 +4797,20 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (IsGpuResident)
             return this;
 
-        var directGpu = Engines.Engine.DirectGpu;
-        if (directGpu is null || !directGpu.IsAvailable || directGpu.Backend is null)
-            return this;
-
-        var backend = directGpu.Backend;
+        // Place onto the SAME backend the active dispatcher executes on, as To() does. Engine.DirectGpu is a
+        // separate lazily-created DirectGpuEngine with its own backend (context + stream), so a buffer placed there
+        // was not the buffer the dispatcher's kernels and fused optimizers read and wrote.
+        Engines.DirectGpu.IDirectGpuBackend? backend =
+            Engines.AiDotNetEngine.Current is Engines.DirectGpuTensorEngine dispatcher
+                ? dispatcher.PlacementBackend
+                : null;
+        if (backend is null)
+        {
+            var directGpu = Engines.Engine.DirectGpu;
+            if (directGpu is null || !directGpu.IsAvailable || directGpu.Backend is null)
+                return this;
+            backend = directGpu.Backend;
+        }
         var logicalData = IsContiguous ? GetDataArray() : GetFlattenedData();
         var floatData = Engines.DirectGpu.DirectGpuEngine.ToFloatArray(logicalData);
         _gpuBuffer = backend.AllocateBuffer(floatData);
@@ -4834,6 +4844,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             "DIRECTML" or "DML" => TensorDevice.DirectML,
             _ => TensorDevice.CUDA
         };
+        // Device-owned from here on: a device-side write (MarkModified) arms a download into the host slice.
+        Helpers.ResidentHostMirror.Attach(this);
 
         return this;
     }
