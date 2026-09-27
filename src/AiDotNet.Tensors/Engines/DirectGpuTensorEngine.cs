@@ -5369,11 +5369,33 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </list>
     /// </summary>
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
-    private static bool IsTapeActive<T>()
-        => (Autodiff.GradientTape<T>.Current is not null
+    private static bool IsTapeActive<T>([System.Runtime.CompilerServices.CallerMemberName] string op = "")
+    {
+        bool active = (Autodiff.GradientTape<T>.Current is not null
             && !Autodiff.NoGradScope<T>.IsSuppressed)
            || Autodiff.AnomalyModeScope.IsActive
            || Compilation.GraphMode.IsActive;
+        if (active && s_tapeBailStats is { } stats) stats.AddOrUpdate(op, 1, static (_, n) => n + 1);
+        return active;
+    }
+
+    // AIDOTNET_TAPE_BAIL_STATS=1: count, per op, how often a GPU op saw an active tape (most then defer to the
+    // host implementation) and print the table at process exit -- the work-list for making a training step
+    // device-resident. Null (zero cost) when the variable is unset.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, long>? s_tapeBailStats = CreateTapeBailStats();
+
+    private static System.Collections.Concurrent.ConcurrentDictionary<string, long>? CreateTapeBailStats()
+    {
+        if (System.Environment.GetEnvironmentVariable("AIDOTNET_TAPE_BAIL_STATS") != "1") return null;
+        var stats = new System.Collections.Concurrent.ConcurrentDictionary<string, long>();
+        System.AppDomain.CurrentDomain.ProcessExit += (_, _) =>
+        {
+            System.Console.Error.WriteLine("[tape-bail-stats] op: count (IsTapeActive true)");
+            foreach (var kv in stats.OrderByDescending(kv => kv.Value))
+                System.Console.Error.WriteLine($"[tape-bail-stats] {kv.Key}: {kv.Value}");
+        };
+        return stats;
+    }
 
     Vector<T> IEngine.Add<T>(Vector<T> a, Vector<T> b)
     {
@@ -16943,8 +16965,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 input = PermuteImpl(input, permutation.ToArray());
         }
 
-        if (outputShapeList.Count == 0)
-            outputShapeList.Add(1);
+        // Reducing every axis without keepDims yields a RANK-0 scalar, exactly as the CPU engine returns. This used to
+        // substitute shape [1], so once ReduceSum stopped deferring to the CPU under a tape (GPU tape recording), a
+        // rank-0 loss became rank 1 on the GPU engine and rank-0 loss arithmetic/backward diverged from the CPU.
 
         var outputShape = outputShapeList.ToArray();
 
@@ -27634,7 +27657,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorSoftmaxRows<T>(Tensor<T> input)
     {
-        if (input.Rank != 2)
+        // The kernel below records no tape node; under a tape (or a graph trace) the base routes to the
+        // differentiable softmax / records the graph node, so the op has a gradient on the GPU engine too.
+        if (input.Rank != 2 || IsTapeActive<T>())
             return base.TensorSoftmaxRows(input);
         if (!TryGetBackend(out var backend))
             return base.TensorSoftmaxRows(input);

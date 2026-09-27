@@ -115,11 +115,35 @@ public sealed class CompiledTrainingOpStalenessProbeTests : IClassFixture<Direct
             case "spectralffn": case "sffn:spec": case "sffn:swap": case "sffn:y":
             case "g:norm": case "g:hidden": case "g:gate": case "g:cre": case "g:bcast": case "g:sign":
                 return SpectralFfn(e, x, op);
+            // Ops whose graph node used to carry no backward (now a tape-replay backward): the parameter must still
+            // receive the eager gradient through them.
+            case "layernorm":
+            {
+                var g = new Tensor<float>([M]); var bta = new Tensor<float>([M]);
+                for (int i = 0; i < M; i++) { g[i] = 1f + 0.1f * i; bta[i] = 0.05f * i; }
+                return e.TensorLayerNorm(x, g, bta, 1e-5);
+            }
+            case "reducestd":
+                return e.ReduceStd(x, [3], keepDims: true);
+            case "lerp":
+                return e.TensorLerp(x, e.TensorMultiply(x, x), 0.3f);
+            case "addscaled":
+                return e.TensorAddScaled(x, e.TensorMultiply(x, x), 0.7f, -1.3f);
+            case "softmaxrows":
+                return e.TensorSoftmaxRows(e.Reshape(x, [B * H * S, M]));
             case "fft":       // spectral filter: IRFFT(RFFT(x) * c) over the last axis
             {
                 var z = e.RFFT(x);   // [B,H,S, 2*(M/2+1)]
                 var c = Const(z.Shape.ToArray(), 32);
                 return e.IRFFT(e.TensorMultiply(z, c), M);
+            }
+            case "mm3fan":    // one intermediate consumed by THREE matmuls (the Q/K/V projections of attention)
+            {
+                var x2 = e.Reshape(x, [B * S, H * M]);
+                var q = e.TensorMatMul(x2, Const([H * M, 4], 51));
+                var k = e.TensorMatMul(x2, Const([H * M, 4], 52));
+                var v = e.TensorMatMul(x2, Const([H * M, 4], 53));
+                return e.TensorAdd(e.TensorMultiply(q, k), v);
             }
             case "reshape":
                 return e.Reshape(x, [B * S, H * M]);
@@ -259,7 +283,7 @@ public sealed class CompiledTrainingOpStalenessProbeTests : IClassFixture<Direct
 
     public static IEnumerable<object[]> Cases()
     {
-        foreach (var op in new[] { "rope", "clampmin", "clampmax", "divide", "outer5d", "permute", "glascan", "rmsnorm", "bdivide", "fft", "spectralffn", "g:norm", "g:hidden", "g:gate", "g:cre", "g:bcast", "g:sign", "linear_gelu", "fusedlinear", "linear_sigmoid", "gelu", "mm", "mmleft", "reshape", "v1", "v2", "v3", "mm2", "f1", "f2", "f3", "f4", "f5", "f6", "f5i", "f5j", "f5k", "f5s", "f5d", "bornattn" })
+        foreach (var op in new[] { "rope", "clampmin", "clampmax", "divide", "outer5d", "permute", "glascan", "rmsnorm", "bdivide", "layernorm", "reducestd", "lerp", "addscaled", "softmaxrows", "fft", "spectralffn", "g:norm", "g:hidden", "g:gate", "g:cre", "g:bcast", "g:sign", "linear_gelu", "fusedlinear", "linear_sigmoid", "gelu", "mm", "mm3fan", "mmleft", "reshape", "v1", "v2", "v3", "mm2", "f1", "f2", "f3", "f4", "f5", "f6", "f5i", "f5j", "f5k", "f5s", "f5d", "bornattn", "born:featq", "born:vaug", "born:scanqk", "born:scan", "born:num", "born:den", "sffn:spec", "sffn:swap", "sffn:y" })
         {
             yield return new object[] { op, false };
             yield return new object[] { op, true };
@@ -271,8 +295,6 @@ public sealed class CompiledTrainingOpStalenessProbeTests : IClassFixture<Direct
     public void CompiledStep_RecomputesOpFromDriftedParameter(string op, bool gpu)
     {
         if (gpu) Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
-        Skip.If(op == "bornattn" && !gpu,
-            "Known open issue: the CPU plan's specialized backward mis-accumulates this composite (dW[0] -0.00073 vs eager -0.00152). The GPU plan (generic backward) is exact.");
         IEngine engine = gpu ? _fixture.Engine! : new CpuEngine();
         int n = B * H * S * M;
         var cData = Rand(n, 1, offset: 0.2);

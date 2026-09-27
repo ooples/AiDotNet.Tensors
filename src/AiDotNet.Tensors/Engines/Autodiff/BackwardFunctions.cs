@@ -44,6 +44,31 @@ internal sealed class LayerNormStateRef<T>
 /// </summary>
 internal static class BackwardFunctions<T>
 {
+    /// <summary>
+    /// A backward for a compiled-graph node whose op has a differentiable EAGER implementation but no dedicated graph
+    /// backward: re-runs the op under a fresh <see cref="GradientTape{T}"/> and seeds that result with the node's
+    /// output gradient, which yields exactly the vector-Jacobian product the tape path would. Graph nodes used to be
+    /// recorded with a null backward in this situation, so every gradient through them was silently dropped in a
+    /// compiled training plan. Costs one recompute of the op during backward.
+    /// </summary>
+    /// <param name="compute">Recomputes the op from the SAME input tensors the node records.</param>
+    internal static BackwardFunction<T> ReplayUnderTape(Func<IEngine, Tensor<T>> compute)
+        => (gradOutput, inputs, output, savedState, engine, grads) =>
+        {
+            Dictionary<Tensor<T>, Tensor<T>> g;
+            using (var tape = new GradientTape<T>())
+            {
+                var result = compute(engine);
+                g = tape.ComputeGradients(result, inputs, createGraph: false,
+                    seedOverride: new[] { new KeyValuePair<Tensor<T>, Tensor<T>>(result, gradOutput) });
+            }
+            foreach (var input in inputs)
+            {
+                if (input is not null && g.TryGetValue(input, out var gi) && gi is not null)
+                    DifferentiableOps.AccumulateGrad(grads, input, gi, engine);
+            }
+        };
+
     // ──────────────────────────────────────────────────────────────
     // Trivial: gradient is grad_output or scaled grad_output
     // ──────────────────────────────────────────────────────────────

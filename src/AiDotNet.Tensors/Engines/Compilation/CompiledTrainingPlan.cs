@@ -5515,6 +5515,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             }
         }
 
+        // The loss is the LAST op the caller RECORDED. Take it before the optimization passes: they may reorder
+        // nodes, and an unconsumed side branch (a tensor computed but not used by the loss) can then end up last.
+        Tensor<T>? recordedLastOutput = scope.Nodes.Count > 0 && scope.Nodes[scope.Nodes.Count - 1] is LazyNode<T> lastRecorded
+            ? lastRecorded.Output
+            : null;
+
         var compiler = new LazyGraphCompiler(forTraining: true);
         var optimized = compiler.Compile(scope.Nodes);
 
@@ -5947,9 +5953,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 {
                     // PR #638 A0: tag the producing op so the capture-path invalidation log can name it.
                     Engines.DirectGpuTensorEngine.s_currentBackwardOp = stepCopy.OpName;
-                    var gradOut = gradAcc.ContainsKey(stepCopy.OutputBuffer)
-                        ? gradAcc[stepCopy.OutputBuffer]
-                        : gradAcc.Values.First();
+                    // No gradient reached this step's output (it does not feed the loss): nothing to propagate. The
+                    // previous fallback borrowed an ARBITRARY gradient buffer (gradAcc.Values.First()) and pushed it
+                    // back through the step, accumulating garbage into the step's inputs.
+                    if (!gradAcc.TryGetValue(stepCopy.OutputBuffer, out var gradOut))
+                        return;
                     stepCopy.BackwardFn(gradOut, stepCopy.Inputs, stepCopy.OutputBuffer,
                         stepCopy.SavedState ?? Array.Empty<object>(), eng, gradAcc);
                 });
@@ -5990,9 +5998,17 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         }
         else
         {
-            lossOutput = forwardSteps.Count > 0
-                ? forwardSteps[forwardSteps.Count - 1].OutputBuffer
-                : new Tensor<T>(new int[] { 1 });
+            // Measured with a side branch in the graph: the last OPTIMIZED step was an unused intermediate, so the plan
+            // trained on (and reported) that tensor instead of the loss. Use the last recorded op's output when it
+            // is a step output; the last step remains the fallback (e.g. when a fusion replaced the final node).
+            var recordedLossStep = recordedLastOutput is null
+                ? null
+                : forwardSteps.FirstOrDefault(st => ReferenceEquals(st.OutputBuffer, recordedLastOutput));
+            lossOutput = recordedLossStep is not null
+                ? recordedLossStep.OutputBuffer
+                : forwardSteps.Count > 0
+                    ? forwardSteps[forwardSteps.Count - 1].OutputBuffer
+                    : new Tensor<T>(new int[] { 1 });
         }
         var lossGradSeed = TensorAllocator.RentUninitialized<T>(lossOutput._shape);
         lossGradSeed.AsWritableSpan().Fill(numOps.One);
@@ -8209,10 +8225,19 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 && !HasSpecializedBacking(inputGrad))
                 return null;
 
+        // Both MatMul specializations below write dA / dB straight into the plan's gradient buffers with an OVERWRITING
+        // GEMM (beta = 0). That is only correct when the operand has exactly one consumer: an operand read by several ops
+        // (e.g. one normalised activation feeding the Q, K and V projections) must SUM their contributions, and with the
+        // overwrite only the last backward's survived (measured: dX came out at the last projection's share only).
+        // Such steps take the generic backward, which accumulates.
+        bool matMulOperandShared = step.OpType == OpType.TensorMatMul && step.Inputs.Length == 2
+            && ((consumerCount.TryGetValue(step.Inputs[0], out int consumersA) && consumersA > 1)
+                || (consumerCount.TryGetValue(step.Inputs[1], out int consumersB) && consumersB > 1));
+
         // MatMul backward (double): dA = dC @ B^T, dB = A^T @ dC — transposed BLAS, zero alloc.
         // Mirrors the float branch with cblas_dgemm via TryGemmEx's double overload;
         // engine fallback is the generic TensorMatMul which routes through SimdGemm.Dgemm.
-        if (typeof(T) == typeof(double)
+        if (typeof(T) == typeof(double) && !matMulOperandShared
             && step.OpType == OpType.TensorMatMul && step.Inputs.Length == 2
             && step.Inputs[0].Rank == 2 && step.Inputs[1].Rank == 2)
             // Same reasoning as the float specialization below: TryGemmEx has a double overload
@@ -8281,7 +8306,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // first replay. (The matching double path is the BLAS-Dgemm
         // backward elsewhere; non-float / non-double types fall through
         // to the generic engine path.)
-        if (step.OpType == OpType.TensorMatMul && step.Inputs.Length == 2
+        if (step.OpType == OpType.TensorMatMul && step.Inputs.Length == 2 && !matMulOperandShared
             && step.Inputs[0].Rank >= 2 && step.Inputs[1].Rank == 2
             && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous
             && step.OutputBuffer.IsContiguous

@@ -160,8 +160,10 @@ public partial class CpuEngine
                         hiddenActivation, outputActivation,
                         hiddenActivationParams, outputActivationParams);
                     DirectGpuTensorEngine.CopyResultInto(eng, eager, output);
-                },
-                backwardFn: null,
+                }, backwardFn: AiDotNet.Tensors.Engines.Autodiff.BackwardFunctions<T>.ReplayUnderTape(eng => eng.MlpForward(
+                        capturedInputs[0], capturedWeights, capturedBiases,
+                        hiddenActivation, outputActivation,
+                        hiddenActivationParams, outputActivationParams)),
                 savedState: savedState);
         }
 
