@@ -118,7 +118,9 @@ public class GpuTapeGradientParityTests : IDisposable
             if (mustNotBail is not null)
                 Assert.False(bails.TryGetValue(mustNotBail, out long bailed) && bailed > 0,
                     $"{opName}: the GPU forward still deferred to the host under the tape ({mustNotBail} bailed).");
-            long materialisations = AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.MaterializeCount;
+            // Downloaded or released without a download (PyTorch-style step release): either proves residency.
+            long materialisations = AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.MaterializeCount
+                + AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.ReleaseCount;
 
             Assert.Equal(cpuGrad.Length, gpuGrad.Length);
 
@@ -1308,7 +1310,8 @@ public class GpuTapeGradientParityTests : IDisposable
 
                 float[] Flat(Tensor<float> t) { var a = new float[t.Length]; for (int i = 0; i < a.Length; i++) a[i] = t[i]; return a; }
                 return (Flat(g1), Flat(g2), Flat(g3),
-                        AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.MaterializeCount);
+                        AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.MaterializeCount
+                        + AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.ReleaseCount);
             }
 
             var (cI, cC, cE, _) = Run(new CpuEngine());

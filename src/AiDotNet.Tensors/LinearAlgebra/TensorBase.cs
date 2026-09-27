@@ -1120,9 +1120,30 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// </para>
     /// </summary>
     /// <returns>The GPU buffer, or null when no GPU mapping exists.</returns>
+    /// <summary>
+    /// Clears PyTorch-style release marks on this tensor's storage keys. Called when an allocator re-issues the
+    /// tensor (or its array) to a new owner: the arena and array pools recycle the objects a released step
+    /// intermediate used, and the new owner's data must not inherit the old owner's "released" state.
+    /// </summary>
+    internal void ClearReleaseMarks()
+    {
+        var array = GetBackingArrayForCacheLookupUnsafe();
+        if (array is not null) Helpers.DeferredArrayMaterializer.ClearReleased(array);
+        Helpers.DeferredArrayMaterializer.ClearReleased(_data);
+    }
+
     public Engines.DirectGpu.IGpuBuffer? TryGetGpuBuffer()
     {
-        if (_gpuBuffer is not null && _gpuBuffer.Handle != IntPtr.Zero) return _gpuBuffer;
+        if (_gpuBuffer is not null && _gpuBuffer.Handle != IntPtr.Zero)
+        {
+            // A released step intermediate still names its old buffer object, which the pool may have re-rented to
+            // another tensor: handing it out would read or overwrite someone else's data.
+            var array = GetBackingArrayForCacheLookupUnsafe();
+            if ((array is not null && Helpers.DeferredArrayMaterializer.IsReleased(array))
+                || Helpers.DeferredArrayMaterializer.IsReleased(_data))
+                throw new InvalidOperationException(Engines.DirectGpuTensorEngine.ReleasedIntermediateMessage);
+            return _gpuBuffer;
+        }
         // GpuPinned / GpuOffload tensors carry a device pointer set by
         // WeightRegistry.RegisterWeight. Wrap it on demand for caller use.
         if (OffloadDevicePointer != IntPtr.Zero

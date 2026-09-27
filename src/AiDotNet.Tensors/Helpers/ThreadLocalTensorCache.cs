@@ -121,6 +121,8 @@ internal static class ThreadLocalTensorCache<T>
             var array = bucket.Buffers.Pop();
             _retainedBytes -= (long)array.Length * ElementSize;
             bucket.LastTouch = ++_touchCounter;
+            // Re-issued to a new owner: drop any release mark the previous owner's data left behind.
+            DeferredArrayMaterializer.ClearReleased(array);
             return array;
         }
 

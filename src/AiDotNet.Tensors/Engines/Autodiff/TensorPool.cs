@@ -103,6 +103,8 @@ public static class TensorPool<T>
         // _gpuBuffer check above.
         var unsafeBacking = tensor.GetBackingArrayForCacheLookupUnsafe();
         if (unsafeBacking is not null && Helpers.DeferredArrayMaterializer.IsPending(unsafeBacking)) return;
+        // A released step intermediate's array has undefined contents and throws on a host read; never recycle it.
+        if (unsafeBacking is not null && Helpers.DeferredArrayMaterializer.IsReleased(unsafeBacking)) return;
 
         // Issue #338 view-safety: refuse view-tensors whose backing
         // storage is shared with another tensor (strided permute views,

@@ -46,6 +46,33 @@ public static class GpuOptimizer
         tensor._gpuBufferVersion = tensor.GpuCacheVersion;
     }
 
+    /// <summary>
+    /// Creates a zero-filled optimizer-state tensor (e.g. Adam's first/second moments) that lives on the GPU when the
+    /// current engine is a GPU engine, so the fused optimizer kernels update it in place with no host traffic; a
+    /// host read downloads it lazily. It is not a step activation, so tape-scoped release never frees it. On a CPU
+    /// engine it is an ordinary zero tensor.
+    /// </summary>
+    public static Tensor<float> CreateStateTensor(int[] shape)
+    {
+        if (shape is null) throw new ArgumentNullException(nameof(shape));
+        if (AiDotNetEngine.Current is DirectGpuTensorEngine gpuEngine
+            && gpuEngine.TryCreateDeviceStateTensor(shape, out var state))
+            return state;
+        return new Tensor<float>(shape);
+    }
+
+    /// <summary>
+    /// Marks a parameter updated in place on the device. A parameter with a host backing array becomes
+    /// device-authoritative: its persistent weight entry follows the new version and a host read downloads it lazily.
+    /// </summary>
+    private static void MarkParameterUpdated(DirectGpuTensorEngine engine, IDirectGpuBackend backend, Tensor<float> param, IGpuBuffer buffer)
+    {
+        if (param.GetBackingArrayForCacheLookupUnsafe() is not null)
+            engine.CommitParameterUpdatedOnDevice(param, buffer, backend, CreateWriteSyncPoint(backend));
+        else
+            MarkGpuUpdated(backend, param);
+    }
+
     private static void MarkGpuUpdated(IDirectGpuBackend backend, Tensor<float>? first, Tensor<float>? second)
     {
         MarkGpuUpdated(backend, first);
@@ -124,18 +151,25 @@ public static class GpuOptimizer
         var backend = gpuEngine.GetBackend();
         if (backend is null) return false;
 
-        var pBuf = param.TryGetGpuBuffer();
         var gBuf = grad.TryGetGpuBuffer();
         var mBuf = m.TryGetGpuBuffer();
         var vBuf = v.TryGetGpuBuffer();
-        if (pBuf is null || gBuf is null || mBuf is null || vBuf is null) return false;
+        // Each decline is recorded: the caller silently falls back to op-by-op AdamW on the host copies, which is
+        // correct but downloads the parameter, gradient and moments every step.
+        if (gBuf is null) { GpuLaunchProbe.OnFallback("TryAdamWStep-gradient-not-device-resident", null); return false; }
+        if (mBuf is null || vBuf is null) { GpuLaunchProbe.OnFallback("TryAdamWStep-moments-not-device-resident", null); return false; }
+        // A host-authoritative parameter (eager training) is moved onto the device once and kept there, as PyTorch
+        // keeps parameters on the GPU; its host copy is downloaded only when read.
+        var pBuf = param.TryGetGpuBuffer() ?? gpuEngine.AcquireParameterBuffer(param, out _);
+        if (pBuf is null) { GpuLaunchProbe.OnFallback("TryAdamWStep-parameter-not-placeable", null); return false; }
 
         backend.AdamWUpdate(pBuf, gBuf, mBuf, vBuf,
             learningRate, beta1, beta2, epsilon, weightDecay, step, param.Length);
         // AdamW mutates param, m and v on the GPU — mark all three current so a later read
         // doesn't serve stale host data. Every other dense/sparse wrapper does this; TryAdamWStep
         // was the lone omission (caught by GpuOptimizerResidencyMockTests.MarkEveryMutatedTensorCurrent).
-        MarkGpuUpdated(backend, param, m, v);
+        MarkGpuUpdated(backend, m, v);
+        MarkParameterUpdated(gpuEngine, backend, param, pBuf);
         return true;
     }
 

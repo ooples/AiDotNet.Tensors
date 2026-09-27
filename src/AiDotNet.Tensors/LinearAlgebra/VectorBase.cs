@@ -324,6 +324,9 @@ public abstract class VectorBase<T>
         // GPU-resident lazy allocation: allocate backing array on first CPU access
         if (IsLazyAllocated)
         {
+            // A released intermediate must fail BEFORE a backing array is installed: otherwise the throw leaves an
+            // allocated (zero) array behind and every later read silently returns it.
+            Helpers.DeferredArrayMaterializer.ThrowIfReleased(this);
             var arr = new T[_logicalLength];
             MaterializeBacking(arr);
             Helpers.DeferredArrayMaterializer.TryMaterialize(this);
@@ -361,6 +364,9 @@ public abstract class VectorBase<T>
     {
         if (IsLazyAllocated)
         {
+            // A released intermediate must fail BEFORE a backing array is installed: otherwise the throw leaves an
+            // allocated (zero) array behind and every later read silently returns it.
+            Helpers.DeferredArrayMaterializer.ThrowIfReleased(this);
             var arr = new T[_logicalLength];
             MaterializeBacking(arr);
             Helpers.DeferredArrayMaterializer.TryMaterialize(this);
@@ -461,6 +467,9 @@ public abstract class VectorBase<T>
         // GPU-resident lazy allocation: allocate backing array on first CPU access
         if (IsLazyAllocated)
         {
+            // A released intermediate must fail BEFORE a backing array is installed: otherwise the throw leaves an
+            // allocated (zero) array behind and every later read silently returns it.
+            Helpers.DeferredArrayMaterializer.ThrowIfReleased(this);
             var arr = new T[_logicalLength];
             MaterializeBacking(arr);
             // Try to materialize GPU data into the new array via the vector-keyed callback

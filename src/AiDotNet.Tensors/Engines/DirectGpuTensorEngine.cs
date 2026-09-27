@@ -98,6 +98,17 @@ internal sealed class CsrGpuCache : IDisposable
 /// When a layer's output is downloaded, we cache the GPU buffer so the next layer
 /// can reuse it without re-uploading if it uses the same data.
 /// </summary>
+/// <summary>How an evicted activation whose only valid copy is still on the device is handled.</summary>
+internal enum ActivationReleaseMode
+{
+    /// <summary>Download to the host, then free (#226): a later host read sees the data.</summary>
+    MaterializeThenFree,
+    /// <summary>Free without a download and without a marker: for provably unread scratch.</summary>
+    DropScratch,
+    /// <summary>Free without a download (PyTorch-style); a later host read throws a clear error.</summary>
+    Release,
+}
+
 internal sealed class ActivationCacheEntry : IDisposable
 {
     public IGpuBuffer Buffer { get; }
@@ -1474,8 +1485,23 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// BEFORE triggering any CPU materialization, avoiding wasteful GPU-to-CPU downloads
     /// for chained GPU operations. This is the primary method for GPU-resident pipelines.
     /// </summary>
+    /// <summary>
+    /// Throws when <paramref name="tensor"/> is a released step intermediate. Its <c>_gpuBuffer</c> field can still
+    /// name a buffer object the pool has since re-rented to another tensor, so using it as an input would silently
+    /// read someone else's data.
+    /// </summary>
+    private static void ThrowIfReleased<T>(Tensor<T> tensor)
+    {
+        // Both keys: a vector-keyed result can gain a backing array later, and the release mark stays on the vector.
+        var array = tensor.GetBackingArrayForCacheLookupUnsafe();
+        if ((array is not null && Helpers.DeferredArrayMaterializer.IsReleased(array))
+            || Helpers.DeferredArrayMaterializer.IsReleased(tensor.DataVector))
+            throw new InvalidOperationException(ReleasedIntermediateMessage);
+    }
+
     private OwnedBuffer GetOrAllocateBuffer<T>(IDirectGpuBackend backend, Tensor<T> tensor)
     {
+        ThrowIfReleased(tensor);
         // #3 FP16-act CONVERT-AT-GAP: an FP16-tagged input → stable up-converted FP32, so EVERY non-FP16-aware op
         // that fetches its activation through this helper (softmax, scale, in-place unary/binary, etc.) reads
         // correct FP32. FP16-aware ops (conv/groupnorm/add) bypass via TryFp16ResidentInput. Capture-safe scratch.
@@ -1495,6 +1521,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // pending deferred GPU download of the source) and applies the strides, so the buffer we upload
         // matches the view. Contiguous() is a no-op (returns `this`) for already-contiguous, offset-0
         // tensors, so this costs nothing on the hot contiguous path.
+        // A ParameterBuffer view whose flat array an on-device optimizer updated: read it in place on the device.
+        // Contiguous() below would download the whole flat array to slice this view on the host.
+        if (tensor._storageOffset != 0 && TryResolveDeviceParameterView(backend, tensor, out var parameterView))
+            return new OwnedBuffer(parameterView, ownsBuffer: false);
         if (!tensor.IsContiguous || tensor._storageOffset != 0)
             tensor = (Tensor<T>)tensor.Contiguous();
 
@@ -1698,6 +1728,26 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 _persistentWeightHostVersion.TryRemove(backing, out _);
             }
         }
+    }
+
+    /// <summary>
+    /// Backward last-use release of a step intermediate, WITHOUT a download. A tensor whose only copy is on the device
+    /// is left for the tape's dispose-time release: the last-use schedule sees recorded inputs and saved state but not
+    /// tensors captured inside custom backward closures, so freeing device-only data here could pull it out from under
+    /// a later backward step (it did, in the HRE LM's specialized backwards). The old materialize-then-free contract
+    /// hid that by downloading and re-uploading. A tensor with a valid host copy is simply uncached, as before.
+    /// </summary>
+    internal void ReleaseDeadActivation<T>(LinearAlgebra.Tensor<T> tensor)
+    {
+        var backingArray = tensor.GetBackingArrayForCacheLookupUnsafe();
+        if ((backingArray is not null && Helpers.DeferredArrayMaterializer.IsRetained(backingArray))
+            || Helpers.DeferredArrayMaterializer.IsRetained(tensor.DataVector))
+            return;   // kept past the tape by the caller
+        if ((backingArray is not null && Helpers.DeferredArrayMaterializer.IsPending(backingArray))
+            || Helpers.DeferredArrayMaterializer.IsPending(tensor.DataVector))
+            return;   // device-only: released (no download) when the tape is disposed
+        if (backingArray is not null) InvalidateActivationCacheEntry(backingArray);
+        InvalidateActivationCacheEntry(tensor.DataVector);
     }
 
     internal void InvalidateGpuCacheForTensor<T>(LinearAlgebra.Tensor<T> tensor)
@@ -2448,6 +2498,43 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// FP16 parity tests gate correctness: a wrongful discard of a still-needed tensor would corrupt the grads.
     /// </summary>
     internal void EvictActivationsCreatedAfter(long snapshot, HashSet<object>? protect, bool materializePending)
+        => EvictActivationsCreatedAfter(snapshot, protect,
+            materializePending ? ActivationReleaseMode.MaterializeThenFree : ActivationReleaseMode.DropScratch);
+
+    /// <summary>
+    /// Message a host read of a released step intermediate throws (see <see cref="ActivationReleaseMode.Release"/>).
+    /// </summary>
+    internal const string ReleasedIntermediateMessage =
+        "This tensor is a GPU intermediate of a finished GradientTape step: its device memory was released when the " +
+        "tape was disposed (or after its last backward use) without copying it to the host, as PyTorch frees an " +
+        "unreferenced CUDA tensor. Read it inside the tape scope, or call GradientTape.Retain(tensor) before the tape " +
+        "ends to keep it. (The loss and gradients returned by ComputeGradients are kept automatically.)";
+
+    /// <summary>
+    /// Hands the kept results of a finished tape (the loss, the gradients, retained tensors) over to their tensors'
+    /// lifetime, as PyTorch does: each leaves the activation cache WITHOUT its buffer being freed, and its pending
+    /// download becomes weakly held, so the device memory is released when the tensor is collected and a host read
+    /// still downloads it. Neither a download nor a leak.
+    /// </summary>
+    internal void DetachToTensorLifetime(IEnumerable<object> keys)
+    {
+        lock (_activationCacheLock)
+        {
+            foreach (var key in keys)
+            {
+                if (!_activationCache.TryRemove(key, out var entry)) continue;
+                System.Threading.Interlocked.Add(ref _currentActivationCacheBytes, -entry.Buffer.SizeInBytes);
+                System.Threading.Interlocked.Add(ref _currentActivationManagedBytes, -entry.ManagedBytes);
+                Helpers.DeferredArrayMaterializer.HoldWeakly(key);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Evicts this thread's activation-cache entries created after <paramref name="snapshot"/> (except
+    /// <paramref name="protect"/>), handling entries whose only valid copy is on the device per <paramref name="mode"/>.
+    /// </summary>
+    internal void EvictActivationsCreatedAfter(long snapshot, HashSet<object>? protect, ActivationReleaseMode mode)
     {
         // The activation timestamp counter is process-wide, so "created after my snapshot"
         // also matches a CONCURRENT tape's activations on another thread. Free only THIS
@@ -2465,20 +2552,28 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 if (entries[i].Value.Timestamp <= snapshot) continue;   // pre-existing — keep
                 if (entries[i].Value.ThreadId != callerThreadId) continue; // another thread's live buffer
                 if (protect is not null && protect.Contains(entries[i].Key)) continue; // live gradient — keep
+                if (mode == ActivationReleaseMode.Release && Helpers.DeferredArrayMaterializer.IsRetained(entries[i].Key))
+                    continue; // the caller kept it past the tape (GradientTape.Retain / returned gradients)
                 if (_activationCache.TryRemove(entries[i].Key, out var entry))
                 {
                     if (Helpers.DeferredArrayMaterializer.IsPending(entries[i].Key))
                     {
-                        if (materializePending)
+                        switch (mode)
                         {
-                            // #226 safe path: flush the pending DtoH so a later CPU read still sees correct data.
-                            try { Helpers.DeferredArrayMaterializer.TryMaterialize(entries[i].Key); }
-                            catch { Helpers.DeferredArrayMaterializer.Remove(entries[i].Key); }
-                        }
-                        else
-                        {
-                            // Dead scratch: drop the pending download (no DtoH) after owning the cache entry.
-                            Helpers.DeferredArrayMaterializer.Remove(entries[i].Key);
+                            case ActivationReleaseMode.MaterializeThenFree:
+                                // #226 safe path: flush the pending DtoH so a later CPU read still sees correct data.
+                                try { Helpers.DeferredArrayMaterializer.TryMaterialize(entries[i].Key); }
+                                catch { Helpers.DeferredArrayMaterializer.Remove(entries[i].Key); }
+                                break;
+                            case ActivationReleaseMode.Release:
+                                // Dead step intermediate: free without a host copy; a later host read throws.
+                                // (Retained keys never reach here: they are skipped with the protect set above.)
+                                Helpers.DeferredArrayMaterializer.Release(entries[i].Key, ReleasedIntermediateMessage);
+                                break;
+                            default:
+                                // Dead scratch: drop the pending download (no DtoH) after owning the cache entry.
+                                Helpers.DeferredArrayMaterializer.Remove(entries[i].Key);
+                                break;
                         }
                     }
                     System.Threading.Interlocked.Add(ref _currentActivationCacheBytes, -entry.Buffer.SizeInBytes);
@@ -2672,7 +2767,40 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // reused -- until a genuine write privatises the storage, which is exactly when a
         // re-upload is correct. This is the read/write split GetDataArray's own remarks call
         // "Stage 2"; weights are an input operand the GPU only reads.
-        => GetOrCacheWeightBuffer(backend, weights.GetReadOnlyDataArray(), role, weights.GpuCacheVersion);
+    {
+        // Look up by the backing array WITHOUT materializing it first. GetReadOnlyDataArray fires a pending
+        // device-to-host download, so a weight whose current value lives on the device (a parameter the optimizer
+        // updated in place, or a GPU-computed table such as RoPE's cos/sin) was downloaded on EVERY forward only to
+        // find its buffer already cached (measured: every HRE LM step re-read the RoPE tables).
+        if (TryResolveDeviceParameterView(backend, weights, out var parameterView))
+            return new OwnedBuffer(parameterView, ownsBuffer: false);
+        var key = weights.GetBackingArrayForCacheLookupUnsafe();
+        if (key is not null && TryGetVersionedPersistentBuffer(key, weights.GpuCacheVersion, out var cached))
+            return new OwnedBuffer(cached, ownsBuffer: false);
+        object pendingKey = (object?)key ?? weights.DataVector;
+        if (Helpers.DeferredArrayMaterializer.IsPending(pendingKey)
+            && _activationCache.TryGetValue(pendingKey, out var activation) && ReferenceEquals(activation.Backend, backend)
+            && !activation.IsFp16 && activation.Buffer.Handle != IntPtr.Zero && activation.Buffer.Size >= weights.Length)
+            return new OwnedBuffer(activation.Buffer, ownsBuffer: false);
+        return GetOrCacheWeightBuffer(backend, weights.GetReadOnlyDataArray(), role, weights.GpuCacheVersion);
+    }
+
+    /// <summary>The persistent-cache buffer for <paramref name="key"/> if it was uploaded at <paramref name="hostVersion"/>.</summary>
+    private bool TryGetVersionedPersistentBuffer(object key, int hostVersion, out IGpuBuffer buffer)
+    {
+        lock (_persistentBufferLock)
+        {
+            if (_persistentBufferCache.TryGetValue(key, out var existing)
+                && _persistentWeightHostVersion.TryGetValue(key, out int stamped) && stamped == hostVersion
+                && existing.Buffer.Handle != IntPtr.Zero)
+            {
+                buffer = existing.Buffer;
+                return true;
+            }
+        }
+        buffer = null!;
+        return false;
+    }
 
     /// <summary>
     /// Gets a GPU buffer for weight/bias tensor, auto-caching if not already persistent.
@@ -2977,6 +3105,173 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         });
         CacheActivation(oKey, oBuf, o.Shape._dims, backend, isFp16: true, elementCount: n,
             hostVersion: o.GpuCacheVersion);
+        return true;
+    }
+
+    /// <summary>
+    /// The device buffer an on-device optimizer should update for <paramref name="param"/>: its bound resident buffer
+    /// when current, else its persistent weight buffer at the current host version (uploading the host weights once
+    /// when neither exists). Returns null when the parameter cannot be placed on the device (views, no backend).
+    /// </summary>
+    internal IGpuBuffer? AcquireParameterBuffer(Tensor<float> param, out IDirectGpuBackend backend)
+    {
+        backend = null!;
+        if (!TryGetBackend(out var be) || !param.IsContiguous) return null;
+        backend = be;
+        if (TryGetFlatParameterView(param, out var flat, out int offset))
+        {
+            // A view into the model's flat ParameterBuffer: the WHOLE flat array lives on the device as one buffer and
+            // each parameter is a view of it. While the flat array is device-authoritative (pending host download) the
+            // existing buffer is current; otherwise the host copy is, so it is uploaded once for every parameter.
+            if (be is not IGpuBufferViews views) return null;
+            IGpuBuffer flatBuffer;
+            lock (_persistentBufferLock)
+            {
+                if (_persistentBufferCache.TryGetValue(flat, out var entry) && Helpers.DeferredArrayMaterializer.IsPending(flat))
+                {
+                    flatBuffer = entry.Buffer;
+                }
+                else
+                {
+                    if (entry is not null && _persistentBufferCache.TryRemove(flat, out var stale))
+                        _retiredWeightBuffers.Add(stale.Buffer);   // disposed past a synchronize (see GetOrCacheWeightBuffer)
+                    flatBuffer = be.AllocateBuffer(flat);
+                    _persistentBufferCache[flat] = new GpuBufferCacheEntry(flatBuffer, PersistentTensorRole.Weights);
+                }
+            }
+            return views.TryCreateView(flatBuffer, offset, param.Length);
+        }
+        if (param._storageOffset != 0) return null;
+        if (param._gpuBuffer is not null && ReferenceEquals(param._gpuBackend, be) && param._gpuBuffer.Handle != IntPtr.Zero
+            && param._gpuBufferVersion == param.Version && param._gpuBuffer.Size >= param.Length)
+            return param._gpuBuffer;
+        var owned = GetOrCacheWeightBufferVersionAware(be, param, PersistentTensorRole.Weights);
+        if (owned.OwnsBuffer) { owned.Dispose(); return null; }   // not cacheable; the caller keeps the host path
+        param._gpuBuffer = owned.Buffer; param._gpuBackend = be; param._gpuBufferVersion = param.Version;
+        return owned.Buffer;
+    }
+
+    /// <summary>
+    /// Records that an optimizer updated <paramref name="param"/>'s device buffer in place (PyTorch-style: the
+    /// weights live on the device). The device copy becomes authoritative: forwards read it (the persistent-cache
+    /// version stamp and the bound buffer follow the bumped Version), the post-step weight-cache invalidation keeps
+    /// it, and a host read downloads it once, lazily.
+    /// </summary>
+    internal void CommitParameterUpdatedOnDevice(Tensor<float> param, IGpuBuffer buffer, IDirectGpuBackend backend,
+        Gpu.GpuSyncPoint? syncPoint)
+    {
+        param.MarkModified(syncPoint);   // bumps Version
+        if (TryGetFlatParameterView(param, out var flat, out _))
+        {
+            // A ParameterBuffer view: the flat array's device buffer is now the authoritative copy of EVERY parameter
+            // in it; a host read of any of them downloads the whole flat buffer once. The view is not bound to the
+            // tensor: forwards resolve it from the flat buffer while that stays authoritative (a bound view could
+            // outlive a later re-upload of the flat array).
+            IGpuBuffer? flatBuffer = null;
+            lock (_persistentBufferLock)
+                if (_persistentBufferCache.TryGetValue(flat, out var flatEntry)) flatBuffer = flatEntry.Buffer;
+            if (flatBuffer is null) return;
+            var capFlat = flatBuffer; var capFlatBackend = backend;
+            Helpers.DeferredArrayMaterializer.Register(flat, a =>
+            {
+                float[] f = capFlatBackend.DownloadBuffer(capFlat);
+                System.Array.Copy(f, (float[])a, System.Math.Min(f.Length, ((float[])a).Length));
+            });
+            return;
+        }
+        param._gpuBuffer = buffer; param._gpuBackend = backend; param._gpuBufferVersion = param.Version;
+        var arr = param.GetBackingArrayForCacheLookupUnsafe();
+        if (arr is null) return;
+        lock (_persistentBufferLock)
+        {
+            if (_persistentBufferCache.TryGetValue(arr, out var entry) && ReferenceEquals(entry.Buffer, buffer))
+                _persistentWeightHostVersion[arr] = param.Version;
+        }
+        var capBuf = buffer; var capBackend = backend;
+        Helpers.DeferredArrayMaterializer.Register(arr, a =>
+        {
+            float[] f = capBackend.DownloadBuffer(capBuf);
+            System.Array.Copy(f, (float[])a, System.Math.Min(f.Length, ((float[])a).Length));
+        });
+    }
+
+    /// <summary>
+    /// A zero-filled float tensor whose data lives in a dedicated device buffer (not the activation cache, so no
+    /// step release or eviction frees it while the tensor is alive); a host read downloads it lazily.
+    /// </summary>
+    internal bool TryCreateDeviceStateTensor(int[] shape, out Tensor<float> tensor)
+    {
+        tensor = null!;
+        if (!TryGetBackend(out var backend)) return false;
+        int n = 1;
+        foreach (var d in shape) n = checked(n * d);
+        if (n == 0) return false;
+        IGpuBuffer buffer;
+        try
+        {
+            buffer = backend.AllocateBuffer(n);
+            backend.Fill(buffer, 0f, n);
+        }
+        catch (Exception ex)
+        {
+            GpuLaunchProbe.OnFallback("TryCreateDeviceStateTensor", ex);
+            return false;
+        }
+        var t = new Tensor<float>(shape);
+        BindResidentBuffer(t, buffer, backend);
+        tensor = t;
+        return true;
+    }
+
+    /// <summary>
+    /// True when <paramref name="tensor"/>'s current value exists only on the device (an optimizer updated it in
+    /// place and the host copy has not been read since). Host-side weight-cache invalidation must skip such a
+    /// tensor: it would discard the update and re-upload the stale host array.
+    /// </summary>
+    public bool IsDeviceAuthoritative<T>(Tensor<T> tensor)
+    {
+        if (tensor is null) return false;
+        // Keyed on the backing array, not this Tensor object: the optimizer and the layer can hold different
+        // wrappers over the same storage, and only the one the optimizer updated has its device buffer bound.
+        object? arr = tensor.GetBackingArrayForCacheLookupUnsafe();
+        if (arr is null && typeof(T) == typeof(float) && TryGetFlatParameterView((Tensor<float>)(object)tensor, out var flat, out _))
+            arr = flat;   // a view into the flat ParameterBuffer: authority belongs to the flat array
+        return arr is not null && Helpers.DeferredArrayMaterializer.IsPending(arr) && _persistentBufferCache.ContainsKey(arr);
+    }
+
+    /// <summary>
+    /// True when <paramref name="t"/> is a contiguous view at a non-zero offset into a larger flat array (the shape of a
+    /// ParameterBuffer parameter), returning that array and the element offset.
+    /// </summary>
+    private static bool TryGetFlatParameterView(Tensor<float> t, out float[] flat, out int offset)
+    {
+        flat = null!; offset = 0;
+        if (!t.IsContiguous) return false;
+        if (!t.DataVector.TryGetBackingArraySegmentForReadOnlyAccess(out var arr, out int segment) || arr is null) return false;
+        offset = segment + t._storageOffset;
+        if (offset == 0 && arr.Length == t.Length) return false;   // the tensor owns the whole array: not a view
+        if ((long)offset + t.Length > arr.Length) return false;
+        flat = arr;
+        return true;
+    }
+
+    /// <summary>
+    /// A device view for a ParameterBuffer parameter whose flat array is device-authoritative (an on-device optimizer
+    /// updated it), so reads never download the flat array to slice it on the host.
+    /// </summary>
+    private bool TryResolveDeviceParameterView<T>(IDirectGpuBackend backend, Tensor<T> t, out IGpuBuffer view)
+    {
+        view = null!;
+        if (typeof(T) != typeof(float) || backend is not IGpuBufferViews views) return false;
+        if (!TryGetFlatParameterView((Tensor<float>)(object)t, out var flat, out int offset)) return false;
+        if (!Helpers.DeferredArrayMaterializer.IsPending(flat)) return false;
+        IGpuBuffer? flatBuffer = null;
+        lock (_persistentBufferLock)
+            if (_persistentBufferCache.TryGetValue(flat, out var entry)) flatBuffer = entry.Buffer;
+        if (flatBuffer is null) return false;
+        var v = views.TryCreateView(flatBuffer, offset, t.Length);
+        if (v is null) return false;
+        view = v;
         return true;
     }
 
@@ -4685,6 +4980,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int hostVersion = residentStep ? 0 : t.GpuCacheVersion;
         // During capture the device is authoritative. Eager consumers must instead reject
         // snapshots superseded by a host write, including writes through another storage view.
+        ThrowIfReleased(t);
         if (t._gpuBuffer is not null && ReferenceEquals(t._gpuBackend, backend)
             && t._gpuBuffer.Handle != System.IntPtr.Zero && t._gpuBuffer.Size >= need
             && (residentStep || (t._gpuBufferVersion == hostVersion && IsCachedGpuBufferLive(t, backend))))
@@ -7490,13 +7786,34 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         lock (_persistentBufferLock)
         {
-            foreach (var entry in _persistentBufferCache.Values)
+            // A parameter the optimizer updated ON THE DEVICE (see CommitParameterUpdatedOnDevice) has its only
+            // current copy in its persistent buffer, with a pending host download: that buffer is the weight, not a
+            // cache of it. Freeing it would lose the update (the pending download would then read a freed buffer).
+            // Keep those entries and their version stamps; drop everything else.
+            List<KeyValuePair<object, GpuBufferCacheEntry>>? kept = null;
+            foreach (var pair in _persistentBufferCache)
             {
-                entry.Dispose();
+                if (Helpers.DeferredArrayMaterializer.IsPending(pair.Key))
+                    (kept ??= new List<KeyValuePair<object, GpuBufferCacheEntry>>()).Add(pair);
+                else
+                    pair.Value.Dispose();
+            }
+            List<KeyValuePair<object, int>>? keptStamps = null;
+            if (kept is not null)
+            {
+                keptStamps = new List<KeyValuePair<object, int>>();
+                foreach (var pair in kept)
+                    if (_persistentWeightHostVersion.TryGetValue(pair.Key, out int stamp))
+                        keptStamps.Add(new KeyValuePair<object, int>(pair.Key, stamp));
             }
             _persistentBufferCache.Clear();
             _tensorVersions.Clear();
             _persistentWeightHostVersion.Clear();
+            if (kept is not null)
+            {
+                foreach (var pair in kept) _persistentBufferCache[pair.Key] = pair.Value;
+                foreach (var stamp in keptStamps!) _persistentWeightHostVersion[stamp.Key] = stamp.Value;
+            }
             // Reclaim any buffers still awaiting deferred disposal: the whole cache is being torn down, so
             // there is no reader to race and they would otherwise leak.
             foreach (var retired in _retiredWeightBuffers) retired.Dispose();
@@ -20274,6 +20591,40 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         catch { }
         return base.TensorMin(a, b);
+    }
+
+    /// <summary>
+    /// Copies <paramref name="source"/> into <paramref name="destination"/> ON THE DEVICE when the destination is
+    /// device-resident. The CPU implementation writes the destination's host array; for a device-resident destination
+    /// that either lands in a detached copy (a GPU-resident tensor's GetDataArray is a snapshot) or leaves its bound
+    /// device buffer stale, so a consumer reading the device buffer directly -- the fused GPU optimizer reads moments
+    /// and gradients through TryGetGpuBuffer -- never saw the copy.
+    /// </summary>
+    void IEngine.TensorCopy<T>(Tensor<T> source, Tensor<T> destination)
+    {
+        if (source is not null && destination is not null && typeof(T) == typeof(float)
+            && source.Length == destination.Length && destination.IsContiguous && destination._storageOffset == 0
+            && !Compilation.GraphMode.IsActive && TryGetBackend(out var backend)
+            && ResolveResidentBufferNoUpload(backend, destination, destination.Length, includePersistentWeightCache: false) is { } destinationBuffer
+            && destinationBuffer.Handle != IntPtr.Zero)
+        {
+            try
+            {
+                using var sourceBuffer = GetOrAllocateBuffer(backend, source.IsContiguous ? source : (Tensor<T>)source.Contiguous());
+                if (!ReferenceEquals(sourceBuffer.Buffer, destinationBuffer))
+                    backend.Copy(sourceBuffer.Buffer, destinationBuffer, destination.Length);
+                // The device copy is now the authoritative value: bump the version (host snapshot is stale) and
+                // rebind, which re-registers the host-read download for this buffer.
+                destination.IncrementVersion();
+                BindResidentBuffer(destination, destinationBuffer, backend);
+                return;
+            }
+            catch (Exception ex)
+            {
+                GpuLaunchProbe.OnFallback("TensorCopy", ex);
+            }
+        }
+        base.TensorCopy(source!, destination!);
     }
 
     public override Tensor<T> TensorClamp<T>(Tensor<T> tensor, T min, T max)
