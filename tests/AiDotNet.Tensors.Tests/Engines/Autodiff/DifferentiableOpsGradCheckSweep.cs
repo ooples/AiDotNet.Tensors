@@ -192,7 +192,8 @@ public class DifferentiableOpsGradCheckSweep
 
         // --- pooling ---
         ["MaxPool2D|T,int,int,int"] = r => [SafeTensor([1, 2, 4, 4], r), 2, 2, 0],
-        ["AvgPool2D|T,int,int,int"] = r => [SafeTensor([1, 2, 4, 4], r), 2, 2, 0],
+        // padding 1 so the sweep also checks the padded backward (it walked unpadded windows before)
+        ["AvgPool2D|T,int,int,int,bool"] = r => [SafeTensor([1, 2, 4, 4], r), 2, 2, 1, false],
         ["AvgPool2D|T,int[],int[]"] = r => [SafeTensor([1, 2, 4, 4], r), new[] { 2, 2 }, new[] { 2, 2 }],
         ["AvgPool3D|T,int,int,int"] = r => [SafeTensor([1, 2, 4, 4, 4], r), 2, 2, 0],
         ["AvgPool3D|T,int[],int[],int[]"] = r => [SafeTensor([1, 2, 4, 4, 4], r),

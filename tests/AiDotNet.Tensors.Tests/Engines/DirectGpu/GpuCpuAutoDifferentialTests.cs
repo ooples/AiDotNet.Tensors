@@ -649,7 +649,7 @@ public sealed class GpuCpuAutoDifferentialTests : IClassFixture<GpuCpuAutoDiffer
         "FusedConv2D(Tensor<T>,Tensor<T>,Tensor<T>,Int32,Int32,Int32,Int32,Int32,Int32,FusedActivationType)",
         "Fold(Tensor<T>,Int32[],Int32[],Int32[],Int32[])",
         "Unfold(Tensor<T>,Int32[],Int32[],Int32[])",
-        "AvgPool2DBackward(Tensor<T>,Int32[],Int32[],Int32[])",
+        "AvgPool2DBackward(Tensor<T>,Int32[],Int32[],Int32[],Int32[],Boolean)",
         // sampling / RoI — feature map + grid/rois of different shapes with coordinate constraints
         "GridSample(Tensor<T>,Tensor<T>)",
         "GridSample(Tensor<T>,Tensor<T>,GridSampleMode,GridSamplePadding,Boolean)",
