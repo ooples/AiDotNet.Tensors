@@ -112,7 +112,6 @@ public class TapeBailAuditTests
         "TensorMaskedFill",
         "TensorStack",
         "TensorDiagonal",
-        "PixelShuffle",
         "TensorSetSlice",
         "FusedLinearReLU",
         "FusedLinearSigmoid",
@@ -189,6 +188,7 @@ public class TapeBailAuditTests
         "TensorDivideScalar",
         // Records ReduceSumBackward on every float device path; the general path suppresses its inner recording.
         "ReduceSum",
+        "PixelShuffle",
     };
 
     private static string[] GpuEngineSources(string root)

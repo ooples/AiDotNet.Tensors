@@ -23993,7 +23993,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.PixelShuffle<T>(Tensor<T> input, int upscaleFactor)
     {
-        if (IsTapeActive<T>()) return base.PixelShuffle(input, upscaleFactor);
+        // Under a tape the kernel runs and records the SAME node CpuEngine records (saved state: the factor);
+        // PixelShuffleBackward calls this engine's device PixelShuffleBackward.
         if (typeof(T) == typeof(float) && input.Rank == 4 && upscaleFactor > 0
             && input.Shape._dims[1] % (upscaleFactor * upscaleFactor) == 0
             && TryGetBackend(out var backend) && backend is IPixelShuffleBackend gpu)
@@ -24012,6 +24013,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var result = DeferTensorResult<T>(backend, output, total,
                     new[] { batch, channels, inH * upscaleFactor, inW * upscaleFactor });
                 handedOff = true;
+                Autodiff.DifferentiableOps.RecordUnary("PixelShuffle", result, input,
+                    Autodiff.BackwardFunctions<T>.PixelShuffleBackward, new object[] { upscaleFactor });
                 return result;
             }
             catch (Exception ex) when (ex is not OutOfMemoryException && ex is not OperationCanceledException)

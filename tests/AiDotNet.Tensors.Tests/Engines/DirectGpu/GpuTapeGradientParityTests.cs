@@ -190,6 +190,18 @@ public class GpuTapeGradientParityTests : IDisposable
     }
 
     [SkippableFact]
+    public void PixelShuffle_gradients_match_cpu() =>
+        // A pure permutation is exact on both engines, so engagement is shown by device residency, not divergence.
+        AssertGradientParity("PixelShuffle", Rand([2, 8, 3, 4], seed: 41),
+            static (e, t) => e.PixelShuffle(t, 2), probe: Engagement.UseResidencyCounter);
+
+    [SkippableFact]
+    public void PixelShuffle_stays_on_the_device_while_a_tape_records() =>
+        AssertStaysOnDeviceUnderTape("PixelShuffle",
+            static (e, t) => e.PixelShuffle(e.Reshape(t, new[] { 1, 4, 3, 5 }), 2),
+            static (_, y) => Assert.Equal(new[] { 1, 1, 6, 10 }, y.Shape.ToArray()));
+
+    [SkippableFact]
     public void TensorTranspose_stays_on_the_device_while_a_tape_records() =>
         AssertStaysOnDeviceUnderTape("TensorTranspose", static (e, t) => e.TensorTranspose(t), static (x, y) =>
         {
