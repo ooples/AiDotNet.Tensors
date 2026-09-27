@@ -22945,10 +22945,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 using var bufIn = GetOrAllocateBuffer(backend, tensor);
                 var bufOut = AllocateOutputBuffer(backend, tensor.Length);
-                backend.AddScalar(bufIn.Buffer, bufOut.Buffer, Convert.ToSingle(scalar), tensor.Length);
-                var sum = DeferTensorResult<T>(backend, bufOut.Buffer, tensor.Length, tensor.Shape.ToArray());
-                Autodiff.DifferentiableOps.RecordUnary("TensorAddScalar", sum, tensor, Autodiff.BackwardFunctions<T>.AddScalarBackward);
-                return sum;
+                bool handedOff = false;
+                try
+                {
+                    backend.AddScalar(bufIn.Buffer, bufOut.Buffer, Convert.ToSingle(scalar), tensor.Length);
+                    var sum = DeferTensorResult<T>(backend, bufOut.Buffer, tensor.Length, tensor.Shape.ToArray());
+                    handedOff = true;
+                    Autodiff.DifferentiableOps.RecordUnary("TensorAddScalar", sum, tensor, Autodiff.BackwardFunctions<T>.AddScalarBackward);
+                    return sum;
+                }
+                finally
+                {
+                    // An owned output that never reached the deferred result would otherwise leak on the CPU fallback.
+                    if (!handedOff) bufOut.Dispose();
+                }
             }
             catch { }
         }
@@ -22967,10 +22977,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 using var bufIn = GetOrAllocateBuffer(backend, tensor);
                 var bufOut = AllocateOutputBuffer(backend, tensor.Length);
-                backend.SubScalar(bufIn.Buffer, bufOut.Buffer, Convert.ToSingle(scalar), tensor.Length);
-                var difference = DeferTensorResult<T>(backend, bufOut.Buffer, tensor.Length, tensor.Shape.ToArray());
-                Autodiff.DifferentiableOps.RecordUnary("TensorSubtractScalar", difference, tensor, Autodiff.BackwardFunctions<T>.SubtractScalarBackward);
-                return difference;
+                bool handedOff = false;
+                try
+                {
+                    backend.SubScalar(bufIn.Buffer, bufOut.Buffer, Convert.ToSingle(scalar), tensor.Length);
+                    var difference = DeferTensorResult<T>(backend, bufOut.Buffer, tensor.Length, tensor.Shape.ToArray());
+                    handedOff = true;
+                    Autodiff.DifferentiableOps.RecordUnary("TensorSubtractScalar", difference, tensor, Autodiff.BackwardFunctions<T>.SubtractScalarBackward);
+                    return difference;
+                }
+                finally
+                {
+                    // An owned output that never reached the deferred result would otherwise leak on the CPU fallback.
+                    if (!handedOff) bufOut.Dispose();
+                }
             }
             catch { }
         }

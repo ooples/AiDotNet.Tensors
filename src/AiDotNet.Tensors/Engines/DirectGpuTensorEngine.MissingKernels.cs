@@ -4738,6 +4738,7 @@ public partial class DirectGpuTensorEngine
         }
         catch (Exception)
         {
+            if (ThrowOnGpuKernelFallback) throw;
             return null;
         }
     }
@@ -4775,7 +4776,9 @@ public partial class DirectGpuTensorEngine
             {
                 return DispatchDeferredGpuOp<T>(backend, n, (int[])shape.Clone(), output =>
                 {
-                    using var scaled = backend.AllocateBuffer(n);
+                    // Read by the broadcast multiply still queued when this callback returns: stream-ordered
+                    // scratch keeps it out of the reuse pool until that work completes.
+                    using var scaled = AllocateStreamOrderedScratch(backend, n);
                     if (hasTensor) backend.Scale(bufT.Buffer, scaled, factor, n);
                     else backend.Fill(scaled, factor, n);
                     backend.BroadcastMultiplyLastAxis(scaled, bufS.Buffer, output, n, 1);
@@ -4788,6 +4791,7 @@ public partial class DirectGpuTensorEngine
         }
         catch (Exception)
         {
+            if (ThrowOnGpuKernelFallback) throw;
             return null;
         }
     }

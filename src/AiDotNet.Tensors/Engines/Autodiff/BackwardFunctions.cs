@@ -485,8 +485,9 @@ internal static class BackwardFunctions<T>
     {
         // On the GPU engine use the device kernel: the host loop below reads every output element back
         // (GetFlat on a resident tensor) and re-uploads the derivative for the multiply. All engine kernels now use
-        // this function's convention (the alpha branch at exactly x == 0, as PyTorch does).
-        if (engine is DirectGpuTensorEngine)
+        // this function's convention (the alpha branch at exactly x == 0, as PyTorch does). The device kernel
+        // is float-only, so every other element type keeps the dtype-generic host path below.
+        if (typeof(T) == typeof(float) && engine is DirectGpuTensorEngine)
         {
             var deviceGrad = engine.EluBackward(gradOutput, inputs[0], output, (double)savedState[0]);
             DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceGrad, engine);

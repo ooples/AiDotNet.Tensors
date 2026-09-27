@@ -248,21 +248,34 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     private CudaEvent? _lastStagedUploadEvent;
 
     /// <summary>
-    /// Orders <paramref name="stream"/> after every staged upload still in flight. A staged upload is ordered only on
-    /// _stream; before staging, the upload's host sync hid any dependency from work queued on ANOTHER stream. Every
-    /// public method that enqueues onto a caller-supplied stream calls this first — a GPU-side wait, no host block.
+    /// Orders <paramref name="stream"/> after ALL work already queued on _stream. Staged uploads are not the only
+    /// such work: allocating a buffer can queue its zero-fill (cuMemsetD8Async) on _stream, and an upload the caller
+    /// then queues on its own stream could land first and be zeroed afterwards. Every public method that enqueues onto
+    /// a caller-supplied stream calls this first. It records one reusable event on _stream and makes the caller's
+    /// stream wait on it: a GPU-side wait, no host block. A wait binds to the event's most recent record, so reusing
+    /// the event is safe.
     /// </summary>
     private void OrderAfterStagedUploads(IGpuStream stream)
     {
         if (stream is not CudaStream cudaStream || cudaStream.Handle == _stream) return;
         lock (_stagedUploadLock)
         {
-            if (_stagedUploads.Count == 0 || _lastStagedUploadEvent is null) return;
+            if (_streamOrderEvent == IntPtr.Zero)
+            {
+                CuBlasNative.CheckCudaResult(
+                    CudaNativeBindings.cuEventCreate(out _streamOrderEvent, CudaNativeBindings.CU_EVENT_DISABLE_TIMING),
+                    "cuEventCreate(stream order)");
+            }
             CuBlasNative.CheckCudaResult(
-                CudaNativeBindings.cuStreamWaitEvent(cudaStream.Handle, _lastStagedUploadEvent.Handle, 0),
-                "cuStreamWaitEvent(staged uploads)");
+                CudaNativeBindings.cuEventRecord(_streamOrderEvent, _stream), "cuEventRecord(stream order)");
+            CuBlasNative.CheckCudaResult(
+                CudaNativeBindings.cuStreamWaitEvent(cudaStream.Handle, _streamOrderEvent, 0),
+                "cuStreamWaitEvent(stream order)");
         }
     }
+
+    // Reused by OrderAfterStagedUploads; destroyed with the backend.
+    private IntPtr _streamOrderEvent;
     private const long MaxStagedUploadBytes = 64L * 1024 * 1024;
     private const long MaxStagedUploadSingleBytes = 16L * 1024 * 1024;
 
@@ -17148,6 +17161,11 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
 
         // In-flight staged uploads still own pinned slots; wait for them before the pool frees its memory.
         try { DrainStagedUploads(blockAll: true); } catch { }
+        if (_streamOrderEvent != IntPtr.Zero)
+        {
+            try { CudaNativeBindings.cuEventDestroy(_streamOrderEvent); } catch { }
+            _streamOrderEvent = IntPtr.Zero;
+        }
         _pinnedPool.Dispose();
         _bufferPool.Dispose();
 
