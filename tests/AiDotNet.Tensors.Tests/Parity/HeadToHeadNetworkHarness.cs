@@ -339,6 +339,15 @@ internal static class HeadToHeadNetworkHarness
         // Mirrors tools/parity/run_torch_network.py layer for layer: the same shape arithmetic and the
         // same weights.bin order (each parameterised layer's weight, then its bias).
         var parameters = new List<(float[] Data, float[] Grad, Tensor<float> Tensor)>();
+        // PyTorch's BatchNorm2d and LayerNorm default; the runner builds both with it.
+        const double NormEpsilon = 1e-5;
+        Tensor<float> BatchNorm(Tensor<float> h, Tensor<float> gamma, Tensor<float> beta)
+            => engine.BatchNorm(h, gamma, beta, NormEpsilon, out _, out _);
+        // A [rows, n] + [n] broadcast add. It is a CpuEngine operation (both engines derive from it), not an IEngine one.
+        var broadcastEngine = (CpuEngine)engine;
+        Tensor<float> AddBias(Tensor<float> a, Tensor<float> bias) => broadcastEngine.TensorBroadcastAdd(a, bias);
+        Tensor<float> Activate(Tensor<float> h, FusedActivationType activation)
+            => activation == FusedActivationType.ReLU ? engine.ReLU(h) : h;
         var layers = new List<Func<Tensor<float>, Tensor<float>>>();
         var shape = inputShape.ToArray();
         using (var reader = new BinaryReader(File.OpenRead(Path.Combine(work, "weights.bin"))))
@@ -375,10 +384,123 @@ internal static class HeadToHeadNetworkHarness
                         int k = layer.GetProperty("kernel").GetInt32();
                         int s = layer.TryGetProperty("stride", out var sElement) ? sElement.GetInt32() : 1;
                         int pad = layer.TryGetProperty("padding", out var pElement) ? pElement.GetInt32() : 0;
+                        bool hasBias = !layer.TryGetProperty("bias", out var biasElement) || biasElement.GetBoolean();
                         var w = Parameter(new[] { outChannels, shape[0], k, k });
-                        var b = Parameter(new[] { outChannels });
+                        var b = hasBias ? Parameter(new[] { outChannels }) : null;
                         layers.Add(h => engine.FusedConv2D(h, w, b, s, s, pad, pad, 1, 1, act));
                         shape = new[] { outChannels, (shape[1] + 2 * pad - k) / s + 1, (shape[2] + 2 * pad - k) / s + 1 };
+                        break;
+                    }
+                    case "batchnorm2d":
+                    {
+                        var gamma = Parameter(new[] { shape[0] });
+                        var beta = Parameter(new[] { shape[0] });
+                        layers.Add(h => Activate(BatchNorm(h, gamma, beta), act));
+                        break;
+                    }
+                    case "basicblock":
+                    {
+                        int inChannels = shape[0], outChannels = layer.GetProperty("out").GetInt32();
+                        int s = layer.TryGetProperty("stride", out var sElement) ? sElement.GetInt32() : 1;
+                        // The runner's order: conv1, bn1, conv2, bn2, then the projection shortcut when the shape changes.
+                        var conv1 = Parameter(new[] { outChannels, inChannels, 3, 3 });
+                        var gamma1 = Parameter(new[] { outChannels });
+                        var beta1 = Parameter(new[] { outChannels });
+                        var conv2 = Parameter(new[] { outChannels, outChannels, 3, 3 });
+                        var gamma2 = Parameter(new[] { outChannels });
+                        var beta2 = Parameter(new[] { outChannels });
+                        bool project = s != 1 || inChannels != outChannels;
+                        var shortcut = project ? Parameter(new[] { outChannels, inChannels, 1, 1 }) : null;
+                        var shortcutGamma = project ? Parameter(new[] { outChannels }) : null;
+                        var shortcutBeta = project ? Parameter(new[] { outChannels }) : null;
+                        layers.Add(h =>
+                        {
+                            var o = engine.ReLU(BatchNorm(engine.FusedConv2D(h, conv1, null, s, s, 1, 1, 1, 1, FusedActivationType.None), gamma1, beta1));
+                            o = BatchNorm(engine.FusedConv2D(o, conv2, null, 1, 1, 1, 1, 1, 1, FusedActivationType.None), gamma2, beta2);
+                            var identity = shortcut is null ? h
+                                : BatchNorm(engine.FusedConv2D(h, shortcut, null, s, s, 0, 0, 1, 1, FusedActivationType.None), shortcutGamma!, shortcutBeta!);
+                            return engine.ReLU(engine.TensorAdd(o, identity));
+                        });
+                        shape = new[] { outChannels, (shape[1] + 2 - 3) / s + 1, (shape[2] + 2 - 3) / s + 1 };
+                        break;
+                    }
+                    case "globalavgpool":
+                    {
+                        int channels = shape[0];
+                        layers.Add(h => engine.Reshape(engine.GlobalAvgPool2D(h), new[] { batch, channels }));
+                        shape = new[] { channels };
+                        break;
+                    }
+                    case "lstm":
+                    {
+                        int steps = shape[0], features = shape[1], hidden = layer.GetProperty("hidden").GetInt32();
+                        // PyTorch's layout and gate order (i, f, g, o): weight_ih, weight_hh, bias_ih, bias_hh.
+                        var weightIh = Parameter(new[] { 4 * hidden, features });
+                        var weightHh = Parameter(new[] { 4 * hidden, hidden });
+                        var biasIh = Parameter(new[] { 4 * hidden });
+                        var biasHh = Parameter(new[] { 4 * hidden });
+                        layers.Add(input =>
+                        {
+                            var h = Place(new Tensor<float>(new[] { batch, hidden }));
+                            var c = Place(new Tensor<float>(new[] { batch, hidden }));
+                            for (int t = 0; t < steps; t++)
+                            {
+                                var xt = engine.Reshape(engine.TensorSlice(input, new[] { 0, t, 0 }, new[] { batch, 1, features }), new[] { batch, features });
+                                var gates = engine.TensorAdd(engine.TensorMatMulTransposed(xt, weightIh), engine.TensorMatMulTransposed(h, weightHh));
+                                gates = AddBias(AddBias(gates, biasIh), biasHh);
+                                var i = engine.Sigmoid(engine.TensorNarrow(gates, 1, 0, hidden));
+                                var f = engine.Sigmoid(engine.TensorNarrow(gates, 1, hidden, hidden));
+                                var g = engine.Tanh(engine.TensorNarrow(gates, 1, 2 * hidden, hidden));
+                                var o = engine.Sigmoid(engine.TensorNarrow(gates, 1, 3 * hidden, hidden));
+                                c = engine.TensorAdd(engine.TensorMultiply(f, c), engine.TensorMultiply(i, g));
+                                h = engine.TensorMultiply(o, engine.Tanh(c));
+                            }
+                            return h;
+                        });
+                        shape = new[] { hidden };
+                        break;
+                    }
+                    case "transformer":
+                    {
+                        int seq = shape[0], model = shape[1];
+                        int heads = layer.GetProperty("heads").GetInt32(), ffn = layer.GetProperty("ffn").GetInt32();
+                        int headDim = model / heads;
+                        // nn.TransformerEncoderLayer's order: in_proj, out_proj, linear1, linear2, norm1, norm2.
+                        var inProj = Parameter(new[] { 3 * model, model });
+                        var inBias = Parameter(new[] { 3 * model });
+                        var outProj = Parameter(new[] { model, model });
+                        var outBias = Parameter(new[] { model });
+                        var linear1 = Parameter(new[] { ffn, model });
+                        var bias1 = Parameter(new[] { ffn });
+                        var linear2 = Parameter(new[] { model, ffn });
+                        var bias2 = Parameter(new[] { model });
+                        var norm1Gamma = Parameter(new[] { model });
+                        var norm1Beta = Parameter(new[] { model });
+                        var norm2Gamma = Parameter(new[] { model });
+                        var norm2Beta = Parameter(new[] { model });
+                        float scale = 1f / MathF.Sqrt(headDim);
+                        layers.Add(input =>
+                        {
+                            var x2 = engine.Reshape(input, new[] { batch * seq, model });
+                            var qkv = AddBias(engine.TensorMatMulTransposed(x2, inProj), inBias);
+                            Tensor<float> Heads(int part) => engine.Reshape(
+                                engine.TensorPermute(engine.Reshape(engine.TensorNarrow(qkv, 1, part * model, model), new[] { batch, seq, heads, headDim }), new[] { 0, 2, 1, 3 }),
+                                new[] { batch * heads, seq, headDim });
+                            var q = Heads(0);
+                            var k = Heads(1);
+                            var v = Heads(2);
+                            var scores = engine.TensorMultiplyScalar(engine.BatchMatMul(q, engine.TensorPermute(k, new[] { 0, 2, 1 })), scale);
+                            var context = engine.BatchMatMul(engine.Softmax(scores, -1), v);
+                            context = engine.Reshape(
+                                engine.TensorPermute(engine.Reshape(context, new[] { batch, heads, seq, headDim }), new[] { 0, 2, 1, 3 }),
+                                new[] { batch * seq, model });
+                            var attention = AddBias(engine.TensorMatMulTransposed(context, outProj), outBias);
+                            var y1 = engine.LayerNorm(engine.TensorAdd(x2, attention), norm1Gamma, norm1Beta, NormEpsilon, out _, out _);
+                            var hidden = engine.ReLU(AddBias(engine.TensorMatMulTransposed(y1, linear1), bias1));
+                            var feedForward = AddBias(engine.TensorMatMulTransposed(hidden, linear2), bias2);
+                            var y2 = engine.LayerNorm(engine.TensorAdd(y1, feedForward), norm2Gamma, norm2Beta, NormEpsilon, out _, out _);
+                            return engine.Reshape(y2, new[] { batch, seq, model });
+                        });
                         break;
                     }
                     case "maxpool2d":

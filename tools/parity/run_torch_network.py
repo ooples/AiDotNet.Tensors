@@ -15,7 +15,18 @@ Spec layers (a layer without "type" is linear):
     {"type": "conv2d", "out": C, "kernel": K, "stride": S, "padding": P, "activation": "relu"|"none"}
     {"type": "maxpool2d", "size": K}          stride equals size
     {"type": "flatten"}
-The input is "inputDim": N (a vector per sample) or "inputShape": [C, H, W].
+    {"type": "conv2d", ..., "bias": false}   a convolution without a bias (it writes only the weight)
+    {"type": "batchnorm2d"}                   training-mode batch statistics, eps 1e-5; writes weight (ones), bias (zeros)
+    {"type": "basicblock", "out": C, "stride": S}
+        ResNet's basic block: conv3x3(S) -> BN -> ReLU -> conv3x3 -> BN, plus the shortcut (identity, or a strided
+        1x1 conv -> BN when the shape changes), then ReLU. Writes conv1, bn1, conv2, bn2[, shortcut conv, shortcut bn].
+    {"type": "globalavgpool"}                 [C, H, W] -> [C]
+    {"type": "lstm", "hidden": H}             [T, F] -> the last step's hidden state [H]; one layer, gate order
+        i, f, g, o. Writes weight_ih [4H, F], weight_hh [4H, H], bias_ih [4H], bias_hh [4H], PyTorch's layout.
+    {"type": "transformer", "heads": N, "ffn": F}
+        nn.TransformerEncoderLayer on [S, D] (post-norm, ReLU, no dropout, eps 1e-5). Writes in_proj [3D, D] and its
+        bias, out_proj [D, D] and bias, linear1 [F, D] and bias, linear2 [D, F] and bias, norm1 and norm2 weight/bias.
+The input is "inputDim": N (a vector per sample) or "inputShape": [C, H, W] / [T, F] / [S, D].
 
 The weights are generated here from the spec's seed with NumPy, not with torch's initialisers,
 so the Tensors side reads bytes rather than reproducing an initialisation scheme.
@@ -80,6 +91,79 @@ def main() -> int:
             f.write(b.tobytes(order="C"))
             return w, b
 
+        def uniform(bound: float, shape: tuple):
+            a = rng.uniform(-bound, bound, size=shape).astype("<f4")
+            f.write(a.tobytes(order="C"))
+            return a
+
+        def constant(value: float, length: int):
+            a = np.full((length,), value, dtype="<f4")
+            f.write(a.tobytes(order="C"))
+            return a
+
+        def conv(c_in: int, c_out: int, k: int, stride: int, pad: int, bias: bool):
+            bound = 1.0 / np.sqrt(c_in * k * k)
+            m = torch.nn.Conv2d(c_in, c_out, k, stride=stride, padding=pad, bias=bias)
+            with torch.no_grad():
+                m.weight.copy_(torch.from_numpy(uniform(bound, (c_out, c_in, k, k))))
+                if bias:
+                    m.bias.copy_(torch.from_numpy(uniform(bound, (c_out,))))
+            return m
+
+        def batchnorm(c: int):
+            m = torch.nn.BatchNorm2d(c, eps=1e-5)
+            with torch.no_grad():
+                m.weight.copy_(torch.from_numpy(constant(1.0, c)))
+                m.bias.copy_(torch.from_numpy(constant(0.0, c)))
+            return m
+
+        class BasicBlock(torch.nn.Module):
+            def __init__(self, c_in: int, c_out: int, stride: int):
+                super().__init__()
+                self.conv1 = conv(c_in, c_out, 3, stride, 1, False)
+                self.bn1 = batchnorm(c_out)
+                self.conv2 = conv(c_out, c_out, 3, 1, 1, False)
+                self.bn2 = batchnorm(c_out)
+                self.shortcut = None
+                if stride != 1 or c_in != c_out:
+                    self.shortcut = torch.nn.Sequential(conv(c_in, c_out, 1, stride, 0, False), batchnorm(c_out))
+
+            def forward(self, t):
+                out = torch.relu(self.bn1(self.conv1(t)))
+                out = self.bn2(self.conv2(out))
+                return torch.relu(out + (t if self.shortcut is None else self.shortcut(t)))
+
+        class LastStepLstm(torch.nn.Module):
+            def __init__(self, features: int, hidden: int):
+                super().__init__()
+                self.lstm = torch.nn.LSTM(features, hidden, batch_first=True)
+                bound = 1.0 / np.sqrt(hidden)
+                with torch.no_grad():
+                    self.lstm.weight_ih_l0.copy_(torch.from_numpy(uniform(bound, (4 * hidden, features))))
+                    self.lstm.weight_hh_l0.copy_(torch.from_numpy(uniform(bound, (4 * hidden, hidden))))
+                    self.lstm.bias_ih_l0.copy_(torch.from_numpy(uniform(bound, (4 * hidden,))))
+                    self.lstm.bias_hh_l0.copy_(torch.from_numpy(uniform(bound, (4 * hidden,))))
+
+            def forward(self, t):
+                return self.lstm(t)[0][:, -1, :]
+
+        def transformer(d: int, heads: int, ffn: int):
+            m = torch.nn.TransformerEncoderLayer(d, heads, dim_feedforward=ffn, dropout=0.0, activation="relu",
+                                                 layer_norm_eps=1e-5, batch_first=True, norm_first=False)
+            with torch.no_grad():
+                m.self_attn.in_proj_weight.copy_(torch.from_numpy(uniform(1.0 / np.sqrt(d), (3 * d, d))))
+                m.self_attn.in_proj_bias.copy_(torch.from_numpy(uniform(1.0 / np.sqrt(d), (3 * d,))))
+                m.self_attn.out_proj.weight.copy_(torch.from_numpy(uniform(1.0 / np.sqrt(d), (d, d))))
+                m.self_attn.out_proj.bias.copy_(torch.from_numpy(uniform(1.0 / np.sqrt(d), (d,))))
+                m.linear1.weight.copy_(torch.from_numpy(uniform(1.0 / np.sqrt(d), (ffn, d))))
+                m.linear1.bias.copy_(torch.from_numpy(uniform(1.0 / np.sqrt(d), (ffn,))))
+                m.linear2.weight.copy_(torch.from_numpy(uniform(1.0 / np.sqrt(ffn), (d, ffn))))
+                m.linear2.bias.copy_(torch.from_numpy(uniform(1.0 / np.sqrt(ffn), (d,))))
+                for norm in (m.norm1, m.norm2):
+                    norm.weight.copy_(torch.from_numpy(constant(1.0, d)))
+                    norm.bias.copy_(torch.from_numpy(constant(0.0, d)))
+            return m
+
         for layer in spec["layers"]:
             kind = layer.get("type", "linear")
             if kind == "linear":
@@ -95,13 +179,34 @@ def main() -> int:
             elif kind == "conv2d":
                 c, h, wd = shape
                 k, s, pad = layer["kernel"], layer.get("stride", 1), layer.get("padding", 0)
-                w, b = params(c * k * k, (layer["out"], c, k, k), layer["out"])
-                conv = torch.nn.Conv2d(c, layer["out"], k, stride=s, padding=pad)
-                with torch.no_grad():
-                    conv.weight.copy_(torch.from_numpy(w))
-                    conv.bias.copy_(torch.from_numpy(b))
-                modules.append(conv)
+                if layer.get("bias", True):
+                    w, b = params(c * k * k, (layer["out"], c, k, k), layer["out"])
+                    conv2d = torch.nn.Conv2d(c, layer["out"], k, stride=s, padding=pad)
+                    with torch.no_grad():
+                        conv2d.weight.copy_(torch.from_numpy(w))
+                        conv2d.bias.copy_(torch.from_numpy(b))
+                else:
+                    conv2d = conv(c, layer["out"], k, s, pad, False)
+                modules.append(conv2d)
                 shape = [layer["out"], (h + 2 * pad - k) // s + 1, (wd + 2 * pad - k) // s + 1]
+            elif kind == "batchnorm2d":
+                modules.append(batchnorm(shape[0]))
+            elif kind == "basicblock":
+                c, h, wd = shape
+                s = layer.get("stride", 1)
+                modules.append(BasicBlock(c, layer["out"], s))
+                shape = [layer["out"], (h + 2 - 3) // s + 1, (wd + 2 - 3) // s + 1]
+            elif kind == "globalavgpool":
+                modules.append(torch.nn.AdaptiveAvgPool2d(1))
+                modules.append(torch.nn.Flatten())
+                shape = [shape[0]]
+            elif kind == "lstm":
+                steps, features = shape
+                modules.append(LastStepLstm(features, layer["hidden"]))
+                shape = [layer["hidden"]]
+            elif kind == "transformer":
+                seq, d = shape
+                modules.append(transformer(d, layer["heads"], layer["ffn"]))
             elif kind == "maxpool2d":
                 k = layer["size"]
                 modules.append(torch.nn.MaxPool2d(k))

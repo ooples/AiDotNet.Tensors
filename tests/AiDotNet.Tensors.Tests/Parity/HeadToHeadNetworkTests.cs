@@ -130,6 +130,27 @@ public sealed class HeadToHeadNetworkTests : HeadToHeadTestBase
     [SkippableFact]
     [Trait("Category", "PyTorchParity")]
     public void Cnn_Cpu_IsAsFastAsPyTorch() => AssertParity(RunCase("cnn", "cpu"));
+
+    [SkippableFact]
+    public void Lstm_Cpu_DoesNotRegress() => AssertRatchet(RunCase("lstm", "cpu"));
+
+    [SkippableFact]
+    [Trait("Category", "PyTorchParity")]
+    public void Lstm_Cpu_IsAsFastAsPyTorch() => AssertParity(RunCase("lstm", "cpu"));
+
+    [SkippableFact]
+    public void Transformer_Cpu_DoesNotRegress() => AssertRatchet(RunCase("transformer", "cpu"));
+
+    [SkippableFact]
+    [Trait("Category", "PyTorchParity")]
+    public void Transformer_Cpu_IsAsFastAsPyTorch() => AssertParity(RunCase("transformer", "cpu"));
+
+    [SkippableFact]
+    public void Resnet18_Cpu_DoesNotRegress() => AssertRatchet(RunCase("resnet18", "cpu"));
+
+    [SkippableFact]
+    [Trait("Category", "PyTorchParity")]
+    public void Resnet18_Cpu_IsAsFastAsPyTorch() => AssertParity(RunCase("resnet18", "cpu"));
 }
 
 /// <summary>
@@ -156,5 +177,29 @@ public sealed class HeadToHeadGpuNetworkTests : HeadToHeadTestBase
     [SkippableFact]
     [Trait("Category", "PyTorchParityGpuTarget")]
     public void Cnn_Cuda_IsAsFastAsPyTorch() => AssertParity(RunCase("cnn", "cuda"));
+
+    [SkippableFact]
+    [Trait("Category", "PyTorchParityGpu")]
+    public void Lstm_Cuda_DoesNotRegress() => AssertRatchet(RunCase("lstm", "cuda"));
+
+    [SkippableFact]
+    [Trait("Category", "PyTorchParityGpuTarget")]
+    public void Lstm_Cuda_IsAsFastAsPyTorch() => AssertParity(RunCase("lstm", "cuda"));
+
+    [SkippableFact]
+    [Trait("Category", "PyTorchParityGpu")]
+    public void Transformer_Cuda_DoesNotRegress() => AssertRatchet(RunCase("transformer", "cuda"));
+
+    [SkippableFact]
+    [Trait("Category", "PyTorchParityGpuTarget")]
+    public void Transformer_Cuda_IsAsFastAsPyTorch() => AssertParity(RunCase("transformer", "cuda"));
+
+    [SkippableFact]
+    [Trait("Category", "PyTorchParityGpu")]
+    public void Resnet18_Cuda_DoesNotRegress() => AssertRatchet(RunCase("resnet18", "cuda"));
+
+    [SkippableFact]
+    [Trait("Category", "PyTorchParityGpuTarget")]
+    public void Resnet18_Cuda_IsAsFastAsPyTorch() => AssertParity(RunCase("resnet18", "cuda"));
 }
 #endif
