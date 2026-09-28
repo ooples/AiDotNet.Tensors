@@ -381,8 +381,16 @@ internal static class HipNativeBindings
     [DllImport(HipLibrary, CallingConvention = CallingConvention.Cdecl)]
     public static extern HipError hipGetDevice(ref int deviceId);
 
-    [DllImport(HipLibrary, CallingConvention = CallingConvention.Cdecl)]
-    public static extern HipError hipDeviceSynchronize();
+    [DllImport(HipLibrary, EntryPoint = "hipDeviceSynchronize", CallingConvention = CallingConvention.Cdecl)]
+    private static extern HipError hipDeviceSynchronizeNative();
+
+    // A device-wide wait blocks the host like a stream sync; counted here, after success, like hipStreamSynchronize.
+    public static HipError hipDeviceSynchronize()
+    {
+        var result = hipDeviceSynchronizeNative();
+        if (result == HipError.Success) GpuLaunchProbe.OnSynchronize(GpuBackendType.Hip);
+        return result;
+    }
 
     [DllImport(HipLibrary, CallingConvention = CallingConvention.Cdecl)]
     public static extern HipError hipDeviceReset();
@@ -486,7 +494,7 @@ internal static class HipNativeBindings
     public static HipError hipStreamSynchronize(IntPtr stream)
     {
         var result = hipStreamSynchronizeNative(stream);
-        if (result == HipError.Success) GpuLaunchProbe.OnSynchronize("HIP");
+        if (result == HipError.Success) GpuLaunchProbe.OnSynchronize(GpuBackendType.Hip);
         return result;
     }
 
@@ -686,8 +694,16 @@ internal static class HipNativeBindings
     [DllImport(HipLibrary, CallingConvention = CallingConvention.Cdecl)]
     public static extern HipError hipEventRecord(IntPtr hipEvent, IntPtr stream);
 
-    [DllImport(HipLibrary, CallingConvention = CallingConvention.Cdecl)]
-    public static extern HipError hipEventSynchronize(IntPtr hipEvent);
+    [DllImport(HipLibrary, EntryPoint = "hipEventSynchronize", CallingConvention = CallingConvention.Cdecl)]
+    private static extern HipError hipEventSynchronizeNative(IntPtr hipEvent);
+
+    // Waiting on an event blocks the host until the device reaches it; counted here, after success.
+    public static HipError hipEventSynchronize(IntPtr hipEvent)
+    {
+        var result = hipEventSynchronizeNative(hipEvent);
+        if (result == HipError.Success) GpuLaunchProbe.OnSynchronize(GpuBackendType.Hip);
+        return result;
+    }
 
     [DllImport(HipLibrary, CallingConvention = CallingConvention.Cdecl)]
     public static extern HipError hipEventElapsedTime(

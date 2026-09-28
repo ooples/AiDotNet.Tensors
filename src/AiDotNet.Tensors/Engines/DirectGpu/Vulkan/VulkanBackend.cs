@@ -1011,7 +1011,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         UploadToBuffer(packed, buffer);
         // UploadToBuffer stages the whole buffer (a partial update is padded to buffer.Size), so that is
         // what crosses the boundary, not data.Length.
-        GpuLaunchProbe.OnUpload((long)buffer.Size * sizeof(float), "Vulkan");
+        GpuLaunchProbe.OnUpload((long)buffer.Size * sizeof(float), GpuBackendType.Vulkan);
     }
 
     /// <inheritdoc/>

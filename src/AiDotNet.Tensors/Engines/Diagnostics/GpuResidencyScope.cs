@@ -24,7 +24,7 @@ public enum GpuTransferKind
 /// The engine operation that caused it, e.g. <c>DirectGpuTensorEngine.TensorMatMul</c>, when the scope captures
 /// operations; otherwise null.
 /// </param>
-public readonly record struct GpuTransferEvent(GpuTransferKind Kind, long Bytes, string Backend, string? Operation);
+public readonly record struct GpuTransferEvent(GpuTransferKind Kind, long Bytes, GpuBackendType Backend, string? Operation);
 
 /// <summary>
 /// Counts every host/device transfer and device synchronization made while it is open, so a test can prove a GPU

@@ -1,4 +1,5 @@
 using System;
+using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Diagnostics;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using Xunit;
@@ -13,6 +14,9 @@ namespace AiDotNet.Tensors.Tests.Parity;
 [Collection("DirectGpuSerial")]
 public sealed class GpuResidencyScopeContractTests
 {
+    // The scope records whichever backend reports a transfer; its contract does not depend on which one.
+    private const GpuBackendType ReportingBackend = GpuBackendType.OpenCl;
+
     /// <summary>
     /// Scopes nest. Disposing an outer scope while an inner one is open used to unlink nothing and then let the inner
     /// scope's disposal restore the disposed outer scope as current, which collected transfers again.
@@ -27,7 +31,7 @@ public sealed class GpuResidencyScopeContractTests
             var refused = Assert.Throws<InvalidOperationException>(() => outer.Dispose());
             Assert.Contains("nest", refused.Message);
 
-            GpuLaunchProbe.OnUpload(16, "Test");
+            GpuLaunchProbe.OnUpload(16, ReportingBackend);
             Assert.Equal(1, inner.Uploads);
             Assert.Equal(1, outer.Uploads);
         }
@@ -37,7 +41,7 @@ public sealed class GpuResidencyScopeContractTests
             outer.Dispose();
         }
 
-        GpuLaunchProbe.OnUpload(16, "Test");
+        GpuLaunchProbe.OnUpload(16, ReportingBackend);
         Assert.Equal(1, outer.Uploads);
         Assert.Equal(1, inner.Uploads);
     }
@@ -50,17 +54,17 @@ public sealed class GpuResidencyScopeContractTests
     public void ProcessWideScope_AfterDispose_NeverChanges()
     {
         var scope = GpuResidencyScope.Begin(processWide: true);
-        GpuLaunchProbe.OnUpload(8, "Test");
-        GpuLaunchProbe.OnReadback(4, "Test");
+        GpuLaunchProbe.OnUpload(8, ReportingBackend);
+        GpuLaunchProbe.OnReadback(4, ReportingBackend);
         scope.Dispose();
         int events = scope.Events.Count;
 
-        GpuLaunchProbe.OnUpload(8, "Test");
-        GpuLaunchProbe.OnReadback(4, "Test");
+        GpuLaunchProbe.OnUpload(8, ReportingBackend);
+        GpuLaunchProbe.OnReadback(4, ReportingBackend);
         // What a racing recorder does after Dispose: it adds to the scope it snapshotted.
         var add = typeof(GpuResidencyScope).GetMethod("Add", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
             ?? throw new InvalidOperationException("GpuResidencyScope.Add not found.");
-        add.Invoke(scope, new object[] { new GpuTransferEvent(GpuTransferKind.HostToDevice, 8, "Test", null) });
+        add.Invoke(scope, new object[] { new GpuTransferEvent(GpuTransferKind.HostToDevice, 8, ReportingBackend, null) });
 
         Assert.Equal(2, events);
         Assert.Equal(events, scope.Events.Count);
@@ -72,6 +76,6 @@ public sealed class GpuResidencyScopeContractTests
     [Fact]
     public void Readback_WithANegativeByteCount_IsRejected()
     {
-        Assert.Throws<ArgumentOutOfRangeException>(() => GpuLaunchProbe.OnReadback(-1, "Test"));
+        Assert.Throws<ArgumentOutOfRangeException>(() => GpuLaunchProbe.OnReadback(-1, ReportingBackend));
     }
 }

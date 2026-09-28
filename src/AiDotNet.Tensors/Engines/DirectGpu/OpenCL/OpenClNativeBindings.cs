@@ -206,7 +206,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public static int Finish(IntPtr commandQueue)
         {
             int result = FinishNative(commandQueue);
-            if (result == 0) GpuLaunchProbe.OnSynchronize("OpenCL");
+            if ((OpenClNative.ClError)result == OpenClNative.ClError.Success) GpuLaunchProbe.OnSynchronize(GpuBackendType.OpenCl);
             return result;
         }
 
@@ -218,9 +218,17 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         #region Event Functions
 
         [DllImport(OpenClLibrary, EntryPoint = "clWaitForEvents")]
-        public static extern int WaitForEvents(
+        private static extern int WaitForEventsNative(
             uint numEvents,
             [In] IntPtr[] eventList);
+
+        // Waiting on events blocks the host until the device reaches them; counted here, after CL_SUCCESS.
+        public static int WaitForEvents(uint numEvents, IntPtr[] eventList)
+        {
+            int result = WaitForEventsNative(numEvents, eventList);
+            if ((OpenClNative.ClError)result == OpenClNative.ClError.Success) GpuLaunchProbe.OnSynchronize(GpuBackendType.OpenCl);
+            return result;
+        }
 
         [DllImport(OpenClLibrary, EntryPoint = "clGetEventProfilingInfo")]
         public static extern int GetEventProfilingInfo(

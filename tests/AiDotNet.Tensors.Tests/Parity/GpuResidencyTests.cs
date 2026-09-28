@@ -82,7 +82,7 @@ public sealed class GpuResidencyTests
         Assert.True(scope.Uploads >= 1, "The upload of a 1024-element tensor was not counted.");
         Assert.True(scope.BytesUploaded >= 1024 * sizeof(float), $"Upload bytes {scope.BytesUploaded} are below the 4096 the tensor holds.");
         Assert.True(scope.Downloads >= 1, "Reading the resident tensor back on the host was not counted as a download.");
-        Assert.All(scope.Events, e => Assert.False(string.IsNullOrEmpty(e.Backend)));
+        Assert.All(scope.Events, e => Assert.NotEqual(GpuBackendType.None, e.Backend));
     }
 
     /// <summary>Transfers made outside a scope, or on another thread, are not attributed to it.</summary>
@@ -110,7 +110,7 @@ public sealed class GpuResidencyTests
     public void MlpTrainingStep_TransfersDoNotRegress()
     {
         var (scope, report) = RunMlpTrainingStep();
-        string backend = scope.Events.FirstOrDefault().Backend ?? "unknown";
+        string backend = scope.Events.FirstOrDefault().Backend.ToString();
         var measured = CrossingsByOperation(scope);
         string root = PyTorchParityInventory.FindRepositoryRoot()
             ?? throw new InvalidOperationException("parity/ is missing from this checkout.");
@@ -118,7 +118,7 @@ public sealed class GpuResidencyTests
         bool recorded = doc.RootElement.GetProperty("mlp").TryGetProperty(backend, out var baselineElement);
         string snapshot = "{ " + string.Join(", ", measured.OrderBy(kv => kv.Key, StringComparer.Ordinal).Select(kv => $"\"{kv.Key}\": {kv.Value}")) + " }";
         // An unmeasured backend is not a passing ratchet: fail with the snapshot to record. A step that produced no
-        // events at all reports backend "unknown", which has no baseline either, so a dead probe fails here too.
+        // events at all reports backend None, which has no baseline either, so a dead probe fails here too.
         Assert.True(recorded, $"No residency baseline for mlp on {backend}. Measure it on that backend and add " +
                               $"\"{backend}\": {snapshot} under \"mlp\" in {BaselineFile}.{Environment.NewLine}{report}");
 
@@ -221,7 +221,7 @@ public sealed class GpuResidencyTests
                 .OrderByDescending(g => g.Sum(e => e.Bytes))
                 .Select(g => $"  {g.Key.Kind,-13} x{g.Count(),-3} {g.Sum(e => e.Bytes),12:N0} B  {g.Key.Op}")
                 .ToList();
-            string report = $"MLP training step on {scope.Events.FirstOrDefault().Backend ?? "GPU"}: " +
+            string report = $"MLP training step on {scope.Events.FirstOrDefault().Backend}: " +
                             $"{scope.Uploads} upload(s) {scope.BytesUploaded:N0} B, {scope.Downloads} download(s) {scope.BytesDownloaded:N0} B, " +
                             $"{scope.Synchronizations} sync(s)" + Environment.NewLine + string.Join(Environment.NewLine, lines);
             _output.WriteLine(report);

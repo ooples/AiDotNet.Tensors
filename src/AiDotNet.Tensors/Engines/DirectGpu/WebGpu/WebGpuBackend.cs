@@ -177,7 +177,7 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
         var bytes = new byte[data.Length * sizeof(int)];
         Buffer.BlockCopy(data, 0, bytes, 0, bytes.Length);
         webGpuBuffer.CopyBytesFrom(bytes);
-        GpuLaunchProbe.OnUpload(data, sizeof(int), "WebGPU");
+        GpuLaunchProbe.OnUpload(data, sizeof(int), GpuBackendType.WebGpu);
     }
 
     /// <param name="elementCount">Number of float elements.</param>
@@ -201,7 +201,7 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
         // Issue #285: per-allocation cap check.
         GpuBufferSizeGuard.EnsureFits("WebGPU", (long)data.Length * sizeof(float), MaxBufferAllocBytes, DeviceName);
         var buffer = new WebGpuBuffer(data);
-        GpuLaunchProbe.OnUpload(data, sizeof(float), "WebGPU");
+        GpuLaunchProbe.OnUpload(data, sizeof(float), GpuBackendType.WebGpu);
         return buffer;
     }
 

@@ -107,7 +107,7 @@ internal static class GpuLaunchProbe
     }
 
     /// <summary>A host-to-device copy of <paramref name="byteCount"/> bytes.</summary>
-    public static void OnUpload(long byteCount, string backend)
+    public static void OnUpload(long byteCount, GpuBackendType backend)
     {
         // An empty upload moves nothing across the boundary (several backends return before copying).
         if (byteCount == 0) return;
@@ -116,14 +116,14 @@ internal static class GpuLaunchProbe
 
     /// <summary>A host-to-device copy of <paramref name="data"/>. Takes the array rather than its length so a
     /// caller's null check after this call still sees the parameter as non-null.</summary>
-    public static void OnUpload(System.Array? data, int elementSize, string backend)
+    public static void OnUpload(System.Array? data, int elementSize, GpuBackendType backend)
         => OnUpload(data is null ? 0 : (long)data.Length * elementSize, backend);
 
     /// <summary>The host blocked until the device drained its queue.</summary>
-    public static void OnSynchronize(string backend)
+    public static void OnSynchronize(GpuBackendType backend)
         => RecordScoped(Diagnostics.GpuTransferKind.Synchronize, 0, backend);
 
-    private static void RecordScoped(Diagnostics.GpuTransferKind kind, long bytes, string backend)
+    private static void RecordScoped(Diagnostics.GpuTransferKind kind, long bytes, GpuBackendType backend)
     {
         if (Volatile.Read(ref _activeScopes) == 0) return;
 
@@ -169,7 +169,7 @@ internal static class GpuLaunchProbe
     }
 
     /// <summary>A device-to-host copy of <paramref name="byteCount"/> bytes.</summary>
-    public static void OnReadback(long byteCount, string backend)
+    public static void OnReadback(long byteCount, GpuBackendType backend)
     {
         if (byteCount < 0)
             throw new System.ArgumentOutOfRangeException(nameof(byteCount), "A readback cannot move a negative number of bytes.");

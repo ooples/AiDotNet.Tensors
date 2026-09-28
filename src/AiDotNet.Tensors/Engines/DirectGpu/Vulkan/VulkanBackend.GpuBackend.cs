@@ -261,7 +261,7 @@ public sealed unsafe partial class VulkanBackend
             throw new InvalidOperationException("Vulkan buffer transfer not initialized.");
         // Issue #285: per-allocation cap check before VkBuffer creation.
         GpuBufferSizeGuard.EnsureFits("Vulkan", (long)data.Length * sizeof(float), MaxBufferAllocBytes, DeviceName);
-        GpuLaunchProbe.OnUpload(data, sizeof(float), "Vulkan");
+        GpuLaunchProbe.OnUpload(data, sizeof(float), GpuBackendType.Vulkan);
         return VulkanGpuBuffer.Create(data, _transfer);
     }
 
@@ -280,7 +280,7 @@ public sealed unsafe partial class VulkanBackend
         var vb = AsVulkan(buffer);
         if (_transfer is null)
             throw new InvalidOperationException("Vulkan buffer transfer not initialized.");
-        GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float), "Vulkan");
+        GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float), GpuBackendType.Vulkan);
         _transfer.CopyFromDevice(vb.Storage, vb.Staging);
         var result = new float[vb.Size];
         vb.Staging.ReadData(result);
@@ -295,7 +295,7 @@ public sealed unsafe partial class VulkanBackend
         var vb = AsVulkan(buffer);
         if (_transfer is null)
             throw new InvalidOperationException("Vulkan buffer transfer not initialized.");
-        GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float), "Vulkan");
+        GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float), GpuBackendType.Vulkan);
         _transfer.CopyFromDevice(vb.Storage, vb.Staging);
         vb.Staging.ReadData(destination);
     }
@@ -310,7 +310,7 @@ public sealed unsafe partial class VulkanBackend
             throw new ArgumentException($"Requested byte count ({byteCount}) exceeds buffer capacity ({vb.SizeInBytes}).", nameof(byteCount));
         if (_transfer is null)
             throw new InvalidOperationException("Vulkan buffer transfer not initialized.");
-        GpuLaunchProbe.OnReadback(byteCount, "Vulkan");
+        GpuLaunchProbe.OnReadback(byteCount, GpuBackendType.Vulkan);
 
         var result = new byte[byteCount];
         if (byteCount == 0)
@@ -333,7 +333,7 @@ public sealed unsafe partial class VulkanBackend
             throw new InvalidOperationException("Vulkan buffer transfer not initialized.");
         if (data.Length == 0)
             return;
-        GpuLaunchProbe.OnUpload(data, sizeof(byte), "Vulkan");
+        GpuLaunchProbe.OnUpload(data, sizeof(byte), GpuBackendType.Vulkan);
 
         vb.Staging.WriteRawData<byte>(data);
         _transfer.CopyToDevice(vb.Staging, vb.Storage);
@@ -381,7 +381,7 @@ public sealed unsafe partial class VulkanBackend
         if (data is null)
             throw new ArgumentNullException(nameof(data));
         GpuBufferSizeGuard.EnsureFits("Vulkan", (long)data.Length * sizeof(int), MaxBufferAllocBytes, DeviceName);
-        GpuLaunchProbe.OnUpload(data, sizeof(int), "Vulkan");
+        GpuLaunchProbe.OnUpload(data, sizeof(int), GpuBackendType.Vulkan);
         var floatData = new float[data.Length];
         for (int i = 0; i < data.Length; i++)
             floatData[i] = Int32BitsToSingleCompat(data[i]);

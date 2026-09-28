@@ -1498,7 +1498,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     {
         if (!IsAvailable)
             throw new InvalidOperationException("CUDA backend is not available.");
-        GpuLaunchProbe.OnUpload(data, sizeof(float), "CUDA");
+        GpuLaunchProbe.OnUpload(data, sizeof(float), GpuBackendType.Cuda);
         AuditSyncIO("HtoD-alloc", (long)data.Length * sizeof(float));
         LogCaptureBlockerIfCapturing("HtoD-alloc", (long)data.Length * sizeof(float));
 
@@ -1981,7 +1981,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
 
         if (destination.Length < buffer.Size)
             throw new ArgumentException("Destination array is too small.", nameof(destination));
-        GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float), "CUDA");
+        GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float), GpuBackendType.Cuda);
 
         using var _ = PushContext();
 
@@ -2020,7 +2020,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw new ArgumentOutOfRangeException(nameof(byteCount), "Byte count must be non-negative.");
         if (byteCount > buffer.SizeInBytes)
             throw new ArgumentException($"Requested byte count ({byteCount}) exceeds buffer capacity ({buffer.SizeInBytes}).", nameof(byteCount));
-        GpuLaunchProbe.OnReadback(byteCount, "CUDA");
+        GpuLaunchProbe.OnReadback(byteCount, GpuBackendType.Cuda);
 
         return DownloadBytes(buffer, byteCount);
     }
@@ -2031,7 +2031,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw new ArgumentNullException(nameof(data));
         if (data.LongLength > buffer.SizeInBytes)
             throw new ArgumentException($"Host data ({data.Length} bytes) exceeds buffer capacity ({buffer.SizeInBytes} bytes).", nameof(data));
-        GpuLaunchProbe.OnUpload(data, sizeof(byte), "CUDA");
+        GpuLaunchProbe.OnUpload(data, sizeof(byte), GpuBackendType.Cuda);
 
         UploadBytes(buffer, data);
     }
@@ -5056,7 +5056,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
                 "GPU buffer was released before its in-place upload.");
         if (data.Length > buffer.Size)
             throw new ArgumentException($"Host data ({data.Length}) exceeds buffer ({buffer.Size}).");
-        GpuLaunchProbe.OnUpload(data, sizeof(int), "CUDA");
+        GpuLaunchProbe.OnUpload(data, sizeof(int), GpuBackendType.Cuda);
         using var _ = PushContext();
         ulong byteSize = (ulong)data.Length * sizeof(int);
         fixed (int* src = data)
@@ -8776,7 +8776,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw new InvalidOperationException("CUDA backend is not available.");
         if (data is null)
             throw new ArgumentNullException(nameof(data));
-        GpuLaunchProbe.OnUpload(data, sizeof(int), "CUDA");
+        GpuLaunchProbe.OnUpload(data, sizeof(int), GpuBackendType.Cuda);
 
         using var _ = PushContext();
         int size = data.Length;

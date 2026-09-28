@@ -230,7 +230,7 @@ internal static class CudaNativeBindings
     public static CudaResult cuStreamSynchronize(IntPtr stream)
     {
         var result = cuStreamSynchronizeNative(stream);
-        if (result == CudaResult.Success) GpuLaunchProbe.OnSynchronize("CUDA");
+        if (result == CudaResult.Success) GpuLaunchProbe.OnSynchronize(GpuBackendType.Cuda);
         return result;
     }
 
@@ -241,7 +241,7 @@ internal static class CudaNativeBindings
     public static CudaResult cuCtxSynchronize()
     {
         var result = cuCtxSynchronizeNative();
-        if (result == CudaResult.Success) GpuLaunchProbe.OnSynchronize("CUDA");
+        if (result == CudaResult.Success) GpuLaunchProbe.OnSynchronize(GpuBackendType.Cuda);
         return result;
     }
 
@@ -275,7 +275,7 @@ internal static class CudaNativeBindings
     public static CudaResult cuEventSynchronize(IntPtr hEvent)
     {
         var result = cuEventSynchronizeNative(hEvent);
-        if (result == CudaResult.Success) GpuLaunchProbe.OnSynchronize("CUDA");
+        if (result == CudaResult.Success) GpuLaunchProbe.OnSynchronize(GpuBackendType.Cuda);
         return result;
     }
 

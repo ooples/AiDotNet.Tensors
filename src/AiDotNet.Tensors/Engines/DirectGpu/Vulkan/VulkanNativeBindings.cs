@@ -413,11 +413,15 @@ public static unsafe class VulkanNativeBindings
     [DllImport(VulkanLinux, EntryPoint = "vkDeviceWaitIdle")]
     private static extern int vkDeviceWaitIdle_Linux(IntPtr device);
 
+    // Every host wait on the device goes through this binding and vkWaitForFences, so the residency probe counts them
+    // here, after VK_SUCCESS (a timed-out fence wait is not a completed wait), rather than at the call sites.
     public static int vkDeviceWaitIdle(IntPtr device)
     {
-        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-            return vkDeviceWaitIdle_Windows(device);
-        return vkDeviceWaitIdle_Linux(device);
+        int result = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+            ? vkDeviceWaitIdle_Windows(device)
+            : vkDeviceWaitIdle_Linux(device);
+        if (result == VK_SUCCESS) GpuLaunchProbe.OnSynchronize(GpuBackendType.Vulkan);
+        return result;
     }
 
     #endregion
@@ -998,9 +1002,11 @@ public static unsafe class VulkanNativeBindings
 
     public static int vkWaitForFences(IntPtr device, uint fenceCount, IntPtr* pFences, uint waitAll, ulong timeout)
     {
-        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-            return vkWaitForFences_Windows(device, fenceCount, pFences, waitAll, timeout);
-        return vkWaitForFences_Linux(device, fenceCount, pFences, waitAll, timeout);
+        int result = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+            ? vkWaitForFences_Windows(device, fenceCount, pFences, waitAll, timeout)
+            : vkWaitForFences_Linux(device, fenceCount, pFences, waitAll, timeout);
+        if (result == VK_SUCCESS) GpuLaunchProbe.OnSynchronize(GpuBackendType.Vulkan);
+        return result;
     }
 
     [DllImport(VulkanWindows, EntryPoint = "vkResetFences")]
