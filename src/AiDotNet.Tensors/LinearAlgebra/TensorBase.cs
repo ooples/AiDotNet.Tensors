@@ -1059,7 +1059,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// </remarks>
     internal int _gpuBufferVersion
     {
-        get => CoversWholeVector ? (_data._deviceState is { DeviceValid: true, Buffer: not null } ? GpuCacheVersion : -1) : _viewGpuBufferVersion;
+        get => CoversWholeVector ? (_data._deviceState is { DeviceValid: true } ? GpuCacheVersion : -1) : _viewGpuBufferVersion;
         set
         {
             if (CoversWholeVector) _data.DeviceState.DeviceValid = value == GpuCacheVersion && value >= 0;
