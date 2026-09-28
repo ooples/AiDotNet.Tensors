@@ -264,8 +264,17 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     {
         if (_backendStreamCaptureActive)
             buffer.Release();
-        else
-            _bufferPool.Return(buffer, AsyncPoolAffinity);
+        else if (buffer.DetachForPool() is { } lease)
+            _bufferPool.Return(lease, AsyncPoolAffinity);
+    }
+
+    /// <summary>
+    /// Pool return for the non-async allocator: the device memory goes back under a fresh wrapper (see
+    /// <see cref="CudaGpuBuffer.DetachForPool"/>), so the returned object reads as released.
+    /// </summary>
+    private void ReturnPooledBuffer(CudaGpuBuffer buffer)
+    {
+        if (buffer.DetachForPool() is { } lease) _bufferPool.Return(lease);
     }
 
     private CudaGpuBuffer? TryRentAsyncBuffer(int size)
@@ -1660,7 +1669,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw;
         }
 
-        return new CudaGpuBuffer(_cudaContext, devicePtr, size, _bufferPool.Return);
+        return new CudaGpuBuffer(_cudaContext, devicePtr, size, ReturnPooledBuffer);
     }
 
     /// <summary>
@@ -1926,7 +1935,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         ulong byteSize = (ulong)size * sizeof(float);
         IntPtr devicePtr = AllocDeviceMemoryWithRetry(byteSize);
         CuBlasNative.CheckCudaResult(CuBlasNative.cuMemsetD32(devicePtr, 0, (ulong)size), "cuMemsetD32");
-        return new CudaGpuBuffer(_cudaContext, devicePtr, size, _bufferPool.Return);
+        return new CudaGpuBuffer(_cudaContext, devicePtr, size, ReturnPooledBuffer);
     }
 
     /// <inheritdoc/>
@@ -18671,6 +18680,24 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
                 throw new ArgumentOutOfRangeException(nameof(size));
             Volatile.Write(ref _size, size);
             Interlocked.Exchange(ref _poolState, 0);
+        }
+
+        /// <summary>
+        /// Hands this buffer's device memory to the pool under a NEW wrapper and leaves this one released (Handle 0).
+        /// Every binding that still holds this object (a tensor's device buffer, an alias, a pending download) then
+        /// sees it as gone, instead of reading whatever the pool's next renter writes into the same memory: the
+        /// engine judges a binding's liveness by a non-zero Handle, and a pooled object kept its Handle across
+        /// renters (measured: compiled steps read another plan's buffers -- a loss of exactly 1 from a seed, stale
+        /// gradients -- depending on which plans ran before). One lease, one wrapper, as PyTorch's storages.
+        /// </summary>
+        internal CudaGpuBuffer? DetachForPool()
+        {
+            var ptr = Interlocked.Exchange(ref _devicePtr, IntPtr.Zero);
+            if (ptr == IntPtr.Zero) return null;
+            GC.SuppressFinalize(this);
+            var lease = new CudaGpuBuffer(_context, ptr, Capacity, _returnToPool, _asyncFreeStream);
+            Volatile.Write(ref lease._poolState, 1);   // pooled until the next MarkRented
+            return lease;
         }
 
         public void Release()
