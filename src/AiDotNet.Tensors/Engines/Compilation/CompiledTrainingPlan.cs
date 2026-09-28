@@ -339,6 +339,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // stale target (measured: the loss matched MSE(pred(x_t), y_(t-1)) exactly).
         if (!_graphHasEmbedding)
             foreach (var leaf in GraphExternalLeaves()) Unbind(leaf);
+        _ownedLeafBuffers.Clear();
     }
 
     /// <summary>
@@ -2015,7 +2016,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 // Upload THIS step's token indices into the stable buffer (OUTSIDE capture) so the captured
                 // embedding gather replays on fresh indices; then replay the whole step as one graph launch.
                 if (_graphHasEmbedding) gte.RefreshGraphEmbeddingIndicesNow();   // upload step-N indices (registered action)
-                RefreshGraphInputInPlace(cb);
+                if (!RefreshGraphInputInPlace(cb))
+                {
+                    // An input the graph reads through a baked pointer was released: replaying would read freed
+                    // memory. Drop the graph and train this plan eagerly from here on.
+                    InvalidateCapturedStepGraph();
+                    _graphStepDisabled = true;
+                    return StepEager();
+                }
                 cb.LaunchCapturedGraph(_stepGraphExec);
                 RearmLossDownload(gte, cb);
                 ApplyL2Regularization();
@@ -2048,6 +2056,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // callers write batches through a host span, which does not bump the version.
     private Tensor<T>[]? _graphExternalLeaves;
 
+    // The device buffer the capture pre-pass bound to each external input. Only these are refreshed in place: any
+    // other binding on an input - left by an earlier eager step - may already be released, or (a pooled buffer keeps
+    // its handle when returned) re-rented by another owner, so writing the batch into it corrupts that owner.
+    private readonly Dictionary<Tensor<T>, Engines.DirectGpu.IGpuBuffer> _ownedLeafBuffers =
+        new(ReferenceEqualityComparer<Tensor<T>>.Instance);
+
+    private bool IsOwnedLeafBinding(Tensor<T> leaf)
+        => leaf._gpuBuffer is { } bound && _ownedLeafBuffers.TryGetValue(leaf, out var owned)
+           && ReferenceEquals(owned, bound);
+
     private Tensor<T>[] GraphExternalLeaves()
     {
         if (_graphExternalLeaves is { } cached) return cached;
@@ -2067,14 +2085,22 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         return _graphExternalLeaves = leaves.ToArray();
     }
 
-    private void RefreshGraphInputInPlace(Engines.DirectGpu.CUDA.CudaBackend cb)
+    /// <returns>False when a bound input buffer has already been released (zero handle). Before a capture that is
+    /// harmless - the pre-pass rebinds every external input - but a captured graph would read freed memory.</returns>
+    private bool RefreshGraphInputInPlace(Engines.DirectGpu.CUDA.CudaBackend cb)
     {
+        bool allLive = true;
         if (!_graphHasEmbedding)
         {
             foreach (var leaf in GraphExternalLeaves())
             {
                 if (ReferenceEquals(leaf, _compiledInputTensor)) continue;   // refreshed below, as before
                 if (leaf._gpuBuffer is not { } leafBuffer || !ReferenceEquals(leaf._gpuBackend, cb)) continue;
+                // Only a binding the pre-pass made is refreshed. One left by an earlier EAGER step may have been
+                // released by that step's end-of-step eviction (uploading threw ObjectDisposedException, which the
+                // capture path answered by disabling the whole-step graph for good - TabDDPM never captured) or
+                // returned to the pool and re-rented. Before the pre-pass that is expected; after capture it is not.
+                if (!IsOwnedLeafBinding(leaf) || leafBuffer.Handle == IntPtr.Zero) { allLive = false; continue; }
                 var leafData = leaf.GetDataArray();
                 if (leafBuffer.Size < leafData.Length) continue;
                 cb.UploadBufferInPlace((float[])(object)leafData, leafBuffer);
@@ -2085,13 +2111,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // happens on-device inside the captured graph; only the small index buffer is refreshed, via
         // RefreshGraphEmbeddingIndicesNow). _compiledInputTensor stays set for SetInput/SetInputs API
         // compatibility (it's the embeddings matrix there), so gate on the flag, not on null.
-        if (_graphHasEmbedding) return;
-        if (_compiledInputTensor is not { } inT) return;
-        if (inT._gpuBuffer is not { } buf || !ReferenceEquals(inT._gpuBackend, cb)) return;
+        if (_graphHasEmbedding) return allLive;
+        if (_compiledInputTensor is not { } inT) return allLive;
+        if (inT._gpuBuffer is not { } buf || !ReferenceEquals(inT._gpuBackend, cb)) return allLive;
+        if (buf.Handle == IntPtr.Zero || (GraphExternalLeaves().Contains(inT) && !IsOwnedLeafBinding(inT))) return false;
         var data = inT.GetDataArray();                 // host backing (T==float on the graph path)
-        if (buf.Size < data.Length) return;
+        if (buf.Size < data.Length) return allLive;
         cb.UploadBufferInPlace((float[])(object)data, buf);
         inT._gpuBufferVersion = inT.GpuCacheVersion;
+        return allLive;
     }
 
     private void RunGpuStepBodyForCapture(Engines.DirectGpu.CUDA.CudaBackend cb)
@@ -2107,7 +2135,19 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // holding its current data, so the captured ops read it through that buffer and replays can refresh it.
         if (de is not null && !_graphHasEmbedding && !cb.IsStreamCapturing())
             foreach (var leaf in GraphExternalLeaves())
+            {
+                // EnsureResidentInput reuses any bound buffer with a live-looking handle. A binding this plan did not
+                // make is not ours to write: drop it (without disposing - its owner does that) so a fresh one is bound.
+                if (leaf._gpuBuffer is not null && !IsOwnedLeafBinding(leaf))
+                {
+                    de.InvalidateGpuCacheForTensor(leaf);
+                    leaf._gpuBuffer = null;
+                    leaf._gpuBackend = null;
+                    leaf._gpuBufferVersion = -1;
+                }
                 de.EnsureResidentInput(leaf);
+                if (leaf._gpuBuffer is { } bound) _ownedLeafBuffers[leaf] = bound;
+            }
         _preForwardParamTransform?.Invoke();
         var fwd = _forwardActions;
         // The whole forward (INCLUDING the embedding, which gathers on-device from the externally-refreshed stable

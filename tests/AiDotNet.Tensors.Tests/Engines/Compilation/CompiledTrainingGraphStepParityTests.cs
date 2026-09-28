@@ -80,7 +80,7 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         public string[] StepStates = Array.Empty<string>();
     }
 
-    private static Run Train(DirectGpuTensorEngine gpu, bool capture, bool failCapture = false, bool composedMse = false, bool failInsideCapture = false)
+    private static Run Train(DirectGpuTensorEngine gpu, bool capture, bool failCapture = false, bool composedMse = false, bool failInsideCapture = false, bool releasedInputBinding = false)
     {
         var x = Rand([Batch, Inputs], 1, 1f);
         var y = Rand([Batch, Outputs], 2, 1f);
@@ -122,6 +122,18 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             for (int s = 0; s < Steps; s++)
             {
                 FeedBatch(x, y, s);
+                if (releasedInputBinding && s == 3)
+                {
+                    // An earlier eager step can leave an input bound to a buffer that is no longer its to use: released
+                    // (zero handle - the capture path's refresh threw, and the catch disabled the whole-step graph) or,
+                    // as here, returned to the pool with its handle intact, where refreshing the batch into it would
+                    // write into whichever tensor rents it next.
+                    var cb = (AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend)gpu.GetBackend()!;
+                    var released = cb.AllocateBuffer(new float[y.Length]);
+                    released.Dispose();
+                    y._gpuBuffer = released;
+                    y._gpuBackend = cb;
+                }
                 // Reference loss from the exact host batch and pre-step weights: a mismatch message then says whether the
                 // plan computed a wrong loss or reported one it never downloaded.
                 double reference = CpuLoss(x, y, parameters, composedMse);
@@ -213,6 +225,31 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                 for (int i = 0; i < eager.FinalWeights[p].Length; i++)
                     Assert.True(Math.Abs(eager.FinalWeights[p][i] - failed.FinalWeights[p][i]) <= 1e-5f,
                         $"param {p}[{i}]: after a failed capture {failed.FinalWeights[p][i]} != eager {eager.FinalWeights[p][i]}");
+        }
+    }
+
+    [SkippableFact]
+    public void An_input_bound_to_a_released_buffer_neither_blocks_capture_nor_corrupts_training()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend,
+                "Whole-step graph capture is CUDA-only.");
+            Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "0",
+                "Graph capture is disabled for this process.");
+
+            var eager = Train(gpu, capture: false);
+            var released = Train(gpu, capture: true, releasedInputBinding: true);
+            Assert.True(released.ReplayedAGraph, "a released input binding kept the step from ever capturing");
+            for (int s = 0; s < Steps; s++)
+                Assert.True(Math.Abs(eager.Losses[s] - released.Losses[s]) <= 1e-5 * Math.Max(1, Math.Abs(eager.Losses[s])),
+                    $"step {s}: loss {released.Losses[s]:G6} != eager {eager.Losses[s]:G6}");
+            for (int p = 0; p < eager.FinalWeights.Length; p++)
+                for (int i = 0; i < eager.FinalWeights[p].Length; i++)
+                    Assert.True(Math.Abs(eager.FinalWeights[p][i] - released.FinalWeights[p][i]) <= 1e-5f,
+                        $"param {p}[{i}]: {released.FinalWeights[p][i]} != eager {eager.FinalWeights[p][i]}");
         }
     }
 
