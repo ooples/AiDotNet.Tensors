@@ -2134,6 +2134,12 @@ internal static class BackwardFunctions<T>
         var start = (int[])savedState[0];
         var inputShape = inputs[0]._shape;
 
+        if (engine is DirectGpuTensorEngine gpu && gpu.TrySliceBackwardOnDevice(gradOutput, inputShape, start) is { } deviceGrad)
+        {
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceGrad, engine);
+            return;
+        }
+
         // Issue #327: write directly into a fresh zero-init buffer
         // instead of going through engine.TensorSetSlice (which Rent's
         // a new result tensor and Array.Copy's the zeros input into it
