@@ -1074,10 +1074,17 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         }
     }
 
+    // A plan dropped without Dispose still releases its captured graph and the memory the graph pins.
+    ~CompiledInferencePlan()
+    {
+        Engines.DirectGpu.CUDA.CudaBackend.DestroyCapturedGraphFromFinalizer(_graphExec);
+    }
+
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
+        GC.SuppressFinalize(this);
 
         // Free the captured CUDA graph (if any) before the buffers it references are torn down,
         // then resume the eviction we suspended for the graph's lifetime.

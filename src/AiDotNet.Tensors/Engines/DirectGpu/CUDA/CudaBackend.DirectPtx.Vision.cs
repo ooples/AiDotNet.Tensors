@@ -83,7 +83,7 @@ public sealed partial class CudaBackend : IDirectPtxVisionBackend
                         $"Direct PTX vision operation {spec.Operation} must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 PtxVisionKernel kernel = GetOrCreateVisionKernel(spec);
                 int count = kernel.Blueprint.Tensors.Count;
                 if ((count > 1 && b is null) || (count > 2 && c is null) ||
@@ -320,7 +320,7 @@ public sealed partial class CudaBackend : IDirectPtxVisionBackend
                         "Direct PTX IoU-family backward must prewarm both owner modules before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 PtxVisionKernel kernelA = GetOrCreateVisionKernel(specA);
                 PtxVisionKernel kernelB = GetOrCreateVisionKernel(specB);
                 DirectPtxTensorView goA = DirectPtxTensorView.Create(gradOutput, kernelA.Blueprint.Tensors[0]);
@@ -450,7 +450,7 @@ public sealed partial class CudaBackend : IDirectPtxVisionBackend
                         "Direct PTX meshgrid must prewarm both output modules before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 PtxVisionKernel kernel0 = GetOrCreateVisionKernel(spec0);
                 PtxVisionKernel kernel1 = GetOrCreateVisionKernel(spec1);
                 DirectPtxTensorView sourceView0 = DirectPtxTensorView.Create(
@@ -519,7 +519,7 @@ public sealed partial class CudaBackend : IDirectPtxVisionBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 _ = GetOrCreateVisionKernel(spec);
             }
             DirectPtxLastError = null;

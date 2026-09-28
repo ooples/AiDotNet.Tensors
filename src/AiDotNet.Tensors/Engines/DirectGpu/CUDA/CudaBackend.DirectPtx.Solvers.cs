@@ -350,7 +350,7 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 var planKey = new DirectPtxSolver4x4PlanKey(operation, batchCount);
                 if (!_directPtxSolver4x4Plans.TryGetValue(planKey, out int blockThreads))
                 {
@@ -508,7 +508,7 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
                     DirectPtxLastError = $"Direct PTX {OperationSlug(operation)} must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 int blockThreads;
                 if (!_directPtxSolver4x4Plans.TryGetValue(planKey, out blockThreads))
                 {
@@ -588,7 +588,7 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
                     DirectPtxLastError = $"Direct PTX {OperationSlug(operation)} must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 int blockThreads;
                 if (!_directPtxSolver4x4Plans.TryGetValue(planKey, out blockThreads))
                 {
@@ -672,7 +672,7 @@ public sealed partial class CudaBackend : IExtendedLinalgBackend
                     DirectPtxLastError = $"Direct PTX {OperationSlug(operation)} must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 int blockThreads;
                 if (!_directPtxSolver4x4Plans.TryGetValue(planKey, out blockThreads))
                 {

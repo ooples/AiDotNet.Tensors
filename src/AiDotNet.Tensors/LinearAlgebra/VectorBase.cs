@@ -45,6 +45,15 @@ public abstract class VectorBase<T>
     /// </summary>
     private System.Action? _beforeWrite;
 
+    /// <summary>
+    /// The device side of this data holder, shared by every tensor view of it; null until something binds a device
+    /// copy. See <see cref="VectorDeviceState"/>.
+    /// </summary>
+    internal VectorDeviceState? _deviceState;
+
+    /// <summary>The shared device state, created on first use.</summary>
+    internal VectorDeviceState DeviceState => _deviceState ??= new VectorDeviceState();
+
     /// <summary>Installs the owner validation that must run before mutable storage is exposed.</summary>
     internal void SetBeforeWriteGuard(System.Action? beforeWrite)
     {

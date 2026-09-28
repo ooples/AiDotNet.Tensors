@@ -251,10 +251,17 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             _pinnedHandles.AddRange(pinnedHandles);
     }
 
+    // A plan dropped without Dispose still releases its captured graph and the memory the graph pins.
+    ~CompiledTrainingPlan()
+    {
+        Engines.DirectGpu.CUDA.CudaBackend.DestroyCapturedGraphFromFinalizer(_stepGraphExec);
+    }
+
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
+        GC.SuppressFinalize(this);
         if (StepTiming.Enabled)
             try { StepTiming.DumpAndReset(s => System.IO.File.AppendAllText(
                 System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_steptiming.txt"), s + System.Environment.NewLine)); }

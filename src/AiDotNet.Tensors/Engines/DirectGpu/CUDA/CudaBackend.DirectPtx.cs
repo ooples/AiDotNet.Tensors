@@ -554,7 +554,7 @@ public sealed partial class CudaBackend
                         "Direct PTX pairwise BoxIoU must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 PtxFusedPairwiseBoxIouF32Kernel kernel = GetOrCreateVisionBoxIouKernel(key);
                 // Build (and thereby ABI/extent-validate) the views before pinning.
                 // DirectPtxTensorView.Create throws on a mismatch; doing it after the
@@ -609,7 +609,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 _ = GetOrCreateVisionBoxIouKernel(new DirectPtxVisionBoxIouKey(n, m));
             }
             DirectPtxLastError = null;
@@ -810,7 +810,7 @@ public sealed partial class CudaBackend
                         "Direct PTX Cholesky 4x4 must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 int blockThreads;
                 if (!_directPtxCholesky4x4Plans.TryGetValue(planKey, out blockThreads))
                 {
@@ -893,7 +893,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 var planKey = new DirectPtxCholesky4x4PlanKey(batchCount);
                 if (!_directPtxCholesky4x4Plans.TryGetValue(planKey, out int blockThreads))
                 {
@@ -1081,7 +1081,7 @@ public sealed partial class CudaBackend
                         "Direct PTX QKV/RoPE/cache must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 PtxFusedQkvRopeCacheD64Kernel kernel = GetOrCreateQkvRopeCacheKernel(key);
                 // A graph executable retains this CUfunction after capture.
                 // cuModuleUnload invalidates function handles, so a captured
@@ -1146,7 +1146,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 _ = GetOrCreateQkvRopeCacheKernel(
                     new DirectPtxQkvRopeCacheKey(heads, cacheCapacity, position));
             }
@@ -1316,7 +1316,7 @@ public sealed partial class CudaBackend
                             "Direct PTX mixed linear must be prewarmed before CUDA graph capture.";
                         return false;
                     }
-                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                     kernel = CreateAndCacheMixedLinearKernelSlow(key);
                 }
                 if (capturing && !PinDirectPtxKernelForCapture(
@@ -1374,7 +1374,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 var key = new DirectPtxFusedLinearKey(inputFeatures, outputFeatures);
                 if (!_directPtxMixedLinearKernels.TryGetValue(key, out _))
                     _ = CreateAndCacheMixedLinearKernelSlow(key);
@@ -1467,7 +1467,7 @@ public sealed partial class CudaBackend
                             "Direct PTX W8A8 linear must be prewarmed before CUDA graph capture.";
                         return false;
                     }
-                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                     kernel = CreateAndCacheQuantizedLinearKernelSlow(key);
                 }
                 if (capturing && !PinDirectPtxKernelForCapture(
@@ -1527,7 +1527,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 var key = new DirectPtxFusedLinearKey(inputFeatures, outputFeatures);
                 if (!_directPtxQuantizedLinearKernels.TryGetValue(key, out _))
                     _ = CreateAndCacheQuantizedLinearKernelSlow(key);
@@ -1635,7 +1635,7 @@ public sealed partial class CudaBackend
                             "Direct PTX fused linear must be prewarmed before CUDA graph capture.";
                         return false;
                     }
-                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                     kernel = CreateAndCacheFusedLinearKernelSlow(key);
                 }
                 // CUDA graph executables retain the CUfunction after capture.
@@ -1706,7 +1706,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 _ = GetOrCreateFusedLinearKernel(
                     new DirectPtxFusedLinearKey(inputFeatures, outputFeatures));
             }
@@ -1923,7 +1923,7 @@ public sealed partial class CudaBackend
                     return false;
                 }
 
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
 
                 if (!_directPtxAttentionPlans.TryGetValue(planKey, out int selectedWarps))
                     selectedWarps = ResolveAttentionPlanSlow(
@@ -2156,7 +2156,7 @@ public sealed partial class CudaBackend
                     DirectPtxLastError = "Direct PTX decode must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 PtxFusedDecodeAttentionD64Kernel kernel = GetOrCreateDecodeKernel(keyShape, scale);
                 lock (GpuDispatchLock)
                 {
@@ -2230,7 +2230,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 var key = new DirectPtxDecodeKey(
                     isPaged, queryHeads, keyValueHeads, sequenceLength,
                     blockSize, poolBlocks, PtxCompat.SingleToInt32Bits(scale));
@@ -2342,7 +2342,7 @@ public sealed partial class CudaBackend
                     DirectPtxLastError = "Direct PTX paged prefill must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 PtxFusedPagedPrefillAttentionD64Kernel kernel = GetOrCreatePagedPrefillKernel(key, scale);
                 lock (GpuDispatchLock)
                     kernel.Launch(
@@ -2404,7 +2404,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 var key = new DirectPtxPagedPrefillKey(
                     queryHeads, keyValueHeads, queryCount, startPosition,
                     blockSize, poolBlocks, PtxCompat.SingleToInt32Bits(scale));
@@ -2549,7 +2549,7 @@ public sealed partial class CudaBackend
                         "Direct PTX FlashAttention backward must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 PtxFlashAttentionBackwardD64Kernel kernel =
                     GetOrCreateFlashAttentionBackwardKernel(keyShape, scale);
                 DirectPtxTensorView? biasView = attentionBias is null
@@ -2619,7 +2619,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 var key = new DirectPtxFlashAttentionBackwardKey(
                     batch, heads, querySequence, keyValueSequence, isCausal,
                     PtxCompat.SingleToInt32Bits(scale), biasBatchStride);
@@ -2748,7 +2748,7 @@ public sealed partial class CudaBackend
                         "Direct PTX attention backward must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 PtxFusedAttentionBackwardD64Kernel kernel =
                     GetOrCreateAttentionBackwardKernel(keyShape, scale);
                 lock (GpuDispatchLock)
@@ -2812,7 +2812,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 var key = new DirectPtxAttentionBackwardKey(
                     batch, queryHeads, keyValueHeads, querySequence, keyValueSequence,
                     PtxCompat.SingleToInt32Bits(scale));
@@ -2976,7 +2976,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 var plan = new DirectPtxAttentionPlanKey(
                     batch, queryHeads, keyValueHeads, querySequence, keyValueSequence,
                     isCausal, causalQueryOffset, fuseLayerNormGelu, emitSoftmaxStats,
@@ -3031,7 +3031,7 @@ public sealed partial class CudaBackend
                     return false;
                 }
 
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 PtxFusedResidualRmsNormD64Kernel kernel;
                 if (!_directPtxResidualRmsNormKernels.TryGetValue(key, out kernel))
                     kernel = CreateAndCacheResidualRmsNormKernel(key, rows, epsilon);
@@ -3064,7 +3064,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 var key = new DirectPtxResidualRmsNormKey(rows, PtxCompat.SingleToInt32Bits(epsilon));
                 if (!_directPtxResidualRmsNormKernels.TryGetValue(key, out _))
                     _ = CreateAndCacheResidualRmsNormKernel(key, rows, epsilon);
@@ -3175,7 +3175,7 @@ public sealed partial class CudaBackend
                             "Direct PTX residual LayerNorm+GELU must be prewarmed before CUDA graph capture.";
                         return false;
                     }
-                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                     kernel = CreateAndCacheResidualLayerNormGeluKernelSlow(key);
                 }
                 if (capturing && !PinDirectPtxKernelForCapture(_directPtxResidualLayerNormGeluKernels, key))
@@ -3271,7 +3271,7 @@ public sealed partial class CudaBackend
                             "Direct PTX SwiGLU must be prewarmed before CUDA graph capture.";
                         return false;
                     }
-                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                     kernel = CreateAndCacheSwiGluKernelSlow(key);
                 }
                 if (capturing && !PinDirectPtxKernelForCapture(
@@ -3343,7 +3343,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 var key = new DirectPtxSwiGluKey(outerSize, halfDimension);
                 if (!_directPtxSwiGluKernels.TryGetValue(key, out _))
                     _ = CreateAndCacheSwiGluKernelSlow(key);
@@ -3439,7 +3439,7 @@ public sealed partial class CudaBackend
                             "Direct PTX GeGLU must be prewarmed before CUDA graph capture.";
                         return false;
                     }
-                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                     kernel = CreateAndCacheGeGluKernelSlow(key);
                 }
                 if (capturing && !PinDirectPtxKernelForCapture(
@@ -3511,7 +3511,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 var key = new DirectPtxSwiGluKey(outerSize, halfDimension);
                 if (!_directPtxGeGluKernels.TryGetValue(key, out _))
                     _ = CreateAndCacheGeGluKernelSlow(key);
@@ -3609,7 +3609,7 @@ public sealed partial class CudaBackend
                             "Direct PTX GeGLU backward must be prewarmed before CUDA graph capture.";
                         return false;
                     }
-                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                     kernel = CreateAndCacheGeGluBackwardKernelSlow(key);
                 }
                 if (capturing && !PinDirectPtxKernelForCapture(
@@ -3682,7 +3682,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 var key = new DirectPtxSwiGluKey(outerSize, halfDimension);
                 if (!_directPtxGeGluBackwardKernels.TryGetValue(key, out _))
                     _ = CreateAndCacheGeGluBackwardKernelSlow(key);
@@ -3764,7 +3764,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 var key = new DirectPtxResidualRmsNormKey(
                     rows, PtxCompat.SingleToInt32Bits(epsilon));
                 if (!_directPtxResidualLayerNormGeluKernels.TryGetValue(key, out _))
@@ -4012,7 +4012,7 @@ public sealed partial class CudaBackend
                         "Direct PTX channel normalization must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 if (!_directPtxChannelNormalizationKernels.TryGetValue(inputKey, out var inputKernel))
                     inputKernel = CreateAndCacheChannelNormalizationKernelSlow(inputKey);
                 if (!_directPtxChannelNormalizationKernels.TryGetValue(parameterKey, out var parameterKernel))
@@ -4095,7 +4095,7 @@ public sealed partial class CudaBackend
                             "Direct PTX channel normalization must be prewarmed before CUDA graph capture.";
                         return false;
                     }
-                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                     kernel = CreateAndCacheChannelNormalizationKernelSlow(key);
                 }
                 if (capturing && !PinDirectPtxKernelForCapture(_directPtxChannelNormalizationKernels, key))
@@ -4209,7 +4209,7 @@ public sealed partial class CudaBackend
                 DirectPtxChannelNormalizationKey.Create(operation, epsilon, momentum);
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 if (!_directPtxChannelNormalizationKernels.TryGetValue(key, out _))
                     _ = CreateAndCacheChannelNormalizationKernelSlow(key);
             }
@@ -4383,7 +4383,7 @@ public sealed partial class CudaBackend
                         "Direct PTX normalization backward pair must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 if (!hasInput)
                     _ = CreateAndCacheRowNormalizationKernelSlow(inputKey);
                 if (!hasParameters)
@@ -4508,7 +4508,7 @@ public sealed partial class CudaBackend
                             "Direct PTX normalization must be prewarmed before CUDA graph capture.";
                         return false;
                     }
-                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                     kernel = CreateAndCacheRowNormalizationKernelSlow(key);
                 }
                 if (capturing && !PinDirectPtxKernelForCapture(_directPtxRowNormalizationKernels, key))
@@ -4645,7 +4645,7 @@ public sealed partial class CudaBackend
                 operation, rows, PtxCompat.SingleToInt32Bits(epsilon));
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 if (!_directPtxRowNormalizationKernels.TryGetValue(key, out _))
                     _ = CreateAndCacheRowNormalizationKernelSlow(key);
                 if (PtxRowNormalizationD64Kernel.RequiresPersistentWorkspace(operation))
@@ -4856,7 +4856,7 @@ public sealed partial class CudaBackend
                             "Direct PTX cast must be prewarmed before CUDA graph capture.";
                         return false;
                     }
-                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                     kernel = CreateAndCacheCastFp16KernelSlow(key);
                 }
                 if (capturing && !_directPtxCastFp16Kernels.Pin(key))
@@ -4932,7 +4932,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 var key = new DirectPtxCastFp16Key(size);
                 if (!_directPtxCastFp16Kernels.TryGetValue(key, out _))
                     _ = CreateAndCacheCastFp16KernelSlow(key);
@@ -5028,7 +5028,7 @@ public sealed partial class CudaBackend
                             "Direct PTX widening cast must be prewarmed before CUDA graph capture.";
                         return false;
                     }
-                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                     kernel = CreateAndCacheCastFp32KernelSlow(key);
                 }
                 if (capturing && !_directPtxCastFp32Kernels.Pin(key))
@@ -5098,7 +5098,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 var key = new DirectPtxCastFp32Key(size);
                 if (!_directPtxCastFp32Kernels.TryGetValue(key, out _))
                     _ = CreateAndCacheCastFp32KernelSlow(key);
@@ -5197,7 +5197,7 @@ public sealed partial class CudaBackend
                             "Direct PTX transpose must be prewarmed before CUDA graph capture.";
                         return false;
                     }
-                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                     kernel = CreateAndCacheTranspose2DKernelSlow(key);
                 }
                 if (capturing && !_directPtxTranspose2DKernels.Pin(key))
@@ -5267,7 +5267,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 var key = new DirectPtxTranspose2DKey(rows, columns);
                 if (!_directPtxTranspose2DKernels.TryGetValue(key, out _))
                     _ = CreateAndCacheTranspose2DKernelSlow(key);
@@ -5389,7 +5389,7 @@ public sealed partial class CudaBackend
                             "Direct PTX row-sum must be prewarmed before CUDA graph capture.";
                         return false;
                     }
-                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                     kernel = CreateAndCacheRowReduceKernelSlow(key);
                 }
                 lock (GpuDispatchLock)
@@ -5454,7 +5454,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 var key = new DirectPtxRowReduceKey(rows, columns);
                 if (!_directPtxRowReduceKernels.TryGetValue(key, out _))
                     _ = CreateAndCacheRowReduceKernelSlow(key);
@@ -5547,7 +5547,7 @@ public sealed partial class CudaBackend
                             "Direct PTX L2-normalize must be prewarmed before CUDA graph capture.";
                         return false;
                     }
-                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                     kernel = CreateAndCacheRowL2NormalizeKernelSlow(key);
                 }
                 lock (GpuDispatchLock)
@@ -5692,7 +5692,7 @@ public sealed partial class CudaBackend
                             "Direct PTX row reduction must be prewarmed before CUDA graph capture.";
                         return false;
                     }
-                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                     kernel = CreateAndCacheRowReduceOpKernelSlow(key);
                 }
                 if (capturing && !_directPtxRowReduceOpKernels.Pin(key))
@@ -5768,7 +5768,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 var key = new DirectPtxRowReduceOpKey(op, rows, columns);
                 if (!_directPtxRowReduceOpKernels.TryGetValue(key, out _))
                     _ = CreateAndCacheRowReduceOpKernelSlow(key);
@@ -5871,7 +5871,7 @@ public sealed partial class CudaBackend
                             "Direct PTX gather must be prewarmed before CUDA graph capture.";
                         return false;
                     }
-                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                     kernel = CreateAndCacheGatherKernelSlow(key);
                 }
                 if (capturing && !_directPtxGatherKernels.Pin(key))
@@ -5946,7 +5946,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 var key = new DirectPtxGatherKey(numIndices, featureSize);
                 if (!_directPtxGatherKernels.TryGetValue(key, out _))
                     _ = CreateAndCacheGatherKernelSlow(key);
@@ -6059,7 +6059,7 @@ public sealed partial class CudaBackend
                             "Direct PTX MSE loss must be prewarmed before CUDA graph capture.";
                         return false;
                     }
-                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                     kernel = CreateAndCacheMseLossKernelSlow(key);
                 }
                 // A graph executable retains this CUfunction after capture. Pin
@@ -6131,7 +6131,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 var key = new DirectPtxMseLossKey(rows, columns);
                 if (!_directPtxMseLossKernels.TryGetValue(key, out _))
                     _ = CreateAndCacheMseLossKernelSlow(key);
@@ -6235,7 +6235,7 @@ public sealed partial class CudaBackend
                             "Direct PTX SGD-momentum must be prewarmed before CUDA graph capture.";
                         return false;
                     }
-                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                     kernel = CreateAndCacheSgdMomentumKernelSlow(key);
                 }
                 if (capturing &&
@@ -6368,7 +6368,7 @@ public sealed partial class CudaBackend
                             "Direct PTX global average pool must be prewarmed before CUDA graph capture.";
                         return false;
                     }
-                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                     kernel = CreateAndCacheGlobalAvgPoolKernelSlow(key);
                 }
                 // CaptureGraph-owned captures must acquire through the active
@@ -6438,7 +6438,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 var key = new DirectPtxGlobalAvgPoolKey(rows, spatial);
                 if (!_directPtxGlobalAvgPoolKernels.TryGetValue(key, out _))
                     _ = CreateAndCacheGlobalAvgPoolKernelSlow(key);
@@ -6572,7 +6572,7 @@ public sealed partial class CudaBackend
                             "Direct PTX complex multiply must be prewarmed before CUDA graph capture.";
                         return false;
                     }
-                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                     kernel = CreateAndCacheComplexMultiplyKernelSlow(key);
                 }
                 // Pin() is the permanent pin for captures the cache cannot observe.
@@ -6629,7 +6629,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 var key = new DirectPtxComplexMultiplyKey(numPairs);
                 if (!_directPtxComplexMultiplyKernels.TryGetValue(key, out _))
                     _ = CreateAndCacheComplexMultiplyKernelSlow(key);
@@ -6677,6 +6677,7 @@ public sealed partial class CudaBackend
         lock (_directPtxLock)
         {
             ReleaseAllDirectPtxGraphPins();
+            RetireAllGraphMemoryPools();
             _directPtxAttentionKernels.Dispose();
             _directPtxAttentionPlans.Clear();
             _directPtxResidualRmsNormKernels.Dispose();

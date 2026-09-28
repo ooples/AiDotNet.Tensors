@@ -105,7 +105,7 @@ public sealed partial class CudaBackend
                             "Direct PTX strided-dot kernel must be prewarmed before CUDA graph capture.";
                         return false;
                     }
-                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                     kernel = CreateAndCacheDirectPtxStridedDotKernelSlow(key);
                 }
                 if (capturing && !PinDirectPtxKernelForCapture(_directPtxStridedDotKernels, key))
@@ -181,7 +181,7 @@ public sealed partial class CudaBackend
                             "Direct PTX dense-vector kernel must be prewarmed before CUDA graph capture.";
                         return false;
                     }
-                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                     kernel = CreateAndCacheDirectPtxDenseVectorKernelSlow(key);
                 }
                 if (capturing && !PinDirectPtxKernelForCapture(_directPtxDenseVectorKernels, key))
@@ -257,7 +257,7 @@ public sealed partial class CudaBackend
                             "Direct PTX batched-vector kernel must be prewarmed before CUDA graph capture.";
                         return false;
                     }
-                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                     kernel = CreateAndCacheDirectPtxBatchedVectorKernelSlow(key);
                 }
                 if (capturing && !PinDirectPtxKernelForCapture(_directPtxBatchedVectorKernels, key))
@@ -299,7 +299,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 var key = new DirectPtxDenseVectorKey((int)operation, m, n);
                 if (!_directPtxDenseVectorKernels.TryGetValue(key, out _))
                     _ = CreateAndCacheDirectPtxDenseVectorKernelSlow(key);
@@ -335,7 +335,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 var key = new DirectPtxBatchedVectorKey((int)operation, batch, m, n);
                 if (!_directPtxBatchedVectorKernels.TryGetValue(key, out _))
                     _ = CreateAndCacheDirectPtxBatchedVectorKernelSlow(key);
@@ -371,7 +371,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 var key = new DirectPtxStridedDotKey(aSize, bSize, bOffset, bStep);
                 if (!_directPtxStridedDotKernels.TryGetValue(key, out _))
                     _ = CreateAndCacheDirectPtxStridedDotKernelSlow(key);

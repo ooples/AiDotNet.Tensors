@@ -973,7 +973,29 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// _data array may be empty/stale until explicitly synchronized.
     /// This is the PyTorch-equivalent of tensor.data_ptr() on a CUDA tensor.
     /// </summary>
-    internal Engines.DirectGpu.IGpuBuffer? _gpuBuffer;
+    internal Engines.DirectGpu.IGpuBuffer? _gpuBuffer
+    {
+        get => CoversWholeVector ? _data._deviceState?.Buffer : _viewGpuBuffer;
+        set
+        {
+            if (CoversWholeVector) _data.DeviceState.Buffer = value;
+            else _viewGpuBuffer = value;
+        }
+    }
+
+    // A strided/offset view's own contiguous device copy. Such a view does not share the vector's layout, so its
+    // device buffer can't be the shared one (see VectorDeviceState).
+    private Engines.DirectGpu.IGpuBuffer? _viewGpuBuffer;
+    private Engines.DirectGpu.IDirectGpuBackend? _viewGpuBackend;
+    private int _viewGpuBufferVersion = -1;
+    private bool _viewGpuBufferIsSplitComplex;
+    private bool _viewGpuBufferContainsRawInt32;
+
+    /// <summary>
+    /// True when this tensor covers its whole data vector in the vector's own layout (contiguous, offset 0, same
+    /// length), so its device copy IS the vector's shared one.
+    /// </summary>
+    private bool CoversWholeVector => IsContiguous && _storageOffset == 0 && _data is not null && Length == _data.Length;
 
     /// <summary>
     /// True when <see cref="_gpuBuffer"/> stores a logical <c>Tensor&lt;Complex&lt;T&gt;&gt;</c>
@@ -982,19 +1004,43 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// elements. Direct GPU complex operations use this marker to split the planes
     /// with device-to-device copies instead of materializing the tensor on the host.
     /// </summary>
-    internal bool _gpuBufferIsSplitComplex;
+    internal bool _gpuBufferIsSplitComplex
+    {
+        get => CoversWholeVector ? _data._deviceState?.IsSplitComplex ?? false : _viewGpuBufferIsSplitComplex;
+        set
+        {
+            if (CoversWholeVector) _data.DeviceState.IsSplitComplex = value;
+            else _viewGpuBufferIsSplitComplex = value;
+        }
+    }
 
     /// <summary>
     /// True when a logical <c>Tensor&lt;int&gt;</c> is backed by raw int32 device storage rather
     /// than the numeric-float index representation used by general index-producing kernels.
     /// Pooling kernels use raw int32 because their backward kernels consume the same buffer.
     /// </summary>
-    internal bool _gpuBufferContainsRawInt32;
+    internal bool _gpuBufferContainsRawInt32
+    {
+        get => CoversWholeVector ? _data._deviceState?.ContainsRawInt32 ?? false : _viewGpuBufferContainsRawInt32;
+        set
+        {
+            if (CoversWholeVector) _data.DeviceState.ContainsRawInt32 = value;
+            else _viewGpuBufferContainsRawInt32 = value;
+        }
+    }
 
     /// <summary>
     /// Backend that owns the GPU buffer. Required for downloading data to CPU.
     /// </summary>
-    internal Engines.DirectGpu.IDirectGpuBackend? _gpuBackend;
+    internal Engines.DirectGpu.IDirectGpuBackend? _gpuBackend
+    {
+        get => CoversWholeVector ? _data._deviceState?.Backend : _viewGpuBackend;
+        set
+        {
+            if (CoversWholeVector) _data.DeviceState.Backend = value;
+            else _viewGpuBackend = value;
+        }
+    }
 
     /// <summary>
     /// Version counter at the time <see cref="_gpuBuffer"/> was last uploaded.
@@ -1005,7 +1051,21 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// tests perturb input[i] in place, then re-call forward — the second
     /// call must see the mutated data).
     /// </summary>
-    internal int _gpuBufferVersion = -1;
+    /// <remarks>
+    /// Kept as a version number for the existing call sites, but the truth is <see cref="VectorDeviceState.DeviceValid"/>:
+    /// reading gives <see cref="Version"/> while the shared device copy is current (else -1), and assigning this
+    /// tensor's own <see cref="Version"/> marks it current (anything else marks it stale). Views of one vector
+    /// therefore agree on whether its device copy is current, which per-tensor version stamps could not.
+    /// </remarks>
+    internal int _gpuBufferVersion
+    {
+        get => CoversWholeVector ? (_data._deviceState is { DeviceValid: true, Buffer: not null } ? Version : -1) : _viewGpuBufferVersion;
+        set
+        {
+            if (CoversWholeVector) _data.DeviceState.DeviceValid = value == Version && value >= 0;
+            else _viewGpuBufferVersion = value;
+        }
+    }
 
     /// <summary>
     /// Issue #338: reference count of active <see cref="Engines.Autodiff.GradientTape{T}"/>
@@ -1299,6 +1359,10 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     internal void IncrementVersion()
     {
         _storage.IncrementGpuCacheVersionIfTracked();
+        // A host-side mutation leaves the shared device copy stale, for every view of this vector. (Under inference
+        // mode the version does not advance, which used to leave a stale device copy looking current.)
+        if (CoversWholeVector) { if (_data._deviceState is { } shared) shared.DeviceValid = false; }
+        else _viewGpuBufferVersion = -1;
         if (Engines.Autodiff.InferenceModeFlag.IsActive)
         {
             // Inference mode: in-place mutation is legal and the

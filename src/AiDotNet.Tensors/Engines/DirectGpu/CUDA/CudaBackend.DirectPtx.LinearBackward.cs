@@ -78,7 +78,7 @@ public sealed partial class CudaBackend
                             "Direct PTX fused-linear backward must be prewarmed before CUDA graph capture.";
                         return false;
                     }
-                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                     kernel = CreateAndCacheDirectPtxLinearBackwardKernelSlow(key);
                 }
                 if (capturing && !PinDirectPtxKernelForCapture(_directPtxLinearBackwardKernels, key))
@@ -126,7 +126,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 var key = new DirectPtxLinearBackwardKey(m, k, n, (int)activation);
                 if (!_directPtxLinearBackwardKernels.TryGetValue(key, out _))
                     _ = CreateAndCacheDirectPtxLinearBackwardKernelSlow(key);

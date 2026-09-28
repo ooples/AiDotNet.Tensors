@@ -15,7 +15,11 @@ internal sealed class DirectPtxRuntime : IDisposable
     [ThreadStatic] private static IntPtr s_scopedContext;
     [ThreadStatic] private static int s_scopeDepth;
     private IntPtr _context;
-    private readonly IntPtr _stream;
+    private IntPtr _ownStream;
+    // Borrowed mode follows the owner's CURRENT stream (a backend's capture side stream while its thread captures,
+    // else its compute stream) instead of freezing whichever stream was current when the runtime was created.
+    private readonly Func<IntPtr>? _borrowedStream;
+    private IntPtr _stream => _borrowedStream is null ? _ownStream : _borrowedStream();
     private readonly bool _ownsContext;
     private readonly bool _ownsStream;
     private bool _disposed;
@@ -74,7 +78,7 @@ internal sealed class DirectPtxRuntime : IDisposable
         // in the legacy default-stream ordering domain. A blocking stream preserves
         // copy-before-launch ordering; CU_STREAM_NON_BLOCKING would be independent
         // and can let a freshly launched block observe pre-upload allocation contents.
-        Check(CudaNativeBindings.cuStreamCreate(out _stream, CudaNativeBindings.CU_STREAM_DEFAULT),
+        Check(CudaNativeBindings.cuStreamCreate(out _ownStream, CudaNativeBindings.CU_STREAM_DEFAULT),
             "cuStreamCreate(blocking)");
         _ownsStream = true;
         // cuCtxCreate makes the context current. Detach it so every operation
@@ -111,12 +115,18 @@ internal sealed class DirectPtxRuntime : IDisposable
     /// generated modules, events, and launches all share one ordering domain.
     /// </summary>
     internal DirectPtxRuntime(IntPtr borrowedContext, IntPtr borrowedStream)
+        : this(borrowedContext, () => borrowedStream)
+    {
+    }
+
+    /// <summary>Non-owning runtime whose launches go to <paramref name="currentStream"/>'s value at each launch.</summary>
+    internal DirectPtxRuntime(IntPtr borrowedContext, Func<IntPtr> currentStream)
     {
         if (borrowedContext == IntPtr.Zero)
             throw new ArgumentException("A borrowed CUDA context cannot be null.", nameof(borrowedContext));
 
         _context = borrowedContext;
-        _stream = borrowedStream;
+        _borrowedStream = currentStream ?? throw new ArgumentNullException(nameof(currentStream));
         _ownsContext = false;
         _ownsStream = false;
 

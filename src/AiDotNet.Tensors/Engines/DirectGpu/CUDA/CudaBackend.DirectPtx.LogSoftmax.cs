@@ -55,7 +55,7 @@ public sealed partial class CudaBackend
                         DirectPtxLastError = "Direct PTX log-softmax must be prewarmed before CUDA graph capture.";
                         return false;
                     }
-                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                     kernel = CreateAndCacheLogSoftmaxKernelSlow(key);
                 }
                 if (capturing && !_directPtxLogSoftmaxKernels.Pin(key))
@@ -100,7 +100,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 var key = new DirectPtxLogSoftmaxKey(m, n);
                 if (!_directPtxLogSoftmaxKernels.TryGetValue(key, out _))
                     _ = CreateAndCacheLogSoftmaxKernelSlow(key);

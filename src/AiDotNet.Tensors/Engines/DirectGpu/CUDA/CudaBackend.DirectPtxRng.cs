@@ -101,7 +101,7 @@ public sealed partial class CudaBackend : IPhiloxBiasDropoutBackend, ICategorica
                         "Direct PTX fused RReLU must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 PtxFusedPhiloxRreluF32Kernel kernel =
                     GetOrCreateFusedRreluKernel(elementCount);
                 if (capturing && !_directPtxFusedRreluKernels.Pin(elementCount))
@@ -197,7 +197,7 @@ public sealed partial class CudaBackend : IPhiloxBiasDropoutBackend, ICategorica
                         "Direct PTX saved-noise RReLU must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 PtxRreluF32Kernel kernel = GetOrCreateRreluKernel(key);
                 if (capturing && !_directPtxRreluKernels.Pin(key))
                     throw new InvalidOperationException(
@@ -245,7 +245,7 @@ public sealed partial class CudaBackend : IPhiloxBiasDropoutBackend, ICategorica
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 _ = GetOrCreateFusedRreluKernel(elementCount);
             }
             DirectPtxLastError = null;
@@ -272,7 +272,7 @@ public sealed partial class CudaBackend : IPhiloxBiasDropoutBackend, ICategorica
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 var key = new DirectPtxRreluKey(kind, elementCount);
                 _ = GetOrCreateRreluKernel(key);
             }
@@ -352,7 +352,7 @@ public sealed partial class CudaBackend : IPhiloxBiasDropoutBackend, ICategorica
                         "Direct PTX dropout backward must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 PtxDropoutBackwardF32Kernel kernel =
                     GetOrCreateDropoutBackwardKernel(elementCount);
                 if (capturing && !_directPtxDropoutBackwardKernels.Pin(elementCount))
@@ -393,7 +393,7 @@ public sealed partial class CudaBackend : IPhiloxBiasDropoutBackend, ICategorica
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 _ = GetOrCreateDropoutBackwardKernel(elementCount);
             }
             DirectPtxLastError = null;
@@ -462,7 +462,7 @@ public sealed partial class CudaBackend : IPhiloxBiasDropoutBackend, ICategorica
                         "Direct PTX Gumbel-softmax must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 PtxFusedGumbelSoftmax32F32Kernel kernel =
                     GetOrCreateGumbelSoftmaxKernel(outerSize);
                 if (capturing && !_directPtxGumbelSoftmaxKernels.Pin(outerSize))
@@ -503,7 +503,7 @@ public sealed partial class CudaBackend : IPhiloxBiasDropoutBackend, ICategorica
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 _ = GetOrCreateGumbelSoftmaxKernel(outerSize);
             }
             DirectPtxLastError = null;
@@ -584,7 +584,7 @@ public sealed partial class CudaBackend : IPhiloxBiasDropoutBackend, ICategorica
                         "Direct PTX importance sampling must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 PtxFusedImportanceSampling64F32Kernel kernel =
                     GetOrCreateImportanceSamplingKernel(numRays);
                 if (capturing && !_directPtxImportanceSamplingKernels.Pin(numRays))
@@ -630,7 +630,7 @@ public sealed partial class CudaBackend : IPhiloxBiasDropoutBackend, ICategorica
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 _ = GetOrCreateImportanceSamplingKernel(numRays);
             }
             DirectPtxLastError = null;
@@ -726,7 +726,7 @@ public sealed partial class CudaBackend : IPhiloxBiasDropoutBackend, ICategorica
                         "Direct PTX bias-dropout must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 PtxFusedBiasPhiloxDropout256F32Kernel kernel =
                     GetOrCreateBiasDropoutKernel(rows);
                 if (capturing && !_directPtxBiasDropoutKernels.Pin(rows))
@@ -769,7 +769,7 @@ public sealed partial class CudaBackend : IPhiloxBiasDropoutBackend, ICategorica
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 _ = GetOrCreateBiasDropoutKernel(rows);
             }
             DirectPtxLastError = null;
@@ -859,7 +859,7 @@ public sealed partial class CudaBackend : IPhiloxBiasDropoutBackend, ICategorica
                         "Direct PTX DDIM step must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 PtxFusedDdimStepF32Kernel kernel = GetOrCreateDdimKernel(elementCount);
                 if (capturing && !_directPtxDdimKernels.Pin(elementCount))
                     throw new InvalidOperationException(
@@ -900,7 +900,7 @@ public sealed partial class CudaBackend : IPhiloxBiasDropoutBackend, ICategorica
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 _ = GetOrCreateDdimKernel(elementCount);
             }
             DirectPtxLastError = null;
@@ -970,7 +970,7 @@ public sealed partial class CudaBackend : IPhiloxBiasDropoutBackend, ICategorica
                         "Direct PTX categorical sampling must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 PtxPhiloxCategorical32F32Kernel kernel = GetOrCreateCategoricalKernel(rows);
                 if (capturing && !_directPtxCategoricalKernels.Pin(rows))
                     throw new InvalidOperationException(
@@ -1008,7 +1008,7 @@ public sealed partial class CudaBackend : IPhiloxBiasDropoutBackend, ICategorica
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 _ = GetOrCreateCategoricalKernel(rows);
             }
             DirectPtxLastError = null;
@@ -1085,7 +1085,7 @@ public sealed partial class CudaBackend : IPhiloxBiasDropoutBackend, ICategorica
                         "Direct PTX Gumbel-softmax backward must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 PtxGumbelSoftmaxBackward32F32Kernel kernel =
                     GetOrCreateGumbelBackwardKernel(rows);
                 if (capturing && !_directPtxGumbelBackwardKernels.Pin(rows))
@@ -1125,7 +1125,7 @@ public sealed partial class CudaBackend : IPhiloxBiasDropoutBackend, ICategorica
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 _ = GetOrCreateGumbelBackwardKernel(rows);
             }
             DirectPtxLastError = null;
@@ -1206,7 +1206,7 @@ public sealed partial class CudaBackend : IPhiloxBiasDropoutBackend, ICategorica
                     DirectPtxLastError = "Direct PTX RNG fill must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 PtxPhiloxFillF32Kernel kernel = GetOrCreateRngFillKernel(key);
                 if (capturing && !_directPtxRngFillKernels.Pin(key))
                     throw new InvalidOperationException(
@@ -1280,7 +1280,7 @@ public sealed partial class CudaBackend : IPhiloxBiasDropoutBackend, ICategorica
                     DirectPtxLastError = "Direct PTX RNG mask must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 PtxPhiloxFillF32Kernel kernel = GetOrCreateRngFillKernel(key);
                 if (capturing && !_directPtxRngFillKernels.Pin(key))
                     throw new InvalidOperationException(
@@ -1353,7 +1353,7 @@ public sealed partial class CudaBackend : IPhiloxBiasDropoutBackend, ICategorica
                         "Direct PTX RNG/dropout must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 PtxFusedPhiloxDropoutF32Kernel kernel = GetOrCreateRngDropoutKernel(key);
                 if (capturing && !_directPtxRngDropoutKernels.Pin(key))
                     throw new InvalidOperationException(
@@ -1407,7 +1407,7 @@ public sealed partial class CudaBackend : IPhiloxBiasDropoutBackend, ICategorica
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 _ = GetOrCreateRngDropoutKernel(new DirectPtxRngDropoutKey(elementCount));
             }
             DirectPtxLastError = null;
@@ -1467,7 +1467,7 @@ public sealed partial class CudaBackend : IPhiloxBiasDropoutBackend, ICategorica
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 _ = GetOrCreateRngFillKernel(new DirectPtxRngFillKey(kind, elementCount));
             }
             DirectPtxLastError = null;

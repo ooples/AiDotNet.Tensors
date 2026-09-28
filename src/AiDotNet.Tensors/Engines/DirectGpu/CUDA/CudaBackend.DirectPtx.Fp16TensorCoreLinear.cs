@@ -107,7 +107,7 @@ public sealed partial class CudaBackend
                         "Direct PTX FP16 Tensor-Core linear must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 if (!_directPtxFp16TensorCoreLinearPlans.TryGetValue(
                         plan, out int outputsPerBlock))
                     outputsPerBlock = ResolveFp16TensorCoreLinearPlanSlow(
@@ -176,7 +176,7 @@ public sealed partial class CudaBackend
                 inputFeatures, outputFeatures);
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
                 int outputsPerBlock = DirectPtxDenseLinearAutotuner.DefaultCandidate(
                     inputFeatures, outputFeatures);
                 if (DirectPtxFeatureGate.IsAutotuneEnabled &&

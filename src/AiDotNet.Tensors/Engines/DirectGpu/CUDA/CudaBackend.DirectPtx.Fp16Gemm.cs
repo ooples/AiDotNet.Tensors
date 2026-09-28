@@ -206,7 +206,7 @@ public sealed partial class CudaBackend
         if (capturing)
             throw new DirectPtxPrewarmRequiredException(
                 "Direct PTX 16-bit GEMM must be prewarmed before CUDA graph capture.");
-        _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+        _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
         return CreateAndCacheDirectPtxFp16GemmKernelSlow(
             key, inputType, outputType);
     }

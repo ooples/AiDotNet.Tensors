@@ -106,7 +106,21 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     internal bool HasWhereSelectKernel => _kernelCache.ContainsKey("where_select");
     private IntPtr _cudaContext;
     private int _cuDevice;   // the CUdevice whose primary context this backend holds
-    private IntPtr _stream;
+    private IntPtr _computeStream;
+
+    // CUDA-graph capture runs on a SIDE stream of this backend, entered only by the capturing thread (PyTorch's
+    // torch.cuda.graph pattern). Capturing the compute stream itself made every OTHER thread using this backend fail
+    // with 900 or leak its work into the graph -- measured as intermittent failures of tests that share the default
+    // engine while a compiled plan captures. Every launch in this file reads `_stream`, so routing it here moves the
+    // capturing thread's whole launch sequence onto the side stream and leaves everyone else on the compute stream.
+    private IntPtr _captureStream;
+    [ThreadStatic] private static CudaBackend? t_capturingBackend;
+
+    /// <summary>
+    /// The stream this thread's work goes to: the capture side stream while this thread is capturing on this
+    /// backend, else the compute stream.
+    /// </summary>
+    private IntPtr _stream => ReferenceEquals(t_capturingBackend, this) && _captureStream != IntPtr.Zero ? _captureStream : _computeStream;
 
     // #226 CONCURRENCY FIX — PER-THREAD cuBLAS HANDLE (instance-scoped).
     // A cuBLAS handle is NOT thread-safe: NVIDIA requires one handle per host thread (the handle carries
@@ -123,7 +137,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     // a pool thread would still hold that engine's now-dangling handle and the NEXT engine would reuse it →
     // use-after-free → fatal host crash. ThreadLocal(trackAllValues:true) is scoped to THIS engine and lets
     // Dispose() enumerate every thread's handle for cublasDestroy.
-    private sealed class ThreadCublas { public IntPtr Handle; public bool IsDeterministic; }
+    private sealed class ThreadCublas { public IntPtr Handle; public bool IsDeterministic; public IntPtr Stream; }
     private ThreadLocal<ThreadCublas>? _threadCublas;
     // The default fp32 GEMM math mode chosen at init (TF32 tensor-op on Ampere+, else PEDANTIC), captured
     // so every per-thread handle applies the same mode on creation.
@@ -242,7 +256,9 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     // safe for the reason #609 made the allocator stream-ordered: every use of these buffers is ordered on _stream, so
     // a reuse is ordered after all earlier work, and an overflow still frees with cuMemFreeAsync (ReleaseCore). Never
     // during a backend capture: a captured graph keeps using a buffer's address after the host lets go of it.
-    private GpuBufferPoolAffinity AsyncPoolAffinity => GpuBufferPoolAffinity.ForNativeQueue(_stream);
+    // Keyed on the COMPUTE stream (where replays run and frees are ordered), not _stream: a buffer allocated or
+    // returned while this thread captures would otherwise land in a side-stream domain.
+    private GpuBufferPoolAffinity AsyncPoolAffinity => GpuBufferPoolAffinity.ForNativeQueue(_computeStream);
 
     private void ReturnAsyncBuffer(CudaGpuBuffer buffer)
     {
@@ -254,7 +270,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
 
     private CudaGpuBuffer? TryRentAsyncBuffer(int size)
     {
-        if (_backendStreamCaptureActive || _stream == IntPtr.Zero) return null;
+        if (_backendStreamCaptureActive || _computeStream == IntPtr.Zero) return null;
         return _bufferPool.TryRent(size, AsyncPoolAffinity, out var pooled) ? pooled : null;
     }
     // Event-based deferred buffer free (#555 / #226). A buffer evicted mid-step may still
@@ -563,7 +579,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             // modules, cuBLAS) depends on that; cuDevicePrimaryCtxRetain does not, so push it the same way.
             CuBlasNative.CheckCudaResult(CuBlasNative.cuCtxPushCurrent(_cudaContext), "cuCtxPushCurrent(primary)");
             lock (ContextLifecycleLock) AddContextHolder(_cudaContext); // a buffer may only free against a live context
-            CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamCreate(out _stream, 0), "cuStreamCreate");
+            CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamCreate(out _computeStream, 0), "cuStreamCreate");
             LiveStreams[_stream] = 0; // register: deferred finalizer frees stay stream-ordered while it's live
             _defaultStream = new CudaStream(this, _stream, GpuStreamType.Default, ownsHandle: false);
 
@@ -739,6 +755,13 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
 
     private CudaContextScope PushContext()
     {
+        // A backend used after its teardown completed would launch unloaded kernels into freed pool memory -- an
+        // illegal address (CUDA 700) that poisons the device's shared primary context for EVERY engine in the
+        // process. Fail the caller instead. (During Dispose itself the context is still held, so teardown works.)
+        if (_disposed && _cudaContext == IntPtr.Zero)
+            throw new ObjectDisposedException(nameof(CudaBackend),
+                "This CUDA backend (and the DirectGpuTensorEngine that owns it) was disposed; it can no longer run " +
+                "operations. A tensor or engine reference outlived its engine.");
         return new CudaContextScope(_cudaContext, _stream);
     }
 
@@ -1563,7 +1586,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             // Reuse a pooled stream-ordered buffer when one fits, and stage the copy so it does not block the host.
             var target = TryRentAsyncBuffer(size)
                 ?? new CudaGpuBuffer(_cudaContext, AllocDeviceMemoryAsync(byteSize), size,
-                    returnToPool: ReturnAsyncBuffer, asyncFreeStream: _stream);
+                    returnToPool: ReturnAsyncBuffer, asyncFreeStream: _computeStream);
             try
             {
                 if (TryStageUpload(target.Handle, data, byteSize))
@@ -1603,7 +1626,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             catch { target.Dispose(); throw; }
             return target;
         }
-        if (_bufferPool.TryRent(size, out var pooled) && pooled != null)
+        if (CaptureMemoryPool.Current is null && _bufferPool.TryRent(size, out var pooled) && pooled != null) // a capture never takes shared-pool memory
         {
             unsafe
             {
@@ -1877,9 +1900,9 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             CuBlasNative.CheckCudaResult(
                 CudaNativeBindings.cuMemsetD8Async(p, 0, (ulong)size * sizeof(float), _stream),
                 "cuMemsetD8Async");
-            return new CudaGpuBuffer(_cudaContext, p, size, returnToPool: ReturnAsyncBuffer, asyncFreeStream: _stream);
+            return new CudaGpuBuffer(_cudaContext, p, size, returnToPool: ReturnAsyncBuffer, asyncFreeStream: _computeStream);
         }
-        if (_bufferPool.TryRent(size, out var pooled) && pooled != null)
+        if (CaptureMemoryPool.Current is null && _bufferPool.TryRent(size, out var pooled) && pooled != null) // a capture never takes shared-pool memory
         {
             CuBlasNative.CheckCudaResult(
                 CuBlasNative.cuMemsetD32(pooled.Handle, 0, (ulong)size), // lgtm[cs/call-to-unmanaged-code] CUDA interop requires native driver calls.
@@ -1910,7 +1933,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (TryRentAsyncBuffer(size) is { } reused)
             return reused;
         var p = AllocDeviceMemoryAsync((ulong)size * sizeof(float));
-        return new CudaGpuBuffer(_cudaContext, p, size, returnToPool: ReturnAsyncBuffer, asyncFreeStream: _stream);
+        return new CudaGpuBuffer(_cudaContext, p, size, returnToPool: ReturnAsyncBuffer, asyncFreeStream: _computeStream);
     }
 
     public IGpuBuffer AllocateByteBuffer(int size)
@@ -1927,7 +1950,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (_asyncAlloc)
         {
             var pA = AllocDeviceMemoryAsync((ulong)size);
-            return new CudaGpuByteBuffer(_cudaContext, pA, size, asyncFreeStream: _stream);
+            return new CudaGpuByteBuffer(_cudaContext, pA, size, asyncFreeStream: _computeStream);
         }
         CuBlasNative.CheckCudaResult(
             CuBlasNative.cuMemAlloc(out IntPtr devicePtr, (ulong)size),
@@ -1940,7 +1963,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     // cuMemFreeAsync reclamations complete) and retry once before surfacing the error.
     private IntPtr AllocDeviceMemoryAsync(ulong byteSize)
     {
-        var r = CuBlasNative.cuMemAllocAsync(out IntPtr p, byteSize, _stream);
+        var r = CuBlasNative.cuMemAllocAsync(out IntPtr p, byteSize, _computeStream);
         if (r != CudaResult.Success && IsStreamCapturing())
         {
             // #1650/#638 capture: during stream capture cuCtxSynchronize / cuMemPoolTrimTo are ILLEGAL
@@ -1976,7 +1999,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
                     System.Diagnostics.Trace.TraceWarning(
                         $"[CudaBackend] cuMemPoolTrimTo failed during async-path OOM reclamation: {trimStatus}; the cuMemAllocAsync retry may still OOM.");
             }
-            r = CuBlasNative.cuMemAllocAsync(out p, byteSize, _stream);
+            r = CuBlasNative.cuMemAllocAsync(out p, byteSize, _computeStream);
         }
         if (r != CudaResult.Success) GpuMemoryTracker.Dump($"cuMemAllocAsync OOM requesting {byteSize} bytes");
         CuBlasNative.CheckCudaResult(r, "cuMemAllocAsync");
@@ -4682,7 +4705,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             GpuLaunchProbe.OnLaunch();
         // Same AIDOTNET_KERNEL_LAUNCH_CHECK=1 probe as the 1D path (PR #638): localize an
         // illegal-access CUDA-700 to the faulting 2D kernel (the batched FFT kernels launch here).
-        if (s_launchCheck)
+        if (s_launchCheck && !IsStreamCapturingCurrentContext())   // a capture's stream cannot be synced (900)
         {
             var sync = CudaNativeBindings.cuStreamSynchronize(_stream);
             if (sync != CudaResult.Success)
@@ -5280,15 +5303,16 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         float alphaVal = alpha;
         float betaVal = beta;
 
-        // Set cuBLAS to use the specified stream
-        CuBlasNative.CheckCublasStatus(CuBlasNative.cublasSetStream(_cublasHandle, stream.Handle), "cublasSetStream");
+        // Set cuBLAS to use the specified stream. Read the handle once: the property re-binds it to _stream.
+        IntPtr cublas = _cublasHandle;
+        CuBlasNative.CheckCublasStatus(CuBlasNative.cublasSetStream(cublas, stream.Handle), "cublasSetStream");
 
         try
         {
             // Row-major C = A * B. Use cuBLAS column-major trick: C^T = B^T * A^T.
             CuBlasNative.CheckCublasStatus(
                 CuBlasNative.cublasSgemm(
-                    _cublasHandle,
+                    cublas,
                     CublasOperation.None,
                     CublasOperation.None,
                     N, M, K,
@@ -5302,7 +5326,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         finally
         {
             // Restore the default stream
-            CuBlasNative.cublasSetStream(_cublasHandle, _stream);
+            CuBlasNative.cublasSetStream(cublas, _stream);
         }
     }
 
@@ -5730,6 +5754,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             _threadCurrentContext = ctx;
         }
         DrainPendingFinalizerFrees();
+        DrainPendingGraphDestroys();
         // Reclaim contexts leaked by undisposed engines (finalizer-deferred). Drain AFTER the buffer frees
         // so any pending free targeting one of these contexts runs first; whatever's left is reclaimed
         // wholesale by cuCtxDestroy. No-op fast path when the queue is empty (the common case).
@@ -5745,7 +5770,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     private void EnsureContextCurrentForBoundLaunch()
     {
         if (_threadCurrentContext == _cudaContext &&
-            PendingFinalizerFrees.IsEmpty && PendingContextDestroys.IsEmpty)
+            PendingFinalizerFrees.IsEmpty && PendingContextDestroys.IsEmpty && PendingGraphDestroys.IsEmpty)
             return;
         EnsureContextCurrent();
     }
@@ -5753,7 +5778,24 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     // #226 CONCURRENCY FIX: the calling thread's OWN cuBLAS handle for THIS engine (created lazily on first
     // use, bound to the shared _stream). Concurrent GEMMs from N threads no longer share one non-thread-safe
     // handle — the root cause of the sticky CUDA-700 under the parallel sweep.
-    private IntPtr _cublasHandle => (_threadCublas ??= new ThreadLocal<ThreadCublas>(CreateThreadCublas, trackAllValues: true)).Value!.Handle;
+    // The handle follows this thread's current stream (_stream): while the thread captures on the side stream its
+    // GEMMs must land in the capture, and afterwards back on the compute stream. Binding once at creation left a
+    // handle made mid-capture bound to the side stream for good (its GEMMs then raced the compute stream's
+    // stream-ordered frees) and let GEMMs issued during a capture escape the graph.
+    private IntPtr _cublasHandle
+    {
+        get
+        {
+            var tc = (_threadCublas ??= new ThreadLocal<ThreadCublas>(CreateThreadCublas, trackAllValues: true)).Value!;
+            IntPtr stream = _stream;
+            if (tc.Stream != stream)
+            {
+                CuBlasNative.CheckCublasStatus(CuBlasNative.cublasSetStream(tc.Handle, stream), "cublasSetStream(follow current stream)");
+                tc.Stream = stream;
+            }
+            return tc.Handle;
+        }
+    }
 
     // ThreadLocal factory: build this thread's cuBLAS handle for this engine. Runs on the accessing thread,
     // so we assert the engine context current first (a fresh worker thread may not have it). The handle is
@@ -5770,7 +5812,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         bool det = GpuDeterminism.IsActive;
         int initMode = det ? CuBlasNative.CUBLAS_PEDANTIC_MATH : _initGemmMathMode;
         CuBlasNative.CheckCublasStatus(CuBlasNative.cublasSetMathMode(h, initMode), "cublasSetMathMode(per-thread)");
-        return new ThreadCublas { Handle = h, IsDeterministic = det };
+        return new ThreadCublas { Handle = h, IsDeterministic = det, Stream = _stream };
     }
 
     // Device frees DEFERRED from buffer FINALIZERS. Calling the CUDA driver (cuCtxPushCurrent /
@@ -5876,7 +5918,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         // residency-probe tests (GpuLaunchProbe.Count > 0) failed on CUDA even though the kernel ran. Mirror
         // the OpenCL/Vulkan contract — increment at this single 1D-dispatch choke point.
         GpuLaunchProbe.OnLaunch();
-        if (s_launchCheck)
+        if (s_launchCheck && !IsStreamCapturingCurrentContext())   // a capture's stream cannot be synced (900)
         {
             var sync = CudaNativeBindings.cuStreamSynchronize(_stream);
             if (sync != CudaResult.Success)
@@ -9661,34 +9703,42 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (!_kernelCache.TryGetValue("copy_2d_strided", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: copy_2d_strided");
 
+        if (numRows <= 0 || srcCols <= 0) return;   // an empty grid is an invalid launch, and there is nothing to copy
         using var _ = PushContext();
 
-        // Launch configuration: srcCols x numRows grid
+        // Launch configuration: srcCols x numRows grid. gridY is capped at 65535 by the hardware (a taller copy was
+        // an invalid-value launch, e.g. TensorCartesianProd's column concat), so rows go in chunks of at most that,
+        // each chunk addressed by offsetting both base pointers to its first row.
+        const int MaxGridY = 65535;
         uint gridX = (uint)((srcCols + DefaultBlockSize - 1) / DefaultBlockSize);
-        uint gridY = (uint)numRows;
-
-        IntPtr srcPtr = source.Handle;
-        IntPtr dstPtr = destination.Handle;
+        IntPtr srcBase = source.Handle;
+        IntPtr dstBase = destination.Handle;
 
         void** args = stackalloc void*[6];
-        args[0] = &srcPtr;
-        args[1] = &dstPtr;
-        args[2] = &numRows;
-        args[3] = &srcCols;
-        args[4] = &destTotalCols;
-        args[5] = &destColOffset;
+        for (int rowStart = 0; rowStart < numRows; rowStart += MaxGridY)
+        {
+            int rows = Math.Min(MaxGridY, numRows - rowStart);
+            IntPtr srcPtr = (IntPtr)((long)srcBase + (long)rowStart * srcCols * sizeof(float));
+            IntPtr dstPtr = (IntPtr)((long)dstBase + (long)rowStart * destTotalCols * sizeof(float));
+            args[0] = &srcPtr;
+            args[1] = &dstPtr;
+            args[2] = &rows;
+            args[3] = &srcCols;
+            args[4] = &destTotalCols;
+            args[5] = &destColOffset;
 
-        CuBlasNative.CheckCudaResult(
-            CudaNativeBindings.cuLaunchKernel(
-                kernel,
-                gridX, gridY, 1,
-                (uint)DefaultBlockSize, 1, 1,
-                0,
-                _stream,
-                (IntPtr)args,
-                IntPtr.Zero),
-            "cuLaunchKernel (copy_2d_strided)");
+            CuBlasNative.CheckCudaResult(
+                CudaNativeBindings.cuLaunchKernel(
+                    kernel,
+                    gridX, (uint)rows, 1,
+                    (uint)DefaultBlockSize, 1, 1,
+                    0,
+                    _stream,
+                    (IntPtr)args,
+                    IntPtr.Zero),
+                "cuLaunchKernel (copy_2d_strided)");
             GpuLaunchProbe.OnLaunch();
+        }
     }
 
     /// <inheritdoc/>
@@ -17407,7 +17457,13 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             {
                 LiveStreams.TryRemove(_stream, out _);
                 CudaNativeBindings.cuStreamDestroy(_stream);
-                _stream = IntPtr.Zero;
+                _computeStream = IntPtr.Zero;
+                if (_captureStream != IntPtr.Zero)
+                {
+                    LiveStreams.TryRemove(_captureStream, out _);
+                    CudaNativeBindings.cuStreamDestroy(_captureStream);
+                    _captureStream = IntPtr.Zero;
+                }
             }
         }
 
@@ -18544,11 +18600,20 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         private readonly IntPtr _asyncFreeStream; // non-zero ⇒ free via cuMemFreeAsync on this stream (#558 layer 6)
         private int _poolState;
         private int _size;
+        private CaptureMemoryPool[]? _capturePins; // live captures whose graphs use this buffer (CaptureMemoryPool)
 
         public int Size => Volatile.Read(ref _size);
         public int Capacity { get; }
         public long SizeInBytes => (long)Size * sizeof(float);
-        public IntPtr Handle => _devicePtr;
+        public IntPtr Handle
+        {
+            get
+            {
+                // A capturing thread reading the pointer is handing it to captured work: pin it to that graph.
+                if (CaptureMemoryPool.Current is { } capture) capture.Pin(ref _capturePins, this);
+                return _devicePtr;
+            }
+        }
         internal bool IsAsyncFreed => _asyncFreeStream != IntPtr.Zero;
         internal IntPtr OwningContext => _context;
 
@@ -18561,7 +18626,16 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             Capacity = size;
             _returnToPool = returnToPool;
             _asyncFreeStream = asyncFreeStream;
+            if (CaptureMemoryPool.Current is { } capture)
+            {
+                capture.Pin(ref _capturePins, this);
+                _capturedAllocation = true;
+            }
         }
+
+        // Allocated during a capture: never returned to the shared pool (another rent could hand it out while a
+        // graph still replays it), always freed.
+        private readonly bool _capturedAllocation;
 
         public void MarkRented(int size)
         {
@@ -18576,6 +18650,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             // #642: while a deferred-execution scope is recording/replaying, queue the free
             // until after the graph runs — the recorded op graph still references this buffer.
             // The queued closure holds a strong ref, so GC can't reclaim it in the meantime.
+            if (CaptureMemoryPool.TryDeferRelease(Volatile.Read(ref _capturePins), Release)) return;
             if (AiDotNet.Tensors.Engines.Gpu.GpuBufferReleaseDeferral.TryDefer(ReleaseCore)) return;
             ReleaseCore();
         }
@@ -18642,13 +18717,15 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             // #642: defer the whole dispose (free OR pool-return) until the deferred-execution
             // scope finishes — returning to the pool mid-record could re-rent + overwrite a
             // buffer the recorded graph still reads. Runs normally once the gate is cleared.
+            // A captured graph's memory goes back to no pool while the graph can replay (CaptureMemoryPool).
+            if (CaptureMemoryPool.TryDeferRelease(Volatile.Read(ref _capturePins), Dispose)) return;
             if (AiDotNet.Tensors.Engines.Gpu.GpuBufferReleaseDeferral.TryDefer(DisposeCore)) return;
             DisposeCore();
         }
 
         private void DisposeCore()
         {
-            if (_returnToPool == null)
+            if (_returnToPool == null || _capturedAllocation)
             {
                 ReleaseCore();
                 return;
@@ -18689,8 +18766,17 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
 
         public int Size { get; }
         public long SizeInBytes { get; }
-        public IntPtr Handle => _devicePtr;
+        public IntPtr Handle
+        {
+            get
+            {
+                if (CaptureMemoryPool.Current is { } capture) capture.Pin(ref _capturePins, this);
+                return _devicePtr;
+            }
+        }
         internal bool IsAsyncFreed => _asyncFreeStream != IntPtr.Zero;
+
+        private CaptureMemoryPool[]? _capturePins; // live captures whose graphs use this buffer (CaptureMemoryPool)
 
         public CudaGpuByteBuffer(IntPtr context, IntPtr devicePtr, int size, IntPtr asyncFreeStream = default)
         {
@@ -18699,9 +18785,16 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             Size = size;
             SizeInBytes = size;
             _asyncFreeStream = asyncFreeStream;
+            CaptureMemoryPool.Current?.Pin(ref _capturePins, this);
         }
 
         public void Dispose()
+        {
+            if (CaptureMemoryPool.TryDeferRelease(Volatile.Read(ref _capturePins), Dispose)) return;
+            DisposeCore();
+        }
+
+        private void DisposeCore()
         {
             // Atomically CLAIM the device pointer so a concurrent finalizer can't enqueue the SAME pointer
             // for a deferred free (double-free → uncatchable 0xC0000005 in DrainPendingFinalizerFrees).

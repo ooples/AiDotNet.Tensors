@@ -391,20 +391,39 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// the NON-captured per-step work (the eager optimizer update, warmup steps, shape-mismatch eager fallbacks)
     /// into resident allocations leaks VRAM every step — nothing is evictable, so a long epoch OOMs (issue #26:
     /// canary 76 steps trained clean, a 488-step epoch OOM'd mid-epoch at two model sizes).
-    /// INSTANCE field + Interlocked (NOT [ThreadStatic]): op execution fans out to the BLAS pool threads — a
-    /// thread-local flag is invisible there, the resident branches decline, and a host download aborts the
-    /// capture (verified on the d256/L2 smoke).</summary>
-    private int _capturePathDepth;
+    /// PER EXECUTION FLOW (AsyncLocal), not per engine and not [ThreadStatic]: the plan's op execution fans out
+    /// to worker threads (Parallel/Task), which inherit the flow's value -- a thread-local flag is invisible there,
+    /// the resident branches decline, and a host download aborts the capture (verified on the d256/L2 smoke). An
+    /// engine-wide counter was worse: every OTHER thread using this engine (e.g. concurrent tapes on the default
+    /// engine) also took the resident branches while a plan stepped, renting and disposing the plan's per-action
+    /// scratch buffers under its in-flight kernels (CUDA 700).</summary>
+    private readonly FlowDepth _capturePathDepth = new();
+
+    /// <summary>A nesting depth scoped to the current execution flow (inherited by Parallel/Task workers).</summary>
+    private sealed class FlowDepth
+    {
+        private readonly System.Threading.AsyncLocal<int> _depth = new();
+        internal bool Active => _depth.Value > 0;
+        internal void Enter() => _depth.Value = _depth.Value + 1;
+        /// <summary>Leaves one level; returns the remaining depth. Clamped at 0 for an exit on another flow.</summary>
+        internal int Exit()
+        {
+            int d = _depth.Value;
+            if (d <= 0) return 0;
+            _depth.Value = d - 1;
+            return d - 1;
+        }
+    }
 
     /// <summary>The correct gate for compiled-step resident-buffer behavior: buffers pinned (eviction suspended)
     /// AND on the capture path (work the captured graph will replay).</summary>
     internal bool ResidentStepActive =>
-        System.Threading.Volatile.Read(ref _capturePathDepth) > 0 && EvictionSuspended;
+        _capturePathDepth.Active && EvictionSuspended;
 
     /// <summary>RAII scope marking the compiled capture path (instance depth; nesting-safe).</summary>
     internal IDisposable EnterCompiledCapturePath()
     {
-        System.Threading.Interlocked.Increment(ref _capturePathDepth);
+        _capturePathDepth.Enter();
         s_residentScratchEngine = this;   // route the static AllocateOutputBuffer's transient allocs here
         return new CapturePathScope(this);
     }
@@ -416,7 +435,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         public void Dispose()
         {
             var e = System.Threading.Interlocked.Exchange(ref _e, null);
-            if (e is not null && System.Threading.Interlocked.Decrement(ref e._capturePathDepth) == 0)
+            if (e is not null && e._capturePathDepth.Exit() == 0)
             {
                 e._currentScratchAction = -1;
                 if (ReferenceEquals(s_residentScratchEngine, e)) s_residentScratchEngine = null;
@@ -429,16 +448,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// engages ONLY for the dedicated, non-aliased gradient leaf — NOT for forward in-place ops
     /// (<c>TensorBroadcastAddInPlace</c> etc.) whose `a` may be an ALIASED resident activation that an in-place
     /// mutation would corrupt (the A2 forward-hijack that threw CUDA-700). Instance field + Interlocked to match
-    /// <see cref="_capturePathDepth"/> (op execution can fan out to BLAS-pool threads).</summary>
-    private int _gradAccumDepth;
+    /// <see cref="_capturePathDepth"/>: per execution flow, so another thread's grad accumulation cannot switch
+    /// this thread's forward in-place ops onto the resident fast path.</summary>
+    private readonly FlowDepth _gradAccumDepth = new();
 
     /// <summary>True while inside autodiff grad accumulation (see <see cref="_gradAccumDepth"/>).</summary>
-    internal bool InGradAccumulation => System.Threading.Volatile.Read(ref _gradAccumDepth) > 0;
+    internal bool InGradAccumulation => _gradAccumDepth.Active;
 
     /// <summary>RAII scope marking the autodiff grad-accumulation in-place add (instance depth; nesting-safe).</summary>
     internal IDisposable EnterGradAccumulation()
     {
-        System.Threading.Interlocked.Increment(ref _gradAccumDepth);
+        _gradAccumDepth.Enter();
         return new GradAccumScope(this);
     }
 
@@ -449,17 +469,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         public void Dispose()
         {
             var e = System.Threading.Interlocked.Exchange(ref _e, null);
-            if (e is not null) System.Threading.Interlocked.Decrement(ref e._gradAccumDepth);
+            if (e is not null) e._gradAccumDepth.Exit();
         }
     }
     // #1650 inference CUDA-graph capture: while set, GPU-resident in-place ops (TryRunBinaryInPlace) engage
     // on ResidentStepActive WITHOUT the training-only InGradAccumulation gate, so the inference forward runs
-    // host-round-trip-free and is capturable. Depth counter (not bool) so it's visible on the BLAS pool
-    // threads the op execution fans out to, mirroring _capturePathDepth / _evictionSuspendDepth.
-    private int _inferenceCaptureDepth;
-    internal bool InferenceCaptureActive => System.Threading.Volatile.Read(ref _inferenceCaptureDepth) > 0;
-    internal void BeginInferenceCapture() => System.Threading.Interlocked.Increment(ref _inferenceCaptureDepth);
-    internal void EndInferenceCapture() => System.Threading.Interlocked.Decrement(ref _inferenceCaptureDepth);
+    // host-round-trip-free and is capturable. Per execution flow, like _capturePathDepth (visible on the workers
+    // the op execution fans out to, invisible to other threads using this engine).
+    private readonly FlowDepth _inferenceCaptureDepth = new();
+    internal bool InferenceCaptureActive => _inferenceCaptureDepth.Active;
+    internal void BeginInferenceCapture() => _inferenceCaptureDepth.Enter();
+    internal void EndInferenceCapture() => _inferenceCaptureDepth.Exit();
 
     internal void SuspendActivationEviction() => System.Threading.Interlocked.Increment(ref _evictionSuspendDepth);
     internal void ResumeActivationEviction()
@@ -534,7 +554,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (GetBackend() is not Engines.DirectGpu.CUDA.CudaBackend) return null;
         SuspendActivationEviction();
         BeginInferenceCapture();
-        System.Threading.Interlocked.Increment(ref _capturePathDepth);
+        _capturePathDepth.Enter();
         return new ResidentCaptureScope(this);
     }
 
@@ -546,7 +566,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             var e = System.Threading.Interlocked.Exchange(ref _e, null);
             if (e is null) return;
-            System.Threading.Interlocked.Decrement(ref e._capturePathDepth);
+            e._capturePathDepth.Exit();
             e.EndInferenceCapture();
             e.ResumeActivationEviction();
         }
@@ -25280,6 +25300,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 // GPU concat failed — fall back to the CPU base. Surface the reason at Trace level
                 // (don't swallow silently); never mask OOM, which must propagate. (#652 review)
                 System.Diagnostics.Trace.TraceWarning($"GPU TensorConcatenate fallback to CPU: {ex.GetType().Name}: {ex.Message}");
+                AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.OnFallback("TensorConcatenate", ex);
                 if (ThrowOnGpuKernelFallback) throw;
             }
         }
