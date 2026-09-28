@@ -463,8 +463,11 @@ public class TapeBailAuditTests
         var bodies = GpuOverrideBodies(GpuEngineSources(RepoRoot()))
             .Where(b => NonFloatStaysOnCpuUnderTape.Contains(b.Name))
             .ToList();
-        var guard = new Regex(@"\bIsTapeActive\s*<T>\(\)\s*&&\s*typeof\(T\)\s*!=\s*typeof\(float\)", RegexOptions.None,
-            RegexTimeout);
+        // Either operand order: the type-first form keeps IsTapeActive (which counts a bail as a side effect) from
+        // being evaluated -- and counted -- for a float call that goes on to the device.
+        var guard = new Regex(
+            @"\bIsTapeActive\s*<T>\(\)\s*&&\s*typeof\(T\)\s*!=\s*typeof\(float\)|typeof\(T\)\s*!=\s*typeof\(float\)\s*&&\s*IsTapeActive\s*<T>\(\)",
+            RegexOptions.None, RegexTimeout);
         var anyTapeCheck = new Regex(@"\bIsTapeActive\s*<", RegexOptions.None, RegexTimeout);
         var records = new Regex(@"DifferentiableOps\.Record[A-Za-z]*\(", RegexOptions.None, RegexTimeout);
 
