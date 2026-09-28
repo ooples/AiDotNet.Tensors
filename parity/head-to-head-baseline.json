@@ -2,6 +2,7 @@
   "noiseFloor": 0.15,
   "cases": {
     "mlp:cpu": {
+      "linux-x64-4cpu-cpu": 2.117,
       "windows-x64-16cpu-cpu": 3.41
     }
   }

@@ -48,7 +48,7 @@ public class PyTorchFeatureCoverageTests
             $"{CoverageFile} was reviewed against torch {coverage.TorchVersion} but {SurfaceFile} was extracted from " +
             $"torch {surface.TorchVersion}. Re-run the seeder for new items and review the result.");
 
-        var surfaceKeys = surface.Items.Select(i => i.Key).ToHashSet(StringComparer.Ordinal);
+        var surfaceKeys = new HashSet<string>(surface.Items.Select(i => i.Key), StringComparer.Ordinal);
         var unrecorded = surface.Items.Where(i => !coverage.Entries.ContainsKey(i.Key)).Select(i => i.Key).ToList();
         var orphaned = coverage.Entries.Keys.Where(k => !surfaceKeys.Contains(k)).OrderBy(k => k, StringComparer.Ordinal).ToList();
         var unresolved = coverage.Entries
