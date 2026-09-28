@@ -262,7 +262,14 @@ internal static class CudaNativeBindings
 
     // Async memory transfer APIs
     [DllImport(CudaLibrary, EntryPoint = "cuMemcpyHtoDAsync_v2")]
-    public static extern CudaResult cuMemcpyHtoDAsync(IntPtr dstDevice, IntPtr srcHost, ulong byteCount, IntPtr stream);
+    private static extern CudaResult cuMemcpyHtoDAsyncNative(IntPtr dstDevice, IntPtr srcHost, ulong byteCount, IntPtr stream);
+
+    /// <summary>Host-to-device copy; counted by <see cref="AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.OnUpload"/> (every upload goes through here).</summary>
+    public static CudaResult cuMemcpyHtoDAsync(IntPtr dstDevice, IntPtr srcHost, ulong byteCount, IntPtr stream)
+    {
+        AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.OnUpload((long)byteCount);
+        return cuMemcpyHtoDAsyncNative(dstDevice, srcHost, byteCount, stream);
+    }
 
     [DllImport(CudaLibrary, EntryPoint = "cuMemcpyDtoHAsync_v2")]
     public static extern CudaResult cuMemcpyDtoHAsync(IntPtr dstHost, IntPtr srcDevice, ulong byteCount, IntPtr stream);
@@ -467,7 +474,14 @@ internal static class CudaNativeBindings
 
     /// <summary>Synchronous host-to-device copy.</summary>
     [DllImport(CudaLibrary, EntryPoint = "cuMemcpyHtoD_v2")]
-    public static extern CudaResult cuMemcpyHtoD(IntPtr dstDevice, IntPtr srcHost, ulong byteCount);
+    private static extern CudaResult cuMemcpyHtoDNative(IntPtr dstDevice, IntPtr srcHost, ulong byteCount);
+
+    /// <summary>Host-to-device copy; counted by <see cref="AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.OnUpload"/> (every upload goes through here).</summary>
+    public static CudaResult cuMemcpyHtoD(IntPtr dstDevice, IntPtr srcHost, ulong byteCount)
+    {
+        AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.OnUpload((long)byteCount);
+        return cuMemcpyHtoDNative(dstDevice, srcHost, byteCount);
+    }
 
     /// <summary>Synchronous device-to-host copy.</summary>
     [DllImport(CudaLibrary, EntryPoint = "cuMemcpyDtoH_v2")]

@@ -357,7 +357,14 @@ public static class CuBlasNative
     /// Copies memory from host to device.
     /// </summary>
     [DllImport(CudaLibrary, EntryPoint = "cuMemcpyHtoD_v2")]
-    public static extern CudaResult cuMemcpyHtoD(IntPtr dstDevice, IntPtr srcHost, ulong byteCount);
+    private static extern CudaResult cuMemcpyHtoDNative(IntPtr dstDevice, IntPtr srcHost, ulong byteCount);
+
+    /// <summary>Host-to-device copy; counted by <see cref="AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.OnUpload"/> (every upload goes through here).</summary>
+    public static CudaResult cuMemcpyHtoD(IntPtr dstDevice, IntPtr srcHost, ulong byteCount)
+    {
+        AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.OnUpload((long)byteCount);
+        return cuMemcpyHtoDNative(dstDevice, srcHost, byteCount);
+    }
 
     /// <summary>
     /// Copies memory from device to host.
