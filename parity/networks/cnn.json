@@ -18,5 +18,6 @@
   "optimizer": { "name": "sgd", "lr": 0.01 },
   "warmupSteps": 30,
   "measuredSteps": 100,
-  "lossAgreementSteps": 10
+  "lossAgreementSteps": 10,
+  "repeats": 3
 }

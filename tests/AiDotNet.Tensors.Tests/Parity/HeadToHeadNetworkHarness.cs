@@ -105,7 +105,55 @@ internal static class HeadToHeadNetworkHarness
         }
     }
 
+    /// <summary>
+    /// Runs the two sides <c>repeats</c> times (from the spec, default 1), alternating, and combines them. On a shared
+    /// runner a burst of neighbour load lands on one side of one repetition; alternating spreads it, and the gated
+    /// statistic (fastest step per side, over every repetition) is the least sensitive to it. Measured on the hosted
+    /// 4-core runner: single-shot min/min ratios of 2.05, 2.12 and 2.82 for the unchanged MLP.
+    /// </summary>
     private static (CaseResult? Result, Deferral? Deferred) RunWith(string root, string network, string device, DirectGpuTensorEngine? gpu)
+    {
+        var specJson = ReadJson(Path.Combine(root, "parity", "networks", network + ".json"));
+        int repeats = specJson.TryGetProperty("repeats", out var repeatsElement) ? Math.Max(1, repeatsElement.GetInt32()) : 1;
+        var torchRuns = new List<SideResult>();
+        var tensorsRuns = new List<SideResult>();
+        string machineKey = MachineKey(device);
+        for (int r = 0; r < repeats; r++)
+        {
+            var (once, deferred) = RunOnce(root, network, device, gpu);
+            if (deferred is not null) return (null, deferred);
+            if (once is null) throw new InvalidOperationException("A repetition returned neither a result nor a deferral.");
+            torchRuns.Add(once.Torch);
+            tensorsRuns.Add(once.Tensors);
+            machineKey = once.MachineKey;
+        }
+
+        var result = new CaseResult(network, device, machineKey, Combine(torchRuns), Combine(tensorsRuns));
+        WriteArtifact(result);
+        return (result, null);
+    }
+
+    /// <summary>Fastest step over every repetition (gated); median of medians and of IQRs; losses from the first.</summary>
+    private static SideResult Combine(List<SideResult> runs)
+    {
+        if (runs.Count == 1) return runs[0];
+        static double Median(IEnumerable<double> values)
+        {
+            var o = values.OrderBy(v => v).ToList();
+            return o.Count % 2 == 1 ? o[o.Count / 2] : (o[o.Count / 2 - 1] + o[o.Count / 2]) / 2.0;
+        }
+
+        var phases = runs[0].Phases.Keys.ToDictionary(
+            phase => phase,
+            phase => new PhaseStats(
+                Median(runs.Select(r => r.Phases[phase].MedianMs)),
+                Median(runs.Select(r => r.Phases[phase].IqrMs)),
+                runs.Min(r => r.Phases[phase].MinMs),
+                runs.Sum(r => r.Phases[phase].Samples)));
+        return new SideResult(runs[0].Framework, runs[0].Version, phases, runs[0].Losses);
+    }
+
+    private static (CaseResult? Result, Deferral? Deferred) RunOnce(string root, string network, string device, DirectGpuTensorEngine? gpu)
     {
         string spec = Path.Combine(root, "parity", "networks", network + ".json");
         string work = Path.Combine(Path.GetTempPath(), "aidotnet-parity", network + "-" + device + "-" + Guid.NewGuid().ToString("N").Substring(0, 8));
@@ -144,9 +192,7 @@ internal static class HeadToHeadNetworkHarness
             ? gpuElement.GetString()
             : null;
         var tensors = RunTensors(ReadJson(spec), work, gpu);
-        var result = new CaseResult(network, device, MachineKey(device, gpuName), torch, tensors);
-        WriteArtifact(result);
-        return (result, null);
+        return (new CaseResult(network, device, MachineKey(device, gpuName), torch, tensors), null);
     }
 
     /// <summary>Latest result per case, for tooling and for the stamped evidence the GPU lane commits.</summary>
