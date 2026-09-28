@@ -4807,6 +4807,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     && (residentStep || e.HostVersion == hostVersion))
                     return e.Buffer;
         }
+        else
+        {
+            // A deferred GPU result with no host backing array is cached under its DataVector (DeferTensorResult),
+            // as GetOrAllocateBuffer already handles. Missing it here made a reshape of such a gradient look
+            // non-resident, so grad accumulation (TensorAddInPlace) took the host path - a download per step and a
+            // capture-path host read (ReshapeBackward -> AccumulateGrad on TabDDPM).
+            lock (_activationCacheLock)
+                if (_activationCache.TryGetValue(t.DataVector, out var e) && ReferenceEquals(e.Backend, backend) && !e.IsFp16
+                    && e.Buffer.Handle != System.IntPtr.Zero && e.Buffer.Size >= need
+                    && (residentStep || e.HostVersion == hostVersion))
+                    return e.Buffer;
+        }
         return null;
     }
 
