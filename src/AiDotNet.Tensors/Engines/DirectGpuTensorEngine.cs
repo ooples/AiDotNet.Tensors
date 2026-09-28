@@ -1561,7 +1561,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // tensors, so this costs nothing on the hot contiguous path.
         // A ParameterBuffer view whose flat array an on-device optimizer updated: read it in place on the device.
         // Contiguous() below would download the whole flat array to slice this view on the host.
-        if (tensor._storageOffset != 0 && TryResolveDeviceParameterView(backend, tensor, out var parameterView))
+        // Every view into a flat ParameterBuffer -- including the one at offset 0, which the persistent-cache path
+        // below would otherwise re-upload from the (stale) host copy over the device-authoritative flat buffer.
+        if (TryResolveDeviceParameterView(backend, tensor, out var parameterView))
             return new OwnedBuffer(parameterView, ownsBuffer: false);
         // A permuted view of a tensor whose data is only on the device: permute on the device. Contiguous() below
         // would download the base, permute it on the host and upload the result.

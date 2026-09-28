@@ -14,10 +14,12 @@ namespace AiDotNet.Tensors.Engines;
 /// storage's state, the host array and the vector over it resolve to the same entry, and the entry lives exactly as
 /// long as the storage -- an unreferenced result's buffer is freed by its finalizer, with no global table keeping it
 /// alive and no LRU deciding what to offload.</para>
-/// <para>Enumeration (the step-end release of a tape or compiled step, the transient drops) walks a per-FLOW ledger
-/// of weak references to the entries created on that flow, so a thread only ever enumerates and frees its own
-/// step's buffers -- another thread's in-flight buffers are never visible to it. The flow is inherited by the
-/// Parallel/Task workers a step fans out to.</para>
+/// <para>Enumeration (the step-end release of a tape or compiled step, the transient drops) walks a per-THREAD ledger
+/// of weak references to the entries created on that thread, so a thread only ever enumerates and frees its own
+/// step's buffers -- another thread's in-flight buffers are never visible to it (the rule the old cache enforced by
+/// filtering on the creating thread). Per thread, not per async flow: a lazily created flow-scoped ledger is one
+/// shared object inherited by every task forked after it was created, so unrelated concurrent work could enumerate
+/// and release each other's results. What a step's worker threads create is freed with their storages.</para>
 /// </remarks>
 internal sealed class DeviceEntryRegistry
 {
@@ -27,9 +29,9 @@ internal sealed class DeviceEntryRegistry
         public int AddsSincePrune;
     }
 
-    private readonly AsyncLocal<Ledger?> _ledger = new();
+    private readonly ThreadLocal<Ledger> _ledger = new(static () => new Ledger());
 
-    private Ledger CurrentLedger => _ledger.Value ??= new Ledger();
+    private Ledger CurrentLedger => _ledger.Value!;
 
     private ActivationCacheEntry? OwnEntry(HostSync? sync)
         => sync?.DeviceEntry is ActivationCacheEntry entry && ReferenceEquals(entry.Owner, this) ? entry : null;
@@ -99,8 +101,8 @@ internal sealed class DeviceEntryRegistry
     /// <summary>The live entries created on the CURRENT flow, oldest first.</summary>
     public KeyValuePair<object, ActivationCacheEntry>[] ToArray()
     {
-        var ledger = _ledger.Value;
-        if (ledger is null) return Array.Empty<KeyValuePair<object, ActivationCacheEntry>>();
+        if (!_ledger.IsValueCreated) return Array.Empty<KeyValuePair<object, ActivationCacheEntry>>();
+        var ledger = _ledger.Value!;
         lock (ledger)
         {
             PruneUnsafe(ledger);
@@ -126,8 +128,7 @@ internal sealed class DeviceEntryRegistry
     public void Clear()
     {
         foreach (var pair in ToArray()) TryRemove(pair.Key, out _);
-        var ledger = _ledger.Value;
-        if (ledger is not null) lock (ledger) ledger.Items.Clear();
+        if (_ledger.IsValueCreated) { var ledger = _ledger.Value!; lock (ledger) ledger.Items.Clear(); }
     }
 
     // Drops ledger items whose storage died, was unbound, or was re-bound to a newer entry (a newer item exists).
