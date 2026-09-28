@@ -213,7 +213,7 @@ public class FusedBf16MomentAdamParityTests
         var (planInt8, wInt8, _) = BuildPlan();
         using (planInt8)
         {
-            planInt8.RequestInt8MomentStorage(true, blockSize: 8);
+            planInt8.RequestInt8MomentStorage(true, blockSize: 8, minQuantizedLength: 0);
             planInt8.ConfigureOptimizer(OptimizerType.Adam, learningRate: 0.01f);
             for (int s = 0; s < Steps; s++) planInt8.Step();
         }
@@ -238,7 +238,7 @@ public class FusedBf16MomentAdamParityTests
         var (planInt8, aInt8, bInt8, _, _) = BuildGroupedPlan();
         using (planInt8)
         {
-            planInt8.RequestInt8MomentStorage(true, blockSize: 8);
+            planInt8.RequestInt8MomentStorage(true, blockSize: 8, minQuantizedLength: 0);
             planInt8.ConfigureOptimizerGrouped(
                 OptimizerType.Adam,
                 new LrSchedule[] { LrSchedule.Constant(0.01), LrSchedule.Constant(0.003) },
@@ -250,13 +250,67 @@ public class FusedBf16MomentAdamParityTests
         AssertClose("group1 int8", expectedB, bInt8.GetDataArray().AsSpan().ToArray(), tolerance: 1e-5);
     }
 
+    /// <summary>
+    /// bitsandbytes' <c>min_8bit_size</c>: a parameter below the minimum quantized length keeps fp32 moments and
+    /// takes exactly the fp32 Adam step, while a larger one in the same plan is block-quantized.
+    /// </summary>
+    [Fact]
+    public void Int8Moments_ParametersBelowMinQuantizedLength_KeepFp32Moments()
+    {
+        (ICompiledTrainingPlan<float> plan, Tensor<float> small, Tensor<float> large, float[] initSmall, float[] initLarge) Build()
+        {
+            var engine = new CpuEngine();
+            var small = new Tensor<float>(new[] { 16 });
+            var large = new Tensor<float>(new[] { 32 });
+            var rng = new System.Random(4321);
+            for (int i = 0; i < small.Length; i++) small[i] = (float)(rng.NextDouble() - 0.5);
+            for (int i = 0; i < large.Length; i++) large[i] = (float)(rng.NextDouble() - 0.5);
+            ICompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.Enable())
+            {
+                engine.TensorAdd(engine.ReduceSum(small, null), engine.ReduceSum(large, null));
+                plan = scope.CompileTraining(new[] { small, large });
+            }
+            return (plan, small, large, small.GetDataArray().AsSpan().ToArray(), large.GetDataArray().AsSpan().ToArray());
+        }
+
+        var (planRef, smallRef, _, _, _) = Build();
+        using (planRef)
+        {
+            planRef.ConfigureOptimizer(OptimizerType.Adam, learningRate: 0.01f);
+            for (int s = 0; s < Steps; s++) planRef.Step();
+        }
+
+        var (plan, small, large, _, initLarge) = Build();
+        using (plan)
+        {
+            plan.RequestInt8MomentStorage(true, blockSize: 8, minQuantizedLength: 32);
+            plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 0.01f);
+            for (int s = 0; s < Steps; s++) plan.Step();
+
+            // The constant gradient makes every moment in a block equal, which int8 stores exactly, so the weights
+            // alone cannot tell the two layouts apart; the captured state can.
+            var checkpoint = Assert.IsType<FusedOptimizerCheckpoint>(
+                Assert.IsType<CompiledTrainingPlan<float>>(plan).CaptureFusedOptimizerCheckpoint());
+            Assert.Equal(32, checkpoint.Int8MinQuantizedLength);
+            Assert.NotNull(checkpoint.Parameters[0].MFloat);
+            Assert.Null(checkpoint.Parameters[0].MQuantized);
+            Assert.NotNull(checkpoint.Parameters[1].MQuantized);
+            Assert.Null(checkpoint.Parameters[1].MFloat);
+        }
+
+        Assert.Equal(smallRef.GetDataArray().AsSpan().ToArray(), small.GetDataArray().AsSpan().ToArray());
+        AssertClose("large int8", RunDirectInt8ConstantGradient(initLarge, lr: 0.01f),
+            large.GetDataArray().AsSpan().ToArray(), tolerance: 1e-5);
+    }
+
     [Fact]
     public void Int8BlockQuantizedMoments_RejectAdamW()
     {
         var (plan, _, _) = BuildPlan();
         using (plan)
         {
-            plan.RequestInt8MomentStorage(true, blockSize: 8);
+            plan.RequestInt8MomentStorage(true, blockSize: 8, minQuantizedLength: 0);
             Assert.Throws<System.NotSupportedException>(() =>
                 plan.ConfigureOptimizer(OptimizerType.AdamW, learningRate: 0.01f));
         }

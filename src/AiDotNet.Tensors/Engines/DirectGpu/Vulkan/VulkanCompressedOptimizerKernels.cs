@@ -94,7 +94,7 @@ void main() {
     /// <summary>
     /// int8 block-quantized Adam: matches CompressedMomentHostFallback.Adam8Bit. One workgroup per block
     /// (up to 256 elements) does a shared-memory reduction for the new per-block M/V scales, then
-    /// quantizes. M is signed (zero-point 128, /127), V is unsigned (zero-point 0, /255).
+    /// quantizes. M and V are indices into the signed and unsigned dynamic codebooks (ADAM8_S / ADAM8_U), scaled by the block absmax.
     /// </summary>
     public static readonly string Adam8Bit = @"#version 450
 layout(local_size_x = 256) in;
@@ -138,6 +138,7 @@ void store_byte(uint isV, uint i, uint b) {
     }
 }
 
+" + Compilation.DynamicQuantizationCodebook.KernelPrelude(Compilation.DynamicQuantizationCodebook.KernelLanguage.Glsl) + @"
 void main() {
     uint block = gl_WorkGroupID.x;
     if (block >= pc.numBlocks) { return; }
@@ -154,8 +155,8 @@ void main() {
     float localMaxM = 0.0;
     float localMaxV = 0.0;
     for (uint i = start + lid; i < end; i += 256u) {
-        float oldM = firstStep ? 0.0 : (float(load_byte(m_quant[i >> 2u], i)) - 128.0) * oldMScale;
-        float oldV = firstStep ? 0.0 : float(load_byte(v_quant[i >> 2u], i)) * oldVScale;
+        float oldM = firstStep ? 0.0 : adam8_dec_s(load_byte(m_quant[i >> 2u], i)) * oldMScale;
+        float oldV = firstStep ? 0.0 : adam8_dec_u(load_byte(v_quant[i >> 2u], i)) * oldVScale;
         float g = grad[i];
         float newM = pc.beta1 * oldM + pc.oneMinusBeta1 * g;
         float newV = pc.beta2 * oldV + pc.oneMinusBeta2 * g * g;
@@ -172,8 +173,9 @@ void main() {
         }
         barrier();
     }
-    float newMScale = max(s_maxM[0] / 127.0, 1e-10);
-    float newVScale = max(s_maxV[0] / 255.0, 1e-10);
+    // Block-wise dynamic quantization: scale = block absmax, value = nearest codebook entry.
+    float newMScale = max(s_maxM[0], 1e-30);
+    float newVScale = max(s_maxV[0], 1e-30);
     if (lid == 0u) {
         m_scales[block] = newMScale;
         v_scales[block] = newVScale;
@@ -182,8 +184,8 @@ void main() {
 
     // Pass 2: recompute, update param, quantize with the new scales.
     for (uint i = start + lid; i < end; i += 256u) {
-        float oldM = firstStep ? 0.0 : (float(load_byte(m_quant[i >> 2u], i)) - 128.0) * oldMScale;
-        float oldV = firstStep ? 0.0 : float(load_byte(v_quant[i >> 2u], i)) * oldVScale;
+        float oldM = firstStep ? 0.0 : adam8_dec_s(load_byte(m_quant[i >> 2u], i)) * oldMScale;
+        float oldV = firstStep ? 0.0 : adam8_dec_u(load_byte(v_quant[i >> 2u], i)) * oldVScale;
         float g = grad[i];
         float newM = pc.beta1 * oldM + pc.oneMinusBeta1 * g;
         float newV = pc.beta2 * oldV + pc.oneMinusBeta2 * g * g;
@@ -192,12 +194,8 @@ void main() {
         float vHat = newV / pc.biasCorrection2;
         param[i] -= pc.lr * mHat / (sqrt(vHat) + pc.epsilon);
 
-        int qm = int(round(newM / newMScale));
-        qm = clamp(qm, -128, 127);
-        store_byte(0u, i, uint(qm + 128));
-        int qv = int(round(newV / newVScale));
-        qv = clamp(qv, 0, 255);
-        store_byte(1u, i, uint(qv));
+        store_byte(0u, i, adam8_enc_s(newM / newMScale));
+        store_byte(1u, i, adam8_enc_u(newV / newVScale));
     }
 }
 ";

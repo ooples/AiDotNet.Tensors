@@ -18,20 +18,23 @@ public class CudaStreamOrderedReuseTests
     private readonly ITestOutputHelper _out;
     public CudaStreamOrderedReuseTests(ITestOutputHelper output) => _out = output;
 
+    /// <summary>
+    /// Skips only when CUDA is confirmed absent (no driver or NVRTC). On a CUDA machine the engine is
+    /// constructed outside any catch, so an initialization failure fails the test instead of reading
+    /// as a skip. An engine that selects a different backend is a selection policy, not a failure.
+    /// </summary>
     private static bool TryCuda(out DirectGpuTensorEngine? engine, out CudaBackend? cuda)
     {
         engine = null; cuda = null;
-        try
+        if (!CudaBackend.IsCudaAvailable) return false;
+
+        var candidate = new DirectGpuTensorEngine();
+        if (candidate.GetBackend() is CudaBackend backend && backend.IsAvailable)
         {
-            var candidate = new DirectGpuTensorEngine();
-            if (candidate.GetBackend() is CudaBackend backend && backend.IsAvailable)
-            {
-                engine = candidate; cuda = backend;
-                return true;
-            }
-            candidate.Dispose();
+            engine = candidate; cuda = backend;
+            return true;
         }
-        catch (Exception) { }
+        candidate.Dispose();
         return false;
     }
 
@@ -90,7 +93,7 @@ public class CudaStreamOrderedReuseTests
             {
                 for (int i = 0; i < n; i++) source[i] = round * 1000 + i;
                 using var uploaded = cuda.AllocateBuffer(source);
-                Array.Fill(source, -9f);                          // the host copy is free immediately
+                for (int i = 0; i < source.Length; i++) source[i] = -9f;                          // the host copy is free immediately
                 cuda.Add(uploaded, uploaded, doubled, n);         // same-stream consumer
                 var d = cuda.DownloadBuffer(doubled);
                 var u = cuda.DownloadBuffer(uploaded);
@@ -143,7 +146,7 @@ public class CudaStreamOrderedReuseTests
                 for (int k = 0; k < 96; k++)
                 {
                     var data = new float[n];
-                    Array.Fill(data, k);
+                    for (int i = 0; i < data.Length; i++) data[i] = k;
                     buffers.Add(cuda!.AllocateBuffer(data));
                 }
                 for (int k = 0; k < buffers.Count; k += 7)

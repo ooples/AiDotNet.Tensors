@@ -393,8 +393,8 @@ internal static class FusedOptimizer
 
             for (int i = start; i < end; i++)
             {
-                float oldM = mHasHistory ? ((int)mQuant[i] - 128) * oldMScale : 0f;
-                float oldV = vHasHistory ? vQuant[i] * oldVScale : 0f;
+                float oldM = mHasHistory ? DynamicQuantizationCodebook.Signed[mQuant[i]] * oldMScale : 0f;
+                float oldV = vHasHistory ? DynamicQuantizationCodebook.Unsigned[vQuant[i]] * oldVScale : 0f;
                 float g = grad[i];
                 float newM = beta1 * oldM + oneMinusBeta1 * g;
                 float newV = beta2 * oldV + oneMinusBeta2 * g * g;
@@ -402,15 +402,17 @@ internal static class FusedOptimizer
                 maxAbsV = MathF.Max(maxAbsV, MathF.Abs(newV));
             }
 
-            float newMScale = MathF.Max(maxAbsM / 127f, 1e-10f);
-            float newVScale = MathF.Max(maxAbsV / 255f, 1e-10f);
+            // Block-wise dynamic quantization (Dettmers et al.): scale = block absmax, value = nearest codebook entry.
+            // Linear /127 and /255 rounded small second moments to zero and exploded the update.
+            float newMScale = MathF.Max(maxAbsM, 1e-30f);
+            float newVScale = MathF.Max(maxAbsV, 1e-30f);
             mScales[block] = newMScale;
             vScales[block] = newVScale;
 
             for (int i = start; i < end; i++)
             {
-                float oldM = mHasHistory ? ((int)mQuant[i] - 128) * oldMScale : 0f;
-                float oldV = vHasHistory ? vQuant[i] * oldVScale : 0f;
+                float oldM = mHasHistory ? DynamicQuantizationCodebook.Signed[mQuant[i]] * oldMScale : 0f;
+                float oldV = vHasHistory ? DynamicQuantizationCodebook.Unsigned[vQuant[i]] * oldVScale : 0f;
                 float g = grad[i];
                 float newM = beta1 * oldM + oneMinusBeta1 * g;
                 float newV = beta2 * oldV + oneMinusBeta2 * g * g;
@@ -418,14 +420,8 @@ internal static class FusedOptimizer
                 float vHat = newV / bc2;
                 param[i] -= lr * mHat / (MathF.Sqrt(vHat) + eps);
 
-                int qM = (int)Math.Round(newM / newMScale, MidpointRounding.ToEven);
-                if (qM < -127) qM = -127;
-                else if (qM > 127) qM = 127;
-                int qV = (int)Math.Round(newV / newVScale, MidpointRounding.ToEven);
-                if (qV < 0) qV = 0;
-                else if (qV > 255) qV = 255;
-                mQuant[i] = (byte)(qM + 128);
-                vQuant[i] = (byte)qV;
+                mQuant[i] = DynamicQuantizationCodebook.Encode(newM / newMScale, DynamicQuantizationCodebook.Signed);
+                vQuant[i] = DynamicQuantizationCodebook.Encode(newV / newVScale, DynamicQuantizationCodebook.Unsigned);
             }
         }
     }
@@ -1553,10 +1549,12 @@ internal static class FusedOptimizer
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static unsafe void LAMBUpdateSimd(
         float* param, float* grad, float* m, float* v, int length,
-        float lr, float beta1, float beta2, float eps, float weightDecay, int step)
+        float lr, float beta1, float beta2, float eps, float weightDecay, int step,
+        float maxTrustRatio = 0f, bool biasCorrection = true)
     {
-        float bc1 = 1f - MathF.Pow(beta1, step);
-        float bc2 = 1f - MathF.Pow(beta2, step);
+        // biasCorrection = false runs the bias-uncorrected variant (You et al., 2020, Alg. 2 without step 7).
+        float bc1 = biasCorrection ? 1f - MathF.Pow(beta1, step) : 1f;
+        float bc2 = biasCorrection ? 1f - MathF.Pow(beta2, step) : 1f;
 
         // Pass 1: update moments + compute param norm (AVX2)
         float paramNormSq = 0f;
@@ -1602,6 +1600,8 @@ internal static class FusedOptimizer
 
         // Trust ratio + apply update
         float trustRatio = (paramNorm > 0f && updateNorm > 0f) ? paramNorm / updateNorm : 1f;
+        // Optional upper clip of the layer-wise trust ratio (<= 0 disables it), as the eager optimizer applies.
+        if (maxTrustRatio > 0f && trustRatio > maxTrustRatio) trustRatio = maxTrustRatio;
         float effectiveLr = lr * trustRatio;
         i = 0;
 #if NET5_0_OR_GREATER
@@ -2840,6 +2840,19 @@ public sealed class FusedOptimizerExtras
     public float AdmmRho { get; init; } = 1f;
 
     /// <summary>
+    /// LAMB: upper clip applied to the layer-wise trust ratio <c>||w|| / ||update||</c>. Default 0: no clip.
+    /// </summary>
+    /// <remarks>
+    /// Clipping changes the step LAMB takes for any layer whose ratio exceeds the bound, so a caller whose eager LAMB
+    /// clips (AiDotNet's defaults to 10) must pass the same bound or the fused and eager paths diverge.
+    /// </remarks>
+    public float LambMaxTrustRatio { get; init; }
+
+    /// <summary>
+    /// LAMB: run the bias-uncorrected variant (no <c>1 - beta^t</c> division of the moments). Default <c>false</c>,
+    /// i.e. bias-corrected, as in the paper.
+    /// </summary>
+    public bool LambDisableBiasCorrection { get; init; }
     /// AMSGrad only: apply the weight decay DECOUPLED (AdamW, Loshchilov &amp; Hutter 2019) instead of as an L2
     /// term folded into the gradient. When true the step first scales the parameter by <c>1 - lr·wd</c> and then
     /// runs AMSGrad with no decay - PyTorch <c>AdamW(amsgrad=True)</c>'s order. Default false keeps
@@ -2875,6 +2888,9 @@ public sealed class FusedOptimizerExtras
         if (!(AdmmRho > 0f) || float.IsInfinity(AdmmRho))
             throw new ArgumentOutOfRangeException(nameof(AdmmRho), AdmmRho,
                 "ADMM penalty parameter AdmmRho must be finite and > 0.");
+        if (!(LambMaxTrustRatio >= 0f) || float.IsInfinity(LambMaxTrustRatio))
+            throw new ArgumentOutOfRangeException(nameof(LambMaxTrustRatio), LambMaxTrustRatio,
+                "LAMB LambMaxTrustRatio must be finite and >= 0 (0 disables the clip).");
     }
 }
 

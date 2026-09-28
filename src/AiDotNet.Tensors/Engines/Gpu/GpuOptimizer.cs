@@ -319,12 +319,13 @@ public static class GpuOptimizer
         return true;
     }
 
-    public static bool TryLambStep(Tensor<float> p, Tensor<float> g, Tensor<float> m, Tensor<float> v, float lr, float beta1, float beta2, float epsilon, float weightDecay, int step)
+    public static bool TryLambStep(Tensor<float> p, Tensor<float> g, Tensor<float> m, Tensor<float> v, float lr, float beta1, float beta2, float epsilon, float weightDecay, int step,
+        float maxTrustRatio = 0f, bool biasCorrection = true)
     {
         if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false; var b = e.GetBackend(); if (b is null) return false;
         var pb = p?.TryGetGpuBuffer(); var gb = g?.TryGetGpuBuffer(); var mb = m?.TryGetGpuBuffer(); var vb = v?.TryGetGpuBuffer();
         if (pb is null || gb is null || mb is null || vb is null) return false;
-        b.LambUpdate(pb, gb, mb, vb, lr, beta1, beta2, epsilon, weightDecay, step, p!.Length);
+        b.LambUpdate(pb, gb, mb, vb, lr, beta1, beta2, epsilon, weightDecay, step, p!.Length, maxTrustRatio, biasCorrection);
         MarkGpuUpdated(b, p, m, v);
         return true;
     }

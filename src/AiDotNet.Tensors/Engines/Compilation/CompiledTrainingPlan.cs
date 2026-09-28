@@ -1202,6 +1202,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         public FusedOptimizerExtras Extras = new FusedOptimizerExtras();
         public FusedMomentStorageMode MomentStorageMode;
         public int Int8MomentBlockSize;
+        public int Int8MinQuantizedLength;
         public FusedOptimizerRuntimeScalars Scalars = new FusedOptimizerRuntimeScalars();
         public float[][]? MFloat;
         public float[][]? VFloat;
@@ -1250,6 +1251,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // the Adam-family m/v state owned by the fused optimizer closure.
     private FusedMomentStorageMode _momentStorageMode = FusedMomentStorageMode.Float32;
     private int _int8MomentBlockSize = 2048;
+    private int _int8MinQuantizedLength = DefaultInt8MinQuantizedLength;
+
+    /// <summary>
+    /// Tensors with fewer elements than this keep fp32 Adam moments under int8 moment storage: bitsandbytes'
+    /// <c>min_8bit_size</c> (Dettmers et al., "8-bit Optimizers via Block-wise Quantization", ICLR 2022). Small
+    /// tensors (biases, norms) cost almost nothing in fp32 and are where quantization error hurts most.
+    /// </summary>
+    public const int DefaultInt8MinQuantizedLength = 4096;
 
     // Return a prior configuration's fp32 Adam m/v/vMax buffers to the cross-arena
     // persistent pool so the NEXT ConfigureOptimizer* re-rents them instead of
@@ -1288,7 +1297,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// path. Supported only for Adam without weight decay. Last request wins
     /// against <see cref="RequestBf16MomentStorage"/>.
     /// </summary>
-    public void RequestInt8MomentStorage(bool enabled, int blockSize = 2048)
+    public void RequestInt8MomentStorage(bool enabled, int blockSize = 2048,
+        int minQuantizedLength = DefaultInt8MinQuantizedLength)
     {
         if (!enabled)
         {
@@ -1297,7 +1307,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         }
         if (blockSize <= 0)
             throw new ArgumentOutOfRangeException(nameof(blockSize), "Block size must be positive.");
+        if (minQuantizedLength < 0)
+            throw new ArgumentOutOfRangeException(nameof(minQuantizedLength), "Minimum quantized length must be >= 0.");
         _int8MomentBlockSize = blockSize;
+        _int8MinQuantizedLength = minQuantizedLength;
         _momentStorageMode = FusedMomentStorageMode.Int8BlockQuantized;
     }
 
@@ -1307,7 +1320,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private static void InitializeAdam8BitCpuState(
         byte[] mQuant, byte[] vQuant, double[] mScales, double[] vScales)
     {
-        for (int i = 0; i < mQuant.Length; i++) mQuant[i] = 128;
+        // m starts at zero: the signed dynamic codebook's zero entry (byte 128 was zero only in the old linear encoding).
+        for (int i = 0; i < mQuant.Length; i++) mQuant[i] = DynamicQuantizationCodebook.SignedZeroIndex;
         for (int i = 0; i < vQuant.Length; i++) vQuant[i] = 0;
         for (int i = 0; i < mScales.Length; i++) mScales[i] = 1e-10;
         for (int i = 0; i < vScales.Length; i++) vScales[i] = 1e-10;
@@ -1334,11 +1348,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             localVQuant = backend.AllocateByteBuffer(length);
 
             var mInitial = new byte[length];
-            for (int i = 0; i < mInitial.Length; i++) mInitial[i] = 128;
+            for (int i = 0; i < mInitial.Length; i++) mInitial[i] = DynamicQuantizationCodebook.SignedZeroIndex;
             backend.UploadByteBuffer(localMQuant, mInitial);
             // V quant uses zero-point 0, so its zero state is all-zero bytes. AllocateByteBuffer leaves
-            // device memory uninitialized (e.g. cuMemAlloc), so upload zeros explicitly — M was seeded to
-            // its 128 zero-point above but V was left as garbage until this fix.
+            // device memory uninitialized (e.g. cuMemAlloc), so upload zeros explicitly: M was seeded to
+            // the codebook's zero entry above, and V's zero entry is byte 0.
             backend.UploadByteBuffer(localVQuant, new byte[length]);
 
             var initialScales = new float[blockCount];
@@ -3221,7 +3235,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     _gpuOptimizerBuffers.Add(vBufBf16);
                     gpuMomentStorage[p] = FusedMomentStorageMode.BFloat16;
                 }
-                else if (useInt8Moments)
+                else if (useInt8Moments && lengths[p] >= _int8MinQuantizedLength)
                 {
                     if (paramBackend is not Engines.DirectGpu.ICompressedMomentGpuOptimizerBackend)
                         throw new NotSupportedException(
@@ -3301,7 +3315,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 mScales[p] = Array.Empty<double>();
                 vScales[p] = Array.Empty<double>();
             }
-            else if (useInt8Moments)
+            else if (useInt8Moments && lengths[p] >= _int8MinQuantizedLength)
             {
                 m[p] = Array.Empty<float>();
                 v[p] = Array.Empty<float>();
@@ -3405,6 +3419,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 : useInt8Moments ? FusedMomentStorageMode.Int8BlockQuantized
                 : FusedMomentStorageMode.Float32,
             Int8MomentBlockSize = _int8MomentBlockSize,
+            Int8MinQuantizedLength = _int8MinQuantizedLength,
             Scalars = scalarState,
             MFloat = m,
             VFloat = v,
@@ -4091,7 +4106,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                 fixed (ushort* pMb = mB[p], pVb = vB[p])
                                     FusedOptimizer.AdamUpdateBf16Simd(pParam, pGrad, pMb, pVb, len,
                                         lr, b1, b2, epsVal, _optimizerStep);
-                            else if (useInt8Moments)
+                            else if (useInt8Moments && mQuant[p].Length != 0)
                                 fixed (byte* pMq = mQuant[p], pVq = vQuant[p])
                                 fixed (double* pMs = mScales[p], pVs = vScales[p])
                                     FusedOptimizer.AdamUpdateInt8BlockQuantized(
@@ -4150,7 +4165,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                             break;
                         case OptimizerType.LAMB:
                             FusedOptimizer.LAMBUpdateSimd(pParam, pGrad, pM, pV, len,
-                                lr, b1, b2, epsVal, wd, _optimizerStep);
+                                lr, b1, b2, epsVal, wd, _optimizerStep, extras.LambMaxTrustRatio, !extras.LambDisableBiasCorrection);
                             break;
                         case OptimizerType.RMSprop:
                             if (wd != 0f)
@@ -4396,7 +4411,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     _gpuOptimizerBuffers.Add(vBufBf16);
                     gpuMomentStorage[p] = FusedMomentStorageMode.BFloat16;
                 }
-                else if (useInt8Moments)
+                else if (useInt8Moments && lengths[p] >= _int8MinQuantizedLength)
                 {
                     if (paramBackend is not Engines.DirectGpu.ICompressedMomentGpuOptimizerBackend)
                         throw new NotSupportedException(
@@ -4469,7 +4484,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 mScales[p] = Array.Empty<double>();
                 vScales[p] = Array.Empty<double>();
             }
-            else if (useInt8Moments)
+            else if (useInt8Moments && lengths[p] >= _int8MinQuantizedLength)
             {
                 m[p] = Array.Empty<float>();
                 v[p] = Array.Empty<float>();
@@ -4529,6 +4544,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 : useInt8Moments ? FusedMomentStorageMode.Int8BlockQuantized
                 : FusedMomentStorageMode.Float32,
             Int8MomentBlockSize = _int8MomentBlockSize,
+            Int8MinQuantizedLength = _int8MinQuantizedLength,
             MFloat = m,
             VFloat = v,
             VMaxFloat = vMax,
@@ -4748,7 +4764,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                 fixed (ushort* pMb = mB[p], pVb = vB[p])
                                     FusedOptimizer.AdamUpdateBf16Simd(pParam, pGrad, pMb, pVb, len,
                                         lr, b1, b2, epsVal, _optimizerStep);
-                            else if (useInt8Moments)
+                            else if (useInt8Moments && mQuant[p].Length != 0)
                                 fixed (byte* pMq = mQuant[p], pVq = vQuant[p])
                                 fixed (double* pMs = mScales[p], pVs = vScales[p])
                                     FusedOptimizer.AdamUpdateInt8BlockQuantized(
@@ -4802,7 +4818,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                             break;
                         case OptimizerType.LAMB:
                             FusedOptimizer.LAMBUpdateSimd(pParam, pGrad, pM, pV, len,
-                                lr, b1, b2, epsVal, wd, _optimizerStep);
+                                lr, b1, b2, epsVal, wd, _optimizerStep, extras.LambMaxTrustRatio, !extras.LambDisableBiasCorrection);
                             break;
                         case OptimizerType.RMSprop:
                             if (wd != 0f)
@@ -4994,6 +5010,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             Extras = CloneFusedOptimizerExtras(extras),
             MomentStorageMode = FusedMomentStorageMode.Float32,
             Int8MomentBlockSize = _int8MomentBlockSize,
+            Int8MinQuantizedLength = _int8MinQuantizedLength,
             MDouble = m,
             VDouble = v,
             VMaxDouble = vMax,
@@ -5196,6 +5213,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             Extras = CloneFusedOptimizerExtras(extras),
             MomentStorageMode = FusedMomentStorageMode.Float32,
             Int8MomentBlockSize = _int8MomentBlockSize,
+            Int8MinQuantizedLength = _int8MinQuantizedLength,
             MDouble = m,
             VDouble = v,
             VMaxDouble = vMax,
@@ -5314,6 +5332,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             WeightDecay = rt.WeightDecay,
             MomentStorageMode = rt.MomentStorageMode,
             Int8MomentBlockSize = rt.Int8MomentBlockSize,
+            Int8MinQuantizedLength = rt.Int8MinQuantizedLength,
             MaxGradNorm = _maxGradNorm,
             Extras = CloneFusedOptimizerExtras(rt.Extras),
             Schedules = schedules,
@@ -5337,12 +5356,88 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     internal void RestoreFusedOptimizerCheckpoint(FusedOptimizerCheckpoint checkpoint)
     {
         if (checkpoint is null) throw new ArgumentNullException(nameof(checkpoint));
+        ValidateCheckpointEnums(checkpoint);
+        if (checkpoint.Parameters.Length != _parameters.Length)
+            throw new InvalidDataException(
+                $"Optimizer checkpoint has {checkpoint.Parameters.Length} parameter states but plan has {_parameters.Length} parameters.");
+
+        // Restoring reconfigures the optimizer before per-parameter state sizes can be checked against the freshly
+        // allocated buffers, so a payload that fails part-way must not leave a half-restored plan behind: put the
+        // previous optimizer back (or none, if there was none) and report the payload as invalid.
+        var previous = CaptureFusedOptimizerCheckpoint();
+        var previousMomentMode = _momentStorageMode;
+        var previousBlockSize = _int8MomentBlockSize;
+        var previousMinQuantizedLength = _int8MinQuantizedLength;
+        var previousMaxGradNorm = _maxGradNorm;
+        try
+        {
+            RestoreFusedOptimizerCheckpointCore(checkpoint);
+        }
+        // Every failure rolls back, not only data errors: an enum-valid but unsupported combination (int8 moments
+        // with SGDMomentum, or weight decay with int8 moments) throws NotSupportedException from ConfigureOptimizer
+        // AFTER the live GPU buffers are disposed and the moments returned to the arena, and without a rollback the
+        // old update closure would keep writing into memory the plan no longer owns.
+        catch (Exception ex)
+        {
+            if (previous is not null)
+            {
+                RestoreFusedOptimizerCheckpointCore(previous);
+            }
+            else
+            {
+                ClearFusedOptimizer();
+                _momentStorageMode = previousMomentMode;
+                _int8MomentBlockSize = previousBlockSize;
+                _int8MinQuantizedLength = previousMinQuantizedLength;
+                _maxGradNorm = previousMaxGradNorm;
+            }
+
+            // A defined-but-unsupported optimizer keeps its NotSupportedException contract; anything else is a
+            // payload that does not fit this plan.
+            if (ex is InvalidDataException || ex is NotSupportedException) throw;
+            throw new InvalidDataException($"Optimizer checkpoint does not fit this plan: {ex.Message}", ex);
+        }
+    }
+
+    /// <summary>Rejects enum values no writer can produce, as corrupt data rather than an unsupported optimizer.</summary>
+    private static void ValidateCheckpointEnums(FusedOptimizerCheckpoint checkpoint)
+    {
+        if (!Enum.IsDefined(typeof(OptimizerType), checkpoint.OptimizerType))
+            throw new InvalidDataException($"Optimizer checkpoint names an unknown optimizer type {(int)checkpoint.OptimizerType}.");
+        if (!Enum.IsDefined(typeof(FusedMomentStorageMode), checkpoint.MomentStorageMode))
+            throw new InvalidDataException($"Optimizer checkpoint names an unknown moment storage mode {(int)checkpoint.MomentStorageMode}.");
+        if (checkpoint.GroupOptimizerTypes is { } groupTypes)
+        {
+            foreach (var type in groupTypes)
+            {
+                if (!Enum.IsDefined(typeof(OptimizerType), type))
+                    throw new InvalidDataException($"Optimizer checkpoint names an unknown group optimizer type {(int)type}.");
+            }
+        }
+    }
+
+    /// <summary>Releases the configured fused optimizer so the plan steps without one, as before configuration.</summary>
+    private void ClearFusedOptimizer()
+    {
+        foreach (var buf in _gpuOptimizerBuffers)
+            buf.Dispose();
+        _gpuOptimizerBuffers.Clear();
+        ReturnPooledMoments(_optimizerRuntimeState);
+        _optimizerRuntimeState = null;
+        _optimizerUpdate = null;
+        _optimizerStep = 0;
+        InvalidateCapturedStepGraph();
+    }
+
+    private void RestoreFusedOptimizerCheckpointCore(FusedOptimizerCheckpoint checkpoint)
+    {
         if (checkpoint.Parameters.Length != _parameters.Length)
             throw new InvalidDataException(
                 $"Optimizer checkpoint has {checkpoint.Parameters.Length} parameter states but plan has {_parameters.Length} parameters.");
 
         _momentStorageMode = checkpoint.MomentStorageMode;
         _int8MomentBlockSize = checkpoint.Int8MomentBlockSize;
+        _int8MinQuantizedLength = checkpoint.Int8MinQuantizedLength;
         _maxGradNorm = checkpoint.MaxGradNorm;
 
         var schedules = new LrSchedule[checkpoint.Schedules.Length];
@@ -5467,16 +5562,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             {
                 case FusedMomentStorageMode.BFloat16:
                     if (state.MBFloat16 is not null)
-                        ReplaceGpuByteStateBuffer(rt.GpuM!, p, backend, UShortArrayToBytes(state.MBFloat16));
+                        ReplaceGpuByteStateBuffer(rt.GpuM!, p, backend, UShortArrayToBytes(state.MBFloat16), sizeof(ushort));
                     if (state.VBFloat16 is not null)
-                        ReplaceGpuByteStateBuffer(rt.GpuV!, p, backend, UShortArrayToBytes(state.VBFloat16));
+                        ReplaceGpuByteStateBuffer(rt.GpuV!, p, backend, UShortArrayToBytes(state.VBFloat16), sizeof(ushort));
                     break;
 
                 case FusedMomentStorageMode.Int8BlockQuantized:
                     if (state.MQuantized is not null)
-                        ReplaceGpuByteStateBuffer(rt.GpuM!, p, backend, state.MQuantized);
+                        ReplaceGpuByteStateBuffer(rt.GpuM!, p, backend, state.MQuantized, sizeof(byte));
                     if (state.VQuantized is not null)
-                        ReplaceGpuByteStateBuffer(rt.GpuV!, p, backend, state.VQuantized);
+                        ReplaceGpuByteStateBuffer(rt.GpuV!, p, backend, state.VQuantized, sizeof(byte));
                     if (state.MScales is not null)
                         ReplaceGpuFloatStateBuffer(rt.GpuMScales!, p, backend, ToFloatArray(state.MScales));
                     if (state.VScales is not null)
@@ -5516,6 +5611,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         float[] data)
     {
         var old = buffers[index];
+        if (old is not null && old.Size != data.Length)
+            throw new InvalidDataException(
+                $"Optimizer checkpoint state length mismatch for parameter {index}: checkpoint={data.Length}, plan={old.Size}.");
         if (old is not null)
         {
             _gpuOptimizerBuffers.Remove(old);
@@ -5530,8 +5628,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         Engines.DirectGpu.IGpuBuffer?[] buffers,
         int index,
         Engines.DirectGpu.IDirectGpuBackend backend,
-        byte[] data)
+        byte[] data,
+        int bytesPerElement)
     {
+        // Checked against the size capture writes (parameter length x bytes per element), not the buffer's reported
+        // size, which a backend may round up for alignment.
+        long expectedBytes = checked((long)_parameters[index].Length * bytesPerElement);
+        if (data.Length != expectedBytes)
+            throw new InvalidDataException(
+                $"Optimizer checkpoint state byte length mismatch for parameter {index}: checkpoint={data.Length}, plan={expectedBytes}.");
         var old = buffers[index];
         if (old is not null)
         {
@@ -5608,6 +5713,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             LbfgsMemorySize = extras.LbfgsMemorySize,
             TrustRegionRadius = extras.TrustRegionRadius,
             AdmmRho = extras.AdmmRho,
+            // LAMB's trust-ratio clip and bias-correction switch select the step LAMB takes; the serializer writes them
+            // (format v7) but this clone - the runtime state the checkpoint is taken from - dropped them, so a clipped or
+            // uncorrected LAMB plan checkpointed and restored as plain LAMB.
+            LambMaxTrustRatio = extras.LambMaxTrustRatio,
+            LambDisableBiasCorrection = extras.LambDisableBiasCorrection,
             DecoupledWeightDecay = extras.DecoupledWeightDecay,
         };
 
@@ -5673,6 +5783,56 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         TrainingPlanWriter.Write(stream, this);
         return Task.CompletedTask;
     }
+
+    /// <inheritdoc/>
+    public byte[]? ExportOptimizerState()
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(CompiledTrainingPlan<T>));
+        var checkpoint = CaptureFusedOptimizerCheckpoint();
+        if (checkpoint is null) return null;
+
+        using var stream = new MemoryStream();
+        using (var writer = new BinaryWriter(stream))
+        {
+            writer.Write(OptimizerStateMagic);
+            writer.Write(OptimizerStateVersion);
+            FusedOptimizerCheckpointSerializer.Write(writer, checkpoint);
+        }
+        return stream.ToArray();
+    }
+
+    /// <inheritdoc/>
+    public void ImportOptimizerState(byte[] state)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(CompiledTrainingPlan<T>));
+        if (state is null) throw new ArgumentNullException(nameof(state));
+
+        FusedOptimizerCheckpoint? checkpoint;
+        try
+        {
+            using var reader = new BinaryReader(new MemoryStream(state, writable: false));
+            if (reader.ReadInt32() != OptimizerStateMagic)
+                throw new InvalidDataException("The payload is not compiled optimizer state (bad magic).");
+            int version = reader.ReadInt32();
+            if (version != OptimizerStateVersion)
+                throw new InvalidDataException(
+                    $"Compiled optimizer state version {version} is not supported (expected {OptimizerStateVersion}).");
+            checkpoint = FusedOptimizerCheckpointSerializer.Read(reader);
+        }
+        catch (EndOfStreamException ex)
+        {
+            throw new InvalidDataException("Compiled optimizer state is truncated.", ex);
+        }
+
+        if (checkpoint is null)
+            throw new InvalidDataException("Compiled optimizer state payload contains no optimizer.");
+        RestoreFusedOptimizerCheckpoint(checkpoint);
+    }
+
+    // "AOPT": identifies an ExportOptimizerState payload so a wrong byte array fails loudly on import.
+    private const int OptimizerStateMagic = 0x54504F41;
+    // 2: the optimizer extras gained LAMB's trust-ratio clip and bias-correction switch (plan format 7).
+    private const int OptimizerStateVersion = 2;
 
     /// <inheritdoc/>
     public bool IsCompatibleWith(PlanCompatibilityInfo info)
@@ -6425,16 +6585,6 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     $"coverage (decisionsMatch={decisionsMatch}, plannedActions={realCoverage.Count}, " +
                     $"builtActions={backwardActions.Count}); refusing to apply a misaligned re-zero schedule.");
             gradPoolReZeroByStep = gradPoolReZeroByPosition;
-        }
-
-        // Phase 4.4: Wire pre-packed weights for MatMul forward steps
-        if (typeof(T) == typeof(float))
-        {
-            var packedWeights = WeightLayoutOptimizer.PrePackWeights(allForwardActions
-                .Select((a, idx) => idx < forwardSteps.Count && !fusedStepIndices.Contains(idx) ? forwardSteps[idx] : null)
-                .Where(s => s is not null)
-                .ToArray()!);
-            // packedWeights are available for future SIMD tile kernels that consume panel format
         }
 
         // Phase 4.4: Fused optimizer — append SGD/Adam parameter update directly to backward actions.
@@ -9336,6 +9486,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             bool accumB = consumerCount.ContainsKey(inputB) && consumerCount[inputB] > 1;
             int[] inputBShape = (int[])inputB._shape.Clone();
             int[] outShape = (int[])output._shape.Clone();
+            // With no reduce axes the output gradient goes to inputB element for element. A lower-rank inputB that
+            // needs no reduction ([64] against a [1, 64] output: the padded axis has size 1 on both sides) holds the
+            // same elements under a different shape, and TensorAddInto refuses mismatched shapes, so an accumulating
+            // inputB threw every step and the whole plan fell back to the eager tape (DeepFactor, found by the model
+            // census). View the output gradient in inputB's shape once, here; a contiguous Reshape is O(1).
+            var gradOutForB = reduceAxesArr.Length == 0 && !System.Linq.Enumerable.SequenceEqual(gradOut._shape, inputBShape)
+                ? gradOut.Reshape(inputBShape)
+                : gradOut;
 
             // Detect the NCHW→[1,C,1,1] bias-add pattern: reduce axes are
             // exactly {0, 2, 3} (batch + both spatial dims) AND output is
@@ -9361,8 +9519,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 // gradInputB: reduce-sum gradOut over the broadcast axes.
                 if (reduceAxesArr.Length == 0)
                 {
-                    if (accumB) eng.TensorAddInto(gradInputB, gradInputB, gradOut);
-                    else gradOut.AsSpan().CopyTo(gradInputB.AsWritableSpan());
+                    if (accumB) eng.TensorAddInto(gradInputB, gradInputB, gradOutForB);
+                    else gradOutForB.AsSpan().CopyTo(gradInputB.AsWritableSpan());
                 }
                 else if (isNchwChannelReduce)
                 {

@@ -7047,20 +7047,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (activationParams is not null)
             return base.FusedLinear(input, weights, bias, activation, activationParams);
 
-        // When a tape is active, defer to the base (CpuEngine) tape-aware
-        // path which decomposes into TensorMatMul + TensorBroadcastAdd and
-        // collapses them into a single recorded "FusedLinear" entry. The
-        // GPU fused kernels below bypass tape recording (they call
-        // backend.GemmBiasRelu / etc directly without going through
-        // DifferentiableOps), so taking them during training would
-        // silently disconnect this op from autograd. The inner
-        // TensorMatMul + TensorBroadcastAdd dispatch via virtual on
-        // `this`, so they still hit the DirectGpu GPU path for the
-        // forward — only the SINGLE-CALL fused kernel is given up.
-        // Pure-inference callers (no tape) still get the full fused
-        // kernel speedup.
+        // Under a tape the fused kernels below cannot be used: they return only the activated output, and the
+        // backward needs the pre-activation. The base path keeps the matmul on the device but applies the
+        // activation IN PLACE ON THE HOST, which read the result back twice per call. Build the same node on the
+        // device instead, with the saved state CpuEngine records.
         if (IsTapeActive<T>())
-            return base.FusedLinear(input, weights, bias, activation);
+        {
+            if (TryFusedLinearForwardUnderTape(input, weights, bias, activation) is not { } taped)
+                return base.FusedLinear(input, weights, bias, activation);
+            var fusedInputs = bias is not null ? new[] { input, weights, bias } : new[] { input, weights };
+            Autodiff.DifferentiableOps.RecordIfActive("FusedLinear", taped.Result, fusedInputs,
+                Autodiff.BackwardFunctions<T>.FusedLinearWithActivationBackward,
+                activation != FusedActivationType.None ? new object[] { activation, taped.PreActivation } : null);
+            return taped.Result;
+        }
 
         if (!TryGetBackend(out var backend))
             return base.FusedLinear(input, weights, bias, activation);
@@ -7311,6 +7311,60 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         ApplyGpuActivation(backend, result, size, activation);
         return result;
     }
+
+    /// <summary>
+    /// Taped FusedLinear forward on the device, returning the activated result and the pre-activation the backward
+    /// needs. The pre-activation comes from the engine's own TensorMatMul and TensorBroadcastAdd, so it is exactly
+    /// what the unfused chain computes (FusedLinearGradientTests holds the fused gradients to it), run WITHOUT
+    /// recording because the caller records the whole op as one node. Activations with a CPU-matching device
+    /// kernel run it directly; any other goes through the same ActivationRegistry handler CpuEngine applies.
+    /// Null when the device path cannot take it, so the caller falls back to base.
+    /// </summary>
+    private (Tensor<T> Result, Tensor<T> PreActivation)? TryFusedLinearForwardUnderTape<T>(Tensor<T> input,
+        Tensor<T> weights, Tensor<T>? bias, FusedActivationType activation)
+    {
+        if (typeof(T) != typeof(float) || Compilation.GraphMode.IsActive || input.Rank < 2 || weights.Rank != 2
+            || !TryGetBackend(out var backend))
+            return null;
+        try
+        {
+            using (new Autodiff.NoGradScope<T>())
+            {
+                var preActivation = TensorMatMul(input, weights);
+                if (bias is not null) preActivation = TensorBroadcastAdd(preActivation, bias);
+                if (activation == FusedActivationType.None)
+                    return (preActivation, preActivation);
+
+                if (!HasCpuMatchingDeviceKernel(activation))
+                {
+                    var handler = ActivationRegistry.Get(activation);
+                    return handler is null ? null : (handler.Apply(this, preActivation), preActivation);
+                }
+
+                int n = preActivation.Length;
+                using var preBuffer = GetOrAllocateBuffer(backend, preActivation);
+                var result = DispatchDeferredGpuOp<T>(backend, n, (int[])preActivation._shape.Clone(), output =>
+                    ApplyGpuActivation(backend, preBuffer.Buffer, output, n, activation));
+                return (result, preActivation);
+            }
+        }
+        catch (Exception)
+        {
+            if (ThrowOnGpuKernelFallback) throw;
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Activations whose device kernel computes the same function as CpuEngine's default-parameter activation, so a
+    /// taped forward on the device and the CPU-defined backward agree. Each is pinned by a gradient-parity test.
+    /// </summary>
+    private static bool HasCpuMatchingDeviceKernel(FusedActivationType activation) => activation switch
+    {
+        FusedActivationType.ReLU or FusedActivationType.Sigmoid or FusedActivationType.Tanh
+            or FusedActivationType.GELU or FusedActivationType.Swish => true,
+        _ => false,
+    };
 
     private static void ApplyGpuActivation(IDirectGpuBackend backend, IGpuBuffer input, IGpuBuffer output, int size, FusedActivationType activation)
     {
@@ -8620,13 +8674,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (stride == 0) stride = poolSize;
 
-        // Keep both values and argmax positions resident for the common no-padding
-        // training path. The legacy base path exposes argmax as a CLR array and must
-        // download the complete index buffer before it can record backward.
-        if (IsTapeActive<T>() && padding == 0)
-            return MaxPool2DWithTensorIndices(
-                input, new[] { poolSize, poolSize }, new[] { stride, stride }, out _);
-        if (IsTapeActive<T>()) return base.MaxPool2D(input, poolSize, stride, padding);
+        // Under a tape, also keep the argmax positions resident: the backward routes by them, and inference never
+        // needs them. The kernel's indices point at real input cells, so padding changes nothing downstream.
+        if (IsTapeActive<T>())
+        {
+            var poolDims = new[] { poolSize, poolSize };
+            var strideDims = new[] { stride, stride };
+            if (TryMaxPool2DWithTensorIndicesOnDevice(input, poolDims, strideDims, padding) is not { } taped)
+                return base.MaxPool2D(input, poolSize, stride, padding);
+            Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
+            Autodiff.DifferentiableOps.RecordUnary("MaxPool2D", taped.Result, input,
+                Autodiff.BackwardFunctions<T>.MaxPool2DTensorIndicesBackward,
+                new object[] { taped.Indices, poolDims, strideDims });
+            return taped.Result;
+        }
 
         if (!TryGetBackend(out var backend))
             return base.MaxPool2D(input, poolSize, stride, padding);
@@ -8788,18 +8849,38 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         Compilation.GraphMode.ThrowIfInferenceUnsupported(
             Compilation.GraphCaptureLimitation.HeterogeneousOutput);
 
-        if (!TryGetBackend(out var backend) || input.Rank != 4
-            || poolSize is not { Length: 2 } || stride is not { Length: 2 })
+        if (TryMaxPool2DWithTensorIndicesOnDevice(input, poolSize, stride, padding: 0) is not { } pooled)
             return base.MaxPool2DWithTensorIndices(input, poolSize, stride, out maxIndices);
+
+        maxIndices = pooled.Indices;
+        Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
+        Autodiff.DifferentiableOps.RecordUnary("MaxPool2D", pooled.Result, input,
+            Autodiff.BackwardFunctions<T>.MaxPool2DTensorIndicesBackward,
+            new object[] { maxIndices, poolSize, stride });
+        return pooled.Result;
+    }
+
+    /// <summary>
+    /// MaxPool2D on the device that also keeps each window's winner resident, as a flat index into its input plane.
+    /// Padding is applied by the kernel, whose indices always name real cells. Null when the device path cannot
+    /// take it, so the caller falls back to base.
+    /// </summary>
+    private (Tensor<T> Result, Tensor<int> Indices)? TryMaxPool2DWithTensorIndicesOnDevice<T>(
+        Tensor<T> input, int[] poolSize, int[] stride, int padding)
+    {
+        if (!TryGetBackend(out var backend) || input.Rank != 4 || padding < 0
+            || poolSize is not { Length: 2 } || stride is not { Length: 2 }
+            || padding >= poolSize[0] || padding >= poolSize[1])
+            return null;
 
         int batch = input.Shape._dims[0];
         int channels = input.Shape._dims[1];
         int inHeight = input.Shape._dims[2];
         int inWidth = input.Shape._dims[3];
-        int outHeight = (inHeight - poolSize[0]) / stride[0] + 1;
-        int outWidth = (inWidth - poolSize[1]) / stride[1] + 1;
+        int outHeight = (inHeight + 2 * padding - poolSize[0]) / stride[0] + 1;
+        int outWidth = (inWidth + 2 * padding - poolSize[1]) / stride[1] + 1;
         if (outHeight <= 0 || outWidth <= 0)
-            return base.MaxPool2DWithTensorIndices(input, poolSize, stride, out maxIndices);
+            return null;
 
         int outputSize = checked(batch * channels * outHeight * outWidth);
         using var inputBuffer = GetOrAllocateBuffer(backend, input);
@@ -8809,30 +8890,24 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             backend.MaxPool2D(inputBuffer.Buffer, outputBuffer.Buffer, indicesBuffer.Buffer,
                 batch, channels, inHeight, inWidth, outHeight, outWidth,
-                poolSize[0], poolSize[1], stride[0], stride[1], 0, 0);
+                poolSize[0], poolSize[1], stride[0], stride[1], padding, padding);
 
             var outputShape = new[] { batch, channels, outHeight, outWidth };
             var result = DeferTensorResult<T>(
                 backend, outputBuffer.Buffer, outputSize, outputShape);
             outputBuffer.RelinquishOwnership();
-            maxIndices = Tensor<int>.FromGpuBuffer(
+            var indices = Tensor<int>.FromGpuBuffer(
                 backend, indicesBuffer.Buffer, outputShape, GpuTensorRole.Intermediate,
                 ownsBuffer: true, bufferContainsRawInt32: true);
             indicesBuffer.RelinquishOwnership();
-
-            Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
-            Autodiff.DifferentiableOps.RecordUnary("MaxPool2D", result, input,
-                Autodiff.BackwardFunctions<T>.MaxPool2DTensorIndicesBackward,
-                new object[] { maxIndices, poolSize, stride });
-            return result;
+            return (result, indices);
         }
-        catch
+        catch (Exception)
         {
             if (ThrowOnGpuKernelFallback) throw;
-            return base.MaxPool2DWithTensorIndices(input, poolSize, stride, out maxIndices);
+            return null;
         }
     }
-
     /// <summary>
     /// GPU-accelerated backward pass for 2D max pooling.
     /// Propagates gradients back through the max pooling operation using stored indices.
@@ -8919,19 +8994,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// GPU-accelerated 2D average pooling operation.
     /// Uses GPU kernels for efficient parallel computation of average values within pooling windows.
     /// </summary>
-    public override Tensor<T> AvgPool2D<T>(Tensor<T> input, int poolSize, int stride = 0, int padding = 0)
+    public override Tensor<T> AvgPool2D<T>(Tensor<T> input, int poolSize, int stride = 0, int padding = 0,
+        bool countIncludePad = false)
     {
         if (stride == 0) stride = poolSize;
 
-        // Tape-active: use the recording CPU base path (see MaxPool2D).
-        if (IsTapeActive<T>()) return base.AvgPool2D(input, poolSize, stride, padding);
-
         if (!TryGetBackend(out var backend))
-            return base.AvgPool2D(input, poolSize, stride, padding);
+            return base.AvgPool2D(input, poolSize, stride, padding, countIncludePad);
 
         // Expected input shape: [batch, channels, height, width]
-        if (input.Rank != 4)
-            return base.AvgPool2D(input, poolSize, stride, padding);
+        if (input.Rank != 4 || padding < 0)
+            return base.AvgPool2D(input, poolSize, stride, padding, countIncludePad);
 
         int batch = input.Shape._dims[0];
         int channels = input.Shape._dims[1];
@@ -8943,7 +9016,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int outWidth = (inWidth + 2 * padding - poolSize) / stride + 1;
 
         if (outHeight <= 0 || outWidth <= 0)
-            return base.AvgPool2D(input, poolSize, stride, padding);
+            return base.AvgPool2D(input, poolSize, stride, padding, countIncludePad);
 
         using var inputBuffer = GetOrAllocateBuffer(backend, input);
         // #642: lazy FinishGpuOp (deferred-correct). The earlier deferred crash was the
@@ -8958,17 +9031,21 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 outHeight, outWidth,
                 poolSize, poolSize,
                 stride, stride, padding, padding,
-                countIncludePad: true);
+                countIncludePad: countIncludePad);
 
             int outputSize = batch * channels * outHeight * outWidth;
             var result = DeferTensorResult<T>(backend, outputBuffer.Buffer, outputSize,
                 new[] { batch, channels, outHeight, outWidth });
             handedOff = true;
+            // Same node and saved state CpuEngine records, padding and divisor rule included.
+            Autodiff.DifferentiableOps.RecordUnary("AvgPool2D", result, input, Autodiff.BackwardFunctions<T>.AvgPool2DBackward,
+                AvgPool2DSavedState(poolSize, stride, padding, countIncludePad));
             return result;
         }
-        catch
+        catch (Exception)
         {
-            return base.AvgPool2D(input, poolSize, stride, padding);
+            if (ThrowOnGpuKernelFallback) throw;
+            return base.AvgPool2D(input, poolSize, stride, padding, countIncludePad);
         }
         finally
         {
@@ -8981,11 +9058,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     public override Tensor<T> AvgPool2D<T>(Tensor<T> input, int[] poolSize, int[] stride)
     {
-        // Defer to CpuEngine when a tape is active so AvgPool2DBackward
-        // is recorded against the correct primitive path; also avoids the
-        // CUDA kernel-launch crash (0xC0000005) on the int[] overload
-        // surfaced by AvgPool2D_IntArrayOverload_ProducesNonZeroInputGradient.
-        if (IsTapeActive<T>()) return base.AvgPool2D(input, poolSize, stride);
+        // The 0xC0000005 launch crash AvgPool2D_IntArrayOverload_ProducesNonZeroInputGradient surfaced was the
+        // CudaBackend kernel-arg mismatch fixed in AvgPool2DBackward (see its remarks), so a tape no longer needs
+        // to route around this kernel.
         if (!TryGetBackend(out var backend))
             return base.AvgPool2D(input, poolSize, stride);
 
@@ -9019,10 +9094,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var result = DeferTensorResult<T>(backend, outputBuffer.Buffer, outputSize,
                 new[] { batch, channels, outHeight, outWidth });
             outputBuffer.RelinquishOwnership();
+            // Same node and saved state CpuEngine records for this overload (no padding).
+            Autodiff.DifferentiableOps.RecordUnary("AvgPool2D", result, input, Autodiff.BackwardFunctions<T>.AvgPool2DBackward,
+                new object[] { (int[])poolSize.Clone(), (int[])stride.Clone() });
             return result;
         }
-        catch
+        catch (Exception)
         {
+            if (ThrowOnGpuKernelFallback) throw;
             return base.AvgPool2D(input, poolSize, stride);
         }
     }
@@ -9041,13 +9120,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// signature; HIP / OpenCL / Vulkan / Metal / WebGpu were already
     /// passing the full 15-arg layout.
     /// </remarks>
-    public override Tensor<T> AvgPool2DBackward<T>(Tensor<T> gradOutput, int[] inputShape, int[] poolSize, int[] stride)
+    public override Tensor<T> AvgPool2DBackward<T>(Tensor<T> gradOutput, int[] inputShape, int[] poolSize, int[] stride,
+        int[]? padding = null, bool countIncludePad = false)
     {
+        var pad = padding ?? new[] { 0, 0 };
         if (!TryGetBackend(out var backend))
-            return base.AvgPool2DBackward(gradOutput, inputShape, poolSize, stride);
+            return base.AvgPool2DBackward(gradOutput, inputShape, poolSize, stride, padding, countIncludePad);
 
-        if (gradOutput.Rank != 4 || inputShape.Length != 4)
-            return base.AvgPool2DBackward(gradOutput, inputShape, poolSize, stride);
+        if (gradOutput.Rank != 4 || inputShape.Length != 4 || pad.Length != 2)
+            return base.AvgPool2DBackward(gradOutput, inputShape, poolSize, stride, padding, countIncludePad);
 
         int batch = inputShape[0];
         int channels = inputShape[1];
@@ -9065,17 +9146,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 batch, channels, inHeight, inWidth,
                 outHeight, outWidth,
                 poolSize[0], poolSize[1],
-                stride[0], stride[1], 0, 0,
-                countIncludePad: true);
+                stride[0], stride[1], pad[0], pad[1],
+                countIncludePad: countIncludePad);
 
             int inputSize = batch * channels * inHeight * inWidth;
             var result = DeferTensorResult<T>(backend, gradInputBuffer.Buffer, inputSize, inputShape);
             gradInputBuffer.RelinquishOwnership();
             return result;
         }
-        catch
+        catch (Exception)
         {
-            return base.AvgPool2DBackward(gradOutput, inputShape, poolSize, stride);
+            if (ThrowOnGpuKernelFallback) throw;
+            return base.AvgPool2DBackward(gradOutput, inputShape, poolSize, stride, padding, countIncludePad);
         }
     }
 
@@ -11489,7 +11571,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (targetIds is null) throw new ArgumentNullException(nameof(targetIds));
         Compilation.GraphMode.ThrowIfInferenceUnsupported(
             Compilation.GraphCaptureLimitation.HeterogeneousInput);
-        if (Compilation.GraphMode.IsActive || IsTapeActive<T>())
+        if (Compilation.GraphMode.IsActive)
             return base.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, targetIds);
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend))
             return base.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, targetIds);
@@ -11521,6 +11603,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 hB.Buffer, wB.Buffer, bB.Buffer, tB.Buffer, loss.Buffer, n, d, vocab);
             var result = DeferTensorResult<T>(backend, loss.Buffer, 1, new[] { 1 });
             loss.RelinquishOwnership();
+            // Same node CpuEngine records, labels saved as a host COPY (supervision, not a tape input). Reading
+            // resident ids here costs one [N] int download per taped step; the logits never leave the device.
+            if (IsTapeActive<T>())
+                Autodiff.DifferentiableOps.RecordIfActive("FusedLinearCrossEntropy", result, new[] { hidden, weight, bias },
+                    CpuEngine.FusedLinearCrossEntropyIndexBackward<T>,
+                    savedState: new object[] { (int[])targetIds.GetDataArray().Clone(), vocab });
             return result;
         }
         catch
@@ -11542,7 +11630,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (weight is null) throw new ArgumentNullException(nameof(weight));
         if (bias is null) throw new ArgumentNullException(nameof(bias));
         if (target is null) throw new ArgumentNullException(nameof(target));
-        if (Compilation.GraphMode.IsActive || IsTapeActive<T>())
+        if (Compilation.GraphMode.IsActive)
             return base.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, target);
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend))
             return base.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, target);
@@ -11567,10 +11655,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 hB.Buffer, wB.Buffer, bB.Buffer, tB.Buffer, loss.Buffer, n, d, vocab);
             var result = DeferTensorResult<T>(backend, loss.Buffer, 1, new[] { 1 });
             loss.RelinquishOwnership();
+            Autodiff.DifferentiableOps.RecordIfActive("FusedLinearCrossEntropy", result, new[] { hidden, weight, bias, target },
+                CpuEngine.FusedLinearCrossEntropyBackward<T>, savedState: null);
             return result;
         }
-        catch
+        catch (Exception)
         {
+            if (ThrowOnGpuKernelFallback) throw;
             return base.FusedLinearCrossEntropyWithLogits(hidden, weight, bias, target);
         }
     }
@@ -11591,9 +11682,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // a tape entry with FlashAttentionBackward so gradient flow to Q,
         // K, V works. Keeping `public override` makes the IEngine dispatch
         // reach this method instead of CpuEngine's implicit-interface impl.
-        if (IsTapeActive<T>())
-            return base.FlashAttention(query, key, value, scale, isCausal, out softmaxStats, attentionBias);
-
         if (!TryGetBackend(out var backend))
             return base.FlashAttention(query, key, value, scale, isCausal, out softmaxStats, attentionBias);
 
@@ -11621,6 +11709,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             out Tensor<T> directResult, out Tensor<T> directSoftmaxStats))
         {
             softmaxStats = directSoftmaxStats;
+            RecordFlashAttention(directResult, query, key, value, softmaxStats, scale ?? 1.0 / Math.Sqrt(headDim), isCausal, attentionBias);
             return directResult;
         }
 #endif
@@ -11654,6 +11743,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     BindResidentBuffer(outT, outBufR, backend);
                     BindResidentBuffer(statsT, statsBufR, backend);
                     softmaxStats = statsT;
+                    RecordFlashAttention(outT, query, key, value, softmaxStats, scale ?? 1.0 / Math.Sqrt(headDim), isCausal, attentionBias);
                     return outT;
                 }
             }
@@ -11686,6 +11776,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             softmaxStats = DeferTensorResult<T>(backend, statsBuffer.Buffer,
                 batch * heads * seqQ, new[] { batch, heads, seqQ });
             faHanded = true;
+            RecordFlashAttention(result, query, key, value, softmaxStats, scale ?? 1.0 / Math.Sqrt(headDim), isCausal, attentionBias);
             return result;
         }
         catch
@@ -11698,6 +11789,22 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // Free the GPU buffers unless they were handed to FinishGpuOp (resident path owns them).
             if (!faHanded) { outputBuffer.Dispose(); statsBuffer.Dispose(); }
         }
+    }
+
+    /// <summary>
+    /// Records the node CpuEngine records for FlashAttention: the per-row log-sum-exp stats, the scale as a double, the
+    /// causal flag, and the bias only when there is one (a missing entry is the only null the saved-state serializer
+    /// can carry). Every device path produces stats in that same LSE layout, and the backward runs this engine's
+    /// FlashAttentionBackward, which falls back to the CPU only for inputs the device forward never takes.
+    /// </summary>
+    private static void RecordFlashAttention<T>(Tensor<T> result, Tensor<T> query, Tensor<T> key, Tensor<T> value,
+        Tensor<T> softmaxStats, double scale, bool isCausal, Tensor<T>? attentionBias)
+    {
+        var saved = attentionBias is null
+            ? new object[] { softmaxStats, scale, isCausal }
+            : new object[] { softmaxStats, scale, isCausal, attentionBias };
+        Autodiff.DifferentiableOps.RecordIfActive("FlashAttention", result, new[] { query, key, value },
+            Autodiff.BackwardFunctions<T>.FlashAttentionBackward, saved);
     }
 
 #if NET5_0_OR_GREATER
@@ -11895,14 +12002,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         bool isCausal,
         out Tensor<T> attentionWeights)
     {
-        // Same rationale as FusedLinear / FusedConv2D: when a tape is
-        // active, defer to the base CpuEngine path which decomposes
-        // into recorded primitives. The fused GPU kernel below bypasses
-        // DifferentiableOps, so taking it during training would
-        // silently disconnect this op from autograd.
-        if (IsTapeActive<T>())
-            return base.GroupedQueryAttention(query, key, value, numQueriesPerKV, scale, isCausal, out attentionWeights);
-
         if (!TryGetBackend(out var backend))
             return base.GroupedQueryAttention(query, key, value, numQueriesPerKV, scale, isCausal, out attentionWeights);
 
@@ -11938,6 +12037,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 batch * numQHeads * seqQ * seqK, new[] { batch, numQHeads, seqQ, seqK });
             outputBuffer.RelinquishOwnership();
             attnWeightsBuffer.RelinquishOwnership();
+            // Same node and saved state CpuEngine records: the softmax weights, the query-per-KV ratio and the
+            // scale as a double. The backward runs this engine's GroupedQueryAttentionBackward.
+            Autodiff.DifferentiableOps.RecordIfActive("GroupedQueryAttention", result, new[] { query, key, value },
+                Autodiff.BackwardFunctions<T>.GroupedQueryAttentionBackward,
+                new object[] { attentionWeights, numQueriesPerKV, scale ?? (1.0 / Math.Sqrt(headDim)) });
             return result;
         }
         catch
@@ -14228,8 +14332,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.LayerNorm<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
         ValidateLayerNormArguments(input, gamma, beta);
-        // Float forwards to the public override, which runs the kernel and records the tape node itself; only a
-        // non-float tape stays on the CPU (the non-float device branch below records nothing).
+        // Float forwards to the public override, which runs the kernel and records the tape node itself.
+        // Non-float stays on CpuEngine under a tape: the norm kernels compute in FP32, so a double training step
+        // would silently lose its precision (a double finite-difference gradcheck cannot resolve it). Float runs
+        // and records on the device.
         if (IsTapeActive<T>() && typeof(T) != typeof(float)) return base.LayerNorm(input, gamma, beta, epsilon, out mean, out variance);
         // AiDotNet#1331: under GraphMode, the base CpuEngine.LayerNorm has the
         // lazy-graph recording branch that emits a backward node for the
@@ -14304,8 +14410,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             trueVarBuffer.RelinquishOwnership();
             return result;
         }
-        catch
+        catch (Exception)
         {
+            if (ThrowOnGpuKernelFallback) throw;
             return base.LayerNorm(input, gamma, beta, epsilon, out mean, out variance);
         }
     }
@@ -14515,7 +14622,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.RMSNorm<T>(Tensor<T> input, Tensor<T> gamma, double epsilon, out Tensor<T> rms)
     {
-        if (IsTapeActive<T>()) return base.RMSNorm(input, gamma, epsilon, out rms);
+        // Non-float stays on CpuEngine under a tape: the norm kernels compute in FP32, so a double training step
+        // would silently lose its precision (a double finite-difference gradcheck cannot resolve it). Float runs
+        // and records on the device.
+        if (IsTapeActive<T>() && typeof(T) != typeof(float)) return base.RMSNorm(input, gamma, epsilon, out rms);
         if (Compilation.GraphMode.IsActive) return base.RMSNorm(input, gamma, epsilon, out rms);
         if (!TryGetBackend(out var backend))
             return base.RMSNorm(input, gamma, epsilon, out rms);
@@ -14540,8 +14650,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             backend.Synchronize();
             var result = DeferTensorResult<T>(backend, outputBuffer.Buffer,
                 input.Length, input.Shape.ToArray());
-            rms = DeferTensorResult<T>(backend, saveRmsBuffer.Buffer,
-                batchSize, new[] { batchSize });
+            // Shaped like CpuEngine's rms: the leading (non-normalised) dims, [1] when there are none.
+            int batchDims = input.Rank - gamma.Rank;
+            var rmsShape = new int[Math.Max(1, batchDims)];
+            if (batchDims <= 0) rmsShape[0] = 1;
+            for (int i = 0; i < batchDims; i++) rmsShape[i] = input.Shape._dims[i];
+            rms = DeferTensorResult<T>(backend, saveRmsBuffer.Buffer, batchSize, rmsShape);
             outputBuffer.RelinquishOwnership();
             saveRmsBuffer.RelinquishOwnership();
             return result;
@@ -14600,7 +14714,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.GroupNorm<T>(Tensor<T> input, int numGroups, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
-        if (IsTapeActive<T>()) return base.GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
+        // Non-float stays on CpuEngine under a tape: the norm kernels compute in FP32, so a double training step
+        // would silently lose its precision (a double finite-difference gradcheck cannot resolve it). Float runs
+        // and records on the device.
+        if (IsTapeActive<T>() && typeof(T) != typeof(float)) return base.GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
         if (Compilation.GraphMode.IsActive) return base.GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
         if (!TryGetBackend(out var backend))
             return base.GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
@@ -14663,7 +14780,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.InstanceNorm<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
-        if (IsTapeActive<T>()) return base.InstanceNorm(input, gamma, beta, epsilon, out mean, out variance);
+        // Non-float stays on CpuEngine under a tape: the norm kernels compute in FP32, so a double training step
+        // would silently lose its precision (a double finite-difference gradcheck cannot resolve it). Float runs
+        // and records on the device.
+        if (IsTapeActive<T>() && typeof(T) != typeof(float)) return base.InstanceNorm(input, gamma, beta, epsilon, out mean, out variance);
         if (Compilation.GraphMode.IsActive) return base.InstanceNorm(input, gamma, beta, epsilon, out mean, out variance);
         if (!TryGetBackend(out var backend))
             return base.InstanceNorm(input, gamma, beta, epsilon, out mean, out variance);
@@ -14727,16 +14847,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.BatchNormBackward<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> gamma, Tensor<T> mean, Tensor<T> variance, double epsilon, out Tensor<T> gradGamma, out Tensor<T> gradBeta)
     {
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || !TryGetBackend(out var backend) || input.Rank < 2)
+        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || !TryGetBackend(out var backend)
+            || !TryBatchNormLayout(input._shape, gamma.Length, out int batch, out int channels, out int spatialSize))
             return base.BatchNormBackward(gradOutput, input, gamma, mean, variance, epsilon, out gradGamma, out gradBeta);
 
         try
         {
-            int channels = gamma.Length;
-            int batch = input.Shape._dims[0];
-            if (channels <= 0 || batch <= 0 || input.Length % (batch * channels) != 0)
-                return base.BatchNormBackward(gradOutput, input, gamma, mean, variance, epsilon, out gradGamma, out gradBeta);
-            int spatialSize = input.Length / (batch * channels);
 
             using var gradOutBuffer = GetOrAllocateBuffer(backend, gradOutput);
             using var inputBuffer = GetOrAllocateBuffer(backend, input);
@@ -15720,7 +15836,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.Dropout<T>(Tensor<T> input, double dropoutRate, bool training, out Tensor<T> mask)
     {
-        if (IsTapeActive<T>()) return base.Dropout(input, dropoutRate, training, out mask);
         if (Compilation.GraphMode.IsActive) return base.Dropout(input, dropoutRate, training, out mask);
         return Dropout(input, dropoutRate, training, out mask);
     }
@@ -15875,7 +15990,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         Compilation.GraphMode.ThrowIfInferenceUnsupported(
             Compilation.GraphCaptureLimitation.HeterogeneousInput);
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || !TryGetBackend(out var backend))
             return base.Embedding(indices, embeddingTable);
 
@@ -15912,7 +16027,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var result = DeferTensorResult<T>(backend, outputBuffer.Buffer, numIndices * embeddingDim, outputShape);
                 outputBuffer.RelinquishOwnership();
                 outputHandedOff = true;
-                return result;
+                return RecordEmbedding(result, indices, embeddingTable, vocabSize, embeddingDim);
             }
             finally
             {
@@ -16475,7 +16590,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.AdaptiveAvgPool2D<T>(Tensor<T> input, int outputHeight, int outputWidth)
     {
-        if (IsTapeActive<T>()) return base.AdaptiveAvgPool2D(input, outputHeight, outputWidth);
         if (!TryGetBackend(out var backend))
             return base.AdaptiveAvgPool2D(input, outputHeight, outputWidth);
 
@@ -16490,10 +16604,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             int inWidth = input.Shape._dims[3];
 
             using var inputBuffer = GetOrAllocateBuffer(backend, input);
-            return DispatchDeferredGpuOp<T>(backend, batch * channels * outputHeight * outputWidth,
+            var result = DispatchDeferredGpuOp<T>(backend, batch * channels * outputHeight * outputWidth,
                 new[] { batch, channels, outputHeight, outputWidth }, output =>
                     backend.AdaptiveAvgPool2D(inputBuffer.Buffer, output, batch, channels,
                         inHeight, inWidth, outputHeight, outputWidth));
+            // Same node and saved state as CpuEngine and the public override.
+            Autodiff.DifferentiableOps.RecordUnary("AdaptiveAvgPool2D", result, input,
+                Autodiff.BackwardFunctions<T>.AdaptiveAvgPool2DBackward,
+                savedState: new object[] { outputHeight, outputWidth });
+            return result;
         }
         catch
         {
@@ -18977,10 +19096,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return MaxPool2D(input, poolSize, stride, padding);
     }
 
-    public override Tensor<T> TensorAvgPool2D<T>(Tensor<T> input, int poolSize, int stride, int padding)
+    public override Tensor<T> TensorAvgPool2D<T>(Tensor<T> input, int poolSize, int stride, int padding,
+        bool countIncludePad)
     {
         // GPU dispatch already handled by the existing AvgPool2D method override
-        return AvgPool2D(input, poolSize, stride, padding);
+        return AvgPool2D(input, poolSize, stride, padding, countIncludePad);
     }
 
     public override Tensor<T> TensorConv2D<T>(Tensor<T> input, Tensor<T> kernel, int stride, int padding, int dilation)
@@ -21047,10 +21167,31 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // GPU-accelerated normalization (BatchNorm, LayerNorm, GroupNorm, InstanceNorm, RMSNorm)
     // ──────────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// The [batch, channels, spatial] view the batchnorm kernels take, under CpuEngine.BatchNorm's layout rule: rank 2
+    /// is [batch, features], rank 3 is ONE unbatched [channels, height, width] sample, rank 4 is [batch, channels,
+    /// height, width]. False for any other rank, or when the channel axis does not match gamma, so the caller falls
+    /// back to the CPU. (Reading rank 3 as [batch, channels, length] normalised the wrong axis against the wrong
+    /// gamma and disagreed with the CPU forward and backward.)
+    /// </summary>
+    private static bool TryBatchNormLayout(int[] shape, int gammaLength, out int batch, out int channels, out int spatial)
+    {
+        batch = channels = spatial = 0;
+        switch (shape.Length)
+        {
+            case 2: batch = shape[0]; channels = shape[1]; spatial = 1; break;
+            case 3: batch = 1; channels = shape[0]; spatial = shape[1] * shape[2]; break;
+            case 4: batch = shape[0]; channels = shape[1]; spatial = shape[2] * shape[3]; break;
+            default: return false;
+        }
+        return channels == gammaLength && batch > 0 && spatial > 0;
+    }
     public override Tensor<T> BatchNorm<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
-        if (IsTapeActive<T>()) return base.BatchNorm(input, gamma, beta, epsilon, out mean, out variance);
-        if (!TryGetBackend(out var backend) || input.Rank < 2)
+        // The batchnorm kernels compute in FP32, so only float runs on the device; double keeps CpuEngine's
+        // precision rather than silently rounding through FP32.
+        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend)
+            || !TryBatchNormLayout(input._shape, gamma.Length, out int batch, out int channels, out int spatial))
             return base.BatchNorm(input, gamma, beta, epsilon, out mean, out variance);
 
         // Issue #226 fix + leak-on-partial-alloc fix: buffers flowing
@@ -21070,9 +21211,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         bool ownershipTransferred = false;
         try
         {
-            int batch = input.Shape._dims[0];
-            int channels = input.Shape._dims[1];
-            int spatial = input.Length / (batch * channels);
             using var bufIn = GetOrAllocateBuffer(backend, input);
             using var bufGamma = GetOrAllocateBuffer(backend, gamma);
             using var bufBeta = GetOrAllocateBuffer(backend, beta);
@@ -21097,6 +21235,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             backend.SubScalar(bufSaveInvVar.Buffer, bufSaveInvVar.Buffer, (float)epsilon, channels);
             variance = DeferTensorResult<T>(backend, bufSaveInvVar.Buffer, channels, new[] { channels });
             ownershipTransferred = true;
+            // Same node and saved state CpuEngine records: batch mean and TRUE variance per channel.
+            Autodiff.DifferentiableOps.RecordIfActive("BatchNorm", result, new[] { input, gamma, beta },
+                Autodiff.BackwardFunctions<T>.BatchNormBackward, new object[] { mean, variance, epsilon });
             return result;
         }
         catch (Exception)
@@ -21107,6 +21248,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 bufSaveMean.Dispose();
                 bufSaveInvVar.Dispose();
             }
+            if (ThrowOnGpuKernelFallback) throw;
             return base.BatchNorm(input, gamma, beta, epsilon, out mean, out variance);
         }
     }
@@ -21114,9 +21256,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public override Tensor<T> LayerNorm<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
         ValidateLayerNormArguments(input, gamma, beta);
-        // A float tape runs the kernel and records CpuEngine's node below: the FP32 path already produces the
-        // per-row mean and (converted) variance LayerNormBackward saves. Only a non-float tape stays on the CPU —
-        // the FP16 half-store branch leaves INVERSE std in its variance slot, which that backward cannot take.
+        // Non-float stays on CpuEngine under a tape: the norm kernels compute in FP32, so a double training step
+        // would silently lose its precision (a double finite-difference gradcheck cannot resolve it). Float runs
+        // and records on the device.
         if (IsTapeActive<T>() && typeof(T) != typeof(float)) return base.LayerNorm(input, gamma, beta, epsilon, out mean, out variance);
         if (!TryGetBackend(out var backend) || input.Rank < 2)
             return base.LayerNorm(input, gamma, beta, epsilon, out mean, out variance);
@@ -21221,7 +21363,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (gamma is null) throw new ArgumentNullException(nameof(gamma));
         if (beta is null) throw new ArgumentNullException(nameof(beta));
         ValidateGroupNormArguments(input, numGroups, gamma, beta);
-        if (IsTapeActive<T>()) return base.GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
+        // Non-float stays on CpuEngine under a tape: the norm kernels compute in FP32, so a double training step
+        // would silently lose its precision (a double finite-difference gradcheck cannot resolve it). Float runs
+        // and records on the device.
+        if (IsTapeActive<T>() && typeof(T) != typeof(float)) return base.GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
         if (!TryGetBackend(out var backend) || input.Rank < 2)
             return base.GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
 
@@ -21254,6 +21399,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             mean = DeferTensorResult<T>(backend, bufMean.Buffer, batch * numGroups, new[] { batch, numGroups });
             variance = DeferTensorResult<T>(backend, bufVar.Buffer, batch * numGroups, new[] { batch, numGroups });
             ownershipTransferred = true;
+            // Same node and saved state CpuEngine records: per-(sample, group) mean and TRUE variance.
+            Autodiff.DifferentiableOps.RecordIfActive("GroupNorm", result, new[] { input, gamma, beta },
+                Autodiff.BackwardFunctions<T>.GroupNormBackward, new object[] { numGroups, mean, variance, epsilon });
             return result;
         }
         catch (Exception)
@@ -21262,13 +21410,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 bufOut.Dispose(); bufMean.Dispose(); bufVar.Dispose();
             }
+            if (ThrowOnGpuKernelFallback) throw;
             return base.GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
         }
     }
 
     public override Tensor<T> InstanceNorm<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
-        if (IsTapeActive<T>()) return base.InstanceNorm(input, gamma, beta, epsilon, out mean, out variance);
+        // Non-float stays on CpuEngine under a tape: the norm kernels compute in FP32, so a double training step
+        // would silently lose its precision (a double finite-difference gradcheck cannot resolve it). Float runs
+        // and records on the device.
+        if (IsTapeActive<T>() && typeof(T) != typeof(float)) return base.InstanceNorm(input, gamma, beta, epsilon, out mean, out variance);
         if (!TryGetBackend(out var backend) || input.Rank < 4)
             return base.InstanceNorm(input, gamma, beta, epsilon, out mean, out variance);
 
@@ -21296,6 +21448,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             mean = DeferTensorResult<T>(backend, bufMean.Buffer, batch * channels, new[] { batch, channels });
             variance = DeferTensorResult<T>(backend, bufVar.Buffer, batch * channels, new[] { batch, channels });
             ownershipTransferred = true;
+            // Same node and saved state CpuEngine records: per-(sample, channel) mean and TRUE variance.
+            Autodiff.DifferentiableOps.RecordIfActive("InstanceNorm", result, new[] { input, gamma, beta },
+                Autodiff.BackwardFunctions<T>.InstanceNormBackward, new object[] { mean, variance, epsilon });
             return result;
         }
         catch (Exception)
@@ -21304,13 +21459,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 bufOut.Dispose(); bufMean.Dispose(); bufVar.Dispose();
             }
+            if (ThrowOnGpuKernelFallback) throw;
             return base.InstanceNorm(input, gamma, beta, epsilon, out mean, out variance);
         }
     }
 
     public override Tensor<T> RMSNorm<T>(Tensor<T> input, Tensor<T> gamma, double epsilon, out Tensor<T> rms)
     {
-        if (IsTapeActive<T>()) return base.RMSNorm(input, gamma, epsilon, out rms);
+        // Non-float stays on CpuEngine under a tape: the norm kernels compute in FP32, so a double training step
+        // would silently lose its precision (a double finite-difference gradcheck cannot resolve it). Float runs
+        // and records on the device.
+        if (IsTapeActive<T>() && typeof(T) != typeof(float)) return base.RMSNorm(input, gamma, epsilon, out rms);
         if (!TryGetBackend(out var backend) || input.Rank < 2)
             return base.RMSNorm(input, gamma, epsilon, out rms);
 
@@ -21333,8 +21492,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             backend.RmsNorm(bufIn.Buffer, bufOut.Buffer, bufGamma.Buffer, bufRms.Buffer,
                 outerSize, normSize, (float)epsilon);
             var result = DeferTensorResult<T>(backend, bufOut.Buffer, input.Length, input.Shape.ToArray());
-            rms = DeferTensorResult<T>(backend, bufRms.Buffer, outerSize, new[] { outerSize });
+            // Shaped like CpuEngine's rms: the leading (non-normalised) dims, [1] when there are none.
+            int batchDims = input.Rank - gamma.Rank;
+            var rmsShape = new int[Math.Max(1, batchDims)];
+            if (batchDims <= 0) rmsShape[0] = 1;
+            for (int i = 0; i < batchDims; i++) rmsShape[i] = input.Shape._dims[i];
+            rms = DeferTensorResult<T>(backend, bufRms.Buffer, outerSize, rmsShape);
             ownershipTransferred = true;
+            Autodiff.DifferentiableOps.RecordIfActive("RMSNorm", result, new[] { input, gamma },
+                Autodiff.BackwardFunctions<T>.RMSNormBackward, new object[] { rms, epsilon });
             return result;
         }
         catch (Exception)
@@ -21343,6 +21509,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 bufOut.Dispose(); bufRms.Dispose();
             }
+            if (ThrowOnGpuKernelFallback) throw;
             return base.RMSNorm(input, gamma, epsilon, out rms);
         }
     }
@@ -21397,13 +21564,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> Conv3D<T>(Tensor<T> input, Tensor<T> kernel, int stride, int padding, int dilation)
     {
-        // Tape-active: use the recording CPU base path so the conv (and its
-        // kernel gradient) participate in autodiff (see MaxPool2D). The GPU path
-        // returns an untracked tensor — frozen training for 3D convs (UNet3D,
-        // VoxelCNN, video models) otherwise.
-        if (IsTapeActive<T>()) return base.Conv3D(input, kernel, stride, padding, dilation);
-
-        if (!TryGetBackend(out var backend) || input.Rank < 5)
+        if (!TryGetBackend(out var backend) || input.Rank < 5 || kernel.Rank < 5)
             return base.Conv3D(input, kernel, stride, padding, dilation);
 
         try
@@ -21426,11 +21587,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 stride, stride, stride,
                 padding, padding, padding,
                 dilation, dilation, dilation);
-            return DeferTensorResult<T>(backend, bufOut.Buffer, batch * outChannels * outD * outH * outW,
+            var result = DeferTensorResult<T>(backend, bufOut.Buffer, batch * outChannels * outD * outH * outW,
                 new[] { batch, outChannels, outD, outH, outW });
+            // Same node and saved state CpuEngine records (its int overload expands to per-axis arrays); the
+            // backward runs this engine's device Conv3DBackwardInput/Kernel. Without it the GPU result was untracked
+            // and 3D-conv weights (UNet3D, VoxelCNN, video models) trained as frozen.
+            Autodiff.DifferentiableOps.RecordBinary("Conv3D", result, input, kernel, Autodiff.BackwardFunctions<T>.Conv3DBackward,
+                new object[] { new[] { stride, stride, stride }, new[] { padding, padding, padding },
+                    new[] { dilation, dilation, dilation } });
+            return result;
         }
         catch (Exception)
         {
+            if (ThrowOnGpuKernelFallback) throw;
             return base.Conv3D(input, kernel, stride, padding, dilation);
         }
     }
@@ -21623,7 +21792,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         Compilation.GraphMode.ThrowIfInferenceUnsupported(
             Compilation.GraphCaptureLimitation.HeterogeneousInput);
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+        // Under a tape the kernel runs and records CpuEngine's GatherBackward node (saved state: indices, axis).
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || !TryGetBackend(out var backend) || axis != 0)
             return base.TensorGather(source, indices, axis);
 
@@ -21646,6 +21816,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
             using var bufSrc = GetOrAllocateBuffer(backend, contiguousSource);
             using var bufIdx = GetOrAllocateInt32IndexBuffer(backend, contiguousIndices);
+            // Matches CpuEngine's rank-2 axis-0 fast path, which also flattens multi-dimensional indices.
             int[] outShape = source.Rank >= 2
                 ? new[] { numIndices }.Concat(source.Shape._dims.Skip(1)).ToArray()
                 : new[] { numIndices };
@@ -21676,7 +21847,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         Compilation.GraphMode.ThrowIfInferenceUnsupported(
             Compilation.GraphCaptureLimitation.HeterogeneousInput);
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || !TryGetBackend(out var backend))
             return base.Embedding(indices, embeddingTable);
 
@@ -21716,16 +21887,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 if (isDeferredRecording)
                 {
                     outputHandedOff = true;
-                    return Tensor<T>.FromGpuBuffer(
+                    return RecordEmbedding(Tensor<T>.FromGpuBuffer(
                         backend,
                         bufOut.Buffer,
                         outShape,
                         GpuTensorRole.Activation,
-                        ownsBuffer: bufOut.OwnsBuffer);
+                        ownsBuffer: bufOut.OwnsBuffer), indices, embeddingTable, vocabSize, embeddingDim);
                 }
 
                 outputHandedOff = true;
-                return DeferTensorResult<T>(backend, bufOut.Buffer, numIndices * embeddingDim, outShape);
+                return RecordEmbedding(DeferTensorResult<T>(backend, bufOut.Buffer, numIndices * embeddingDim, outShape),
+                    indices, embeddingTable, vocabSize, embeddingDim);
             }
             finally
             {
@@ -21738,6 +21910,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (ThrowOnGpuKernelFallback) throw;
             return base.Embedding(indices, embeddingTable);
         }
+    }
+
+    /// <summary>
+    /// Records the node CpuEngine records for Embedding — same backward, same saved indices and sizes — so a
+    /// taped lookup keeps the gather on the device and its gradient takes the GPU EmbeddingBackward.
+    /// </summary>
+    private static Tensor<T> RecordEmbedding<T>(Tensor<T> result, Tensor<int> indices, Tensor<T> embeddingTable,
+        int vocabSize, int embeddingDim)
+    {
+        Autodiff.DifferentiableOps.RecordUnary("Embedding", result, embeddingTable,
+            Autodiff.BackwardFunctions<T>.EmbeddingBackward, new object[] { indices, vocabSize, embeddingDim });
+        return result;
     }
 
     // ──────────────────────────────────────────────────────────────
@@ -21962,7 +22146,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> Dropout<T>(Tensor<T> input, double dropoutRate, bool training, out Tensor<T> mask)
     {
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive)
+        if (Compilation.GraphMode.IsActive)
             return base.Dropout(input, dropoutRate, training, out mask);
         if (!TryGetBackend(out var backend))
             return base.Dropout(input, dropoutRate, training, out mask);
@@ -21978,6 +22162,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 mask = DispatchDeferredGpuOp<T>(backend, input.Length, input.Shape.ToArray(),
                     output => backend.Fill(output, 1f, input.Length));
+                RecordDropout(result, input, mask, dropoutRate);
                 return result;
             }
             catch
@@ -22003,6 +22188,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             outputHandedOff = true;
             mask = DeferTensorResult<T>(backend, maskBuffer, size, input.Shape.ToArray());
             maskHandedOff = true;
+            RecordDropout(result, input, mask, dropoutRate);
             return result;
         }
         finally
@@ -22011,6 +22197,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (!maskHandedOff) maskBuffer?.Dispose();
         }
     }
+
+    /// <summary>
+    /// Records the node CpuEngine records for Dropout. The saved mask is the one THIS backend's kernel wrote, and the
+    /// backward resolves to this engine's DropoutBackward, which reads masks in the same backend's convention.
+    /// </summary>
+    private static void RecordDropout<T>(Tensor<T> result, Tensor<T> input, Tensor<T> mask, double dropoutRate) =>
+        Autodiff.DifferentiableOps.RecordUnary("Dropout", result, input, Autodiff.BackwardFunctions<T>.DropoutBackward,
+            new object[] { mask, dropoutRate });
 
     public override Tensor<T> Upsample<T>(Tensor<T> input, int scaleH, int scaleW)
     {
@@ -23108,10 +23302,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 using var bufIn = GetOrAllocateBuffer(backend, tensor);
                 var bufOut = AllocateOutputBuffer(backend, tensor.Length);
-                backend.AddScalar(bufIn.Buffer, bufOut.Buffer, Convert.ToSingle(scalar), tensor.Length);
-                var sum = DeferTensorResult<T>(backend, bufOut.Buffer, tensor.Length, tensor.Shape.ToArray());
-                Autodiff.DifferentiableOps.RecordUnary("TensorAddScalar", sum, tensor, Autodiff.BackwardFunctions<T>.AddScalarBackward);
-                return sum;
+                bool handedOff = false;
+                try
+                {
+                    backend.AddScalar(bufIn.Buffer, bufOut.Buffer, Convert.ToSingle(scalar), tensor.Length);
+                    var sum = DeferTensorResult<T>(backend, bufOut.Buffer, tensor.Length, tensor.Shape.ToArray());
+                    handedOff = true;
+                    Autodiff.DifferentiableOps.RecordUnary("TensorAddScalar", sum, tensor, Autodiff.BackwardFunctions<T>.AddScalarBackward);
+                    return sum;
+                }
+                finally
+                {
+                    // An owned output that never reached the deferred result would otherwise leak on the CPU fallback.
+                    if (!handedOff) bufOut.Dispose();
+                }
             }
             catch { }
         }
@@ -23130,10 +23334,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 using var bufIn = GetOrAllocateBuffer(backend, tensor);
                 var bufOut = AllocateOutputBuffer(backend, tensor.Length);
-                backend.SubScalar(bufIn.Buffer, bufOut.Buffer, Convert.ToSingle(scalar), tensor.Length);
-                var difference = DeferTensorResult<T>(backend, bufOut.Buffer, tensor.Length, tensor.Shape.ToArray());
-                Autodiff.DifferentiableOps.RecordUnary("TensorSubtractScalar", difference, tensor, Autodiff.BackwardFunctions<T>.SubtractScalarBackward);
-                return difference;
+                bool handedOff = false;
+                try
+                {
+                    backend.SubScalar(bufIn.Buffer, bufOut.Buffer, Convert.ToSingle(scalar), tensor.Length);
+                    var difference = DeferTensorResult<T>(backend, bufOut.Buffer, tensor.Length, tensor.Shape.ToArray());
+                    handedOff = true;
+                    Autodiff.DifferentiableOps.RecordUnary("TensorSubtractScalar", difference, tensor, Autodiff.BackwardFunctions<T>.SubtractScalarBackward);
+                    return difference;
+                }
+                finally
+                {
+                    // An owned output that never reached the deferred result would otherwise leak on the CPU fallback.
+                    if (!handedOff) bufOut.Dispose();
+                }
             }
             catch { }
         }
@@ -23303,7 +23517,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (mask is null) throw new ArgumentNullException(nameof(mask));
         Compilation.GraphMode.ThrowIfInferenceUnsupported(
             Compilation.GraphCaptureLimitation.HeterogeneousInput);
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+        // Under a tape the kernel runs and records CpuEngine's MaskedFillBackward node.
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || !tensor._shape.SequenceEqual(mask._shape) || !TryGetBackend(out var backend))
             return base.TensorMaskedFill(tensor, mask, value);
 
@@ -23331,7 +23546,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (mask is null) throw new ArgumentNullException(nameof(mask));
         Compilation.GraphMode.ThrowIfInferenceUnsupported(
             Compilation.GraphCaptureLimitation.HeterogeneousInput);
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+        // Under a tape the kernel runs and records CpuEngine's MaskedFillBackward node.
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || !tensor._shape.SequenceEqual(mask._shape) || !TryGetBackend(out var backend))
             return base.TensorMaskedFill(tensor, mask, value);
 
@@ -23345,9 +23561,24 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 : (Tensor<Bit>)mask.Contiguous();
             using var inputBuffer = GetOrAllocateBuffer(backend, contiguousTensor);
             using var maskBuffer = GetOrAllocateBuffer(backend, contiguousMask);
-            return DispatchDeferredGpuOp<T>(backend, tensor.Length, tensor.Shape.ToArray(), output =>
+            var filled = DispatchDeferredGpuOp<T>(backend, tensor.Length, tensor.Shape.ToArray(), output =>
                 backend.MaskedFillKernel(inputBuffer.Buffer, maskBuffer.Buffer, output,
                     Convert.ToSingle(value), tensor.Length));
+            // Only a tape needs the mask again, and reading a resident Bit mask's span DOWNLOADS it — which every
+            // call used to do. Instead derive the mask as a 0/1 Tensor<T> on the device (the same kernel filling 1
+            // over zeros) and hand it to MaskedFillBackward's Tensor<T> branch, which stays on the device too.
+            if (IsTapeActive<T>())
+            {
+                int n = tensor.Length;
+                var maskAsValues = DispatchDeferredGpuOp<T>(backend, n, tensor.Shape.ToArray(), output =>
+                {
+                    backend.Fill(output, 0f, n);
+                    backend.MaskedFillKernel(output, maskBuffer.Buffer, output, 1f, n);
+                });
+                Autodiff.DifferentiableOps.RecordUnary("TensorMaskedFill", filled, tensor,
+                    Autodiff.BackwardFunctions<T>.MaskedFillBackward, new object[] { maskAsValues });
+            }
+            return filled;
         }
         catch
         {
@@ -23996,7 +24227,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.TensorDiagonal<T>(Tensor<T> tensor)
     {
-        if (!IsTapeActive<T>() && !Compilation.GraphMode.IsActive && typeof(T) == typeof(float)
+        // Under a tape the gather runs and records CpuEngine's DiagonalBackward node, whose device path
+        // (TryDiagonalBackwardOnDevice) scatters the gradient back without a host round trip.
+        if (!Compilation.GraphMode.IsActive && typeof(T) == typeof(float)
             && tensor.Rank == 2 && tensor.IsContiguous && TryGetBackend(out var backend))
         {
             try
@@ -24008,7 +24241,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 try
                 {
                     backend.StridedGather(input, output, offset: 0, stride: columns + 1, count: n);
-                    return DeferTensorResult<T>(backend, output, n, new[] { n });
+                    var diagonal = DeferTensorResult<T>(backend, output, n, new[] { n });
+                    Autodiff.DifferentiableOps.RecordUnary("TensorDiagonal", diagonal, tensor,
+                        Autodiff.BackwardFunctions<T>.DiagonalBackward);
+                    return diagonal;
                 }
                 catch
                 {
@@ -24140,7 +24376,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.PixelShuffle<T>(Tensor<T> input, int upscaleFactor)
     {
-        if (IsTapeActive<T>()) return base.PixelShuffle(input, upscaleFactor);
+        // Under a tape the kernel runs and records the SAME node CpuEngine records (saved state: the factor);
+        // PixelShuffleBackward calls this engine's device PixelShuffleBackward.
         if (typeof(T) == typeof(float) && input.Rank == 4 && upscaleFactor > 0
             && input.Shape._dims[1] % (upscaleFactor * upscaleFactor) == 0
             && TryGetBackend(out var backend) && backend is IPixelShuffleBackend gpu)
@@ -24159,6 +24396,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var result = DeferTensorResult<T>(backend, output, total,
                     new[] { batch, channels, inH * upscaleFactor, inW * upscaleFactor });
                 handedOff = true;
+                Autodiff.DifferentiableOps.RecordUnary("PixelShuffle", result, input,
+                    Autodiff.BackwardFunctions<T>.PixelShuffleBackward, new object[] { upscaleFactor });
                 return result;
             }
             catch (Exception ex) when (ex is not OutOfMemoryException && ex is not OperationCanceledException)
@@ -25040,7 +25279,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.TensorStack<T>(Tensor<T>[] tensors, int axis)
     {
-        if (IsTapeActive<T>()) return base.TensorStack(tensors, axis);
+        // Under a tape the kernel runs and records CpuEngine's StackBackward node. Its saved axis is the
+        // NORMALISED one: StackBackward indexes the gradient's shape with it directly, so a negative axis breaks.
         if (typeof(T) == typeof(float) && tensors is { Length: > 0 } && TryGetBackend(out var backend))
         {
             int rank = tensors[0].Rank;
@@ -25072,6 +25312,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     for (int d = normalizedAxis; d < rank; d++) outShape[d + 1] = tensors[0].Shape._dims[d];
                     var result = DeferTensorResult<T>(backend, output, total, outShape);
                     handedOff = true;
+                    Autodiff.DifferentiableOps.RecordIfActive("TensorStack", result, (Tensor<T>[])tensors.Clone(),
+                        Autodiff.BackwardFunctions<T>.StackBackward, savedState: new object[] { normalizedAxis });
                     return result;
                 }
                 catch (Exception ex) when (ex is not OutOfMemoryException)
@@ -25093,7 +25335,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (destination is null) throw new ArgumentNullException(nameof(destination));
         if (source is null) throw new ArgumentNullException(nameof(source));
         if (start is null) throw new ArgumentNullException(nameof(start));
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
             || !destination.IsContiguous || source.Rank != destination.Rank
             || start.Length != destination.Rank || !TryGetBackend(out var backend))
             return base.TensorSetSlice(destination, source, start);
@@ -25112,7 +25354,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             int rowCount = source.Length / rowSize;
             using var destBuffer = GetOrAllocateBuffer(backend, destination);
             using var sourceBuffer = GetOrAllocateBuffer(backend, contiguousSource);
-            return DispatchDeferredGpuOp<T>(backend, destination.Length, destination.Shape.ToArray(), output =>
+            var result = DispatchDeferredGpuOp<T>(backend, destination.Length, destination.Shape.ToArray(), output =>
             {
                 backend.Copy(destBuffer.Buffer, output, destination.Length);
                 for (int row = 0; row < rowCount; row++)
@@ -25130,9 +25372,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     backend.Copy(sourceBuffer.Buffer, row * rowSize, output, destinationOffset, rowSize);
                 }
             });
+            // Same node and saved state CpuEngine records; SetSliceBackward runs through engine slice ops.
+            Autodiff.DifferentiableOps.RecordBinary("TensorSetSlice", result, destination, source,
+                Autodiff.BackwardFunctions<T>.SetSliceBackward, new object[] { (int[])start.Clone() });
+            return result;
         }
         catch (Exception)
         {
+            if (ThrowOnGpuKernelFallback) throw;
             return base.TensorSetSlice(destination, source, start);
         }
     }
@@ -25762,7 +26009,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.Upsample<T>(Tensor<T> input, int scaleH, int scaleW)
     {
-        if (IsTapeActive<T>()) return base.Upsample(input, scaleH, scaleW);
+        // Under a tape the kernel runs and records the same UpsampleBackward node the public override and
+        // CpuEngine record; UpsampleBackward has its own device path.
         if (typeof(T)==typeof(float) && TryGetBackend(out var b) && input.Rank==4 && scaleH==scaleW)
         {
             try
@@ -25771,8 +26019,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 int oh=ih*scaleH,ow=iw*scaleW;
                 int total=ba*ch*oh*ow;
                 var gi=UploadTensorRaw(b, input);
-                return DispatchDeferredGpuOp<T>(b,total,new[]{ba,ch,oh,ow},
+                var upsampled = DispatchDeferredGpuOp<T>(b,total,new[]{ba,ch,oh,ow},
                     output => b.NearestNeighborUpsample(gi,output,ba*ch,ih,iw,scaleH));
+                Autodiff.DifferentiableOps.RecordUnary("Upsample", upsampled, input,
+                    Autodiff.BackwardFunctions<T>.UpsampleBackward, savedState: new object[] { scaleH, scaleW });
+                return upsampled;
             }
             catch { }
         }
@@ -25977,13 +26228,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> FusedLinearReLU<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
     {
-        // FusedLinearGradientTests asserts the fused path produces gradients
-        // equal-to-3-decimals with the unfused TensorMatMul + TensorBroadcastAdd
-        // + ReLU chain. The CpuEngine fused path delegates to those same ops
-        // before collapsing the tape, so the precision matches. The GPU
-        // Gemm+BiasAdd+ReLU chain diverges enough to fail the 3-decimal
-        // assertion. Defer to base when the tape is active.
-        if (IsTapeActive<T>()) return base.FusedLinearReLU(input, weight, bias);
+        // Under a tape, build the pre-activation with the SAME TensorMatMul + TensorBroadcastAdd the unfused chain
+        // uses (FusedLinearGradientTests holds the fused gradients to the unfused ones), not the Gemm+BiasAdd below.
+        if (IsTapeActive<T>())
+        {
+            if (TryFusedLinearForwardUnderTape(input, weight, bias, FusedActivationType.ReLU) is not { } taped)
+                return base.FusedLinearReLU(input, weight, bias);
+            Autodiff.DifferentiableOps.RecordIfActive("FusedLinearReLU", taped.Result, new[] { input, weight, bias },
+                Autodiff.BackwardFunctions<T>.FusedMatMulAddReLUBackward, new object[] { taped.PreActivation });
+            return taped.Result;
+        }
         try
         {
             if (TryGetBackend(out var backend) && input.Shape.Length == 2 && weight.Shape.Length == 2
@@ -26009,7 +26263,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> FusedLinearSigmoid<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
     {
-        if (IsTapeActive<T>()) return base.FusedLinearSigmoid(input, weight, bias);
+        if (IsTapeActive<T>())
+        {
+            if (TryFusedLinearForwardUnderTape(input, weight, bias, FusedActivationType.Sigmoid) is not { } taped)
+                return base.FusedLinearSigmoid(input, weight, bias);
+            Autodiff.DifferentiableOps.RecordIfActive("FusedLinearSigmoid", taped.Result, new[] { input, weight, bias },
+                Autodiff.BackwardFunctions<T>.FusedMatMulAddSigmoidBackward, null);
+            return taped.Result;
+        }
         try
         {
             if (TryGetBackend(out var backend) && input.Shape.Length == 2 && weight.Shape.Length == 2
@@ -26030,7 +26291,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> FusedLinearTanh<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
     {
-        if (IsTapeActive<T>()) return base.FusedLinearTanh(input, weight, bias);
+        if (IsTapeActive<T>())
+        {
+            if (TryFusedLinearForwardUnderTape(input, weight, bias, FusedActivationType.Tanh) is not { } taped)
+                return base.FusedLinearTanh(input, weight, bias);
+            Autodiff.DifferentiableOps.RecordIfActive("FusedLinearTanh", taped.Result, new[] { input, weight, bias },
+                Autodiff.BackwardFunctions<T>.FusedMatMulAddTanhBackward, null);
+            return taped.Result;
+        }
         try
         {
             if (TryGetBackend(out var backend) && input.Shape.Length == 2 && weight.Shape.Length == 2
@@ -26051,7 +26319,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> FusedLinearGELU<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
     {
-        if (IsTapeActive<T>()) return base.FusedLinearGELU(input, weight, bias);
+        if (IsTapeActive<T>())
+        {
+            if (TryFusedLinearForwardUnderTape(input, weight, bias, FusedActivationType.GELU) is not { } taped)
+                return base.FusedLinearGELU(input, weight, bias);
+            Autodiff.DifferentiableOps.RecordIfActive("FusedLinearGELU", taped.Result, new[] { input, weight, bias },
+                Autodiff.BackwardFunctions<T>.FusedMatMulAddGELUBackward, new object[] { taped.PreActivation });
+            return taped.Result;
+        }
         try
         {
             if (TryGetBackend(out var backend) && input.Shape.Length == 2 && weight.Shape.Length == 2
@@ -26072,7 +26347,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> FusedLinearSwish<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias)
     {
-        if (IsTapeActive<T>()) return base.FusedLinearSwish(input, weight, bias);
+        if (IsTapeActive<T>())
+        {
+            if (TryFusedLinearForwardUnderTape(input, weight, bias, FusedActivationType.Swish) is not { } taped)
+                return base.FusedLinearSwish(input, weight, bias);
+            Autodiff.DifferentiableOps.RecordIfActive("FusedLinearSwish", taped.Result, new[] { input, weight, bias },
+                Autodiff.BackwardFunctions<T>.FusedMatMulAddSwishBackward, new object[] { taped.PreActivation });
+            return taped.Result;
+        }
         try
         {
             if (TryGetBackend(out var backend) && input.Shape.Length == 2 && weight.Shape.Length == 2

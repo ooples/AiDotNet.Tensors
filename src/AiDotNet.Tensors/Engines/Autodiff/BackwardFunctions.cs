@@ -485,8 +485,9 @@ internal static class BackwardFunctions<T>
     {
         // On the GPU engine use the device kernel: the host loop below reads every output element back
         // (GetFlat on a resident tensor) and re-uploads the derivative for the multiply. All engine kernels now use
-        // this function's convention (the alpha branch at exactly x == 0, as PyTorch does).
-        if (engine is DirectGpuTensorEngine)
+        // this function's convention (the alpha branch at exactly x == 0, as PyTorch does). The device kernel
+        // is float-only, so every other element type keeps the dtype-generic host path below.
+        if (typeof(T) == typeof(float) && engine is DirectGpuTensorEngine)
         {
             var deviceGrad = engine.EluBackward(gradOutput, inputs[0], output, (double)savedState[0]);
             DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceGrad, engine);
@@ -1359,8 +1360,12 @@ internal static class BackwardFunctions<T>
     {
         var poolSize = (int[])savedState[0];
         var stride = (int[])savedState[1];
+        // [2] padding and [3] divisor rule. Absent on nodes from the int[] overload, which has no padding, and on
+        // plans serialized before they were saved; those replay the old unpadded gradient.
+        var padding = savedState.Length > 2 ? savedState[2] as int[] : null;
+        bool countIncludePad = savedState.Length > 3 && savedState[3] is true;
 
-        var grad = engine.AvgPool2DBackward(gradOutput, inputs[0]._shape, poolSize, stride);
+        var grad = engine.AvgPool2DBackward(gradOutput, inputs[0]._shape, poolSize, stride, padding, countIncludePad);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
@@ -2184,6 +2189,19 @@ internal static class BackwardFunctions<T>
         var indices = (Tensor<int>)savedState[0];
         var axis = (int)savedState[1];
 
+        // An axis-0 gather with multi-dimensional indices: flatten the indices to [count] and the gradient to
+        // [count, source.shape[1..]] before scattering. The forward's own output shape varies by path (the CPU fast
+        // path flattens, the general path keeps indices.shape), so the trailing shape is taken from the SOURCE. The
+        // device ScatterAdd only swaps axis 0 for the source extent, so an unflattened 2-D index set gave
+        // [rows, indices.shape[1..], rest] (180 elements for a 60-element source) instead of the source's shape.
+        if (axis == 0 && indices.Rank > 1)
+        {
+            int count = indices.Length;
+            var flatShape = new[] { count }.Concat(inputs[0]._shape.Skip(1)).ToArray();
+            gradOutput = engine.Reshape(gradOutput, flatShape);
+            indices = indices.Reshape(new[] { count });
+        }
+
         // Sparse-grad fast path mirroring TensorEmbeddingLookupBackward: when the input
         // is a 2-D table (rank-2 axis-0 gather is structurally identical to an embedding
         // lookup over [vocab, dim]), record the gradient as a SparseEmbeddingGradient
@@ -2569,6 +2587,13 @@ internal static class BackwardFunctions<T>
         var inShape = inputs[0]._shape;
         int batch = inShape[0], channels = inShape[1], inH = inShape[2], inW = inShape[3];
         int outH = (int)savedState[0], outW = (int)savedState[1];
+
+        if (engine is DirectGpuTensorEngine gpu
+            && gpu.TryAdaptiveAvgPool2DBackwardOnDevice(gradOutput, inShape, outH, outW) is { } deviceGrad)
+        {
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceGrad, engine);
+            return;
+        }
 
         var inputGrad = TensorPool<T>.RentZeroed(inShape);
         for (int b = 0; b < batch; b++)
@@ -5631,6 +5656,18 @@ internal static class BackwardFunctions<T>
             : (int[])savedState[0];
         var axis = (int)savedState[1];
 
+        // Axis scatter with 1-D indices is index_copy, so the device helpers proven there apply unchanged.
+        if (engine is DirectGpuTensorEngine gpu && savedState[0] is Tensor<int> { Rank: 1 } deviceIndices
+            && gpu.TryIndexWriteInputGradOnDevice(gradOutput, axis, deviceIndices) is { } deviceInputGrad
+            && gpu.TryIndexCopySourceGradOnDevice(gradOutput, axis, deviceIndices,
+                OverwrittenIndexPositions(indices)) is { } deviceValuesGrad
+            && deviceValuesGrad.Length == inputs[1].Length)
+        {
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceInputGrad, engine);
+            DifferentiableOps.AccumulateGrad(grads, inputs[1], deviceValuesGrad.Reshape(inputs[1]._shape), engine);
+            return;
+        }
+
         // dL/dinput = gradOutput with scattered positions zeroed.
         //
         // FRESH allocation, NOT gradOutput.Clone(): Clone() shares gradOutput's TensorStorage
@@ -5666,7 +5703,36 @@ internal static class BackwardFunctions<T>
 
         // dL/dvalues = gather from gradOutput at indices
         var gradValues = engine.Gather(gradOutput, new Tensor<int>(new[] { indices.Length }, new Vector<int>(indices)), axis);
+        var overwritten = OverwrittenIndexPositions(indices);
+        if (overwritten.Length > 0)
+        {
+            // Last write wins in the forward, so an overwritten values entry never reached the output.
+            gradValues = gradValues.IsContiguous ? gradValues.Clone() : gradValues.Contiguous();
+            var gv = gradValues.AsWritableSpan();
+            int k = indices.Length, rowsBefore = 1, rowsAfter = 1;
+            for (int d = 0; d < axis; d++) rowsBefore *= gradValues._shape[d];
+            for (int d = axis + 1; d < gradValues.Rank; d++) rowsAfter *= gradValues._shape[d];
+            var zero = MathHelper.GetNumericOperations<T>().Zero;
+            for (int outer = 0; outer < rowsBefore; outer++)
+                foreach (int j in overwritten)
+                    for (int inner = 0; inner < rowsAfter; inner++)
+                        gv[(outer * k + j) * rowsAfter + inner] = zero;
+        }
         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradValues, engine);
+    }
+
+    /// <summary>
+    /// Positions j whose write an index_copy / scatter overwrites with a LATER duplicate (indices[j'] == indices[j],
+    /// j' &gt; j). The forward is last-write-wins, so those source entries never reach the output and their gradient is
+    /// zero. Empty when the indices are distinct, which is the common case.
+    /// </summary>
+    internal static int[] OverwrittenIndexPositions(int[] indices)
+    {
+        var seen = new HashSet<int>();
+        var overwritten = new List<int>();
+        for (int j = indices.Length - 1; j >= 0; j--)
+            if (!seen.Add(indices[j])) overwritten.Add(j);
+        return overwritten.ToArray();
     }
 
     /// <summary>d(cosh(x))/dx = sinh(x)</summary>
@@ -5921,6 +5987,11 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var inputShape = inputs[0]._shape;
+        if (engine is DirectGpuTensorEngine gpu && gpu.TryDiagonalBackwardOnDevice(gradOutput, inputShape) is { } deviceGrad)
+        {
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceGrad, engine);
+            return;
+        }
         var grad = new Tensor<T>(inputShape); // zero
         int diagLen = gradOutput.Length;
         for (int i = 0; i < diagLen; i++)
@@ -6705,6 +6776,12 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var min = (T)savedState[0];
+        if (min is float minBound && engine is DirectGpuTensorEngine gpu
+            && gpu.TryOneSidedClampBackwardOnDevice(gradOutput, inputs[0], minBound, lowerBound: true) is { } deviceGrad)
+        {
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceGrad, engine);
+            return;
+        }
         var ops = MathHelper.GetNumericOperations<T>();
         var input = inputs[0];
         var grad = new Tensor<T>(input._shape);
@@ -6723,6 +6800,12 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var max = (T)savedState[0];
+        if (max is float maxBound && engine is DirectGpuTensorEngine gpu
+            && gpu.TryOneSidedClampBackwardOnDevice(gradOutput, inputs[0], maxBound, lowerBound: false) is { } deviceGrad)
+        {
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceGrad, engine);
+            return;
+        }
         var ops = MathHelper.GetNumericOperations<T>();
         var input = inputs[0];
         var grad = new Tensor<T>(input._shape);
@@ -7318,6 +7401,23 @@ internal static class BackwardFunctions<T>
         var indices = (Tensor<int>)savedState[1];
         var input = inputs[0];
         var ops = MathHelper.GetNumericOperations<T>();
+        if (engine is DirectGpuTensorEngine gpu
+            && gpu.TryIndexWriteInputGradOnDevice(gradOutput, axis, indices) is { } deviceInputGrad)
+        {
+            if (inputs.Length < 2)
+            {
+                DifferentiableOps.AccumulateGrad(grads, input, deviceInputGrad, engine);
+                return;
+            }
+            // Source gradient on the device too, or fall through so the host computes both consistently.
+            if (gpu.TryIndexCopySourceGradOnDevice(gradOutput, axis, indices,
+                    OverwrittenIndexPositions(indices.GetFlattenedData())) is { } deviceSourceGrad)
+            {
+                DifferentiableOps.AccumulateGrad(grads, input, deviceInputGrad, engine);
+                DifferentiableOps.AccumulateGrad(grads, inputs[1], deviceSourceGrad, engine);
+                return;
+            }
+        }
 
         // dL/d(input): clone gradOutput, zero the overwritten positions.
             // FRESH allocation, NOT gradOutput.Clone(). Clone() shares gradOutput's TensorStorage
@@ -7358,11 +7458,14 @@ internal static class BackwardFunctions<T>
         var srcGrad = new Tensor<T>(source._shape);
         var sd = srcGrad.AsWritableSpan();
         var go = gradOutput.AsSpan();
+        var overwritten = new HashSet<int>(OverwrittenIndexPositions(idx.ToArray()));
         for (int outer = 0; outer < outerSize; outer++)
             for (int i = 0; i < idx.Length; i++)
             {
                 int target = idx[i];
                 if (target < 0 || target >= axisSize) continue;
+                if (overwritten.Contains(i)) continue;   // a later duplicate overwrote this entry
+
                 for (int inner = 0; inner < innerSize; inner++)
                 {
                     int goPos = outer * axisSize * innerSize + target * innerSize + inner;
@@ -7386,6 +7489,12 @@ internal static class BackwardFunctions<T>
         var indices = (Tensor<int>)savedState[1];
         var input = inputs[0];
         var ops = MathHelper.GetNumericOperations<T>();
+        if (engine is DirectGpuTensorEngine gpu
+            && gpu.TryIndexWriteInputGradOnDevice(gradOutput, axis, indices) is { } deviceGrad)
+        {
+            DifferentiableOps.AccumulateGrad(grads, input, deviceGrad, engine);
+            return;
+        }
             // FRESH allocation, NOT gradOutput.Clone(). Clone() shares gradOutput's TensorStorage
             // copy-on-write; the write below privatises it, but the privatised buffer is pool-backed and
             // gets recycled once the backward scope ends — while the grads dictionary still holds a
@@ -7470,6 +7579,13 @@ internal static class BackwardFunctions<T>
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         var mask = (Tensor<Bit>)savedState[0];
+        if (inputs.Length >= 2 && engine is DirectGpuTensorEngine gpu
+            && gpu.TryMaskedScatterBackwardOnDevice(gradOutput, mask, inputs[1]._shape) is { } device)
+        {
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], device.InputGrad, engine);
+            DifferentiableOps.AccumulateGrad(grads, inputs[1], device.SourceGrad, engine);
+            return;
+        }
         var ops = MathHelper.GetNumericOperations<T>();
 
         // dL/d(input): copy gradOutput into a fresh tensor, then zero masked positions.
@@ -8169,34 +8285,50 @@ internal static class BackwardFunctions<T>
         var pad = (int[])savedState[0];
         var mode = (PadMode)savedState[1];
 
+        var gradOutputShape = gradOutput._shape;
+        if (engine is DirectGpuTensorEngine gpu
+            && gpu.TryPadNdBackwardOnDevice(gradOutput, input._shape, pad, mode) is { } deviceGrad)
+        {
+            DifferentiableOps.AccumulateGrad(grads, input, deviceGrad, engine);
+            return;
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradInput = new Tensor<T>(input._shape);
-        int rank = input.Rank;
-        var before = new int[rank]; var after = new int[rank];
-        int padAxes = pad.Length / 2;
-        for (int i = 0; i < padAxes; i++)
-        {
-            int axis = rank - 1 - i;
-            before[axis] = pad[i * 2];
-            after[axis] = pad[i * 2 + 1];
-        }
-        var outShape = gradOutput._shape;
-        var inStride = new int[rank]; var outStride = new int[rank];
-        inStride[rank - 1] = 1; outStride[rank - 1] = 1;
-        for (int i = rank - 2; i >= 0; i--)
-        {
-            inStride[i] = inStride[i + 1] * input._shape[i + 1];
-            outStride[i] = outStride[i + 1] * outShape[i + 1];
-        }
+        var sourceMap = PadNdSourceMap(input._shape, gradOutputShape, pad, mode);
         var gout = gradOutput.AsSpan();
         var gin = gradInput.AsWritableSpan();
-
-        // Walk every output element once. When the inverse coord maps to
-        // an in-range input position — either directly (middle region)
-        // or via boundary mapping (reflect/replicate/circular) — add the
-        // gradient to the source. Constant mode discards out-of-range.
-        var outIdx = new int[rank];
         for (int k = 0; k < gout.Length; k++)
+        {
+            int inOff = sourceMap[k];
+            if (inOff >= 0) gin[inOff] = numOps.Add(gin[inOff], gout[k]);
+        }
+        DifferentiableOps.AccumulateGrad(grads, input, gradInput, engine);
+    }
+
+    /// <summary>
+    /// For every element of a PadNd output (row-major over <paramref name="outShape"/>), the flat input offset it
+    /// was read from, or -1 where Constant mode wrote the fill value. Uses the forward's boundary map for
+    /// Reflect/Replicate/Circular, so summing the output gradient into these offsets is the exact backward.
+    /// Shared by the host backward and the device one, which must agree element for element.
+    /// </summary>
+    internal static int[] PadNdSourceMap(int[] inShape, int[] outShape, int[] pad, PadMode mode)
+    {
+        int rank = inShape.Length;
+        var before = new int[rank];
+        int padAxes = pad.Length / 2;
+        for (int i = 0; i < padAxes; i++)
+            before[rank - 1 - i] = pad[i * 2];
+        var inStride = new int[rank];
+        inStride[rank - 1] = 1;
+        for (int i = rank - 2; i >= 0; i--)
+            inStride[i] = inStride[i + 1] * inShape[i + 1];
+        int outLength = 1;
+        for (int i = 0; i < rank; i++) outLength = checked(outLength * outShape[i]);
+
+        var map = new int[outLength];
+        var outIdx = new int[rank];
+        for (int k = 0; k < outLength; k++)
         {
             int tmp = k;
             for (int i = rank - 1; i >= 0; i--) { outIdx[i] = tmp % outShape[i]; tmp /= outShape[i]; }
@@ -8205,7 +8337,7 @@ internal static class BackwardFunctions<T>
             for (int i = 0; i < rank; i++)
             {
                 int local = outIdx[i] - before[i];
-                int extent = input._shape[i];
+                int extent = inShape[i];
                 if (local < 0 || local >= extent)
                 {
                     if (mode == PadMode.Constant) { drop = true; break; }
@@ -8233,10 +8365,9 @@ internal static class BackwardFunctions<T>
                 }
                 inOff += local * inStride[i];
             }
-            if (drop) continue;
-            gin[inOff] = numOps.Add(gin[inOff], gout[k]);
+            map[k] = drop ? -1 : inOff;
         }
-        DifferentiableOps.AccumulateGrad(grads, input, gradInput, engine);
+        return map;
     }
 
     /// <summary>

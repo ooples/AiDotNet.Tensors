@@ -230,6 +230,7 @@ internal sealed class FusedOptimizerCheckpoint
     public float WeightDecay { get; set; }
     public FusedMomentStorageMode MomentStorageMode { get; set; }
     public int Int8MomentBlockSize { get; set; }
+    public int Int8MinQuantizedLength { get; set; }
     public double MaxGradNorm { get; set; }
     public FusedOptimizerExtras Extras { get; set; } = new FusedOptimizerExtras();
     public FusedLrScheduleCheckpoint[] Schedules { get; set; } = System.Array.Empty<FusedLrScheduleCheckpoint>();

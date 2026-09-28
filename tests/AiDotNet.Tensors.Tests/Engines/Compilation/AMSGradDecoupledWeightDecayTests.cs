@@ -122,6 +122,33 @@ public class AMSGradDecoupledWeightDecayTests
         Assert.True(maxAbs > 1e-3, $"decoupled and coupled AMSGrad agreed to {maxAbs} - the flag had no effect");
     }
 
+    /// <summary>
+    /// Same contract for LAMB's algorithm-selecting extras: the runtime-state clone the checkpoint is taken from used
+    /// to drop them, so a clipped / uncorrected LAMB plan restored as plain LAMB.
+    /// </summary>
+    [Fact]
+    public void Lamb_extras_reach_the_checkpoint()
+    {
+        var engine = new CpuEngine();
+        var weight = new Tensor<float>(new[] { 1f, -2f, 3f }, new[] { 3 });
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            engine.ReduceSum(engine.TensorMultiply(weight, weight), null);
+            plan = scope.CompileTraining(new[] { weight });
+        }
+        using (plan)
+        {
+            plan.ConfigureOptimizer(OptimizerType.LAMB, 0.01f, 0.9f, 0.999f, 1e-6f, 0.01f,
+                new FusedOptimizerExtras { LambMaxTrustRatio = 10f, LambDisableBiasCorrection = true });
+            plan.Step();
+            var checkpoint = Assert.IsType<FusedOptimizerCheckpoint>(
+                Assert.IsType<CompiledTrainingPlan<float>>(plan).CaptureFusedOptimizerCheckpoint());
+            Assert.Equal(10f, checkpoint.Extras.LambMaxTrustRatio);
+            Assert.True(checkpoint.Extras.LambDisableBiasCorrection);
+        }
+    }
+
     [Fact]
     public void The_flag_survives_a_checkpoint_round_trip()
     {
