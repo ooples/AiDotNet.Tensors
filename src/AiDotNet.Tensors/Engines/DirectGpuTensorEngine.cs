@@ -2269,6 +2269,23 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (any) { t._gpuBuffer = null; t._gpuBufferVersion = -1; }
     }
 
+    /// <summary>
+    /// Removes the cache entry for <paramref name="key"/> when it holds <paramref name="expected"/>, WITHOUT releasing
+    /// the buffer: the caller takes ownership (re-caches it under another key). Byte accounting is released here and
+    /// re-added by that CacheActivation.
+    /// </summary>
+    private bool TryTakeActivationByKey(object key, IGpuBuffer expected)
+    {
+        lock (_activationCacheLock)
+        {
+            if (!_activationCache.TryGetValue(key, out var e) || !ReferenceEquals(e.Buffer, expected)) return false;
+            if (!_activationCache.TryRemove(key, out e)) return false;
+            System.Threading.Interlocked.Add(ref _currentActivationCacheBytes, -e.Buffer.SizeInBytes);
+            System.Threading.Interlocked.Add(ref _currentActivationManagedBytes, -e.ManagedBytes);
+            return true;
+        }
+    }
+
     private bool TryFreeActivationByKey(object key)
     {
         if (!_activationCache.TryRemove(key, out var e)) return false;
@@ -2949,15 +2966,32 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (oKey is null) return false;
         int n = o.Length;
         long bytes = (long)n * 2;
+        // r is a transient op result that exists only to be landed here. Leaving its Half entry cached held a second
+        // copy of every activation for the rest of the step (eviction is suspended mid-step), so the Half store used
+        // 2 x 2 bytes per element - exactly the 4 bytes of the FP32 store it replaces. Measured: resident activation
+        // bytes on == off (98308) in Fp16HeteroScratchFreeTests.
+        var rKey = r.GetBackingArrayForCacheLookupUnsafe();
         // Reuse o's resident Half buffer when it's still cached (stable across steps → also the capture-#38
-        // prereq): just DtoD-overwrite it with this step's result.
+        // prereq): just DtoD-overwrite it with this step's result, then release r's copy.
         if (TryGetResidentFp16Buffer(o, backend, out var existing) && existing is not null && existing.SizeInBytes >= bytes)
         {
             cb.CopyBufferDtoD(rBuf, existing, bytes);
+            if (rKey is not null && TryFreeActivationByKey(rKey)) { r._gpuBuffer = null; r._gpuBufferVersion = -1; }
             return true;
         }
-        var oBuf = cb.AllocateByteBuffer(n * 2);
-        cb.CopyBufferDtoD(rBuf, oBuf, bytes);
+        // First landing for o: take r's buffer outright - no allocation, no copy.
+        IGpuBuffer oBuf;
+        if (rKey is not null && TryTakeActivationByKey(rKey, rBuf))
+        {
+            Helpers.DeferredArrayMaterializer.Remove(rKey);
+            if (ReferenceEquals(r._gpuBuffer, rBuf)) { r._gpuBuffer = null; r._gpuBufferVersion = -1; }
+            oBuf = rBuf;
+        }
+        else
+        {
+            oBuf = cb.AllocateByteBuffer(n * 2);
+            cb.CopyBufferDtoD(rBuf, oBuf, bytes);
+        }
         // Half-aware deferred materializer (DownloadBuffer is FP32-only) so any HOST read of o stays correct:
         // up-cast oBuf -> FP32 -> narrow to Half. Remove+Register keeps it pointing at the CURRENT buffer if o
         // was evicted then re-landed on a later step.
