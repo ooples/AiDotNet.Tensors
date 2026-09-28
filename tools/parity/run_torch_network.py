@@ -4,10 +4,18 @@ Usage:
     python tools/parity/run_torch_network.py --spec parity/networks/mlp.json --workdir <dir>
 
 Writes into <workdir>:
-    weights.bin   every layer's weight ([in, out], row-major) then bias, float32 little-endian,
-                  in layer order: the exact bytes the Tensors side loads, so both start identical
-    data.bin      input batch [batch, inputDim] then target [batch, lastOut], float32
+    weights.bin   every parameterised layer's weight then bias, float32 little-endian, in layer
+                  order: the exact bytes the Tensors side loads, so both start identical. A linear
+                  weight is [in, out]; a conv weight is [out, in, kH, kW], PyTorch's own layout.
+    data.bin      input batch [batch, *input] then target [batch, lastOut], float32
     torch.json    timings (median and spread per phase), loss curve, environment
+
+Spec layers (a layer without "type" is linear):
+    {"type": "linear", "out": N, "activation": "relu"|"none"}
+    {"type": "conv2d", "out": C, "kernel": K, "stride": S, "padding": P, "activation": "relu"|"none"}
+    {"type": "maxpool2d", "size": K}          stride equals size
+    {"type": "flatten"}
+The input is "inputDim": N (a vector per sample) or "inputShape": [C, H, W].
 
 The weights are generated here from the spec's seed with NumPy, not with torch's initialisers,
 so the Tensors side reads bytes rather than reproducing an initialisation scheme.
@@ -59,33 +67,62 @@ def main() -> int:
     work.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(spec["seed"])
 
-    dims = [spec["inputDim"]] + [layer["out"] for layer in spec["layers"]]
-    weights = []
+    input_shape = list(spec["inputShape"]) if "inputShape" in spec else [spec["inputDim"]]
+    shape = list(input_shape)
+    modules = []
     with open(work / "weights.bin", "wb") as f:
-        for fan_in, fan_out in zip(dims[:-1], dims[1:]):
+
+        def params(fan_in: int, w_shape: tuple, b_len: int):
             bound = 1.0 / np.sqrt(fan_in)
-            w = rng.uniform(-bound, bound, size=(fan_in, fan_out)).astype("<f4")
-            b = rng.uniform(-bound, bound, size=(fan_out,)).astype("<f4")
+            w = rng.uniform(-bound, bound, size=w_shape).astype("<f4")
+            b = rng.uniform(-bound, bound, size=(b_len,)).astype("<f4")
             f.write(w.tobytes(order="C"))
             f.write(b.tobytes(order="C"))
-            weights.append((w, b))
-    x_np = rng.standard_normal((spec["batch"], spec["inputDim"])).astype("<f4")
-    y_np = rng.standard_normal((spec["batch"], dims[-1])).astype("<f4")
+            return w, b
+
+        for layer in spec["layers"]:
+            kind = layer.get("type", "linear")
+            if kind == "linear":
+                if len(shape) != 1:
+                    sys.exit(f"linear layer needs a flat input, got {shape}; add a flatten layer")
+                w, b = params(shape[0], (shape[0], layer["out"]), layer["out"])
+                linear = torch.nn.Linear(shape[0], layer["out"])
+                with torch.no_grad():
+                    linear.weight.copy_(torch.from_numpy(w.T.copy()))
+                    linear.bias.copy_(torch.from_numpy(b))
+                modules.append(linear)
+                shape = [layer["out"]]
+            elif kind == "conv2d":
+                c, h, wd = shape
+                k, s, pad = layer["kernel"], layer.get("stride", 1), layer.get("padding", 0)
+                w, b = params(c * k * k, (layer["out"], c, k, k), layer["out"])
+                conv = torch.nn.Conv2d(c, layer["out"], k, stride=s, padding=pad)
+                with torch.no_grad():
+                    conv.weight.copy_(torch.from_numpy(w))
+                    conv.bias.copy_(torch.from_numpy(b))
+                modules.append(conv)
+                shape = [layer["out"], (h + 2 * pad - k) // s + 1, (wd + 2 * pad - k) // s + 1]
+            elif kind == "maxpool2d":
+                k = layer["size"]
+                modules.append(torch.nn.MaxPool2d(k))
+                shape = [shape[0], shape[1] // k, shape[2] // k]
+            elif kind == "flatten":
+                modules.append(torch.nn.Flatten())
+                shape = [int(np.prod(shape))]
+            else:
+                sys.exit(f"unsupported layer type {kind!r}")
+            if layer.get("activation") == "relu":
+                modules.append(torch.nn.ReLU())
+    if len(shape) != 1:
+        sys.exit(f"the network must end flat, ends at {shape}")
+    x_np = rng.standard_normal([spec["batch"]] + input_shape).astype("<f4")
+    y_np = rng.standard_normal((spec["batch"], shape[0])).astype("<f4")
     with open(work / "data.bin", "wb") as f:
         f.write(x_np.tobytes(order="C"))
         f.write(y_np.tobytes(order="C"))
 
     device = torch.device(args.device)
-    layers = []
-    for (w, b), layer in zip(weights, spec["layers"]):
-        linear = torch.nn.Linear(w.shape[0], w.shape[1])
-        with torch.no_grad():
-            linear.weight.copy_(torch.from_numpy(w.T.copy()))
-            linear.bias.copy_(torch.from_numpy(b))
-        layers.append(linear)
-        if layer["activation"] == "relu":
-            layers.append(torch.nn.ReLU())
-    model = torch.nn.Sequential(*layers).to(device)
+    model = torch.nn.Sequential(*modules).to(device)
     x = torch.from_numpy(x_np).to(device)
     y = torch.from_numpy(y_np).to(device)
     optimizer = torch.optim.SGD(model.parameters(), lr=spec["optimizer"]["lr"])

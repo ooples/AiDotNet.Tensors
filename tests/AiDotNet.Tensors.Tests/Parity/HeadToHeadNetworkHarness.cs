@@ -162,33 +162,82 @@ internal static class HeadToHeadNetworkHarness
     {
         var engine = AiDotNetEngine.Current;
         int batch = spec.GetProperty("batch").GetInt32();
-        int inputDim = spec.GetProperty("inputDim").GetInt32();
-        var layerSpecs = spec.GetProperty("layers").EnumerateArray().ToList();
-        var dims = new List<int> { inputDim };
-        dims.AddRange(layerSpecs.Select(l => l.GetProperty("out").GetInt32()));
+        var inputShape = spec.TryGetProperty("inputShape", out var shapeElement)
+            ? shapeElement.EnumerateArray().Select(d => d.GetInt32()).ToArray()
+            : new[] { spec.GetProperty("inputDim").GetInt32() };
 
+        // Mirrors tools/parity/run_torch_network.py layer for layer: the same shape arithmetic and the
+        // same weights.bin order (each parameterised layer's weight, then its bias).
         var parameters = new List<(float[] Data, float[] Grad, Tensor<float> Tensor)>();
-        var layers = new List<(Tensor<float> W, Tensor<float> B, FusedActivationType Act)>();
+        var layers = new List<Func<Tensor<float>, Tensor<float>>>();
+        var shape = inputShape.ToArray();
         using (var reader = new BinaryReader(File.OpenRead(Path.Combine(work, "weights.bin"))))
         {
-            for (int i = 0; i < layerSpecs.Count; i++)
+            Tensor<float> Parameter(int[] parameterShape)
             {
-                var w = ReadFloats(reader, dims[i] * dims[i + 1]);
-                var b = ReadFloats(reader, dims[i + 1]);
-                var wt = Tensor<float>.FromMemory(w, new[] { dims[i], dims[i + 1] });
-                var bt = Tensor<float>.FromMemory(b, new[] { dims[i + 1] });
-                parameters.Add((w, new float[w.Length], wt));
-                parameters.Add((b, new float[b.Length], bt));
-                var act = layerSpecs[i].GetProperty("activation").GetString() == "relu" ? FusedActivationType.ReLU : FusedActivationType.None;
-                layers.Add((wt, bt, act));
+                var data = ReadFloats(reader, parameterShape.Aggregate(1, (a, d) => a * d));
+                var tensor = Tensor<float>.FromMemory(data, parameterShape);
+                parameters.Add((data, new float[data.Length], tensor));
+                return tensor;
+            }
+
+            foreach (var layer in spec.GetProperty("layers").EnumerateArray())
+            {
+                string kind = layer.TryGetProperty("type", out var typeElement) ? typeElement.GetString() ?? "linear" : "linear";
+                var act = layer.TryGetProperty("activation", out var actElement) && actElement.GetString() == "relu"
+                    ? FusedActivationType.ReLU
+                    : FusedActivationType.None;
+                switch (kind)
+                {
+                    case "linear":
+                    {
+                        if (shape.Length != 1) throw new InvalidDataException($"linear layer needs a flat input, got [{string.Join(", ", shape)}].");
+                        int outDim = layer.GetProperty("out").GetInt32();
+                        var w = Parameter(new[] { shape[0], outDim });
+                        var b = Parameter(new[] { outDim });
+                        layers.Add(h => engine.FusedLinear(h, w, b, act));
+                        shape = new[] { outDim };
+                        break;
+                    }
+                    case "conv2d":
+                    {
+                        int outChannels = layer.GetProperty("out").GetInt32();
+                        int k = layer.GetProperty("kernel").GetInt32();
+                        int s = layer.TryGetProperty("stride", out var sElement) ? sElement.GetInt32() : 1;
+                        int pad = layer.TryGetProperty("padding", out var pElement) ? pElement.GetInt32() : 0;
+                        var w = Parameter(new[] { outChannels, shape[0], k, k });
+                        var b = Parameter(new[] { outChannels });
+                        layers.Add(h => engine.FusedConv2D(h, w, b, s, s, pad, pad, 1, 1, act));
+                        shape = new[] { outChannels, (shape[1] + 2 * pad - k) / s + 1, (shape[2] + 2 * pad - k) / s + 1 };
+                        break;
+                    }
+                    case "maxpool2d":
+                    {
+                        int k = layer.GetProperty("size").GetInt32();
+                        layers.Add(h => engine.MaxPool2D(h, k));
+                        shape = new[] { shape[0], shape[1] / k, shape[2] / k };
+                        break;
+                    }
+                    case "flatten":
+                    {
+                        int flat = shape.Aggregate(1, (a, d) => a * d);
+                        layers.Add(h => engine.Reshape(h, new[] { batch, flat }));
+                        shape = new[] { flat };
+                        break;
+                    }
+                    default:
+                        throw new InvalidDataException($"unsupported layer type '{kind}'.");
+                }
             }
         }
 
+        if (shape.Length != 1) throw new InvalidDataException($"the network must end flat, ends at [{string.Join(", ", shape)}].");
         Tensor<float> x, y;
         using (var reader = new BinaryReader(File.OpenRead(Path.Combine(work, "data.bin"))))
         {
-            x = Tensor<float>.FromMemory(ReadFloats(reader, batch * inputDim), new[] { batch, inputDim });
-            y = Tensor<float>.FromMemory(ReadFloats(reader, batch * dims[dims.Count - 1]), new[] { batch, dims[dims.Count - 1] });
+            var xShape = new[] { batch }.Concat(inputShape).ToArray();
+            x = Tensor<float>.FromMemory(ReadFloats(reader, xShape.Aggregate(1, (a, d) => a * d)), xShape);
+            y = Tensor<float>.FromMemory(ReadFloats(reader, batch * shape[0]), new[] { batch, shape[0] });
         }
 
         var optimizer = new SgdOptimizer();
@@ -212,7 +261,7 @@ internal static class HeadToHeadNetworkHarness
             sw.Restart();
             using var tape = new GradientTape<float>();
             var h = x;
-            foreach (var (w, b, act) in layers) h = engine.FusedLinear(h, w, b, act);
+            foreach (var layer in layers) h = layer(h);
             var loss = engine.ReduceMean(engine.TensorSquare(engine.TensorSubtract(h, y)), allAxes, keepDims: false);
             double t1 = sw.Elapsed.TotalMilliseconds;
 

@@ -54,6 +54,12 @@ public class HeadToHeadNetworkTests
     [SkippableFact]
     [Trait("Category", "PyTorchParity")]
     public void Mlp_Cpu_IsAsFastAsPyTorch() => AssertParity(RunCase("mlp", "cpu"));
+    [SkippableFact]
+    public void Cnn_Cpu_DoesNotRegress() => AssertRatchet(RunCase("cnn", "cpu"));
+
+    [SkippableFact]
+    [Trait("Category", "PyTorchParity")]
+    public void Cnn_Cpu_IsAsFastAsPyTorch() => AssertParity(RunCase("cnn", "cpu"));
 
     private void Report(HeadToHeadNetworkHarness.CaseResult r)
     {

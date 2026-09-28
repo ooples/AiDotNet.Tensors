@@ -1,0 +1,22 @@
+{
+  "name": "cnn",
+  "description": "LeNet-style convnet on 28x28 single-channel input: two 3x3 conv + ReLU + 2x2 max-pool stages, then two linear layers. MSE loss, plain SGD.",
+  "dtype": "float32",
+  "seed": 1057,
+  "batch": 64,
+  "inputShape": [1, 28, 28],
+  "layers": [
+    { "type": "conv2d", "out": 32, "kernel": 3, "stride": 1, "padding": 1, "activation": "relu" },
+    { "type": "maxpool2d", "size": 2 },
+    { "type": "conv2d", "out": 64, "kernel": 3, "stride": 1, "padding": 1, "activation": "relu" },
+    { "type": "maxpool2d", "size": 2 },
+    { "type": "flatten" },
+    { "type": "linear", "out": 128, "activation": "relu" },
+    { "type": "linear", "out": 10, "activation": "none" }
+  ],
+  "loss": "mse",
+  "optimizer": { "name": "sgd", "lr": 0.01 },
+  "warmupSteps": 30,
+  "measuredSteps": 100,
+  "lossAgreementSteps": 10
+}
