@@ -137,6 +137,8 @@ public class CompiledAddSubtractBackwardShapeTests
             try
             {
                 plan.Step();
+                Assert.Equal(a.Shape.ToArray(), plan.Gradients[0].Shape.ToArray());
+                Assert.Equal(b.Shape.ToArray(), plan.Gradients[1].Shape.ToArray());
                 AssertClose(eagerA, plan.Gradients[0].GetFlattenedData(), "a");
                 AssertClose(eagerB, plan.Gradients[1].GetFlattenedData(), "b");
             }
@@ -196,6 +198,8 @@ public class CompiledAddSubtractBackwardShapeTests
             try
             {
                 plan.Step();
+                Assert.Equal(vShape, plan.Gradients[0].Shape.ToArray());
+                Assert.Equal(new[] { 1 }, plan.Gradients[1].Shape.ToArray());
                 AssertClose(eagerV, plan.Gradients[0].GetFlattenedData(), "v");
                 AssertClose(eagerC, plan.Gradients[1].GetFlattenedData(), "c");
             }
@@ -254,6 +258,7 @@ public class CompiledAddSubtractBackwardShapeTests
             try
             {
                 plan.Step();
+                Assert.Equal(aShape, plan.Gradients[0].Shape.ToArray());
                 Assert.Equal(bShape, plan.Gradients[1].Shape.ToArray());
                 AssertClose(eagerA, plan.Gradients[0].GetFlattenedData(), "a");
                 AssertClose(eagerB, plan.Gradients[1].GetFlattenedData(), "b");
@@ -269,6 +274,24 @@ public class CompiledAddSubtractBackwardShapeTests
         {
             AiDotNetEngine.Current = prior;
         }
+    }
+    /// <summary>
+    /// The shape-mismatch refusal names all three shapes: "All tensor shapes must match." alone is what hid the
+    /// [64] against [1, 64] case above for a whole census cycle.
+    /// </summary>
+    [Fact]
+    public void ElementwiseInto_ShapeMismatch_NamesEveryShape()
+    {
+        var engine = new CpuEngine();
+        var destination = new Tensor<float>(new float[64], new[] { 64 });
+        var a = new Tensor<float>(new float[64], new[] { 64 });
+        var b = new Tensor<float>(new float[64], new[] { 1, 64 });
+
+        var add = Assert.Throws<ArgumentException>(() => engine.TensorAddInto(destination, a, b));
+        Assert.Contains("a [64], b [1, 64], destination [64]", add.Message);
+
+        var multiply = Assert.Throws<ArgumentException>(() => engine.TensorMultiplyInto(destination, a, b));
+        Assert.Contains("a [64], b [1, 64], destination [64]", multiply.Message);
     }
     private static Tensor<float> Filled(int[] shape, int seed)
     {
