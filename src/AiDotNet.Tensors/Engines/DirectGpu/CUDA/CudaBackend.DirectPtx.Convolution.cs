@@ -70,7 +70,7 @@ public sealed partial class CudaBackend
                     return false;
                 }
 
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 DirectPtxConvolutionVariant selected = _directPtxConvolutionPlan ??=
                     ResolveDirectPtxConvolutionPlanSlow(input, weights, bias, output, shape);
                 EnsureDirectPtxConvolutionKernelLoaded(selected);
@@ -118,7 +118,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 if (!_directPtxConvolutionPlan.HasValue)
                 {
                     DirectPtxConvolutionVariant selected = DirectPtxConvolutionVariant.Direct;
@@ -240,7 +240,7 @@ public sealed partial class CudaBackend
                         "Direct PTX depthwise convolution must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxFusedDepthwiseConv2D3x3F32Kernel kernel = GetOrCreateDirectPtxDepthwiseConvKernel();
                 if (capturing && !_directPtxDepthwiseConvKernels.Pin(key))
                     throw new InvalidOperationException(
@@ -284,7 +284,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateDirectPtxDepthwiseConvKernel();
             }
             DirectPtxLastError = null;
@@ -393,7 +393,7 @@ public sealed partial class CudaBackend
                         "Direct PTX depthwise backward-input must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxDepthwiseConv2D3x3BackwardInputF32Kernel kernel =
                     GetOrCreateDirectPtxDepthwiseConvBwdInputKernel();
                 if (capturing && !_directPtxDepthwiseConvBwdInputKernels.Pin(key))
@@ -438,7 +438,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateDirectPtxDepthwiseConvBwdInputKernel();
             }
             DirectPtxLastError = null;
@@ -547,7 +547,7 @@ public sealed partial class CudaBackend
                         "Direct PTX depthwise backward-weight must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxDepthwiseConv2D3x3BackwardWeightF32Kernel kernel =
                     GetOrCreateDirectPtxDepthwiseConvBwdWeightKernel();
                 if (capturing && !_directPtxDepthwiseConvBwdWeightKernels.Pin(key))
@@ -592,7 +592,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateDirectPtxDepthwiseConvBwdWeightKernel();
             }
             DirectPtxLastError = null;
@@ -700,7 +700,7 @@ public sealed partial class CudaBackend
                         "Direct PTX conv backward-bias must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxConv2DBackwardBiasF32Kernel kernel = GetOrCreateDirectPtxConvBwdBiasKernel();
                 if (capturing && !_directPtxConvBwdBiasKernels.Pin(key))
                     throw new InvalidOperationException(
@@ -743,7 +743,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateDirectPtxConvBwdBiasKernel();
             }
             DirectPtxLastError = null;
@@ -852,7 +852,7 @@ public sealed partial class CudaBackend
                         "Direct PTX conv backward-input must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxConv2DNchwK1BackwardInputF32Kernel kernel = GetOrCreateDirectPtxConvBwdInputKernel();
                 if (capturing && !_directPtxConvBwdInputKernels.Pin(key))
                     throw new InvalidOperationException(
@@ -896,7 +896,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateDirectPtxConvBwdInputKernel();
             }
             DirectPtxLastError = null;
@@ -1005,7 +1005,7 @@ public sealed partial class CudaBackend
                         "Direct PTX conv backward-weight must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxConv2DNchwK1BackwardWeightF32Kernel kernel = GetOrCreateDirectPtxConvBwdWeightKernel();
                 if (capturing && !_directPtxConvBwdWeightKernels.Pin(key))
                     throw new InvalidOperationException(
@@ -1049,7 +1049,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateDirectPtxConvBwdWeightKernel();
             }
             DirectPtxLastError = null;
@@ -1158,7 +1158,7 @@ public sealed partial class CudaBackend
                         "Direct PTX Conv1D must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxConv1DNclForwardF32Kernel kernel = GetOrCreateDirectPtxConv1DKernel();
                 if (capturing && !_directPtxConv1DKernels.Pin(key))
                     throw new InvalidOperationException(
@@ -1202,7 +1202,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateDirectPtxConv1DKernel();
             }
             DirectPtxLastError = null;
@@ -1311,7 +1311,7 @@ public sealed partial class CudaBackend
                         "Direct PTX Conv1D backward-input must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxConv1DNclBackwardInputF32Kernel kernel = GetOrCreateDirectPtxConv1DBwdInputKernel();
                 if (capturing && !_directPtxConv1DBwdInputKernels.Pin(key))
                     throw new InvalidOperationException(
@@ -1355,7 +1355,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateDirectPtxConv1DBwdInputKernel();
             }
             DirectPtxLastError = null;
@@ -1464,7 +1464,7 @@ public sealed partial class CudaBackend
                         "Direct PTX Conv1D backward-weight must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxConv1DNclBackwardWeightF32Kernel kernel = GetOrCreateDirectPtxConv1DBwdWeightKernel();
                 if (capturing && !_directPtxConv1DBwdWeightKernels.Pin(key))
                     throw new InvalidOperationException(
@@ -1508,7 +1508,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateDirectPtxConv1DBwdWeightKernel();
             }
             DirectPtxLastError = null;
@@ -1617,7 +1617,7 @@ public sealed partial class CudaBackend
                         "Direct PTX Conv2D 3x3 must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxConv2DNchw3x3ForwardF32Kernel kernel = GetOrCreateDirectPtxConv2D3x3Kernel();
                 if (capturing && !_directPtxConv2D3x3Kernels.Pin(key))
                     throw new InvalidOperationException(
@@ -1661,7 +1661,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateDirectPtxConv2D3x3Kernel();
             }
             DirectPtxLastError = null;
@@ -1770,7 +1770,7 @@ public sealed partial class CudaBackend
                         "Direct PTX Conv2D 3x3 backward-input must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxConv2DNchw3x3BackwardInputF32Kernel kernel = GetOrCreateDirectPtxConv2D3x3BwdInputKernel();
                 if (capturing && !_directPtxConv2D3x3BwdInputKernels.Pin(key))
                     throw new InvalidOperationException(
@@ -1814,7 +1814,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateDirectPtxConv2D3x3BwdInputKernel();
             }
             DirectPtxLastError = null;
@@ -1923,7 +1923,7 @@ public sealed partial class CudaBackend
                         "Direct PTX Conv2D 3x3 backward-weight must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxConv2DNchw3x3BackwardWeightF32Kernel kernel = GetOrCreateDirectPtxConv2D3x3BwdWeightKernel();
                 if (capturing && !_directPtxConv2D3x3BwdWeightKernels.Pin(key))
                     throw new InvalidOperationException(
@@ -1967,7 +1967,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateDirectPtxConv2D3x3BwdWeightKernel();
             }
             DirectPtxLastError = null;
@@ -2078,7 +2078,7 @@ public sealed partial class CudaBackend
                         "Direct PTX fused Conv2D 3x3 must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxFusedConv2DNchw3x3BiasReluF32Kernel kernel = GetOrCreateDirectPtxFusedConv2D3x3Kernel();
                 if (capturing && !_directPtxFusedConv2D3x3Kernels.Pin(key))
                     throw new InvalidOperationException(
@@ -2123,7 +2123,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateDirectPtxFusedConv2D3x3Kernel();
             }
             DirectPtxLastError = null;
@@ -2232,7 +2232,7 @@ public sealed partial class CudaBackend
                         "Direct PTX ConvTranspose2D 3x3 must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxConvTranspose2DNchw3x3ForwardF32Kernel kernel = GetOrCreateDirectPtxConvTranspose2D3x3Kernel();
                 if (capturing && !_directPtxConvTranspose2D3x3Kernels.Pin(key))
                     throw new InvalidOperationException(
@@ -2276,7 +2276,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateDirectPtxConvTranspose2D3x3Kernel();
             }
             DirectPtxLastError = null;
@@ -2380,7 +2380,7 @@ public sealed partial class CudaBackend
                         "Direct PTX Conv3D 3x3x3 must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxConv3DNcdhw3x3x3ForwardF32Kernel kernel = GetOrCreateDirectPtxConv3D3x3x3Kernel();
                 if (capturing && !_directPtxConv3D3x3x3Kernels.Pin(key))
                     throw new InvalidOperationException(
@@ -2424,7 +2424,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateDirectPtxConv3D3x3x3Kernel();
             }
             DirectPtxLastError = null;
@@ -2533,7 +2533,7 @@ public sealed partial class CudaBackend
                         "Direct PTX DepthwiseConv1D must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxDepthwiseConv1DNcl3ForwardF32Kernel kernel = GetOrCreateDirectPtxDepthwiseConv1DKernel();
                 if (capturing && !_directPtxDepthwiseConv1DKernels.Pin(key))
                     throw new InvalidOperationException(
@@ -2577,7 +2577,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateDirectPtxDepthwiseConv1DKernel();
             }
             DirectPtxLastError = null;
@@ -2678,7 +2678,7 @@ public sealed partial class CudaBackend
                         "Direct PTX unfold must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxUnfoldIm2ColNchw3x3F32Kernel kernel = GetOrCreateDirectPtxUnfoldKernel();
                 if (capturing && !_directPtxUnfoldKernels.Pin(key))
                     throw new InvalidOperationException(
@@ -2721,7 +2721,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateDirectPtxUnfoldKernel();
             }
             DirectPtxLastError = null;
@@ -2830,7 +2830,7 @@ public sealed partial class CudaBackend
                         "Direct PTX DepthwiseConv1D backward-input must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxDepthwiseConv1DNcl3BackwardInputF32Kernel kernel = GetOrCreateDirectPtxDepthwiseConv1DBwdInputKernel();
                 if (capturing && !_directPtxDepthwiseConv1DBwdInputKernels.Pin(key))
                     throw new InvalidOperationException(
@@ -2874,7 +2874,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateDirectPtxDepthwiseConv1DBwdInputKernel();
             }
             DirectPtxLastError = null;
@@ -2983,7 +2983,7 @@ public sealed partial class CudaBackend
                         "Direct PTX DepthwiseConv1D backward-weight must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxDepthwiseConv1DNcl3BackwardWeightF32Kernel kernel = GetOrCreateDirectPtxDepthwiseConv1DBwdWeightKernel();
                 if (capturing && !_directPtxDepthwiseConv1DBwdWeightKernels.Pin(key))
                     throw new InvalidOperationException(
@@ -3027,7 +3027,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateDirectPtxDepthwiseConv1DBwdWeightKernel();
             }
             DirectPtxLastError = null;
@@ -3130,7 +3130,7 @@ public sealed partial class CudaBackend
                         "Direct PTX FP16 1x1 conv must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxConv2DFp16K1NchwF32Kernel kernel = GetOrCreateDirectPtxConv2DFp16K1Kernel();
                 if (capturing && !_directPtxConv2DFp16K1Kernels.Pin(key))
                     throw new InvalidOperationException(
@@ -3174,7 +3174,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateDirectPtxConv2DFp16K1Kernel();
             }
             DirectPtxLastError = null;
@@ -3283,7 +3283,7 @@ public sealed partial class CudaBackend
                         "Direct PTX ConvTranspose2D backward-input must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxConvTranspose2DNchw3x3BackwardInputF32Kernel kernel = GetOrCreateDirectPtxConvTranspose2D3x3BwdInputKernel();
                 if (capturing && !_directPtxConvTranspose2D3x3BwdInputKernels.Pin(key))
                     throw new InvalidOperationException(
@@ -3327,7 +3327,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateDirectPtxConvTranspose2D3x3BwdInputKernel();
             }
             DirectPtxLastError = null;
@@ -3436,7 +3436,7 @@ public sealed partial class CudaBackend
                         "Direct PTX ConvTranspose2D backward-weight must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxConvTranspose2DNchw3x3BackwardWeightF32Kernel kernel = GetOrCreateDirectPtxConvTranspose2D3x3BwdWeightKernel();
                 if (capturing && !_directPtxConvTranspose2D3x3BwdWeightKernels.Pin(key))
                     throw new InvalidOperationException(
@@ -3480,7 +3480,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateDirectPtxConvTranspose2D3x3BwdWeightKernel();
             }
             DirectPtxLastError = null;
@@ -3591,7 +3591,7 @@ public sealed partial class CudaBackend
                         "Direct PTX fused ConvTranspose2D must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxFusedConvTranspose2DNchw3x3BiasReluF32Kernel kernel = GetOrCreateDirectPtxFusedConvTranspose2D3x3Kernel();
                 if (capturing && !_directPtxFusedConvTranspose2D3x3Kernels.Pin(key))
                     throw new InvalidOperationException(
@@ -3636,7 +3636,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateDirectPtxFusedConvTranspose2D3x3Kernel();
             }
             DirectPtxLastError = null;
@@ -3739,7 +3739,7 @@ public sealed partial class CudaBackend
                         "Direct PTX Conv3D backward-input must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxConv3DNcdhw3x3x3BackwardInputF32Kernel kernel = GetOrCreateDirectPtxConv3D3x3x3BwdInputKernel();
                 if (capturing && !_directPtxConv3D3x3x3BwdInputKernels.Pin(key))
                     throw new InvalidOperationException(
@@ -3783,7 +3783,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateDirectPtxConv3D3x3x3BwdInputKernel();
             }
             DirectPtxLastError = null;
@@ -3886,7 +3886,7 @@ public sealed partial class CudaBackend
                         "Direct PTX Conv3D backward-weight must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxConv3DNcdhw3x3x3BackwardWeightF32Kernel kernel = GetOrCreateDirectPtxConv3D3x3x3BwdWeightKernel();
                 if (capturing && !_directPtxConv3D3x3x3BwdWeightKernels.Pin(key))
                     throw new InvalidOperationException(
@@ -3930,7 +3930,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateDirectPtxConv3D3x3x3BwdWeightKernel();
             }
             DirectPtxLastError = null;
@@ -4036,7 +4036,7 @@ public sealed partial class CudaBackend
                         "Direct PTX fused Conv3D 3x3x3 must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxFusedConv3DNcdhw3x3x3BiasReluF32Kernel kernel = GetOrCreateDirectPtxFusedConv3D3x3x3Kernel();
                 if (capturing && !_directPtxFusedConv3D3x3x3Kernels.Pin(key))
                     throw new InvalidOperationException(
@@ -4081,7 +4081,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateDirectPtxFusedConv3D3x3x3Kernel();
             }
             DirectPtxLastError = null;
@@ -4185,7 +4185,7 @@ public sealed partial class CudaBackend
                         "Direct PTX locally-connected Conv2D must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxLocallyConnectedConv2DNchw3x3F32Kernel kernel = GetOrCreateDirectPtxLocallyConnectedConv2DKernel();
                 if (capturing && !_directPtxLocallyConnectedConv2DKernels.Pin(key))
                     throw new InvalidOperationException(
@@ -4229,7 +4229,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateDirectPtxLocallyConnectedConv2DKernel();
             }
             DirectPtxLastError = null;
@@ -4333,7 +4333,7 @@ public sealed partial class CudaBackend
                         "Direct PTX locally-connected Conv2D backward-input must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxLocallyConnectedConv2DNchw3x3BackwardInputF32Kernel kernel =
                     GetOrCreateDirectPtxLocallyConnectedConv2DBwdInputKernel();
                 if (capturing && !_directPtxLocallyConnectedConv2DBwdInputKernels.Pin(key))
@@ -4378,7 +4378,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateDirectPtxLocallyConnectedConv2DBwdInputKernel();
             }
             DirectPtxLastError = null;
@@ -4484,7 +4484,7 @@ public sealed partial class CudaBackend
                         "Direct PTX locally-connected Conv2D backward-weight must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxLocallyConnectedConv2DNchw3x3BackwardWeightF32Kernel kernel =
                     GetOrCreateDirectPtxLocallyConnectedConv2DBwdWeightKernel();
                 if (capturing && !_directPtxLocallyConnectedConv2DBwdWeightKernels.Pin(key))
@@ -4529,7 +4529,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateDirectPtxLocallyConnectedConv2DBwdWeightKernel();
             }
             DirectPtxLastError = null;
@@ -4632,7 +4632,7 @@ public sealed partial class CudaBackend
                         "Direct PTX locally-connected Conv2D backward-bias must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxLocallyConnectedConv2DNchwBackwardBiasF32Kernel kernel =
                     GetOrCreateDirectPtxLocallyConnectedConv2DBwdBiasKernel();
                 if (capturing && !_directPtxLocallyConnectedConv2DBwdBiasKernels.Pin(key))
@@ -4676,7 +4676,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateDirectPtxLocallyConnectedConv2DBwdBiasKernel();
             }
             DirectPtxLastError = null;
@@ -4785,7 +4785,7 @@ public sealed partial class CudaBackend
                         "Direct PTX deformable Conv2D must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxDeformableConv2DNchw3x3F32Kernel kernel = GetOrCreateDirectPtxDeformableConv2DKernel();
                 if (capturing && !_directPtxDeformableConv2DKernels.Pin(key))
                     throw new InvalidOperationException(
@@ -4831,7 +4831,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateDirectPtxDeformableConv2DKernel();
             }
             DirectPtxLastError = null;
@@ -4939,7 +4939,7 @@ public sealed partial class CudaBackend
                         "Direct PTX deformable Conv2D backward-weight must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxDeformableConv2DNchw3x3BackwardWeightF32Kernel kernel =
                     GetOrCreateDirectPtxDeformableConv2DBwdWeightKernel();
                 if (capturing && !_directPtxDeformableConv2DBwdWeightKernels.Pin(key))
@@ -4986,7 +4986,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateDirectPtxDeformableConv2DBwdWeightKernel();
             }
             DirectPtxLastError = null;
@@ -5095,7 +5095,7 @@ public sealed partial class CudaBackend
                         "Direct PTX deformable Conv2D backward-mask must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxDeformableConv2DNchw3x3BackwardMaskF32Kernel kernel =
                     GetOrCreateDirectPtxDeformableConv2DBwdMaskKernel();
                 if (capturing && !_directPtxDeformableConv2DBwdMaskKernels.Pin(key))
@@ -5142,7 +5142,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateDirectPtxDeformableConv2DBwdMaskKernel();
             }
             DirectPtxLastError = null;
@@ -5254,7 +5254,7 @@ public sealed partial class CudaBackend
                         "Direct PTX deformable Conv2D backward-offset must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxDeformableConv2DNchw3x3BackwardOffsetF32Kernel kernel =
                     GetOrCreateDirectPtxDeformableConv2DBwdOffsetKernel();
                 if (capturing && !_directPtxDeformableConv2DBwdOffsetKernels.Pin(key))
@@ -5302,7 +5302,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateDirectPtxDeformableConv2DBwdOffsetKernel();
             }
             DirectPtxLastError = null;
@@ -5411,7 +5411,7 @@ public sealed partial class CudaBackend
                         "Direct PTX deformable Conv2D backward-input must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxDeformableConv2DNchw3x3BackwardInputF32Kernel kernel =
                     GetOrCreateDirectPtxDeformableConv2DBwdInputKernel();
                 if (capturing && !_directPtxDeformableConv2DBwdInputKernels.Pin(key))
@@ -5458,7 +5458,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateDirectPtxDeformableConv2DBwdInputKernel();
             }
             DirectPtxLastError = null;
@@ -5563,7 +5563,7 @@ public sealed partial class CudaBackend
                         "Direct PTX ConvTranspose3D 3x3x3 must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxConvTranspose3DNcdhw3x3x3ForwardF32Kernel kernel = GetOrCreateDirectPtxConvTranspose3D3x3x3Kernel();
                 if (capturing && !_directPtxConvTranspose3D3x3x3Kernels.Pin(key))
                     throw new InvalidOperationException(
@@ -5607,7 +5607,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateDirectPtxConvTranspose3D3x3x3Kernel();
             }
             DirectPtxLastError = null;
@@ -5710,7 +5710,7 @@ public sealed partial class CudaBackend
                         "Direct PTX ConvTranspose3D 3x3x3 backward-input must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxConvTranspose3DNcdhw3x3x3BackwardInputF32Kernel kernel =
                     GetOrCreateDirectPtxConvTranspose3D3x3x3BwdInputKernel();
                 if (capturing && !_directPtxConvTranspose3D3x3x3BwdInputKernels.Pin(key))
@@ -5755,7 +5755,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateDirectPtxConvTranspose3D3x3x3BwdInputKernel();
             }
             DirectPtxLastError = null;
@@ -5861,7 +5861,7 @@ public sealed partial class CudaBackend
                         "Direct PTX ConvTranspose3D 3x3x3 backward-weight must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxConvTranspose3DNcdhw3x3x3BackwardWeightF32Kernel kernel =
                     GetOrCreateDirectPtxConvTranspose3D3x3x3BwdWeightKernel();
                 if (capturing && !_directPtxConvTranspose3D3x3x3BwdWeightKernels.Pin(key))
@@ -5906,7 +5906,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateDirectPtxConvTranspose3D3x3x3BwdWeightKernel();
             }
             DirectPtxLastError = null;
@@ -6009,7 +6009,7 @@ public sealed partial class CudaBackend
                         "Direct PTX Im2col-KN-FP16 must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxIm2colKNFp16Nchw3x3Kernel kernel = GetOrCreateDirectPtxIm2colKNFp16Kernel();
                 if (capturing && !_directPtxIm2colKNFp16Kernels.Pin(key))
                     throw new InvalidOperationException(
@@ -6052,7 +6052,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateDirectPtxIm2colKNFp16Kernel();
             }
             DirectPtxLastError = null;
@@ -6153,7 +6153,7 @@ public sealed partial class CudaBackend
                         "Direct PTX Unfold-KN-FP16-from-FP16 must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxUnfoldKNFp16FromFp16Nchw3x3Kernel kernel = GetOrCreateDirectPtxUnfoldKNFp16FromFp16Kernel();
                 if (capturing && !_directPtxUnfoldKNFp16FromFp16Kernels.Pin(key))
                     throw new InvalidOperationException(
@@ -6196,7 +6196,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateDirectPtxUnfoldKNFp16FromFp16Kernel();
             }
             DirectPtxLastError = null;
@@ -6304,7 +6304,7 @@ public sealed partial class CudaBackend
                         "Direct PTX grouped deformable Conv2D must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxDeformableConv2DGroupedNchw3x3F32Kernel kernel = GetOrCreateDirectPtxDeformableConv2DGroupedKernel();
                 if (capturing && !_directPtxDeformableConv2DGroupedKernels.Pin(key))
                     throw new InvalidOperationException(
@@ -6350,7 +6350,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateDirectPtxDeformableConv2DGroupedKernel();
             }
             DirectPtxLastError = null;
@@ -6458,7 +6458,7 @@ public sealed partial class CudaBackend
                         "Direct PTX grouped deformable Conv2D backward-weight must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxDeformableConv2DGroupedNchw3x3BackwardWeightF32Kernel kernel =
                     GetOrCreateDirectPtxDeformableConv2DGroupedBwdWeightKernel();
                 if (capturing && !_directPtxDeformableConv2DGroupedBwdWeightKernels.Pin(key))
@@ -6505,7 +6505,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateDirectPtxDeformableConv2DGroupedBwdWeightKernel();
             }
             DirectPtxLastError = null;
@@ -6615,7 +6615,7 @@ public sealed partial class CudaBackend
                         "Direct PTX grouped deformable Conv2D backward-mask must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxDeformableConv2DGroupedNchw3x3BackwardMaskF32Kernel kernel =
                     GetOrCreateDirectPtxDeformableConv2DGroupedBwdMaskKernel();
                 if (capturing && !_directPtxDeformableConv2DGroupedBwdMaskKernels.Pin(key))
@@ -6662,7 +6662,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateDirectPtxDeformableConv2DGroupedBwdMaskKernel();
             }
             DirectPtxLastError = null;
@@ -6775,7 +6775,7 @@ public sealed partial class CudaBackend
                         "Direct PTX grouped deformable Conv2D backward-offset must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxDeformableConv2DGroupedNchw3x3BackwardOffsetF32Kernel kernel =
                     GetOrCreateDirectPtxDeformableConv2DGroupedBwdOffsetKernel();
                 if (capturing && !_directPtxDeformableConv2DGroupedBwdOffsetKernels.Pin(key))
@@ -6823,7 +6823,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateDirectPtxDeformableConv2DGroupedBwdOffsetKernel();
             }
             DirectPtxLastError = null;
@@ -6933,7 +6933,7 @@ public sealed partial class CudaBackend
                         "Direct PTX grouped deformable Conv2D backward-input must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxDeformableConv2DGroupedNchw3x3BackwardInputF32Kernel kernel =
                     GetOrCreateDirectPtxDeformableConv2DGroupedBwdInputKernel();
                 if (capturing && !_directPtxDeformableConv2DGroupedBwdInputKernels.Pin(key))
@@ -6980,7 +6980,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateDirectPtxDeformableConv2DGroupedBwdInputKernel();
             }
             DirectPtxLastError = null;

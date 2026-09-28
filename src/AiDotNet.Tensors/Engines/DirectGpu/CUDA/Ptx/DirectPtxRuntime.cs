@@ -32,7 +32,8 @@ internal sealed class DirectPtxRuntime : IDisposable
     internal int DriverVersion { get; }
     internal string DeviceFingerprint { get; }
     internal Helpers.Autotune.GpuDeviceFingerprint Fingerprint { get; }
-    internal IntPtr Stream => _stream;
+    internal IntPtr Stream => CudaBackend.ResolveCaptureStream(_stream);
+    internal IntPtr Context => _context;
     internal uint StreamFlags
     {
         get
@@ -309,7 +310,7 @@ internal sealed class DirectPtxRuntime : IDisposable
     internal void LaunchGraph(IntPtr graphExec)
     {
         using var _ = Enter();
-        Check(CudaNativeBindings.cuGraphLaunch(graphExec, _stream), "cuGraphLaunch");
+        Check(CudaNativeBindings.cuGraphLaunch(graphExec, Stream), "cuGraphLaunch");
     }
 
     internal void DestroyGraph(IntPtr graphExec)
@@ -613,7 +614,7 @@ internal sealed class DirectPtxBuffer : IDisposable
             // kernel, or concurrent contexts can observe an incompletely staged
             // input and leave apparently random output blocks at zero.
             DirectPtxRuntime.Check(
-                CudaNativeBindings.cuCtxSynchronize(), "cuCtxSynchronize(upload)");
+                CudaBackend.SynchronizeContextOutsideCapture(_runtime.Context), "cuCtxSynchronize(upload)");
             // The synchronous pageable-host copy stages through the default
             // stream. Complete that stream before a caller can enqueue new work
             // on the runtime's CU_STREAM_NON_BLOCKING stream.
@@ -632,7 +633,7 @@ internal sealed class DirectPtxBuffer : IDisposable
         // non-blocking stream. Make Download independently correct even when a
         // caller omits an explicit Synchronize before reading the result.
         DirectPtxRuntime.Check(
-            CudaNativeBindings.cuCtxSynchronize(), "cuCtxSynchronize(download)");
+            CudaBackend.SynchronizeContextOutsideCapture(_runtime.Context), "cuCtxSynchronize(download)");
         // Make Download independently correct when the caller omits an explicit
         // barrier, while waiting only for the stream that produces this buffer.
         _runtime.Synchronize();

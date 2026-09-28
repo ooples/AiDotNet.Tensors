@@ -82,7 +82,7 @@ public sealed partial class CudaBackend
                             "Direct PTX fused linear/CE must be prewarmed before CUDA graph capture.";
                         return false;
                     }
-                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                     kernel = CreateAndCacheDirectPtxCrossEntropyKernelSlow(key);
                 }
                 if (capturing && !PinDirectPtxKernelForCapture(_directPtxCrossEntropyKernels, key))
@@ -134,7 +134,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 var key = new DirectPtxCrossEntropyKey(
                     (int)targetKind, rows, hiddenDimension, vocabulary);
                 if (!_directPtxCrossEntropyKernels.TryGetValue(key, out _))

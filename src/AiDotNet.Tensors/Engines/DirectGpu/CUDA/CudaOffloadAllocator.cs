@@ -34,6 +34,7 @@ public sealed class CudaOffloadAllocator : IGpuOffloadAllocator, IGpuDevicePoint
     // reading the pinned moments and the stream sync that orders it are in one
     // context. Sharing must NOT destroy a context the backend still owns.
     private readonly bool _ownsContext = true;
+    private readonly long _sharedContextGeneration;
     private bool _disposed;
 
     /// <summary>Standalone offload allocator — lazily creates and owns its own CUDA context.</summary>
@@ -51,6 +52,9 @@ public sealed class CudaOffloadAllocator : IGpuOffloadAllocator, IGpuDevicePoint
     {
         _context = sharedContext;
         _ownsContext = sharedContext == IntPtr.Zero; // zero -> behave like the default ctor (create our own)
+        // A shared context is identified by its registration generation, not its handle value, which the driver
+        // reuses for later contexts (see CudaBackend.LiveContexts).
+        _sharedContextGeneration = CudaBackend.ContextGenerationOf(sharedContext);
     }
 
     internal static bool IsCudaUsable(bool driverAvailable, bool circuitBroken)
@@ -79,7 +83,7 @@ public sealed class CudaOffloadAllocator : IGpuOffloadAllocator, IGpuDevicePoint
     // is the authoritative lifetime signal: CudaBackend removes it under the same lock immediately
     // before cuCtxDestroy. Owned primary contexts are protected by this allocator's lifecycle lock.
     private bool IsContextUsableUnderLifecycleLock()
-        => _ownsContext || (_context != IntPtr.Zero && CudaBackend.LiveContexts.ContainsKey(_context));
+        => _ownsContext || CudaBackend.IsLiveContext(_context, _sharedContextGeneration);
 
     public GpuOffloadHandle Allocate(long bytes, OffloadScheme scheme)
     {
@@ -324,7 +328,7 @@ public sealed class CudaOffloadAllocator : IGpuOffloadAllocator, IGpuDevicePoint
                 // that case because cuCtxDestroy has already reclaimed the context's resources.
                 lock (CudaBackend.ContextLifecycleLock)
                 {
-                    if (CudaBackend.LiveContexts.ContainsKey(ctxToDestroy))
+                    if (CudaBackend.IsLiveContext(ctxToDestroy, _sharedContextGeneration))
                     {
                         using var scope = new CudaContextPushScope(ctxToDestroy);
                         foreach (var h in snapshot) FreeNative(h);
