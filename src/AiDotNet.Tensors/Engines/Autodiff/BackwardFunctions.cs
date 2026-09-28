@@ -3038,26 +3038,16 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        // d(log_softmax)/dx = gradOutput - softmax * sum(gradOutput)
-        // softmax = exp(log_softmax) = exp(output)
+        // d(log_softmax)/dx = gradOutput - softmax * sum(gradOutput) along the SOFTMAX AXIS, as engine ops so a
+        // GPU backward stays on the device. The former host loop read every gradient element back (GetFlat on a
+        // resident tensor - a stream sync per step, and CUDA 900 inside a whole-step capture) and always reduced
+        // over the LAST axis, so a log-softmax over any other axis got a wrong gradient. The axis is recorded by
+        // TensorLogSoftmax; tapes recorded before it was saved default to the last axis, which is what they used.
+        int axis = savedState is { Length: > 0 } && savedState[0] is int savedAxis ? savedAxis : inputs[0].Rank - 1;
         var softmax = engine.TensorExp(output);
-        // For each row, compute sum(gradOutput) and subtract softmax * sum
-        // This is a per-row operation. Use engine ops for the computation.
-        var numOps = MathHelper.GetNumericOperations<T>();
-        int lastDim = inputs[0].Shape[^1];
-        int outerSize = inputs[0].Length / lastDim;
-        var dx = TensorPool<T>.RentZeroed(inputs[0]._shape);
-
-        for (int outer = 0; outer < outerSize; outer++)
-        {
-            int offset = outer * lastDim;
-            T sumGrad = numOps.Zero;
-            for (int d = 0; d < lastDim; d++)
-                sumGrad = numOps.Add(sumGrad, gradOutput[offset + d]);
-            for (int d = 0; d < lastDim; d++)
-                dx[offset + d] = numOps.Subtract(gradOutput[offset + d],
-                    numOps.Multiply(softmax[offset + d], sumGrad));
-        }
+        var rowSums = engine.ReduceSum(gradOutput, new[] { axis }, keepDims: true);
+        var dx = engine.TensorSubtract(gradOutput,
+            engine.TensorMultiply(softmax, engine.TensorBroadcastTo(rowSums, output._shape)));
         DifferentiableOps.AccumulateGrad(grads, inputs[0], dx, engine);
     }
 

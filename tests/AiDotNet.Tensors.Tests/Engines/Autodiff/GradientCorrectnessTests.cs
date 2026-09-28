@@ -316,6 +316,26 @@ public class GradientCorrectnessTests : IDisposable
         }, x, "LogSoftmax");
     }
 
+    /// <summary>
+    /// Log-softmax over a NON-last axis. The backward used to reduce the incoming gradient over the last axis no matter
+    /// which axis the forward normalized, so this gradient was wrong (the recorded op saved no axis).
+    /// </summary>
+    [Fact]
+    public void LogSoftmax_Gradient_MatchesNumerical_OnANonLastAxis()
+    {
+        var x = new Tensor<float>(new float[] { 0.3f, -1.2f, 2.0f, 0.7f, 1.1f, 0.4f, -0.5f, 0.9f, -0.2f, 1.6f, 0.1f, -0.8f }, [3, 4]);
+        var weights = new Tensor<float>(new float[] { 1f, 0.5f, -1f, 2f, 0.25f, 1f, 0.3f, -0.7f, 1.5f, -0.4f, 0.8f, 1.2f }, [3, 4]);
+        VerifyGradient(inp => _engine.TensorMultiply(_engine.TensorLogSoftmax(inp, axis: 0), weights), x, "LogSoftmax_axis0");
+    }
+
+    [Fact]
+    public void LogSoftmax_Gradient_MatchesNumerical_OverSeveralRows()
+    {
+        var x = new Tensor<float>(new float[] { 0.3f, -1.2f, 2.0f, 0.7f, 1.1f, 0.4f, -0.5f, 0.9f, -0.2f, 1.6f, 0.1f, -0.8f }, [3, 4]);
+        var weights = new Tensor<float>(new float[] { 1f, 0.5f, -1f, 2f, 0.25f, 1f, 0.3f, -0.7f, 1.5f, -0.4f, 0.8f, 1.2f }, [3, 4]);
+        VerifyGradient(inp => _engine.TensorMultiply(_engine.TensorLogSoftmax(inp, axis: -1), weights), x, "LogSoftmax_rows");
+    }
+
     // ─── Shape ops ──────────────────────────────────────────────
 
     [Fact]
