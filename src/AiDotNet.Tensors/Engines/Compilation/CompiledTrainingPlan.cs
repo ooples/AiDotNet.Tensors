@@ -325,6 +325,20 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         for (int i = 0; i < _preAllocatedGrads.Length; i++) Unbind(_preAllocatedGrads[i]);
         Unbind(_lossGradSeed);
         Unbind(_lossGradDest);
+        // The pre-pass (and the aborted capture) ran every forward op on the capture path, where GPU ops bind their
+        // outputs - the loss and every intermediate - to stable resident buffers. Left bound, the eager step after a
+        // failed capture served those stale device copies: with a composed loss (ReduceMean over (pred - y)^2) the
+        // reported loss froze at the last warmup step's value and the backward read stale intermediates.
+        if (_forwardSteps is not null)
+            foreach (var step in _forwardSteps) Unbind(step.OutputBuffer);
+        Unbind(_lossOutput);
+        // The pre-pass bound every external input (the batch and target slots) to a stable device buffer holding THAT
+        // step's data - the captured graph re-uploads them per replay (RefreshGraphInputInPlace), the eager step does
+        // not. Batches are fed through AsWritableSpan, which by contract does not bump the GPU-cache version, so after
+        // a failed capture the eager step kept reading the pre-pass batch as current: every later step trained on a
+        // stale target (measured: the loss matched MSE(pred(x_t), y_(t-1)) exactly).
+        if (!_graphHasEmbedding)
+            foreach (var leaf in GraphExternalLeaves()) Unbind(leaf);
     }
 
     /// <summary>
@@ -340,6 +354,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
 
     /// <summary>Test hook: the next capture attempt runs the pre-pass and then fails, like a capture-unsafe op.</summary>
     internal bool FailNextCaptureForTesting { get; set; }
+
+    /// <summary>Test hook: the next capture fails from INSIDE the captured body, after its forward and backward ran.</summary>
+    internal bool FailInsideNextCaptureForTesting { get; set; }
 
     /// <summary>
     /// After the eager step rewrites a HOST-authoritative slot through a raw array, retire any device copy cached from
@@ -2174,6 +2191,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             }
         }
         de?.SetCurrentScratchAction(-1);   // grad clip + optimizer (run after) must NOT pool
+        if (FailInsideNextCaptureForTesting && cb.IsStreamCapturing())
+        {
+            // The real failure shape: a host read of a device-resident value INSIDE the capture, after the whole
+            // forward and backward have already issued (and allocated) inside it.
+            FailInsideNextCaptureForTesting = false;
+            _ = _lossOutput.ToArray();
+            throw new InvalidOperationException("capture failure forced inside the captured step for testing");
+        }
         // NOTE: _optimizerUpdate is intentionally NOT invoked here — it runs eagerly
         // in Step() after LaunchCapturedGraph so the LR schedule / Adam bias-correction
         // scalars are fresh per step rather than frozen at capture time.

@@ -2337,6 +2337,16 @@ internal static class BackwardFunctions<T>
         // ~halved by skipping the redundant clear.
         if (grad.Length == 1)
         {
+            // A device-resident scalar (the loss gradient of a GPU training step) is broadcast on the device.
+            // Reading it with GetFlat downloaded it - a stream sync per step, and inside a CUDA-graph capture an
+            // illegal operation (cuStreamSynchronize 900) that aborted the capture of every plan whose loss ends
+            // in a full ReduceSum/Mean.
+            if (targetShape.Length > 0 && grad.TryGetGpuBuffer() is not null)
+            {
+                var ones = new int[targetShape.Length];
+                for (int i = 0; i < ones.Length; i++) ones[i] = 1;
+                return engine.TensorBroadcastTo(engine.Reshape(grad, ones), targetShape);
+            }
             var result = TensorAllocator.RentUninitialized<T>(targetShape);
             engine.TensorFill(result, grad.GetFlat(0));
             return result;

@@ -80,7 +80,7 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         public string[] StepStates = Array.Empty<string>();
     }
 
-    private static Run Train(DirectGpuTensorEngine gpu, bool capture, bool failCapture = false, bool composedMse = false)
+    private static Run Train(DirectGpuTensorEngine gpu, bool capture, bool failCapture = false, bool composedMse = false, bool failInsideCapture = false)
     {
         var x = Rand([Batch, Inputs], 1, 1f);
         var y = Rand([Batch, Outputs], 2, 1f);
@@ -115,6 +115,7 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             var concrete = (CompiledTrainingPlan<float>)plan;
             if (!capture) concrete.DisableGraphStep();
             concrete.FailNextCaptureForTesting = failCapture;
+            concrete.FailInsideNextCaptureForTesting = failInsideCapture;
             plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2f);
             var losses = new double[Steps];
             var states = new string[Steps];
@@ -178,8 +179,12 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
     /// plan that never tried: the pre-pass it ran bound the gradient accumulators to device buffers, and leaving them
     /// bound made the eager step's in-place gradient adds land on never-zeroed device memory.
     /// </summary>
-    [SkippableFact]
-    public void A_failed_capture_trains_exactly_like_the_eager_step()
+    [SkippableTheory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public void A_failed_capture_trains_exactly_like_the_eager_step(bool failInsideCapture, bool composedMse)
     {
         Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
         using (gpu)
@@ -190,10 +195,15 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "0",
                 "Graph capture is disabled for this process.");
 
-            var eager = Train(gpu, capture: false);
-            var failed = Train(gpu, capture: true, failCapture: true);
+            // failInsideCapture: the capture aborts from INSIDE, after its forward and backward already issued and
+            // allocated there (a host read of a resident value - how a TabDDPM fused step failed). Buffers the aborted
+            // capture handed out were graph-owned addresses, and the eager fallback then faulted on them (CUDA 700).
+            var eager = Train(gpu, capture: false, composedMse: composedMse);
+            var failed = Train(gpu, capture: true, failCapture: !failInsideCapture, composedMse: composedMse,
+                failInsideCapture: failInsideCapture);
             _output.WriteLine("eager  " + string.Join(" ", eager.Losses.Select(l => l.ToString("G6"))));
             _output.WriteLine("failed " + string.Join(" ", failed.Losses.Select(l => l.ToString("G6"))));
+            for (int s = 0; s < Steps; s++) _output.WriteLine($"failed step {s}: {failed.StepStates[s]}");
 
             Assert.False(failed.ReplayedAGraph, "the forced capture failure did not take effect");
             for (int s = 0; s < Steps; s++)
