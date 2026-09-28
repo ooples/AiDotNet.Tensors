@@ -13,7 +13,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.Metal;
 /// </summary>
 internal static class MetalCompressedOptimizerKernels
 {
-    public const string Source = @"
+    /// <summary>The compiled source: <see cref="RawSource"/> with the dynamic-quantization codebook prelude inserted.</summary>
+    public static readonly string Source = RawSource.Replace(
+        "using namespace metal;",
+        "using namespace metal;" + System.Environment.NewLine + Compilation.DynamicQuantizationCodebook.KernelPrelude(
+            Compilation.DynamicQuantizationCodebook.KernelLanguage.Metal));
+
+    private const string RawSource = @"
 #include <metal_stdlib>
 using namespace metal;
 
@@ -132,8 +138,8 @@ kernel void adam8bit(
     float localMaxM = 0.0f;
     float localMaxV = 0.0f;
     for (uint i = start + lid; i < endIdx; i += 256u) {
-        float oldM = firstStep ? 0.0f : ((float)load_byte(atomic_load_explicit(&m_quant[i >> 2u], memory_order_relaxed), i) - 128.0f) * oldMScale;
-        float oldV = firstStep ? 0.0f : (float)load_byte(atomic_load_explicit(&v_quant[i >> 2u], memory_order_relaxed), i) * oldVScale;
+        float oldM = firstStep ? 0.0f : adam8_dec_s(load_byte(atomic_load_explicit(&m_quant[i >> 2u], memory_order_relaxed), i)) * oldMScale;
+        float oldV = firstStep ? 0.0f : adam8_dec_u(load_byte(atomic_load_explicit(&v_quant[i >> 2u], memory_order_relaxed), i)) * oldVScale;
         float g = grad[i];
         float newM = beta1 * oldM + oneMinusBeta1 * g;
         float newV = beta2 * oldV + oneMinusBeta2 * g * g;
@@ -150,8 +156,9 @@ kernel void adam8bit(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    float newMScale = max(s_maxM[0] / 127.0f, 1e-10f);
-    float newVScale = max(s_maxV[0] / 255.0f, 1e-10f);
+    // Block-wise dynamic quantization: scale = block absmax, value = nearest codebook entry.
+    float newMScale = max(s_maxM[0], 1e-30f);
+    float newVScale = max(s_maxV[0], 1e-30f);
     if (lid == 0u) {
         m_scales[block] = newMScale;
         v_scales[block] = newVScale;
@@ -159,8 +166,8 @@ kernel void adam8bit(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint i = start + lid; i < endIdx; i += 256u) {
-        float oldM = firstStep ? 0.0f : ((float)load_byte(atomic_load_explicit(&m_quant[i >> 2u], memory_order_relaxed), i) - 128.0f) * oldMScale;
-        float oldV = firstStep ? 0.0f : (float)load_byte(atomic_load_explicit(&v_quant[i >> 2u], memory_order_relaxed), i) * oldVScale;
+        float oldM = firstStep ? 0.0f : adam8_dec_s(load_byte(atomic_load_explicit(&m_quant[i >> 2u], memory_order_relaxed), i)) * oldMScale;
+        float oldV = firstStep ? 0.0f : adam8_dec_u(load_byte(atomic_load_explicit(&v_quant[i >> 2u], memory_order_relaxed), i)) * oldVScale;
         float g = grad[i];
         float newM = beta1 * oldM + oneMinusBeta1 * g;
         float newV = beta2 * oldV + oneMinusBeta2 * g * g;
@@ -169,10 +176,8 @@ kernel void adam8bit(
         float vHat = newV / biasCorrection2;
         param[i] -= lr * mHat / (sqrt(vHat) + epsilon);
 
-        int qm = clamp((int)round(newM / newMScale), -128, 127);
-        store_byte(m_quant, i, (uint)(qm + 128));
-        int qv = clamp((int)round(newV / newVScale), 0, 255);
-        store_byte(v_quant, i, (uint)qv);
+        store_byte(m_quant, i, adam8_enc_s(newM / newMScale));
+        store_byte(v_quant, i, adam8_enc_u(newV / newVScale));
     }
 }
 ";

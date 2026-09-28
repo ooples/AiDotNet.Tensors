@@ -123,6 +123,8 @@ public class TrainingPlanSerializationTests
     [Theory]
     [InlineData(3)]
     [InlineData(4)]
+    [InlineData(5)]
+    [InlineData(6)]
     public async Task Load_LegacyTrainingPlan_IsRejectedAfterOptimizerPayloadChanges(int legacyVersion)
     {
         await Task.Yield();
@@ -645,7 +647,7 @@ public class TrainingPlanSerializationTests
         if (momentMode == FusedMomentStorageMode.BFloat16)
             plan.RequestBf16MomentStorage(true);
         else if (momentMode == FusedMomentStorageMode.Int8BlockQuantized)
-            plan.RequestInt8MomentStorage(true, blockSize: 4);
+            plan.RequestInt8MomentStorage(true, blockSize: 4, minQuantizedLength: 0);
 
         plan.ConfigureOptimizer(
             OptimizerType.Adam,
