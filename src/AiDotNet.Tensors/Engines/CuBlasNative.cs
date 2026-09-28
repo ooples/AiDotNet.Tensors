@@ -290,6 +290,13 @@ public static class CuBlasNative
     public static extern CudaResult cuDevicePrimaryCtxRelease(int device);
 
     /// <summary>
+    /// Sets the scheduling flags the device's primary context is created with. Fails with
+    /// CUDA_ERROR_PRIMARY_CONTEXT_ACTIVE once it exists (the first retainer's flags then apply).
+    /// </summary>
+    [DllImport(CudaLibrary, EntryPoint = "cuDevicePrimaryCtxSetFlags_v2")]
+    public static extern CudaResult cuDevicePrimaryCtxSetFlags(int device, uint flags);
+
+    /// <summary>
     /// Pushes a context on the current CPU thread's stack.
     /// </summary>
     [DllImport(CudaLibrary, EntryPoint = "cuCtxPushCurrent_v2")]
@@ -363,26 +370,41 @@ public static class CuBlasNative
     public static CudaResult cuMemcpyHtoD(IntPtr dstDevice, IntPtr srcHost, ulong byteCount)
     {
         AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.OnUpload((long)byteCount);
-        return cuMemcpyHtoDNative(dstDevice, srcHost, byteCount);
+        var stream = DirectGpu.CUDA.CudaCurrentStream.ForCurrentContext();
+        return stream != IntPtr.Zero
+            ? DirectGpu.CUDA.CudaNativeBindings.cuMemcpyHtoDAsyncNative(dstDevice, srcHost, byteCount, stream)
+            : cuMemcpyHtoDNative(dstDevice, srcHost, byteCount);
     }
 
     /// <summary>
     /// Copies memory from device to host.
     /// </summary>
     [DllImport(CudaLibrary, EntryPoint = "cuMemcpyDtoH_v2")]
-    public static extern CudaResult cuMemcpyDtoH(IntPtr dstHost, IntPtr srcDevice, ulong byteCount);
+    private static extern CudaResult cuMemcpyDtoHNative(IntPtr dstHost, IntPtr srcDevice, ulong byteCount);
+
+    /// <summary>Device-to-host copy on the current stream when there is one (see CudaCurrentStream).</summary>
+    public static CudaResult cuMemcpyDtoH(IntPtr dstHost, IntPtr srcDevice, ulong byteCount)
+        => DirectGpu.CUDA.CudaNativeBindings.StreamOrdered.CopyDtoH(dstHost, srcDevice, byteCount, cuMemcpyDtoHNative);
 
     /// <summary>
     /// Copies memory from device to device.
     /// </summary>
     [DllImport(CudaLibrary, EntryPoint = "cuMemcpyDtoD_v2")]
-    public static extern CudaResult cuMemcpyDtoD(IntPtr dstDevice, IntPtr srcDevice, ulong byteCount);
+    private static extern CudaResult cuMemcpyDtoDNative(IntPtr dstDevice, IntPtr srcDevice, ulong byteCount);
+
+    /// <summary>Device-to-device copy on the current stream when there is one (see CudaCurrentStream).</summary>
+    public static CudaResult cuMemcpyDtoD(IntPtr dstDevice, IntPtr srcDevice, ulong byteCount)
+        => DirectGpu.CUDA.CudaNativeBindings.StreamOrdered.CopyDtoD(dstDevice, srcDevice, byteCount, cuMemcpyDtoDNative);
 
     /// <summary>
     /// Sets device memory to a value.
     /// </summary>
     [DllImport(CudaLibrary, EntryPoint = "cuMemsetD32_v2")]
-    public static extern CudaResult cuMemsetD32(IntPtr dstDevice, uint value, ulong count);
+    private static extern CudaResult cuMemsetD32Native(IntPtr dstDevice, uint value, ulong count);
+
+    /// <summary>32-bit memset on the current stream when there is one (see CudaCurrentStream).</summary>
+    public static CudaResult cuMemsetD32(IntPtr dstDevice, uint value, ulong count)
+        => DirectGpu.CUDA.CudaNativeBindings.StreamOrdered.MemsetD32(dstDevice, value, count, cuMemsetD32Native);
 
     #endregion
 

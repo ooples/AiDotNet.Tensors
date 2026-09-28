@@ -262,7 +262,7 @@ internal static class CudaNativeBindings
 
     // Async memory transfer APIs
     [DllImport(CudaLibrary, EntryPoint = "cuMemcpyHtoDAsync_v2")]
-    private static extern CudaResult cuMemcpyHtoDAsyncNative(IntPtr dstDevice, IntPtr srcHost, ulong byteCount, IntPtr stream);
+    internal static extern CudaResult cuMemcpyHtoDAsyncNative(IntPtr dstDevice, IntPtr srcHost, ulong byteCount, IntPtr stream);
 
     /// <summary>Host-to-device copy; counted by <see cref="AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.OnUpload"/> (every upload goes through here).</summary>
     public static CudaResult cuMemcpyHtoDAsync(IntPtr dstDevice, IntPtr srcHost, ulong byteCount, IntPtr stream)
@@ -480,10 +480,54 @@ internal static class CudaNativeBindings
     public static CudaResult cuMemcpyHtoD(IntPtr dstDevice, IntPtr srcHost, ulong byteCount)
     {
         AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.OnUpload((long)byteCount);
-        return cuMemcpyHtoDNative(dstDevice, srcHost, byteCount);
+        var stream = CudaCurrentStream.ForCurrentContext();
+        return stream != IntPtr.Zero
+            ? cuMemcpyHtoDAsyncNative(dstDevice, srcHost, byteCount, stream)
+            : cuMemcpyHtoDNative(dstDevice, srcHost, byteCount);
     }
 
     /// <summary>Synchronous device-to-host copy.</summary>
     [DllImport(CudaLibrary, EntryPoint = "cuMemcpyDtoH_v2")]
-    public static extern CudaResult cuMemcpyDtoH(IntPtr dstHost, IntPtr srcDevice, ulong byteCount);
+    private static extern CudaResult cuMemcpyDtoHNative(IntPtr dstHost, IntPtr srcDevice, ulong byteCount);
+
+    /// <summary>Device-to-host copy on the current stream when there is one (see <see cref="CudaCurrentStream"/>).</summary>
+    public static CudaResult cuMemcpyDtoH(IntPtr dstHost, IntPtr srcDevice, ulong byteCount)
+        => StreamOrdered.CopyDtoH(dstHost, srcDevice, byteCount, cuMemcpyDtoHNative);
+
+    [DllImport(CudaLibrary, EntryPoint = "cuMemsetD32Async")]
+    internal static extern CudaResult cuMemsetD32Async(IntPtr dstDevice, uint value, ulong count, IntPtr stream);
+
+    /// <summary>
+    /// Legacy-stream copy/memset replacements shared by the binding classes: the stream-ordered form on the current
+    /// stream (see <see cref="CudaCurrentStream"/>), or the given legacy call when there is no current stream.
+    /// </summary>
+    internal static class StreamOrdered
+    {
+        internal delegate CudaResult Copy(IntPtr dst, IntPtr src, ulong byteCount);
+        internal delegate CudaResult Memset32(IntPtr dst, uint value, ulong count);
+
+        internal static CudaResult CopyDtoH(IntPtr dstHost, IntPtr srcDevice, ulong byteCount, Copy legacy)
+        {
+            var stream = CudaCurrentStream.ForCurrentContext();
+            if (stream == IntPtr.Zero) return legacy(dstHost, srcDevice, byteCount);
+            var result = cuMemcpyDtoHAsync(dstHost, srcDevice, byteCount, stream);
+            return result != CudaResult.Success ? result : cuStreamSynchronize(stream);
+        }
+
+        internal static CudaResult CopyDtoD(IntPtr dstDevice, IntPtr srcDevice, ulong byteCount, Copy legacy)
+        {
+            var stream = CudaCurrentStream.ForCurrentContext();
+            return stream == IntPtr.Zero
+                ? legacy(dstDevice, srcDevice, byteCount)
+                : cuMemcpyDtoDAsync(dstDevice, srcDevice, byteCount, stream);
+        }
+
+        internal static CudaResult MemsetD32(IntPtr dstDevice, uint value, ulong count, Memset32 legacy)
+        {
+            var stream = CudaCurrentStream.ForCurrentContext();
+            return stream == IntPtr.Zero
+                ? legacy(dstDevice, value, count)
+                : cuMemsetD32Async(dstDevice, value, count, stream);
+        }
+    }
 }

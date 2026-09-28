@@ -182,7 +182,9 @@ public sealed partial class CudaBackend
         // oscillation and a training plateau (the embedding grad flickered 0.11↔0 step-to-step). The capture
         // win is launch-overhead collapse, NOT cross-step async overlap, and a training step must finish
         // before the next anyway, so this per-step barrier costs ~nothing while making grads deterministic.
-        CuBlasNative.CheckCudaResult(CudaNativeBindings.cuCtxSynchronize(), "cuCtxSynchronize (post-capture-launch grad barrier)");
+        // Every backend shares the device's primary context, so a context-wide sync would also wait on streams
+        // another engine is capturing (CUDA 900). Wait on this backend's own streams instead.
+        SynchronizeOwnStreams("stream sync (post-capture-launch grad barrier)");
     }
 
     /// <summary>

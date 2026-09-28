@@ -114,7 +114,8 @@ public sealed class CudaGraphScope : IDisposable
         CleanupGraph();
 
         var result = CudaNativeBindings.cuStreamBeginCapture(
-            _stream, CudaNativeBindings.CU_STREAM_CAPTURE_MODE_GLOBAL);
+            // Thread-local: other threads' engines share the device context and must keep working during capture.
+            _stream, CudaNativeBindings.CU_STREAM_CAPTURE_MODE_THREAD_LOCAL);
 
         if (result != CudaResult.Success)
             throw new InvalidOperationException($"cuStreamBeginCapture failed: {result}");
