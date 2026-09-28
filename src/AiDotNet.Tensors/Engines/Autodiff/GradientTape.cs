@@ -201,7 +201,11 @@ public sealed class GradientTape<T> : IDisposable
             // The engine that PRODUCED the data, not whatever engine was global when the tape was created: measured,
             // a tape over data from a test fixture's GPU engine ran its backward on the host whenever an earlier test
             // had left AiDotNetEngine.Current as a CpuEngine ("dA was computed on the host").
-            _dataEngine = DirectGpuTensorEngine.EngineOwning(tensor._gpuBackend);
+            // Prefer the tape's own default when it already drives that backend: several engines can share one
+            // backend, and the registry holds only the most recently created of them.
+            _dataEngine = _engine is DirectGpuTensorEngine current && ReferenceEquals(current.GetBackend(), tensor._gpuBackend)
+                ? current
+                : DirectGpuTensorEngine.EngineOwning(tensor._gpuBackend);
         }
     }
 
