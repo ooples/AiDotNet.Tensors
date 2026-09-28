@@ -1315,7 +1315,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 return pooled;
             }
 
-            var buffer = new DirectOpenClBuffer(_context, data);
+            var context = _context;
+            var buffer = AllocateReclaiming(() => new DirectOpenClBuffer(context, data));
             return new DirectOpenClGpuBuffer(buffer, ReturnOpenClBufferToPool);
         }
 
@@ -1328,8 +1329,23 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (_bufferPool.TryRent(size, affinity, out var pooled) && pooled != null)
                 return pooled;
 
-            var buffer = new DirectOpenClBuffer(_context, size);
+            var context = _context;
+            var buffer = AllocateReclaiming(() => new DirectOpenClBuffer(context, size));
             return new DirectOpenClGpuBuffer(buffer, ReturnOpenClBufferToPool);
+        }
+
+        /// <summary>
+        /// Creates a device buffer after running the frees queued by collected buffers; on out-of-memory collects
+        /// unreachable buffers, runs their frees, drains the pool and retries once (see <see cref="DeviceMemoryReclaim"/>).
+        /// </summary>
+        private TBuffer AllocateReclaiming<TBuffer>(Func<TBuffer> create)
+        {
+            if (!DirectOpenClGpuBuffer.PendingFrees.IsEmpty) DirectOpenClGpuBuffer.PendingFrees.Drain();
+            return DeviceMemoryReclaim.AllocateWithRetry(create, ex => ex is GpuOutOfMemoryException, () =>
+            {
+                DirectOpenClGpuBuffer.PendingFrees.Drain();
+                _bufferPool.DrainAll();
+            });
         }
 
         private void ReturnOpenClBufferToPool(DirectOpenClGpuBuffer buffer)
@@ -4280,7 +4296,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 throw new InvalidOperationException("OpenCL context not available");
 
             // Allocate as byte buffer (size in bytes, not floats)
-            var buffer = new DirectOpenClByteBuffer(_context, size);
+            var context = _context;
+            var buffer = AllocateReclaiming(() => new DirectOpenClByteBuffer(context, size));
             return new DirectOpenClGpuByteBuffer(buffer);
         }
 
@@ -8623,7 +8640,8 @@ KERNEL VARIANTS (A/B testing):
             if (_context == null)
                 throw new InvalidOperationException("OpenCL context not available");
 
-            var buffer = new DirectOpenClBuffer(_context, size);
+            var context = _context;
+            var buffer = AllocateReclaiming(() => new DirectOpenClBuffer(context, size));
             return new DirectOpenClGpuBuffer(buffer);
         }
 
@@ -8654,7 +8672,8 @@ KERNEL VARIANTS (A/B testing):
                 floatData[i] = BitConverter.ToSingle(bytes, 0);
             }
 
-            var buffer = new DirectOpenClBuffer(_context, floatData);
+            var context = _context;
+            var buffer = AllocateReclaiming(() => new DirectOpenClBuffer(context, floatData));
             return new DirectOpenClGpuBuffer(buffer);
         }
 
@@ -13959,11 +13978,23 @@ KERNEL VARIANTS (A/B testing):
         public long SizeInBytes => (long)Size * sizeof(float);
         public IntPtr Handle => Buffer.Handle;
 
+        /// <summary>Frees of OpenCL buffers collected without Dispose, run by the backend's next allocation.</summary>
+        internal static readonly DeviceFreeQueue PendingFrees = new();
+
         public DirectOpenClGpuBuffer(DirectOpenClBuffer buffer, Action<DirectOpenClGpuBuffer>? returnToPool = null)
         {
             Buffer = buffer;
             _returnToPool = returnToPool;
             _size = buffer.Length;
+        }
+
+        // An undisposed buffer (a result nothing references any more) frees its device memory through the queue; a
+        // pooled buffer is referenced by its pool, so it is never finalized while pooled.
+        ~DirectOpenClGpuBuffer()
+        {
+            if (Interlocked.Exchange(ref _poolState, 2) == 2) return;
+            var inner = Buffer;
+            PendingFrees.Enqueue(inner.Dispose);
         }
 
         public float[] Download()
@@ -13994,6 +14025,7 @@ KERNEL VARIANTS (A/B testing):
         {
             if (Interlocked.Exchange(ref _poolState, 2) == 2)
                 return;
+            GC.SuppressFinalize(this);
 
             if (GpuBufferReleaseDeferral.TryDefer(Buffer.Dispose))
                 return;
@@ -14140,6 +14172,13 @@ KERNEL VARIANTS (A/B testing):
             Buffer = buffer;
         }
 
+        ~DirectOpenClGpuByteBuffer()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+            var inner = Buffer;
+            DirectOpenClGpuBuffer.PendingFrees.Enqueue(inner.Dispose);
+        }
+
         public byte[] Download()
         {
             return Buffer.ToArray();
@@ -14159,6 +14198,7 @@ KERNEL VARIANTS (A/B testing):
         {
             if (Interlocked.Exchange(ref _disposed, 1) != 0)
                 return;
+            GC.SuppressFinalize(this);
 
             if (GpuBufferReleaseDeferral.TryDefer(Buffer.Dispose))
                 return;

@@ -37,6 +37,22 @@ internal sealed class HostSync
     private string? _released;          // device data freed without a host copy: host reads throw this
     private bool _retained;             // exempt from PyTorch-style release of dead step intermediates
     private bool _downloading;          // a download is filling the host array: other readers wait on _lock
+    private LinearAlgebra.VectorDeviceState? _device;
+
+    /// <summary>
+    /// The device copy of the WHOLE host array, shared by every storage that covers it (a result array later wrapped
+    /// in a tensor, an alias, a lazy GPU vector before and after its array appears); null until one is bound.
+    /// </summary>
+    internal LinearAlgebra.VectorDeviceState? Device => Volatile.Read(ref _device);
+
+    /// <summary>The whole-array device state, created on first use.</summary>
+    internal LinearAlgebra.VectorDeviceState GetOrCreateDevice()
+    {
+        var device = Volatile.Read(ref _device);
+        if (device is not null) return device;
+        Interlocked.CompareExchange(ref _device, new LinearAlgebra.VectorDeviceState(), null);
+        return _device!;
+    }
 
     // array (or not-yet-backed storage) -> its state. Weak on the key: an entry disappears with its array.
     private static readonly ConditionalWeakTable<object, HostSync> s_byKey = new();
@@ -88,10 +104,18 @@ internal sealed class HostSync
         return s_byKey.GetValue(array, _ => sync);
     }
 
-    private static HostSync For(object key)
+    /// <summary>
+    /// The engine's device entry for this storage (an activation-cache entry: buffer, shape, backend), or null.
+    /// Stored on the storage so a lookup is a field read and the entry lives exactly as long as the storage.
+    /// </summary>
+    internal object? DeviceEntry;
+
+    /// <summary>The state of <paramref name="key"/> (a host array, vector or matrix), created on demand.</summary>
+    internal static HostSync For(object key)
         => key is IHostSyncOwner owner ? owner.GetOrCreateHostSync() : ForArray(key);
 
-    private static HostSync? Find(object key)
+    /// <summary>The state of <paramref name="key"/> if one exists; never creates.</summary>
+    internal static HostSync? Find(object key)
     {
         if (!AnyExists) return null;
         return key is IHostSyncOwner owner ? owner.FindHostSync()

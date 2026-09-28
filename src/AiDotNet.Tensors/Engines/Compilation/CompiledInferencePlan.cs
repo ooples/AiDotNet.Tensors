@@ -834,7 +834,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                 _graphCaptureDisabled = true;
                 if (_graphEvictionSuspended && _graphEngine is not null)
                 {
-                    try { _graphEngine.ResumeActivationEviction(); } catch { }
+                    try { _graphEngine.EndGraphLifetime(); } catch { }
                     _graphEvictionSuspended = false;
                 }
                 _graphEngine = null;
@@ -853,7 +853,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                 // buffers the captured graph references aren't evicted/freed before replay.
                 try
                 {
-                    if (!_graphEvictionSuspended) { gte.SuspendActivationEviction(); _graphEvictionSuspended = true; }
+                    if (!_graphEvictionSuspended) { gte.BeginGraphLifetime(); _graphEvictionSuspended = true; }
                     gte.BeginInferenceCapture();
                     try
                     {
@@ -891,7 +891,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                         }
                         // Capture failed (a non-capturable op remains) — disable + resume eviction.
                         _graphCaptureDisabled = true;
-                        if (_graphEvictionSuspended) { gte.ResumeActivationEviction(); _graphEvictionSuspended = false; }
+                        if (_graphEvictionSuspended) { gte.EndGraphLifetime(); _graphEvictionSuspended = false; }
                     }
                     finally
                     {
@@ -911,7 +911,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                         _graphBackend = null;
                         _graphEngine = null;
                     }
-                    if (_graphEvictionSuspended) { gte.ResumeActivationEviction(); _graphEvictionSuspended = false; }
+                    if (_graphEvictionSuspended) { gte.EndGraphLifetime(); _graphEvictionSuspended = false; }
                 }
             }
 
@@ -1095,7 +1095,7 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         }
         if (_graphEvictionSuspended && _graphEngine is not null)
         {
-            try { _graphEngine.ResumeActivationEviction(); } catch { }
+            try { _graphEngine.EndGraphLifetime(); } catch { }
             _graphEvictionSuspended = false;
         }
 

@@ -1821,11 +1821,24 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     /// free/total device memory (cuMemGetInfo) in the exception so the residual
     /// consumer is visible rather than a bare "Out of memory".
     /// </summary>
+    /// <summary>
+    /// Frees device memory held only by unreachable tensors before an out-of-memory retry. There is no LRU that offloads
+    /// live data any more: a result nothing references is freed by its buffer's finalizer, which only QUEUES the free
+    /// (the driver is never called on the finalizer thread), so collect, let the finalizers queue, and run the queue
+    /// here -- PyTorch's allocator frees its cached blocks and retries the same way.
+    /// </summary>
+    private void ReclaimUnreachableForRetry()
+    {
+        DeviceMemoryReclaim.CollectUnreachable();
+        if (CanRunDeferredFrees()) DrainPendingFinalizerFrees();
+    }
+
     private IntPtr AllocDeviceMemoryWithRetry(ulong byteSize)
     {
         var result = CuBlasNative.cuMemAlloc(out IntPtr devicePtr, byteSize);
         if (result == CudaResult.OutOfMemory)
         {
+            ReclaimUnreachableForRetry();
             // Reclaim event-deferred frees first (#555) — under genuine pressure block on
             // their events so their device memory returns to the pool — then drain the pool.
             DrainDeferredFrees(blockOldest: true);
@@ -1991,6 +2004,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             // Buffers parked in the host-side reuse pool are still allocated as far as the driver knows; release
             // them first (stream-ordered frees) so the sync + trim below can hand their memory to this request.
             _bufferPool.DrainAll();
+            ReclaimUnreachableForRetry();
             SynchronizeOwnStreams("stream sync (async-pool OOM reclamation)");
             if (_asyncMemPool != IntPtr.Zero)
             {
@@ -5753,12 +5767,26 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             // call after this thread has been validated for the same backend.
             _threadCurrentContext = ctx;
         }
+        if (!CanRunDeferredFrees()) return;
         DrainPendingFinalizerFrees();
         DrainPendingGraphDestroys();
         // Reclaim contexts leaked by undisposed engines (finalizer-deferred). Drain AFTER the buffer frees
         // so any pending free targeting one of these contexts runs first; whatever's left is reclaimed
         // wholesale by cuCtxDestroy. No-op fast path when the queue is empty (the common case).
         DrainPendingContextDestroys();
+    }
+
+    /// <summary>
+    /// True when the finalizer-deferred frees / graph and context destroys may run on this thread now: something is
+    /// queued, and this thread is not capturing. A synchronous cuMemFree, cuGraphExecDestroy or cuCtxDestroy is
+    /// illegal inside a stream capture and silently invalidates it (seen as intermittent explicit-capture failures
+    /// under load); the queues then wait for this thread's next non-capturing operation.
+    /// </summary>
+    private bool CanRunDeferredFrees()
+    {
+        if (PendingFinalizerFrees.IsEmpty && PendingGraphDestroys.IsEmpty && PendingContextDestroys.IsEmpty) return false;
+        if (t_capturingBackend is not null || CaptureMemoryPool.Current is not null) return false;
+        return _cudaContext == IntPtr.Zero || !IsStreamCapturingCurrentContext();
     }
 
     /// <summary>

@@ -374,7 +374,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // the buffers no longer need stable pointers, so re-enable normal activation eviction.
         if (_graphEvictionSuspended && _engine is Engines.DirectGpuTensorEngine gEvict)
         {
-            gEvict.ResumeActivationEviction();
+            gEvict.EndGraphLifetime();
             _graphEvictionSuspended = false;
         }
     }
@@ -1704,7 +1704,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 // Graph replay bakes in device POINTERS, so every buffer the captured step touches — params,
                 // activations, and the persistent input — must keep a STABLE pointer across replays; eviction
                 // would free+realloc them and invalidate the graph. (75d806b #558 model — suspend-once, not per-step.)
-                if (!_graphEvictionSuspended) { gte.SuspendActivationEviction(); _graphEvictionSuspended = true; }
+                if (!_graphEvictionSuspended) { gte.BeginGraphLifetime(); _graphEvictionSuspended = true; }
                 if (_stepGraphExec == IntPtr.Zero)
                 {
                     // PRE-RESIDENCY runs the body with the embedding index buffer EAGER (managed=false): the embedding
@@ -1745,7 +1745,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         _graphStepDisabled = true;
                         DetachCapturePathBindings();
                         if (_graphHasEmbedding) gte.EmbeddingIndexExternallyManaged = false;
-                        gte.ResumeActivationEviction();
+                        gte.EndGraphLifetime();
                         _graphEvictionSuspended = false;
                         return StepResidentOrEager();
                     }
@@ -1762,7 +1762,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                         // _graphEvictionSuspended flag also gates Dispose, so clearing it prevents a double-resume.
                         _graphStepDisabled = true;
                         DetachCapturePathBindings();
-                        gte.ResumeActivationEviction();
+                        gte.EndGraphLifetime();
                         _graphEvictionSuspended = false;
                         return StepResidentOrEager();
                     }

@@ -91,6 +91,12 @@ public sealed unsafe class VulkanBuffer : IDisposable
     /// </summary>
     /// <param name="elementCount">Number of float elements.</param>
     /// <returns>A new VulkanBuffer, or null if creation failed.</returns>
+    /// <summary>
+    /// The last vkAllocateMemory result on this thread: lets a factory that returned null tell out-of-memory
+    /// (VK_ERROR_OUT_OF_DEVICE_MEMORY / VK_ERROR_OUT_OF_HOST_MEMORY) from other failures.
+    /// </summary>
+    [ThreadStatic] internal static int LastAllocationResult;
+
     public static VulkanBuffer? CreateStorageBuffer(int elementCount)
     {
         var device = VulkanDevice.Instance;
@@ -232,6 +238,7 @@ public sealed unsafe class VulkanBuffer : IDisposable
 
         var result = VulkanNativeBindings.vkAllocateMemory(
             _device.Device, &allocInfo, IntPtr.Zero, out _memory);
+        LastAllocationResult = result;
 
         if (result != VulkanNativeBindings.VK_SUCCESS || _memory == IntPtr.Zero)
         {

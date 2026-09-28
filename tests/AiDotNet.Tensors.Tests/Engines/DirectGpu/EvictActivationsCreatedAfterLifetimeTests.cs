@@ -53,6 +53,10 @@ public class EvictActivationsCreatedAfterLifetimeTests
         return ctor!;
     }
 
+    // The engine's device-entry registry exposes a dictionary-shaped ContainsKey (entries live on their storages).
+    private static bool ContainsKey(object registry, object key)
+        => (bool)registry.GetType().GetMethod("ContainsKey")!.Invoke(registry, new[] { key })!;
+
     [Fact]
     public void EvictActivationsCreatedAfter_KeepsPreSnapshot_ReleasesPostSnapshot()
     {
@@ -104,13 +108,13 @@ public class EvictActivationsCreatedAfterLifetimeTests
 
         // Pre-snapshot entry survives — buffer not disposed, still in cache.
         Assert.Equal(0, bufPre.DisposeCount);
-        Assert.True(((System.Collections.IDictionary)activationCache).Contains(keyPre));
+        Assert.True(ContainsKey(activationCache, keyPre));
 
         // Post-snapshot entries are released — buffers disposed, removed from cache.
         Assert.Equal(1, bufPost1.DisposeCount);
         Assert.Equal(1, bufPost2.DisposeCount);
-        Assert.False(((System.Collections.IDictionary)activationCache).Contains(keyPost1));
-        Assert.False(((System.Collections.IDictionary)activationCache).Contains(keyPost2));
+        Assert.False(ContainsKey(activationCache, keyPost1));
+        Assert.False(ContainsKey(activationCache, keyPost2));
     }
 
     [Fact]
@@ -375,7 +379,7 @@ public class EvictActivationsCreatedAfterLifetimeTests
 
             Assert.False(materializerRan);
             Assert.False(AiDotNet.Tensors.Helpers.HostSync.IsPending(key));
-            Assert.False(((System.Collections.IDictionary)activationCache).Contains(key));
+            Assert.False(ContainsKey(activationCache, key));
             Assert.Equal(1, buffer.DisposeCount);
         }
         finally

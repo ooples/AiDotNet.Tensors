@@ -1405,7 +1405,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             return pooled;
         }
 
-        var allocResult = HipNativeBindings.hipMalloc(ref devicePtr, size); // lgtm[cs/call-to-unmanaged-code] HIP interop requires native driver calls.
+        var allocResult = HipMallocReclaiming(ref devicePtr, size); // lgtm[cs/call-to-unmanaged-code] HIP interop requires native driver calls.
         HipNativeBindings.CheckError(allocResult, "hipMalloc");
 
         // Copy data to device
@@ -1422,6 +1422,21 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         return new HipGpuBuffer(devicePtr, data.Length, this, ReturnBufferToPool);
     }
 
+    /// <summary>
+    /// hipMalloc that first runs the frees queued by collected buffers, and on out-of-memory collects unreachable
+    /// buffers, runs their frees, drains the pool and retries once (see <see cref="DeviceMemoryReclaim"/>).
+    /// </summary>
+    private HipError HipMallocReclaiming(ref IntPtr devicePtr, UIntPtr sizeBytes)
+    {
+        if (!HipGpuBuffer.PendingFrees.IsEmpty) HipGpuBuffer.PendingFrees.Drain();
+        var result = HipNativeBindings.hipMalloc(ref devicePtr, sizeBytes); // lgtm[cs/call-to-unmanaged-code] HIP interop requires native driver calls.
+        if (result != HipError.ErrorOutOfMemory) return result;
+        DeviceMemoryReclaim.CollectUnreachable();
+        HipGpuBuffer.PendingFrees.Drain();
+        _bufferPool.DrainAll();
+        return HipNativeBindings.hipMalloc(ref devicePtr, sizeBytes); // lgtm[cs/call-to-unmanaged-code] HIP interop requires native driver calls.
+    }
+
     public IGpuBuffer AllocateBuffer(int size)
     {
         IntPtr devicePtr = IntPtr.Zero;
@@ -1436,7 +1451,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             return pooled;
         }
 
-        var allocResult = HipNativeBindings.hipMalloc(ref devicePtr, sizeBytes); // lgtm[cs/call-to-unmanaged-code] HIP interop requires native driver calls.
+        var allocResult = HipMallocReclaiming(ref devicePtr, sizeBytes); // lgtm[cs/call-to-unmanaged-code] HIP interop requires native driver calls.
         HipNativeBindings.CheckError(allocResult, "hipMalloc");
 
         // Zero-initialize
@@ -1459,7 +1474,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (_bufferPool.TryRent(size, out var pooled) && pooled != null)
             return pooled;
 
-        var allocResult = HipNativeBindings.hipMalloc(ref devicePtr, sizeBytes); // lgtm[cs/call-to-unmanaged-code] HIP interop requires native driver calls.
+        var allocResult = HipMallocReclaiming(ref devicePtr, sizeBytes); // lgtm[cs/call-to-unmanaged-code] HIP interop requires native driver calls.
         HipNativeBindings.CheckError(allocResult, "hipMalloc");
         return new HipGpuBuffer(devicePtr, size, this, ReturnBufferToPool);
     }
@@ -3486,7 +3501,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         // Issue #285: per-allocation cap check before hipMalloc.
         GpuBufferSizeGuard.EnsureFits("HIP", size, MaxBufferAllocBytes, DeviceName);
 
-        var result = HipNativeBindings.hipMalloc(ref devicePtr, sizeBytes);
+        var result = HipMallocReclaiming(ref devicePtr, sizeBytes);
         HipNativeBindings.CheckError(result, "hipMalloc (byte buffer)");
 
         // Zero-initialize
@@ -5801,7 +5816,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         // Issue #285: per-allocation cap check before hipMalloc.
         GpuBufferSizeGuard.EnsureFits("HIP", (long)size * sizeof(int), MaxBufferAllocBytes, DeviceName);
 
-        var result = HipNativeBindings.hipMalloc(ref devicePtr, sizeBytes);
+        var result = HipMallocReclaiming(ref devicePtr, sizeBytes);
         HipNativeBindings.CheckError(result, "hipMalloc(int)");
 
         result = HipNativeBindings.hipMemset(devicePtr, 0, sizeBytes);
@@ -5845,7 +5860,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         // Issue #285: per-allocation cap check before hipMalloc.
         GpuBufferSizeGuard.EnsureFits("HIP", (long)size * sizeof(int), MaxBufferAllocBytes, DeviceName);
 
-        var result = HipNativeBindings.hipMalloc(ref devicePtr, sizeBytes);
+        var result = HipMallocReclaiming(ref devicePtr, sizeBytes);
         HipNativeBindings.CheckError(result, "hipMalloc(int)");
 
         GCHandle handle = GCHandle.Alloc(data, GCHandleType.Pinned);
@@ -12382,6 +12397,9 @@ internal sealed class HipGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
     private readonly Action<HipGpuBuffer>? _returnToPool;
     private int _poolState;
 
+    /// <summary>Frees of HIP buffers collected without Dispose, run by the backend's next allocation.</summary>
+    internal static readonly DeviceFreeQueue PendingFrees = new();
+
     public HipGpuBuffer(
         IntPtr handle,
         int size,
@@ -12416,6 +12434,16 @@ internal sealed class HipGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
                 System.Diagnostics.Debug.WriteLine($"hipFree warning: {result}");
             }
         }
+        GC.SuppressFinalize(this);
+    }
+
+    // An undisposed buffer (a result nothing references any more) frees its device memory through the queue. A buffer
+    // in the pool is referenced by the pool, so it is never finalized while pooled.
+    ~HipGpuBuffer()
+    {
+        if (Interlocked.Exchange(ref _poolState, 2) == 2 || Handle == IntPtr.Zero) return;
+        var handle = Handle;
+        PendingFrees.Enqueue(() => HipNativeBindings.hipFree(handle));
     }
 
     public void Dispose()
@@ -12450,7 +12478,7 @@ internal sealed class HipGpuByteBuffer : IGpuBuffer
     public IntPtr Handle { get; }
     public int Size { get; }
     public long SizeInBytes => Size;
-    private bool _disposed;
+    private int _disposed;
 
     public HipGpuByteBuffer(IntPtr handle, int size)
     {
@@ -12460,7 +12488,7 @@ internal sealed class HipGpuByteBuffer : IGpuBuffer
 
     public void Dispose()
     {
-        if (_disposed) return;
+        if (Interlocked.Exchange(ref _disposed, 1) == 1) return;
 
         if (Handle != IntPtr.Zero)
         {
@@ -12470,7 +12498,13 @@ internal sealed class HipGpuByteBuffer : IGpuBuffer
                 System.Diagnostics.Debug.WriteLine($"hipFree (byte buffer) warning: {result}");
             }
         }
+        GC.SuppressFinalize(this);
+    }
 
-        _disposed = true;
+    ~HipGpuByteBuffer()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) == 1 || Handle == IntPtr.Zero) return;
+        var handle = Handle;
+        HipGpuBuffer.PendingFrees.Enqueue(() => HipNativeBindings.hipFree(handle));
     }
 }

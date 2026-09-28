@@ -37,6 +37,12 @@ internal sealed class DirectPtxRuntime : IDisposable
     internal string DeviceFingerprint { get; }
     internal Helpers.Autotune.GpuDeviceFingerprint Fingerprint { get; }
     internal IntPtr Stream => _stream;
+
+    /// <summary>
+    /// True for a standalone runtime with its own context. A borrowed runtime shares the device's primary context with
+    /// every backend, where a context-wide synchronize would wait on -- and invalidate -- another thread's capture.
+    /// </summary>
+    internal bool OwnsContext => _ownsContext;
     internal uint StreamFlags
     {
         get
@@ -622,8 +628,11 @@ internal sealed class DirectPtxBuffer : IDisposable
             // stream. Complete the transfer before the caller can enqueue a
             // kernel, or concurrent contexts can observe an incompletely staged
             // input and leave apparently random output blocks at zero.
-            DirectPtxRuntime.Check(
-                CudaNativeBindings.cuCtxSynchronize(), "cuCtxSynchronize(upload)");
+            // Context-wide only on a standalone runtime's own context (see OwnsContext); on the shared primary context
+            // the null-stream synchronize below completes the copy without touching other threads' streams.
+            if (_runtime.OwnsContext)
+                DirectPtxRuntime.Check(
+                    CudaNativeBindings.cuCtxSynchronize(), "cuCtxSynchronize(upload)");
             // The synchronous pageable-host copy stages through the default
             // stream. Complete that stream before a caller can enqueue new work
             // on the runtime's CU_STREAM_NON_BLOCKING stream.
@@ -641,8 +650,11 @@ internal sealed class DirectPtxBuffer : IDisposable
         // The null-stream DtoH copy does not wait for work in the runtime's
         // non-blocking stream. Make Download independently correct even when a
         // caller omits an explicit Synchronize before reading the result.
-        DirectPtxRuntime.Check(
-            CudaNativeBindings.cuCtxSynchronize(), "cuCtxSynchronize(download)");
+        // Context-wide only on a standalone runtime's own context (see OwnsContext); the runtime-stream synchronize below
+        // is the barrier that matters on the shared primary context.
+        if (_runtime.OwnsContext)
+            DirectPtxRuntime.Check(
+                CudaNativeBindings.cuCtxSynchronize(), "cuCtxSynchronize(download)");
         // Make Download independently correct when the caller omits an explicit
         // barrier, while waiting only for the stream that produces this buffer.
         _runtime.Synchronize();

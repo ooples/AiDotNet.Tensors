@@ -49,10 +49,21 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     /// The device side of this data holder, shared by every tensor view of it; null until something binds a device
     /// copy. See <see cref="VectorDeviceState"/>.
     /// </summary>
-    internal VectorDeviceState? _deviceState;
+    internal VectorDeviceState? _deviceState => SharesStorageDeviceState
+        ? (_hostSync ?? ((Helpers.IHostSyncOwner)this).FindHostSync())?.Device
+        : _ownDeviceState;
 
     /// <summary>The shared device state, created on first use.</summary>
-    internal VectorDeviceState DeviceState => _deviceState ??= new VectorDeviceState();
+    internal VectorDeviceState DeviceState => SharesStorageDeviceState
+        ? ((Helpers.IHostSyncOwner)this).GetOrCreateHostSync().GetOrCreateDevice()
+        : _ownDeviceState ??= new VectorDeviceState();
+
+    // A vector that covers its WHOLE host array (or has none yet) keeps its device copy on the array's storage state,
+    // so every vector over that array -- a result array later wrapped in a tensor, an alias -- finds the same device
+    // copy. A segment of a larger array (a parameter inside a flat buffer, a pool-padded array) holds only part of
+    // it, so it keeps a device copy of its own.
+    private VectorDeviceState? _ownDeviceState;
+    private bool SharesStorageDeviceState => _cachedArray is { } array ? array.Length == _logicalLength : _memory.Length == 0;
 
     /// <summary>
     /// Whether this storage's host array is current, shared with every alias of that array (see
