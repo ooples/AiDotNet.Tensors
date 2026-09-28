@@ -1985,8 +1985,34 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         }
     }
 
+    // AIDOTNET_GRAPH_CAPTURE_DEBUG=1: every device-to-host read made while an engine is on the compiled capture path
+    // (the pre-pass or the capture itself) is a whole-step-capture blocker; log each distinct call site once.
+    private static readonly bool s_captureHostReadDebug =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1";
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> s_captureHostReadSites = new();
+
+    private static void TraceCapturePathHostRead()
+    {
+        if (!s_captureHostReadDebug || System.Threading.Volatile.Read(ref DirectGpuTensorEngine.s_capturePathEngines) == 0) return;
+        var frames = new System.Diagnostics.StackTrace(2, false).GetFrames();
+        var site = new System.Text.StringBuilder();
+        int kept = 0;
+        foreach (var f in frames ?? Array.Empty<System.Diagnostics.StackFrame>())
+        {
+            var m = f.GetMethod();
+            if (m?.DeclaringType is null) continue;
+            site.Append(" <- ").Append(m.DeclaringType.Name).Append('.').Append(m.Name);
+            if (++kept == 10) break;
+        }
+        var key = site.ToString();
+        if (s_captureHostReadSites.TryAdd(key, 0))
+            try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphcapture_diag.txt"),
+                "[CAPTURE-PATH-HOST-READ]" + key + System.Environment.NewLine); } catch { }
+    }
+
     public void DownloadBuffer(IGpuBuffer buffer, float[] destination)
     {
+        TraceCapturePathHostRead();
         GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float));
         // #226: never issue a device→host copy from a released buffer. After CudaGpuBuffer.Release
         // the device pointer is zeroed; cuMemcpyDtoH from a null/freed pointer is an ILLEGAL memory

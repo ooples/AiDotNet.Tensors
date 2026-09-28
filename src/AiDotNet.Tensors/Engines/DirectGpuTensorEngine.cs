@@ -391,9 +391,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         System.Threading.Volatile.Read(ref _capturePathDepth) > 0 && EvictionSuspended;
 
     /// <summary>RAII scope marking the compiled capture path (instance depth; nesting-safe).</summary>
+    /// <summary>Process-wide count of engines currently on the compiled capture path (diagnostics only: lets the
+    /// backend's download entry points name host reads that would abort a whole-step capture).</summary>
+    internal static int s_capturePathEngines;
+
     internal IDisposable EnterCompiledCapturePath()
     {
-        System.Threading.Interlocked.Increment(ref _capturePathDepth);
+        if (System.Threading.Interlocked.Increment(ref _capturePathDepth) == 1)
+            System.Threading.Interlocked.Increment(ref s_capturePathEngines);
         s_residentScratchEngine = this;   // route the static AllocateOutputBuffer's transient allocs here
         return new CapturePathScope(this);
     }
@@ -407,6 +412,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var e = System.Threading.Interlocked.Exchange(ref _e, null);
             if (e is not null && System.Threading.Interlocked.Decrement(ref e._capturePathDepth) == 0)
             {
+                System.Threading.Interlocked.Decrement(ref s_capturePathEngines);
                 e._currentScratchAction = -1;
                 if (ReferenceEquals(s_residentScratchEngine, e)) s_residentScratchEngine = null;
             }
