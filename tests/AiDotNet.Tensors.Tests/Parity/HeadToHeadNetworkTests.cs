@@ -27,15 +27,14 @@ namespace AiDotNet.Tensors.Tests.Parity;
 /// Without Python and torch the case is skipped with the reason, never passed.
 /// </para>
 /// </remarks>
-[Collection("PyTorchHeadToHead")]
-public class HeadToHeadNetworkTests
+public abstract class HeadToHeadTestBase
 {
     private const string BaselineFile = "parity/head-to-head-baseline.json";
     private readonly ITestOutputHelper _output;
 
-    public HeadToHeadNetworkTests(ITestOutputHelper output) => _output = output;
+    protected HeadToHeadTestBase(ITestOutputHelper output) => _output = output;
 
-    private HeadToHeadNetworkHarness.CaseResult RunCase(string network, string device)
+    private protected HeadToHeadNetworkHarness.CaseResult RunCase(string network, string device)
     {
         string root = PyTorchParityInventory.FindRepositoryRoot()
             ?? throw new InvalidOperationException("parity/ is missing from this checkout.");
@@ -47,19 +46,6 @@ public class HeadToHeadNetworkTests
         AssertLossesAgree(result);
         return result;
     }
-
-    [SkippableFact]
-    public void Mlp_Cpu_DoesNotRegress() => AssertRatchet(RunCase("mlp", "cpu"));
-
-    [SkippableFact]
-    [Trait("Category", "PyTorchParity")]
-    public void Mlp_Cpu_IsAsFastAsPyTorch() => AssertParity(RunCase("mlp", "cpu"));
-    [SkippableFact]
-    public void Cnn_Cpu_DoesNotRegress() => AssertRatchet(RunCase("cnn", "cpu"));
-
-    [SkippableFact]
-    [Trait("Category", "PyTorchParity")]
-    public void Cnn_Cpu_IsAsFastAsPyTorch() => AssertParity(RunCase("cnn", "cpu"));
 
     private void Report(HeadToHeadNetworkHarness.CaseResult r)
     {
@@ -90,7 +76,7 @@ public class HeadToHeadNetworkTests
         }
     }
 
-    private void AssertRatchet(HeadToHeadNetworkHarness.CaseResult r)
+    private protected void AssertRatchet(HeadToHeadNetworkHarness.CaseResult r)
     {
         string root = PyTorchParityInventory.FindRepositoryRoot()
             ?? throw new InvalidOperationException("parity/ is missing from this checkout.");
@@ -113,7 +99,7 @@ public class HeadToHeadNetworkTests
                               $"{BaselineFile} so the gain is locked in.");
     }
 
-    private static void AssertParity(HeadToHeadNetworkHarness.CaseResult r)
+    private protected static void AssertParity(HeadToHeadNetworkHarness.CaseResult r)
     {
         const double band = 0.05;
         Assert.True(r.StepRatio <= 1 + band,
@@ -123,5 +109,52 @@ public class HeadToHeadNetworkTests
                 .OrderByDescending(p => p.Value.MinMs / r.Torch.Phases[p.Key].MinMs)
                 .Select(p => $"{p.Key} {p.Value.MinMs / r.Torch.Phases[p.Key].MinMs:F2}x").First());
     }
+}
+
+/// <summary>CPU cases: the PR ratchet and the nightly parity check (see <see cref="HeadToHeadTestBase"/>).</summary>
+[Collection("PyTorchHeadToHead")]
+public sealed class HeadToHeadNetworkTests : HeadToHeadTestBase
+{
+    public HeadToHeadNetworkTests(ITestOutputHelper output) : base(output) { }
+
+    [SkippableFact]
+    public void Mlp_Cpu_DoesNotRegress() => AssertRatchet(RunCase("mlp", "cpu"));
+
+    [SkippableFact]
+    [Trait("Category", "PyTorchParity")]
+    public void Mlp_Cpu_IsAsFastAsPyTorch() => AssertParity(RunCase("mlp", "cpu"));
+
+    [SkippableFact]
+    public void Cnn_Cpu_DoesNotRegress() => AssertRatchet(RunCase("cnn", "cpu"));
+
+    [SkippableFact]
+    [Trait("Category", "PyTorchParity")]
+    public void Cnn_Cpu_IsAsFastAsPyTorch() => AssertParity(RunCase("cnn", "cpu"));
+}
+
+/// <summary>
+/// CUDA cases, run by tools/parity/run-gpu.ps1 (<c>Category=PyTorchParityGpu</c>); hosted CI has no GPU. They share
+/// the serial GPU collection so no other GPU test runs on the device while a step is being timed.
+/// </summary>
+[Collection("DirectGpuSerial")]
+public sealed class HeadToHeadGpuNetworkTests : HeadToHeadTestBase
+{
+    public HeadToHeadGpuNetworkTests(ITestOutputHelper output) : base(output) { }
+
+    [SkippableFact]
+    [Trait("Category", "PyTorchParityGpu")]
+    public void Mlp_Cuda_DoesNotRegress() => AssertRatchet(RunCase("mlp", "cuda"));
+
+    [SkippableFact]
+    [Trait("Category", "PyTorchParityGpu")]
+    public void Mlp_Cuda_IsAsFastAsPyTorch() => AssertParity(RunCase("mlp", "cuda"));
+
+    [SkippableFact]
+    [Trait("Category", "PyTorchParityGpu")]
+    public void Cnn_Cuda_DoesNotRegress() => AssertRatchet(RunCase("cnn", "cuda"));
+
+    [SkippableFact]
+    [Trait("Category", "PyTorchParityGpu")]
+    public void Cnn_Cuda_IsAsFastAsPyTorch() => AssertParity(RunCase("cnn", "cuda"));
 }
 #endif

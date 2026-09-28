@@ -1158,8 +1158,10 @@ internal static class BackwardFunctions<T>
         // (~1 MB/step leak measured by `--trainbench --block conv`: only 76.6% recycled vs
         // 98-99.9% for matmul/attention backward). The *Into variants fill a rented buffer and
         // zero it first (accumulate:false -> Array.Clear), so renting uninitialized memory is
-        // safe. CPU-only; the GPU engine keeps the allocating path.
-        if (engine is CpuEngine cpu)
+        // safe. CPU-only; the GPU engine keeps the allocating path. DirectGpuTensorEngine derives from
+        // CpuEngine, so the type test alone sent GPU training down the host path: the kernel gradient came
+        // back as a host tensor and the parameter update had to leave the device (#1058).
+        if (engine is CpuEngine cpu && !engine.SupportsGpu)
         {
             if (needsInputGradient)
             {

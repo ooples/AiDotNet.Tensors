@@ -10,6 +10,7 @@ using System.Runtime.InteropServices;
 using System.Text.Json;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.Engines.Gpu;
 using AiDotNet.Tensors.Engines.Optimization.Optimizers;
 using AiDotNet.Tensors.LinearAlgebra;
 
@@ -60,8 +61,18 @@ internal static class HeadToHeadNetworkHarness
         => Environment.GetEnvironmentVariable("PARITY_PYTHON") is { Length: > 0 } configured ? configured : "python";
 
     /// <summary>A coarse identity for comparing ratios: only numbers from the same machine class compare.</summary>
-    internal static string MachineKey(string device)
-        => $"{OsName()}-{RuntimeInformation.ProcessArchitecture.ToString().ToLowerInvariant()}-{Environment.ProcessorCount}cpu-{device}";
+    /// <summary>
+    /// Ratios are only comparable on like hardware, so baselines are keyed by machine class. A GPU case adds
+    /// the device model, since the same CPU box can carry a different card.
+    /// </summary>
+    internal static string MachineKey(string device, string? gpuName = null)
+    {
+        string key = $"{OsName()}-{RuntimeInformation.ProcessArchitecture.ToString().ToLowerInvariant()}-{Environment.ProcessorCount}cpu-{device}";
+        if (string.IsNullOrWhiteSpace(gpuName)) return key;
+        var slug = new string(gpuName.ToLowerInvariant().Select(c => char.IsLetterOrDigit(c) ? c : '-').ToArray());
+        while (slug.Contains("--")) slug = slug.Replace("--", "-");
+        return key + "-" + slug.Trim('-');
+    }
 
     private static string OsName()
         => RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "windows"
@@ -70,6 +81,31 @@ internal static class HeadToHeadNetworkHarness
          : "other";
 
     internal static (CaseResult? Result, Deferral? Deferred) Run(string root, string network, string device)
+    {
+        if (device != "cpu" && device != "cuda") throw new ArgumentException($"Unknown device '{device}'.", nameof(device));
+        DirectGpuTensorEngine? gpu = null;
+        if (device == "cuda")
+        {
+            try { gpu = new DirectGpuTensorEngine(); }
+            catch (Exception ex) { return (null, new Deferral($"no GPU backend ({ex.GetType().Name}: {ex.Message}).")); }
+            if (!gpu.IsGpuAvailable)
+            {
+                gpu.Dispose();
+                return (null, new Deferral("no GPU available to AiDotNet.Tensors."));
+            }
+        }
+
+        try
+        {
+            return RunWith(root, network, device, gpu);
+        }
+        finally
+        {
+            gpu?.Dispose();
+        }
+    }
+
+    private static (CaseResult? Result, Deferral? Deferred) RunWith(string root, string network, string device, DirectGpuTensorEngine? gpu)
     {
         string spec = Path.Combine(root, "parity", "networks", network + ".json");
         string work = Path.Combine(Path.GetTempPath(), "aidotnet-parity", network + "-" + device + "-" + Guid.NewGuid().ToString("N").Substring(0, 8));
@@ -101,9 +137,14 @@ internal static class HeadToHeadNetworkHarness
         if (process.ExitCode != 0)
             throw new InvalidOperationException($"PyTorch runner failed ({process.ExitCode}):{Environment.NewLine}{stderr}{stdout}");
 
-        var torch = LoadTorchResult(Path.Combine(work, "torch.json"));
-        var tensors = RunTensors(ReadJson(spec), work);
-        var result = new CaseResult(network, device, MachineKey(device), torch, tensors);
+        var torchJson = ReadJson(Path.Combine(work, "torch.json"));
+        var torch = LoadTorchResult(torchJson);
+        string? gpuName = torchJson.GetProperty("machine").TryGetProperty("gpu", out var gpuElement)
+                          && gpuElement.ValueKind == JsonValueKind.String
+            ? gpuElement.GetString()
+            : null;
+        var tensors = RunTensors(ReadJson(spec), work, gpu);
+        var result = new CaseResult(network, device, MachineKey(device, gpuName), torch, tensors);
         WriteArtifact(result);
         return (result, null);
     }
@@ -134,9 +175,8 @@ internal static class HeadToHeadNetworkHarness
         return doc.RootElement.Clone();
     }
 
-    private static SideResult LoadTorchResult(string path)
+    private static SideResult LoadTorchResult(JsonElement root)
     {
-        var root = ReadJson(path);
         var phases = root.GetProperty("phases").EnumerateObject().ToDictionary(
             p => p.Name,
             p => new PhaseStats(
@@ -158,9 +198,29 @@ internal static class HeadToHeadNetworkHarness
         return values;
     }
 
-    private static SideResult RunTensors(JsonElement spec, string work)
+    /// <summary>
+    /// Trains the spec's network with Tensors. With <paramref name="gpu"/> the whole step runs on the device:
+    /// data and parameters are uploaded once, the update is the device-side SGD kernel, and every phase
+    /// boundary synchronises the stream, as the PyTorch side does, so a phase's time includes its kernels.
+    /// </summary>
+    private static SideResult RunTensors(JsonElement spec, string work, DirectGpuTensorEngine? gpu)
     {
-        var engine = AiDotNetEngine.Current;
+        var previous = AiDotNetEngine.Current;
+        if (gpu is not null) AiDotNetEngine.Current = gpu;
+        try
+        {
+            return TrainTensors(spec, work, gpu);
+        }
+        finally
+        {
+            AiDotNetEngine.Current = previous;
+        }
+    }
+
+    private static SideResult TrainTensors(JsonElement spec, string work, DirectGpuTensorEngine? gpu)
+    {
+        IEngine engine = gpu ?? AiDotNetEngine.Current;
+        Tensor<float> Place(Tensor<float> tensor) => gpu is null ? tensor : gpu.UploadToGpu(tensor, GpuTensorRole.General);
         int batch = spec.GetProperty("batch").GetInt32();
         var inputShape = spec.TryGetProperty("inputShape", out var shapeElement)
             ? shapeElement.EnumerateArray().Select(d => d.GetInt32()).ToArray()
@@ -176,7 +236,7 @@ internal static class HeadToHeadNetworkHarness
             Tensor<float> Parameter(int[] parameterShape)
             {
                 var data = ReadFloats(reader, parameterShape.Aggregate(1, (a, d) => a * d));
-                var tensor = Tensor<float>.FromMemory(data, parameterShape);
+                var tensor = Place(Tensor<float>.FromMemory(data, parameterShape));
                 parameters.Add((data, new float[data.Length], tensor));
                 return tensor;
             }
@@ -236,13 +296,15 @@ internal static class HeadToHeadNetworkHarness
         using (var reader = new BinaryReader(File.OpenRead(Path.Combine(work, "data.bin"))))
         {
             var xShape = new[] { batch }.Concat(inputShape).ToArray();
-            x = Tensor<float>.FromMemory(ReadFloats(reader, xShape.Aggregate(1, (a, d) => a * d)), xShape);
-            y = Tensor<float>.FromMemory(ReadFloats(reader, batch * shape[0]), new[] { batch, shape[0] });
+            x = Place(Tensor<float>.FromMemory(ReadFloats(reader, xShape.Aggregate(1, (a, d) => a * d)), xShape));
+            y = Place(Tensor<float>.FromMemory(ReadFloats(reader, batch * shape[0]), new[] { batch, shape[0] }));
         }
 
+        double lr = spec.GetProperty("optimizer").GetProperty("lr").GetDouble();
         var optimizer = new SgdOptimizer();
-        var group = optimizer.AddParamGroup(new Dictionary<string, double> { ["lr"] = spec.GetProperty("optimizer").GetProperty("lr").GetDouble() });
+        var group = optimizer.AddParamGroup(new Dictionary<string, double> { ["lr"] = lr });
         foreach (var p in parameters) group.AddParameter(p.Data, p.Grad);
+        void Sync() => gpu?.SynchronizeStream();
         var sources = parameters.Select(p => p.Tensor).ToArray();
         var allAxes = new[] { 0, 1 };
 
@@ -258,24 +320,34 @@ internal static class HeadToHeadNetworkHarness
 
         for (int step = 0; step < warmup + measured; step++)
         {
+            Sync();
             sw.Restart();
             using var tape = new GradientTape<float>();
             var h = x;
             foreach (var layer in layers) h = layer(h);
             var loss = engine.ReduceMean(engine.TensorSquare(engine.TensorSubtract(h, y)), allAxes, keepDims: false);
+            Sync();
             double t1 = sw.Elapsed.TotalMilliseconds;
 
             var grads = tape.ComputeGradients(loss, sources);
+            Sync();
             double t2 = sw.Elapsed.TotalMilliseconds;
 
             for (int i = 0; i < parameters.Count; i++)
             {
                 if (!grads.TryGetValue(parameters[i].Tensor, out var g))
                     throw new InvalidOperationException($"Tape produced no gradient for parameter {i}.");
-                g.AsSpan().CopyTo(parameters[i].Grad);
+                if (gpu is null)
+                    g.AsSpan().CopyTo(parameters[i].Grad);
+                else if (!GpuOptimizer.TrySgdStep(parameters[i].Tensor, g, (float)lr))
+                    throw new InvalidOperationException(
+                        $"Parameter {i} [{string.Join(", ", parameters[i].Tensor.Shape.ToArray())}]: the device-side SGD step " +
+                        $"was refused (parameter on device: {parameters[i].Tensor.TryGetGpuBuffer() is not null}, gradient on " +
+                        $"device: {g.TryGetGpuBuffer() is not null}). That is a residency gap: the step would have to leave the device.");
             }
 
-            optimizer.Step();
+            if (gpu is null) optimizer.Step();
+            Sync();
             double t3 = sw.Elapsed.TotalMilliseconds;
 
             if (step < lossSteps) losses.Add(loss.GetFlat(0));

@@ -32,6 +32,37 @@ public sealed class GpuResidencyTests
         return gpu;
     }
 
+    /// <summary>
+    /// A device-side write made after the host has read the tensor must reach the next host read. The pending
+    /// download was re-registered under the vector while the read path checked only the backing array, so a
+    /// GPU optimizer step on an already-read weight left the host (and every CPU-fallback op) on the old values:
+    /// the head-to-head CNN trained on stale conv weights and its loss drifted from PyTorch's.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void DeviceWriteAfterHostRead_ReachesTheHost(bool readBeforeWrite)
+    {
+        using var gpu = RequireGpu();
+        var previous = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = gpu;
+        try
+        {
+            var shape = new[] { 4, 1, 3, 3 };
+            var p = gpu.UploadToGpu(new Tensor<float>(Enumerable.Repeat(1f, 36).ToArray(), shape), GpuTensorRole.General);
+            var g = gpu.UploadToGpu(new Tensor<float>(Enumerable.Repeat(1f, 36).ToArray(), shape), GpuTensorRole.General);
+            if (readBeforeWrite) Assert.Equal(1f, p.AsSpan()[0]);
+
+            Assert.True(GpuOptimizer.TrySgdStep(p, g, 0.25f), "The device-side SGD step was refused.");
+
+            Assert.All(p.AsSpan().ToArray(), v => Assert.Equal(0.75f, v));
+            Assert.Equal(0.75f, p.GetFlat(35));
+        }
+        finally
+        {
+            AiDotNetEngine.Current = previous;
+        }
+    }
     /// <summary>The scope sees a real upload and a real download, with their byte counts and backend.</summary>
     [SkippableFact]
     public void Scope_CountsUploadsAndDownloadsWithBytes()
