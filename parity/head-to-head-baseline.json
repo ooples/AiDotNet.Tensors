@@ -11,7 +11,8 @@
       "windows-x64-16cpu-amd-ryzen-7-4800h-with-radeon-graphics-cpu": 21.72
     },
     "mlp:cpu": {
-      "windows-x64-16cpu-amd-ryzen-7-4800h-with-radeon-graphics-cpu": 3.41
+      "windows-x64-16cpu-amd-ryzen-7-4800h-with-radeon-graphics-cpu": 3.41,
+      "linux-x64-4cpu-amd-epyc-9v74-80-core-processor-cpu": 2.931
     }
   }
 }

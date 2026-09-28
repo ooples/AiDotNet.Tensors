@@ -76,7 +76,7 @@ jobs:
       - name: Ratchet
         run: |
           dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --no-build --framework net10.0 \
-            --filter "FullyQualifiedName~PyTorchFeatureCoverageTests.Coverage_DoesNotRegress|FullyQualifiedName~HeadToHeadNetworkTests.Mlp_Cpu_DoesNotRegress" \
+            --filter "FullyQualifiedName~PyTorchFeatureCoverageTests.Coverage_DoesNotRegress|FullyQualifiedName~HeadToHeadNetworkTests.Mlp_Cpu_DoesNotRegress|FullyQualifiedName~HeadToHeadNetworkTests.Cnn_Cpu_DoesNotRegress" \
             --logger "console;verbosity=detailed" | tee "$RUNNER_TEMP/ratchet.log"
           exit "${PIPESTATUS[0]}"
 
