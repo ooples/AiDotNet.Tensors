@@ -21,7 +21,7 @@ public partial class CpuEngine
         ValidateMesaScan(q, k, v, initialWeights, regularization, numHeads,
             out int batch, out int time, out int model, out int headDim);
 
-        if (GraphMode.IsActive && GraphMode.Current is { } scope)
+        if (GraphMode.IsActive && GraphMode.Current is { } scope && scope.BindEngine(this))
         {
             scope.BindEngineIfUnset(this);
             var capturedQ = q;

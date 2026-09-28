@@ -73,7 +73,7 @@ public partial class CpuEngine
                 $"slotKeys must be [numHeads={numHeads}, numSlots >= 1, headDim={headDim}]; got numSlots={numSlots}.",
                 nameof(slotKeys));
 
-        if (GraphMode.IsActive && GraphMode.Current is { } scope)
+        if (GraphMode.IsActive && GraphMode.Current is { } scope && scope.BindEngine(this))
         {
             scope.BindEngineIfUnset(this);
             var capturedQ = qProj;

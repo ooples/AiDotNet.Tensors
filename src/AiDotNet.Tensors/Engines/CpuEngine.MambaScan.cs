@@ -62,7 +62,7 @@ public partial class CpuEngine
         if (dParam.Length != innerDim)
             throw new ArgumentException($"dParam length ({dParam.Length}) must equal innerDim ({innerDim}).", nameof(dParam));
 
-        if (GraphMode.IsActive && GraphMode.Current is { } scope)
+        if (GraphMode.IsActive && GraphMode.Current is { } scope && scope.BindEngine(this))
         {
             scope.BindEngineIfUnset(this);
             var capturedX = x;

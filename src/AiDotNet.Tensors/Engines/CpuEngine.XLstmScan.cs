@@ -65,7 +65,7 @@ public partial class CpuEngine
         EnsureGateShape(fGate, batch, seqLen, numHeads, nameof(fGate));
         EnsureGateShape(oGate, batch, seqLen, numHeads, nameof(oGate));
 
-        if (GraphMode.IsActive && GraphMode.Current is { } scope)
+        if (GraphMode.IsActive && GraphMode.Current is { } scope && scope.BindEngine(this))
         {
             scope.BindEngineIfUnset(this);
             var capturedQ = qProj;

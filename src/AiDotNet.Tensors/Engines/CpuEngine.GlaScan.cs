@@ -56,7 +56,7 @@ public partial class CpuEngine
         if (gate.Rank != 3 || gate.Shape[0] != batch || gate.Shape[1] != seqLen || gate.Shape[2] != numHeads)
             throw new ArgumentException($"gate must be [batch={batch}, seqLen={seqLen}, numHeads={numHeads}].", nameof(gate));
 
-        if (GraphMode.IsActive && GraphMode.Current is { } scope)
+        if (GraphMode.IsActive && GraphMode.Current is { } scope && scope.BindEngine(this))
         {
             scope.BindEngineIfUnset(this);
             var capturedQ = qProj;

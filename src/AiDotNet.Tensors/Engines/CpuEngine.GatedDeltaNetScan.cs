@@ -58,7 +58,7 @@ public partial class CpuEngine
         if (beta.Rank != 3 || beta.Shape[0] != batch || beta.Shape[1] != seqLen || beta.Shape[2] != numHeads)
             throw new ArgumentException($"beta must be [batch={batch}, seqLen={seqLen}, numHeads={numHeads}].", nameof(beta));
 
-        if (GraphMode.IsActive && GraphMode.Current is { } scope)
+        if (GraphMode.IsActive && GraphMode.Current is { } scope && scope.BindEngine(this))
         {
             scope.BindEngineIfUnset(this);
             var capturedQ = qProj;

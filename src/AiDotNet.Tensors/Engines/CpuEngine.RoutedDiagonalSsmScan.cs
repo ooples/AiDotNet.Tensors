@@ -16,7 +16,7 @@ public partial class CpuEngine
     {
         ValidateRoutedDiagonalSsm(input, activeMask, transition, inputMap, outputMap, skip,
             out int batch, out int time, out int model, out int experts, out int state);
-        if (GraphMode.IsActive && GraphMode.Current is { } scope)
+        if (GraphMode.IsActive && GraphMode.Current is { } scope && scope.BindEngine(this))
         {
             scope.BindEngineIfUnset(this);
             var capturedInput = input;

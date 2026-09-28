@@ -52,7 +52,7 @@ public sealed class LazyGraphCompilerPerformanceTests
         public bool IsRealized { get; set; }
         public int TopologicalIndex { get; set; }
         public int ConsumerCount { get; set; }
-        public IEngine RecordingEngine => StubEngine;
+        public IEngine RecordingEngine { get; set; } = StubEngine;
 
         public void Realize(IEngine engine) => IsRealized = true;
         public ILazyNode[] GetInputNodes() => _inputs;

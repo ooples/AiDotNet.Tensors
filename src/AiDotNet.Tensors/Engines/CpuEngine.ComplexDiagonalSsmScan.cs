@@ -25,7 +25,7 @@ public partial class CpuEngine
             outputMapReal, outputMapImag, skip,
             out int batch, out int time, out int groups, out int width, out int state);
 
-        if (GraphMode.IsActive && GraphMode.Current is { } scope)
+        if (GraphMode.IsActive && GraphMode.Current is { } scope && scope.BindEngine(this))
         {
             scope.BindEngineIfUnset(this);
             var capturedInput = input;

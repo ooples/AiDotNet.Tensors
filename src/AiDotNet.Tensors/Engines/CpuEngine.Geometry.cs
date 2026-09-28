@@ -25,7 +25,7 @@ public partial class CpuEngine
     {
         var outputShape = ValidateInterpolate(input, sizes, mode);
 
-        if (GraphMode.IsActive && GraphMode.Current is { } scope)
+        if (GraphMode.IsActive && GraphMode.Current is { } scope && scope.BindEngine(this))
         {
             scope.BindEngineIfUnset(this);
             var capturedInput = input;

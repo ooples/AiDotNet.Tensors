@@ -99,7 +99,7 @@ public partial class CpuEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 scope.BindEngineIfUnset(this);
