@@ -313,8 +313,10 @@ internal static class HeadToHeadNetworkHarness
     /// </summary>
     private static SideResult RunTensors(JsonElement spec, string work, DirectGpuTensorEngine? gpu)
     {
+        // The CPU case must run on the CPU engine: on a machine with a GPU the default engine is the GPU engine, so the
+        // "cpu" case trained and timed the GPU engine over host tensors.
         var previous = AiDotNetEngine.Current;
-        if (gpu is not null) AiDotNetEngine.Current = gpu;
+        AiDotNetEngine.Current = gpu is not null ? gpu : new CpuEngine();
         try
         {
             return TrainTensors(spec, work, gpu);
@@ -327,7 +329,7 @@ internal static class HeadToHeadNetworkHarness
 
     private static SideResult TrainTensors(JsonElement spec, string work, DirectGpuTensorEngine? gpu)
     {
-        IEngine engine = gpu ?? AiDotNetEngine.Current;
+        IEngine engine = AiDotNetEngine.Current;
         Tensor<float> Place(Tensor<float> tensor) => gpu is null ? tensor : gpu.UploadToGpu(tensor, GpuTensorRole.General);
         int batch = spec.GetProperty("batch").GetInt32();
         var inputShape = spec.TryGetProperty("inputShape", out var shapeElement)
@@ -454,7 +456,13 @@ internal static class HeadToHeadNetworkHarness
                         $"device: {g.TryGetGpuBuffer() is not null}). That is a residency gap: the step would have to leave the device.");
             }
 
-            if (gpu is null) optimizer.Step();
+            if (gpu is null)
+            {
+                // The optimizer updates the raw parameter arrays the tensors were built on; tell the tensors, or the
+                // engine keeps using data derived from the previous weights.
+                optimizer.Step();
+                foreach (var parameter in parameters) parameter.Tensor.MarkModified();
+            }
             Sync();
             double t3 = sw.Elapsed.TotalMilliseconds;
 
