@@ -618,7 +618,8 @@ public sealed unsafe class VulkanDevice : IDisposable
     {
         if (_device != IntPtr.Zero)
         {
-            VulkanNativeBindings.vkDeviceWaitIdle(_device);
+            // VK_SUCCESS is 0. Every device drain goes through here, so the residency probe counts it once, here.
+            if (VulkanNativeBindings.vkDeviceWaitIdle(_device) == 0) GpuLaunchProbe.OnSynchronize("Vulkan");
         }
     }
 

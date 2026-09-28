@@ -478,8 +478,17 @@ internal static class HipNativeBindings
     [DllImport(HipLibrary, CallingConvention = CallingConvention.Cdecl)]
     public static extern HipError hipStreamDestroy(IntPtr stream);
 
-    [DllImport(HipLibrary, CallingConvention = CallingConvention.Cdecl)]
-    public static extern HipError hipStreamSynchronize(IntPtr stream);
+    [DllImport(HipLibrary, EntryPoint = "hipStreamSynchronize", CallingConvention = CallingConvention.Cdecl)]
+    private static extern HipError hipStreamSynchronizeNative(IntPtr stream);
+
+    // Every stream synchronization in the backend goes through this binding, so the residency probe counts
+    // them all here, after the driver reports success, instead of only the ones a Synchronize() wrapper makes.
+    public static HipError hipStreamSynchronize(IntPtr stream)
+    {
+        var result = hipStreamSynchronizeNative(stream);
+        if (result == HipError.Success) GpuLaunchProbe.OnSynchronize("HIP");
+        return result;
+    }
 
     [DllImport(HipLibrary, CallingConvention = CallingConvention.Cdecl)]
     public static extern HipError hipStreamWaitEvent(

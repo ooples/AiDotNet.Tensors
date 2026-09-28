@@ -137,8 +137,9 @@ public sealed class GpuResidencyTests
     }
 
     private static Dictionary<string, int> CrossingsByOperation(GpuResidencyScope scope)
+        // Synchronizations are gated too: a new host block on the device is a residency regression even when no
+        // bytes move. Every backend counts them at its stream-sync binding, after success.
         => scope.Events
-            .Where(e => e.Kind != GpuTransferKind.Synchronize)
             .GroupBy(e => $"{e.Kind} {e.Operation ?? "<outside the engine>"}")
             .ToDictionary(g => g.Key, g => g.Count(), StringComparer.Ordinal);
 

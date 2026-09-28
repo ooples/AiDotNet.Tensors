@@ -10253,7 +10253,6 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (_stream != IntPtr.Zero)
         {
             var result = HipNativeBindings.hipStreamSynchronize(_stream);
-            if (result == HipError.Success) GpuLaunchProbe.OnSynchronize("HIP");
             // Don't throw on sync errors, just log
             if (result != HipError.Success)
             {

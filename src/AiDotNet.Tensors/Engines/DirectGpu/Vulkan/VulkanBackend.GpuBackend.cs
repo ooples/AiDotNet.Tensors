@@ -1091,10 +1091,7 @@ void main() {
     public void Synchronize()
     {
         if (_initialized && !_disposed)
-        {
             _device.WaitIdle();
-            GpuLaunchProbe.OnSynchronize("Vulkan");
-        }
     }
 
     #endregion

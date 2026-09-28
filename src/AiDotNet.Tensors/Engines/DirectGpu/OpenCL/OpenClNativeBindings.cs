@@ -199,7 +199,16 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public static extern int ReleaseCommandQueue(IntPtr commandQueue);
 
         [DllImport(OpenClLibrary, EntryPoint = "clFinish")]
-        public static extern int Finish(IntPtr commandQueue);
+        private static extern int FinishNative(IntPtr commandQueue);
+
+        // Every queue drain in the backend goes through this binding, so the residency probe counts them all
+        // here, after CL_SUCCESS, instead of only the ones a Synchronize() wrapper makes.
+        public static int Finish(IntPtr commandQueue)
+        {
+            int result = FinishNative(commandQueue);
+            if (result == 0) GpuLaunchProbe.OnSynchronize("OpenCL");
+            return result;
+        }
 
         [DllImport(OpenClLibrary, EntryPoint = "clFlush")]
         public static extern int Flush(IntPtr commandQueue);

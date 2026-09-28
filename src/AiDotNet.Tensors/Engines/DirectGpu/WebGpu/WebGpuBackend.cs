@@ -174,11 +174,10 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
         if (data.Length > webGpuBuffer.Size)
             throw new ArgumentException($"Host data ({data.Length}) exceeds buffer capacity ({webGpuBuffer.Size}).", nameof(data));
         if (data.Length == 0) return;
-        GpuLaunchProbe.OnUpload(data, sizeof(int), "WebGPU");
-
         var bytes = new byte[data.Length * sizeof(int)];
         Buffer.BlockCopy(data, 0, bytes, 0, bytes.Length);
         webGpuBuffer.CopyBytesFrom(bytes);
+        GpuLaunchProbe.OnUpload(data, sizeof(int), "WebGPU");
     }
 
     /// <param name="elementCount">Number of float elements.</param>
@@ -201,8 +200,9 @@ public sealed partial class WebGpuBackend : IDirectGpuBackend, IDisposable, IFus
         ThrowIfNotInitialized();
         // Issue #285: per-allocation cap check.
         GpuBufferSizeGuard.EnsureFits("WebGPU", (long)data.Length * sizeof(float), MaxBufferAllocBytes, DeviceName);
+        var buffer = new WebGpuBuffer(data);
         GpuLaunchProbe.OnUpload(data, sizeof(float), "WebGPU");
-        return new WebGpuBuffer(data);
+        return buffer;
     }
 
     #region Element-wise Operations

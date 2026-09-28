@@ -25,13 +25,14 @@ $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 Set-Location $root
 
-$probe = & $Python -c "import torch, sys; print(torch.__version__); sys.exit(0 if torch.cuda.is_available() else 4)" 2>&1
+# numpy too: the PyTorch runner needs it, and without it every CUDA case defers (skips) instead of measuring.
+$probe = & $Python -c "import torch, numpy, sys; print(torch.__version__); sys.exit(0 if torch.cuda.is_available() else 4)" 2>&1
 if ($LASTEXITCODE -eq 4) {
     [Console]::Error.WriteLine("torch $probe has no CUDA device. Install a CUDA build (https://pytorch.org/get-started/locally/) before running the GPU lane.")
     exit 4
 }
 if ($LASTEXITCODE -ne 0) {
-    [Console]::Error.WriteLine("Could not import torch with '$Python': $probe")
+    [Console]::Error.WriteLine("Could not import torch and numpy with '$Python': $probe")
     exit 3
 }
 Write-Host "torch $probe with CUDA"
@@ -43,16 +44,43 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 # Artifacts older than this run are someone else's evidence; only files written after it are copied.
 $runStart = Get-Date
 
+# A successful `dotnet test` exit does not mean the selected tests passed: a skipped (deferred) test is not a
+# failure. Read the TRX counters so a skipped gate fails the lane and a skipped target is never reported as met.
+$results = Join-Path ([IO.Path]::GetTempPath()) ("aidotnet-parity-gpu-" + [Guid]::NewGuid().ToString('N'))
+function Get-TrxCounts([string]$Name) {
+    $trx = Get-ChildItem $results -Filter "$Name.trx" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $trx) { return $null }
+    $c = ([xml](Get-Content $trx.FullName -Raw)).TestRun.ResultSummary.Counters
+    [pscustomobject]@{ Total = [int]$c.total; Passed = [int]$c.passed; Failed = [int]$c.failed; Skipped = [int]$c.notExecuted }
+}
+
 # Gate: the ratchets, plus the transfer-count smoke tests, so "zero crossings" can only mean no transfers,
 # never a probe that stopped reporting.
 dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --no-build -f net10.0 `
-    --filter 'Category=PyTorchParityGpu|FullyQualifiedName~GpuResidencyTests.Scope_' --logger 'console;verbosity=detailed'
+    --filter 'Category=PyTorchParityGpu|FullyQualifiedName~GpuResidencyTests.Scope_' `
+    --logger 'console;verbosity=detailed' --logger 'trx;LogFileName=gate.trx' --results-directory $results
 $testExit = $LASTEXITCODE
+$gate = Get-TrxCounts 'gate'
+if ($null -eq $gate -or $gate.Total -eq 0) {
+    [Console]::Error.WriteLine('The GPU gate ran no tests; nothing was measured.')
+    $testExit = 1
+}
+elseif ($gate.Skipped -gt 0) {
+    [Console]::Error.WriteLine("The GPU gate skipped $($gate.Skipped) of $($gate.Total) test(s): a skipped ratchet measured nothing, so the gate is not met.")
+    if ($testExit -eq 0) { $testExit = 1 }
+}
+Write-Host "GPU gate: $($gate.Passed) passed, $($gate.Failed) failed, $($gate.Skipped) skipped of $($gate.Total)"
 
 # Targets: zero crossings and PyTorch-speed parity. Red until reached; reported, never gating.
 dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --no-build -f net10.0 `
-    --filter 'Category=PyTorchParityGpuTarget' --logger 'console;verbosity=normal'
-Write-Host ("GPU parity targets: " + $(if ($LASTEXITCODE -eq 0) { 'all met' } else { 'not yet met (see above); not gating' }))
+    --filter 'Category=PyTorchParityGpuTarget' `
+    --logger 'console;verbosity=normal' --logger 'trx;LogFileName=targets.trx' --results-directory $results
+$targets = Get-TrxCounts 'targets'
+$verdict = if ($null -eq $targets -or $targets.Total -eq 0) { 'none ran' }
+           elseif ($targets.Skipped -gt 0) { "$($targets.Skipped) of $($targets.Total) skipped, so not established" }
+           elseif ($targets.Failed -gt 0) { "$($targets.Failed) of $($targets.Total) not yet met" }
+           else { "all $($targets.Total) met" }
+Write-Host "GPU parity targets: $verdict (not gating)"
 
 # Named by the harness's machine key (os-arch-cpus-cpu model-device-gpu model), never the host name: results are
 # meant to be committed, and a host name does not belong in the repository.

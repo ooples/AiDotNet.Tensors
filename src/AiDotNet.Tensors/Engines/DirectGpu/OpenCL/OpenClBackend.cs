@@ -4702,9 +4702,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         public void Synchronize()
         {
-            if (_context is null) return;
-            _context.Finish();
-            GpuLaunchProbe.OnSynchronize("OpenCL");
+            _context?.Finish();
         }
 
         #region IAsyncGpuBackend Implementation

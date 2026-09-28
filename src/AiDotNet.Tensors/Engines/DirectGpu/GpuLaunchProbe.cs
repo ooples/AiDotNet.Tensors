@@ -108,7 +108,11 @@ internal static class GpuLaunchProbe
 
     /// <summary>A host-to-device copy of <paramref name="byteCount"/> bytes.</summary>
     public static void OnUpload(long byteCount, string backend)
-        => RecordScoped(Diagnostics.GpuTransferKind.HostToDevice, byteCount, backend);
+    {
+        // An empty upload moves nothing across the boundary (several backends return before copying).
+        if (byteCount == 0) return;
+        RecordScoped(Diagnostics.GpuTransferKind.HostToDevice, byteCount, backend);
+    }
 
     /// <summary>A host-to-device copy of <paramref name="data"/>. Takes the array rather than its length so a
     /// caller's null check after this call still sees the parameter as non-null.</summary>
@@ -169,6 +173,8 @@ internal static class GpuLaunchProbe
     {
         if (byteCount < 0)
             throw new System.ArgumentOutOfRangeException(nameof(byteCount), "A readback cannot move a negative number of bytes.");
+        // An empty readback moves nothing (the byte-download paths return an empty array without a copy).
+        if (byteCount == 0) return;
         RecordScoped(Diagnostics.GpuTransferKind.DeviceToHost, byteCount, backend);
         OnReadback(byteCount);
     }

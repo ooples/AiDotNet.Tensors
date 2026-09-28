@@ -223,7 +223,16 @@ internal static class CudaNativeBindings
     public static extern CudaResult cuStreamDestroy(IntPtr stream);
 
     [DllImport(CudaLibrary, EntryPoint = "cuStreamSynchronize")]
-    public static extern CudaResult cuStreamSynchronize(IntPtr stream);
+    private static extern CudaResult cuStreamSynchronizeNative(IntPtr stream);
+
+    // Every stream synchronization in the backend goes through this binding, so the residency probe counts
+    // them all here, after the driver reports success, instead of only the ones a Synchronize() wrapper makes.
+    public static CudaResult cuStreamSynchronize(IntPtr stream)
+    {
+        var result = cuStreamSynchronizeNative(stream);
+        if (result == CudaResult.Success) GpuLaunchProbe.OnSynchronize("CUDA");
+        return result;
+    }
 
     [DllImport(CudaLibrary, EntryPoint = "cuCtxSynchronize")]
     public static extern CudaResult cuCtxSynchronize();

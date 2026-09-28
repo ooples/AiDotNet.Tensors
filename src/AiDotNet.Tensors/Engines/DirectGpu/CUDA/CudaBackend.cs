@@ -4892,7 +4892,6 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     {
         if (!IsAvailable)
             return;
-        GpuLaunchProbe.OnSynchronize("CUDA");
 
         using var _ = PushContext();
         CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamSynchronize(_stream), "cuStreamSynchronize");
