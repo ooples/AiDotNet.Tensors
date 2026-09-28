@@ -62,16 +62,59 @@ internal static class HeadToHeadNetworkHarness
 
     /// <summary>A coarse identity for comparing ratios: only numbers from the same machine class compare.</summary>
     /// <summary>
-    /// Ratios are only comparable on like hardware, so baselines are keyed by machine class. A GPU case adds
-    /// the device model, since the same CPU box can carry a different card.
+    /// Ratios are only comparable on like hardware, so baselines are keyed by machine class, including the CPU
+    /// model: the hosted pool behind one runner label mixes models, and on a faster one PyTorch's MLP step fell
+    /// from 4.25 ms to 1.39 ms while ours fell from 9.74 to 7.62, moving the ratio from 2.3x to 5.5x with no code
+    /// change. A GPU case adds the device model too. An unseen machine class defers; it never compares against
+    /// another's baseline.
     /// </summary>
     internal static string MachineKey(string device, string? gpuName = null)
     {
-        string key = $"{OsName()}-{RuntimeInformation.ProcessArchitecture.ToString().ToLowerInvariant()}-{Environment.ProcessorCount}cpu-{device}";
-        if (string.IsNullOrWhiteSpace(gpuName)) return key;
-        var slug = new string(gpuName.ToLowerInvariant().Select(c => char.IsLetterOrDigit(c) ? c : '-').ToArray());
+        string key = $"{OsName()}-{RuntimeInformation.ProcessArchitecture.ToString().ToLowerInvariant()}-" +
+                     $"{Environment.ProcessorCount}cpu-{Slug(CpuModel())}-{device}";
+        return string.IsNullOrWhiteSpace(gpuName) ? key : key + "-" + Slug(gpuName);
+    }
+
+    private static string Slug(string text)
+    {
+        var slug = new string(text.ToLowerInvariant().Select(c => char.IsLetterOrDigit(c) ? c : '-').ToArray());
         while (slug.Contains("--")) slug = slug.Replace("--", "-");
-        return key + "-" + slug.Trim('-');
+        slug = slug.Trim('-');
+        return slug.Length == 0 ? "unknown" : slug;
+    }
+
+    /// <summary>The CPU model string the OS reports, or "unknown".</summary>
+    internal static string CpuModel()
+    {
+        try
+        {
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux) && File.Exists("/proc/cpuinfo"))
+            {
+                var line = File.ReadLines("/proc/cpuinfo").FirstOrDefault(l => l.StartsWith("model name", StringComparison.Ordinal));
+                if (line is not null && line.IndexOf(':') is var colon and >= 0) return line.Substring(colon + 1).Trim();
+            }
+            else if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            {
+                using var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(@"HARDWARE\DESCRIPTION\System\CentralProcessor\0");
+                if (key?.GetValue("ProcessorNameString") is string name) return name.Trim();
+            }
+            else if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+            {
+                var psi = new ProcessStartInfo("sysctl", "-n machdep.cpu.brand_string") { RedirectStandardOutput = true, UseShellExecute = false };
+                using var process = Process.Start(psi);
+                if (process is not null)
+                {
+                    string output = process.StandardOutput.ReadToEnd().Trim();
+                    process.WaitForExit();
+                    if (output.Length > 0) return output;
+                }
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException or System.ComponentModel.Win32Exception)
+        {
+        }
+
+        return "unknown";
     }
 
     private static string OsName()

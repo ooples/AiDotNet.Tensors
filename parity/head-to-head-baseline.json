@@ -2,17 +2,16 @@
   "noiseFloor": 0.15,
   "cases": {
     "cnn:cuda": {
-      "windows-x64-16cpu-cuda-nvidia-geforce-gtx-1660-ti": 59.53
+      "windows-x64-16cpu-amd-ryzen-7-4800h-with-radeon-graphics-cuda-nvidia-geforce-gtx-1660-ti": 59.53
     },
     "mlp:cuda": {
-      "windows-x64-16cpu-cuda-nvidia-geforce-gtx-1660-ti": 1.123
+      "windows-x64-16cpu-amd-ryzen-7-4800h-with-radeon-graphics-cuda-nvidia-geforce-gtx-1660-ti": 1.123
     },
     "cnn:cpu": {
-      "windows-x64-16cpu-cpu": 21.72
+      "windows-x64-16cpu-amd-ryzen-7-4800h-with-radeon-graphics-cpu": 21.72
     },
     "mlp:cpu": {
-      "linux-x64-4cpu-cpu": 2.117,
-      "windows-x64-16cpu-cpu": 3.41
+      "windows-x64-16cpu-amd-ryzen-7-4800h-with-radeon-graphics-cpu": 3.41
     }
   }
 }
