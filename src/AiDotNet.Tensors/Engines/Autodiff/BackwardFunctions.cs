@@ -434,8 +434,9 @@ internal static class BackwardFunctions<T>
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         var sig = engine.Sigmoid(inputs[0]);
-        var oneMinusSig = engine.TensorSubtract(
-            CreateOnes(inputs[0]._shape, numOps), sig);
+        // 1 - sig as device ops: a host tensor of ones (CreateOnes) forced an upload per step - illegal inside a
+        // whole-step capture - and sent the subtract to the CPU engine.
+        var oneMinusSig = engine.TensorAddScalar(engine.TensorNegate(sig), numOps.One);
         var xTimesSig = engine.TensorMultiply(inputs[0], sig);
         var xSigOneMinusSig = engine.TensorMultiply(xTimesSig, oneMinusSig);
         var derivative = engine.TensorAdd(sig, xSigOneMinusSig);
@@ -451,15 +452,14 @@ internal static class BackwardFunctions<T>
         var numOps = MathHelper.GetNumericOperations<T>();
         // softplus = log(1 + exp(x))
         var expX = engine.TensorExp(inputs[0]);
-        var ones = CreateOnes(inputs[0]._shape, numOps);
-        var onePlusExp = engine.TensorAdd(ones, expX);
+        var onePlusExp = engine.TensorAddScalar(expX, numOps.One);   // device op; no host tensor of ones
         var softplus = engine.TensorLog(onePlusExp);
         var tanhSp = engine.Tanh(softplus);
         // sigmoid = exp(x) / (1 + exp(x))
         var sigmoid = engine.TensorDivide(expX, onePlusExp);
         // d(tanh(sp))/dx = (1 - tanh(sp)^2) * sigmoid
         var tanhSq = engine.TensorMultiply(tanhSp, tanhSp);
-        var oneMinusTanhSq = engine.TensorSubtract(ones, tanhSq);
+        var oneMinusTanhSq = engine.TensorAddScalar(engine.TensorNegate(tanhSq), numOps.One);
         var dtanhDx = engine.TensorMultiply(oneMinusTanhSq, sigmoid);
         // d(mish)/dx = tanh(sp) + x * dtanh/dx
         var xDtanh = engine.TensorMultiply(inputs[0], dtanhDx);
@@ -2387,17 +2387,6 @@ internal static class BackwardFunctions<T>
         for (int i = 0; i < targetShape.Length; i++)
             multiples[i] = currentShape[i] == 1 ? targetShape[i] : 1;
         return multiples;
-    }
-
-    private static Tensor<T> CreateOnes(int[] shape, INumericOperations<T> numOps)
-    {
-        int length = 1;
-        for (int i = 0; i < shape.Length; i++)
-            length *= shape[i];
-        var data = new T[length];
-        for (int i = 0; i < data.Length; i++)
-            data[i] = numOps.One;
-        return new Tensor<T>(data, shape);
     }
 
     // ──────────────────────────────────────────────────────────────
