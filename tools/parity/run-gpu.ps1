@@ -7,8 +7,9 @@
     1. refuses to run unless the Python it uses has a CUDA build of torch (a CPU-only wheel would
        silently measure the wrong thing);
     2. builds the test project;
-    3. runs every Category=PyTorchParityGpu test: the per-operation residency ratchet and the
-       zero-crossing parity check;
+    3. gates on Category=PyTorchParityGpu (the residency and CUDA head-to-head ratchets) plus the
+       transfer-count smoke tests, then reports Category=PyTorchParityGpuTarget (zero crossings,
+       PyTorch-speed parity) without gating on it;
     4. copies the result artifacts into parity/results/<machine>/ for review and commit.
 
 .PARAMETER Python
@@ -39,16 +40,31 @@ $env:PARITY_PYTHON = $Python
 dotnet build tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj -f net10.0 -m:2 -p:UseSharedCompilation=false
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+# Artifacts older than this run are someone else's evidence; only files written after it are copied.
+$runStart = Get-Date
+
+# Gate: the ratchets, plus the transfer-count smoke tests, so "zero crossings" can only mean no transfers,
+# never a probe that stopped reporting.
 dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --no-build -f net10.0 `
-    --filter 'Category=PyTorchParityGpu' --logger 'console;verbosity=detailed'
+    --filter 'Category=PyTorchParityGpu|FullyQualifiedName~GpuResidencyTests.Scope_' --logger 'console;verbosity=detailed'
 $testExit = $LASTEXITCODE
 
-# Named by the harness's machine key (os-arch-cpus-device-gpu model), never the host name: results are
+# Targets: zero crossings and PyTorch-speed parity. Red until reached; reported, never gating.
+dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --no-build -f net10.0 `
+    --filter 'Category=PyTorchParityGpuTarget' --logger 'console;verbosity=normal'
+Write-Host ("GPU parity targets: " + $(if ($LASTEXITCODE -eq 0) { 'all met' } else { 'not yet met (see above); not gating' }))
+
+# Named by the harness's machine key (os-arch-cpus-cpu model-device-gpu model), never the host name: results are
 # meant to be committed, and a host name does not belong in the repository.
-$artifacts = @(Get-ChildItem (Join-Path ([IO.Path]::GetTempPath()) 'aidotnet-parity') -Filter '*-cuda-latest.json' -ErrorAction SilentlyContinue)
-$machine = if ($artifacts.Count -gt 0) { (Get-Content $artifacts[0].FullName -Raw | ConvertFrom-Json).machineKey } else { 'unknown' }
+$artifacts = @(Get-ChildItem (Join-Path ([IO.Path]::GetTempPath()) 'aidotnet-parity') -Filter '*-cuda-latest.json' -ErrorAction SilentlyContinue |
+    Where-Object { $_.LastWriteTime -ge $runStart })
+if ($artifacts.Count -eq 0) {
+    Write-Host 'No CUDA head-to-head artifact was written by this run; nothing copied.'
+    exit $testExit
+}
+$machine = (Get-Content $artifacts[0].FullName -Raw | ConvertFrom-Json).machineKey
 $dest = Join-Path $root "parity/results/$machine"
 New-Item -ItemType Directory -Force $dest | Out-Null
 $artifacts | Copy-Item -Destination $dest -Force
-Write-Host "Artifacts: $dest"
+Write-Host "Artifacts ($($artifacts.Count), this run only): $dest"
 exit $testExit

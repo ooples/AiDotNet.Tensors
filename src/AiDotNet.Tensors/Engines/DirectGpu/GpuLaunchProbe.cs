@@ -89,6 +89,9 @@ internal static class GpuLaunchProbe
         Interlocked.Increment(ref _activeScopes);
     }
 
+    /// <summary>Whether <paramref name="scope"/> is the scope opened most recently on this thread.</summary>
+    internal static bool IsInnermostThreadScope(Diagnostics.GpuResidencyScope scope) => ReferenceEquals(_threadScope, scope);
+
     internal static void ExitScope(Diagnostics.GpuResidencyScope scope)
     {
         if (scope.ProcessWide)
@@ -164,6 +167,8 @@ internal static class GpuLaunchProbe
     /// <summary>A device-to-host copy of <paramref name="byteCount"/> bytes.</summary>
     public static void OnReadback(long byteCount, string backend)
     {
+        if (byteCount < 0)
+            throw new System.ArgumentOutOfRangeException(nameof(byteCount), "A readback cannot move a negative number of bytes.");
         RecordScoped(Diagnostics.GpuTransferKind.DeviceToHost, byteCount, backend);
         OnReadback(byteCount);
     }

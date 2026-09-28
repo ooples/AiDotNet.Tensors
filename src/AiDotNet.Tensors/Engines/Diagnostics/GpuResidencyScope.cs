@@ -55,6 +55,9 @@ public sealed class GpuResidencyScope : IDisposable
     private readonly int _threadId;
     private GpuResidencyScope? _previous;
     private bool _disposed;
+    // Set under _gate once the scope is unlinked. Add checks it under the same lock, so a recording that
+    // raced Dispose either lands before Dispose returns or is dropped: the report never changes afterwards.
+    private bool _closed;
 
     private GpuResidencyScope(bool captureOperations, bool processWide)
     {
@@ -109,7 +112,10 @@ public sealed class GpuResidencyScope : IDisposable
 
     internal void Add(in GpuTransferEvent e)
     {
-        lock (_gate) _events.Add(e);
+        lock (_gate)
+        {
+            if (!_closed) _events.Add(e);
+        }
     }
 
     private int Count(GpuTransferKind kind)
@@ -133,10 +139,23 @@ public sealed class GpuResidencyScope : IDisposable
     }
 
     /// <summary>Stops recording.</summary>
+    /// <exception cref="InvalidOperationException">A thread scope is disposed on another thread, or while a scope
+    /// opened after it is still open. Scopes nest: unlinking an outer one first would leave the inner one's
+    /// restore pointing back at a disposed scope, which would then collect transfers again.</exception>
     public void Dispose()
     {
         if (_disposed) return;
+        if (!_processWide)
+        {
+            if (Environment.CurrentManagedThreadId != _threadId)
+                throw new InvalidOperationException("A thread GpuResidencyScope must be disposed on the thread that opened it.");
+            if (!DirectGpu.GpuLaunchProbe.IsInnermostThreadScope(this))
+                throw new InvalidOperationException(
+                    "GpuResidencyScopes nest: dispose the scope opened most recently on this thread first.");
+        }
+
         _disposed = true;
         DirectGpu.GpuLaunchProbe.ExitScope(this);
+        lock (_gate) _closed = true;
     }
 }

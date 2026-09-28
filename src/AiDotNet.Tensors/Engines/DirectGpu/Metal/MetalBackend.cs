@@ -488,7 +488,6 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
     /// </summary>
     public IGpuBuffer AllocateBuffer(float[] data)
     {
-        GpuLaunchProbe.OnUpload(data, sizeof(float), "Metal");
         ThrowIfDisposed();
 
         if (data is null || data.Length == 0)
@@ -497,6 +496,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
         }
         // Issue #285: per-allocation cap check.
         GpuBufferSizeGuard.EnsureFits("Metal", (long)data.Length * sizeof(float), MaxBufferAllocBytes, DeviceName);
+        GpuLaunchProbe.OnUpload(data, sizeof(float), "Metal");
 
         return new MetalGpuBuffer(_device, data);
     }
@@ -523,13 +523,13 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
     /// </summary>
     public float[] DownloadBuffer(IGpuBuffer buffer)
     {
-        GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float), "Metal");
         ThrowIfDisposed();
 
         if (buffer is not MetalGpuBuffer metalBuffer)
         {
             throw new ArgumentException("Buffer must be a MetalGpuBuffer", nameof(buffer));
         }
+        GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float), "Metal");
 
         var result = new float[buffer.Size];
         metalBuffer.CopyTo(result);
@@ -541,13 +541,13 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
     /// </summary>
     public void DownloadBuffer(IGpuBuffer buffer, float[] destination)
     {
-        GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float), "Metal");
         ThrowIfDisposed();
 
         if (buffer is not MetalGpuBuffer metalBuffer)
         {
             throw new ArgumentException("Buffer must be a MetalGpuBuffer", nameof(buffer));
         }
+        GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float), "Metal");
 
         metalBuffer.CopyTo(destination);
     }
@@ -557,7 +557,6 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
     /// </summary>
     public byte[] DownloadByteBuffer(IGpuBuffer buffer, int byteCount)
     {
-        GpuLaunchProbe.OnReadback(byteCount, "Metal");
         ThrowIfDisposed();
 
         if (buffer is not MetalGpuBuffer metalBuffer)
@@ -568,6 +567,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
             throw new ArgumentOutOfRangeException(nameof(byteCount), "Byte count must be non-negative.");
         if (byteCount > metalBuffer.SizeInBytes)
             throw new ArgumentException($"Requested byte count ({byteCount}) exceeds buffer capacity ({metalBuffer.SizeInBytes}).", nameof(byteCount));
+        GpuLaunchProbe.OnReadback(byteCount, "Metal");
 
         var result = new byte[byteCount];
         if (byteCount > 0)
@@ -580,7 +580,6 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
     /// </summary>
     public void UploadByteBuffer(IGpuBuffer buffer, byte[] data)
     {
-        GpuLaunchProbe.OnUpload(data, sizeof(byte), "Metal");
         ThrowIfDisposed();
 
         if (data is null)
@@ -591,6 +590,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
         }
         if (data.LongLength > metalBuffer.SizeInBytes)
             throw new ArgumentException($"Host data ({data.Length} bytes) exceeds buffer capacity ({metalBuffer.SizeInBytes} bytes).", nameof(data));
+        GpuLaunchProbe.OnUpload(data, sizeof(byte), "Metal");
 
         if (data.Length > 0)
             metalBuffer.CopyBytesFrom(data, 0, data.Length);
@@ -685,7 +685,6 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
     /// <inheritdoc/>
     public void UploadIntBufferInPlace(int[] data, IGpuBuffer buffer)
     {
-        GpuLaunchProbe.OnUpload(data, sizeof(int), "Metal");
         ThrowIfDisposed();
         if (data is null) throw new ArgumentNullException(nameof(data));
         if (buffer is not MetalGpuBuffer metalBuffer)
@@ -693,6 +692,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
         if (data.Length > metalBuffer.Size)
             throw new ArgumentException($"Host data ({data.Length}) exceeds buffer capacity ({metalBuffer.Size}).", nameof(data));
         if (data.Length == 0) return;
+        GpuLaunchProbe.OnUpload(data, sizeof(int), "Metal");
 
         var packed = new float[data.Length];
         for (int i = 0; i < data.Length; i++)
@@ -702,7 +702,6 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
 
     public IGpuBuffer AllocateIntBuffer(int[] data)
     {
-        GpuLaunchProbe.OnUpload(data, sizeof(int), "Metal");
         ThrowIfDisposed();
 
         if (data is null || data.Length == 0)
@@ -710,6 +709,7 @@ public sealed partial class MetalBackend : IDirectGpuBackend, IFusedAdvancedKern
             throw new ArgumentException("Data cannot be null or empty", nameof(data));
         }
         GpuBufferSizeGuard.EnsureFits("Metal", (long)data.Length * sizeof(int), MaxBufferAllocBytes, DeviceName);
+        GpuLaunchProbe.OnUpload(data, sizeof(int), "Metal");
 
         // Convert int array to float array for buffer allocation
         var floatData = new float[data.Length];

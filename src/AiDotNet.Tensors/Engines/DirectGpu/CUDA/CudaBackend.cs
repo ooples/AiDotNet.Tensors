@@ -1496,9 +1496,9 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
 
     public IGpuBuffer AllocateBuffer(float[] data)
     {
-        GpuLaunchProbe.OnUpload(data, sizeof(float), "CUDA");
         if (!IsAvailable)
             throw new InvalidOperationException("CUDA backend is not available.");
+        GpuLaunchProbe.OnUpload(data, sizeof(float), "CUDA");
         AuditSyncIO("HtoD-alloc", (long)data.Length * sizeof(float));
         LogCaptureBlockerIfCapturing("HtoD-alloc", (long)data.Length * sizeof(float));
 
@@ -1969,7 +1969,6 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
 
     public void DownloadBuffer(IGpuBuffer buffer, float[] destination)
     {
-        GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float), "CUDA");
         // #226: never issue a device→host copy from a released buffer. After CudaGpuBuffer.Release
         // the device pointer is zeroed; cuMemcpyDtoH from a null/freed pointer is an ILLEGAL memory
         // access that corrupts the CUDA context — every subsequent driver call then fails with error
@@ -1982,6 +1981,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
 
         if (destination.Length < buffer.Size)
             throw new ArgumentException("Destination array is too small.", nameof(destination));
+        GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float), "CUDA");
 
         using var _ = PushContext();
 
@@ -2016,22 +2016,22 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
 
     public byte[] DownloadByteBuffer(IGpuBuffer buffer, int byteCount)
     {
-        GpuLaunchProbe.OnReadback(byteCount, "CUDA");
         if (byteCount < 0)
             throw new ArgumentOutOfRangeException(nameof(byteCount), "Byte count must be non-negative.");
         if (byteCount > buffer.SizeInBytes)
             throw new ArgumentException($"Requested byte count ({byteCount}) exceeds buffer capacity ({buffer.SizeInBytes}).", nameof(byteCount));
+        GpuLaunchProbe.OnReadback(byteCount, "CUDA");
 
         return DownloadBytes(buffer, byteCount);
     }
 
     public void UploadByteBuffer(IGpuBuffer buffer, byte[] data)
     {
-        GpuLaunchProbe.OnUpload(data, sizeof(byte), "CUDA");
         if (data is null)
             throw new ArgumentNullException(nameof(data));
         if (data.LongLength > buffer.SizeInBytes)
             throw new ArgumentException($"Host data ({data.Length} bytes) exceeds buffer capacity ({buffer.SizeInBytes} bytes).", nameof(data));
+        GpuLaunchProbe.OnUpload(data, sizeof(byte), "CUDA");
 
         UploadBytes(buffer, data);
     }
@@ -4890,9 +4890,9 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
 
     public void Synchronize()
     {
-        GpuLaunchProbe.OnSynchronize("CUDA");
         if (!IsAvailable)
             return;
+        GpuLaunchProbe.OnSynchronize("CUDA");
 
         using var _ = PushContext();
         CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamSynchronize(_stream), "cuStreamSynchronize");
@@ -5048,7 +5048,6 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     /// step so the per-step path has no <c>cuMemAlloc</c> (which is synchronous and serializes the step).</summary>
     public unsafe void UploadIntBufferInPlace(int[] data, IGpuBuffer buffer)
     {
-        GpuLaunchProbe.OnUpload(data, sizeof(int), "CUDA");
         if (data == null) throw new ArgumentNullException(nameof(data));
         if (buffer == null) throw new ArgumentNullException(nameof(buffer));
         if (!IsAvailable)
@@ -5058,6 +5057,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
                 "GPU buffer was released before its in-place upload.");
         if (data.Length > buffer.Size)
             throw new ArgumentException($"Host data ({data.Length}) exceeds buffer ({buffer.Size}).");
+        GpuLaunchProbe.OnUpload(data, sizeof(int), "CUDA");
         using var _ = PushContext();
         ulong byteSize = (ulong)data.Length * sizeof(int);
         fixed (int* src = data)
@@ -8773,11 +8773,11 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
 
     public IGpuBuffer AllocateIntBuffer(int[] data)
     {
-        GpuLaunchProbe.OnUpload(data, sizeof(int), "CUDA");
         if (!IsAvailable)
             throw new InvalidOperationException("CUDA backend is not available.");
         if (data is null)
             throw new ArgumentNullException(nameof(data));
+        GpuLaunchProbe.OnUpload(data, sizeof(int), "CUDA");
 
         using var _ = PushContext();
         int size = data.Length;

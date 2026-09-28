@@ -117,8 +117,10 @@ public sealed class GpuResidencyTests
         using var doc = System.Text.Json.JsonDocument.Parse(System.IO.File.ReadAllText(System.IO.Path.Combine(root, BaselineFile)));
         bool recorded = doc.RootElement.GetProperty("mlp").TryGetProperty(backend, out var baselineElement);
         string snapshot = "{ " + string.Join(", ", measured.OrderBy(kv => kv.Key, StringComparer.Ordinal).Select(kv => $"\"{kv.Key}\": {kv.Value}")) + " }";
-        Skip.IfNot(recorded, $"DEFERRED: no residency baseline for mlp on {backend}. Add \"{backend}\": {snapshot} under \"mlp\" " +
-                             $"in {BaselineFile}.{Environment.NewLine}{report}");
+        // An unmeasured backend is not a passing ratchet: fail with the snapshot to record. A step that produced no
+        // events at all reports backend "unknown", which has no baseline either, so a dead probe fails here too.
+        Assert.True(recorded, $"No residency baseline for mlp on {backend}. Measure it on that backend and add " +
+                              $"\"{backend}\": {snapshot} under \"mlp\" in {BaselineFile}.{Environment.NewLine}{report}");
 
         var baseline = baselineElement.EnumerateObject().ToDictionary(p => p.Name, p => p.Value.GetInt32(), StringComparer.Ordinal);
         var rises = measured
@@ -145,7 +147,9 @@ public sealed class GpuResidencyTests
     /// beyond the batch it is given, so every reported operation is residency work still to do.
     /// </summary>
     [SkippableFact]
-    [Trait("Category", "PyTorchParityGpu")]
+    // The absolute target, reported by run-gpu.ps1 but not gating it: the per-operation ratchet above is the gate
+    // until a step reaches zero crossings.
+    [Trait("Category", "PyTorchParityGpuTarget")]
     public void MlpTrainingStep_StaysResident()
     {
         var (scope, report) = RunMlpTrainingStep();
@@ -197,6 +201,13 @@ public sealed class GpuResidencyTests
                 var loss = engine.ReduceMean(engine.TensorSquare(engine.TensorSubtract(h, y)), new[] { 0, 1 }, keepDims: false);
                 var grads = tape.ComputeGradients(loss, sources);
                 Assert.Equal(sources.Length, grads.Count);
+                // A training step includes the update: the device-side SGD kernel, so the measured crossings cover
+                // forward, backward and optimizer exactly as the head-to-head CUDA step runs them.
+                foreach (var parameter in sources)
+                    Assert.True(GpuOptimizer.TrySgdStep(parameter, grads[parameter], 0.01f),
+                        $"The device-side SGD step was refused for a [{string.Join(", ", parameter.Shape.ToArray())}] parameter " +
+                        $"(parameter on device: {parameter.TryGetGpuBuffer() is not null}, gradient on device: " +
+                        $"{grads[parameter].TryGetGpuBuffer() is not null}).");
             }
 
             for (int i = 0; i < 5; i++) Step();

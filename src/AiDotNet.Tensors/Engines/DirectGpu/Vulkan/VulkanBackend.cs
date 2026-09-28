@@ -999,18 +999,19 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     /// <inheritdoc/>
     public void UploadIntBufferInPlace(int[] data, IGpuBuffer buffer)
     {
-        GpuLaunchProbe.OnUpload(data, sizeof(int), "Vulkan");
         EnsureInitialized();
         if (data is null) throw new ArgumentNullException(nameof(data));
         if (buffer is null) throw new ArgumentNullException(nameof(buffer));
         if (data.Length > buffer.Size)
             throw new ArgumentException($"Host data ({data.Length}) exceeds buffer capacity ({buffer.Size}).", nameof(data));
         if (data.Length == 0) return;
-
         var packed = new float[data.Length];
         for (int i = 0; i < data.Length; i++)
             packed[i] = Int32BitsToSingleCompat(data[i]);
         UploadToBuffer(packed, buffer);
+        // UploadToBuffer stages the whole buffer (a partial update is padded to buffer.Size), so that is
+        // what crosses the boundary, not data.Length.
+        GpuLaunchProbe.OnUpload((long)buffer.Size * sizeof(float), "Vulkan");
     }
 
     /// <inheritdoc/>

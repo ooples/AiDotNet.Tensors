@@ -1385,11 +1385,11 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe IGpuBuffer AllocateBuffer(float[] data)
     {
-        GpuLaunchProbe.OnUpload(data, sizeof(float), "HIP");
         IntPtr devicePtr = IntPtr.Zero;
         var size = (UIntPtr)(data.Length * sizeof(float));
         // Issue #285: per-allocation cap check before hipMalloc.
         GpuBufferSizeGuard.EnsureFits("HIP", (long)data.Length * sizeof(float), MaxBufferAllocBytes, DeviceName);
+        GpuLaunchProbe.OnUpload(data, sizeof(float), "HIP");
 
         if (_bufferPool.TryRent(data.Length, out var pooled) && pooled != null)
         {
@@ -1475,8 +1475,8 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void DownloadBuffer(IGpuBuffer buffer, float[] destination)
     {
-        GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float), "HIP");
         var hipBuffer = (HipGpuBuffer)buffer;
+        GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float), "HIP");
         var size = (UIntPtr)(hipBuffer.Size * sizeof(float));
 
         fixed (float* destPtr = destination)
@@ -1492,13 +1492,13 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe byte[] DownloadByteBuffer(IGpuBuffer buffer, int byteCount)
     {
-        GpuLaunchProbe.OnReadback(byteCount, "HIP");
         if (buffer is null)
             throw new ArgumentNullException(nameof(buffer));
         if (byteCount < 0)
             throw new ArgumentOutOfRangeException(nameof(byteCount), "Byte count must be non-negative.");
         if (byteCount > buffer.SizeInBytes)
             throw new ArgumentException($"Requested byte count ({byteCount}) exceeds buffer capacity ({buffer.SizeInBytes}).", nameof(byteCount));
+        GpuLaunchProbe.OnReadback(byteCount, "HIP");
 
         var resultBytes = new byte[byteCount];
         if (byteCount == 0)
@@ -1519,7 +1519,6 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe void UploadByteBuffer(IGpuBuffer buffer, byte[] data)
     {
-        GpuLaunchProbe.OnUpload(data, sizeof(byte), "HIP");
         if (buffer is null)
             throw new ArgumentNullException(nameof(buffer));
         if (data is null)
@@ -1528,6 +1527,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             throw new ArgumentException($"Host data ({data.Length} bytes) exceeds buffer capacity ({buffer.SizeInBytes} bytes).", nameof(data));
         if (data.Length == 0)
             return;
+        GpuLaunchProbe.OnUpload(data, sizeof(byte), "HIP");
 
         fixed (byte* srcPtr = data)
         {
@@ -5816,7 +5816,6 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     /// <inheritdoc/>
     public void UploadIntBufferInPlace(int[] data, IGpuBuffer buffer)
     {
-        GpuLaunchProbe.OnUpload(data, sizeof(int), "HIP");
         if (data is null) throw new ArgumentNullException(nameof(data));
         if (buffer is null) throw new ArgumentNullException(nameof(buffer));
         if (data.Length > buffer.Size)
@@ -5824,6 +5823,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         if (data.Length == 0) return;
         if (buffer.Handle == IntPtr.Zero)
             throw new ObjectDisposedException(nameof(buffer));
+        GpuLaunchProbe.OnUpload(data, sizeof(int), "HIP");
 
         GCHandle handle = GCHandle.Alloc(data, GCHandleType.Pinned);
         try
@@ -5843,12 +5843,12 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public IGpuBuffer AllocateIntBuffer(int[] data)
     {
-        GpuLaunchProbe.OnUpload(data, sizeof(int), "HIP");
         IntPtr devicePtr = IntPtr.Zero;
         var size = data.Length;
         var sizeBytes = (UIntPtr)(size * sizeof(int));
         // Issue #285: per-allocation cap check before hipMalloc.
         GpuBufferSizeGuard.EnsureFits("HIP", (long)size * sizeof(int), MaxBufferAllocBytes, DeviceName);
+        GpuLaunchProbe.OnUpload(data, sizeof(int), "HIP");
 
         var result = HipNativeBindings.hipMalloc(ref devicePtr, sizeBytes);
         HipNativeBindings.CheckError(result, "hipMalloc(int)");
@@ -10250,10 +10250,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public void Synchronize()
     {
-        GpuLaunchProbe.OnSynchronize("HIP");
         if (_stream != IntPtr.Zero)
         {
             var result = HipNativeBindings.hipStreamSynchronize(_stream);
+            if (result == HipError.Success) GpuLaunchProbe.OnSynchronize("HIP");
             // Don't throw on sync errors, just log
             if (result != HipError.Success)
             {

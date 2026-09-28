@@ -146,7 +146,7 @@ public sealed class HeadToHeadGpuNetworkTests : HeadToHeadTestBase
     public void Mlp_Cuda_DoesNotRegress() => AssertRatchet(RunCase("mlp", "cuda"));
 
     [SkippableFact]
-    [Trait("Category", "PyTorchParityGpu")]
+    [Trait("Category", "PyTorchParityGpuTarget")]
     public void Mlp_Cuda_IsAsFastAsPyTorch() => AssertParity(RunCase("mlp", "cuda"));
 
     [SkippableFact]
@@ -154,7 +154,7 @@ public sealed class HeadToHeadGpuNetworkTests : HeadToHeadTestBase
     public void Cnn_Cuda_DoesNotRegress() => AssertRatchet(RunCase("cnn", "cuda"));
 
     [SkippableFact]
-    [Trait("Category", "PyTorchParityGpu")]
+    [Trait("Category", "PyTorchParityGpuTarget")]
     public void Cnn_Cuda_IsAsFastAsPyTorch() => AssertParity(RunCase("cnn", "cuda"));
 }
 #endif

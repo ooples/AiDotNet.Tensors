@@ -57,6 +57,9 @@ internal static class HeadToHeadNetworkHarness
     /// <summary>Why the case could not run: no python, no torch, no CUDA. Null when it ran.</summary>
     internal sealed record Deferral(string Reason);
 
+    /// <summary>One PyTorch run of a spec; the CNN on a 4-core runner takes under two minutes.</summary>
+    private static readonly TimeSpan RunnerTimeout = TimeSpan.FromMinutes(15);
+
     internal static string PythonExecutable
         => Environment.GetEnvironmentVariable("PARITY_PYTHON") is { Length: > 0 } configured ? configured : "python";
 
@@ -156,8 +159,14 @@ internal static class HeadToHeadNetworkHarness
     /// </summary>
     private static (CaseResult? Result, Deferral? Deferred) RunWith(string root, string network, string device, DirectGpuTensorEngine? gpu)
     {
-        var specJson = ReadJson(Path.Combine(root, "parity", "networks", network + ".json"));
-        int repeats = specJson.TryGetProperty("repeats", out var repeatsElement) ? Math.Max(1, repeatsElement.GetInt32()) : 1;
+        string specPath = Path.Combine(root, "parity", "networks", network + ".json");
+        var specJson = ReadJson(specPath);
+        int repeats = 1;
+        if (specJson.TryGetProperty("repeats", out var repeatsElement))
+        {
+            if (repeatsElement.ValueKind != JsonValueKind.Number || !repeatsElement.TryGetInt32(out repeats) || repeats < 1)
+                throw new InvalidDataException($"{specPath}: \"repeats\" must be a positive integer, got {repeatsElement.GetRawText()}.");
+        }
         var torchRuns = new List<SideResult>();
         var tensorsRuns = new List<SideResult>();
         string machineKey = MachineKey(device);
@@ -221,9 +230,19 @@ internal static class HeadToHeadNetworkHarness
             return (null, new Deferral($"'{PythonExecutable}' is not on PATH; set PARITY_PYTHON to a Python with torch installed."));
         }
 
-        string stdout = process.StandardOutput.ReadToEnd();
-        string stderr = process.StandardError.ReadToEnd();
-        process.WaitForExit();
+        // Drain both pipes at once. Reading stdout to the end first deadlocks as soon as the runner fills the stderr
+        // pipe (torch writes warnings there): the child blocks on its next write and never exits.
+        var stdoutTask = process.StandardOutput.ReadToEndAsync();
+        var stderrTask = process.StandardError.ReadToEndAsync();
+        if (!process.WaitForExit((int)RunnerTimeout.TotalMilliseconds))
+        {
+            try { process.Kill(entireProcessTree: true); } catch (InvalidOperationException) { }
+            process.WaitForExit();
+            throw new TimeoutException($"PyTorch runner for {network} on {device} did not finish within {RunnerTimeout}.");
+        }
+
+        string stdout = stdoutTask.GetAwaiter().GetResult();
+        string stderr = stderrTask.GetAwaiter().GetResult();
         if (process.ExitCode == 3) return (null, new Deferral(stderr.Trim()));
         if (process.ExitCode != 0)
             throw new InvalidOperationException($"PyTorch runner failed ({process.ExitCode}):{Environment.NewLine}{stderr}{stdout}");
