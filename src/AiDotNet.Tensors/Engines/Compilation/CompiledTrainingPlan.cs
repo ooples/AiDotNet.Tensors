@@ -1,4 +1,4 @@
-﻿#pragma warning disable CS0618 // SimdGemm.Sgemm/Dgemm (no-trans shims) are [Obsolete] — pending migration to BlasManaged.Gemm<T> in later K tasks.
+#pragma warning disable CS0618 // SimdGemm.Sgemm/Dgemm (no-trans shims) are [Obsolete] — pending migration to BlasManaged.Gemm<T> in later K tasks.
 using System.Buffers;
 using System.Diagnostics;
 using System.IO;
@@ -26,7 +26,7 @@ namespace AiDotNet.Tensors.Engines.Compilation;
 ///
 /// This REPLACES the GradientTape for compiled workloads.
 /// </summary>
-internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
+internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompiledTrainingPlanIntrospection<T>
 {
     // Phase G.4: mutable so EnableFrozenWeightOptimizations() can swap in
     // a rebuilt forward-action array using allowCachedB=true.
@@ -797,6 +797,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     // every other optimizer (they evaluate at the live weights directly).
     private Action? _preForwardParamTransform;
     private int _optimizerStep;
+
+    /// <inheritdoc/>
+    public int OptimizerStep => _optimizerStep;
+
+    /// <inheritdoc/>
+    public IReadOnlyList<Tensor<T>> OptimizedParameters => _optimizedParametersView ??= Array.AsReadOnly(_parameters);
+
+    // A read-only view, so a caller cannot cast the result back to the array and rewrite the plan's parameter slots.
+    private System.Collections.ObjectModel.ReadOnlyCollection<Tensor<T>>? _optimizedParametersView;
     private FusedOptimizerRuntimeState? _optimizerRuntimeState;
 
     private int _nonFiniteStepsSkipped;
@@ -5234,21 +5243,22 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         };
 
     private static float[]? CopyNonEmpty(float[][]? arrays, int index)
-        => arrays is not null && arrays[index].Length != 0 ? (float[])arrays[index].Clone() : null;
+        => arrays is not null && arrays[index] is { Length: > 0 } slot ? (float[])slot.Clone() : null;
 
     private static double[]? CopyNonEmpty(double[][]? arrays, int index)
-        => arrays is not null && arrays[index].Length != 0 ? (double[])arrays[index].Clone() : null;
+        => arrays is not null && arrays[index] is { Length: > 0 } slot ? (double[])slot.Clone() : null;
 
     private static ushort[]? CopyNonEmpty(ushort[][]? arrays, int index)
-        => arrays is not null && arrays[index].Length != 0 ? (ushort[])arrays[index].Clone() : null;
+        => arrays is not null && arrays[index] is { Length: > 0 } slot ? (ushort[])slot.Clone() : null;
 
     private static byte[]? CopyNonEmpty(byte[][]? arrays, int index)
-        => arrays is not null && arrays[index].Length != 0 ? (byte[])arrays[index].Clone() : null;
+        => arrays is not null && arrays[index] is { Length: > 0 } slot ? (byte[])slot.Clone() : null;
 
     private static void CopyInto(float[][]? destination, int index, float[]? source)
     {
         if (source is null) return;
-        if (destination is null)
+        // A slot the plan never allocated (e.g. VMax without AMSGrad) is as unexpected as a missing array.
+        if (destination is null || destination[index] is null)
             throw new InvalidDataException($"Optimizer checkpoint has unexpected float state for parameter {index}.");
         CopyInto(destination[index], source, index, "float");
     }
@@ -5256,7 +5266,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private static void CopyInto(double[][]? destination, int index, double[]? source)
     {
         if (source is null) return;
-        if (destination is null)
+        // A slot the plan never allocated (e.g. VMax without AMSGrad) is as unexpected as a missing array.
+        if (destination is null || destination[index] is null)
             throw new InvalidDataException($"Optimizer checkpoint has unexpected double state for parameter {index}.");
         CopyInto(destination[index], source, index, "double");
     }
@@ -5264,7 +5275,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private static void CopyInto(ushort[][]? destination, int index, ushort[]? source)
     {
         if (source is null) return;
-        if (destination is null)
+        // A slot the plan never allocated (e.g. VMax without AMSGrad) is as unexpected as a missing array.
+        if (destination is null || destination[index] is null)
             throw new InvalidDataException($"Optimizer checkpoint has unexpected bf16 state for parameter {index}.");
         CopyInto(destination[index], source, index, "ushort");
     }
@@ -5272,7 +5284,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private static void CopyInto(byte[][]? destination, int index, byte[]? source)
     {
         if (source is null) return;
-        if (destination is null)
+        // A slot the plan never allocated (e.g. VMax without AMSGrad) is as unexpected as a missing array.
+        if (destination is null || destination[index] is null)
             throw new InvalidDataException($"Optimizer checkpoint has unexpected byte state for parameter {index}.");
         CopyInto(destination[index], source, index, "byte");
     }
