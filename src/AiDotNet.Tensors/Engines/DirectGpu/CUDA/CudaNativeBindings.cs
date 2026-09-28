@@ -235,7 +235,15 @@ internal static class CudaNativeBindings
     }
 
     [DllImport(CudaLibrary, EntryPoint = "cuCtxSynchronize")]
-    public static extern CudaResult cuCtxSynchronize();
+    private static extern CudaResult cuCtxSynchronizeNative();
+
+    // A context-wide wait blocks the host like a stream sync; counted here, after success, like cuStreamSynchronize.
+    public static CudaResult cuCtxSynchronize()
+    {
+        var result = cuCtxSynchronizeNative();
+        if (result == CudaResult.Success) GpuLaunchProbe.OnSynchronize("CUDA");
+        return result;
+    }
 
     [DllImport(CudaLibrary, EntryPoint = "cuStreamQuery")]
     public static extern CudaResult cuStreamQuery(IntPtr stream);
@@ -261,7 +269,15 @@ internal static class CudaNativeBindings
         IntPtr hEvent, IntPtr stream, uint flags);
 
     [DllImport(CudaLibrary, EntryPoint = "cuEventSynchronize")]
-    public static extern CudaResult cuEventSynchronize(IntPtr hEvent);
+    private static extern CudaResult cuEventSynchronizeNative(IntPtr hEvent);
+
+    // Waiting on an event blocks the host until the device reaches it; counted here, after success.
+    public static CudaResult cuEventSynchronize(IntPtr hEvent)
+    {
+        var result = cuEventSynchronizeNative(hEvent);
+        if (result == CudaResult.Success) GpuLaunchProbe.OnSynchronize("CUDA");
+        return result;
+    }
 
     [DllImport(CudaLibrary, EntryPoint = "cuEventQuery")]
     public static extern CudaResult cuEventQuery(IntPtr hEvent);

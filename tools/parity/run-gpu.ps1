@@ -75,8 +75,11 @@ Write-Host "GPU gate: $($gate.Passed) passed, $($gate.Failed) failed, $($gate.Sk
 dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --no-build -f net10.0 `
     --filter 'Category=PyTorchParityGpuTarget' `
     --logger 'console;verbosity=normal' --logger 'trx;LogFileName=targets.trx' --results-directory $results
+$targetExit = $LASTEXITCODE
 $targets = Get-TrxCounts 'targets'
+# A nonzero exit with clean counters means the run did not finish (host crash, build or logger failure).
 $verdict = if ($null -eq $targets -or $targets.Total -eq 0) { 'none ran' }
+           elseif ($targetExit -ne 0 -and $targets.Failed -eq 0) { "incomplete (dotnet test exited $targetExit)" }
            elseif ($targets.Skipped -gt 0) { "$($targets.Skipped) of $($targets.Total) skipped, so not established" }
            elseif ($targets.Failed -gt 0) { "$($targets.Failed) of $($targets.Total) not yet met" }
            else { "all $($targets.Total) met" }
