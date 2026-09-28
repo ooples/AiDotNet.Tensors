@@ -3366,7 +3366,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
         if (!ShapesMatch(a._shape, b._shape) || !ShapesMatch(a._shape, destination._shape))
         {
-            throw new ArgumentException("All tensor shapes must match.");
+            throw new ArgumentException($"All tensor shapes must match: a [{string.Join(", ", a._shape)}], b [{string.Join(", ", b._shape)}], destination [{string.Join(", ", destination._shape)}].");
         }
 
         int length = a.Length;
@@ -6041,7 +6041,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
         if (!ShapesMatch(a._shape, b._shape) || !ShapesMatch(a._shape, destination._shape))
         {
-            throw new ArgumentException("All tensor shapes must match.");
+            throw new ArgumentException($"All tensor shapes must match: a [{string.Join(", ", a._shape)}], b [{string.Join(", ", b._shape)}], destination [{string.Join(", ", destination._shape)}].");
         }
 
         int length = a.Length;

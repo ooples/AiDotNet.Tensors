@@ -46,32 +46,4 @@ internal static class WeightLayoutOptimizer
         return packed;
     }
 
-    /// <summary>
-    /// Pre-packs weight matrices for all MatMul steps in a compiled plan at compile time.
-    /// Returns a dictionary mapping step index to packed weights.
-    /// </summary>
-    internal static Dictionary<int, float[]> PrePackWeights<T>(CompiledStep<T>[] steps)
-    {
-        var packedWeights = new Dictionary<int, float[]>();
-
-        for (int i = 0; i < steps.Length; i++)
-        {
-            if (steps[i].OpName == "TensorMatMul" && steps[i].Inputs.Length == 2
-                && steps[i].Inputs[1].Rank == 2 && typeof(T) == typeof(float))
-            {
-                var weight = steps[i].Inputs[1];
-                int k = weight._shape[0];
-                int n = weight._shape[1];
-
-                // Only pack if the weight is large enough to benefit
-                if (k >= 32 && n >= 32)
-                {
-                    var weightData = (float[])(object)weight.GetDataArray();
-                    packedWeights[i] = PackRowMajorToPanelFormat(weightData, k, n);
-                }
-            }
-        }
-
-        return packedWeights;
-    }
 }

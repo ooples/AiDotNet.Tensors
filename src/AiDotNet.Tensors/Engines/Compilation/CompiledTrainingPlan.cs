@@ -6076,16 +6076,6 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             gradPoolReZeroByStep = gradPoolReZeroByPosition;
         }
 
-        // Phase 4.4: Wire pre-packed weights for MatMul forward steps
-        if (typeof(T) == typeof(float))
-        {
-            var packedWeights = WeightLayoutOptimizer.PrePackWeights(allForwardActions
-                .Select((a, idx) => idx < forwardSteps.Count && !fusedStepIndices.Contains(idx) ? forwardSteps[idx] : null)
-                .Where(s => s is not null)
-                .ToArray()!);
-            // packedWeights are available for future SIMD tile kernels that consume panel format
-        }
-
         // Phase 4.4: Fused optimizer — append SGD/Adam parameter update directly to backward actions.
         // This is optional and controlled by the caller via FusedOptimizer.AppendFusedUpdates().
         // The default compiled plan returns gradients for the caller to update parameters manually.
@@ -8985,6 +8975,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             bool accumB = consumerCount.ContainsKey(inputB) && consumerCount[inputB] > 1;
             int[] inputBShape = (int[])inputB._shape.Clone();
             int[] outShape = (int[])output._shape.Clone();
+            // With no reduce axes the output gradient goes to inputB element for element. A lower-rank inputB that
+            // needs no reduction ([64] against a [1, 64] output: the padded axis has size 1 on both sides) holds the
+            // same elements under a different shape, and TensorAddInto refuses mismatched shapes, so an accumulating
+            // inputB threw every step and the whole plan fell back to the eager tape (DeepFactor, found by the model
+            // census). View the output gradient in inputB's shape once, here; a contiguous Reshape is O(1).
+            var gradOutForB = reduceAxesArr.Length == 0 && !System.Linq.Enumerable.SequenceEqual(gradOut._shape, inputBShape)
+                ? gradOut.Reshape(inputBShape)
+                : gradOut;
 
             // Detect the NCHW→[1,C,1,1] bias-add pattern: reduce axes are
             // exactly {0, 2, 3} (batch + both spatial dims) AND output is
@@ -9010,8 +9008,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                 // gradInputB: reduce-sum gradOut over the broadcast axes.
                 if (reduceAxesArr.Length == 0)
                 {
-                    if (accumB) eng.TensorAddInto(gradInputB, gradInputB, gradOut);
-                    else gradOut.AsSpan().CopyTo(gradInputB.AsWritableSpan());
+                    if (accumB) eng.TensorAddInto(gradInputB, gradInputB, gradOutForB);
+                    else gradOutForB.AsSpan().CopyTo(gradInputB.AsWritableSpan());
                 }
                 else if (isNchwChannelReduce)
                 {
