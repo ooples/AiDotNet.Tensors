@@ -179,7 +179,7 @@ internal sealed class ActivationCacheEntry : IDisposable
 }
 
 // DeferredDownloadEntry was removed in the #226 cleanup — the engine no longer
-// maintains a local pending-download map. DeferredArrayMaterializer is the
+// maintains a local pending-download map. HostSync is the
 // single source of truth for "some caller still needs this buffer downloaded",
 // and its Register/TryMaterialize/MaterializeAll drive both eviction protection
 // (via IsPending) and scope-end flushing.
@@ -737,7 +737,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (arr is null) return;
         _fp16ResidentArrays[arr] = elementCount;
         var capBuf = buf; var capBackend = backend; var capCount = elementCount;
-        Helpers.DeferredArrayMaterializer.Register(arr, a =>
+        Helpers.HostSync.Register(arr, a =>
         {
             using var f32 = AllocateOutputBuffer(capBackend, capCount); // post-capture host read: alloc is fine
             capBackend.ConvertToFp32(capBuf, f32.Buffer, capCount);
@@ -945,9 +945,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // Deferred download tracking for GPU-resident execution
     // When GpuScope is active, intermediate results skip the blocking download.
     // The GPU buffer stays in the activation cache for direct GPU-to-GPU chaining.
-    // If CPU data is later needed, the DeferredArrayMaterializer registry fires
+    // If CPU data is later needed, the HostSync registry fires
     // the per-tensor download callback. The engine-local pending map was removed
-    // in the #226 cleanup — see DeferredArrayMaterializer for the full contract.
+    // in the #226 cleanup — see HostSync for the full contract.
 
     public DirectGpuTensorEngine()
     {
@@ -1537,7 +1537,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         ActivationCacheEntry? entry = null;
         foreach (var key in new object?[] { view.GetBackingArrayForCacheLookupUnsafe(), view.DataVector })
         {
-            if (key is null || !Helpers.DeferredArrayMaterializer.IsPending(key)) continue;
+            if (key is null || !Helpers.HostSync.IsPending(key)) continue;
             if (_activationCache.TryGetValue(key, out var candidate) && ReferenceEquals(candidate.Backend, backend) && !candidate.IsFp16)
             {
                 entry = candidate;
@@ -1588,8 +1588,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         // Both keys: a vector-keyed result can gain a backing array later, and the release mark stays on the vector.
         var array = tensor.GetBackingArrayForCacheLookupUnsafe();
-        if ((array is not null && Helpers.DeferredArrayMaterializer.IsReleased(array))
-            || Helpers.DeferredArrayMaterializer.IsReleased(tensor.DataVector))
+        if ((array is not null && Helpers.HostSync.IsReleased(array))
+            || Helpers.HostSync.IsReleased(tensor.DataVector))
             throw new InvalidOperationException(ReleasedIntermediateMessage);
     }
 
@@ -1690,7 +1690,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 }
                 // A view of a lazily allocated (vector-keyed) result can report a backing array that is not the cache
                 // key; its data vector still is. Missing it here downloaded the result to re-upload it.
-                if (Helpers.DeferredArrayMaterializer.IsPending(tensor.DataVector)
+                if (Helpers.HostSync.IsPending(tensor.DataVector)
                     && _activationCache.TryGetValue(tensor.DataVector, out var vectorEntry)
                     && ReferenceEquals(vectorEntry.Backend, backend) && !vectorEntry.IsFp16
                     && vectorEntry.Buffer.Size >= tensor.Length)
@@ -1783,7 +1783,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // host weights authoritative — the next forward re-uploads them.
         var pendingBacking = tensor.GetBackingArrayForCacheLookupUnsafe();
         if (pendingBacking is not null)
-            Helpers.DeferredArrayMaterializer.Remove(pendingBacking);
+            Helpers.HostSync.Remove(pendingBacking);
 
         InvalidateGpuCacheForTensor(tensor);
         // Drop the fast-path resident pointer so GetOrAllocateBuffer's `_gpuBuffer is not null`
@@ -1847,11 +1847,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     internal void ReleaseDeadActivation<T>(LinearAlgebra.Tensor<T> tensor)
     {
         var backingArray = tensor.GetBackingArrayForCacheLookupUnsafe();
-        if ((backingArray is not null && Helpers.DeferredArrayMaterializer.IsRetained(backingArray))
-            || Helpers.DeferredArrayMaterializer.IsRetained(tensor.DataVector))
+        if ((backingArray is not null && Helpers.HostSync.IsRetained(backingArray))
+            || Helpers.HostSync.IsRetained(tensor.DataVector))
             return;   // kept past the tape by the caller
-        if ((backingArray is not null && Helpers.DeferredArrayMaterializer.IsPending(backingArray))
-            || Helpers.DeferredArrayMaterializer.IsPending(tensor.DataVector))
+        if ((backingArray is not null && Helpers.HostSync.IsPending(backingArray))
+            || Helpers.HostSync.IsPending(tensor.DataVector))
             return;   // device-only: released (no download) when the tape is disposed
         if (backingArray is not null) InvalidateActivationCacheEntry(backingArray);
         InvalidateActivationCacheEntry(tensor.DataVector);
@@ -1865,20 +1865,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var backingArray = tensor.GetBackingArrayForCacheLookupUnsafe();
         if (backingArray is not null)
         {
-            if (Helpers.DeferredArrayMaterializer.IsPending(backingArray))
+            if (Helpers.HostSync.IsPending(backingArray))
             {
                 // Force-materialize before invalidating so the array
                 // ends up with valid CPU data (user might still read
                 // tensor.GetDataArray() after Dispose).
-                try { Helpers.DeferredArrayMaterializer.TryMaterialize(backingArray); }
-                catch { Helpers.DeferredArrayMaterializer.Remove(backingArray); }
+                try { Helpers.HostSync.TryMaterialize(backingArray); }
+                catch { Helpers.HostSync.Remove(backingArray); }
             }
             InvalidateActivationCacheEntry(backingArray);
         }
-        if (Helpers.DeferredArrayMaterializer.IsPending(tensor.DataVector))
+        if (Helpers.HostSync.IsPending(tensor.DataVector))
         {
-            try { Helpers.DeferredArrayMaterializer.TryMaterialize(tensor.DataVector); }
-            catch { Helpers.DeferredArrayMaterializer.Remove(tensor.DataVector); }
+            try { Helpers.HostSync.TryMaterialize(tensor.DataVector); }
+            catch { Helpers.HostSync.Remove(tensor.DataVector); }
         }
         InvalidateActivationCacheEntry(tensor.DataVector);
     }
@@ -1886,7 +1886,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private void InvalidateActivationCacheEntry(object key)
     {
         // #226 / #1468: NEVER free a GPU buffer that still backs a pending deferred
-        // download. DeferredArrayMaterializer.Register is first-write-wins (TryAdd),
+        // download. HostSync.Register is first-write-wins (TryAdd),
         // so the array `key` is permanently bound to exactly one materializer that
         // downloads exactly one buffer — making that buffer's contents the array's
         // ONLY defined CPU value. Materialize it to the CPU array FIRST (while the
@@ -1902,10 +1902,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // unguarded stale-buffer re-upload paths in UploadTensor (and any future
         // caller) are safe by construction. Idempotent: if a caller already
         // materialized, IsPending is false and this is a no-op.
-        if (Helpers.DeferredArrayMaterializer.IsPending(key))
+        if (Helpers.HostSync.IsPending(key))
         {
-            try { Helpers.DeferredArrayMaterializer.TryMaterialize(key); }
-            catch { Helpers.DeferredArrayMaterializer.Remove(key); }
+            try { Helpers.HostSync.TryMaterialize(key); }
+            catch { Helpers.HostSync.Remove(key); }
         }
 
         // Byte-accounting units must match the add/remove/evict paths
@@ -1970,7 +1970,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Not cached - need to upload. If this array still has a pending
         // deferred download from an earlier GPU op, flush it first so the
         // upload sees the current data instead of stale CPU bytes.
-        if (Helpers.DeferredArrayMaterializer.IsPending(data))
+        if (Helpers.HostSync.IsPending(data))
         {
             MaterializeIfDeferred(data);
         }
@@ -2443,7 +2443,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // the cache-owned buffer. Materializing here would be wasted work, and
         // leaving the registration behind would point a later bulk drain at a
         // freed buffer. Remove only after the cache entry is actually owned.
-        Helpers.DeferredArrayMaterializer.Remove(key);
+        Helpers.HostSync.Remove(key);
         System.Threading.Interlocked.Add(ref _currentActivationCacheBytes, -e.Buffer.SizeInBytes);
         System.Threading.Interlocked.Add(ref _currentActivationManagedBytes, -e.ManagedBytes);
         // CUDA uses STREAM-ORDERED deferred free (cuMemFreeAsync) to release the buffer at the stream's
@@ -2499,18 +2499,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int removeCount = entries.Length / 2;
         if (removeCount == 0) return toDispose;
 
-        // #226 ROBUST FIX: drain THIS THREAD's pending deferred downloads before freeing ANY buffer. The
-        // per-entry `IsPending(entries[i].Key)` guard below only catches a materializer registered under the
-        // SAME object as the cache key — but BindResidentBuffer registers its download keyed by the tensor's
-        // BACKING ARRAY while the activation cache may key the same logical tensor by its DataVector (or vice
-        // versa). A buffer whose pending download is keyed differently than its cache entry then gets freed
-        // here, and the later materialize hits a released buffer → "GPU buffer released before its deferred
-        // download (#226)" (seen on eager d384/L4+). MaterializeAll is thread-scoped (only this thread's
-        // pending, so it never touches another tape-thread's in-flight buffer) and idempotent; after it runs
-        // no buffer we are about to free can have an outstanding download, regardless of its key. Eviction
-        // only fires under real VRAM pressure (the count cap is huge), so this broader drain is rare, not
-        // per-step. Not reached during capture (eviction is suspended while the stream is capturing).
-        Helpers.DeferredArrayMaterializer.MaterializeAll(swallowErrors: true);
+        // #226: every pending download of a buffer about to be freed is materialized per entry below. The host-sync
+        // state is per host ARRAY and shared by the vector and array keys (HostSync), so a download registered under
+        // the other key of the same data is found by the entry's own key -- no thread-wide bulk drain is needed.
 
         // Find threshold using Array.Sort on timestamps (avoids LINQ allocation)
         var timestamps = new long[entries.Length];
@@ -2533,10 +2524,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // contract InvalidateActivationCacheEntry relies on), THEN free the buffer below.
             // Eviction only fires under real VRAM pressure now (the count cap is huge — see
             // CacheActivation), so this offload is rare, not the per-step thrash it used to be.
-            if (Helpers.DeferredArrayMaterializer.IsPending(entries[i].Key))
+            if (Helpers.HostSync.IsPending(entries[i].Key))
             {
-                try { Helpers.DeferredArrayMaterializer.TryMaterialize(entries[i].Key); }
-                catch { Helpers.DeferredArrayMaterializer.Remove(entries[i].Key); }
+                try { Helpers.HostSync.TryMaterialize(entries[i].Key); }
+                catch { Helpers.HostSync.Remove(entries[i].Key); }
             }
 
             if (_activationCache.TryRemove(entries[i].Key, out var entry))
@@ -2632,7 +2623,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 if (!_activationCache.TryRemove(key, out var entry)) continue;
                 System.Threading.Interlocked.Add(ref _currentActivationCacheBytes, -entry.Buffer.SizeInBytes);
                 System.Threading.Interlocked.Add(ref _currentActivationManagedBytes, -entry.ManagedBytes);
-                Helpers.DeferredArrayMaterializer.HoldWeakly(key);
+                // Its pending download (HostSync) already lives exactly as long as the host array: nothing to move.
             }
         }
     }
@@ -2693,27 +2684,27 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 if (entries[i].Value.Timestamp <= snapshot) continue;   // pre-existing — keep
                 if (entries[i].Value.ThreadId != callerThreadId) continue; // another thread's live buffer
                 if (protect is not null && protect.Contains(entries[i].Key)) continue; // live gradient — keep
-                if (mode == ActivationReleaseMode.Release && Helpers.DeferredArrayMaterializer.IsRetained(entries[i].Key))
+                if (mode == ActivationReleaseMode.Release && Helpers.HostSync.IsRetained(entries[i].Key))
                     continue; // the caller kept it past the tape (GradientTape.Retain / returned gradients)
                 if (_activationCache.TryRemove(entries[i].Key, out var entry))
                 {
-                    if (Helpers.DeferredArrayMaterializer.IsPending(entries[i].Key))
+                    if (Helpers.HostSync.IsPending(entries[i].Key))
                     {
                         switch (mode)
                         {
                             case ActivationReleaseMode.MaterializeThenFree:
                                 // #226 safe path: flush the pending DtoH so a later CPU read still sees correct data.
-                                try { Helpers.DeferredArrayMaterializer.TryMaterialize(entries[i].Key); }
-                                catch { Helpers.DeferredArrayMaterializer.Remove(entries[i].Key); }
+                                try { Helpers.HostSync.TryMaterialize(entries[i].Key); }
+                                catch { Helpers.HostSync.Remove(entries[i].Key); }
                                 break;
                             case ActivationReleaseMode.Release:
                                 // Dead step intermediate: free without a host copy; a later host read throws.
                                 // (Retained keys never reach here: they are skipped with the protect set above.)
-                                Helpers.DeferredArrayMaterializer.Release(entries[i].Key, ReleasedIntermediateMessage);
+                                Helpers.HostSync.Release(entries[i].Key, ReleasedIntermediateMessage);
                                 break;
                             default:
                                 // Dead scratch: drop the pending download (no DtoH) after owning the cache entry.
-                                Helpers.DeferredArrayMaterializer.Remove(entries[i].Key);
+                                Helpers.HostSync.Remove(entries[i].Key);
                                 break;
                         }
                     }
@@ -2769,7 +2760,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 if (!allThreads && entries[i].Value.ThreadId != callerThreadId) continue; // another thread's live buffer
                 if (keepKey is not null && ReferenceEquals(entries[i].Key, keepKey)) continue; // the live result
                 // Dead intermediate: discard its pending download (never read) and free the buffer.
-                Helpers.DeferredArrayMaterializer.Remove(entries[i].Key);
+                Helpers.HostSync.Remove(entries[i].Key);
                 if (_activationCache.TryRemove(entries[i].Key, out var entry))
                 {
                     System.Threading.Interlocked.Add(ref _currentActivationCacheBytes, -entry.Buffer.SizeInBytes);
@@ -2805,10 +2796,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // engines'/threads' in-flight buffers and race them (the -38 / GPU-fault hazard).
         foreach (var kv in toDispose)
         {
-            if (Helpers.DeferredArrayMaterializer.IsPending(kv.Key))
+            if (Helpers.HostSync.IsPending(kv.Key))
             {
-                try { Helpers.DeferredArrayMaterializer.TryMaterialize(kv.Key); }
-                catch { Helpers.DeferredArrayMaterializer.Remove(kv.Key); }
+                try { Helpers.HostSync.TryMaterialize(kv.Key); }
+                catch { Helpers.HostSync.Remove(kv.Key); }
             }
         }
 
@@ -2838,7 +2829,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             System.Threading.Interlocked.Exchange(ref _currentActivationManagedBytes, 0);
         }
         foreach (var kv in toDispose)
-            Helpers.DeferredArrayMaterializer.Remove(kv.Key); // drop the pending download — the data is dead
+            Helpers.HostSync.Remove(kv.Key); // drop the pending download — the data is dead
         foreach (var kv in toDispose)
             kv.Value.Dispose();                               // free the GPU buffer
     }
@@ -2919,7 +2910,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (key is not null && TryGetVersionedPersistentBuffer(key, weights.GpuCacheVersion, out var cached))
             return new OwnedBuffer(cached, ownsBuffer: false);
         object pendingKey = (object?)key ?? weights.DataVector;
-        if (Helpers.DeferredArrayMaterializer.IsPending(pendingKey)
+        if (Helpers.HostSync.IsPending(pendingKey)
             && _activationCache.TryGetValue(pendingKey, out var activation) && ReferenceEquals(activation.Backend, backend)
             && !activation.IsFp16 && activation.Buffer.Handle != IntPtr.Zero && activation.Buffer.Size >= weights.Length)
             return new OwnedBuffer(activation.Buffer, ownsBuffer: false);
@@ -3101,7 +3092,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Always defer the download. The GPU buffer stays cached so chained GPU ops
         // reuse it without re-uploading (GetOrAllocateBuffer checks _activationCache).
         // The CPU array is populated lazily when code first accesses the data
-        // (via DeferredArrayMaterializer triggered by GetDataArray/AsSpan/indexer).
+        // (via HostSync triggered by GetDataArray/AsSpan/indexer).
         //
         // This eliminates both upload AND download for chained GPU operations:
         //   result1 = sigmoid(x)     → GPU kernel, buffer cached, no download
@@ -3118,7 +3109,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 #endif
 
         // Capture the buffer + backend in the materializer closure directly so
-        // the DeferredArrayMaterializer registry is the single source of truth
+        // the HostSync registry is the single source of truth
         // for pending downloads (#226). The activation-cache eviction guard
         // checks IsPending on this same key, keeping the buffer alive until
         // the callback runs.
@@ -3134,7 +3125,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // → MaterializeAllDeferred → callback → DownloadBuffer → -38).
         var capturedBuffer = outputBuffer.Buffer;
         var capturedBackend = backend;
-        Helpers.DeferredArrayMaterializer.Register(result, arr =>
+        Helpers.HostSync.Register(result, arr =>
         {
             float[] floatData;
             try
@@ -3188,7 +3179,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var capturedBuffer = halfBuffer;
         var capturedBackend = backend;
         int n = elementCount;
-        Helpers.DeferredArrayMaterializer.Register(result, arr =>
+        Helpers.HostSync.Register(result, arr =>
         {
             using var tmp = AllocateOutputBuffer(capturedBackend, n); // FP32 transient
             capturedBackend.ConvertToFp32(capturedBuffer, tmp.Buffer, n);
@@ -3235,8 +3226,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // up-cast oBuf -> FP32 -> narrow to Half. Remove+Register keeps it pointing at the CURRENT buffer if o
         // was evicted then re-landed on a later step.
         var capBuf = oBuf; var capBackend = cb; int cn = n;
-        Helpers.DeferredArrayMaterializer.Remove(oKey);
-        Helpers.DeferredArrayMaterializer.Register(oKey, arr =>
+        Helpers.HostSync.Remove(oKey);
+        Helpers.HostSync.Register(oKey, arr =>
         {
             using var tmp = AllocateOutputBuffer(capBackend, cn);
             capBackend.ConvertToFp32Native(capBuf, tmp.Buffer, cn);
@@ -3268,7 +3259,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             IGpuBuffer flatBuffer;
             lock (_persistentBufferLock)
             {
-                if (_persistentBufferCache.TryGetValue(flat, out var entry) && Helpers.DeferredArrayMaterializer.IsPending(flat))
+                if (_persistentBufferCache.TryGetValue(flat, out var entry) && Helpers.HostSync.IsPending(flat))
                 {
                     flatBuffer = entry.Buffer;
                 }
@@ -3313,7 +3304,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 if (_persistentBufferCache.TryGetValue(flat, out var flatEntry)) flatBuffer = flatEntry.Buffer;
             if (flatBuffer is null) return;
             var capFlat = flatBuffer; var capFlatBackend = backend;
-            Helpers.DeferredArrayMaterializer.Register(flat, a =>
+            Helpers.HostSync.Register(flat, a =>
             {
                 float[] f = capFlatBackend.DownloadBuffer(capFlat);
                 System.Array.Copy(f, (float[])a, System.Math.Min(f.Length, ((float[])a).Length));
@@ -3329,7 +3320,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 _persistentWeightHostVersion[arr] = param.Version;
         }
         var capBuf = buffer; var capBackend = backend;
-        Helpers.DeferredArrayMaterializer.Register(arr, a =>
+        Helpers.HostSync.Register(arr, a =>
         {
             float[] f = capBackend.DownloadBuffer(capBuf);
             System.Array.Copy(f, (float[])a, System.Math.Min(f.Length, ((float[])a).Length));
@@ -3377,7 +3368,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         object? arr = tensor.GetBackingArrayForCacheLookupUnsafe();
         if (arr is null && typeof(T) == typeof(float) && TryGetFlatParameterView((Tensor<float>)(object)tensor, out var flat, out _))
             arr = flat;   // a view into the flat ParameterBuffer: authority belongs to the flat array
-        return arr is not null && Helpers.DeferredArrayMaterializer.IsPending(arr) && _persistentBufferCache.ContainsKey(arr);
+        return arr is not null && Helpers.HostSync.IsPending(arr) && _persistentBufferCache.ContainsKey(arr);
     }
 
     /// <summary>True when <paramref name="t"/> is a view into a larger flat array (a ParameterBuffer parameter).</summary>
@@ -3408,7 +3399,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         view = null!;
         if (typeof(T) != typeof(float) || backend is not IGpuBufferViews views) return false;
         if (!TryGetFlatParameterView((Tensor<float>)(object)t, out var flat, out int offset)) return false;
-        if (!Helpers.DeferredArrayMaterializer.IsPending(flat)) return false;
+        if (!Helpers.HostSync.IsPending(flat)) return false;
         IGpuBuffer? flatBuffer = null;
         lock (_persistentBufferLock)
             if (_persistentBufferCache.TryGetValue(flat, out var entry)) flatBuffer = entry.Buffer;
@@ -3502,8 +3493,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // Refresh the deferred materializer to point at the current contents (one-shot; first-write-wins, so
             // Remove first). The buffer pointer is unchanged on the reuse path, so this is a cheap closure swap.
             var capBuf = halfBuf; var capBackend = backend; int cn = n;
-            Helpers.DeferredArrayMaterializer.Remove(oArr);
-            Helpers.DeferredArrayMaterializer.Register(oArr, a =>
+            Helpers.HostSync.Remove(oArr);
+            Helpers.HostSync.Register(oArr, a =>
             {
                 using var tmp = AllocateOutputBuffer(capBackend, cn);
                 capBackend.ConvertToFp32(capBuf, tmp.Buffer, cn);
@@ -3760,7 +3751,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         else if (dest._gpuBuffer is not null || dest.HasPendingGpuData)
         {
             var staleKey = dest.GetBackingArrayForCacheLookupUnsafe();
-            if (staleKey is not null) Helpers.DeferredArrayMaterializer.Remove(staleKey);
+            if (staleKey is not null) Helpers.HostSync.Remove(staleKey);
             dest._gpuBuffer = null;
             dest._gpuBackend = null;
             dest._gpuBufferVersion = -1;
@@ -3819,7 +3810,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (srcBuf is null)
         {
             var cArr = src.GetBackingArrayForCacheLookupUnsafe();
-            if (cArr is not null && src.IsContiguous && !Helpers.DeferredArrayMaterializer.IsPending(cArr))
+            if (cArr is not null && src.IsContiguous && !Helpers.HostSync.IsPending(cArr))
             {
                 try { srcBuf = GetOrCacheWeightBuffer(backend, src.GetDataArray(), PersistentTensorRole.Weights, src.GpuCacheVersion).Buffer; }
                 catch { srcBuf = null; }
@@ -3851,7 +3842,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Host reads of dest (the loss scalar, a debug checksum, a host op) download from the borrowed buffer.
         var capturedBuf = srcBuf;
         var capturedBackend = backend;
-        Helpers.DeferredArrayMaterializer.Register(destArr, arr =>
+        Helpers.HostSync.Register(destArr, arr =>
         {
             float[] floatData = capturedBackend.DownloadBuffer(capturedBuf);
             var converted = DirectGpuEngine.FromFloatArray<T>(floatData);
@@ -3880,12 +3871,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         destinationTensor.IncrementVersion();
         int hostVersion = destinationTensor.GpuCacheVersion;
-        Helpers.DeferredArrayMaterializer.Remove(destination);
+        Helpers.HostSync.Remove(destination);
         RemoveActivationCacheEntry(destination);
 
         var capturedBuffer = outputBuffer.Buffer;
         var capturedBackend = backend;
-        Helpers.DeferredArrayMaterializer.Register(destination, arr =>
+        Helpers.HostSync.Register(destination, arr =>
         {
             float[] floatData;
             try
@@ -3944,7 +3935,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         // Register materializer keyed by the vector — when GetDataArray() is called,
         // it allocates the backing array and then TryMaterialize(vector) downloads from GPU.
-        // The DeferredArrayMaterializer registry also acts as the pending-download
+        // The HostSync registry also acts as the pending-download
         // source of truth for activation-cache eviction (#226): the eviction guard
         // checks IsPending on this same vector key to decide whether to spare the
         // underlying GPU buffer.
@@ -3960,7 +3951,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var vector = tensor.DataVector;
         var capturedBuffer = outputBuffer;
         var capturedBackend = backend;
-        Helpers.DeferredArrayMaterializer.Register(vector, obj =>
+        Helpers.HostSync.Register(vector, obj =>
         {
             var vec = (LinearAlgebra.VectorBase<T>)obj;
             float[] floatData;
@@ -4015,24 +4006,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// code needs the actual data (e.g., reductions, CPU fallback operations, scope exit).
     /// </summary>
     /// <remarks>
-    /// Delegates to <see cref="Helpers.DeferredArrayMaterializer"/>, which is the
+    /// Delegates to <see cref="Helpers.HostSync"/>, which is the
     /// single source of truth for pending downloads after the #226 cleanup. Each
     /// registered callback closes over its own buffer + backend + type conversion,
     /// so there is no engine-local metadata to consult.
     /// </remarks>
     private void MaterializeIfDeferred<T>(T[] data)
     {
-        Helpers.DeferredArrayMaterializer.TryMaterialize(data);
-    }
-
-    /// <summary>
-    /// Materializes all pending deferred downloads at the end of a normal
-    /// <see cref="GpuScope"/> or cache clear. Propagates exceptions so callers
-    /// observe any failed download instead of silently seeing empty arrays.
-    /// </summary>
-    internal void MaterializeAllDeferred()
-    {
-        Helpers.DeferredArrayMaterializer.MaterializeAll(swallowErrors: false);
+        Helpers.HostSync.TryMaterialize(data);
     }
 
     /// <summary>
@@ -4760,7 +4741,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // was already recycled ("buffer released before materialization"). Reading the unsafe reference does not
         // fire the materializer; Remove clears it so a later host read can't resurrect obsolete GPU bytes either.
         var rawArr = destination.GetBackingArrayForCacheLookupUnsafe();
-        if (rawArr is not null) Helpers.DeferredArrayMaterializer.Remove(rawArr);
+        if (rawArr is not null) Helpers.HostSync.Remove(rawArr);
 
         destinationArray = destination.GetLiveBackingArrayOrNull()!;
         return destinationArray is not null;
@@ -4925,8 +4906,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // historical key rather than relying on Register's intentional first-write-wins behavior;
         // otherwise an older callback can remain attached to a buffer that no longer owns the value.
         if (previousVectorKey is not null)
-            Helpers.DeferredArrayMaterializer.Remove(previousVectorKey);
-        Helpers.DeferredArrayMaterializer.Remove(arr);
+            Helpers.HostSync.Remove(previousVectorKey);
+        Helpers.HostSync.Remove(arr);
         if (displacedEntry is not null)
         {
             // The replaced array entry represented the tensor's previous resident value.
@@ -4948,7 +4929,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (Fp16ActEnabled) _fp16ResidentArrays.TryRemove(arr, out _);
         if (s_currentForwardOp is not null) if (s_producerDiagEnabled && s_producerOf.Count < ProducerDiagCap) s_producerOf[arr] = s_currentForwardOp;
         var capBuf = buf; var capBackend = backend;
-        Helpers.DeferredArrayMaterializer.Register(arr, a =>
+        Helpers.HostSync.Register(arr, a =>
         {
             float[] f = capBackend.DownloadBuffer(capBuf);
             var conv = DirectGpuEngine.FromFloatArray<T>(f);
@@ -6172,7 +6153,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
 
             // Defer the download: the result T[] is registered with
-            // DeferredArrayMaterializer so a chained next-MatMul that consumes
+            // HostSync so a chained next-MatMul that consumes
             // this Matrix finds the buffer in the activation cache (no
             // download, no re-upload), and host reads materialize lazily on
             // first access. Matrix<T>.FromMemory wraps the deferred array
@@ -6388,7 +6369,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     /// <summary>GPU-RESIDENT elementwise unary-into for the compiled step: run <paramref name="kernel"/> from the
     /// resident input buffer into the destination's stable buffer and bind it — no materialize/download (the host
-    /// *Into activations go through .Data → DeferredArrayMaterializer → DownloadBuffer, which aborts capture, and
+    /// *Into activations go through .Data → HostSync → DownloadBuffer, which aborts capture, and
     /// can hit the #226 "buffer released before materialization" race). Same-length contiguous float only.</summary>
     private bool TryUnaryResidentInto<T>(Tensor<T> output, Tensor<T> input,
         System.Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, int> kernel, string opName)
@@ -6414,7 +6395,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     /// <summary>Resident negate INTO a caller-provided output buffer, for the GraphMode lazy-node executor that the
     /// compiled loss tail replays (the cross-entropy -log(p) negate). The lazy closure (CpuEngine.TensorNegate's
-    /// RecordUnary) hardcodes CPU AsSpan() → DeferredArrayMaterializer download → CUDA-900 during capture. Routing it
+    /// RecordUnary) hardcodes CPU AsSpan() → HostSync download → CUDA-900 during capture. Routing it
     /// here keeps the negate GPU-resident (no download). Returns false off the resident step → caller does CPU.</summary>
     internal bool TensorNegateIntoResident<T>(Tensor<T> output, Tensor<T> input)
         => TryUnaryResidentInto(output, input, static (be, i, o, n) => be.Negate(i, o, n), "NegateLazy");
@@ -7199,7 +7180,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
             else
             {
-                Helpers.DeferredArrayMaterializer.Remove(aData);
+                Helpers.HostSync.Remove(aData);
                 a._gpuBuffer = null;
                 a._gpuBackend = null;
             }
@@ -7991,7 +7972,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             List<KeyValuePair<object, GpuBufferCacheEntry>>? kept = null;
             foreach (var pair in _persistentBufferCache)
             {
-                if (Helpers.DeferredArrayMaterializer.IsPending(pair.Key))
+                if (Helpers.HostSync.IsPending(pair.Key))
                     (kept ??= new List<KeyValuePair<object, GpuBufferCacheEntry>>()).Add(pair);
                 else
                     pair.Value.Dispose();
@@ -21667,7 +21648,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 if (arr is not null)
                 {
                     var capBuf = outBuf; var capBackend = backend;
-                    Helpers.DeferredArrayMaterializer.Register(arr, a =>
+                    Helpers.HostSync.Register(arr, a =>
                     {
                         float[] f = capBackend.DownloadBuffer(capBuf);
                         var conv = DirectGpuEngine.FromFloatArray<T>(f);
@@ -27208,7 +27189,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         tensor._gpuMaterializerCallback = materialize;
         tensor._gpuMaterializerKey = vector;
-        Helpers.DeferredArrayMaterializer.Register(vector, materialize);
+        Helpers.HostSync.Register(vector, materialize);
         CacheActivation(vector, outputBuffer, shape, backend, hostVersion: tensor.GpuCacheVersion);
         return tensor;
     }

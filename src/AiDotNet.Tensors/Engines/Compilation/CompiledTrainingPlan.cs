@@ -330,7 +330,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     {
         if (t?._gpuBuffer is null) return;
         var key = t.GetBackingArrayForCacheLookupUnsafe();
-        if (key is not null) Helpers.DeferredArrayMaterializer.Remove(key);
+        if (key is not null) Helpers.HostSync.Remove(key);
         t._gpuBuffer = null;
         t._gpuBackend = null;
         t._gpuBufferVersion = -1;
@@ -354,7 +354,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         var fresh = gte.DownloadResidentBuffer(_lossOutput);
         if (fresh is null) return;
         var key = _lossOutput.GetBackingArrayForCacheLookupUnsafe();
-        if (key is not null) Helpers.DeferredArrayMaterializer.Remove(key);
+        if (key is not null) Helpers.HostSync.Remove(key);
         var dst = _lossOutput.AsWritableSpan();
         int n = Math.Min(dst.Length, fresh.Length);
         for (int i = 0; i < n; i++) dst[i] = (T)(object)fresh[i];
@@ -2413,8 +2413,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     {
         var lossKey = _lossOutput.GetBackingArrayForCacheLookupUnsafe();
         if (lossKey is not null)
-            Helpers.DeferredArrayMaterializer.TryMaterialize(lossKey);
-        Helpers.DeferredArrayMaterializer.TryMaterialize(_lossOutput.DataVector);
+            Helpers.HostSync.TryMaterialize(lossKey);
+        Helpers.HostSync.TryMaterialize(_lossOutput.DataVector);
     }
 
     private HashSet<object> BuildStepEvictionProtectSet()
@@ -3818,7 +3818,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                     // the resident buffer. Net effect: the forward trains on FROZEN weights → the loss goes flat
                     // (7.70→7.70 resident vs 7.70→1.31 non-resident on the same graph) — the GPU-resident-param
                     // mistrain that hit the TimeSeries family (AIDOTNET_GPU_RESIDENT_PARAMS on by default).
-                    // Re-registering re-arms the download against the CURRENT device buffer (DeferredArrayMaterializer
+                    // Re-registering re-arms the download against the CURRENT device buffer (HostSync
                     // .Register TryAdds, so it's a no-op if a read is still pending, and re-arms after one fired).
                     if (_engine is Engines.DirectGpuTensorEngine _rebindEngine)
                         _rebindEngine.BindResidentBuffer(_parameters[p], gpuP, gpuBe);

@@ -1188,8 +1188,8 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     internal void ClearReleaseMarks()
     {
         var array = GetBackingArrayForCacheLookupUnsafe();
-        if (array is not null) Helpers.DeferredArrayMaterializer.ClearReleased(array);
-        Helpers.DeferredArrayMaterializer.ClearReleased(_data);
+        if (array is not null) Helpers.HostSync.ClearReleased(array);
+        Helpers.HostSync.ClearReleased(_data);
     }
 
     public Engines.DirectGpu.IGpuBuffer? TryGetGpuBuffer()
@@ -1199,8 +1199,8 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
             // A released step intermediate still names its old buffer object, which the pool may have re-rented to
             // another tensor: handing it out would read or overwrite someone else's data.
             var array = GetBackingArrayForCacheLookupUnsafe();
-            if ((array is not null && Helpers.DeferredArrayMaterializer.IsReleased(array))
-                || Helpers.DeferredArrayMaterializer.IsReleased(_data))
+            if ((array is not null && Helpers.HostSync.IsReleased(array))
+                || Helpers.HostSync.IsReleased(_data))
                 throw new InvalidOperationException(Engines.DirectGpuTensorEngine.ReleasedIntermediateMessage);
             return _gpuBuffer;
         }
@@ -1292,7 +1292,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         {
             if (_device != TensorDevice.CPU) return true;
             var live = GetLiveBackingArrayOrNull();
-            return live is not null && Helpers.DeferredArrayMaterializer.IsPending(live);
+            return live is not null && Helpers.HostSync.IsPending(live);
         }
     }
 
@@ -1422,7 +1422,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
 
         // Re-register deferred materializer so next CPU read downloads fresh GPU data
         if (_gpuMaterializerCallback is not null && _gpuMaterializerKey is not null)
-            Helpers.DeferredArrayMaterializer.Register(_gpuMaterializerKey, _gpuMaterializerCallback);
+            Helpers.HostSync.Register(_gpuMaterializerKey, _gpuMaterializerCallback);
     }
 
     /// <summary>
@@ -2397,15 +2397,15 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         {
             // Force any PENDING GPU download before handing the array out.
             // DirectGpuTensorEngine.FinishGpuOp returns a GC.AllocateUninitializedArray and
-            // registers a DeferredArrayMaterializer keyed on it, documenting that the data is
-            // "populated lazily when code first accesses the data (via DeferredArrayMaterializer
+            // registers a HostSync keyed on it, documenting that the data is
+            // "populated lazily when code first accesses the data (via HostSync
             // triggered by GetDataArray/AsSpan/indexer)". VectorBase.GetDataArray does call
             // TryMaterialize; this accessor did NOT, so reading a deferred GPU result through the
             // TENSOR accessor returned UNINITIALISED memory. Fresh pages read as zero, which is why
             // 13 Parity210 GPU ops (Erfc, Lgamma, Erfinv, I0, Flip, Roll, CumSum, CumMax,
             // LogCumSumExp, LogAddExp, Hypot, DiagEmbed, NanToNum) each reported gpu=0 against
             // every CPU value. TryMaterialize is a no-op for arrays with nothing pending.
-            Helpers.DeferredArrayMaterializer.TryMaterialize(live);
+            Helpers.HostSync.TryMaterialize(live);
             return live;
         }
         return ToArray();
@@ -2430,7 +2430,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         {
             // Same pending-GPU-download trigger as GetDataArray above — a read-only accessor still
             // has to see materialised data.
-            Helpers.DeferredArrayMaterializer.TryMaterialize(live);
+            Helpers.HostSync.TryMaterialize(live);
             return live;
         }
         return ToArray();
@@ -3575,7 +3575,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         // Remove pending deferred materializer to prevent callback on disposed tensor
         if (_gpuMaterializerKey is not null && _storage.RefCount == 1)
         {
-            Helpers.DeferredArrayMaterializer.Remove(_gpuMaterializerKey);
+            Helpers.HostSync.Remove(_gpuMaterializerKey);
             _gpuMaterializerKey = null;
             _gpuMaterializerCallback = null;
         }

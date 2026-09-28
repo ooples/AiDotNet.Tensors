@@ -122,7 +122,7 @@ internal static class ThreadLocalTensorCache<T>
             _retainedBytes -= (long)array.Length * ElementSize;
             bucket.LastTouch = ++_touchCounter;
             // Re-issued to a new owner: drop any release mark the previous owner's data left behind.
-            DeferredArrayMaterializer.ClearReleased(array);
+            HostSync.ClearReleased(array);
             return array;
         }
 

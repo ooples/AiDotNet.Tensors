@@ -1004,8 +1004,8 @@ public sealed class GradientTape<T> : IDisposable
         var root = this;
         while (root._parent is not null) root = root._parent;
         var array = tensor.GetBackingArrayForCacheLookupUnsafe();
-        if (array is not null) Helpers.DeferredArrayMaterializer.MarkRetained(array);
-        Helpers.DeferredArrayMaterializer.MarkRetained(tensor.DataVector);
+        if (array is not null) Helpers.HostSync.MarkRetained(array);
+        Helpers.HostSync.MarkRetained(tensor.DataVector);
         if (root._snapshotEngine is null) return;   // nothing is released without a GPU snapshot
         var keys = root._keptKeys ??= new HashSet<object>(ReferenceEqualityComparer<object>.Instance);
         if (array is not null) keys.Add(array);

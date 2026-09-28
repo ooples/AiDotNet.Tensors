@@ -102,9 +102,9 @@ public static class TensorPool<T>
         // array. Skip — the few recycled bytes aren't worth breaking residency; the temp is GC'd. Complements the
         // _gpuBuffer check above.
         var unsafeBacking = tensor.GetBackingArrayForCacheLookupUnsafe();
-        if (unsafeBacking is not null && Helpers.DeferredArrayMaterializer.IsPending(unsafeBacking)) return;
+        if (unsafeBacking is not null && Helpers.HostSync.IsPending(unsafeBacking)) return;
         // A released step intermediate's array has undefined contents and throws on a host read; never recycle it.
-        if (unsafeBacking is not null && Helpers.DeferredArrayMaterializer.IsReleased(unsafeBacking)) return;
+        if (unsafeBacking is not null && Helpers.HostSync.IsReleased(unsafeBacking)) return;
 
         // Issue #338 view-safety: refuse view-tensors whose backing
         // storage is shared with another tensor (strided permute views,

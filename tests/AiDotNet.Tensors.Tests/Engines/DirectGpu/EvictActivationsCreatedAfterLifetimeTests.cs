@@ -149,7 +149,7 @@ public class EvictActivationsCreatedAfterLifetimeTests
 
         int disposeCountWhenMaterialized = -1;
         bool materializerRan = false;
-        AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.Register(key, _ =>
+        AiDotNet.Tensors.Helpers.HostSync.Register(key, _ =>
         {
             materializerRan = true;
             disposeCountWhenMaterialized = buffer.DisposeCount;
@@ -157,7 +157,7 @@ public class EvictActivationsCreatedAfterLifetimeTests
 
         try
         {
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(key));
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(key));
 
             // Snapshot of 0 means "all entries are post-snapshot" — releases everything.
             evictMethod.Invoke(engine, new object[] { 0L });
@@ -166,12 +166,12 @@ public class EvictActivationsCreatedAfterLifetimeTests
                 "EvictActivationsCreatedAfter must materialize a pending deferred download " +
                 "before disposing its buffer (#226 contract on the per-step release path).");
             Assert.Equal(0, disposeCountWhenMaterialized);
-            Assert.False(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(key));
+            Assert.False(AiDotNet.Tensors.Helpers.HostSync.IsPending(key));
             Assert.Equal(1, buffer.DisposeCount);
         }
         finally
         {
-            AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.Remove(key);
+            AiDotNet.Tensors.Helpers.HostSync.Remove(key);
         }
     }
 
@@ -208,7 +208,7 @@ public class EvictActivationsCreatedAfterLifetimeTests
         object vectorKey = tensor.DataVector;
         Assert.Null(tensor.GetBackingArrayForCacheLookupUnsafe());
 
-        AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.Register(vectorKey, key =>
+        AiDotNet.Tensors.Helpers.HostSync.Register(vectorKey, key =>
         {
             var values = backend.DownloadBuffer(buffer);
             ((AiDotNet.Tensors.LinearAlgebra.VectorBase<float>)key).MaterializeBacking(values);
@@ -225,7 +225,7 @@ public class EvictActivationsCreatedAfterLifetimeTests
         object entry = dictionary[vectorKey]
             ?? throw new InvalidOperationException("Expected the lazy tensor cache entry to remain vector-keyed.");
         Assert.False(dictionary.Contains(arrayKey));
-        Assert.False(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(vectorKey));
+        Assert.False(AiDotNet.Tensors.Helpers.HostSync.IsPending(vectorKey));
         Assert.Equal(1, state.DownloadBufferCalls);
         Assert.Equal(buffer.SizeInBytes, engine.CurrentActivationCacheBytes);
 
@@ -236,8 +236,8 @@ public class EvictActivationsCreatedAfterLifetimeTests
             Assert.False(dictionary.Contains(vectorKey));
             Assert.True(dictionary.Contains(arrayKey));
             Assert.Same(entry, dictionary[arrayKey]);
-            Assert.False(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(vectorKey));
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(arrayKey));
+            Assert.False(AiDotNet.Tensors.Helpers.HostSync.IsPending(vectorKey));
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(arrayKey));
             Assert.Equal(1, state.DownloadBufferCalls);
             Assert.Equal(buffer.SizeInBytes, engine.CurrentActivationCacheBytes);
 
@@ -245,14 +245,14 @@ public class EvictActivationsCreatedAfterLifetimeTests
 
             Assert.Equal(2, state.DownloadBufferCalls);
             Assert.Equal(new[] { 3f, 5f, 7f, 11f }, tensor.ToArray());
-            Assert.False(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(arrayKey));
+            Assert.False(AiDotNet.Tensors.Helpers.HostSync.IsPending(arrayKey));
             Assert.Equal(0L, engine.CurrentActivationCacheBytes);
             Assert.Equal(1, buffer.DisposeCount);
         }
         finally
         {
-            AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.Remove(vectorKey);
-            AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.Remove(arrayKey);
+            AiDotNet.Tensors.Helpers.HostSync.Remove(vectorKey);
+            AiDotNet.Tensors.Helpers.HostSync.Remove(arrayKey);
         }
     }
 
@@ -289,7 +289,7 @@ public class EvictActivationsCreatedAfterLifetimeTests
             new[] { 1, 4 }, TensorDevice.OpenCL);
         object vectorKey = tensor.DataVector;
 
-        AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.Register(vectorKey, key =>
+        AiDotNet.Tensors.Helpers.HostSync.Register(vectorKey, key =>
         {
             var values = backend.DownloadBuffer(residentBuffer);
             ((AiDotNet.Tensors.LinearAlgebra.VectorBase<float>)key).MaterializeBacking(values);
@@ -309,7 +309,7 @@ public class EvictActivationsCreatedAfterLifetimeTests
             arrayKey, displacedBuffer, new[] { 1, 4 }, backend, false, 0, 0
         });
         bool staleMaterializerRan = false;
-        AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.Register(
+        AiDotNet.Tensors.Helpers.HostSync.Register(
             arrayKey, _ => staleMaterializerRan = true);
 
         try
@@ -337,8 +337,8 @@ public class EvictActivationsCreatedAfterLifetimeTests
         }
         finally
         {
-            AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.Remove(vectorKey);
-            AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.Remove(arrayKey);
+            AiDotNet.Tensors.Helpers.HostSync.Remove(vectorKey);
+            AiDotNet.Tensors.Helpers.HostSync.Remove(arrayKey);
         }
     }
 
@@ -367,20 +367,20 @@ public class EvictActivationsCreatedAfterLifetimeTests
         timestampField.SetValue(engine, 5L);
 
         bool materializerRan = false;
-        AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.Register(key, _ => materializerRan = true);
+        AiDotNet.Tensors.Helpers.HostSync.Register(key, _ => materializerRan = true);
 
         try
         {
             evictMethod.Invoke(engine, new object?[] { 0L, null, false });
 
             Assert.False(materializerRan);
-            Assert.False(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(key));
+            Assert.False(AiDotNet.Tensors.Helpers.HostSync.IsPending(key));
             Assert.False(((System.Collections.IDictionary)activationCache).Contains(key));
             Assert.Equal(1, buffer.DisposeCount);
         }
         finally
         {
-            AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.Remove(key);
+            AiDotNet.Tensors.Helpers.HostSync.Remove(key);
         }
     }
 

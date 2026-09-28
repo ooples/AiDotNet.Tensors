@@ -3966,8 +3966,8 @@ public partial class DirectGpuTensorEngine
         count = 0;
         var backingArray = mask.GetBackingArrayForCacheLookupUnsafe();
         if (backingArray is null
-            || Helpers.DeferredArrayMaterializer.IsPending(backingArray)
-            || Helpers.DeferredArrayMaterializer.IsPending(mask.DataVector))
+            || Helpers.HostSync.IsPending(backingArray)
+            || Helpers.HostSync.IsPending(mask.DataVector))
             return false;
 
         var values = mask.AsSpan();
@@ -3994,7 +3994,7 @@ public partial class DirectGpuTensorEngine
         if (indices.IsGpuResident) return true;
         var backingArray = indices.GetBackingArrayForCacheLookupUnsafe();
         return backingArray is not null &&
-            Helpers.DeferredArrayMaterializer.IsPending(backingArray);
+            Helpers.HostSync.IsPending(backingArray);
     }
 
     private static OwnedBuffer ConvertNumericIndicesToInt32(
@@ -8059,7 +8059,7 @@ public partial class DirectGpuTensorEngine
         if (tensor.IsGpuResident) return true;
         var backingArray = tensor.GetBackingArrayForCacheLookupUnsafe();
         return backingArray is not null &&
-            Helpers.DeferredArrayMaterializer.IsPending(backingArray);
+            Helpers.HostSync.IsPending(backingArray);
     }
 
     private static void ValidateEmbeddingIndices(

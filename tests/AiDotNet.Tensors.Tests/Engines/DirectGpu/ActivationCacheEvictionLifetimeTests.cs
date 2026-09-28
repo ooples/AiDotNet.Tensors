@@ -13,13 +13,13 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// is full. Before the fix, eviction only skipped entries present in an engine-local
 /// <c>_deferredDownloads</c> map that <see cref="DirectGpuTensorEngine.DeferTensorResult"/>
 /// never populated — so GPU-resident tensors returned to the caller could have their
-/// underlying buffer released while a <see cref="Helpers.DeferredArrayMaterializer"/>
+/// underlying buffer released while a <see cref="Helpers.HostSync"/>
 /// callback was still pending. The next CPU access triggered a download against a
 /// freed OpenCL buffer, producing <c>CL_INVALID_MEM_OBJECT</c> (OpenCL error -38)
 /// one epoch into Transformer training on AMD <c>gfx1012</c>.
 ///
 /// The eviction guard is the unified
-/// <see cref="Helpers.DeferredArrayMaterializer.IsPending(object)"/> check, with the
+/// <see cref="Helpers.HostSync.IsPending(object)"/> check, with the
 /// materializer registry as the single source of truth for pending downloads. A pending
 /// entry in the eviction window is NOT skipped — during pure-GPU training essentially every
 /// activation is pending-deferred and never read on the CPU, so skipping made the cache
@@ -71,7 +71,7 @@ public class ActivationCacheEvictionLifetimeTests
     public void EvictOldest_MaterializesPendingEntryBeforeFreeing()
     {
         // The fix: EvictOldestActivationsUnsafe must consult the global
-        // DeferredArrayMaterializer registry. This test reaches past CacheActivation
+        // HostSync registry. This test reaches past CacheActivation
         // and directly populates _activationCache so the assertion focuses purely
         // on the eviction predicate's pending-entry handling.
         using var engine = new DirectGpuTensorEngine();
@@ -133,14 +133,14 @@ public class ActivationCacheEvictionLifetimeTests
         timestampField.SetValue(engine, 4L);
 
         // Register a materializer for the protected key that records whether it ran.
-        // IsPending(protectedKey) is now true. DeferredArrayMaterializer is process-global
+        // IsPending(protectedKey) is now true. HostSync is process-global
         // state, so any test body that registers into it must guarantee cleanup even on
         // assertion failure — hence the try/finally.
         bool materializerInvoked = false;
-        AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.Register(protectedKey, _ => materializerInvoked = true);
+        AiDotNet.Tensors.Helpers.HostSync.Register(protectedKey, _ => materializerInvoked = true);
         try
         {
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(protectedKey));
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(protectedKey));
 
             object[] evictedList;
             lock (cacheLock)
@@ -155,7 +155,7 @@ public class ActivationCacheEvictionLifetimeTests
             Assert.True(materializerInvoked,
                 "A pending entry in the eviction window must have its deferred download materialized " +
                 "(buffer copied to its CPU array) before the buffer is freed — not skipped.");
-            Assert.False(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(protectedKey),
+            Assert.False(AiDotNet.Tensors.Helpers.HostSync.IsPending(protectedKey),
                 "TryMaterialize must consume the pending registration so the entry isn't materialized twice.");
 
             // Dispose like the real code does (outside the cache lock).
@@ -175,7 +175,7 @@ public class ActivationCacheEvictionLifetimeTests
         finally
         {
             // Always clear the process-global registry so later tests start clean.
-            AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.Remove(protectedKey);
+            AiDotNet.Tensors.Helpers.HostSync.Remove(protectedKey);
         }
     }
 

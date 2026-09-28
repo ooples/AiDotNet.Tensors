@@ -33,7 +33,7 @@ public sealed class CompiledTrainingPlanCleanupTests
     }
 
     [Fact]
-    public void MaterializeStepLoss_MaterializesBackingArrayAndVectorKeys()
+    public void MaterializeStepLoss_RunsTheStoragesNewestPendingDownloadOnce()
     {
         var loss = new Tensor<float>(new float[] { 1.0f }, new[] { 1 });
         var plan = CreatePlan(loss, Array.Empty<Tensor<float>>(), new Tensor<float>(new[] { 1 }), null);
@@ -42,19 +42,21 @@ public sealed class CompiledTrainingPlanCleanupTests
         int backingCalls = 0;
         int vectorCalls = 0;
 
-        DeferredArrayMaterializer.Register(backing, _ => backingCalls++);
-        DeferredArrayMaterializer.Register(loss.DataVector, _ => vectorCalls++);
+        HostSync.Register(backing, _ => backingCalls++);
+        HostSync.Register(loss.DataVector, _ => vectorCalls++);
         try
         {
             Invoke(plan, "MaterializeStepLoss");
 
-            Assert.Equal(1, backingCalls);
+            // The backing array and the vector are one storage with one host-sync state: the newer registration
+            // replaced the older, and materializing runs it exactly once.
+            Assert.Equal(0, backingCalls);
             Assert.Equal(1, vectorCalls);
         }
         finally
         {
-            DeferredArrayMaterializer.Remove(backing);
-            DeferredArrayMaterializer.Remove(loss.DataVector);
+            HostSync.Remove(backing);
+            HostSync.Remove(loss.DataVector);
         }
     }
 

@@ -3430,7 +3430,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         };
         tensor._gpuMaterializerCallback = materializeCallback;
         tensor._gpuMaterializerKey = tensor._data; // Vector as key — matches VectorBase.AsSpan() TryMaterialize(this)
-        Helpers.DeferredArrayMaterializer.Register(tensor._data, materializeCallback);
+        Helpers.HostSync.Register(tensor._data, materializeCallback);
 
         return tensor;
     }
@@ -4875,7 +4875,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         var backingArray = _data.GetBackingArrayUnsafe();
         if (backingArray is not null)
         {
-            Helpers.DeferredArrayMaterializer.TryMaterialize(backingArray);
+            Helpers.HostSync.TryMaterialize(backingArray);
         }
 
         // Split-complex buffers have a physical [real plane][imaginary plane]

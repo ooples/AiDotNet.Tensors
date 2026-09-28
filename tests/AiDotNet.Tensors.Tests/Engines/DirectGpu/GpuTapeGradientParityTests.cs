@@ -109,7 +109,7 @@ public class GpuTapeGradientParityTests : IDisposable
             // Count deferred GPU->host materialisations across the GPU run. A non-zero delta means results
             // were GPU-resident and had to be downloaded — direct evidence the device path ran, independent
             // of whether the numbers happen to match the CPU exactly.
-            AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.ResetMaterializeCount();
+            AiDotNet.Tensors.Helpers.HostSync.ResetMaterializeCount();
             var bails = DirectGpuTensorEngine.EnableTapeBailStats();
             if (mustNotBail is not null) bails.TryRemove(mustNotBail, out _);
             var gpuGrad = GradientOf(gpu, x, op);
@@ -119,8 +119,8 @@ public class GpuTapeGradientParityTests : IDisposable
                 Assert.False(bails.TryGetValue(mustNotBail, out long bailed) && bailed > 0,
                     $"{opName}: the GPU forward still deferred to the host under the tape ({mustNotBail} bailed).");
             // Downloaded or released without a download (PyTorch-style step release): either proves residency.
-            long materialisations = AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.MaterializeCount
-                + AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.ReleaseCount;
+            long materialisations = AiDotNet.Tensors.Helpers.HostSync.MaterializeCount
+                + AiDotNet.Tensors.Helpers.HostSync.ReleaseCount;
 
             Assert.Equal(cpuGrad.Length, gpuGrad.Length);
 
@@ -1295,7 +1295,7 @@ public class GpuTapeGradientParityTests : IDisposable
                 var eps = new Tensor<float>([centers]);
                 for (int i = 0; i < centers; i++) eps[i] = 0.75f;   // uniform — see remarks
 
-                AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.ResetMaterializeCount();
+                AiDotNet.Tensors.Helpers.HostSync.ResetMaterializeCount();
                 using var tape = new GradientTape<float>();
                 var y = engine.RBFKernel(x, c, eps);
 
@@ -1310,8 +1310,8 @@ public class GpuTapeGradientParityTests : IDisposable
 
                 float[] Flat(Tensor<float> t) { var a = new float[t.Length]; for (int i = 0; i < a.Length; i++) a[i] = t[i]; return a; }
                 return (Flat(g1), Flat(g2), Flat(g3),
-                        AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.MaterializeCount
-                        + AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.ReleaseCount);
+                        AiDotNet.Tensors.Helpers.HostSync.MaterializeCount
+                        + AiDotNet.Tensors.Helpers.HostSync.ReleaseCount);
             }
 
             var (cI, cC, cE, _) = Run(new CpuEngine());

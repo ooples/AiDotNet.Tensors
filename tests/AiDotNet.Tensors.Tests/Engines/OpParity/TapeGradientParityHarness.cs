@@ -312,7 +312,7 @@ public static class TapeGradientParityHarness
         Tensor<float>[]? retainedFlattenedOutputs = null;
         try
         {
-            AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.ResetMaterializeCount();
+            AiDotNet.Tensors.Helpers.HostSync.ResetMaterializeCount();
             using var tape = new GradientTape<float>();
 
             try
@@ -360,7 +360,7 @@ public static class TapeGradientParityHarness
                 bool usesContractIdentity = capturedInputs.Count > 0;
                 if (sources.Count == 0)
                     return (new List<LeafGradientSnapshot>(),
-                        AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.MaterializeCount,
+                        AiDotNet.Tensors.Helpers.HostSync.MaterializeCount,
                         0, usesContractIdentity, capturedInputs.Count);
 
                 grads = tape.ComputeGradients(loss, sources.ToArray());
@@ -399,8 +399,8 @@ public static class TapeGradientParityHarness
                 // releases device-only intermediates when it is disposed, so dispose it (idempotent) before counting;
                 // every gradient value above is already copied out.
                 tape.Dispose();
-                long materialisations = AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.MaterializeCount
-                    + AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.ReleaseCount;
+                long materialisations = AiDotNet.Tensors.Helpers.HostSync.MaterializeCount
+                    + AiDotNet.Tensors.Helpers.HostSync.ReleaseCount;
                 return (leaves, materialisations, leaves.Count, usesContractIdentity, capturedInputs.Count);
             }
             finally

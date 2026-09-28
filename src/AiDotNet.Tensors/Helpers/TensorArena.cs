@@ -197,7 +197,7 @@ public sealed class TensorArena : IDisposable
             // cross-arena reuse corrupts those consumers (caught by GroupNorm
             // correctness tests).
             Array.Clear(arr, 0, arr.Length);
-            DeferredArrayMaterializer.ClearReleased(arr);   // new owner: no inherited release mark
+            HostSync.ClearReleased(arr);   // new owner: no inherited release mark
             return arr;
         }
         return null;
