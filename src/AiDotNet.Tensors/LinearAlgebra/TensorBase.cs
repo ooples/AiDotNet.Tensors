@@ -1053,16 +1053,16 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// </summary>
     /// <remarks>
     /// Kept as a version number for the existing call sites, but the truth is <see cref="VectorDeviceState.DeviceValid"/>:
-    /// reading gives <see cref="Version"/> while the shared device copy is current (else -1), and assigning this
-    /// tensor's own <see cref="Version"/> marks it current (anything else marks it stale). Views of one vector
-    /// therefore agree on whether its device copy is current, which per-tensor version stamps could not.
+    /// reading gives <see cref="GpuCacheVersion"/> (the storage's GPU-cache epoch) while the shared device copy is
+    /// current (else -1), and assigning the current <see cref="GpuCacheVersion"/> marks it current (anything else marks
+    /// it stale). Views of one vector therefore agree on whether its device copy is current.
     /// </remarks>
     internal int _gpuBufferVersion
     {
-        get => CoversWholeVector ? (_data._deviceState is { DeviceValid: true, Buffer: not null } ? Version : -1) : _viewGpuBufferVersion;
+        get => CoversWholeVector ? (_data._deviceState is { DeviceValid: true, Buffer: not null } ? GpuCacheVersion : -1) : _viewGpuBufferVersion;
         set
         {
-            if (CoversWholeVector) _data.DeviceState.DeviceValid = value == Version && value >= 0;
+            if (CoversWholeVector) _data.DeviceState.DeviceValid = value == GpuCacheVersion && value >= 0;
             else _viewGpuBufferVersion = value;
         }
     }

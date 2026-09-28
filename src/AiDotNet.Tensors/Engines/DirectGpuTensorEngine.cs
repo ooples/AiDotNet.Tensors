@@ -3046,11 +3046,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         if (param._storageOffset != 0) return null;
         if (param._gpuBuffer is not null && ReferenceEquals(param._gpuBackend, be) && param._gpuBuffer.Handle != IntPtr.Zero
-            && param._gpuBufferVersion == param.Version && param._gpuBuffer.Size >= param.Length)
+            && param._gpuBufferVersion == param.GpuCacheVersion && param._gpuBuffer.Size >= param.Length)
             return param._gpuBuffer;
         var owned = GetOrCacheWeightBufferVersionAware(be, param, PersistentTensorRole.Weights);
         if (owned.OwnsBuffer) { owned.Dispose(); return null; }   // not cacheable; the caller keeps the host path
-        param._gpuBuffer = owned.Buffer; param._gpuBackend = be; param._gpuBufferVersion = param.Version;
+        param._gpuBuffer = owned.Buffer; param._gpuBackend = be; param._gpuBufferVersion = param.GpuCacheVersion;
         return owned.Buffer;
     }
 
@@ -3082,13 +3082,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             });
             return;
         }
-        param._gpuBuffer = buffer; param._gpuBackend = backend; param._gpuBufferVersion = param.Version;
+        param._gpuBuffer = buffer; param._gpuBackend = backend; param._gpuBufferVersion = param.GpuCacheVersion;
         var arr = param.GetBackingArrayForCacheLookupUnsafe();
         if (arr is null) return;
         lock (_persistentBufferLock)
         {
             if (_persistentBufferCache.TryGetValue(arr, out var entry) && ReferenceEquals(entry.Buffer, buffer))
-                _persistentWeightHostVersion[arr] = param.Version;
+                _persistentWeightHostVersion[arr] = param.GpuCacheVersion;
         }
         var capBuf = buffer; var capBackend = backend;
         Helpers.HostSync.Register(arr, a =>
