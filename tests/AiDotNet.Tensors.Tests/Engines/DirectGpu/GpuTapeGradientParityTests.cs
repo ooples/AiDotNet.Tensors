@@ -1390,7 +1390,7 @@ public class GpuTapeGradientParityTests : IDisposable
         }, probe: Engagement.UseResidencyCounter, mustNotBail: "ApplyRoPEInterleaved");
 
     [SkippableFact]
-    public void TensorClampMin_gradients_match_cpu() =>
+    public void TensorClampMin_composite_records_on_device_without_bailing() =>
         AssertGradientParity("ClampMin", Rand(new[] { 64 }, 23), (e, t) => e.TensorMultiply(e.TensorClampMin(t, 0.1f), t),
             probe: Engagement.UseResidencyCounter, mustNotBail: "TensorClampMin");
 
@@ -1401,7 +1401,7 @@ public class GpuTapeGradientParityTests : IDisposable
             probe: Engagement.UseResidencyCounter, mustNotBail: "TensorGather");
 
     [SkippableFact]
-    public void TensorClampMax_gradients_match_cpu() =>
+    public void TensorClampMax_composite_records_on_device_without_bailing() =>
         AssertGradientParity("ClampMax", Rand(new[] { 64 }, 25), (e, t) => e.TensorMultiply(e.TensorClampMax(t, -0.1f), t),
             probe: Engagement.UseResidencyCounter, mustNotBail: "TensorClampMax");
 }
