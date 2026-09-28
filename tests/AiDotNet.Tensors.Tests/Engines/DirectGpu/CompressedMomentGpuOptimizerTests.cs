@@ -578,9 +578,10 @@ public sealed class CompressedMomentGpuOptimizerTests :
                         float g = grad[i] + weightDecay * param[i];
                         state1[i] = beta1 * state1[i] + (1f - beta1) * g;
                         state2[i] = beta2 * state2[i] + (1f - beta2) * g * g;
-                        float mHat = state1[i] / bc1;
                         float vHat = state2[i] / bc2;
-                        float mNesterov = beta1 * mHat + (1f - beta1) * g / bc1Next;
+                        // Dozat (2016) Alg. 2, constant mu: look-ahead momentum by (1 - b1^(t+1)), gradient by (1 - b1^t)
+                        // - FusedOptimizer.NadamUpdateSimd and PyTorch NAdam at constant momentum.
+                        float mNesterov = beta1 * state1[i] / bc1Next + (1f - beta1) * g / bc1;
                         param[i] -= lr * mNesterov / (MathF.Sqrt(vHat) + eps);
                         break;
                     }

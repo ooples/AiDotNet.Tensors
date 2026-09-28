@@ -101,6 +101,8 @@ internal static class FusedOptimizerCheckpointSerializer
         writer.Write(extras.LbfgsMemorySize);
         writer.Write(extras.TrustRegionRadius);
         writer.Write(extras.AdmmRho);
+        // Selects decoupled (AdamW) vs L2 decay for AMSGrad - an algorithm choice, so it must round-trip.
+        writer.Write(extras.DecoupledWeightDecay);
     }
 
     private static FusedOptimizerExtras ReadExtras(BinaryReader reader)
@@ -128,6 +130,7 @@ internal static class FusedOptimizerCheckpointSerializer
             LbfgsMemorySize = reader.ReadInt32(),
             TrustRegionRadius = reader.ReadSingle(),
             AdmmRho = reader.ReadSingle(),
+            DecoupledWeightDecay = reader.ReadBoolean(),
         };
 
     private static void WriteLrSchedules(BinaryWriter writer, FusedLrScheduleCheckpoint[] schedules)

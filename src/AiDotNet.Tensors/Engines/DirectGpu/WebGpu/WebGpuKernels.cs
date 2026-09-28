@@ -2873,9 +2873,9 @@ fn nadam(@builtin(global_invocation_id) gid: vec3<u32>) {
         let bc2 = 1.0 - pow(opt_params.beta2, step);
         state1[idx] = opt_params.beta1 * state1[idx] + (1.0 - opt_params.beta1) * grad;
         state2[idx] = opt_params.beta2 * state2[idx] + (1.0 - opt_params.beta2) * grad * grad;
-        let m_hat = state1[idx] / bc1;
         let v_hat = state2[idx] / bc2;
-        params_arr[idx] = params_arr[idx] - opt_params.lr * (opt_params.beta1 * m_hat + (1.0 - opt_params.beta1) * grad / bc1_next) / (sqrt(v_hat) + opt_params.epsilon);
+        // Dozat 2016 Alg. 2 (constant mu): look-ahead momentum by bc1_next, current gradient by bc1.
+        params_arr[idx] = params_arr[idx] - opt_params.lr * (opt_params.beta1 * state1[idx] / bc1_next + (1.0 - opt_params.beta1) * grad / bc1) / (sqrt(v_hat) + opt_params.epsilon);
     }
 }
 ";
@@ -3166,7 +3166,7 @@ fn sparse_nadam_update(@builtin(global_invocation_id) gid: vec3<u32>) {
     let step = f32(opt_params.t);
     let bc1 = 1.0 - pow(opt_params.beta1, step);
     let bc2 = 1.0 - pow(opt_params.beta2, step);
-    let m_hat = (opt_params.beta1 * state1[i] + (1.0 - opt_params.beta1) * grad) / bc1;
+    let m_hat = opt_params.beta1 * state1[i] / (1.0 - pow(opt_params.beta1, step + 1.0)) + (1.0 - opt_params.beta1) * grad / bc1;
     let v_hat = state2[i] / bc2;
     params_arr[i] = params_arr[i] - opt_params.lr * m_hat / (sqrt(v_hat) + opt_params.epsilon);
 }

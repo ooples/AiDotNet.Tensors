@@ -1813,6 +1813,7 @@ internal static class FusedOptimizer
         float bc1 = 1f - MathF.Pow(beta1, step);
         float bc2 = 1f - MathF.Pow(beta2, step);
         float bc2Inv = 1f / bc2;
+        float bc1Next = 1f - MathF.Pow(beta1, step + 1);
         for (int k = 0; k < nnz; k++)
         {
             int idx = indices[k];
@@ -1822,7 +1823,7 @@ internal static class FusedOptimizer
             float vNew = beta2 * v[idx] + (1f - beta2) * g * g;
             m[idx] = mNew;
             v[idx] = vNew;
-            float mHat = (beta1 * mNew + (1f - beta1) * g) / bc1;  // Nesterov-corrected
+            float mHat = beta1 * mNew / bc1Next + (1f - beta1) * g / bc1;  // Nesterov look-ahead, as NadamUpdateSimd
             float vHat = vNew * bc2Inv;
             param[idx] -= lr * mHat / (MathF.Sqrt(vHat) + eps);
         }
@@ -2837,6 +2838,15 @@ public sealed class FusedOptimizerExtras
     /// different algorithm.
     /// </remarks>
     public float AdmmRho { get; init; } = 1f;
+
+    /// <summary>
+    /// AMSGrad only: apply the weight decay DECOUPLED (AdamW, Loshchilov &amp; Hutter 2019) instead of as an L2
+    /// term folded into the gradient. When true the step first scales the parameter by <c>1 - lr·wd</c> and then
+    /// runs AMSGrad with no decay - PyTorch <c>AdamW(amsgrad=True)</c>'s order. Default false keeps
+    /// <c>Adam(amsgrad=True)</c>'s coupled <c>g += wd·p</c>. Without it an AdamW+AMSGrad caller had its decoupled
+    /// decay silently turned into L2 regularization, a different optimizer from the eager one.
+    /// </summary>
+    public bool DecoupledWeightDecay { get; init; }
 
     /// <summary>
     /// Validates the hyperparameters that would otherwise produce undefined or

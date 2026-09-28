@@ -2626,7 +2626,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             // The double closures only implement SGD/Adam/AdamW/AMSGrad; the
             // extras-driven optimizers are float-only and were already rejected
             // by ValidatePlanOptimizerSupport above for double.
-            ConfigureOptimizerDouble(optimizerType, schedule, beta1, beta2, eps, weightDecay);
+            ConfigureOptimizerDouble(optimizerType, schedule, beta1, beta2, eps, weightDecay, ex);
             return;
         }
         throw new NotSupportedException("Fused optimizer updates support float and double parameters.");
@@ -2782,7 +2782,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         }
         if (typeof(T) == typeof(double))
         {
-            ConfigureOptimizerDoubleGrouped(optimizerType, groupTypes, groupSchedules, canonicalParamToGroup, beta1, beta2, eps, weightDecay, groupWds);
+            ConfigureOptimizerDoubleGrouped(optimizerType, groupTypes, groupSchedules, canonicalParamToGroup, beta1, beta2, eps, weightDecay, groupWds, ex);
             return;
         }
         throw new NotSupportedException("Fused optimizer updates support float and double parameters.");
@@ -3905,8 +3905,18 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                 }
                                 break;
                             case OptimizerType.AMSGrad:
-                                gpuBe.AmsgradUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!, gpuVMax[p]!,
-                                    lr, b1, b2, epsVal, wd, _optimizerStep, len);
+                                if (extras.DecoupledWeightDecay)
+                                {
+                                    // AdamW(amsgrad): p *= 1 - lr*wd, then AMSGrad without decay (FusedOptimizerExtras).
+                                    if (wd != 0f) gpuBe.Scale(gpuP, gpuP, 1f - lr * wd, len);
+                                    gpuBe.AmsgradUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!, gpuVMax[p]!,
+                                        lr, b1, b2, epsVal, 0f, _optimizerStep, len);
+                                }
+                                else
+                                {
+                                    gpuBe.AmsgradUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!, gpuVMax[p]!,
+                                        lr, b1, b2, epsVal, wd, _optimizerStep, len);
+                                }
                                 break;
                             case OptimizerType.Nadam:
                                 gpuBe.NadamUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!,
@@ -4042,8 +4052,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                             // (drift fix, AiDotNet #1332). Uses Adam's L2 weight-decay
                             // convention (grad += wd*param); wd is 0 for that default.
                             // AMSGradUpdateSimd binds the float or double overload by
-                            // pointer type.
-                            if (wd != 0f)
+                            // pointer type. DecoupledWeightDecay (AdamW + AMSGrad) instead
+                            // scales the parameter by 1 - lr*wd first, PyTorch AdamW's order.
+                            if (wd != 0f && extras.DecoupledWeightDecay)
+                            {
+                                var decay = 1f - lr * wd;
+                                for (int i = 0; i < len; i++) pParam[i] *= decay;
+                            }
+                            else if (wd != 0f)
                                 for (int i = 0; i < len; i++) pGrad[i] += wd * pParam[i];
                             FusedOptimizer.AMSGradUpdateSimd(pParam, pGrad, pM, pV, pVMax, len,
                                 lr, b1, b2, epsVal, _optimizerStep);
@@ -4578,8 +4594,18 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                                 }
                                 break;
                             case OptimizerType.AMSGrad:
-                                gpuBe.AmsgradUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!, gpuVMax[p]!,
-                                    lr, b1, b2, epsVal, wd, _optimizerStep, len);
+                                if (extras.DecoupledWeightDecay)
+                                {
+                                    // AdamW(amsgrad): p *= 1 - lr*wd, then AMSGrad without decay (FusedOptimizerExtras).
+                                    if (wd != 0f) gpuBe.Scale(gpuP, gpuP, 1f - lr * wd, len);
+                                    gpuBe.AmsgradUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!, gpuVMax[p]!,
+                                        lr, b1, b2, epsVal, 0f, _optimizerStep, len);
+                                }
+                                else
+                                {
+                                    gpuBe.AmsgradUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!, gpuVMax[p]!,
+                                        lr, b1, b2, epsVal, wd, _optimizerStep, len);
+                                }
                                 break;
                             case OptimizerType.Nadam:
                                 gpuBe.NadamUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!,
@@ -4683,8 +4709,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                             // (drift fix, AiDotNet #1332). Uses Adam's L2 weight-decay
                             // convention (grad += wd*param); wd is 0 for that default.
                             // AMSGradUpdateSimd binds the float or double overload by
-                            // pointer type.
-                            if (wd != 0f)
+                            // pointer type. DecoupledWeightDecay (AdamW + AMSGrad) instead
+                            // scales the parameter by 1 - lr*wd first, PyTorch AdamW's order.
+                            if (wd != 0f && extras.DecoupledWeightDecay)
+                            {
+                                var decay = 1f - lr * wd;
+                                for (int i = 0; i < len; i++) pParam[i] *= decay;
+                            }
+                            else if (wd != 0f)
                                 for (int i = 0; i < len; i++) pGrad[i] += wd * pParam[i];
                             FusedOptimizer.AMSGradUpdateSimd(pParam, pGrad, pM, pV, pVMax, len,
                                 lr, b1, b2, epsVal, _optimizerStep);
@@ -4792,7 +4824,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     }
 
     private unsafe void ConfigureOptimizerDouble(
-        OptimizerType optimizerType, LrSchedule schedule, float beta1, float beta2, float eps, float weightDecay)
+        OptimizerType optimizerType, LrSchedule schedule, float beta1, float beta2, float eps, float weightDecay,
+        FusedOptimizerExtras extras)
     {
         LeaveSharedMoments();
         foreach (var buf in _gpuOptimizerBuffers)
@@ -4893,7 +4926,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             Beta2 = beta2,
             Epsilon = eps,
             WeightDecay = weightDecay,
-            Extras = new FusedOptimizerExtras(),
+            Extras = CloneFusedOptimizerExtras(extras),
             MomentStorageMode = FusedMomentStorageMode.Float32,
             Int8MomentBlockSize = _int8MomentBlockSize,
             MDouble = m,
@@ -4968,8 +5001,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                             // (drift fix, AiDotNet #1332). Uses Adam's L2 weight-decay
                             // convention (grad += wd*param); wd is 0 for that default.
                             // AMSGradUpdateSimd binds the float or double overload by
-                            // pointer type.
-                            if (wd != 0f)
+                            // pointer type. DecoupledWeightDecay (AdamW + AMSGrad) instead
+                            // scales the parameter by 1 - lr*wd first, PyTorch AdamW's order.
+                            if (wd != 0f && extras.DecoupledWeightDecay)
+                            {
+                                var decay = 1f - lr * wd;
+                                for (int i = 0; i < len; i++) pParam[i] *= decay;
+                            }
+                            else if (wd != 0f)
                                 for (int i = 0; i < len; i++) pGrad[i] += wd * pParam[i];
                             FusedOptimizer.AMSGradUpdateSimd(pParam, pGrad, pM, pV, pVMax, len,
                                 lr, b1, b2, epsVal, _optimizerStep);
@@ -4997,7 +5036,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         System.Collections.Generic.IReadOnlyList<LrSchedule> groupSchedules,
         System.Collections.Generic.IReadOnlyList<int> paramToGroup,
         float beta1, float beta2, float eps, float weightDecay,
-        float[]? groupWeightDecays)
+        float[]? groupWeightDecays,
+        FusedOptimizerExtras extras)
     {
         LeaveSharedMoments();
         foreach (var buf in _gpuOptimizerBuffers)
@@ -5088,7 +5128,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             Beta2 = beta2,
             Epsilon = eps,
             WeightDecay = weightDecay,
-            Extras = new FusedOptimizerExtras(),
+            Extras = CloneFusedOptimizerExtras(extras),
             MomentStorageMode = FusedMomentStorageMode.Float32,
             Int8MomentBlockSize = _int8MomentBlockSize,
             MDouble = m,
@@ -5151,8 +5191,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
                             // (drift fix, AiDotNet #1332). Uses Adam's L2 weight-decay
                             // convention (grad += wd*param); wd is 0 for that default.
                             // AMSGradUpdateSimd binds the float or double overload by
-                            // pointer type.
-                            if (wd != 0f)
+                            // pointer type. DecoupledWeightDecay (AdamW + AMSGrad) instead
+                            // scales the parameter by 1 - lr*wd first, PyTorch AdamW's order.
+                            if (wd != 0f && extras.DecoupledWeightDecay)
+                            {
+                                var decay = 1f - lr * wd;
+                                for (int i = 0; i < len; i++) pParam[i] *= decay;
+                            }
+                            else if (wd != 0f)
                                 for (int i = 0; i < len; i++) pGrad[i] += wd * pParam[i];
                             FusedOptimizer.AMSGradUpdateSimd(pParam, pGrad, pM, pV, pVMax, len,
                                 lr, b1, b2, epsVal, _optimizerStep);
@@ -5497,6 +5543,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             LbfgsMemorySize = extras.LbfgsMemorySize,
             TrustRegionRadius = extras.TrustRegionRadius,
             AdmmRho = extras.AdmmRho,
+            DecoupledWeightDecay = extras.DecoupledWeightDecay,
         };
 
     private static float[]? CopyNonEmpty(float[][]? arrays, int index)

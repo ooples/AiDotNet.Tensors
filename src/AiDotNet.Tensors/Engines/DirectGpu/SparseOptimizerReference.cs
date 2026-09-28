@@ -244,6 +244,7 @@ internal static class SparseOptimizerReference
     {
         ValidateBiasCorrected(param, m, v, indices, values, nnz, epsilon, step);
         float bc1 = 1f - MathF.Pow(beta1, step);
+        float bc1Next = 1f - MathF.Pow(beta1, step + 1);
         float bc2 = 1f - MathF.Pow(beta2, step);
         for (int k = 0; k < nnz; k++)
         {
@@ -254,7 +255,7 @@ internal static class SparseOptimizerReference
             float vVal = beta2 * v[i] + (1f - beta2) * grad * grad;
             m[i] = mVal;
             v[i] = vVal;
-            float mHat = (beta1 * mVal + (1f - beta1) * grad) / bc1;
+            float mHat = beta1 * mVal / bc1Next + (1f - beta1) * grad / bc1;   // Dozat 2016 Alg. 2 (constant mu)
             param[i] -= learningRate * mHat / (MathF.Sqrt(vVal / bc2) + epsilon);
         }
     }
