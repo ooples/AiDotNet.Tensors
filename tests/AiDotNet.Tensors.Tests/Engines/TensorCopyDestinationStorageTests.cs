@@ -78,6 +78,9 @@ public class TensorCopyAliasCompiledPlanTests
         var prior = AiDotNetEngine.Current;
         string? priorFusion = Environment.GetEnvironmentVariable("AIDOTNET_CROSS_LAYER_FUSION");
         Environment.SetEnvironmentVariable("AIDOTNET_CROSS_LAYER_FUSION", "1");
+        var priorOptions = AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.Current;
+        AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.SetCurrent(
+            new AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions { EnableDataflowFusion = true });
         try
         {
             var engine = new CpuEngine();
@@ -87,12 +90,27 @@ public class TensorCopyAliasCompiledPlanTests
             var w2 = TensorCopyDestinationStorageTests.Filled(new[] { 4, 5 }, 0.3f);
             Tensor<float> Loss() => engine.ReduceSum(engine.TensorMatMul(engine.TensorMatMul(x, w1), w2), null);
 
+            // Prove the fused W1*W2 chain is what gets compiled: the same graph without cross-layer fusion must have
+            // more forward steps. Otherwise the loss comparison below could pass on two ordinary MatMuls.
+            Environment.SetEnvironmentVariable("AIDOTNET_CROSS_LAYER_FUSION", null);
+            int unfusedSteps;
+            using (var scope = GraphMode.Enable())
+            {
+                Loss();
+                using var unfused = scope.CompileTraining(new[] { w1, w2 });
+                unfusedSteps = unfused.ForwardStepCount;
+            }
+
+            Environment.SetEnvironmentVariable("AIDOTNET_CROSS_LAYER_FUSION", "1");
             ICompiledTrainingPlan<float> plan;
             using (var scope = GraphMode.Enable())
             {
                 Loss();
                 plan = scope.CompileTraining(new[] { w1, w2 });
             }
+
+            Assert.True(plan.ForwardStepCount < unfusedSteps,
+                $"cross-layer fusion did not fuse the MatMul chain ({plan.ForwardStepCount} forward steps, {unfusedSteps} unfused)");
 
             try
             {
@@ -114,6 +132,7 @@ public class TensorCopyAliasCompiledPlanTests
         {
             AiDotNetEngine.Current = prior;
             Environment.SetEnvironmentVariable("AIDOTNET_CROSS_LAYER_FUSION", priorFusion);
+            AiDotNet.Tensors.Engines.Optimization.TensorCodecOptions.SetCurrent(priorOptions);
         }
     }
 }
