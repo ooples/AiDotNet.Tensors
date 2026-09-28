@@ -195,8 +195,17 @@ public sealed class GradientTape<T> : IDisposable
     internal void NoteDataDevice(Tensor<T>? tensor)
     {
         if (_engineExplicitlyBound || _sawGpuResidentData || tensor is null) return;
-        if (tensor.HasPendingGpuData) _sawGpuResidentData = true;
+        if (tensor.HasPendingGpuData)
+        {
+            _sawGpuResidentData = true;
+            // The engine that PRODUCED the data, not whatever engine was global when the tape was created: measured,
+            // a tape over data from a test fixture's GPU engine ran its backward on the host whenever an earlier test
+            // had left AiDotNetEngine.Current as a CpuEngine ("dA was computed on the host").
+            _dataEngine = DirectGpuTensorEngine.EngineOwning(tensor._gpuBackend);
+        }
     }
+
+    private IEngine? _dataEngine;
 
     /// <summary>
     /// Picks the backward engine from where the taped data lives, unless an engine bound itself.
@@ -210,7 +219,11 @@ public sealed class GradientTape<T> : IDisposable
     private void ResolveEngineFromData()
     {
         if (_engineExplicitlyBound) return;
-        if (_sawGpuResidentData) return;   // Current is the GPU engine that produced the data.
+        if (_sawGpuResidentData)
+        {
+            if (_dataEngine is not null) _engine = _dataEngine;   // the GPU engine that produced the data
+            return;
+        }
         if (_engine is DirectGpuTensorEngine) _engine = CpuFallbackEngine;
     }
 

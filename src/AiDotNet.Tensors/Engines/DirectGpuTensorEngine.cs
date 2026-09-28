@@ -914,6 +914,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         _ownsDirectGpu = true;
         _maxActivationCacheBytes = ResolveActCacheVramCap(_directGpu.GlobalMemoryBytes); // see helper — env-overridablery
         _maxActivationManagedBytes = ResolveManagedCacheCapBytes();
+        RegisterAsBackendOwner();
     }
 
     public DirectGpuTensorEngine(DirectGpuEngine directGpu)
@@ -922,6 +923,33 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         _ownsDirectGpu = false;
         _maxActivationCacheBytes = directGpu is null ? 0 : ResolveActCacheVramCap(directGpu.GlobalMemoryBytes);
         _maxActivationManagedBytes = ResolveManagedCacheCapBytes();
+        RegisterAsBackendOwner();
+    }
+
+    // Which engine placed data on a backend, so a consumer holding only a tensor (its _gpuBackend) can run follow-up
+    // work - the autodiff backward - on that engine rather than on the process-wide AiDotNetEngine.Current, which
+    // reflects what the process auto-detected or some unrelated caller last set, not what produced this data.
+    // Weakly keyed: an engine and its backend are collected together.
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<IDirectGpuBackend, DirectGpuTensorEngine>
+        s_engineByBackend = new();
+    private static readonly object s_engineByBackendLock = new();
+
+    private void RegisterAsBackendOwner()
+    {
+        if (!TryGetBackend(out var backend) || backend is null) return;
+        lock (s_engineByBackendLock)
+        {
+            s_engineByBackend.Remove(backend);
+            s_engineByBackend.Add(backend, this);
+        }
+    }
+
+    /// <summary>The engine that placed data on <paramref name="backend"/>, or null.</summary>
+    internal static DirectGpuTensorEngine? EngineOwning(IDirectGpuBackend? backend)
+    {
+        if (backend is null) return null;
+        lock (s_engineByBackendLock)
+            return s_engineByBackend.TryGetValue(backend, out var engine) ? engine : null;
     }
 
     // Managed-heap cap for the activation cache. Default 8 GB; AIDOTNET_ACT_CACHE_MANAGED_MB
