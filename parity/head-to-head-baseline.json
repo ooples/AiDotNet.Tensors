@@ -1,6 +1,12 @@
 {
   "noiseFloor": 0.15,
   "cases": {
+    "cnn:cuda": {
+      "windows-x64-16cpu-cuda-nvidia-geforce-gtx-1660-ti": 59.53
+    },
+    "mlp:cuda": {
+      "windows-x64-16cpu-cuda-nvidia-geforce-gtx-1660-ti": 1.123
+    },
     "cnn:cpu": {
       "windows-x64-16cpu-cpu": 21.72
     },

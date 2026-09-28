@@ -43,10 +43,12 @@ dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --no-buil
     --filter 'Category=PyTorchParityGpu' --logger 'console;verbosity=detailed'
 $testExit = $LASTEXITCODE
 
-$machine = "{0}-{1}cpu" -f [Environment]::MachineName.ToLowerInvariant(), [Environment]::ProcessorCount
+# Named by the harness's machine key (os-arch-cpus-device-gpu model), never the host name: results are
+# meant to be committed, and a host name does not belong in the repository.
+$artifacts = @(Get-ChildItem (Join-Path ([IO.Path]::GetTempPath()) 'aidotnet-parity') -Filter '*-cuda-latest.json' -ErrorAction SilentlyContinue)
+$machine = if ($artifacts.Count -gt 0) { (Get-Content $artifacts[0].FullName -Raw | ConvertFrom-Json).machineKey } else { 'unknown' }
 $dest = Join-Path $root "parity/results/$machine"
 New-Item -ItemType Directory -Force $dest | Out-Null
-Get-ChildItem (Join-Path ([IO.Path]::GetTempPath()) 'aidotnet-parity') -Filter '*-latest.json' -ErrorAction SilentlyContinue |
-    Copy-Item -Destination $dest -Force
+$artifacts | Copy-Item -Destination $dest -Force
 Write-Host "Artifacts: $dest"
 exit $testExit
