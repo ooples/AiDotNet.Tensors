@@ -381,13 +381,25 @@ public sealed partial class CudaBackend
     public void DestroyCapturedGraph(IntPtr graphExec)
     {
         if (graphExec == IntPtr.Zero) return;
-        using var _ = PushContext();
-        CuBlasNative.CheckCudaResult(
-            CudaNativeBindings.cuStreamSynchronize(_stream),
-            "cuStreamSynchronize (graph destroy)");
-        CuBlasNative.CheckCudaResult(
-            CudaNativeBindings.cuGraphExecDestroy(graphExec),
-            "cuGraphExecDestroy");
+        // A plan can outlive the engine it captured on (a thread-cached compiled training step disposed after its
+        // model's engine was): cuCtxDestroy already reclaimed the graph with the context, and touching the dead
+        // context threw "cuStreamSynchronize (graph destroy) failed: Invalid context" out of plan disposal.
+        // Checked under the lifecycle lock so a concurrent context destroy cannot land between check and use.
+        lock (ContextLifecycleLock)
+        {
+            if (!IsLiveContext(_cudaContext, _contextGeneration))
+            {
+                ReleaseDirectPtxGraphPins(graphExec);
+                return;
+            }
+            using var _ = PushContext();
+            CuBlasNative.CheckCudaResult(
+                CudaNativeBindings.cuStreamSynchronize(_stream),
+                "cuStreamSynchronize (graph destroy)");
+            CuBlasNative.CheckCudaResult(
+                CudaNativeBindings.cuGraphExecDestroy(graphExec),
+                "cuGraphExecDestroy");
+        }
         ReleaseDirectPtxGraphPins(graphExec);
     }
 

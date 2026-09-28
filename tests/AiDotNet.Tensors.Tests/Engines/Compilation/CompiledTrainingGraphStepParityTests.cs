@@ -611,6 +611,42 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         return e.ReduceMean(e.TensorMultiply(diff, diff), new[] { 0, 1 }, keepDims: false);
     }
 
+    /// <summary>
+    /// A compiled plan can outlive the engine it captured its step graph on - AiDotNet caches the compiled training
+    /// step per thread and disposes it on the next model's setup, after the previous model's engine is gone.
+    /// Disposing it then threw "cuStreamSynchronize (graph destroy) failed: Invalid context" (measured in the
+    /// AiDotNet model-family suite). The dead context already reclaimed the graph; disposal must just let go.
+    /// </summary>
+    [SkippableFact]
+    public void A_plan_whose_engine_was_disposed_disposes_without_touching_the_dead_context()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        Skip.IfNot(gpu!.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend,
+            "Whole-step graph capture is CUDA-only.");
+        Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "0",
+            "Graph capture is disabled for this process.");
+        AiDotNetEngine.Current = gpu;
+        var x = Rand([Batch, Inputs], 1, 1f);
+        var y = Rand([Batch, Outputs], 2, 1f);
+        var parameters = new[] { Rand([Inputs, Hidden], 3, 0.3f), new Tensor<float>([Hidden]), Rand([Hidden, Outputs], 4, 0.3f), new Tensor<float>([Outputs]) };
+        foreach (var p in parameters) p.Gpu();
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.EnableTraining(parameters))
+        {
+            Loss(gpu, x, y, parameters, composedMse: false);
+            plan = scope.CompileTraining(parameters);
+        }
+        plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2f);
+        for (int s = 0; s < 6; s++) { FeedBatch(x, y, s); plan.Step(); }
+        var exec = (IntPtr)typeof(CompiledTrainingPlan<float>)
+            .GetField("_stepGraphExec", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(plan)!;
+        Assert.True(exec != IntPtr.Zero, "no graph was captured, so the dead-context disposal went untested");
+
+        AiDotNetEngine.Current = _prior;
+        gpu.Dispose();
+        plan.Dispose();
+    }
+
     private static double CpuLoss(Tensor<float> x, Tensor<float> y, Tensor<float>[] parameters, bool composedMse)
     {
         var prior = AiDotNetEngine.Current;
