@@ -262,6 +262,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // ConfigureOptimizerFloat / ConfigureOptimizerFloatGrouped after the
         // paramBackend.AllocateBuffer calls; reconfiguring also disposes
         // these via the same list before re-allocating.
+        LeaveSharedMoments();
         foreach (var buf in _gpuOptimizerBuffers)
             buf.Dispose();
         _gpuOptimizerBuffers.Clear();
@@ -1389,10 +1390,171 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             if (!ReferenceEquals(source._parameters[p], _parameters[p]))
                 throw new ArgumentException($"Parameter {p} is a different tensor in the previous plan.", nameof(previous));
         }
-        var checkpoint = source.CaptureFusedOptimizerCheckpoint()
-            ?? throw new InvalidOperationException("The previous plan has no configured optimizer to continue.");
-        RestoreFusedOptimizerCheckpoint(checkpoint);
+        if (source._optimizerRuntimeState is null)
+            throw new InvalidOperationException("The previous plan has no configured optimizer to continue.");
+        if (!TryShareMomentsWith(source))
+        {
+            var checkpoint = source.CaptureFusedOptimizerCheckpoint()
+                ?? throw new InvalidOperationException("The previous plan has no configured optimizer to continue.");
+            RestoreFusedOptimizerCheckpoint(checkpoint);
+        }
         _l2Regularization = source._l2Regularization;
+    }
+
+    /// <summary>
+    /// Optimizer moment storage shared by plans that train the same parameters: a loop alternating batch shapes
+    /// (full batches, then the short last batch of each epoch) switches between one plan per shape, and sharing the
+    /// moment buffers makes that switch free - no moment copy, and no CUDA-graph recapture, because the captured step
+    /// graph covers forward and backward only and never addresses the moments. The group owns every shared buffer;
+    /// each member plan's runtime aliases them; the last member to leave releases them.
+    /// </summary>
+    private sealed class SharedOptimizerMoments
+    {
+        public int Members;
+        public readonly List<Engines.DirectGpu.IGpuBuffer> GpuBuffers = new();
+        public readonly List<Array> ArenaArrays = new();
+
+        public void Release()
+        {
+            foreach (var buffer in GpuBuffers) buffer.Dispose();
+            GpuBuffers.Clear();
+            foreach (var array in ArenaArrays)
+            {
+                if (array is float[] f) TensorArena.ReturnPersistentBuffer(f);
+                else if (array is double[] d) TensorArena.ReturnPersistentBuffer(d);
+            }
+            ArenaArrays.Clear();
+        }
+    }
+
+    private SharedOptimizerMoments? _sharedMoments;
+
+    /// <summary>
+    /// Joins <paramref name="source"/>'s moment storage (creating the group on first use) and takes over its step
+    /// count and optimizer scalars. Returns false - leaving this plan untouched - for state that is not per-parameter
+    /// (L-BFGS history, grouped configurations) or when the two plans place a parameter's state differently (one on
+    /// the device, one on the host); the caller then copies the state instead.
+    /// </summary>
+    private bool TryShareMomentsWith(CompiledTrainingPlan<T> source)
+    {
+        var src = source._optimizerRuntimeState!;
+        if (src.IsGrouped || src.OptimizerType == OptimizerType.LBFGS || src.Schedules.Length != 1)
+            return false;
+
+        if (_sharedMoments is null || !ReferenceEquals(_sharedMoments, source._sharedMoments))
+        {
+            // Configure with the source's exact settings, then check the per-parameter placement matches before
+            // committing: a parameter updated on the device in one plan and on the host in the other cannot share.
+            _momentStorageMode = src.MomentStorageMode;
+            _int8MomentBlockSize = src.Int8MomentBlockSize;
+            ConfigureOptimizer(src.OptimizerType, src.Schedules[0], src.Beta1, src.Beta2, src.Epsilon, src.WeightDecay,
+                CloneFusedOptimizerExtras(src.Extras));
+            var rt = _optimizerRuntimeState!;
+            for (int p = 0; p < _parameters.Length; p++)
+            {
+                bool srcOnDevice = src.GpuBackends?[p] is not null;
+                bool onDevice = rt.GpuBackends?[p] is not null;
+                var srcMode = src.GpuMomentStorage?[p] ?? FusedMomentStorageMode.Float32;
+                var mode = rt.GpuMomentStorage?[p] ?? FusedMomentStorageMode.Float32;
+                if (srcOnDevice != onDevice || srcMode != mode)
+                    return false;
+            }
+
+            var group = source._sharedMoments ??= source.MoveOwnMomentsIntoGroup();
+            ReleaseOwnMoments(rt);
+            AliasMoments(rt, src);
+            group.Members++;
+            _sharedMoments = group;
+        }
+
+        var target = _optimizerRuntimeState!;
+        _optimizerStep = source._optimizerStep;
+        _maxGradNorm = source._maxGradNorm;
+        target.Scalars.HypergradientAdjustment = src.Scalars.HypergradientAdjustment;
+        target.Scalars.DAdaptationEstimate = src.Scalars.DAdaptationEstimate;
+        target.Scalars.DAdaptationRAccum = src.Scalars.DAdaptationRAccum;
+        target.Scalars.ScheduleFreeWeightSum = src.Scalars.ScheduleFreeWeightSum;
+        target.Scalars.CgPrevGradNorm2 = src.Scalars.CgPrevGradNorm2;
+        return true;
+    }
+
+    /// <summary>Creates a group owning this plan's current moment storage (this plan its first member).</summary>
+    private SharedOptimizerMoments MoveOwnMomentsIntoGroup()
+    {
+        var group = new SharedOptimizerMoments { Members = 1 };
+        var rt = _optimizerRuntimeState!;
+        foreach (var slots in GpuMomentSlots(rt))
+            foreach (var buffer in slots)
+                if (buffer is not null && _gpuOptimizerBuffers.Remove(buffer)) group.GpuBuffers.Add(buffer);
+        foreach (var slots in ArenaMomentSlots(rt))
+            foreach (var array in slots)
+                if (array is { Length: > 0 }) group.ArenaArrays.Add(array);
+        return group;
+    }
+
+    /// <summary>Frees the moment storage this plan's configure just allocated, before it aliases a group's.</summary>
+    private void ReleaseOwnMoments(FusedOptimizerRuntimeState rt)
+    {
+        foreach (var slots in GpuMomentSlots(rt))
+            for (int p = 0; p < slots.Length; p++)
+            {
+                if (slots[p] is { } buffer && _gpuOptimizerBuffers.Remove(buffer)) buffer.Dispose();
+                slots[p] = null;
+            }
+        ReturnPooledMoments(rt);
+    }
+
+    private static void AliasMoments(FusedOptimizerRuntimeState rt, FusedOptimizerRuntimeState src)
+    {
+        static void Alias<TSlot>(TSlot[]? dst, TSlot[]? from)
+        {
+            if (dst is null || from is null) return;
+            Array.Copy(from, dst, Math.Min(dst.Length, from.Length));
+        }
+        Alias(rt.MFloat, src.MFloat); Alias(rt.VFloat, src.VFloat); Alias(rt.VMaxFloat, src.VMaxFloat);
+        Alias(rt.MDouble, src.MDouble); Alias(rt.VDouble, src.VDouble); Alias(rt.VMaxDouble, src.VMaxDouble);
+        Alias(rt.MBFloat16, src.MBFloat16); Alias(rt.VBFloat16, src.VBFloat16);
+        Alias(rt.MQuantized, src.MQuantized); Alias(rt.VQuantized, src.VQuantized);
+        Alias(rt.MScales, src.MScales); Alias(rt.VScales, src.VScales);
+        Alias(rt.GpuM, src.GpuM); Alias(rt.GpuV, src.GpuV); Alias(rt.GpuVMax, src.GpuVMax);
+        Alias(rt.GpuMScales, src.GpuMScales); Alias(rt.GpuVScales, src.GpuVScales);
+    }
+
+    private static IEnumerable<Engines.DirectGpu.IGpuBuffer?[]> GpuMomentSlots(FusedOptimizerRuntimeState rt)
+    {
+        if (rt.GpuM is not null) yield return rt.GpuM;
+        if (rt.GpuV is not null) yield return rt.GpuV;
+        if (rt.GpuVMax is not null) yield return rt.GpuVMax;
+        if (rt.GpuMScales is not null) yield return rt.GpuMScales;
+        if (rt.GpuVScales is not null) yield return rt.GpuVScales;
+    }
+
+    private static IEnumerable<Array[]> ArenaMomentSlots(FusedOptimizerRuntimeState rt)
+    {
+        if (rt.MFloat is not null) yield return rt.MFloat;
+        if (rt.VFloat is not null) yield return rt.VFloat;
+        if (rt.VMaxFloat is not null) yield return rt.VMaxFloat;
+        if (rt.MDouble is not null) yield return rt.MDouble;
+        if (rt.VDouble is not null) yield return rt.VDouble;
+        if (rt.VMaxDouble is not null) yield return rt.VMaxDouble;
+    }
+
+    /// <summary>
+    /// Leaves the shared-moment group before this plan releases or replaces its optimizer state. The aliased slots
+    /// belong to the group, so they are detached from this plan's runtime first - its own release then cannot free
+    /// storage another member still steps with - and the last member releases the group.
+    /// </summary>
+    private void LeaveSharedMoments()
+    {
+        var group = _sharedMoments;
+        if (group is null) return;
+        _sharedMoments = null;
+        if (_optimizerRuntimeState is { } rt)
+        {
+            foreach (var slots in GpuMomentSlots(rt)) Array.Clear(slots, 0, slots.Length);
+            foreach (var slots in ArenaMomentSlots(rt)) Array.Clear(slots, 0, slots.Length);
+        }
+        if (--group.Members == 0) group.Release();
     }
 
     // grad += strength * param for every parameter, before clipping (see SetL2Regularization). On the device when both
@@ -2832,6 +2994,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // buffers. Without this the device memory grows every time the user
         // calls ConfigureOptimizer (e.g., to switch from SGD to Adam mid-run
         // or to retune lr via re-configure with a fresh schedule).
+        LeaveSharedMoments();
         foreach (var buf in _gpuOptimizerBuffers)
             buf.Dispose();
         _gpuOptimizerBuffers.Clear();
@@ -4012,6 +4175,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     {
         // CodeRabbit #425: reconfigure releases prior GPU optimizer-state.
         // See ConfigureOptimizerFloat for the rationale.
+        LeaveSharedMoments();
         foreach (var buf in _gpuOptimizerBuffers)
             buf.Dispose();
         _gpuOptimizerBuffers.Clear();
@@ -4630,6 +4794,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private unsafe void ConfigureOptimizerDouble(
         OptimizerType optimizerType, LrSchedule schedule, float beta1, float beta2, float eps, float weightDecay)
     {
+        LeaveSharedMoments();
         foreach (var buf in _gpuOptimizerBuffers)
             buf.Dispose();
         _gpuOptimizerBuffers.Clear();
@@ -4834,6 +4999,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         float beta1, float beta2, float eps, float weightDecay,
         float[]? groupWeightDecays)
     {
+        LeaveSharedMoments();
         foreach (var buf in _gpuOptimizerBuffers)
             buf.Dispose();
         _gpuOptimizerBuffers.Clear();
