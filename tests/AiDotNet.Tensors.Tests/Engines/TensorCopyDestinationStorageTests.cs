@@ -1,5 +1,6 @@
 using System;
 using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
 
@@ -17,7 +18,7 @@ namespace AiDotNet.Tensors.Tests.Engines;
 /// </remarks>
 public class TensorCopyDestinationStorageTests
 {
-    private static Tensor<float> Filled(int[] shape, float start)
+    internal static Tensor<float> Filled(int[] shape, float start)
     {
         var t = new Tensor<float>(shape);
         var span = t.AsWritableSpan();
@@ -40,5 +41,79 @@ public class TensorCopyDestinationStorageTests
         Assert.Equal(new[] { 1f, 2f, 3f, 4f }, row.AsSpan().ToArray());
         Assert.Equal(new[] { 100f, 101f, 102f, 103f, 1f, 2f, 3f, 4f, 108f, 109f, 110f, 111f }, matrix.AsSpan().ToArray());
         Assert.True(row.Version > versionBefore, "a write through TensorCopy must bump the destination's version");
+    }
+
+    /// <summary>
+    /// A write through one view reaches every alias's mutation epoch. The per-tensor Version is local to the
+    /// object written, so a cache keyed on an alias's Version never saw the write.
+    /// </summary>
+    [Fact]
+    public void TensorCopy_IntoAView_AdvancesTheParentsStorageMutationVersion()
+    {
+        var engine = new CpuEngine();
+        var matrix = Filled(new[] { 3, 4 }, 100f);
+        var row = matrix.Slice(1);
+        int parentEpoch = matrix.StorageMutationVersion;
+        long parentVersion = matrix.Version;
+
+        engine.TensorCopy(Filled(new[] { 4 }, 1f), row);
+
+        Assert.True(matrix.StorageMutationVersion > parentEpoch, "the parent shares the written storage, so its epoch must move");
+        Assert.Equal(parentVersion, matrix.Version);
+    }
+}
+
+/// <summary>The fused MatMul chain is opt-in (AIDOTNET_CROSS_LAYER_FUSION), a process-wide switch, so this runs serialized with the other compilation-state tests.</summary>
+[Collection("CompilationGlobalState")]
+public class TensorCopyAliasCompiledPlanTests
+{
+    /// <summary>
+    /// The compiled plan fuses x·W1·W2 into a cached W1·W2 product and refreshed it only when W1.Version or
+    /// W2.Version changed. Overwriting W1 through an alias left both unchanged, so the plan kept training on
+    /// the pre-copy weights. It now keys on the storage epoch.
+    /// </summary>
+    [Fact]
+    public void CompiledPlan_FusedMatMulChain_SeesAWeightOverwrittenThroughAnAlias()
+    {
+        var prior = AiDotNetEngine.Current;
+        string? priorFusion = Environment.GetEnvironmentVariable("AIDOTNET_CROSS_LAYER_FUSION");
+        Environment.SetEnvironmentVariable("AIDOTNET_CROSS_LAYER_FUSION", "1");
+        try
+        {
+            var engine = new CpuEngine();
+            AiDotNetEngine.Current = engine;
+            var x = TensorCopyDestinationStorageTests.Filled(new[] { 2, 3 }, 0.1f);
+            var w1 = TensorCopyDestinationStorageTests.Filled(new[] { 3, 4 }, 0.2f);
+            var w2 = TensorCopyDestinationStorageTests.Filled(new[] { 4, 5 }, 0.3f);
+            Tensor<float> Loss() => engine.ReduceSum(engine.TensorMatMul(engine.TensorMatMul(x, w1), w2), null);
+
+            ICompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.Enable())
+            {
+                Loss();
+                plan = scope.CompileTraining(new[] { w1, w2 });
+            }
+
+            try
+            {
+                plan.Step();
+                var alias = w1.Reshape(new[] { 12 });         // same storage, a different tensor object
+                engine.TensorCopy(TensorCopyDestinationStorageTests.Filled(new[] { 12 }, -1f), alias);
+
+                float expected = Loss().GetFlattenedData()[0];
+                float compiled = plan.Step()[0];
+                Assert.True(Math.Abs(expected - compiled) <= 1e-3f * Math.Max(1f, Math.Abs(expected)),
+                    $"compiled loss {compiled} after overwriting W1 through an alias; the eager loss is {expected}");
+            }
+            finally
+            {
+                plan.Dispose();
+            }
+        }
+        finally
+        {
+            AiDotNetEngine.Current = prior;
+            Environment.SetEnvironmentVariable("AIDOTNET_CROSS_LAYER_FUSION", priorFusion);
+        }
     }
 }
