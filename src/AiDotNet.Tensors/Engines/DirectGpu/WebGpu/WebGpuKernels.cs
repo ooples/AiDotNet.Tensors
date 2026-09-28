@@ -1461,7 +1461,7 @@ fn adamw_bf16(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 ";
 
-    public const string CompressedOptimizerInt8Source = @"
+    public static readonly string CompressedOptimizerInt8Source = Compilation.DynamicQuantizationCodebook.KernelPrelude(Compilation.DynamicQuantizationCodebook.KernelLanguage.Wgsl) + @"
 @group(0) @binding(0) var<storage, read_write> params_arr: array<f32>;
 @group(0) @binding(1) var<storage, read> gradients: array<f32>;
 @group(0) @binding(2) var<storage, read_write> m_quant: array<atomic<u32>>;
@@ -1565,8 +1565,8 @@ fn adam8bit(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id)
         if (i >= end_idx) {
             break;
         }
-        let old_m = select((f32(i32(load_m_byte(i)) - 128) * m_scale), 0.0, first_step);
-        let old_v = select((f32(load_v_byte(i)) * v_scale), 0.0, first_step);
+        let old_m = select((adam8_dec_s(load_m_byte(i)) * m_scale), 0.0, first_step);
+        let old_v = select((adam8_dec_u(load_v_byte(i)) * v_scale), 0.0, first_step);
         let g = gradients[i];
         let new_m = opt_params.beta1 * old_m + opt_params.one_minus_beta1 * g;
         let new_v = opt_params.beta2 * old_v + opt_params.one_minus_beta2 * (g * g);
@@ -1592,8 +1592,9 @@ fn adam8bit(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id)
         stride = stride >> 1u;
     }
 
-    let new_m_scale = max(s_max_m[0] / 127.0, 0.0000000001);
-    let new_v_scale = max(s_max_v[0] / 255.0, 0.0000000001);
+    // Block-wise dynamic quantization: scale = block absmax, value = nearest codebook entry.
+    let new_m_scale = max(s_max_m[0], 1e-30);
+    let new_v_scale = max(s_max_v[0], 1e-30);
     if (tid == 0u) {
         m_scales[blk] = new_m_scale;
         v_scales[blk] = new_v_scale;
@@ -1605,8 +1606,8 @@ fn adam8bit(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id)
         if (j >= end_idx) {
             break;
         }
-        let old_m = select((f32(i32(load_m_byte(j)) - 128) * m_scale), 0.0, first_step);
-        let old_v = select((f32(load_v_byte(j)) * v_scale), 0.0, first_step);
+        let old_m = select((adam8_dec_s(load_m_byte(j)) * m_scale), 0.0, first_step);
+        let old_v = select((adam8_dec_u(load_v_byte(j)) * v_scale), 0.0, first_step);
         let g = gradients[j];
         let new_m = opt_params.beta1 * old_m + opt_params.one_minus_beta1 * g;
         let new_v = opt_params.beta2 * old_v + opt_params.one_minus_beta2 * (g * g);
@@ -1615,11 +1616,8 @@ fn adam8bit(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id)
         let v_hat = new_v / opt_params.bias_correction2;
         params_arr[j] = params_arr[j] - opt_params.lr * m_hat / (sqrt(v_hat) + opt_params.epsilon);
 
-        let qm = clamp(i32(round_ties_even(new_m / new_m_scale)), -127, 127);
-        store_m_byte(j, u32(qm + 128));
-
-        let qv = clamp(i32(round_ties_even(new_v / new_v_scale)), 0, 255);
-        store_v_byte(j, u32(qv));
+        store_m_byte(j, adam8_enc_s(new_m / new_m_scale));
+        store_v_byte(j, adam8_enc_u(new_v / new_v_scale));
         j = j + 256u;
     }
 }

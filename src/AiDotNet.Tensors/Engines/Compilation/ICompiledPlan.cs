@@ -479,7 +479,9 @@ public interface ICompiledTrainingPlan<T> : IDisposable
     /// </summary>
     /// <param name="enabled">True to request int8 moment storage; false to return to fp32 moments.</param>
     /// <param name="blockSize">Number of elements per quantization block. Must be positive when enabled.</param>
-    void RequestInt8MomentStorage(bool enabled, int blockSize = 2048);
+    /// <param name="minQuantizedLength">Parameters with fewer elements keep fp32 moments (bitsandbytes'
+    /// <c>min_8bit_size</c>, default 4096); 0 quantizes every parameter.</param>
+    void RequestInt8MomentStorage(bool enabled, int blockSize = 2048, int minQuantizedLength = 4096);
 
     /// <summary>
     /// Configures fused optimizer updates with a per-step

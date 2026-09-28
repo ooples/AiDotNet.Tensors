@@ -13290,46 +13290,13 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     }
 
     /// <inheritdoc/>
-    public unsafe void LambUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
-        float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
-    {
-        // Validate buffer parameters
-        if (param is null) throw new ArgumentNullException(nameof(param));
-        if (gradient is null) throw new ArgumentNullException(nameof(gradient));
-        if (m is null) throw new ArgumentNullException(nameof(m));
-        if (v is null) throw new ArgumentNullException(nameof(v));
-        if (size <= 0)
-            throw new ArgumentOutOfRangeException(nameof(size), "Size must be positive.");
-        if (step < 1)
-            throw new ArgumentOutOfRangeException(nameof(step), "Step must be at least 1.");
-        if (epsilon <= 0)
-            throw new ArgumentOutOfRangeException(nameof(epsilon), "Epsilon must be positive.");
-
-        if (!_kernelCache.TryGetValue("lamb_update", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: lamb_update");
-
-        using var _ = PushContext();
-        uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
-        IntPtr paramPtr = param.Handle;
-        IntPtr gradPtr = gradient.Handle;
-        IntPtr mPtr = m.Handle;
-        IntPtr vPtr = v.Handle;
-        float trustRatio = 1.0f; // Default: no layer-wise scaling (degenerates to AdamW)
-        void** args = stackalloc void*[12];
-        args[0] = &paramPtr;
-        args[1] = &gradPtr;
-        args[2] = &mPtr;
-        args[3] = &vPtr;
-        args[4] = &learningRate;
-        args[5] = &beta1;
-        args[6] = &beta2;
-        args[7] = &epsilon;
-        args[8] = &weightDecay;
-        args[9] = &trustRatio;
-        args[10] = &step;
-        args[11] = &size;
-        LaunchKernel(kernel, grid, DefaultBlockSize, args);
-    }
+    public void LambUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
+        float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size,
+        float maxTrustRatio = 0f, bool biasCorrection = true)
+        // The trust ratio needs two whole-tensor norms, so it is computed between an element-wise phase and the
+        // update rather than in one kernel (the old kernel was always passed a ratio of 1, i.e. it ran AdamW).
+        => GpuLamb.Step(this, param, gradient, m, v, learningRate, beta1, beta2, epsilon, weightDecay, step, size,
+            maxTrustRatio, biasCorrection);
 
     /// <inheritdoc/>
     public unsafe void SgdUpdate(IGpuBuffer param, IGpuBuffer gradient,

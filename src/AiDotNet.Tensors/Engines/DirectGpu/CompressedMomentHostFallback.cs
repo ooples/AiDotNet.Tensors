@@ -115,8 +115,8 @@ internal static class CompressedMomentHostFallback
 
             for (int i = start; i < end; i++)
             {
-                float oldM = firstStep ? 0f : (mQuant[i] - 128) * oldMScale;
-                float oldV = firstStep ? 0f : vQuant[i] * oldVScale;
+                float oldM = firstStep ? 0f : Compilation.DynamicQuantizationCodebook.Signed[mQuant[i]] * oldMScale;
+                float oldV = firstStep ? 0f : Compilation.DynamicQuantizationCodebook.Unsigned[vQuant[i]] * oldVScale;
                 float g = grad[i];
                 float newM = beta1 * oldM + oneMinusBeta1 * g;
                 float newV = beta2 * oldV + oneMinusBeta2 * g * g;
@@ -124,15 +124,17 @@ internal static class CompressedMomentHostFallback
                 maxV = MathF.Max(maxV, MathF.Abs(newV));
             }
 
-            float newMScale = MathF.Max(maxM / 127f, 1e-10f);
-            float newVScale = MathF.Max(maxV / 255f, 1e-10f);
+            // Block-wise dynamic quantization (Dettmers et al.): the scale is the block absmax and each value is the
+            // nearest codebook entry. Linear /127 and /255 rounded small second moments to zero.
+            float newMScale = MathF.Max(maxM, 1e-30f);
+            float newVScale = MathF.Max(maxV, 1e-30f);
             mScales[block] = newMScale;
             vScales[block] = newVScale;
 
             for (int i = start; i < end; i++)
             {
-                float oldM = firstStep ? 0f : (mQuant[i] - 128) * oldMScale;
-                float oldV = firstStep ? 0f : vQuant[i] * oldVScale;
+                float oldM = firstStep ? 0f : Compilation.DynamicQuantizationCodebook.Signed[mQuant[i]] * oldMScale;
+                float oldV = firstStep ? 0f : Compilation.DynamicQuantizationCodebook.Unsigned[vQuant[i]] * oldVScale;
                 float g = grad[i];
                 float newM = beta1 * oldM + oneMinusBeta1 * g;
                 float newV = beta2 * oldV + oneMinusBeta2 * g * g;
@@ -141,15 +143,8 @@ internal static class CompressedMomentHostFallback
                 float vHat = newV / biasCorrection2;
                 param[i] -= learningRate * mHat / (MathF.Sqrt(vHat) + epsilon);
 
-                int qm = (int)Math.Round(newM / newMScale, MidpointRounding.ToEven);
-                if (qm < -127) qm = -127;
-                if (qm > 127) qm = 127;
-                mQuant[i] = (byte)(qm + 128);
-
-                int qv = (int)Math.Round(newV / newVScale, MidpointRounding.ToEven);
-                if (qv < 0) qv = 0;
-                if (qv > 255) qv = 255;
-                vQuant[i] = (byte)qv;
+                mQuant[i] = Compilation.DynamicQuantizationCodebook.Encode(newM / newMScale, Compilation.DynamicQuantizationCodebook.Signed);
+                vQuant[i] = Compilation.DynamicQuantizationCodebook.Encode(newV / newVScale, Compilation.DynamicQuantizationCodebook.Unsigned);
             }
         }
     }
