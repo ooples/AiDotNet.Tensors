@@ -16,7 +16,7 @@ internal static class CudaOptimizerKernels
     /// </summary>
     public static string GetSource()
     {
-        return @"
+        return Compilation.DynamicQuantizationCodebook.KernelPrelude(Compilation.DynamicQuantizationCodebook.KernelLanguage.CudaHip) + @"
 // ===========================================================================
 // CUDA OPTIMIZER KERNELS
 // ===========================================================================
@@ -588,8 +588,8 @@ extern ""C"" __global__ __launch_bounds__(256) void proximal_l1_update(
 // ---------------------------------------------------------------------------
 // 8-bit Adam (bitsandbytes-style blockwise dynamic quantization). Matches the
 // CPU Adam8BitOptimizer (CompressBothMoments, QuantizationPercentile>=100,
-// no stochastic rounding) per block: m is SIGNED int8 (scale=maxAbs/127, stored
-// as q+128), v is UNSIGNED int8 (scale=maxAbs/255). One CUDA block per quant
+// no stochastic rounding) per block: m and v are codebook INDICES into the signed
+// and unsigned dynamic maps (ADAM8_S / ADAM8_U), scaled by the block absmax. One CUDA block per quant
 // block; blockDim=256; shared-memory maxAbs reduction recomputes the per-block
 // scale before requantizing. Adam math is float (matching the CPU Tensor ops);
 // quant/dequant scaling is float on GPU; rint() = round-half-to-even.
@@ -617,8 +617,8 @@ extern ""C"" __global__ __launch_bounds__(256) void adam8bit_update(
     // Phase 1: compute newM/newV, reduce per-block maxAbs for the new scales.
     float locM = 0.0f, locV = 0.0f;
     for (int i = start + threadIdx.x; i < endIdx; i += blockDim.x) {
-        float m_i = firstStep ? 0.0f : (float)((int)mQ[i] - 128) * mScale;
-        float v_i = firstStep ? 0.0f : (float)((int)vQ[i]) * vScale;
+        float m_i = firstStep ? 0.0f : adam8_dec_s(mQ[i]) * mScale;
+        float v_i = firstStep ? 0.0f : adam8_dec_u(vQ[i]) * vScale;
         float g = gradient[i];
         float newM = beta1 * m_i + oneMinusBeta1 * g;
         float newV = beta2 * v_i + oneMinusBeta2 * (g * g);
@@ -634,15 +634,17 @@ extern ""C"" __global__ __launch_bounds__(256) void adam8bit_update(
         }
         __syncthreads();
     }
-    float newMScale = sMaxM[0] / 127.0f; if (newMScale < 1e-10f) newMScale = 1e-10f;
-    float newVScale = sMaxV[0] / 255.0f; if (newVScale < 1e-10f) newVScale = 1e-10f;
+    // Block-wise dynamic quantization: scale = block absmax, value = nearest codebook entry (linear /127 and
+    // /255 rounded small second moments to zero and exploded the update).
+    float newMScale = fmax(sMaxM[0], 1e-30f);
+    float newVScale = fmax(sMaxV[0], 1e-30f);
     if (threadIdx.x == 0) { mScales[blk] = newMScale; vScales[blk] = newVScale; }
     __syncthreads();
 
     // Phase 2: recompute, apply bias-corrected param update, requantize.
     for (int i = start + threadIdx.x; i < endIdx; i += blockDim.x) {
-        float m_i = firstStep ? 0.0f : (float)((int)mQ[i] - 128) * mScale;
-        float v_i = firstStep ? 0.0f : (float)((int)vQ[i]) * vScale;
+        float m_i = firstStep ? 0.0f : adam8_dec_s(mQ[i]) * mScale;
+        float v_i = firstStep ? 0.0f : adam8_dec_u(vQ[i]) * vScale;
         float g = gradient[i];
         float newM = beta1 * m_i + oneMinusBeta1 * g;
         float newV = beta2 * v_i + oneMinusBeta2 * (g * g);
@@ -651,13 +653,8 @@ extern ""C"" __global__ __launch_bounds__(256) void adam8bit_update(
         float vHat = newV / biasCorrection2;
         param[i] = param[i] - learningRate * mHat / (sqrtf(vHat) + epsilon);
 
-        int qm = (int)rintf(newM / newMScale);
-        if (qm < -127) qm = -127; if (qm > 127) qm = 127;
-        mQ[i] = (unsigned char)(qm + 128);
-
-        int qv = (int)rintf(newV / newVScale);
-        if (qv < 0) qv = 0; if (qv > 255) qv = 255;
-        vQ[i] = (unsigned char)qv;
+        mQ[i] = (unsigned char)adam8_enc_s(newM / newMScale);
+        vQ[i] = (unsigned char)adam8_enc_u(newV / newVScale);
     }
 }
 

@@ -11467,26 +11467,12 @@ KERNEL VARIANTS (A/B testing):
 
         /// <inheritdoc/>
         public void LambUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
-            float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
-        {
-            var k = _kernelCache["lamb_update"];
-            float trustRatio = 1.0f; // Default: no layer-wise scaling (degenerates to AdamW)
-            uint arg = 0;
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)param).Buffer.Handle);
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)gradient).Buffer.Handle);
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)m).Buffer.Handle);
-            k.SetArg(arg++, ((DirectOpenClGpuBuffer)v).Buffer.Handle);
-            k.SetArg(arg++, learningRate);
-            k.SetArg(arg++, beta1);
-            k.SetArg(arg++, beta2);
-            k.SetArg(arg++, epsilon);
-            k.SetArg(arg++, weightDecay);
-            k.SetArg(arg++, trustRatio);
-            k.SetArg(arg++, step);
-            k.SetArg(arg++, size);
-
-            k.Execute1D(size, Math.Min(256, size));
-        }
+            float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size,
+            float maxTrustRatio = 0f, bool biasCorrection = true)
+            // The trust ratio needs two whole-tensor norms, so it is computed between an element-wise phase and the
+            // update rather than in one kernel (the old kernel was always passed a ratio of 1, i.e. it ran AdamW).
+            => GpuLamb.Step(this, param, gradient, m, v, learningRate, beta1, beta2, epsilon, weightDecay, step, size,
+                maxTrustRatio, biasCorrection);
 
         /// <inheritdoc/>
         public void SgdUpdate(IGpuBuffer param, IGpuBuffer gradient,

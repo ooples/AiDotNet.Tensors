@@ -147,35 +147,12 @@ public sealed partial class WebGpuBackend
     }
 
     public void LambUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
-        float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
-    {
-        // Two-pass GPU: compute param_norm and update_norm entirely on GPU
-        // Step 1: param_norm via GPU square + sum
-        using var paramSq = (WebGpuBuffer)AllocateBuffer(size);
-        SquareAsync(param, paramSq, size).GetAwaiter().GetResult();
-        float pNormSq = SumAsync(paramSq, size).GetAwaiter().GetResult();
-        float pNorm = MathF.Sqrt(pNormSq);
-        // Step 2: update_norm via GPU kernel that computes Adam update^2 per element, then sum
-        float bc1 = 1f - MathF.Pow(beta1, step);
-        float bc2 = 1f - MathF.Pow(beta2, step);
-        using var updateSq = (WebGpuBuffer)AllocateBuffer(size);
-        var lambNormUniforms = new float[]
-        {
-            BitConverter.Int32BitsToSingle(size),
-            beta1, beta2, epsilon,
-            bc1, bc2, weightDecay, 0
-        };
-        Dispatch4BufferAsync("LambNorm", WebGpuKernels.LambNormSource, "lamb_update_sq",
-            m, v, gradient, updateSq, lambNormUniforms, size).GetAwaiter().GetResult();
-        float uNormSq = SumAsync(updateSq, size).GetAwaiter().GetResult();
-        float uNorm = MathF.Sqrt(uNormSq);
-        float ratio = uNorm > 0 ? pNorm / uNorm : 1f;
-        // Step 3: Apply LAMB update with pre-computed trust ratio
-        var uniforms = MakeOptimizerUniforms(size, learningRate, beta1, beta2, epsilon, weightDecay, step);
-        uniforms[7] = ratio;
-        Dispatch4BufferAsync("LarsLambFtrl", WebGpuKernels.LarsLambFtrlSource, "lamb_update",
-            param, gradient, m, v, uniforms, size).GetAwaiter().GetResult();
-    }
+        float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size,
+        float maxTrustRatio = 0f, bool biasCorrection = true)
+        // The trust ratio needs two whole-tensor norms, so it is computed between an element-wise phase and the
+        // update rather than in one kernel (the old kernel was always passed a ratio of 1, i.e. it ran AdamW).
+        => GpuLamb.Step(this, param, gradient, m, v, learningRate, beta1, beta2, epsilon, weightDecay, step, size,
+            maxTrustRatio, biasCorrection);
 
     public void AdadeltaUpdate(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer accumGrad, IGpuBuffer accumUpdate,
         float rho, float epsilon, float weightDecay, int size)
