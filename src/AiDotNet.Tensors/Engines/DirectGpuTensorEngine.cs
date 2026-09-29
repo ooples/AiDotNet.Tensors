@@ -17385,11 +17385,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
                 // Outer-product broadcast is exact for a contiguous suffix reduction.
                 int firstReduced = normalized.Length == 0 ? inputShape.Length : normalized[0];
-                if (normalized.Length == 0 || normalized.Length != inputShape.Length - firstReduced)
-                    return base.ReduceMeanBackward(gradOutput, inputShape, axes);
-                for (int i = 0; i < normalized.Length; i++)
-                    if (normalized[i] != firstReduced + i)
-                        return base.ReduceMeanBackward(gradOutput, inputShape, axes);
+                bool trailingOnly = normalized.Length != 0 && normalized.Length == inputShape.Length - firstReduced;
+                for (int i = 0; trailingOnly && i < normalized.Length; i++)
+                    if (normalized[i] != firstReduced + i) trailingOnly = false;
+                if (!trailingOnly)
+                    return ReduceMeanBackwardAroundKeptBlockOrHost(gradOutput, inputShape, axes);
 
                 int inputSize = 1;
                 for (int i = 0; i < inputShape.Length; i++) inputSize = checked(inputSize * inputShape[i]);
@@ -17421,6 +17421,23 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 // graph capture and a device round trip everywhere else.
                 AliasDiag($"ReduceMeanBackward device path FELLBACK: {ex.GetType().Name}: {ex.Message}");
             }
+        }
+        return ReduceMeanBackwardAroundKeptBlockOrHost(gradOutput, inputShape, axes);
+    }
+
+    /// <summary>
+    /// A mean over a leading (or leading and trailing) block of axes, a bias-style mean, broadcasts its gradient on the
+    /// device; anything else takes the host path.
+    /// </summary>
+    private Tensor<T> ReduceMeanBackwardAroundKeptBlockOrHost<T>(Tensor<T> gradOutput, int[] inputShape, int[] axes)
+    {
+        if (inputShape is { Length: > 0 })
+        {
+            int count = 1;
+            foreach (int axis in axes.Select(a => a < 0 ? a + inputShape.Length : a).Distinct())
+                if (axis >= 0 && axis < inputShape.Length) count *= inputShape[axis];
+            if (count > 0 && TryBroadcastReducedGradient(gradOutput, inputShape, axes, 1f / count) is { } broadcast)
+                return broadcast;
         }
         return base.ReduceMeanBackward(gradOutput, inputShape, axes);
     }
@@ -17506,6 +17523,155 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private enum ReduceOperation { Sum, Mean, Max }
 
     /// <summary>
+    /// Splits a shape around its reduced axes: when the reduced axes are a leading block and/or a trailing block with the
+    /// kept axes contiguous between them, the tensor is [leading, kept, trailing] row-major. False otherwise.
+    /// </summary>
+    private static bool TrySplitAroundKeptBlock(int[] dims, int[] sortedAxes, out int leading, out int kept, out int trailing)
+    {
+        leading = kept = trailing = 1;
+        int rank = dims.Length;
+        var reduced = new bool[rank];
+        foreach (int axis in sortedAxes)
+        {
+            if (axis < 0 || axis >= rank) return false;
+            reduced[axis] = true;
+        }
+        int keptStart = 0;
+        while (keptStart < rank && reduced[keptStart]) keptStart++;
+        int keptEnd = rank;
+        while (keptEnd > keptStart && reduced[keptEnd - 1]) keptEnd--;
+        for (int i = keptStart; i < keptEnd; i++)
+            if (reduced[i]) return false;   // a reduced axis between kept ones
+        for (int i = 0; i < keptStart; i++) leading = checked(leading * dims[i]);
+        for (int i = keptStart; i < keptEnd; i++) kept = checked(kept * dims[i]);
+        for (int i = keptEnd; i < rank; i++) trailing = checked(trailing * dims[i]);
+        return true;
+    }
+
+    /// <summary>
+    /// Sums (or averages) a contiguous tensor over a leading and/or a trailing block of axes. Viewed as
+    /// [L, K, R]: one SumAxis reduces R, and ones[1, L] x [L, K] against the engine's cached ones vector reduces L, so no
+    /// permute and no uploaded stride or axis tables. Null when the axes are not that shape or no ones vector can be made
+    /// (during a capture).
+    /// </summary>
+    private Tensor<T>? TryReduceAroundKeptBlock<T>(Tensor<T> input, int[] sortedAxes, bool keepDims,
+        IDirectGpuBackend backend, ReduceOperation op)
+    {
+        if (typeof(T) != typeof(float) || !input.IsContiguous || input.Length == 0) return null;
+        var dims = input.Shape._dims;
+        if (!TrySplitAroundKeptBlock(dims, sortedAxes, out int leading, out int kept, out int trailing)) return null;
+
+        var reducedAxes = new bool[dims.Length];
+        foreach (int axis in sortedAxes) reducedAxes[axis] = true;
+        int[] outputShape;
+        if (keepDims)
+        {
+            outputShape = (int[])dims.Clone();
+            for (int i = 0; i < dims.Length; i++) if (reducedAxes[i]) outputShape[i] = 1;
+        }
+        else
+        {
+            outputShape = dims.Where((_, i) => !reducedAxes[i]).ToArray();
+        }
+
+        IGpuBuffer? ones = leading > 1 ? GetCachedOnesBuffer(backend, leading) : null;
+        if (leading > 1 && ones is null) return null;
+
+        using var inputBuffer = GetOrAllocateBuffer(backend, input);
+        bool sumTrailing = trailing > 1;
+        OwnedBuffer rowSums = sumTrailing ? AllocateOutputBuffer(backend, leading * kept) : default;
+        var output = AllocateOutputBuffer(backend, kept);
+        bool handedOff = false;
+        try
+        {
+            var afterTrailing = inputBuffer.Buffer;
+            if (sumTrailing)
+            {
+                backend.SumAxis(inputBuffer.Buffer, rowSums.Buffer, leading * kept, trailing);
+                afterTrailing = rowSums.Buffer;
+            }
+            if (ones is not null)
+                backend.Gemm(ones, afterTrailing, output.Buffer, 1, kept, leading);
+            else
+                backend.Copy(afterTrailing, output.Buffer, kept);
+            if (op == ReduceOperation.Mean)
+                backend.Scale(output.Buffer, output.Buffer, 1f / ((float)leading * trailing), kept);
+
+            var result = DeferTensorResult<T>(backend, output.Buffer, kept, outputShape);
+            handedOff = true;
+            return result;
+        }
+        finally
+        {
+            if (sumTrailing) rowSums.Dispose();
+            if (!handedOff) output.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// The gradient of a sum (scale 1) or mean over a leading and/or trailing block of axes: gradOutput[K] broadcast to
+    /// [L, K, R], times <paramref name="scale"/>. Two outer products against the cached ones vectors, so nothing is
+    /// uploaded and the host tile path is not taken. Null when the axes are not that shape.
+    /// </summary>
+    internal Tensor<T>? TryBroadcastReducedGradient<T>(Tensor<T> gradOutput, int[] inputShape, int[] axes, float scale)
+    {
+        if (typeof(T) != typeof(float) || Compilation.GraphMode.IsActive || !gradOutput.IsContiguous
+            || inputShape is null || !TryGetBackend(out var backend))
+            return null;
+
+        // Every reduced axis had extent 1, or the input was a scalar (a full sum of a rank-0 tensor yields [1]): the
+        // gradient is the incoming one, reshaped and scaled.
+        int inputLength = 1;
+        foreach (int d in inputShape) inputLength = checked(inputLength * d);
+        if (gradOutput.Length == inputLength)
+        {
+            using var same = GetOrAllocateBuffer(backend, gradOutput);
+            return DispatchDeferredGpuOp<T>(backend, inputLength, (int[])inputShape.Clone(), output =>
+            {
+                if (scale != 1f) backend.Scale(same.Buffer, output, scale, inputLength);
+                else backend.Copy(same.Buffer, output, inputLength);
+            });
+        }
+        if (inputShape.Length == 0) return null;
+        var sorted = axes.Select(a => a < 0 ? a + inputShape.Length : a).OrderBy(a => a).ToArray();
+        for (int i = 1; i < sorted.Length; i++) if (sorted[i] == sorted[i - 1]) return null;
+        if (!TrySplitAroundKeptBlock(inputShape, sorted, out int leading, out int kept, out int trailing)) return null;
+        if (gradOutput.Length != kept) return null;
+
+        var leadingOnes = leading > 1 ? GetCachedOnesBuffer(backend, leading) : null;
+        var trailingOnes = trailing > 1 ? GetCachedOnesBuffer(backend, trailing) : null;
+        if ((leading > 1 && leadingOnes is null) || (trailing > 1 && trailingOnes is null)) return null;
+
+        int inputSize = leading * kept * trailing;
+        using var gradient = GetOrAllocateBuffer(backend, gradOutput);
+        bool expandLeading = leadingOnes is not null, expandTrailing = trailingOnes is not null;
+        OwnedBuffer middle = expandLeading && expandTrailing ? AllocateOutputBuffer(backend, leading * kept) : default;
+        try
+        {
+            return DispatchDeferredGpuOp<T>(backend, inputSize, (int[])inputShape.Clone(), output =>
+            {
+                if (expandLeading && expandTrailing)
+                {
+                    backend.OuterProduct(leadingOnes!, gradient.Buffer, middle.Buffer, leading, kept);
+                    backend.OuterProduct(middle.Buffer, trailingOnes!, output, leading * kept, trailing);
+                }
+                else if (expandLeading)
+                    backend.OuterProduct(leadingOnes!, gradient.Buffer, output, leading, kept);
+                else if (expandTrailing)
+                    backend.OuterProduct(gradient.Buffer, trailingOnes!, output, kept, trailing);
+                else
+                    backend.Copy(gradient.Buffer, output, kept);
+                if (scale != 1f)
+                    backend.Scale(output, output, scale, inputSize);
+            });
+        }
+        finally
+        {
+            if (expandLeading && expandTrailing) middle.Dispose();
+        }
+    }
+
+    /// <summary>
     /// Internal GPU reduction implementation that handles arbitrary axes.
     /// </summary>
     private Tensor<T> ReduceAxisGpu<T>(Tensor<T> input, int[] normalizedAxes, bool keepDims,
@@ -17513,6 +17679,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         var inputShape = input.Shape._dims;
         int inputRank = inputShape.Length;
+
+        // Sum/mean over a leading and/or trailing block of axes (a conv bias gradient reduces [N, C, H, W] over N, H and
+        // W; a flattened loss over its trailing axes) needs no permute: the permute kernel uploads its stride and axis
+        // tables on every call. The resident compiled step keeps its own path below.
+        if (!ResidentStepActive && (op == ReduceOperation.Sum || op == ReduceOperation.Mean)
+            && !(normalizedAxes.Length == 1 && normalizedAxes[0] == inputRank - 1)
+            && TryReduceAroundKeptBlock(input, normalizedAxes, keepDims, backend, op) is { } aroundKept)
+            return aroundKept;
 
         // Compute output shape
         var outputShapeList = new List<int>();
