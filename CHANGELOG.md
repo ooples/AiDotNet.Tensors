@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.133.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.133.0...v0.133.1) (2026-09-29)
+
+
+### Bug Fixes
+
+* **compile:** accumulate a lower-rank broadcast operand's gradient; stop discarding pre-packed weights ([#1062](https://github.com/ooples/AiDotNet.Tensors/issues/1062)) ([3101ee7](https://github.com/ooples/AiDotNet.Tensors/commit/3101ee71e26967b00291cf7e87d69e731d10ee1b))
+* **engine:** make TensorCopy write into the destination's live storage ([#1054](https://github.com/ooples/AiDotNet.Tensors/issues/1054)) ([589122c](https://github.com/ooples/AiDotNet.Tensors/commit/589122cd39fe345170c0f49646409b7b1d9cf179))
+* optimizer formulas agree on every backend; failed graph captures no longer corrupt training; more backwards on the device ([#1065](https://github.com/ooples/AiDotNet.Tensors/issues/1065)) ([582b470](https://github.com/ooples/AiDotNet.Tensors/commit/582b470fb6a083320950d2afc4c91bd6272079b6))
+* **optimizers:** dynamic-codebook 8-bit Adam, min_8bit_size, and a real LAMB on every backend ([#1061](https://github.com/ooples/AiDotNet.Tensors/issues/1061)) ([295b135](https://github.com/ooples/AiDotNet.Tensors/commit/295b1355610ff7a40aa89cc1f258e161135ea55f))
+
 ## [0.133.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.132.1...v0.133.0) (2026-09-27)
 
 
