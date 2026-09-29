@@ -177,7 +177,7 @@ internal sealed class BackwardStorageReleasePlan<T>
             var candidate = candidates[i];
             if (protectedStorages.Contains(candidate.StorageIdentity)) continue;
             if (!ReferenceEquals(candidate.Tensor.StorageIdentity, candidate.StorageIdentity)) continue;
-            engine.InvalidateGpuCacheForTensor(candidate.Tensor);
+            engine.ReleaseActivationStorage(candidate.Tensor);
         }
     }
 

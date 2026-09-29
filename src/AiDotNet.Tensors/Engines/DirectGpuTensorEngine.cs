@@ -1747,6 +1747,23 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
     }
 
+    /// <summary>
+    /// Releases the activation-cache storage of a tensor the backward no longer needs. A tensor with no cache entry
+    /// under either key - an op result that owns its buffer (DeferTensorResult) - has nothing to release, and
+    /// InvalidateGpuCacheForTensor would still force its pending host download first: one device-to-host copy of
+    /// every released forward activation per step, for data nothing reads (measured on the parity MLP step: all 5
+    /// downloads of the training step's backward). Its buffer stays with the tensor and a later host read still
+    /// materializes lazily.
+    /// </summary>
+    internal void ReleaseActivationStorage<T>(LinearAlgebra.Tensor<T> tensor)
+    {
+        var backingArray = tensor.GetBackingArrayForCacheLookupUnsafe();
+        if (!_activationCache.ContainsKey(tensor.DataVector)
+            && (backingArray is null || !_activationCache.ContainsKey(backingArray)))
+            return;
+        InvalidateGpuCacheForTensor(tensor);
+    }
+
     internal void InvalidateGpuCacheForTensor<T>(LinearAlgebra.Tensor<T> tensor)
     {
         // Both the array-keyed and vector-keyed activation cache
