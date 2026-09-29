@@ -69,4 +69,63 @@ public class CompiledTrainingPlanIntrospectionTests
         Assert.False(parameters is Tensor<float>[], "the plan's parameter array must not be handed out");
         Assert.Throws<NotSupportedException>(() => ((IList<Tensor<float>>)parameters)[0] = Tensor<float>.CreateRandom([3, 2]));
     }
+    public static TheoryData<string> MomentStorageModes => new() { "float32", "bfloat16", "int8", "amsgrad" };
+
+    /// <summary>
+    /// Exporting and importing optimizer state works in every moment-storage mode. Each mode keeps its moments in a
+    /// different per-parameter array (float, bfloat16 ushort, int8 byte plus double scales) and leaves the others
+    /// allocated with null entries, which made ExportOptimizerState throw NullReferenceException before the slot check.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(MomentStorageModes))]
+    public void OptimizerState_RoundTrips_InEveryMomentStorageMode(string mode)
+    {
+        ICompiledTrainingPlan<float> Build()
+        {
+            // 64 x 64 = 4096 elements: the default int8 minimum, so the int8 mode really quantizes.
+            var plan = Compile(Tensor<float>.CreateRandom([64, 64]));
+            if (mode == "bfloat16") plan.RequestBf16MomentStorage(true);
+            if (mode == "int8") plan.RequestInt8MomentStorage(true, blockSize: 256);
+            plan.ConfigureOptimizer(mode == "amsgrad" ? OptimizerType.AMSGrad : OptimizerType.Adam, 1e-3f);
+            return plan;
+        }
+
+        using var source = Build();
+        for (int i = 0; i < 3; i++) source.Step();
+        byte[] state = source.ExportOptimizerState() ?? throw new InvalidOperationException($"{mode} plan exported no state.");
+
+        using var target = Build();
+        target.ImportOptimizerState(state);
+        Assert.Equal(3, Assert.IsAssignableFrom<ICompiledTrainingPlanIntrospection<float>>(target).OptimizerStep);
+
+        // The imported state is the source's: exporting it again reproduces the payload byte for byte.
+        Assert.Equal(state, target.ExportOptimizerState());
+    }
+
+    [Fact]
+    public void OptimizerState_RoundTrips_ForADoublePlan()
+    {
+        ICompiledTrainingPlan<double> Build()
+        {
+            var engine = new CpuEngine();
+            var weight = Tensor<double>.CreateRandom([3, 2]);
+            ICompiledTrainingPlan<double> plan;
+            using (var scope = GraphMode.Enable())
+            {
+                engine.ReduceSum(weight, null);
+                plan = scope.CompileTraining(new[] { weight });
+            }
+            plan.ConfigureOptimizer(OptimizerType.Adam, 1e-3f);
+            return plan;
+        }
+
+        using var source = Build();
+        for (int i = 0; i < 2; i++) source.Step();
+        byte[] state = source.ExportOptimizerState() ?? throw new InvalidOperationException("double plan exported no state.");
+
+        using var target = Build();
+        target.ImportOptimizerState(state);
+        Assert.Equal(2, Assert.IsAssignableFrom<ICompiledTrainingPlanIntrospection<double>>(target).OptimizerStep);
+        Assert.Equal(state, target.ExportOptimizerState());
+    }
 }
