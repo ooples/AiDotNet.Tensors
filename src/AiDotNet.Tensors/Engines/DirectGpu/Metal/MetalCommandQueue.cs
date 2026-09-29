@@ -248,6 +248,8 @@ public sealed class MetalCommandQueue : IDisposable
         if (commandBuffer != IntPtr.Zero)
         {
             SendMessageVoid(commandBuffer, Selectors.WaitUntilCompleted);
+            // The host blocked until the command buffer finished: a synchronization for the residency probe.
+            GpuLaunchProbe.OnSynchronize(GpuBackendType.Metal);
         }
     }
 

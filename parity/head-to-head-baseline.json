@@ -1,0 +1,19 @@
+{
+  "noiseFloor": 0.15,
+  "cases": {
+    "cnn:cuda": {
+      "windows-x64-16cpu-amd-ryzen-7-4800h-with-radeon-graphics-cuda-nvidia-geforce-gtx-1660-ti": 59.53
+    },
+    "mlp:cuda": {
+      "windows-x64-16cpu-amd-ryzen-7-4800h-with-radeon-graphics-cuda-nvidia-geforce-gtx-1660-ti": 1.123
+    },
+    "cnn:cpu": {
+      "windows-x64-16cpu-amd-ryzen-7-4800h-with-radeon-graphics-cpu": 21.72,
+      "linux-x64-4cpu-amd-epyc-9v74-80-core-processor-cpu": 2.986
+    },
+    "mlp:cpu": {
+      "windows-x64-16cpu-amd-ryzen-7-4800h-with-radeon-graphics-cpu": 3.41,
+      "linux-x64-4cpu-amd-epyc-9v74-80-core-processor-cpu": 2.931
+    }
+  }
+}

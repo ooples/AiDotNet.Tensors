@@ -383,18 +383,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     /// </remarks>
     public ReadOnlySpan<T> AsSpan()
     {
-        // GPU-resident lazy allocation: allocate backing array on first CPU access
-        if (IsLazyAllocated)
-        {
-            // A released intermediate must fail BEFORE a backing array is installed: otherwise the throw leaves an
-            // allocated (zero) array behind and every later read silently returns it.
-            Helpers.HostSync.ThrowIfReleased(this);
-            var arr = new T[_logicalLength];
-            MaterializeBacking(arr);
-            SyncHostFromDevice();
-        }
-        // Materialize deferred GPU download before exposing CPU data
-        SyncHostFromDevice();
+        EnsureMaterialized();
         return _memory.Span;
     }
 
@@ -421,16 +410,21 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     /// Ensures the backing array is allocated and populated for CPU access.
     /// Call this at the top of any method that reads _memory directly.
     /// </summary>
+    /// <remarks>
+    /// A pending download is registered on the storage's one HostSync state, which the vector and its backing
+    /// array share, and that state is checked on every read. Checking the vector only while it was still lazy
+    /// meant a device write made after the first host read (a GPU optimizer step updating a weight the host
+    /// had already read) was never downloaded, and every later host read returned the pre-update values.
+    /// </remarks>
     private void EnsureMaterialized()
     {
+        // GPU-resident lazy allocation: allocate backing array on first CPU access
         if (IsLazyAllocated)
         {
             // A released intermediate must fail BEFORE a backing array is installed: otherwise the throw leaves an
             // allocated (zero) array behind and every later read silently returns it.
             Helpers.HostSync.ThrowIfReleased(this);
-            var arr = new T[_logicalLength];
-            MaterializeBacking(arr);
-            SyncHostFromDevice();
+            MaterializeBacking(new T[_logicalLength]);
         }
         SyncHostFromDevice();
     }
@@ -524,17 +518,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     internal T[] GetDataArray()
     {
         _beforeWrite?.Invoke();
-        // GPU-resident lazy allocation: allocate backing array on first CPU access
-        if (IsLazyAllocated)
-        {
-            // A released intermediate must fail BEFORE a backing array is installed: otherwise the throw leaves an
-            // allocated (zero) array behind and every later read silently returns it.
-            Helpers.HostSync.ThrowIfReleased(this);
-            var arr = new T[_logicalLength];
-            MaterializeBacking(arr);
-            // Try to materialize GPU data into the new array via the vector-keyed callback
-            SyncHostFromDevice();
-        }
+        EnsureMaterialized();
 
         // One sync for every shape of backing (whole array, offset-0 segment, or an offset segment copied below).
         SyncHostFromDevice();
