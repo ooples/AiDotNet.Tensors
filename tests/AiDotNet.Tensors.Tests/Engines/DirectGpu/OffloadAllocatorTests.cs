@@ -71,15 +71,28 @@ public class OffloadAllocatorTests
         Skip.IfNot(CudaNativeBindings.IsAvailable, "CUDA driver is unavailable.");
         using var backend = new CudaBackend();
         Skip.IfNot(backend.IsAvailable, "CUDA backend failed to initialize.");
-        using var allocator = new CudaOffloadAllocator(backend.CudaContextHandle);
+        var context = backend.CudaContextHandle;
+        using var allocator = new CudaOffloadAllocator(context);
 
         Assert.True(allocator.IsAvailable);
         backend.Dispose();
 
-        Assert.False(allocator.IsAvailable);
-        var error = Assert.Throws<NotSupportedException>(
-            () => allocator.Allocate(1024, OffloadScheme.Pinned));
-        Assert.Contains("no longer live", error.Message, StringComparison.Ordinal);
+        // Backends share the device's primary context, so disposing this one releases only its hold: the context
+        // stays live while any other backend in the process holds it, and dies with the last. The allocator must
+        // track exactly that -- usable while the context is live, failing closed once it is gone.
+        bool contextLive = CudaBackend.LiveContexts.ContainsKey(context);
+        Assert.Equal(contextLive, allocator.IsAvailable);
+        if (contextLive)
+        {
+            var handle = allocator.Allocate(1024, OffloadScheme.Pinned);
+            Assert.NotEqual(IntPtr.Zero, handle.HostPointer);
+        }
+        else
+        {
+            var error = Assert.Throws<NotSupportedException>(
+                () => allocator.Allocate(1024, OffloadScheme.Pinned));
+            Assert.Contains("no longer live", error.Message, StringComparison.Ordinal);
+        }
     }
 
     [SkippableFact]

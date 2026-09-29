@@ -171,19 +171,19 @@ public class PersistentTensorRegistrationTests
 
         // Stand in for FinishGpuOp: the host array is stale and a download that would fill it with the
         // device's current value (3.0) is registered but has not run yet.
-        DeferredArrayMaterializer.Register(array, pending =>
+        HostSync.Register(array, pending =>
         {
             var target = (float[])pending;
             for (int i = 0; i < target.Length; i++) target[i] = 3.0f;
         });
         try
         {
-            Assert.True(DeferredArrayMaterializer.IsPending(array));
+            Assert.True(HostSync.IsPending(array));
 
             engine.InvalidatePersistentTensor(weight);
 
             Assert.False(
-                DeferredArrayMaterializer.IsPending(array),
+                HostSync.IsPending(array),
                 "invalidation uploaded without materialising the pending download; the GPU now holds stale data.");
 
             // Read the weight back THROUGH the cache: the weight path serves the buffer invalidation
@@ -194,7 +194,7 @@ public class PersistentTensorRegistrationTests
         }
         finally
         {
-            DeferredArrayMaterializer.Remove(array);
+            HostSync.Remove(array);
             engine.UnregisterPersistentTensor(weight);
         }
     }

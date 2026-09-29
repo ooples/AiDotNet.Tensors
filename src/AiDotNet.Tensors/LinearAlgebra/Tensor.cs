@@ -1,4 +1,4 @@
-﻿using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Helpers;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
@@ -446,6 +446,14 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             }
             catch { }
         }
+
+        // A permuted view of a tensor whose only current copy is on the GPU: permute on the device (and record the
+        // same Contiguous node) instead of downloading the base to walk it here -- the host walk made every
+        // permute's backward (and any other Contiguous caller) a device-to-host-to-device round trip.
+        if (!IsContiguous && _storageOffset == 0
+            && Engines.AiDotNetEngine.Current is Engines.DirectGpuTensorEngine gpuEngine
+            && gpuEngine.TryContiguousOnDevice(this, out var onDevice))
+            return FinalizeContiguousCopy(onDevice);
 
         // Arena-aware output: every element is written below (bulk copy or odometer
         // walk), so an uninitialized pooled/arena buffer is safe — and this makes the
@@ -3456,7 +3464,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         };
         tensor._gpuMaterializerCallback = materializeCallback;
         tensor._gpuMaterializerKey = tensor._data; // Vector as key — matches VectorBase.AsSpan() TryMaterialize(this)
-        Helpers.DeferredArrayMaterializer.Register(tensor._data, materializeCallback);
+        Helpers.HostSync.Register(tensor._data, materializeCallback);
 
         return tensor;
     }
@@ -4904,7 +4912,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         var backingArray = _data.GetBackingArrayUnsafe();
         if (backingArray is not null)
         {
-            Helpers.DeferredArrayMaterializer.TryMaterialize(backingArray);
+            Helpers.HostSync.TryMaterialize(backingArray);
         }
 
         // Split-complex buffers have a physical [real plane][imaginary plane]

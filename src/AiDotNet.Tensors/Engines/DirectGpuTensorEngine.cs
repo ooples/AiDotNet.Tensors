@@ -98,6 +98,17 @@ internal sealed class CsrGpuCache : IDisposable
 /// When a layer's output is downloaded, we cache the GPU buffer so the next layer
 /// can reuse it without re-uploading if it uses the same data.
 /// </summary>
+/// <summary>How an evicted activation whose only valid copy is still on the device is handled.</summary>
+internal enum ActivationReleaseMode
+{
+    /// <summary>Download to the host, then free (#226): a later host read sees the data.</summary>
+    MaterializeThenFree,
+    /// <summary>Free without a download and without a marker: for provably unread scratch.</summary>
+    DropScratch,
+    /// <summary>Free without a download (PyTorch-style); a later host read throws a clear error.</summary>
+    Release,
+}
+
 internal sealed class ActivationCacheEntry : IDisposable
 {
     public IGpuBuffer Buffer { get; }
@@ -128,6 +139,9 @@ internal sealed class ActivationCacheEntry : IDisposable
         get => Volatile.Read(ref _hostVersion);
         set => Volatile.Write(ref _hostVersion, value);
     }
+
+    /// <summary>The registry (engine) this entry is bound in; a storage's entry slot is shared by all engines.</summary>
+    internal object? Owner;
 
     // 5-arg overload preserved for reflection-based callers (test helpers like
     // EvictActivationsCreatedAfterLifetimeTests.GetActivationCacheEntryCtor
@@ -168,7 +182,7 @@ internal sealed class ActivationCacheEntry : IDisposable
 }
 
 // DeferredDownloadEntry was removed in the #226 cleanup — the engine no longer
-// maintains a local pending-download map. DeferredArrayMaterializer is the
+// maintains a local pending-download map. HostSync is the
 // single source of truth for "some caller still needs this buffer downloaded",
 // and its Register/TryMaterialize/MaterializeAll drive both eviction protection
 // (via IsPending) and scope-end flushing.
@@ -315,48 +329,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private IGpuBuffer? _occupancyBufferCacheBuffer;
     private int _occupancyBufferCacheVersion = -1;
 
-    // Activation cache for intermediate tensors - enables GPU-resident layer chaining
-    // Key: tensor data array reference, Value: (buffer, shape, timestamp)
-    // This cache holds the last N activation buffers to avoid re-uploading layer outputs
-    // Thread-safety: ConcurrentDictionary + _activationCacheLock for atomic compound operations.
-    // CAUTION: ClearActivationCache should not be called during active GPU operations.
-    private readonly ConcurrentDictionary<object, ActivationCacheEntry> _activationCache = new();
+    // Device entries of this engine's results and uploads (buffer, shape, backend), stored ON each storage -- see
+    // DeviceEntryRegistry. No count, byte or managed-heap cap and no LRU offload: an entry lives as long as its storage,
+    // a step's entries are released at its end (EvictActivationsCreatedAfter over the flow's ledger), and memory
+    // pressure is handled by the GC-driven reclaim and the allocator's retry.
+    private readonly DeviceEntryRegistry _activationCache = new();
     private readonly object _activationCacheLock = new();
-    // Lowered from 4096 (2026-05-12, issue #283): the larger cap was tuned
-    // for batched inference where many activations could be in-flight, but
-    // in long-running training loops the eviction skip-pending guard meant
-    // unused intermediates rode along until the next deliberate cache clear.
-    // 512 keeps long-loop memory pressure bounded while leaving headroom for
-    // chained-op GPU pipelines (BatchNorm/LayerNorm get unhappy below ~128).
-    // The entry-count cap is a backstop only; the 75%-VRAM byte cap (_maxActivationCacheBytes)
-    // is the real memory guard. It was 512, but a single cortex/transformer TRAINING STEP caches
-    // far more than 512 activations, so a 512 cap fired eviction EVERY step and offloaded
-    // (downloaded) forward activations that backward then re-uploaded — a GPU->CPU->GPU thrash
-    // that starved the GPU to ~13% utilization. Raised to 131072 so eviction is driven by actual
-    // VRAM pressure: a model whose per-step working set fits in 75% VRAM stays fully resident
-    // (full GPU util), and the byte cap still bounds memory for large models.
-    private const int DefaultActivationCacheSize = 131072;
-    private int _maxActivationCacheSize = DefaultActivationCacheSize;
 
-    /// <summary>
-    /// Maximum GPU memory (bytes) the activation cache is allowed to use.
-    /// Default is 75% of total GPU memory. When this limit is approached,
-    /// the oldest entries are evicted regardless of entry count.
-    /// Set to 0 to disable memory-based eviction (count-based only).
-    /// </summary>
-    private long _maxActivationCacheBytes;
-
-    // VRAM byte cap for the activation cache. Default = 75% of TOTAL device memory — which over-commits when
-    // other processes (the Windows desktop holds GBs) occupy the card: the cache saturates toward the cap and
-    // per-step transients then OOM at a fixed step horizon. AIDOTNET_ACT_CACHE_VRAM_MB overrides (MB).
-    private static long ResolveActCacheVramCap(long globalBytes)
-    {
-        var env = System.Environment.GetEnvironmentVariable("AIDOTNET_ACT_CACHE_VRAM_MB");
-        if (long.TryParse(env, out var mb) && mb > 0) return mb * 1024L * 1024L;
-        return globalBytes * 3 / 4;
-    }
-
-    private long _currentActivationCacheBytes;
     private long _activationCacheTimestamp = 0;
 
     // Eviction-suspend depth (#226 race fix). A training step (compiled-plan StepEager,
@@ -369,9 +348,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // free that step's activations deterministically AFTER it (EvictActivationsCreatedAfter).
     // If a single step genuinely exceeds VRAM, the result is a clean CUDA OOM (reduce
     // batch / enable gradient checkpointing / use mixed precision) instead of a 700.
-    // Instance field + Interlocked so it is visible across the BLAS thread pool.
-    private int _evictionSuspendDepth;
-    internal bool EvictionSuspended => System.Threading.Volatile.Read(ref _evictionSuspendDepth) > 0;
+    // PER EXECUTION FLOW (visible to the workers a step fans out to, invisible to other threads): an engine-wide
+    // counter let one thread's step suppress -- or its end trigger -- another thread's releases.
+    private readonly FlowDepth _evictionSuspendDepth = new();
+    internal bool EvictionSuspended => _evictionSuspendDepth.Active;
+
+    // Captured CUDA graphs alive on this engine (any thread). A graph replays the device weights it captured, so a
+    // weight-cache invalidation waits until none is alive (see InvalidateAllWeightCaches).
+    private int _liveCapturedGraphs;
 
     /// <summary>Nonzero only while the compiled plan runs the CAPTURE-PATH step body (pre-residency pass or inside
     /// cuStreamBeginCapture) — set by CompiledTrainingPlan via <see cref="EnterCompiledCapturePath"/>. The
@@ -380,15 +364,35 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// the NON-captured per-step work (the eager optimizer update, warmup steps, shape-mismatch eager fallbacks)
     /// into resident allocations leaks VRAM every step — nothing is evictable, so a long epoch OOMs (issue #26:
     /// canary 76 steps trained clean, a 488-step epoch OOM'd mid-epoch at two model sizes).
-    /// INSTANCE field + Interlocked (NOT [ThreadStatic]): op execution fans out to the BLAS pool threads — a
-    /// thread-local flag is invisible there, the resident branches decline, and a host download aborts the
-    /// capture (verified on the d256/L2 smoke).</summary>
-    private int _capturePathDepth;
+    /// PER EXECUTION FLOW (AsyncLocal), not per engine and not [ThreadStatic]: the plan's op execution fans out
+    /// to worker threads (Parallel/Task), which inherit the flow's value -- a thread-local flag is invisible there,
+    /// the resident branches decline, and a host download aborts the capture (verified on the d256/L2 smoke). An
+    /// engine-wide counter was worse: every OTHER thread using this engine (e.g. concurrent tapes on the default
+    /// engine) also took the resident branches while a plan stepped, renting and disposing the plan's per-action
+    /// scratch buffers under its in-flight kernels (CUDA 700).</summary>
+    private readonly FlowDepth _capturePathDepth = new();
+
+    /// <summary>A nesting depth scoped to the current execution flow (inherited by Parallel/Task workers).</summary>
+    private sealed class FlowDepth
+    {
+        private readonly System.Threading.AsyncLocal<int> _depth = new();
+        internal bool Active => _depth.Value > 0;
+        /// <summary>Enters one level; returns the new depth.</summary>
+        internal int Enter() => _depth.Value = _depth.Value + 1;
+        /// <summary>Leaves one level; returns the remaining depth. Clamped at 0 for an exit on another flow.</summary>
+        internal int Exit()
+        {
+            int d = _depth.Value;
+            if (d <= 0) return 0;
+            _depth.Value = d - 1;
+            return d - 1;
+        }
+    }
 
     /// <summary>The correct gate for compiled-step resident-buffer behavior: buffers pinned (eviction suspended)
     /// AND on the capture path (work the captured graph will replay).</summary>
     internal bool ResidentStepActive =>
-        System.Threading.Volatile.Read(ref _capturePathDepth) > 0 && EvictionSuspended;
+        _capturePathDepth.Active && EvictionSuspended;
 
     /// <summary>RAII scope marking the compiled capture path (instance depth; nesting-safe).</summary>
     /// <summary>Process-wide count of engines currently on the compiled capture path (diagnostics only: lets the
@@ -397,7 +401,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     internal IDisposable EnterCompiledCapturePath()
     {
-        if (System.Threading.Interlocked.Increment(ref _capturePathDepth) == 1)
+        if (_capturePathDepth.Enter() == 1)
             System.Threading.Interlocked.Increment(ref s_capturePathEngines);
         s_residentScratchEngine = this;   // route the static AllocateOutputBuffer's transient allocs here
         return new CapturePathScope(this);
@@ -410,7 +414,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         public void Dispose()
         {
             var e = System.Threading.Interlocked.Exchange(ref _e, null);
-            if (e is not null && System.Threading.Interlocked.Decrement(ref e._capturePathDepth) == 0)
+            if (e is not null && e._capturePathDepth.Exit() == 0)
             {
                 System.Threading.Interlocked.Decrement(ref s_capturePathEngines);
                 e._currentScratchAction = -1;
@@ -424,16 +428,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// engages ONLY for the dedicated, non-aliased gradient leaf — NOT for forward in-place ops
     /// (<c>TensorBroadcastAddInPlace</c> etc.) whose `a` may be an ALIASED resident activation that an in-place
     /// mutation would corrupt (the A2 forward-hijack that threw CUDA-700). Instance field + Interlocked to match
-    /// <see cref="_capturePathDepth"/> (op execution can fan out to BLAS-pool threads).</summary>
-    private int _gradAccumDepth;
+    /// <see cref="_capturePathDepth"/>: per execution flow, so another thread's grad accumulation cannot switch
+    /// this thread's forward in-place ops onto the resident fast path.</summary>
+    private readonly FlowDepth _gradAccumDepth = new();
 
     /// <summary>True while inside autodiff grad accumulation (see <see cref="_gradAccumDepth"/>).</summary>
-    internal bool InGradAccumulation => System.Threading.Volatile.Read(ref _gradAccumDepth) > 0;
+    internal bool InGradAccumulation => _gradAccumDepth.Active;
 
     /// <summary>RAII scope marking the autodiff grad-accumulation in-place add (instance depth; nesting-safe).</summary>
     internal IDisposable EnterGradAccumulation()
     {
-        System.Threading.Interlocked.Increment(ref _gradAccumDepth);
+        _gradAccumDepth.Enter();
         return new GradAccumScope(this);
     }
 
@@ -444,24 +449,43 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         public void Dispose()
         {
             var e = System.Threading.Interlocked.Exchange(ref _e, null);
-            if (e is not null) System.Threading.Interlocked.Decrement(ref e._gradAccumDepth);
+            if (e is not null) e._gradAccumDepth.Exit();
         }
     }
     // #1650 inference CUDA-graph capture: while set, GPU-resident in-place ops (TryRunBinaryInPlace) engage
     // on ResidentStepActive WITHOUT the training-only InGradAccumulation gate, so the inference forward runs
-    // host-round-trip-free and is capturable. Depth counter (not bool) so it's visible on the BLAS pool
-    // threads the op execution fans out to, mirroring _capturePathDepth / _evictionSuspendDepth.
-    private int _inferenceCaptureDepth;
-    internal bool InferenceCaptureActive => System.Threading.Volatile.Read(ref _inferenceCaptureDepth) > 0;
-    internal void BeginInferenceCapture() => System.Threading.Interlocked.Increment(ref _inferenceCaptureDepth);
-    internal void EndInferenceCapture() => System.Threading.Interlocked.Decrement(ref _inferenceCaptureDepth);
+    // host-round-trip-free and is capturable. Per execution flow, like _capturePathDepth (visible on the workers
+    // the op execution fans out to, invisible to other threads using this engine).
+    private readonly FlowDepth _inferenceCaptureDepth = new();
+    internal bool InferenceCaptureActive => _inferenceCaptureDepth.Active;
+    internal void BeginInferenceCapture() => _inferenceCaptureDepth.Enter();
+    internal void EndInferenceCapture() => _inferenceCaptureDepth.Exit();
 
-    internal void SuspendActivationEviction() => System.Threading.Interlocked.Increment(ref _evictionSuspendDepth);
-    internal void ResumeActivationEviction()
+    internal void SuspendActivationEviction() => _evictionSuspendDepth.Enter();
+    internal void ResumeActivationEviction() => _evictionSuspendDepth.Exit();
+
+    /// <summary>
+    /// A captured graph starts to live: suspends this flow's step releases (its buffers stay bound) and counts the
+    /// graph so weight-cache invalidations wait for it. Pair with <see cref="EndGraphLifetime"/>.
+    /// </summary>
+    internal void BeginGraphLifetime()
     {
-        if (System.Threading.Interlocked.Decrement(ref _evictionSuspendDepth) < 0)
-            System.Threading.Interlocked.Increment(ref _evictionSuspendDepth); // clamp at 0
+        System.Threading.Interlocked.Increment(ref _liveCapturedGraphs);
+        _evictionSuspendDepth.Enter();
     }
+
+    /// <summary>Ends a <see cref="BeginGraphLifetime"/>; runs a weight-cache invalidation deferred while it lived.</summary>
+    internal void EndGraphLifetime()
+    {
+        _evictionSuspendDepth.Exit();
+        int live = System.Threading.Interlocked.Decrement(ref _liveCapturedGraphs);
+        if (live < 0) { System.Threading.Interlocked.Increment(ref _liveCapturedGraphs); live = 0; }
+        if (live == 0 && System.Threading.Interlocked.Exchange(ref _pendingWeightCacheInvalidation, 0) == 1)
+            InvalidateAllWeightCaches();
+    }
+
+    // Set when InvalidateAllWeightCaches is called while a captured graph is alive (see there).
+    private int _pendingWeightCacheInvalidation;
 
     // ───────────────────────────────────────────────────────────────────────────────────────────
     // #1650 PUBLIC inference CUDA-graph capture API. ForwardUNet (the diffusion eager GPU forward to
@@ -517,9 +541,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public IDisposable? EnterResidentCaptureScope()
     {
         if (GetBackend() is not Engines.DirectGpu.CUDA.CudaBackend) return null;
-        SuspendActivationEviction();
+        BeginGraphLifetime();
         BeginInferenceCapture();
-        System.Threading.Interlocked.Increment(ref _capturePathDepth);
+        _capturePathDepth.Enter();
         return new ResidentCaptureScope(this);
     }
 
@@ -531,9 +555,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             var e = System.Threading.Interlocked.Exchange(ref _e, null);
             if (e is null) return;
-            System.Threading.Interlocked.Decrement(ref e._capturePathDepth);
+            e._capturePathDepth.Exit();
             e.EndInferenceCapture();
-            e.ResumeActivationEviction();
+            e.EndGraphLifetime();
         }
     }
 
@@ -702,7 +726,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (arr is null) return;
         _fp16ResidentArrays[arr] = elementCount;
         var capBuf = buf; var capBackend = backend; var capCount = elementCount;
-        Helpers.DeferredArrayMaterializer.Register(arr, a =>
+        Helpers.HostSync.Register(arr, a =>
         {
             using var f32 = AllocateOutputBuffer(capBackend, capCount); // post-capture host read: alloc is fine
             capBackend.ConvertToFp32(capBuf, f32.Buffer, capCount);
@@ -894,32 +918,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             cudaBackend.ReclaimUnderPressure();
     }
 
-    // MANAGED-heap bound for the activation cache (independent of the VRAM byte cap).
-    // Root cause of the cortex training OOM/crash (2026-06-05, gcroot): the cache keys
-    // are the managed float[] backing arrays, but eviction was driven ONLY by GPU-buffer
-    // bytes (_currentActivationCacheBytes) and a huge 131072 entry cap. When a step's GPU
-    // buffers are freed/deferred but their managed keys linger (stale cross-step entries),
-    // nothing bounded the MANAGED heap — it grew to 36GB+ (live after GC) and crashed the
-    // process while VRAM stayed capped at ~75%. This cap evicts the OLDEST entries (exactly
-    // those stale prior-step activations) once managed retention exceeds the limit, while
-    // the current step's newest activations stay resident (no GPU<->CPU thrash for the live
-    // step). Tunable via AIDOTNET_ACT_CACHE_MANAGED_MB (default 8192 MB); 0 disables.
-    private long _maxActivationManagedBytes;
-    private long _currentActivationManagedBytes;
 
     // Deferred download tracking for GPU-resident execution
     // When GpuScope is active, intermediate results skip the blocking download.
     // The GPU buffer stays in the activation cache for direct GPU-to-GPU chaining.
-    // If CPU data is later needed, the DeferredArrayMaterializer registry fires
+    // If CPU data is later needed, the HostSync registry fires
     // the per-tensor download callback. The engine-local pending map was removed
-    // in the #226 cleanup — see DeferredArrayMaterializer for the full contract.
+    // in the #226 cleanup — see HostSync for the full contract.
 
     public DirectGpuTensorEngine()
     {
         _directGpu = new DirectGpuEngine();
         _ownsDirectGpu = true;
-        _maxActivationCacheBytes = ResolveActCacheVramCap(_directGpu.GlobalMemoryBytes); // see helper — env-overridablery
-        _maxActivationManagedBytes = ResolveManagedCacheCapBytes();
         RegisterAsBackendOwner();
     }
 
@@ -927,8 +937,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         _directGpu = directGpu;
         _ownsDirectGpu = false;
-        _maxActivationCacheBytes = directGpu is null ? 0 : ResolveActCacheVramCap(directGpu.GlobalMemoryBytes);
-        _maxActivationManagedBytes = ResolveManagedCacheCapBytes();
         RegisterAsBackendOwner();
     }
 
@@ -999,17 +1007,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         : "CPU Engine (DirectGpu unavailable)";
 
     public override bool SupportsGpu => IsGpuAvailable;
-
-    /// <summary>
-    /// Gets or sets the maximum number of activation cache entries.
-    /// Larger values use more GPU memory but reduce re-uploads for deep networks.
-    /// Default is 256, sized for typical DNN layer chains.
-    /// </summary>
-    public int MaxActivationCacheSize
-    {
-        get => _maxActivationCacheSize;
-        set => _maxActivationCacheSize = value > 0 ? value : DefaultActivationCacheSize;
-    }
 
     DirectGpuEngine? IEngine.DirectGpu => _directGpu;
 
@@ -1521,8 +1518,123 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// BEFORE triggering any CPU materialization, avoiding wasteful GPU-to-CPU downloads
     /// for chained GPU operations. This is the primary method for GPU-resident pipelines.
     /// </summary>
+    /// <summary>
+    /// GradientTape hook: the ones seed dL/dL for a loss that lives on the device, filled there, or false (the tape
+    /// seeds on the host). A host seed crossed the boundary on every step: step-end release frees the device copy
+    /// made for the backward, even of the tape's cached scalar seed. Not during a compiled/captured step or lazy
+    /// graph recording.
+    /// </summary>
+    internal bool TryCreateDeviceSeed<T>(Tensor<T> loss, out Tensor<T> seed)
+    {
+        seed = null!;
+        if (typeof(T) != typeof(float) || loss.Length == 0 || loss.TryGetGpuBuffer() is null) return false;
+        if (ResidentStepActive || Compilation.GraphMode.IsActive || !TryGetBackend(out var backend)) return false;
+        if (backend is Engines.DirectGpu.CUDA.CudaBackend cuda && cuda.IsStreamCapturing()) return false;
+        var output = AllocateOutputBuffer(backend, loss.Length);
+        try
+        {
+            backend.Fill(output.Buffer, 1f, loss.Length);
+            seed = DeferTensorResult<T>(backend, output.Buffer, loss.Length, (int[])loss._shape.Clone());
+            return true;
+        }
+        catch
+        {
+            output.Dispose();
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Tensor.Contiguous() hook: a contiguous device copy of a permuted view of device-only data, or false (the
+    /// caller walks it on the host). Not during a compiled/captured step or lazy graph recording.
+    /// </summary>
+    internal bool TryContiguousOnDevice<T>(Tensor<T> view, out Tensor<T> result)
+    {
+        result = null!;
+        if (ResidentStepActive || Compilation.GraphMode.IsActive || !TryGetBackend(out var backend)) return false;
+        if (backend is Engines.DirectGpu.CUDA.CudaBackend cuda && cuda.IsStreamCapturing()) return false;
+        if (!TryPermuteViewOnDevice(backend, view, out var permuted)) return false;
+        result = DeferTensorResult<T>(backend, permuted.Buffer, view.Length, view.Shape.ToArray());
+        return true;
+    }
+
+    /// <summary>
+    /// Materializes a strided view whose strides are a permutation of a contiguous row-major base (what
+    /// TensorPermute / Transpose return) into a fresh device buffer with the backend's Permute kernel, when the
+    /// base's only current copy is a cached device buffer. Returns false for anything else (the host path handles it).
+    /// </summary>
+    private bool TryPermuteViewOnDevice<T>(IDirectGpuBackend backend, Tensor<T> view, out OwnedBuffer result)
+    {
+        result = default;
+        if (typeof(T) != typeof(float) || view._storageOffset != 0) return false;
+        int rank = view._shape.Length;
+        var dims = view._shape;
+        var strides = view._strides;
+        if (rank < 2 || strides is null || strides.Length != rank) return false;
+        // The device data can be keyed by the backing array or (a lazily allocated result) by the data vector; a view
+        // of a vector-keyed result can still report a backing array, so try both.
+        ActivationCacheEntry? entry = null;
+        foreach (var key in new object?[] { view.GetBackingArrayForCacheLookupUnsafe(), view.DataVector })
+        {
+            if (key is null || !Helpers.HostSync.IsPending(key)) continue;
+            if (_activationCache.TryGetValue(key, out var candidate) && ReferenceEquals(candidate.Backend, backend) && !candidate.IsFp16)
+            {
+                entry = candidate;
+                break;
+            }
+        }
+        if (entry is null) return false;   // host copy current, or not cached: the host path handles it
+
+        // Base axis order = view axes by descending stride; the view is a pure permutation iff those strides are the
+        // row-major strides of the reordered shape (size-1 axes may carry any stride).
+        var order = new int[rank];
+        for (int i = 0; i < rank; i++) order[i] = i;
+        Array.Sort(order, (p, q) => strides[q].CompareTo(strides[p]));
+        var baseShape = new int[rank];
+        long expected = 1;
+        for (int k = rank - 1; k >= 0; k--)
+        {
+            int axis = order[k];
+            if (dims[axis] != 1 && strides[axis] != expected) return false;
+            baseShape[k] = dims[axis];
+            expected *= dims[axis];
+        }
+        if (expected != view.Length || entry.Buffer.Size < view.Length) return false;
+        var permutation = new int[rank];
+        for (int k = 0; k < rank; k++) permutation[order[k]] = k;   // output axis j reads base axis permutation[j]
+
+        var output = AllocateOutputBuffer(backend, view.Length);
+        try
+        {
+            backend.Permute(entry.Buffer, output.Buffer, baseShape, permutation);
+        }
+        catch (Exception ex)
+        {
+            output.Dispose();
+            GpuLaunchProbe.OnFallback("PermuteViewOnDevice", ex);
+            return false;
+        }
+        result = output;
+        return true;
+    }
+
+    /// <summary>
+    /// Throws when <paramref name="tensor"/> is a released step intermediate. Its <c>_gpuBuffer</c> field can still
+    /// name a buffer object the pool has since re-rented to another tensor, so using it as an input would silently
+    /// read someone else's data.
+    /// </summary>
+    private static void ThrowIfReleased<T>(Tensor<T> tensor)
+    {
+        // Both keys: a vector-keyed result can gain a backing array later, and the release mark stays on the vector.
+        var array = tensor.GetBackingArrayForCacheLookupUnsafe();
+        if ((array is not null && Helpers.HostSync.IsReleased(array))
+            || Helpers.HostSync.IsReleased(tensor.DataVector))
+            throw new InvalidOperationException(ReleasedIntermediateMessage);
+    }
+
     private OwnedBuffer GetOrAllocateBuffer<T>(IDirectGpuBackend backend, Tensor<T> tensor)
     {
+        ThrowIfReleased(tensor);
         // #3 FP16-act CONVERT-AT-GAP: an FP16-tagged input → stable up-converted FP32, so EVERY non-FP16-aware op
         // that fetches its activation through this helper (softmax, scale, in-place unary/binary, etc.) reads
         // correct FP32. FP16-aware ops (conv/groupnorm/add) bypass via TryFp16ResidentInput. Capture-safe scratch.
@@ -1542,6 +1654,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // pending deferred GPU download of the source) and applies the strides, so the buffer we upload
         // matches the view. Contiguous() is a no-op (returns `this`) for already-contiguous, offset-0
         // tensors, so this costs nothing on the hot contiguous path.
+        // A ParameterBuffer view whose flat array an on-device optimizer updated: read it in place on the device.
+        // Contiguous() below would download the whole flat array to slice this view on the host.
+        // Every view into a flat ParameterBuffer -- including the one at offset 0, which the persistent-cache path
+        // below would otherwise re-upload from the (stale) host copy over the device-authoritative flat buffer.
+        if (TryResolveDeviceParameterView(backend, tensor, out var parameterView))
+            return new OwnedBuffer(parameterView, ownsBuffer: false);
+        // A permuted view of a tensor whose data is only on the device: permute on the device. Contiguous() below
+        // would download the base, permute it on the host and upload the result.
+        if (!tensor.IsContiguous && TryPermuteViewOnDevice(backend, tensor, out var permuted))
+            return permuted;
         if (!tensor.IsContiguous || tensor._storageOffset != 0)
             tensor = (Tensor<T>)tensor.Contiguous();
 
@@ -1607,6 +1729,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                         return new OwnedBuffer(activationEntry.Buffer, ownsBuffer: false);
                     staleActivation = true;
                 }
+                // A view of a lazily allocated (vector-keyed) result can report a backing array that is not the cache
+                // key; its data vector still is. Missing it here downloaded the result to re-upload it.
+                if (Helpers.HostSync.IsPending(tensor.DataVector)
+                    && _activationCache.TryGetValue(tensor.DataVector, out var vectorEntry)
+                    && ReferenceEquals(vectorEntry.Backend, backend) && !vectorEntry.IsFp16
+                    && vectorEntry.Buffer.Size >= tensor.Length)
+                {
+                    return new OwnedBuffer(vectorEntry.Buffer, ownsBuffer: false);
+                }
             }
             if (staleActivation)
                 InvalidateActivationCacheEntry(backingArray);
@@ -1655,7 +1786,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (tensor._gpuBuffer is null || tensor._gpuBuffer.Handle == IntPtr.Zero) return false;
         if (tensor.IsGpuResident) return true;
         var key = (object?)tensor.GetBackingArrayForCacheLookupUnsafe() ?? tensor.DataVector;
-        // _activationCache is a ConcurrentDictionary — this read is lock-free.
+        // A device-owned binding (an optimizer state, a resident step buffer, a parameter updated on the device) is
+        // not a cache entry: its storage has a pending download FROM the device, so the device copy is the current
+        // one. A recycled buffer cannot pass for it -- a pooled buffer's old wrapper reads Handle 0 (DetachForPool).
+        if (Helpers.HostSync.IsPending(key)) return true;
         return _activationCache.TryGetValue(key, out var entry)
             && ReferenceEquals(entry.Buffer, tensor._gpuBuffer)
             && ReferenceEquals(entry.Backend, backend);
@@ -1693,7 +1827,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // host weights authoritative — the next forward re-uploads them.
         var pendingBacking = tensor.GetBackingArrayForCacheLookupUnsafe();
         if (pendingBacking is not null)
-            Helpers.DeferredArrayMaterializer.Remove(pendingBacking);
+            Helpers.HostSync.Remove(pendingBacking);
 
         InvalidateGpuCacheForTensor(tensor);
         // Drop the fast-path resident pointer so GetOrAllocateBuffer's `_gpuBuffer is not null`
@@ -1748,20 +1882,23 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     /// <summary>
-    /// Releases the activation-cache storage of a tensor the backward no longer needs. A tensor with no cache entry
-    /// under either key - an op result that owns its buffer (DeferTensorResult) - has nothing to release, and
-    /// InvalidateGpuCacheForTensor would still force its pending host download first: one device-to-host copy of
-    /// every released forward activation per step, for data nothing reads (measured on the parity MLP step: all 5
-    /// downloads of the training step's backward). Its buffer stays with the tensor and a later host read still
-    /// materializes lazily.
+    /// Backward last-use release of a step intermediate, WITHOUT a download. A tensor whose only copy is on the device
+    /// is left for the tape's dispose-time release: the last-use schedule sees recorded inputs and saved state but not
+    /// tensors captured inside custom backward closures, so freeing device-only data here could pull it out from under
+    /// a later backward step (it did, in the HRE LM's specialized backwards). The old materialize-then-free contract
+    /// hid that by downloading and re-uploading. A tensor with a valid host copy is simply uncached, as before.
     /// </summary>
-    internal void ReleaseActivationStorage<T>(LinearAlgebra.Tensor<T> tensor)
+    internal void ReleaseDeadActivation<T>(LinearAlgebra.Tensor<T> tensor)
     {
         var backingArray = tensor.GetBackingArrayForCacheLookupUnsafe();
-        if (!_activationCache.ContainsKey(tensor.DataVector)
-            && (backingArray is null || !_activationCache.ContainsKey(backingArray)))
-            return;
-        InvalidateGpuCacheForTensor(tensor);
+        if ((backingArray is not null && Helpers.HostSync.IsRetained(backingArray))
+            || Helpers.HostSync.IsRetained(tensor.DataVector))
+            return;   // kept past the tape by the caller
+        if ((backingArray is not null && Helpers.HostSync.IsPending(backingArray))
+            || Helpers.HostSync.IsPending(tensor.DataVector))
+            return;   // device-only: released (no download) when the tape is disposed
+        if (backingArray is not null) InvalidateActivationCacheEntry(backingArray);
+        InvalidateActivationCacheEntry(tensor.DataVector);
     }
 
     internal void InvalidateGpuCacheForTensor<T>(LinearAlgebra.Tensor<T> tensor)
@@ -1772,20 +1909,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var backingArray = tensor.GetBackingArrayForCacheLookupUnsafe();
         if (backingArray is not null)
         {
-            if (Helpers.DeferredArrayMaterializer.IsPending(backingArray))
+            if (Helpers.HostSync.IsPending(backingArray))
             {
                 // Force-materialize before invalidating so the array
                 // ends up with valid CPU data (user might still read
                 // tensor.GetDataArray() after Dispose).
-                try { Helpers.DeferredArrayMaterializer.TryMaterialize(backingArray); }
-                catch { Helpers.DeferredArrayMaterializer.Remove(backingArray); }
+                try { Helpers.HostSync.TryMaterialize(backingArray); }
+                catch { Helpers.HostSync.Remove(backingArray); }
             }
             InvalidateActivationCacheEntry(backingArray);
         }
-        if (Helpers.DeferredArrayMaterializer.IsPending(tensor.DataVector))
+        if (Helpers.HostSync.IsPending(tensor.DataVector))
         {
-            try { Helpers.DeferredArrayMaterializer.TryMaterialize(tensor.DataVector); }
-            catch { Helpers.DeferredArrayMaterializer.Remove(tensor.DataVector); }
+            try { Helpers.HostSync.TryMaterialize(tensor.DataVector); }
+            catch { Helpers.HostSync.Remove(tensor.DataVector); }
         }
         InvalidateActivationCacheEntry(tensor.DataVector);
     }
@@ -1793,7 +1930,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private void InvalidateActivationCacheEntry(object key)
     {
         // #226 / #1468: NEVER free a GPU buffer that still backs a pending deferred
-        // download. DeferredArrayMaterializer.Register is first-write-wins (TryAdd),
+        // download. HostSync.Register is first-write-wins (TryAdd),
         // so the array `key` is permanently bound to exactly one materializer that
         // downloads exactly one buffer — making that buffer's contents the array's
         // ONLY defined CPU value. Materialize it to the CPU array FIRST (while the
@@ -1809,28 +1946,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // unguarded stale-buffer re-upload paths in UploadTensor (and any future
         // caller) are safe by construction. Idempotent: if a caller already
         // materialized, IsPending is false and this is a no-op.
-        if (Helpers.DeferredArrayMaterializer.IsPending(key))
+        if (Helpers.HostSync.IsPending(key))
         {
-            try { Helpers.DeferredArrayMaterializer.TryMaterialize(key); }
-            catch { Helpers.DeferredArrayMaterializer.Remove(key); }
+            try { Helpers.HostSync.TryMaterialize(key); }
+            catch { Helpers.HostSync.Remove(key); }
         }
 
-        // Byte-accounting units must match the add/remove/evict paths
-        // (CacheActivation, RemoveActivationCacheEntry, EvictOldestActivationsUnsafe).
-        // All four go through Interlocked.Add(ref _currentActivationCacheBytes, ±SizeInBytes)
-        // so the counter is unit-consistent across FP32 and FP16 (AutocastScope)
-        // entries and stays well-formed under concurrent eviction.
-        // Disposal happens OUTSIDE the lock (parity with CacheActivation /
-        // RemoveActivationCacheEntry / EvictOldestActivationsUnsafe) so a slow
-        // GPU-backend free doesn't block concurrent cache lookups.
+        // Disposal happens OUTSIDE the lock (as in RemoveActivationCacheEntry) so a slow GPU-backend free doesn't
+        // block concurrent lookups.
         ActivationCacheEntry? removed = null;
         lock (_activationCacheLock)
         {
             if (_activationCache.TryRemove(key, out var entry))
             {
-                System.Threading.Interlocked.Add(ref _currentActivationCacheBytes,
-                    -entry.Buffer.SizeInBytes);
-                System.Threading.Interlocked.Add(ref _currentActivationManagedBytes, -entry.ManagedBytes);
                 removed = entry;
             }
         }
@@ -1877,7 +2005,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Not cached - need to upload. If this array still has a pending
         // deferred download from an earlier GPU op, flush it first so the
         // upload sees the current data instead of stale CPU bytes.
-        if (Helpers.DeferredArrayMaterializer.IsPending(data))
+        if (Helpers.HostSync.IsPending(data))
         {
             MaterializeIfDeferred(data);
         }
@@ -2094,109 +2222,18 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private void CacheActivation(object cacheKey, IGpuBuffer buffer, int[] shape, IDirectGpuBackend backend,
         bool isFp16 = false, int elementCount = 0, int hostVersion = 0)
     {
-        // Approximate managed-heap footprint of the key array this entry pins
-        // (product(shape) * 4 bytes; activation backing arrays are float[]). Bounds
-        // managed retention independently of the VRAM byte cap — see overManaged below.
+        // Approximate managed footprint of the key array (product(shape) * 4 bytes).
         long managedBytes = 4L;
         for (int d = 0; d < shape.Length; d++) managedBytes *= shape[d];
 
-        List<ActivationCacheEntry> evicted = new List<ActivationCacheEntry>();
-        lock (_activationCacheLock)
-        {
-            // Evict old entries if cache is full by count or GPU memory budget
-            bool overCount = _activationCache.Count >= _maxActivationCacheSize;
-            // Use IGpuBuffer.SizeInBytes (per-backend, dtype-aware) instead of
-            // `Size * sizeof(float)` so the accounting stays correct when
-            // AutocastScope inserts FP16 buffers — see InvalidateActivationCacheEntry
-            // for the unit-consistency contract.
-            bool overMemory = _maxActivationCacheBytes > 0
-                && _currentActivationCacheBytes + buffer.SizeInBytes > _maxActivationCacheBytes;
-            // MANAGED-heap guard: the cache keys strong-root their float[] backing
-            // arrays, so stale cross-step entries can balloon the managed heap even
-            // while VRAM stays capped. Evicting the oldest (stale prior-step) entries
-            // here is what bounds the training-loop leak (gcroot 2026-06-05).
-            bool overManaged = _maxActivationManagedBytes > 0
-                && _currentActivationManagedBytes + managedBytes > _maxActivationManagedBytes;
-            // #226 race fix: never evict (offload) an activation while a training step is
-            // in flight — every cached forward activation is consumed by THIS step's
-            // backward, and the mid-step materialize-then-free races the compiled plan's
-            // deferred downloads (CUDA 700 "buffer released before materialization"). The
-            // compiled plan reuses STABLE buffers each step, so suspending eviction here
-            // does not accumulate across steps; a step that genuinely exceeds VRAM now
-            // fails as a clean CUDA OOM instead of a 700 corruption. The managed-heap
-            // guard composes the same way: stale CROSS-step entries are evicted on the
-            // next non-suspended insert (or the deterministic post-step release), so
-            // suspending within the step does not unbound the managed leak fix.
-            if ((overMemory || overCount || overManaged) && !EvictionSuspended)
-            {
-                // Evict the oldest activations, offloading any pending deferred downloads so a
-                // later CPU read / backward re-upload still sees correct data (#226 contract).
-                //
-                // GPU-utilization fix: the REAL guard is the 75%-VRAM byte cap (overMemory).
-                // The entry-COUNT cap is now deliberately huge (see DefaultActivationCacheSize)
-                // so it does NOT fire mid-training-step. A training step's forward activations
-                // must stay GPU-resident because backward re-reads them; evicting them early
-                // (the old 512 count cap fired every step) forced a download-in-forward +
-                // re-upload-in-backward thrash that starved the GPU to ~13% util. With the count
-                // cap raised, a model whose per-step working set fits in VRAM keeps everything
-                // resident → no offload → full GPU utilization; only genuine VRAM pressure
-                // triggers the (correct, bounded) offload. Memory stays bounded by the byte cap.
-                evicted = EvictOldestActivationsUnsafe();
-            }
-
-            var timestamp = System.Threading.Interlocked.Increment(ref _activationCacheTimestamp);
-            var entry = isFp16
-                ? new ActivationCacheEntry(buffer, shape, timestamp, backend, managedBytes: managedBytes, isFp16: true, elementCount: elementCount, hostVersion: hostVersion)
-                : new ActivationCacheEntry(buffer, shape, timestamp, backend, managedBytes, isFp16: false, elementCount: 0, hostVersion: hostVersion);
-            bool added = false;
-            try
-            {
-                added = _activationCache.TryAdd(cacheKey, entry);
-            }
-            finally
-            {
-                if (!added)
-                {
-                    entry.Dispose();
-                }
-                else
-                {
-                    System.Threading.Interlocked.Add(ref _currentActivationCacheBytes, buffer.SizeInBytes);
-                    System.Threading.Interlocked.Add(ref _currentActivationManagedBytes, managedBytes);
-                }
-            }
-        }
-
-        // Dispose evicted GPU buffers OUTSIDE the lock to avoid blocking cache lookups.
-        // #226 race fix (#555): a step's forward/backward enqueues a long async kernel chain
-        // on the stream; returning an evicted buffer to the pool (for reuse OR a real cuMemFree
-        // when the bucket is full) while a kernel that still references it is in flight is an
-        // illegal access (CUDA 700 at the next sync). On CUDA, route the free through the
-        // event-based deferred-free queue: the buffer is held until a stream event marking its
-        // last use completes (polled NON-blocking), so offload is race-free AND does not stall
-        // the pipeline (the earlier full-stream-sync fix was correct but impractically slow).
-        if (evicted.Count > 0)
-        {
-            if (backend is Engines.DirectGpu.CUDA.CudaBackend cudaBackend)
-            {
-                foreach (var entry in evicted)
-                    cudaBackend.FreeBufferDeferred(entry.Buffer);
-            }
-            else
-            {
-                // Non-CUDA backends have no event-based deferred-free, so a synchronous free of an
-                // evicted buffer races the step's in-flight async kernels that may still reference it
-                // (the OpenCL/Vulkan analogue of the #226/#555 CUDA-700 illegal-access race). Stream-
-                // synchronize FIRST (#555 approach 1) so every enqueued kernel that could touch an
-                // evicted buffer has completed before we return it to the pool / free it. Eviction only
-                // fires under genuine VRAM pressure (the count cap is huge), so this sync is rare and
-                // does not stall the steady-state pipeline.
-                try { backend.Synchronize(); }
-                catch { /* best-effort: a failed sync must not leak the eviction set */ }
-                foreach (var entry in evicted)
-                    entry.Dispose();
-            }
-        }
+        var timestamp = System.Threading.Interlocked.Increment(ref _activationCacheTimestamp);
+        var entry = new ActivationCacheEntry(buffer, shape, timestamp, backend, managedBytes,
+            isFp16, isFp16 ? elementCount : 0, hostVersion);
+        // A failed add means the storage already has an entry (bound through its other key -- the host array and the
+        // vector over it share one -- or an earlier result). That entry keeps its buffer; this buffer stays owned by
+        // whoever holds it (the result tensor, its pending download) and is freed with them. Disposing it here, as the
+        // old cache did, could free a buffer a pending download still reads.
+        _activationCache.TryAdd(cacheKey, entry);
     }
 
     private void RemoveActivationCacheEntry(object cacheKey)
@@ -2206,9 +2243,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             if (_activationCache.TryRemove(cacheKey, out var entry))
             {
-                System.Threading.Interlocked.Add(ref _currentActivationCacheBytes,
-                    -entry.Buffer.SizeInBytes);
-                System.Threading.Interlocked.Add(ref _currentActivationManagedBytes, -entry.ManagedBytes);
                 removed = entry;
             }
         }
@@ -2240,12 +2274,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 cuda.ConvertToFp16(e.Buffer, fp16, elementCount);
             }
             catch { return false; }
-            // Carry ManagedBytes through: the cache KEY (the managed float[] backing array)
-            // is unchanged by the FP16 swap, so the managed-heap retention it pins is too.
-            // Dropping it would make RemoveActivationCacheEntry decrement 0 against the
-            // insert-time add and drift _currentActivationManagedBytes upward.
             _activationCache[key] = new ActivationCacheEntry(fp16, e.Shape, e.Timestamp, e.Backend, managedBytes: e.ManagedBytes, isFp16: true, elementCount: elementCount, hostVersion: e.HostVersion);
-            System.Threading.Interlocked.Add(ref _currentActivationCacheBytes, fp16.SizeInBytes - e.Buffer.SizeInBytes);
             old = e;
         }
         if (old is not null && old.Backend is Engines.DirectGpu.CUDA.CudaBackend c) c.FreeBufferDeferred(old.Buffer);
@@ -2300,7 +2329,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             catch { return false; }
             // Same ManagedBytes carry-through as the FP16 compress swap above.
             _activationCache[key] = new ActivationCacheEntry(fp32, e.Shape, e.Timestamp, e.Backend, managedBytes: e.ManagedBytes, isFp16: false, elementCount: e.ElementCount, hostVersion: e.HostVersion);
-            System.Threading.Interlocked.Add(ref _currentActivationCacheBytes, fp32.SizeInBytes - e.Buffer.SizeInBytes);
             old = e;
         }
         if (old is not null && old.Backend is Engines.DirectGpu.CUDA.CudaBackend c) c.FreeBufferDeferred(old.Buffer);
@@ -2345,8 +2373,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     /// <summary>
     /// Removes the cache entry for <paramref name="key"/> when it holds <paramref name="expected"/>, WITHOUT releasing
-    /// the buffer: the caller takes ownership (re-caches it under another key). Byte accounting is released here and
-    /// re-added by that CacheActivation.
+    /// the buffer: the caller takes ownership (re-caches it under another key).
     /// </summary>
     private bool TryTakeActivationByKey(object key, IGpuBuffer expected)
     {
@@ -2354,8 +2381,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             if (!_activationCache.TryGetValue(key, out var e) || !ReferenceEquals(e.Buffer, expected)) return false;
             if (!_activationCache.TryRemove(key, out e)) return false;
-            System.Threading.Interlocked.Add(ref _currentActivationCacheBytes, -e.Buffer.SizeInBytes);
-            System.Threading.Interlocked.Add(ref _currentActivationManagedBytes, -e.ManagedBytes);
             return true;
         }
     }
@@ -2370,9 +2395,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // the cache-owned buffer. Materializing here would be wasted work, and
         // leaving the registration behind would point a later bulk drain at a
         // freed buffer. Remove only after the cache entry is actually owned.
-        Helpers.DeferredArrayMaterializer.Remove(key);
-        System.Threading.Interlocked.Add(ref _currentActivationCacheBytes, -e.Buffer.SizeInBytes);
-        System.Threading.Interlocked.Add(ref _currentActivationManagedBytes, -e.ManagedBytes);
+        Helpers.HostSync.Remove(key);
         // CUDA uses STREAM-ORDERED deferred free (cuMemFreeAsync) to release the buffer at the stream's
         // current point without a host sync — a CUDA-stream-specific optimization with no portable
         // equivalent. Every other backend takes the immediate, equally-correct e.Dispose() (no leak, no
@@ -2409,83 +2432,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     /// <summary>
-    /// Evicts the oldest half of the activation cache entries.
-    /// Must be called while holding _activationCacheLock.
-    /// Returns entries to dispose AFTER releasing the lock.
-    /// </summary>
-    private List<ActivationCacheEntry> EvictOldestActivationsUnsafe()
-    {
-        // Only free THIS thread's activations — another thread's buffer may be in-flight
-        // on a kernel right now (freeing it = use-after-free / 0xC0000005). A thread's
-        // GPU buffers are only ever used by that thread, so this is the safe set.
-        int callerThreadId = System.Environment.CurrentManagedThreadId;
-        var entries = Array.FindAll(_activationCache.ToArray(), kv => kv.Value.ThreadId == callerThreadId);
-        var toDispose = new List<ActivationCacheEntry>();
-        if (entries.Length == 0) return toDispose;
-
-        int removeCount = entries.Length / 2;
-        if (removeCount == 0) return toDispose;
-
-        // #226 ROBUST FIX: drain THIS THREAD's pending deferred downloads before freeing ANY buffer. The
-        // per-entry `IsPending(entries[i].Key)` guard below only catches a materializer registered under the
-        // SAME object as the cache key — but BindResidentBuffer registers its download keyed by the tensor's
-        // BACKING ARRAY while the activation cache may key the same logical tensor by its DataVector (or vice
-        // versa). A buffer whose pending download is keyed differently than its cache entry then gets freed
-        // here, and the later materialize hits a released buffer → "GPU buffer released before its deferred
-        // download (#226)" (seen on eager d384/L4+). MaterializeAll is thread-scoped (only this thread's
-        // pending, so it never touches another tape-thread's in-flight buffer) and idempotent; after it runs
-        // no buffer we are about to free can have an outstanding download, regardless of its key. Eviction
-        // only fires under real VRAM pressure (the count cap is huge), so this broader drain is rare, not
-        // per-step. Not reached during capture (eviction is suspended while the stream is capturing).
-        //
-        // That blanket drain downloaded EVERY pending result on the thread — including the half this eviction
-        // keeps — to cover a cache key that differed from its materializer key. Every path that both caches and
-        // registers now uses one key (FinishGpuOp's array, the split-complex/fp16 result keys; BindResidentBuffer
-        // re-keys its cache entry to the array it registers), and DeferTensorResult results are owned by their
-        // tensors and never enter this cache. So the per-entry IsPending check below materializes exactly the
-        // entries being freed, and nothing else.
-
-        // Find threshold using Array.Sort on timestamps (avoids LINQ allocation)
-        var timestamps = new long[entries.Length];
-        for (int i = 0; i < entries.Length; i++)
-            timestamps[i] = entries[i].Value.Timestamp;
-        Array.Sort(timestamps);
-        long threshold = timestamps[removeCount - 1];
-
-        // Remove entries at or below threshold, collect for disposal outside lock.
-        int removed = 0;
-        for (int i = 0; i < entries.Length && removed < removeCount; i++)
-        {
-            if (entries[i].Value.Timestamp > threshold) continue;
-
-            // #226: an entry whose key still has a pending deferred download owns the ONLY
-            // copy of its data (the CPU array hasn't been populated yet). Dropping its buffer
-            // outright would make a later CPU read / backward re-upload see garbage / hit a
-            // freed buffer (CL_INVALID_MEM_OBJECT). So MATERIALIZE the pending download now
-            // (copy the buffer into its CPU array while the buffer is still alive — the exact
-            // contract InvalidateActivationCacheEntry relies on), THEN free the buffer below.
-            // Eviction only fires under real VRAM pressure now (the count cap is huge — see
-            // CacheActivation), so this offload is rare, not the per-step thrash it used to be.
-            if (Helpers.DeferredArrayMaterializer.IsPending(entries[i].Key))
-            {
-                try { Helpers.DeferredArrayMaterializer.TryMaterialize(entries[i].Key); }
-                catch { Helpers.DeferredArrayMaterializer.Remove(entries[i].Key); }
-            }
-
-            if (_activationCache.TryRemove(entries[i].Key, out var entry))
-            {
-                System.Threading.Interlocked.Add(ref _currentActivationCacheBytes,
-                    -entry.Buffer.SizeInBytes);
-                System.Threading.Interlocked.Add(ref _currentActivationManagedBytes, -entry.ManagedBytes);
-                toDispose.Add(entry);
-                removed++;
-            }
-        }
-
-        return toDispose;
-    }
-
-    /// <summary>
     /// Monotonic snapshot of the activation-cache timestamp counter. Capture this
     /// at the start of a forward+backward pass (the outermost GradientTape) and pass
     /// it to <see cref="EvictActivationsCreatedAfter"/> on tape dispose to release
@@ -2513,7 +2459,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// buffers). Lets a test measure the FP16 hetero backward's per-node scratch release without GPU memory
     /// tracking. Lock-free read of the Interlocked-maintained counter.
     /// </summary>
-    internal long CurrentActivationCacheBytes => System.Threading.Interlocked.Read(ref _currentActivationCacheBytes);
+    internal long CurrentActivationCacheBytes
+    {
+        get
+        {
+            // Exact: the live device entries created on the caller's flow (an engine-wide counter drifted -- entries
+            // freed by the GC never decremented it -- and counted other threads' work).
+            long bytes = 0;
+            foreach (var pair in _activationCache.ToArray()) bytes += pair.Value.Buffer.SizeInBytes;
+            return bytes;
+        }
+    }
 
     /// <summary>
     /// Deterministically evicts every activation-cache entry created AFTER <paramref name="snapshot"/> whose
@@ -2538,6 +2494,75 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// FP16 parity tests gate correctness: a wrongful discard of a still-needed tensor would corrupt the grads.
     /// </summary>
     internal void EvictActivationsCreatedAfter(long snapshot, HashSet<object>? protect, bool materializePending)
+        => EvictActivationsCreatedAfter(snapshot, protect,
+            materializePending ? ActivationReleaseMode.MaterializeThenFree : ActivationReleaseMode.DropScratch);
+
+    /// <summary>
+    /// Message a host read of a released step intermediate throws (see <see cref="ActivationReleaseMode.Release"/>).
+    /// </summary>
+    internal const string ReleasedIntermediateMessage =
+        "This tensor is a GPU intermediate of a finished GradientTape step: its device memory was released when the " +
+        "tape was disposed (or after its last backward use) without copying it to the host, as PyTorch frees an " +
+        "unreferenced CUDA tensor. Read it inside the tape scope, or call GradientTape.Retain(tensor) before the tape " +
+        "ends to keep it. (The loss and gradients returned by ComputeGradients are kept automatically.)";
+
+    /// <summary>
+    /// Hands the kept results of a finished tape (the loss, the gradients, retained tensors) over to their tensors'
+    /// lifetime, as PyTorch does: each leaves the activation cache WITHOUT its buffer being freed, and its pending
+    /// download becomes weakly held, so the device memory is released when the tensor is collected and a host read
+    /// still downloads it. Neither a download nor a leak.
+    /// </summary>
+    internal void DetachToTensorLifetime(IEnumerable<object> keys)
+    {
+        lock (_activationCacheLock)
+        {
+            foreach (var key in keys)
+            {
+                if (!_activationCache.TryRemove(key, out var entry)) continue;
+                // Its pending download (HostSync) already lives exactly as long as the host array: nothing to move.
+            }
+        }
+    }
+
+    // Device memory held only by unreachable managed objects -- results handed to tensor lifetime, and buffers other
+    // paths leave to their finalizers -- is released when the GC runs. The materialize-then-free contract downloaded
+    // ~4 GB per training step into managed arrays, and that allocation churn kept the GC (and so the finalizers)
+    // running; with the downloads gone a GPU training loop allocates almost nothing managed, the GC stops, and dead
+    // buffers pile up on the device (measured: the HRE LM step degraded from 0.3 s to 37-137 s; collecting after
+    // every step held it at 0.28 s).
+    private long _freeBytesAtLastReclaim = -1;
+
+    /// <summary>
+    /// Called when an outermost tape ends. Reclaims finalizer-owned device memory when free device memory has
+    /// fallen by more than max(1/16 of the device, 256 MiB) since the last reclaim, or is below 15% of the device.
+    /// One cuMemGetInfo when nothing is due; a collection (cheap: the managed heap of a GPU loop is small) when it is.
+    /// </summary>
+    internal void ReclaimDetachedResultsOverBudget()
+    {
+        if (!TryGetBackend(out var backend) || backend is not Engines.DirectGpu.CUDA.CudaBackend cuda) return;
+        if (!cuda.TryGetDeviceMemory(out ulong free, out ulong total)) return;
+        long freeNow = (long)free;
+        long last = System.Threading.Interlocked.Read(ref _freeBytesAtLastReclaim);
+        bool pressured = (double)free / total < 0.15;
+        if (last < 0 || freeNow > last)
+        {
+            // First call, or memory came back (another process freed, or a reclaim ran): new reference point.
+            System.Threading.Interlocked.Exchange(ref _freeBytesAtLastReclaim, freeNow);
+            if (!pressured) return;
+            last = freeNow;
+        }
+        long growthAllowance = Math.Max((long)(total / 16), 256L << 20);
+        if (last - freeNow < growthAllowance && !pressured) return;
+        cuda.ReclaimNow();
+        if (cuda.TryGetDeviceMemory(out ulong afterFree, out _))
+            System.Threading.Interlocked.Exchange(ref _freeBytesAtLastReclaim, (long)afterFree);
+    }
+
+    /// <summary>
+    /// Evicts this thread's activation-cache entries created after <paramref name="snapshot"/> (except
+    /// <paramref name="protect"/>), handling entries whose only valid copy is on the device per <paramref name="mode"/>.
+    /// </summary>
+    internal void EvictActivationsCreatedAfter(long snapshot, HashSet<object>? protect, ActivationReleaseMode mode)
     {
         // The activation timestamp counter is process-wide, so "created after my snapshot"
         // also matches a CONCURRENT tape's activations on another thread. Free only THIS
@@ -2555,24 +2580,30 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 if (entries[i].Value.Timestamp <= snapshot) continue;   // pre-existing — keep
                 if (entries[i].Value.ThreadId != callerThreadId) continue; // another thread's live buffer
                 if (protect is not null && protect.Contains(entries[i].Key)) continue; // live gradient — keep
+                if (mode == ActivationReleaseMode.Release && Helpers.HostSync.IsRetained(entries[i].Key))
+                    continue; // the caller kept it past the tape (GradientTape.Retain / returned gradients)
                 if (_activationCache.TryRemove(entries[i].Key, out var entry))
                 {
-                    if (Helpers.DeferredArrayMaterializer.IsPending(entries[i].Key))
+                    if (Helpers.HostSync.IsPending(entries[i].Key))
                     {
-                        if (materializePending)
+                        switch (mode)
                         {
-                            // #226 safe path: flush the pending DtoH so a later CPU read still sees correct data.
-                            try { Helpers.DeferredArrayMaterializer.TryMaterialize(entries[i].Key); }
-                            catch { Helpers.DeferredArrayMaterializer.Remove(entries[i].Key); }
-                        }
-                        else
-                        {
-                            // Dead scratch: drop the pending download (no DtoH) after owning the cache entry.
-                            Helpers.DeferredArrayMaterializer.Remove(entries[i].Key);
+                            case ActivationReleaseMode.MaterializeThenFree:
+                                // #226 safe path: flush the pending DtoH so a later CPU read still sees correct data.
+                                try { Helpers.HostSync.TryMaterialize(entries[i].Key); }
+                                catch { Helpers.HostSync.Remove(entries[i].Key); }
+                                break;
+                            case ActivationReleaseMode.Release:
+                                // Dead step intermediate: free without a host copy; a later host read throws.
+                                // (Retained keys never reach here: they are skipped with the protect set above.)
+                                Helpers.HostSync.Release(entries[i].Key, ReleasedIntermediateMessage);
+                                break;
+                            default:
+                                // Dead scratch: drop the pending download (no DtoH) after owning the cache entry.
+                                Helpers.HostSync.Remove(entries[i].Key);
+                                break;
                         }
                     }
-                    System.Threading.Interlocked.Add(ref _currentActivationCacheBytes, -entry.Buffer.SizeInBytes);
-                    System.Threading.Interlocked.Add(ref _currentActivationManagedBytes, -entry.ManagedBytes);
                     toDispose.Add(entry);
                 }
             }
@@ -2623,11 +2654,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 if (!allThreads && entries[i].Value.ThreadId != callerThreadId) continue; // another thread's live buffer
                 if (keepKey is not null && ReferenceEquals(entries[i].Key, keepKey)) continue; // the live result
                 // Dead intermediate: discard its pending download (never read) and free the buffer.
-                Helpers.DeferredArrayMaterializer.Remove(entries[i].Key);
+                Helpers.HostSync.Remove(entries[i].Key);
                 if (_activationCache.TryRemove(entries[i].Key, out var entry))
                 {
-                    System.Threading.Interlocked.Add(ref _currentActivationCacheBytes, -entry.Buffer.SizeInBytes);
-                    System.Threading.Interlocked.Add(ref _currentActivationManagedBytes, -entry.ManagedBytes);
                     toDispose.Add(entry);
                 }
             }
@@ -2647,10 +2676,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         List<KeyValuePair<object, ActivationCacheEntry>> toDispose;
         lock (_activationCacheLock)
         {
-            toDispose = new List<KeyValuePair<object, ActivationCacheEntry>>(_activationCache);
+            toDispose = new List<KeyValuePair<object, ActivationCacheEntry>>(_activationCache.ToArray());
             _activationCache.Clear();
-            System.Threading.Interlocked.Exchange(ref _currentActivationCacheBytes, 0);
-            System.Threading.Interlocked.Exchange(ref _currentActivationManagedBytes, 0);
         }
 
         // Materialize each pending deferred download into its CPU array BEFORE freeing the
@@ -2659,10 +2686,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // engines'/threads' in-flight buffers and race them (the -38 / GPU-fault hazard).
         foreach (var kv in toDispose)
         {
-            if (Helpers.DeferredArrayMaterializer.IsPending(kv.Key))
+            if (Helpers.HostSync.IsPending(kv.Key))
             {
-                try { Helpers.DeferredArrayMaterializer.TryMaterialize(kv.Key); }
-                catch { Helpers.DeferredArrayMaterializer.Remove(kv.Key); }
+                try { Helpers.HostSync.TryMaterialize(kv.Key); }
+                catch { Helpers.HostSync.Remove(kv.Key); }
             }
         }
 
@@ -2686,13 +2713,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         List<KeyValuePair<object, ActivationCacheEntry>> toDispose;
         lock (_activationCacheLock)
         {
-            toDispose = new List<KeyValuePair<object, ActivationCacheEntry>>(_activationCache);
+            toDispose = new List<KeyValuePair<object, ActivationCacheEntry>>(_activationCache.ToArray());
             _activationCache.Clear();
-            System.Threading.Interlocked.Exchange(ref _currentActivationCacheBytes, 0);
-            System.Threading.Interlocked.Exchange(ref _currentActivationManagedBytes, 0);
         }
         foreach (var kv in toDispose)
-            Helpers.DeferredArrayMaterializer.Remove(kv.Key); // drop the pending download — the data is dead
+            Helpers.HostSync.Remove(kv.Key); // drop the pending download — the data is dead
         foreach (var kv in toDispose)
             kv.Value.Dispose();                               // free the GPU buffer
     }
@@ -2762,7 +2787,40 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // reused -- until a genuine write privatises the storage, which is exactly when a
         // re-upload is correct. This is the read/write split GetDataArray's own remarks call
         // "Stage 2"; weights are an input operand the GPU only reads.
-        => GetOrCacheWeightBuffer(backend, weights.GetReadOnlyDataArray(), role, weights.GpuCacheVersion);
+    {
+        // Look up by the backing array WITHOUT materializing it first. GetReadOnlyDataArray fires a pending
+        // device-to-host download, so a weight whose current value lives on the device (a parameter the optimizer
+        // updated in place, or a GPU-computed table such as RoPE's cos/sin) was downloaded on EVERY forward only to
+        // find its buffer already cached (measured: every HRE LM step re-read the RoPE tables).
+        if (TryResolveDeviceParameterView(backend, weights, out var parameterView))
+            return new OwnedBuffer(parameterView, ownsBuffer: false);
+        var key = weights.GetBackingArrayForCacheLookupUnsafe();
+        if (key is not null && TryGetVersionedPersistentBuffer(key, weights.GpuCacheVersion, out var cached))
+            return new OwnedBuffer(cached, ownsBuffer: false);
+        object pendingKey = (object?)key ?? weights.DataVector;
+        if (Helpers.HostSync.IsPending(pendingKey)
+            && _activationCache.TryGetValue(pendingKey, out var activation) && ReferenceEquals(activation.Backend, backend)
+            && !activation.IsFp16 && activation.Buffer.Handle != IntPtr.Zero && activation.Buffer.Size >= weights.Length)
+            return new OwnedBuffer(activation.Buffer, ownsBuffer: false);
+        return GetOrCacheWeightBuffer(backend, weights.GetReadOnlyDataArray(), role, weights.GpuCacheVersion);
+    }
+
+    /// <summary>The persistent-cache buffer for <paramref name="key"/> if it was uploaded at <paramref name="hostVersion"/>.</summary>
+    private bool TryGetVersionedPersistentBuffer(object key, int hostVersion, out IGpuBuffer buffer)
+    {
+        lock (_persistentBufferLock)
+        {
+            if (_persistentBufferCache.TryGetValue(key, out var existing)
+                && _persistentWeightHostVersion.TryGetValue(key, out int stamped) && stamped == hostVersion
+                && existing.Buffer.Handle != IntPtr.Zero)
+            {
+                buffer = existing.Buffer;
+                return true;
+            }
+        }
+        buffer = null!;
+        return false;
+    }
 
     /// <summary>
     /// Gets a GPU buffer for weight/bias tensor, auto-caching if not already persistent.
@@ -2942,7 +3000,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Always defer the download. The GPU buffer stays cached so chained GPU ops
         // reuse it without re-uploading (GetOrAllocateBuffer checks _activationCache).
         // The CPU array is populated lazily when code first accesses the data
-        // (via DeferredArrayMaterializer triggered by GetDataArray/AsSpan/indexer).
+        // (via HostSync triggered by GetDataArray/AsSpan/indexer).
         //
         // This eliminates both upload AND download for chained GPU operations:
         //   result1 = sigmoid(x)     → GPU kernel, buffer cached, no download
@@ -2959,7 +3017,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 #endif
 
         // Capture the buffer + backend in the materializer closure directly so
-        // the DeferredArrayMaterializer registry is the single source of truth
+        // the HostSync registry is the single source of truth
         // for pending downloads (#226). The activation-cache eviction guard
         // checks IsPending on this same key, keeping the buffer alive until
         // the callback runs.
@@ -2975,7 +3033,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // → MaterializeAllDeferred → callback → DownloadBuffer → -38).
         var capturedBuffer = outputBuffer.Buffer;
         var capturedBackend = backend;
-        Helpers.DeferredArrayMaterializer.Register(result, arr =>
+        Helpers.HostSync.Register(result, arr =>
         {
             float[] floatData;
             try
@@ -3029,7 +3087,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var capturedBuffer = halfBuffer;
         var capturedBackend = backend;
         int n = elementCount;
-        Helpers.DeferredArrayMaterializer.Register(result, arr =>
+        Helpers.HostSync.Register(result, arr =>
         {
             using var tmp = AllocateOutputBuffer(capturedBackend, n); // FP32 transient
             capturedBackend.ConvertToFp32(capturedBuffer, tmp.Buffer, n);
@@ -3088,7 +3146,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             : null;
         if (takenKey is not null)
         {
-            Helpers.DeferredArrayMaterializer.Remove(takenKey);
+            Helpers.HostSync.Remove(takenKey);
             // A second entry for r under its other key is another copy of the same activation (never rBuf, which o
             // now owns).
             var otherKey = ReferenceEquals(takenKey, rVec) ? rKey : rVec;
@@ -3105,8 +3163,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // up-cast oBuf -> FP32 -> narrow to Half. Remove+Register keeps it pointing at the CURRENT buffer if o
         // was evicted then re-landed on a later step.
         var capBuf = oBuf; var capBackend = cb; int cn = n;
-        Helpers.DeferredArrayMaterializer.Remove(oKey);
-        Helpers.DeferredArrayMaterializer.Register(oKey, arr =>
+        Helpers.HostSync.Remove(oKey);
+        Helpers.HostSync.Register(oKey, arr =>
         {
             using var tmp = AllocateOutputBuffer(capBackend, cn);
             capBackend.ConvertToFp32Native(capBuf, tmp.Buffer, cn);
@@ -3116,6 +3174,176 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         });
         CacheActivation(oKey, oBuf, o.Shape._dims, backend, isFp16: true, elementCount: n,
             hostVersion: o.GpuCacheVersion);
+        return true;
+    }
+
+    /// <summary>
+    /// The device buffer an on-device optimizer should update for <paramref name="param"/>: its bound resident buffer
+    /// when current, else its persistent weight buffer at the current host version (uploading the host weights once
+    /// when neither exists). Returns null when the parameter cannot be placed on the device (views, no backend).
+    /// </summary>
+    internal IGpuBuffer? AcquireParameterBuffer(Tensor<float> param, out IDirectGpuBackend backend)
+    {
+        backend = null!;
+        if (!TryGetBackend(out var be) || !param.IsContiguous) return null;
+        backend = be;
+        if (TryGetFlatParameterView(param, out var flat, out int offset))
+        {
+            // A view into the model's flat ParameterBuffer: the WHOLE flat array lives on the device as one buffer and
+            // each parameter is a view of it. While the flat array is device-authoritative (pending host download) the
+            // existing buffer is current; otherwise the host copy is, so it is uploaded once for every parameter.
+            if (be is not IGpuBufferViews views) return null;
+            IGpuBuffer flatBuffer;
+            lock (_persistentBufferLock)
+            {
+                if (_persistentBufferCache.TryGetValue(flat, out var entry) && Helpers.HostSync.IsPending(flat))
+                {
+                    flatBuffer = entry.Buffer;
+                }
+                else
+                {
+                    if (entry is not null && _persistentBufferCache.TryRemove(flat, out var stale))
+                        _retiredWeightBuffers.Add(stale.Buffer);   // disposed past a synchronize (see GetOrCacheWeightBuffer)
+                    flatBuffer = be.AllocateBuffer(flat);
+                    _persistentBufferCache[flat] = new GpuBufferCacheEntry(flatBuffer, PersistentTensorRole.Weights);
+                }
+            }
+            return views.TryCreateView(flatBuffer, offset, param.Length);
+        }
+        if (param._storageOffset != 0) return null;
+        if (param._gpuBuffer is not null && ReferenceEquals(param._gpuBackend, be) && param._gpuBuffer.Handle != IntPtr.Zero
+            && param._gpuBufferVersion == param.GpuCacheVersion && param._gpuBuffer.Size >= param.Length)
+            return param._gpuBuffer;
+        var owned = GetOrCacheWeightBufferVersionAware(be, param, PersistentTensorRole.Weights);
+        if (owned.OwnsBuffer) { owned.Dispose(); return null; }   // not cacheable; the caller keeps the host path
+        param._gpuBuffer = owned.Buffer; param._gpuBackend = be; param._gpuBufferVersion = param.GpuCacheVersion;
+        return owned.Buffer;
+    }
+
+    /// <summary>
+    /// Records that an optimizer updated <paramref name="param"/>'s device buffer in place (PyTorch-style: the
+    /// weights live on the device). The device copy becomes authoritative: forwards read it (the persistent-cache
+    /// version stamp and the bound buffer follow the bumped Version), the post-step weight-cache invalidation keeps
+    /// it, and a host read downloads it once, lazily.
+    /// </summary>
+    internal void CommitParameterUpdatedOnDevice(Tensor<float> param, IGpuBuffer buffer, IDirectGpuBackend backend,
+        Gpu.GpuSyncPoint? syncPoint)
+    {
+        param.MarkModified(syncPoint);   // bumps Version
+        if (TryGetFlatParameterView(param, out var flat, out _))
+        {
+            // A ParameterBuffer view: the flat array's device buffer is now the authoritative copy of EVERY parameter
+            // in it; a host read of any of them downloads the whole flat buffer once. The view is not bound to the
+            // tensor: forwards resolve it from the flat buffer while that stays authoritative (a bound view could
+            // outlive a later re-upload of the flat array).
+            IGpuBuffer? flatBuffer = null;
+            lock (_persistentBufferLock)
+                if (_persistentBufferCache.TryGetValue(flat, out var flatEntry)) flatBuffer = flatEntry.Buffer;
+            if (flatBuffer is null) return;
+            var capFlat = flatBuffer; var capFlatBackend = backend;
+            Helpers.HostSync.Register(flat, a =>
+            {
+                float[] f = capFlatBackend.DownloadBuffer(capFlat);
+                System.Array.Copy(f, (float[])a, System.Math.Min(f.Length, ((float[])a).Length));
+            });
+            return;
+        }
+        param._gpuBuffer = buffer; param._gpuBackend = backend; param._gpuBufferVersion = param.GpuCacheVersion;
+        var arr = param.GetBackingArrayForCacheLookupUnsafe();
+        if (arr is null) return;
+        lock (_persistentBufferLock)
+        {
+            if (_persistentBufferCache.TryGetValue(arr, out var entry) && ReferenceEquals(entry.Buffer, buffer))
+                _persistentWeightHostVersion[arr] = param.GpuCacheVersion;
+        }
+        var capBuf = buffer; var capBackend = backend;
+        Helpers.HostSync.Register(arr, a =>
+        {
+            float[] f = capBackend.DownloadBuffer(capBuf);
+            System.Array.Copy(f, (float[])a, System.Math.Min(f.Length, ((float[])a).Length));
+        });
+    }
+
+    /// <summary>
+    /// A zero-filled float tensor whose data lives in a dedicated device buffer (not the activation cache, so no
+    /// step release or eviction frees it while the tensor is alive); a host read downloads it lazily.
+    /// </summary>
+    internal bool TryCreateDeviceStateTensor(int[] shape, out Tensor<float> tensor)
+    {
+        tensor = null!;
+        if (!TryGetBackend(out var backend)) return false;
+        int n = 1;
+        foreach (var d in shape) n = checked(n * d);
+        if (n == 0) return false;
+        IGpuBuffer buffer;
+        try
+        {
+            buffer = backend.AllocateBuffer(n);
+            backend.Fill(buffer, 0f, n);
+        }
+        catch (Exception ex)
+        {
+            GpuLaunchProbe.OnFallback("TryCreateDeviceStateTensor", ex);
+            return false;
+        }
+        var t = new Tensor<float>(shape);
+        BindResidentBuffer(t, buffer, backend);
+        tensor = t;
+        return true;
+    }
+
+    /// <summary>
+    /// True when <paramref name="tensor"/>'s current value exists only on the device (an optimizer updated it in
+    /// place and the host copy has not been read since). Host-side weight-cache invalidation must skip such a
+    /// tensor: it would discard the update and re-upload the stale host array.
+    /// </summary>
+    public bool IsDeviceAuthoritative<T>(Tensor<T> tensor)
+    {
+        if (tensor is null) return false;
+        // Keyed on the backing array, not this Tensor object: the optimizer and the layer can hold different
+        // wrappers over the same storage, and only the one the optimizer updated has its device buffer bound.
+        object? arr = tensor.GetBackingArrayForCacheLookupUnsafe();
+        if (arr is null && typeof(T) == typeof(float) && TryGetFlatParameterView((Tensor<float>)(object)tensor, out var flat, out _))
+            arr = flat;   // a view into the flat ParameterBuffer: authority belongs to the flat array
+        return arr is not null && Helpers.HostSync.IsPending(arr) && _persistentBufferCache.ContainsKey(arr);
+    }
+
+    /// <summary>True when <paramref name="t"/> is a view into a larger flat array (a ParameterBuffer parameter).</summary>
+    internal static bool IsFlatParameterView(Tensor<float> t) => TryGetFlatParameterView(t, out _, out _);
+
+    /// <summary>
+    /// True when <paramref name="t"/> is a contiguous view at a non-zero offset into a larger flat array (the shape of a
+    /// ParameterBuffer parameter), returning that array and the element offset.
+    /// </summary>
+    private static bool TryGetFlatParameterView(Tensor<float> t, out float[] flat, out int offset)
+    {
+        flat = null!; offset = 0;
+        if (!t.IsContiguous) return false;
+        if (!t.DataVector.TryGetBackingArraySegmentForReadOnlyAccess(out var arr, out int segment) || arr is null) return false;
+        offset = segment + t._storageOffset;
+        if (offset == 0 && arr.Length == t.Length) return false;   // the tensor owns the whole array: not a view
+        if ((long)offset + t.Length > arr.Length) return false;
+        flat = arr;
+        return true;
+    }
+
+    /// <summary>
+    /// A device view for a ParameterBuffer parameter whose flat array is device-authoritative (an on-device optimizer
+    /// updated it), so reads never download the flat array to slice it on the host.
+    /// </summary>
+    private bool TryResolveDeviceParameterView<T>(IDirectGpuBackend backend, Tensor<T> t, out IGpuBuffer view)
+    {
+        view = null!;
+        if (typeof(T) != typeof(float) || backend is not IGpuBufferViews views) return false;
+        if (!TryGetFlatParameterView((Tensor<float>)(object)t, out var flat, out int offset)) return false;
+        if (!Helpers.HostSync.IsPending(flat)) return false;
+        IGpuBuffer? flatBuffer = null;
+        lock (_persistentBufferLock)
+            if (_persistentBufferCache.TryGetValue(flat, out var entry)) flatBuffer = entry.Buffer;
+        if (flatBuffer is null) return false;
+        var v = views.TryCreateView(flatBuffer, offset, t.Length);
+        if (v is null) return false;
+        view = v;
         return true;
     }
 
@@ -3202,8 +3430,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // Refresh the deferred materializer to point at the current contents (one-shot; first-write-wins, so
             // Remove first). The buffer pointer is unchanged on the reuse path, so this is a cheap closure swap.
             var capBuf = halfBuf; var capBackend = backend; int cn = n;
-            Helpers.DeferredArrayMaterializer.Remove(oArr);
-            Helpers.DeferredArrayMaterializer.Register(oArr, a =>
+            Helpers.HostSync.Remove(oArr);
+            Helpers.HostSync.Register(oArr, a =>
             {
                 using var tmp = AllocateOutputBuffer(capBackend, cn);
                 capBackend.ConvertToFp32(capBuf, tmp.Buffer, cn);
@@ -3451,6 +3679,25 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (eng is DirectGpuTensorEngine gpu && gpu.TryAliasResidentOutput(src, dest))
         { AliasDiag("OK aliased"); return; }
         AliasDiag(eng is DirectGpuTensorEngine ? "FELLBACK host-copy" : "not-gpu-engine");
+        // The host copy below makes dest's HOST data authoritative, so every device-side copy of dest is stale from
+        // here on and must go: its bound buffer and pending download (the next read would run that download over the
+        // fresh host values), and any activation- or persistent-cache entry keyed by its backing array (those lookups
+        // have no version check and would keep serving the old device values to the next GPU consumer). Measured in
+        // compiled training: the replayed GPU RMSNorm read a trace-time rms buffer (dW 4461 vs -0.134), and a GELU fed
+        // by a replayed broadcast add kept reading the trace-time input, so the forward froze after the first step.
+        if (eng is DirectGpuTensorEngine destEngine)
+        {
+            if (dest.IsGpuResident) dest.Cpu();   // device-resident proper: return it to the host before overwriting
+            destEngine.InvalidateResidentWeightBuffer(dest);
+        }
+        else if (dest._gpuBuffer is not null || dest.HasPendingGpuData)
+        {
+            var staleKey = dest.GetBackingArrayForCacheLookupUnsafe();
+            if (staleKey is not null) Helpers.HostSync.Remove(staleKey);
+            dest._gpuBuffer = null;
+            dest._gpuBackend = null;
+            dest._gpuBufferVersion = -1;
+        }
         var destination = dest.AsWritableSpan();
         if (src.IsContiguous)
             src.AsSpan().CopyTo(destination);
@@ -3505,7 +3752,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (srcBuf is null)
         {
             var cArr = src.GetBackingArrayForCacheLookupUnsafe();
-            if (cArr is not null && src.IsContiguous && !Helpers.DeferredArrayMaterializer.IsPending(cArr))
+            if (cArr is not null && src.IsContiguous && !Helpers.HostSync.IsPending(cArr))
             {
                 try { srcBuf = GetOrCacheWeightBuffer(backend, src.GetDataArray(), PersistentTensorRole.Weights, src.GpuCacheVersion).Buffer; }
                 catch { srcBuf = null; }
@@ -3537,7 +3784,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Host reads of dest (the loss scalar, a debug checksum, a host op) download from the borrowed buffer.
         var capturedBuf = srcBuf;
         var capturedBackend = backend;
-        Helpers.DeferredArrayMaterializer.Register(destArr, arr =>
+        Helpers.HostSync.Register(destArr, arr =>
         {
             float[] floatData = capturedBackend.DownloadBuffer(capturedBuf);
             var converted = DirectGpuEngine.FromFloatArray<T>(floatData);
@@ -3566,12 +3813,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         destinationTensor.IncrementVersion();
         int hostVersion = destinationTensor.GpuCacheVersion;
-        Helpers.DeferredArrayMaterializer.Remove(destination);
+        Helpers.HostSync.Remove(destination);
         RemoveActivationCacheEntry(destination);
 
         var capturedBuffer = outputBuffer.Buffer;
         var capturedBackend = backend;
-        Helpers.DeferredArrayMaterializer.Register(destination, arr =>
+        Helpers.HostSync.Register(destination, arr =>
         {
             float[] floatData;
             try
@@ -3630,7 +3877,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         // Register materializer keyed by the vector — when GetDataArray() is called,
         // it allocates the backing array and then TryMaterialize(vector) downloads from GPU.
-        // The DeferredArrayMaterializer registry also acts as the pending-download
+        // The HostSync registry also acts as the pending-download
         // source of truth for activation-cache eviction (#226): the eviction guard
         // checks IsPending on this same vector key to decide whether to spare the
         // underlying GPU buffer.
@@ -3646,7 +3893,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var vector = tensor.DataVector;
         var capturedBuffer = outputBuffer;
         var capturedBackend = backend;
-        Helpers.DeferredArrayMaterializer.Register(vector, obj =>
+        Helpers.HostSync.Register(vector, obj =>
         {
             var vec = (LinearAlgebra.VectorBase<T>)obj;
             float[] floatData;
@@ -3769,24 +4016,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// code needs the actual data (e.g., reductions, CPU fallback operations, scope exit).
     /// </summary>
     /// <remarks>
-    /// Delegates to <see cref="Helpers.DeferredArrayMaterializer"/>, which is the
+    /// Delegates to <see cref="Helpers.HostSync"/>, which is the
     /// single source of truth for pending downloads after the #226 cleanup. Each
     /// registered callback closes over its own buffer + backend + type conversion,
     /// so there is no engine-local metadata to consult.
     /// </remarks>
     private void MaterializeIfDeferred<T>(T[] data)
     {
-        Helpers.DeferredArrayMaterializer.TryMaterialize(data);
-    }
-
-    /// <summary>
-    /// Materializes all pending deferred downloads at the end of a normal
-    /// <see cref="GpuScope"/> or cache clear. Propagates exceptions so callers
-    /// observe any failed download instead of silently seeing empty arrays.
-    /// </summary>
-    internal void MaterializeAllDeferred()
-    {
-        Helpers.DeferredArrayMaterializer.MaterializeAll(swallowErrors: false);
+        Helpers.HostSync.TryMaterialize(data);
     }
 
     /// <summary>
@@ -4514,7 +4751,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // was already recycled ("buffer released before materialization"). Reading the unsafe reference does not
         // fire the materializer; Remove clears it so a later host read can't resurrect obsolete GPU bytes either.
         var rawArr = destination.GetBackingArrayForCacheLookupUnsafe();
-        if (rawArr is not null) Helpers.DeferredArrayMaterializer.Remove(rawArr);
+        if (rawArr is not null) Helpers.HostSync.Remove(rawArr);
 
         destinationArray = destination.GetLiveBackingArrayOrNull()!;
         return destinationArray is not null;
@@ -4679,8 +4916,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // historical key rather than relying on Register's intentional first-write-wins behavior;
         // otherwise an older callback can remain attached to a buffer that no longer owns the value.
         if (previousVectorKey is not null)
-            Helpers.DeferredArrayMaterializer.Remove(previousVectorKey);
-        Helpers.DeferredArrayMaterializer.Remove(arr);
+            Helpers.HostSync.Remove(previousVectorKey);
+        Helpers.HostSync.Remove(arr);
         if (displacedEntry is not null)
         {
             // The replaced array entry represented the tensor's previous resident value.
@@ -4708,7 +4945,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (Helpers.ResidentHostMirror.ArmDownload(t))
             return;
         var capBuf = buf; var capBackend = backend;
-        Helpers.DeferredArrayMaterializer.Register(arr, a =>
+        Helpers.HostSync.Register(arr, a =>
         {
             float[] f = capBackend.DownloadBuffer(capBuf);
             var conv = DirectGpuEngine.FromFloatArray<T>(f);
@@ -4786,14 +5023,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
 
             previousVectorKey = vectorKey;
-
-            if (displaced is not null)
-            {
-                System.Threading.Interlocked.Add(
-                    ref _currentActivationCacheBytes, -displaced.Buffer.SizeInBytes);
-                System.Threading.Interlocked.Add(
-                    ref _currentActivationManagedBytes, -displaced.ManagedBytes);
-            }
 
             // If corrupt duplicate ownership pointed both entries at the same buffer, the surviving
             // vector entry (now array-keyed) remains its owner; never dispose that shared handle.
@@ -4874,12 +5103,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// cache by backing array), big enough for `need`, WITHOUT uploading or allocating. Returns null when not
     /// resident. Capture-safe (unlike GetResidentOrPersistentInputBuffer, which may upload/allocate). Used to
     /// propagate residency through metadata-only views (Reshape) during the resident step.</summary>
-    private IGpuBuffer? ResolveResidentBufferNoUpload<T>(IDirectGpuBackend backend, Tensor<T> t, int need)
+    /// <param name="includePersistentWeightCache">False when the caller will WRITE the resolved buffer in place.
+    /// A persistent weight-cache entry is an uploaded COPY of a host-authoritative tensor (a weight a GPU inference
+    /// pass cached), not that tensor's residency: mutating it and binding the tensor to it leaves the result only in
+    /// a deferred download, which the host-authoritative post-optimizer invalidation then discards.</param>
+    private IGpuBuffer? ResolveResidentBufferNoUpload<T>(IDirectGpuBackend backend, Tensor<T> t, int need, bool includePersistentWeightCache = true)
     {
         bool residentStep = ResidentStepActive;
         int hostVersion = residentStep ? 0 : t.GpuCacheVersion;
         // During capture the device is authoritative. Eager consumers must instead reject
         // snapshots superseded by a host write, including writes through another storage view.
+        ThrowIfReleased(t);
         if (t._gpuBuffer is not null && ReferenceEquals(t._gpuBackend, backend)
             && t._gpuBuffer.Handle != System.IntPtr.Zero && t._gpuBuffer.Size >= need
             && (residentStep || (t._gpuBufferVersion == hostVersion && IsCachedGpuBufferLive(t, backend))))
@@ -4891,7 +5125,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var arr = t.GetBackingArrayForCacheLookupUnsafe();
         if (arr is not null)
         {
-            var cached = TryGetCachedBuffer(arr);
+            var cached = includePersistentWeightCache ? TryGetCachedBuffer(arr) : null;
             if (cached is not null && cached.Handle != System.IntPtr.Zero && cached.Size >= need
                 && (residentStep || (_persistentWeightHostVersion.TryGetValue(arr, out var stamped)
                     && stamped == hostVersion)))
@@ -5003,6 +5237,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 _lnStatsScratch[arr] = stats;
             }
             backend.LayerNorm(bufIn.Buffer, outBuf, bufGamma.Buffer, bufBeta.Buffer, stats.mean, stats.var, outerSize, normSize, (float)epsilon);
+            // The kernel saves 1/sqrt(var + eps); the backward (LayerNormBackward) takes the VARIANCE, like the CPU
+            // path's out-parameter. Handing it the inverse std-dev gave wrong gradients on every resident step
+            // (measured: dW[0] -0.0019 vs -0.0174). Convert in place: var = 1/invStd^2 - eps.
+            backend.Multiply(stats.var, stats.var, stats.var, outerSize);
+            backend.Reciprocal(stats.var, stats.var, outerSize);
+            backend.AddScalar(stats.var, stats.var, -(float)epsilon, outerSize);
             ResidentSyncCheck("LayerNorm");
             BindResidentBuffer(output, outBuf, backend);
             var meanT = new Tensor<T>(new T[outerSize], new[] { outerSize });
@@ -5187,6 +5427,34 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// <summary>GPU-RESIDENT elementwise multiply (same-shape a*b) for the compiled step via backend.Multiply
     /// into the destination's stable buffer — no host CpuEngine.TensorMultiplyInto (DtoH download = CUDA-900
     /// that aborts capture). Same-shape only (broadcasting falls back). Returns false to fall back.</summary>
+    /// <summary>
+    /// Resident-step elementwise binary op written into <paramref name="output"/>'s stable device buffer (same
+    /// contract as <see cref="TryMultiplyResidentInto{T}"/>, with the kernel as a parameter). False off the resident
+    /// step or for shapes it does not cover; the caller then runs its host path.
+    /// </summary>
+    internal bool TryBinaryResidentInto<T>(Tensor<T> output, Tensor<T> a, Tensor<T> b,
+        Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, IGpuBuffer, int> op, string opName)
+    {
+        if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
+        if (!TryGetBackend(out var backend)) return false;
+        if (!a.IsContiguous || !b.IsContiguous || a.Length != output.Length || b.Length != a.Length) return false;
+        try
+        {
+            using var bufA = GetResidentOrPersistentInputBuffer(backend, a);
+            using var bufB = GetResidentOrPersistentInputBuffer(backend, b);
+            var outBuf = GetOrCreateResidentBuffer(backend, output, output.Length);
+            op(backend, bufA.Buffer, bufB.Buffer, outBuf, output.Length);
+            ResidentSyncCheck(opName);
+            BindResidentBuffer(output, outBuf, backend);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            AliasDiag($"{opName}-resident FELLBACK: {ex.GetType().Name}: {ex.Message}");
+            return false;
+        }
+    }
+
     internal bool TryMultiplyResidentInto<T>(Tensor<T> output, Tensor<T> a, Tensor<T> b)
     {
         if (!ResidentStepActive || Gpu.AutocastScope.IsEnabled || typeof(T) != typeof(float)) return false;
@@ -5586,11 +5854,37 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </list>
     /// </summary>
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
-    private static bool IsTapeActive<T>()
-        => (Autodiff.GradientTape<T>.Current is not null
+    private static bool IsTapeActive<T>([System.Runtime.CompilerServices.CallerMemberName] string op = "")
+    {
+        bool active = (Autodiff.GradientTape<T>.Current is not null
             && !Autodiff.NoGradScope<T>.IsSuppressed)
            || Autodiff.AnomalyModeScope.IsActive
            || Compilation.GraphMode.IsActive;
+        if (active && s_tapeBailStats is { } stats) stats.AddOrUpdate(op, 1, static (_, n) => n + 1);
+        return active;
+    }
+
+    // AIDOTNET_TAPE_BAIL_STATS=1: count, per op, how often a GPU op saw an active tape (most then defer to the
+    // host implementation) and print the table at process exit -- the work-list for making a training step
+    // device-resident. Null (zero cost) when the variable is unset.
+    private static System.Collections.Concurrent.ConcurrentDictionary<string, long>? s_tapeBailStats = CreateTapeBailStats();
+
+    /// <summary>Test hook: turns the tape-bail counters on (idempotent) and returns them.</summary>
+    internal static System.Collections.Concurrent.ConcurrentDictionary<string, long> EnableTapeBailStats()
+        => s_tapeBailStats ??= new System.Collections.Concurrent.ConcurrentDictionary<string, long>();
+
+    private static System.Collections.Concurrent.ConcurrentDictionary<string, long>? CreateTapeBailStats()
+    {
+        if (System.Environment.GetEnvironmentVariable("AIDOTNET_TAPE_BAIL_STATS") != "1") return null;
+        var stats = new System.Collections.Concurrent.ConcurrentDictionary<string, long>();
+        System.AppDomain.CurrentDomain.ProcessExit += (_, _) =>
+        {
+            System.Console.Error.WriteLine("[tape-bail-stats] op: count (IsTapeActive true)");
+            foreach (var kv in stats.OrderByDescending(kv => kv.Value))
+                System.Console.Error.WriteLine($"[tape-bail-stats] {kv.Key}: {kv.Value}");
+        };
+        return stats;
+    }
 
     Vector<T> IEngine.Add<T>(Vector<T> a, Vector<T> b)
     {
@@ -5879,7 +6173,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
 
             // Defer the download: the result T[] is registered with
-            // DeferredArrayMaterializer so a chained next-MatMul that consumes
+            // HostSync so a chained next-MatMul that consumes
             // this Matrix finds the buffer in the activation cache (no
             // download, no re-upload), and host reads materialize lazily on
             // first access. Matrix<T>.FromMemory wraps the deferred array
@@ -6095,7 +6389,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     /// <summary>GPU-RESIDENT elementwise unary-into for the compiled step: run <paramref name="kernel"/> from the
     /// resident input buffer into the destination's stable buffer and bind it — no materialize/download (the host
-    /// *Into activations go through .Data → DeferredArrayMaterializer → DownloadBuffer, which aborts capture, and
+    /// *Into activations go through .Data → HostSync → DownloadBuffer, which aborts capture, and
     /// can hit the #226 "buffer released before materialization" race). Same-length contiguous float only.</summary>
     private bool TryUnaryResidentInto<T>(Tensor<T> output, Tensor<T> input,
         System.Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, int> kernel, string opName)
@@ -6121,7 +6415,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     /// <summary>Resident negate INTO a caller-provided output buffer, for the GraphMode lazy-node executor that the
     /// compiled loss tail replays (the cross-entropy -log(p) negate). The lazy closure (CpuEngine.TensorNegate's
-    /// RecordUnary) hardcodes CPU AsSpan() → DeferredArrayMaterializer download → CUDA-900 during capture. Routing it
+    /// RecordUnary) hardcodes CPU AsSpan() → HostSync download → CUDA-900 during capture. Routing it
     /// here keeps the negate GPU-resident (no download). Returns false off the resident step → caller does CPU.</summary>
     internal bool TensorNegateIntoResident<T>(Tensor<T> output, Tensor<T> input)
         => TryUnaryResidentInto(output, input, static (be, i, o, n) => be.Negate(i, o, n), "NegateLazy");
@@ -6769,9 +7063,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// Runs a binary GPU operation in-place on tensor a: a = op(a, b).
     /// Uploads a and b to GPU, runs kernel with a's buffer as output, downloads back.
     /// </summary>
+    /// <summary>True for element types the GPU paths convert to float buffers (real scalars); false for e.g. Complex&lt;T&gt;.</summary>
+    private static bool IsFloatConvertible<T>()
+        => !(typeof(T).IsGenericType && typeof(T).GetGenericTypeDefinition() == typeof(Complex<>));
+
     private bool TryRunBinaryInPlace<T>(Tensor<T> a, Tensor<T> b, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, int> op)
     {
-        if (!TryGetBackend(out var backend))
+        // Element types without a float device representation (e.g. Complex<T>) belong to the base implementation.
+        // Gradient accumulation for complex tensors reached the host path below and threw converting to float.
+        if (!IsFloatConvertible<T>() || !TryGetBackend(out var backend))
             return false;
 
         // GPU-RESIDENT compiled-step path (PR #638 A2): the dominant backward host-traffic is grad accumulation
@@ -6811,7 +7111,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // comment identifies as making this safe.
         if (!Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
             && a.IsContiguous && b.IsContiguous && a.Length == b.Length
-            && ResolveResidentBufferNoUpload(backend, a, a.Length) is { } aResident
+            // The target must be resident in its OWN right (bound buffer / activation), never via a persistent
+            // weight-cache copy: after a GPU inference pass cached a weight, `weight -= update` used to write that
+            // copy, bind the weight to it and leave the host stale behind a deferred download -- which the
+            // optimizer's post-step invalidation (host treated as authoritative) dropped, so every update was lost
+            // (a float network trained after a GPU Predict never moved). The host path below uses the same cached
+            // buffer and downloads the result synchronously, keeping host and cache coherent.
+            && ResolveResidentBufferNoUpload(backend, a, a.Length, includePersistentWeightCache: false) is { } aResident
             && ResolveResidentBufferNoUpload(backend, b, b.Length) is { } bResident
             && !ReferenceEquals(aResident, bResident)
             && aResident.Handle != bResident.Handle
@@ -6880,6 +7186,26 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         op(backend, bufferA.Buffer, bufferB.Buffer, aData.Length);
 
+        // `a` can be bound to a device buffer of its own that is not the one resolved from its backing array (the
+        // compiled resident step binds its gradient accumulators that way). The op above did not touch it, yet the
+        // version sync below declared it current: every later device read of `a` -- and a host read, through the
+        // bound buffer's pending download -- saw the pre-op values. Measured: a compiled step whose ReduceSum
+        // backward produced a host contribution trained with all-zero gradients. Mirror the result into the bound
+        // buffer (ordered before the download, whose stream sync covers it), or drop a binding that cannot hold it.
+        if (a._gpuBuffer is { } bound && !ReferenceEquals(bound, bufferA.Buffer) && bound.Handle != bufferA.Buffer.Handle)
+        {
+            if (ReferenceEquals(a._gpuBackend, backend) && bound.Handle != System.IntPtr.Zero && bound.Size >= aData.Length)
+            {
+                backend.Copy(bufferA.Buffer, bound, aData.Length);
+            }
+            else
+            {
+                Helpers.HostSync.Remove(aData);
+                a._gpuBuffer = null;
+                a._gpuBackend = null;
+            }
+        }
+
         // Download result back into a's backing array
         float[] resultFloat = backend.DownloadBuffer(bufferA.Buffer);
         var resultT = DirectGpuEngine.FromFloatArray<T>(resultFloat);
@@ -6901,7 +7227,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     private bool TryRunUnaryInPlace<T>(Tensor<T> tensor, Action<IDirectGpuBackend, IGpuBuffer, int> op)
     {
-        if (!TryGetBackend(out var backend))
+        if (!IsFloatConvertible<T>() || !TryGetBackend(out var backend))
             return false;
 
         // Same correctness problem as TryRunBinaryInPlace: GetDataArray() hands back a DETACHED COPY for a
@@ -7646,15 +7972,47 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     public void InvalidateAllWeightCaches()
     {
+        // While eviction is suspended a captured CUDA graph may reference persistent-cache buffers (the capture path
+        // aliases constant inputs -- e.g. a regression target -- to persistent entries). Disposing them here freed
+        // memory the graph kept reading on every replay: measured, the first replayed training step reported a loss
+        // of 0.4132 for parameters whose true loss was 0.4238, and the trajectory drifted from the graph-off run.
+        // Defer the invalidation until the last live graph ends; a host weight write retires the graph before it would
+        // need fresh device weights.
+        if (System.Threading.Volatile.Read(ref _liveCapturedGraphs) > 0)
+        {
+            System.Threading.Interlocked.Exchange(ref _pendingWeightCacheInvalidation, 1);
+            return;
+        }
         lock (_persistentBufferLock)
         {
-            foreach (var entry in _persistentBufferCache.Values)
+            // A parameter the optimizer updated ON THE DEVICE (see CommitParameterUpdatedOnDevice) has its only
+            // current copy in its persistent buffer, with a pending host download: that buffer is the weight, not a
+            // cache of it. Freeing it would lose the update (the pending download would then read a freed buffer).
+            // Keep those entries and their version stamps; drop everything else.
+            List<KeyValuePair<object, GpuBufferCacheEntry>>? kept = null;
+            foreach (var pair in _persistentBufferCache)
             {
-                entry.Dispose();
+                if (Helpers.HostSync.IsPending(pair.Key))
+                    (kept ??= new List<KeyValuePair<object, GpuBufferCacheEntry>>()).Add(pair);
+                else
+                    pair.Value.Dispose();
+            }
+            List<KeyValuePair<object, int>>? keptStamps = null;
+            if (kept is not null)
+            {
+                keptStamps = new List<KeyValuePair<object, int>>();
+                foreach (var pair in kept)
+                    if (_persistentWeightHostVersion.TryGetValue(pair.Key, out int stamp))
+                        keptStamps.Add(new KeyValuePair<object, int>(pair.Key, stamp));
             }
             _persistentBufferCache.Clear();
             _tensorVersions.Clear();
             _persistentWeightHostVersion.Clear();
+            if (kept is not null)
+            {
+                foreach (var pair in kept) _persistentBufferCache[pair.Key] = pair.Value;
+                foreach (var stamp in keptStamps!) _persistentWeightHostVersion[stamp.Key] = stamp.Value;
+            }
             // Reclaim any buffers still awaiting deferred disposal: the whole cache is being torn down, so
             // there is no reader to race and they would otherwise leak.
             foreach (var retired in _retiredWeightBuffers) retired.Dispose();
@@ -12426,16 +12784,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (headDim <= 0 || seqLen <= 0 || (headDim & 1) != 0)
             throw new ArgumentException("RoPE requires positive seqLen and an even headDim.", nameof(input));
 
-        var contiguousInput = input.IsContiguous ? input : (Tensor<T>)input.Contiguous();
-        int rows = contiguousInput.Length / headDim;
+        int rows = input.Length / headDim;
 
-        // input is an activation (upload if host, reuse if resident); cos/sin are constant caches that stay
+        // input is an activation (upload if host, reuse if resident; a permuted view of a resident tensor is
+        // permuted on the device -- Contiguous() here used to download it); cos/sin are constant caches that stay
         // resident across every layer/step via the weight-buffer cache, so they upload exactly once.
-        using var inputBuffer = GetOrAllocateBuffer(backend, contiguousInput);
+        using var inputBuffer = GetOrAllocateBuffer(backend, input);
         using var cosBuffer = GetWeightBufferPreferResident(backend, cos, PersistentTensorRole.Weights);
         using var sinBuffer = GetWeightBufferPreferResident(backend, sin, PersistentTensorRole.Weights);
 
-        var outputBuffer = backend.AllocateBuffer(contiguousInput.Length);
+        var outputBuffer = backend.AllocateBuffer(input.Length);
         backend.RopeInterleaved(inputBuffer.Buffer, cosBuffer.Buffer, sinBuffer.Buffer, outputBuffer,
             rows, headDim, seqLen, startPosition);
 
@@ -14450,7 +14808,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Non-float stays on CpuEngine under a tape: the norm kernels compute in FP32, so a double training step
         // would silently lose its precision (a double finite-difference gradcheck cannot resolve it). Float runs
         // and records on the device.
-        if (IsTapeActive<T>() && typeof(T) != typeof(float)) return base.LayerNorm(input, gamma, beta, epsilon, out mean, out variance);
+        if (typeof(T) != typeof(float) && IsTapeActive<T>()) return base.LayerNorm(input, gamma, beta, epsilon, out mean, out variance);
         // AiDotNet#1331: under GraphMode, the base CpuEngine.LayerNorm has the
         // lazy-graph recording branch that emits a backward node for the
         // compiled plan. The GPU eager path below would silently bypass
@@ -14698,13 +15056,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     Tensor<T> IEngine.ApplyRoPEInterleaved<T>(Tensor<T> input, Tensor<T> cos, Tensor<T> sin, int startPosition)
     {
-        if (IsTapeActive<T>()) return base.ApplyRoPEInterleaved(input, cos, sin, startPosition);
-        if (Compilation.GraphMode.IsActive) return base.ApplyRoPEInterleaved(input, cos, sin, startPosition);
+        // No bail on an active tape: the device result records the same tape node (inverse-rotation backward, which
+        // itself runs this GPU kernel) as the CPU path. Bailing sent every training step's RoPE to the host.
+        if (Compilation.GraphMode.IsActive || Autodiff.AnomalyModeScope.IsActive) return base.ApplyRoPEInterleaved(input, cos, sin, startPosition);
         if (typeof(T) != typeof(float)) return base.ApplyRoPEInterleaved(input, cos, sin, startPosition);
         if (!TryGetBackend(out _)) return base.ApplyRoPEInterleaved(input, cos, sin, startPosition);
         try
         {
-            return ApplyRoPEInterleavedGpu(input, cos, sin, startPosition);
+            var rotated = ApplyRoPEInterleavedGpu(input, cos, sin, startPosition);
+            Autodiff.DifferentiableOps.RecordIfActive("ApplyRoPEInterleaved", rotated, new[] { input },
+                Autodiff.BackwardFunctions<T>.ApplyRoPEInterleavedBackward, new object[] { cos, sin, startPosition });
+            return rotated;
         }
         catch
         {
@@ -14739,8 +15101,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Non-float stays on CpuEngine under a tape: the norm kernels compute in FP32, so a double training step
         // would silently lose its precision (a double finite-difference gradcheck cannot resolve it). Float runs
         // and records on the device.
-        if (IsTapeActive<T>() && typeof(T) != typeof(float)) return base.RMSNorm(input, gamma, epsilon, out rms);
-        if (Compilation.GraphMode.IsActive) return base.RMSNorm(input, gamma, epsilon, out rms);
+        if (typeof(T) != typeof(float) && IsTapeActive<T>()) return base.RMSNorm(input, gamma, epsilon, out rms);
+        // Graph traces and anomaly mode take the base path (it records the graph node / checks every op).
+        if (Compilation.GraphMode.IsActive || Autodiff.AnomalyModeScope.IsActive) return base.RMSNorm(input, gamma, epsilon, out rms);
         if (!TryGetBackend(out var backend))
             return base.RMSNorm(input, gamma, epsilon, out rms);
         if (typeof(T) == typeof(float))
@@ -14772,6 +15135,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             rms = DeferTensorResult<T>(backend, saveRmsBuffer.Buffer, batchSize, rmsShape);
             outputBuffer.RelinquishOwnership();
             saveRmsBuffer.RelinquishOwnership();
+            Autodiff.DifferentiableOps.RecordIfActive("RMSNorm", result, new[] { input, gamma },
+                Autodiff.BackwardFunctions<T>.RMSNormBackward, new object[] { rms, epsilon });
             return result;
         }
         catch
@@ -14831,7 +15196,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Non-float stays on CpuEngine under a tape: the norm kernels compute in FP32, so a double training step
         // would silently lose its precision (a double finite-difference gradcheck cannot resolve it). Float runs
         // and records on the device.
-        if (IsTapeActive<T>() && typeof(T) != typeof(float)) return base.GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
+        if (typeof(T) != typeof(float) && IsTapeActive<T>()) return base.GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
         if (Compilation.GraphMode.IsActive) return base.GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
         if (!TryGetBackend(out var backend))
             return base.GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
@@ -14897,7 +15262,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Non-float stays on CpuEngine under a tape: the norm kernels compute in FP32, so a double training step
         // would silently lose its precision (a double finite-difference gradcheck cannot resolve it). Float runs
         // and records on the device.
-        if (IsTapeActive<T>() && typeof(T) != typeof(float)) return base.InstanceNorm(input, gamma, beta, epsilon, out mean, out variance);
+        if (typeof(T) != typeof(float) && IsTapeActive<T>()) return base.InstanceNorm(input, gamma, beta, epsilon, out mean, out variance);
         if (Compilation.GraphMode.IsActive) return base.InstanceNorm(input, gamma, beta, epsilon, out mean, out variance);
         if (!TryGetBackend(out var backend))
             return base.InstanceNorm(input, gamma, beta, epsilon, out mean, out variance);
@@ -16760,13 +17125,40 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         for (int i = 0; i < safeAxes.Length; i++)
         {
             normalizedAxes[i] = safeAxes[i] < 0 ? safeAxes[i] + input.Rank : safeAxes[i];
+            if (normalizedAxes[i] < 0 || normalizedAxes[i] >= input.Rank)
+                return base.ReduceMean(input, safeAxes, keepDims);
         }
         Array.Sort(normalizedAxes);
+        for (int i = 1; i < normalizedAxes.Length; i++)
+            if (normalizedAxes[i] == normalizedAxes[i - 1])
+                return base.ReduceMean(input, safeAxes, keepDims);
 
         try
         {
-            // ReduceAxisGpu may compose engine ops; suppress their recording so the result has exactly one
-            // producer node, the ReduceMean below.
+            // Every axis of a contiguous tensor: one mean over all elements. Shape [1] whatever keepDims says,
+            // exactly as CpuEngine's full-reduction fast path returns it.
+            if (normalizedAxes.Length == input.Rank && input.IsContiguous && input.Length > 0)
+            {
+                using var source = GetOrAllocateBuffer(backend, input);
+                var output = AllocateOutputBuffer(backend, 1);
+                bool handedOff = false;
+                try
+                {
+                    backend.MeanAxis(source.Buffer, output.Buffer, outerSize: 1, reduceSize: input.Length);
+                    var result = DeferTensorResult<T>(backend, output.Buffer, 1, new[] { 1 });
+                    handedOff = true;
+                    Autodiff.DifferentiableOps.RecordUnary("ReduceMean", result, input,
+                        Autodiff.BackwardFunctions<T>.ReduceMeanBackward, new object[] { normalizedAxes, keepDims });
+                    return result;
+                }
+                finally
+                {
+                    if (!handedOff) output.Dispose();
+                }
+            }
+
+            // The general path may compose engine ops (permute/reshape); suppress their recording so the result has
+            // exactly ONE producer node -- the ReduceMean below -- and gradients are not counted twice.
             Tensor<T> reduced;
             using (new Autodiff.NoGradScope<T>())
                 reduced = ReduceAxisGpu(input, normalizedAxes, keepDims, backend, ReduceOperation.Mean);
@@ -17008,14 +17400,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 if (gradOutput.Length != outerSize)
                     return base.ReduceMeanBackward(gradOutput, inputShape, axes);
 
+                // Capture-safe: no per-call allocation or memset (both abort a CUDA-graph capture, which then fell back
+                // to the host implementation and its device-to-host download -- CUDA 900 -- so a compiled training step
+                // with a mean loss could never be captured). The ones vector is the engine's stable cached buffer
+                // (created and filled outside capture, by the warm pass), and the outer product lands directly in the
+                // output, which is then scaled in place.
+                var ones = GetCachedOnesBuffer(backend, reduceCount);
+                if (ones is null)
+                    return base.ReduceMeanBackward(gradOutput, inputShape, axes);
                 using var gradient = GetOrAllocateBuffer(backend, gradOutput);
-                using var ones = backend.AllocateBuffer(reduceCount);
-                using var expanded = backend.AllocateBuffer(inputSize);
-                backend.Fill(ones, 1f, reduceCount);
                 return DispatchDeferredGpuOp<T>(backend, inputSize, (int[])inputShape.Clone(), output =>
                 {
-                    backend.OuterProduct(gradient.Buffer, ones, expanded, outerSize, reduceCount);
-                    backend.Scale(expanded, output, 1f / reduceCount, inputSize);
+                    backend.OuterProduct(gradient.Buffer, ones, output, outerSize, reduceCount);
+                    backend.Scale(output, output, 1f / reduceCount, inputSize);
                 });
             }
             catch (Exception ex)
@@ -17195,8 +17592,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 input = PermuteImpl(input, permutation.ToArray());
         }
 
-        if (outputShapeList.Count == 0)
-            outputShapeList.Add(1);
+        // Reducing every axis without keepDims yields a RANK-0 scalar, exactly as the CPU engine returns. This used to
+        // substitute shape [1], so once ReduceSum stopped deferring to the CPU under a tape (GPU tape recording), a
+        // rank-0 loss became rank 1 on the GPU engine and rank-0 loss arithmetic/backward diverged from the CPU.
 
         var outputShape = outputShapeList.ToArray();
 
@@ -20380,6 +20778,58 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return base.TensorRound(tensor);
     }
 
+    public override Tensor<T> TensorGatherClassValues<T>(Tensor<T> values, Tensor<T> classIndices)
+    {
+        if (values is null) throw new ArgumentNullException(nameof(values));
+        if (classIndices is null) throw new ArgumentNullException(nameof(classIndices));
+        int numClasses = ValidateClassGather(values, classIndices, out int rows);
+        // GraphMode records through the base (TryGetBackend refuses there); the recorded node replays onto this path.
+        if (typeof(T) == typeof(float) && rows > 0 && TryGetBackend(out var backend)
+            && backend is DirectGpu.CUDA.CudaBackend cuda && cuda.HasClassGatherKernels)
+        {
+            try
+            {
+                using var valuesBuffer = GetOrAllocateBuffer(backend, values.IsContiguous ? values : values.Contiguous());
+                using var classBuffer = GetOrAllocateBuffer(backend, classIndices.IsContiguous ? classIndices : classIndices.Contiguous());
+                var result = DispatchDeferredGpuOp<T>(backend, rows, (int[])classIndices._shape.Clone(), output =>
+                    cuda.GatherClassValues(valuesBuffer.Buffer, classBuffer.Buffer, output, rows, numClasses));
+                Autodiff.DifferentiableOps.RecordUnary("TensorGatherClassValues", result, values,
+                    Autodiff.BackwardFunctions<T>.GatherClassValuesBackward, new object[] { classIndices, numClasses });
+                return result;
+            }
+            catch (Exception ex) when (ex is not ArgumentException)
+            {
+                GpuLaunchProbe.OnFallback("TensorGatherClassValues", ex);
+            }
+        }
+        return base.TensorGatherClassValues(values, classIndices);
+    }
+
+    internal override Tensor<T> ScatterClassValuesGrad<T>(Tensor<T> gradOutput, Tensor<T> classIndices, int[] valuesShape)
+    {
+        int numClasses = valuesShape[valuesShape.Length - 1];
+        long total = 1;
+        foreach (var d in valuesShape) total *= d;
+        int rows = numClasses > 0 ? (int)(total / numClasses) : 0;
+        if (typeof(T) == typeof(float) && total > 0 && total <= int.MaxValue
+            && gradOutput.Length == rows && classIndices.Length == rows
+            && TryGetBackend(out var backend) && backend is DirectGpu.CUDA.CudaBackend cuda && cuda.HasClassGatherKernels)
+        {
+            try
+            {
+                using var gradBuffer = GetOrAllocateBuffer(backend, gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous());
+                using var classBuffer = GetOrAllocateBuffer(backend, classIndices.IsContiguous ? classIndices : classIndices.Contiguous());
+                return DispatchDeferredGpuOp<T>(backend, (int)total, (int[])valuesShape.Clone(), output =>
+                    cuda.ScatterClassGrad(gradBuffer.Buffer, classBuffer.Buffer, output, rows, numClasses));
+            }
+            catch (Exception ex)
+            {
+                GpuLaunchProbe.OnFallback("ScatterClassValuesGrad", ex);
+            }
+        }
+        return base.ScatterClassValuesGrad(gradOutput, classIndices, valuesShape);
+    }
+
     public override Tensor<T> TensorSign<T>(Tensor<T> tensor)
     {
         try
@@ -20462,15 +20912,46 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return base.TensorMin(a, b);
     }
 
+    /// <summary>
+    /// Copies <paramref name="source"/> into <paramref name="destination"/> ON THE DEVICE when the destination is
+    /// device-resident. The CPU implementation writes the destination's host array; for a device-resident destination
+    /// that either lands in a detached copy (a GPU-resident tensor's GetDataArray is a snapshot) or leaves its bound
+    /// device buffer stale, so a consumer reading the device buffer directly -- the fused GPU optimizer reads moments
+    /// and gradients through TryGetGpuBuffer -- never saw the copy.
+    /// </summary>
+    void IEngine.TensorCopy<T>(Tensor<T> source, Tensor<T> destination)
+    {
+        if (source is not null && destination is not null && typeof(T) == typeof(float)
+            && source.Length == destination.Length && destination.IsContiguous && destination._storageOffset == 0
+            && !Compilation.GraphMode.IsActive && TryGetBackend(out var backend)
+            && ResolveResidentBufferNoUpload(backend, destination, destination.Length, includePersistentWeightCache: false) is { } destinationBuffer
+            && destinationBuffer.Handle != IntPtr.Zero)
+        {
+            try
+            {
+                using var sourceBuffer = GetOrAllocateBuffer(backend, source.IsContiguous ? source : (Tensor<T>)source.Contiguous());
+                if (!ReferenceEquals(sourceBuffer.Buffer, destinationBuffer))
+                    backend.Copy(sourceBuffer.Buffer, destinationBuffer, destination.Length);
+                // The device copy is now the authoritative value: bump the version (host snapshot is stale) and
+                // rebind, which re-registers the host-read download for this buffer.
+                destination.IncrementVersion();
+                BindResidentBuffer(destination, destinationBuffer, backend);
+                return;
+            }
+            catch (Exception ex)
+            {
+                GpuLaunchProbe.OnFallback("TensorCopy", ex);
+            }
+        }
+        base.TensorCopy(source!, destination!);
+    }
+
     public override Tensor<T> TensorClamp<T>(Tensor<T> tensor, T min, T max)
     {
-        // ClampBackward unpacks savedState[0]/savedState[1] as boxed double,
-        // matching the CpuEngine.TensorClamp recording path. Defer to base
-        // when tape is active so the boxed-double contract is preserved and
-        // the public override doesn't have to duplicate the double-box logic.
-        if (IsTapeActive<T>()) return base.TensorClamp(tensor, min, max);
-
-        if (!TryGetBackend(out var backend))
+        // No bail on a plain tape: the device result records the same Clamp node as the CPU path (ClampBackward
+        // reads savedState as boxed doubles). The bail downloaded the input of every clamp in a training step.
+        // Graph traces and anomaly mode keep the base path.
+        if (Compilation.GraphMode.IsActive || Autodiff.AnomalyModeScope.IsActive || !TryGetBackend(out var backend))
             return base.TensorClamp(tensor, min, max);
 
         try
@@ -20480,7 +20961,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var bufferA = GetOrAllocateBuffer(backend, tensor);
             var bufferOut = AllocateOutputBuffer(backend, tensor.Length);
             backend.Clamp(bufferA.Buffer, bufferOut.Buffer, minF, maxF, tensor.Length);
-            return DeferTensorResult<T>(backend, bufferOut.Buffer, tensor.Length, tensor.Shape.ToArray());
+            var result = DeferTensorResult<T>(backend, bufferOut.Buffer, tensor.Length, tensor.Shape.ToArray());
+            var numOps = MathHelper.GetNumericOperations<T>();
+            Autodiff.DifferentiableOps.RecordUnary("Clamp", result, tensor,
+                Autodiff.BackwardFunctions<T>.ClampBackward, new object[] { numOps.ToDouble(min), numOps.ToDouble(max) });
+            return result;
         }
         catch (Exception)
         {
@@ -21251,7 +21736,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 if (arr is not null)
                 {
                     var capBuf = outBuf; var capBackend = backend;
-                    Helpers.DeferredArrayMaterializer.Register(arr, a =>
+                    Helpers.HostSync.Register(arr, a =>
                     {
                         float[] f = capBackend.DownloadBuffer(capBuf);
                         var conv = DirectGpuEngine.FromFloatArray<T>(f);
@@ -21377,7 +21862,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Non-float stays on CpuEngine under a tape: the norm kernels compute in FP32, so a double training step
         // would silently lose its precision (a double finite-difference gradcheck cannot resolve it). Float runs
         // and records on the device.
-        if (IsTapeActive<T>() && typeof(T) != typeof(float)) return base.LayerNorm(input, gamma, beta, epsilon, out mean, out variance);
+        if (typeof(T) != typeof(float) && IsTapeActive<T>()) return base.LayerNorm(input, gamma, beta, epsilon, out mean, out variance);
         if (!TryGetBackend(out var backend) || input.Rank < 2)
             return base.LayerNorm(input, gamma, beta, epsilon, out mean, out variance);
 
@@ -21484,7 +21969,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Non-float stays on CpuEngine under a tape: the norm kernels compute in FP32, so a double training step
         // would silently lose its precision (a double finite-difference gradcheck cannot resolve it). Float runs
         // and records on the device.
-        if (IsTapeActive<T>() && typeof(T) != typeof(float)) return base.GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
+        if (typeof(T) != typeof(float) && IsTapeActive<T>()) return base.GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
         if (!TryGetBackend(out var backend) || input.Rank < 2)
             return base.GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
 
@@ -21538,7 +22023,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Non-float stays on CpuEngine under a tape: the norm kernels compute in FP32, so a double training step
         // would silently lose its precision (a double finite-difference gradcheck cannot resolve it). Float runs
         // and records on the device.
-        if (IsTapeActive<T>() && typeof(T) != typeof(float)) return base.InstanceNorm(input, gamma, beta, epsilon, out mean, out variance);
+        if (typeof(T) != typeof(float) && IsTapeActive<T>()) return base.InstanceNorm(input, gamma, beta, epsilon, out mean, out variance);
         if (!TryGetBackend(out var backend) || input.Rank < 4)
             return base.InstanceNorm(input, gamma, beta, epsilon, out mean, out variance);
 
@@ -21587,7 +22072,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Non-float stays on CpuEngine under a tape: the norm kernels compute in FP32, so a double training step
         // would silently lose its precision (a double finite-difference gradcheck cannot resolve it). Float runs
         // and records on the device.
-        if (IsTapeActive<T>() && typeof(T) != typeof(float)) return base.RMSNorm(input, gamma, epsilon, out rms);
+        if (typeof(T) != typeof(float) && IsTapeActive<T>()) return base.RMSNorm(input, gamma, epsilon, out rms);
+        // An active tape no longer sends RMSNorm to the host: the device result records the same tape node as the
+        // CPU path, and its backward dispatches to the GPU RMSNormBackward kernel. (Graph traces and anomaly mode
+        // still take the base path, which records the graph node / checks every op.)
+        if (Compilation.GraphMode.IsActive || Autodiff.AnomalyModeScope.IsActive) return base.RMSNorm(input, gamma, epsilon, out rms);
         if (!TryGetBackend(out var backend) || input.Rank < 2)
             return base.RMSNorm(input, gamma, epsilon, out rms);
 
@@ -21910,8 +22399,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         Compilation.GraphMode.ThrowIfInferenceUnsupported(
             Compilation.GraphCaptureLimitation.HeterogeneousInput);
-        // Under a tape the kernel runs and records CpuEngine's GatherBackward node (saved state: indices, axis).
-        if (Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
+        // No bail on a plain tape: the device result below records the same Gather node (GatherBackward) as the
+        // CPU path. The tape bail made that record dead code and sent every training step's embedding lookup (the
+        // [V, E] table read) to the host. Graph traces and anomaly mode keep the base path.
+        if (Compilation.GraphMode.IsActive || Autodiff.AnomalyModeScope.IsActive || typeof(T) != typeof(float)
             || !TryGetBackend(out var backend) || axis != 0)
             return base.TensorGather(source, indices, axis);
 
@@ -22048,6 +22539,33 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorMSELoss<T>(Tensor<T> predictions, Tensor<T> targets)
     {
+        if (predictions is null) throw new ArgumentNullException(nameof(predictions));
+        if (targets is null) throw new ArgumentNullException(nameof(targets));
+        // Composed from device ops the tape records -- mean((p - t)^2) = sum((p - t)^2) / n -- so the loss and its
+        // gradient stay on the device, training or not. Under a tape both GPU implementations (this override and
+        // the explicit IEngine one, which IEngine callers reach) used to run the CPU base, downloading the
+        // predictions and targets every training step; the fused MseLoss kernel is reachable only through
+        // IGpuBatchExecution (Vulkan).
+        if (typeof(T) == typeof(float) && !Compilation.GraphMode.IsActive
+            && predictions.Length == targets.Length && predictions.Length > 0
+            && ShapesMatch(predictions.Shape._dims, targets.Shape._dims) && TryGetBackend(out _))
+        {
+            try
+            {
+                IEngine e = this;
+                var diff = e.TensorSubtract(predictions, targets);
+                var squared = e.TensorMultiply(diff, diff);
+                var allAxes = new int[squared.Rank];
+                for (int i = 0; i < allAxes.Length; i++) allAxes[i] = i;
+                var total = e.ReduceSum(squared, allAxes, keepDims: false);
+                var mean = e.TensorMultiplyScalar(total, (T)(object)(1f / predictions.Length));
+                return mean.Rank == 1 && mean.Length == 1 ? mean : e.Reshape(mean, new[] { 1 });
+            }
+            catch (Exception ex)
+            {
+                GpuLaunchProbe.OnFallback("TensorMSELoss", ex);
+            }
+        }
         if (IsTapeActive<T>()) return base.TensorMSELoss(predictions, targets);
         if (!TryGetBatchBackend(out var bb))
             return base.TensorMSELoss(predictions, targets);
@@ -22657,6 +23175,26 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // Shape metadata ops — no GPU compute, override for full coverage
     public override Tensor<T> Reshape<T>(Tensor<T> tensor, int[] newShape)
     {
+        if (tensor is null) throw new ArgumentNullException(nameof(tensor));
+        if (newShape is null) throw new ArgumentNullException(nameof(newShape));
+        // Reshaping a permuted view (head merge: permute then reshape) needs a contiguous copy. The base made it on
+        // the host (download, permute, upload); when the view's base is device-only, permute on the device and
+        // record the same Reshape node the base records, so autograd is unchanged.
+        if (!tensor.IsContiguous && typeof(T) == typeof(float)
+            && !Compilation.GraphMode.IsActive && AiDotNet.Tensors.Engines.Compilation.AutoTracer.TryGetCompiledPlan<T>("Reshape", tensor._shape) is null
+            && TryGetBackend(out var permuteBackend) && TryPermuteViewOnDevice(permuteBackend, tensor, out var permuted))
+        {
+            var contiguous = DeferTensorResult<T>(permuteBackend, permuted.Buffer, tensor.Length, tensor.Shape.ToArray());
+            Tensor<T> reshaped;
+            using (Autodiff.DifferentiableOps.SuppressTensorViewRecording())
+                reshaped = contiguous.Reshape(newShape);
+            var originalShape = tensor.Shape.ToArray();
+            Autodiff.DifferentiableOps.RecordUnary("Reshape", reshaped, tensor,
+                Autodiff.BackwardFunctions<T>.ReshapeBackward, new object[] { originalShape });
+            var tracedInput = tensor; var tracedShape = newShape;
+            AiDotNet.Tensors.Engines.Compilation.AutoTracer.RecordOp("Reshape", reshaped, eng => eng.Reshape(tracedInput, tracedShape));
+            return reshaped;
+        }
         var result = base.Reshape(tensor, newShape);
         // PR #638 A1: a reshape is a metadata-only view (same flat buffer, new shape). When the input is resident
         // (e.g. the backward reshape's gradOutput), propagate that GPU buffer to the reshaped output so the grad
@@ -23414,6 +23952,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // tape or not: the kernel converts the scalar to float, which silently cost double callers precision
         // (TensorDivideScalar was already float-only for the same reason).
         if (typeof(T) != typeof(float)) return base.TensorAddScalar(tensor, scalar);
+        // A plain tape records the same node as the CPU path (the gradient is the identity), so no bail -- the bail
+        // downloaded the input. Graph traces and anomaly mode keep the base path.
+        if (Compilation.GraphMode.IsActive || Autodiff.AnomalyModeScope.IsActive) return base.TensorAddScalar(tensor, scalar);
         if (TryGetBackend(out var backend))
         {
             try
@@ -23446,6 +23987,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // tape or not: the kernel converts the scalar to float, which silently cost double callers precision
         // (TensorDivideScalar was already float-only for the same reason).
         if (typeof(T) != typeof(float)) return base.TensorSubtractScalar(tensor, scalar);
+        // A plain tape records the same node as the CPU path (the gradient is the identity), so no bail -- the bail
+        // downloaded the input. Graph traces and anomaly mode keep the base path.
+        if (Compilation.GraphMode.IsActive || Autodiff.AnomalyModeScope.IsActive) return base.TensorSubtractScalar(tensor, scalar);
         if (TryGetBackend(out var backend))
         {
             try
@@ -24311,8 +24855,22 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     T IEngine.TensorSumOfSquares<T>(Tensor<T> tensor)
     {
-        if (typeof(T)==typeof(float) && TryGetBatchBackend(out var bb))
-        { try { var gi=UploadTensorRaw(bb, tensor); using var go=bb.AllocateBuffer(1); bb.Fill(go,0f,1); bb.ReduceSumOfSquares(gi,go,tensor.Length); return (T)(object)bb.DownloadBuffer(go)[0]; } catch{} }
+        // Composed from IDirectGpuBackend primitives (Multiply + the parallel full reduction Sum), which every
+        // backend implements; only the scalar comes back. It used the fused ReduceSumOfSquares through
+        // IGpuBatchExecution, which only Vulkan implements, so on CUDA/OpenCL/HIP every call took the CPU base and
+        // downloaded the whole tensor (e.g. every gradient, every step, in global-norm clipping).
+        if (typeof(T) == typeof(float) && tensor.Length > 0 && TryGetBackend(out var backend))
+        {
+            try
+            {
+                var source = tensor.IsContiguous ? tensor : (Tensor<T>)tensor.Contiguous();
+                using var input = GetOrAllocateBuffer(backend, source);
+                using var squares = backend.AllocateBuffer(tensor.Length);
+                backend.Multiply(input.Buffer, input.Buffer, squares, tensor.Length);
+                return (T)(object)backend.Sum(squares, tensor.Length);
+            }
+            catch (Exception ex) { GpuLaunchProbe.OnFallback("TensorSumOfSquares", ex); }
+        }
         return base.TensorSumOfSquares(tensor);
     }
 
@@ -24815,6 +25373,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 // GPU concat failed — fall back to the CPU base. Surface the reason at Trace level
                 // (don't swallow silently); never mask OOM, which must propagate. (#652 review)
                 System.Diagnostics.Trace.TraceWarning($"GPU TensorConcatenate fallback to CPU: {ex.GetType().Name}: {ex.Message}");
+                AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.OnFallback("TensorConcatenate", ex);
                 if (ThrowOnGpuKernelFallback) throw;
             }
         }
@@ -26200,27 +26759,48 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.TensorLogSoftmax<T>(Tensor<T> tensor, int axis)
     {
-        if (IsTapeActive<T>()) return base.TensorLogSoftmax(tensor, axis);
+        // No IsTapeActive bail: the GPU result records the same LogSoftmax tape node as CpuEngine, so training keeps
+        // it on the device. The previous GPU path computed log(softmax(x)), which underflows to log(0) = -inf for any
+        // entry more than ~88 below its row maximum in float32 (a routine situation for LM logits); it is now the
+        // stable x - max - log(sum(exp(x - max))), composed from IDirectGpuBackend kernels available on all backends.
         if (typeof(T) == typeof(float) && TryGetBackend(out var backend))
         {
             try
             {
                 int rank = tensor.Rank;
                 int normalizedAxis = axis < 0 ? rank + axis : axis;
-                if (normalizedAxis == rank - 1)
+                if (normalizedAxis == rank - 1 && tensor.Length > 0)
                 {
                     int features = tensor.Shape._dims[normalizedAxis];
                     int outerSize = tensor.Length / features;
-                    using var input = GetOrAllocateBuffer(backend, tensor);
+                    var source = tensor.IsContiguous ? tensor : (Tensor<T>)tensor.Contiguous();
+                    using var input = GetOrAllocateBuffer(backend, source);
                     var output = AllocateOutputBuffer(backend, tensor.Length);
                     bool handedOff = false;
                     try
                     {
-                        using var probabilities = backend.AllocateBuffer(tensor.Length);
-                        backend.Softmax(input.Buffer, probabilities, outerSize, features);
-                        backend.Log(probabilities, output.Buffer, tensor.Length);
+                        // Per-ROW values are expanded across the row with TileAxis and subtracted elementwise:
+                        // BroadcastSubLast broadcasts along the last axis (one value per COLUMN), and the per-row
+                        // broadcast kernels are only on the optional IGpuBatchExecution interface.
+                        using var rowMax = backend.AllocateBuffer(outerSize);
+                        using var rowValues = backend.AllocateBuffer(tensor.Length);
+                        using var shifted = backend.AllocateBuffer(tensor.Length);
+                        using var expShifted = backend.AllocateBuffer(tensor.Length);
+                        using var rowSum = backend.AllocateBuffer(outerSize);
+                        using var logSum = backend.AllocateBuffer(outerSize);
+                        backend.MaxAxis(input.Buffer, rowMax, outerSize, features);
+                        backend.TileAxis(rowMax, rowValues, outerSize, 1, 1, features);
+                        backend.Subtract(input.Buffer, rowValues, shifted, tensor.Length);
+                        backend.Exp(shifted, expShifted, tensor.Length);
+                        backend.SumAxis(expShifted, rowSum, outerSize, features);
+                        backend.Log(rowSum, logSum, outerSize);
+                        backend.TileAxis(logSum, rowValues, outerSize, 1, 1, features);
+                        backend.Subtract(shifted, rowValues, output.Buffer, tensor.Length);
                         handedOff = true;
-                        return DeferTensorResult<T>(backend, output.Buffer, tensor.Length, tensor.Shape.ToArray());
+                        var result = DeferTensorResult<T>(backend, output.Buffer, tensor.Length, tensor.Shape.ToArray());
+                        Autodiff.DifferentiableOps.RecordUnary("LogSoftmax", result, tensor,
+                            Autodiff.BackwardFunctions<T>.LogSoftmaxBackward, new object[] { normalizedAxis });
+                        return result;
                     }
                     finally
                     {
@@ -26232,7 +26812,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         return base.TensorLogSoftmax(tensor,axis);
     }
-
     Tensor<T> IEngine.TensorSoftmaxBackward<T>(Tensor<T> softmaxOutput, Tensor<T> gradOutput, int axis)
     {
         if (typeof(T)==typeof(float) && TryGetBackend(out var b))
@@ -26707,7 +27286,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         tensor._gpuMaterializerCallback = materialize;
         tensor._gpuMaterializerKey = vector;
-        Helpers.DeferredArrayMaterializer.Register(vector, materialize);
+        Helpers.HostSync.Register(vector, materialize);
         CacheActivation(vector, outputBuffer, shape, backend, hostVersion: tensor.GpuCacheVersion);
         return tensor;
     }
@@ -26924,8 +27503,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             backend.SplitComplexMultiply(aRBuf.Buffer, aIBuf.Buffer, bRBuf.Buffer, bIBuf.Buffer,
                 oRBuf.Buffer, oIBuf.Buffer, n);
 
-            return PackAndDeferSplitComplexResult<T>(backend,
-                oRBuf.Buffer, oIBuf.Buffer, n, a._shape);
+            return RecordComplexResult("NativeComplexMultiply", new[] { a, b }, Autodiff.ComplexBackwardFunctions<T>.MultiplyBackward, null, PackAndDeferSplitComplexResult<T>(backend,
+                oRBuf.Buffer, oIBuf.Buffer, n, a._shape));
         }
         catch { return base.NativeComplexMultiply(a, b); }
     }
@@ -27228,8 +27807,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
             backend.SplitComplexConjugate(aRBuf.Buffer, aIBuf.Buffer, oRBuf.Buffer, oIBuf.Buffer, n);
 
-            return PackAndDeferSplitComplexResult<T>(backend,
-                oRBuf.Buffer, oIBuf.Buffer, n, a._shape);
+            return RecordComplexResult("NativeComplexConjugate", new[] { a }, Autodiff.ComplexBackwardFunctions<T>.ConjugateBackward, null, PackAndDeferSplitComplexResult<T>(backend,
+                oRBuf.Buffer, oIBuf.Buffer, n, a._shape));
         }
         catch { return base.NativeComplexConjugate(a); }
     }
@@ -27340,10 +27919,19 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
             backend.SplitComplexScale(aRBuf.Buffer, aIBuf.Buffer, oRBuf.Buffer, oIBuf.Buffer, scalarF, n);
 
-            return PackAndDeferSplitComplexResult<T>(backend,
-                oRBuf.Buffer, oIBuf.Buffer, n, a._shape);
+            return RecordComplexResult("NativeComplexScale", new[] { a }, Autodiff.ComplexBackwardFunctions<T>.ScaleBackward, new object[] { (object?)scalar ?? throw new ArgumentNullException(nameof(scalar)) }, PackAndDeferSplitComplexResult<T>(backend,
+                oRBuf.Buffer, oIBuf.Buffer, n, a._shape));
         }
         catch { return base.NativeComplexScale(a, scalar); }
+    }
+
+    /// <summary>Records a native complex op's tape node from its device result (complex autodiff; see
+    /// <see cref="Autodiff.ComplexBackwardFunctions{T}"/>). No-op without an active complex tape.</summary>
+    private static Tensor<Complex<T>> RecordComplexResult<T>(string name, Tensor<Complex<T>>[] inputs,
+        Autodiff.BackwardFunction<Complex<T>> backward, object[]? savedState, Tensor<Complex<T>> result)
+    {
+        Autodiff.DifferentiableOps.RecordIfActive(name, result, inputs, backward, savedState);
+        return result;
     }
 
     public override Tensor<Complex<T>> NativeComplexAdd<T>(Tensor<Complex<T>> a, Tensor<Complex<T>> b)
@@ -27370,8 +27958,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             backend.SplitComplexAdd(aRBuf.Buffer, aIBuf.Buffer, bRBuf.Buffer, bIBuf.Buffer,
                 oRBuf.Buffer, oIBuf.Buffer, n);
 
-            return PackAndDeferSplitComplexResult<T>(backend,
-                oRBuf.Buffer, oIBuf.Buffer, n, a._shape);
+            return RecordComplexResult("NativeComplexAdd", new[] { a, b }, Autodiff.ComplexBackwardFunctions<T>.AddBackward, null, PackAndDeferSplitComplexResult<T>(backend,
+                oRBuf.Buffer, oIBuf.Buffer, n, a._shape));
         }
         catch { return base.NativeComplexAdd(a, b); }
     }
@@ -27402,8 +27990,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             else
                 backend.FFT(inRBuf.Buffer, inIBuf.Buffer, outRBuf.Buffer, outIBuf.Buffer, fftSize, inverse: false);
 
-            return PackAndDeferSplitComplexResult<T>(backend,
-                outRBuf.Buffer, outIBuf.Buffer, n, input._shape);
+            return RecordComplexResult("NativeComplexFFTComplex", new[] { input }, Autodiff.ComplexBackwardFunctions<T>.FftBackward, new object[] { input._shape[input._shape.Length - 1] }, PackAndDeferSplitComplexResult<T>(backend,
+                outRBuf.Buffer, outIBuf.Buffer, n, input._shape));
         }
         catch { return base.NativeComplexFFTComplex(input); }
     }
@@ -27461,8 +28049,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             backend.SplitComplexCrossSpectral(xRBuf.Buffer, xIBuf.Buffer, yRBuf.Buffer, yIBuf.Buffer,
                 oRBuf.Buffer, oIBuf.Buffer, n);
 
-            return PackAndDeferSplitComplexResult<T>(backend,
-                oRBuf.Buffer, oIBuf.Buffer, n, x._shape);
+            return RecordComplexResult("NativeComplexCrossSpectral", new[] { x, y }, Autodiff.ComplexBackwardFunctions<T>.CrossSpectralBackward, null, PackAndDeferSplitComplexResult<T>(backend,
+                oRBuf.Buffer, oIBuf.Buffer, n, x._shape));
         }
         catch { return base.NativeComplexCrossSpectral(x, y); }
     }
@@ -27559,8 +28147,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             else
                 backend.FFT(inRBuf.Buffer, inIBuf.Buffer, outRBuf.Buffer, outIBuf.Buffer, fftSize, inverse: true);
 
-            return PackAndDeferSplitComplexResult<T>(backend,
-                outRBuf.Buffer, outIBuf.Buffer, n, input._shape);
+            return RecordComplexResult("NativeComplexIFFT", new[] { input }, Autodiff.ComplexBackwardFunctions<T>.IfftBackward, new object[] { input._shape[input._shape.Length - 1] }, PackAndDeferSplitComplexResult<T>(backend,
+                outRBuf.Buffer, outIBuf.Buffer, n, input._shape));
         }
         catch { return base.NativeComplexIFFT(input); }
     }
@@ -27875,7 +28463,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> TensorSoftmaxRows<T>(Tensor<T> input)
     {
-        if (input.Rank != 2)
+        // The kernel below records no tape node; under a tape (or a graph trace) the base routes to the
+        // differentiable softmax / records the graph node, so the op has a gradient on the GPU engine too.
+        if (input.Rank != 2 || IsTapeActive<T>())
             return base.TensorSoftmaxRows(input);
         if (!TryGetBackend(out var backend))
             return base.TensorSoftmaxRows(input);

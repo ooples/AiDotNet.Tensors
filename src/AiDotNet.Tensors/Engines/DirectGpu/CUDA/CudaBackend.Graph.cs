@@ -34,7 +34,14 @@ public sealed partial class CudaBackend
     // their actions synchronously. Direct resident dispatch can therefore
     // recognize the supported capture path without polling the driver on
     // every already-resident eager launch.
-    private bool _backendStreamCaptureActive;
+    // Per THREAD: capture now runs on a side stream entered only by the capturing thread, so other threads using
+    // this backend are not capturing and must not take capture-only paths.
+    [ThreadStatic] private static CudaBackend? t_captureActiveBackend;
+    private bool _backendStreamCaptureActive
+    {
+        get => ReferenceEquals(t_captureActiveBackend, this);
+        set => t_captureActiveBackend = value ? this : (ReferenceEquals(t_captureActiveBackend, this) ? null : t_captureActiveBackend);
+    }
 
     /// <summary>
     /// This backend's CUDA context handle. Exposed so the GPU offload allocator
@@ -105,6 +112,8 @@ public sealed partial class CudaBackend
 
     [ThreadStatic] private static IntPtr t_captureMainStream;
     [ThreadStatic] private static IntPtr t_captureStream;
+    // The ambient stream (CudaCurrentStream) this thread had before its capture opened, restored when it closes.
+    [ThreadStatic] private static (IntPtr Stream, IntPtr Context) t_ambientBeforeCapture;
     private IntPtr _captureStream;
     private IntPtr _captureOrderEvent;
     private CudaStream? _captureStreamWrapper;
@@ -139,6 +148,9 @@ public sealed partial class CudaBackend
         }
         t_captureMainStream = _mainStream;
         t_captureStream = _captureStream;
+        // Copies and memsets issued through the CuBlasNative/CudaNativeBindings stream wrappers read the ambient stream,
+        // not _stream, so point it at the capture stream too; otherwise they would run outside the capture.
+        t_ambientBeforeCapture = CudaCurrentStream.Enter(_captureStream, _cudaContext);
         CuBlasNative.cublasSetStream(_cublasHandle, _captureStream);
     }
 
@@ -194,6 +206,8 @@ public sealed partial class CudaBackend
     private void ExitCapture()
     {
         if (t_captureDepth == 0 || --t_captureDepth > 0) return;
+        CudaCurrentStream.Restore(t_ambientBeforeCapture);
+        t_ambientBeforeCapture = default;
         t_captureMainStream = IntPtr.Zero;
         t_captureStream = IntPtr.Zero;
         CuBlasNative.cublasSetStream(_cublasHandle, _mainStream);
@@ -218,6 +232,14 @@ public sealed partial class CudaBackend
         if (!IsAvailable || launch is null) return IntPtr.Zero;
         using var _ = PushContext();
 
+        // Capture on this backend's side stream, entered only by this thread: other threads keep submitting to the
+        // compute stream untouched (see _captureStream). The side stream first waits for everything already queued
+        // on the compute stream, so captured work sees prior results; replays launch on the compute stream.
+        return CaptureWithPrivateMemory(() => CaptureGraphOnCurrentStream(launch), graphExec => graphExec);
+    }
+
+    private IntPtr CaptureGraphOnCurrentStream(Action launch)
+    {
         DirectPtxCapturePinSet directPtxPins = BeginDirectPtxCapturePinTracking();
         try { EnterCapture(); }
         catch
@@ -330,7 +352,9 @@ public sealed partial class CudaBackend
     /// <summary>Destroys a graph after the caller has validated this backend's context.</summary>
     private static void DestroyCapturedGraphCurrentContext(IntPtr graphExec)
     {
-        if (graphExec != IntPtr.Zero) CudaNativeBindings.cuGraphExecDestroy(graphExec);
+        if (graphExec == IntPtr.Zero) return;
+        CudaNativeBindings.cuGraphExecDestroy(graphExec);
+        RetireGraphMemoryPool(graphExec);
     }
 
     /// <summary>
@@ -344,13 +368,18 @@ public sealed partial class CudaBackend
         using var _ = PushContext();
         CuBlasNative.CheckCudaResult(
             CudaNativeBindings.cuGraphLaunch(graphExec, _stream), "cuGraphLaunch");
-        // Barrier so the WHOLE captured step completes before the caller's EAGER grad-clip / optimizer read the
-        // gradients (grads written on BLAS lease streams flickered to zero without one). A graph launch is a single
-        // operation on _stream, and every lease-stream branch recorded in it rejoins the origin stream before
-        // capture can end, so synchronizing _stream waits for all of it. The context-wide cuCtxSynchronize this
-        // replaced also waited on every OTHER thread's streams, and failed outright (CUDA 900) whenever another
-        // thread held a capture open in the same context.
-        CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamSynchronize(_stream), "cuStreamSynchronize (post-capture-launch grad barrier)");
+        // DEVICE-WIDE barrier so the WHOLE captured step completes before the caller's EAGER grad-clip /
+        // optimizer read the gradients. The captured backward writes some grads on BLAS LEASE streams (not
+        // _stream), so a stream-only sync — or no sync — lets the eager optimizer race the still-in-flight
+        // grad writes and read partially-written (intermittently ZERO) gradients → non-deterministic grad
+        // oscillation and a training plateau (the embedding grad flickered 0.11↔0 step-to-step). The capture
+        // win is launch-overhead collapse, NOT cross-step async overlap, and a training step must finish
+        // before the next anyway, so this per-step barrier costs ~nothing while making grads deterministic.
+        // Every backend shares the device's primary context, so a context-wide sync would also wait on streams
+        // another engine is capturing (CUDA 900). Wait on this backend's own streams instead.
+        SynchronizeOwnStreams("stream sync (post-capture-launch grad barrier)");
+        // main (#1065) synchronized only _stream here, on the grounds that lease-stream branches rejoin it before capture
+        // ends; SynchronizeOwnStreams covers that stream and every stream this backend created, so it is the superset.
     }
 
     /// <summary>
@@ -368,6 +397,13 @@ public sealed partial class CudaBackend
     {
         if (graphExec == IntPtr.Zero || relaunch is null || !IsAvailable) return false;
         using var _ = PushContext();
+        return CaptureWithPrivateMemory(
+            () => TryUpdateCapturedGraphOnCurrentStream(graphExec, relaunch),
+            updated => updated ? graphExec : IntPtr.Zero);
+    }
+
+    private bool TryUpdateCapturedGraphOnCurrentStream(IntPtr graphExec, Action relaunch)
+    {
 
         DirectPtxCapturePinSet directPtxPins = BeginDirectPtxCapturePinTracking();
         try { EnterCapture(); }
@@ -449,6 +485,7 @@ public sealed partial class CudaBackend
                 "cuGraphExecDestroy");
         }
         ReleaseDirectPtxGraphPins(graphExec);
+        RetireGraphMemoryPool(graphExec);
     }
 
     /// <summary>

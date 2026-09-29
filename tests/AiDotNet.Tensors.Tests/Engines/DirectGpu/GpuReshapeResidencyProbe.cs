@@ -35,11 +35,11 @@ public sealed class GpuReshapeResidencyProbe : IDisposable
         var b = Rand(2, 64, 64);
         var r = _gpu.TensorMatMul(a, b);
         var rVector = r.DataVector;
-        bool rPending = AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(rVector);
+        bool rPending = AiDotNet.Tensors.Helpers.HostSync.IsPending(rVector);
 
         var rs = r.Reshape(4096);
         var rsVector = rs.DataVector;
-        bool rsPending = AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(rsVector);
+        bool rsPending = AiDotNet.Tensors.Helpers.HostSync.IsPending(rsVector);
 
         // Emit findings so the run output answers the residency question directly.
         System.Console.WriteLine($"[PROBE] matmul-result pending(resident)={rPending}; " +

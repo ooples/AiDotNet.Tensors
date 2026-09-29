@@ -17,6 +17,9 @@ internal sealed class LinearFusionPattern : IFusionPattern
 {
     public string Name => "Linear";
 
+    /// <inheritdoc />
+    public bool IsDifferentiable => true;   // records FusedLinearWithActivationBackward
+
     public bool TryFuse(
         IReadOnlyList<ILazyNode> nodes, int index,
         IReadOnlyDictionary<ILazyNode, int> consumerCounts,
@@ -157,7 +160,7 @@ internal sealed class LinearFusionPattern : IFusionPattern
                 (eng, output) =>
                 {
                     var eager = eng.FusedLinear(capturedInput, capturedWeights, capturedBias, capturedActivation);
-                    eager.AsSpan().CopyTo(output.AsWritableSpan());
+                    AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CopyResultInto(eng, eager, output);
                 },
                 BackwardFunctions<T>.FusedLinearWithActivationBackward,
                 savedState);

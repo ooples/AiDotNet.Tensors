@@ -724,3 +724,34 @@ public interface ICompiledTrainingPlan<T> : IDisposable
     /// </summary>
     bool IsCompatibleWith(PlanCompatibilityInfo info);
 }
+
+/// <summary>
+/// Read-only facts about a compiled training plan that a caller needs to reason about a step it just ran.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Separate from <see cref="ICompiledTrainingPlan{T}"/> so adding it breaks no existing implementer of that interface
+/// (default interface members are unavailable on .NET Framework). The built-in plan implements both; test for it with
+/// <c>plan is ICompiledTrainingPlanIntrospection&lt;T&gt; introspection</c>.
+/// </para>
+/// <para>
+/// A caller uses these to tell apart the two reasons a step can leave every parameter unchanged. Either the update was
+/// legitimately zero (a learning rate of 0 at this <see cref="OptimizerStep"/>), or the plan no longer writes the
+/// tensors the model reads, which <see cref="OptimizedParameters"/> shows by reference identity.
+/// </para>
+/// </remarks>
+/// <typeparam name="T">The tensor element type.</typeparam>
+public interface ICompiledTrainingPlanIntrospection<T>
+{
+    /// <summary>
+    /// The optimizer step the plan applied most recently: the index its learning-rate schedule was evaluated at,
+    /// 1 after its first update and 0 before any. <c>ImportOptimizerState</c> sets it to the imported step.
+    /// </summary>
+    int OptimizerStep { get; }
+
+    /// <summary>
+    /// The parameter tensors the plan's optimizer update writes, in the order the plan was compiled with. A plan is
+    /// still attached to a model exactly when these are the model's live parameter tensors (reference identity).
+    /// </summary>
+    IReadOnlyList<Tensor<T>> OptimizedParameters { get; }
+}

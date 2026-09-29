@@ -170,11 +170,11 @@ internal sealed class TensorStorage<T>
         }
         // GPU result arrays can be cached before their wrapping Tensor exists.
         // Tag that storage while its deferred download is still registered.
-        if (Helpers.DeferredArrayMaterializer.HasPendingMaterializations)
+        if (Helpers.HostSync.HasPendingMaterializations)
         {
-            _trackGpuCacheVersion = Helpers.DeferredArrayMaterializer.IsPending(data)
+            _trackGpuCacheVersion = Helpers.HostSync.IsPending(data)
                 || (data.GetBackingArrayForReadOnlyAccess() is { } array
-                    && Helpers.DeferredArrayMaterializer.IsPending(array));
+                    && Helpers.HostSync.IsPending(array));
             if (_trackGpuCacheVersion && _externalArrayGpuCacheEpoch is { } external)
                 Volatile.Write(ref external.IsTracked, true);
         }

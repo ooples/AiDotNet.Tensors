@@ -20,7 +20,7 @@ namespace AiDotNet.Tensors.LinearAlgebra;
 /// <para><b>For Beginners:</b> A matrix is a rectangular array of numbers arranged in rows and columns.
 /// Matrices are fundamental in machine learning for representing data and transformations.</para>
 /// </remarks>
-public abstract class MatrixBase<T>
+public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
 {
     /// <summary>
     /// The internal memory storing matrix data in a flattened row-major format.
@@ -32,6 +32,41 @@ public abstract class MatrixBase<T>
     protected readonly Memory<T> _memory;
     internal readonly T[]? _cachedArray;
     private long _version;
+
+    /// <summary>Host-sync state of this matrix's host array, shared with its aliases (see <see cref="Helpers.HostSync"/>).</summary>
+    private Helpers.HostSync? _hostSync;
+
+    private object HostSyncKey()
+    {
+        // An EMPTY backing (a GPU-resident storage before its host array exists) reports the shared
+        // Array.Empty<T>() instance: keying by it would make every such storage share one state.
+        if (_cachedArray is { Length: > 0 }) return _cachedArray;
+        if (_memory.Length > 0 && MemoryMarshal.TryGetArray((ReadOnlyMemory<T>)_memory, out var segment)
+            && segment.Array is not null)
+            return segment.Array;
+        return this;
+    }
+
+    Helpers.HostSync Helpers.IHostSyncOwner.GetOrCreateHostSync()
+        => _hostSync ??= Helpers.HostSync.ForArray(HostSyncKey());
+
+    Helpers.HostSync? Helpers.IHostSyncOwner.FindHostSync()
+    {
+        if (_hostSync is { } cached) return cached;
+        var found = Helpers.HostSync.FindForArray(HostSyncKey());
+        if (found is not null) _hostSync = found;
+        return found;
+    }
+
+    /// <summary>
+    /// Makes this storage's host array current: runs its pending device download once (shared with every alias,
+    /// including segment views of a larger array). A field read when nothing is pending.
+    /// </summary>
+    internal void SyncHostFromDevice()
+    {
+        if (!Helpers.HostSync.AnyExists) return;
+        ((Helpers.IHostSyncOwner)this).FindHostSync()?.MakeHostCurrent();
+    }
 
     /// <summary>
     /// If this matrix was created from a pooled array, holds a reference to it for return.
@@ -102,7 +137,7 @@ public abstract class MatrixBase<T>
         // returns the same array WITHOUT triggering the download.
         if (_cachedArray is not null)
         {
-            Helpers.DeferredArrayMaterializer.TryMaterialize(_cachedArray);
+            SyncHostFromDevice();
             return _cachedArray;
         }
 
@@ -110,7 +145,7 @@ public abstract class MatrixBase<T>
         {
             if (segment.Offset == 0)
             {
-                Helpers.DeferredArrayMaterializer.TryMaterialize(segment.Array);
+                SyncHostFromDevice();
                 return segment.Array;
             }
         }
@@ -376,12 +411,11 @@ public abstract class MatrixBase<T>
             ValidateIndices(row, col);
             // A Matrix returned by a deferred GPU op holds an uninitialized
             // backing array whose values only get populated when its
-            // DeferredArrayMaterializer callback fires. The span accessors
+            // HostSync callback fires. The span accessors
             // already trigger materialization; the indexer was bypassing it,
             // so matrix[i,j] silently read zeros until something else hit
             // the deferred path. Mirror AsSpan's TryMaterialize call here.
-            if (_cachedArray is not null)
-                Helpers.DeferredArrayMaterializer.TryMaterialize(_cachedArray);
+            SyncHostFromDevice();
             return _memory.Span[row * _cols + col];
         }
         set
@@ -390,8 +424,7 @@ public abstract class MatrixBase<T>
             // Writers must observe materialized data too — a read-modify-write
             // pattern (`m[i,j] += x`) reads the slot first and would otherwise
             // overwrite the not-yet-downloaded GPU result with `0 + x`.
-            if (_cachedArray is not null)
-                Helpers.DeferredArrayMaterializer.TryMaterialize(_cachedArray);
+            SyncHostFromDevice();
             MarkDirty();
             _memory.Span[row * _cols + col] = value;
         }
@@ -1550,12 +1583,11 @@ public abstract class MatrixBase<T>
     public ReadOnlySpan<T> AsSpan()
     {
         // Issues #561 / #562: a Matrix returned by IEngine.MatrixMultiply on
-        // the GPU may be backed by a DeferredArrayMaterializer-registered
+        // the GPU may be backed by a HostSync-registered
         // array — its GPU buffer is still resident and the host array is
         // empty until first read. Materialize before exposing the span so
         // callers don't see zeros. Mirrors VectorBase.AsSpan's trigger.
-        if (_cachedArray is not null)
-            Helpers.DeferredArrayMaterializer.TryMaterialize(_cachedArray);
+        SyncHostFromDevice();
         return _memory.Span;
     }
 
@@ -1575,8 +1607,7 @@ public abstract class MatrixBase<T>
         // See AsSpan() — a writable view must observe materialized data too,
         // otherwise an "x[i] += y" pattern would read 0 and overwrite the
         // not-yet-downloaded GPU result.
-        if (_cachedArray is not null)
-            Helpers.DeferredArrayMaterializer.TryMaterialize(_cachedArray);
+        SyncHostFromDevice();
         MarkDirty();
         return _memory.Span;
     }
@@ -1598,8 +1629,7 @@ public abstract class MatrixBase<T>
     {
         // Memory is held + read later, so we have to materialize NOW; we
         // can't observe the read point of a stored Memory<T>.
-        if (_cachedArray is not null)
-            Helpers.DeferredArrayMaterializer.TryMaterialize(_cachedArray);
+        SyncHostFromDevice();
         return _memory;
     }
 
@@ -1616,8 +1646,7 @@ public abstract class MatrixBase<T>
     /// </remarks>
     internal Memory<T> AsWritableMemory()
     {
-        if (_cachedArray is not null)
-            Helpers.DeferredArrayMaterializer.TryMaterialize(_cachedArray);
+        SyncHostFromDevice();
         MarkDirty();
         return _memory;
     }

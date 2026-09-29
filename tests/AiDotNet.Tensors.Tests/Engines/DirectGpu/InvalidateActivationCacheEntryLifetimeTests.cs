@@ -18,7 +18,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// for every prebuilt CNN/RNN model.
 ///
 /// The fix centralizes the guard inside <c>InvalidateActivationCacheEntry</c>:
-/// because <see cref="Helpers.DeferredArrayMaterializer.Register"/> is
+/// because <see cref="Helpers.HostSync.Register"/> is
 /// first-write-wins, the array key is permanently bound to exactly one buffer, so
 /// that buffer's contents are the array's ONLY defined CPU value. The entry is
 /// therefore materialized (downloaded) to CPU BEFORE the buffer is disposed.
@@ -89,7 +89,7 @@ public class InvalidateActivationCacheEntryLifetimeTests
         // freed) when the deferred download executed.
         int disposeCountWhenMaterialized = -1;
         bool materializerRan = false;
-        AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.Register(key, _ =>
+        AiDotNet.Tensors.Helpers.HostSync.Register(key, _ =>
         {
             materializerRan = true;
             disposeCountWhenMaterialized = buffer.DisposeCount;
@@ -97,7 +97,7 @@ public class InvalidateActivationCacheEntryLifetimeTests
 
         try
         {
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(key));
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(key));
 
             invalidateMethod.Invoke(engine, new object[] { key });
 
@@ -110,14 +110,14 @@ public class InvalidateActivationCacheEntryLifetimeTests
             Assert.Equal(0, disposeCountWhenMaterialized);
 
             // 3. No longer pending — a subsequent read won't touch a freed buffer.
-            Assert.False(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(key));
+            Assert.False(AiDotNet.Tensors.Helpers.HostSync.IsPending(key));
 
             // 4. The buffer was disposed afterward (no leak).
             Assert.Equal(1, buffer.DisposeCount);
         }
         finally
         {
-            AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.Remove(key);
+            AiDotNet.Tensors.Helpers.HostSync.Remove(key);
         }
     }
 
@@ -130,21 +130,21 @@ public class InvalidateActivationCacheEntryLifetimeTests
 
         var key = new float[4];
         bool materializerRan = false;
-        AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.Register(key, _ => materializerRan = true);
+        AiDotNet.Tensors.Helpers.HostSync.Register(key, _ => materializerRan = true);
         try
         {
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(key));
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(key));
 
             var removed = (bool)method.Invoke(engine, new object[] { key })!;
 
             Assert.False(removed);
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(key),
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(key),
                 "A miss in the activation cache must not remove an unrelated still-valid deferred materializer.");
             Assert.False(materializerRan);
         }
         finally
         {
-            AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.Remove(key);
+            AiDotNet.Tensors.Helpers.HostSync.Remove(key);
         }
     }
 }

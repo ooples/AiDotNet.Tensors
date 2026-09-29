@@ -106,7 +106,14 @@ public sealed class MetalGpuBuffer : IGpuBuffer
         StorageMode = options;
 
         var sizeInBytes = (ulong)elementCount * sizeof(float);
+        if (!PendingFrees.IsEmpty) PendingFrees.Drain();
         _buffer = device.CreateBuffer(sizeInBytes, options);
+        if (_buffer == IntPtr.Zero)
+        {
+            // Out of memory: free what unreachable buffers hold, then retry once (see DeviceMemoryReclaim).
+            ReclaimForRetry();
+            _buffer = device.CreateBuffer(sizeInBytes, options);
+        }
 
         if (_buffer == IntPtr.Zero)
         {
@@ -137,11 +144,18 @@ public sealed class MetalGpuBuffer : IGpuBuffer
         StorageMode = options;
 
         var sizeInBytes = (ulong)data.Length * sizeof(float);
+        if (!PendingFrees.IsEmpty) PendingFrees.Drain();
         var handle = GCHandle.Alloc(data, GCHandleType.Pinned);
 
         try
         {
             _buffer = device.CreateBufferWithData(handle.AddrOfPinnedObject(), sizeInBytes, options);
+            if (_buffer == IntPtr.Zero)
+            {
+                // Out of memory: free what unreachable buffers hold, then retry once (see DeviceMemoryReclaim).
+                ReclaimForRetry();
+                _buffer = device.CreateBufferWithData(handle.AddrOfPinnedObject(), sizeInBytes, options);
+            }
         }
         finally
         {
@@ -523,6 +537,30 @@ public sealed class MetalGpuBuffer : IGpuBuffer
                 _buffer = IntPtr.Zero;
             }
         }
+        GC.SuppressFinalize(this);
+    }
+
+    /// <summary>Frees of Metal buffers collected without Dispose, run by the next allocation.</summary>
+    internal static readonly DeviceFreeQueue PendingFrees = new();
+
+    private static void ReclaimForRetry()
+    {
+        DeviceMemoryReclaim.CollectUnreachable();
+        PendingFrees.Drain();
+    }
+
+    // An undisposed buffer (a result nothing references any more) releases its MTLBuffer through the queue.
+    ~MetalGpuBuffer()
+    {
+        IntPtr buffer;
+        lock (_lock)
+        {
+            if (_disposed) return;
+            _disposed = true;
+            buffer = _buffer;
+            _buffer = IntPtr.Zero;
+        }
+        if (buffer != IntPtr.Zero) PendingFrees.Enqueue(() => Release(buffer));
     }
 
     public override string ToString()

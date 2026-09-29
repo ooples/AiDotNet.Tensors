@@ -20,6 +20,13 @@ internal interface IFusionPattern
     string Name { get; }
 
     /// <summary>
+    /// True when the fused node records a backward function, so the rewrite is valid in a TRAINING graph.
+    /// A pattern whose fused node has no backward is inference-only: applied while compiling a training plan it
+    /// removes the matched ops' backward steps, and every gradient flowing through them is silently dropped.
+    /// </summary>
+    bool IsDifferentiable { get; }
+
+    /// <summary>
     /// Attempts to fuse a chain of nodes starting at <paramref name="index"/>.
     /// Returns true on a successful match. On match the implementation must:
     /// <list type="bullet">

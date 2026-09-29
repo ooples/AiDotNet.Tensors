@@ -360,6 +360,15 @@ public partial class CpuEngine
         IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
         int numHeads = (int)savedState[0];
+        // Device backward on the GPU engine. A compiled plan records this function from the CPU base (GraphMode)
+        // and replays it on the GPU engine, so it ran the managed BPTT recurrence with host copies around it on
+        // every compiled GPU step.
+        if (engine is DirectGpuTensorEngine gpu && gpu.GlaScanBackwardGpu(gradOutput, inputs, numHeads) is { } gpuGrads)
+        {
+            for (int i = 0; i < 4; i++)
+                DifferentiableOps.AccumulateGrad(grads, inputs[i], gpuGrads[i], engine);
+            return;
+        }
         var qProj = inputs[0];
         var kProj = inputs[1];
         var vProj = inputs[2];

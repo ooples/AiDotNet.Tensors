@@ -36,7 +36,11 @@ public sealed class WebGpuBuffer : IGpuBuffer, IDisposable
     private readonly int _sizeBytes;
     private readonly int _elementCount;
     private readonly WebGpuBufferUsage _usage;
-    private bool _disposed;
+    private int _disposedFlag;
+    private bool _disposed => System.Threading.Volatile.Read(ref _disposedFlag) != 0;
+
+    /// <summary>Frees of WebGPU buffers collected without Dispose, run by the next allocation.</summary>
+    internal static readonly DeviceFreeQueue PendingFrees = new();
 
     /// <summary>
     /// Gets the buffer handle ID.
@@ -97,7 +101,17 @@ public sealed class WebGpuBuffer : IGpuBuffer, IDisposable
 
         // Ensure buffer size is aligned to 4 bytes (required by WebGPU)
         var alignedSize = (_sizeBytes + 3) & ~3;
-        _bufferId = WebGpuNativeBindings.CreateBuffer(alignedSize, (int)usage);
+        if (!PendingFrees.IsEmpty) PendingFrees.Drain();
+        int bufferId = WebGpuNativeBindings.CreateBuffer(alignedSize, (int)usage);
+        if (bufferId < 0)
+        {
+            // The binding does not say why creation failed; free what unreachable buffers hold and retry once
+            // (see DeviceMemoryReclaim) before reporting the failure.
+            DeviceMemoryReclaim.CollectUnreachable();
+            PendingFrees.Drain();
+            bufferId = WebGpuNativeBindings.CreateBuffer(alignedSize, (int)usage);
+        }
+        _bufferId = bufferId;
 
         if (_bufferId < 0)
         {
@@ -276,17 +290,24 @@ public sealed class WebGpuBuffer : IGpuBuffer, IDisposable
     /// </summary>
     public void Dispose()
     {
-        if (_disposed)
+        if (System.Threading.Interlocked.Exchange(ref _disposedFlag, 1) != 0)
         {
             return;
         }
-
-        _disposed = true;
 
         if (_bufferId >= 0)
         {
             WebGpuNativeBindings.DestroyBuffer(_bufferId);
         }
+        GC.SuppressFinalize(this);
+    }
+
+    // An undisposed buffer (a result nothing references any more) destroys its device buffer through the queue.
+    ~WebGpuBuffer()
+    {
+        if (System.Threading.Interlocked.Exchange(ref _disposedFlag, 1) != 0 || _bufferId < 0) return;
+        int bufferId = _bufferId;
+        PendingFrees.Enqueue(() => WebGpuNativeBindings.DestroyBuffer(bufferId));
     }
 
     public override string ToString()

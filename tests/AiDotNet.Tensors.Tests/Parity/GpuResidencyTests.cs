@@ -109,16 +109,17 @@ public sealed class GpuResidencyTests
     [Trait("Category", "PyTorchParityGpu")]
     public void MlpTrainingStep_TransfersDoNotRegress()
     {
-        var (scope, report) = RunMlpTrainingStep();
-        string backend = scope.Events.FirstOrDefault().Backend.ToString();
+        var (scope, report, backendType) = RunMlpTrainingStep();
+        string backend = backendType.ToString();
         var measured = CrossingsByOperation(scope);
         string root = PyTorchParityInventory.FindRepositoryRoot()
             ?? throw new InvalidOperationException("parity/ is missing from this checkout.");
         using var doc = System.Text.Json.JsonDocument.Parse(System.IO.File.ReadAllText(System.IO.Path.Combine(root, BaselineFile)));
         bool recorded = doc.RootElement.GetProperty("mlp").TryGetProperty(backend, out var baselineElement);
         string snapshot = "{ " + string.Join(", ", measured.OrderBy(kv => kv.Key, StringComparer.Ordinal).Select(kv => $"\"{kv.Key}\": {kv.Value}")) + " }";
-        // An unmeasured backend is not a passing ratchet: fail with the snapshot to record. A step that produced no
-        // events at all reports backend None, which has no baseline either, so a dead probe fails here too.
+        // An unmeasured backend is not a passing ratchet: fail with the snapshot to record. The backend is named by a
+        // deliberate upload the probe must see (RunMlpTrainingStep), so a dead probe fails there, and a step that
+        // is fully resident -- no events at all -- is still compared against its backend's baseline.
         Assert.True(recorded, $"No residency baseline for mlp on {backend}. Measure it on that backend and add " +
                               $"\"{backend}\": {snapshot} under \"mlp\" in {BaselineFile}.{Environment.NewLine}{report}");
 
@@ -153,7 +154,7 @@ public sealed class GpuResidencyTests
     [Trait("Category", "PyTorchParityGpuTarget")]
     public void MlpTrainingStep_StaysResident()
     {
-        var (scope, report) = RunMlpTrainingStep();
+        var (scope, report, _) = RunMlpTrainingStep();
         int crossings = scope.Uploads + scope.Downloads;
         Assert.True(crossings == 0,
             $"A warmed-up MLP training step on the GPU crossed the host/device boundary {crossings} time(s) " +
@@ -165,7 +166,7 @@ public sealed class GpuResidencyTests
     /// Runs warmed-up MLP training steps on the GPU engine and records one step's crossings, grouped by the engine
     /// operation that caused each.
     /// </summary>
-    private (GpuResidencyScope Scope, string Report) RunMlpTrainingStep()
+    private (GpuResidencyScope Scope, string Report, GpuBackendType Backend) RunMlpTrainingStep()
     {
         using var gpu = RequireGpu();
         var previous = AiDotNetEngine.Current;
@@ -213,6 +214,17 @@ public sealed class GpuResidencyTests
 
             for (int i = 0; i < 5; i++) Step();
 
+            // Name the backend from one deliberate upload rather than from the step's first event: a step that stays
+            // fully resident has no events, and must still be compared with its own backend's baseline. The probe
+            // has to see this upload, so a dead probe fails here instead of passing as "resident".
+            GpuBackendType backend;
+            using (var probe = GpuResidencyScope.Begin())
+            {
+                gpu.UploadToGpu(new Tensor<float>(new[] { 1f }, new[] { 1 }), GpuTensorRole.General);
+                Assert.True(probe.Uploads >= 1, "The residency probe did not see a deliberate upload; its counts mean nothing.");
+                backend = probe.Events.First(e => e.Kind == GpuTransferKind.HostToDevice).Backend;
+            }
+
             GpuResidencyScope scope;
             using (scope = GpuResidencyScope.Begin(captureOperations: true)) Step();
 
@@ -221,11 +233,11 @@ public sealed class GpuResidencyTests
                 .OrderByDescending(g => g.Sum(e => e.Bytes))
                 .Select(g => $"  {g.Key.Kind,-13} x{g.Count(),-3} {g.Sum(e => e.Bytes),12:N0} B  {g.Key.Op}")
                 .ToList();
-            string report = $"MLP training step on {scope.Events.FirstOrDefault().Backend}: " +
+            string report = $"MLP training step on {backend}: " +
                             $"{scope.Uploads} upload(s) {scope.BytesUploaded:N0} B, {scope.Downloads} download(s) {scope.BytesDownloaded:N0} B, " +
                             $"{scope.Synchronizations} sync(s)" + Environment.NewLine + string.Join(Environment.NewLine, lines);
             _output.WriteLine(report);
-            return (scope, report);
+            return (scope, report, backend);
         }
         finally
         {

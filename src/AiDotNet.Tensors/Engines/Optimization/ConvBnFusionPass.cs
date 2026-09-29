@@ -255,7 +255,7 @@ internal sealed class ConvBnFusionPass : ICpuOptimizationPass
                     result = eng.TensorAdd(result, capturedBroadcastBias);
                 }
 
-                result.AsSpan().CopyTo(output.AsWritableSpan());
+                AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CopyResultInto(eng, result, output);
             },
             finalOutput,
             new[] { convInput, capturedFusedWeights, capturedFusedBias },

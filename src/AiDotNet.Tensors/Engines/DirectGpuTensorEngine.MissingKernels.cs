@@ -2051,7 +2051,9 @@ public partial class DirectGpuTensorEngine
     public override Tensor<T> TensorClampMin<T>(Tensor<T> tensor, T min)
     {
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
-        if (!TryGetBackend(out var backend))
+        // Graph traces / anomaly mode take the base path. Under a plain tape the device result records the same
+        // tape node as the CPU path (ClampMinBackward, boxed T bound), instead of sending the op to the host.
+        if (Compilation.GraphMode.IsActive || Autodiff.AnomalyModeScope.IsActive || !TryGetBackend(out var backend))
             return base.TensorClampMin(tensor, min);
 
         try
@@ -2074,7 +2076,7 @@ public partial class DirectGpuTensorEngine
     public override Tensor<T> TensorClampMax<T>(Tensor<T> tensor, T max)
     {
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
-        if (!TryGetBackend(out var backend))
+        if (Compilation.GraphMode.IsActive || Autodiff.AnomalyModeScope.IsActive || !TryGetBackend(out var backend))
             return base.TensorClampMax(tensor, max);
 
         try
@@ -2383,40 +2385,95 @@ public partial class DirectGpuTensorEngine
     {
         if (embeddings is null) throw new ArgumentNullException(nameof(embeddings));
         if (floatIndices is null) throw new ArgumentNullException(nameof(floatIndices));
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive || typeof(T) != typeof(float)
-            || embeddings.Rank != 2 || !embeddings.IsContiguous || !TryGetBackend(out var backend))
+        // No bail on a plain tape: the device result records the same backward as the CPU path. Under a tape the
+        // base converted the ids to ints and ran the CPU lookup -- downloading the whole [V, E] table every
+        // training step (and without a tape this path issued one copy launch per id). Graph traces and anomaly
+        // mode keep the base path; the traced node replays onto this one.
+        if (Compilation.GraphMode.IsActive || Autodiff.AnomalyModeScope.IsActive || typeof(T) != typeof(float)
+            || embeddings.Rank != 2 || !TryGetBackend(out var backend)
+            || backend is not DirectGpu.CUDA.CudaBackend cuda || !cuda.HasFloatIdEmbeddingKernels)
             return base.TensorEmbeddingLookupFromFloatIndices(embeddings, floatIndices);
 
+        int vocabSize = embeddings._shape[0];
+        int embeddingDim = embeddings._shape[1];
+        int numIndices = floatIndices.Length;
+        var ids = floatIndices.IsContiguous ? floatIndices : floatIndices.Contiguous();
+        ValidateHostFloatIds(ids, vocabSize);
         try
         {
-            int vocabSize = embeddings._shape[0];
-            int embeddingDim = embeddings._shape[1];
-            int numIndices = floatIndices.Length;
-            var rawIndices = floatIndices.GetFlattenedData();
-            var indices = new int[numIndices];
-            for (int i = 0; i < numIndices; i++)
-            {
-                long index = Convert.ToInt64(Convert.ToDouble(rawIndices[i]));
-                if (index < 0 || index >= vocabSize)
-                    throw new ArgumentOutOfRangeException(nameof(floatIndices),
-                        $"Index {index} at position {i} out of bounds for vocab {vocabSize}.");
-                indices[i] = (int)index;
-            }
-
             var outputShape = new int[floatIndices.Rank + 1];
             for (int i = 0; i < floatIndices.Rank; i++) outputShape[i] = floatIndices._shape[i];
-            outputShape[^1] = embeddingDim;
+            outputShape[floatIndices.Rank] = embeddingDim;
 
-            using var table = GetOrAllocateBuffer(backend, embeddings);
-            int elementCount = checked(numIndices * embeddingDim);
-            return DispatchDeferredGpuOp<T>(backend, elementCount, outputShape, output =>
+            using var table = GetOrAllocateBuffer(backend, embeddings.IsContiguous ? embeddings : embeddings.Contiguous());
+            using var idBuffer = GetOrAllocateBuffer(backend, ids);
+            var output = DispatchDeferredGpuOp<T>(backend, checked(numIndices * embeddingDim), outputShape, result =>
+                cuda.EmbeddingFromFloatIds(idBuffer.Buffer, table.Buffer, result, numIndices, embeddingDim, vocabSize));
+            Autodiff.DifferentiableOps.RecordUnary("TensorEmbeddingLookupFromFloatIndices", output, embeddings,
+                Autodiff.BackwardFunctions<T>.TensorEmbeddingLookupFromFloatIndicesBackward,
+                new object[] { floatIndices, vocabSize, embeddingDim });
+            return output;
+        }
+        catch (Exception ex)
+        {
+            if (ThrowOnGpuKernelFallback) throw;
+            GpuLaunchProbe.OnFallback("TensorEmbeddingLookupFromFloatIndices", ex);
+            return base.TensorEmbeddingLookupFromFloatIndices(embeddings, floatIndices);
+        }
+    }
+
+    /// <summary>
+    /// Dense [V, E] gradient of a float-id embedding lookup, scattered on the device (no id conversion, no
+    /// download of the upstream gradient). Bit-deterministic mode (the default) sums each id's positions in a fixed
+    /// order; otherwise an atomicAdd scatter. Null when the device path does not apply; the caller then takes the
+    /// host path.
+    /// </summary>
+    internal Tensor<T>? TryEmbeddingBackwardFromFloatIds<T>(Tensor<T> gradOutput, Tensor<T> floatIndices, int vocabSize, int embeddingDim)
+    {
+        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend)
+            || backend is not DirectGpu.CUDA.CudaBackend cuda || !cuda.HasFloatIdEmbeddingKernels)
+            return null;
+        int numIndices = floatIndices.Length;
+        if (gradOutput.Length != (long)numIndices * embeddingDim) return null;
+        try
+        {
+            var ids = floatIndices.IsContiguous ? floatIndices : floatIndices.Contiguous();
+            using var gradBuffer = GetOrAllocateBuffer(backend, gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous());
+            using var idBuffer = GetOrAllocateBuffer(backend, ids);
+            bool deterministic = global::AiDotNet.Tensors.Engines.DirectGpu.GpuDeterminism.IsActive;
+            using var links = deterministic ? backend.AllocateIntBuffer(checked(2 * numIndices)) : null;
+            return DispatchDeferredGpuOp<T>(backend, checked(vocabSize * embeddingDim), new[] { vocabSize, embeddingDim }, result =>
             {
-                for (int i = 0; i < numIndices; i++)
-                    backend.Copy(table.Buffer, indices[i] * embeddingDim,
-                        output, i * embeddingDim, embeddingDim);
+                backend.Fill(result, 0f, vocabSize * embeddingDim);
+                if (links is not null)
+                    cuda.EmbeddingBackwardFromFloatIdsDeterministic(gradBuffer.Buffer, idBuffer.Buffer, links, result, numIndices, embeddingDim, vocabSize);
+                else
+                    cuda.EmbeddingBackwardFromFloatIds(gradBuffer.Buffer, idBuffer.Buffer, result, numIndices, embeddingDim, vocabSize);
             });
         }
-        catch { return base.TensorEmbeddingLookupFromFloatIndices(embeddings, floatIndices); }
+        catch (Exception ex)
+        {
+            if (ThrowOnGpuKernelFallback) throw;
+            GpuLaunchProbe.OnFallback("TryEmbeddingBackwardFromFloatIds", ex);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Range-checks ids that live on the host (the usual case: a data batch), matching the CPU path's error. Ids
+    /// that are only on the device are not read back for this; the kernel gathers zeros for an out-of-range id.
+    /// </summary>
+    private static void ValidateHostFloatIds<T>(Tensor<T> ids, int vocabSize)
+    {
+        if (ids.HasPendingGpuData || ids.IsGpuResident) return;
+        var values = (float[])(object)ids.GetReadOnlyDataArray();
+        for (int i = 0; i < ids.Length; i++)
+        {
+            double rounded = Math.Round((double)values[i]);
+            if (!(rounded >= 0 && rounded < vocabSize))
+                throw new ArgumentOutOfRangeException("floatIndices",
+                    $"Index {values[i]} at position {i} out of bounds for vocab {vocabSize}.");
+        }
     }
 
     Tensor<T> IEngine.PairwiseDistanceSquared<T>(Tensor<T> x, Tensor<T> y)
@@ -3909,8 +3966,8 @@ public partial class DirectGpuTensorEngine
         count = 0;
         var backingArray = mask.GetBackingArrayForCacheLookupUnsafe();
         if (backingArray is null
-            || Helpers.DeferredArrayMaterializer.IsPending(backingArray)
-            || Helpers.DeferredArrayMaterializer.IsPending(mask.DataVector))
+            || Helpers.HostSync.IsPending(backingArray)
+            || Helpers.HostSync.IsPending(mask.DataVector))
             return false;
 
         var values = mask.AsSpan();
@@ -3937,7 +3994,7 @@ public partial class DirectGpuTensorEngine
         if (indices.IsGpuResident) return true;
         var backingArray = indices.GetBackingArrayForCacheLookupUnsafe();
         return backingArray is not null &&
-            Helpers.DeferredArrayMaterializer.IsPending(backingArray);
+            Helpers.HostSync.IsPending(backingArray);
     }
 
     private static OwnedBuffer ConvertNumericIndicesToInt32(
@@ -8050,7 +8107,7 @@ public partial class DirectGpuTensorEngine
         if (tensor.IsGpuResident) return true;
         var backingArray = tensor.GetBackingArrayForCacheLookupUnsafe();
         return backingArray is not null &&
-            Helpers.DeferredArrayMaterializer.IsPending(backingArray);
+            Helpers.HostSync.IsPending(backingArray);
     }
 
     private static void ValidateEmbeddingIndices(
@@ -8146,7 +8203,9 @@ public partial class DirectGpuTensorEngine
 
     Tensor<T> IEngine.ScalarMinusTensor<T>(T scalar, Tensor<T> tensor)
     {
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive)
+        // A plain tape needs no bail: Negate and AddScalar each record their own node, so the composition carries
+        // the gradient (-1). The bail downloaded the input.
+        if (Compilation.GraphMode.IsActive || Autodiff.AnomalyModeScope.IsActive)
             return base.ScalarMinusTensor(scalar, tensor);
         // scalar - x = (-x) + scalar — negate then AddScalar, mirroring CpuEngine exactly.
         return TensorAddScalar(TensorNegate(tensor), scalar);
@@ -8240,15 +8299,7 @@ public partial class DirectGpuTensorEngine
     // #775: MSE loss = mean((pred - target)^2), output [1]. Subtract -> square -> reduce-mean over all
     // axes (all GPU-resident), reshape to [1]. Defer to base under tape/GraphMode.
     Tensor<T> IEngine.TensorMSELoss<T>(Tensor<T> predictions, Tensor<T> targets)
-    {
-        if (IsTapeActive<T>() || Compilation.GraphMode.IsActive)
-            return base.TensorMSELoss(predictions, targets);
-        var diff = TensorSubtract(predictions, targets);
-        var sq = TensorMultiply(diff, diff);
-        var allAxes = new int[sq.Rank];
-        for (int i = 0; i < sq.Rank; i++) allAxes[i] = i;
-        return ReduceMean(sq, allAxes, keepDims: false).Reshape(new[] { 1 });
-    }
+        => TensorMSELoss(predictions, targets);   // one implementation for IEngine and concrete-type callers
 
     // #775: order-2 Taylor softmax = normalize(1 + s + s^2/2) along `axis`, s = x - max(x). Only order 2
     // is accelerated: its polynomial 0.5*(s+1)^2 + 0.5 >= 0.5 > 0, so the axis-sum is strictly positive

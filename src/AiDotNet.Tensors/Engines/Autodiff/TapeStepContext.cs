@@ -168,6 +168,10 @@ public sealed class TapeStepContext<T>
         _evaluationCount++;
 
         // Run forward + backward under a fresh tape
+        // The optimizer step (the caller) may run under NoGradScope so its own arithmetic is not taped; the
+        // re-evaluation needs a real tape, so lift the suppression for its duration.
+        int savedSuppression = NoGradScope<T>.SuspendSuppression();
+        using var restoreSuppression = new SuppressionRestorer(savedSuppression);
         using var tape = new GradientTape<T>(new GradientTapeOptions { Persistent = false });
         var prediction = _forwardFn(_input, _target);
         var lossTensor = _lossFn(prediction, _target);
@@ -230,6 +234,10 @@ public sealed class TapeStepContext<T>
         if (_forwardFn is null || _lossFn is null || _input is null || _target is null)
             throw new InvalidOperationException(
                 "HVP requires re-evaluation capability. Create this context with forward/loss functions.");
+
+        // Like Reevaluate: the HVP needs recording tapes even when the optimizer step runs under NoGradScope.
+        int savedSuppression = NoGradScope<T>.SuspendSuppression();
+        using var restoreSuppression = new SuppressionRestorer(savedSuppression);
 
         // Step 1: Forward + backward with createGraph=true to record gradient ops
         using var outerTape = new GradientTape<T>(new GradientTapeOptions { Persistent = true });
@@ -377,5 +385,13 @@ public sealed class TapeStepContext<T>
                     $"Parameter {i} is not a view into the provided ParameterBuffer. " +
                     "Use ParameterBuffer.CreateAllViews() to create parameter tensors backed by the buffer.");
         }
+    }
+
+    /// <summary>Restores the no-grad suppression count on dispose (declared before the tape, so disposed after it).</summary>
+    private readonly struct SuppressionRestorer : IDisposable
+    {
+        private readonly int _saved;
+        public SuppressionRestorer(int saved) => _saved = saved;
+        public void Dispose() => NoGradScope<T>.RestoreSuppression(_saved);
     }
 }

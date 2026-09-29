@@ -177,7 +177,9 @@ internal sealed class BackwardStorageReleasePlan<T>
             var candidate = candidates[i];
             if (protectedStorages.Contains(candidate.StorageIdentity)) continue;
             if (!ReferenceEquals(candidate.Tensor.StorageIdentity, candidate.StorageIdentity)) continue;
-            engine.ReleaseActivationStorage(candidate.Tensor);
+            // Dead after this step: never download it (materializing moved ~0.6 GB device-to-host per training step
+            // on a 26.8M-parameter LM). Device-only data waits for the tape's dispose-time release.
+            engine.ReleaseDeadActivation(candidate.Tensor);
         }
     }
 

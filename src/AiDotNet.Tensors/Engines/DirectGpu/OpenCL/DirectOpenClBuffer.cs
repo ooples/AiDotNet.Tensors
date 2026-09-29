@@ -57,6 +57,16 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
     /// </summary>
     internal sealed class DirectOpenClBuffer : IDisposable, IDirectOpenClMemoryObject
     {
+        /// <summary>
+        /// The error for a failed clCreateBuffer: out-of-memory codes (CL_MEM_OBJECT_ALLOCATION_FAILURE,
+        /// CL_OUT_OF_RESOURCES, CL_OUT_OF_HOST_MEMORY) raise <see cref="GpuOutOfMemoryException"/> so the backend can
+        /// reclaim and retry; anything else stays an <see cref="InvalidOperationException"/>.
+        /// </summary>
+        internal static InvalidOperationException OpenClAllocationError(string what, int err)
+            => err is -4 or -5 or -6
+                ? new GpuOutOfMemoryException($"{what}: {err}", err)
+                : new InvalidOperationException($"{what}: {err}");
+
         private IntPtr _buffer;
         private readonly DirectOpenClContext _context;
         private readonly int _length;
@@ -91,7 +101,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     out int err);
 
                 if (err != OpenClNativeBindings.CL_SUCCESS || _buffer == IntPtr.Zero)
-                    throw new InvalidOperationException($"Failed to create OpenCL buffer: {err}");
+                    throw DirectOpenClBuffer.OpenClAllocationError("Failed to create OpenCL buffer", err);
 
                 GpuKernelDiagnostics.RecordBufferAllocated(ByteSize);
                 _context.RegisterMemoryObject(this);
@@ -119,7 +129,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 out int err);
 
             if (err != OpenClNativeBindings.CL_SUCCESS || _buffer == IntPtr.Zero)
-                throw new InvalidOperationException($"Failed to create OpenCL buffer: {err}");
+                throw DirectOpenClBuffer.OpenClAllocationError("Failed to create OpenCL buffer", err);
 
             GpuKernelDiagnostics.RecordBufferAllocated(ByteSize);
             _context.RegisterMemoryObject(this);
@@ -312,7 +322,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     out int err);
 
                 if (err != OpenClNativeBindings.CL_SUCCESS || _buffer == IntPtr.Zero)
-                    throw new InvalidOperationException($"Failed to create OpenCL byte buffer: {err}");
+                    throw DirectOpenClBuffer.OpenClAllocationError("Failed to create OpenCL byte buffer", err);
 
                 GpuKernelDiagnostics.RecordBufferAllocated(ByteSize);
                 _context.RegisterMemoryObject(this);
@@ -340,7 +350,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 out int err);
 
             if (err != OpenClNativeBindings.CL_SUCCESS || _buffer == IntPtr.Zero)
-                throw new InvalidOperationException($"Failed to create OpenCL byte buffer: {err}");
+                throw DirectOpenClBuffer.OpenClAllocationError("Failed to create OpenCL byte buffer", err);
 
             GpuKernelDiagnostics.RecordBufferAllocated(ByteSize);
             _context.RegisterMemoryObject(this);
@@ -511,7 +521,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     out int err);
 
                 if (err != OpenClNativeBindings.CL_SUCCESS || _buffer == IntPtr.Zero)
-                    throw new InvalidOperationException($"Failed to create OpenCL int buffer: {err}");
+                    throw DirectOpenClBuffer.OpenClAllocationError("Failed to create OpenCL int buffer", err);
 
                 GpuKernelDiagnostics.RecordBufferAllocated(ByteSize);
                 _context.RegisterMemoryObject(this);
@@ -539,7 +549,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 out int err);
 
             if (err != OpenClNativeBindings.CL_SUCCESS || _buffer == IntPtr.Zero)
-                throw new InvalidOperationException($"Failed to create OpenCL int buffer: {err}");
+                throw DirectOpenClBuffer.OpenClAllocationError("Failed to create OpenCL int buffer", err);
 
             GpuKernelDiagnostics.RecordBufferAllocated(ByteSize);
             _context.RegisterMemoryObject(this);

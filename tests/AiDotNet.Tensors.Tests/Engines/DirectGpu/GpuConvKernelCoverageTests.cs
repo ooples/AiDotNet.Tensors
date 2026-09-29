@@ -20,7 +20,9 @@ public sealed class GpuConvKernelCoverageTests : IDisposable, IClassFixture<Dire
     private readonly DirectGpuTensorEngineTestFixture _fixture;
     private readonly CpuEngine _cpu = new();
     private readonly bool _ready;
-    private DirectGpuTensorEngine Gpu => _fixture.Engine ?? throw new InvalidOperationException(
+    // Typed as IEngine on purpose: most GPU overrides are explicit IEngine implementations, so a call on the
+    // concrete DirectGpuTensorEngine binds to the inherited CpuEngine method and the test compares the CPU with itself.
+    private IEngine Gpu => _fixture.Engine ?? throw new InvalidOperationException(
         "Direct GPU engine was not initialized.", _fixture.InitializationException);
 
     public GpuConvKernelCoverageTests(DirectGpuTensorEngineTestFixture fixture)

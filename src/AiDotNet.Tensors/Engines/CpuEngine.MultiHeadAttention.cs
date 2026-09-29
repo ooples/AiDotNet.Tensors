@@ -137,8 +137,9 @@ public partial class CpuEngine
                         graphInputs[0], graphInputs[1], graphInputs[2], graphInputs[3], graphInputs[4],
                         numHeads, capturedMask);
                     DirectGpuTensorEngine.CopyResultInto(eng, eager, output);
-                },
-                backwardFn: null,
+                }, backwardFn: AiDotNet.Tensors.Engines.Autodiff.BackwardFunctions<T>.ReplayUnderTape(eng => eng.MultiHeadAttentionForward(
+                        graphInputs[0], graphInputs[1], graphInputs[2], graphInputs[3], graphInputs[4],
+                        numHeads, capturedMask)),
                 savedState);
         }
 

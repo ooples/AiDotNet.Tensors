@@ -229,7 +229,7 @@ internal static class AutoTensorCache
         // in a later engine's work. Measured: a captured training step reported a NEGATIVE mean-squared loss late in a
         // long test process. TensorPool refuses these tensors for the same reason (PR #638).
         if (tensor._gpuBuffer is not null || tensor._device != TensorDevice.CPU) return;
-        if (tensor.GetBackingArrayForCacheLookupUnsafe() is { } backing && DeferredArrayMaterializer.IsPending(backing)) return;
+        if (tensor.GetBackingArrayForCacheLookupUnsafe() is { } backing && HostSync.IsPending(backing)) return;
 
         long elements = tensor.Length;
         if (elements > MaxElementsPerTensor)

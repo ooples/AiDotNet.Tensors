@@ -92,7 +92,7 @@ internal sealed class GroupNormOp<T> : ICompiledOp<T>
         return (eng, output) =>
         {
             var result = eng.GroupNorm(input, numGroups, gamma, beta, epsilon, out var mean, out var variance);
-            result.AsSpan().CopyTo(output.AsWritableSpan());
+            AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CopyResultInto(eng, result, output);
             op.Mean = mean;
             op.Variance = variance;
         };
@@ -141,7 +141,7 @@ internal sealed class GroupNormOp<T> : ICompiledOp<T>
         Action<IEngine, Tensor<T>> forward = (eng, output) =>
         {
             var result = eng.GroupNorm(input, numGroups, gamma, beta, epsilon, out var mean, out var variance);
-            result.AsSpan().CopyTo(output.AsWritableSpan());
+            AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CopyResultInto(eng, result, output);
             op.Mean = mean;
             op.Variance = variance;
             sharedSavedState[1] = mean;

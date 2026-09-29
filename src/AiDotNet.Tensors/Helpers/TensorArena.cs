@@ -197,6 +197,7 @@ public sealed class TensorArena : IDisposable
             // cross-arena reuse corrupts those consumers (caught by GroupNorm
             // correctness tests).
             Array.Clear(arr, 0, arr.Length);
+            HostSync.ClearReleased(arr);   // new owner: no inherited release mark
             return arr;
         }
         return null;
@@ -770,6 +771,8 @@ public sealed class TensorArena : IDisposable
                     // record a Reshape node on the active tape.
                     if (!cached._shape.AsSpan().SequenceEqual(shape))
                         cached.ArenaReshapeInPlace(shape);
+                    // Re-issued to a new owner: drop any release mark the previous owner's data left behind.
+                    cached.ClearReleaseMarks();
                     return cached;
                 }
 

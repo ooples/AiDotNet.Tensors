@@ -44,6 +44,31 @@ internal sealed class LayerNormStateRef<T>
 /// </summary>
 internal static class BackwardFunctions<T>
 {
+    /// <summary>
+    /// A backward for a compiled-graph node whose op has a differentiable EAGER implementation but no dedicated graph
+    /// backward: re-runs the op under a fresh <see cref="GradientTape{T}"/> and seeds that result with the node's
+    /// output gradient, which yields exactly the vector-Jacobian product the tape path would. Graph nodes used to be
+    /// recorded with a null backward in this situation, so every gradient through them was silently dropped in a
+    /// compiled training plan. Costs one recompute of the op during backward.
+    /// </summary>
+    /// <param name="compute">Recomputes the op from the SAME input tensors the node records.</param>
+    internal static BackwardFunction<T> ReplayUnderTape(Func<IEngine, Tensor<T>> compute)
+        => (gradOutput, inputs, output, savedState, engine, grads) =>
+        {
+            Dictionary<Tensor<T>, Tensor<T>> g;
+            using (var tape = new GradientTape<T>())
+            {
+                var result = compute(engine);
+                g = tape.ComputeGradients(result, inputs, createGraph: false,
+                    seedOverride: new[] { new KeyValuePair<Tensor<T>, Tensor<T>>(result, gradOutput) });
+            }
+            foreach (var input in inputs)
+            {
+                if (input is not null && g.TryGetValue(input, out var gi) && gi is not null)
+                    DifferentiableOps.AccumulateGrad(grads, input, gi, engine);
+            }
+        };
+
     // ──────────────────────────────────────────────────────────────
     // Trivial: gradient is grad_output or scaled grad_output
     // ──────────────────────────────────────────────────────────────
@@ -1668,6 +1693,17 @@ internal static class BackwardFunctions<T>
             }
         }
 
+        // Dense device scatter when no sparse-gradient consumer is wired for this parameter: reads the ids on the
+        // device, so neither the ids nor the upstream gradient is downloaded, and the [V, E] result stays resident
+        // for accumulation with the other uses of a tied table.
+        if (engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine deFloat
+            && !DifferentiableOps.IsSparseEmbeddingGradWired(inputs[0])
+            && deFloat.TryEmbeddingBackwardFromFloatIds(gradOutput, capturedFloatIdx, vocabSize, embeddingDim) is { } deviceTableGrad)
+        {
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceTableGrad, engine);
+            return;
+        }
+
         // Materialise fresh int indices for this Step. The float input may
         // have been overwritten between forward and backward — that's the
         // whole reason this op exists — so the int[] we build here MUST
@@ -1723,6 +1759,22 @@ internal static class BackwardFunctions<T>
             if (c >= 0 && c < V) gl[i * V + c] = go[i];   // scatter upstream grad to the true class
         }
         DifferentiableOps.AccumulateGrad(grads, logP, gradLogP, engine);
+    }
+
+    /// <summary>
+    /// Backward for <see cref="IEngine.TensorGatherClassValues{T}"/>: scatters gradOutput[r] to
+    /// grad_values[r, class[r]]. The class indices (savedState[0]) are read at backward time -- the same live tensor
+    /// the forward gathered from -- so a compiled replay scatters against the current targets.
+    /// </summary>
+    internal static void GatherClassValuesBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var classIndices = (Tensor<T>)savedState[0];
+        var values = inputs[0];
+        var cpu = engine as CpuEngine ?? new CpuEngine();
+        var gradValues = cpu.ScatterClassValuesGrad(gradOutput, classIndices, values._shape);
+        DifferentiableOps.AccumulateGrad(grads, values, gradValues, engine);
     }
 
     /// <summary>GeGLU backward: dispatches to engine.GeGLUBackward(gradOutput, input, dim).</summary>
@@ -2363,11 +2415,12 @@ internal static class BackwardFunctions<T>
         // ~halved by skipping the redundant clear.
         if (grad.Length == 1)
         {
-            // A device-resident scalar (the loss gradient of a GPU training step) is broadcast on the device.
-            // Reading it with GetFlat downloaded it - a stream sync per step, and inside a CUDA-graph capture an
-            // illegal operation (cuStreamSynchronize 900) that aborted the capture of every plan whose loss ends
-            // in a full ReduceSum/Mean.
-            if (targetShape.Length > 0 && grad.TryGetGpuBuffer() is not null)
+            // A device-resident scalar (the loss gradient of a GPU training step) is broadcast on the device. Reading it
+            // with GetFlat downloaded it - a stream sync per step, and inside a CUDA-graph capture an illegal operation
+            // (cuStreamSynchronize 900) that aborted the capture of every plan whose loss ends in a full ReduceSum/Mean -
+            // and the host-filled result made the accumulation into the device gradient take the host path. A result
+            // whose only copy is still pending on the device counts too.
+            if (targetShape.Length > 0 && (grad.HasPendingGpuData || grad.TryGetGpuBuffer() is not null))
             {
                 var ones = new int[targetShape.Length];
                 for (int i = 0; i < ones.Length; i++) ones[i] = 1;
@@ -3055,7 +3108,12 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
-    /// <summary>LogSoftmax backward</summary>
+    /// <summary>LogSoftmax backward along the saved axis (savedState[0]; the last axis when nothing was saved).</summary>
+    /// <remarks>
+    /// d(log_softmax)/dx = g - softmax * sum_axis(g). It used to reduce over the LAST axis unconditionally while the
+    /// forward accepts any axis, so a log-softmax over a non-last axis (e.g. a class axis of 1 in [N, C, L]) received
+    /// the gradient of a different function.
+    /// </remarks>
     internal static void LogSoftmaxBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
@@ -6784,16 +6842,12 @@ internal static class BackwardFunctions<T>
             DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceGrad, engine);
             return;
         }
-        var ops = MathHelper.GetNumericOperations<T>();
         var input = inputs[0];
-        var grad = new Tensor<T>(input._shape);
-        var src = input.AsSpan();
-        var gsrc = gradOutput.AsSpan();
-        var dst = grad.AsWritableSpan();
-        var zero = ops.Zero;
-        for (int i = 0; i < src.Length; i++)
-            dst[i] = ops.GreaterThanOrEquals(src[i], min) ? gsrc[i] : zero;
-        DifferentiableOps.AccumulateGrad(grads, input, grad, engine);
+        // grad * (x >= min) as engine ops: grad - grad * (x < min). Exactly the pass-through rule of the former host
+        // loop (including at x == min), but it stays on the device on the GPU engine instead of reading both
+        // tensors back to the host every backward.
+        var clamped = engine.TensorMultiply(gradOutput, engine.TensorLessThan(input, min));
+        DifferentiableOps.AccumulateGrad(grads, input, engine.TensorSubtract(gradOutput, clamped), engine);
     }
 
     /// <summary>ClampMax backward: gradient passes only where x &lt;= max.</summary>
@@ -6808,16 +6862,10 @@ internal static class BackwardFunctions<T>
             DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceGrad, engine);
             return;
         }
-        var ops = MathHelper.GetNumericOperations<T>();
         var input = inputs[0];
-        var grad = new Tensor<T>(input._shape);
-        var src = input.AsSpan();
-        var gsrc = gradOutput.AsSpan();
-        var dst = grad.AsWritableSpan();
-        var zero = ops.Zero;
-        for (int i = 0; i < src.Length; i++)
-            dst[i] = ops.LessThanOrEquals(src[i], max) ? gsrc[i] : zero;
-        DifferentiableOps.AccumulateGrad(grads, input, grad, engine);
+        // grad * (x <= max) = grad - grad * (x > max), on the device (see ClampMinBackward).
+        var clamped = engine.TensorMultiply(gradOutput, engine.TensorGreaterThan(input, max));
+        DifferentiableOps.AccumulateGrad(grads, input, engine.TensorSubtract(gradOutput, clamped), engine);
     }
 
     // =====================================================================
@@ -8998,6 +9046,16 @@ internal static class BackwardFunctions<T>
         int nFft = SavedInt(nameof(RFFTAdjointBackward), savedState, 1, "nFft");
         int numFreqs = nFft / 2 + 1;
 
+        // Device adjoint when the backward runs on the GPU engine. A compiled plan records this function from the
+        // CPU base (GraphMode), so without this every compiled GPU step ran the transform on the host: a download,
+        // a managed FFT per row, an upload (measured: ~26% of an LM's compiled step).
+        if (engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine gpuRfft
+            && gpuRfft.RfftAdjointGpu(gradOutput, n, nFft, input._shape) is { } deviceGrad)
+        {
+            DifferentiableOps.AccumulateGrad(grads, input, deviceGrad, engine);
+            return;
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradData = gradOutput.GetDataArray();
         int batchSize = gradOutput.Length / (numFreqs * 2);
@@ -9060,6 +9118,15 @@ internal static class BackwardFunctions<T>
         int numFreqs = SavedInt(nameof(IRFFTAdjointBackward), savedState, 0, "numFreqs");
         int nFft = SavedInt(nameof(IRFFTAdjointBackward), savedState, 1, "nFft");
         int outputLength = SavedInt(nameof(IRFFTAdjointBackward), savedState, 2, "outputLength");
+
+        // Device adjoint on the GPU engine (see RFFTAdjointBackward: the compiled plan records this CPU-path
+        // function and replays it on the GPU engine).
+        if (engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine gpuIrfft
+            && gpuIrfft.IrfftAdjointGpu(gradOutput, numFreqs, nFft, outputLength, input._shape) is { } deviceGrad)
+        {
+            DifferentiableOps.AccumulateGrad(grads, input, deviceGrad, engine);
+            return;
+        }
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradData = gradOutput.GetDataArray();

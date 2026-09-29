@@ -2,7 +2,7 @@
 // stays GPU-resident — the forward (Half-resident store), the fused Half backward, the on-device float↔Half
 // gradient cast bridges, and the per-node scratch release keep activations / op results / cast-boundary
 // gradients / scratch on the device across a full training step. Measured via
-// DeferredArrayMaterializer.MaterializeCount (each fired callback = one real GPU→CPU download of a resident
+// HostSync.MaterializeCount (each fired callback = one real GPU→CPU download of a resident
 // tensor): a full Step with no loss read pulls only a small bounded number of tensors to host — the per-PARAMETER
 // gradient reads handed to the optimizer's master-weight update (count = trainable-parameter count, independent
 // of activation size / model depth), NOT the activations/op-results/scratch (which never round-trip). Driving
@@ -96,9 +96,9 @@ public class Fp16FullyResidentTrainingTests
             // non-resident path would instead download every op's result: dozens for this graph's forward+backward.
             // (Driving these last per-parameter grad reads to zero needs the optimizer's master-weight update +
             // the forward param-cast to run on-device too — a coupled param-residency change, tracked separately.)
-            DeferredArrayMaterializer.ResetMaterializeCount();
+            HostSync.ResetMaterializeCount();
             plan.Step(); // intentionally do NOT read the returned loss
-            long downloads = DeferredArrayMaterializer.MaterializeCount;
+            long downloads = HostSync.MaterializeCount;
             _out.WriteLine($"deferred GPU→CPU downloads during a full no-read FP16 step: {downloads} " +
                 "(per-parameter gradient reads for the optimizer only; the autodiff activations/results/scratch stay resident)");
             // Bound = a small multiple of the trainable-parameter count (2 here), NOT the activation/op count. A

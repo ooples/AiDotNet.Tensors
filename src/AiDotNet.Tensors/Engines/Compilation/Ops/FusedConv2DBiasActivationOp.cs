@@ -112,7 +112,7 @@ internal sealed class FusedConv2DBiasActivationOp<T> : ICompiledOp<T>
             // constructing a long-lived reshape here creates a storage alias that prevents safe
             // copy-on-write model clones for the entire compiled-plan lifetime.
             var result = eng.FusedConv2D(input, kernel, bias, sH, sW, pH, pW, dH, dW, activation);
-            result.AsSpan().CopyTo(output.AsWritableSpan());
+            AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CopyResultInto(eng, result, output);
         };
     }
 
