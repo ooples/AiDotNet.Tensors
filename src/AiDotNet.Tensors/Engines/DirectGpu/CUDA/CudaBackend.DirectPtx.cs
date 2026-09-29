@@ -6677,6 +6677,7 @@ public sealed partial class CudaBackend
         lock (_directPtxLock)
         {
             ReleaseAllDirectPtxGraphPins();
+            RetireAllGraphMemoryPools();
             _directPtxAttentionKernels.Dispose();
             _directPtxAttentionPlans.Clear();
             _directPtxResidualRmsNormKernels.Dispose();

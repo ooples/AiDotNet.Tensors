@@ -31,6 +31,8 @@ public sealed class GroupNormDeferredCaptureTests :
     private readonly DirectGpuTensorEngineTestFixture _fixture;
     private readonly bool _gpuAvailable;
     private const float Tolerance = 1e-3f;
+    // Calls to ops that DirectGpuTensorEngine overrides only as explicit IEngine implementations go through
+    // ((IEngine)Gpu): on the concrete type they bind to the inherited CpuEngine method and compare the CPU with itself.
     private DirectGpuTensorEngine Gpu => _fixture.Engine ?? throw new InvalidOperationException(
         "Direct GPU engine was not initialized.", _fixture.InitializationException);
 
@@ -74,10 +76,10 @@ public sealed class GroupNormDeferredCaptureTests :
         Tensor<float> k1, Tensor<float> k2)
     {
         var gpu = Gpu;
-        var h = gpu.GroupNorm(input, Groups, gamma, beta, 1e-5, out _, out _);
+        var h = ((IEngine)gpu).GroupNorm(input, Groups, gamma, beta, 1e-5, out _, out _);
         gpu.SwishInPlace(h);
         h = gpu.Conv2D(h, k1, 1, 1, 1);
-        h = gpu.GroupNorm(h, Groups, gamma, beta, 1e-5, out _, out _);
+        h = ((IEngine)gpu).GroupNorm(h, Groups, gamma, beta, 1e-5, out _, out _);
         gpu.SwishInPlace(h);
         h = gpu.Conv2D(h, k2, 1, 1, 1);
         return gpu.TensorAdd(input, h);
@@ -125,7 +127,7 @@ public sealed class GroupNormDeferredCaptureTests :
         var gamma = Rand(new[] { C }, 2);
         var beta = Rand(new[] { C }, 3);
 
-        var gpuOut = gpu.GroupNorm(input, Groups, gamma, beta, 1e-5, out _, out _);
+        var gpuOut = ((IEngine)gpu).GroupNorm(input, Groups, gamma, beta, 1e-5, out _, out _);
         var cpuOut = new CpuEngine().GroupNorm(input, Groups, gamma, beta, 1e-5, out _, out _);
 
         float maxDiff = 0;
@@ -189,7 +191,7 @@ public sealed class GroupNormDeferredCaptureTests :
         var beta = Rand(new[] { C }, 93);
         AssertDeferredMatchesEager("GroupNorm+Swish", () =>
         {
-            var h = Gpu.GroupNorm(input, Groups, gamma, beta, 1e-5, out _, out _);
+            var h = ((IEngine)Gpu).GroupNorm(input, Groups, gamma, beta, 1e-5, out _, out _);
             Gpu.SwishInPlace(h);
             return h;
         });
@@ -205,7 +207,7 @@ public sealed class GroupNormDeferredCaptureTests :
         var kernel = Rand(new[] { C, C, 3, 3 }, 97);
         AssertDeferredMatchesEager("GroupNorm+Swish+Conv", () =>
         {
-            var h = Gpu.GroupNorm(input, Groups, gamma, beta, 1e-5, out _, out _);
+            var h = ((IEngine)Gpu).GroupNorm(input, Groups, gamma, beta, 1e-5, out _, out _);
             Gpu.SwishInPlace(h);
             return Gpu.Conv2D(h, kernel, 1, 1, 1);
         });
@@ -264,7 +266,7 @@ public sealed class GroupNormDeferredCaptureTests :
         var cpu = new CpuEngine().TensorConcatenate(new[] { a, b }, axis: 1);
         Assert.Equal(C + C / 2, cpu.Shape[1]);
 
-        var eager = gpu.TensorConcatenate(new[] { a, b }, axis: 1);
+        var eager = ((IEngine)gpu).TensorConcatenate(new[] { a, b }, axis: 1);
         float eagerDiff = 0;
         for (int i = 0; i < cpu.Length; i++) eagerDiff = Math.Max(eagerDiff, Math.Abs(cpu[i] - eager[i]));
         Assert.True(eagerDiff < Tolerance, $"Eager GPU channel-concat diverged from CPU: maxDiff={eagerDiff}");
@@ -275,7 +277,7 @@ public sealed class GroupNormDeferredCaptureTests :
             Skip.If(scope is null, "Deferred execution unsupported.");
             if (scope is null)
                 throw new InvalidOperationException("Deferred execution was reported as supported without a scope.");
-            deferred = gpu.TensorConcatenate(new[] { a, b }, axis: 1);
+            deferred = ((IEngine)gpu).TensorConcatenate(new[] { a, b }, axis: 1);
             scope.Execute();
         }
         float defDiff = 0;
@@ -314,7 +316,7 @@ public sealed class GroupNormDeferredCaptureTests :
     {
         Skip.IfNot(_gpuAvailable, "No CUDA device.");
         var input = Rand(new[] { 1, C, Sp, Sp }, 11);
-        AssertDeferredMatchesEager("Upsample", () => Gpu.Upsample(input, 2, 2));
+        AssertDeferredMatchesEager("Upsample", () => ((IEngine)Gpu).Upsample(input, 2, 2));
     }
 
     [SkippableFact]
@@ -344,7 +346,7 @@ public sealed class GroupNormDeferredCaptureTests :
         // 1x1 adaptive avg-pool → GlobalAvgPool2D (SE blocks / attention pooling).
         Skip.IfNot(_gpuAvailable, "No CUDA device.");
         var input = Rand(new[] { 1, C, Sp, Sp }, 25);
-        AssertDeferredMatchesEager("AdaptiveAvgPool2D", () => Gpu.AdaptiveAvgPool2D(input, 1, 1));
+        AssertDeferredMatchesEager("AdaptiveAvgPool2D", () => ((IEngine)Gpu).AdaptiveAvgPool2D(input, 1, 1));
     }
 
     [SkippableFact]
@@ -354,7 +356,7 @@ public sealed class GroupNormDeferredCaptureTests :
         var indices = new Tensor<int>(new[] { 4 });
         for (int i = 0; i < 4; i++) indices[i] = i % 3;
         var table = Rand(new[] { 3, 16 }, 26);
-        AssertDeferredMatchesEager("Embedding", () => Gpu.Embedding(indices, table));
+        AssertDeferredMatchesEager("Embedding", () => ((IEngine)Gpu).Embedding(indices, table));
     }
 
     [SkippableFact]
@@ -411,7 +413,7 @@ public sealed class GroupNormDeferredCaptureTests :
             var h = input;
             var skip = h;
             for (int i = 0; i < 8; i++) h = ResBlock(h, gamma, beta, k1, k2);
-            var cat = gpu.TensorConcatenate(new[] { h, skip }, axis: 1);   // [1, 2C, Sp, Sp]
+            var cat = ((IEngine)gpu).TensorConcatenate(new[] { h, skip }, axis: 1);   // [1, 2C, Sp, Sp]
             var merged = gpu.Conv2D(cat, kMerge, 1, 1, 1);                 // [1, C, Sp, Sp]
             return ResBlock(merged, gamma, beta, k1, k2);
         };
@@ -459,10 +461,10 @@ public sealed class GroupNormDeferredCaptureTests :
         AssertDeferredMatchesEager("LongLivedSkipConcat(3x intervening)", () =>
         {
             var gpu = Gpu;
-            var skip = gpu.GroupNorm(input, Groups, gamma, beta, 1e-5, out _, out _); // produced early
+            var skip = ((IEngine)gpu).GroupNorm(input, Groups, gamma, beta, 1e-5, out _, out _); // produced early
             var h = skip;
             for (int i = 0; i < 3; i++) h = ResBlock(h, gamma, beta, k1, k2);          // intervening ops
-            var cat = gpu.TensorConcatenate(new[] { h, skip }, axis: 1);               // consumes the old skip
+            var cat = ((IEngine)gpu).TensorConcatenate(new[] { h, skip }, axis: 1);               // consumes the old skip
             return gpu.Conv2D(cat, kMerge, 1, 1, 1);
         });
     }

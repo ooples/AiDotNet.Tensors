@@ -126,6 +126,8 @@ public sealed class DirectPtxDenseLinearBackendTests
         Skip.IfNot(DirectPtxRuntime.IsAvailable, "Requires an NVIDIA CUDA driver and GPU.");
         bool? previousGate = DirectPtxFeatureGate.TestOverride;
         bool previousExperiment = DirectPtxFeatureGate.FusedLinearExperimentOverride;
+        // The fp16 tensor-core linear family gained its own performance gate (#886) after this test was written;
+        // without opting in, a non-promoted shape is rejected before the extent validation this test exercises.
         bool previousMixedExperiment = DirectPtxFeatureGate.MixedPrecisionLinearExperimentOverride;
         bool previousDeterministic = AiDotNetEngine.DeterministicMode;
         DirectPtxFeatureGate.TestOverride = true;
@@ -254,6 +256,7 @@ public sealed class DirectPtxDenseLinearBackendTests
             AiDotNetEngine.SetDeterministicMode(previousDeterministic);
             DirectPtxFeatureGate.MixedPrecisionLinearExperimentOverride = previousMixedExperiment;
             DirectPtxFeatureGate.FusedLinearExperimentOverride = previousExperiment;
+            DirectPtxFeatureGate.MixedPrecisionLinearExperimentOverride = previousMixedExperiment;
             DirectPtxFeatureGate.TestOverride = previousGate;
         }
     }

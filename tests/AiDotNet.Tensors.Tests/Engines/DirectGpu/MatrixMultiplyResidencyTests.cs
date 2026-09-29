@@ -84,10 +84,10 @@ public class MatrixMultiplyResidencyTests
             var c = ((IEngine)engine).MatrixMultiply(a, b);
 
             // Inside the scope the FIRST MatMul's result must be deferred:
-            // its backing array is registered with DeferredArrayMaterializer
+            // its backing array is registered with HostSync
             // and its GPU buffer sits in the activation cache. We check this
             // BEFORE any host read (AsSpan / GetDataArray would materialize).
-            Assert.True(DeferredArrayMaterializer.IsPending(c.GetBackingArrayUnsafe()!),
+            Assert.True(HostSync.IsPending(c.GetBackingArrayUnsafe()!),
                 "MatrixMultiply result must be deferred inside a GpuScope (#561).");
 
             // Second MatMul consumes C — must hit the activation cache rather
@@ -129,7 +129,7 @@ AssertCloseFloat(e.AsSpan().ToArray(), eRef.AsSpan().ToArray(), absTol: 1e-2f, r
                 // Must check IsPending BEFORE any host read — AsSpan/GetDataArray
                 // now materialize on first access (the fix to MatrixBase span
                 // accessors that pairs with the deferred-result Matrix path).
-                Assert.True(DeferredArrayMaterializer.IsPending(c.GetBackingArrayUnsafe()!),
+                Assert.True(HostSync.IsPending(c.GetBackingArrayUnsafe()!),
                     "Single MatMul result must be deferred inside a GpuScope (#561).");
 
                 // First host access materializes — value is correct.

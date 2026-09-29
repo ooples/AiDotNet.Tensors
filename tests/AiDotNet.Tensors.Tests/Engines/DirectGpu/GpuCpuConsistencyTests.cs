@@ -32,6 +32,8 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
     private readonly bool _isDirectGpuAvailable;
     private const float Tolerance = 1e-5f;
     private const float RelativeTolerance = 1e-4f;
+    // Calls to ops that DirectGpuTensorEngine overrides only as explicit IEngine implementations go through
+    // ((IEngine)gpu): on the concrete type they bind to the inherited CpuEngine method and compare the CPU with itself.
     private DirectGpuTensorEngine Gpu => _directGpuFixture.Engine ?? throw new InvalidOperationException(
         "Direct GPU engine was not initialized.", _directGpuFixture.InitializationException);
 
@@ -923,15 +925,15 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
 
         Assert.Equal(new[] { batch, heads, seqQ, dimension }, actual.Shape.ToArray());
         Assert.Equal(new[] { batch, heads, seqQ, seqK }, actualWeights.Shape.ToArray());
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(actual.DataVector),
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(actual.DataVector),
             "Cross-attention output must remain GPU-resident before host access.");
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(actualWeights.DataVector),
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(actualWeights.DataVector),
             "Cross-attention weights must remain GPU-resident before host access.");
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(actualGradQuery.DataVector),
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(actualGradQuery.DataVector),
             "Cross-attention query gradients must remain GPU-resident before host access.");
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(actualGradKey.DataVector),
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(actualGradKey.DataVector),
             "Cross-attention key gradients must remain GPU-resident before host access.");
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(actualGradValue.DataVector),
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(actualGradValue.DataVector),
             "Cross-attention value gradients must remain GPU-resident before host access.");
 
         var expectedData = expected.AsSpan();
@@ -1038,15 +1040,15 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
             gradOutput, query, key, value, actualWeights, scale,
             out var actualGradQuery, out var actualGradKey, out var actualGradValue);
 
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(actual.DataVector),
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(actual.DataVector),
             "Masked attention output must remain GPU-resident before host access.");
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(actualWeights.DataVector),
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(actualWeights.DataVector),
             "Masked attention weights must remain GPU-resident before host access.");
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(actualGradQuery.DataVector),
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(actualGradQuery.DataVector),
             "Masked attention query gradients must remain GPU-resident before host access.");
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(actualGradKey.DataVector),
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(actualGradKey.DataVector),
             "Masked attention key gradients must remain GPU-resident before host access.");
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(actualGradValue.DataVector),
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(actualGradValue.DataVector),
             "Masked attention value gradients must remain GPU-resident before host access.");
 
         AssertTensorClose(expected, actual, "masked output");
@@ -1651,8 +1653,8 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
         var actual = gpu.TensorEmbeddingLookup<float, int>(table, indices);
         var actualGradient = gpu.TensorEmbeddingLookupBackward<float, int>(gradient, indices, 8, 4);
 
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(actual.DataVector));
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(actualGradient.DataVector));
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(actual.DataVector));
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(actualGradient.DataVector));
         Assert.Equal(expected.GetDataArray(), actual.GetDataArray());
         Assert.Equal(expectedGradient.GetDataArray(), actualGradient.GetDataArray());
     }
@@ -1757,7 +1759,7 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
         var expected = cpu.ImportanceSampling(tValues, weights, numFineSamples: 8);
         var actual = gpu.ImportanceSampling(tValues, weights, numFineSamples: 8);
 
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(actual.DataVector));
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(actual.DataVector));
         Assert.Equal(new[] { 2, 8 }, actual.Shape.ToArray());
         Assert.Equal(expected.GetDataArray(), actual.GetDataArray());
     }
@@ -1778,9 +1780,9 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
         var residentIndices = gpu.TensorSearchSorted(boundaries, probes, right: true);
         var actual = gpu.TensorBinCount(residentIndices, minLength: 7);
 
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(
             residentIndices.DataVector));
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(actual.DataVector));
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(actual.DataVector));
         Assert.Equal(expected.GetDataArray(), actual.GetDataArray());
     }
 
@@ -1809,8 +1811,8 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
         var actual = gpu.Nms(boxes, scores, 0.5);
         var actualBatched = gpu.BatchedNms(boxes, scores, classIds, 0.5);
 
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(actual.DataVector));
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(actual.DataVector));
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(
             actualBatched.DataVector));
         Assert.Equal(expected.GetDataArray(), actual.GetDataArray());
         Assert.Equal(expectedBatched.GetDataArray(), actualBatched.GetDataArray());
@@ -1842,7 +1844,7 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
         var expected = cpu.GenerateSpiralIndices(vertices, faces, spiralLength: 4);
         var actual = gpu.GenerateSpiralIndices(vertices, faces, spiralLength: 4);
 
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(actual.DataVector));
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(actual.DataVector));
         Assert.Equal(expected.GetDataArray(), actual.GetDataArray());
     }
 
@@ -1860,16 +1862,16 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
 
         var expectedSpectrum = cpu.NativeComplexFFTND(input, new[] { 0, 2 });
         var spectrum = gpu.NativeComplexFFTND(input, new[] { 0, 2 });
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(
             spectrum.DataVector));
 
         // The inverse must consume both complex planes directly from the resident
         // buffer. If it decomposes through Complex<T> on the host, this pending
         // registration is cleared before the assertion below.
         var recovered = gpu.NativeComplexIFFTNDReal(spectrum, new[] { 0, 2 });
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(
             spectrum.DataVector));
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(
             recovered.DataVector));
 
         var expected = expectedSpectrum.GetDataArray();
@@ -1911,11 +1913,11 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
         var sum = gpu.NativeComplexAdd(scaled, conjugate);
         var actual = gpu.NativeComplexMagnitude(sum);
 
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(spectrum.DataVector));
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(scaled.DataVector));
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(conjugate.DataVector));
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(sum.DataVector));
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(actual.DataVector));
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(spectrum.DataVector));
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(scaled.DataVector));
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(conjugate.DataVector));
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(sum.DataVector));
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(actual.DataVector));
 
         var expectedValues = expected.GetDataArray();
         var actualValues = actual.GetDataArray();
@@ -1943,17 +1945,17 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
         IEngine gpu = gpuEngine;
 
         cpu.STFT(input, nFft, hopLength, window, center: true, out var expectedMagnitude, out var expectedPhase);
-        gpu.STFT(input, nFft, hopLength, window, center: true, out var magnitude, out var phase);
+        ((IEngine)gpu).STFT(input, nFft, hopLength, window, center: true, out var magnitude, out var phase);
 
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(magnitude.DataVector));
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(phase.DataVector));
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(magnitude.DataVector));
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(phase.DataVector));
 
         var expectedOutput = cpu.ISTFT(expectedMagnitude, expectedPhase, nFft, hopLength, window, center: true);
-        var output = gpu.ISTFT(magnitude, phase, nFft, hopLength, window, center: true);
+        var output = ((IEngine)gpu).ISTFT(magnitude, phase, nFft, hopLength, window, center: true);
 
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(magnitude.DataVector));
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(phase.DataVector));
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(output.DataVector));
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(magnitude.DataVector));
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(phase.DataVector));
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(output.DataVector));
         Assert.Equal(expectedOutput.Shape.ToArray(), output.Shape.ToArray());
 
         var expected = expectedOutput.GetDataArray();
@@ -1979,9 +1981,9 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
         IEngine gpu = gpuEngine;
 
         var expected = cpu.MelSpectrogram(input, 16000, nFft, hopLength, nMels, 0f, 8000f, window, true);
-        var actual = gpu.MelSpectrogram(input, 16000, nFft, hopLength, nMels, 0f, 8000f, window, true);
+        var actual = ((IEngine)gpu).MelSpectrogram(input, 16000, nFft, hopLength, nMels, 0f, 8000f, window, true);
 
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(actual.DataVector));
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(actual.DataVector));
         Assert.Equal(expected.Shape.ToArray(), actual.Shape.ToArray());
         var expectedValues = expected.GetDataArray();
         var actualValues = actual.GetDataArray();
@@ -2003,13 +2005,13 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
         var imag1D = new Tensor<float>(Enumerable.Range(0, 3 * 8)
             .Select(i => DeterministicValue(i + 801)).ToArray(), new[] { 3, 8 });
         cpu.FFT(real1D, imag1D, out var expectedReal1D, out var expectedImag1D);
-        gpu.FFT(real1D, imag1D, out var actualReal1D, out var actualImag1D);
-        gpu.IFFT(actualReal1D, actualImag1D, out var recoveredReal1D, out var recoveredImag1D);
+        ((IEngine)gpu).FFT(real1D, imag1D, out var actualReal1D, out var actualImag1D);
+        ((IEngine)gpu).IFFT(actualReal1D, actualImag1D, out var recoveredReal1D, out var recoveredImag1D);
 
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(actualReal1D.DataVector));
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(actualImag1D.DataVector));
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(recoveredReal1D.DataVector));
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(recoveredImag1D.DataVector));
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(actualReal1D.DataVector));
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(actualImag1D.DataVector));
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(recoveredReal1D.DataVector));
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(recoveredImag1D.DataVector));
         AssertFftPlaneClose(expectedReal1D, actualReal1D, "batched FFT real");
         AssertFftPlaneClose(expectedImag1D, actualImag1D, "batched FFT imaginary");
         AssertFftPlaneClose(real1D, recoveredReal1D, "batched IFFT real");
@@ -2020,13 +2022,13 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
         var imag2D = new Tensor<float>(Enumerable.Range(0, 2 * 4 * 4)
             .Select(i => DeterministicValue(i + 1001)).ToArray(), new[] { 2, 4, 4 });
         cpu.FFT2D(real2D, imag2D, out var expectedReal2D, out var expectedImag2D);
-        gpu.FFT2D(real2D, imag2D, out var actualReal2D, out var actualImag2D);
-        gpu.IFFT2D(actualReal2D, actualImag2D, out var recoveredReal2D, out var recoveredImag2D);
+        ((IEngine)gpu).FFT2D(real2D, imag2D, out var actualReal2D, out var actualImag2D);
+        ((IEngine)gpu).IFFT2D(actualReal2D, actualImag2D, out var recoveredReal2D, out var recoveredImag2D);
 
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(actualReal2D.DataVector));
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(actualImag2D.DataVector));
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(recoveredReal2D.DataVector));
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(recoveredImag2D.DataVector));
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(actualReal2D.DataVector));
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(actualImag2D.DataVector));
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(recoveredReal2D.DataVector));
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(recoveredImag2D.DataVector));
         AssertFftPlaneClose(expectedReal2D, actualReal2D, "batched FFT2D real");
         AssertFftPlaneClose(expectedImag2D, actualImag2D, "batched FFT2D imaginary");
         AssertFftPlaneClose(real2D, recoveredReal2D, "batched IFFT2D real");
@@ -2055,16 +2057,16 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
             .Select(i => 0.5f - 0.5f * MathF.Cos(2f * MathF.PI * i / nFft)).ToArray(), new[] { nFft });
         var gpuEngine = Gpu;
         IEngine gpu = gpuEngine;
-        gpu.STFT(input, nFft, hopLength, window, center: true, out var magnitude, out _);
+        ((IEngine)gpu).STFT(input, nFft, hopLength, window, center: true, out var magnitude, out _);
 
-        var first = gpu.GriffinLim(magnitude, nFft, hopLength, window,
+        var first = ((IEngine)gpu).GriffinLim(magnitude, nFft, hopLength, window,
             iterations: 2, momentum: 0.5, length: null);
-        var second = gpu.GriffinLim(magnitude, nFft, hopLength, window,
+        var second = ((IEngine)gpu).GriffinLim(magnitude, nFft, hopLength, window,
             iterations: 2, momentum: 0.5, length: null);
 
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(magnitude.DataVector));
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(first.DataVector));
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(second.DataVector));
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(magnitude.DataVector));
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(first.DataVector));
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(second.DataVector));
         var firstValues = first.GetDataArray();
         var secondValues = second.GetDataArray();
         Assert.Equal(firstValues, secondValues);
@@ -2086,17 +2088,17 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
         {
             var inference = gpu.FusedBiasDropout(input, bias, 0.25, training: false,
                 out var inferenceMask);
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(input.DataVector));
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(bias.DataVector));
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(inference.DataVector));
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(inferenceMask.DataVector));
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(input.DataVector));
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(bias.DataVector));
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(inference.DataVector));
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(inferenceMask.DataVector));
             Assert.Equal(new[] { -1.5f, -2.5f, 2f, 1.5f, 0.5f, 5f }, inference.GetDataArray());
             Assert.All(inferenceMask.GetDataArray(), value => Assert.Equal(1f, value));
 
             var training = gpu.FusedBiasDropout(input, bias, 0.25, training: true,
                 out var trainingMask);
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(training.DataVector));
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(trainingMask.DataVector));
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(training.DataVector));
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(trainingMask.DataVector));
 
             float[] biased = { -1.5f, -2.5f, 2f, 1.5f, 0.5f, 5f };
             float scale = 1f / 0.75f;
@@ -2133,14 +2135,14 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
         {
             var spectrum = gpu.TryBackendFft(input, inverse: false);
             Assert.NotNull(spectrum);
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(
                 spectrum!.DataVector));
 
             var recovered = gpu.TryBackendFft(spectrum, inverse: true);
             Assert.NotNull(recovered);
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(
                 spectrum.DataVector));
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(
                 recovered!.DataVector));
 
             var actual = recovered.GetDataArray();
@@ -2189,11 +2191,11 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
             var actualSparse = gpu.FusedSparseLinear(input, rowOffsets, columnIndices,
                 sparseValues, sparseBias, FusedActivationType.None);
 
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(
                 actualLora.GetBackingArrayForCacheLookupUnsafe()!));
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(
                 actualDdim.GetBackingArrayForCacheLookupUnsafe()!));
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(
                 actualSparse.GetBackingArrayForCacheLookupUnsafe()!));
             AssertTensorClose(expectedLora, actualLora, "fused LoRA");
             AssertTensorClose(expectedDdim, actualDdim, "fused DDIM");
@@ -2223,13 +2225,13 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
             var selected = gpu.TensorIsIn(elements, testElements);
             var inverted = gpu.TensorIsIn(elements, testElements, invert: true);
 
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(
                 elements.DataVector));
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(
                 testElements.DataVector));
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(
                 selected.GetBackingArrayForCacheLookupUnsafe()!));
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(
                 inverted.GetBackingArrayForCacheLookupUnsafe()!));
             Assert.Equal(new[] { false, true, false, true, true, false },
                 selected.GetDataArray().Select(value => (bool)value).ToArray());
@@ -2258,11 +2260,11 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
         {
             var selected = gpu.TensorMaskedSelect(values, mask);
 
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(
                 values.DataVector));
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(
                 mask.GetBackingArrayForCacheLookupUnsafe()!));
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(
                 selected.DataVector));
             Assert.Equal(new[] { -3f, -1f, 2f }, selected.GetDataArray());
         }
@@ -2288,7 +2290,7 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
         {
             var actual = gpu.TensorMode(input);
 
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(
                 input.DataVector));
             Assert.Equal(expected.Count, actual.Count);
             Assert.Equal(expected.Value, actual.Value);
@@ -2387,51 +2389,51 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
                 30f, 31f,
                 40f, 41f,
             }, new[] { 5, 2 }), 0f);
-            var embedded = gpu.Embedding(indices, embeddingTable);
+            var embedded = ((IEngine)gpu).Embedding(indices, embeddingTable);
             var interfaceEmbedded = engine.Embedding(indices, embeddingTable);
 
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(
                 indices.GetBackingArrayForCacheLookupUnsafe()!));
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(
                 rowIndices.GetBackingArrayForCacheLookupUnsafe()!));
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(
                 columnIndices.GetBackingArrayForCacheLookupUnsafe()!));
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(
                 mask.GetBackingArrayForCacheLookupUnsafe()!));
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(copied.DataVector));
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(filled.DataVector));
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(put.DataVector));
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(taken.DataVector));
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(selected.DataVector));
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(gathered.DataVector));
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(tensorGathered.DataVector));
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(scatter.DataVector));
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(rowScatter.DataVector));
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(scatterAdd.DataVector));
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(scatterMax.DataVector));
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(copied.DataVector));
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(filled.DataVector));
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(put.DataVector));
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(taken.DataVector));
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(selected.DataVector));
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(gathered.DataVector));
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(tensorGathered.DataVector));
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(scatter.DataVector));
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(rowScatter.DataVector));
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(scatterAdd.DataVector));
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(scatterMax.DataVector));
             Assert.NotNull(scatterArgmax);
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(
                 scatterArgmax!.DataVector));
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(scatterMean.DataVector));
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(scatterMean.DataVector));
             Assert.NotNull(scatterMeanCounts);
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(
                 scatterMeanCounts!.DataVector));
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(
                 scatterAddGradient.DataVector));
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(
                 scatterMeanGradient.DataVector));
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(
                 scatterMaxGradient.DataVector));
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(
                 scatterSoftmaxGradient.DataVector));
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(scattered.DataVector));
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(maskedFilled.DataVector));
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(indexPut.DataVector));
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(indexAdded.DataVector));
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(packedGather.DataVector));
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(packedScatter.DataVector));
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(embedded.DataVector));
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(scattered.DataVector));
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(maskedFilled.DataVector));
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(indexPut.DataVector));
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(indexAdded.DataVector));
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(packedGather.DataVector));
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(packedScatter.DataVector));
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(embedded.DataVector));
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(
                 interfaceEmbedded.DataVector));
 
             Assert.Equal(new[] { 30f, 31f, 10f, 11f, 40f, 41f, 20f, 21f }, copied.GetDataArray());
@@ -2526,19 +2528,19 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
             sourceWeights, targetWeights, 0.2, out var actualCoefficients);
 
         Assert.Equal(0, GpuLaunchProbe.Readbacks);
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(
             sourceIndices.GetBackingArrayForCacheLookupUnsafe()!));
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(
             targetIndices.GetBackingArrayForCacheLookupUnsafe()!));
         var actualBacking = actual.GetBackingArrayForCacheLookupUnsafe();
         var coefficientBacking = actualCoefficients.GetBackingArrayForCacheLookupUnsafe();
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(actual.DataVector)
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(actual.DataVector)
             || (actualBacking is not null &&
-                AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(actualBacking)));
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
+                AiDotNet.Tensors.Helpers.HostSync.IsPending(actualBacking)));
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(
                 actualCoefficients.DataVector)
             || (coefficientBacking is not null &&
-                AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(coefficientBacking)));
+                AiDotNet.Tensors.Helpers.HostSync.IsPending(coefficientBacking)));
 
         var expected = cpu.GraphAttention(nodes,
             new Tensor<int>(new[] { 1, 3, 0, 2 }, new[] { 4 }),
@@ -2582,11 +2584,11 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
 
         Assert.Equal(0, GpuLaunchProbe.Readbacks);
         var faceBacking = residentFaces.GetBackingArrayForCacheLookupUnsafe();
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(
                 residentFaces.DataVector)
             || (faceBacking is not null &&
-                AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(faceBacking)));
-        Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(actual.DataVector));
+                AiDotNet.Tensors.Helpers.HostSync.IsPending(faceBacking)));
+        Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(actual.DataVector));
 
         var expected = cpu.ComputeMeshLaplacian(vertices, hostFaces, LaplacianType.Uniform);
         Assert.Equal(expected.GetDataArray(), actual.GetDataArray());
@@ -2650,7 +2652,7 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
             batchOutput, batchSaveMean!, batchSaveVar!, runningMean, runningVar,
         })
         {
-            Assert.True(AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.IsPending(
+            Assert.True(AiDotNet.Tensors.Helpers.HostSync.IsPending(
                 tensor.DataVector));
         }
 
@@ -2662,7 +2664,7 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
         var filledGradOutput = new Tensor<float>(input.Shape.ToArray());
         gpu.TensorFill(filledGradOutput, 1f);
         GpuLaunchProbe.Reset();
-        var publicGradInput = gpu.LayerNormBackward(
+        var publicGradInput = ((IEngine)gpu).LayerNormBackward(
             filledGradOutput, input, gamma, expectedMean, expectedVariance, 1e-5,
             out var publicGradGamma, out var publicGradBeta);
         var expectedPublicGradInput = cpu.LayerNormBackward(

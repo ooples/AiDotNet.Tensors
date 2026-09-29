@@ -85,7 +85,7 @@ internal static class ResidentHostMirror
     internal static bool ArmDownload<T>(Tensor<T> tensor)
     {
         if (Attach(tensor) is not { } key) return false;
-        DeferredArrayMaterializer.Register(key, tensor._gpuMaterializerCallback!);
+        HostSync.Register(key, tensor._gpuMaterializerCallback!);
         return true;
     }
 }

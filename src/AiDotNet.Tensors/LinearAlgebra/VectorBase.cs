@@ -17,7 +17,7 @@ namespace AiDotNet.Tensors.LinearAlgebra;
 /// Think of it as a row or column of values that you can add, subtract, multiply, etc. Vectors are fundamental
 /// building blocks in machine learning for representing data points and model parameters.</para>
 /// </remarks>
-public abstract class VectorBase<T>
+public abstract class VectorBase<T> : Helpers.IHostSyncOwner
 {
     /// <summary>
     /// The internal memory that stores the vector's elements.
@@ -44,6 +44,66 @@ public abstract class VectorBase<T>
     /// engine code reaches the backing vector directly.
     /// </summary>
     private System.Action? _beforeWrite;
+
+    /// <summary>
+    /// The device side of this data holder, shared by every tensor view of it; null until something binds a device
+    /// copy. See <see cref="VectorDeviceState"/>.
+    /// </summary>
+    internal VectorDeviceState? _deviceState => SharesStorageDeviceState
+        ? (_hostSync ?? ((Helpers.IHostSyncOwner)this).FindHostSync())?.Device
+        : _ownDeviceState;
+
+    /// <summary>The shared device state, created on first use.</summary>
+    internal VectorDeviceState DeviceState => SharesStorageDeviceState
+        ? ((Helpers.IHostSyncOwner)this).GetOrCreateHostSync().GetOrCreateDevice()
+        : _ownDeviceState ??= new VectorDeviceState();
+
+    // A vector that covers its WHOLE host array (or has none yet) keeps its device copy on the array's storage state,
+    // so every vector over that array -- a result array later wrapped in a tensor, an alias -- finds the same device
+    // copy. A segment of a larger array (a parameter inside a flat buffer, a pool-padded array) holds only part of
+    // it, so it keeps a device copy of its own.
+    private VectorDeviceState? _ownDeviceState;
+    private bool SharesStorageDeviceState => _cachedArray is { } array ? array.Length == _logicalLength : _memory.Length == 0;
+
+    /// <summary>
+    /// Whether this storage's host array is current, shared with every alias of that array (see
+    /// <see cref="Helpers.HostSync"/>); null until looked up or created.
+    /// </summary>
+    internal Helpers.HostSync? _hostSync;
+
+    // The object host-sync state is keyed by: the host array (the WHOLE array for a segment view, so every segment
+    // of a flat buffer shares one state), or this storage while it has no host array yet (GPU-resident lazy).
+    private object HostSyncKey()
+    {
+        // An EMPTY backing (a GPU-resident storage before its host array exists) reports the shared
+        // Array.Empty<T>() instance: keying by it would make every such storage share one state.
+        if (_cachedArray is { Length: > 0 }) return _cachedArray;
+        if (_memory.Length > 0 && MemoryMarshal.TryGetArray((ReadOnlyMemory<T>)_memory, out var segment)
+            && segment.Array is not null)
+            return segment.Array;
+        return this;
+    }
+
+    Helpers.HostSync Helpers.IHostSyncOwner.GetOrCreateHostSync()
+        => _hostSync ??= Helpers.HostSync.ForArray(HostSyncKey());
+
+    Helpers.HostSync? Helpers.IHostSyncOwner.FindHostSync()
+    {
+        if (_hostSync is { } cached) return cached;
+        var found = Helpers.HostSync.FindForArray(HostSyncKey());
+        if (found is not null) _hostSync = found;
+        return found;
+    }
+
+    /// <summary>
+    /// Makes this storage's host array current: runs its pending device download once (shared with every alias,
+    /// including segment views of a larger array). A field read when nothing is pending.
+    /// </summary>
+    internal void SyncHostFromDevice()
+    {
+        if (!Helpers.HostSync.AnyExists) return;
+        ((Helpers.IHostSyncOwner)this).FindHostSync()?.MakeHostCurrent();
+    }
 
     /// <summary>Installs the owner validation that must run before mutable storage is exposed.</summary>
     internal void SetBeforeWriteGuard(System.Action? beforeWrite)
@@ -227,6 +287,8 @@ public abstract class VectorBase<T>
         _memory = data;
         _cachedArray = data;
         // _logicalLength stays the same
+        // The state was keyed by this storage while it had no array; aliases of the new array must share it.
+        if (_hostSync is { } sync) _hostSync = Helpers.HostSync.Adopt(data, sync);
     }
 
     /// <summary>
@@ -349,20 +411,22 @@ public abstract class VectorBase<T>
     /// Call this at the top of any method that reads _memory directly.
     /// </summary>
     /// <remarks>
-    /// A pending download can be registered under either key: the vector itself (Tensor.FromGpuBuffer, and
-    /// TensorBase.MarkModified after every device-side write) or its backing array. Both are checked on every
-    /// read. Checking the vector key only while the vector was still lazy meant a device write made after the
-    /// first host read (a GPU optimizer step updating a weight the host had already read) was never
-    /// downloaded, and every later host read returned the pre-update values.
+    /// A pending download is registered on the storage's one HostSync state, which the vector and its backing
+    /// array share, and that state is checked on every read. Checking the vector only while it was still lazy
+    /// meant a device write made after the first host read (a GPU optimizer step updating a weight the host
+    /// had already read) was never downloaded, and every later host read returned the pre-update values.
     /// </remarks>
     private void EnsureMaterialized()
     {
         // GPU-resident lazy allocation: allocate backing array on first CPU access
         if (IsLazyAllocated)
+        {
+            // A released intermediate must fail BEFORE a backing array is installed: otherwise the throw leaves an
+            // allocated (zero) array behind and every later read silently returns it.
+            Helpers.HostSync.ThrowIfReleased(this);
             MaterializeBacking(new T[_logicalLength]);
-        Helpers.DeferredArrayMaterializer.TryMaterialize(this);
-        if (_cachedArray is not null)
-            Helpers.DeferredArrayMaterializer.TryMaterialize(_cachedArray);
+        }
+        SyncHostFromDevice();
     }
 
     /// <summary>
@@ -456,16 +520,15 @@ public abstract class VectorBase<T>
         _beforeWrite?.Invoke();
         EnsureMaterialized();
 
+        // One sync for every shape of backing (whole array, offset-0 segment, or an offset segment copied below).
+        SyncHostFromDevice();
         if (_cachedArray is not null)
             return _cachedArray;
 
         if (MemoryMarshal.TryGetArray((ReadOnlyMemory<T>)_memory, out var segment) && segment.Array is not null)
         {
             if (segment.Offset == 0)
-            {
-                Helpers.DeferredArrayMaterializer.TryMaterialize(segment.Array);
                 return segment.Array;
-            }
         }
 
         return _memory.ToArray();

@@ -46,7 +46,7 @@ public class AutoTensorCacheDeviceStateTests
     {
         var pending = RentFresh();
         var backing = pending.GetBackingArrayForCacheLookupUnsafe()!;
-        DeferredArrayMaterializer.Register(backing, _ => { });
+        HostSync.Register(backing, _ => { });
         try
         {
             AutoTensorCache.Return(pending);
@@ -54,7 +54,7 @@ public class AutoTensorCacheDeviceStateTests
         }
         finally
         {
-            DeferredArrayMaterializer.Remove(backing);
+            HostSync.Remove(backing);
         }
     }
 }

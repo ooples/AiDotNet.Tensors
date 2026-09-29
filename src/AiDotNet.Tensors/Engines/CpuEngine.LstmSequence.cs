@@ -245,7 +245,15 @@ public partial class CpuEngine
                         capturedBIh, capturedBHh, returnSequences);
                     DirectGpuTensorEngine.CopyResultInto(eng, eager, output);
                 },
-                backwardFn: null,
+                // Tape-replay backward: the graph node used to carry none, so compiled training dropped every gradient
+                // through the LSTM (weights never updated). Re-runs the eager op under a tape for the exact VJP.
+                backwardFn: AiDotNet.Tensors.Engines.Autodiff.BackwardFunctions<T>.ReplayUnderTape(eng =>
+                {
+                    UnpackLstmSequenceInputs(
+                        capturedInputs, optionalInputs,
+                        out var rInput, out var rH0, out var rC0, out var rWIh, out var rWHh, out var rBIh, out var rBHh);
+                    return eng.LstmSequenceForward(rInput, rH0, rC0, rWIh, rWHh, rBIh, rBHh, returnSequences);
+                }),
                 savedState: savedState);
         }
 

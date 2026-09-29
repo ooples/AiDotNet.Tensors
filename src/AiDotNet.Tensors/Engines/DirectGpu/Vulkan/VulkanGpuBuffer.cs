@@ -13,7 +13,10 @@ public sealed class VulkanGpuBuffer : IGpuBuffer
 {
     internal readonly VulkanBuffer Storage;
     internal readonly VulkanBuffer Staging;
-    private bool _disposed;
+    private int _disposed;
+
+    /// <summary>Frees of Vulkan buffers collected without Dispose, run by the next allocation.</summary>
+    internal static readonly DeviceFreeQueue PendingFrees = new();
 
     /// <inheritdoc/>
     public int Size { get; }
@@ -47,15 +50,29 @@ public sealed class VulkanGpuBuffer : IGpuBuffer
     {
         if (size <= 0)
             throw new ArgumentOutOfRangeException(nameof(size), "Element count must be positive.");
+        // Run the frees queued by collected buffers; on out-of-memory collect unreachable buffers, run their frees and
+        // retry once (see DeviceMemoryReclaim).
+        if (!PendingFrees.IsEmpty) PendingFrees.Drain();
+        return DeviceMemoryReclaim.AllocateWithRetry(() => CreateCore(size), ex => ex is GpuOutOfMemoryException,
+            () => PendingFrees.Drain());
+    }
 
+    private static VulkanGpuBuffer CreateCore(int size)
+    {
         VulkanBuffer? storage = null;
         VulkanBuffer? staging = null;
         try
         {
+            VulkanBuffer.LastAllocationResult = VulkanNativeBindings.VK_SUCCESS;
             storage = VulkanBuffer.CreateStorageBuffer(size);
-            staging = VulkanBuffer.CreateStagingBuffer(size);
+            staging = storage is null ? null : VulkanBuffer.CreateStagingBuffer(size);
             if (storage is null || staging is null)
+            {
+                int vk = VulkanBuffer.LastAllocationResult;
+                if (vk == VulkanNativeBindings.VK_ERROR_OUT_OF_DEVICE_MEMORY || vk == VulkanNativeBindings.VK_ERROR_OUT_OF_HOST_MEMORY)
+                    throw new GpuOutOfMemoryException($"Failed to allocate Vulkan GPU buffer: {vk}", vk);
                 throw new InvalidOperationException("Failed to allocate Vulkan GPU buffer.");
+            }
 
             return new VulkanGpuBuffer(storage, staging, size);
         }
@@ -105,9 +122,18 @@ public sealed class VulkanGpuBuffer : IGpuBuffer
     /// <inheritdoc/>
     public void Dispose()
     {
-        if (_disposed) return;
-        _disposed = true;
+        if (System.Threading.Interlocked.Exchange(ref _disposed, 1) != 0) return;
         Storage.Dispose();
         Staging.Dispose();
+        GC.SuppressFinalize(this);
+    }
+
+    // An undisposed buffer (a result nothing references any more) frees its device memory through the queue.
+    ~VulkanGpuBuffer()
+    {
+        if (System.Threading.Interlocked.Exchange(ref _disposed, 1) != 0) return;
+        var storage = Storage;
+        var staging = Staging;
+        PendingFrees.Enqueue(() => { storage.Dispose(); staging.Dispose(); });
     }
 }

@@ -615,6 +615,8 @@ public sealed class GpuCpuAutoDifferentialTests : IClassFixture<GpuCpuAutoDiffer
     // TODO(gpu-correctness): add dedicated GPU-vs-CPU tests for these and remove them from the list.
     private static readonly HashSet<string> DedicatedlyCovered = new(StringComparer.Ordinal)
     {
+        // Class-index gather (CE/NLL core): GPU-vs-CPU forward + gradient parity and residency in ClassGatherTests.
+        "TensorGatherClassValues(Tensor<T>,Tensor<T>)",
         // Deformable / depthwise / locally-connected conv, 3D / transposed fused conv, FlashAttention
         // backward — GPU-vs-CPU parity in GpuConvKernelCoverageTests (and MaxPool2DBackward in
         // MaxPool2DBackwardGpuCorrectnessTests). These were hidden from this gate by a `public new`

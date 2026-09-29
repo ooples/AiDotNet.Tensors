@@ -312,7 +312,7 @@ public static class TapeGradientParityHarness
         Tensor<float>[]? retainedFlattenedOutputs = null;
         try
         {
-            AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.ResetMaterializeCount();
+            AiDotNet.Tensors.Helpers.HostSync.ResetMaterializeCount();
             using var tape = new GradientTape<float>();
 
             try
@@ -360,7 +360,7 @@ public static class TapeGradientParityHarness
                 bool usesContractIdentity = capturedInputs.Count > 0;
                 if (sources.Count == 0)
                     return (new List<LeafGradientSnapshot>(),
-                        AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.MaterializeCount,
+                        AiDotNet.Tensors.Helpers.HostSync.MaterializeCount,
                         0, usesContractIdentity, capturedInputs.Count);
 
                 grads = tape.ComputeGradients(loss, sources.ToArray());
@@ -394,7 +394,13 @@ public static class TapeGradientParityHarness
                         contractIndex, src.Shape.ToArray(), key, gradientValues));
                 }
 
-                long materialisations = AiDotNet.Tensors.Helpers.DeferredArrayMaterializer.MaterializeCount;
+                // A GPU-resident result is either downloaded (materialized) or, since step intermediates are released
+                // PyTorch-style, dropped with its pending download: both prove the device path produced it. The tape
+                // releases device-only intermediates when it is disposed, so dispose it (idempotent) before counting;
+                // every gradient value above is already copied out.
+                tape.Dispose();
+                long materialisations = AiDotNet.Tensors.Helpers.HostSync.MaterializeCount
+                    + AiDotNet.Tensors.Helpers.HostSync.ReleaseCount;
                 return (leaves, materialisations, leaves.Count, usesContractIdentity, capturedInputs.Count);
             }
             finally
@@ -583,7 +589,7 @@ public static class TapeGradientParityHarness
         // directly: a non-zero count means results were GPU-resident and had to be downloaded. It is the
         // right probe for every op, with no whitelist to maintain and no false positives.
         Assert.True(materialisations > 0,
-            $"{opName} tapegrad: no deferred GPU->host materialisation, so nothing was ever GPU-resident "
+            $"{opName} tapegrad: no deferred GPU->host materialisation or release, so nothing was ever GPU-resident "
             + "and the device path did not run. Either the forward bails under an active tape, or it has no "
             + "GPU override at all — in both cases the comparison would be CPU against CPU.");
 

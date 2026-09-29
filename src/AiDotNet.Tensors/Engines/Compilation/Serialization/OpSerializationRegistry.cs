@@ -129,7 +129,7 @@ internal static class OpSerializationRegistry<T>
             throw new InvalidDataException(
                 $"Unary op rebuild requires exactly 1 input, got {inputs.Length}.");
         var a = inputs[0];
-        return (eng, output) => { var r = op(eng, a); r.AsSpan().CopyTo(output.AsWritableSpan()); };
+        return (eng, output) => { var r = op(eng, a); AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CopyResultInto(eng, r, output); };
     }
 
     private static Action<IEngine, Tensor<T>> Binary(
@@ -139,7 +139,7 @@ internal static class OpSerializationRegistry<T>
             throw new InvalidDataException(
                 $"Binary op rebuild requires exactly 2 inputs, got {inputs.Length}.");
         var a = inputs[0]; var b = inputs[1];
-        return (eng, output) => { var r = op(eng, a, b); r.AsSpan().CopyTo(output.AsWritableSpan()); };
+        return (eng, output) => { var r = op(eng, a, b); AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CopyResultInto(eng, r, output); };
     }
 
     private static Action<IEngine, Tensor<T>> RebuildExpand(Tensor<T>[] inputs, Tensor<T> output)
@@ -237,7 +237,7 @@ internal static class OpSerializationRegistry<T>
         return (eng, output) =>
         {
             var r = eng.LeakyReLU(a, alpha);
-            r.AsSpan().CopyTo(output.AsWritableSpan());
+            AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CopyResultInto(eng, r, output);
         };
     }
 
@@ -249,7 +249,7 @@ internal static class OpSerializationRegistry<T>
         return (eng, output) =>
         {
             var r = eng.ELU(a, alpha);
-            r.AsSpan().CopyTo(output.AsWritableSpan());
+            AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CopyResultInto(eng, r, output);
         };
     }
 
@@ -267,7 +267,7 @@ internal static class OpSerializationRegistry<T>
         return (eng, output) =>
         {
             var r = eng.ReduceSum(a, axes);
-            r.AsSpan().CopyTo(output.AsWritableSpan());
+            AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CopyResultInto(eng, r, output);
         };
     }
 
@@ -279,7 +279,7 @@ internal static class OpSerializationRegistry<T>
         return (eng, output) =>
         {
             var r = eng.Softmax(inp, axis);
-            r.AsSpan().CopyTo(output.AsWritableSpan());
+            AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CopyResultInto(eng, r, output);
         };
     }
 
@@ -302,7 +302,7 @@ internal static class OpSerializationRegistry<T>
             var r = axes is null
                 ? ScalarTensor(eng.TensorMean(a))
                 : eng.ReduceMean(a, axes, keepDims);
-            r.AsSpan().CopyTo(output.AsWritableSpan());
+            AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CopyResultInto(eng, r, output);
         };
     }
 
@@ -328,7 +328,7 @@ internal static class OpSerializationRegistry<T>
         return (eng, output) =>
         {
             var r = eng.Conv2D(input, kernel, stride, padding, dilation);
-            r.AsSpan().CopyTo(output.AsWritableSpan());
+            AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CopyResultInto(eng, r, output);
         };
     }
 
@@ -341,7 +341,7 @@ internal static class OpSerializationRegistry<T>
         return (eng, output) =>
         {
             var r = eng.MaxPool2D(input, poolSize, stride);
-            r.AsSpan().CopyTo(output.AsWritableSpan());
+            AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CopyResultInto(eng, r, output);
         };
     }
 
@@ -354,7 +354,7 @@ internal static class OpSerializationRegistry<T>
         return (eng, output) =>
         {
             var r = eng.AvgPool2D(input, poolSize, stride);
-            r.AsSpan().CopyTo(output.AsWritableSpan());
+            AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CopyResultInto(eng, r, output);
         };
     }
 
@@ -371,7 +371,7 @@ internal static class OpSerializationRegistry<T>
         return (eng, output) =>
         {
             var r = eng.BatchNorm(input, gamma, beta, eps, out _, out _);
-            r.AsSpan().CopyTo(output.AsWritableSpan());
+            AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CopyResultInto(eng, r, output);
         };
     }
 
@@ -383,7 +383,7 @@ internal static class OpSerializationRegistry<T>
         return (eng, output) =>
         {
             var r = eng.LayerNorm(input, gamma, beta, eps, out _, out _);
-            r.AsSpan().CopyTo(output.AsWritableSpan());
+            AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CopyResultInto(eng, r, output);
         };
     }
 
@@ -413,7 +413,7 @@ internal static class OpSerializationRegistry<T>
         return (eng, output) =>
         {
             var r = eng.ScaledDotProductAttention(q, k, v, null, scale, out _);
-            r.AsSpan().CopyTo(output.AsWritableSpan());
+            AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CopyResultInto(eng, r, output);
         };
     }
 
@@ -432,11 +432,11 @@ internal static class OpSerializationRegistry<T>
             if (bias is not null)
             {
                 var added = eng.TensorAdd(r, bias);
-                added.AsSpan().CopyTo(output.AsWritableSpan());
+                AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CopyResultInto(eng, added, output);
             }
             else
             {
-                r.AsSpan().CopyTo(output.AsWritableSpan());
+                AiDotNet.Tensors.Engines.DirectGpuTensorEngine.CopyResultInto(eng, r, output);
             }
         };
     }

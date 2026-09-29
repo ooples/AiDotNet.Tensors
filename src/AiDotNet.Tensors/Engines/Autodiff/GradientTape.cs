@@ -714,7 +714,12 @@ public sealed class GradientTape<T> : IDisposable
             // [1]), not a hardcoded [1] — a hardcoded rank-1 seed mismatches a
             // 0-dim scalar loss and can break shape-checked backward ops.
             Tensor<T> seedGrad;
-            if (loss.Length == 1)
+            if (DeviceLossSeed.TryCreate(engine, loss, out var deviceSeed))
+            {
+                // A device-resident loss gets a device-filled seed: a host one crosses the boundary every step.
+                seedGrad = deviceSeed;
+            }
+            else if (loss.Length == 1)
             {
                 seedGrad = new Tensor<T>(new[] { numOps.One }, (int[])loss._shape.Clone());
             }
@@ -1006,6 +1011,42 @@ public sealed class GradientTape<T> : IDisposable
         bool createGraph,
         IReadOnlyList<KeyValuePair<Tensor<T>, Tensor<T>>>? seedOverride)
     {
+        var grads = ComputeGradientsCore(loss, sources, createGraph, seedOverride);
+        // What backward hands back belongs to the caller: the gradients (produced on the device during backward,
+        // so inside the release window) and the loss outlive the tape, for as long as the caller holds them.
+        KeepAfterTape(loss);
+        foreach (var gradient in grads.Values)
+            if (gradient is not null) KeepAfterTape(gradient);
+        return grads;
+    }
+
+    // Activation keys of what the caller keeps past the tape (loss, returned gradients, Retain), owned by the
+    // OUTERMOST tape, which releases everything else at dispose.
+    private HashSet<object>? _keptKeys;
+
+    /// <summary>
+    /// Exempts <paramref name="tensor"/> from the step-end and last-use releases; at dispose its device memory is
+    /// handed to the tensor's own lifetime (see DirectGpuTensorEngine.DetachToTensorLifetime).
+    /// </summary>
+    private void KeepAfterTape(Tensor<T> tensor)
+    {
+        var root = this;
+        while (root._parent is not null) root = root._parent;
+        var array = tensor.GetBackingArrayForCacheLookupUnsafe();
+        if (array is not null) Helpers.HostSync.MarkRetained(array);
+        Helpers.HostSync.MarkRetained(tensor.DataVector);
+        if (root._snapshotEngine is null) return;   // nothing is released without a GPU snapshot
+        var keys = root._keptKeys ??= new HashSet<object>(ReferenceEqualityComparer<object>.Instance);
+        if (array is not null) keys.Add(array);
+        keys.Add(tensor.DataVector);
+    }
+
+    private Dictionary<Tensor<T>, Tensor<T>> ComputeGradientsCore(
+        Tensor<T> loss,
+        IReadOnlyList<Tensor<T>>? sources,
+        bool createGraph,
+        IReadOnlyList<KeyValuePair<Tensor<T>, Tensor<T>>>? seedOverride)
+    {
         using var accumulationPrecisionScope = new GradientAccumulationPrecisionScope(
             _options.GradientAccumulationPrecision);
         if (_disposed)
@@ -1174,7 +1215,13 @@ public sealed class GradientTape<T> : IDisposable
             // Fast path for scalar loss (the overwhelmingly common case in training).
             // Reuse cached scalar seed across training steps to avoid per-backward allocation.
             Tensor<T> seedGrad;
-            if (loss.Length == 1)
+            if (DeviceLossSeed.TryCreate(engine, loss, out var deviceSeed))
+            {
+                // A device-resident loss gets a device-filled seed. The cached host seed below crossed the boundary
+                // on every step: step-end release frees the device copy the backward makes of it.
+                seedGrad = deviceSeed;
+            }
+            else if (loss.Length == 1)
             {
                 // Use loss's actual shape (could be [1] or [] for 0-dim scalar)
                 seedGrad = _cachedScalarSeed ??= new Tensor<T>(new[] { numOps.One }, (int[])loss._shape.Clone());
@@ -2547,6 +2594,23 @@ public sealed class GradientTape<T> : IDisposable
     }
 
     /// <summary>
+    /// Keeps <paramref name="tensor"/> readable after this tape ends.
+    /// </summary>
+    /// <remarks>
+    /// On a GPU engine a tape frees the device memory of the step's intermediates when it is disposed, and after
+    /// their last backward use, without copying them to the host (as PyTorch frees an unreferenced CUDA tensor).
+    /// Reading such a tensor afterwards throws. Call this for an intermediate you need after the step (a metric,
+    /// a prediction to log, state carried to the next step). Inputs, parameters, the loss and gradients are not
+    /// affected: only tensors the step itself produced on the device are released.
+    /// </remarks>
+    public void Retain(Tensor<T> tensor)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(GradientTape<T>));
+        if (tensor is null) throw new ArgumentNullException(nameof(tensor));
+        KeepAfterTape(tensor);
+    }
+
+    /// <summary>
     /// Marks a tensor to retain its gradient after backward, even if it's a non-leaf tensor.
     /// Like PyTorch's tensor.retain_grad().
     /// </summary>
@@ -2741,7 +2805,15 @@ public sealed class GradientTape<T> : IDisposable
             // until the next non-suspended insert and the steady-state memory
             // bound (~one step) would not hold for back-to-back tape scopes.
             _snapshotEngine.ResumeActivationEviction();
-            _snapshotEngine.EvictActivationsCreatedAfter(_activationSnapshot);
+            // PyTorch-style release: the step's intermediates are dead once the tape ends, so their device memory is
+            // freed WITHOUT a host copy (materializing every intermediate used to move ~2.4 GB device-to-host per
+            // step on a 26.8M-parameter LM). Reading one afterwards throws a clear error; Retain(tensor) keeps one.
+            _snapshotEngine.EvictActivationsCreatedAfter(_activationSnapshot, _keptKeys,
+                Engines.ActivationReleaseMode.Release);
+            // What the caller keeps (loss, gradients, retained tensors) now lives as long as its tensor; earlier
+            // steps' kept results that are no longer referenced are reclaimed once they add up (see the engine).
+            if (_keptKeys is not null) _snapshotEngine.DetachToTensorLifetime(_keptKeys);
+            _snapshotEngine.ReclaimDetachedResultsOverBudget();
         }
 
         // A tape may be disposed before backward, or after a cleanup path that
@@ -2876,6 +2948,23 @@ public sealed class NoGradScope<T> : IDisposable
     /// <see cref="DecrementSuppressionCount"/>.
     /// </summary>
     internal static void IncrementSuppressionCount() => _suppressionCount++;
+
+    /// <summary>
+    /// Temporarily lifts no-grad suppression on this thread and returns the previous count for
+    /// <see cref="RestoreSuppression"/>. Used where code that legitimately needs a tape runs inside a no-grad
+    /// region: the optimizer update runs under <see cref="NoGradScope{T}"/> (its arithmetic must not be recorded),
+    /// but a second-order / line-search optimizer re-evaluates the loss and gradients through
+    /// <see cref="TapeStepContext{T}.Reevaluate"/>, which must record normally.
+    /// </summary>
+    internal static int SuspendSuppression()
+    {
+        int saved = _suppressionCount;
+        _suppressionCount = 0;
+        return saved;
+    }
+
+    /// <summary>Restores the count saved by <see cref="SuspendSuppression"/>.</summary>
+    internal static void RestoreSuppression(int saved) => _suppressionCount = saved;
 
     /// <summary>
     /// Pair to <see cref="IncrementSuppressionCount"/>. Must not be

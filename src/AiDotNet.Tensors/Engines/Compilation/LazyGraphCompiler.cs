@@ -11,11 +11,13 @@ internal sealed class LazyGraphCompiler
 {
     private readonly List<ILazyGraphOptimizationPass> _passes;
 
-    internal LazyGraphCompiler()
+    /// <param name="forTraining">True when the compiled graph will be differentiated (a training plan): fusions
+    /// without a backward are not applied.</param>
+    internal LazyGraphCompiler(bool forTraining = false)
     {
         _passes = new List<ILazyGraphOptimizationPass>
         {
-            new CpuFusionPass(),
+            new CpuFusionPass(forTraining),
             new DeadCodeEliminationPass(),
             new OperationReorderingPass(),
             new MemoryPlanningPass()

@@ -973,7 +973,29 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// _data array may be empty/stale until explicitly synchronized.
     /// This is the PyTorch-equivalent of tensor.data_ptr() on a CUDA tensor.
     /// </summary>
-    internal Engines.DirectGpu.IGpuBuffer? _gpuBuffer;
+    internal Engines.DirectGpu.IGpuBuffer? _gpuBuffer
+    {
+        get => CoversWholeVector ? _data._deviceState?.Buffer : _viewGpuBuffer;
+        set
+        {
+            if (CoversWholeVector) _data.DeviceState.Buffer = value;
+            else _viewGpuBuffer = value;
+        }
+    }
+
+    // A strided/offset view's own contiguous device copy. Such a view does not share the vector's layout, so its
+    // device buffer can't be the shared one (see VectorDeviceState).
+    private Engines.DirectGpu.IGpuBuffer? _viewGpuBuffer;
+    private Engines.DirectGpu.IDirectGpuBackend? _viewGpuBackend;
+    private int _viewGpuBufferVersion = -1;
+    private bool _viewGpuBufferIsSplitComplex;
+    private bool _viewGpuBufferContainsRawInt32;
+
+    /// <summary>
+    /// True when this tensor covers its whole data vector in the vector's own layout (contiguous, offset 0, same
+    /// length), so its device copy IS the vector's shared one.
+    /// </summary>
+    private bool CoversWholeVector => IsContiguous && _storageOffset == 0 && _data is not null && Length == _data.Length;
 
     /// <summary>
     /// True when <see cref="_gpuBuffer"/> stores a logical <c>Tensor&lt;Complex&lt;T&gt;&gt;</c>
@@ -982,19 +1004,43 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// elements. Direct GPU complex operations use this marker to split the planes
     /// with device-to-device copies instead of materializing the tensor on the host.
     /// </summary>
-    internal bool _gpuBufferIsSplitComplex;
+    internal bool _gpuBufferIsSplitComplex
+    {
+        get => CoversWholeVector ? _data._deviceState?.IsSplitComplex ?? false : _viewGpuBufferIsSplitComplex;
+        set
+        {
+            if (CoversWholeVector) _data.DeviceState.IsSplitComplex = value;
+            else _viewGpuBufferIsSplitComplex = value;
+        }
+    }
 
     /// <summary>
     /// True when a logical <c>Tensor&lt;int&gt;</c> is backed by raw int32 device storage rather
     /// than the numeric-float index representation used by general index-producing kernels.
     /// Pooling kernels use raw int32 because their backward kernels consume the same buffer.
     /// </summary>
-    internal bool _gpuBufferContainsRawInt32;
+    internal bool _gpuBufferContainsRawInt32
+    {
+        get => CoversWholeVector ? _data._deviceState?.ContainsRawInt32 ?? false : _viewGpuBufferContainsRawInt32;
+        set
+        {
+            if (CoversWholeVector) _data.DeviceState.ContainsRawInt32 = value;
+            else _viewGpuBufferContainsRawInt32 = value;
+        }
+    }
 
     /// <summary>
     /// Backend that owns the GPU buffer. Required for downloading data to CPU.
     /// </summary>
-    internal Engines.DirectGpu.IDirectGpuBackend? _gpuBackend;
+    internal Engines.DirectGpu.IDirectGpuBackend? _gpuBackend
+    {
+        get => CoversWholeVector ? _data._deviceState?.Backend : _viewGpuBackend;
+        set
+        {
+            if (CoversWholeVector) _data.DeviceState.Backend = value;
+            else _viewGpuBackend = value;
+        }
+    }
 
     /// <summary>
     /// Version counter at the time <see cref="_gpuBuffer"/> was last uploaded.
@@ -1005,7 +1051,21 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// tests perturb input[i] in place, then re-call forward — the second
     /// call must see the mutated data).
     /// </summary>
-    internal int _gpuBufferVersion = -1;
+    /// <remarks>
+    /// Kept as a version number for the existing call sites, but the truth is <see cref="VectorDeviceState.DeviceValid"/>:
+    /// reading gives <see cref="GpuCacheVersion"/> (the storage's GPU-cache epoch) while the shared device copy is
+    /// current (else -1), and assigning the current <see cref="GpuCacheVersion"/> marks it current (anything else marks
+    /// it stale). Views of one vector therefore agree on whether its device copy is current.
+    /// </remarks>
+    internal int _gpuBufferVersion
+    {
+        get => CoversWholeVector ? (_data._deviceState is { DeviceValid: true } ? GpuCacheVersion : -1) : _viewGpuBufferVersion;
+        set
+        {
+            if (CoversWholeVector) _data.DeviceState.DeviceValid = value == GpuCacheVersion && value >= 0;
+            else _viewGpuBufferVersion = value;
+        }
+    }
 
     /// <summary>
     /// Issue #338: reference count of active <see cref="Engines.Autodiff.GradientTape{T}"/>
@@ -1120,9 +1180,30 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// </para>
     /// </summary>
     /// <returns>The GPU buffer, or null when no GPU mapping exists.</returns>
+    /// <summary>
+    /// Clears PyTorch-style release marks on this tensor's storage keys. Called when an allocator re-issues the
+    /// tensor (or its array) to a new owner: the arena and array pools recycle the objects a released step
+    /// intermediate used, and the new owner's data must not inherit the old owner's "released" state.
+    /// </summary>
+    internal void ClearReleaseMarks()
+    {
+        var array = GetBackingArrayForCacheLookupUnsafe();
+        if (array is not null) Helpers.HostSync.ClearReleased(array);
+        Helpers.HostSync.ClearReleased(_data);
+    }
+
     public Engines.DirectGpu.IGpuBuffer? TryGetGpuBuffer()
     {
-        if (_gpuBuffer is not null && _gpuBuffer.Handle != IntPtr.Zero) return _gpuBuffer;
+        if (_gpuBuffer is not null && _gpuBuffer.Handle != IntPtr.Zero)
+        {
+            // A released step intermediate still names its old buffer object, which the pool may have re-rented to
+            // another tensor: handing it out would read or overwrite someone else's data.
+            var array = GetBackingArrayForCacheLookupUnsafe();
+            if ((array is not null && Helpers.HostSync.IsReleased(array))
+                || Helpers.HostSync.IsReleased(_data))
+                throw new InvalidOperationException(Engines.DirectGpuTensorEngine.ReleasedIntermediateMessage);
+            return _gpuBuffer;
+        }
         // GpuPinned / GpuOffload tensors carry a device pointer set by
         // WeightRegistry.RegisterWeight. Wrap it on demand for caller use.
         if (OffloadDevicePointer != IntPtr.Zero
@@ -1211,7 +1292,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         {
             if (_device != TensorDevice.CPU) return true;
             var live = GetLiveBackingArrayOrNull();
-            return live is not null && Helpers.DeferredArrayMaterializer.IsPending(live);
+            return live is not null && Helpers.HostSync.IsPending(live);
         }
     }
 
@@ -1300,6 +1381,10 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     internal void IncrementVersion()
     {
         _storage.IncrementGpuCacheVersionIfTracked();
+        // A host-side mutation leaves the shared device copy stale, for every view of this vector. (Under inference
+        // mode the version does not advance, which used to leave a stale device copy looking current.)
+        if (CoversWholeVector) { if (_data._deviceState is { } shared) shared.DeviceValid = false; }
+        else _viewGpuBufferVersion = -1;
         if (Engines.Autodiff.InferenceModeFlag.IsActive)
         {
             // Inference mode: in-place mutation is legal and the
@@ -1359,7 +1444,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
 
         // Re-register deferred materializer so next CPU read downloads fresh GPU data
         if (_gpuMaterializerCallback is not null && _gpuMaterializerKey is not null)
-            Helpers.DeferredArrayMaterializer.Register(_gpuMaterializerKey, _gpuMaterializerCallback);
+            Helpers.HostSync.Register(_gpuMaterializerKey, _gpuMaterializerCallback);
     }
 
     /// <summary>
@@ -2334,15 +2419,15 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         {
             // Force any PENDING GPU download before handing the array out.
             // DirectGpuTensorEngine.FinishGpuOp returns a GC.AllocateUninitializedArray and
-            // registers a DeferredArrayMaterializer keyed on it, documenting that the data is
-            // "populated lazily when code first accesses the data (via DeferredArrayMaterializer
+            // registers a HostSync keyed on it, documenting that the data is
+            // "populated lazily when code first accesses the data (via HostSync
             // triggered by GetDataArray/AsSpan/indexer)". VectorBase.GetDataArray does call
             // TryMaterialize; this accessor did NOT, so reading a deferred GPU result through the
             // TENSOR accessor returned UNINITIALISED memory. Fresh pages read as zero, which is why
             // 13 Parity210 GPU ops (Erfc, Lgamma, Erfinv, I0, Flip, Roll, CumSum, CumMax,
             // LogCumSumExp, LogAddExp, Hypot, DiagEmbed, NanToNum) each reported gpu=0 against
             // every CPU value. TryMaterialize is a no-op for arrays with nothing pending.
-            Helpers.DeferredArrayMaterializer.TryMaterialize(live);
+            Helpers.HostSync.TryMaterialize(live);
             return live;
         }
         return ToArray();
@@ -2367,7 +2452,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         {
             // Same pending-GPU-download trigger as GetDataArray above — a read-only accessor still
             // has to see materialised data.
-            Helpers.DeferredArrayMaterializer.TryMaterialize(live);
+            Helpers.HostSync.TryMaterialize(live);
             return live;
         }
         return ToArray();
@@ -3512,7 +3597,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         // Remove pending deferred materializer to prevent callback on disposed tensor
         if (_gpuMaterializerKey is not null && _storage.RefCount == 1)
         {
-            Helpers.DeferredArrayMaterializer.Remove(_gpuMaterializerKey);
+            Helpers.HostSync.Remove(_gpuMaterializerKey);
             _gpuMaterializerKey = null;
             _gpuMaterializerCallback = null;
         }
