@@ -6461,7 +6461,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 var aBf16 = new ushort[M * K];
                 return eng =>
                 {
-                    int bVersion = capInputB.Version;
+                    int bVersion = capInputB.StorageMutationVersion;
                     if (bVersion != cachedBVersion)
                     {
                         unsafe
@@ -8366,7 +8366,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                         cachedBBf16 = new ushort[K * N];
                         cachedDCBf16 = new ushort[M * N];
                     }
-                    int bVersion = capInputBForBf16.Version;
+                    int bVersion = capInputBForBf16.StorageMutationVersion;
                     if (bVersion != cachedBBf16Version)
                     {
                         unsafe
@@ -9984,7 +9984,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 // optimizer's in-place mutators). Frozen-weights workloads
                 // get the one-shot path; training workloads pay the
                 // K*V scan only when weights actually moved.
-                int wVersion = gW.Version;
+                int wVersion = gW.StorageMutationVersion;
                 if (wVersion != rowSumWVersion)
                 {
                     for (int k = 0; k < gK; k++)
@@ -10533,8 +10533,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
 
             fusedForward.Add(eng =>
             {
-                int v1 = capturedW1.Version;
-                int v2 = capturedW2.Version;
+                int v1 = capturedW1.StorageMutationVersion;
+                int v2 = capturedW2.StorageMutationVersion;
                 if (v1 != wFusedW1Version || v2 != wFusedW2Version)
                 {
                     if (!BlasProvider.TryGemm(cK, cN, cH, w1Data, 0, cH, w2Data, 0, cN, cWFused, 0, cN))

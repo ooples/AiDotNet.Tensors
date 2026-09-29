@@ -1241,6 +1241,15 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// <summary>Storage-shared cache freshness, including writes made in inference mode.</summary>
     internal int GpuCacheVersion => _storage.GpuCacheVersion;
 
+    /// <summary>
+    /// Mutation epoch of the STORAGE this tensor views, shared by every view and alias of it. A cache derived
+    /// from a tensor's data must key on this, not on <see cref="Version"/>: Version is per tensor object, so a
+    /// write through another view of the same storage (TensorCopy into an alias, an optimizer updating a
+    /// parameter through its view) leaves it unchanged, and inference-mode writes skip it. Every
+    /// IncrementVersion bumps this epoch, so it misses nothing Version would have caught.
+    /// </summary>
+    internal int StorageMutationVersion => _storage.GpuCacheVersion;
+
     private void InvalidateGpuBindingAfterStorageReplacement()
     {
         _gpuBuffer = null;
