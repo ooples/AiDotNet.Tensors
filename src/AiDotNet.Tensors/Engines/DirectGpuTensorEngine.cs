@@ -580,16 +580,21 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// so the captured graph reads a fixed device address and GetOrAllocateBuffer finds it (no re-upload mid-
     /// capture). Call during the non-capturing pre-residency pass for each EXTERNAL stable input (the graph's
     /// own intermediates become resident via FinishGpuOp under ResidentStepActive). Idempotent: re-binds the
-    /// current data into the existing buffer if already bound + big enough. float only / no-op off CUDA.</summary>
+    /// current data into the existing buffer if already bound + big enough. float only. Off CUDA (no in-place float
+    /// upload, and no capture that needs a fixed address) each call binds a fresh upload of the current data.</summary>
     public void EnsureResidentInput<T>(Tensor<T> t)
     {
         if (typeof(T) != typeof(float) || t is null) return;
-        if (GetBackend() is not Engines.DirectGpu.CUDA.CudaBackend cb) return;
+        if (!TryGetBackend(out var cb)) return;
+        // The host is authoritative for an external input (callers write batches through a host span). A device op on
+        // a view sharing its array (the backward's Reshape or Transpose of the batch) can have armed a download into
+        // it; materializing that would read back data the host already holds.
+        if (t.GetBackingArrayForCacheLookupUnsafe() is { } hostArray) Helpers.HostSync.Remove(hostArray);
         var data = t.GetDataArray();
-        if (t._gpuBuffer is { } existing && ReferenceEquals(t._gpuBackend, cb)
+        if (cb is Engines.DirectGpu.CUDA.CudaBackend cuda && t._gpuBuffer is { } existing && ReferenceEquals(t._gpuBackend, cb)
             && existing.Handle != System.IntPtr.Zero && existing.Size >= data.Length)
         {
-            cb.UploadBufferInPlace((float[])(object)data, existing);
+            cuda.UploadBufferInPlace((float[])(object)data, existing);
             t._gpuBufferVersion = t.GpuCacheVersion;
             return;
         }
@@ -611,10 +616,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public float[]? DownloadResidentBuffer<T>(Tensor<T> t)
     {
         if (typeof(T) != typeof(float) || t is null) return null;
-        if (GetBackend() is not Engines.DirectGpu.CUDA.CudaBackend cb) return null;
+        if (!TryGetBackend(out var cb)) return null;
         var buf = t._gpuBuffer;
         if (buf is null || !ReferenceEquals(t._gpuBackend, cb) || buf.Handle == System.IntPtr.Zero) return null;
-        return cb.DownloadBuffer(buf);
+        // A buffer can be larger than the tensor (a pooled or padded allocation: a scalar loss has been seen bound to
+        // 256 floats). Read only the tensor's elements, through a device copy into an exactly sized buffer.
+        if (buf.Size <= t.Length) return cb.DownloadBuffer(buf);
+        using var exact = cb.AllocateBuffer(t.Length);
+        cb.Copy(buf, 0, exact, 0, t.Length);
+        var values = cb.DownloadBuffer(exact);
+        return values.Length == t.Length ? values : values.AsSpan(0, t.Length).ToArray();
     }
 
     // #1650 — STABLE captured-graph output. The forward's own output buffer is a graph-internal cuMemAllocAsync
