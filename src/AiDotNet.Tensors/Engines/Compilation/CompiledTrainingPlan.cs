@@ -2190,7 +2190,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         if (s_residentStepEnabled && !_residentStepFailed && _graphStepEligible && typeof(T) == typeof(float)
             && _checkpointing is null && _fp16HeteroOrder is null
             && _engine is Engines.DirectGpuTensorEngine gte
-            && gte.GetBackend() is { } cb)
+            && gte.GetBackend() is { } cb
+            && DeviceParametersLiveOn(cb))
         {
             // Eviction is suspended for THIS step only -- the resident branches require it while they borrow cached
             // buffers -- and the step's activations are released at the end, as StepEager does. Holding the
@@ -2206,6 +2207,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 {
                     ran = true;
                     RefreshLossFromCapturedGraph(gte);
+                    ApplyL2Regularization();   // before clipping, as the eager and graph steps order it
                     if (_maxGradNorm > 0.0 && !TryClipGradientsGlobalL2Gpu(_gradients, _maxGradNorm))
                         ClipGradientsGlobalL2(_gradients, _maxGradNorm);
                     CommitHostOptimizerGradients();
@@ -2345,6 +2347,25 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     /// the body threw; the plan then uses StepEager from here on. Only the body is retried that way -- nothing has
     /// been applied to the parameters yet.
     /// </summary>
+    /// <summary>
+    /// Whether every parameter lives on the device, on <paramref name="backend"/>. Off CUDA the resident body is taken
+    /// only then:
+    /// - a parameter placed by another engine (Tensor.Gpu() uses the default engine) is in another OpenCL context,
+    ///   where the optimizer's kernels reject the gradient buffers (CL_INVALID_CONTEXT);
+    /// - a host parameter is updated by the host optimizer, which reads its gradient on the host anyway, and the
+    ///   resident forward kept reading the device copy it cached before that update (measured: a host weight in a
+    ///   mixed-residency Adam run ended at -0.0816 against the tape oracle's -0.0728).
+    /// The eager step stages both cases through the host. CUDA keeps its existing resident and captured paths.
+    /// </summary>
+    private bool DeviceParametersLiveOn(Engines.DirectGpu.IDirectGpuBackend backend)
+    {
+        if (backend is Engines.DirectGpu.CUDA.CudaBackend) return true;
+        foreach (var parameter in _parameters)
+            if (parameter.TryGetGpuBuffer() is null || !ReferenceEquals(parameter._gpuBackend, backend))
+                return false;
+        return true;
+    }
+
     private bool TryRunResidentBody(Engines.DirectGpuTensorEngine gte, Engines.DirectGpu.IDirectGpuBackend cb)
     {
         using var _autocast = AiDotNet.Tensors.Engines.Gpu.AutocastScope.EnableFromEnvironment();
