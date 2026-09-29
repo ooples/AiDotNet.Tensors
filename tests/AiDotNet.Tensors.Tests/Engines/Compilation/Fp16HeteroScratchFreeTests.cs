@@ -108,10 +108,14 @@ public class Fp16HeteroScratchFreeTests
             gpu.ClearActivationCache();
             using var plan = MixedPrecisionCompiledPlan.FromCapturedOrder(gpu, order, loss, paging: false);
             gpu.SuspendActivationEviction();
+            DirectGpuTensorEngine.TrackOwnedResultBytes = true;
+            gpu.ResetOwnedResultTracking();
             try
             {
                 plan.Forward();
-                long bytes = gpu.CurrentActivationCacheBytes;  // resident activation storage right after forward
+                // Resident activation storage right after the forward: the activation cache PLUS the results that own
+                // their device buffers (FP32 results are no longer cache entries, so the cache alone undercounts).
+                long bytes = gpu.CurrentActivationCacheBytes + gpu.LiveOwnedResultBytes;
                 var grads = plan.Backward();
                 double sum = 0;
                 foreach (var kv in grads.Fp32)
@@ -121,7 +125,7 @@ public class Fp16HeteroScratchFreeTests
                 }
                 return (Math.Sqrt(sum), bytes);
             }
-            finally { gpu.ResumeActivationEviction(); }
+            finally { gpu.ResumeActivationEviction(); DirectGpuTensorEngine.TrackOwnedResultBytes = false; }
         }
         finally { Environment.SetEnvironmentVariable("AIDOTNET_FP16_NO_FWD_STORE", prevEnv); }
     }
@@ -132,13 +136,12 @@ public class Fp16HeteroScratchFreeTests
         using var gpu = new DirectGpuTensorEngine();
         Skip.If(!gpu.IsGpuAvailable, "needs a DirectGpu backend (CUDA/OpenCL/…).");
 
+        // The Half-resident store needs a half-output GEMM. Skip on the CAPABILITY, not on "the bytes came out
+        // equal": inferring it from the measurement let a store that silently stopped engaging pass as a skip.
+        Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend { SupportsHgemm: true },
+            "backend has no half-output GEMM, so the forward Half-store cannot engage.");
         var off = RunForwardStoreOnce(gpu, store: false);
         var on = RunForwardStoreOnce(gpu, store: true);
-
-        // The Half-resident store only engages on a backend with a half-output GEMM; if it didn't (bytes equal),
-        // this backend lacks SupportsHgemm — skip rather than fail (the store no-ops to the FP32 path there).
-        Skip.If(on.cacheBytesAfterForward == off.cacheBytesAfterForward,
-            "forward Half-store did not engage (backend has no half-output GEMM) — nothing to measure.");
 
         // (1) Correctness: keeping activations Half-resident must not change the gradients (the captured graph
         // already intends Half activations; the fused Half backward reads them directly).

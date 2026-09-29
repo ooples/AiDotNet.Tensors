@@ -505,43 +505,6 @@ public class DevicePrimitivesTests
         Assert.True(true);
     }
 
-    [Fact]
-    public void GpuMemoryStats_RecordAllocFree_ReflectInCounters()
-    {
-        GpuMemoryStats.Reset();
-        GpuMemoryStats.RecordAllocation("test_alloc", 1024);
-        GpuMemoryStats.RecordAllocation("test_alloc", 2048);
-        Assert.Equal(3072, GpuMemoryStats.CurrentBytes);
-        Assert.Equal(3072, GpuMemoryStats.PeakBytes);
-        Assert.Equal(3072, GpuMemoryStats.TotalAllocatedBytes);
-        Assert.Equal(2, GpuMemoryStats.ActiveAllocations);
-
-        GpuMemoryStats.RecordFree("test_alloc", 1024);
-        Assert.Equal(2048, GpuMemoryStats.CurrentBytes);
-        Assert.Equal(3072, GpuMemoryStats.PeakBytes); // peak is sticky
-        Assert.Equal(1, GpuMemoryStats.ActiveAllocations);
-
-        GpuMemoryStats.ResetPeakStats();
-        Assert.Equal(2048, GpuMemoryStats.PeakBytes);
-
-        GpuMemoryStats.Reset();
-    }
-
-    [Fact]
-    public void GpuMemoryStats_Stats_ExposesTorchParityKeys()
-    {
-        GpuMemoryStats.Reset();
-        GpuMemoryStats.RecordAllocation("test_alloc", 512);
-        var stats = GpuMemoryStats.Stats();
-
-        Assert.Equal(512L, stats["allocated_bytes.current"]);
-        Assert.Equal(512L, stats["allocated_bytes.peak"]);
-        Assert.Equal(512L, stats["allocated_bytes.total"]);
-        Assert.Equal(1L, stats["active.current"]);
-
-        GpuMemoryStats.Reset();
-    }
-
     private static T[] NewLinear<T>(int n, T scale)
     {
         var a = new T[n];

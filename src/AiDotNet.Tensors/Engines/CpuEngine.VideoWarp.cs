@@ -22,7 +22,7 @@ public partial class CpuEngine
         int diameter = radius * 2 + 1;
         int offsets = diameter * diameter;
 
-        if (GraphMode.IsActive && GraphMode.Current is { } scope)
+        if (GraphMode.IsActive && GraphMode.Current is { } scope && scope.BindEngine(this))
         {
             var capturedFirst = first;
             var capturedSecond = second;
@@ -80,7 +80,7 @@ public partial class CpuEngine
     {
         ValidateSplatInputs(input, flow);
 
-        if (GraphMode.IsActive && GraphMode.Current is { } scope)
+        if (GraphMode.IsActive && GraphMode.Current is { } scope && scope.BindEngine(this))
         {
             var capturedInput = input;
             var capturedFlow = flow;

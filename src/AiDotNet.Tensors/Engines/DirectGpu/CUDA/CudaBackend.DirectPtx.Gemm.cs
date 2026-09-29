@@ -77,7 +77,7 @@ public sealed partial class CudaBackend
                             "Direct PTX GEMM must be prewarmed before CUDA graph capture.";
                         return false;
                     }
-                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                     kernel = CreateAndCacheGemmKernelSlow(key);
                 }
                 if (capturing && !PinDirectPtxKernelForCapture(_directPtxGemmKernels, key))
@@ -132,7 +132,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 var key = new DirectPtxGemmKey(m, k, n);
                 if (!_directPtxGemmKernels.TryGetValue(key, out _))
                     _ = CreateAndCacheGemmKernelSlow(key);

@@ -198,14 +198,26 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (_device == TensorDevice.CPU || _gpuBuffer is null || _gpuBackend is null)
             return view;
 
-        view._device = _device;
-        view._gpuDeviceIndex = _gpuDeviceIndex;
-        view._gpuBuffer = _gpuBuffer;
-        view._gpuBackend = _gpuBackend;
+        ShareGpuStateWith(view);
         // A metadata-only view borrows the same snapshot; it does not upload current host data.
         // Preserve a stale source stamp so a view created after a host mutation cannot certify
         // the old GPU buffer as current merely by adopting the storage's latest epoch.
         view._gpuBufferVersion = _gpuBufferVersion;
+        return view;
+    }
+
+    /// <summary>
+    /// Everything a view borrowing this tensor's device buffer must carry besides the version stamp (which each caller
+    /// sets by its own rule). One helper for both view paths, so a reshape and a storage view of the same resident
+    /// tensor behave the same: same materializer (a host read of either refreshes the shared backing through one
+    /// registration), same role, never the owner of the buffer.
+    /// </summary>
+    private void ShareGpuStateWith(Tensor<T> view)
+    {
+        view._device = _device;
+        view._gpuDeviceIndex = _gpuDeviceIndex;
+        view._gpuBuffer = _gpuBuffer;
+        view._gpuBackend = _gpuBackend;
         view._gpuBufferIsSplitComplex = _gpuBufferIsSplitComplex;
         view._gpuBufferContainsRawInt32 = _gpuBufferContainsRawInt32;
         view._gpuRole = _gpuRole;
@@ -214,7 +226,6 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         view._gpuMaterializerKey = _gpuMaterializerKey;
         view.IsDirty = IsDirty;
         view.Layout = Layout;
-        return view;
     }
 
     /// <summary>
@@ -224,6 +235,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </summary>
     private Tensor<T> FinalizeReshapeLikeView(Tensor<T> view, string opName)
     {
+        CarryResidencyToShapeOnlyView(view);
         if (!IsDifferentiableRecordingActive)
             return view;
 
@@ -234,6 +246,25 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             opName,
             Engines.Autodiff.BackwardFunctions<T>.ReshapeBackward,
             new object[] { originalShape });
+    }
+
+    /// <summary>
+    /// A shape-only view (same storage, same offset, both contiguous, same length) has the SAME bytes as its source,
+    /// so it carries the source's device buffer. Without this a reshape of a GPU result was a host-only object: a
+    /// consumer that needed its device buffer (CopyResultInto aliasing, an in-place op, a GEMM operand) could not
+    /// find it and downloaded the data instead — a per-op host round-trip in eager training, and a CUDA 900 that
+    /// aborted whole-step graph capture (the MSE loss is ReduceMean(...).Reshape([1])). Sharing the IGpuBuffer
+    /// reference is lifetime-safe: the buffer is freed by its own finalizer once nothing references it, so the view
+    /// keeps it alive for as long as the view is reachable.
+    /// </summary>
+    private void CarryResidencyToShapeOnlyView(Tensor<T> view)
+    {
+        if (_gpuBuffer is null || view._gpuBuffer is not null) return;
+        if (!IsContiguous || !view.IsContiguous || view._storageOffset != _storageOffset || view.Length != Length) return;
+        if (!ReferenceEquals(view._storage, _storage)) return;
+        ShareGpuStateWith(view);
+        // Same storage => same GpuCacheVersion; carry "current" only if the source's buffer was current.
+        view._gpuBufferVersion = _gpuBufferVersion == GpuCacheVersion ? view.GpuCacheVersion : -1;
     }
 
     /// <summary>Attaches inverse-permutation gradients to a storage view.</summary>
@@ -4762,7 +4793,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         _gpuBufferContainsRawInt32 = false;
         _gpuDeviceIndex = deviceInfo.Index;
         _device = deviceInfo.Type;
-
+        _gpuBufferVersion = GpuCacheVersion; // filled from the current host data, so in sync (see Gpu())
+        Helpers.ResidentHostMirror.Attach(this);
         return this;
     }
 
@@ -4799,11 +4831,20 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (IsGpuResident)
             return this;
 
-        var directGpu = Engines.Engine.DirectGpu;
-        if (directGpu is null || !directGpu.IsAvailable || directGpu.Backend is null)
-            return this;
-
-        var backend = directGpu.Backend;
+        // Place onto the SAME backend the active dispatcher executes on, as To() does. Engine.DirectGpu is a
+        // separate lazily-created DirectGpuEngine with its own backend (context + stream), so a buffer placed there
+        // was not the buffer the dispatcher's kernels and fused optimizers read and wrote.
+        Engines.DirectGpu.IDirectGpuBackend? backend =
+            Engines.AiDotNetEngine.Current is Engines.DirectGpuTensorEngine dispatcher
+                ? dispatcher.PlacementBackend
+                : null;
+        if (backend is null)
+        {
+            var directGpu = Engines.Engine.DirectGpu;
+            if (directGpu is null || !directGpu.IsAvailable || directGpu.Backend is null)
+                return this;
+            backend = directGpu.Backend;
+        }
         var logicalData = IsContiguous ? GetDataArray() : GetFlattenedData();
         var floatData = Engines.DirectGpu.DirectGpuEngine.ToFloatArray(logicalData);
         _gpuBuffer = backend.AllocateBuffer(floatData);
@@ -4837,6 +4878,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             "DIRECTML" or "DML" => TensorDevice.DirectML,
             _ => TensorDevice.CUDA
         };
+        // Device-owned from here on: a device-side write (MarkModified) arms a download into the host slice.
+        Helpers.ResidentHostMirror.Attach(this);
 
         return this;
     }

@@ -177,13 +177,6 @@ public sealed class GradientTape<T> : IDisposable
     public IEngine Engine => _engine;
 
     /// <summary>
-    /// Binds this tape to <paramref name="engine"/> if no engine has yet been
-    /// explicitly bound. Idempotent — once bound, subsequent calls are
-    /// no-ops. Engine recording paths (e.g. <see cref="CpuEngine.BatchNorm{T}"/>)
-    /// call this with <c>this</c> so the backward walk dispatches to the same
-    /// engine instance the user invoked the forward op on. Closes #350.
-    /// </summary>
-    /// <summary>
     /// Records where a tensor's data lived when it was taped, so the backward can be dispatched to the
     /// device that actually holds it.
     /// </summary>
@@ -194,9 +187,18 @@ public sealed class GradientTape<T> : IDisposable
     /// </remarks>
     internal void NoteDataDevice(Tensor<T>? tensor)
     {
-        if (_engineExplicitlyBound || _sawGpuResidentData || tensor is null) return;
-        if (tensor.HasPendingGpuData) _sawGpuResidentData = true;
+        if (_engineExplicitlyBound || tensor is null) return;
+        if (_sawGpuResidentData && ReferenceEquals(tensor._gpuBackend, _dataBackend)) return;
+        if (!tensor.HasPendingGpuData) return;
+        // Only the backend is kept; the engine is resolved when the backward runs (ResolveEngineFromData). A persistent
+        // tape records again after a backward, and by then the engine seen first may be disposed or the new entries may
+        // live on another backend - the newest such backend wins.
+        _sawGpuResidentData = true;
+        _dataBackend = tensor._gpuBackend;
     }
+
+    private Engines.DirectGpu.IDirectGpuBackend? _dataBackend;
+    private IEngine _defaultEngine = null!;
 
     /// <summary>
     /// Picks the backward engine from where the taped data lives, unless an engine bound itself.
@@ -210,10 +212,31 @@ public sealed class GradientTape<T> : IDisposable
     private void ResolveEngineFromData()
     {
         if (_engineExplicitlyBound) return;
-        if (_sawGpuResidentData) return;   // Current is the GPU engine that produced the data.
+        if (_sawGpuResidentData)
+        {
+            // The engine that PRODUCED the data, not whatever engine was global when the tape was created: measured,
+            // a tape over data from a test fixture's GPU engine ran its backward on the host whenever an earlier test
+            // had left AiDotNetEngine.Current as a CpuEngine ("dA was computed on the host"). Prefer the tape's own
+            // default when it drives that backend (several engines can share one); otherwise the registry's newest
+            // live owner. Never a disposed engine.
+            var engine = _defaultEngine is DirectGpuTensorEngine own && !own.IsDisposed
+                         && ReferenceEquals(own.GetBackend(), _dataBackend)
+                ? own
+                : DirectGpuTensorEngine.EngineOwning(_dataBackend);
+            if (engine is not null) _engine = engine;
+            else if (_engine is DirectGpuTensorEngine { IsDisposed: true }) _engine = CpuFallbackEngine;
+            return;
+        }
         if (_engine is DirectGpuTensorEngine) _engine = CpuFallbackEngine;
     }
 
+    /// <summary>
+    /// Binds this tape to <paramref name="engine"/> if no engine has yet been
+    /// explicitly bound. Idempotent — once bound, subsequent calls are
+    /// no-ops. Engine recording paths (e.g. <see cref="CpuEngine.BatchNorm{T}"/>)
+    /// call this with <c>this</c> so the backward walk dispatches to the same
+    /// engine instance the user invoked the forward op on. Closes #350.
+    /// </summary>
     public void BindEngineIfUnset(IEngine engine)
     {
         if (_engineExplicitlyBound) return;
@@ -275,6 +298,7 @@ public sealed class GradientTape<T> : IDisposable
         // divergences in the 1e-7 range that look like FMA noise but are
         // actually two distinct backward kernels racing on different devices.
         _engine = AiDotNetEngine.Current;
+        _defaultEngine = _engine;
         _engineExplicitlyBound = false;
         _parent = _current;
 
@@ -1663,6 +1687,14 @@ public sealed class GradientTape<T> : IDisposable
     // Cached delegate chain for persistent tapes — avoids topological sort on repeat backward
     private CompiledDelegateChain<T>? _cachedDelegateChain;
 
+    private static bool ChainRootedAt(CompiledDelegateChain<T> chain, Tensor<T> loss)
+    {
+        var steps = chain.Steps;
+        for (int i = 0; i < steps.Length; i++)
+            if (ReferenceEquals(steps[i].Output, loss)) return true;
+        return false;
+    }
+
     private Dictionary<Tensor<T>, Tensor<T>> ComputeGradientsViaGraph(
         Tensor<T> loss,
         IReadOnlyList<Tensor<T>>? sources)
@@ -1782,6 +1814,13 @@ public sealed class GradientTape<T> : IDisposable
             // by AccumulateGrad on the next forward+backward anyway,
             // so clearing here only severs the per-tensor mirror — the
             // returned grads dict carries the data either way.
+            // Only a chain built for THIS loss: its steps address the tensors of the recording it was built from, so
+            // replaying it for another recording's loss seeds a gradient nothing reads and returns no gradients.
+            if (_cachedDelegateChain is not null && !ChainRootedAt(_cachedDelegateChain, loss))
+            {
+                _cachedDelegateChain.Clear();
+                _cachedDelegateChain = null;
+            }
             if (_cachedDelegateChain is not null)
             {
                 var cachedResult = _cachedDelegateChain.Execute(
@@ -2382,6 +2421,14 @@ public sealed class GradientTape<T> : IDisposable
 
         ReleaseSavedStatePins(_entries.Count);
         _entries.Reset();
+        // The cached backward chain addresses the entries just dropped.
+        _cachedDelegateChain?.Clear();
+        _cachedDelegateChain = null;
+        // The next recording decides its own device: a persistent tape reused across steps must not keep the engine
+        // the previous step's data resolved to.
+        _sawGpuResidentData = false;
+        _dataBackend = null;
+        if (!_engineExplicitlyBound) _engine = _defaultEngine;
     }
 
     /// <summary>

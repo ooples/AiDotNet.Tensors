@@ -34,7 +34,24 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     // exit, not per-test context destruction). cuCtxDestroy already reclaimed that buffer's memory, so
     // the finalizer skips the native free when its context is no longer registered here. Added at
     // cuCtxCreate, removed immediately before cuCtxDestroy.
-    internal static readonly ConcurrentDictionary<IntPtr, byte> LiveContexts = new();
+    //
+    // Keyed by handle, VALUED by a registration generation that is never reused. The driver reuses context handle
+    // VALUES once a context is destroyed, and a new context can be handed device addresses a destroyed one used. A
+    // free queued for a buffer of a dead context therefore looked "live" as soon as a new context received the same
+    // handle, and freed that address inside the new context - a live allocation of some unrelated engine. The same
+    // held for a deferred context destroy, which could destroy a live context. Only a long process creates enough
+    // contexts for this: measured as captured training steps replaying garbage (0 / 0.0003 / 14.69 / 251 against a
+    // true 0.39) only in the full test suite. Every liveness check compares the generation, not the handle.
+    internal static readonly ConcurrentDictionary<IntPtr, long> LiveContexts = new();
+    private static long s_contextGenerations;
+
+    /// <summary>True when <paramref name="context"/> is still the registration <paramref name="generation"/> named.</summary>
+    internal static bool IsLiveContext(IntPtr context, long generation)
+        => context != IntPtr.Zero && LiveContexts.TryGetValue(context, out long live) && live == generation;
+
+    /// <summary>The current registration generation of a live context, or 0.</summary>
+    internal static long ContextGenerationOf(IntPtr context)
+        => context != IntPtr.Zero && LiveContexts.TryGetValue(context, out long live) ? live : 0;
 
     // #226 crash fix: live async-free streams. A buffer finalizer defers its free as (ptr, ctx, stream) and
     // DrainPendingFinalizerFrees replays it later; if the owning engine tore its stream down in between,
@@ -73,7 +90,16 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     private readonly ConcurrentDictionary<string, IntPtr> _kernelCache;
     internal bool HasWhereSelectKernel => _kernelCache.ContainsKey("where_select");
     private IntPtr _cudaContext;
-    private IntPtr _stream;
+    private long _contextGeneration; // this context's LiveContexts registration (see LiveContexts)
+
+    /// <summary>True while this backend's CUDA context has not been destroyed (engine disposal destroys it; the
+    /// backend object and its buffers can outlive it). Anything that would touch the device - a download included -
+    /// must check this first, or it throws "Invalid context".</summary>
+    internal bool ContextIsLive => _cudaContext != IntPtr.Zero && IsLiveContext(_cudaContext, _contextGeneration);
+    // The backend's one compute stream. Every op reaches it through _stream, which a thread capturing a CUDA graph
+    // resolves to this backend's PRIVATE capture stream instead (ResolveCaptureStream) - see CudaBackend.Graph.cs.
+    private IntPtr _mainStream;
+    private IntPtr _stream => ResolveCaptureStream(_mainStream);
 
     // #226 CONCURRENCY FIX — PER-THREAD cuBLAS HANDLE (instance-scoped).
     // A cuBLAS handle is NOT thread-safe: NVIDIA requires one handle per host thread (the handle carries
@@ -410,7 +436,9 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     public bool SupportsAsyncTransfer => true;
     public bool SupportsGraphCapture => false; // CUDA graphs not yet implemented
     public int MaxConcurrentStreams => 16;
-    public IGpuStream DefaultStream => _defaultStream ?? throw new InvalidOperationException("Backend not initialized");
+    public IGpuStream DefaultStream => IsCapturingOnThisBackend && _captureStreamWrapper is { } capturing
+        ? capturing
+        : _defaultStream ?? throw new InvalidOperationException("Backend not initialized");
 
     public static bool IsCudaAvailable => CudaNativeBindings.IsAvailable && NvrtcNativeBindings.IsAvailable;
 
@@ -523,10 +551,11 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
                 CuBlasNative.cuCtxCreate(
                     out _cudaContext, contextScheduling, device),
                 "cuCtxCreate");
-            LiveContexts[_cudaContext] = 0; // register: a buffer finalizer may only free against a live context
-            CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamCreate(out _stream, 0), "cuStreamCreate");
+            _contextGeneration = System.Threading.Interlocked.Increment(ref s_contextGenerations);
+            LiveContexts[_cudaContext] = _contextGeneration; // register: a buffer finalizer may only free against a live context
+            CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamCreate(out _mainStream, 0), "cuStreamCreate");
             LiveStreams[_stream] = 0; // register: deferred finalizer frees stay stream-ordered while it's live
-            _defaultStream = new CudaStream(this, _stream, GpuStreamType.Default, ownsHandle: false);
+            _defaultStream = new CudaStream(this, _mainStream, GpuStreamType.Default, ownsHandle: false);
 
             // Stream-ordered allocator setup (#558 layer 6). Retain freed memory in the pool for reuse
             // (caching-allocator behaviour) by maxing the release threshold; disable if the pool query
@@ -1522,7 +1551,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             // Reuse a pooled stream-ordered buffer when one fits, and stage the copy so it does not block the host.
             var target = TryRentAsyncBuffer(size)
                 ?? new CudaGpuBuffer(_cudaContext, AllocDeviceMemoryAsync(byteSize), size,
-                    returnToPool: ReturnAsyncBuffer, asyncFreeStream: _stream);
+                    returnToPool: ReturnAsyncBuffer, asyncFreeStream: _mainStream);
             try
             {
                 if (TryStageUpload(target.Handle, data, byteSize))
@@ -1618,6 +1647,9 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             buffer.Dispose();
             return;
         }
+        // An event recorded on the capturing stream becomes a captured event that cuEventQuery rejects later. (Only
+        // synchronously allocated buffers get here, and those cannot have been allocated inside a capture.)
+        if (TryDeferReleaseUntilCaptureEnds(allocatedDuringCapture: false, () => FreeBufferDeferred(buffer))) return;
         CudaEvent evt;
         using (PushContext())
             evt = new CudaEvent(this, _defaultStream, enableTiming: false); // creates + records on the compute stream
@@ -1634,6 +1666,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     /// </summary>
     public void DrainDeferredFrees(bool blockOldest)
     {
+        if (IsCapturingOnThisThread) return;
         lock (_deferredFreeLock)
         {
             while (_deferredFrees.Count > 0)
@@ -1753,7 +1786,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
                 // A failed sync here is almost always a STICKY context error (the very CUDA-700 this
                 // allocator guards against), NOT out-of-memory — throw with its real name so the OOM
                 // diagnostic below isn't misleading. Trim is best-effort: warn but still attempt the retry.
-                CuBlasNative.CheckCudaResult(CudaNativeBindings.cuCtxSynchronize(), "cuCtxSynchronize (async-pool OOM reclamation)");
+                CuBlasNative.CheckCudaResult(SynchronizeContextOutsideCapture(_cudaContext), "cuCtxSynchronize (async-pool OOM reclamation)");
                 var trimStatus = CuBlasNative.cuMemPoolTrimTo(_asyncMemPool, 0);
                 if (trimStatus != CudaResult.Success)
                     System.Diagnostics.Trace.TraceWarning(
@@ -1814,7 +1847,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             CuBlasNative.CheckCudaResult(
                 CudaNativeBindings.cuMemsetD8Async(p, 0, (ulong)size * sizeof(float), _stream),
                 "cuMemsetD8Async");
-            return new CudaGpuBuffer(_cudaContext, p, size, returnToPool: ReturnAsyncBuffer, asyncFreeStream: _stream);
+            return new CudaGpuBuffer(_cudaContext, p, size, returnToPool: ReturnAsyncBuffer, asyncFreeStream: _mainStream);
         }
         if (_bufferPool.TryRent(size, out var pooled) && pooled != null)
         {
@@ -1826,7 +1859,9 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
 
         ulong byteSize = (ulong)size * sizeof(float);
         IntPtr devicePtr = AllocDeviceMemoryWithRetry(byteSize);
-        CuBlasNative.CheckCudaResult(CuBlasNative.cuMemsetD32(devicePtr, 0, (ulong)size), "cuMemsetD32");
+        // Stream-ordered: a synchronous cuMemset runs on the legacy stream, which is illegal while _stream is being
+        // captured (CUDA 906) and serializes the device everywhere else.
+        CuBlasNative.CheckCudaResult(CudaNativeBindings.cuMemsetD32Async(devicePtr, 0, (ulong)size, _stream), "cuMemsetD32Async");
         return new CudaGpuBuffer(_cudaContext, devicePtr, size, _bufferPool.Return);
     }
 
@@ -1847,7 +1882,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (TryRentAsyncBuffer(size) is { } reused)
             return reused;
         var p = AllocDeviceMemoryAsync((ulong)size * sizeof(float));
-        return new CudaGpuBuffer(_cudaContext, p, size, returnToPool: ReturnAsyncBuffer, asyncFreeStream: _stream);
+        return new CudaGpuBuffer(_cudaContext, p, size, returnToPool: ReturnAsyncBuffer, asyncFreeStream: _mainStream);
     }
 
     public IGpuBuffer AllocateByteBuffer(int size)
@@ -1864,7 +1899,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (_asyncAlloc)
         {
             var pA = AllocDeviceMemoryAsync((ulong)size);
-            return new CudaGpuByteBuffer(_cudaContext, pA, size, asyncFreeStream: _stream);
+            return new CudaGpuByteBuffer(_cudaContext, pA, size, asyncFreeStream: _mainStream);
         }
         CuBlasNative.CheckCudaResult(
             CuBlasNative.cuMemAlloc(out IntPtr devicePtr, (ulong)size),
@@ -1905,7 +1940,12 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             // Buffers parked in the host-side reuse pool are still allocated as far as the driver knows; release
             // them first (stream-ordered frees) so the sync + trim below can hand their memory to this request.
             _bufferPool.DrainAll();
-            CuBlasNative.CheckCudaResult(CudaNativeBindings.cuCtxSynchronize(), "cuCtxSynchronize (async-pool OOM reclamation)");
+            // GPU results are owned by their tensors and freed by the buffer finalizer once unreachable; the GC
+            // cannot see device memory, so collect now, run those finalizers, and free what they queued.
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            DrainPendingFinalizerFrees();
+            CuBlasNative.CheckCudaResult(SynchronizeContextOutsideCapture(_cudaContext), "cuCtxSynchronize (async-pool OOM reclamation)");
             if (_asyncMemPool != IntPtr.Zero)
             {
                 var trimStatus = CuBlasNative.cuMemPoolTrimTo(_asyncMemPool, 0);
@@ -1967,8 +2007,34 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         }
     }
 
+    // AIDOTNET_GRAPH_CAPTURE_DEBUG=1: every device-to-host read made while an engine is on the compiled capture path
+    // (the pre-pass or the capture itself) is a whole-step-capture blocker; log each distinct call site once.
+    private static readonly bool s_captureHostReadDebug =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1";
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> s_captureHostReadSites = new();
+
+    private static void TraceCapturePathHostRead()
+    {
+        if (!s_captureHostReadDebug || System.Threading.Volatile.Read(ref DirectGpuTensorEngine.s_capturePathEngines) == 0) return;
+        var frames = new System.Diagnostics.StackTrace(2, false).GetFrames();
+        var site = new System.Text.StringBuilder();
+        int kept = 0;
+        foreach (var f in frames ?? Array.Empty<System.Diagnostics.StackFrame>())
+        {
+            var m = f.GetMethod();
+            if (m?.DeclaringType is null) continue;
+            site.Append(" <- ").Append(m.DeclaringType.Name).Append('.').Append(m.Name);
+            if (++kept == 10) break;
+        }
+        var key = site.ToString();
+        if (s_captureHostReadSites.TryAdd(key, 0))
+            try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphcapture_diag.txt"),
+                "[CAPTURE-PATH-HOST-READ]" + key + System.Environment.NewLine); } catch { }
+    }
+
     public void DownloadBuffer(IGpuBuffer buffer, float[] destination)
     {
+        TraceCapturePathHostRead();
         // #226: never issue a device→host copy from a released buffer. After CudaGpuBuffer.Release
         // the device pointer is zeroed; cuMemcpyDtoH from a null/freed pointer is an ILLEGAL memory
         // access that corrupts the CUDA context — every subsequent driver call then fails with error
@@ -5634,7 +5700,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     {
         IntPtr ctx = _cudaContext;
         if (ctx != IntPtr.Zero && _threadCurrentContext != ctx && !IsRuntimeTearingDown &&
-            LiveContexts.ContainsKey(ctx))
+            IsLiveContext(ctx, _contextGeneration))
         {
             CuBlasNative.CheckCudaResult(
                 CudaNativeBindings.cuCtxSetCurrent(ctx),
@@ -5694,17 +5760,21 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     // GC, never crashes). Instead the finalizer just enqueues the pointer, and the free runs here on a
     // real op thread (with this engine's context current) at the next GPU op. A pending entry whose
     // context was meanwhile destroyed is dropped — cuCtxDestroy already reclaimed that memory.
-    internal static readonly ConcurrentQueue<(IntPtr Ptr, IntPtr Ctx, IntPtr Stream)> PendingFinalizerFrees = new();
+    internal static readonly ConcurrentQueue<(IntPtr Ptr, IntPtr Ctx, long Gen, IntPtr Stream)> PendingFinalizerFrees = new();
 
     internal static void DrainPendingFinalizerFrees()
     {
+        // Inside a capture every free would be recorded into the graph (see TryDeferReleaseUntilCaptureEnds); the
+        // queue drains at the first op after it.
+        if (IsCapturingOnThisThread) return;
+        List<(IntPtr Ptr, IntPtr Ctx, long Gen, IntPtr Stream)>? capturing = null;
         while (PendingFinalizerFrees.TryDequeue(out var f))
         {
             if (f.Ptr == IntPtr.Zero) continue;
             lock (ContextLifecycleLock)
             {
                 if (f.Ctx == IntPtr.Zero || IsRuntimeTearingDown || ProcessExiting
-                    || !LiveContexts.ContainsKey(f.Ctx))
+                    || !IsLiveContext(f.Ctx, f.Gen))
                     continue; // context gone — its device memory was reclaimed by cuCtxDestroy
                 try
                 {
@@ -5716,7 +5786,14 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
                     // (checked above under the lock). LiveStreams membership and the free are both under
                     // ContextLifecycleLock, so this never races the atomic {remove + cuStreamDestroy} in Dispose.
                     if (f.Stream != IntPtr.Zero && LiveStreams.ContainsKey(f.Stream))
-                        CuBlasNative.cuMemFreeAsync(f.Ptr, f.Stream);
+                    {
+                        // Another thread is capturing this stream: a free issued now would join its graph.
+                        if (CudaNativeBindings.cuStreamIsCapturing(f.Stream, out int captureStatus) == CudaResult.Success
+                            && captureStatus != 0)
+                            (capturing ??= new List<(IntPtr, IntPtr, long, IntPtr)>()).Add(f);
+                        else
+                            CuBlasNative.cuMemFreeAsync(f.Ptr, f.Stream);
+                    }
                     else
                         CuBlasNative.cuMemFree(f.Ptr);
                     CuBlasNative.cuCtxPopCurrent(out _);
@@ -5724,6 +5801,8 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
                 catch { }
             }
         }
+        if (capturing is not null)
+            foreach (var f in capturing) PendingFinalizerFrees.Enqueue(f);
     }
 
     // Whole-CONTEXT teardowns DEFERRED from the CudaBackend FINALIZER (an engine that was never Dispose()d).
@@ -5731,7 +5810,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     // leaks the entire ~200 MB context for the rest of the process. So the finalizer captures the context
     // handle (an IntPtr, safe to read) and a real op thread destroys it here. cuCtxDestroy reclaims the
     // context's stream, buffers, cuBLAS handles and modules in ONE call, so the context is all we need.
-    internal static readonly ConcurrentQueue<(IntPtr Ctx, IntPtr Stream)> PendingContextDestroys = new();
+    internal static readonly ConcurrentQueue<(IntPtr Ctx, long Gen, IntPtr Stream)> PendingContextDestroys = new();
 
     internal static void DrainPendingContextDestroys()
     {
@@ -5740,7 +5819,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             if (c.Ctx == IntPtr.Zero) continue;
             lock (ContextLifecycleLock)
             {
-                if (IsRuntimeTearingDown || ProcessExiting || !LiveContexts.ContainsKey(c.Ctx))
+                if (IsRuntimeTearingDown || ProcessExiting || !IsLiveContext(c.Ctx, c.Gen))
                     continue; // already torn down / process exiting (OS reclaims)
                 // Deregister BEFORE destroying so any concurrent buffer-free drain for this context (under
                 // the same lock) sees it gone and skips — never freeing into a context we just destroyed.
@@ -8766,7 +8845,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         using var _ = PushContext();
         ulong byteSize = (ulong)size * sizeof(int);
         CuBlasNative.CheckCudaResult(CuBlasNative.cuMemAlloc(out IntPtr devicePtr, byteSize), "cuMemAlloc(int)");
-        CuBlasNative.CheckCudaResult(CuBlasNative.cuMemsetD32(devicePtr, 0, (ulong)size), "cuMemsetD32(int)");
+        CuBlasNative.CheckCudaResult(CudaNativeBindings.cuMemsetD32Async(devicePtr, 0, (ulong)size, _stream), "cuMemsetD32Async(int)");
         return new CudaGpuBuffer(_cudaContext, devicePtr, size);
     }
 
@@ -9556,9 +9635,12 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         // cuMemsetD32 sets 32-bit values (net471 compatible conversion)
         byte[] bytes = BitConverter.GetBytes(value);
         uint bits = BitConverter.ToUInt32(bytes, 0);
+        // Stream-ordered on _stream. The synchronous cuMemsetD32 ran on the legacy stream: inside a whole-step graph
+        // capture that is CUDA 906 (it would make the legacy stream wait on the capturing one), which threw out of
+        // ReduceMeanBackward's device path, sent it to the CPU fallback, and aborted the capture with a host read.
         CuBlasNative.CheckCudaResult(
-            CuBlasNative.cuMemsetD32(buffer.Handle, bits, (ulong)size),
-            "cuMemsetD32");
+            CudaNativeBindings.cuMemsetD32Async(buffer.Handle, bits, (ulong)size, _stream),
+            "cuMemsetD32Async");
         GpuLaunchProbe.OnLaunch();   // device-side memset IS GPU work
     }
 
@@ -10521,8 +10603,8 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     {
         using var _ = PushContext();
         CuBlasNative.CheckCudaResult(
-            CuBlasNative.cuMemcpyDtoD(destination.Handle, source.Handle, (nuint)(size * sizeof(float))),
-            "cuMemcpyDtoD (CopyBuffer)");
+            CudaNativeBindings.cuMemcpyDtoDAsync(destination.Handle, source.Handle, (ulong)size * sizeof(float), _stream),
+            "cuMemcpyDtoDAsync (CopyBuffer)");
         GpuLaunchProbe.OnLaunch();   // device-side copy IS GPU work — see the note on the 3-arg Copy
     }
 
@@ -17118,7 +17200,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             // stream, buffers, cuBLAS handles and modules in one shot. Skip during process/runtime teardown
             // (driver may be gone; the OS reclaims everything at exit).
             if (!disposing && !IsRuntimeTearingDown && !ProcessExiting && _cudaContext != IntPtr.Zero)
-                PendingContextDestroys.Enqueue((_cudaContext, _stream));
+                PendingContextDestroys.Enqueue((_cudaContext, _contextGeneration, _mainStream));
             return;
         }
 
@@ -17185,7 +17267,19 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             _threadCublas = null;
         }
 
-        if (_stream != IntPtr.Zero)
+        if (_captureStream != IntPtr.Zero)
+        {
+            lock (ContextLifecycleLock)
+            {
+                LiveStreams.TryRemove(_captureStream, out _);
+                CudaNativeBindings.cuStreamDestroy(_captureStream);
+                _captureStream = IntPtr.Zero;
+            }
+            if (_captureOrderEvent != IntPtr.Zero) CudaNativeBindings.cuEventDestroy(_captureOrderEvent);
+            _captureOrderEvent = IntPtr.Zero;
+        }
+
+        if (_mainStream != IntPtr.Zero)
         {
             // #226 crash fix: buffer FINALIZERS enqueue deferred frees (ptr, ctx, _stream) that
             // DrainPendingFinalizerFrees replays later. Deregister the stream from LiveStreams and destroy it
@@ -17195,9 +17289,9 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             // destroyed stream (the uncatchable 0xC0000005 that FailFast-crashes the host).
             lock (ContextLifecycleLock)
             {
-                LiveStreams.TryRemove(_stream, out _);
-                CudaNativeBindings.cuStreamDestroy(_stream);
-                _stream = IntPtr.Zero;
+                LiveStreams.TryRemove(_mainStream, out _);
+                CudaNativeBindings.cuStreamDestroy(_mainStream);
+                _mainStream = IntPtr.Zero;
             }
         }
 
@@ -18333,6 +18427,8 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         private IntPtr _devicePtr;
         private readonly Action<CudaGpuBuffer>? _returnToPool;
         private readonly IntPtr _asyncFreeStream; // non-zero ⇒ free via cuMemFreeAsync on this stream (#558 layer 6)
+        private readonly bool _allocatedDuringCapture; // a graph-owned allocation: its free belongs in the capture
+        private readonly long _contextGeneration = 0; // the context registration this memory belongs to
         private int _poolState;
         private int _size;
 
@@ -18352,6 +18448,8 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             Capacity = size;
             _returnToPool = returnToPool;
             _asyncFreeStream = asyncFreeStream;
+            _allocatedDuringCapture = IsCapturingOnThisThread;
+            _contextGeneration = ContextGenerationOf(context);
         }
 
         public void MarkRented(int size)
@@ -18368,6 +18466,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             // until after the graph runs — the recorded op graph still references this buffer.
             // The queued closure holds a strong ref, so GC can't reclaim it in the meantime.
             if (AiDotNet.Tensors.Engines.Gpu.GpuBufferReleaseDeferral.TryDefer(ReleaseCore)) return;
+            if (TryDeferReleaseUntilCaptureEnds(_allocatedDuringCapture, ReleaseCore)) return;
             ReleaseCore();
         }
 
@@ -18400,7 +18499,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
                 // can't cuCtxDestroy this context between the check and the cuCtxPushCurrent/free.
                 lock (ContextLifecycleLock)
                 {
-                    if (_context != IntPtr.Zero && !ProcessExiting && LiveContexts.ContainsKey(_context))
+                    if (_context != IntPtr.Zero && !ProcessExiting && IsLiveContext(_context, _contextGeneration))
                     {
                         try
                         {
@@ -18408,7 +18507,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
                             GpuMemoryTracker.OnFree(ptr);
                             // Stream-ordered free (#558 layer 6): race-safe + pool-reused in stream order.
                             if (_asyncFreeStream != IntPtr.Zero)
-                                CuBlasNative.cuMemFreeAsync(ptr, _asyncFreeStream);
+                                CuBlasNative.cuMemFreeAsync(ptr, ResolveCaptureStream(_asyncFreeStream));
                             else
                                 CuBlasNative.cuMemFree(ptr);
                             CuBlasNative.cuCtxPopCurrent(out _);
@@ -18431,6 +18530,9 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             // scope finishes — returning to the pool mid-record could re-rent + overwrite a
             // buffer the recorded graph still reads. Runs normally once the gate is cleared.
             if (AiDotNet.Tensors.Engines.Gpu.GpuBufferReleaseDeferral.TryDefer(DisposeCore)) return;
+            // Pool return counts too: a pre-capture buffer recycled mid-capture could be re-rented by the capture and
+            // then handed to another owner after it, while every graph launch still writes it.
+            if (TryDeferReleaseUntilCaptureEnds(_allocatedDuringCapture, DisposeCore)) return;
             DisposeCore();
         }
 
@@ -18464,7 +18566,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             // enqueue nothing, so the pointer is never freed twice (the double-free that crashed the host).
             var ptr = Interlocked.Exchange(ref _devicePtr, IntPtr.Zero);
             if (ptr != IntPtr.Zero && !IsRuntimeTearingDown && !ProcessExiting)
-                PendingFinalizerFrees.Enqueue((ptr, _context, _asyncFreeStream));
+                PendingFinalizerFrees.Enqueue((ptr, _context, _contextGeneration, _asyncFreeStream));
             _context = IntPtr.Zero;
         }
     }
@@ -18474,6 +18576,8 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         private IntPtr _context;
         private IntPtr _devicePtr;
         private readonly IntPtr _asyncFreeStream; // #558 layer 6: free via cuMemFreeAsync when non-zero
+        private readonly bool _allocatedDuringCapture; // see CudaGpuBuffer
+        private readonly long _contextGeneration = 0; // see CudaGpuBuffer
 
         public int Size { get; }
         public long SizeInBytes { get; }
@@ -18487,9 +18591,17 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             Size = size;
             SizeInBytes = size;
             _asyncFreeStream = asyncFreeStream;
+            _allocatedDuringCapture = IsCapturingOnThisThread;
+            _contextGeneration = ContextGenerationOf(context);
         }
 
         public void Dispose()
+        {
+            if (TryDeferReleaseUntilCaptureEnds(_allocatedDuringCapture, DisposeCore)) return;
+            DisposeCore();
+        }
+
+        private void DisposeCore()
         {
             // Atomically CLAIM the device pointer so a concurrent finalizer can't enqueue the SAME pointer
             // for a deferred free (double-free → uncatchable 0xC0000005 in DrainPendingFinalizerFrees).
@@ -18511,7 +18623,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
                 // can't cuCtxDestroy this context between the check and the cuCtxPushCurrent/free.
                 lock (ContextLifecycleLock)
                 {
-                    if (_context != IntPtr.Zero && !ProcessExiting && LiveContexts.ContainsKey(_context))
+                    if (_context != IntPtr.Zero && !ProcessExiting && IsLiveContext(_context, _contextGeneration))
                     {
                         try
                         {
@@ -18519,7 +18631,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
                             GpuMemoryTracker.OnFree(ptr);
                             // Stream-ordered free (#558 layer 6): race-safe + pool-reused in stream order.
                             if (_asyncFreeStream != IntPtr.Zero)
-                                CuBlasNative.cuMemFreeAsync(ptr, _asyncFreeStream);
+                                CuBlasNative.cuMemFreeAsync(ptr, ResolveCaptureStream(_asyncFreeStream));
                             else
                                 CuBlasNative.cuMemFree(ptr);
                             CuBlasNative.cuCtxPopCurrent(out _);
@@ -18544,7 +18656,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             // so it is never freed twice (the double-free that crashed the host).
             var ptr = Interlocked.Exchange(ref _devicePtr, IntPtr.Zero);
             if (ptr != IntPtr.Zero && !IsRuntimeTearingDown && !ProcessExiting)
-                PendingFinalizerFrees.Enqueue((ptr, _context, _asyncFreeStream));
+                PendingFinalizerFrees.Enqueue((ptr, _context, _contextGeneration, _asyncFreeStream));
             _context = IntPtr.Zero;
         }
     }

@@ -2024,7 +2024,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -2063,7 +2063,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -2137,7 +2137,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -2465,7 +2465,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // result so the compiled plan reads the CURRENT running mean/variance each step.
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var capX = x; var capG = gamma; var capB = beta; var capM = mean; var capV = variance; double capE = epsilon;
@@ -2510,7 +2510,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // would bake placeholder data into the frozen BN output.
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var capX = x; var capG = gamma; var capB = beta; var capM = mean; var capV = variance;
@@ -2660,7 +2660,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("BatchMatMul", a._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null && a.Rank >= 2 && b.Rank >= 2 && a.Rank == b.Rank)
             {
                 var outShape = ComputeMatMulOutputShape(a._shape, b._shape);
@@ -3049,7 +3049,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Lazy graph mode: record and return placeholder
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 scope.BindEngineIfUnset(this);
@@ -3227,7 +3227,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // must accumulate FROM that condition, not from a polluted one.
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var ca = a; var cb = b;
@@ -3417,7 +3417,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 nameof(bias));
         }
 
-        var scope = GraphMode.Current;
+        var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
         if (scope is not null)
         {
             var capturedInput = input;
@@ -3510,7 +3510,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorBroadcastAdd", a._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var capturedA = a;
@@ -3620,7 +3620,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorBroadcastSubtract", a._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var capturedA = a;
@@ -3736,7 +3736,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorBroadcastDivide", a._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var capturedA = a;
@@ -3794,7 +3794,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorBroadcastMultiply", a._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var capturedA = a;
@@ -4173,7 +4173,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Issue #350 v3 (GraphMode-aware in-place op — record-only).
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var ca = a; var cb = b;
@@ -4508,7 +4508,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Issue #350 v3 (GraphMode-aware in-place op).
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var ct = tensor;
@@ -4567,7 +4567,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Issue #350 v3 (GraphMode-aware in-place op).
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var ct = tensor;
@@ -4631,7 +4631,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Issue #350 v3 (GraphMode-aware in-place op).
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var ct = tensor;
@@ -4687,7 +4687,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Issue #350 v3 (GraphMode-aware in-place op).
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var ct = tensor;
@@ -4739,7 +4739,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Issue #350 v3 (GraphMode-aware in-place op).
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var ct = tensor; var ca = alpha;
@@ -5538,7 +5538,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var captured = tensors.ToArray(); return scope.RecordVariadic(LazyNodeType.Custom, "TensorAddMany", captured, referenceShape, (eng, output) => { var r = eng.TensorAddMany(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.AddManyBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var captured = tensors.ToArray(); return scope.RecordVariadic(LazyNodeType.Custom, "TensorAddMany", captured, referenceShape, (eng, output) => { var r = eng.TensorAddMany(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.AddManyBackward); } }
 
         var numOps = MathHelper.GetNumericOperations<T>();
         int length = tensors[0].Length;
@@ -5608,7 +5608,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Lazy graph mode: record and return placeholder
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 // Bind THIS engine to the scope so the compiled plan replays
@@ -5771,7 +5771,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Lazy graph mode: record and return placeholder
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 scope.BindEngineIfUnset(this);
@@ -5908,7 +5908,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Issue #350 v3 (GraphMode-aware in-place op — record-only).
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var ca = a; var cb = b;
@@ -6091,7 +6091,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Issue #350 v3 (GraphMode-aware in-place op — record-only).
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var ca = a; var cb = b;
@@ -6208,7 +6208,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // LazyTensorScope.RecordInPlace docstring).
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var ca = a; var csc = scalar;
@@ -6399,7 +6399,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var captured = tensors.ToArray(); return scope.RecordVariadic(LazyNodeType.Custom, "TensorMultiplyMany", captured, referenceShape, (eng, output) => { var r = eng.TensorMultiplyMany(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.MultiplyManyBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var captured = tensors.ToArray(); return scope.RecordVariadic(LazyNodeType.Custom, "TensorMultiplyMany", captured, referenceShape, (eng, output) => { var r = eng.TensorMultiplyMany(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.MultiplyManyBackward); } }
 
         var numOps = MathHelper.GetNumericOperations<T>();
 
@@ -6426,7 +6426,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorMultiplyScalar", tensor._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -6505,7 +6505,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Lazy graph mode: record and return placeholder
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var capturedA = a;
@@ -6820,7 +6820,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -6884,7 +6884,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -6953,7 +6953,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorSqrt", tensor._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -7003,7 +7003,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorAbs", tensor._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -7071,7 +7071,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Lazy graph mode: record and return placeholder
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -7112,7 +7112,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // while gradient propagation terminates at this node.
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 scope.BindEngineIfUnset(this);
@@ -7156,7 +7156,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorPower", tensor._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor; var capturedExp = exponent;
@@ -7237,7 +7237,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (bases == null) throw new ArgumentNullException(nameof(bases));
         if (exponents == null) throw new ArgumentNullException(nameof(exponents));
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_bases = bases; var c_exponents = exponents; return scope.RecordBinary(LazyNodeType.Custom, "TensorPowerTensor", bases, exponents, bases._shape, (eng, output) => { var r = eng.TensorPower(c_bases, c_exponents); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.PowerTensorBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var c_bases = bases; var c_exponents = exponents; return scope.RecordBinary(LazyNodeType.Custom, "TensorPowerTensor", bases, exponents, bases._shape, (eng, output) => { var r = eng.TensorPower(c_bases, c_exponents); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.PowerTensorBackward); } }
 
         var basesOrig = bases;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!bases.IsContiguous) bases = bases.Contiguous();
@@ -7264,7 +7264,7 @@ public partial class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> TensorFloor<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope != null) { var c = tensor; return scope.RecordUnary(LazyNodeType.Custom, "Floor", tensor, tensor._shape, (eng, o) => { var r = eng.TensorFloor(c); r.AsSpan().CopyTo(o.AsWritableSpan()); }, BackwardFunctions<T>.SignBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope != null) { var c = tensor; return scope.RecordUnary(LazyNodeType.Custom, "Floor", tensor, tensor._shape, (eng, o) => { var r = eng.TensorFloor(c); r.AsSpan().CopyTo(o.AsWritableSpan()); }, BackwardFunctions<T>.SignBackward); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("Floor", tensor._shape); if (ac is not null) return ac.Execute(); }
 
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
@@ -7312,7 +7312,7 @@ public partial class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> TensorCeiling<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope != null) { var c = tensor; return scope.RecordUnary(LazyNodeType.Custom, "Ceiling", tensor, tensor._shape, (eng, o) => { var r = eng.TensorCeiling(c); r.AsSpan().CopyTo(o.AsWritableSpan()); }, BackwardFunctions<T>.SignBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope != null) { var c = tensor; return scope.RecordUnary(LazyNodeType.Custom, "Ceiling", tensor, tensor._shape, (eng, o) => { var r = eng.TensorCeiling(c); r.AsSpan().CopyTo(o.AsWritableSpan()); }, BackwardFunctions<T>.SignBackward); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("Ceiling", tensor._shape); if (ac is not null) return ac.Execute(); }
 
 
@@ -7358,7 +7358,7 @@ public partial class CpuEngine : ITensorLevelEngine
     public virtual Tensor<T> TensorRound<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope != null) { var c = tensor; return scope.RecordUnary(LazyNodeType.Custom, "Round", tensor, tensor._shape, (eng, o) => { var r = eng.TensorRound(c); r.AsSpan().CopyTo(o.AsWritableSpan()); }, BackwardFunctions<T>.SignBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope != null) { var c = tensor; return scope.RecordUnary(LazyNodeType.Custom, "Round", tensor, tensor._shape, (eng, o) => { var r = eng.TensorRound(c); r.AsSpan().CopyTo(o.AsWritableSpan()); }, BackwardFunctions<T>.SignBackward); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("Round", tensor._shape); if (ac is not null) return ac.Execute(); }
 
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
@@ -7411,7 +7411,7 @@ public partial class CpuEngine : ITensorLevelEngine
     public Tensor<T> TensorFrac<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_tensor = tensor; return scope.RecordUnary(LazyNodeType.Custom, "TensorFrac", tensor, tensor._shape, (eng, output) => { var r = eng.TensorFrac(c_tensor); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.FracBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var c_tensor = tensor; return scope.RecordUnary(LazyNodeType.Custom, "TensorFrac", tensor, tensor._shape, (eng, output) => { var r = eng.TensorFrac(c_tensor); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.FracBackward); } }
 
 
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
@@ -7439,7 +7439,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("Sin", tensor._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -7494,7 +7494,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("Cos", tensor._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -7555,7 +7555,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (positions._shape.Length != 2 || positions._shape[1] != 3)
             throw new ArgumentException("Positions must be 2D tensor of shape [N, 3]", nameof(positions));
         var outputShape = new[] { positions._shape[0], grid._shape[3] };
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_grid = grid; var c_positions = positions; return scope.RecordBinary(LazyNodeType.Custom, "TensorTrilinearInterpolate", grid, positions, outputShape, (eng, output) => { var r = eng.TensorTrilinearInterpolate(c_grid, c_positions); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.TrilinearInterpolateBackward, savedState: new object[] { c_positions }); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var c_grid = grid; var c_positions = positions; return scope.RecordBinary(LazyNodeType.Custom, "TensorTrilinearInterpolate", grid, positions, outputShape, (eng, output) => { var r = eng.TensorTrilinearInterpolate(c_grid, c_positions); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.TrilinearInterpolateBackward, savedState: new object[] { c_positions }); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorTrilinearInterpolate", outputShape); if (ac is not null) return ac.Execute(); }
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -7800,7 +7800,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorPow", tensor._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -7839,7 +7839,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorMax", a._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var capturedA = a;
@@ -7935,7 +7935,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorMin", a._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var capturedA = a;
@@ -8029,7 +8029,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("Clamp", tensor._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -8184,7 +8184,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Lazy graph mode: record and return placeholder
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 scope.BindEngineIfUnset(this);
@@ -8943,7 +8943,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Lazy graph mode: record and return placeholder
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = input;
@@ -9389,7 +9389,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null && input.Rank == 4)
             {
                 int st = stride == 0 ? poolSize : stride;
@@ -9469,7 +9469,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 int effectiveK = dilation * (kernel._shape[2] - 1) + 1;
@@ -9535,7 +9535,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 int outL = (input._shape[2] + 2 * padding - kernel._shape[2]) / stride + 1;
@@ -9644,7 +9644,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("Conv2D", input._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var outShape = new[] { batch, outChannels, outputHeight, outputWidth };
@@ -10832,7 +10832,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Lazy graph mode: record and return placeholder
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 scope.BindEngineIfUnset(this);
@@ -10914,7 +10914,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Lazy graph mode: record and return placeholder
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -11019,7 +11019,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Issue #350 v3 (GraphMode-aware in-place op).
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var ct = tensor;
@@ -11070,7 +11070,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Issue #350 v3 (GraphMode-aware in-place op).
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var ct = tensor;
@@ -11193,7 +11193,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Lazy graph mode: record and return placeholder
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 // FP16 activation storage (#558): FP16-native ReLU so the activation stays Half end-to-end.
@@ -11315,7 +11315,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Issue #350 v3 (GraphMode-aware in-place op).
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var ct = tensor;
@@ -11366,7 +11366,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Issue #350 v3 (GraphMode-aware in-place op).
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var ct = tensor;
@@ -11511,7 +11511,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 // FP16 activation storage (#558): under an FP16 autocast scope + the opt-in flag, emit GELU
@@ -11617,7 +11617,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -11683,7 +11683,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -11746,7 +11746,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("ELU", tensor._shape, paramHash: alpha.GetHashCode()); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -11839,7 +11839,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -11939,7 +11939,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = input;
@@ -12464,7 +12464,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorTranspose", tensor._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 int rows0 = tensor._shape[0];
@@ -12524,7 +12524,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // PR #362 — fixed here for #365.
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 scope.BindEngineIfUnset(this);
@@ -12627,7 +12627,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (GraphMode.IsActive)
         {
             var outShape = ComputeMatMulOutputShape(a._shape, b._shape);
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 // FP16 activation storage (#555 P2c): under an FP16 autocast scope + the opt-in flag,
@@ -13849,7 +13849,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // because it already has the output to write into.
         if (preAllocatedOutput is null && GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var outShape = new[] { batch, outChannels, outputHeight, outputWidth };
@@ -16654,7 +16654,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (GraphMode.IsActive
             && Autodiff.GradientTape<T>.Current is null)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 maxIndices = new int[batch, channels, outputHeight, outputWidth, 2];
@@ -17017,7 +17017,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // identified in #365.
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 scope.BindEngineIfUnset(this);
@@ -17237,7 +17237,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 int oH = (input._shape[2] + 2 * padding[0] - kernel._shape[2]) / stride[0] + 1;
@@ -17694,7 +17694,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 int oH = (input._shape[2] - 1) * stride[0] - 2 * padding[0] + kernel._shape[2] + outputPadding[0];
@@ -18345,7 +18345,7 @@ public partial class CpuEngine : ITensorLevelEngine
             // under the compiled path (cf. AiDotNet#1328).
             if (GraphMode.IsActive)
             {
-                var scope = GraphMode.Current;
+                var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
                 if (scope != null)
                 {
                     var capturedInput = input;
@@ -18387,7 +18387,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
             if (GraphMode.IsActive)
             {
-                var scope = GraphMode.Current;
+                var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
                 if (scope != null)
                 {
                     var capturedInput = input;
@@ -18554,7 +18554,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
             if (GraphMode.IsActive)
             {
-                var scope = GraphMode.Current;
+                var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
                 if (scope != null)
                 {
                     var capturedInput = input;
@@ -18599,7 +18599,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
             if (GraphMode.IsActive)
             {
-                var scope = GraphMode.Current;
+                var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
                 if (scope != null)
                 {
                     var capturedInput = input;
@@ -20275,7 +20275,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 int effKD = dilation[0] * (kernel._shape[2] - 1) + 1;
@@ -21352,7 +21352,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // tensor buffer always zero because no step produced it.
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 if (input.Rank != 5) throw new ArgumentException($"MaxPool3D requires 5D input; got rank {input.Rank}.", nameof(input));
@@ -21734,7 +21734,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // avg-pool outputs are zero in a compiled plan.
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 // Validate parameters BEFORE indexing into them to avoid
@@ -21766,7 +21766,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 int oD = (input._shape[2] + 2 * padding[0] - poolSize[0]) / stride[0] + 1;
@@ -21979,7 +21979,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("Upsample3D", input._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = input;
@@ -22129,7 +22129,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope is not null)
             {
                 int oD = (inDepth - 1) * stride[0] - 2 * padding[0] + kD + outputPadding[0];
@@ -22381,7 +22381,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope is not null)
             {
                 var outShape = new[] { batch, outChannels, outputHeight, outputWidth };
@@ -22642,7 +22642,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Lazy graph mode: record and return placeholder
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = input;
@@ -23452,7 +23452,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (order < 1)
             throw new ArgumentOutOfRangeException(nameof(order), order, "Order must be at least 1.");
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_order = order; var c_axis = axis; return scope.RecordUnary(LazyNodeType.Custom, "TaylorSoftmax", input, input._shape, (eng, output) => { var r = eng.TaylorSoftmax(c_input, c_order, c_axis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.TaylorSoftmaxBackward, savedState: new object[] { c_order, c_axis }); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var c_input = input; var c_order = order; var c_axis = axis; return scope.RecordUnary(LazyNodeType.Custom, "TaylorSoftmax", input, input._shape, (eng, output) => { var r = eng.TaylorSoftmax(c_input, c_order, c_axis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.TaylorSoftmaxBackward, savedState: new object[] { c_order, c_axis }); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TaylorSoftmax", input._shape); if (ac is not null) return ac.Execute(); }
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -23624,7 +23624,7 @@ public partial class CpuEngine : ITensorLevelEngine
     public Tensor<T> Sparsemax<T>(Tensor<T> input, int axis = -1)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_axis = axis; return scope.RecordUnary(LazyNodeType.Custom, "Sparsemax", input, input._shape, (eng, output) => { var r = eng.Sparsemax(c_input, c_axis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.SparsemaxBackward, savedState: new object[] { c_axis }); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var c_input = input; var c_axis = axis; return scope.RecordUnary(LazyNodeType.Custom, "Sparsemax", input, input._shape, (eng, output) => { var r = eng.Sparsemax(c_input, c_axis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.SparsemaxBackward, savedState: new object[] { c_axis }); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("Sparsemax", input._shape); if (ac is not null) return ac.Execute(); }
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -23933,7 +23933,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // GraphMode: execute eagerly (out params), but record result in graph for compiled plan
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var ci = input; var cg = gamma; var cb = beta; double ce = epsilon;
@@ -25403,7 +25403,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 // FP16 activation storage (#558): FP16-native LayerNorm — input + gamma/beta taken as Half
@@ -26853,7 +26853,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var ci = input; var cg = gamma; var cb = beta; int cn = numGroups; double ce = epsilon;
@@ -27384,7 +27384,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var capturedInput = input;
@@ -27520,7 +27520,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var ci = input; var cg = gamma; double ce = epsilon;
@@ -27858,8 +27858,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     query, graphKey, graphValue, graphMask, scale, out _, softcap);
             }
 
-            var scope = GraphMode.Current!;
-            scope.BindEngineIfUnset(this);
+            var scope = GraphMode.Current!; scope.BindEngineIfUnset(this);
             var graphInputs = new[] { query, key, value };
             var outputShape = new[] { query._shape[0], qHeads, query._shape[2], value._shape[3] };
             object[] savedState = { scale, isCausal, softcap };
@@ -29397,7 +29396,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // ────────────────────────────────────────────────────────────────────
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 // Compute eager once OUTSIDE the graph scope so the lazy graph
@@ -30584,8 +30583,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsInferenceTrace)
         {
-            var scope = GraphMode.Current!;
-            scope.BindEngineIfUnset(this);
+            var scope = GraphMode.Current!; scope.BindEngineIfUnset(this);
             var graphInputs = new[] { query, key, value };
 
             object[] SavedStateFor(int selectedOutput) =>
@@ -31073,7 +31071,7 @@ public partial class CpuEngine : ITensorLevelEngine
             // (cf. AiDotNet#1328 / TensorEmbeddingLookup).
             if (GraphMode.IsActive)
             {
-                var scope = GraphMode.Current;
+                var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
                 if (scope != null)
                 {
                     var capturedNode = nodeFeatures;
@@ -31609,7 +31607,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var cs = source; var ci = indices; int cd = dim; int? co = outputSize;
@@ -32008,7 +32006,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (indices == null)
             throw new ArgumentNullException(nameof(indices));
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var cs = source; var ci = indices; var cd = dim; var co = outputSize; return scope.RecordUnary(LazyNodeType.Custom, "ScatterSoftmax", source, source._shape, (eng, output) => { var r = eng.ScatterSoftmax(cs, ci, cd, co); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.ScatterSoftmaxBackward, savedState: new object[] { ci }); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var cs = source; var ci = indices; var cd = dim; var co = outputSize; return scope.RecordUnary(LazyNodeType.Custom, "ScatterSoftmax", source, source._shape, (eng, output) => { var r = eng.ScatterSoftmax(cs, ci, cd, co); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.ScatterSoftmaxBackward, savedState: new object[] { ci }); } }
 
         { var ac = AutoTracer.TryGetCompiledPlan<T>("ScatterSoftmax", source._shape); if (ac is not null) return ac.Execute(); }
 
@@ -32236,7 +32234,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // GraphMode: record lazy node for compiled plan
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 // Compute output shape
@@ -32542,14 +32540,14 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> ReduceMean<T>(Tensor<T> input, int[] axes, bool keepDims)
     {
-        // Match ReduceSum and the eager reduction contract: null means reduce
-        // every axis. Normalize before graph-shape construction so tracing does
-        // not enumerate a null array even though the eager path supports it.
-        axes ??= Enumerable.Range(0, input.Rank).ToArray();
+        // Match ReduceSum and the eager reduction contract: null or empty means reduce every axis. Normalize before
+        // graph-shape construction: with an empty array the graph recorded an UNREDUCED output shape, then its replay
+        // ran this eager path - a full reduction - into it.
+        if (axes is null || axes.Length == 0) axes = Enumerable.Range(0, input.Rank).ToArray();
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = input;
@@ -33034,7 +33032,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // same bug class as AiDotNet#1328 / TensorEmbeddingLookup.
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var capturedInput = input;
@@ -33199,7 +33197,7 @@ public partial class CpuEngine : ITensorLevelEngine
             : axes;
         var normalizedAxes = ValidateAndNormalizeAxes(effectiveAxes, input.Rank);
         var outputShape = GetReductionOutputShape(input._shape, normalizedAxes, keepDims);
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_axes = effectiveAxes; var c_keepDims = keepDims; var c_epsilon = epsilon; var cSaved = new object[3]; return scope.RecordUnary(LazyNodeType.Custom, "ReduceLogVariance", input, outputShape, (eng, output) => { using (new NoGradScope<T>()) { var ops = MathHelper.GetNumericOperations<T>(); var v = eng.ReduceVariance(c_input, c_axes, c_keepDims); var vd = v.AsSpan(); var vpe = new T[vd.Length]; var logVar = new T[vd.Length]; T ep = ops.FromDouble(c_epsilon); for (int i = 0; i < vd.Length; i++) { vpe[i] = ops.Add(vd[i], ep); logVar[i] = ops.Log(vpe[i]); } DirectGpuTensorEngine.CopyResultInto(eng, TensorAllocator.Rent<T>(v._shape, logVar), output); cSaved[0] = c_axes; cSaved[1] = eng.ReduceMean(c_input, c_axes, c_keepDims); cSaved[2] = TensorAllocator.Rent<T>(v._shape, vpe); } }, BackwardFunctions<T>.ReduceLogVarianceBackward, savedState: cSaved); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var c_input = input; var c_axes = effectiveAxes; var c_keepDims = keepDims; var c_epsilon = epsilon; var cSaved = new object[3]; return scope.RecordUnary(LazyNodeType.Custom, "ReduceLogVariance", input, outputShape, (eng, output) => { using (new NoGradScope<T>()) { var ops = MathHelper.GetNumericOperations<T>(); var v = eng.ReduceVariance(c_input, c_axes, c_keepDims); var vd = v.AsSpan(); var vpe = new T[vd.Length]; var logVar = new T[vd.Length]; T ep = ops.FromDouble(c_epsilon); for (int i = 0; i < vd.Length; i++) { vpe[i] = ops.Add(vd[i], ep); logVar[i] = ops.Log(vpe[i]); } DirectGpuTensorEngine.CopyResultInto(eng, TensorAllocator.Rent<T>(v._shape, logVar), output); cSaved[0] = c_axes; cSaved[1] = eng.ReduceMean(c_input, c_axes, c_keepDims); cSaved[2] = TensorAllocator.Rent<T>(v._shape, vpe); } }, BackwardFunctions<T>.ReduceLogVarianceBackward, savedState: cSaved); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("ReduceLogVariance", outputShape); if (ac is not null) return ac.Execute(); }
 
         var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
@@ -33453,7 +33451,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = input;
@@ -33722,7 +33720,7 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentException("PixelShuffle expects 4D tensor [batch, channels, height, width]");
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope is not null)
             {
                 var c_input = input;
@@ -33871,7 +33869,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var ci = input; var cg = grid;
@@ -34046,7 +34044,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var ci = input; var ck = kernelSize; var cs = stride; var cp = padding;
@@ -34142,7 +34140,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var ci = input; var co = outputSize; var ck = kernelSize; var cs = stride; var cp = padding;
@@ -34290,7 +34288,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (real == null || imag == null)
             throw new ArgumentNullException("ComplexMagnitudeSquared inputs cannot be null");
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_real = real; var c_imag = imag; return scope.RecordBinary(LazyNodeType.Custom, "ComplexMagnitudeSquared", real, imag, real._shape, (eng, output) => { var r = eng.ComplexMagnitudeSquared(c_real, c_imag); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.ComplexMagnitudeSquaredBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var c_real = real; var c_imag = imag; return scope.RecordBinary(LazyNodeType.Custom, "ComplexMagnitudeSquared", real, imag, real._shape, (eng, output) => { var r = eng.ComplexMagnitudeSquared(c_real, c_imag); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.ComplexMagnitudeSquaredBackward); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("ComplexMagnitudeSquared", real._shape); if (ac is not null) return ac.Execute(); }
 
         if (!real._shape.SequenceEqual(imag._shape))
@@ -34434,7 +34432,7 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentException("Crop expects 4D tensor [batch, channels, height, width]");
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope is not null)
             {
                 var c_input = input;
@@ -34625,7 +34623,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = input;
@@ -34707,7 +34705,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensors.ToArray();
@@ -34987,7 +34985,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope is not null)
             {
                 var capLogP = logP; var capTarget = targetFloat; int capV = V, capB = B;
@@ -35063,7 +35061,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // (large-scale retrieval / search-corpus embeddings).
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var capturedEmb = embeddings;
@@ -35192,7 +35190,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // come from a fresh-per-call user input tensor (AiDotNet#1331).
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var capturedEmb = embeddings;
@@ -35340,7 +35338,7 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"epsilons length ({epsilons._shape[0]}) must match number of centers ({numCenters})", nameof(epsilons));
 
         var outputShape = new[] { batchSize, numCenters };
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_centers = centers; var c_epsilons = epsilons; return scope.RecordVariadic(LazyNodeType.Custom, "RBFKernel", new[] { input, centers, epsilons }, outputShape, (eng, output) => { var r = eng.RBFKernel(c_input, c_centers, c_epsilons); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.RBFKernelBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var c_input = input; var c_centers = centers; var c_epsilons = epsilons; return scope.RecordVariadic(LazyNodeType.Custom, "RBFKernel", new[] { input, centers, epsilons }, outputShape, (eng, output) => { var r = eng.RBFKernel(c_input, c_centers, c_epsilons); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.RBFKernelBackward); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("RBFKernel", outputShape); if (ac is not null) return ac.Execute(); }
 
         var output = TensorAllocator.Rent<T>(outputShape);
@@ -35493,7 +35491,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var outputShape = new int[tensor._shape.Length];
         Array.Copy(tensor._shape, outputShape, tensor._shape.Length);
         outputShape[axis] *= repeats;
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_tensor = tensor; var c_repeats = repeats; var c_axis = axis; return scope.RecordUnary(LazyNodeType.Custom, "TensorRepeatElements", tensor, outputShape, (eng, output) => { var r = eng.TensorRepeatElements(c_tensor, c_repeats, c_axis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.RepeatElementsBackward, savedState: new object[] { c_repeats, c_axis }); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var c_tensor = tensor; var c_repeats = repeats; var c_axis = axis; return scope.RecordUnary(LazyNodeType.Custom, "TensorRepeatElements", tensor, outputShape, (eng, output) => { var r = eng.TensorRepeatElements(c_tensor, c_repeats, c_axis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.RepeatElementsBackward, savedState: new object[] { c_repeats, c_axis }); } }
 
         var result = AutoTensorCache.RentOrAllocate<T>(outputShape);
 
@@ -35543,7 +35541,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -35623,7 +35621,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -35714,7 +35712,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope is not null)
             {
                 var capturedDestination = destination;
@@ -35789,7 +35787,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var cc = condition; var cx = x; var cy = y;
@@ -35882,7 +35880,7 @@ public partial class CpuEngine : ITensorLevelEngine
         int n = a.Length;
         int m = b.Length;
         var outputShape = new[] { n, m };
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_a = a; var c_b = b; return scope.RecordBinary(LazyNodeType.Custom, "TensorOuterProduct", a, b, outputShape, (eng, output) => { var r = eng.TensorOuterProduct(c_a, c_b); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.OuterProductBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var c_a = a; var c_b = b; return scope.RecordBinary(LazyNodeType.Custom, "TensorOuterProduct", a, b, outputShape, (eng, output) => { var r = eng.TensorOuterProduct(c_a, c_b); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.OuterProductBackward); } }
 
         var result = TensorAllocator.Rent<T>(outputShape);
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -35919,7 +35917,7 @@ public partial class CpuEngine : ITensorLevelEngine
         int n = a._shape[1];
         int m = b._shape[1];
         var outputShape = new[] { batch, n, m };
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_a = a; var c_b = b; return scope.RecordBinary(LazyNodeType.Custom, "TensorBatchOuterProduct", a, b, outputShape, (eng, output) => { var r = eng.TensorBatchOuterProduct(c_a, c_b); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.OuterProductBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var c_a = a; var c_b = b; return scope.RecordBinary(LazyNodeType.Custom, "TensorBatchOuterProduct", a, b, outputShape, (eng, output) => { var r = eng.TensorBatchOuterProduct(c_a, c_b); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.OuterProductBackward); } }
 
         var result = TensorAllocator.Rent<T>(outputShape);
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -35965,7 +35963,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // entry in the owner's audit.
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 scope.BindEngineIfUnset(this);
@@ -36154,7 +36152,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -36199,7 +36197,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -36240,7 +36238,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -36292,7 +36290,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (indices == null) throw new ArgumentNullException(nameof(indices));
         if (updates == null) throw new ArgumentNullException(nameof(updates));
         GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_destination = destination; var c_indices = indices; var c_updates = updates; var c_axis = axis; return scope.RecordBinary(LazyNodeType.Custom, "TensorScatterAdd", destination, updates, destination._shape, (eng, output) => { var r = eng.TensorScatterAdd(c_destination, c_indices, c_updates, c_axis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.ScatterAddBackward, savedState: new object[] { c_indices, c_axis }); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var c_destination = destination; var c_indices = indices; var c_updates = updates; var c_axis = axis; return scope.RecordBinary(LazyNodeType.Custom, "TensorScatterAdd", destination, updates, destination._shape, (eng, output) => { var r = eng.TensorScatterAdd(c_destination, c_indices, c_updates, c_axis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.ScatterAddBackward, savedState: new object[] { c_indices, c_axis }); } }
 
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
 
@@ -36383,7 +36381,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope is not null)
             {
                 var captured = source;
@@ -36479,7 +36477,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorCumSum", tensor._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -36610,7 +36608,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -37120,7 +37118,7 @@ public partial class CpuEngine : ITensorLevelEngine
     public Tensor<T> ScalarMinusTensor<T>(T scalar, Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_scalar = scalar; var c_tensor = tensor; return scope.RecordUnary(LazyNodeType.Custom, "ScalarMinusTensor", tensor, tensor._shape, (eng, output) => { var r = eng.ScalarMinusTensor(c_scalar, c_tensor); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.NegateBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var c_scalar = scalar; var c_tensor = tensor; return scope.RecordUnary(LazyNodeType.Custom, "ScalarMinusTensor", tensor, tensor._shape, (eng, output) => { var r = eng.ScalarMinusTensor(c_scalar, c_tensor); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.NegateBackward); } }
 
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
@@ -37185,7 +37183,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (tensor._shape.Length != 2)
             throw new ArgumentException("Tensor must be 2D");
         int n = Math.Min(tensor._shape[0], tensor._shape[1]);
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_tensor = tensor; return scope.RecordUnary(LazyNodeType.Custom, "TensorDiagonal", tensor, new[] { n }, (eng, output) => { var r = eng.TensorDiagonal(c_tensor); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.DiagonalBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var c_tensor = tensor; return scope.RecordUnary(LazyNodeType.Custom, "TensorDiagonal", tensor, new[] { n }, (eng, output) => { var r = eng.TensorDiagonal(c_tensor); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.DiagonalBackward); } }
 
         var result = AutoTensorCache.RentOrAllocate<T>([n]);
 
@@ -37302,7 +37300,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorAddScalar", tensor._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -37332,7 +37330,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorSubtractScalar", tensor._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -37362,7 +37360,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorDivideScalar", tensor._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -37553,7 +37551,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -37719,7 +37717,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = (Tensor<T>[])tensors.Clone();
@@ -37876,7 +37874,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // tensor._shape directly.
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 if (axis < 0) axis = tensor._shape.Length + axis;
@@ -38105,7 +38103,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope is not null)
             {
                 var cp = predictions; var ct = targets; var ce = epsilon;
@@ -38345,7 +38343,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -38464,7 +38462,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 $"TensorBatchMatMul requires a to be 3D and b to be 2D or 3D. Got ranks {a.Rank} and {b.Rank}.");
         }
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; var cb = b; var outShape = new[] { a._shape[0], a._shape[1], b._shape[1] }; return scope.RecordBinary(LazyNodeType.Custom, "TensorBatchMatMul", a, b, outShape, (eng, output) => { var r = eng.TensorBatchMatMul(ca, cb); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.BatchMatMulBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var ca = a; var cb = b; var outShape = new[] { a._shape[0], a._shape[1], b._shape[1] }; return scope.RecordBinary(LazyNodeType.Custom, "TensorBatchMatMul", a, b, outShape, (eng, output) => { var r = eng.TensorBatchMatMul(ca, cb); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.BatchMatMulBackward); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorBatchMatMul", a._shape); if (ac is not null) return ac.Execute(); }
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -38594,14 +38592,14 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("LogSoftmax", tensor._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
                 var capturedAxis = axis;
                 return scope.RecordUnary(LazyNodeType.Custom, "LogSoftmax", tensor, tensor._shape,
                     (eng, output) => { var r = eng.TensorLogSoftmax(captured, capturedAxis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
-                    BackwardFunctions<T>.LogSoftmaxBackward);
+                    BackwardFunctions<T>.LogSoftmaxBackward, new object[] { axis });
             }
         }
 
@@ -38622,7 +38620,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 LogSoftmaxFloatFastPtr((float*)pinIn.Pointer, (float*)pinOut.Pointer, outerSize, axisSize);
             }
             DifferentiableOps.RecordUnary("LogSoftmax", result, tensor,
-                BackwardFunctions<T>.LogSoftmaxBackward);
+                BackwardFunctions<T>.LogSoftmaxBackward, new object[] { axis });
             if (AutoTracer.ShouldRecord) { var c = tensor; var ca = axis; AutoTracer.RecordOp("LogSoftmax", result, eng => eng.TensorLogSoftmax(c, ca)); }
             return result;
         }
@@ -38655,7 +38653,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 CpuParallelSettings.ParallelForOrSerial(0, outerSz, (long)outerSz * axisSz, rowKernel);
             }
             DifferentiableOps.RecordUnary("LogSoftmax", resultD, tensor,
-                BackwardFunctions<T>.LogSoftmaxBackward);
+                BackwardFunctions<T>.LogSoftmaxBackward, new object[] { axis });
             if (AutoTracer.ShouldRecord) { var c = tensor; var ca = axis; AutoTracer.RecordOp("LogSoftmax", resultD, eng => eng.TensorLogSoftmax(c, ca)); }
             return resultD;
         }
@@ -38700,7 +38698,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var logSoftmaxResult = TensorAllocator.Rent<T>(tensor._shape, outputData);
         DifferentiableOps.RecordUnary("LogSoftmax", logSoftmaxResult, tensor,
-            BackwardFunctions<T>.LogSoftmaxBackward);
+            BackwardFunctions<T>.LogSoftmaxBackward, new object[] { axis });
         if (AutoTracer.ShouldRecord) { var c = tensor; var ca = axis; AutoTracer.RecordOp("LogSoftmax", logSoftmaxResult, eng => eng.TensorLogSoftmax(c, ca)); }
         return logSoftmaxResult;
     }
@@ -38841,7 +38839,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null && tensor.Rank == 2)
             {
                 var captured = tensor;
@@ -38928,7 +38926,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = (Tensor<T>[])tensors.Clone();
@@ -39054,7 +39052,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var ct = tensor; var cm = mask; var cv = value;
@@ -39099,7 +39097,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!tensor._shape.SequenceEqual(mask._shape))
             throw new ArgumentException($"Tensor shape [{string.Join(", ", tensor._shape)}] must match mask shape [{string.Join(", ", mask._shape)}].");
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ct = tensor; var cm = mask; var cv = value; var cSaved = new object[1]; return scope.RecordUnary(LazyNodeType.Custom, "MaskedFill", tensor, tensor._shape, (eng, output) => { var r = eng.TensorMaskedFill(ct, cm, cv); DirectGpuTensorEngine.CopyResultInto(eng, r, output); var ms = cm.AsSpan(); var mb = new bool[ms.Length]; for (int i = 0; i < ms.Length; i++) mb[i] = (bool)ms[i]; cSaved[0] = mb; }, BackwardFunctions<T>.MaskedFillBackward, savedState: cSaved); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var ct = tensor; var cm = mask; var cv = value; var cSaved = new object[1]; return scope.RecordUnary(LazyNodeType.Custom, "MaskedFill", tensor, tensor._shape, (eng, output) => { var r = eng.TensorMaskedFill(ct, cm, cv); DirectGpuTensorEngine.CopyResultInto(eng, r, output); var ms = cm.AsSpan(); var mb = new bool[ms.Length]; for (int i = 0; i < ms.Length; i++) mb[i] = (bool)ms[i]; cSaved[0] = mb; }, BackwardFunctions<T>.MaskedFillBackward, savedState: cSaved); } }
 
         { var ac = AutoTracer.TryGetCompiledPlan<T>("MaskedFill", tensor._shape); if (ac is not null) return ac.Execute(); }
 
@@ -39884,7 +39882,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = input;
@@ -39943,7 +39941,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; var cind = indices; var cv = values; var ca = axis; return scope.RecordBinary(LazyNodeType.Custom, "Scatter", input, values, input._shape, (eng, output) => { var r = eng.Scatter(ci, cind, cv, ca); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.ScatterBackward, new object[] { indices, axis }); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var ci = input; var cind = indices; var cv = values; var ca = axis; return scope.RecordBinary(LazyNodeType.Custom, "Scatter", input, values, input._shape, (eng, output) => { var r = eng.Scatter(ci, cind, cv, ca); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.ScatterBackward, new object[] { indices, axis }); } }
 
         { var ac = AutoTracer.TryGetCompiledPlan<T>("Scatter", input._shape); if (ac is not null) return ac.Execute(); }
 
@@ -40051,7 +40049,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorCosh", tensor._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -40105,7 +40103,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorSinh", tensor._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -40160,7 +40158,7 @@ public partial class CpuEngine : ITensorLevelEngine
         int n = a._shape[0];
         int m = b._shape[0];
         var outputShape = new[] { n, m };
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_a = a; var c_b = b; return scope.RecordBinary(LazyNodeType.Custom, "TensorOuter", a, b, outputShape, (eng, output) => { var r = eng.TensorOuter(c_a, c_b); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.OuterProductBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var c_a = a; var c_b = b; return scope.RecordBinary(LazyNodeType.Custom, "TensorOuter", a, b, outputShape, (eng, output) => { var r = eng.TensorOuter(c_a, c_b); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.OuterProductBackward); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorOuter", outputShape); if (ac is not null) return ac.Execute(); }
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -40220,7 +40218,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Lazy graph mode: record the fused operation for later compilation
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 // Compute output shape eagerly: [M, K] @ [K, N] = [M, N]
@@ -40848,8 +40846,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var outputShape = (int[])input._shape.Clone();
             outputShape[outputShape.Length - 1] = graphUnits;
             var graphInputs = bias is null ? new[] { input, weights } : new[] { input, weights, bias };
-            var scope = GraphMode.Current!;
-            scope.BindEngineIfUnset(this);
+            var scope = GraphMode.Current!; scope.BindEngineIfUnset(this);
             return scope.RecordVariadic(
                 LazyNodeType.FusedLinearMaxout,
                 "FusedLinearMaxout",
@@ -40940,8 +40937,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
             var outputShape = (int[])input._shape.Clone();
             outputShape[outputShape.Length - 1] = numClasses;
-            var scope = GraphMode.Current!;
-            scope.BindEngineIfUnset(this);
+            var scope = GraphMode.Current!; scope.BindEngineIfUnset(this);
             return scope.RecordBinary(
                 LazyNodeType.FusedHierarchicalSoftmax,
                 "FusedHierarchicalSoftmax",
@@ -41586,7 +41582,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Compute shape for output (last dim becomes 2 * numFreqs for interleaved complex)
         var outputShape = input.Shape.ToArray();
         outputShape[^1] = numFreqs * 2; // Interleaved real/imag
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; return scope.RecordUnary(LazyNodeType.Custom, "RFFT", input, outputShape, (eng, output) => { var r = eng.RFFT(c_input); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, null); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var c_input = input; return scope.RecordUnary(LazyNodeType.Custom, "RFFT", input, outputShape, (eng, output) => { var r = eng.RFFT(c_input); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, null); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("RFFT", outputShape); if (ac is not null) return ac.Execute(); }
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -41663,7 +41659,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var outputShape = input.Shape.ToArray();
         outputShape[^1] = outputLength;
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_outputLength = outputLength; return scope.RecordUnary(LazyNodeType.Custom, "IRFFT", input, outputShape, (eng, output) => { var r = eng.IRFFT(c_input, c_outputLength); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, null); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var c_input = input; var c_outputLength = outputLength; return scope.RecordUnary(LazyNodeType.Custom, "IRFFT", input, outputShape, (eng, output) => { var r = eng.IRFFT(c_input, c_outputLength); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, null); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("IRFFT", outputShape); if (ac is not null) return ac.Execute(); }
 
         var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
@@ -42926,7 +42922,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("Softplus", input._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = input;
@@ -42977,7 +42973,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("HardSwish", input._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = input;
@@ -43775,7 +43771,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var ci = input; var cg = gamma; var cb = beta; double ce = epsilon;
@@ -43980,7 +43976,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var ci = input; double cdr = dropoutRate; bool ct = training;
@@ -44141,7 +44137,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var ci = indices; var ct = embeddingTable;
@@ -44739,7 +44735,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("AdaptiveAvgPool2D", input._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = input;
@@ -44965,7 +44961,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var ci = input; var cg = gamma; var cb = beta; double ce = epsilon;
@@ -44987,7 +44983,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var ci = input; var ca = axes; bool ck = keepDims;
@@ -45028,7 +45024,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorLerp", a._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var ca = a; var cb = b; var ct = t;
@@ -45108,7 +45104,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorAddScaled", a._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var ca = a; var cb = b; var csA = scaleA; var csB = scaleB;
@@ -45366,7 +45362,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("MSELoss", predictions._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var capturedPred = predictions;
@@ -45436,7 +45432,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("L1Loss", predictions._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var capturedP = predictions;
@@ -45500,7 +45496,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("HuberLoss", predictions._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var capturedP = predictions;
@@ -45582,7 +45578,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("BCEWithLogitsLoss", logits._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var capturedLogits = logits;
@@ -45661,7 +45657,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("CrossEntropyLoss", logits._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var capturedLogits = logits;
@@ -45706,7 +45702,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("NLLLoss", logProbs._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var capturedLogProbs = logProbs;
@@ -45745,7 +45741,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("KLDivLoss", input._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var capturedInput = input;
@@ -45778,7 +45774,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <summary>Cosine similarity loss between two tensors.</summary>
     public Tensor<T> TensorCosineSimilarityLoss<T>(Tensor<T> a, Tensor<T> b)
     {
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_a = a; var c_b = b; return scope.RecordBinary(LazyNodeType.Custom, "CosineSimilarity", a, b, new[] { 1 }, (eng, output) => { var r = eng.TensorCosineSimilarityLoss(c_a, c_b); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.CosineSimilarityBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var c_a = a; var c_b = b; return scope.RecordBinary(LazyNodeType.Custom, "CosineSimilarity", a, b, new[] { 1 }, (eng, output) => { var r = eng.TensorCosineSimilarityLoss(c_a, c_b); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.CosineSimilarityBackward); } }
 
         var numOps = MathHelper.GetNumericOperations<T>();
         double dotProd = 0, normA = 0, normB = 0;
@@ -45808,7 +45804,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("SELU", tensor._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -45870,7 +45866,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("HardSigmoid", tensor._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -45926,7 +45922,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("ReLU6", tensor._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -45977,7 +45973,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("PReLU", tensor._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -46065,7 +46061,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("RReLU", tensor._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -46133,7 +46129,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("Threshold", tensor._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -46165,7 +46161,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("Reciprocal", tensor._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -46209,7 +46205,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("Sign", tensor._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -46255,7 +46251,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -46279,7 +46275,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -46315,7 +46311,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -46559,7 +46555,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("UpsampleBilinear", input._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = input;
@@ -46597,7 +46593,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("AvgPool1D", input._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 int lazyOutW = (input._shape[2] - kernelSize) / stride + 1;
@@ -46640,7 +46636,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("MaxPool1D", input._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 int lazyOutW = (input._shape[2] - kernelSize) / stride + 1;
@@ -46695,7 +46691,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("Mean", tensor._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -46732,7 +46728,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("Var", tensor._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -46766,7 +46762,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("Std", tensor._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -46810,7 +46806,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("LogSumExp", tensor._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -46841,7 +46837,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("Norm", tensor._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;
@@ -46871,7 +46867,7 @@ public partial class CpuEngine : ITensorLevelEngine
         { var ac = AutoTracer.TryGetCompiledPlan<T>("AdaptiveMaxPool2D", input._shape); if (ac is not null) return ac.Execute(); }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = input;
@@ -46923,7 +46919,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var capturedX = x;
@@ -47154,7 +47150,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var cp = predicted; var ct = target;
@@ -47220,7 +47216,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var cp = predicted; var ct = target;
@@ -47290,7 +47286,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var cp = predicted; var ct = target;
@@ -47368,7 +47364,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var cp = predicted; var ct = target;
@@ -47646,7 +47642,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (input._shape[1] != weight._shape[1])
             throw new ArgumentException($"Input features ({input._shape[1]}) must match weight input dimension ({weight._shape[1]}).");
         var outputShape = new[] { input._shape[0], weight._shape[0], 8 };
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_input = input; var c_weight = weight; return scope.RecordBinary(LazyNodeType.Custom, "OctonionMatMulTensor", input, weight, outputShape, (eng, output) => { var r = eng.OctonionMatMulTensor(c_input, c_weight); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.OctonionMatMulBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var c_input = input; var c_weight = weight; return scope.RecordBinary(LazyNodeType.Custom, "OctonionMatMulTensor", input, weight, outputShape, (eng, output) => { var r = eng.OctonionMatMulTensor(c_input, c_weight); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.OctonionMatMulBackward); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("OctonionMatMulTensor", outputShape); if (ac is not null) return ac.Execute(); }
 
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -47818,7 +47814,7 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"Tensor lengths must match: {a.Length} vs {b.Length}");
         if (a.Length % 2 != 0 || (a.Rank > 0 && a._shape[a.Rank - 1] % 2 != 0))
             throw new ArgumentException("Complex tensors must have even length with the last axis divisible by 2 (interleaved re/im).");
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_a = a; var c_b = b; return scope.RecordBinary(LazyNodeType.Custom, "ComplexMultiply", a, b, a._shape, (eng, output) => { var r = eng.TensorComplexMultiply(c_a, c_b); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.ComplexMultiplyBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var c_a = a; var c_b = b; return scope.RecordBinary(LazyNodeType.Custom, "ComplexMultiply", a, b, a._shape, (eng, output) => { var r = eng.TensorComplexMultiply(c_a, c_b); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.ComplexMultiplyBackward); } }
 
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -47846,7 +47842,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a.Length % 2 != 0)
             throw new ArgumentException("Complex tensors must have even length (interleaved re/im).");
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c_a = a; return scope.RecordUnary(LazyNodeType.Custom, "ComplexConjugate", a, a._shape, (eng, output) => { var r = eng.TensorComplexConjugate(c_a); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.ComplexConjugateBackward); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var c_a = a; return scope.RecordUnary(LazyNodeType.Custom, "ComplexConjugate", a, a._shape, (eng, output) => { var r = eng.TensorComplexConjugate(c_a); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.ComplexConjugateBackward); } }
 
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -47870,7 +47866,7 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentException("Complex tensors must have even length (interleaved re/im).");
         var ops = MathHelper.GetNumericOperations<T>();
         int pairs = a.Length / 2;
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c = a; return scope.RecordUnary(LazyNodeType.Custom, "ComplexMagnitude", a, new[] { pairs }, (eng, output) => { var r = eng.TensorComplexMagnitude(c); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.ComplexMagnitudeBackward, savedState: new object[] { c }); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var c = a; return scope.RecordUnary(LazyNodeType.Custom, "ComplexMagnitude", a, new[] { pairs }, (eng, output) => { var r = eng.TensorComplexMagnitude(c); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.ComplexMagnitudeBackward, savedState: new object[] { c }); } }
 
         var result = new Tensor<T>(new[] { pairs });
 
@@ -47990,7 +47986,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var (batchCount, fftSize) = GetBatchedFFTDims(input._shape);
         ValidatePowerOfTwo(fftSize, nameof(input));
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; return scope.RecordCrossType<T, Complex<T>>(LazyNodeType.Custom, "NativeComplexFFT", input, input._shape, (eng, output) => { var r = eng.NativeComplexFFT(ci); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var ci = input; return scope.RecordCrossType<T, Complex<T>>(LazyNodeType.Custom, "NativeComplexFFT", input, input._shape, (eng, output) => { var r = eng.NativeComplexFFT(ci); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }); } }
         { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexFFT", input._shape); if (ac is not null) return ac.Execute(); }
 
         var result = new Tensor<Complex<T>>(input._shape);
@@ -48356,7 +48352,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var (batchCount, fftSize) = GetBatchedFFTDims(input._shape);
         ValidatePowerOfTwo(fftSize, nameof(input));
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; var fL = freqLow; var fH = freqHigh; var sr = sampleRate; return scope.RecordCrossType<T, Complex<T>>(LazyNodeType.Custom, "NativeAnalyticSignal", input, input._shape, (eng, output) => { var r = eng.NativeAnalyticSignal(ci, fL, fH, sr); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var ci = input; var fL = freqLow; var fH = freqHigh; var sr = sampleRate; return scope.RecordCrossType<T, Complex<T>>(LazyNodeType.Custom, "NativeAnalyticSignal", input, input._shape, (eng, output) => { var r = eng.NativeAnalyticSignal(ci, fL, fH, sr); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }); } }
 
         var ops = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<Complex<T>>(input._shape);
@@ -49330,7 +49326,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var (batchCount, fftSize) = GetBatchedFFTDims(input._shape);
         ValidatePowerOfTwo(fftSize, nameof(input));
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; return scope.RecordCrossType<Complex<T>, T>(LazyNodeType.Custom, "NativeComplexIFFTReal", input, input._shape, (eng, output) => { var r = eng.NativeComplexIFFTReal(ci); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var ci = input; return scope.RecordCrossType<Complex<T>, T>(LazyNodeType.Custom, "NativeComplexIFFTReal", input, input._shape, (eng, output) => { var r = eng.NativeComplexIFFTReal(ci); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("NativeComplexIFFTReal", input._shape); if (ac is not null) return ac.Execute(); }
 
         var result = new Tensor<T>(input._shape);
@@ -49408,7 +49404,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var (batchCount, fftSize) = GetBatchedFFTDims(input._shape);
         ValidatePowerOfTwo(fftSize, nameof(input));
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; return scope.RecordUnary(LazyNodeType.Custom, "NativeComplexIFFT", input, input._shape, (eng, output) => { var r = eng.NativeComplexIFFT(ci); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, null); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var ci = input; return scope.RecordUnary(LazyNodeType.Custom, "NativeComplexIFFT", input, input._shape, (eng, output) => { var r = eng.NativeComplexIFFT(ci); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, null); } }
         { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexIFFT", input._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -49440,7 +49436,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var (batchCount, fftSize) = GetBatchedFFTDims(input._shape);
         ValidatePowerOfTwo(fftSize, nameof(input));
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; return scope.RecordUnary(LazyNodeType.Custom, "NativeComplexFFTComplex", input, input._shape, (eng, output) => { var r = eng.NativeComplexFFTComplex(ci); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, null); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var ci = input; return scope.RecordUnary(LazyNodeType.Custom, "NativeComplexFFTComplex", input, input._shape, (eng, output) => { var r = eng.NativeComplexFFTComplex(ci); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, null); } }
         { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexFFTComplex", input._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -49522,7 +49518,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (input.Rank != 2) throw new ArgumentException("TensorSoftmaxRows requires a 2D tensor.", nameof(input));
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ci = input; return scope.RecordUnary(LazyNodeType.Custom, "TensorSoftmaxRows", input, input._shape, (eng, output) => { var r = eng.TensorSoftmaxRows(ci); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, null); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var ci = input; return scope.RecordUnary(LazyNodeType.Custom, "TensorSoftmaxRows", input, input._shape, (eng, output) => { var r = eng.TensorSoftmaxRows(ci); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, null); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorSoftmaxRows", input._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -49568,7 +49564,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (a.Length != b.Length)
             throw new ArgumentException($"Tensor lengths must match: {a.Length} vs {b.Length}");
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; var cb = b; return scope.RecordBinary(LazyNodeType.Custom, "NativeComplexMultiply", a, b, a._shape, (eng, output) => { var r = eng.NativeComplexMultiply(ca, cb); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, null); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var ca = a; var cb = b; return scope.RecordBinary(LazyNodeType.Custom, "NativeComplexMultiply", a, b, a._shape, (eng, output) => { var r = eng.NativeComplexMultiply(ca, cb); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, null); } }
         { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexMultiply", a._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -49986,7 +49982,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a is null) throw new ArgumentNullException(nameof(a));
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; return scope.RecordUnary(LazyNodeType.Custom, "NativeComplexConjugate", a, a._shape, (eng, output) => { var r = eng.NativeComplexConjugate(ca); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, null); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var ca = a; return scope.RecordUnary(LazyNodeType.Custom, "NativeComplexConjugate", a, a._shape, (eng, output) => { var r = eng.NativeComplexConjugate(ca); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, null); } }
         { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexConjugate", a._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -50022,7 +50018,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a is null) throw new ArgumentNullException(nameof(a));
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; return scope.RecordCrossType<Complex<T>, T>(LazyNodeType.Custom, "NativeComplexMagnitude", a, a._shape, (eng, output) => { var r = eng.NativeComplexMagnitude(ca); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var ca = a; return scope.RecordCrossType<Complex<T>, T>(LazyNodeType.Custom, "NativeComplexMagnitude", a, a._shape, (eng, output) => { var r = eng.NativeComplexMagnitude(ca); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("NativeComplexMagnitude", a._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -50062,7 +50058,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a is null) throw new ArgumentNullException(nameof(a));
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; return scope.RecordCrossType<Complex<T>, T>(LazyNodeType.Custom, "NativeComplexMagnitudeSquared", a, a._shape, (eng, output) => { var r = eng.NativeComplexMagnitudeSquared(ca); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var ca = a; return scope.RecordCrossType<Complex<T>, T>(LazyNodeType.Custom, "NativeComplexMagnitudeSquared", a, a._shape, (eng, output) => { var r = eng.NativeComplexMagnitudeSquared(ca); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("NativeComplexMagnitudeSquared", a._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -50100,7 +50096,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a is null) throw new ArgumentNullException(nameof(a));
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; return scope.RecordCrossType<Complex<T>, T>(LazyNodeType.Custom, "NativeComplexPhase", a, a._shape, (eng, output) => { var r = eng.NativeComplexPhase(ca); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var ca = a; return scope.RecordCrossType<Complex<T>, T>(LazyNodeType.Custom, "NativeComplexPhase", a, a._shape, (eng, output) => { var r = eng.NativeComplexPhase(ca); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("NativeComplexPhase", a._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -50134,7 +50130,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (magnitudes.Length != phases.Length)
             throw new ArgumentException($"Tensor lengths must match: {magnitudes.Length} vs {phases.Length}");
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { _ = phases.Length; var cm = magnitudes; var cp = phases; return scope.RecordCrossType<T, Complex<T>>(LazyNodeType.Custom, "NativeComplexFromPolar", magnitudes, magnitudes._shape, (eng, output) => { var r = eng.NativeComplexFromPolar(cm, cp); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { _ = phases.Length; var cm = magnitudes; var cp = phases; return scope.RecordCrossType<T, Complex<T>>(LazyNodeType.Custom, "NativeComplexFromPolar", magnitudes, magnitudes._shape, (eng, output) => { var r = eng.NativeComplexFromPolar(cm, cp); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }); } }
         { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexFromPolar", magnitudes._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -50175,7 +50171,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         if (a is null) throw new ArgumentNullException(nameof(a));
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; var cs = scalar; return scope.RecordUnary(LazyNodeType.Custom, "NativeComplexScale", a, a._shape, (eng, output) => { var r = eng.NativeComplexScale(ca, cs); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, null); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var ca = a; var cs = scalar; return scope.RecordUnary(LazyNodeType.Custom, "NativeComplexScale", a, a._shape, (eng, output) => { var r = eng.NativeComplexScale(ca, cs); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, null); } }
         { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexScale", a._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -50216,7 +50212,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (x.Length != y.Length)
             throw new ArgumentException($"Tensor lengths must match: {x.Length} vs {y.Length}");
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var cx = x; var cy = y; return scope.RecordBinary(LazyNodeType.Custom, "NativeComplexCrossSpectral", x, y, x._shape, (eng, output) => { var r = eng.NativeComplexCrossSpectral(cx, cy); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, null); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var cx = x; var cy = y; return scope.RecordBinary(LazyNodeType.Custom, "NativeComplexCrossSpectral", x, y, x._shape, (eng, output) => { var r = eng.NativeComplexCrossSpectral(cx, cy); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, null); } }
         { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexCrossSpectral", x._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -50262,7 +50258,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (input.Rank < 2)
             throw new ArgumentException("NativeComplexFFT2D requires at least a 2D tensor.", nameof(input));
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c = input; return scope.RecordCrossType<T, Complex<T>>(LazyNodeType.Custom, "NativeComplexFFT2D", input, input._shape, (eng, output) => { var r = eng.NativeComplexFFT2D(c); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var c = input; return scope.RecordCrossType<T, Complex<T>>(LazyNodeType.Custom, "NativeComplexFFT2D", input, input._shape, (eng, output) => { var r = eng.NativeComplexFFT2D(c); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }); } }
         { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexFFT2D", input._shape); if (ac is not null) return ac.Execute(); }
 
         int h = input._shape[^2];
@@ -50301,7 +50297,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if ((iw & (iw - 1)) != 0 || iw <= 0)
             throw new ArgumentException($"Width {iw} must be a positive power of 2.", nameof(input));
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c = input; return scope.RecordCrossType<Complex<T>, T>(LazyNodeType.Custom, "NativeComplexIFFT2DReal", input, input._shape, (eng, output) => { var r = eng.NativeComplexIFFT2DReal(c); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var c = input; return scope.RecordCrossType<Complex<T>, T>(LazyNodeType.Custom, "NativeComplexIFFT2DReal", input, input._shape, (eng, output) => { var r = eng.NativeComplexIFFT2DReal(c); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("NativeComplexIFFT2DReal", input._shape); if (ac is not null) return ac.Execute(); }
 
         // Step 1: Transpose so columns are last axis
@@ -50331,7 +50327,7 @@ public partial class CpuEngine : ITensorLevelEngine
         for (int i = 0; i < axes.Length; i++)
             axesHash = axesHash * 31 + axes[i];
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c = input; var ca = axes; return scope.RecordCrossType<T, Complex<T>>(LazyNodeType.Custom, "NativeComplexFFTND", input, input._shape, (eng, output) => { var r = eng.NativeComplexFFTND(c, ca); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var c = input; var ca = axes; return scope.RecordCrossType<T, Complex<T>>(LazyNodeType.Custom, "NativeComplexFFTND", input, input._shape, (eng, output) => { var r = eng.NativeComplexFFTND(c, ca); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }); } }
         { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexFFTND", input._shape, paramHash: axesHash); if (ac is not null) return ac.Execute(); }
 
         // Normalize negative axes and reject duplicates (matches NumPy/PyTorch behavior)
@@ -50369,7 +50365,7 @@ public partial class CpuEngine : ITensorLevelEngine
         for (int i = 0; i < axes.Length; i++)
             axesHash = axesHash * 31 + axes[i];
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var c = input; var ca = axes; return scope.RecordCrossType<Complex<T>, T>(LazyNodeType.Custom, "NativeComplexIFFTNDReal", input, input._shape, (eng, output) => { var r = eng.NativeComplexIFFTNDReal(c, ca); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var c = input; var ca = axes; return scope.RecordCrossType<Complex<T>, T>(LazyNodeType.Custom, "NativeComplexIFFTNDReal", input, input._shape, (eng, output) => { var r = eng.NativeComplexIFFTNDReal(c, ca); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }); } }
         { var ac = AutoTracer.TryGetCompiledPlan<T>("NativeComplexIFFTNDReal", input._shape, paramHash: axesHash); if (ac is not null) return ac.Execute(); }
 
         int rank = input.Rank;
@@ -50821,7 +50817,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (a.Length != b.Length)
             throw new ArgumentException($"Tensor lengths must match: {a.Length} vs {b.Length}");
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var ca = a; var cb = b; return scope.RecordBinary(LazyNodeType.Custom, "NativeComplexAdd", a, b, a._shape, (eng, output) => { var r = eng.NativeComplexAdd(ca, cb); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, null); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var ca = a; var cb = b; return scope.RecordBinary(LazyNodeType.Custom, "NativeComplexAdd", a, b, a._shape, (eng, output) => { var r = eng.NativeComplexAdd(ca, cb); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, null); } }
         { var ac = AutoTracer.TryGetCompiledPlan<Complex<T>>("NativeComplexAdd", a._shape); if (ac is not null) return ac.Execute(); }
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -51246,7 +51242,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (logProbs.Rank != 3)
             throw new ArgumentException("logProbs must be 3D [T, N, C].");
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; if (scope is not null) { var clp = logProbs; var ct = targets; var cil = inputLengths; var ctl = targetLengths; var cb = blank; var outShape = new[] { logProbs._shape[1] }; return scope.RecordUnary(LazyNodeType.Custom, "CTCLoss", logProbs, outShape, (eng, output) => { var r = eng.TensorCTCLoss(clp, ct, cil, ctl, cb); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.CTCLossBackward, savedState: new object[] { clp, ct, cil, ctl, cb }); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var clp = logProbs; var ct = targets; var cil = inputLengths; var ctl = targetLengths; var cb = blank; var outShape = new[] { logProbs._shape[1] }; return scope.RecordUnary(LazyNodeType.Custom, "CTCLoss", logProbs, outShape, (eng, output) => { var r = eng.TensorCTCLoss(clp, ct, cil, ctl, cb); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }, BackwardFunctions<T>.CTCLossBackward, savedState: new object[] { clp, ct, cil, ctl, cb }); } }
 
         var ops = MathHelper.GetNumericOperations<T>();
         int maxT = logProbs._shape[0];

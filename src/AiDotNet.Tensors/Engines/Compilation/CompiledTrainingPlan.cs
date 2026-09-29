@@ -262,6 +262,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // ConfigureOptimizerFloat / ConfigureOptimizerFloatGrouped after the
         // paramBackend.AllocateBuffer calls; reconfiguring also disposes
         // these via the same list before re-allocating.
+        LeaveSharedMoments();
         foreach (var buf in _gpuOptimizerBuffers)
             buf.Dispose();
         _gpuOptimizerBuffers.Clear();
@@ -283,6 +284,108 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     }
 
     /// <summary>
+    /// Undoes what the capture pre-pass did to the step's gradient state when capture fails, so the eager fallback
+    /// runs this step exactly as if capture had never been attempted.
+    /// </summary>
+    /// <remarks>
+    /// The pre-pass binds every gradient accumulator (and the loss-gradient seed) to a device buffer and runs a
+    /// forward + backward into them. The eager step zeroes only the HOST gradient arrays, but with both operands now
+    /// resident its in-place accumulations ran on the never-zeroed device buffers, while the optimizer read the host
+    /// arrays that never received them. So a failed capture did not just cost the speed-up: it corrupted the
+    /// gradients of that step and every later one (measured: the captured plan's loss diverged from the eager plan's
+    /// from the capture step on, and a 1024-3x1024-10 MLP stopped learning after three steps).
+    /// </remarks>
+    /// <param name="engine">The engine the plan's tensors are bound through.</param>
+    /// <param name="deviceHoldsResults">
+    /// False after a FAILED capture: the device data is the pre-pass's, so its pending downloads are discarded.
+    /// True when retiring a graph that RAN: the device buffers hold the only copy of the last step's loss and
+    /// gradients, so their pending downloads are materialized onto the host before the binding is dropped (the host
+    /// optimizer path and every caller of ConfigureOptimizer / Dispose after a replay read those host arrays).
+    /// </param>
+    private void RollBackCaptureResidency(Engines.DirectGpuTensorEngine engine, bool deviceHoldsResults = false)
+    {
+        // A disposed engine's context is gone: nothing can be downloaded, and nothing can read the results anyway.
+        bool landResults = deviceHoldsResults && engine.GetBackend() is Engines.DirectGpu.CUDA.CudaBackend { ContextIsLive: true };
+        void Unbind(Tensor<T>? t)
+        {
+            if (t is null || t._gpuBuffer is null) return;
+            var backing = t.GetBackingArrayForCacheLookupUnsafe();
+            if (landResults)
+            {
+                // The graph wrote this step's values on the device: land them on the host before unbinding.
+                if (backing is not null) Helpers.DeferredArrayMaterializer.TryMaterialize(backing);
+                Helpers.DeferredArrayMaterializer.TryMaterialize(t.DataVector);
+            }
+            // Drop the pending device->host download FIRST: after a failed capture its device data is the pre-pass's,
+            // and letting it fire (or letting the cache invalidation below force it) would overwrite the host gradient.
+            if (backing is not null)
+                Helpers.DeferredArrayMaterializer.Remove(backing);
+            Helpers.DeferredArrayMaterializer.Remove(t.DataVector);
+            engine.InvalidateGpuCacheForTensor(t);
+            t._gpuBuffer = null;
+            t._gpuBackend = null;
+            t._gpuBufferVersion = -1;
+        }
+        for (int i = 0; i < _preAllocatedGrads.Length; i++) Unbind(_preAllocatedGrads[i]);
+        Unbind(_lossGradSeed);
+        Unbind(_lossGradDest);
+        // The pre-pass (and the aborted capture) ran every forward op on the capture path, where GPU ops bind their
+        // outputs - the loss and every intermediate - to stable resident buffers. Left bound, the eager step after a
+        // failed capture served those stale device copies: with a composed loss (ReduceMean over (pred - y)^2) the
+        // reported loss froze at the last warmup step's value and the backward read stale intermediates.
+        if (_forwardSteps is not null)
+            foreach (var step in _forwardSteps) Unbind(step.OutputBuffer);
+        Unbind(_lossOutput);
+        // The pre-pass bound every external input (the batch and target slots) to a stable device buffer holding THAT
+        // step's data - the captured graph re-uploads them per replay (RefreshGraphInputInPlace), the eager step does
+        // not. Batches are fed through AsWritableSpan, which by contract does not bump the GPU-cache version, so after
+        // a failed capture the eager step kept reading the pre-pass batch as current: every later step trained on a
+        // stale target (measured: the loss matched MSE(pred(x_t), y_(t-1)) exactly).
+        if (!_graphHasEmbedding)
+            foreach (var leaf in GraphExternalLeaves()) Unbind(leaf);
+        _ownedLeafBuffers.Clear();
+    }
+
+    /// <summary>
+    /// A graph launch runs no host code, so the loss it just wrote on the device never re-arms its host download: the
+    /// caller's read of the returned loss saw the capture step's value on every replay (the training itself was right
+    /// - the weights matched an eager run exactly - but every reported loss after capture was the same number).
+    /// </summary>
+    private void RearmLossDownload(Engines.DirectGpuTensorEngine engine, Engines.DirectGpu.CUDA.CudaBackend backend)
+    {
+        if (_lossOutput._gpuBuffer is { } lossBuffer)
+            engine.BindResidentBuffer(_lossOutput, lossBuffer, backend);
+    }
+
+    /// <summary>Test hook: the next capture attempt runs the pre-pass and then fails, like a capture-unsafe op.</summary>
+    internal bool FailNextCaptureForTesting { get; set; }
+
+    /// <summary>Test hook: the next capture fails from INSIDE the captured body, after its forward and backward ran.</summary>
+    internal bool FailInsideNextCaptureForTesting { get; set; }
+
+    /// <summary>
+    /// After the eager step rewrites a HOST-authoritative slot through a raw array, retire any device copy cached from
+    /// the previous step. Only host-authoritative slots: a slot bound to a device buffer (the fully-resident / FP16
+    /// paths) holds its current value on the device, and bumping its version would mark that value stale - the
+    /// optimizer then read the zeroed host array instead (FP16 resident training's loss went flat, 7.70 -> 7.70).
+    /// </summary>
+    private static void InvalidateStaleDeviceCopy(Tensor<T> slot)
+    {
+        if (slot._gpuBuffer is null) slot.IncrementVersion();
+    }
+
+    /// <summary>
+    /// Keeps THIS plan on the eager step even where whole-step CUDA-graph capture is enabled process-wide. The
+    /// environment switch is read once per process, so this is how a single test process compares a captured plan
+    /// against an eager one (the parity oracle for capture).
+    /// </summary>
+    internal void DisableGraphStep()
+    {
+        InvalidateCapturedStepGraph();
+        _graphStepDisabled = true;
+    }
+
+    /// <summary>
     /// Destroys the captured CUDA step graph (if any) and resets the warmup counter
     /// so the next eligible Step() re-captures. MUST be called whenever the captured
     /// kernel sequence's inputs change — optimizer reconfigure (new state buffers /
@@ -297,8 +400,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         {
             cb.DestroyCapturedGraph(_stepGraphExec);
         }
+        bool hadGraph = _stepGraphExec != IntPtr.Zero;
         _stepGraphExec = IntPtr.Zero;
         _graphStepCalls = 0;
+        // The eager step accumulates into HOST gradient arrays; leaving the accumulators bound to the capture's
+        // device buffers made its in-place adds land on never-zeroed device memory (gradients piled up across steps).
+        if (hadGraph && _engine is Engines.DirectGpuTensorEngine gRoll)
+            RollBackCaptureResidency(gRoll, deviceHoldsResults: true);
         // Balance the graph-lifetime eviction suspension (Step()): once the captured graph is gone,
         // the buffers no longer need stable pointers, so re-enable normal activation eviction.
         if (_graphEvictionSuspended && _engine is Engines.DirectGpuTensorEngine gEvict)
@@ -1314,6 +1422,238 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     /// (<c>NeuralNetworkBase.TrainWithTape</c>) applies the same clip
     /// independently — both paths agree when given the same threshold.
     /// </remarks>
+    private float _l2Regularization;
+
+    /// <inheritdoc/>
+    public void SetL2Regularization(double strength)
+    {
+        if (double.IsNaN(strength) || double.IsInfinity(strength) || strength < 0)
+            throw new ArgumentOutOfRangeException(nameof(strength), strength, "L2 strength must be finite and >= 0.");
+        _l2Regularization = (float)strength;
+    }
+
+    /// <inheritdoc/>
+    public void ContinueOptimizerFrom(ICompiledTrainingPlan<T> previous)
+    {
+        if (previous is null) throw new ArgumentNullException(nameof(previous));
+        if (ReferenceEquals(previous, this)) return;
+        if (previous is not CompiledTrainingPlan<T> source)
+            throw new ArgumentException($"Cannot continue the optimizer of a {previous.GetType().Name}.", nameof(previous));
+        if (source._parameters.Length != _parameters.Length)
+            throw new ArgumentException(
+                $"The previous plan trains {source._parameters.Length} parameters, this one {_parameters.Length}.", nameof(previous));
+        for (int p = 0; p < _parameters.Length; p++)
+        {
+            if (!ReferenceEquals(source._parameters[p], _parameters[p]))
+                throw new ArgumentException($"Parameter {p} is a different tensor in the previous plan.", nameof(previous));
+        }
+        if (source._optimizerRuntimeState is null)
+            throw new InvalidOperationException("The previous plan has no configured optimizer to continue.");
+        if (!TryShareMomentsWith(source))
+        {
+            var checkpoint = source.CaptureFusedOptimizerCheckpoint()
+                ?? throw new InvalidOperationException("The previous plan has no configured optimizer to continue.");
+            RestoreFusedOptimizerCheckpoint(checkpoint);
+        }
+        _l2Regularization = source._l2Regularization;
+    }
+
+    /// <summary>
+    /// Optimizer moment storage shared by plans that train the same parameters: a loop alternating batch shapes
+    /// (full batches, then the short last batch of each epoch) switches between one plan per shape, and sharing the
+    /// moment buffers makes that switch free - no moment copy, and no CUDA-graph recapture, because the captured step
+    /// graph covers forward and backward only and never addresses the moments. The group owns every shared buffer;
+    /// each member plan's runtime aliases them; the last member to leave releases them.
+    /// </summary>
+    private sealed class SharedOptimizerMoments
+    {
+        public int Members;
+        public readonly List<Engines.DirectGpu.IGpuBuffer> GpuBuffers = new();
+        public readonly List<Array> ArenaArrays = new();
+
+        public void Release()
+        {
+            foreach (var buffer in GpuBuffers) buffer.Dispose();
+            GpuBuffers.Clear();
+            foreach (var array in ArenaArrays)
+            {
+                if (array is float[] f) TensorArena.ReturnPersistentBuffer(f);
+                else if (array is double[] d) TensorArena.ReturnPersistentBuffer(d);
+            }
+            ArenaArrays.Clear();
+        }
+    }
+
+    private SharedOptimizerMoments? _sharedMoments;
+
+    /// <summary>
+    /// Joins <paramref name="source"/>'s moment storage (creating the group on first use) and takes over its step
+    /// count and optimizer scalars. Returns false - leaving this plan untouched - for state that is not per-parameter
+    /// (L-BFGS history, grouped configurations) or when the two plans place a parameter's state differently (one on
+    /// the device, one on the host); the caller then copies the state instead.
+    /// </summary>
+    private bool TryShareMomentsWith(CompiledTrainingPlan<T> source)
+    {
+        var src = source._optimizerRuntimeState!;
+        if (src.IsGrouped || src.OptimizerType == OptimizerType.LBFGS || src.Schedules.Length != 1)
+            return false;
+
+        if (_sharedMoments is null || !ReferenceEquals(_sharedMoments, source._sharedMoments))
+        {
+            // Configure with the source's exact settings, then check the per-parameter placement matches before
+            // committing: a parameter updated on the device in one plan and on the host in the other cannot share.
+            _momentStorageMode = src.MomentStorageMode;
+            _int8MomentBlockSize = src.Int8MomentBlockSize;
+            ConfigureOptimizer(src.OptimizerType, src.Schedules[0], src.Beta1, src.Beta2, src.Epsilon, src.WeightDecay,
+                CloneFusedOptimizerExtras(src.Extras));
+            var rt = _optimizerRuntimeState!;
+            for (int p = 0; p < _parameters.Length; p++)
+            {
+                bool srcOnDevice = src.GpuBackends?[p] is not null;
+                bool onDevice = rt.GpuBackends?[p] is not null;
+                var srcMode = src.GpuMomentStorage?[p] ?? FusedMomentStorageMode.Float32;
+                var mode = rt.GpuMomentStorage?[p] ?? FusedMomentStorageMode.Float32;
+                if (srcOnDevice != onDevice || srcMode != mode)
+                    return false;
+            }
+
+            var group = source._sharedMoments ??= source.MoveOwnMomentsIntoGroup();
+            ReleaseOwnMoments(rt);
+            AliasMoments(rt, src);
+            group.Members++;
+            _sharedMoments = group;
+        }
+
+        var target = _optimizerRuntimeState!;
+        _optimizerStep = source._optimizerStep;
+        _maxGradNorm = source._maxGradNorm;
+        target.Scalars.HypergradientAdjustment = src.Scalars.HypergradientAdjustment;
+        target.Scalars.DAdaptationEstimate = src.Scalars.DAdaptationEstimate;
+        target.Scalars.DAdaptationRAccum = src.Scalars.DAdaptationRAccum;
+        target.Scalars.ScheduleFreeWeightSum = src.Scalars.ScheduleFreeWeightSum;
+        target.Scalars.CgPrevGradNorm2 = src.Scalars.CgPrevGradNorm2;
+        return true;
+    }
+
+    /// <summary>Creates a group owning this plan's current moment storage (this plan its first member).</summary>
+    private SharedOptimizerMoments MoveOwnMomentsIntoGroup()
+    {
+        var group = new SharedOptimizerMoments { Members = 1 };
+        var rt = _optimizerRuntimeState!;
+        foreach (var slots in GpuMomentSlots(rt))
+            foreach (var buffer in slots)
+                if (buffer is not null && _gpuOptimizerBuffers.Remove(buffer)) group.GpuBuffers.Add(buffer);
+        foreach (var slots in ArenaMomentSlots(rt))
+            foreach (var array in slots)
+                if (array is { Length: > 0 }) group.ArenaArrays.Add(array);
+        return group;
+    }
+
+    /// <summary>Frees the moment storage this plan's configure just allocated, before it aliases a group's.</summary>
+    private void ReleaseOwnMoments(FusedOptimizerRuntimeState rt)
+    {
+        foreach (var slots in GpuMomentSlots(rt))
+            for (int p = 0; p < slots.Length; p++)
+            {
+                if (slots[p] is { } buffer && _gpuOptimizerBuffers.Remove(buffer)) buffer.Dispose();
+                slots[p] = null;
+            }
+        ReturnPooledMoments(rt);
+    }
+
+    private static void AliasMoments(FusedOptimizerRuntimeState rt, FusedOptimizerRuntimeState src)
+    {
+        static void Alias<TSlot>(TSlot[]? dst, TSlot[]? from)
+        {
+            if (dst is null || from is null) return;
+            Array.Copy(from, dst, Math.Min(dst.Length, from.Length));
+        }
+        Alias(rt.MFloat, src.MFloat); Alias(rt.VFloat, src.VFloat); Alias(rt.VMaxFloat, src.VMaxFloat);
+        Alias(rt.MDouble, src.MDouble); Alias(rt.VDouble, src.VDouble); Alias(rt.VMaxDouble, src.VMaxDouble);
+        Alias(rt.MBFloat16, src.MBFloat16); Alias(rt.VBFloat16, src.VBFloat16);
+        Alias(rt.MQuantized, src.MQuantized); Alias(rt.VQuantized, src.VQuantized);
+        Alias(rt.MScales, src.MScales); Alias(rt.VScales, src.VScales);
+        Alias(rt.GpuM, src.GpuM); Alias(rt.GpuV, src.GpuV); Alias(rt.GpuVMax, src.GpuVMax);
+        Alias(rt.GpuMScales, src.GpuMScales); Alias(rt.GpuVScales, src.GpuVScales);
+    }
+
+    private static IEnumerable<Engines.DirectGpu.IGpuBuffer?[]> GpuMomentSlots(FusedOptimizerRuntimeState rt)
+    {
+        if (rt.GpuM is not null) yield return rt.GpuM;
+        if (rt.GpuV is not null) yield return rt.GpuV;
+        if (rt.GpuVMax is not null) yield return rt.GpuVMax;
+        if (rt.GpuMScales is not null) yield return rt.GpuMScales;
+        if (rt.GpuVScales is not null) yield return rt.GpuVScales;
+    }
+
+    private static IEnumerable<Array[]> ArenaMomentSlots(FusedOptimizerRuntimeState rt)
+    {
+        if (rt.MFloat is not null) yield return rt.MFloat;
+        if (rt.VFloat is not null) yield return rt.VFloat;
+        if (rt.VMaxFloat is not null) yield return rt.VMaxFloat;
+        if (rt.MDouble is not null) yield return rt.MDouble;
+        if (rt.VDouble is not null) yield return rt.VDouble;
+        if (rt.VMaxDouble is not null) yield return rt.VMaxDouble;
+    }
+
+    /// <summary>
+    /// Leaves the shared-moment group before this plan releases or replaces its optimizer state. The aliased slots
+    /// belong to the group, so they are detached from this plan's runtime first - its own release then cannot free
+    /// storage another member still steps with - and the last member releases the group.
+    /// </summary>
+    private void LeaveSharedMoments()
+    {
+        var group = _sharedMoments;
+        if (group is null) return;
+        _sharedMoments = null;
+        if (_optimizerRuntimeState is { } rt)
+        {
+            foreach (var slots in GpuMomentSlots(rt)) Array.Clear(slots, 0, slots.Length);
+            foreach (var slots in ArenaMomentSlots(rt)) Array.Clear(slots, 0, slots.Length);
+        }
+        if (--group.Members == 0) group.Release();
+    }
+
+    // grad += strength * param for every parameter, before clipping (see SetL2Regularization). On the device when both
+    // the gradient and the parameter are resident (the captured / resident path) - one launch per parameter - else on
+    // the host arrays the optimizer binds.
+    private void ApplyL2Regularization()
+    {
+        if (_l2Regularization == 0f) return;
+        var engine = _engine as Engines.DirectGpuTensorEngine;
+        var backend = engine?.GetBackend();
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var strength = numOps.FromDouble(_l2Regularization);
+        for (int p = 0; p < _parameters.Length; p++)
+        {
+            var grad = _gradients[p];
+            if (grad is null) continue;
+            var param = _parameters[p];
+            // Add the term where the optimizer will READ the gradient. ResolveAuthoritativeGpuGradients takes the device
+            // gradient only when it is current (its buffer version matches, or the stream is capturing) and the
+            // parameter lives on the device; otherwise it reads the host array. Writing on the device merely because
+            // both tensors HAD a buffer put the term on a stale device copy while the optimizer read the host
+            // gradient - L2 silently dropped.
+            bool capturing = backend is Engines.DirectGpu.CUDA.CudaBackend cuda && cuda.IsStreamCapturing();
+            if (typeof(T) == typeof(float) && backend is not null
+                && CurrentDeviceBuffer(grad, capturing) is { } gradBuffer
+                && CurrentDeviceBuffer(param, capturing) is { } paramBuffer)
+            {
+                backend.AddScaled(gradBuffer, paramBuffer, gradBuffer, 1f, _l2Regularization, grad.Length);
+                continue;
+            }
+            var g = grad.AsWritableSpan();   // materializes a pending device result first
+            var w = param.AsSpan();
+            for (int i = 0; i < g.Length; i++) g[i] = numOps.Add(g[i], numOps.Multiply(strength, w[i]));
+            // AsWritableSpan does not bump the GPU-cache version. A device copy of this gradient would otherwise stay
+            // "current" and the optimizer would read it - without the term just added on the host.
+            if (grad._gpuBuffer is not null) grad.IncrementVersion();
+        }
+
+        static Engines.DirectGpu.IGpuBuffer? CurrentDeviceBuffer(Tensor<T> t, bool capturing)
+            => t.TryGetGpuBuffer() is { } buffer && (capturing || t._gpuBufferVersion == t.GpuCacheVersion) ? buffer : null;
+    }
+
     public void SetMaxGradNorm(double maxNorm)
     {
         if (double.IsNaN(maxNorm) || double.IsInfinity(maxNorm) || maxNorm < 0)
@@ -1656,6 +1996,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                         // VRAM every step (a 488-step epoch OOM'd; the 76-step canary survived). Instance-scoped
                         // (not thread-local): op execution fans out to the BLAS pool threads.
                         using var _cap = gte.EnterCompiledCapturePath();
+                        if (FailNextCaptureForTesting)
+                        {
+                            FailNextCaptureForTesting = false;
+                            RunGpuStepBodyForCapture(cb);   // the pre-pass runs, as it does before a real failure
+                            throw new InvalidOperationException("capture failure forced for testing");
+                        }
                         if (_graphHasEmbedding) gte.EmbeddingIndexExternallyManaged = false;
                         RefreshGraphInputInPlace(cb);
                         RunGpuStepBodyForCapture(cb);
@@ -1679,6 +2025,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                         if (_graphHasEmbedding) gte.EmbeddingIndexExternallyManaged = false;
                         gte.ResumeActivationEviction();
                         _graphEvictionSuspended = false;
+                        RollBackCaptureResidency(gte);
                         return StepEager();
                     }
                     finally
@@ -1695,10 +2042,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                         _graphStepDisabled = true;
                         gte.ResumeActivationEviction();
                         _graphEvictionSuspended = false;
+                        RollBackCaptureResidency(gte);
                         return StepEager();
                     }
                     _stepGraphExec = exec;
                     cb.LaunchCapturedGraph(exec);   // executes THIS step on the just-uploaded indices
+                    RearmLossDownload(gte, cb);
                     // The optimizer update is run eagerly (NOT captured): its closure
                     // increments _optimizerStep and re-evaluates lrSchedule.GetLr +
                     // Adam/AdamW bias-correction each step, and bakes those scalars into
@@ -1706,6 +2055,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                     // capture step. Its kernels enqueue (in order) after the graph launch.
                     // GPU-resident grad clip (if enabled): scales the device grad buffers in place on the
                     // compute stream — ordered after the captured backward, before the optimizer reads them.
+                    ApplyL2Regularization();
                     if (_maxGradNorm > 0.0 && !TryClipGradientsGlobalL2Gpu(_gradients, _maxGradNorm))
                         ClipGradientsGlobalL2(_gradients, _maxGradNorm);
                     _optimizerUpdate?.Invoke();
@@ -1718,8 +2068,17 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 // Upload THIS step's token indices into the stable buffer (OUTSIDE capture) so the captured
                 // embedding gather replays on fresh indices; then replay the whole step as one graph launch.
                 if (_graphHasEmbedding) gte.RefreshGraphEmbeddingIndicesNow();   // upload step-N indices (registered action)
-                RefreshGraphInputInPlace(cb);
+                if (!RefreshGraphInputInPlace(cb))
+                {
+                    // An input the graph reads through a baked pointer was released: replaying would read freed
+                    // memory. Drop the graph and train this plan eagerly from here on.
+                    InvalidateCapturedStepGraph();
+                    _graphStepDisabled = true;
+                    return StepEager();
+                }
                 cb.LaunchCapturedGraph(_stepGraphExec);
+                RearmLossDownload(gte, cb);
+                ApplyL2Regularization();
                 if (_maxGradNorm > 0.0 && !TryClipGradientsGlobalL2Gpu(_gradients, _maxGradNorm))
                     ClipGradientsGlobalL2(_gradients, _maxGradNorm);
                 _optimizerUpdate?.Invoke();
@@ -1727,6 +2086,111 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             }
         }
         return StepEager();
+    }
+
+    // Every tensor the graph reads that it does not produce and does not own as a parameter: the batch input, the
+    // TARGET, masks, any caller-fed tensor. Each is bound to a stable device buffer in the capture pre-pass and
+    // re-uploaded before every launch. Refreshing only the primary input left the target at the capture step's batch,
+    // so a replayed graph trained on one frozen target forever (AiDotNet's NeuralNetwork.Train: reported loss -> 0 on
+    // random targets while the real fit got worse than eager). Uploaded unconditionally, like the input always was:
+    // callers write batches through a host span, which does not bump the version.
+    private Tensor<T>[]? _graphExternalLeaves;
+
+    // The device buffer the capture pre-pass bound to each external input. Only these are refreshed in place: any
+    // other binding on an input - left by an earlier eager step - may already be released, or (a pooled buffer keeps
+    // its handle when returned) re-rented by another owner, so writing the batch into it corrupts that owner.
+    private readonly Dictionary<Tensor<T>, Engines.DirectGpu.IGpuBuffer> _ownedLeafBuffers =
+        new(ReferenceEqualityComparer<Tensor<T>>.Instance);
+
+    private bool IsOwnedLeafBinding(Tensor<T> leaf)
+        => leaf._gpuBuffer is { } bound && _ownedLeafBuffers.TryGetValue(leaf, out var owned)
+           && ReferenceEquals(owned, bound);
+
+    /// <summary>
+    /// Whether the captured graph can still be fed <paramref name="leaf"/> through the buffer it baked in. False when
+    /// the pre-pass bound a buffer and the leaf is no longer bound to it - dropped, rebound, or released - since the
+    /// replay would read that baked pointer regardless: a dropped binding left the graph training on the capture
+    /// step's batch, and a pooled buffer keeps its handle after it is returned, so writing into it anyway could
+    /// corrupt its next owner. Also false for any binding the pre-pass did not make (left by an eager step, possibly
+    /// released or re-rented). True with a null <paramref name="buffer"/> when the graph reads no device copy of it.
+    /// </summary>
+    private bool LeafStillBoundToCapturedBuffer(Tensor<T> leaf, Engines.DirectGpu.CUDA.CudaBackend cb,
+        out Engines.DirectGpu.IGpuBuffer? buffer)
+    {
+        buffer = null;
+        bool captured = _ownedLeafBuffers.TryGetValue(leaf, out var owned);
+        if (leaf._gpuBuffer is not { } bound || !ReferenceEquals(leaf._gpuBackend, cb))
+            return !captured;
+        if (!captured || !ReferenceEquals(owned, bound) || bound.Handle == IntPtr.Zero) return false;
+        buffer = bound;
+        return true;
+    }
+
+    private Tensor<T>[] GraphExternalLeaves()
+    {
+        if (_graphExternalLeaves is { } cached) return cached;
+        var produced = new HashSet<Tensor<T>>();
+        var owned = new HashSet<Tensor<T>>();
+        foreach (var p in _parameters) owned.Add(p);
+        if (_forwardSteps is not null)
+            foreach (var step in _forwardSteps) produced.Add(step.OutputBuffer);
+        var leaves = new List<Tensor<T>>();
+        var seen = new HashSet<Tensor<T>>();
+        if (_forwardSteps is not null)
+            foreach (var step in _forwardSteps)
+                foreach (var input in step.Inputs)
+                    if (input is not null && input.IsContiguous && input.Length > 0
+                        && !produced.Contains(input) && !owned.Contains(input) && seen.Add(input))
+                        leaves.Add(input);
+        return _graphExternalLeaves = leaves.ToArray();
+    }
+
+    /// <summary>Refresh the persistent graph-input tensor's GPU buffer IN PLACE (stable pointer) with
+    /// its current host contents, OUTSIDE capture, and sync its buffer-version so a captured read is a
+    /// cache hit. Called before each graph REPLAY (SetInput already wrote this step's batch into the
+    /// host tensor). No-op until the input has a resident buffer (the pre-residency pass allocates it).</summary>
+    /// <returns>False when a bound input buffer has already been released (zero handle). Before a capture that is
+    /// harmless - the pre-pass rebinds every external input - but a captured graph would read freed memory.</returns>
+    private bool RefreshGraphInputInPlace(Engines.DirectGpu.CUDA.CudaBackend cb)
+    {
+        bool allLive = true;
+        if (!_graphHasEmbedding)
+        {
+            foreach (var leaf in GraphExternalLeaves())
+            {
+                if (ReferenceEquals(leaf, _compiledInputTensor)) continue;   // refreshed below, as before
+                if (!LeafStillBoundToCapturedBuffer(leaf, cb, out var leafBuffer)) { allLive = false; continue; }
+                if (leafBuffer is null) continue;
+                var leafData = leaf.GetDataArray();
+                if (leafBuffer.Size < leafData.Length) continue;
+                cb.UploadBufferInPlace((float[])(object)leafData, leafBuffer);
+                leaf._gpuBufferVersion = leaf.GpuCacheVersion;
+            }
+        }
+        // In-graph embedding design: for an embedding-first plan there is NO float input to refresh (the gather
+        // happens on-device inside the captured graph; only the small index buffer is refreshed, via
+        // RefreshGraphEmbeddingIndicesNow). _compiledInputTensor stays set for SetInput/SetInputs API
+        // compatibility (it's the embeddings matrix there), so gate on the flag, not on null.
+        if (_graphHasEmbedding) return allLive;
+        if (_compiledInputTensor is not { } inT) return allLive;
+        Engines.DirectGpu.IGpuBuffer? buf;
+        if (GraphExternalLeaves().Contains(inT))
+        {
+            if (!LeafStillBoundToCapturedBuffer(inT, cb, out buf)) return false;
+            if (buf is null) return allLive;
+        }
+        else
+        {
+            // Not an external leaf, so the pre-pass never bound it: refresh whatever binding it has, as before.
+            if (inT._gpuBuffer is not { } bound || !ReferenceEquals(inT._gpuBackend, cb)) return allLive;
+            if (bound.Handle == IntPtr.Zero) return false;
+            buf = bound;
+        }
+        var data = inT.GetDataArray();                 // host backing (T==float on the graph path)
+        if (buf.Size < data.Length) return allLive;
+        cb.UploadBufferInPlace((float[])(object)data, buf);
+        inT._gpuBufferVersion = inT.GpuCacheVersion;
+        return allLive;
     }
 
     /// <summary>
@@ -1737,25 +2201,6 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     /// is deliberately NOT captured — it runs eagerly in Step() so its per-step LR /
     /// bias-correction scalars are recomputed each replay instead of frozen at capture.
     /// </summary>
-    /// <summary>Refresh the persistent graph-input tensor's GPU buffer IN PLACE (stable pointer) with
-    /// its current host contents, OUTSIDE capture, and sync its buffer-version so a captured read is a
-    /// cache hit. Called before each graph REPLAY (SetInput already wrote this step's batch into the
-    /// host tensor). No-op until the input has a resident buffer (the pre-residency pass allocates it).</summary>
-    private void RefreshGraphInputInPlace(Engines.DirectGpu.CUDA.CudaBackend cb)
-    {
-        // In-graph embedding design: for an embedding-first plan there is NO float input to refresh (the gather
-        // happens on-device inside the captured graph; only the small index buffer is refreshed, via
-        // RefreshGraphEmbeddingIndicesNow). _compiledInputTensor stays set for SetInput/SetInputs API
-        // compatibility (it's the embeddings matrix there), so gate on the flag, not on null.
-        if (_graphHasEmbedding) return;
-        if (_compiledInputTensor is not { } inT) return;
-        if (inT._gpuBuffer is not { } buf || !ReferenceEquals(inT._gpuBackend, cb)) return;
-        var data = inT.GetDataArray();                 // host backing (T==float on the graph path)
-        if (buf.Size < data.Length) return;
-        cb.UploadBufferInPlace((float[])(object)data, buf);
-        inT._gpuBufferVersion = inT.GpuCacheVersion;
-    }
-
     private void RunGpuStepBodyForCapture(Engines.DirectGpu.CUDA.CudaBackend cb)
     {
         var engine = _engine;
@@ -1765,6 +2210,23 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // (the pre-pass's persistent EnsureResidentBuffer allocs must NOT be pooled).
         var de = engine as Engines.DirectGpuTensorEngine;
         de?.SetCurrentScratchAction(-1);
+        // Pre-pass only (allocation is illegal inside the capture): give every external leaf a stable device buffer
+        // holding its current data, so the captured ops read it through that buffer and replays can refresh it.
+        if (de is not null && !_graphHasEmbedding && !cb.IsStreamCapturing())
+            foreach (var leaf in GraphExternalLeaves())
+            {
+                // EnsureResidentInput reuses any bound buffer with a live-looking handle. A binding this plan did not
+                // make is not ours to write: drop it (without disposing - its owner does that) so a fresh one is bound.
+                if (leaf._gpuBuffer is not null && !IsOwnedLeafBinding(leaf))
+                {
+                    de.InvalidateGpuCacheForTensor(leaf);
+                    leaf._gpuBuffer = null;
+                    leaf._gpuBackend = null;
+                    leaf._gpuBufferVersion = -1;
+                }
+                de.EnsureResidentInput(leaf);
+                if (leaf._gpuBuffer is { } bound) _ownedLeafBuffers[leaf] = bound;
+            }
         _preForwardParamTransform?.Invoke();
         var fwd = _forwardActions;
         // The whole forward (INCLUDING the embedding, which gathers on-device from the externally-refreshed stable
@@ -1848,6 +2310,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             }
         }
         de?.SetCurrentScratchAction(-1);   // grad clip + optimizer (run after) must NOT pool
+        if (FailInsideNextCaptureForTesting && cb.IsStreamCapturing())
+        {
+            // The real failure shape: a host read of a device-resident value INSIDE the capture, after the whole
+            // forward and backward have already issued (and allocated) inside it.
+            FailInsideNextCaptureForTesting = false;
+            _ = _lossOutput.ToArray();
+            throw new InvalidOperationException("capture failure forced inside the captured step for testing");
+        }
         // NOTE: _optimizerUpdate is intentionally NOT invoked here — it runs eagerly
         // in Step() after LaunchCapturedGraph so the LR schedule / Adam bias-correction
         // scalars are fresh per step rather than frozen at capture time.
@@ -2031,20 +2501,33 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             {
                 int idx = _genericGradIndices[i];
                 Array.Clear(gradArrays[idx], 0, _preAllocatedGrads[idx].Length);
+                InvalidateStaleDeviceCopy(_preAllocatedGrads[idx]);   // see the note on the full clear below
             }
         }
         else
         {
             // First call: clear everything (safe fallback)
             for (int i = 0; i < gradArrays.Length; i++)
+            {
                 Array.Clear(gradArrays[i], 0, _preAllocatedGrads[i].Length);
+                // A raw clear does not bump the version, so a device copy of this slot cached during the previous
+                // step (a backward op uploads it to read it as an upstream gradient) still looked current, and the
+                // in-place accumulation - which prefers a resident operand - added onto LAST step's gradient on the
+                // device. Measured: two back-to-back gradient passes at identical weights disagreed by 22% in the
+                // gradient of (pred - y) for ReduceMean((pred - y)^2); it also made every captured-step comparison
+                // against this "eager" reference meaningless.
+                InvalidateStaleDeviceCopy(_preAllocatedGrads[i]);
+            }
         }
 
         // Re-seed loss gradient — direct Array.Copy
         var seedArr = _cachedLossGradSeedArray;
         var destArr = _cachedLossGradDestArray;
         if (seedArr != null && destArr != null)
+        {
             Array.Copy(seedArr, destArr, seedArr.Length);
+            if (_lossGradDest is not null) InvalidateStaleDeviceCopy(_lossGradDest);   // same reason as the gradient clear
+        }
 
         long t2 = _profileStepEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
 
@@ -2137,6 +2620,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // every traced tensor) and not using arr.Length (which is the
         // pool-padded backing-array length whose tail bytes Array.Clear
         // leaves uninitialised).
+        ApplyL2Regularization();   // before clipping, as the flat optimizer path orders it
         if (_maxGradNorm > 0.0)
         {
             // Prefer the fully GPU-resident clip when grads are CUDA-resident — it scales the device grad
@@ -2286,7 +2770,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             // The double closures only implement SGD/Adam/AdamW/AMSGrad; the
             // extras-driven optimizers are float-only and were already rejected
             // by ValidatePlanOptimizerSupport above for double.
-            ConfigureOptimizerDouble(optimizerType, schedule, beta1, beta2, eps, weightDecay);
+            ConfigureOptimizerDouble(optimizerType, schedule, beta1, beta2, eps, weightDecay, ex);
             return;
         }
         throw new NotSupportedException("Fused optimizer updates support float and double parameters.");
@@ -2442,7 +2926,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         }
         if (typeof(T) == typeof(double))
         {
-            ConfigureOptimizerDoubleGrouped(optimizerType, groupTypes, groupSchedules, canonicalParamToGroup, beta1, beta2, eps, weightDecay, groupWds);
+            ConfigureOptimizerDoubleGrouped(optimizerType, groupTypes, groupSchedules, canonicalParamToGroup, beta1, beta2, eps, weightDecay, groupWds, ex);
             return;
         }
         throw new NotSupportedException("Fused optimizer updates support float and double parameters.");
@@ -2654,6 +3138,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // buffers. Without this the device memory grows every time the user
         // calls ConfigureOptimizer (e.g., to switch from SGD to Adam mid-run
         // or to retune lr via re-configure with a fresh schedule).
+        LeaveSharedMoments();
         foreach (var buf in _gpuOptimizerBuffers)
             buf.Dispose();
         _gpuOptimizerBuffers.Clear();
@@ -3064,7 +3549,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             // below) — otherwise a later LaunchCapturedGraph would replay against freed/stale device
             // pointers. No-op when no graph is captured (the CPU and on-device optimizer paths are
             // normally mutually exclusive; this is the requested safety net).
-            if (_stepGraphExec != IntPtr.Zero) InvalidateCapturedStepGraph();
+            // Only when this update writes weights on the HOST. When every parameter is updated on the device (the
+            // resident fused path), the graph's pointers stay valid; retiring it here destroyed every graph right after
+            // its first launch, so the plan cycled warm-up -> capture -> destroy and never replayed.
+            if (_stepGraphExec != IntPtr.Zero && Array.Exists(gpuParam, g => g is null)) InvalidateCapturedStepGraph();
             // Issue #348: read lr from the schedule each step. PyTorch's
             // LRScheduler.step() pays managed-code dispatch overhead per
             // step; here it's an inlined Math.Cos / Math.Pow.
@@ -3562,8 +4050,18 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                                 }
                                 break;
                             case OptimizerType.AMSGrad:
-                                gpuBe.AmsgradUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!, gpuVMax[p]!,
-                                    lr, b1, b2, epsVal, wd, _optimizerStep, len);
+                                if (extras.DecoupledWeightDecay)
+                                {
+                                    // AdamW(amsgrad): p *= 1 - lr*wd, then AMSGrad without decay (FusedOptimizerExtras).
+                                    if (wd != 0f) gpuBe.Scale(gpuP, gpuP, 1f - lr * wd, len);
+                                    gpuBe.AmsgradUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!, gpuVMax[p]!,
+                                        lr, b1, b2, epsVal, 0f, _optimizerStep, len);
+                                }
+                                else
+                                {
+                                    gpuBe.AmsgradUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!, gpuVMax[p]!,
+                                        lr, b1, b2, epsVal, wd, _optimizerStep, len);
+                                }
                                 break;
                             case OptimizerType.Nadam:
                                 gpuBe.NadamUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!,
@@ -3699,8 +4197,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                             // (drift fix, AiDotNet #1332). Uses Adam's L2 weight-decay
                             // convention (grad += wd*param); wd is 0 for that default.
                             // AMSGradUpdateSimd binds the float or double overload by
-                            // pointer type.
-                            if (wd != 0f)
+                            // pointer type. DecoupledWeightDecay (AdamW + AMSGrad) instead
+                            // scales the parameter by 1 - lr*wd first, PyTorch AdamW's order.
+                            if (wd != 0f && extras.DecoupledWeightDecay)
+                            {
+                                var decay = 1f - lr * wd;
+                                for (int i = 0; i < len; i++) pParam[i] *= decay;
+                            }
+                            else if (wd != 0f)
                                 for (int i = 0; i < len; i++) pGrad[i] += wd * pParam[i];
                             FusedOptimizer.AMSGradUpdateSimd(pParam, pGrad, pM, pV, pVMax, len,
                                 lr, b1, b2, epsVal, _optimizerStep);
@@ -3832,6 +4336,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     {
         // CodeRabbit #425: reconfigure releases prior GPU optimizer-state.
         // See ConfigureOptimizerFloat for the rationale.
+        LeaveSharedMoments();
         foreach (var buf in _gpuOptimizerBuffers)
             buf.Dispose();
         _gpuOptimizerBuffers.Clear();
@@ -4144,7 +4649,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             // #739 review: retire any captured on-device step graph before this CPU fused optimizer
             // invalidates resident weight buffers below — else a later LaunchCapturedGraph replays
             // against freed/stale device pointers. No-op when no graph is captured.
-            if (_stepGraphExec != IntPtr.Zero) InvalidateCapturedStepGraph();
+            // Only when this update writes weights on the HOST (see the ungrouped closure).
+            if (_stepGraphExec != IntPtr.Zero && Array.Exists(gpuParam, g => g is null)) InvalidateCapturedStepGraph();
             // Resolve each group's lr ONCE per step. PyTorch does N kernel
             // launches for N groups; we do one schedule eval per group and
             // one fused-kernel call per parameter.
@@ -4234,8 +4740,18 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                                 }
                                 break;
                             case OptimizerType.AMSGrad:
-                                gpuBe.AmsgradUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!, gpuVMax[p]!,
-                                    lr, b1, b2, epsVal, wd, _optimizerStep, len);
+                                if (extras.DecoupledWeightDecay)
+                                {
+                                    // AdamW(amsgrad): p *= 1 - lr*wd, then AMSGrad without decay (FusedOptimizerExtras).
+                                    if (wd != 0f) gpuBe.Scale(gpuP, gpuP, 1f - lr * wd, len);
+                                    gpuBe.AmsgradUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!, gpuVMax[p]!,
+                                        lr, b1, b2, epsVal, 0f, _optimizerStep, len);
+                                }
+                                else
+                                {
+                                    gpuBe.AmsgradUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!, gpuVMax[p]!,
+                                        lr, b1, b2, epsVal, wd, _optimizerStep, len);
+                                }
                                 break;
                             case OptimizerType.Nadam:
                                 gpuBe.NadamUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!,
@@ -4339,8 +4855,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                             // (drift fix, AiDotNet #1332). Uses Adam's L2 weight-decay
                             // convention (grad += wd*param); wd is 0 for that default.
                             // AMSGradUpdateSimd binds the float or double overload by
-                            // pointer type.
-                            if (wd != 0f)
+                            // pointer type. DecoupledWeightDecay (AdamW + AMSGrad) instead
+                            // scales the parameter by 1 - lr*wd first, PyTorch AdamW's order.
+                            if (wd != 0f && extras.DecoupledWeightDecay)
+                            {
+                                var decay = 1f - lr * wd;
+                                for (int i = 0; i < len; i++) pParam[i] *= decay;
+                            }
+                            else if (wd != 0f)
                                 for (int i = 0; i < len; i++) pGrad[i] += wd * pParam[i];
                             FusedOptimizer.AMSGradUpdateSimd(pParam, pGrad, pM, pV, pVMax, len,
                                 lr, b1, b2, epsVal, _optimizerStep);
@@ -4448,8 +4970,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     }
 
     private unsafe void ConfigureOptimizerDouble(
-        OptimizerType optimizerType, LrSchedule schedule, float beta1, float beta2, float eps, float weightDecay)
+        OptimizerType optimizerType, LrSchedule schedule, float beta1, float beta2, float eps, float weightDecay,
+        FusedOptimizerExtras extras)
     {
+        LeaveSharedMoments();
         foreach (var buf in _gpuOptimizerBuffers)
             buf.Dispose();
         _gpuOptimizerBuffers.Clear();
@@ -4548,7 +5072,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             Beta2 = beta2,
             Epsilon = eps,
             WeightDecay = weightDecay,
-            Extras = new FusedOptimizerExtras(),
+            Extras = CloneFusedOptimizerExtras(extras),
             MomentStorageMode = FusedMomentStorageMode.Float32,
             Int8MomentBlockSize = _int8MomentBlockSize,
             Int8MinQuantizedLength = _int8MinQuantizedLength,
@@ -4624,8 +5148,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                             // (drift fix, AiDotNet #1332). Uses Adam's L2 weight-decay
                             // convention (grad += wd*param); wd is 0 for that default.
                             // AMSGradUpdateSimd binds the float or double overload by
-                            // pointer type.
-                            if (wd != 0f)
+                            // pointer type. DecoupledWeightDecay (AdamW + AMSGrad) instead
+                            // scales the parameter by 1 - lr*wd first, PyTorch AdamW's order.
+                            if (wd != 0f && extras.DecoupledWeightDecay)
+                            {
+                                var decay = 1f - lr * wd;
+                                for (int i = 0; i < len; i++) pParam[i] *= decay;
+                            }
+                            else if (wd != 0f)
                                 for (int i = 0; i < len; i++) pGrad[i] += wd * pParam[i];
                             FusedOptimizer.AMSGradUpdateSimd(pParam, pGrad, pM, pV, pVMax, len,
                                 lr, b1, b2, epsVal, _optimizerStep);
@@ -4653,8 +5183,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         System.Collections.Generic.IReadOnlyList<LrSchedule> groupSchedules,
         System.Collections.Generic.IReadOnlyList<int> paramToGroup,
         float beta1, float beta2, float eps, float weightDecay,
-        float[]? groupWeightDecays)
+        float[]? groupWeightDecays,
+        FusedOptimizerExtras extras)
     {
+        LeaveSharedMoments();
         foreach (var buf in _gpuOptimizerBuffers)
             buf.Dispose();
         _gpuOptimizerBuffers.Clear();
@@ -4743,7 +5275,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             Beta2 = beta2,
             Epsilon = eps,
             WeightDecay = weightDecay,
-            Extras = new FusedOptimizerExtras(),
+            Extras = CloneFusedOptimizerExtras(extras),
             MomentStorageMode = FusedMomentStorageMode.Float32,
             Int8MomentBlockSize = _int8MomentBlockSize,
             Int8MinQuantizedLength = _int8MinQuantizedLength,
@@ -4807,8 +5339,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                             // (drift fix, AiDotNet #1332). Uses Adam's L2 weight-decay
                             // convention (grad += wd*param); wd is 0 for that default.
                             // AMSGradUpdateSimd binds the float or double overload by
-                            // pointer type.
-                            if (wd != 0f)
+                            // pointer type. DecoupledWeightDecay (AdamW + AMSGrad) instead
+                            // scales the parameter by 1 - lr*wd first, PyTorch AdamW's order.
+                            if (wd != 0f && extras.DecoupledWeightDecay)
+                            {
+                                var decay = 1f - lr * wd;
+                                for (int i = 0; i < len; i++) pParam[i] *= decay;
+                            }
+                            else if (wd != 0f)
                                 for (int i = 0; i < len; i++) pGrad[i] += wd * pParam[i];
                             FusedOptimizer.AMSGradUpdateSimd(pParam, pGrad, pM, pV, pVMax, len,
                                 lr, b1, b2, epsVal, _optimizerStep);
@@ -5240,19 +5778,25 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             LbfgsMemorySize = extras.LbfgsMemorySize,
             TrustRegionRadius = extras.TrustRegionRadius,
             AdmmRho = extras.AdmmRho,
+            // LAMB's trust-ratio clip and bias-correction switch select the step LAMB takes; the serializer writes them
+            // (format v7) but this clone - the runtime state the checkpoint is taken from - dropped them, so a clipped or
+            // uncorrected LAMB plan checkpointed and restored as plain LAMB.
+            LambMaxTrustRatio = extras.LambMaxTrustRatio,
+            LambDisableBiasCorrection = extras.LambDisableBiasCorrection,
+            DecoupledWeightDecay = extras.DecoupledWeightDecay,
         };
 
     private static float[]? CopyNonEmpty(float[][]? arrays, int index)
-        => arrays is not null && arrays[index] is { Length: > 0 } slot ? (float[])slot.Clone() : null;
+        => arrays?[index] is { Length: > 0 } slot ? (float[])slot.Clone() : null;   // a device-resident parameter has no host slot
 
     private static double[]? CopyNonEmpty(double[][]? arrays, int index)
-        => arrays is not null && arrays[index] is { Length: > 0 } slot ? (double[])slot.Clone() : null;
+        => arrays?[index] is { Length: > 0 } slot ? (double[])slot.Clone() : null;   // a device-resident parameter has no host slot
 
     private static ushort[]? CopyNonEmpty(ushort[][]? arrays, int index)
-        => arrays is not null && arrays[index] is { Length: > 0 } slot ? (ushort[])slot.Clone() : null;
+        => arrays?[index] is { Length: > 0 } slot ? (ushort[])slot.Clone() : null;   // a device-resident parameter has no host slot
 
     private static byte[]? CopyNonEmpty(byte[][]? arrays, int index)
-        => arrays is not null && arrays[index] is { Length: > 0 } slot ? (byte[])slot.Clone() : null;
+        => arrays?[index] is { Length: > 0 } slot ? (byte[])slot.Clone() : null;   // a device-resident parameter has no host slot
 
     private static void CopyInto(float[][]? destination, int index, float[]? source)
     {

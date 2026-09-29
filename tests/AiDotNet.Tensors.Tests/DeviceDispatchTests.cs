@@ -9,6 +9,16 @@ namespace AiDotNet.Tensors.Tests;
 /// Unit tests for the central device-dispatch policy. Devices are set directly via the internal setter
 /// (InternalsVisibleTo) so the resolution logic is exercised without a real multi-GPU box.
 /// </summary>
+/// <summary>Serializes tests that set the process-wide <see cref="DeviceDispatch.Mode"/>.</summary>
+[CollectionDefinition(Name, DisableParallelization = true)]
+public sealed class DeviceDispatchGlobalStateCollection
+{
+    public const string Name = "DeviceDispatchGlobalState";
+}
+
+// DeviceDispatch.Mode is process-wide: while a test here held it at Strict, a concurrently running test doing an
+// ordinary mixed CPU/GPU op threw DeviceMismatchException (measured: GradientTapeReplayModeTests in the full suite).
+[Collection(DeviceDispatchGlobalStateCollection.Name)]
 public sealed class DeviceDispatchTests
 {
     private static Tensor<float> OnDevice(TensorDevice device, int index = 0)

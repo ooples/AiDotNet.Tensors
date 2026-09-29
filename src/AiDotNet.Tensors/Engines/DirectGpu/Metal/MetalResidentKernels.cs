@@ -842,7 +842,7 @@ kernel void optimizer_update(
         g += d * value; float m = a * state1[gid] + (1.0f - a) * g, v = b * state2[gid] + (1.0f - b) * g * g;
         state1[gid] = m; state2[gid] = v;
         float correction1 = 1.0f - pow(a, float(step)), correctionNext = 1.0f - pow(a, float(step + 1u));
-        float nesterov = a * (m / correction1) + (1.0f - a) * g / correctionNext;
+        float nesterov = a * (m / correctionNext) + (1.0f - a) * g / correction1;   // Dozat 2016 Alg. 2 (constant mu)
         parameter[gid] = value - learningRate * nesterov / (sqrt(v / (1.0f - pow(b, float(step)))) + c); return;
     }
     if (operation == 12u) {
@@ -927,7 +927,7 @@ kernel void sparse_optimizer_serial(
         else if (operation == 8u) { if (d > 0.0f) g += d * value; float m = a * state1[i] + (1.0f - a) * g, v = b * state2[i] + (1.0f - b) * g * g; state1[i] = m; state2[i] = v; float maximum = max(state3[i], v); state3[i] = maximum; parameter[i] = value - learningRate * (m / correction1) / (sqrt(maximum / correction2) + c); }
         else if (operation == 9u) { if (d > 0.0f) g += d * value; float m = a * state1[i] + (1.0f - a) * g, u = max(b * state2[i], abs(g)); state1[i] = m; state2[i] = u; parameter[i] = value - (learningRate / correction1) * m / (u + c); }
         else if (operation == 10u) { float combined = a * state1[i] + (1.0f - a) * g, update = sign(combined); if (c > 0.0f) update += c * value; parameter[i] = value - learningRate * update; state1[i] = b * state1[i] + (1.0f - b) * g; }
-        else if (operation == 11u) { if (d > 0.0f) g += d * value; float m = a * state1[i] + (1.0f - a) * g, v = b * state2[i] + (1.0f - b) * g * g; state1[i] = m; state2[i] = v; float mHat = (a * m + (1.0f - a) * g) / correction1; parameter[i] = value - learningRate * mHat / (sqrt(v / correction2) + c); }
+        else if (operation == 11u) { if (d > 0.0f) g += d * value; float m = a * state1[i] + (1.0f - a) * g, v = b * state2[i] + (1.0f - b) * g * g; state1[i] = m; state2[i] = v; float mHat = a * m / (1.0f - pow(a, float(step + 1u))) + (1.0f - a) * g / correction1; parameter[i] = value - learningRate * mHat / (sqrt(v / correction2) + c); }
         else if (operation == 12u) { float old = state2[i], current = old + g * g; state2[i] = current; float sigma = (sqrt(current) - sqrt(old)) / learningRate; float z = state1[i] + g - sigma * value; state1[i] = z; parameter[i] = abs(z) <= a ? 0.0f : ((z > 0.0f ? 1.0f : -1.0f) * a - z) / ((c + sqrt(current)) / learningRate + b); }
         else { float updated = value - learningRate * g, threshold = learningRate * a; parameter[i] = updated > threshold ? updated - threshold : (updated < -threshold ? updated + threshold : 0.0f); }
     }

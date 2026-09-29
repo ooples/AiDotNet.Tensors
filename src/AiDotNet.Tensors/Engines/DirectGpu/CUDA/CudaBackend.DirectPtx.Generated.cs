@@ -234,7 +234,7 @@ public sealed partial class CudaBackend
             var emitter = new PtxAffineEmitter();
             string ptx = emitter.Emit(spec, _ccMajor, _ccMinor);
 
-            _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+            _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
             var module = _directPtxRuntime.LoadModule(ptx, allowExperimentalJitFallback: true);
 
             return new GeneratedKernel

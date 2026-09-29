@@ -32,7 +32,8 @@ internal sealed class DirectPtxRuntime : IDisposable
     internal int DriverVersion { get; }
     internal string DeviceFingerprint { get; }
     internal Helpers.Autotune.GpuDeviceFingerprint Fingerprint { get; }
-    internal IntPtr Stream => _stream;
+    internal IntPtr Stream => CudaBackend.ResolveCaptureStream(_stream);
+    internal IntPtr Context => _context;
     internal uint StreamFlags
     {
         get
@@ -274,19 +275,34 @@ internal sealed class DirectPtxRuntime : IDisposable
                 "CUDA graph capture requires an explicit non-default stream.");
 
         using var _ = Enter();
-        Check(CudaNativeBindings.cuStreamBeginCapture(
-            _stream, CudaNativeBindings.CU_STREAM_CAPTURE_MODE_THREAD_LOCAL),
-            "cuStreamBeginCapture");
+        // Same gate as CudaBackend's captures: a cuCtxSynchronize from another thread (SynchronizeContextOutsideCapture
+        // in Upload/Download) while this capture is open would be rejected by the driver.
+        var gate = CudaBackend.CaptureGateFor(_context);
+        System.Threading.Monitor.Enter(gate);
+        bool gateHeld = true;
         IntPtr graph = IntPtr.Zero;
         bool endCaptureCalled = false;
+        try
+        {
+            Check(CudaNativeBindings.cuStreamBeginCapture(
+                _stream, CudaNativeBindings.CU_STREAM_CAPTURE_MODE_THREAD_LOCAL),
+                "cuStreamBeginCapture");
+        }
+        catch
+        {
+            System.Threading.Monitor.Exit(gate);
+            throw;
+        }
         try
         {
             launch();
             // EndCapture terminates the capture even when it reports an error. Mark
             // the attempt first so no failure below can issue a second EndCapture.
             endCaptureCalled = true;
-            Check(CudaNativeBindings.cuStreamEndCapture(_stream, out graph),
-                "cuStreamEndCapture");
+            CudaResult endResult = CudaNativeBindings.cuStreamEndCapture(_stream, out graph);
+            System.Threading.Monitor.Exit(gate);
+            gateHeld = false;
+            Check(endResult, "cuStreamEndCapture");
             Check(CudaNativeBindings.cuGraphInstantiate(
                 out IntPtr graphExec, graph, 0), "cuGraphInstantiate");
             return new DirectPtxGraph(this, graphExec);
@@ -302,6 +318,7 @@ internal sealed class DirectPtxRuntime : IDisposable
         }
         finally
         {
+            if (gateHeld) System.Threading.Monitor.Exit(gate);
             if (graph != IntPtr.Zero) CudaNativeBindings.cuGraphDestroy(graph);
         }
     }
@@ -309,7 +326,7 @@ internal sealed class DirectPtxRuntime : IDisposable
     internal void LaunchGraph(IntPtr graphExec)
     {
         using var _ = Enter();
-        Check(CudaNativeBindings.cuGraphLaunch(graphExec, _stream), "cuGraphLaunch");
+        Check(CudaNativeBindings.cuGraphLaunch(graphExec, Stream), "cuGraphLaunch");
     }
 
     internal void DestroyGraph(IntPtr graphExec)
@@ -423,12 +440,16 @@ internal sealed class DirectPtxRuntime : IDisposable
         IntPtr start = IntPtr.Zero;
         IntPtr stop = IntPtr.Zero;
         bool captureActive = false;
+        var gate = CudaBackend.CaptureGateFor(_context);   // see CaptureGraph
+        bool gateHeld = false;
         try
         {
             Check(CudaNativeBindings.cuEventCreate(out start, CudaNativeBindings.CU_EVENT_DEFAULT),
                 "cuEventCreate(tuner start)");
             Check(CudaNativeBindings.cuEventCreate(out stop, CudaNativeBindings.CU_EVENT_DEFAULT),
                 "cuEventCreate(tuner stop)");
+            System.Threading.Monitor.Enter(gate);
+            gateHeld = true;
             Check(CudaNativeBindings.cuStreamBeginCapture(
                 _stream, CudaNativeBindings.CU_STREAM_CAPTURE_MODE_THREAD_LOCAL),
                 "cuStreamBeginCapture(tuner)");
@@ -442,6 +463,8 @@ internal sealed class DirectPtxRuntime : IDisposable
                 "cuEventRecordWithFlags(tuner stop)");
             CudaResult endResult = CudaNativeBindings.cuStreamEndCapture(_stream, out graph);
             captureActive = false;
+            System.Threading.Monitor.Exit(gate);   // the timed launches below are not a capture
+            gateHeld = false;
             Check(endResult, "cuStreamEndCapture(tuner)");
             if (graph == IntPtr.Zero)
                 throw new InvalidOperationException("CUDA tuner capture returned a null graph.");
@@ -472,6 +495,7 @@ internal sealed class DirectPtxRuntime : IDisposable
                 CudaNativeBindings.cuStreamEndCapture(_stream, out IntPtr aborted);
                 if (aborted != IntPtr.Zero) CudaNativeBindings.cuGraphDestroy(aborted);
             }
+            if (gateHeld) System.Threading.Monitor.Exit(gate);
             if (start != IntPtr.Zero) CudaNativeBindings.cuEventDestroy(start);
             if (stop != IntPtr.Zero) CudaNativeBindings.cuEventDestroy(stop);
             if (graphExec != IntPtr.Zero) CudaNativeBindings.cuGraphExecDestroy(graphExec);
@@ -613,7 +637,7 @@ internal sealed class DirectPtxBuffer : IDisposable
             // kernel, or concurrent contexts can observe an incompletely staged
             // input and leave apparently random output blocks at zero.
             DirectPtxRuntime.Check(
-                CudaNativeBindings.cuCtxSynchronize(), "cuCtxSynchronize(upload)");
+                CudaBackend.SynchronizeContextOutsideCapture(_runtime.Context), "cuCtxSynchronize(upload)");
             // The synchronous pageable-host copy stages through the default
             // stream. Complete that stream before a caller can enqueue new work
             // on the runtime's CU_STREAM_NON_BLOCKING stream.
@@ -632,7 +656,7 @@ internal sealed class DirectPtxBuffer : IDisposable
         // non-blocking stream. Make Download independently correct even when a
         // caller omits an explicit Synchronize before reading the result.
         DirectPtxRuntime.Check(
-            CudaNativeBindings.cuCtxSynchronize(), "cuCtxSynchronize(download)");
+            CudaBackend.SynchronizeContextOutsideCapture(_runtime.Context), "cuCtxSynchronize(download)");
         // Make Download independently correct when the caller omits an explicit
         // barrier, while waiting only for the stream that produces this buffer.
         _runtime.Synchronize();

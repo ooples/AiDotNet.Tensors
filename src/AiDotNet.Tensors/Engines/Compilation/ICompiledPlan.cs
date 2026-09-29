@@ -459,6 +459,40 @@ public interface ICompiledTrainingPlan<T> : IDisposable
     void SetMaxGradNorm(double maxNorm);
 
     /// <summary>
+    /// Adds <c>strength * parameter</c> to every parameter gradient each step, BEFORE gradient clipping and the
+    /// optimizer update - L2 regularization in the order AiDotNet's optimizers apply it to a flat gradient (which is
+    /// not the order of a coupled optimizer weight decay, applied after clipping). 0 disables it.
+    /// </summary>
+    void SetL2Regularization(double strength);
+
+    /// <summary>
+    /// Continues <paramref name="previous"/>'s optimizer in this plan: its configuration, step count, LR schedule
+    /// position, gradient clip, L2 strength and every per-parameter moment. Both plans must train the same parameter
+    /// tensors in the same order. A training loop recompiles when the batch shape changes - most commonly the smaller
+    /// last batch of an epoch - and a freshly configured plan would otherwise restart the optimizer from zero moments
+    /// and step 1, so the run silently trains a different trajectory from the eager optimizer it stands in for.
+    /// </summary>
+    /// <remarks>
+    /// <para>When the two plans lay the optimizer state out the same way (same optimizer, same host/device placement
+    /// per parameter, not grouped, not L-BFGS) they <b>share</b> the per-parameter moment storage instead of copying it;
+    /// otherwise the state is copied. Either way the step count and optimizer scalars are copied at the time of the
+    /// call, and each plan then advances its own. So call this on <b>every</b> switch between plans - before stepping
+    /// <c>full</c> again after <c>tail</c>, call <c>full.ContinueOptimizerFrom(tail)</c> - or the plan you switch back
+    /// to applies the shared moments with a stale step count (wrong bias correction).</para>
+    /// <para>Disposing or reconfiguring one plan leaves the other's state valid: shared moments are reference-counted
+    /// and the last plan to let go releases them.</para>
+    /// <para><b>BINARY/SOURCE-BREAKING CHANGE WARNING:</b> adding this member to
+    /// <see cref="ICompiledTrainingPlan{T}"/> is source-breaking for any downstream type that implements the interface
+    /// directly and binary-breaking for already-compiled external implementers. The built-in
+    /// <c>CompiledTrainingPlan&lt;T&gt;</c> is updated alongside it, so consumers that only use the interface are
+    /// unaffected; third-party implementers must recompile and add the method.</para>
+    /// </remarks>
+    /// <exception cref="ArgumentException">The plans train different parameters, or <paramref name="previous"/>
+    /// is not a plan this library compiled.</exception>
+    /// <exception cref="InvalidOperationException"><paramref name="previous"/> has no configured optimizer.</exception>
+    void ContinueOptimizerFrom(ICompiledTrainingPlan<T> previous);
+
+    /// <summary>
     /// Requests bfloat16 storage for the Adam/AdamW moment state (m, v) on the
     /// float fused path (#1745). Halves resident optimizer-state memory while
     /// keeping the fp32 update math, so large models can stay on the fused fast

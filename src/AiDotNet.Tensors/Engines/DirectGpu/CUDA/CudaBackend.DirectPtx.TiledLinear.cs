@@ -96,7 +96,7 @@ public sealed partial class CudaBackend
                             "Direct PTX tiled fused linear must be prewarmed before CUDA graph capture.";
                         return false;
                     }
-                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                     kernel = CreateAndCacheFusedLinearTiledKernelSlow(key);
                 }
                 if (capturing && !PinDirectPtxKernelForCapture(_directPtxFusedLinearTiledKernels, key))
@@ -159,7 +159,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 var key = new DirectPtxFusedLinearTiledKey(
                     m, k, n, (int)activation, (int)weightLayout, true, 1);
                 if (!_directPtxFusedLinearTiledKernels.TryGetValue(key, out _))
@@ -229,7 +229,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 var key = new DirectPtxFusedLinearTiledKey(
                     m, k, n, (int)DirectPtxLinearActivation.None,
                     (int)weightLayout, false, batchCount);
@@ -380,7 +380,7 @@ public sealed partial class CudaBackend
                             "Direct PTX GEMM must be prewarmed before CUDA graph capture.";
                         return false;
                     }
-                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                     kernel = CreateAndCacheFusedLinearTiledKernelSlow(key);
                 }
                 if (capturing && !PinDirectPtxKernelForCapture(_directPtxFusedLinearTiledKernels, key))
