@@ -2835,9 +2835,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     /// <summary>
-    /// Allocates a new output buffer (always owned, never cached).
-    /// </summary>
-    /// <summary>
     /// As <see cref="AllocateOutputBuffer"/>, but the buffer is NOT zero-filled when the backend supports it — for
     /// outputs the following kernel writes in full (elementwise maps, GEMM with beta = 0). See
     /// <see cref="IUninitializedGpuAllocation"/> for why, and for what must never use it.
@@ -2847,11 +2844,34 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var eng = s_residentScratchEngine;
         if (eng is not null && eng.ScratchPoolingActive)
             return new OwnedBuffer(eng.RentActionScratchOrAllocate(backend, size), ownsBuffer: false);
-        return backend is IUninitializedGpuAllocation uninitialized
-            ? new OwnedBuffer(uninitialized.AllocateBufferUninitialized(size), ownsBuffer: true)
-            : new OwnedBuffer(backend.AllocateBuffer(size), ownsBuffer: true);
+        return new OwnedBuffer(AllocateReclaiming(backend, b => b is IUninitializedGpuAllocation uninitialized
+            ? uninitialized.AllocateBufferUninitialized(size)
+            : b.AllocateBuffer(size)), ownsBuffer: true);
     }
 
+    /// <summary>
+    /// Runs <paramref name="allocate"/>, and if it fails, reclaims memory held only by unreachable objects and tries
+    /// once more. An op result owns its device buffer and releases it from its finalizer, so a long run can hold
+    /// device memory that nothing references until a collection runs; the periodic non-blocking collect
+    /// (NoteOwnedResultAllocation) is only a hint. CUDA drains finalizers and retries inside its own allocator; the
+    /// other backends (HIP, Metal, OpenCL, Vulkan, WebGPU) allocate directly, so an allocation that would have fit
+    /// after a collection failed outright there. A failure that is not about memory fails again and propagates.
+    /// </summary>
+    internal static IGpuBuffer AllocateReclaiming(IDirectGpuBackend backend, Func<IDirectGpuBackend, IGpuBuffer> allocate)
+    {
+        try { return allocate(backend); }
+        catch (Exception ex) when (backend is not Engines.DirectGpu.CUDA.CudaBackend && ex is not ObjectDisposedException)
+        {
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+            return allocate(backend);
+        }
+    }
+
+    /// <summary>
+    /// Allocates a new output buffer (always owned, never cached).
+    /// </summary>
     private static OwnedBuffer AllocateOutputBuffer(IDirectGpuBackend backend, int size)
     {
         // PR #638 capture-determinism: inside a compiled action during the resident step, draw from the engine's
@@ -2860,7 +2880,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var eng = s_residentScratchEngine;
         if (eng is not null && eng.ScratchPoolingActive)
             return new OwnedBuffer(eng.RentActionScratchOrAllocate(backend, size), ownsBuffer: false);
-        return new OwnedBuffer(backend.AllocateBuffer(size), ownsBuffer: true);
+        return new OwnedBuffer(AllocateReclaiming(backend, b => b.AllocateBuffer(size)), ownsBuffer: true);
     }
 
     // Synchronously download a GPU op's output and free its buffer. Used by the array/span-based

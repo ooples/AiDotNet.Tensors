@@ -807,9 +807,11 @@ public class GpuTapeGradientParityTests : IDisposable
     // Rand in [-1,1] over 10 columns leaves several entries per row outside the support, so the gradient's
     // support mask and its per-row mean correction are both exercised.
     [SkippableFact]
+    // Exact on both engines at this size (measured: maxAbs 0 with 5 device materialisations), so bit-identical output
+    // is not evidence the device path was skipped; the residency counter is.
     public void Sparsemax_gradients_match_cpu() =>
         AssertGradientParity("Sparsemax", Rand([6, 10], seed: 443),
-            static (e, t) => e.Sparsemax(t, -1));
+            static (e, t) => e.Sparsemax(t, -1), probe: Engagement.UseResidencyCounter);
 
     [SkippableFact]
     public void Sparsemax_taped_forward_matches_cpu() =>
