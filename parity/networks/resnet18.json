@@ -1,0 +1,83 @@
+{
+  "name": "resnet18",
+  "description": "ResNet-18 for 32x32 input (3x3 stem, four stages of two basic blocks, training-mode batch norm, global average pool), a linear head. MSE loss, plain SGD.",
+  "dtype": "float32",
+  "seed": 1061,
+  "batch": 8,
+  "inputShape": [
+    3,
+    32,
+    32
+  ],
+  "layers": [
+    {
+      "type": "conv2d",
+      "out": 64,
+      "kernel": 3,
+      "stride": 1,
+      "padding": 1,
+      "bias": false
+    },
+    {
+      "type": "batchnorm2d",
+      "activation": "relu"
+    },
+    {
+      "type": "basicblock",
+      "out": 64,
+      "stride": 1
+    },
+    {
+      "type": "basicblock",
+      "out": 64,
+      "stride": 1
+    },
+    {
+      "type": "basicblock",
+      "out": 128,
+      "stride": 2
+    },
+    {
+      "type": "basicblock",
+      "out": 128,
+      "stride": 1
+    },
+    {
+      "type": "basicblock",
+      "out": 256,
+      "stride": 2
+    },
+    {
+      "type": "basicblock",
+      "out": 256,
+      "stride": 1
+    },
+    {
+      "type": "basicblock",
+      "out": 512,
+      "stride": 2
+    },
+    {
+      "type": "basicblock",
+      "out": 512,
+      "stride": 1
+    },
+    {
+      "type": "globalavgpool"
+    },
+    {
+      "type": "linear",
+      "out": 10,
+      "activation": "none"
+    }
+  ],
+  "loss": "mse",
+  "optimizer": {
+    "name": "sgd",
+    "lr": 0.01
+  },
+  "warmupSteps": 5,
+  "measuredSteps": 15,
+  "lossAgreementSteps": 5,
+  "repeats": 1
+}

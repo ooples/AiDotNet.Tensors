@@ -777,6 +777,9 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// <para><b>Warning:</b> The caller must ensure the memory remains valid for the
     /// lifetime of the tensor. If using ArrayPool, do NOT return the array to the pool
     /// until the tensor is no longer in use.</para>
+    /// <para><b>Writes through the memory:</b> after changing the contents directly (not through this tensor's
+    /// operations), call <see cref="TensorBase{T}.MarkModified"/>. Engines keep data derived from the contents, such as
+    /// device copies of weights, and refresh it only when told.</para>
     /// </remarks>
     public static Tensor<T> FromMemory(Memory<T> memory, int[] dimensions)
     {

@@ -1,0 +1,35 @@
+{
+  "name": "transformer",
+  "description": "One post-norm transformer encoder block (4 heads, d_model 64, ffn 128, ReLU, no dropout) over 16 positions, flattened into a linear head. MSE loss, plain SGD.",
+  "dtype": "float32",
+  "seed": 1060,
+  "batch": 16,
+  "inputShape": [
+    16,
+    64
+  ],
+  "layers": [
+    {
+      "type": "transformer",
+      "heads": 4,
+      "ffn": 128
+    },
+    {
+      "type": "flatten"
+    },
+    {
+      "type": "linear",
+      "out": 10,
+      "activation": "none"
+    }
+  ],
+  "loss": "mse",
+  "optimizer": {
+    "name": "sgd",
+    "lr": 0.01
+  },
+  "warmupSteps": 30,
+  "measuredSteps": 100,
+  "lossAgreementSteps": 10,
+  "repeats": 3
+}

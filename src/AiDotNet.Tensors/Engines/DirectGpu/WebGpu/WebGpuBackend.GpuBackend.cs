@@ -44,16 +44,17 @@ public sealed partial class WebGpuBackend
 
     public float[] DownloadBuffer(IGpuBuffer buffer)
     {
-        GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float));
         EnsureInitialized();
-        return DownloadBufferData(buffer);
+        var result = DownloadBufferData(buffer);
+        GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float), GpuBackendType.WebGpu);
+        return result;
     }
 
     public void DownloadBuffer(IGpuBuffer buffer, float[] destination)
     {
-        GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float));
         EnsureInitialized();
         var data = DownloadBufferData(buffer);
+        GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float), GpuBackendType.WebGpu);
         Array.Copy(data, destination, Math.Min(data.Length, destination.Length));
     }
 
@@ -65,6 +66,7 @@ public sealed partial class WebGpuBackend
         var wb = AsWebGpu(buffer);
         if (byteCount > wb.SizeInBytes)
             throw new ArgumentException($"Requested byte count ({byteCount}) exceeds buffer capacity ({wb.SizeInBytes}).", nameof(byteCount));
+        GpuLaunchProbe.OnReadback(byteCount, GpuBackendType.WebGpu);
 
         var result = new byte[byteCount];
         if (byteCount > 0)
@@ -80,6 +82,7 @@ public sealed partial class WebGpuBackend
         var wb = AsWebGpu(buffer);
         if (data.Length > wb.SizeInBytes)
             throw new ArgumentException($"Host data ({data.Length} bytes) exceeds buffer capacity ({wb.SizeInBytes} bytes).", nameof(data));
+        GpuLaunchProbe.OnUpload(data, sizeof(byte), GpuBackendType.WebGpu);
 
         if (data.Length > 0)
             wb.CopyBytesFrom(data);
@@ -139,6 +142,7 @@ public sealed partial class WebGpuBackend
         if (data is null)
             throw new ArgumentNullException(nameof(data));
         GpuBufferSizeGuard.EnsureFits("WebGPU", (long)data.Length * sizeof(int), MaxBufferAllocBytes, DeviceName);
+        GpuLaunchProbe.OnUpload(data, sizeof(int), GpuBackendType.WebGpu);
         var floatData = new float[data.Length];
         for (int i = 0; i < data.Length; i++)
             floatData[i] = BitConverter.Int32BitsToSingle(data[i]);

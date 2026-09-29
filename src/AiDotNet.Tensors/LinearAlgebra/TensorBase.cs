@@ -1272,6 +1272,19 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     }
 
     /// <summary>
+    /// Records that this tensor's data was written from outside the library, for example through the memory passed
+    /// to <see cref="Tensor{T}.FromMemory(System.Memory{T}, int[])"/> or by an optimizer that updates raw parameter
+    /// arrays.
+    /// </summary>
+    /// <remarks>
+    /// The library keeps data derived from a tensor's contents (device copies of weights, packed or transposed
+    /// kernels, the version autograd checks against in-place changes) and refreshes it when the tensor's own
+    /// operations write. A write it did not make is invisible to it until this is called; without it the next
+    /// operation can use the old values.
+    /// </remarks>
+    public void MarkModified() => IncrementVersion();
+
+    /// <summary>
     /// Increments the version counter. Called by in-place operations to signal mutation.
     /// </summary>
     /// <remarks>
