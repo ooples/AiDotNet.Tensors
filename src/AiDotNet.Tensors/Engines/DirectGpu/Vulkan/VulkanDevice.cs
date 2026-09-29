@@ -618,6 +618,7 @@ public sealed unsafe class VulkanDevice : IDisposable
     {
         if (_device != IntPtr.Zero)
         {
+            // The binding counts the drain for the residency probe, as it does for the teardown and fence waits.
             VulkanNativeBindings.vkDeviceWaitIdle(_device);
         }
     }

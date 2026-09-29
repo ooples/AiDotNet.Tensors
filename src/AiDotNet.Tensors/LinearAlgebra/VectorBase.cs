@@ -321,16 +321,7 @@ public abstract class VectorBase<T>
     /// </remarks>
     public ReadOnlySpan<T> AsSpan()
     {
-        // GPU-resident lazy allocation: allocate backing array on first CPU access
-        if (IsLazyAllocated)
-        {
-            var arr = new T[_logicalLength];
-            MaterializeBacking(arr);
-            Helpers.DeferredArrayMaterializer.TryMaterialize(this);
-        }
-        // Materialize deferred GPU download before exposing CPU data
-        if (_cachedArray is not null)
-            Helpers.DeferredArrayMaterializer.TryMaterialize(_cachedArray);
+        EnsureMaterialized();
         return _memory.Span;
     }
 
@@ -357,14 +348,19 @@ public abstract class VectorBase<T>
     /// Ensures the backing array is allocated and populated for CPU access.
     /// Call this at the top of any method that reads _memory directly.
     /// </summary>
+    /// <remarks>
+    /// A pending download can be registered under either key: the vector itself (Tensor.FromGpuBuffer, and
+    /// TensorBase.MarkModified after every device-side write) or its backing array. Both are checked on every
+    /// read. Checking the vector key only while the vector was still lazy meant a device write made after the
+    /// first host read (a GPU optimizer step updating a weight the host had already read) was never
+    /// downloaded, and every later host read returned the pre-update values.
+    /// </remarks>
     private void EnsureMaterialized()
     {
+        // GPU-resident lazy allocation: allocate backing array on first CPU access
         if (IsLazyAllocated)
-        {
-            var arr = new T[_logicalLength];
-            MaterializeBacking(arr);
-            Helpers.DeferredArrayMaterializer.TryMaterialize(this);
-        }
+            MaterializeBacking(new T[_logicalLength]);
+        Helpers.DeferredArrayMaterializer.TryMaterialize(this);
         if (_cachedArray is not null)
             Helpers.DeferredArrayMaterializer.TryMaterialize(_cachedArray);
     }
@@ -458,20 +454,10 @@ public abstract class VectorBase<T>
     internal T[] GetDataArray()
     {
         _beforeWrite?.Invoke();
-        // GPU-resident lazy allocation: allocate backing array on first CPU access
-        if (IsLazyAllocated)
-        {
-            var arr = new T[_logicalLength];
-            MaterializeBacking(arr);
-            // Try to materialize GPU data into the new array via the vector-keyed callback
-            Helpers.DeferredArrayMaterializer.TryMaterialize(this);
-        }
+        EnsureMaterialized();
 
         if (_cachedArray is not null)
-        {
-            Helpers.DeferredArrayMaterializer.TryMaterialize(_cachedArray);
             return _cachedArray;
-        }
 
         if (MemoryMarshal.TryGetArray((ReadOnlyMemory<T>)_memory, out var segment) && segment.Array is not null)
         {

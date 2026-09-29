@@ -44426,6 +44426,11 @@ public partial class CpuEngine : ITensorLevelEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (GraphMode.IsInferenceTrace)
             return CaptureInferenceKernel(new[] { input }, engine => engine.GlobalAvgPool2D(input));
+        // Global average pooling is adaptive average pooling to 1x1, which records its node on a gradient tape and in a
+        // compiled training graph. The fast paths below record nothing, so a network that pooled globally before its
+        // head got no gradient for anything upstream of the pool.
+        if (DifferentiableOps.IsTapeActiveForThread<T>() || GraphMode.IsActive)
+            return AdaptiveAvgPool2D(input, 1, 1);
         var numOps = MathHelper.GetNumericOperations<T>();
         int batch = input._shape[0];
         int channels = input._shape[1];

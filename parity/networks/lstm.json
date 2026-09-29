@@ -1,0 +1,31 @@
+{
+  "name": "lstm",
+  "description": "One-layer LSTM over 16 steps of 32 features, the last step's hidden state into a linear head. MSE loss, plain SGD.",
+  "dtype": "float32",
+  "seed": 1059,
+  "batch": 32,
+  "inputShape": [
+    16,
+    32
+  ],
+  "layers": [
+    {
+      "type": "lstm",
+      "hidden": 64
+    },
+    {
+      "type": "linear",
+      "out": 10,
+      "activation": "none"
+    }
+  ],
+  "loss": "mse",
+  "optimizer": {
+    "name": "sgd",
+    "lr": 0.01
+  },
+  "warmupSteps": 30,
+  "measuredSteps": 100,
+  "lossAgreementSteps": 10,
+  "repeats": 3
+}
