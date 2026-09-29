@@ -35851,17 +35851,15 @@ public partial class CpuEngine : ITensorLevelEngine
         if (source.Length != destination.Length)
             throw new ArgumentException($"Tensor lengths must match. Got {source.Length} and {destination.Length}");
 
-        // Copy exactly source.Length elements — NOT sourceArray.Length.
-        // GetFlattenedData / GetDataArray can return the underlying storage
-        // array directly when the tensor is contiguous (zero-copy fast
-        // path), and that array may be over-allocated past the logical
-        // Length (e.g. arrays grown for capacity headroom). Copying
-        // sourceArray.Length would then attempt to write past
-        // destination's logical length and throw "Destination array was
-        // not long enough", even though the logical Length values agree.
-        var sourceArray = source.GetFlattenedData();
-        var destArray = destination.GetDataArray();
-        Array.Copy(sourceArray, destArray, source.Length);
+        // Write through the destination's LIVE storage. GetDataArray() hands back the backing array only when
+        // it is exactly this tensor (offset 0, storage length == Length); a pooled tensor whose rented array is
+        // longer than its Length, or a view at a non-zero offset into shared storage, gets a fresh COPY instead,
+        // so writing into that array silently discarded the whole copy. Optimizers that assign their result to a
+        // parameter with TensorCopy (FTRL, ASGD) therefore never updated pooled parameters at all. AsWritableSpan
+        // slices the live storage at the view's offset, and the version bump tells caches the data changed.
+        // Exactly source.Length elements are copied, never a (possibly over-allocated) backing array's length.
+        source.AsSpan().Slice(0, source.Length).CopyTo(destination.AsWritableSpan());
+        destination.IncrementVersion();
     }
 
     /// <inheritdoc/>
@@ -44424,6 +44422,11 @@ public partial class CpuEngine : ITensorLevelEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (GraphMode.IsInferenceTrace)
             return CaptureInferenceKernel(new[] { input }, engine => engine.GlobalAvgPool2D(input));
+        // Global average pooling is adaptive average pooling to 1x1, which records its node on a gradient tape and in a
+        // compiled training graph. The fast paths below record nothing, so a network that pooled globally before its
+        // head got no gradient for anything upstream of the pool.
+        if (DifferentiableOps.IsTapeActiveForThread<T>() || GraphMode.IsActive)
+            return AdaptiveAvgPool2D(input, 1, 1);
         var numOps = MathHelper.GetNumericOperations<T>();
         int batch = input._shape[0];
         int channels = input._shape[1];

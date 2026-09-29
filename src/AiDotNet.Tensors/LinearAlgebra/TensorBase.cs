@@ -1241,6 +1241,15 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// <summary>Storage-shared cache freshness, including writes made in inference mode.</summary>
     internal int GpuCacheVersion => _storage.GpuCacheVersion;
 
+    /// <summary>
+    /// Mutation epoch of the STORAGE this tensor views, shared by every view and alias of it. A cache derived
+    /// from a tensor's data must key on this, not on <see cref="Version"/>: Version is per tensor object, so a
+    /// write through another view of the same storage (TensorCopy into an alias, an optimizer updating a
+    /// parameter through its view) leaves it unchanged, and inference-mode writes skip it. Every
+    /// IncrementVersion bumps this epoch, so it misses nothing Version would have caught.
+    /// </summary>
+    internal int StorageMutationVersion => _storage.GpuCacheVersion;
+
     private void InvalidateGpuBindingAfterStorageReplacement()
     {
         _gpuBuffer = null;
@@ -1261,6 +1270,19 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         // to that consumer as though their bit patterns were indices.
         _gpuBufferContainsRawInt32 = false;
     }
+
+    /// <summary>
+    /// Records that this tensor's data was written from outside the library, for example through the memory passed
+    /// to <see cref="Tensor{T}.FromMemory(System.Memory{T}, int[])"/> or by an optimizer that updates raw parameter
+    /// arrays.
+    /// </summary>
+    /// <remarks>
+    /// The library keeps data derived from a tensor's contents (device copies of weights, packed or transposed
+    /// kernels, the version autograd checks against in-place changes) and refreshes it when the tensor's own
+    /// operations write. A write it did not make is invisible to it until this is called; without it the next
+    /// operation can use the old values.
+    /// </remarks>
+    public void MarkModified() => IncrementVersion();
 
     /// <summary>
     /// Increments the version counter. Called by in-place operations to signal mutation.

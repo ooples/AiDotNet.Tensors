@@ -1,0 +1,19 @@
+{
+  "name": "mlp",
+  "description": "Three-layer perceptron, ReLU hidden layers, MSE loss, plain SGD.",
+  "dtype": "float32",
+  "seed": 1055,
+  "batch": 128,
+  "inputDim": 784,
+  "layers": [
+    { "out": 512, "activation": "relu" },
+    { "out": 256, "activation": "relu" },
+    { "out": 10, "activation": "none" }
+  ],
+  "loss": "mse",
+  "optimizer": { "name": "sgd", "lr": 0.01 },
+  "warmupSteps": 30,
+  "measuredSteps": 100,
+  "lossAgreementSteps": 10,
+  "repeats": 5
+}

@@ -199,7 +199,16 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         public static extern int ReleaseCommandQueue(IntPtr commandQueue);
 
         [DllImport(OpenClLibrary, EntryPoint = "clFinish")]
-        public static extern int Finish(IntPtr commandQueue);
+        private static extern int FinishNative(IntPtr commandQueue);
+
+        // Every queue drain in the backend goes through this binding, so the residency probe counts them all
+        // here, after CL_SUCCESS, instead of only the ones a Synchronize() wrapper makes.
+        public static int Finish(IntPtr commandQueue)
+        {
+            int result = FinishNative(commandQueue);
+            if ((OpenClNative.ClError)result == OpenClNative.ClError.Success) GpuLaunchProbe.OnSynchronize(GpuBackendType.OpenCl);
+            return result;
+        }
 
         [DllImport(OpenClLibrary, EntryPoint = "clFlush")]
         public static extern int Flush(IntPtr commandQueue);
@@ -209,9 +218,17 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         #region Event Functions
 
         [DllImport(OpenClLibrary, EntryPoint = "clWaitForEvents")]
-        public static extern int WaitForEvents(
+        private static extern int WaitForEventsNative(
             uint numEvents,
             [In] IntPtr[] eventList);
+
+        // Waiting on events blocks the host until the device reaches them; counted here, after CL_SUCCESS.
+        public static int WaitForEvents(uint numEvents, IntPtr[] eventList)
+        {
+            int result = WaitForEventsNative(numEvents, eventList);
+            if ((OpenClNative.ClError)result == OpenClNative.ClError.Success) GpuLaunchProbe.OnSynchronize(GpuBackendType.OpenCl);
+            return result;
+        }
 
         [DllImport(OpenClLibrary, EntryPoint = "clGetEventProfilingInfo")]
         public static extern int GetEventProfilingInfo(

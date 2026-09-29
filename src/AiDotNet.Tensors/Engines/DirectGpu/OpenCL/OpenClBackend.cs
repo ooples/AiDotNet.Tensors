@@ -1307,6 +1307,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         {
             if (_context == null)
                 throw new InvalidOperationException("OpenCL context not available");
+            GpuLaunchProbe.OnUpload(data, sizeof(float), GpuBackendType.OpenCl);
 
             var affinity = GpuBufferPoolAffinity.ForNativeQueue(_context.CommandQueue);
             if (_bufferPool.TryRent(data.Length, affinity, out var pooled) && pooled != null)
@@ -1351,15 +1352,15 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         public float[] DownloadBuffer(IGpuBuffer buffer)
         {
-            GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float));
             var openClBuffer = (DirectOpenClGpuBuffer)buffer;
+            GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float), GpuBackendType.OpenCl);
             return openClBuffer.Download();
         }
 
         public void DownloadBuffer(IGpuBuffer buffer, float[] destination)
         {
-            GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float));
             var openClBuffer = (DirectOpenClGpuBuffer)buffer;
+            GpuLaunchProbe.OnReadback((long)buffer.Size * sizeof(float), GpuBackendType.OpenCl);
             openClBuffer.Download(destination);
         }
 
@@ -1371,6 +1372,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 throw new ArgumentException("Buffer must be a DirectOpenClGpuByteBuffer.", nameof(buffer));
             if (byteCount > byteBuffer.Size)
                 throw new ArgumentException($"Requested byte count ({byteCount}) exceeds buffer capacity ({byteBuffer.Size}).", nameof(byteCount));
+            GpuLaunchProbe.OnReadback(byteCount, GpuBackendType.OpenCl);
 
             var result = new byte[byteCount];
             if (byteCount == 0)
@@ -1389,6 +1391,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 throw new ArgumentException("Buffer must be a DirectOpenClGpuByteBuffer.", nameof(buffer));
             if (data.Length > byteBuffer.Size)
                 throw new ArgumentException($"Host data ({data.Length} bytes) exceeds buffer capacity ({byteBuffer.Size} bytes).", nameof(data));
+            GpuLaunchProbe.OnUpload(data, sizeof(byte), GpuBackendType.OpenCl);
 
             byteBuffer.Upload(data);
         }
@@ -4247,8 +4250,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             // directly instead of copying the scratch buffer's logical size (or its still larger
             // pooled capacity) merely to discard the tail.
             var resultBuffer = (DirectOpenClGpuBuffer)current;
-            GpuLaunchProbe.OnReadback(sizeof(float));
-            return resultBuffer.Buffer.ToArray(1)[0];
+            float scalar = resultBuffer.Buffer.ToArray(1)[0];
+            GpuLaunchProbe.OnReadback(sizeof(float), GpuBackendType.OpenCl);
+            return scalar;
         }
 
         public void SumAxis(IGpuBuffer A, IGpuBuffer B, int outerSize, int reduceSize)
@@ -8632,6 +8636,7 @@ KERNEL VARIANTS (A/B testing):
         {
             if (data is null) throw new ArgumentNullException(nameof(data));
             if (buffer is null) throw new ArgumentNullException(nameof(buffer));
+            GpuLaunchProbe.OnUpload(data, sizeof(int), GpuBackendType.OpenCl);
             // Mirror AllocateIntBuffer: the OpenCL backend stores int buffers as the reinterpreted
             // float bit pattern (net471-compatible), so convert and write the floats into the existing
             // buffer in place (blocking) rather than allocating a new one.
@@ -8645,6 +8650,7 @@ KERNEL VARIANTS (A/B testing):
         {
             if (_context == null)
                 throw new InvalidOperationException("OpenCL context not available");
+            GpuLaunchProbe.OnUpload(data, sizeof(int), GpuBackendType.OpenCl);
 
             // Convert int array to float array for storage (net471 compatible)
             var floatData = new float[data.Length];

@@ -8102,14 +8102,33 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int dilationH, int dilationW,
         FusedActivationType activation)
     {
-        // Same rationale as FusedLinear: when a tape is active, defer to
-        // the base CpuEngine implementation which decomposes into recorded
-        // primitives. The GPU fused kernel below bypasses
-        // DifferentiableOps entirely, so taking it during training would
-        // silently disconnect the op from autograd. Pure-inference callers
-        // still take the fused-kernel speedup.
+        // The GPU fused kernel below bypasses DifferentiableOps, so under a tape the op must be recorded. The CPU
+        // base does that by decomposing into Conv2D(int[]...), but that overload is a CpuEngine method, not virtual:
+        // the convolution ran on the host, downloading the input and uploading the result every training step.
+        // Instead the convolution runs here on the device with recording suppressed (the untaped kernel path) and
+        // the same Conv2D node the base records is added; its backward already dispatches to the device through
+        // IEngine.Conv2DBackwardInput/Kernel. Bias and activation are the GPU ops, which record themselves. Graph
+        // capture and anomaly mode keep the base path, which they instrument.
         if (IsTapeActive<T>())
-            return base.FusedConv2D(input, kernel, bias, strideH, strideW, padH, padW, dilationH, dilationW, activation);
+        {
+            // Only float, the type the device kernels compute in: a taped double (a gradient check, say) keeps the
+            // exact host path it always had, rather than the default policy's float down-cast.
+            if (typeof(T) != typeof(float) || Compilation.GraphMode.IsActive || Autodiff.AnomalyModeScope.IsActive
+                || Autodiff.GradientTape<T>.Current is null)
+                return base.FusedConv2D(input, kernel, bias, strideH, strideW, padH, padW, dilationH, dilationW, activation);
+
+            Tensor<T> conv;
+            using (Autodiff.GradientTape<T>.NoGrad())
+                conv = FusedConv2D(input, kernel, null, strideH, strideW, padH, padW, dilationH, dilationW, FusedActivationType.None);
+            Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
+            Autodiff.DifferentiableOps.RecordBinary("Conv2D", conv, input, kernel, Autodiff.BackwardFunctions<T>.Conv2DBackward,
+                new object[] { new[] { strideH, strideW }, new[] { padH, padW }, new[] { dilationH, dilationW } });
+
+            var biased = bias is null ? conv
+                : bias.Rank == 1 ? TensorChannelBiasAdd(conv, bias)
+                : TensorBroadcastAdd(conv, bias);
+            return ActivationRegistry.Get(activation) is { } handler ? handler.Apply(this, biased) : biased;
+        }
 
         if (!TryGetBackend(out var backend))
             return base.FusedConv2D(input, kernel, bias, strideH, strideW, padH, padW, dilationH, dilationW, activation);
@@ -16511,7 +16530,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.Conv2DBackwardInput<T>(Tensor<T> gradOutput, Tensor<T> kernel, int[] inputShape,
         int[] stride, int[] padding, int[] dilation)
     {
-        if (!TryGetBackend(out var backend))
+        // The device kernels compute in float: a double gradient would lose ~7 mantissa bits (the same Stage 8
+        // precision gate every forward op applies), so it takes the host path.
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>() || !TryGetBackend(out var backend))
             return base.Conv2DBackwardInput(gradOutput, kernel, inputShape, stride, padding, dilation);
 
         try
@@ -16558,7 +16579,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     Tensor<T> IEngine.Conv2DBackwardKernel<T>(Tensor<T> gradOutput, Tensor<T> input, int[] kernelShape,
         int[] stride, int[] padding, int[] dilation)
     {
-        if (!TryGetBackend(out var backend))
+        // The device kernels compute in float: a double gradient would lose ~7 mantissa bits (the same Stage 8
+        // precision gate every forward op applies), so it takes the host path.
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>() || !TryGetBackend(out var backend))
             return base.Conv2DBackwardKernel(gradOutput, input, kernelShape, stride, padding, dilation);
 
         try

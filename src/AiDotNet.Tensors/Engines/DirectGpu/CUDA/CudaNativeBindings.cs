@@ -223,10 +223,27 @@ internal static class CudaNativeBindings
     public static extern CudaResult cuStreamDestroy(IntPtr stream);
 
     [DllImport(CudaLibrary, EntryPoint = "cuStreamSynchronize")]
-    public static extern CudaResult cuStreamSynchronize(IntPtr stream);
+    private static extern CudaResult cuStreamSynchronizeNative(IntPtr stream);
+
+    // Every stream synchronization in the backend goes through this binding, so the residency probe counts
+    // them all here, after the driver reports success, instead of only the ones a Synchronize() wrapper makes.
+    public static CudaResult cuStreamSynchronize(IntPtr stream)
+    {
+        var result = cuStreamSynchronizeNative(stream);
+        if (result == CudaResult.Success) GpuLaunchProbe.OnSynchronize(GpuBackendType.Cuda);
+        return result;
+    }
 
     [DllImport(CudaLibrary, EntryPoint = "cuCtxSynchronize")]
-    public static extern CudaResult cuCtxSynchronize();
+    private static extern CudaResult cuCtxSynchronizeNative();
+
+    // A context-wide wait blocks the host like a stream sync; counted here, after success, like cuStreamSynchronize.
+    public static CudaResult cuCtxSynchronize()
+    {
+        var result = cuCtxSynchronizeNative();
+        if (result == CudaResult.Success) GpuLaunchProbe.OnSynchronize(GpuBackendType.Cuda);
+        return result;
+    }
 
     [DllImport(CudaLibrary, EntryPoint = "cuStreamQuery")]
     public static extern CudaResult cuStreamQuery(IntPtr stream);
@@ -252,7 +269,15 @@ internal static class CudaNativeBindings
         IntPtr hEvent, IntPtr stream, uint flags);
 
     [DllImport(CudaLibrary, EntryPoint = "cuEventSynchronize")]
-    public static extern CudaResult cuEventSynchronize(IntPtr hEvent);
+    private static extern CudaResult cuEventSynchronizeNative(IntPtr hEvent);
+
+    // Waiting on an event blocks the host until the device reaches it; counted here, after success.
+    public static CudaResult cuEventSynchronize(IntPtr hEvent)
+    {
+        var result = cuEventSynchronizeNative(hEvent);
+        if (result == CudaResult.Success) GpuLaunchProbe.OnSynchronize(GpuBackendType.Cuda);
+        return result;
+    }
 
     [DllImport(CudaLibrary, EntryPoint = "cuEventQuery")]
     public static extern CudaResult cuEventQuery(IntPtr hEvent);
