@@ -183,7 +183,11 @@ public sealed class CompiledBackwardGraph<T>
         // Seed gradient — use current loss (may differ from compilation-time _loss
         // when persistent tapes Reset + re-record between steps)
         Tensor<T> seedGrad;
-        if (loss.Length == 1)
+        if (DeviceLossSeed.TryCreate(_engine, loss, out var deviceSeed))
+        {
+            seedGrad = deviceSeed;
+        }
+        else if (loss.Length == 1)
         {
             seedGrad = new Tensor<T>(new[] { numOps.One }, (int[])loss._shape.Clone());
         }

@@ -690,7 +690,12 @@ public sealed class GradientTape<T> : IDisposable
             // [1]), not a hardcoded [1] — a hardcoded rank-1 seed mismatches a
             // 0-dim scalar loss and can break shape-checked backward ops.
             Tensor<T> seedGrad;
-            if (loss.Length == 1)
+            if (DeviceLossSeed.TryCreate(engine, loss, out var deviceSeed))
+            {
+                // A device-resident loss gets a device-filled seed: a host one crosses the boundary every step.
+                seedGrad = deviceSeed;
+            }
+            else if (loss.Length == 1)
             {
                 seedGrad = new Tensor<T>(new[] { numOps.One }, (int[])loss._shape.Clone());
             }
@@ -1186,7 +1191,13 @@ public sealed class GradientTape<T> : IDisposable
             // Fast path for scalar loss (the overwhelmingly common case in training).
             // Reuse cached scalar seed across training steps to avoid per-backward allocation.
             Tensor<T> seedGrad;
-            if (loss.Length == 1)
+            if (DeviceLossSeed.TryCreate(engine, loss, out var deviceSeed))
+            {
+                // A device-resident loss gets a device-filled seed. The cached host seed below crossed the boundary
+                // on every step: step-end release frees the device copy the backward makes of it.
+                seedGrad = deviceSeed;
+            }
+            else if (loss.Length == 1)
             {
                 // Use loss's actual shape (could be [1] or [] for 0-dim scalar)
                 seedGrad = _cachedScalarSeed ??= new Tensor<T>(new[] { numOps.One }, (int[])loss._shape.Clone());

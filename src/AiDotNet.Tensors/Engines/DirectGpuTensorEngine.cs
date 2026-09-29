@@ -1450,6 +1450,32 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// for chained GPU operations. This is the primary method for GPU-resident pipelines.
     /// </summary>
     /// <summary>
+    /// GradientTape hook: the ones seed dL/dL for a loss that lives on the device, filled there, or false (the tape
+    /// seeds on the host). A host seed crossed the boundary on every step: step-end release frees the device copy
+    /// made for the backward, even of the tape's cached scalar seed. Not during a compiled/captured step or lazy
+    /// graph recording.
+    /// </summary>
+    internal bool TryCreateDeviceSeed<T>(Tensor<T> loss, out Tensor<T> seed)
+    {
+        seed = null!;
+        if (typeof(T) != typeof(float) || loss.Length == 0 || loss.TryGetGpuBuffer() is null) return false;
+        if (ResidentStepActive || Compilation.GraphMode.IsActive || !TryGetBackend(out var backend)) return false;
+        if (backend is Engines.DirectGpu.CUDA.CudaBackend cuda && cuda.IsStreamCapturing()) return false;
+        var output = AllocateOutputBuffer(backend, loss.Length);
+        try
+        {
+            backend.Fill(output.Buffer, 1f, loss.Length);
+            seed = DeferTensorResult<T>(backend, output.Buffer, loss.Length, (int[])loss._shape.Clone());
+            return true;
+        }
+        catch
+        {
+            output.Dispose();
+            return false;
+        }
+    }
+
+    /// <summary>
     /// Tensor.Contiguous() hook: a contiguous device copy of a permuted view of device-only data, or false (the
     /// caller walks it on the host). Not during a compiled/captured step or lazy graph recording.
     /// </summary>
@@ -16860,9 +16886,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     public override Tensor<T> ReduceMean<T>(Tensor<T> input, int[] axes, bool keepDims)
     {
+        // No tape bail: every device path below records CpuEngine's node (ReduceMeanBackward with the same reduced
+        // axes), so a mean loss stays on the GPU during training. Non-float goes to the exact CPU path, tape or
+        // not -- the kernels compute in float.
         var safeAxes = axes ?? Array.Empty<int>();
-        if (IsTapeActive<T>()) return base.ReduceMean(input, safeAxes, keepDims);
-        if (!TryGetBackend(out var backend))
+        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend))
             return base.ReduceMean(input, safeAxes, keepDims);
 
         // Validate and normalize axes
@@ -16874,12 +16902,46 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         for (int i = 0; i < safeAxes.Length; i++)
         {
             normalizedAxes[i] = safeAxes[i] < 0 ? safeAxes[i] + input.Rank : safeAxes[i];
+            if (normalizedAxes[i] < 0 || normalizedAxes[i] >= input.Rank)
+                return base.ReduceMean(input, safeAxes, keepDims);
         }
         Array.Sort(normalizedAxes);
+        for (int i = 1; i < normalizedAxes.Length; i++)
+            if (normalizedAxes[i] == normalizedAxes[i - 1])
+                return base.ReduceMean(input, safeAxes, keepDims);
 
         try
         {
-            return ReduceAxisGpu(input, normalizedAxes, keepDims, backend, ReduceOperation.Mean);
+            // Every axis of a contiguous tensor: one mean over all elements. Shape [1] whatever keepDims says,
+            // exactly as CpuEngine's full-reduction fast path returns it.
+            if (normalizedAxes.Length == input.Rank && input.IsContiguous && input.Length > 0)
+            {
+                using var source = GetOrAllocateBuffer(backend, input);
+                var output = AllocateOutputBuffer(backend, 1);
+                bool handedOff = false;
+                try
+                {
+                    backend.MeanAxis(source.Buffer, output.Buffer, outerSize: 1, reduceSize: input.Length);
+                    var result = DeferTensorResult<T>(backend, output.Buffer, 1, new[] { 1 });
+                    handedOff = true;
+                    Autodiff.DifferentiableOps.RecordUnary("ReduceMean", result, input,
+                        Autodiff.BackwardFunctions<T>.ReduceMeanBackward, new object[] { normalizedAxes });
+                    return result;
+                }
+                finally
+                {
+                    if (!handedOff) output.Dispose();
+                }
+            }
+
+            // The general path may compose engine ops (permute/reshape); suppress their recording so the result has
+            // exactly ONE producer node -- the ReduceMean below -- and gradients are not counted twice.
+            Tensor<T> reduced;
+            using (new Autodiff.NoGradScope<T>())
+                reduced = ReduceAxisGpu(input, normalizedAxes, keepDims, backend, ReduceOperation.Mean);
+            Autodiff.DifferentiableOps.RecordUnary("ReduceMean", reduced, input,
+                Autodiff.BackwardFunctions<T>.ReduceMeanBackward, new object[] { normalizedAxes });
+            return reduced;
         }
         catch
         {
@@ -24478,13 +24540,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.ReduceMean<T>(Tensor<T> input, int[] axes, bool keepDims)
     {
-        if (IsTapeActive<T>()) return base.ReduceMean(input, axes, keepDims);
+        // No tape bail (see ReduceSum): the innermost-axis kernel below records CpuEngine's node, and everything
+        // else defers to the public override, which records its own. The bail sent every mean loss under a tape to
+        // the host: the whole tensor downloaded, averaged on the CPU, and the scalar gradient uploaded again.
         // Same axis-must-be-innermost constraint as ReduceSum: backend.MeanAxis
         // treats the buffer as [N, reduceSize] rows; correct only when the
         // reduce axis is contiguous (axis == rank - 1). For middle/outer
         // axes the row-major strides scatter reduce elements across the
         // buffer, so MeanAxis would silently reduce the wrong axis.
-        if (typeof(T)==typeof(float) && TryGetBackend(out var b) && axes.Length == 1)
+        if (typeof(T)==typeof(float) && TryGetBackend(out var b) && axes is { Length: 1 })
         {
             try
             {
@@ -24510,7 +24574,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                         for (int i = 0, j = 0; i < rank; i++)
                             if (i != axis) outShape[j++] = input.Shape._dims[i];
                     }
-                    return DeferTensorResult<T>(b, go, outerSize, outShape);
+                    var mean = DeferTensorResult<T>(b, go, outerSize, outShape);
+                    Autodiff.DifferentiableOps.RecordUnary("ReduceMean", mean, input,
+                        Autodiff.BackwardFunctions<T>.ReduceMeanBackward, new object[] { new[] { axis } });
+                    return mean;
                 }
             }
             catch { }

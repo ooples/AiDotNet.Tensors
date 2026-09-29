@@ -183,7 +183,11 @@ internal sealed class CompiledDelegateChain<T>
         // allocation doesn't repeat for fixed-shape losses (the typical
         // training-loop pattern).
         Tensor<T> seedGrad;
-        if (loss.Length == 1)
+        if (DeviceLossSeed.TryCreate(engine, loss, out var deviceSeed))
+        {
+            seedGrad = deviceSeed;
+        }
+        else if (loss.Length == 1)
         {
             // Tiny: just allocate. Caching a 1-element tensor doesn't pay.
             var numOps = Helpers.MathHelper.GetNumericOperations<T>();

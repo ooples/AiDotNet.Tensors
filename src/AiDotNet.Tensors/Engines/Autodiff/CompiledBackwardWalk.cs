@@ -1585,7 +1585,7 @@ internal static class CompiledBackwardWalk<T>
     /// Emits the unrolled walker as a <see cref="DynamicMethod"/>. The
     /// emitted IL has the shape:
     /// <code>
-    /// var state = CompiledBackwardWalkHelpers&lt;T&gt;.InitState(loss, indices.Length);
+    /// var state = CompiledBackwardWalkHelpers&lt;T&gt;.InitState(loss, indices.Length, engine);
     /// CompiledBackwardWalkHelpers&lt;T&gt;.ProcessEntry(entries, idx_0, state, engine);
     /// CompiledBackwardWalkHelpers&lt;T&gt;.ProcessEntry(entries, idx_1, state, engine);
     /// ... (one call per baked index) ...
@@ -1617,9 +1617,10 @@ internal static class CompiledBackwardWalk<T>
         // Local 0: state — holds grads + per-arity buffer arrays.
         var stateLocal = il.DeclareLocal(typeof(CompiledBackwardWalkHelpers<T>.WalkState));
 
-        // state = InitState(loss, reservedCount)
+        // state = InitState(loss, reservedCount, engine)
         il.Emit(OpCodes.Ldarg_1);                              // loss
         il.Emit(OpCodes.Ldc_I4, reverseTopoIndices.Length);    // reservedCount
+        il.Emit(OpCodes.Ldarg_3);                              // engine (the seed is created where the loss lives)
         il.Emit(OpCodes.Call, s_initStateMethod);              // -> WalkState
         il.Emit(OpCodes.Stloc, stateLocal);
 
@@ -1705,9 +1706,10 @@ internal static class CompiledBackwardWalk<T>
         var previousAccumulatorOwnersLocal = il.DeclareLocal(
             typeof(Dictionary<Tensor<T>, Tensor<T>>));
 
-        // state = InitState(loss, reservedCount)
+        // state = InitState(loss, reservedCount, engine)
         il.Emit(OpCodes.Ldarg_1);
         il.Emit(OpCodes.Ldc_I4, reverseTopoIndices.Length);
+        il.Emit(OpCodes.Ldarg_3);
         il.Emit(OpCodes.Call, s_initStateMethod);
         il.Emit(OpCodes.Stloc, stateLocal);
 
@@ -1891,7 +1893,7 @@ internal static class CompiledBackwardWalk<T>
         var indices = reverseTopoIndices;
         return (entries, loss, sources, engine) =>
         {
-            var state = CompiledBackwardWalkHelpers<T>.InitState(loss, indices.Length);
+            var state = CompiledBackwardWalkHelpers<T>.InitState(loss, indices.Length, engine);
             for (int i = 0; i < indices.Length; i++)
             {
                 if (!CompiledBackwardWalkHelpers<T>.ProcessEntry(entries, indices[i], ref state, engine))
@@ -1928,7 +1930,7 @@ internal static class CompiledBackwardWalkHelpers<T>
     /// per-arity input buffers, and seeds <paramref name="loss"/>'s
     /// gradient to ones.
     /// </summary>
-    public static WalkState InitState(Tensor<T> loss, int reservedCount)
+    public static WalkState InitState(Tensor<T> loss, int reservedCount, IEngine engine)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         var grads = new Dictionary<Tensor<T>, Tensor<T>>(
@@ -1936,7 +1938,11 @@ internal static class CompiledBackwardWalkHelpers<T>
             ReferenceEqualityComparer<Tensor<T>>.Instance);
 
         Tensor<T> seedGrad;
-        if (loss.Length == 1)
+        if (DeviceLossSeed.TryCreate(engine, loss, out var deviceSeed))
+        {
+            seedGrad = deviceSeed;
+        }
+        else if (loss.Length == 1)
         {
             seedGrad = new Tensor<T>(new[] { numOps.One }, (int[])loss._shape.Clone());
         }
