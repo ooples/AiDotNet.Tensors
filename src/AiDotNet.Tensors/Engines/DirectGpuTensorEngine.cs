@@ -3249,6 +3249,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             else if (k1 is not null && _activationCache.TryGetValue(k1, out var e1) && ReferenceEquals(e1.Backend, backend))
             { srcBuf = e1.Buffer; srcIsFp16 = e1.IsFp16; }
         }
+        // An op result owns its device buffer and is not in the activation cache (DeferTensorResult). Its buffer is
+        // FP32 like every tensor-bound buffer; use it while it is the current value.
+        if (srcBuf is null && src._gpuBuffer is { } owned && owned.Handle != IntPtr.Zero
+            && ReferenceEquals(src._gpuBackend, backend) && src._gpuBufferVersion == src.GpuCacheVersion)
+        { srcBuf = owned; srcIsFp16 = false; }
         if (srcBuf is null) return src.Cast<TOut>(); // not GPU-resident — host cast (correct, just not resident)
 
         try
