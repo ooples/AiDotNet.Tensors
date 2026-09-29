@@ -117,8 +117,7 @@ public partial class CpuEngine
                     expandedMask, batch, seqLen, dModel, numHeads, dHead);
             }
 
-            var scope = GraphMode.Current!;
-            scope.BindEngineIfUnset(this);
+            var scope = GraphMode.Current!; scope.BindEngineIfUnset(this);
             var graphInputs = new[] { input, qWeight, kWeight, vWeight, outWeight };
             var capturedMask = mask;
             var savedState = new object[PlanFormatConstants.MultiHeadAttentionSavedStateCount];

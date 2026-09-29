@@ -77,7 +77,7 @@ public partial class CpuEngine
         }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var capturedY = y;
@@ -155,7 +155,7 @@ public partial class CpuEngine
         }
 
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var captured = tensor;

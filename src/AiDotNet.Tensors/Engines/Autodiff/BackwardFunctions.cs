@@ -459,8 +459,9 @@ internal static class BackwardFunctions<T>
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         var sig = engine.Sigmoid(inputs[0]);
-        var oneMinusSig = engine.TensorSubtract(
-            CreateOnes(inputs[0]._shape, numOps), sig);
+        // 1 - sig as device ops: a host tensor of ones (CreateOnes) forced an upload per step - illegal inside a
+        // whole-step capture - and sent the subtract to the CPU engine.
+        var oneMinusSig = engine.TensorAddScalar(engine.TensorNegate(sig), numOps.One);
         var xTimesSig = engine.TensorMultiply(inputs[0], sig);
         var xSigOneMinusSig = engine.TensorMultiply(xTimesSig, oneMinusSig);
         var derivative = engine.TensorAdd(sig, xSigOneMinusSig);
@@ -476,15 +477,14 @@ internal static class BackwardFunctions<T>
         var numOps = MathHelper.GetNumericOperations<T>();
         // softplus = log(1 + exp(x))
         var expX = engine.TensorExp(inputs[0]);
-        var ones = CreateOnes(inputs[0]._shape, numOps);
-        var onePlusExp = engine.TensorAdd(ones, expX);
+        var onePlusExp = engine.TensorAddScalar(expX, numOps.One);   // device op; no host tensor of ones
         var softplus = engine.TensorLog(onePlusExp);
         var tanhSp = engine.Tanh(softplus);
         // sigmoid = exp(x) / (1 + exp(x))
         var sigmoid = engine.TensorDivide(expX, onePlusExp);
         // d(tanh(sp))/dx = (1 - tanh(sp)^2) * sigmoid
         var tanhSq = engine.TensorMultiply(tanhSp, tanhSp);
-        var oneMinusTanhSq = engine.TensorSubtract(ones, tanhSq);
+        var oneMinusTanhSq = engine.TensorAddScalar(engine.TensorNegate(tanhSq), numOps.One);
         var dtanhDx = engine.TensorMultiply(oneMinusTanhSq, sigmoid);
         // d(mish)/dx = tanh(sp) + x * dtanh/dx
         var xDtanh = engine.TensorMultiply(inputs[0], dtanhDx);
@@ -2193,6 +2193,12 @@ internal static class BackwardFunctions<T>
         var start = (int[])savedState[0];
         var inputShape = inputs[0]._shape;
 
+        if (engine is DirectGpuTensorEngine gpu && gpu.TrySliceBackwardOnDevice(gradOutput, inputShape, start) is { } deviceGrad)
+        {
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceGrad, engine);
+            return;
+        }
+
         // Issue #327: write directly into a fresh zero-init buffer
         // instead of going through engine.TensorSetSlice (which Rent's
         // a new result tensor and Array.Copy's the zeros input into it
@@ -2409,11 +2415,12 @@ internal static class BackwardFunctions<T>
         // ~halved by skipping the redundant clear.
         if (grad.Length == 1)
         {
-            // A device-resident scalar (the loss gradient of a compiled GPU step) is broadcast on the device. Reading
-            // it with GetFlat was a sync + download per step, and the host-filled result made the accumulation into
-            // the device gradient take the host path (a download of the whole gradient).
-            if (engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine
-                && (grad.HasPendingGpuData || grad._gpuBuffer is not null))
+            // A device-resident scalar (the loss gradient of a GPU training step) is broadcast on the device. Reading it
+            // with GetFlat downloaded it - a stream sync per step, and inside a CUDA-graph capture an illegal operation
+            // (cuStreamSynchronize 900) that aborted the capture of every plan whose loss ends in a full ReduceSum/Mean -
+            // and the host-filled result made the accumulation into the device gradient take the host path. A result
+            // whose only copy is still pending on the device counts too.
+            if (targetShape.Length > 0 && (grad.HasPendingGpuData || grad.TryGetGpuBuffer() is not null))
             {
                 var ones = new int[targetShape.Length];
                 for (int i = 0; i < ones.Length; i++) ones[i] = 1;
@@ -2453,17 +2460,6 @@ internal static class BackwardFunctions<T>
         for (int i = 0; i < targetShape.Length; i++)
             multiples[i] = currentShape[i] == 1 ? targetShape[i] : 1;
         return multiples;
-    }
-
-    private static Tensor<T> CreateOnes(int[] shape, INumericOperations<T> numOps)
-    {
-        int length = 1;
-        for (int i = 0; i < shape.Length; i++)
-            length *= shape[i];
-        var data = new T[length];
-        for (int i = 0; i < data.Length; i++)
-            data[i] = numOps.One;
-        return new Tensor<T>(data, shape);
     }
 
     // ──────────────────────────────────────────────────────────────
@@ -3122,44 +3118,16 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        int rank = inputs[0].Rank;
-        int axis = savedState is { Length: > 0 } && savedState[0] is int saved ? saved : rank - 1;
-        if (axis < 0) axis += rank;
-        if (engine.SupportsGpu && rank >= 1)
-        {
-            // Device path: the host loop below reads every element through the indexer, which on a GPU engine
-            // downloads the upstream gradient and the output. Same math with engine ops, no per-element access.
-            // The sums are tiled explicitly because the GPU engine's elementwise ops take equal shapes.
-            var softmaxOnDevice = engine.TensorExp(output);
-            var axisSums = engine.ReduceSum(gradOutput, new[] { axis }, keepDims: true);
-            var tileMultiples = new int[rank];
-            for (int i = 0; i < tileMultiples.Length; i++) tileMultiples[i] = 1;
-            tileMultiples[axis] = inputs[0].Shape[axis];
-            var dxOnDevice = engine.TensorSubtract(gradOutput,
-                engine.TensorMultiply(softmaxOnDevice, engine.TensorTile(axisSums, tileMultiples)));
-            DifferentiableOps.AccumulateGrad(grads, inputs[0], dxOnDevice, engine);
-            return;
-        }
-
+        // d(log_softmax)/dx = gradOutput - softmax * sum(gradOutput) along the SOFTMAX AXIS, as engine ops so a
+        // GPU backward stays on the device. The former host loop read every gradient element back (GetFlat on a
+        // resident tensor - a stream sync per step, and CUDA 900 inside a whole-step capture) and always reduced
+        // over the LAST axis, so a log-softmax over any other axis got a wrong gradient. The axis is recorded by
+        // TensorLogSoftmax; tapes recorded before it was saved default to the last axis, which is what they used.
+        int axis = savedState is { Length: > 0 } && savedState[0] is int savedAxis ? savedAxis : inputs[0].Rank - 1;
         var softmax = engine.TensorExp(output);
-        var numOps = MathHelper.GetNumericOperations<T>();
-        int axisSize = inputs[0].Shape[axis];
-        int innerSize = 1;
-        for (int i = axis + 1; i < rank; i++) innerSize *= inputs[0].Shape[i];
-        int outerSize = inputs[0].Length / (axisSize * innerSize);
-        var dx = TensorPool<T>.RentZeroed(inputs[0]._shape);
-
-        for (int outer = 0; outer < outerSize; outer++)
-        for (int inner = 0; inner < innerSize; inner++)
-        {
-            int offset = outer * axisSize * innerSize + inner;
-            T sumGrad = numOps.Zero;
-            for (int d = 0; d < axisSize; d++)
-                sumGrad = numOps.Add(sumGrad, gradOutput[offset + d * innerSize]);
-            for (int d = 0; d < axisSize; d++)
-                dx[offset + d * innerSize] = numOps.Subtract(gradOutput[offset + d * innerSize],
-                    numOps.Multiply(softmax[offset + d * innerSize], sumGrad));
-        }
+        var rowSums = engine.ReduceSum(gradOutput, new[] { axis }, keepDims: true);
+        var dx = engine.TensorSubtract(gradOutput,
+            engine.TensorMultiply(softmax, engine.TensorBroadcastTo(rowSums, output._shape)));
         DifferentiableOps.AccumulateGrad(grads, inputs[0], dx, engine);
     }
 

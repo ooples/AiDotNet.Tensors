@@ -68,9 +68,8 @@ public partial class CpuEngine
                 throw new ArgumentOutOfRangeException(nameof(targetIds),
                     $"targetIds[{r}] ({ids[r]}) must be in [0, vocab={vocab}).");
 
-        if (GraphMode.IsActive && GraphMode.Current is { } scope)
+        if (GraphMode.IsActive && GraphMode.Current is { } scope && scope.BindEngine(this))
         {
-            scope.BindEngineIfUnset(this);
             var capturedHidden = hidden;
             var capturedWeight = weight;
             var capturedBias = bias;
@@ -177,9 +176,8 @@ public partial class CpuEngine
         if (target.Rank != 2 || target.Shape[0] != n || target.Shape[1] != vocab)
             throw new ArgumentException($"target must be rank-2 [N={n}, vocab={vocab}].", nameof(target));
 
-        if (GraphMode.IsActive && GraphMode.Current is { } scope)
+        if (GraphMode.IsActive && GraphMode.Current is { } scope && scope.BindEngine(this))
         {
-            scope.BindEngineIfUnset(this);
             var capturedHidden = hidden;
             var capturedWeight = weight;
             var capturedBias = bias;

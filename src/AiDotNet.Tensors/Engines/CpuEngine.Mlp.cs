@@ -137,8 +137,7 @@ public partial class CpuEngine
 
             var outputShape = (int[])input._shape.Clone();
             outputShape[outputShape.Length - 1] = runningFeatures;
-            var scope = GraphMode.Current!;
-            scope.BindEngineIfUnset(this);
+            var scope = GraphMode.Current!; scope.BindEngineIfUnset(this);
             var capturedInputs = graphInputs.ToArray();
             object[] savedState =
             {

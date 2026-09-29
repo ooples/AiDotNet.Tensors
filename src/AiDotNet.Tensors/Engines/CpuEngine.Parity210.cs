@@ -49,7 +49,7 @@ public partial class CpuEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var ct = tensor;
@@ -122,7 +122,7 @@ public partial class CpuEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var ct = tensor;
@@ -181,7 +181,7 @@ public partial class CpuEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var ct = tensor;
@@ -444,7 +444,7 @@ public partial class CpuEngine
         GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var ct = tensor; var ci = indices;
@@ -489,7 +489,7 @@ public partial class CpuEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var ct = tensor; var ci = indices; var cd = dim;
@@ -562,7 +562,7 @@ public partial class CpuEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var ci = input; var ca = a; var cb = b; var al = alpha; var be = beta;
@@ -1209,7 +1209,7 @@ public partial class CpuEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var ct = tensor; var co = offset;
@@ -1274,7 +1274,7 @@ public partial class CpuEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var ca = a; var cb = b; var cd = dim;
@@ -1342,7 +1342,7 @@ public partial class CpuEngine
     {
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var ct = tensor; var ca = axis;
@@ -1361,7 +1361,7 @@ public partial class CpuEngine
     {
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var ct = tensor; var ca = axis;
@@ -1407,7 +1407,7 @@ public partial class CpuEngine
     {
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var ct = tensor; var ca = axis;
@@ -1566,7 +1566,7 @@ public partial class CpuEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var ct = tensor; var cn = nan; var cpi = posinf; var cni = neginf;
@@ -1657,7 +1657,7 @@ public partial class CpuEngine
     {
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var ct = tensor; var cd = diagonal;
@@ -1678,7 +1678,7 @@ public partial class CpuEngine
     {
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var ct = tensor; var cd = diagonal;
@@ -2101,7 +2101,7 @@ public partial class CpuEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var ct = tensor; var ca = axis; var ci = indices; var cs = source;
@@ -2244,7 +2244,7 @@ public partial class CpuEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var ct = tensor; var ca = axis; var ci = indices; var cs = source;
@@ -2659,7 +2659,7 @@ public partial class CpuEngine
 
         if (GraphMode.IsActive)
         {
-            var scope = GraphMode.Current;
+            var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
             if (scope != null)
             {
                 var ct = tensor; var cm = mask; var cs = source;

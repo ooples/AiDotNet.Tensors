@@ -222,6 +222,14 @@ internal static class AutoTensorCache
         // check is a safety net for callers that pool from inside the
         // backward (per-op intermediate pooling).
         if (tensor.GradFn is not null) return;
+        // Device state must never ride along into the next rental. A tensor bound to a GPU buffer (a resident-step
+        // binding, a view carrying its source's buffer, a device-owned tensor) or with a pending device->host download
+        // would come back out of this process-wide pool still pointing at that buffer; the next op then resolves it
+        // through the _gpuBuffer fast path and reads memory owned by something else - or freed, when the rental lands
+        // in a later engine's work. Measured: a captured training step reported a NEGATIVE mean-squared loss late in a
+        // long test process. TensorPool refuses these tensors for the same reason (PR #638).
+        if (tensor._gpuBuffer is not null || tensor._device != TensorDevice.CPU) return;
+        if (tensor.GetBackingArrayForCacheLookupUnsafe() is { } backing && HostSync.IsPending(backing)) return;
 
         long elements = tensor.Length;
         if (elements > MaxElementsPerTensor)

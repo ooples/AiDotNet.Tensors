@@ -76,7 +76,7 @@ public sealed partial class CudaBackend
                         "Direct PTX RG-LRU must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxFusedRgLruScan128x256Kernel kernel = GetOrCreateRgLruKernel(key);
                 if (capturing && !_directPtxRgLruKernels.Pin(key))
                     throw new InvalidOperationException(
@@ -117,7 +117,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateRgLruKernel(
                     new DirectPtxRgLruKey(batch, sequenceLength, recurrentDimension));
             }

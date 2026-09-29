@@ -148,8 +148,6 @@ public sealed partial class CudaBackend
         }
     }
 
-    // One capture at a time per backend: the side stream and the direct-PTX pin set are per backend.
-    private readonly object _captureGate = new();
 
     /// <summary>Hands a capture's pool to the graph it produced; replaces (and retires) a prior pool.</summary>
     private void AttachGraphMemoryPool(IntPtr graphExec, CaptureMemoryPool pool)
@@ -206,7 +204,9 @@ public sealed partial class CudaBackend
             TResult result;
             try
             {
-                result = OnCaptureStream(body);
+                // The body opens the capture itself (EnterCapture): the side stream, its ordering after the main stream,
+                // this thread's redirection and the per-context gate all live there.
+                result = body();
             }
             finally
             {

@@ -67,9 +67,8 @@ public partial class CpuEngine
         if (dParam.Length != numHeads)
             throw new ArgumentException($"dParam length ({dParam.Length}) must equal numHeads ({numHeads}).", nameof(dParam));
 
-        if (GraphMode.IsActive && GraphMode.Current is { } scope)
+        if (GraphMode.IsActive && GraphMode.Current is { } scope && scope.BindEngine(this))
         {
-            scope.BindEngineIfUnset(this);
             var capturedX = x;
             var capturedDelta = delta;
             var capturedALog = aLog;

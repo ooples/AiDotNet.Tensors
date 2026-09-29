@@ -33,7 +33,7 @@ internal sealed class CrossTypeLazyNode<TIn, TOut> : ILazyNode
     public bool IsRealized { get; set; }
     public int TopologicalIndex { get; set; } = -1;
     public int ConsumerCount { get; set; }
-    public IEngine RecordingEngine { get; } = AiDotNetEngine.Current;
+    public IEngine RecordingEngine { get; set; } = AiDotNetEngine.Current;
 
     public readonly Tensor<TIn> Input;
     public readonly Tensor<TOut> Output;

@@ -4846,6 +4846,54 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <summary>
+    /// Slice backward on the device: a zero tensor of <paramref name="inputShape"/> with <paramref name="gradOutput"/>
+    /// written at <paramref name="start"/>. The host version pulled the whole upstream gradient back
+    /// (GetFlattenedData) - a sync per step and, inside a whole-step capture, CUDA 900. Zero-fill (a memset) and
+    /// row copies are both capture-safe. Null when the device path cannot run.
+    /// </summary>
+    internal Tensor<T>? TrySliceBackwardOnDevice<T>(Tensor<T> gradOutput, int[] inputShape, int[] start)
+    {
+        if (typeof(T) != typeof(float) || Compilation.GraphMode.IsActive || !TryGetBackend(out var backend))
+            return null;
+        int rank = inputShape.Length;
+        if (rank == 0 || gradOutput.Rank != rank || start.Length != rank) return null;
+        for (int d = 0; d < rank; d++)
+            if (start[d] < 0 || start[d] + gradOutput._shape[d] > inputShape[d]) return null;
+        try
+        {
+            int total = 1; for (int d = 0; d < rank; d++) total = checked(total * inputShape[d]);
+            var source = gradOutput.IsContiguous ? gradOutput : (Tensor<T>)gradOutput.Contiguous();
+            int rowSize = source._shape[rank - 1];
+            int rowCount = rowSize == 0 ? 0 : source.Length / rowSize;
+            var sourceShape = (int[])source._shape.Clone();
+            using var sourceBuffer = GetOrAllocateBuffer(backend, source);
+            return DispatchDeferredGpuOp<T>(backend, total, (int[])inputShape.Clone(), output =>
+            {
+                backend.Fill(output, 0f, total);
+                for (int row = 0; row < rowCount; row++)
+                {
+                    int remaining = row;
+                    int destinationOffset = start[rank - 1];
+                    int stride = inputShape[rank - 1];
+                    for (int axis = rank - 2; axis >= 0; axis--)
+                    {
+                        int sourceIndex = remaining % sourceShape[axis];
+                        remaining /= sourceShape[axis];
+                        destinationOffset += (start[axis] + sourceIndex) * stride;
+                        stride *= inputShape[axis];
+                    }
+                    backend.Copy(sourceBuffer.Buffer, row * rowSize, output, destinationOffset, rowSize);
+                }
+            });
+        }
+        catch (Exception)
+        {
+            if (ThrowOnGpuKernelFallback) throw;
+            return null;
+        }
+    }
+
+    /// <summary>
     /// The adjoint of <c>TensorNarrow</c> on the device: a zero tensor of <paramref name="inputShape"/> with
     /// <paramref name="gradOutput"/> copied into positions [start, start+length) of <paramref name="dim"/>.
     /// </summary>

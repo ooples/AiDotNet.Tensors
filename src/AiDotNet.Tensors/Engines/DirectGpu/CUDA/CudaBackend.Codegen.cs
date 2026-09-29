@@ -145,7 +145,7 @@ public sealed partial class CudaBackend
 
     private DirectPtxCodegenKernel CompileCodegenKernel(PtxCodegenKernel kernel)
     {
-        _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+        _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
         DirectPtxModule module = _directPtxRuntime.LoadModule(
             kernel.Ptx, allowExperimentalJitFallback: true);
         try

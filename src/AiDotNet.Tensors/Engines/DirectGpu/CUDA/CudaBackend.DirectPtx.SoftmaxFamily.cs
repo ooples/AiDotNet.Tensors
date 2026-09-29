@@ -213,7 +213,7 @@ public sealed partial class CudaBackend
                         DirectPtxLastError = "Direct PTX softmax-family kernels must be prewarmed before CUDA graph capture.";
                         return false;
                     }
-                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 }
                 if (capturing && !kernels.Pin(key))
                     throw new InvalidOperationException(

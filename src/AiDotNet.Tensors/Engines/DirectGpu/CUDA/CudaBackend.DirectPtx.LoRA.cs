@@ -81,7 +81,7 @@ public sealed partial class CudaBackend
                             "Direct PTX fused LoRA must be prewarmed before CUDA graph capture.";
                         return false;
                     }
-                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
+                    _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                     kernel = CreateAndCacheDirectPtxLoRAKernelSlow(key);
                 }
                 if (capturing && !PinDirectPtxKernelForCapture(_directPtxLoRAKernels, key))
@@ -129,7 +129,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 var key = new DirectPtxLoRAKey(
                     batch, inputFeatures, rank, outputFeatures,
                     PtxCompat.SingleToInt32Bits(scaling));

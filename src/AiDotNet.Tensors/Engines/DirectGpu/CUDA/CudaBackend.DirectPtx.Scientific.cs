@@ -744,7 +744,7 @@ public sealed partial class CudaBackend
                         "Direct PTX scientific kernels must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, () => _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 launch();
             }
             System.Threading.Interlocked.Increment(ref _sciDispatchCount);

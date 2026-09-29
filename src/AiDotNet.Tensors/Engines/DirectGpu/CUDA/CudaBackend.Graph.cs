@@ -1,4 +1,6 @@
 using System;
+using System.Threading;
+using System.Collections.Generic;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
 
@@ -63,6 +65,168 @@ public sealed partial class CudaBackend
             "aidotnet_graphcapture_diag.txt"), "[GRAPH-CAPTURE] " + s + System.Environment.NewLine); } catch { }
     }
 
+    // Releases of device memory that existed BEFORE a stream capture began must not run while it is open: a
+    // cuMemFreeAsync issued on the capturing stream is RECORDED as a free node - the graph then frees that pointer on
+    // every launch - and an event recorded on it (FreeBufferDeferred) becomes a captured event that cuEventQuery later
+    // rejects ("invalid value"), poisoning the backend's deferred-free queue for every later caller. Both happen when
+    // an op inside the capture drains frees queued by GC finalizers, which is why a captured training step replayed
+    // garbage only in a long test process full of dead GPU results. Frees of memory allocated INSIDE the capture stay
+    // captured: those are the graph's own allocations. Thread-scoped because capture is THREAD_LOCAL.
+    [ThreadStatic] private static int t_captureDepth;
+    [ThreadStatic] private static List<Action>? t_postCaptureReleases;
+
+    /// <summary>True while this thread has a stream capture open on a CUDA backend.</summary>
+    internal static bool IsCapturingOnThisThread => t_captureDepth > 0;
+
+    /// <summary>
+    /// Queues <paramref name="release"/> until this thread's capture ends, when it releases memory allocated before the
+    /// capture began. Returns false (caller releases now) outside a capture or for memory the capture allocated.
+    /// </summary>
+    internal static bool TryDeferReleaseUntilCaptureEnds(bool allocatedDuringCapture, Action release)
+    {
+        if (t_captureDepth == 0 || allocatedDuringCapture) return false;
+        (t_postCaptureReleases ??= new List<Action>()).Add(release);
+        return true;
+    }
+
+    // A capture runs on this backend's PRIVATE stream. The compute stream is shared by every thread using the
+    // backend, and a stream capture records whatever is enqueued on the stream - whichever thread enqueues it. On the
+    // shared stream another thread's kernels were recorded into this thread's step graph (replayed every step, never
+    // run for that thread), its synchronous calls invalidated the capture (CUDA 901), and events it recorded became
+    // captured events its later cuEventQuery rejected. Measured in the full test suite as captured training losses of
+    // 0 / -176 and dozens of unrelated tests failing "cuEventQuery failed: Invalid value". On the capturing thread,
+    // _stream resolves to the capture stream (ordered after the compute stream's prior work); every other thread keeps
+    // the compute stream. Replays still launch on the compute stream.
+    // Captures on one context are serialized, and a context-wide synchronize waits for an open capture instead of
+    // failing (CUDA 900 "operation not permitted when stream is capturing" - cuCtxSynchronize would have to wait on the
+    // capturing stream). Keyed by context: the standalone Direct-PTX runtime shares the backend's context.
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<IntPtr, object> s_captureGates = new();
+    internal static object CaptureGateFor(IntPtr context) => s_captureGates.GetOrAdd(context, _ => new object());
+
+    /// <summary>cuCtxSynchronize that waits for any capture open on <paramref name="context"/> to end first.</summary>
+    internal static CudaResult SynchronizeContextOutsideCapture(IntPtr context)
+    {
+        lock (CaptureGateFor(context))
+            return CudaNativeBindings.cuCtxSynchronize();
+    }
+
+    [ThreadStatic] private static IntPtr t_captureMainStream;
+    [ThreadStatic] private static IntPtr t_captureStream;
+    // The ambient stream (CudaCurrentStream) this thread had before its capture opened, restored when it closes.
+    [ThreadStatic] private static (IntPtr Stream, IntPtr Context) t_ambientBeforeCapture;
+    private IntPtr _captureStream;
+    private IntPtr _captureOrderEvent;
+    private CudaStream? _captureStreamWrapper;
+
+    /// <summary>The stream this thread must enqueue on for work bound to <paramref name="mainStream"/>.</summary>
+    internal static IntPtr ResolveCaptureStream(IntPtr mainStream)
+        => mainStream != IntPtr.Zero && mainStream == t_captureMainStream ? t_captureStream : mainStream;
+
+    private bool IsCapturingOnThisBackend => t_captureMainStream != IntPtr.Zero && t_captureMainStream == _mainStream;
+
+    /// <summary>Opens a capture scope: redirects this thread to the private capture stream. Before cuStreamBeginCapture.</summary>
+    private void EnterCapture()
+    {
+        if (t_captureDepth++ > 0) return;
+        var gate = CaptureGateFor(_cudaContext);
+        System.Threading.Monitor.Enter(gate);
+        try
+        {
+            if (_captureStream == IntPtr.Zero) CreateCaptureStream();
+            TestHookCaptureSetup?.Invoke();
+            // Everything this thread already enqueued on the compute stream happens before the captured work.
+            CuBlasNative.CheckCudaResult(CudaNativeBindings.cuEventRecord(_captureOrderEvent, _mainStream), "cuEventRecord(capture order)");
+            CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamWaitEvent(_captureStream, _captureOrderEvent, 0), "cuStreamWaitEvent(capture order)");
+        }
+        catch
+        {
+            // The scope never opened: leaving the depth raised would make this thread treat every later capture as
+            // nested (and defer its frees forever), and a held gate blocks every other capture and context sync.
+            t_captureDepth--;
+            System.Threading.Monitor.Exit(gate);
+            throw;
+        }
+        t_captureMainStream = _mainStream;
+        t_captureStream = _captureStream;
+        // Copies and memsets issued through the CuBlasNative/CudaNativeBindings stream wrappers read the ambient stream,
+        // not _stream, so point it at the capture stream too; otherwise they would run outside the capture.
+        t_ambientBeforeCapture = CudaCurrentStream.Enter(_captureStream, _cudaContext);
+        CuBlasNative.cublasSetStream(_cublasHandle, _captureStream);
+    }
+
+    // All or nothing: a stream without its order event would pass the `_captureStream == 0` check next time and record on
+    // a null event.
+    private void CreateCaptureStream()
+    {
+        CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamCreate(out var stream, 1 /* CU_STREAM_NON_BLOCKING */),
+            "cuStreamCreate(capture)");
+        var eventResult = CudaNativeBindings.cuEventCreate(out var orderEvent, 2 /* CU_EVENT_DISABLE_TIMING */);
+        if (eventResult != CudaResult.Success)
+        {
+            CudaNativeBindings.cuStreamDestroy(stream);
+            CuBlasNative.CheckCudaResult(eventResult, "cuEventCreate(capture order)");
+        }
+        _captureStream = stream;
+        _captureOrderEvent = orderEvent;
+        LiveStreams.TryAdd(_captureStream, 0);
+        _captureStreamWrapper = new CudaStream(this, _captureStream, AiDotNet.Tensors.Engines.Gpu.GpuStreamType.Default, ownsHandle: false);
+    }
+
+    private static long _failedDeferredReleases;
+
+    /// <summary>Releases deferred until a capture ended that then threw (process-wide). Each one leaked its buffer.</summary>
+    internal static long FailedDeferredReleases => Interlocked.Read(ref _failedDeferredReleases);
+
+    /// <summary>Memory-free nodes in the most recent step capture: a free of memory the graph did not allocate shows
+    /// up here as an extra node (see TryDeferReleaseUntilCaptureEnds).</summary>
+    internal int LastCaptureFreeNodeCount { get; private set; }
+
+    /// <summary>Kernel nodes in the most recent step capture: work another thread enqueued would show up here.</summary>
+    internal int LastCaptureKernelNodeCount { get; private set; }
+
+    private static int CountNodes(IntPtr graph, int nodeType)
+    {
+        ulong count = 0;
+        if (CudaNativeBindings.cuGraphGetNodes(graph, IntPtr.Zero, ref count) != CudaResult.Success || count == 0) return 0;
+        var nodes = new IntPtr[count];
+        if (CudaNativeBindings.cuGraphGetNodesArray(graph, nodes, ref count) != CudaResult.Success) return 0;
+        int matches = 0;
+        for (ulong i = 0; i < count; i++)
+            if (CudaNativeBindings.cuGraphNodeGetType(nodes[i], out int t) == CudaResult.Success && t == nodeType) matches++;
+        return matches;
+    }
+
+    /// <summary>Test hook: runs inside EnterCapture's setup, where a CUDA setup call can fail.</summary>
+    internal static Action? TestHookCaptureSetup;
+
+    /// <summary>Test hook: runs on the capturing thread right after the step capture opens.</summary>
+    internal static Action? TestHookInsideCapture;
+
+    /// <summary>Call right after cuStreamEndCapture, so the queued releases are not captured.</summary>
+    private void ExitCapture()
+    {
+        if (t_captureDepth == 0 || --t_captureDepth > 0) return;
+        CudaCurrentStream.Restore(t_ambientBeforeCapture);
+        t_ambientBeforeCapture = default;
+        t_captureMainStream = IntPtr.Zero;
+        t_captureStream = IntPtr.Zero;
+        CuBlasNative.cublasSetStream(_cublasHandle, _mainStream);
+        System.Threading.Monitor.Exit(CaptureGateFor(_cudaContext));
+        var releases = t_postCaptureReleases;
+        if (releases is null || releases.Count == 0) return;
+        t_postCaptureReleases = null;
+        foreach (var release in releases)
+        {
+            try { release(); }
+            catch (Exception ex)
+            {
+                // One buffer's release must not strand the rest, but a failed free is a leak: count it and say why.
+                Interlocked.Increment(ref _failedDeferredReleases);
+                GcDiag($"deferred release FAILED: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+    }
+
     public IntPtr CaptureGraph(Action launch)
     {
         if (!IsAvailable || launch is null) return IntPtr.Zero;
@@ -74,69 +238,19 @@ public sealed partial class CudaBackend
         return CaptureWithPrivateMemory(() => CaptureGraphOnCurrentStream(launch), graphExec => graphExec);
     }
 
-    /// <summary>
-    /// Runs a capture body on this backend's side stream, entered by this thread only: the side stream first waits
-    /// for the compute stream's queued work, and every launch and copy the body issues goes to the side stream.
-    /// Every capture of this backend goes through here; capturing the compute stream itself breaks every other
-    /// thread using the backend (CUDA 900 on their next sync).
-    /// </summary>
-    private TResult OnCaptureStream<TResult>(Func<TResult> body)
-    {
-        lock (_captureGate)
-        {
-            EnsureCaptureStream();
-            ForkCaptureStreamFromCompute();
-            var previousCapturing = t_capturingBackend;
-            t_capturingBackend = this;
-            var previousAmbient = CudaCurrentStream.Enter(_captureStream, _cudaContext);
-            try
-            {
-                return body();
-            }
-            finally
-            {
-                CudaCurrentStream.Restore(previousAmbient);
-                t_capturingBackend = previousCapturing;
-            }
-        }
-    }
-
-    /// <summary>Creates the capture side stream once (non-blocking: legacy-stream work never waits on it).</summary>
-    private void EnsureCaptureStream()
-    {
-        if (_captureStream != IntPtr.Zero) return;
-        lock (ContextLifecycleLock)
-        {
-            if (_captureStream != IntPtr.Zero) return;
-            CuBlasNative.CheckCudaResult(
-                CudaNativeBindings.cuStreamCreate(out var stream, CudaNativeBindings.CU_STREAM_NON_BLOCKING),
-                "cuStreamCreate(capture side stream)");
-            LiveStreams[stream] = 0;
-            _captureStream = stream;
-        }
-    }
-
-    /// <summary>Makes the capture stream wait for all work queued so far on the compute stream.</summary>
-    private void ForkCaptureStreamFromCompute()
-    {
-        CuBlasNative.CheckCudaResult(CudaNativeBindings.cuEventCreate(out var fork, CudaNativeBindings.CU_EVENT_DISABLE_TIMING), "cuEventCreate(capture fork)");
-        try
-        {
-            CuBlasNative.CheckCudaResult(CudaNativeBindings.cuEventRecord(fork, _computeStream), "cuEventRecord(capture fork)");
-            CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamWaitEvent(_captureStream, fork, 0), "cuStreamWaitEvent(capture fork)");
-        }
-        finally
-        {
-            CudaNativeBindings.cuEventDestroy(fork);
-        }
-    }
-
     private IntPtr CaptureGraphOnCurrentStream(Action launch)
     {
         DirectPtxCapturePinSet directPtxPins = BeginDirectPtxCapturePinTracking();
+        try { EnterCapture(); }
+        catch
+        {
+            AbortDirectPtxCapturePinTracking(directPtxPins);
+            throw;
+        }
         var rc = CudaNativeBindings.cuStreamBeginCapture(_stream, CudaNativeBindings.CU_STREAM_CAPTURE_MODE_THREAD_LOCAL);
         if (rc != CudaResult.Success)
         {
+            ExitCapture();
             AbortDirectPtxCapturePinTracking(directPtxPins);
             GcDiag($"beginCapture FAILED rc={rc}");
             return IntPtr.Zero;
@@ -147,12 +261,14 @@ public sealed partial class CudaBackend
         try
         {
             _backendStreamCaptureActive = true;
+            TestHookInsideCapture?.Invoke();
             launch();
         }
         catch (Exception ex)
         {
             { var st = ex.StackTrace?.Replace("\r", "").Replace("\n", " >> ") ?? ""; GcDiag($"launch() THREW {ex.GetType().Name}: {ex.Message} | {st.Substring(0, System.Math.Min(2500, st.Length))}"); }
             CudaNativeBindings.cuStreamEndCapture(_stream, out var abortedGraph);
+            ExitCapture();
             if (abortedGraph != IntPtr.Zero) CudaNativeBindings.cuGraphDestroy(abortedGraph);
             AbortDirectPtxCapturePinTracking(directPtxPins);
             return IntPtr.Zero;
@@ -163,6 +279,7 @@ public sealed partial class CudaBackend
         }
 
         rc = CudaNativeBindings.cuStreamEndCapture(_stream, out var graph);
+        ExitCapture();
         if (rc != CudaResult.Success || graph == IntPtr.Zero)
         {
             AbortDirectPtxCapturePinTracking(directPtxPins);
@@ -173,6 +290,8 @@ public sealed partial class CudaBackend
         // Diagnostic: how many kernel/memory nodes did the capture actually record? A near-empty graph means
         // the forward's ops were short-circuited (e.g. served from the activation cache) during capture, so
         // replay reproduces a frozen output that ignores refreshed inputs.
+        LastCaptureFreeNodeCount = CountNodes(graph, nodeType: 11); // CU_GRAPH_NODE_TYPE_MEM_FREE
+        LastCaptureKernelNodeCount = CountNodes(graph, nodeType: 0); // CU_GRAPH_NODE_TYPE_KERNEL
         { ulong nodeCount = 0; var gn = CudaNativeBindings.cuGraphGetNodes(graph, IntPtr.Zero, ref nodeCount); GcDiag($"captured graph node count = {nodeCount} (rc={gn})");
           // Node-type breakdown (KERNEL/MEMCPY/MEMSET/MEM_ALLOC/MEM_FREE/…) — tells us how much of the chain is
           // fusable kernels vs memcpy/alloc overhead. Only when capture-debug is on.
@@ -259,6 +378,8 @@ public sealed partial class CudaBackend
         // Every backend shares the device's primary context, so a context-wide sync would also wait on streams
         // another engine is capturing (CUDA 900). Wait on this backend's own streams instead.
         SynchronizeOwnStreams("stream sync (post-capture-launch grad barrier)");
+        // main (#1065) synchronized only _stream here, on the grounds that lease-stream branches rejoin it before capture
+        // ends; SynchronizeOwnStreams covers that stream and every stream this backend created, so it is the superset.
     }
 
     /// <summary>
@@ -285,8 +406,15 @@ public sealed partial class CudaBackend
     {
 
         DirectPtxCapturePinSet directPtxPins = BeginDirectPtxCapturePinTracking();
+        try { EnterCapture(); }
+        catch
+        {
+            AbortDirectPtxCapturePinTracking(directPtxPins);
+            throw;
+        }
         if (CudaNativeBindings.cuStreamBeginCapture(_stream, CudaNativeBindings.CU_STREAM_CAPTURE_MODE_THREAD_LOCAL) != CudaResult.Success)
         {
+            ExitCapture();
             AbortDirectPtxCapturePinTracking(directPtxPins);
             return false;
         }
@@ -298,6 +426,7 @@ public sealed partial class CudaBackend
         catch
         {
             CudaNativeBindings.cuStreamEndCapture(_stream, out var g);
+            ExitCapture();
             if (g != IntPtr.Zero) CudaNativeBindings.cuGraphDestroy(g);
             AbortDirectPtxCapturePinTracking(directPtxPins);
             return false;
@@ -307,7 +436,9 @@ public sealed partial class CudaBackend
             _backendStreamCaptureActive = false;
         }
 
-        if (CudaNativeBindings.cuStreamEndCapture(_stream, out var newGraph) != CudaResult.Success || newGraph == IntPtr.Zero)
+        var endRc = CudaNativeBindings.cuStreamEndCapture(_stream, out var newGraph);
+        ExitCapture();
+        if (endRc != CudaResult.Success || newGraph == IntPtr.Zero)
         {
             AbortDirectPtxCapturePinTracking(directPtxPins);
             return false;
@@ -334,13 +465,25 @@ public sealed partial class CudaBackend
     public void DestroyCapturedGraph(IntPtr graphExec)
     {
         if (graphExec == IntPtr.Zero) return;
-        using var _ = PushContext();
-        CuBlasNative.CheckCudaResult(
-            CudaNativeBindings.cuStreamSynchronize(_stream),
-            "cuStreamSynchronize (graph destroy)");
-        CuBlasNative.CheckCudaResult(
-            CudaNativeBindings.cuGraphExecDestroy(graphExec),
-            "cuGraphExecDestroy");
+        // A plan can outlive the engine it captured on (a thread-cached compiled training step disposed after its
+        // model's engine was): cuCtxDestroy already reclaimed the graph with the context, and touching the dead
+        // context threw "cuStreamSynchronize (graph destroy) failed: Invalid context" out of plan disposal.
+        // Checked under the lifecycle lock so a concurrent context destroy cannot land between check and use.
+        lock (ContextLifecycleLock)
+        {
+            if (!IsLiveContext(_cudaContext, _contextGeneration))
+            {
+                ReleaseDirectPtxGraphPins(graphExec);
+                return;
+            }
+            using var _ = PushContext();
+            CuBlasNative.CheckCudaResult(
+                CudaNativeBindings.cuStreamSynchronize(_stream),
+                "cuStreamSynchronize (graph destroy)");
+            CuBlasNative.CheckCudaResult(
+                CudaNativeBindings.cuGraphExecDestroy(graphExec),
+                "cuGraphExecDestroy");
+        }
         ReleaseDirectPtxGraphPins(graphExec);
         RetireGraphMemoryPool(graphExec);
     }
