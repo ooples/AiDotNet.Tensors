@@ -21,7 +21,7 @@ public class SliceBackwardDeviceTests
     public void Slice_gradient_on_the_gpu_scatters_into_zeros_at_the_origin(int[] shape, int[] start, int[] size)
     {
         DirectGpuTensorEngine? gpu = null;
-        try { gpu = new DirectGpuTensorEngine(); } catch (Exception) { }
+        try { gpu = new DirectGpuTensorEngine(); } catch (Exception ex) when (ex is PlatformNotSupportedException or DllNotFoundException) { }
         Skip.IfNot(gpu is not null && gpu.IsGpuAvailable, "GPU backend did not resolve.");
         var prior = AiDotNetEngine.Current;
         try

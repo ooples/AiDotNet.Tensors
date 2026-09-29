@@ -2343,6 +2343,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
     }
 
+    private bool CachedUnderKey(object key, IGpuBuffer buffer)
+        => _activationCache.TryGetValue(key, out var e) && ReferenceEquals(e.Buffer, buffer);
+
     private bool TryFreeActivationByKey(object key)
     {
         if (!_activationCache.TryRemove(key, out var e)) return false;
@@ -3027,20 +3030,32 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // copy of every activation for the rest of the step (eviction is suspended mid-step), so the Half store used
         // 2 x 2 bytes per element - exactly the 4 bytes of the FP32 store it replaces. Measured: resident activation
         // bytes on == off (98308) in Fp16HeteroScratchFreeTests.
+        // r's Half copy can be cached under its DataVector (a deferred result - what TryGetResidentFp16Buffer checks
+        // first) or its backing array; release it under whichever key holds it, or the copy leaks for the step.
+        object? rVec = r.DataVector;
         var rKey = r.GetBackingArrayForCacheLookupUnsafe();
         // Reuse o's resident Half buffer when it's still cached (stable across steps → also the capture-#38
         // prereq): just DtoD-overwrite it with this step's result, then release r's copy.
         if (TryGetResidentFp16Buffer(o, backend, out var existing) && existing is not null && existing.SizeInBytes >= bytes)
         {
             cb.CopyBufferDtoD(rBuf, existing, bytes);
-            if (rKey is not null && TryFreeActivationByKey(rKey)) { r._gpuBuffer = null; r._gpuBufferVersion = -1; }
+            bool freed = rVec is not null && TryFreeActivationByKey(rVec);
+            if (rKey is not null) freed |= TryFreeActivationByKey(rKey);
+            if (freed) { r._gpuBuffer = null; r._gpuBufferVersion = -1; }
             return true;
         }
         // First landing for o: take r's buffer outright - no allocation, no copy.
         IGpuBuffer oBuf;
-        if (rKey is not null && TryTakeActivationByKey(rKey, rBuf))
+        object? takenKey = rVec is not null && TryTakeActivationByKey(rVec, rBuf) ? rVec
+            : rKey is not null && TryTakeActivationByKey(rKey, rBuf) ? rKey
+            : null;
+        if (takenKey is not null)
         {
-            Helpers.DeferredArrayMaterializer.Remove(rKey);
+            Helpers.DeferredArrayMaterializer.Remove(takenKey);
+            // A second entry for r under its other key is another copy of the same activation (never rBuf, which o
+            // now owns).
+            var otherKey = ReferenceEquals(takenKey, rVec) ? rKey : rVec;
+            if (otherKey is not null && !CachedUnderKey(otherKey, rBuf)) TryFreeActivationByKey(otherKey);
             if (ReferenceEquals(r._gpuBuffer, rBuf)) { r._gpuBuffer = null; r._gpuBufferVersion = -1; }
             oBuf = rBuf;
         }
@@ -3648,10 +3663,25 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // extend any result's lifetime.
     internal static volatile bool TrackOwnedResultBytes;
     private readonly List<(WeakReference<IGpuBuffer> Buffer, long Bytes)> _trackedOwnedResults = new();
+    private int _trackedOwnedResultsPruneAt = 1024;
+
+    // Caller holds the _trackedOwnedResults lock.
+    private void PruneTrackedOwnedResults()
+        => _trackedOwnedResults.RemoveAll(e => !e.Buffer.TryGetTarget(out var b) || b.Handle == IntPtr.Zero);
 
     private void TrackOwnedResult(IGpuBuffer buffer)
     {
-        lock (_trackedOwnedResults) _trackedOwnedResults.Add((new WeakReference<IGpuBuffer>(buffer), buffer.SizeInBytes));
+        lock (_trackedOwnedResults)
+        {
+            _trackedOwnedResults.Add((new WeakReference<IGpuBuffer>(buffer), buffer.SizeInBytes));
+            // Prune on growth too, not only when LiveOwnedResultBytes is read: a run that enables tracking and never
+            // reads it would otherwise keep one entry per op forever. Doubling the threshold keeps this amortized O(1).
+            if (_trackedOwnedResults.Count >= _trackedOwnedResultsPruneAt)
+            {
+                PruneTrackedOwnedResults();
+                _trackedOwnedResultsPruneAt = Math.Max(1024, 2 * _trackedOwnedResults.Count);
+            }
+        }
     }
 
     /// <summary>Device bytes of tracked owned results that are still alive and not yet freed.</summary>
@@ -3662,7 +3692,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             long total = 0;
             lock (_trackedOwnedResults)
             {
-                _trackedOwnedResults.RemoveAll(e => !e.Buffer.TryGetTarget(out var b) || b.Handle == IntPtr.Zero);
+                PruneTrackedOwnedResults();
                 foreach (var e in _trackedOwnedResults) total += e.Bytes;
             }
             return total;
@@ -25433,8 +25463,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     #endregion
 
+    /// <summary>True once <see cref="Dispose"/> ran: a consumer holding this engine must not dispatch to it.</summary>
+    internal bool IsDisposed { get; private set; }
+
     public void Dispose()
     {
+        IsDisposed = true;
         UnregisterAsBackendOwner();
         // Clear activation cache to free GPU memory from cached activations
         ClearActivationCache();

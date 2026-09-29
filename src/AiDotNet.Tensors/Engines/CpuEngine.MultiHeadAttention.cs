@@ -118,7 +118,6 @@ public partial class CpuEngine
             }
 
             var scope = GraphMode.Current!; scope.BindEngineIfUnset(this);
-            scope.BindEngineIfUnset(this);
             var graphInputs = new[] { input, qWeight, kWeight, vWeight, outWeight };
             var capturedMask = mask;
             var savedState = new object[PlanFormatConstants.MultiHeadAttentionSavedStateCount];

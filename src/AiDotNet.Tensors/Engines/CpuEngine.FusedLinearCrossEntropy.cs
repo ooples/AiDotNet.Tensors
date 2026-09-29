@@ -70,7 +70,6 @@ public partial class CpuEngine
 
         if (GraphMode.IsActive && GraphMode.Current is { } scope && scope.BindEngine(this))
         {
-            scope.BindEngineIfUnset(this);
             var capturedHidden = hidden;
             var capturedWeight = weight;
             var capturedBias = bias;
@@ -179,7 +178,6 @@ public partial class CpuEngine
 
         if (GraphMode.IsActive && GraphMode.Current is { } scope && scope.BindEngine(this))
         {
-            scope.BindEngineIfUnset(this);
             var capturedHidden = hidden;
             var capturedWeight = weight;
             var capturedBias = bias;

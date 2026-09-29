@@ -20,7 +20,7 @@ public class ContextHandleReuseTests
     public void A_queued_free_from_a_dead_context_never_frees_memory_of_a_new_context_with_the_same_handle()
     {
         DirectGpuTensorEngine? gpu = null;
-        try { gpu = new DirectGpuTensorEngine(); } catch (Exception) { }
+        try { gpu = new DirectGpuTensorEngine(); } catch (Exception ex) when (ex is PlatformNotSupportedException or DllNotFoundException) { }
         Skip.IfNot(gpu is not null && gpu.IsGpuAvailable && gpu.GetBackend() is CudaBackend, "CUDA backend did not resolve.");
         using (gpu)
         {

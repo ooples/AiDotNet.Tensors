@@ -4831,6 +4831,7 @@ public partial class DirectGpuTensorEngine
         }
         catch (Exception)
         {
+            if (ThrowOnGpuKernelFallback) throw;
             return null;
         }
     }

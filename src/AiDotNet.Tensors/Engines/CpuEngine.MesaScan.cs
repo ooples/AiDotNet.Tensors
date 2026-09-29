@@ -23,7 +23,6 @@ public partial class CpuEngine
 
         if (GraphMode.IsActive && GraphMode.Current is { } scope && scope.BindEngine(this))
         {
-            scope.BindEngineIfUnset(this);
             var capturedQ = q;
             var capturedK = k;
             var capturedV = v;

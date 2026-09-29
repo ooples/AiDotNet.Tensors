@@ -39,7 +39,13 @@ internal static class ResidentHostMirror
             {
                 if (!weak.TryGetTarget(out var t) || !HasContiguousResidentBuffer(t)) continue;
                 if (!ReferenceEquals(t.GetBackingArrayForCacheLookupUnsafe(), array)) continue; // re-homed since
-                var floats = t._gpuBackend!.DownloadBuffer(t._gpuBuffer!);
+                // A member bound to a pooled scratch buffer that was since released (ClearActionScratchPool) has
+                // nothing to contribute; its host slice is already the value. One such member must not abort the
+                // host read for every other view on the array.
+                if (t._gpuBuffer!.Handle == IntPtr.Zero) continue;
+                float[] floats;
+                try { floats = t._gpuBackend!.DownloadBuffer(t._gpuBuffer!); }
+                catch (ObjectDisposedException) { continue; }
                 var values = DirectGpuEngine.FromFloatArray<T>(floats);
                 Array.Copy(values, 0, array, t._storageOffset, Math.Min(t.Length, values.Length));
             }

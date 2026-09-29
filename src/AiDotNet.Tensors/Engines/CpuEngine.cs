@@ -27859,7 +27859,6 @@ public partial class CpuEngine : ITensorLevelEngine
             }
 
             var scope = GraphMode.Current!; scope.BindEngineIfUnset(this);
-            scope.BindEngineIfUnset(this);
             var graphInputs = new[] { query, key, value };
             var outputShape = new[] { query._shape[0], qHeads, query._shape[2], value._shape[3] };
             object[] savedState = { scale, isCausal, softcap };
@@ -30585,7 +30584,6 @@ public partial class CpuEngine : ITensorLevelEngine
         if (GraphMode.IsInferenceTrace)
         {
             var scope = GraphMode.Current!; scope.BindEngineIfUnset(this);
-            scope.BindEngineIfUnset(this);
             var graphInputs = new[] { query, key, value };
 
             object[] SavedStateFor(int selectedOutput) =>
@@ -32542,10 +32540,10 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> ReduceMean<T>(Tensor<T> input, int[] axes, bool keepDims)
     {
-        // Match ReduceSum and the eager reduction contract: null means reduce
-        // every axis. Normalize before graph-shape construction so tracing does
-        // not enumerate a null array even though the eager path supports it.
-        axes ??= Enumerable.Range(0, input.Rank).ToArray();
+        // Match ReduceSum and the eager reduction contract: null or empty means reduce every axis. Normalize before
+        // graph-shape construction: with an empty array the graph recorded an UNREDUCED output shape, then its replay
+        // ran this eager path - a full reduction - into it.
+        if (axes is null || axes.Length == 0) axes = Enumerable.Range(0, input.Rank).ToArray();
 
         if (GraphMode.IsActive)
         {
@@ -40851,7 +40849,6 @@ public partial class CpuEngine : ITensorLevelEngine
             outputShape[outputShape.Length - 1] = graphUnits;
             var graphInputs = bias is null ? new[] { input, weights } : new[] { input, weights, bias };
             var scope = GraphMode.Current!; scope.BindEngineIfUnset(this);
-            scope.BindEngineIfUnset(this);
             return scope.RecordVariadic(
                 LazyNodeType.FusedLinearMaxout,
                 "FusedLinearMaxout",
@@ -40943,7 +40940,6 @@ public partial class CpuEngine : ITensorLevelEngine
             var outputShape = (int[])input._shape.Clone();
             outputShape[outputShape.Length - 1] = numClasses;
             var scope = GraphMode.Current!; scope.BindEngineIfUnset(this);
-            scope.BindEngineIfUnset(this);
             return scope.RecordBinary(
                 LazyNodeType.FusedHierarchicalSoftmax,
                 "FusedHierarchicalSoftmax",

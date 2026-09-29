@@ -198,14 +198,26 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (_device == TensorDevice.CPU || _gpuBuffer is null || _gpuBackend is null)
             return view;
 
-        view._device = _device;
-        view._gpuDeviceIndex = _gpuDeviceIndex;
-        view._gpuBuffer = _gpuBuffer;
-        view._gpuBackend = _gpuBackend;
+        ShareGpuStateWith(view);
         // A metadata-only view borrows the same snapshot; it does not upload current host data.
         // Preserve a stale source stamp so a view created after a host mutation cannot certify
         // the old GPU buffer as current merely by adopting the storage's latest epoch.
         view._gpuBufferVersion = _gpuBufferVersion;
+        return view;
+    }
+
+    /// <summary>
+    /// Everything a view borrowing this tensor's device buffer must carry besides the version stamp (which each caller
+    /// sets by its own rule). One helper for both view paths, so a reshape and a storage view of the same resident
+    /// tensor behave the same: same materializer (a host read of either refreshes the shared backing through one
+    /// registration), same role, never the owner of the buffer.
+    /// </summary>
+    private void ShareGpuStateWith(Tensor<T> view)
+    {
+        view._device = _device;
+        view._gpuDeviceIndex = _gpuDeviceIndex;
+        view._gpuBuffer = _gpuBuffer;
+        view._gpuBackend = _gpuBackend;
         view._gpuBufferIsSplitComplex = _gpuBufferIsSplitComplex;
         view._gpuBufferContainsRawInt32 = _gpuBufferContainsRawInt32;
         view._gpuRole = _gpuRole;
@@ -214,7 +226,6 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         view._gpuMaterializerKey = _gpuMaterializerKey;
         view.IsDirty = IsDirty;
         view.Layout = Layout;
-        return view;
     }
 
     /// <summary>
@@ -237,7 +248,6 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             new object[] { originalShape });
     }
 
-    /// <summary>Attaches inverse-permutation gradients to a storage view.</summary>
     /// <summary>
     /// A shape-only view (same storage, same offset, both contiguous, same length) has the SAME bytes as its source,
     /// so it carries the source's device buffer. Without this a reshape of a GPU result was a host-only object: a
@@ -252,16 +262,12 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (_gpuBuffer is null || view._gpuBuffer is not null) return;
         if (!IsContiguous || !view.IsContiguous || view._storageOffset != _storageOffset || view.Length != Length) return;
         if (!ReferenceEquals(view._storage, _storage)) return;
-        view._gpuBuffer = _gpuBuffer;
-        view._gpuBackend = _gpuBackend;
-        view._gpuBufferIsSplitComplex = _gpuBufferIsSplitComplex;
-        view._gpuBufferContainsRawInt32 = _gpuBufferContainsRawInt32;
-        view._device = _device;
-        view._gpuDeviceIndex = _gpuDeviceIndex;
+        ShareGpuStateWith(view);
         // Same storage => same GpuCacheVersion; carry "current" only if the source's buffer was current.
         view._gpuBufferVersion = _gpuBufferVersion == GpuCacheVersion ? view.GpuCacheVersion : -1;
     }
 
+    /// <summary>Attaches inverse-permutation gradients to a storage view.</summary>
     private Tensor<T> FinalizePermuteView(Tensor<T> view, int[] permutation)
     {
         if (!IsDifferentiableRecordingActive)

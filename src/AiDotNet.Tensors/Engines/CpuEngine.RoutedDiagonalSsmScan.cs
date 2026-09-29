@@ -18,7 +18,6 @@ public partial class CpuEngine
             out int batch, out int time, out int model, out int experts, out int state);
         if (GraphMode.IsActive && GraphMode.Current is { } scope && scope.BindEngine(this))
         {
-            scope.BindEngineIfUnset(this);
             var capturedInput = input;
             var capturedActiveMask = activeMask;
             var capturedTransition = transition;

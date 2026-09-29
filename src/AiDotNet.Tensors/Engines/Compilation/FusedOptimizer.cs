@@ -2853,6 +2853,8 @@ public sealed class FusedOptimizerExtras
     /// i.e. bias-corrected, as in the paper.
     /// </summary>
     public bool LambDisableBiasCorrection { get; init; }
+
+    /// <summary>
     /// AMSGrad only: apply the weight decay DECOUPLED (AdamW, Loshchilov &amp; Hutter 2019) instead of as an L2
     /// term folded into the gradient. When true the step first scales the parameter by <c>1 - lr·wd</c> and then
     /// runs AMSGrad with no decay - PyTorch <c>AdamW(amsgrad=True)</c>'s order. Default false keeps

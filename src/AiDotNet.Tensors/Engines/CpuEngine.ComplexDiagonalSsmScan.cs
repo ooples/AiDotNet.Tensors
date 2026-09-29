@@ -27,7 +27,6 @@ public partial class CpuEngine
 
         if (GraphMode.IsActive && GraphMode.Current is { } scope && scope.BindEngine(this))
         {
-            scope.BindEngineIfUnset(this);
             var capturedInput = input;
             var capturedTransitionReal = transitionReal;
             var capturedTransitionImag = transitionImag;

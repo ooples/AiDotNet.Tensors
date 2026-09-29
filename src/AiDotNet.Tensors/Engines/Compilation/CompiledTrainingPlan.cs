@@ -284,18 +284,6 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     }
 
     /// <summary>
-    /// Destroys the captured CUDA step graph (if any) and resets the warmup counter
-    /// so the next eligible Step() re-captures. MUST be called whenever the captured
-    /// kernel sequence's inputs change — optimizer reconfigure (new state buffers /
-    /// optimizer wiring) or a forward-action rebuild — otherwise replay would launch
-    /// kernels against freed or stale buffers.
-    /// </summary>
-    /// <summary>
-    /// Keeps THIS plan on the eager step even where whole-step CUDA-graph capture is enabled process-wide. The
-    /// environment switch is read once per process, so this is how a single test process compares a captured plan
-    /// against an eager one (the parity oracle for capture).
-    /// </summary>
-    /// <summary>
     /// Undoes what the capture pre-pass did to the step's gradient state when capture fails, so the eager fallback
     /// runs this step exactly as if capture had never been attempted.
     /// </summary>
@@ -386,12 +374,24 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         if (slot._gpuBuffer is null) slot.IncrementVersion();
     }
 
+    /// <summary>
+    /// Keeps THIS plan on the eager step even where whole-step CUDA-graph capture is enabled process-wide. The
+    /// environment switch is read once per process, so this is how a single test process compares a captured plan
+    /// against an eager one (the parity oracle for capture).
+    /// </summary>
     internal void DisableGraphStep()
     {
         InvalidateCapturedStepGraph();
         _graphStepDisabled = true;
     }
 
+    /// <summary>
+    /// Destroys the captured CUDA step graph (if any) and resets the warmup counter
+    /// so the next eligible Step() re-captures. MUST be called whenever the captured
+    /// kernel sequence's inputs change — optimizer reconfigure (new state buffers /
+    /// optimizer wiring) or a forward-action rebuild — otherwise replay would launch
+    /// kernels against freed or stale buffers.
+    /// </summary>
     private void InvalidateCapturedStepGraph()
     {
         if (_stepGraphExec != IntPtr.Zero
@@ -2079,18 +2079,6 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         return StepEager();
     }
 
-    /// <summary>
-    /// The GPU-only body of a training step (forward → grad-zero → loss-grad reseed →
-    /// backward), with grad-zero and loss-grad reseed done as GPU ops so a
-    /// cuGraphLaunch replay re-does them (a host Array.Clear/Copy would run only at
-    /// capture time). Used solely under the captured graph path. The optimizer update
-    /// is deliberately NOT captured — it runs eagerly in Step() so its per-step LR /
-    /// bias-correction scalars are recomputed each replay instead of frozen at capture.
-    /// </summary>
-    /// <summary>Refresh the persistent graph-input tensor's GPU buffer IN PLACE (stable pointer) with
-    /// its current host contents, OUTSIDE capture, and sync its buffer-version so a captured read is a
-    /// cache hit. Called before each graph REPLAY (SetInput already wrote this step's batch into the
-    /// host tensor). No-op until the input has a resident buffer (the pre-residency pass allocates it).</summary>
     // Every tensor the graph reads that it does not produce and does not own as a parameter: the batch input, the
     // TARGET, masks, any caller-fed tensor. Each is bound to a stable device buffer in the capture pre-pass and
     // re-uploaded before every launch. Refreshing only the primary input left the target at the capture step's batch,
@@ -2108,6 +2096,26 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     private bool IsOwnedLeafBinding(Tensor<T> leaf)
         => leaf._gpuBuffer is { } bound && _ownedLeafBuffers.TryGetValue(leaf, out var owned)
            && ReferenceEquals(owned, bound);
+
+    /// <summary>
+    /// Whether the captured graph can still be fed <paramref name="leaf"/> through the buffer it baked in. False when
+    /// the pre-pass bound a buffer and the leaf is no longer bound to it - dropped, rebound, or released - since the
+    /// replay would read that baked pointer regardless: a dropped binding left the graph training on the capture
+    /// step's batch, and a pooled buffer keeps its handle after it is returned, so writing into it anyway could
+    /// corrupt its next owner. Also false for any binding the pre-pass did not make (left by an eager step, possibly
+    /// released or re-rented). True with a null <paramref name="buffer"/> when the graph reads no device copy of it.
+    /// </summary>
+    private bool LeafStillBoundToCapturedBuffer(Tensor<T> leaf, Engines.DirectGpu.CUDA.CudaBackend cb,
+        out Engines.DirectGpu.IGpuBuffer? buffer)
+    {
+        buffer = null;
+        bool captured = _ownedLeafBuffers.TryGetValue(leaf, out var owned);
+        if (leaf._gpuBuffer is not { } bound || !ReferenceEquals(leaf._gpuBackend, cb))
+            return !captured;
+        if (!captured || !ReferenceEquals(owned, bound) || bound.Handle == IntPtr.Zero) return false;
+        buffer = bound;
+        return true;
+    }
 
     private Tensor<T>[] GraphExternalLeaves()
     {
@@ -2128,6 +2136,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         return _graphExternalLeaves = leaves.ToArray();
     }
 
+    /// <summary>Refresh the persistent graph-input tensor's GPU buffer IN PLACE (stable pointer) with
+    /// its current host contents, OUTSIDE capture, and sync its buffer-version so a captured read is a
+    /// cache hit. Called before each graph REPLAY (SetInput already wrote this step's batch into the
+    /// host tensor). No-op until the input has a resident buffer (the pre-residency pass allocates it).</summary>
     /// <returns>False when a bound input buffer has already been released (zero handle). Before a capture that is
     /// harmless - the pre-pass rebinds every external input - but a captured graph would read freed memory.</returns>
     private bool RefreshGraphInputInPlace(Engines.DirectGpu.CUDA.CudaBackend cb)
@@ -2138,12 +2150,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             foreach (var leaf in GraphExternalLeaves())
             {
                 if (ReferenceEquals(leaf, _compiledInputTensor)) continue;   // refreshed below, as before
-                if (leaf._gpuBuffer is not { } leafBuffer || !ReferenceEquals(leaf._gpuBackend, cb)) continue;
-                // Only a binding the pre-pass made is refreshed. One left by an earlier EAGER step may have been
-                // released by that step's end-of-step eviction (uploading threw ObjectDisposedException, which the
-                // capture path answered by disabling the whole-step graph for good - TabDDPM never captured) or
-                // returned to the pool and re-rented. Before the pre-pass that is expected; after capture it is not.
-                if (!IsOwnedLeafBinding(leaf) || leafBuffer.Handle == IntPtr.Zero) { allLive = false; continue; }
+                if (!LeafStillBoundToCapturedBuffer(leaf, cb, out var leafBuffer)) { allLive = false; continue; }
+                if (leafBuffer is null) continue;
                 var leafData = leaf.GetDataArray();
                 if (leafBuffer.Size < leafData.Length) continue;
                 cb.UploadBufferInPlace((float[])(object)leafData, leafBuffer);
@@ -2156,8 +2164,19 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // compatibility (it's the embeddings matrix there), so gate on the flag, not on null.
         if (_graphHasEmbedding) return allLive;
         if (_compiledInputTensor is not { } inT) return allLive;
-        if (inT._gpuBuffer is not { } buf || !ReferenceEquals(inT._gpuBackend, cb)) return allLive;
-        if (buf.Handle == IntPtr.Zero || (GraphExternalLeaves().Contains(inT) && !IsOwnedLeafBinding(inT))) return false;
+        Engines.DirectGpu.IGpuBuffer? buf;
+        if (GraphExternalLeaves().Contains(inT))
+        {
+            if (!LeafStillBoundToCapturedBuffer(inT, cb, out buf)) return false;
+            if (buf is null) return allLive;
+        }
+        else
+        {
+            // Not an external leaf, so the pre-pass never bound it: refresh whatever binding it has, as before.
+            if (inT._gpuBuffer is not { } bound || !ReferenceEquals(inT._gpuBackend, cb)) return allLive;
+            if (bound.Handle == IntPtr.Zero) return false;
+            buf = bound;
+        }
         var data = inT.GetDataArray();                 // host backing (T==float on the graph path)
         if (buf.Size < data.Length) return allLive;
         cb.UploadBufferInPlace((float[])(object)data, buf);
@@ -2165,6 +2184,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         return allLive;
     }
 
+    /// <summary>
+    /// The GPU-only body of a training step (forward → grad-zero → loss-grad reseed →
+    /// backward), with grad-zero and loss-grad reseed done as GPU ops so a
+    /// cuGraphLaunch replay re-does them (a host Array.Clear/Copy would run only at
+    /// capture time). Used solely under the captured graph path. The optimizer update
+    /// is deliberately NOT captured — it runs eagerly in Step() so its per-step LR /
+    /// bias-correction scalars are recomputed each replay instead of frozen at capture.
+    /// </summary>
     private void RunGpuStepBodyForCapture(Engines.DirectGpu.CUDA.CudaBackend cb)
     {
         var engine = _engine;

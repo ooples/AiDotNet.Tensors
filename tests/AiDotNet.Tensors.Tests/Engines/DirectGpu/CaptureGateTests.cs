@@ -20,7 +20,7 @@ public class CaptureGateTests
     public void A_failed_capture_setup_releases_the_gate_the_depth_and_the_pins()
     {
         DirectGpuTensorEngine? gpu = null;
-        try { gpu = new DirectGpuTensorEngine(); } catch (Exception) { }
+        try { gpu = new DirectGpuTensorEngine(); } catch (Exception ex) when (ex is PlatformNotSupportedException or DllNotFoundException) { }
         Skip.IfNot(gpu is not null && gpu.IsGpuAvailable && gpu.GetBackend() is CudaBackend, "CUDA backend did not resolve.");
         using (gpu)
         {
@@ -72,7 +72,9 @@ public class CaptureGateTests
     {
         Skip.IfNot(DirectPtxRuntime.IsAvailable, "CUDA driver not available.");
         DirectPtxRuntime? runtime = null;
-        try { runtime = new DirectPtxRuntime(0); } catch (Exception) { }
+        // A driver without a usable device fails cuInit / cuDeviceGet; anything else is a real failure.
+        try { runtime = new DirectPtxRuntime(0); }
+        catch (InvalidOperationException ex) when (ex.Message.StartsWith("cuInit") || ex.Message.StartsWith("cuDeviceGet")) { }
         Skip.If(runtime is null, "CUDA device did not initialize.");
         using (runtime)
         {
@@ -104,7 +106,7 @@ public class BackendOwnerRegistryTests
     public void Disposing_the_newest_engine_hands_the_backend_back_to_a_live_one()
     {
         AiDotNet.Tensors.Engines.DirectGpu.DirectGpuEngine? direct = null;
-        try { direct = new AiDotNet.Tensors.Engines.DirectGpu.DirectGpuEngine(); } catch (Exception) { }
+        try { direct = new AiDotNet.Tensors.Engines.DirectGpu.DirectGpuEngine(); } catch (Exception ex) when (ex is PlatformNotSupportedException or DllNotFoundException) { }
         Skip.IfNot(direct is not null && direct.IsAvailable, "GPU backend did not resolve.");
         using (direct)
         {

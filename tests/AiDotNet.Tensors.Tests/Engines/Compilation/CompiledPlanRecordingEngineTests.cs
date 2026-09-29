@@ -20,7 +20,7 @@ public class CompiledPlanRecordingEngineTests
     public void A_plan_recorded_on_an_explicit_cpu_engine_runs_on_it_whatever_engine_is_global()
     {
         DirectGpuTensorEngine? gpu = null;
-        try { gpu = new DirectGpuTensorEngine(); } catch (Exception) { }
+        try { gpu = new DirectGpuTensorEngine(); } catch (Exception ex) when (ex is PlatformNotSupportedException or DllNotFoundException) { }
         Skip.IfNot(gpu is not null && gpu.IsGpuAvailable, "needs a second engine to be the global one");
         var prior = AiDotNetEngine.Current;
         try

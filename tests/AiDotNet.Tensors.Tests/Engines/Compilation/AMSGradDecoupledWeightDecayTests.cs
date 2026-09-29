@@ -188,7 +188,7 @@ public class AMSGradDecoupledWeightDecayTests
     {
         var prior = AiDotNetEngine.Current;
         DirectGpuTensorEngine? gpu = null;
-        try { gpu = new DirectGpuTensorEngine(); } catch (Exception) { }
+        try { gpu = new DirectGpuTensorEngine(); } catch (Exception ex) when (ex is PlatformNotSupportedException or DllNotFoundException) { }
         Skip.IfNot(gpu is not null && gpu.IsGpuAvailable, "GPU backend did not resolve.");
         try
         {

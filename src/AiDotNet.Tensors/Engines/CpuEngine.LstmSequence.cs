@@ -225,7 +225,6 @@ public partial class CpuEngine
                 ? new[] { batch, seqLen, hidden }
                 : new[] { batch, hidden };
             var scope = GraphMode.Current!; scope.BindEngineIfUnset(this);
-            scope.BindEngineIfUnset(this);
             object[] savedState = { returnSequences, optionalInputs };
             finalHidden = Tensor<T>.Empty();
             finalCell = Tensor<T>.Empty();
