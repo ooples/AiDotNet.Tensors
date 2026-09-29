@@ -11,7 +11,9 @@ namespace AiDotNet.Tensors.Engines.Simd;
 /// Adam update over raw parameter / gradient / moment spans:
 /// <code>
 /// m = β1·m + (1-β1)·g;   v = β2·v + (1-β2)·g²
-/// m̂ = m / bc1;           v̂ = AMSGrad ? max(v̂, v̂_prev) : v / bc2
+/// m̂ = m / bc1;           v̂ = AMSGrad ? (vMax = max(vMax, v)) / bc2 : v / bc2
+/// (AMSGrad keeps the running max of the RAW second moment and bias-corrects it at use - PyTorch
+/// Adam(amsgrad=True), FusedOptimizer.AMSGradUpdateSimd, the GPU kernels and <see cref="AdamStepSparse"/>.)
 /// p -= lr · m̂ / (√v̂ + ε)
 /// </code>
 /// This is the single source of truth for the CPU eager-optimizer Adam inner loop: the consumer's
@@ -130,12 +132,11 @@ internal static class AdamMomentKernels
                     Vector256<float> vHatEff;
                     if (useAmsgrad)
                     {
-                        var vHatNow = Avx.Divide(vNew, vBc2);
                         var vMaxPrev = Avx.LoadVector256(pVMax + i);
-                        var mask = Avx.Compare(vHatNow, vMaxPrev, FloatComparisonMode.OrderedGreaterThanSignaling);
-                        var vMaxNew = Avx.BlendVariable(vMaxPrev, vHatNow, mask);
+                        var mask = Avx.Compare(vNew, vMaxPrev, FloatComparisonMode.OrderedGreaterThanSignaling);
+                        var vMaxNew = Avx.BlendVariable(vMaxPrev, vNew, mask);
                         Avx.Store(pVMax + i, vMaxNew);
-                        vHatEff = vMaxNew;
+                        vHatEff = Avx.Divide(vMaxNew, vBc2);
                     }
                     else
                     {
@@ -185,11 +186,10 @@ internal static class AdamMomentKernels
                 float vHatEff;
                 if (useAmsgrad)
                 {
-                    float vHatNow = vNew / bc2;
                     float prev = pVMax[i];
-                    float mx = vHatNow > prev ? vHatNow : prev;
+                    float mx = vNew > prev ? vNew : prev;
                     pVMax[i] = mx;
-                    vHatEff = mx;
+                    vHatEff = mx / bc2;
                 }
                 else
                 {
@@ -307,12 +307,11 @@ internal static class AdamMomentKernels
                     Vector256<double> vHatEff;
                     if (useAmsgrad)
                     {
-                        var vHatNow = Avx.Divide(vNew, vBc2);
                         var vMaxPrev = Avx.LoadVector256(pVMax + i);
-                        var mask = Avx.Compare(vHatNow, vMaxPrev, FloatComparisonMode.OrderedGreaterThanSignaling);
-                        var vMaxNew = Avx.BlendVariable(vMaxPrev, vHatNow, mask);
+                        var mask = Avx.Compare(vNew, vMaxPrev, FloatComparisonMode.OrderedGreaterThanSignaling);
+                        var vMaxNew = Avx.BlendVariable(vMaxPrev, vNew, mask);
                         Avx.Store(pVMax + i, vMaxNew);
-                        vHatEff = vMaxNew;
+                        vHatEff = Avx.Divide(vMaxNew, vBc2);
                     }
                     else
                     {
@@ -344,11 +343,10 @@ internal static class AdamMomentKernels
                 double vHatEff;
                 if (useAmsgrad)
                 {
-                    double vHatNow = vNew / bc2;
                     double prev = pVMax[i];
-                    double mx = vHatNow > prev ? vHatNow : prev;
+                    double mx = vNew > prev ? vNew : prev;
                     pVMax[i] = mx;
-                    vHatEff = mx;
+                    vHatEff = mx / bc2;
                 }
                 else
                 {

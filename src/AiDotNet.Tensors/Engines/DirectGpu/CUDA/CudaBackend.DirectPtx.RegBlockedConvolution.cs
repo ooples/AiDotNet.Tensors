@@ -67,7 +67,7 @@ public sealed partial class CudaBackend
                         "Register-blocked convolution must be prewarmed before CUDA graph capture.";
                     return false;
                 }
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 PtxConv2DNchwK1RegBlockedKernel kernel = GetOrCreateRegBlockedConvKernel();
                 if (capturing && !PinDirectPtxKernelForCapture(
                         _directPtxRegBlockedConvKernels, key))
@@ -109,7 +109,7 @@ public sealed partial class CudaBackend
             EnsureContextCurrent();
             lock (_directPtxLock)
             {
-                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _stream);
+                _directPtxRuntime ??= new DirectPtxRuntime(_cudaContext, _mainStream);
                 _ = GetOrCreateRegBlockedConvKernel();
             }
             DirectPtxLastError = null;

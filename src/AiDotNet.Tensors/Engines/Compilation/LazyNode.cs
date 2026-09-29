@@ -47,7 +47,7 @@ internal sealed class LazyNode<T> : ILazyNode
     public bool IsRealized { get; set; }
     public int TopologicalIndex { get; set; } = -1;
     public int ConsumerCount { get; set; }
-    public IEngine RecordingEngine { get; } = AiDotNetEngine.Current;
+    public IEngine RecordingEngine { get; set; } = AiDotNetEngine.Current;
 
     /// <summary>Creates a unary lazy node (one input).</summary>
     public LazyNode(

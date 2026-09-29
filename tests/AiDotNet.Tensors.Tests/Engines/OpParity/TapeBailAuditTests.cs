@@ -214,6 +214,8 @@ public class TapeBailAuditTests
         "GroupedQueryAttention",
         "Scatter",
         "Sparsemax",
+        // Records ReduceMeanBackward (normalized axes) on both device paths; its backward is resident too.
+        "ReduceMean",
     };
 
     private static string[] GpuEngineSources(string root)

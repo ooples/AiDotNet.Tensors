@@ -59,7 +59,7 @@ public class AdamMomentKernelsParityTests
             v[i] = vNew;
             float mHat = mNew / bc1;
             float vHatEff;
-            if (ams) { float now = vNew / bc2; float prev = vMax[i]; float mx = now > prev ? now : prev; vMax[i] = mx; vHatEff = mx; }
+            if (ams) { float prev = vMax[i]; float mx = vNew > prev ? vNew : prev; vMax[i] = mx; vHatEff = mx / bc2; }   // PyTorch: max of raw v
             else vHatEff = vNew / bc2;
             param[i] -= lr * mHat / (SqrtF(vHatEff) + eps);
         }
@@ -78,7 +78,7 @@ public class AdamMomentKernelsParityTests
             v[i] = vNew;
             double mHat = mNew / bc1;
             double vHatEff;
-            if (ams) { double now = vNew / bc2; double prev = vMax[i]; double mx = now > prev ? now : prev; vMax[i] = mx; vHatEff = mx; }
+            if (ams) { double prev = vMax[i]; double mx = vNew > prev ? vNew : prev; vMax[i] = mx; vHatEff = mx / bc2; }
             else vHatEff = vNew / bc2;
             param[i] -= lr * mHat / (Math.Sqrt(vHatEff) + eps);
         }

@@ -13,7 +13,11 @@ public sealed class TensorCodecOptions
     private static TensorCodecOptions? _current;
 
     /// <summary>Gets the active TensorCodec options for this thread, or the default.</summary>
-    public static TensorCodecOptions Current => _current ?? Default;
+    // The thread's instance, created on first use. It returned a NEW default object whenever no options were set, so
+    // the documented opt-out "TensorCodecOptions.Current.EnableCompilation = false" configured a throwaway instance
+    // and changed nothing - measured: AiDotNet's fused-vs-eager parity tests ran their "eager" half compiled (and
+    // passed by comparing fused with fused) unless an earlier test on the same thread had called SetCurrent.
+    public static TensorCodecOptions Current => _current ??= new TensorCodecOptions();
 
     /// <summary>
     /// Default options: dataflow fusion and algebraic backward enabled, spectral opt-in.

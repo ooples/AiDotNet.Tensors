@@ -224,8 +224,7 @@ public partial class CpuEngine
             var outputShape = returnSequences
                 ? new[] { batch, seqLen, hidden }
                 : new[] { batch, hidden };
-            var scope = GraphMode.Current!;
-            scope.BindEngineIfUnset(this);
+            var scope = GraphMode.Current!; scope.BindEngineIfUnset(this);
             object[] savedState = { returnSequences, optionalInputs };
             finalHidden = Tensor<T>.Empty();
             finalCell = Tensor<T>.Empty();

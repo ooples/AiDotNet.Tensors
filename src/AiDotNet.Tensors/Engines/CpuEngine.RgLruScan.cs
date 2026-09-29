@@ -62,9 +62,8 @@ public partial class CpuEngine
         if (decay.Length != recDim)
             throw new ArgumentException($"decay length ({decay.Length}) must equal recDim ({recDim}).", nameof(decay));
 
-        if (GraphMode.IsActive && GraphMode.Current is { } scope)
+        if (GraphMode.IsActive && GraphMode.Current is { } scope && scope.BindEngine(this))
         {
-            scope.BindEngineIfUnset(this);
             var capturedValue = value;
             var capturedRecGate = recGate;
             var capturedInpGate = inpGate;

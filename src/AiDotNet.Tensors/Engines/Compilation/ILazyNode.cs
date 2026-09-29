@@ -22,8 +22,12 @@ internal interface ILazyNode
     /// <summary>Number of downstream nodes that depend on this node's output.</summary>
     int ConsumerCount { get; set; }
 
-    /// <summary>The engine that was active when this node was recorded.</summary>
-    IEngine RecordingEngine { get; }
+    /// <summary>
+    /// The engine that recorded this node: the scope's bound engine (the one the op was invoked on), stamped when the
+    /// scope publishes the node. A read of an unrealized output realizes it here - defaulting to the process-wide
+    /// AiDotNetEngine.Current realized a CpuEngine model on whatever engine happened to be global.
+    /// </summary>
+    IEngine RecordingEngine { get; set; }
 
 
     /// <summary>Execute this node, materializing its output tensor's data.</summary>

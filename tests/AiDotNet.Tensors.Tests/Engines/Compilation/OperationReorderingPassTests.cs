@@ -157,7 +157,7 @@ public sealed class OperationReorderingPassTests
         public bool IsRealized { get; set; }
         public int TopologicalIndex { get; set; }
         public int ConsumerCount { get; set; }
-        public IEngine RecordingEngine => null!;
+        public IEngine RecordingEngine { get; set; } = null!;
         public void Realize(IEngine engine) { }
         public ILazyNode[] GetInputNodes() => _inputs;
         public void ClearOutputLazySource() { }

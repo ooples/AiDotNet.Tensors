@@ -60,6 +60,15 @@ internal sealed class LazyTensorScope : IDisposable
         _engineExplicitlyBound = true;
     }
 
+    /// <summary>
+    /// <see cref="BindEngineIfUnset"/> usable inside a condition: binds and returns true.
+    /// </summary>
+    internal bool BindEngine(IEngine engine)
+    {
+        BindEngineIfUnset(engine);
+        return true;
+    }
+
     /// <summary>Number of lazy operations recorded.</summary>
     internal int NodeCount => _nodes.Count;
 
@@ -376,6 +385,7 @@ internal sealed class LazyTensorScope : IDisposable
         // temporary tensor immediately after its operation returns; the graph must therefore
         // hold an independent storage reference from the moment the node becomes visible.
         node.AddStorageLeases(_storageLeases);
+        node.RecordingEngine = _engine;
         _nodes.Add(node);
     }
 

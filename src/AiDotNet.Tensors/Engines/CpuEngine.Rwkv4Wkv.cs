@@ -65,9 +65,8 @@ public partial class CpuEngine
         if (timeFirst.Length != modelDim)
             throw new ArgumentException($"timeFirst length ({timeFirst.Length}) must equal modelDim ({modelDim}).", nameof(timeFirst));
 
-        if (GraphMode.IsActive && GraphMode.Current is { } scope)
+        if (GraphMode.IsActive && GraphMode.Current is { } scope && scope.BindEngine(this))
         {
-            scope.BindEngineIfUnset(this);
             var capturedR = rProj;
             var capturedK = kProj;
             var capturedV = vProj;
