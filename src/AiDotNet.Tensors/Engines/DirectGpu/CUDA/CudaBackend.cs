@@ -91,6 +91,11 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     internal bool HasWhereSelectKernel => _kernelCache.ContainsKey("where_select");
     private IntPtr _cudaContext;
     private long _contextGeneration; // this context's LiveContexts registration (see LiveContexts)
+
+    /// <summary>True while this backend's CUDA context has not been destroyed (engine disposal destroys it; the
+    /// backend object and its buffers can outlive it). Anything that would touch the device - a download included -
+    /// must check this first, or it throws "Invalid context".</summary>
+    internal bool ContextIsLive => _cudaContext != IntPtr.Zero && IsLiveContext(_cudaContext, _contextGeneration);
     // The backend's one compute stream. Every op reaches it through _stream, which a thread capturing a CUDA graph
     // resolves to this backend's PRIVATE capture stream instead (ResolveCaptureStream) - see CudaBackend.Graph.cs.
     private IntPtr _mainStream;

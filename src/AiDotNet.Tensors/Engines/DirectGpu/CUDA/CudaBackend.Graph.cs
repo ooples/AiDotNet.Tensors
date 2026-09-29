@@ -1,4 +1,5 @@
 using System;
+using System.Threading;
 using System.Collections.Generic;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA;
@@ -118,23 +119,51 @@ public sealed partial class CudaBackend
     private void EnterCapture()
     {
         if (t_captureDepth++ > 0) return;
-        System.Threading.Monitor.Enter(CaptureGateFor(_cudaContext));
-        if (_captureStream == IntPtr.Zero)
+        var gate = CaptureGateFor(_cudaContext);
+        System.Threading.Monitor.Enter(gate);
+        try
         {
-            CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamCreate(out _captureStream, 1 /* CU_STREAM_NON_BLOCKING */),
-                "cuStreamCreate(capture)");
-            LiveStreams.TryAdd(_captureStream, 0);
-            CuBlasNative.CheckCudaResult(CudaNativeBindings.cuEventCreate(out _captureOrderEvent, 2 /* CU_EVENT_DISABLE_TIMING */),
-                "cuEventCreate(capture order)");
-            _captureStreamWrapper = new CudaStream(this, _captureStream, AiDotNet.Tensors.Engines.Gpu.GpuStreamType.Default, ownsHandle: false);
+            if (_captureStream == IntPtr.Zero) CreateCaptureStream();
+            TestHookCaptureSetup?.Invoke();
+            // Everything this thread already enqueued on the compute stream happens before the captured work.
+            CuBlasNative.CheckCudaResult(CudaNativeBindings.cuEventRecord(_captureOrderEvent, _mainStream), "cuEventRecord(capture order)");
+            CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamWaitEvent(_captureStream, _captureOrderEvent, 0), "cuStreamWaitEvent(capture order)");
         }
-        // Everything this thread already enqueued on the compute stream happens before the captured work.
-        CuBlasNative.CheckCudaResult(CudaNativeBindings.cuEventRecord(_captureOrderEvent, _mainStream), "cuEventRecord(capture order)");
-        CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamWaitEvent(_captureStream, _captureOrderEvent, 0), "cuStreamWaitEvent(capture order)");
+        catch
+        {
+            // The scope never opened: leaving the depth raised would make this thread treat every later capture as
+            // nested (and defer its frees forever), and a held gate blocks every other capture and context sync.
+            t_captureDepth--;
+            System.Threading.Monitor.Exit(gate);
+            throw;
+        }
         t_captureMainStream = _mainStream;
         t_captureStream = _captureStream;
         CuBlasNative.cublasSetStream(_cublasHandle, _captureStream);
     }
+
+    // All or nothing: a stream without its order event would pass the `_captureStream == 0` check next time and record on
+    // a null event.
+    private void CreateCaptureStream()
+    {
+        CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamCreate(out var stream, 1 /* CU_STREAM_NON_BLOCKING */),
+            "cuStreamCreate(capture)");
+        var eventResult = CudaNativeBindings.cuEventCreate(out var orderEvent, 2 /* CU_EVENT_DISABLE_TIMING */);
+        if (eventResult != CudaResult.Success)
+        {
+            CudaNativeBindings.cuStreamDestroy(stream);
+            CuBlasNative.CheckCudaResult(eventResult, "cuEventCreate(capture order)");
+        }
+        _captureStream = stream;
+        _captureOrderEvent = orderEvent;
+        LiveStreams.TryAdd(_captureStream, 0);
+        _captureStreamWrapper = new CudaStream(this, _captureStream, AiDotNet.Tensors.Engines.Gpu.GpuStreamType.Default, ownsHandle: false);
+    }
+
+    private static long _failedDeferredReleases;
+
+    /// <summary>Releases deferred until a capture ended that then threw (process-wide). Each one leaked its buffer.</summary>
+    internal static long FailedDeferredReleases => Interlocked.Read(ref _failedDeferredReleases);
 
     /// <summary>Memory-free nodes in the most recent step capture: a free of memory the graph did not allocate shows
     /// up here as an extra node (see TryDeferReleaseUntilCaptureEnds).</summary>
@@ -155,6 +184,9 @@ public sealed partial class CudaBackend
         return matches;
     }
 
+    /// <summary>Test hook: runs inside EnterCapture's setup, where a CUDA setup call can fail.</summary>
+    internal static Action? TestHookCaptureSetup;
+
     /// <summary>Test hook: runs on the capturing thread right after the step capture opens.</summary>
     internal static Action? TestHookInsideCapture;
 
@@ -171,7 +203,13 @@ public sealed partial class CudaBackend
         t_postCaptureReleases = null;
         foreach (var release in releases)
         {
-            try { release(); } catch { /* one buffer's release must not strand the rest */ }
+            try { release(); }
+            catch (Exception ex)
+            {
+                // One buffer's release must not strand the rest, but a failed free is a leak: count it and say why.
+                Interlocked.Increment(ref _failedDeferredReleases);
+                GcDiag($"deferred release FAILED: {ex.GetType().Name}: {ex.Message}");
+            }
         }
     }
 
@@ -181,7 +219,12 @@ public sealed partial class CudaBackend
         using var _ = PushContext();
 
         DirectPtxCapturePinSet directPtxPins = BeginDirectPtxCapturePinTracking();
-        EnterCapture();
+        try { EnterCapture(); }
+        catch
+        {
+            AbortDirectPtxCapturePinTracking(directPtxPins);
+            throw;
+        }
         var rc = CudaNativeBindings.cuStreamBeginCapture(_stream, CudaNativeBindings.CU_STREAM_CAPTURE_MODE_THREAD_LOCAL);
         if (rc != CudaResult.Success)
         {
@@ -327,7 +370,12 @@ public sealed partial class CudaBackend
         using var _ = PushContext();
 
         DirectPtxCapturePinSet directPtxPins = BeginDirectPtxCapturePinTracking();
-        EnterCapture();
+        try { EnterCapture(); }
+        catch
+        {
+            AbortDirectPtxCapturePinTracking(directPtxPins);
+            throw;
+        }
         if (CudaNativeBindings.cuStreamBeginCapture(_stream, CudaNativeBindings.CU_STREAM_CAPTURE_MODE_THREAD_LOCAL) != CudaResult.Success)
         {
             ExitCapture();

@@ -307,14 +307,30 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
     /// gradients of that step and every later one (measured: the captured plan's loss diverged from the eager plan's
     /// from the capture step on, and a 1024-3x1024-10 MLP stopped learning after three steps).
     /// </remarks>
-    private void RollBackCaptureResidency(Engines.DirectGpuTensorEngine engine)
+    /// <param name="engine">The engine the plan's tensors are bound through.</param>
+    /// <param name="deviceHoldsResults">
+    /// False after a FAILED capture: the device data is the pre-pass's, so its pending downloads are discarded.
+    /// True when retiring a graph that RAN: the device buffers hold the only copy of the last step's loss and
+    /// gradients, so their pending downloads are materialized onto the host before the binding is dropped (the host
+    /// optimizer path and every caller of ConfigureOptimizer / Dispose after a replay read those host arrays).
+    /// </param>
+    private void RollBackCaptureResidency(Engines.DirectGpuTensorEngine engine, bool deviceHoldsResults = false)
     {
+        // A disposed engine's context is gone: nothing can be downloaded, and nothing can read the results anyway.
+        bool landResults = deviceHoldsResults && engine.GetBackend() is Engines.DirectGpu.CUDA.CudaBackend { ContextIsLive: true };
         void Unbind(Tensor<T>? t)
         {
             if (t is null || t._gpuBuffer is null) return;
-            // Drop the pending device->host download FIRST: its device data is the pre-pass's, and letting it fire
-            // (or letting the cache invalidation below force it) would overwrite the host gradient.
-            if (t.GetBackingArrayForCacheLookupUnsafe() is { } backing)
+            var backing = t.GetBackingArrayForCacheLookupUnsafe();
+            if (landResults)
+            {
+                // The graph wrote this step's values on the device: land them on the host before unbinding.
+                if (backing is not null) Helpers.DeferredArrayMaterializer.TryMaterialize(backing);
+                Helpers.DeferredArrayMaterializer.TryMaterialize(t.DataVector);
+            }
+            // Drop the pending device->host download FIRST: after a failed capture its device data is the pre-pass's,
+            // and letting it fire (or letting the cache invalidation below force it) would overwrite the host gradient.
+            if (backing is not null)
                 Helpers.DeferredArrayMaterializer.Remove(backing);
             Helpers.DeferredArrayMaterializer.Remove(t.DataVector);
             engine.InvalidateGpuCacheForTensor(t);
@@ -390,7 +406,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
         // The eager step accumulates into HOST gradient arrays; leaving the accumulators bound to the capture's
         // device buffers made its in-place adds land on never-zeroed device memory (gradients piled up across steps).
         if (hadGraph && _engine is Engines.DirectGpuTensorEngine gRoll)
-            RollBackCaptureResidency(gRoll);
+            RollBackCaptureResidency(gRoll, deviceHoldsResults: true);
         // Balance the graph-lifetime eviction suspension (Step()): once the captured graph is gone,
         // the buffers no longer need stable pointers, so re-enable normal activation eviction.
         if (_graphEvictionSuspended && _engine is Engines.DirectGpuTensorEngine gEvict)
@@ -1604,16 +1620,29 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>
             var grad = _gradients[p];
             if (grad is null) continue;
             var param = _parameters[p];
+            // Add the term where the optimizer will READ the gradient. ResolveAuthoritativeGpuGradients takes the device
+            // gradient only when it is current (its buffer version matches, or the stream is capturing) and the
+            // parameter lives on the device; otherwise it reads the host array. Writing on the device merely because
+            // both tensors HAD a buffer put the term on a stale device copy while the optimizer read the host
+            // gradient - L2 silently dropped.
+            bool capturing = backend is Engines.DirectGpu.CUDA.CudaBackend cuda && cuda.IsStreamCapturing();
             if (typeof(T) == typeof(float) && backend is not null
-                && grad.TryGetGpuBuffer() is { } gradBuffer && param.TryGetGpuBuffer() is { } paramBuffer)
+                && CurrentDeviceBuffer(grad, capturing) is { } gradBuffer
+                && CurrentDeviceBuffer(param, capturing) is { } paramBuffer)
             {
                 backend.AddScaled(gradBuffer, paramBuffer, gradBuffer, 1f, _l2Regularization, grad.Length);
                 continue;
             }
-            var g = grad.AsWritableSpan();
+            var g = grad.AsWritableSpan();   // materializes a pending device result first
             var w = param.AsSpan();
             for (int i = 0; i < g.Length; i++) g[i] = numOps.Add(g[i], numOps.Multiply(strength, w[i]));
+            // AsWritableSpan does not bump the GPU-cache version. A device copy of this gradient would otherwise stay
+            // "current" and the optimizer would read it - without the term just added on the host.
+            if (grad._gpuBuffer is not null) grad.IncrementVersion();
         }
+
+        static Engines.DirectGpu.IGpuBuffer? CurrentDeviceBuffer(Tensor<T> t, bool capturing)
+            => t.TryGetGpuBuffer() is { } buffer && (capturing || t._gpuBufferVersion == t.GpuCacheVersion) ? buffer : null;
     }
 
     public void SetMaxGradNorm(double maxNorm)

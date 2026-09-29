@@ -78,9 +78,10 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         public float[][] FinalWeights = Array.Empty<float[]>();
         public bool ReplayedAGraph;
         public string[] StepStates = Array.Empty<string>();
+        public float[][] LastGradients = Array.Empty<float[]>();
     }
 
-    private static Run Train(DirectGpuTensorEngine gpu, bool capture, bool failCapture = false, bool composedMse = false, bool failInsideCapture = false, bool releasedInputBinding = false)
+    private static Run Train(DirectGpuTensorEngine gpu, bool capture, bool failCapture = false, bool composedMse = false, bool failInsideCapture = false, bool releasedInputBinding = false, bool retireGraphBeforeLastRead = false)
     {
         var x = Rand([Batch, Inputs], 1, 1f);
         var y = Rand([Batch, Outputs], 2, 1f);
@@ -118,6 +119,7 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             concrete.FailInsideNextCaptureForTesting = failInsideCapture;
             plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2f);
             var losses = new double[Steps];
+            float[][] lastGradients = Array.Empty<float[]>();
             var states = new string[Steps];
             for (int s = 0; s < Steps; s++)
             {
@@ -138,8 +140,16 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                 // plan computed a wrong loss or reported one it never downloaded.
                 double reference = CpuLoss(x, y, parameters, composedMse);
                 var lossTensor = plan.Step();
+                if (retireGraphBeforeLastRead && s == Steps - 1)
+                {
+                    // Retire the replayed graph BEFORE anything reads this step's results, as ConfigureOptimizer,
+                    // EnableFrozenWeightOptimizations and Dispose do: the rollback must land the device results on
+                    // the host, not discard them.
+                    concrete.DisableGraphStep();
+                }
                 states[s] = $"resident={lossTensor.IsGpuResident} pending={lossTensor.HasPendingGpuData} cpuRef={reference:G6}";
                 losses[s] = lossTensor.ToArray()[0];
+                if (s == Steps - 1) lastGradients = plan.Gradients.Select(g => g.ToArray()).ToArray();
             }
             var exec = (IntPtr)typeof(CompiledTrainingPlan<float>)
                 .GetField("_stepGraphExec", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(concrete)!;
@@ -147,7 +157,8 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             {
                 Losses = losses,
                 FinalWeights = parameters.Select(p => p.ToArray()).ToArray(),
-                ReplayedAGraph = exec != IntPtr.Zero,
+                ReplayedAGraph = exec != IntPtr.Zero || retireGraphBeforeLastRead,
+                LastGradients = lastGradients,
                 StepStates = states,
             };
         }
@@ -225,6 +236,180 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                 for (int i = 0; i < eager.FinalWeights[p].Length; i++)
                     Assert.True(Math.Abs(eager.FinalWeights[p][i] - failed.FinalWeights[p][i]) <= 1e-5f,
                         $"param {p}[{i}]: after a failed capture {failed.FinalWeights[p][i]} != eager {eager.FinalWeights[p][i]}");
+        }
+    }
+
+    /// <summary>
+    /// Retiring a graph that RAN (ConfigureOptimizer, frozen-weight specialization, Dispose, the host optimizer path)
+    /// must keep that step's results. The rollback used to discard every pending device-to-host download - right for
+    /// a failed capture's pre-pass, wrong here, where the device holds the only copy of the loss and gradients.
+    /// </summary>
+    [SkippableFact]
+    public void Retiring_a_replayed_graph_keeps_the_last_steps_loss_and_gradients()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend,
+                "Whole-step graph capture is CUDA-only.");
+            Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "0",
+                "Graph capture is disabled for this process.");
+
+            var eager = Train(gpu, capture: false);
+            var retired = Train(gpu, capture: true, retireGraphBeforeLastRead: true);
+            int last = Steps - 1;
+            Assert.True(Math.Abs(eager.Losses[last] - retired.Losses[last]) <= 1e-5 * Math.Max(1, Math.Abs(eager.Losses[last])),
+                $"last loss after retiring the graph {retired.Losses[last]:G6} != eager {eager.Losses[last]:G6}");
+            for (int p = 0; p < eager.LastGradients.Length; p++)
+                for (int i = 0; i < eager.LastGradients[p].Length; i++)
+                    Assert.True(Math.Abs(eager.LastGradients[p][i] - retired.LastGradients[p][i]) <= 1e-5f,
+                        $"grad {p}[{i}] after retiring the graph {retired.LastGradients[p][i]} != eager {eager.LastGradients[p][i]}");
+        }
+    }
+
+    /// <summary>
+    /// L2 regularization must land where the optimizer reads each gradient. It used to be written on the device
+    /// whenever the gradient and parameter merely HAD device buffers, while the optimizer reads the host gradient
+    /// unless the device copy is current and the parameter is resident - with mixed residency the term was silently
+    /// dropped for some parameters. Every residency pattern must now train identically.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void L2_regularization_trains_identically_whatever_each_parameters_residency(bool capture)
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            // A smooth hidden activation. With ReLU, a pre-activation within float rounding of zero lands on different
+            // sides of the kink in the GPU forward and the CPU oracle (measured: one hidden unit flipped at step 4 of
+            // the all-device run, every per-parameter sum still agreeing to 1e-4) - noise the L2 check cannot tell
+            // from a misplaced term.
+            const FusedActivationType Smooth = FusedActivationType.Tanh;
+            float[][] RunWith(bool[] resident)
+            {
+                var x = Rand([Batch, Inputs], 1, 1f);
+                var y = Rand([Batch, Outputs], 2, 1f);
+                var parameters = new[] { Rand([Inputs, Hidden], 3, 0.3f), new Tensor<float>([Hidden]), Rand([Hidden, Outputs], 4, 0.3f), new Tensor<float>([Outputs]) };
+                for (int i = 0; i < parameters.Length; i++) if (resident[i]) parameters[i].Gpu();
+                ICompiledTrainingPlan<float> plan;
+                using (var scope = GraphMode.EnableTraining(parameters))
+                {
+                    Loss(gpu, x, y, parameters, composedMse: true, Smooth);
+                    plan = scope.CompileTraining(parameters);
+                }
+                using (plan)
+                {
+                    if (!capture) ((CompiledTrainingPlan<float>)plan).DisableGraphStep();
+                    plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2f);
+                    plan.SetL2Regularization(0.05);
+                    for (int s = 0; s < Steps; s++) { FeedBatch(x, y, s); plan.Step(); }
+                }
+                return parameters.Select(t => t.ToArray()).ToArray();
+            }
+
+            // Oracle: CPU tape gradients + 0.05*theta, stepped with textbook Adam (the plan's defaults).
+            float[][] Reference()
+            {
+                var x = Rand([Batch, Inputs], 1, 1f);
+                var y = Rand([Batch, Outputs], 2, 1f);
+                var w = new[] { Rand([Inputs, Hidden], 3, 0.3f), new Tensor<float>([Hidden]), Rand([Hidden, Outputs], 4, 0.3f), new Tensor<float>([Outputs]) };
+                var m = w.Select(t => new double[t.Length]).ToArray();
+                var v = w.Select(t => new double[t.Length]).ToArray();
+                for (int s = 0; s < Steps; s++)
+                {
+                    FeedBatch(x, y, s);
+                    var g = CpuTapeGradients(x, y, w, composedMse: true, Smooth);
+                    int t = s + 1;
+                    for (int p = 0; p < w.Length; p++)
+                    {
+                        var theta = w[p].ToArray();
+                        for (int i = 0; i < theta.Length; i++)
+                        {
+                            double gi = g[p][i] + 0.05 * theta[i];
+                            m[p][i] = 0.9 * m[p][i] + 0.1 * gi;
+                            v[p][i] = 0.999 * v[p][i] + 0.001 * gi * gi;
+                            double update = 1e-2 * (m[p][i] / (1 - Math.Pow(0.9, t))) / (Math.Sqrt(v[p][i] / (1 - Math.Pow(0.999, t))) + 1e-8);
+                            w[p][i] = (float)(theta[i] - update);
+                        }
+                    }
+                }
+                return w.Select(t => t.ToArray()).ToArray();
+            }
+
+            var expected = Reference();
+            foreach (var pattern in new[] { new[] { true, true, true, true }, new[] { true, false, true, false }, new[] { false, true, false, true }, new[] { false, false, false, false } })
+            {
+                var actual = RunWith(pattern);
+                for (int p = 0; p < expected.Length; p++)
+                    for (int i = 0; i < expected[p].Length; i++)
+                        Assert.True(Math.Abs(expected[p][i] - actual[p][i]) <= 1e-4f,
+                            $"residency [{string.Join(",", pattern)}] capture={capture}: param {p}[{i}] {actual[p][i]} != reference {expected[p][i]}");
+            }
+        }
+    }
+
+    /// <summary>
+    /// The state the residency theory cannot reach through a public flow (the eager step detaches a stale device
+    /// gradient before backward; a replay keeps gradient versions current): a gradient bound to a device copy that is
+    /// NOT current while both tensors have buffers. The optimizer reads the host gradient then, so the term must land
+    /// there - the old rule wrote it into the stale device copy and the step trained without L2.
+    /// </summary>
+    [SkippableFact]
+    public void L2_lands_in_the_host_gradient_when_the_device_copy_is_stale()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            var x = Rand([Batch, Inputs], 1, 1f);
+            var y = Rand([Batch, Outputs], 2, 1f);
+            var parameters = new[] { Rand([Inputs, Hidden], 3, 0.3f), new Tensor<float>([Hidden]), Rand([Hidden, Outputs], 4, 0.3f), new Tensor<float>([Outputs]) };
+            foreach (var t in parameters) t.Gpu();
+            ICompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.EnableTraining(parameters))
+            {
+                Loss(gpu, x, y, parameters, composedMse: true);
+                plan = scope.CompileTraining(parameters);
+            }
+            using (plan)
+            {
+                var compiled = (CompiledTrainingPlan<float>)plan;
+                compiled.DisableGraphStep();
+                plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2f);
+                plan.SetL2Regularization(0.05);
+                FeedBatch(x, y, 0);
+                plan.Step();
+
+                var backend = gpu.GetBackend()!;
+                var before = new float[plan.Gradients.Length][];
+                for (int p = 0; p < plan.Gradients.Length; p++)
+                {
+                    var g = plan.Gradients[p];
+                    Assert.NotNull(parameters[p].TryGetGpuBuffer());
+                    before[p] = g.ToArray();
+                    g._gpuBuffer?.Dispose();
+                    g._gpuBuffer = backend.AllocateBuffer(new float[g.Length]);
+                    g._gpuBackend = backend;
+                    g._gpuBufferVersion = -1;   // bound, but not the current value
+                }
+                typeof(CompiledTrainingPlan<float>)
+                    .GetMethod("ApplyL2Regularization", BindingFlags.NonPublic | BindingFlags.Instance)!
+                    .Invoke(compiled, null);
+
+                for (int p = 0; p < plan.Gradients.Length; p++)
+                {
+                    var g = plan.Gradients[p];
+                    var theta = parameters[p].ToArray();
+                    var host = g.GetBackingArrayForCacheLookupUnsafe()!;
+                    for (int i = 0; i < theta.Length; i++)
+                        Assert.True(Math.Abs(before[p][i] + 0.05f * theta[i] - host[i]) <= 1e-6f,
+                            $"grad {p}[{i}]: host {host[i]} != {before[p][i]} + 0.05*{theta[i]}");
+                    Assert.NotEqual(g._gpuBufferVersion, g.GpuCacheVersion);   // the stale copy is not revived
+                }
+            }
         }
     }
 
@@ -649,9 +834,10 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         }
     }
 
-    private static Tensor<float> Loss(IEngine e, Tensor<float> x, Tensor<float> y, Tensor<float>[] w, bool composedMse)
+    private static Tensor<float> Loss(IEngine e, Tensor<float> x, Tensor<float> y, Tensor<float>[] w, bool composedMse,
+        FusedActivationType hidden = FusedActivationType.ReLU)
     {
-        var h = e.FusedLinear(x, w[0], w[1], FusedActivationType.ReLU);
+        var h = e.FusedLinear(x, w[0], w[1], hidden);
         var pred = e.FusedLinear(h, w[2], w[3], FusedActivationType.None);
         if (!composedMse) return e.TensorMSELoss(pred, y);
         var diff = e.TensorSubtract(pred, y);
@@ -707,7 +893,8 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         finally { AiDotNetEngine.Current = prior; }
     }
 
-    private static float[][] CpuTapeGradients(Tensor<float> x, Tensor<float> y, Tensor<float>[] parameters, bool composedMse)
+    private static float[][] CpuTapeGradients(Tensor<float> x, Tensor<float> y, Tensor<float>[] parameters, bool composedMse,
+        FusedActivationType hidden = FusedActivationType.ReLU)
     {
         var prior = AiDotNetEngine.Current;
         var cpu = new CpuEngine();
@@ -717,7 +904,7 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             Tensor<float> Copy(Tensor<float> t) => new Tensor<float>(t.ToArray(), t.Shape.ToArray());
             var w = parameters.Select(Copy).ToArray();
             using var tape = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<float>();
-            var loss = Loss(cpu, Copy(x), Copy(y), w, composedMse);
+            var loss = Loss(cpu, Copy(x), Copy(y), w, composedMse, hidden);
             var grads = tape.ComputeGradients(loss, w);
             return w.Select(p => grads[p].ToArray()).ToArray();
         }

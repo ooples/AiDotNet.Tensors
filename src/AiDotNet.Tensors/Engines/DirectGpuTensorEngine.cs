@@ -935,27 +935,50 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // Which engine placed data on a backend, so a consumer holding only a tensor (its _gpuBackend) can run follow-up
     // work - the autodiff backward - on that engine rather than on the process-wide AiDotNetEngine.Current, which
     // reflects what the process auto-detected or some unrelated caller last set, not what produced this data.
-    // Weakly keyed: an engine and its backend are collected together.
-    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<IDirectGpuBackend, DirectGpuTensorEngine>
-        s_engineByBackend = new();
+    // Weakly keyed: an engine and its backend are collected together. Several engines can wrap one backend (the
+    // DirectGpuEngine constructor), so every live one is kept, newest last: disposing the newest hands ownership back
+    // to an older live engine instead of leaving a disposed engine to run a backward.
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<IDirectGpuBackend, System.Collections.Generic.List<WeakReference<DirectGpuTensorEngine>>>
+        s_enginesByBackend = new();
     private static readonly object s_engineByBackendLock = new();
+    private IDirectGpuBackend? _registeredBackend;
 
     private void RegisterAsBackendOwner()
     {
         if (!TryGetBackend(out var backend) || backend is null) return;
         lock (s_engineByBackendLock)
         {
-            s_engineByBackend.Remove(backend);
-            s_engineByBackend.Add(backend, this);
+            s_enginesByBackend.GetValue(backend, _ => new System.Collections.Generic.List<WeakReference<DirectGpuTensorEngine>>())
+                .Add(new WeakReference<DirectGpuTensorEngine>(this));
+            _registeredBackend = backend;
         }
     }
 
-    /// <summary>The engine that placed data on <paramref name="backend"/>, or null.</summary>
+    private void UnregisterAsBackendOwner()
+    {
+        lock (s_engineByBackendLock)
+        {
+            if (_registeredBackend is null) return;
+            if (s_enginesByBackend.TryGetValue(_registeredBackend, out var engines))
+                engines.RemoveAll(r => !r.TryGetTarget(out var e) || ReferenceEquals(e, this));
+            _registeredBackend = null;
+        }
+    }
+
+    /// <summary>The newest live engine that placed data on <paramref name="backend"/>, or null.</summary>
     internal static DirectGpuTensorEngine? EngineOwning(IDirectGpuBackend? backend)
     {
         if (backend is null) return null;
         lock (s_engineByBackendLock)
-            return s_engineByBackend.TryGetValue(backend, out var engine) ? engine : null;
+        {
+            if (!s_enginesByBackend.TryGetValue(backend, out var engines)) return null;
+            for (int i = engines.Count - 1; i >= 0; i--)
+            {
+                if (engines[i].TryGetTarget(out var engine)) return engine;
+                engines.RemoveAt(i);
+            }
+            return null;
+        }
     }
 
     // Managed-heap cap for the activation cache. Default 8 GB; AIDOTNET_ACT_CACHE_MANAGED_MB
@@ -25412,6 +25435,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public void Dispose()
     {
+        UnregisterAsBackendOwner();
         // Clear activation cache to free GPU memory from cached activations
         ClearActivationCache();
 
