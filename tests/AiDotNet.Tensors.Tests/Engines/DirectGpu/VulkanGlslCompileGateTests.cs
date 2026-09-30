@@ -26,8 +26,15 @@ public sealed class VulkanGlslCompileGateTests
 
         var failures = new List<string>();
         int compiled = 0;
-        foreach (var (name, source) in ShippedShaders())
+        foreach (var (name, source, readError) in ShippedShaders())
         {
+            // A getter that throws is a shader that cannot be built at all; it must fail the gate, not vanish from it.
+            if (readError is not null)
+            {
+                failures.Add($"{name}: reading the shader source threw {readError.GetType().Name}: {readError.Message}");
+                continue;
+            }
+            if (source is null || !IsShader(source)) continue;
             if (compiler.CompileToSpirv(source) is null)
                 failures.Add($"{name}: {compiler.LastError}{QuoteFirstErrorLine(source, compiler.LastError)}");
             else
@@ -40,7 +47,27 @@ public sealed class VulkanGlslCompileGateTests
             + string.Join(Environment.NewLine, failures));
     }
 
-    private static IEnumerable<(string Name, string Source)> ShippedShaders()
+    [SkippableFact]
+    public void NonAsciiSource_CompilesWithItsFullLength()
+    {
+        // shaderc receives an explicit byte length. Default string marshaling is UTF-8 on Linux, where a multi-byte
+        // character made a character-count length too short and cut the end of the shader off - 13 shipped shaders
+        // failed there with "unexpected end of file" because of an em dash in a comment. The non-ASCII comment sits
+        // right before main's closing lines so any truncation lands on code.
+        using var compiler = new VulkanGlslCompiler();
+        Skip.If(!compiler.IsAvailable, "Vulkan's runtime GLSL compiler (libshaderc) is unavailable.");
+        const string Source =
+            "#version 450\n"
+            + "layout(local_size_x = 64) in;\n"
+            + "layout(std430, binding = 0) buffer B { float data[]; };\n"
+            + "void main() {\n"
+            + "    // non-ASCII — é ü ∑ → ≥ λ, several bytes each in UTF-8 — before the last statement\n"
+            + "    data[gl_GlobalInvocationID.x] = 1.0;\n"
+            + "}\n";
+        Assert.True(compiler.CompileToSpirv(Source) is not null, $"A shader with non-ASCII comments failed: {compiler.LastError}");
+    }
+
+    private static IEnumerable<(string Name, string? Source, Exception? ReadError)> ShippedShaders()
     {
         const BindingFlags AnyStatic = BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic;
         var vulkanTypes = typeof(VulkanBackend).Assembly.GetTypes()
@@ -48,11 +75,15 @@ public sealed class VulkanGlslCompileGateTests
         foreach (var type in vulkanTypes)
         {
             foreach (var property in type.GetProperties(AnyStatic).Where(p => p.PropertyType == typeof(string) && p.GetIndexParameters().Length == 0))
-                if (ReadOrNull(() => property.GetValue(null)) is string source && IsShader(source))
-                    yield return ($"{type.Name}.{property.Name}", source);
+            {
+                var (value, error) = Read(() => property.GetValue(null));
+                yield return ($"{type.Name}.{property.Name}", value, error);
+            }
             foreach (var field in type.GetFields(AnyStatic).Where(f => f.FieldType == typeof(string)))
-                if (ReadOrNull(() => field.GetValue(null)) is string source && IsShader(source))
-                    yield return ($"{type.Name}.{field.Name}", source);
+            {
+                var (value, error) = Read(() => field.GetValue(null));
+                yield return ($"{type.Name}.{field.Name}", value, error);
+            }
         }
     }
 
@@ -63,19 +94,23 @@ public sealed class VulkanGlslCompileGateTests
 
     private const string EntryPoint = "void main";
 
+    private static readonly TimeSpan RegexTimeout = TimeSpan.FromSeconds(1);
+
     // The source line the compiler's first "kernel.comp:N:" error names, so a failure can be fixed from the report.
     private static string QuoteFirstErrorLine(string source, string? error)
     {
-        var match = System.Text.RegularExpressions.Regex.Match(error ?? string.Empty, @"kernel\.comp:(\d+):");
+        var match = System.Text.RegularExpressions.Regex.Match(
+            error ?? string.Empty, @"kernel\.comp:(\d+):", System.Text.RegularExpressions.RegexOptions.None, RegexTimeout);
         if (!match.Success) return string.Empty;
         var lines = source.Split('\n');
         int line = int.Parse(match.Groups[1].Value, System.Globalization.CultureInfo.InvariantCulture);
         return line >= 1 && line <= lines.Length ? $"    >> {lines[line - 1].Trim()}" : string.Empty;
     }
 
-    private static object? ReadOrNull(Func<object?> read)
+    // A string member whose getter throws is reported, with its exception, instead of being dropped from the sweep.
+    private static (string? Value, Exception? Error) Read(Func<object?> read)
     {
-        try { return read(); }
-        catch (TargetInvocationException) { return null; }
+        try { return (read() as string, null); }
+        catch (TargetInvocationException ex) { return (null, ex.InnerException ?? ex); }
     }
 }

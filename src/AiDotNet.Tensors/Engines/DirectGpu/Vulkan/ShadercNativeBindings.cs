@@ -105,22 +105,29 @@ internal static class ShadercNativeBindings
 
     // --- Compilation ---
 
+    // The source is passed as explicit UTF-8 on BOTH platforms, with its UTF-8 byte count. Default string marshaling is
+    // ANSI on Windows (one byte per character) but UTF-8 on Linux, where a non-ASCII character (an em dash in a comment)
+    // becomes several bytes: a character-count sourceSize then cut that many bytes off the end, and 13 shipped shaders
+    // failed on Linux with "unexpected end of file" while compiling on Windows.
     [DllImport(ShadercWindows, EntryPoint = "shaderc_compile_into_spv")]
     private static extern IntPtr shaderc_compile_into_spv_Windows(
-        IntPtr compiler, string source, UIntPtr sourceSize,
+        IntPtr compiler, byte[] source, UIntPtr sourceSize,
         int shaderKind, string inputFileName, string entryPointName, IntPtr options);
 
     [DllImport(ShadercLinux, EntryPoint = "shaderc_compile_into_spv")]
     private static extern IntPtr shaderc_compile_into_spv_Linux(
-        IntPtr compiler, string source, UIntPtr sourceSize,
+        IntPtr compiler, byte[] source, UIntPtr sourceSize,
         int shaderKind, string inputFileName, string entryPointName, IntPtr options);
 
+    /// <summary>Compiles <paramref name="source"/>, sent to shaderc as UTF-8 with its exact byte length.</summary>
     public static IntPtr shaderc_compile_into_spv(
-        IntPtr compiler, string source, UIntPtr sourceSize,
+        IntPtr compiler, string source,
         int shaderKind, string inputFileName, string entryPointName, IntPtr options)
     {
-        try { return shaderc_compile_into_spv_Windows(compiler, source, sourceSize, shaderKind, inputFileName, entryPointName, options); }
-        catch (DllNotFoundException) { return shaderc_compile_into_spv_Linux(compiler, source, sourceSize, shaderKind, inputFileName, entryPointName, options); }
+        byte[] utf8 = System.Text.Encoding.UTF8.GetBytes(source);
+        var size = (UIntPtr)utf8.Length;
+        try { return shaderc_compile_into_spv_Windows(compiler, utf8, size, shaderKind, inputFileName, entryPointName, options); }
+        catch (DllNotFoundException) { return shaderc_compile_into_spv_Linux(compiler, utf8, size, shaderKind, inputFileName, entryPointName, options); }
     }
 
     // --- Result inspection ---

@@ -72,7 +72,6 @@ internal sealed class VulkanGlslCompiler : IDisposable
             result = ShadercNativeBindings.shaderc_compile_into_spv(
                 _compiler,
                 glslSource,
-                (UIntPtr)glslSource.Length,
                 ShadercNativeBindings.shaderc_compute_shader,
                 "kernel.comp",
                 entryPoint,
