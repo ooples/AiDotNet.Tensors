@@ -8,7 +8,11 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Only superseded PR runs are cancelled. A cancelled main run uploads no coverage, and codecov then
+  # scores every open PR against an older base: #1066 and #1064 both merged within a minute on
+  # 2026-09-29, each cancelled the other, and #1067's codecov/patch read 15.38% while codecov's own
+  # PR record said 62.38%.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true

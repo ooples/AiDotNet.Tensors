@@ -458,7 +458,12 @@ __kernel void clamp_values(
     const int idx = get_global_id(0);
     if (idx >= size) return;
 
-    output[idx] = fmin(fmax(input[idx], minVal), maxVal);
+    // torch.clamp propagates NaN; fmin/fmax would return the bound. NaN is tested on the bits (magnitude above the
+    // +Inf pattern) because fast/finite math may fold isnan() away.
+    const uint F32_ABS_MASK = 0x7fffffffu;       // IEEE-754 binary32: every bit but the sign
+    const uint F32_POS_INF_BITS = 0x7f800000u;   // IEEE-754 binary32: +Inf
+    const float x = input[idx];
+    output[idx] = ((as_uint(x) & F32_ABS_MASK) > F32_POS_INF_BITS) ? x : fmin(fmax(x, minVal), maxVal);
 }
 
 // Clip by value (symmetric around 0)

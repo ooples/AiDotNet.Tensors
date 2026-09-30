@@ -17,7 +17,7 @@ uvec4 philoxRound(uint c0,uint c1,uint k0,uint k1){const uint m0=0xd2511f53u,m1=
 uvec4 philox(uvec4 counter,uvec2 key){uvec4 c=counter;uvec2 k=key;for(uint i=0u;i<10u;++i){c=philoxRound(c.x,c.z,k.x,k.y);k.x+=0x9e3779b9u;k.y+=0xbb67ae85u;}return c;}
 float uniform01(uint value){return float(value>>8u)*(1.0/16777216.0);}
 void main(){uint idx=gl_GlobalInvocationID.x;if(idx>=count)return;uvec2 key=uvec2(seedLow,seedHigh);
-    if(mode==0u){uint seed=seedLow^seedHigh;uint state=idx*747796405u+seed+2891336453u;uint word=((state>>((state>>28u)+4u))^state)*277803737u;uint sample=(word>>22u)^word;float u=float(sample>>8u)*(1.0/16777216.0);float minimum=uintBitsToFloat(minimumBits),maximum=uintBitsToFloat(maximumBits);outputData[idx]=fma(u,maximum-minimum,minimum);return;}
+    if(mode==0u){uint seed=seedLow^seedHigh;uint state=idx*747796405u+seed+2891336453u;uint word=((state>>((state>>28u)+4u))^state)*277803737u;uint sampleValue=(word>>22u)^word;float u=float(sampleValue>>8u)*(1.0/16777216.0);float minimum=uintBitsToFloat(minimumBits),maximum=uintBitsToFloat(maximumBits);outputData[idx]=fma(u,maximum-minimum,minimum);return;}
     uint pairIndex=idx/2u,pairBlock=pairIndex/2u,pairLane=pairIndex%2u;uvec4 randomPair=philox(uvec4(pairBlock,1u,0u,0u),key);float u1=max(uniform01(randomPair[pairLane*2u]),1.0e-10),u2=uniform01(randomPair[pairLane*2u+1u]);float magnitude=uintBitsToFloat(stdDevBits)*sqrt(-2.0*log(u1)),angle=6.283185307*u2,mean=uintBitsToFloat(meanBits);outputData[idx]=mean+magnitude*((idx&1u)==0u?cos(angle):sin(angle));
 }";
 
@@ -28,8 +28,8 @@ void main(){
     uint idx=gl_GlobalInvocationID.x;if(idx>=count)return;
     uint state=idx*747796405u+seed+2891336453u;
     uint word=((state>>((state>>28u)+4u))^state)*277803737u;
-    uint sample=(word>>22u)^word;
-    outputData[idx]=sample<threshold?0.0:uintBitsToFloat(scaleBits);
+    uint sampleValue=(word>>22u)^word;
+    outputData[idx]=sampleValue<threshold?0.0:uintBitsToFloat(scaleBits);
 }";
 
     public static string Enforce2x4 => Header + @"
@@ -253,9 +253,9 @@ layout(set=0,binding=1) readonly buffer WeightsIh { float weightsIh[]; };
 layout(set=0,binding=2) readonly buffer WeightsHh { float weightsHh[]; };
 layout(set=0,binding=3) readonly buffer BiasIh { float biasIh[]; };
 layout(set=0,binding=4) readonly buffer BiasHh { float biasHh[]; };
-layout(set=0,binding=5) writeonly buffer Output { float outputData[]; };
+layout(set=0,binding=5) buffer Output { float outputData[]; };
 layout(set=0,binding=6) buffer AllH { float allH[]; };
-layout(set=0,binding=7) writeonly buffer CacheGates { float cacheGates[]; };
+layout(set=0,binding=7) buffer CacheGates { float cacheGates[]; };
 layout(push_constant) uniform Params { uint seqLen; uint batch; uint inputSize; uint hiddenSize; };
 float sigmoid(float x){return 1.0/(1.0+exp(-x));}
 void main(){uint b=gl_GlobalInvocationID.x;if(b>=batch)return;uint gateSize=3u*hiddenSize,cellSize=batch*hiddenSize;

@@ -2153,6 +2153,16 @@ internal static class BackwardFunctions<T>
         var keepDims = (bool)savedState[1];
         var inputShape = inputs[0]._shape;
 
+        // On a GPU engine, a sum over a leading and/or trailing block of axes broadcasts its gradient on the device; the
+        // generic expand-and-tile below took the host path. No axes (a traced full sum records none) means every axis,
+        // as the tiling below treats it.
+        var reducedAxes = axes.Length == 0 ? Enumerable.Range(0, inputShape.Length).ToArray() : axes;
+        if (engine is DirectGpuTensorEngine gpu && gpu.TryBroadcastReducedGradient(gradOutput, inputShape, reducedAxes, 1f) is { } onDevice)
+        {
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], onDevice, engine);
+            return;
+        }
+
         // If keepDims was false, we need to reinsert singleton dimensions at the reduced axes
         // so we can broadcast back to the original shape
         var expandedGrad = gradOutput;
