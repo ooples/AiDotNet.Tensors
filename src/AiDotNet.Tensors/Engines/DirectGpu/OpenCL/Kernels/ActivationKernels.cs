@@ -725,7 +725,7 @@ __kernel void round_vector(
     const int idx = get_global_id(0);
     if (idx >= size) return;
 
-    B[idx] = round(A[idx]);
+    B[idx] = rint(A[idx]);   // half to even, as the CPU and torch.round; round() rounds halves away from zero
 }
 
 // Truncate

@@ -225,6 +225,8 @@ internal static class GpuLaunchProbe
             // The counted driver-copy wrappers are the transfer itself, not who issued it.
             if (method.Name.StartsWith("cuMemcpy", System.StringComparison.Ordinal)) return false;
             var declaringType = method.DeclaringType;
+            // The probe's own overloads (the backend-typed OnReadback forwards here) are not the issuer either.
+            if (declaringType == typeof(GpuLaunchProbe)) return false;
             if (declaringType == typeof(DirectGpuTensorEngine))
             {
                 return method.Name is not "DeferTensorResult" and not "FinishGpuOp"

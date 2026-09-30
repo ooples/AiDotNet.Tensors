@@ -973,16 +973,6 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// _data array may be empty/stale until explicitly synchronized.
     /// This is the PyTorch-equivalent of tensor.data_ptr() on a CUDA tensor.
     /// </summary>
-    /// <summary>
-    /// The whole data vector's shared device buffer (what a whole-vector view's <c>_gpuBuffer</c> resolves to), or null.
-    /// A strided or offset view keeps its own slot, so this is how it finds the device copy of the data it views.
-    /// Plain float-encoded buffers only (not split-complex planes or raw int32).
-    /// </summary>
-    internal Engines.DirectGpu.IGpuBuffer? VectorDeviceBuffer
-        => _data?._deviceState is { Buffer: { } buffer } state && !state.IsSplitComplex && !state.ContainsRawInt32 ? buffer : null;
-
-    internal Engines.DirectGpu.IDirectGpuBackend? VectorDeviceBackend => _data?._deviceState?.Backend;
-
     internal Engines.DirectGpu.IGpuBuffer? _gpuBuffer
     {
         get => CoversWholeVector ? _data._deviceState?.Buffer : _viewGpuBuffer;
@@ -3615,12 +3605,20 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         // Release any zero-copy mmap mapping before tearing down storage.
         DisposeStreamingMmapOwner();
         StreamingInt8 = null;
+        // A tensor covering its whole vector shares the vector's device state with every other view of it (a reshape
+        // of this result, say). While another view still holds the storage, disposing this one must leave that state
+        // alone: clearing it left the surviving view with no device buffer and a pending download, so its next device
+        // use read the data back to the host and uploaded it again. The buffer is freed with the last reference.
+        bool sharedDeviceStateOutlivesThis = CoversWholeVector && _storage.RefCount > 1;
         _storage.Release();
-        if (_ownsGpuBuffer && _gpuBuffer is IDisposable disposableBuffer)
+        if (!sharedDeviceStateOutlivesThis)
         {
-            disposableBuffer.Dispose();
+            if (_ownsGpuBuffer && _gpuBuffer is IDisposable disposableBuffer)
+            {
+                disposableBuffer.Dispose();
+            }
+            _gpuBuffer = null;
         }
-        _gpuBuffer = null;
         GC.SuppressFinalize(this);
     }
 }

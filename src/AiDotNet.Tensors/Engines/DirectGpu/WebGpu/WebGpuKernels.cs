@@ -1989,7 +1989,12 @@ struct ClampParams {
 fn clamp_op(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx < params.size) {
-        B[idx] = clamp(A[idx], params.min_val, params.max_val);
+        let x = A[idx];
+        // torch.clamp propagates NaN; WGSL clamp may return a bound for it. NaN is tested on the bits (magnitude above
+        // the +Inf pattern): WGSL implementations may assume finite values and fold x != x.
+        let F32_ABS_MASK = 0x7fffffffu;       // IEEE-754 binary32: every bit but the sign
+        let F32_POS_INF_BITS = 0x7f800000u;   // IEEE-754 binary32: +Inf
+        B[idx] = select(clamp(x, params.min_val, params.max_val), x, (bitcast<u32>(x) & F32_ABS_MASK) > F32_POS_INF_BITS);
     }
 }
 ";

@@ -259,9 +259,9 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </summary>
     private void CarryResidencyToShapeOnlyView(Tensor<T> view)
     {
-        // A whole-vector view SHARES its source's device state, so it already reports the source's buffer; that is no
-        // reason to skip the rest of the metadata (materializer, role, ownership, dirty, layout). Skip only a view
-        // bound to some other buffer.
+        // A view covering the whole vector already SEES the buffer (it lives on the shared vector's device state), but
+        // not the per-tensor metadata (materializer, role, ownership, dirty flag, layout): share those too. Returning
+        // early on "already has a buffer" left such a reshape claiming no materializer and no role.
         if (_gpuBuffer is null || (view._gpuBuffer is not null && !ReferenceEquals(view._gpuBuffer, _gpuBuffer))) return;
         if (!IsContiguous || !view.IsContiguous || view._storageOffset != _storageOffset || view.Length != Length) return;
         if (!ReferenceEquals(view._storage, _storage)) return;

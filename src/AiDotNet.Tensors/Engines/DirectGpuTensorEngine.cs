@@ -580,16 +580,21 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// so the captured graph reads a fixed device address and GetOrAllocateBuffer finds it (no re-upload mid-
     /// capture). Call during the non-capturing pre-residency pass for each EXTERNAL stable input (the graph's
     /// own intermediates become resident via FinishGpuOp under ResidentStepActive). Idempotent: re-binds the
-    /// current data into the existing buffer if already bound + big enough. float only / no-op off CUDA.</summary>
+    /// current data into the existing buffer if already bound + big enough. float only. Off CUDA (no in-place float
+    /// upload, and no capture that needs a fixed address) each call binds a fresh upload of the current data.</summary>
     public void EnsureResidentInput<T>(Tensor<T> t)
     {
         if (typeof(T) != typeof(float) || t is null) return;
-        if (GetBackend() is not Engines.DirectGpu.CUDA.CudaBackend cb) return;
+        if (!TryGetBackend(out var cb)) return;
+        // The host is authoritative for an external input (callers write batches through a host span). A device op on
+        // a view sharing its array (the backward's Reshape or Transpose of the batch) can have armed a download into
+        // it; materializing that would read back data the host already holds.
+        if (t.GetBackingArrayForCacheLookupUnsafe() is { } hostArray) Helpers.HostSync.Remove(hostArray);
         var data = t.GetDataArray();
-        if (t._gpuBuffer is { } existing && ReferenceEquals(t._gpuBackend, cb)
+        if (cb is Engines.DirectGpu.CUDA.CudaBackend cuda && t._gpuBuffer is { } existing && ReferenceEquals(t._gpuBackend, cb)
             && existing.Handle != System.IntPtr.Zero && existing.Size >= data.Length)
         {
-            cb.UploadBufferInPlace((float[])(object)data, existing);
+            cuda.UploadBufferInPlace((float[])(object)data, existing);
             t._gpuBufferVersion = t.GpuCacheVersion;
             return;
         }
@@ -611,16 +616,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public float[]? DownloadResidentBuffer<T>(Tensor<T> t)
     {
         if (typeof(T) != typeof(float) || t is null) return null;
-        if (GetBackend() is not Engines.DirectGpu.CUDA.CudaBackend cb) return null;
+        if (!TryGetBackend(out var cb)) return null;
         var buf = t._gpuBuffer;
         if (buf is null || !ReferenceEquals(t._gpuBackend, cb) || buf.Handle == System.IntPtr.Zero) return null;
-        // Only the tensor's own elements: a pooled buffer can be larger than the tensor (the 1-element loss was
-        // measured riding a 256-float buffer), and downloading all of it moved that whole buffer every step.
-        int count = System.Math.Min(t.Length, buf.Size);
-        var bytes = cb.DownloadByteBuffer(buf, checked(count * sizeof(float)));
-        var values = new float[count];
-        System.Buffer.BlockCopy(bytes, 0, values, 0, bytes.Length);
-        return values;
+        // A buffer can be larger than the tensor (a pooled or padded allocation: a scalar loss has been seen bound to
+        // 256 floats). Read only the tensor's elements, through a device copy into an exactly sized buffer.
+        if (buf.Size <= t.Length) return cb.DownloadBuffer(buf);
+        using var exact = cb.AllocateBuffer(t.Length);
+        cb.Copy(buf, 0, exact, 0, t.Length);
+        var values = cb.DownloadBuffer(exact);
+        return values.Length == t.Length ? values : values.AsSpan(0, t.Length).ToArray();
     }
 
     // #1650 — STABLE captured-graph output. The forward's own output buffer is a graph-internal cuMemAllocAsync
@@ -1415,6 +1420,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// Helper struct for tracking GPU buffer ownership. Implements IDisposable
     /// to only dispose buffers we own (not cached ones).
     /// </summary>
+    /// <summary>The predicate of <see cref="IDirectGpuBackend.ClassifyFloat"/>, by the mode number it takes.</summary>
+    internal enum FloatClassification
+    {
+        IsNaN = 0,
+        IsInfinity = 1,
+        IsFinite = 2,
+    }
+
     private readonly struct OwnedBuffer : IDisposable
     {
         private sealed class OwnershipState
@@ -1477,9 +1490,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private static void DisposeBufferAfterQueuedUse(IDirectGpuBackend backend, IGpuBuffer buffer)
     {
         if (backend is DirectGpu.CUDA.CudaBackend cudaBackend)
+        {
             cudaBackend.FreeBufferDeferred(buffer);
-        else
+        }
+        else if (backend is DirectGpu.HIP.HipBackend hipBackend)
+        {
+            // HIP has no event-ordered release here, and hipFree does not wait for work queued on a non-default
+            // stream, so drain the queue before the buffer can go back to the allocator.
+            hipBackend.Synchronize();
             buffer.Dispose();
+        }
+        else
+        {
+            buffer.Dispose();
+        }
     }
 
     private static void ConvertInverseStandardDeviationToVariance(
@@ -1589,7 +1613,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return candidate.Buffer;
         }
         if (!pending) return null;
-        return view.VectorDeviceBuffer is { } shared && shared.Handle != IntPtr.Zero && ReferenceEquals(view.VectorDeviceBackend, backend)
+        // Device-owned storage: a view of a device result shares its vector's device buffer. Use it only while it holds
+        // the vector's current values.
+        return view.DataVector._deviceState is { Buffer: { } shared, DeviceValid: true } state
+            && shared.Handle != IntPtr.Zero && ReferenceEquals(state.Backend, backend)
+            && !state.IsSplitComplex && !state.ContainsRawInt32
             ? shared
             : null;
     }
@@ -17493,11 +17521,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
                 // Outer-product broadcast is exact for a contiguous suffix reduction.
                 int firstReduced = normalized.Length == 0 ? inputShape.Length : normalized[0];
-                if (normalized.Length == 0 || normalized.Length != inputShape.Length - firstReduced)
-                    return base.ReduceMeanBackward(gradOutput, inputShape, axes);
-                for (int i = 0; i < normalized.Length; i++)
-                    if (normalized[i] != firstReduced + i)
-                        return base.ReduceMeanBackward(gradOutput, inputShape, axes);
+                bool trailingOnly = normalized.Length != 0 && normalized.Length == inputShape.Length - firstReduced;
+                for (int i = 0; trailingOnly && i < normalized.Length; i++)
+                    if (normalized[i] != firstReduced + i) trailingOnly = false;
+                if (!trailingOnly)
+                    return ReduceMeanBackwardAroundKeptBlockOrHost(gradOutput, inputShape, axes);
 
                 int inputSize = 1;
                 for (int i = 0; i < inputShape.Length; i++) inputSize = checked(inputSize * inputShape[i]);
@@ -17529,6 +17557,23 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 // graph capture and a device round trip everywhere else.
                 AliasDiag($"ReduceMeanBackward device path FELLBACK: {ex.GetType().Name}: {ex.Message}");
             }
+        }
+        return ReduceMeanBackwardAroundKeptBlockOrHost(gradOutput, inputShape, axes);
+    }
+
+    /// <summary>
+    /// A mean over a leading (or leading and trailing) block of axes, a bias-style mean, broadcasts its gradient on the
+    /// device; anything else takes the host path.
+    /// </summary>
+    private Tensor<T> ReduceMeanBackwardAroundKeptBlockOrHost<T>(Tensor<T> gradOutput, int[] inputShape, int[] axes)
+    {
+        if (inputShape is { Length: > 0 })
+        {
+            int count = 1;
+            foreach (int axis in axes.Select(a => a < 0 ? a + inputShape.Length : a).Distinct())
+                if (axis >= 0 && axis < inputShape.Length) count *= inputShape[axis];
+            if (count > 0 && TryBroadcastReducedGradient(gradOutput, inputShape, axes, 1f / count) is { } broadcast)
+                return broadcast;
         }
         return base.ReduceMeanBackward(gradOutput, inputShape, axes);
     }
@@ -17614,6 +17659,243 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private enum ReduceOperation { Sum, Mean, Max }
 
     /// <summary>
+    /// Splits a shape around its reduced axes: when the reduced axes are a leading block and/or a trailing block with the
+    /// kept axes contiguous between them, the tensor is [leading, kept, trailing] row-major. False otherwise.
+    /// </summary>
+    private static bool TrySplitAroundKeptBlock(int[] dims, int[] sortedAxes, out int leading, out int kept, out int trailing)
+    {
+        leading = kept = trailing = 1;
+        int rank = dims.Length;
+        var reduced = new bool[rank];
+        foreach (int axis in sortedAxes)
+        {
+            if (axis < 0 || axis >= rank) return false;
+            reduced[axis] = true;
+        }
+        int keptStart = 0;
+        while (keptStart < rank && reduced[keptStart]) keptStart++;
+        int keptEnd = rank;
+        while (keptEnd > keptStart && reduced[keptEnd - 1]) keptEnd--;
+        for (int i = keptStart; i < keptEnd; i++)
+            if (reduced[i]) return false;   // a reduced axis between kept ones
+        for (int i = 0; i < keptStart; i++) leading = checked(leading * dims[i]);
+        for (int i = keptStart; i < keptEnd; i++) kept = checked(kept * dims[i]);
+        for (int i = keptEnd; i < rank; i++) trailing = checked(trailing * dims[i]);
+        return true;
+    }
+
+    /// <summary>
+    /// Sums (or averages) a contiguous tensor over a leading and/or a trailing block of axes. Viewed as
+    /// [L, K, R]: one SumAxis reduces R, and ones[1, L] x [L, K] against the engine's cached ones vector reduces L, so no
+    /// permute and no uploaded stride or axis tables. Null when the axes are not that shape or no ones vector can be made
+    /// (during a capture).
+    /// </summary>
+    private Tensor<T>? TryReduceAroundKeptBlock<T>(Tensor<T> input, int[] sortedAxes, bool keepDims,
+        IDirectGpuBackend backend, ReduceOperation op)
+    {
+        if (typeof(T) != typeof(float) || !input.IsContiguous || input.Length == 0) return null;
+        var dims = input.Shape._dims;
+        if (!TrySplitAroundKeptBlock(dims, sortedAxes, out int leading, out int kept, out int trailing)) return null;
+
+        var reducedAxes = new bool[dims.Length];
+        foreach (int axis in sortedAxes) reducedAxes[axis] = true;
+        int[] outputShape;
+        if (keepDims)
+        {
+            outputShape = (int[])dims.Clone();
+            for (int i = 0; i < dims.Length; i++) if (reducedAxes[i]) outputShape[i] = 1;
+        }
+        else
+        {
+            outputShape = dims.Where((_, i) => !reducedAxes[i]).ToArray();
+        }
+
+        IGpuBuffer? ones = leading > 1 ? GetCachedOnesBuffer(backend, leading) : null;
+        if (leading > 1 && ones is null) return null;
+
+        using var inputBuffer = GetOrAllocateBuffer(backend, input);
+        bool sumTrailing = trailing > 1;
+        OwnedBuffer rowSums = sumTrailing ? AllocateOutputBuffer(backend, leading * kept) : default;
+        var output = AllocateOutputBuffer(backend, kept);
+        bool handedOff = false;
+        try
+        {
+            var afterTrailing = inputBuffer.Buffer;
+            if (sumTrailing)
+            {
+                backend.SumAxis(inputBuffer.Buffer, rowSums.Buffer, leading * kept, trailing);
+                afterTrailing = rowSums.Buffer;
+            }
+            if (ones is not null)
+                backend.Gemm(ones, afterTrailing, output.Buffer, 1, kept, leading);
+            else
+                backend.Copy(afterTrailing, output.Buffer, kept);
+            if (op == ReduceOperation.Mean)
+                backend.Scale(output.Buffer, output.Buffer, 1f / ((float)leading * trailing), kept);
+
+            var result = DeferTensorResult<T>(backend, output.Buffer, kept, outputShape);
+            handedOff = true;
+            return result;
+        }
+        finally
+        {
+            // rowSums is read by the queued Gemm: release it only after that work (see DisposeAfterQueuedUse).
+            if (sumTrailing) rowSums.DisposeAfterQueuedUse(backend);
+            if (!handedOff) output.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Splits a shape around ONE contiguous block of reduced axes that has kept axes on both sides, the case
+    /// <see cref="TrySplitAroundKeptBlock"/> rejects: the tensor is [outer, reduced, inner] row-major. False otherwise.
+    /// </summary>
+    private static bool TrySplitAroundReducedBlock(int[] dims, int[] sortedAxes, out int outer, out int reduced, out int inner)
+    {
+        outer = reduced = inner = 1;
+        int rank = dims.Length;
+        if (sortedAxes.Length == 0) return false;
+        int first = sortedAxes[0], last = sortedAxes[^1];
+        if (first <= 0 || last >= rank - 1 || last - first + 1 != sortedAxes.Length) return false;
+        for (int i = 1; i < sortedAxes.Length; i++)
+            if (sortedAxes[i] != sortedAxes[i - 1] + 1) return false;
+        for (int i = 0; i < first; i++) outer = checked(outer * dims[i]);
+        for (int i = first; i <= last; i++) reduced = checked(reduced * dims[i]);
+        for (int i = last + 1; i < rank; i++) inner = checked(inner * dims[i]);
+        return true;
+    }
+
+    /// <summary>
+    /// Sums (or averages) a contiguous [outer, reduced, inner] tensor over its middle block: outer independent products
+    /// ones[1, reduced] x X_o[reduced, inner], one batched GEMM against the engine's cached ones buffer. The general path
+    /// permuted instead, and every backend's permute uploads its stride and axis tables on each call. Null when the axes
+    /// are not a single middle block or no ones buffer can be made (during a capture).
+    /// </summary>
+    private Tensor<T>? TryReduceAroundReducedBlock<T>(Tensor<T> input, int[] sortedAxes, bool keepDims,
+        IDirectGpuBackend backend, ReduceOperation op)
+    {
+        if (typeof(T) != typeof(float) || !input.IsContiguous || input.Length == 0) return null;
+        var dims = input.Shape._dims;
+        if (!TrySplitAroundReducedBlock(dims, sortedAxes, out int outer, out int reduced, out int inner)) return null;
+        var ones = GetCachedOnesBuffer(backend, checked(outer * reduced));
+        if (ones is null) return null;
+
+        var reducedAxes = new bool[dims.Length];
+        foreach (int axis in sortedAxes) reducedAxes[axis] = true;
+        int[] outputShape = keepDims
+            ? dims.Select((d, i) => reducedAxes[i] ? 1 : d).ToArray()
+            : dims.Where((_, i) => !reducedAxes[i]).ToArray();
+
+        using var inputBuffer = GetOrAllocateBuffer(backend, input);
+        int outputLength = outer * inner;
+        var output = AllocateOutputBuffer(backend, outputLength);
+        bool handedOff = false;
+        try
+        {
+            // outer batches of [1, reduced] x [reduced, inner] -> [1, inner]; the ones buffer holds outer * reduced ones,
+            // i.e. outer concatenated [1, reduced] rows.
+            backend.BatchedGemm(ones, inputBuffer.Buffer, output.Buffer, 1, inner, reduced, outer);
+            if (op == ReduceOperation.Mean)
+                backend.Scale(output.Buffer, output.Buffer, 1f / reduced, outputLength);
+            var result = DeferTensorResult<T>(backend, output.Buffer, outputLength, outputShape);
+            handedOff = true;
+            return result;
+        }
+        finally
+        {
+            if (!handedOff) output.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// The gradient of a sum (scale 1) or mean over a leading and/or trailing block of axes: gradOutput[K] broadcast to
+    /// [L, K, R], times <paramref name="scale"/>. Two outer products against the cached ones vectors, so nothing is
+    /// uploaded and the host tile path is not taken. Null when the axes are not that shape.
+    /// </summary>
+    internal Tensor<T>? TryBroadcastReducedGradient<T>(Tensor<T> gradOutput, int[] inputShape, int[] axes, float scale)
+    {
+        if (typeof(T) != typeof(float) || Compilation.GraphMode.IsActive || !gradOutput.IsContiguous
+            || inputShape is null || !TryGetBackend(out var backend))
+            return null;
+
+        // Every reduced axis had extent 1, or the input was a scalar (a full sum of a rank-0 tensor yields [1]): the
+        // gradient is the incoming one, reshaped and scaled.
+        int inputLength = 1;
+        foreach (int d in inputShape) inputLength = checked(inputLength * d);
+        if (gradOutput.Length == inputLength)
+        {
+            using var same = GetOrAllocateBuffer(backend, gradOutput);
+            return DispatchDeferredGpuOp<T>(backend, inputLength, (int[])inputShape.Clone(), output =>
+            {
+                if (scale != 1f) backend.Scale(same.Buffer, output, scale, inputLength);
+                else backend.Copy(same.Buffer, output, inputLength);
+            });
+        }
+        if (inputShape.Length == 0) return null;
+        var sorted = axes.Select(a => a < 0 ? a + inputShape.Length : a).OrderBy(a => a).ToArray();
+        for (int i = 1; i < sorted.Length; i++) if (sorted[i] == sorted[i - 1]) return null;
+        if (!TrySplitAroundKeptBlock(inputShape, sorted, out int leading, out int kept, out int trailing))
+            return TryBroadcastAroundReducedBlock(gradOutput, inputShape, sorted, scale, backend);
+        if (gradOutput.Length != kept) return null;
+
+        var leadingOnes = leading > 1 ? GetCachedOnesBuffer(backend, leading) : null;
+        var trailingOnes = trailing > 1 ? GetCachedOnesBuffer(backend, trailing) : null;
+        if ((leading > 1 && leadingOnes is null) || (trailing > 1 && trailingOnes is null)) return null;
+
+        int inputSize = leading * kept * trailing;
+        using var gradient = GetOrAllocateBuffer(backend, gradOutput);
+        bool expandLeading = leadingOnes is not null, expandTrailing = trailingOnes is not null;
+        OwnedBuffer middle = expandLeading && expandTrailing ? AllocateOutputBuffer(backend, leading * kept) : default;
+        try
+        {
+            return DispatchDeferredGpuOp<T>(backend, inputSize, (int[])inputShape.Clone(), output =>
+            {
+                if (expandLeading && expandTrailing)
+                {
+                    backend.OuterProduct(leadingOnes!, gradient.Buffer, middle.Buffer, leading, kept);
+                    backend.OuterProduct(middle.Buffer, trailingOnes!, output, leading * kept, trailing);
+                }
+                else if (expandLeading)
+                    backend.OuterProduct(leadingOnes!, gradient.Buffer, output, leading, kept);
+                else if (expandTrailing)
+                    backend.OuterProduct(gradient.Buffer, trailingOnes!, output, kept, trailing);
+                else
+                    backend.Copy(gradient.Buffer, output, kept);
+                if (scale != 1f)
+                    backend.Scale(output, output, scale, inputSize);
+            });
+        }
+        finally
+        {
+            // middle is read by the queued second outer product: release it only after that work.
+            if (expandLeading && expandTrailing) middle.DisposeAfterQueuedUse(backend);
+        }
+    }
+
+    /// <summary>
+    /// The gradient of a sum or mean over one middle block of axes: gradOutput[outer, inner] broadcast to
+    /// [outer, reduced, inner], times <paramref name="scale"/>. outer products ones[reduced, 1] x g_o[1, inner] in one
+    /// batched GEMM against the cached ones buffer, so nothing is uploaded and the host path is not taken.
+    /// </summary>
+    private Tensor<T>? TryBroadcastAroundReducedBlock<T>(Tensor<T> gradOutput, int[] inputShape, int[] sortedAxes,
+        float scale, IDirectGpuBackend backend)
+    {
+        if (!TrySplitAroundReducedBlock(inputShape, sortedAxes, out int outer, out int reduced, out int inner)) return null;
+        if (gradOutput.Length != outer * inner) return null;
+        var ones = GetCachedOnesBuffer(backend, checked(outer * reduced));
+        if (ones is null) return null;
+
+        int inputSize = outer * reduced * inner;
+        using var gradient = GetOrAllocateBuffer(backend, gradOutput);
+        return DispatchDeferredGpuOp<T>(backend, inputSize, (int[])inputShape.Clone(), output =>
+        {
+            // outer batches of [reduced, 1] x [1, inner] -> [reduced, inner].
+            backend.BatchedGemm(ones, gradient.Buffer, output, reduced, inner, 1, outer);
+            if (scale != 1f)
+                backend.Scale(output, output, scale, inputSize);
+        });
+    }
+
+    /// <summary>
     /// Internal GPU reduction implementation that handles arbitrary axes.
     /// </summary>
     private Tensor<T> ReduceAxisGpu<T>(Tensor<T> input, int[] normalizedAxes, bool keepDims,
@@ -17621,6 +17903,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         var inputShape = input.Shape._dims;
         int inputRank = inputShape.Length;
+
+        // Sum/mean over a leading and/or trailing block of axes (a conv bias gradient reduces [N, C, H, W] over N, H and
+        // W; a flattened loss over its trailing axes) needs no permute: the permute kernel uploads its stride and axis
+        // tables on every call. The resident compiled step keeps its own path below.
+        if (!ResidentStepActive && (op == ReduceOperation.Sum || op == ReduceOperation.Mean)
+            && !(normalizedAxes.Length == 1 && normalizedAxes[0] == inputRank - 1)
+            && TryReduceAroundKeptBlock(input, normalizedAxes, keepDims, backend, op) is { } aroundKept)
+            return aroundKept;
+        if (!ResidentStepActive && (op == ReduceOperation.Sum || op == ReduceOperation.Mean)
+            && TryReduceAroundReducedBlock(input, normalizedAxes, keepDims, backend, op) is { } aroundReduced)
+            return aroundReduced;
 
         // Compute output shape
         var outputShapeList = new List<int>();
@@ -20892,15 +21185,28 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (classIndices is null) throw new ArgumentNullException(nameof(classIndices));
         int numClasses = ValidateClassGather(values, classIndices, out int rows);
         // GraphMode records through the base (TryGetBackend refuses there); the recorded node replays onto this path.
-        if (typeof(T) == typeof(float) && rows > 0 && TryGetBackend(out var backend)
-            && backend is DirectGpu.CUDA.CudaBackend cuda && cuda.HasClassGatherKernels)
+        if (typeof(T) == typeof(float) && rows > 0 && TryGetBackend(out var backend))
         {
             try
             {
+                var cuda = backend as DirectGpu.CUDA.CudaBackend;
+                bool fused = cuda is not null && cuda.HasClassGatherKernels;
                 using var valuesBuffer = GetOrAllocateBuffer(backend, values.IsContiguous ? values : values.Contiguous());
                 using var classBuffer = GetOrAllocateBuffer(backend, classIndices.IsContiguous ? classIndices : classIndices.Contiguous());
+                // Elsewhere: the classes read as the CPU reads them, then take_along_dim over values viewed [rows, C, 1]
+                // (a class outside [0, C), -1 for NaN, gathers 0).
+                using var classes = fused ? null : new DeviceFloatIds(backend, rows);
                 var result = DispatchDeferredGpuOp<T>(backend, rows, (int[])classIndices._shape.Clone(), output =>
-                    cuda.GatherClassValues(valuesBuffer.Buffer, classBuffer.Buffer, output, rows, numClasses));
+                {
+                    if (fused)
+                    {
+                        cuda!.GatherClassValues(valuesBuffer.Buffer, classBuffer.Buffer, output, rows, numClasses);
+                        return;
+                    }
+                    classes!.Normalize(classBuffer.Buffer);
+                    backend.TakeAlongDim(valuesBuffer.Buffer, classes.Normalized, output,
+                        outerSize: rows, axisOut: 1, innerSize: 1, axisIn: numClasses);
+                });
                 Autodiff.DifferentiableOps.RecordUnary("TensorGatherClassValues", result, values,
                     Autodiff.BackwardFunctions<T>.GatherClassValuesBackward, new object[] { classIndices, numClasses });
                 return result;
@@ -20921,14 +21227,45 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int rows = numClasses > 0 ? (int)(total / numClasses) : 0;
         if (typeof(T) == typeof(float) && total > 0 && total <= int.MaxValue
             && gradOutput.Length == rows && classIndices.Length == rows
-            && TryGetBackend(out var backend) && backend is DirectGpu.CUDA.CudaBackend cuda && cuda.HasClassGatherKernels)
+            && TryGetBackend(out var backend))
         {
             try
             {
+                var cuda = backend as DirectGpu.CUDA.CudaBackend;
+                bool fused = cuda is not null && cuda.HasClassGatherKernels;
                 using var gradBuffer = GetOrAllocateBuffer(backend, gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous());
                 using var classBuffer = GetOrAllocateBuffer(backend, classIndices.IsContiguous ? classIndices : classIndices.Contiguous());
-                return DispatchDeferredGpuOp<T>(backend, (int)total, (int[])valuesShape.Clone(), output =>
-                    cuda.ScatterClassGrad(gradBuffer.Buffer, classBuffer.Buffer, output, rows, numClasses));
+                // Elsewhere: each row's gradient broadcast across its classes, then every class but the target set to
+                // zero (a masked fill, not a multiply by the one-hot, so an infinite gradient stays out of the others).
+                // Scratch is released only after the queued kernels can no longer read it (DisposeAfterQueuedUse):
+                // DispatchDeferredGpuOp returns once the work is queued, and a plain Dispose could hand the buffer back
+                // to CUDA's legacy pool for reuse while those kernels still read it.
+                var notTarget = fused ? default : AllocateOutputBuffer(backend, (int)total);
+                var classes = fused ? null : new DeviceFloatIds(backend, rows);
+                try
+                {
+                    var ones = fused ? null : GetCachedOnesBuffer(backend, numClasses);   // engine-owned: not disposed here
+                    if (!fused && ones is null) return base.ScatterClassValuesGrad(gradOutput, classIndices, valuesShape);
+                    return DispatchDeferredGpuOp<T>(backend, (int)total, (int[])valuesShape.Clone(), output =>
+                    {
+                        if (fused)
+                        {
+                            cuda!.ScatterClassGrad(gradBuffer.Buffer, classBuffer.Buffer, output, rows, numClasses);
+                            return;
+                        }
+                        classes!.Normalize(classBuffer.Buffer);
+                        backend.OneHotKernel(classes.Normalized, notTarget.Buffer, rows, numClasses);
+                        backend.Scale(notTarget.Buffer, notTarget.Buffer, -1f, (int)total);
+                        backend.AddScalar(notTarget.Buffer, notTarget.Buffer, 1f, (int)total);   // 1 where not the target
+                        backend.OuterProduct(gradBuffer.Buffer, ones!, output, rows, numClasses);
+                        backend.MaskedFillKernel(output, notTarget.Buffer, output, 0f, (int)total);
+                    });
+                }
+                finally
+                {
+                    notTarget.DisposeAfterQueuedUse(backend);
+                    classes?.DisposeAfterQueuedUse();
+                }
             }
             catch (Exception ex)
             {
