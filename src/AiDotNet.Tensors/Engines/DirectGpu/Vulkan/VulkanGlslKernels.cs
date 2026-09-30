@@ -36,6 +36,8 @@ void main() {
     float x = a[idx];
     float v0 = uintBitsToFloat(p0), v1 = uintBitsToFloat(p1), v2 = uintBitsToFloat(p2);
     float y = 0.0;
+    const uint F32_ABS_MASK = 0x7fffffffu;       // IEEE-754 binary32: every bit but the sign
+    const uint F32_POS_INF_BITS = 0x7f800000u;   // IEEE-754 binary32: +Inf; magnitude bits above it are NaN
     switch (op) {
         case 0u: {
             // GLSL pow is undefined for a negative base. Integral exponents
@@ -90,7 +92,7 @@ void main() {
         case 36u: y = x <= -3.0 ? 0.0 : (x >= 3.0 ? x : x * (x + 3.0) / 6.0); break;
         case 37u: y = v1 * (x >= 0.0 ? x : v0 * (exp(x) - 1.0)); break;
         case 38u: y = clamp(x / 6.0 + 0.5, 0.0, 1.0); break;
-        case 39u: y = ((floatBitsToUint(x) & 0x7fffffffu) > 0x7f800000u) ? x : clamp(x, v0, v1); break;   // torch.clamp propagates NaN (bit test: isnan may be folded)
+        case 39u: y = ((floatBitsToUint(x) & F32_ABS_MASK) > F32_POS_INF_BITS) ? x : clamp(x, v0, v1); break;   // torch.clamp propagates NaN (bit test: isnan may be folded)
         case 40u: {
             uint xb = floatBitsToUint(x), vb = p0;
             uint xa = xb & 0x7FFFFFFFu, va = vb & 0x7FFFFFFFu;

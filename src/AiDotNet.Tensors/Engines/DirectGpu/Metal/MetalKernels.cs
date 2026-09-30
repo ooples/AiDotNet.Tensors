@@ -55,10 +55,14 @@ inline float safe_divide(float a, float b) {
     return a / (b + EPSILON);
 }
 
+// IEEE-754 binary32: the bits other than the sign, and +Inf's bit pattern. A value whose magnitude bits exceed +Inf's is
+// NaN, a test the default fast math cannot fold away the way it folds isnan().
+constant uint F32_ABS_MASK = 0x7fffffffu;
+constant uint F32_POS_INF_BITS = 0x7f800000u;
+
 inline float clamp_value(float x, float min_val, float max_val) {
-    // torch.clamp propagates NaN. Tested on the bits (magnitude above the +Inf pattern 0x7f800000): the default fast
-    // math folds isnan() away.
-    return ((as_type<uint>(x) & 0x7fffffffu) > 0x7f800000u) ? x : max(min_val, min(max_val, x));
+    // torch.clamp propagates NaN.
+    return ((as_type<uint>(x) & F32_ABS_MASK) > F32_POS_INF_BITS) ? x : max(min_val, min(max_val, x));
 }
 ";
 
