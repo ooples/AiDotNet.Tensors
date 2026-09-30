@@ -1420,6 +1420,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// Helper struct for tracking GPU buffer ownership. Implements IDisposable
     /// to only dispose buffers we own (not cached ones).
     /// </summary>
+    /// <summary>The predicate of <see cref="IDirectGpuBackend.ClassifyFloat"/>, by the mode number it takes.</summary>
+    internal enum FloatClassification
+    {
+        IsNaN = 0,
+        IsInfinity = 1,
+        IsFinite = 2,
+    }
+
     private readonly struct OwnedBuffer : IDisposable
     {
         private sealed class OwnershipState
@@ -20975,15 +20983,28 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (classIndices is null) throw new ArgumentNullException(nameof(classIndices));
         int numClasses = ValidateClassGather(values, classIndices, out int rows);
         // GraphMode records through the base (TryGetBackend refuses there); the recorded node replays onto this path.
-        if (typeof(T) == typeof(float) && rows > 0 && TryGetBackend(out var backend)
-            && backend is DirectGpu.CUDA.CudaBackend cuda && cuda.HasClassGatherKernels)
+        if (typeof(T) == typeof(float) && rows > 0 && TryGetBackend(out var backend))
         {
             try
             {
+                var cuda = backend as DirectGpu.CUDA.CudaBackend;
+                bool fused = cuda is not null && cuda.HasClassGatherKernels;
                 using var valuesBuffer = GetOrAllocateBuffer(backend, values.IsContiguous ? values : values.Contiguous());
                 using var classBuffer = GetOrAllocateBuffer(backend, classIndices.IsContiguous ? classIndices : classIndices.Contiguous());
+                // Elsewhere: the classes read as the CPU reads them, then take_along_dim over values viewed [rows, C, 1]
+                // (a class outside [0, C), -1 for NaN, gathers 0).
+                using var classes = fused ? null : new DeviceFloatIds(backend, rows);
                 var result = DispatchDeferredGpuOp<T>(backend, rows, (int[])classIndices._shape.Clone(), output =>
-                    cuda.GatherClassValues(valuesBuffer.Buffer, classBuffer.Buffer, output, rows, numClasses));
+                {
+                    if (fused)
+                    {
+                        cuda!.GatherClassValues(valuesBuffer.Buffer, classBuffer.Buffer, output, rows, numClasses);
+                        return;
+                    }
+                    classes!.Normalize(classBuffer.Buffer);
+                    backend.TakeAlongDim(valuesBuffer.Buffer, classes.Normalized, output,
+                        outerSize: rows, axisOut: 1, innerSize: 1, axisIn: numClasses);
+                });
                 Autodiff.DifferentiableOps.RecordUnary("TensorGatherClassValues", result, values,
                     Autodiff.BackwardFunctions<T>.GatherClassValuesBackward, new object[] { classIndices, numClasses });
                 return result;
@@ -21004,14 +21025,34 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         int rows = numClasses > 0 ? (int)(total / numClasses) : 0;
         if (typeof(T) == typeof(float) && total > 0 && total <= int.MaxValue
             && gradOutput.Length == rows && classIndices.Length == rows
-            && TryGetBackend(out var backend) && backend is DirectGpu.CUDA.CudaBackend cuda && cuda.HasClassGatherKernels)
+            && TryGetBackend(out var backend))
         {
             try
             {
+                var cuda = backend as DirectGpu.CUDA.CudaBackend;
+                bool fused = cuda is not null && cuda.HasClassGatherKernels;
                 using var gradBuffer = GetOrAllocateBuffer(backend, gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous());
                 using var classBuffer = GetOrAllocateBuffer(backend, classIndices.IsContiguous ? classIndices : classIndices.Contiguous());
+                // Elsewhere: each row's gradient broadcast across its classes, then every class but the target set to
+                // zero (a masked fill, not a multiply by the one-hot, so an infinite gradient stays out of the others).
+                using var notTarget = fused ? default : AllocateOutputBuffer(backend, (int)total);
+                using var classes = fused ? null : new DeviceFloatIds(backend, rows);
+                var ones = fused ? null : GetCachedOnesBuffer(backend, numClasses);   // engine-owned: not disposed here
+                if (!fused && ones is null) return base.ScatterClassValuesGrad(gradOutput, classIndices, valuesShape);
                 return DispatchDeferredGpuOp<T>(backend, (int)total, (int[])valuesShape.Clone(), output =>
-                    cuda.ScatterClassGrad(gradBuffer.Buffer, classBuffer.Buffer, output, rows, numClasses));
+                {
+                    if (fused)
+                    {
+                        cuda!.ScatterClassGrad(gradBuffer.Buffer, classBuffer.Buffer, output, rows, numClasses);
+                        return;
+                    }
+                    classes!.Normalize(classBuffer.Buffer);
+                    backend.OneHotKernel(classes.Normalized, notTarget.Buffer, rows, numClasses);
+                    backend.Scale(notTarget.Buffer, notTarget.Buffer, -1f, (int)total);
+                    backend.AddScalar(notTarget.Buffer, notTarget.Buffer, 1f, (int)total);   // 1 where not the target
+                    backend.OuterProduct(gradBuffer.Buffer, ones!, output, rows, numClasses);
+                    backend.MaskedFillKernel(output, notTarget.Buffer, output, 0f, (int)total);
+                });
             }
             catch (Exception ex)
             {

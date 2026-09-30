@@ -1513,7 +1513,7 @@ kernel void round_kernel(
     uint gid [[thread_position_in_grid]])
 {
     if (gid < size) {
-        B[gid] = round(A[gid]);
+        B[gid] = rint(A[gid]);   // half to even, as the CPU and torch.round; round() rounds halves away from zero
     }
 }
 
