@@ -200,12 +200,12 @@ __kernel void parity211_qr_reduced(
         barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
 
         float norm = sScalar;
-        if (norm > 1e-30f) {
-            float invNorm = 1.0f / norm;
-            for (int i = tid; i < m; i += blockSize) Qb[i * k + j] *= invNorm;
-        } else {
-            for (int i = tid; i < m; i += blockSize) Qb[i * k + j] = 0.0f;
-        }
+        // A per-element select, not an if/else around the loops: POCL cannot form parallel regions for a branch
+        // that is followed by a barrier (Kernel.cc createParallelRegionBefore asserts and kills the process).
+        // Same values as the branch, including +0.0 (not -0.0) for a degenerate column and NaN norm -> 0.
+        const int keep = norm > 1e-30f;
+        float invNorm = keep ? 1.0f / norm : 0.0f;
+        for (int i = tid; i < m; i += blockSize) Qb[i * k + j] = keep ? Qb[i * k + j] * invNorm : 0.0f;
         barrier(CLK_GLOBAL_MEM_FENCE);
     }
 
