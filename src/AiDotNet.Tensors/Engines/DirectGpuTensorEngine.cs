@@ -17634,6 +17634,67 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     /// <summary>
+    /// Splits a shape around ONE contiguous block of reduced axes that has kept axes on both sides, the case
+    /// <see cref="TrySplitAroundKeptBlock"/> rejects: the tensor is [outer, reduced, inner] row-major. False otherwise.
+    /// </summary>
+    private static bool TrySplitAroundReducedBlock(int[] dims, int[] sortedAxes, out int outer, out int reduced, out int inner)
+    {
+        outer = reduced = inner = 1;
+        int rank = dims.Length;
+        if (sortedAxes.Length == 0) return false;
+        int first = sortedAxes[0], last = sortedAxes[^1];
+        if (first <= 0 || last >= rank - 1 || last - first + 1 != sortedAxes.Length) return false;
+        for (int i = 1; i < sortedAxes.Length; i++)
+            if (sortedAxes[i] != sortedAxes[i - 1] + 1) return false;
+        for (int i = 0; i < first; i++) outer = checked(outer * dims[i]);
+        for (int i = first; i <= last; i++) reduced = checked(reduced * dims[i]);
+        for (int i = last + 1; i < rank; i++) inner = checked(inner * dims[i]);
+        return true;
+    }
+
+    /// <summary>
+    /// Sums (or averages) a contiguous [outer, reduced, inner] tensor over its middle block: outer independent products
+    /// ones[1, reduced] x X_o[reduced, inner], one batched GEMM against the engine's cached ones buffer. The general path
+    /// permuted instead, and every backend's permute uploads its stride and axis tables on each call. Null when the axes
+    /// are not a single middle block or no ones buffer can be made (during a capture).
+    /// </summary>
+    private Tensor<T>? TryReduceAroundReducedBlock<T>(Tensor<T> input, int[] sortedAxes, bool keepDims,
+        IDirectGpuBackend backend, ReduceOperation op)
+    {
+        if (typeof(T) != typeof(float) || !input.IsContiguous || input.Length == 0) return null;
+        var dims = input.Shape._dims;
+        if (!TrySplitAroundReducedBlock(dims, sortedAxes, out int outer, out int reduced, out int inner)) return null;
+        var ones = GetCachedOnesBuffer(backend, checked(outer * reduced));
+        if (ones is null) return null;
+
+        var reducedAxes = new bool[dims.Length];
+        foreach (int axis in sortedAxes) reducedAxes[axis] = true;
+        int[] outputShape = keepDims
+            ? dims.Select((d, i) => reducedAxes[i] ? 1 : d).ToArray()
+            : dims.Where((_, i) => !reducedAxes[i]).ToArray();
+
+        using var inputBuffer = GetOrAllocateBuffer(backend, input);
+        int outputLength = outer * inner;
+        var output = AllocateOutputBuffer(backend, outputLength);
+        bool handedOff = false;
+        try
+        {
+            // outer batches of [1, reduced] x [reduced, inner] -> [1, inner]; the ones buffer holds outer * reduced ones,
+            // i.e. outer concatenated [1, reduced] rows.
+            backend.BatchedGemm(ones, inputBuffer.Buffer, output.Buffer, 1, inner, reduced, outer);
+            if (op == ReduceOperation.Mean)
+                backend.Scale(output.Buffer, output.Buffer, 1f / reduced, outputLength);
+            var result = DeferTensorResult<T>(backend, output.Buffer, outputLength, outputShape);
+            handedOff = true;
+            return result;
+        }
+        finally
+        {
+            if (!handedOff) output.Dispose();
+        }
+    }
+
+    /// <summary>
     /// The gradient of a sum (scale 1) or mean over a leading and/or trailing block of axes: gradOutput[K] broadcast to
     /// [L, K, R], times <paramref name="scale"/>. Two outer products against the cached ones vectors, so nothing is
     /// uploaded and the host tile path is not taken. Null when the axes are not that shape.
@@ -17660,7 +17721,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (inputShape.Length == 0) return null;
         var sorted = axes.Select(a => a < 0 ? a + inputShape.Length : a).OrderBy(a => a).ToArray();
         for (int i = 1; i < sorted.Length; i++) if (sorted[i] == sorted[i - 1]) return null;
-        if (!TrySplitAroundKeptBlock(inputShape, sorted, out int leading, out int kept, out int trailing)) return null;
+        if (!TrySplitAroundKeptBlock(inputShape, sorted, out int leading, out int kept, out int trailing))
+            return TryBroadcastAroundReducedBlock(gradOutput, inputShape, sorted, scale, backend);
         if (gradOutput.Length != kept) return null;
 
         var leadingOnes = leading > 1 ? GetCachedOnesBuffer(backend, leading) : null;
@@ -17697,6 +17759,30 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     /// <summary>
+    /// The gradient of a sum or mean over one middle block of axes: gradOutput[outer, inner] broadcast to
+    /// [outer, reduced, inner], times <paramref name="scale"/>. outer products ones[reduced, 1] x g_o[1, inner] in one
+    /// batched GEMM against the cached ones buffer, so nothing is uploaded and the host path is not taken.
+    /// </summary>
+    private Tensor<T>? TryBroadcastAroundReducedBlock<T>(Tensor<T> gradOutput, int[] inputShape, int[] sortedAxes,
+        float scale, IDirectGpuBackend backend)
+    {
+        if (!TrySplitAroundReducedBlock(inputShape, sortedAxes, out int outer, out int reduced, out int inner)) return null;
+        if (gradOutput.Length != outer * inner) return null;
+        var ones = GetCachedOnesBuffer(backend, checked(outer * reduced));
+        if (ones is null) return null;
+
+        int inputSize = outer * reduced * inner;
+        using var gradient = GetOrAllocateBuffer(backend, gradOutput);
+        return DispatchDeferredGpuOp<T>(backend, inputSize, (int[])inputShape.Clone(), output =>
+        {
+            // outer batches of [reduced, 1] x [1, inner] -> [reduced, inner].
+            backend.BatchedGemm(ones, gradient.Buffer, output, reduced, inner, 1, outer);
+            if (scale != 1f)
+                backend.Scale(output, output, scale, inputSize);
+        });
+    }
+
+    /// <summary>
     /// Internal GPU reduction implementation that handles arbitrary axes.
     /// </summary>
     private Tensor<T> ReduceAxisGpu<T>(Tensor<T> input, int[] normalizedAxes, bool keepDims,
@@ -17712,6 +17798,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             && !(normalizedAxes.Length == 1 && normalizedAxes[0] == inputRank - 1)
             && TryReduceAroundKeptBlock(input, normalizedAxes, keepDims, backend, op) is { } aroundKept)
             return aroundKept;
+        if (!ResidentStepActive && (op == ReduceOperation.Sum || op == ReduceOperation.Mean)
+            && TryReduceAroundReducedBlock(input, normalizedAxes, keepDims, backend, op) is { } aroundReduced)
+            return aroundReduced;
 
         // Compute output shape
         var outputShapeList = new List<int>();

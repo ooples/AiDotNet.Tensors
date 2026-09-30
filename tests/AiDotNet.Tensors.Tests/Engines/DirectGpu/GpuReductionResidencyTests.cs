@@ -94,11 +94,11 @@ public sealed class GpuReductionResidencyTests
                 tape.ComputeGradients(loss, new[] { x });
             }
 
-            bool middleAxis = axes.SequenceEqual(new[] { 1 });
-            if (!middleAxis)
-                Assert.True(scope.Uploads + scope.Downloads == 0,
-                    $"{op} over [{string.Join(",", axes)}] crossed the boundary: " +
-                    string.Join(", ", scope.Events.Select(e => $"{e.Kind} {e.Bytes} B {e.Operation}")));
+            // Every axis set, including the middle axis that goes through the general permutation path: a transfer or a
+            // CPU fallback there would still pass the value and gradient checks below.
+            Assert.True(scope.Uploads + scope.Downloads == 0,
+                $"{op} over [{string.Join(",", axes)}] crossed the boundary: " +
+                string.Join(", ", scope.Events.Select(e => $"{e.Kind} {e.Bytes} B {e.Operation}")));
 
             var gpuRun = Run(gpu, x, op, axes, keepDims);
             Assert.Equal(cpu.OutShape, gpuRun.OutShape);
