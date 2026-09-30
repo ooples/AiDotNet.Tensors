@@ -533,18 +533,15 @@ namespace AiDotNet.Tensors.Engines.Simd
         {
             int i = 0;
 #if NET5_0_OR_GREATER
-            // CPU-adaptive dispatch:
-            // Intel (fast gather): use table-driven sigmoid (no exp, no divide)
-            // AMD (slow gather): use polynomial FastSigmoid256 (exp + divide)
-            if (CpuFeatures.HasFastGather && Avx2.IsSupported && Fma.IsSupported && length >= 8)
-            {
-                TableDrivenSigmoid.SigmoidArray(input, output, length);
-                return;
-            }
-
+            // One kernel on every CPU vendor. An Intel-only table-driven path (chosen when the CPU
+            // reported fast gathers) used to run here: accurate to ~2e-6, but numerically DIFFERENT
+            // from this polynomial, so the same model trained differently on Intel and AMD. On
+            // RepViT-SAM that difference alone decided whether ten AdamW steps landed inside or after
+            // the first-step transient (loss 41 -> 2847 -> recovered only at step 14 on Intel; smooth
+            // to 0.24 on AMD). Identical inputs now give identical sigmoid bits on either vendor.
             if (Avx2.IsSupported && Fma.IsSupported && length >= 32)
             {
-                // 4x unrolled FastSigmoid256: optimal for AMD Zen (polynomial path)
+                // 4x unrolled FastSigmoid256 (polynomial exp + divide).
                 int simdLength = length & ~31;
                 for (; i < simdLength; i += 32)
                 {

@@ -23,7 +23,7 @@ internal enum CpuSigmoidKernelKind : byte
 /// The runtime JIT kernel is specialized for a multiple-of-eight length. The scalar tail remains
 /// part of this value's invocation contract, so callers cannot accidentally select the fast path
 /// and leave elements unwritten. On platforms where runtime code generation is unavailable, the
-/// adaptive SIMD path retains its Intel table / AMD Padé dispatch.
+/// adaptive SIMD path runs the same polynomial kernel on every CPU vendor.
 /// </remarks>
 internal readonly struct CpuSigmoidKernel
 {
