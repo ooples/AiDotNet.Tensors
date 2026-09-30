@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.133.2](https://github.com/ooples/AiDotNet.Tensors/compare/v0.133.1...v0.133.2) (2026-09-30)
+
+
+### Bug Fixes
+
+* **compile:** BatchNorm's running-statistics update uses the current step's batch statistics ([#1068](https://github.com/ooples/AiDotNet.Tensors/issues/1068)) ([2fe8826](https://github.com/ooples/AiDotNet.Tensors/commit/2fe88262f1de3d1339df789a3bd9ce4de5efd016))
+* **gpu:** disposing a view no longer unbinds the device copy other views share ([#1072](https://github.com/ooples/AiDotNet.Tensors/issues/1072)) ([e907b5a](https://github.com/ooples/AiDotNet.Tensors/commit/e907b5a49fa6ef882a434a23a83e635432076c3a))
+* **gpu:** L2 on the resident step, view residency and tape release after device-owned storage ([#1070](https://github.com/ooples/AiDotNet.Tensors/issues/1070)) ([d624085](https://github.com/ooples/AiDotNet.Tensors/commit/d624085ba3eaa24acb6e634766ac50a00d1660a0))
+* **opencl:** revive the pocl gpu-parity job and cover the device training paths ([#1073](https://github.com/ooples/AiDotNet.Tensors/issues/1073)) ([7b2363d](https://github.com/ooples/AiDotNet.Tensors/commit/7b2363d3a5d90de6d4eb7eba09f9c5614b404978))
+* **simd:** one sigmoid on every CPU vendor, and saturate infinities in the Padé kernel ([#1069](https://github.com/ooples/AiDotNet.Tensors/issues/1069)) ([c1827e6](https://github.com/ooples/AiDotNet.Tensors/commit/c1827e61f739b82a3aeb7a2bae529e8191bd9372))
+
+
+### Performance
+
+* **gpu:** device-resident training steps on every GPU backend, plus Vulkan shader and op fixes ([#1067](https://github.com/ooples/AiDotNet.Tensors/issues/1067)) ([010b9e5](https://github.com/ooples/AiDotNet.Tensors/commit/010b9e5bd643cf50c8d511f897c753b7c1f0edaa))
+
 ## [0.133.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.133.0...v0.133.1) (2026-09-29)
 
 
