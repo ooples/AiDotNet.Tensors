@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Threading;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Compilation;
@@ -973,6 +973,19 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// _data array may be empty/stale until explicitly synchronized.
     /// This is the PyTorch-equivalent of tensor.data_ptr() on a CUDA tensor.
     /// </summary>
+    /// <summary>
+    /// The whole data vector's shared device buffer (what a whole-vector view's <c>_gpuBuffer</c> resolves to), or null.
+    /// A strided or offset view keeps its own slot, so this is how it finds the device copy of the data it views.
+    /// Plain float-encoded buffers only (not split-complex planes or raw int32).
+    /// </summary>
+    internal Engines.DirectGpu.IGpuBuffer? VectorDeviceBuffer
+        => _data?._deviceState is { Buffer: { } buffer } state && !state.IsSplitComplex && !state.ContainsRawInt32 ? buffer : null;
+
+    internal Engines.DirectGpu.IDirectGpuBackend? VectorDeviceBackend => _data?._deviceState?.Backend;
+
+    /// <summary>Whether the data vector's shared device copy is current (no host write since it was produced).</summary>
+    internal bool VectorDeviceValid => _data?._deviceState is { DeviceValid: true };
+
     internal Engines.DirectGpu.IGpuBuffer? _gpuBuffer
     {
         get => CoversWholeVector ? _data._deviceState?.Buffer : _viewGpuBuffer;
@@ -1383,8 +1396,11 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         _storage.IncrementGpuCacheVersionIfTracked();
         // A host-side mutation leaves the shared device copy stale, for every view of this vector. (Under inference
         // mode the version does not advance, which used to leave a stale device copy looking current.)
-        if (CoversWholeVector) { if (_data._deviceState is { } shared) shared.DeviceValid = false; }
-        else _viewGpuBufferVersion = -1;
+        // Every view writes into the SAME data vector, so a write through an offset or strided view leaves the shared
+        // device copy stale too: invalidating only the view's own slot let the whole tensor and every other view keep
+        // reading the pre-write device data. A partial view also drops its own contiguous copy.
+        if (_data._deviceState is { } shared) shared.DeviceValid = false;
+        if (!CoversWholeVector) _viewGpuBufferVersion = -1;
         if (Engines.Autodiff.InferenceModeFlag.IsActive)
         {
             // Inference mode: in-place mutation is legal and the
