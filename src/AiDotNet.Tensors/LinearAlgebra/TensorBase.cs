@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Threading;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Compilation;
@@ -983,6 +983,9 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
 
     internal Engines.DirectGpu.IDirectGpuBackend? VectorDeviceBackend => _data?._deviceState?.Backend;
 
+    /// <summary>Whether the data vector's shared device copy is current (no host write since it was produced).</summary>
+    internal bool VectorDeviceValid => _data?._deviceState is { DeviceValid: true };
+
     internal Engines.DirectGpu.IGpuBuffer? _gpuBuffer
     {
         get => CoversWholeVector ? _data._deviceState?.Buffer : _viewGpuBuffer;
@@ -1393,8 +1396,11 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         _storage.IncrementGpuCacheVersionIfTracked();
         // A host-side mutation leaves the shared device copy stale, for every view of this vector. (Under inference
         // mode the version does not advance, which used to leave a stale device copy looking current.)
-        if (CoversWholeVector) { if (_data._deviceState is { } shared) shared.DeviceValid = false; }
-        else _viewGpuBufferVersion = -1;
+        // Every view writes into the SAME data vector, so a write through an offset or strided view leaves the shared
+        // device copy stale too: invalidating only the view's own slot let the whole tensor and every other view keep
+        // reading the pre-write device data. A partial view also drops its own contiguous copy.
+        if (_data._deviceState is { } shared) shared.DeviceValid = false;
+        if (!CoversWholeVector) _viewGpuBufferVersion = -1;
         if (Engines.Autodiff.InferenceModeFlag.IsActive)
         {
             // Inference mode: in-place mutation is legal and the

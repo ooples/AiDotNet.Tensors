@@ -1589,7 +1589,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return candidate.Buffer;
         }
         if (!pending) return null;
-        return view.VectorDeviceBuffer is { } shared && shared.Handle != IntPtr.Zero && ReferenceEquals(view.VectorDeviceBackend, backend)
+        // Pending and on this backend is not enough: the shared copy must also still be current, or a host write made
+        // since it was produced would be read back from the stale device data.
+        return view.VectorDeviceBuffer is { } shared && shared.Handle != IntPtr.Zero && view.VectorDeviceValid
+            && ReferenceEquals(view.VectorDeviceBackend, backend)
             ? shared
             : null;
     }
@@ -2509,8 +2512,22 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             Target = new WeakReference(tensor),
             Release = static (target, protect) => ReleaseTapeOwnedResult((Tensor<T>)target, protect),
         };
-        lock (_tapeOwnedResults) _tapeOwnedResults.Add(record);
+        lock (_tapeOwnedResults)
+        {
+            // Only a Release-mode eviction drains this log, so a tape that never releases (MaterializeThenFree,
+            // DropScratch, or no eviction) would grow it without bound. Drop collected targets whenever it doubles:
+            // amortized O(1) per record, and nothing still alive is dropped.
+            if (_tapeOwnedResults.Count >= _tapeOwnedPruneAt)
+            {
+                _tapeOwnedResults.RemoveAll(static r => !r.Target.IsAlive);
+                _tapeOwnedPruneAt = Math.Max(TapeOwnedPruneFloor, _tapeOwnedResults.Count * 2);
+            }
+            _tapeOwnedResults.Add(record);
+        }
     }
+
+    private const int TapeOwnedPruneFloor = 1024;
+    private int _tapeOwnedPruneAt = TapeOwnedPruneFloor;
 
     /// <summary>
     /// Releases a dead tape intermediate that owns its buffer: marks its pending host copy released (a host read
