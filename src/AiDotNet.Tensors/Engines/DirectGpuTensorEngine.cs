@@ -1594,7 +1594,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 break;
             }
         }
-        if (entry is null) return false;   // host copy current, or not cached: the host path handles it
+        // Device-owned storage: a view of a device result shares its vector's device buffer (a strided view has no
+        // binding of its own). Use it while it holds the vector's current values.
+        IGpuBuffer? source = entry?.Buffer;
+        if (source is null && view.DataVector._deviceState is { Buffer: { } shared, DeviceValid: true } state
+            && ReferenceEquals(state.Backend, backend) && !state.IsSplitComplex && !state.ContainsRawInt32)
+            source = shared;
+        if (source is null) return false;   // host copy current, or not on the device: the host path handles it
 
         // Base axis order = view axes by descending stride; the view is a pure permutation iff those strides are the
         // row-major strides of the reordered shape (size-1 axes may carry any stride).
@@ -1610,14 +1616,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             baseShape[k] = dims[axis];
             expected *= dims[axis];
         }
-        if (expected != view.Length || entry.Buffer.Size < view.Length) return false;
+        if (expected != view.Length || source.Size < view.Length) return false;
         var permutation = new int[rank];
         for (int k = 0; k < rank; k++) permutation[order[k]] = k;   // output axis j reads base axis permutation[j]
 
         var output = AllocateOutputBuffer(backend, view.Length);
         try
         {
-            backend.Permute(entry.Buffer, output.Buffer, baseShape, permutation);
+            backend.Permute(source, output.Buffer, baseShape, permutation);
         }
         catch (Exception ex)
         {
