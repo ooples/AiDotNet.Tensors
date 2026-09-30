@@ -3605,12 +3605,21 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         // Release any zero-copy mmap mapping before tearing down storage.
         DisposeStreamingMmapOwner();
         StreamingInt8 = null;
+        // A whole-vector tensor's device binding is SHARED with every other tensor over the same storage (#1066's
+        // device-owned storage). Disposing one of them - a reshape view dropped mid-computation - cleared that shared
+        // binding and every surviving view lost its device copy: their next GPU use downloaded the data it was about
+        // to upload again (measured in AbcScanGpuParityTests: every view of a deferred result took a host round trip).
+        // Only the last reference tears the shared binding down; a tensor's own (strided/offset) binding is its own.
+        bool sharedWithLiveTensors = CoversWholeVector && _storage.RefCount > 1;
         _storage.Release();
-        if (_ownsGpuBuffer && _gpuBuffer is IDisposable disposableBuffer)
+        if (!sharedWithLiveTensors)
         {
-            disposableBuffer.Dispose();
+            if (_ownsGpuBuffer && _gpuBuffer is IDisposable disposableBuffer)
+            {
+                disposableBuffer.Dispose();
+            }
+            _gpuBuffer = null;
         }
-        _gpuBuffer = null;
         GC.SuppressFinalize(this);
     }
 }
