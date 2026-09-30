@@ -280,14 +280,14 @@ void main() {
     positions[positionIndex + 2] = 0.0; directions[positionIndex] = 0.0;
     directions[positionIndex + 1] = 0.0; directions[positionIndex + 2] = 0.0;
     validMask[sampleIndex] = 0.0; tValues[sampleIndex] = 0.0;
-    int ray = sampleIndex / maxSamples, sample = sampleIndex - ray * maxSamples;
+    int ray = sampleIndex / maxSamples, sampleValue = sampleIndex - ray * maxSamples;
     float ox = rayOrigins[ray * 3], oy = rayOrigins[ray * 3 + 1], oz = rayOrigins[ray * 3 + 2];
     float dx = rayDirections[ray * 3], dy = rayDirections[ray * 3 + 1], dz = rayDirections[ray * 3 + 2];
     float tMin = nearBound, tMax = farBound;
     if (!sample_ray_axis(ox, dx, minX, maxX, tMin, tMax) ||
         !sample_ray_axis(oy, dy, minY, maxY, tMin, tMax) ||
         !sample_ray_axis(oz, dz, minZ, maxZ, tMin, tMax) || tMax < tMin) return;
-    float t = tMin + ((tMax - tMin) / float(maxSamples)) * (float(sample) + 0.5);
+    float t = tMin + ((tMax - tMin) / float(maxSamples)) * (float(sampleValue) + 0.5);
     float px = ox + t * dx, py = oy + t * dy, pz = oz + t * dz;
     float nx = clamp((px - minX) / max(1.0e-10, maxX - minX), 0.0, 0.999999);
     float ny = clamp((py - minY) / max(1.0e-10, maxY - minY), 0.0, 0.999999);
@@ -574,11 +574,11 @@ void main() {
     int total = numRays * numFine;
     if (gid >= total) return;
     int ray = gid / numFine;
-    int sample = gid - ray * numFine;
+    int sampleValue = gid - ray * numFine;
     int base = ray * numCoarse;
     uint bits = importance_hash(seed ^ (uint(gid) * 747796405u + 2891336453u));
     float random = float(bits >> 8) * (1.0 / 16777216.0);
-    float u = (float(sample) + random) / float(numFine);
+    float u = (float(sampleValue) + random) / float(numFine);
     float weightSum = 0.0;
     for (int s = 0; s < numCoarse; s++) {
         float weight = weights[base + s];

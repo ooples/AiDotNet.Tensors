@@ -350,15 +350,15 @@ public sealed partial class VulkanBackend
     public void DiagKernel(IGpuBuffer i, IGpuBuffer o, int n) => GlslUnaryOp(VulkanGlslKernels.DiagKernelGlsl, i, o, n * n, sizeof(uint));
     public void ExtractDiagKernel(IGpuBuffer i, IGpuBuffer o, int n, int cols) => GlslUnaryOp(VulkanGlslKernels.ExtractDiagKernelGlsl, i, o, n, 2 * sizeof(uint));
     public void TriangularMask(IGpuBuffer o, int rows, int cols, int diag, float mv) => GlslGenerateOp(VulkanGlslKernels.TriangularMaskGlsl, o, rows * cols, 2 * sizeof(uint) + sizeof(int) + sizeof(float));
-    public void MaskedFillKernel(IGpuBuffer i, IGpuBuffer m, IGpuBuffer o, float fv, int sz) => GlslBinaryOp(VulkanGlslKernels.MaskedFillKernel, i, m, o, sz, sizeof(float) + sizeof(uint));
-    public void IndexSelect(IGpuBuffer i, IGpuBuffer idx, IGpuBuffer o, int ni, int isz) => GlslBinaryOp(VulkanGlslKernels.IndexSelectGlsl, i, idx, o, ni * isz, 2 * sizeof(uint));
+    public void MaskedFillKernel(IGpuBuffer i, IGpuBuffer m, IGpuBuffer o, float fv, int sz) => GlslBinaryOp(VulkanGlslKernels.MaskedFillKernel, i, m, o, sz, new uint[] { FloatBits(fv), (uint)sz }, sizeof(float) + sizeof(uint));
+    public void IndexSelect(IGpuBuffer i, IGpuBuffer idx, IGpuBuffer o, int ni, int isz) => GlslBinaryOp(VulkanGlslKernels.IndexSelectGlsl, i, idx, o, ni * isz, new uint[] { (uint)ni, (uint)isz }, 2 * sizeof(uint));
 
     #endregion
 
     #region Fused Loss + Noise
 
-    public void CrossEntropyLoss(IGpuBuffer p, IGpuBuffer t, IGpuBuffer l, int bs, int nc) => GlslBinaryOp(VulkanGlslKernels.CrossEntropyLossGlsl, p, t, l, bs, 2 * sizeof(uint));
-    public void MseLoss(IGpuBuffer p, IGpuBuffer t, IGpuBuffer l, int bs, int nf) => GlslBinaryOp(VulkanGlslKernels.MseLossGlsl, p, t, l, bs, 2 * sizeof(uint));
+    public void CrossEntropyLoss(IGpuBuffer p, IGpuBuffer t, IGpuBuffer l, int bs, int nc) => GlslBinaryOp(VulkanGlslKernels.CrossEntropyLossGlsl, p, t, l, bs, new uint[] { (uint)bs, (uint)nc }, 2 * sizeof(uint));
+    public void MseLoss(IGpuBuffer p, IGpuBuffer t, IGpuBuffer l, int bs, int nf) => GlslBinaryOp(VulkanGlslKernels.MseLossGlsl, p, t, l, bs, new uint[] { (uint)bs, (uint)nf }, 2 * sizeof(uint));
     public void BceLoss(IGpuBuffer p, IGpuBuffer t, IGpuBuffer l, int sz) => GlslBinaryOp(VulkanGlslKernels.BceLossGlsl, p, t, l, sz, sizeof(uint));
     public void DropoutMask(IGpuBuffer m, int sz, float kp, ulong seed) => GlslGenerateOp(
         VulkanGlslKernels.DropoutMaskGlsl, m, sz,
@@ -381,7 +381,7 @@ public sealed partial class VulkanBackend
     public void Sparsemax(IGpuBuffer i, IGpuBuffer o, int os, int isz) => GlslUnaryOp(VulkanGlslKernels.SparsemaxGlsl, i, o, os, 2 * sizeof(uint));
     public void TaylorSoftmax(IGpuBuffer i, IGpuBuffer o, int os, int isz) => GlslUnaryOp(VulkanGlslKernels.TaylorSoftmaxGlsl, i, o, os, 2 * sizeof(uint));
     public void SphericalSoftmax(IGpuBuffer i, IGpuBuffer o, int os, int isz) => GlslUnaryOp(VulkanGlslKernels.SphericalSoftmaxGlsl, i, o, os, 2 * sizeof(uint));
-    public void BatchDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int bs, int dim) => GlslBinaryOp(VulkanGlslKernels.BatchDotProductGlsl, a, b, o, bs, 2 * sizeof(uint));
+    public void BatchDotProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int bs, int dim) => GlslBinaryOp(VulkanGlslKernels.BatchDotProductGlsl, a, b, o, bs, new uint[] { (uint)bs, (uint)dim }, 2 * sizeof(uint));
     public void OuterProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int M, int N) => GlslBinaryOp(VulkanGlslKernels.OuterProduct, a, b, o, M * N, 2 * sizeof(uint));
     public void BatchOuterProduct(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int bs, int M, int N) => GlslBinaryOp(VulkanGlslKernels.BatchOuterProductGlsl, a, b, o, bs * M * N, 3 * sizeof(uint));
     public void CosineSimilarity(IGpuBuffer a, IGpuBuffer b, IGpuBuffer o, int bs, int dim)

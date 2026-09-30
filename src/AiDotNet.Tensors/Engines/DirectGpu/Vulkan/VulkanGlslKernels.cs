@@ -16,6 +16,12 @@ layout(set = 0, binding = 0) readonly buffer A { float a[]; };
 layout(set = 0, binding = 1) writeonly buffer B { float b[]; };
 ";
 
+    // Two buffers where the kernel also reads what it writes (an in-place sort in the output).
+    private const string ReadWriteTwoBufferLayout = @"
+layout(set = 0, binding = 0) readonly buffer A { float a[]; };
+layout(set = 0, binding = 1) buffer B { float b[]; };
+";
+
     private const string ThreeBufferLayout = @"
 layout(set = 0, binding = 0) readonly buffer A { float a[]; };
 layout(set = 0, binding = 1) readonly buffer B { float bdata[]; };
@@ -555,6 +561,7 @@ float gradAttention(uint batchIndex, uint queryHead, uint queryIndex, uint keyIn
     return sum;
 }
 float gradScore(uint batchIndex, uint queryHead, uint queryIndex, uint keyIndex, uint kvHead) {
+    uint qPos = queryIndex + (seqK - seqQ);   // as the forward: the query position among the keys
     if (causal != 0u && keyIndex > qPos) return 0.0;
     uint weightOffset = ((batchIndex * queryHeads + queryHead) * seqQ + queryIndex) * seqK;
     float dot = 0.0;
@@ -1888,8 +1895,8 @@ void main() {
     private const string PhiloxPrng = @"
 // Philox 2x32 round function
 uvec2 philox2x32_round(uvec2 ctr, uint key) {
-    uint hi = uint((uint64_t(ctr.x) * uint64_t(0xD256D193u)) >> 32);
-    uint lo = ctr.x * 0xD256D193u;
+    uint hi, lo;
+    umulExtended(ctr.x, 0xD256D193u, hi, lo);   // both halves of the 64-bit product, without the int64 extension
     return uvec2(hi ^ key ^ ctr.y, lo);
 }
 // Philox 2x32-10: 10 rounds for full period
@@ -1932,7 +1939,7 @@ void main() {
     b[idx] = mean + stddev * z;
 }";
 
-    public static string GumbelSoftmaxGlsl => Header + TwoBufferLayout + @"
+    public static string GumbelSoftmaxGlsl => Header + ReadWriteTwoBufferLayout + @"
 layout(push_constant) uniform Params { uint outerSize; uint innerSize; float temperature; uint seedLo; uint seedHi; };
 " + PhiloxPrng + @"
 void main() {
@@ -2007,12 +2014,11 @@ void main() {
     b[offset + selected] = 1.0;
 }";
 
-    public static string SparsemaxGlsl => Header + TwoBufferLayout + @"
+    public static string SparsemaxGlsl => Header + ReadWriteTwoBufferLayout + @"
 layout(push_constant) uniform Params { uint outerSize; uint innerSize; };
 void main() {
     uint row = gl_GlobalInvocationID.x;
     if (row >= outerSize) return;
-    if (innerSize > 256) return; // Safety: skip rows with too many classes
     uint base_idx = row * innerSize;
 
     // Copy to output and sort in-place (each thread owns its row — no shared memory race)
@@ -2213,8 +2219,8 @@ void main() {
     uint idx = gl_GlobalInvocationID.x;
     uint total = batch * channels * outLength;
     if (idx >= total) return;
-    uint o = idx % outLength; uint ch = (idx / outLength) % channels; uint b = idx / (outLength * channels);
-    uint inOff = (b * channels + ch) * inLength;
+    uint o = idx % outLength; uint ch = (idx / outLength) % channels; uint batchIndex = idx / (outLength * channels);
+    uint inOff = (batchIndex * channels + ch) * inLength;
     float sum = 0.0; uint cnt = 0;
     for (uint k = 0; k < kernelSize; k++) { uint pos = o * stride + k; if (pos < inLength) { sum += a[inOff + pos]; cnt++; } }
     b[idx] = cnt > 0 ? sum / float(cnt) : 0.0;
@@ -2226,8 +2232,8 @@ void main() {
     uint idx = gl_GlobalInvocationID.x;
     uint total = batch * channels * outLength;
     if (idx >= total) return;
-    uint o = idx % outLength; uint ch = (idx / outLength) % channels; uint b = idx / (outLength * channels);
-    uint inOff = (b * channels + ch) * inLength;
+    uint o = idx % outLength; uint ch = (idx / outLength) % channels; uint batchIndex = idx / (outLength * channels);
+    uint inOff = (batchIndex * channels + ch) * inLength;
     float maxVal = -3.402823466e+38;
     for (uint k = 0; k < kernelSize; k++) { uint pos = o * stride + k; if (pos < inLength) maxVal = max(maxVal, a[inOff + pos]); }
     b[idx] = maxVal;
@@ -2239,13 +2245,13 @@ void main() {
     uint idx = gl_GlobalInvocationID.x;
     uint total = batch * channels * outH * outW;
     if (idx >= total) return;
-    uint ow = idx % outW; uint oh = (idx / outW) % outH; uint ch = (idx / (outW * outH)) % channels; uint b = idx / (outW * outH * channels);
+    uint ow = idx % outW; uint oh = (idx / outW) % outH; uint ch = (idx / (outW * outH)) % channels; uint batchIndex = idx / (outW * outH * channels);
     float h_ratio = (outH > 1) ? float(inH - 1) / float(outH - 1) : 0.0;
     float w_ratio = (outW > 1) ? float(inW - 1) / float(outW - 1) : 0.0;
     float h_in = float(oh) * h_ratio; float w_in = float(ow) * w_ratio;
     uint h0 = uint(h_in); uint h1 = min(h0 + 1, inH - 1); uint w0 = uint(w_in); uint w1 = min(w0 + 1, inW - 1);
     float hd = h_in - float(h0); float wd = w_in - float(w0);
-    uint base_idx = (b * channels + ch) * inH * inW;
+    uint base_idx = (batchIndex * channels + ch) * inH * inW;
     b[idx] = (1-hd)*(1-wd)*a[base_idx+h0*inW+w0] + (1-hd)*wd*a[base_idx+h0*inW+w1] + hd*(1-wd)*a[base_idx+h1*inW+w0] + hd*wd*a[base_idx+h1*inW+w1];
 }";
 

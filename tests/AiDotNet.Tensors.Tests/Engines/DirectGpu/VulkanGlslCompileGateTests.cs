@@ -29,7 +29,7 @@ public sealed class VulkanGlslCompileGateTests
         foreach (var (name, source) in ShippedShaders())
         {
             if (compiler.CompileToSpirv(source) is null)
-                failures.Add($"{name}: {compiler.LastError}");
+                failures.Add($"{name}: {compiler.LastError}{QuoteFirstErrorLine(source, compiler.LastError)}");
             else
                 compiled++;
         }
@@ -62,6 +62,16 @@ public sealed class VulkanGlslCompileGateTests
         => text.TrimStart().StartsWith(VersionDirective, StringComparison.Ordinal) && text.Contains(EntryPoint);
 
     private const string EntryPoint = "void main";
+
+    // The source line the compiler's first "kernel.comp:N:" error names, so a failure can be fixed from the report.
+    private static string QuoteFirstErrorLine(string source, string? error)
+    {
+        var match = System.Text.RegularExpressions.Regex.Match(error ?? string.Empty, @"kernel\.comp:(\d+):");
+        if (!match.Success) return string.Empty;
+        var lines = source.Split('\n');
+        int line = int.Parse(match.Groups[1].Value, System.Globalization.CultureInfo.InvariantCulture);
+        return line >= 1 && line <= lines.Length ? $"    >> {lines[line - 1].Trim()}" : string.Empty;
+    }
 
     private static object? ReadOrNull(Func<object?> read)
     {
