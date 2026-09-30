@@ -1599,10 +1599,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     /// <summary>A contiguous slice (nonzero offset) of device-only data: copy the range on the device.</summary>
     private bool TrySliceViewOnDevice<T>(IDirectGpuBackend backend, Tensor<T> view, out OwnedBuffer result)
+        => TrySliceViewOnDevice(backend, view, DeviceAuthoritativeViewBase(backend, view), out result);
+
+    /// <summary>As above, from an explicit <paramref name="baseBuffer"/> holding the viewed STORAGE in storage order.</summary>
+    private bool TrySliceViewOnDevice<T>(IDirectGpuBackend backend, Tensor<T> view, IGpuBuffer? baseBuffer, out OwnedBuffer result)
     {
         result = default;
         if (typeof(T) != typeof(float) || !view.IsContiguous || view._storageOffset == 0) return false;
-        var baseBuffer = DeviceAuthoritativeViewBase(backend, view);
         if (baseBuffer is null || baseBuffer.Size < (long)view._storageOffset + view.Length) return false;
         var output = AllocateOutputBuffer(backend, view.Length);
         try
@@ -1620,6 +1623,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     private bool TryPermuteViewOnDevice<T>(IDirectGpuBackend backend, Tensor<T> view, out OwnedBuffer result)
+        => TryPermuteViewOnDevice(backend, view, null, lookUpBase: true, out result);
+
+    /// <summary>As above, from an explicit <paramref name="baseBuffer"/> holding the viewed STORAGE in storage order.</summary>
+    private bool TryPermuteViewOnDevice<T>(IDirectGpuBackend backend, Tensor<T> view, IGpuBuffer? baseBuffer, bool lookUpBase, out OwnedBuffer result)
     {
         result = default;
         if (typeof(T) != typeof(float) || view._storageOffset != 0) return false;
@@ -1627,7 +1634,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var dims = view._shape;
         var strides = view._strides;
         if (rank < 2 || strides is null || strides.Length != rank) return false;
-        var baseBuffer = DeviceAuthoritativeViewBase(backend, view);
+        if (lookUpBase) baseBuffer = DeviceAuthoritativeViewBase(backend, view);
         if (baseBuffer is null) return false;   // host copy current, or no device copy: the host path handles it
 
         // Base axis order = view axes by descending stride; the view is a pure permutation iff those strides are the
@@ -23309,14 +23316,46 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private void CarryResidentBufferToView<T>(Tensor<T> source, Tensor<T> view, IGpuBuffer resident, IDirectGpuBackend backend)
     {
         var viewArray = view.GetBackingArrayForCacheLookupUnsafe();
-        if (viewArray is not null && ReferenceEquals(viewArray, source.GetBackingArrayForCacheLookupUnsafe()))
+        // Shared storage (the same backing array, or the same lazily allocated data vector): alias the buffer.
+        if ((viewArray is not null && ReferenceEquals(viewArray, source.GetBackingArrayForCacheLookupUnsafe()))
+            || ReferenceEquals(view.DataVector, source.DataVector))
         {
             view._gpuBuffer = resident;
             view._gpuBackend = backend;
             view._gpuBufferVersion = view.GpuCacheVersion;
             return;
         }
-        BindResidentBuffer(view, resident, backend);
+        // The view does not share the source's storage: the base op copied the source into it in the VIEW's element
+        // order. `resident` is owned by the source's cache entry and, for a strided or offset source, is its BASE
+        // buffer (another order, another range), so aliasing it gave the view wrong data on the device and a pending
+        // download that read a buffer the source's eviction frees. Give the view a correctly laid-out buffer it owns
+        // under its own cache key, or carry nothing (the host path is correct).
+        OwnedBuffer laid;
+        // The resident buffer is in the view's order when the source's storage order IS its view order, or when it is the
+        // source's own contiguous copy (a strided view's slot). Otherwise it holds the source's STORAGE, in storage order.
+        bool viewOrdered = (source.IsContiguous && source._storageOffset == 0)
+            || (!ReferenceEquals(source._gpuBuffer, null) && ReferenceEquals(source._gpuBuffer, resident) && !ReferenceEquals(resident, source.VectorDeviceBuffer));
+        if (viewOrdered && resident.Size >= view.Length)
+        {
+            laid = AllocateOutputBuffer(backend, view.Length);
+            try { backend.Copy(resident, laid.Buffer, view.Length); }
+            catch (Exception ex)
+            {
+                laid.Dispose();
+                GpuLaunchProbe.OnFallback("CarryResidentBufferToView", ex);
+                return;
+            }
+        }
+        else if (viewOrdered
+            || (!TrySliceViewOnDevice(backend, source, resident, out laid)
+                && !TryPermuteViewOnDevice(backend, source, resident, lookUpBase: false, out laid)))
+        {
+            return;
+        }
+        object key = (object?)viewArray ?? view.DataVector;
+        CacheActivation(key, laid.Buffer, view._shape, backend, hostVersion: view.GpuCacheVersion);
+        laid.RelinquishOwnership();   // the cache entry now owns it
+        BindResidentBuffer(view, laid.Buffer, backend);
     }
 
     public override Tensor<T> Reshape<T>(Tensor<T> tensor, int[] newShape)
