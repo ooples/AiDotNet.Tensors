@@ -56,7 +56,9 @@ inline float safe_divide(float a, float b) {
 }
 
 inline float clamp_value(float x, float min_val, float max_val) {
-    return isnan(x) ? x : max(min_val, min(max_val, x));   // torch.clamp propagates NaN
+    // torch.clamp propagates NaN. Tested on the bits (magnitude above the +Inf pattern 0x7f800000): the default fast
+    // math folds isnan() away.
+    return ((as_type<uint>(x) & 0x7fffffffu) > 0x7f800000u) ? x : max(min_val, min(max_val, x));
 }
 ";
 
