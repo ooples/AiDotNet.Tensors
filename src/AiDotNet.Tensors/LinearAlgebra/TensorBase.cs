@@ -3605,12 +3605,20 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         // Release any zero-copy mmap mapping before tearing down storage.
         DisposeStreamingMmapOwner();
         StreamingInt8 = null;
+        // A tensor covering its whole vector shares the vector's device state with every other view of it (a reshape
+        // of this result, say). While another view still holds the storage, disposing this one must leave that state
+        // alone: clearing it left the surviving view with no device buffer and a pending download, so its next device
+        // use read the data back to the host and uploaded it again. The buffer is freed with the last reference.
+        bool sharedDeviceStateOutlivesThis = CoversWholeVector && _storage.RefCount > 1;
         _storage.Release();
-        if (_ownsGpuBuffer && _gpuBuffer is IDisposable disposableBuffer)
+        if (!sharedDeviceStateOutlivesThis)
         {
-            disposableBuffer.Dispose();
+            if (_ownsGpuBuffer && _gpuBuffer is IDisposable disposableBuffer)
+            {
+                disposableBuffer.Dispose();
+            }
+            _gpuBuffer = null;
         }
-        _gpuBuffer = null;
         GC.SuppressFinalize(this);
     }
 }
