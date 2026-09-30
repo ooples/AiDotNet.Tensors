@@ -614,7 +614,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (GetBackend() is not Engines.DirectGpu.CUDA.CudaBackend cb) return null;
         var buf = t._gpuBuffer;
         if (buf is null || !ReferenceEquals(t._gpuBackend, cb) || buf.Handle == System.IntPtr.Zero) return null;
-        return cb.DownloadBuffer(buf);
+        // Only the tensor's own elements: a pooled buffer can be larger than the tensor (the 1-element loss was
+        // measured riding a 256-float buffer), and downloading all of it moved that whole buffer every step.
+        int count = System.Math.Min(t.Length, buf.Size);
+        var bytes = cb.DownloadByteBuffer(buf, checked(count * sizeof(float)));
+        var values = new float[count];
+        System.Buffer.BlockCopy(bytes, 0, values, 0, bytes.Length);
+        return values;
     }
 
     // #1650 — STABLE captured-graph output. The forward's own output buffer is a graph-internal cuMemAllocAsync
@@ -1563,6 +1569,53 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// TensorPermute / Transpose return) into a fresh device buffer with the backend's Permute kernel, when the
     /// base's only current copy is a cached device buffer. Returns false for anything else (the host path handles it).
     /// </summary>
+    /// <summary>
+    /// The device buffer holding the data <paramref name="view"/> views, when the DEVICE copy is the authoritative
+    /// one (a pending host download); null when the host copy is current or no device copy exists. Looks in the
+    /// activation cache and then at the data vector's shared device buffer: an op result owns its buffer and is
+    /// never in the cache, so a cache-only lookup sent every view of a result through a host download
+    /// (measured in PermutedViewResidencyTests / AbcScanGpuParityTests).
+    /// </summary>
+    private IGpuBuffer? DeviceAuthoritativeViewBase<T>(IDirectGpuBackend backend, Tensor<T> view)
+    {
+        // The device data can be keyed by the backing array or (a lazily allocated result) by the data vector; a view
+        // of a vector-keyed result can still report a backing array, so try both.
+        bool pending = false;
+        foreach (var key in new object?[] { view.GetBackingArrayForCacheLookupUnsafe(), view.DataVector })
+        {
+            if (key is null || !Helpers.HostSync.IsPending(key)) continue;
+            pending = true;
+            if (_activationCache.TryGetValue(key, out var candidate) && ReferenceEquals(candidate.Backend, backend) && !candidate.IsFp16)
+                return candidate.Buffer;
+        }
+        if (!pending) return null;
+        return view.VectorDeviceBuffer is { } shared && shared.Handle != IntPtr.Zero && ReferenceEquals(view.VectorDeviceBackend, backend)
+            ? shared
+            : null;
+    }
+
+    /// <summary>A contiguous slice (nonzero offset) of device-only data: copy the range on the device.</summary>
+    private bool TrySliceViewOnDevice<T>(IDirectGpuBackend backend, Tensor<T> view, out OwnedBuffer result)
+    {
+        result = default;
+        if (typeof(T) != typeof(float) || !view.IsContiguous || view._storageOffset == 0) return false;
+        var baseBuffer = DeviceAuthoritativeViewBase(backend, view);
+        if (baseBuffer is null || baseBuffer.Size < (long)view._storageOffset + view.Length) return false;
+        var output = AllocateOutputBuffer(backend, view.Length);
+        try
+        {
+            backend.Copy(baseBuffer, view._storageOffset, output.Buffer, 0, view.Length);
+        }
+        catch (Exception ex)
+        {
+            output.Dispose();
+            GpuLaunchProbe.OnFallback("SliceViewOnDevice", ex);
+            return false;
+        }
+        result = output;
+        return true;
+    }
+
     private bool TryPermuteViewOnDevice<T>(IDirectGpuBackend backend, Tensor<T> view, out OwnedBuffer result)
     {
         result = default;
@@ -1571,19 +1624,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var dims = view._shape;
         var strides = view._strides;
         if (rank < 2 || strides is null || strides.Length != rank) return false;
-        // The device data can be keyed by the backing array or (a lazily allocated result) by the data vector; a view
-        // of a vector-keyed result can still report a backing array, so try both.
-        ActivationCacheEntry? entry = null;
-        foreach (var key in new object?[] { view.GetBackingArrayForCacheLookupUnsafe(), view.DataVector })
-        {
-            if (key is null || !Helpers.HostSync.IsPending(key)) continue;
-            if (_activationCache.TryGetValue(key, out var candidate) && ReferenceEquals(candidate.Backend, backend) && !candidate.IsFp16)
-            {
-                entry = candidate;
-                break;
-            }
-        }
-        if (entry is null) return false;   // host copy current, or not cached: the host path handles it
+        var baseBuffer = DeviceAuthoritativeViewBase(backend, view);
+        if (baseBuffer is null) return false;   // host copy current, or no device copy: the host path handles it
 
         // Base axis order = view axes by descending stride; the view is a pure permutation iff those strides are the
         // row-major strides of the reordered shape (size-1 axes may carry any stride).
@@ -1599,14 +1641,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             baseShape[k] = dims[axis];
             expected *= dims[axis];
         }
-        if (expected != view.Length || entry.Buffer.Size < view.Length) return false;
+        if (expected != view.Length || baseBuffer.Size < view.Length) return false;
         var permutation = new int[rank];
         for (int k = 0; k < rank; k++) permutation[order[k]] = k;   // output axis j reads base axis permutation[j]
 
         var output = AllocateOutputBuffer(backend, view.Length);
         try
         {
-            backend.Permute(entry.Buffer, output.Buffer, baseShape, permutation);
+            backend.Permute(baseBuffer, output.Buffer, baseShape, permutation);
         }
         catch (Exception ex)
         {
@@ -1664,6 +1706,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // would download the base, permute it on the host and upload the result.
         if (!tensor.IsContiguous && TryPermuteViewOnDevice(backend, tensor, out var permuted))
             return permuted;
+        if (TrySliceViewOnDevice(backend, tensor, out var sliced))
+            return sliced;
         if (!tensor.IsContiguous || tensor._storageOffset != 0)
             tensor = (Tensor<T>)tensor.Contiguous();
 
@@ -2441,6 +2485,68 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// BEFORE the snapshot (cross-tape cached intermediates an outer scope still
     /// wants) are preserved.
     /// </summary>
+    // Op results created while a gradient tape records. They own their device buffers and never enter the activation
+    // cache, so the tape's dispose-time release (EvictActivationsCreatedAfter, Release mode) - which walks that cache -
+    // never saw them: a dead intermediate stayed readable (downloaded on a host read) and kept its device memory until
+    // finalization. Each record carries the cache's timestamp so "created after the tape's snapshot" means the same
+    // thing for both. Weak: recording must not extend a result's lifetime.
+    private sealed class TapeOwnedResult
+    {
+        public long Timestamp;
+        public int ThreadId;
+        public WeakReference Target = null!;
+        public Func<object, HashSet<object>?, bool> Release = null!;
+    }
+
+    private readonly List<TapeOwnedResult> _tapeOwnedResults = new();
+
+    private void RecordTapeOwnedResult<T>(Tensor<T> tensor)
+    {
+        var record = new TapeOwnedResult
+        {
+            Timestamp = System.Threading.Interlocked.Increment(ref _activationCacheTimestamp),
+            ThreadId = System.Environment.CurrentManagedThreadId,
+            Target = new WeakReference(tensor),
+            Release = static (target, protect) => ReleaseTapeOwnedResult((Tensor<T>)target, protect),
+        };
+        lock (_tapeOwnedResults) _tapeOwnedResults.Add(record);
+    }
+
+    /// <summary>
+    /// Releases a dead tape intermediate that owns its buffer: marks its pending host copy released (a host read
+    /// throws the Retain message) and unbinds the device buffer so no later op reads it. Kept (protected) or retained
+    /// results, and results whose host copy is already current, are left alone.
+    /// </summary>
+    private static bool ReleaseTapeOwnedResult<T>(Tensor<T> tensor, HashSet<object>? protect)
+    {
+        object vector = tensor.DataVector;
+        var array = tensor.GetBackingArrayForCacheLookupUnsafe();
+        if (protect is not null && (protect.Contains(vector) || (array is not null && protect.Contains(array)))) return false;
+        if (Helpers.HostSync.IsRetained(vector) || (array is not null && Helpers.HostSync.IsRetained(array))) return false;
+        bool released = false;
+        if (Helpers.HostSync.IsPending(vector)) released |= Helpers.HostSync.Release(vector, ReleasedIntermediateMessage);
+        if (array is not null && Helpers.HostSync.IsPending(array)) released |= Helpers.HostSync.Release(array, ReleasedIntermediateMessage);
+        if (!released) return false;
+        tensor._gpuBuffer = null;
+        tensor._gpuBackend = null;
+        tensor._gpuBufferVersion = -1;
+        return true;
+    }
+
+    /// <summary>Releases this thread's tape-owned results created after <paramref name="snapshot"/>; prunes the log.</summary>
+    private void ReleaseTapeOwnedResultsCreatedAfter(long snapshot, HashSet<object>? protect)
+    {
+        int thread = System.Environment.CurrentManagedThreadId;
+        List<TapeOwnedResult> mine;
+        lock (_tapeOwnedResults)
+        {
+            mine = _tapeOwnedResults.FindAll(r => r.ThreadId == thread && r.Timestamp > snapshot);
+            _tapeOwnedResults.RemoveAll(r => !r.Target.IsAlive || (r.ThreadId == thread && r.Timestamp > snapshot));
+        }
+        foreach (var record in mine)
+            if (record.Target.Target is { } target) record.Release(target, protect);
+    }
+
     internal long ActivationCacheTimestampSnapshot()
         => System.Threading.Interlocked.Read(ref _activationCacheTimestamp);
 
@@ -2564,6 +2670,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     internal void EvictActivationsCreatedAfter(long snapshot, HashSet<object>? protect, ActivationReleaseMode mode)
     {
+        if (mode == ActivationReleaseMode.Release) ReleaseTapeOwnedResultsCreatedAfter(snapshot, protect);
         // The activation timestamp counter is process-wide, so "created after my snapshot"
         // also matches a CONCURRENT tape's activations on another thread. Free only THIS
         // thread's entries — disposing another thread's in-flight buffer is a use-after-free
@@ -3942,6 +4049,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // which strongly owned it, so the cache had to materialize (download) every result before it could free it:
         // at every tape dispose and every pressure eviction, plus the cache bookkeeping on every op.
         NoteOwnedResultAllocation(outputBuffer.SizeInBytes);
+        if (Autodiff.GradientTape<T>.Current is not null) RecordTapeOwnedResult(tensor);
         if (TrackOwnedResultBytes) TrackOwnedResult(outputBuffer);
         return tensor;
     }
@@ -23173,6 +23281,27 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // ──────────────────────────────────────────────────────────────
 
     // Shape metadata ops — no GPU compute, override for full coverage
+    /// <summary>
+    /// Gives a metadata-only view of <paramref name="source"/> the source's resident buffer. When they share storage
+    /// the buffer is only carried, NOT bound: BindResidentBuffer declares the device authoritative for the backing
+    /// array and arms a host download, so a view of a host-authoritative input (the batch, reshaped by
+    /// MatMulBackward) made the next host read DOWNLOAD the input the caller had just written - measured as 8 KB per
+    /// step in CompiledMlpStep_ReadsBackOnlyTheLoss. A source whose device copy IS authoritative already has its
+    /// download pending on that same array.
+    /// </summary>
+    private void CarryResidentBufferToView<T>(Tensor<T> source, Tensor<T> view, IGpuBuffer resident, IDirectGpuBackend backend)
+    {
+        var viewArray = view.GetBackingArrayForCacheLookupUnsafe();
+        if (viewArray is not null && ReferenceEquals(viewArray, source.GetBackingArrayForCacheLookupUnsafe()))
+        {
+            view._gpuBuffer = resident;
+            view._gpuBackend = backend;
+            view._gpuBufferVersion = view.GpuCacheVersion;
+            return;
+        }
+        BindResidentBuffer(view, resident, backend);
+    }
+
     public override Tensor<T> Reshape<T>(Tensor<T> tensor, int[] newShape)
     {
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
@@ -23203,7 +23332,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             && !ReferenceEquals(result, tensor) && TryGetBackend(out var backend))
         {
             var resident = ResolveResidentBufferNoUpload(backend, tensor, tensor.Length);
-            if (resident is not null) BindResidentBuffer(result, resident, backend);
+            if (resident is not null) CarryResidentBufferToView(tensor, result, resident, backend);
         }
         return result;
     }
@@ -23216,7 +23345,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             && !ReferenceEquals(result, tensor) && TryGetBackend(out var backend))
         {
             var resident = ResolveResidentBufferNoUpload(backend, tensor, tensor.Length);
-            if (resident is not null) BindResidentBuffer(result, resident, backend);
+            if (resident is not null) CarryResidentBufferToView(tensor, result, resident, backend);
         }
         return result;
     }

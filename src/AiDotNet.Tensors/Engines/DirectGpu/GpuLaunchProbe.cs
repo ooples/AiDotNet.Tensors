@@ -219,6 +219,9 @@ internal static class GpuLaunchProbe
         {
             var method = candidate.GetMethod();
             if (method is null) return false;
+            // The probe's own frames: OnReadback(bytes, backend) forwards to OnReadback(bytes), so a fixed skip count
+            // landed on the probe and every site read "GpuLaunchProbe.OnReadback".
+            if (method.DeclaringType == typeof(GpuLaunchProbe)) return false;
             // The counted driver-copy wrappers are the transfer itself, not who issued it.
             if (method.Name.StartsWith("cuMemcpy", System.StringComparison.Ordinal)) return false;
             var declaringType = method.DeclaringType;

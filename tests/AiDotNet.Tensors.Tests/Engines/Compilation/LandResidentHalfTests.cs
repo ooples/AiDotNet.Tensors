@@ -8,9 +8,8 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Engines.Compilation;
 
 /// <summary>
-/// TryLandResidentHalf moves an op result r into the stable node output o and must release every Half copy of r,
-/// or each activation is held twice for the rest of the step. r's copy can be cached under its DataVector (a deferred
-/// result - the key the lookup checks first) as well as its backing array; only the backing-array key was released.
+/// TryLandResidentHalf moves an op result r into the stable node output o and must release r's Half copy, or each
+/// activation is held twice for the rest of the step: after landing, only o's entry may remain, holding r's values.
 /// </summary>
 [Collection("DirectGpuSerial")]
 public class LandResidentHalfTests
@@ -42,9 +41,10 @@ public class LandResidentHalfTests
         var o = new Tensor<Half>(new[] { n });
         gpu.ClearActivationCache();
         long baseline = gpu.CurrentActivationCacheBytes;
+        // r's copy cached under its DataVector - a deferred result, the key TryGetResidentFp16Buffer resolves first.
+        // (The cache now keeps one entry per tensor storage, so a second copy under the backing array cannot coexist.)
         CacheActivation.Invoke(gpu, new object?[] { r.DataVector, HalfOf(values), new[] { n }, backend, true, n, 0 });
-        CacheActivation.Invoke(gpu, new object?[] { r.GetBackingArrayForCacheLookupUnsafe()!, HalfOf(new float[n]), new[] { n }, backend, true, n, 0 });
-        Assert.Equal(baseline + 2L * n * 2, gpu.CurrentActivationCacheBytes);
+        Assert.Equal(baseline + (long)n * 2, gpu.CurrentActivationCacheBytes);
 
         Assert.True(gpu.TryLandResidentHalf(r, o));
 

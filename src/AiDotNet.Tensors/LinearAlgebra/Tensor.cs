@@ -259,7 +259,10 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </summary>
     private void CarryResidencyToShapeOnlyView(Tensor<T> view)
     {
-        if (_gpuBuffer is null || view._gpuBuffer is not null) return;
+        // A whole-vector view SHARES its source's device state, so it already reports the source's buffer; that is no
+        // reason to skip the rest of the metadata (materializer, role, ownership, dirty, layout). Skip only a view
+        // bound to some other buffer.
+        if (_gpuBuffer is null || (view._gpuBuffer is not null && !ReferenceEquals(view._gpuBuffer, _gpuBuffer))) return;
         if (!IsContiguous || !view.IsContiguous || view._storageOffset != _storageOffset || view.Length != Length) return;
         if (!ReferenceEquals(view._storage, _storage)) return;
         ShareGpuStateWith(view);

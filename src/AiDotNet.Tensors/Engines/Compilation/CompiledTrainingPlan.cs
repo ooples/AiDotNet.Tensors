@@ -2201,6 +2201,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 {
                     ran = true;
                     RefreshLossFromCapturedGraph(gte);
+                    // Before clipping, as on every other step path: this path was added without it and trained every
+                    // resident GPU plan with its L2 silently dropped (measured: the step-0 plan gradient missed the
+                    // whole 0.05 * theta term, |plan - tape| = 0.292 of |tape| = 0.399).
+                    ApplyL2Regularization();
                     if (_maxGradNorm > 0.0 && !TryClipGradientsGlobalL2Gpu(_gradients, _maxGradNorm))
                         ClipGradientsGlobalL2(_gradients, _maxGradNorm);
                     CommitHostOptimizerGradients();

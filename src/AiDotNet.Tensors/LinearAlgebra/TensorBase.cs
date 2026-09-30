@@ -973,6 +973,16 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// _data array may be empty/stale until explicitly synchronized.
     /// This is the PyTorch-equivalent of tensor.data_ptr() on a CUDA tensor.
     /// </summary>
+    /// <summary>
+    /// The whole data vector's shared device buffer (what a whole-vector view's <c>_gpuBuffer</c> resolves to), or null.
+    /// A strided or offset view keeps its own slot, so this is how it finds the device copy of the data it views.
+    /// Plain float-encoded buffers only (not split-complex planes or raw int32).
+    /// </summary>
+    internal Engines.DirectGpu.IGpuBuffer? VectorDeviceBuffer
+        => _data?._deviceState is { Buffer: { } buffer } state && !state.IsSplitComplex && !state.ContainsRawInt32 ? buffer : null;
+
+    internal Engines.DirectGpu.IDirectGpuBackend? VectorDeviceBackend => _data?._deviceState?.Backend;
+
     internal Engines.DirectGpu.IGpuBuffer? _gpuBuffer
     {
         get => CoversWholeVector ? _data._deviceState?.Buffer : _viewGpuBuffer;
