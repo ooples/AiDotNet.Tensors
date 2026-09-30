@@ -20,6 +20,20 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels
 
 // Batch Normalization forward pass — workgroup-parallel
 // 1 workgroup per channel, threads cooperate on batch*spatial reduction
+// Normalize and apply the affine transform for one channel. A helper rather than a shared tail after the
+// training/inference branch: merging mean/invVar after a branch that contains barriers left a PHI node at a
+// barrier-region entry, which POCL's work-item loop pass cannot lower (it asserts and kills the process).
+void batchnorm_apply(__global const float* input, __global float* output, float mean, float invVar, float g,
+    float b_val, int c, int channels, int spatialSize, int batchSpatial, int lid, int localSize)
+{
+    for (int i = lid; i < batchSpatial; i += localSize) {
+        int b = i / spatialSize;
+        int s = i % spatialSize;
+        int idx = (b * channels + c) * spatialSize + s;
+        output[idx] = g * ((input[idx] - mean) * invVar) + b_val;
+    }
+}
+
 __kernel void batchnorm_forward(
     __global const float* input,
     __global float* output,
@@ -92,22 +106,14 @@ __kernel void batchnorm_forward(
             runningVar[c] = (1.0f - momentum) * runningVar[c] + momentum * runVarUnbiased;
         }
         barrier(CLK_LOCAL_MEM_FENCE);
-    } else {
-        // Inference: use running statistics
-        mean = runningMean[c];
-        invVar = 1.0f / sqrt(runningVar[c] + epsilon);
+        batchnorm_apply(input, output, mean, invVar, gamma[c], beta[c], c, channels, spatialSize, batchSpatial, lid, localSize);
+        return;
     }
 
-    // Normalize and apply affine transform
-    float g = gamma[c];
-    float b_val = beta[c];
-    for (int i = lid; i < batchSpatial; i += localSize) {
-        int b = i / spatialSize;
-        int s = i % spatialSize;
-        int idx = (b * channels + c) * spatialSize + s;
-        float normalized = (input[idx] - mean) * invVar;
-        output[idx] = g * normalized + b_val;
-    }
+    // Inference: use running statistics
+    mean = runningMean[c];
+    invVar = 1.0f / sqrt(runningVar[c] + epsilon);
+    batchnorm_apply(input, output, mean, invVar, gamma[c], beta[c], c, channels, spatialSize, batchSpatial, lid, localSize);
 }
 
 // Batch Normalization backward pass — workgroup-parallel
