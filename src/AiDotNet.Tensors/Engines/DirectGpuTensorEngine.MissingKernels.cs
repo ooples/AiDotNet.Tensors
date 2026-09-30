@@ -2389,9 +2389,15 @@ public partial class DirectGpuTensorEngine
         // base converted the ids to ints and ran the CPU lookup -- downloading the whole [V, E] table every
         // training step (and without a tape this path issued one copy launch per id). Graph traces and anomaly
         // mode keep the base path; the traced node replays onto this one.
+        // CUDA gathers straight from the float ids; every other backend converts them to int32 on the device and
+        // selects rows (IResidentIndexBackend).
         if (Compilation.GraphMode.IsActive || Autodiff.AnomalyModeScope.IsActive || typeof(T) != typeof(float)
-            || embeddings.Rank != 2 || !TryGetBackend(out var backend)
-            || backend is not DirectGpu.CUDA.CudaBackend cuda || !cuda.HasFloatIdEmbeddingKernels)
+            || embeddings.Rank != 2 || !TryGetBackend(out var backend))
+            return base.TensorEmbeddingLookupFromFloatIndices(embeddings, floatIndices);
+        var cuda = backend as DirectGpu.CUDA.CudaBackend;
+        bool fusedFloatIds = cuda is not null && cuda.HasFloatIdEmbeddingKernels;
+        var indexBackend = backend as IResidentIndexBackend;
+        if (!fusedFloatIds && indexBackend is null)
             return base.TensorEmbeddingLookupFromFloatIndices(embeddings, floatIndices);
 
         int vocabSize = embeddings._shape[0];
@@ -2407,8 +2413,34 @@ public partial class DirectGpuTensorEngine
 
             using var table = GetOrAllocateBuffer(backend, embeddings.IsContiguous ? embeddings : embeddings.Contiguous());
             using var idBuffer = GetOrAllocateBuffer(backend, ids);
-            var output = DispatchDeferredGpuOp<T>(backend, checked(numIndices * embeddingDim), outputShape, result =>
-                cuda.EmbeddingFromFloatIds(idBuffer.Buffer, table.Buffer, result, numIndices, embeddingDim, vocabSize));
+            // Released after the queued kernels (DisposeAfterQueuedUse), not when this method returns.
+            var ids32 = fusedFloatIds ? null : new DeviceFloatIds(backend, numIndices);
+            Tensor<T> output;
+            try
+            {
+                var rowOnes = fusedFloatIds ? null : GetCachedOnesBuffer(backend, embeddingDim);   // engine-owned
+                if (!fusedFloatIds && rowOnes is null) return base.TensorEmbeddingLookupFromFloatIndices(embeddings, floatIndices);
+                output = DispatchDeferredGpuOp<T>(backend, checked(numIndices * embeddingDim), outputShape, result =>
+                {
+                    if (fusedFloatIds)
+                    {
+                        cuda!.EmbeddingFromFloatIds(idBuffer.Buffer, table.Buffer, result, numIndices, embeddingDim, vocabSize);
+                        return;
+                    }
+                    // Read each id as the CPU does (round half to even, NaN ignored), select rows through ids clamped into
+                    // the table (resident_index_select has no bounds check), then zero the rows whose id was outside it.
+                    ids32!.Normalize(idBuffer.Buffer);
+                    ids32.ClampAndMarkInvalid(vocabSize);
+                    indexBackend!.ConvertIndicesToInt32(ids32.Clamped, ids32.Int32, numIndices);
+                    indexBackend.IndexSelect(table.Buffer, ids32.Int32, result,
+                        outerSize: 1, sourceAxis: vocabSize, indexAxis: numIndices, innerSize: embeddingDim);
+                    ids32.ZeroInvalidRows(result, rowOnes!, embeddingDim);
+                });
+            }
+            finally
+            {
+                ids32?.DisposeAfterQueuedUse();
+            }
             Autodiff.DifferentiableOps.RecordUnary("TensorEmbeddingLookupFromFloatIndices", output, embeddings,
                 Autodiff.BackwardFunctions<T>.TensorEmbeddingLookupFromFloatIndicesBackward,
                 new object[] { floatIndices, vocabSize, embeddingDim });
@@ -2430,11 +2462,14 @@ public partial class DirectGpuTensorEngine
     /// </summary>
     internal Tensor<T>? TryEmbeddingBackwardFromFloatIds<T>(Tensor<T> gradOutput, Tensor<T> floatIndices, int vocabSize, int embeddingDim)
     {
-        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend)
-            || backend is not DirectGpu.CUDA.CudaBackend cuda || !cuda.HasFloatIdEmbeddingKernels)
+        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend))
             return null;
         int numIndices = floatIndices.Length;
         if (gradOutput.Length != (long)numIndices * embeddingDim) return null;
+        if (backend is not DirectGpu.CUDA.CudaBackend cuda || !cuda.HasFloatIdEmbeddingKernels)
+            return backend is IResidentIndexBackend indexBackend
+                ? EmbeddingBackwardFromFloatIdsByIndexAdd(backend, indexBackend, gradOutput, floatIndices, vocabSize, embeddingDim)
+                : null;
         try
         {
             var ids = floatIndices.IsContiguous ? floatIndices : floatIndices.Contiguous();
@@ -2455,6 +2490,149 @@ public partial class DirectGpuTensorEngine
         {
             if (ThrowOnGpuKernelFallback) throw;
             GpuLaunchProbe.OnFallback("TryEmbeddingBackwardFromFloatIds", ex);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Float ids (token ids, class labels) on the device, read the way the CPU reads them (CpuEngine.ClassIndexOf):
+    /// rounded half to even, NaN treated as no id (-1). Built from primitives every backend has, for the backends
+    /// without CUDA's fused float-id kernels. Owns its scratch buffers.
+    /// </summary>
+    private sealed class DeviceFloatIds : IDisposable
+    {
+        private readonly IDirectGpuBackend _backend;
+        private readonly int _count;
+        private readonly OwnedBuffer _normalized, _mask, _clamped, _invalid;
+        private readonly IGpuBuffer _int32;
+        private int _rowWidth;
+
+        internal DeviceFloatIds(IDirectGpuBackend backend, int count)
+        {
+            _backend = backend;
+            _count = count;
+            // Five allocations in a row: if a later one throws (device OOM), the ones already made would never reach
+            // Dispose, because the caller's `using` never receives an object, and both callers catch and fall back. Under
+            // memory pressure that leaked up to four count-sized buffers per call. Release the partial set, then rethrow.
+            try
+            {
+                _normalized = AllocateOutputBuffer(backend, count);
+                _mask = AllocateOutputBuffer(backend, count);
+                _clamped = AllocateOutputBuffer(backend, count);
+                _invalid = AllocateOutputBuffer(backend, count);
+                _int32 = backend.AllocateIntBuffer(count);
+            }
+            catch
+            {
+                _normalized.Dispose();
+                _mask.Dispose();
+                _clamped.Dispose();
+                _invalid.Dispose();
+                throw;
+            }
+        }
+
+        private OwnedBuffer _rows;
+        private bool _hasRows;
+
+        internal IGpuBuffer Normalized => _normalized.Buffer;
+        internal IGpuBuffer Clamped => _clamped.Buffer;
+        internal IGpuBuffer Int32 => _int32;
+
+        /// <summary>Normalized = round-half-even(ids), with NaN ids set to -1.</summary>
+        internal void Normalize(IGpuBuffer ids)
+        {
+            _backend.Round(ids, _normalized.Buffer, _count);
+            _backend.ClassifyFloat(ids, _mask.Buffer, (int)FloatClassification.IsNaN, _count);
+            _backend.MaskedFillKernel(_normalized.Buffer, _mask.Buffer, _normalized.Buffer, NoId, _count);
+        }
+
+        /// <summary>Clamped = the normalized ids clipped into [0, size); invalid = 1 where that changed the id.</summary>
+        internal void ClampAndMarkInvalid(int size)
+        {
+            _backend.ClipKernel(_normalized.Buffer, _clamped.Buffer, 0f, size - 1, _count);
+            _backend.Equal(_normalized.Buffer, _clamped.Buffer, _invalid.Buffer, _count);   // 1 where valid
+            _backend.Scale(_invalid.Buffer, _invalid.Buffer, -1f, _count);
+            _backend.AddScalar(_invalid.Buffer, _invalid.Buffer, 1f, _count);               // 1 where invalid
+        }
+
+        /// <summary>Sets to zero every row of <paramref name="rows"/> ([count, width]) whose id was invalid.</summary>
+        internal void ZeroInvalidRows(IGpuBuffer rows, IGpuBuffer onesOfWidth, int width)
+        {
+            if (!_hasRows || _rowWidth != width)
+            {
+                if (_hasRows) _rows.Dispose();
+                _rows = AllocateOutputBuffer(_backend, checked(_count * width));
+                _hasRows = true;
+                _rowWidth = width;
+            }
+            _backend.OuterProduct(_invalid.Buffer, onesOfWidth, _rows.Buffer, _count, width);
+            _backend.MaskedFillKernel(rows, _rows.Buffer, rows, 0f, _count * width);
+        }
+
+        public void Dispose()
+        {
+            _normalized.Dispose();
+            _mask.Dispose();
+            _clamped.Dispose();
+            _invalid.Dispose();
+            _int32.Dispose();
+            if (_hasRows) _rows.Dispose();
+        }
+
+        /// <summary>
+        /// Releases every scratch buffer only after work already queued on the backend can no longer read it, for a
+        /// caller that returns while the kernels using these buffers are still queued.
+        /// </summary>
+        internal void DisposeAfterQueuedUse()
+        {
+            _normalized.DisposeAfterQueuedUse(_backend);
+            _mask.DisposeAfterQueuedUse(_backend);
+            _clamped.DisposeAfterQueuedUse(_backend);
+            _invalid.DisposeAfterQueuedUse(_backend);
+            DisposeBufferAfterQueuedUse(_backend, _int32);
+            if (_hasRows) _rows.DisposeAfterQueuedUse(_backend);
+        }
+
+        private const float NoId = -1f;
+    }
+
+    /// <summary>
+    /// The float-id embedding gradient on a backend without CUDA's float-id kernels: the ids are converted to int32 on
+    /// the device and the upstream rows are index-added into a zeroed [V, E] table gradient.
+    /// </summary>
+    private Tensor<T>? EmbeddingBackwardFromFloatIdsByIndexAdd<T>(IDirectGpuBackend backend, IResidentIndexBackend indexBackend,
+        Tensor<T> gradOutput, Tensor<T> floatIndices, int vocabSize, int embeddingDim)
+    {
+        int numIndices = floatIndices.Length;
+        try
+        {
+            var ids = floatIndices.IsContiguous ? floatIndices : floatIndices.Contiguous();
+            using var gradBuffer = GetOrAllocateBuffer(backend, gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous());
+            using var idBuffer = GetOrAllocateBuffer(backend, ids);
+            // Released after the queued kernels (DisposeAfterQueuedUse), not when this method returns.
+            var ids32 = new DeviceFloatIds(backend, numIndices);
+            try
+            {
+                return DispatchDeferredGpuOp<T>(backend, checked(vocabSize * embeddingDim), new[] { vocabSize, embeddingDim }, result =>
+                {
+                    backend.Fill(result, 0f, vocabSize * embeddingDim);
+                    // resident_index_add gathers per destination row, so an id outside the table (-1 for NaN) matches none.
+                    ids32.Normalize(idBuffer.Buffer);
+                    indexBackend.ConvertIndicesToInt32(ids32.Normalized, ids32.Int32, numIndices);
+                    indexBackend.IndexAdd(result, ids32.Int32, gradBuffer.Buffer, result,
+                        outerSize: 1, sourceAxis: numIndices, destinationAxis: vocabSize, innerSize: embeddingDim);
+                });
+            }
+            finally
+            {
+                ids32.DisposeAfterQueuedUse();
+            }
+        }
+        catch (Exception ex)
+        {
+            if (ThrowOnGpuKernelFallback) throw;
+            GpuLaunchProbe.OnFallback("EmbeddingBackwardFromFloatIdsByIndexAdd", ex);
             return null;
         }
     }
@@ -8119,6 +8297,21 @@ public partial class DirectGpuTensorEngine
                     $"Index {values[i]} at position {i} is out of bounds for embedding table with vocabulary size {vocabularySize}.");
     }
 
+    private static Tensor<int> NarrowIndices(Tensor<long> indices, int vocabSize)
+    {
+        var wide = indices.IsContiguous ? indices.GetDataArray() : indices.Contiguous().GetDataArray();
+        var narrow = new int[indices.Length];
+        for (int i = 0; i < narrow.Length; i++)
+        {
+            long id = wide[i];
+            if (id < 0 || id >= vocabSize)
+                throw new ArgumentOutOfRangeException(nameof(indices),
+                    $"Index {id} at position {i} is out of bounds for vocabulary size {vocabSize}.");
+            narrow[i] = (int)id;
+        }
+        return new Tensor<int>(narrow, (int[])indices._shape.Clone());
+    }
+
     Tensor<TValue> IEngine.TensorEmbeddingLookupBackward<TValue, TIndex>(
         Tensor<TValue> gradOutput, Tensor<TIndex> indices, int vocabSize, int embeddingDim)
     {
@@ -8126,7 +8319,7 @@ public partial class DirectGpuTensorEngine
         if (indices is null) throw new ArgumentNullException(nameof(indices));
         if (vocabSize <= 0) throw new ArgumentOutOfRangeException(nameof(vocabSize));
         if (embeddingDim <= 0) throw new ArgumentOutOfRangeException(nameof(embeddingDim));
-        if (typeof(TValue) != typeof(float) || typeof(TIndex) != typeof(int)
+        if (typeof(TValue) != typeof(float) || (typeof(TIndex) != typeof(int) && typeof(TIndex) != typeof(long))
             || !TryGetBackend(out var backend) || backend is not IResidentIndexBackend indexBackend)
             return base.TensorEmbeddingLookupBackward(gradOutput, indices, vocabSize, embeddingDim);
 
@@ -8135,7 +8328,11 @@ public partial class DirectGpuTensorEngine
             int numIndices = indices.Length;
             if (gradOutput.Length != checked(numIndices * embeddingDim))
                 return base.TensorEmbeddingLookupBackward(gradOutput, indices, vocabSize, embeddingDim);
-            var intIndices = (Tensor<int>)(object)indices;
+            // The tape's backward (and a sparse gradient made dense) hands host long ids: narrow them to the int32 ids
+            // the scatter kernel reads. A vocabulary index always fits, and one out of range is rejected below.
+            var intIndices = typeof(TIndex) == typeof(int)
+                ? (Tensor<int>)(object)indices
+                : NarrowIndices((Tensor<long>)(object)indices, vocabSize);
             var contiguousIndices = intIndices.IsContiguous
                 ? intIndices
                 : (Tensor<int>)intIndices.Contiguous();

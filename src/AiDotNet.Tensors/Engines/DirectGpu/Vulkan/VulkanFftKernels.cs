@@ -50,14 +50,14 @@ void main() {
 
     float sign = (inverse != 0) ? 1.0 : -1.0;
     for (int size = 2; size <= n; size <<= 1) {
-        int half = size >> 1;
+        int halfSize = size >> 1;
         float theta = sign * 2.0 * 3.14159265358979323846 / float(size);
         int numButterflies = n >> 1;
         for (int bf = int(tid); bf < numButterflies; bf += int(blockSize)) {
-            int group = bf / half;
-            int k = bf - group * half;
+            int group = bf / halfSize;
+            int k = bf - group * halfSize;
             int e = group * size + k;
-            int o = e + half;
+            int o = e + halfSize;
             float angle = theta * float(k);
             float wRe = cos(angle);
             float wIm = sin(angle);

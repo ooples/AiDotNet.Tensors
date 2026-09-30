@@ -290,8 +290,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         }
         _clipSumSq?.Dispose();
         _clipTmp?.Dispose();
+        _clipSquares?.Dispose();
         _clipSumSq = null;
         _clipTmp = null;
+        _clipSquares = null;
 
         // Free the captured training-step graph, if any.
         InvalidateCapturedStepGraph();
@@ -2182,10 +2184,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     /// </remarks>
     private Tensor<T> StepResidentOrEager()
     {
+        // The uncaptured resident body needs only fills and device copies, so it runs on every DirectGpu backend
+        // (OpenCL, Vulkan, Metal, HIP as well as CUDA). The host-array eager step downloads every device gradient to
+        // accumulate it; only the graph capture above is CUDA's.
         if (s_residentStepEnabled && !_residentStepFailed && _graphStepEligible && typeof(T) == typeof(float)
             && _checkpointing is null && _fp16HeteroOrder is null
             && _engine is Engines.DirectGpuTensorEngine gte
-            && gte.GetBackend() is Engines.DirectGpu.CUDA.CudaBackend cb)
+            && gte.GetBackend() is { } cb
+            && DeviceParametersLiveOn(cb))
         {
             // Eviction is suspended for THIS step only -- the resident branches require it while they borrow cached
             // buffers -- and the step's activations are released at the end, as StepEager does. Holding the
@@ -2201,6 +2207,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 {
                     ran = true;
                     RefreshLossFromCapturedGraph(gte);
+                    ApplyL2Regularization();   // before clipping, as the eager and graph steps order it
                     if (_maxGradNorm > 0.0 && !TryClipGradientsGlobalL2Gpu(_gradients, _maxGradNorm))
                         ClipGradientsGlobalL2(_gradients, _maxGradNorm);
                     CommitHostOptimizerGradients();
@@ -2340,7 +2347,26 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     /// the body threw; the plan then uses StepEager from here on. Only the body is retried that way -- nothing has
     /// been applied to the parameters yet.
     /// </summary>
-    private bool TryRunResidentBody(Engines.DirectGpuTensorEngine gte, Engines.DirectGpu.CUDA.CudaBackend cb)
+    /// <summary>
+    /// Whether every parameter lives on the device, on <paramref name="backend"/>. Off CUDA the resident body is taken
+    /// only then:
+    /// - a parameter placed by another engine (Tensor.Gpu() uses the default engine) is in another OpenCL context,
+    ///   where the optimizer's kernels reject the gradient buffers (CL_INVALID_CONTEXT);
+    /// - a host parameter is updated by the host optimizer, which reads its gradient on the host anyway, and the
+    ///   resident forward kept reading the device copy it cached before that update (measured: a host weight in a
+    ///   mixed-residency Adam run ended at -0.0816 against the tape oracle's -0.0728).
+    /// The eager step stages both cases through the host. CUDA keeps its existing resident and captured paths.
+    /// </summary>
+    private bool DeviceParametersLiveOn(Engines.DirectGpu.IDirectGpuBackend backend)
+    {
+        if (backend is Engines.DirectGpu.CUDA.CudaBackend) return true;
+        foreach (var parameter in _parameters)
+            if (parameter.TryGetGpuBuffer() is null || !ReferenceEquals(parameter._gpuBackend, backend))
+                return false;
+        return true;
+    }
+
+    private bool TryRunResidentBody(Engines.DirectGpuTensorEngine gte, Engines.DirectGpu.IDirectGpuBackend cb)
     {
         using var _autocast = AiDotNet.Tensors.Engines.Gpu.AutocastScope.EnableFromEnvironment();
         try
@@ -2390,9 +2416,19 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     /// is deliberately NOT captured — it runs eagerly in Step() so its per-step LR /
     /// bias-correction scalars are recomputed each replay instead of frozen at capture.
     /// </summary>
-    private void RunGpuStepBodyForCapture(Engines.DirectGpu.CUDA.CudaBackend cb)
+    private static void ZeroDeviceBuffer(Engines.DirectGpu.IDirectGpuBackend backend, Engines.DirectGpu.IGpuBuffer buffer,
+        int length, int elementSize)
+    {
+        if (backend is Engines.DirectGpu.CUDA.CudaBackend cuda) cuda.MemsetBuffer(buffer, 0, (long)length * elementSize);
+        else backend.Fill(buffer, 0f, length);
+    }
+
+    private void RunGpuStepBodyForCapture(Engines.DirectGpu.IDirectGpuBackend backend)
     {
         var engine = _engine;
+        // Stream capture exists only on CUDA; every other backend runs this body uncaptured.
+        var cb = backend as Engines.DirectGpu.CUDA.CudaBackend;
+        bool IsCapturing() => cb is not null && cb.IsStreamCapturing();
         // PR #638 capture-determinism: tag each compiled action so its transient scratch draws from the engine's
         // STATIC (action,local)-keyed pool → identical device addresses across the pre-residency pass, the capture
         // pass, and every replay (XLA/TensorRT-style position-keyed buffer assignment). action=-1 disables pooling
@@ -2401,7 +2437,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         de?.SetCurrentScratchAction(-1);
         // Pre-pass only (allocation is illegal inside the capture): give every external leaf a stable device buffer
         // holding its current data, so the captured ops read it through that buffer and replays can refresh it.
-        if (de is not null && !_graphHasEmbedding && !cb.IsStreamCapturing())
+        if (de is not null && !_graphHasEmbedding && !IsCapturing())
             foreach (var leaf in GraphExternalLeaves())
             {
                 // EnsureResidentInput reuses any bound buffer with a live-looking handle. A binding this plan did not
@@ -2420,12 +2456,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         var fwd = _forwardActions;
         // The whole forward (INCLUDING the embedding, which gathers on-device from the externally-refreshed stable
         // index buffer) is captured. _graphEagerFwd is 0 in capture mode (no eager prefix).
-        bool capDiag = System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1" && cb.IsStreamCapturing();
+        bool capDiag = System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1" && IsCapturing();
         for (int i = _graphEagerFwd; i < fwd.Length; i++)
         {
             de?.SetCurrentScratchAction(i);   // pool this forward action's transient scratch by (i, local)
             fwd[i](engine);
-            if (capDiag && cb.StreamCaptureStatusRaw() == 2)
+            if (capDiag && cb!.StreamCaptureStatusRaw() == 2)
             {
                 try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphcapture_diag.txt"),
                     $"[CAPTURE-INVALIDATED-BY] forwardAction#{i} op={Engines.DirectGpuTensorEngine.s_currentForwardOp}" + System.Environment.NewLine); } catch { }
@@ -2440,7 +2476,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // the host and every TensorAddInPlace downloaded it → CUDA-900 abort). Allocate ONLY in the not-capturing
         // pre-pass; during capture/replay the buffers already exist and we just memset + accumulate in place.
         var residentEngine = engine as Engines.DirectGpuTensorEngine;
-        bool capturingNow = cb.IsStreamCapturing();
+        bool capturingNow = IsCapturing();
         if (residentEngine is not null && !capturingNow)
         {
             for (int i = 0; i < _preAllocatedGrads.Length; i++)
@@ -2458,7 +2494,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                     ?? throw new InvalidOperationException(
                         "Could not make the loss-gradient seed GPU-resident for the captured backward; the captured "
                         + "reseed (CopyBufferDtoD) would be skipped and the backward would start from a zero loss gradient.");
-                cb.Fill(seedResident, 1f, _lossGradSeed.Length);
+                backend.Fill(seedResident, 1f, _lossGradSeed.Length);
             }
         }
         // Every device write below leaves the host copy stale, so each written tensor is re-bound (re-arming its
@@ -2472,8 +2508,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 int idx = _genericGradIndices[i];
                 if (_preAllocatedGrads[idx].TryGetGpuBuffer() is { } gb)
                 {
-                    cb.MemsetBuffer(gb, 0, (long)_preAllocatedGrads[idx].Length * esz);
-                    residentEngine?.BindResidentBuffer(_preAllocatedGrads[idx], gb, cb);
+                    ZeroDeviceBuffer(backend, gb, _preAllocatedGrads[idx].Length, esz);
+                    residentEngine?.BindResidentBuffer(_preAllocatedGrads[idx], gb, backend);
                 }
             }
         }
@@ -2482,14 +2518,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             for (int i = 0; i < _preAllocatedGrads.Length; i++)
                 if (_preAllocatedGrads[i].TryGetGpuBuffer() is { } gb)
                 {
-                    cb.MemsetBuffer(gb, 0, (long)_preAllocatedGrads[i].Length * esz);
-                    residentEngine?.BindResidentBuffer(_preAllocatedGrads[i], gb, cb);
+                    ZeroDeviceBuffer(backend, gb, _preAllocatedGrads[i].Length, esz);
+                    residentEngine?.BindResidentBuffer(_preAllocatedGrads[i], gb, backend);
                 }
         }
         if (_lossGradSeed.TryGetGpuBuffer() is { } seedBuf && _lossGradDest?.TryGetGpuBuffer() is { } destBuf)
         {
-            cb.CopyBufferDtoD(seedBuf, destBuf, (long)_lossGradSeed.Length * esz);
-            residentEngine?.BindResidentBuffer(_lossGradDest, destBuf, cb);
+            if (cb is not null) cb.CopyBufferDtoD(seedBuf, destBuf, (long)_lossGradSeed.Length * esz);
+            else backend.Copy(seedBuf, destBuf, _lossGradSeed.Length);
+            residentEngine?.BindResidentBuffer(_lossGradDest, destBuf, backend);
         }
 
         var bwd = _backwardActions;
@@ -2497,13 +2534,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // capture-resident, so capture is still live entering here; the FIRST backward action that issues a
         // host transfer (a non-resident gradient intermediate) flips StreamCaptureStatusRaw to 2 (invalidated).
         // Logging its index + name + producing op turns "the THREW op moved" into a concrete backward work-item.
-        bool bwdDiag = System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1" && cb.IsStreamCapturing();
+        bool bwdDiag = System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1" && IsCapturing();
         var bwdNames = ProfBackwardStepNames;
         for (int i = 0; i < bwd.Length; i++)
         {
             de?.SetCurrentScratchAction(fwd.Length + i);   // backward actions keyed in a namespace above forward
             bwd[i](engine);
-            if (bwdDiag && cb.StreamCaptureStatusRaw() == 2)
+            if (bwdDiag && cb!.StreamCaptureStatusRaw() == 2)
             {
                 string nm = i < bwdNames.Length ? bwdNames[i] : "?";
                 try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphcapture_diag.txt"),
@@ -2512,7 +2549,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             }
         }
         de?.SetCurrentScratchAction(-1);   // grad clip + optimizer (run after) must NOT pool
-        if (FailInsideNextCaptureForTesting && cb.IsStreamCapturing())
+        if (FailInsideNextCaptureForTesting && IsCapturing())
         {
             // The real failure shape: a host read of a device-resident value INSIDE the capture, after the whole
             // forward and backward have already issued (and allocated) inside it.
@@ -8822,18 +8859,18 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
 
     private bool TryClipGradientsGlobalL2Gpu(Tensor<T>[] gradients, double maxNorm)
     {
-        // The CUDA reduction/scale path is float-typed. For a Tensor<double> (or any
+        // The device reduction/scale path is float-typed. For a Tensor<double> (or any
         // non-float T) it would reinterpret the buffer as float and corrupt the
         // gradient bytes, so refuse and let the caller fall back to the generic clip.
         if (typeof(T) != typeof(float)) return false;
         if (gradients.Length == 0) return true;
-        Engines.DirectGpu.CUDA.CudaBackend? cb = null;
-        // All gradients must be CUDA-resident for a correct global norm.
+        Engines.DirectGpu.IDirectGpuBackend? cb = null;
+        // All gradients must be device-resident, on one backend, for a correct global norm.
         for (int p = 0; p < gradients.Length; p++)
         {
             var g = gradients[p];
             if (g == null) continue;
-            if (g.TryGetGpuBuffer() is null || g._gpuBackend is not Engines.DirectGpu.CUDA.CudaBackend gcb)
+            if (g.TryGetGpuBuffer() is null || g._gpuBackend is not Engines.DirectGpu.IDirectGpuBackend gcb)
             {
                 Engines.DirectGpu.GpuLaunchProbe.OnFallback("TryClipGradientsGlobalL2Gpu-gradient-not-device-resident", null);
                 return false;
@@ -8852,8 +8889,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         {
             _clipSumSq?.Dispose();
             _clipTmp?.Dispose();
+            _clipSquares?.Dispose();
             _clipSumSq = null;
             _clipTmp = null;
+            _clipSquares = null;
         }
         _clipScratchBackend = cb;
         var sumSq = _clipSumSq ??= cb.AllocateBuffer(1);
@@ -8871,7 +8910,18 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 var buf = g.TryGetGpuBuffer();
                 if (buf is null) continue;
                 cb.Fill(tmp, 0f, 1);
-                cb.ReduceSumOfSquares(buf, tmp, g.Length);
+                if (cb is Engines.DirectGpu.IGpuBatchExecution batch) batch.ReduceSumOfSquares(buf, tmp, g.Length);
+                else
+                {
+                    // No fused sum-of-squares (OpenCL): square into plan-owned scratch, then one row sum.
+                    if (_clipSquares is null || _clipSquares.Size < g.Length)
+                    {
+                        _clipSquares?.Dispose();
+                        _clipSquares = cb.AllocateBuffer(g.Length);
+                    }
+                    cb.Multiply(buf, buf, _clipSquares, g.Length);
+                    cb.SumAxis(_clipSquares, tmp, 1, g.Length);
+                }
                 cb.Add(sumSq, tmp, sumSq, 1);
             }
             // scale = min(1, maxNorm / (sqrt(sumSq) + 1e-6)) — all in place in sumSq, '1' staged in tmp.
@@ -8888,7 +8938,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 if (g == null) continue;
                 var buf = g.TryGetGpuBuffer();
                 if (buf is null) continue;
-                cb.ScaleByDeviceScalar(buf, sumSq, g.Length);
+                // grad *= scale[0]: CUDA's device-scalar kernel, elsewhere a [1, n] broadcast against the scalar.
+                if (cb is Engines.DirectGpu.CUDA.CudaBackend cuda) cuda.ScaleByDeviceScalar(buf, sumSq, g.Length);
+                else cb.BroadcastMultiplyFirstAxis(buf, sumSq, buf, 1, g.Length);
                 // The scale is a device write: re-arm the host copy's pending download, or a host reader whose copy
                 // was already materialized (a host optimizer, for one) keeps the UNCLIPPED values. Measured on an LM
                 // compiled step with SGD: every parameter moved 2.8x the clipped amount.
@@ -8901,7 +8953,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     // Plan-owned scratch for TryClipGradientsGlobalL2Gpu (see there); released in Dispose.
     private Engines.DirectGpu.IGpuBuffer? _clipSumSq;
     private Engines.DirectGpu.IGpuBuffer? _clipTmp;
-    private Engines.DirectGpu.CUDA.CudaBackend? _clipScratchBackend;
+    private Engines.DirectGpu.IGpuBuffer? _clipSquares;
+    private Engines.DirectGpu.IDirectGpuBackend? _clipScratchBackend;
 
     private static void TensorMatMulGemvFloat(float[] matrix, float[] vector, float[] output, int rows, int cols)
     {
