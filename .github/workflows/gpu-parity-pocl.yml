@@ -60,6 +60,10 @@ jobs:
           - { name: lstm,            filter: "FullyQualifiedName~GpuMissingKernelsParityTests.LstmSequence" }
           - { name: missing-kernels, filter: "FullyQualifiedName~GpuMissingKernelsParityTests&FullyQualifiedName!~LstmSequence" }
           - { name: scan-kernels,    filter: "FullyQualifiedName~ScanGpuParityTests|FullyQualifiedName~Rwkv4WkvGpuParityTests" }
+          # The non-CUDA device training paths (the resident step off CUDA, device-side gradient clipping, device
+          # optimizer storage) run nowhere else in CI: the coverage job has no GPU. This shard runs them on POCL and
+          # uploads their coverage, so codecov measures them instead of reporting them as missed.
+          - { name: resident-training, coverage: true, filter: "FullyQualifiedName~ResidentCompiledStepTests|FullyQualifiedName~GradientClippingStorageContractTests|FullyQualifiedName~CompiledOptimizerParameterViewTests|FullyQualifiedName~Fp16FullyResidentTrainingTests|FullyQualifiedName~FullParamResidentTrainingReproTests|FullyQualifiedName~GpuOptimizerStorageEpochTests|FullyQualifiedName~ConfigureOptimizerParamUpdateTests|FullyQualifiedName~ResidentWeightInvalidationDeviceStateTests|FullyQualifiedName~GpuReductionResidencyTests" }
           - { name: op-forward-1, filter: "FullyQualifiedName~Engines.OpParity.OpParityTests", shard: "1/6" }
           - { name: op-forward-2, filter: "FullyQualifiedName~Engines.OpParity.OpParityTests", shard: "2/6" }
           - { name: op-forward-3, filter: "FullyQualifiedName~Engines.OpParity.OpParityTests", shard: "3/6" }
@@ -122,7 +126,20 @@ jobs:
         dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj \
           --configuration Release --no-build --framework net10.0 \
           --filter "(${{ matrix.filter }})&Category!=Benchmark&Category!=Performance" \
-          --blame-hang --blame-hang-timeout 600s --blame-crash
+          --blame-hang --blame-hang-timeout 600s --blame-crash \
+          ${{ matrix.coverage && '--collect:"XPlat Code Coverage" --results-directory ./coverage -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=cobertura DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Exclude="[*]AiDotNet.Tensors.Engines.DirectGpu.*,[*]AiDotNet.Tensors.Engines.DirectGpuTensorEngine*,[*]AiDotNet.Tensors.Engines.Cu*,[*]AiDotNet.Tensors.Engines.ClBlast*,[*]AiDotNet.Tensors.Engines.OpenCl*,[*]AiDotNet.Tensors.Engines.Simd.*,[*]AiDotNet.Tensors.Engines.BlasManaged.*"' || '' }}
+
+    - name: Upload device-path coverage to Codecov
+      if: always() && matrix.coverage
+      uses: codecov/codecov-action@v4
+      with:
+        files: ./coverage/**/coverage.cobertura.xml
+        disable_search: true
+        flags: gpu-pocl
+        name: gpu-pocl-${{ matrix.name }}
+        fail_ci_if_error: false
+      env:
+        CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
     - name: Upload parity divergence report
       uses: actions/upload-artifact@v4
