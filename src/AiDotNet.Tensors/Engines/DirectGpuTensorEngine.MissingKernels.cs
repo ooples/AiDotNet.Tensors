@@ -8119,6 +8119,21 @@ public partial class DirectGpuTensorEngine
                     $"Index {values[i]} at position {i} is out of bounds for embedding table with vocabulary size {vocabularySize}.");
     }
 
+    private static Tensor<int> NarrowIndices(Tensor<long> indices, int vocabSize)
+    {
+        var wide = indices.IsContiguous ? indices.GetDataArray() : indices.Contiguous().GetDataArray();
+        var narrow = new int[indices.Length];
+        for (int i = 0; i < narrow.Length; i++)
+        {
+            long id = wide[i];
+            if (id < 0 || id >= vocabSize)
+                throw new ArgumentOutOfRangeException(nameof(indices),
+                    $"Index {id} at position {i} is out of bounds for vocabulary size {vocabSize}.");
+            narrow[i] = (int)id;
+        }
+        return new Tensor<int>(narrow, (int[])indices._shape.Clone());
+    }
+
     Tensor<TValue> IEngine.TensorEmbeddingLookupBackward<TValue, TIndex>(
         Tensor<TValue> gradOutput, Tensor<TIndex> indices, int vocabSize, int embeddingDim)
     {
@@ -8126,7 +8141,7 @@ public partial class DirectGpuTensorEngine
         if (indices is null) throw new ArgumentNullException(nameof(indices));
         if (vocabSize <= 0) throw new ArgumentOutOfRangeException(nameof(vocabSize));
         if (embeddingDim <= 0) throw new ArgumentOutOfRangeException(nameof(embeddingDim));
-        if (typeof(TValue) != typeof(float) || typeof(TIndex) != typeof(int)
+        if (typeof(TValue) != typeof(float) || (typeof(TIndex) != typeof(int) && typeof(TIndex) != typeof(long))
             || !TryGetBackend(out var backend) || backend is not IResidentIndexBackend indexBackend)
             return base.TensorEmbeddingLookupBackward(gradOutput, indices, vocabSize, embeddingDim);
 
@@ -8135,7 +8150,11 @@ public partial class DirectGpuTensorEngine
             int numIndices = indices.Length;
             if (gradOutput.Length != checked(numIndices * embeddingDim))
                 return base.TensorEmbeddingLookupBackward(gradOutput, indices, vocabSize, embeddingDim);
-            var intIndices = (Tensor<int>)(object)indices;
+            // The tape's backward (and a sparse gradient made dense) hands host long ids: narrow them to the int32 ids
+            // the scatter kernel reads. A vocabulary index always fits, and one out of range is rejected below.
+            var intIndices = typeof(TIndex) == typeof(int)
+                ? (Tensor<int>)(object)indices
+                : NarrowIndices((Tensor<long>)(object)indices, vocabSize);
             var contiguousIndices = intIndices.IsContiguous
                 ? intIndices
                 : (Tensor<int>)intIndices.Contiguous();
