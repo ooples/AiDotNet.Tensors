@@ -56,7 +56,7 @@ inline float safe_divide(float a, float b) {
 }
 
 inline float clamp_value(float x, float min_val, float max_val) {
-    return max(min_val, min(max_val, x));
+    return isnan(x) ? x : max(min_val, min(max_val, x));   // torch.clamp propagates NaN
 }
 ";
 

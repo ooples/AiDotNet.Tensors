@@ -458,7 +458,9 @@ __kernel void clamp_values(
     const int idx = get_global_id(0);
     if (idx >= size) return;
 
-    output[idx] = fmin(fmax(input[idx], minVal), maxVal);
+    // torch.clamp propagates NaN; fmin/fmax would return the bound.
+    const float x = input[idx];
+    output[idx] = isnan(x) ? x : fmin(fmax(x, minVal), maxVal);
 }
 
 // Clip by value (symmetric around 0)

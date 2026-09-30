@@ -1989,7 +1989,9 @@ struct ClampParams {
 fn clamp_op(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx < params.size) {
-        B[idx] = clamp(A[idx], params.min_val, params.max_val);
+        let x = A[idx];
+        // torch.clamp propagates NaN; WGSL clamp may return a bound for it. x != x is the NaN test.
+        B[idx] = select(clamp(x, params.min_val, params.max_val), x, x != x);
     }
 }
 ";
