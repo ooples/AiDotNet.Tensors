@@ -19,7 +19,7 @@ name: GPU Parity (POCL / CPU-OpenCL)
 # Vulkan/WebGpu) and the GPU-feature-specific OpenCL kernels (FlashDecode/PagedAttention/QuantGemm/
 # RopeGqa) are excluded — POCL can't provide those devices/features, so they'd fail "unavailable".
 #
-# STATUS: informational (continue-on-error), NOT required. POCL has also shown intermittent
+# STATUS: gating since #1073 (the parity step fails the job; a DirectGpu engine that does not initialize fails the gate step). Not yet a required status check. POCL has also shown intermittent
 # DirectGpu-init failures on hosted runners that are unreproducible without POCL hardware locally.
 # This runs + uploads a per-shard divergence report but never blocks. Promote a shard to required
 # in branch protection only once it is reliably green here. The fully reliable gate remains real GPU
@@ -97,8 +97,8 @@ jobs:
         # Packages.gz whose size disagreed with its own Release file ("Mirror sync in progress"),
         # and tape-grad-6 went red on PR #1017 with nothing in its log but an apt error.
         #
-        # The parity step below is deliberately `continue-on-error` because POCL is not reliable
-        # enough on hosted runners to gate on. Setup failing the job anyway contradicts that: it
+        # The parity step below gates the job (see its comment), so a setup failure here must not be caused by
+        # an unrelated third-party mirror. Setup failing the job anyway contradicts that: it
         # reports a problem with the change under test when the problem is a Google mirror.
         #
         # Removed by name rather than globbing `*.list`, so a runner image that keeps the Ubuntu
@@ -113,9 +113,23 @@ jobs:
     - name: Build tests (net10.0)
       run: dotnet build tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj --configuration Release --framework net10.0
 
+    # A gate, not a skip: with AIDOTNET_REQUIRE_GPU_TESTS=1 this fails when the DirectGpu engine does not come up.
+    # Most GPU tests skip when no device is found, so from at least 2026-09-10 until #1073 a backend that never
+    # initialized (an OpenCL program failing to build on POCL) read as a green job running nothing.
+    - name: Verify the OpenCL backend initializes on POCL
+      env:
+        AIDOTNET_OPENCL_ALLOW_CPU: '1'
+        AIDOTNET_REQUIRE_GPU_TESTS: '1'
+        AIDOTNET_GPU_VERBOSE: '1'
+      run: |
+        dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj \
+          --configuration Release --no-build --framework net10.0 \
+          --filter "FullyQualifiedName~DirectGpuInitializationGateTests"
+
+    # Gating since #1073. It was continue-on-error while POCL was unreliable, and that hid a dead backend for
+    # weeks. With the source-truncation and barrier fixes every shard ran green (0 failures), so a failure here
+    # is now a real CPU-vs-GPU divergence or a regression.
     - name: Run CPU-vs-GPU parity on POCL (shard ${{ matrix.name }})
-      # Informational only: POCL is not yet reliable as a hard gate on hosted runners (see header).
-      continue-on-error: true
       env:
         AIDOTNET_OPENCL_ALLOW_CPU: '1'
         AIDOTNET_REQUIRE_GPU_TESTS: '1'
