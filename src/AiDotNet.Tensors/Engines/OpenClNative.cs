@@ -495,7 +495,7 @@ public static class OpenClNative
         IntPtr context,
         uint count,
         string[] strings,
-        UIntPtr[] lengths,
+        UIntPtr[]? lengths,
         out ClError errcode);
 
     /// <summary>Creates a program from IL (SPIR-V).</summary>
@@ -512,7 +512,7 @@ public static class OpenClNative
         IntPtr context,
         uint numDevices,
         IntPtr[] deviceList,
-        UIntPtr[] lengths,
+        UIntPtr[]? lengths,
         IntPtr[] binaries,
         int[] binaryStatus,
         out ClError errcode);
@@ -1238,7 +1238,11 @@ public sealed class OpenClProgram : IDisposable
         _context = context ?? throw new ArgumentNullException(nameof(context));
 
         var sources = new[] { source };
-        var lengths = new UIntPtr[] { (UIntPtr)source.Length };
+        // No lengths: OpenCL then reads each source up to its null terminator, which the marshaller always adds.
+        // Passing source.Length (UTF-16 chars) was wrong wherever marshaling is UTF-8 (Linux): every non-ASCII
+        // character (an em dash in a kernel comment) takes 2-3 bytes, so the driver saw the source cut short by
+        // that many bytes. POCL then failed to build the whole activation program, and the OpenCL backend never started.
+        UIntPtr[]? lengths = null;
 
         OpenClNative.ClError error;
         _program = OpenClNative.clCreateProgramWithSource(
