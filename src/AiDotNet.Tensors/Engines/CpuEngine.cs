@@ -23910,6 +23910,19 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    /// <summary>
+    /// A BatchNorm batch statistic as a node downstream of the BatchNorm node that refreshes it, so the compiled plan
+    /// schedules its consumers after that refresh. Not differentiable: batch statistics feed running-statistics buffers.
+    /// </summary>
+    private static Tensor<T> BatchStatisticOutput<T>(
+        LazyTensorScope scope, Tensor<T> batchNormOutput, Tensor<T> refreshedStatistic, string opName)
+    {
+        var statistic = scope.RecordUnary(LazyNodeType.Custom, opName, batchNormOutput, refreshedStatistic._shape,
+            (eng, output) => refreshedStatistic.AsSpan().CopyTo(output.AsWritableSpan()));
+        refreshedStatistic.AsSpan().CopyTo(statistic.AsWritableSpan());
+        return statistic;
+    }
+
     public virtual Tensor<T> BatchNorm<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance)
     {
         using var _opScope = AiDotNet.Tensors.Engines.Profiling.Profiler.OpScope("BatchNorm");
@@ -23999,6 +24012,15 @@ public partial class CpuEngine : ITensorLevelEngine
                     BackwardFunctions<T>.BatchNormBackward, new object[] { mean, variance, epsilon });
                 eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
                 Helpers.TensorAllocator.Return(eagerResult);
+                // Hand the batch statistics out as outputs OF this node. The replay above refreshes capturedMean /
+                // capturedVar as a side effect the plan cannot see, so a consumer reading them directly - the
+                // running-statistics EMA every BatchNorm layer keeps - depended only on leaf tensors and the plan's
+                // schedule was free to run it BEFORE this node: each step then folded in the PREVIOUS step's batch
+                // statistics (measured: AiDotNet GraFPrint's compiled running mean after two steps was exactly
+                // 0.9 * rm1 + 0.1 * mean(step 1)). Nodes that take the normalized output as input order every
+                // consumer after the refresh.
+                mean = BatchStatisticOutput(scope, lazyResult, capturedMean, "BatchNormBatchMean");
+                variance = BatchStatisticOutput(scope, lazyResult, capturedVar, "BatchNormBatchVariance");
                 return lazyResult;
             }
         }
