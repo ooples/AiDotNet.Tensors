@@ -370,7 +370,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             IntPtr context,
             uint count,
             [In] string[] strings,
-            [In] UIntPtr[] lengths,
+            [In] UIntPtr[]? lengths,
             out int errcode);
 
         [DllImport(OpenClLibrary, EntryPoint = "clBuildProgram")]
@@ -407,7 +407,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             IntPtr context,
             uint numDevices,
             [In] IntPtr[] deviceList,
-            [In] UIntPtr[] lengths,
+            [In] UIntPtr[]? lengths,
             [In] IntPtr[] binaries,
             [In, Out] int[] binaryStatus,
             out int errcode);

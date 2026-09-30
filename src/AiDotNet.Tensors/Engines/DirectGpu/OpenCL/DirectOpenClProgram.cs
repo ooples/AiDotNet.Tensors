@@ -142,7 +142,11 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             _sourceHash = ComputeHash(source);
 
             var sources = new string[] { source };
-            var lengths = new UIntPtr[] { (UIntPtr)source.Length };
+            // No lengths: OpenCL then reads each source up to its null terminator, which the marshaller always adds.
+            // Passing source.Length (UTF-16 chars) was wrong wherever marshaling is UTF-8 (Linux): every non-ASCII
+            // character (an em dash in a kernel comment) takes 2-3 bytes, so the driver saw the source cut short by
+            // that many bytes. POCL then failed to build the whole activation program, and the OpenCL backend never started.
+            UIntPtr[]? lengths = null;
 
             _program = OpenClNativeBindings.CreateProgramWithSource(
                 context.Context,
