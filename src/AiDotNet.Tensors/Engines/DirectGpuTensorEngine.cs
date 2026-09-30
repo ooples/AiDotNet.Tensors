@@ -1490,9 +1490,20 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private static void DisposeBufferAfterQueuedUse(IDirectGpuBackend backend, IGpuBuffer buffer)
     {
         if (backend is DirectGpu.CUDA.CudaBackend cudaBackend)
+        {
             cudaBackend.FreeBufferDeferred(buffer);
-        else
+        }
+        else if (backend is DirectGpu.HIP.HipBackend hipBackend)
+        {
+            // HIP has no event-ordered release here, and hipFree does not wait for work queued on a non-default
+            // stream, so drain the queue before the buffer can go back to the allocator.
+            hipBackend.Synchronize();
             buffer.Dispose();
+        }
+        else
+        {
+            buffer.Dispose();
+        }
     }
 
     private static void ConvertInverseStandardDeviationToVariance(
@@ -17628,7 +17639,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         finally
         {
-            if (sumTrailing) rowSums.Dispose();
+            // rowSums is read by the queued Gemm: release it only after that work (see DisposeAfterQueuedUse).
+            if (sumTrailing) rowSums.DisposeAfterQueuedUse(backend);
             if (!handedOff) output.Dispose();
         }
     }
@@ -17754,7 +17766,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         finally
         {
-            if (expandLeading && expandTrailing) middle.Dispose();
+            // middle is read by the queued second outer product: release it only after that work.
+            if (expandLeading && expandTrailing) middle.DisposeAfterQueuedUse(backend);
         }
     }
 
@@ -21124,24 +21137,35 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 using var classBuffer = GetOrAllocateBuffer(backend, classIndices.IsContiguous ? classIndices : classIndices.Contiguous());
                 // Elsewhere: each row's gradient broadcast across its classes, then every class but the target set to
                 // zero (a masked fill, not a multiply by the one-hot, so an infinite gradient stays out of the others).
-                using var notTarget = fused ? default : AllocateOutputBuffer(backend, (int)total);
-                using var classes = fused ? null : new DeviceFloatIds(backend, rows);
-                var ones = fused ? null : GetCachedOnesBuffer(backend, numClasses);   // engine-owned: not disposed here
-                if (!fused && ones is null) return base.ScatterClassValuesGrad(gradOutput, classIndices, valuesShape);
-                return DispatchDeferredGpuOp<T>(backend, (int)total, (int[])valuesShape.Clone(), output =>
+                // Scratch is released only after the queued kernels can no longer read it (DisposeAfterQueuedUse):
+                // DispatchDeferredGpuOp returns once the work is queued, and a plain Dispose could hand the buffer back
+                // to CUDA's legacy pool for reuse while those kernels still read it.
+                var notTarget = fused ? default : AllocateOutputBuffer(backend, (int)total);
+                var classes = fused ? null : new DeviceFloatIds(backend, rows);
+                try
                 {
-                    if (fused)
+                    var ones = fused ? null : GetCachedOnesBuffer(backend, numClasses);   // engine-owned: not disposed here
+                    if (!fused && ones is null) return base.ScatterClassValuesGrad(gradOutput, classIndices, valuesShape);
+                    return DispatchDeferredGpuOp<T>(backend, (int)total, (int[])valuesShape.Clone(), output =>
                     {
-                        cuda!.ScatterClassGrad(gradBuffer.Buffer, classBuffer.Buffer, output, rows, numClasses);
-                        return;
-                    }
-                    classes!.Normalize(classBuffer.Buffer);
-                    backend.OneHotKernel(classes.Normalized, notTarget.Buffer, rows, numClasses);
-                    backend.Scale(notTarget.Buffer, notTarget.Buffer, -1f, (int)total);
-                    backend.AddScalar(notTarget.Buffer, notTarget.Buffer, 1f, (int)total);   // 1 where not the target
-                    backend.OuterProduct(gradBuffer.Buffer, ones!, output, rows, numClasses);
-                    backend.MaskedFillKernel(output, notTarget.Buffer, output, 0f, (int)total);
-                });
+                        if (fused)
+                        {
+                            cuda!.ScatterClassGrad(gradBuffer.Buffer, classBuffer.Buffer, output, rows, numClasses);
+                            return;
+                        }
+                        classes!.Normalize(classBuffer.Buffer);
+                        backend.OneHotKernel(classes.Normalized, notTarget.Buffer, rows, numClasses);
+                        backend.Scale(notTarget.Buffer, notTarget.Buffer, -1f, (int)total);
+                        backend.AddScalar(notTarget.Buffer, notTarget.Buffer, 1f, (int)total);   // 1 where not the target
+                        backend.OuterProduct(gradBuffer.Buffer, ones!, output, rows, numClasses);
+                        backend.MaskedFillKernel(output, notTarget.Buffer, output, 0f, (int)total);
+                    });
+                }
+                finally
+                {
+                    notTarget.DisposeAfterQueuedUse(backend);
+                    classes?.DisposeAfterQueuedUse();
+                }
             }
             catch (Exception ex)
             {

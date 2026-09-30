@@ -2413,25 +2413,34 @@ public partial class DirectGpuTensorEngine
 
             using var table = GetOrAllocateBuffer(backend, embeddings.IsContiguous ? embeddings : embeddings.Contiguous());
             using var idBuffer = GetOrAllocateBuffer(backend, ids);
-            using var ids32 = fusedFloatIds ? null : new DeviceFloatIds(backend, numIndices);
-            var rowOnes = fusedFloatIds ? null : GetCachedOnesBuffer(backend, embeddingDim);   // engine-owned
-            if (!fusedFloatIds && rowOnes is null) return base.TensorEmbeddingLookupFromFloatIndices(embeddings, floatIndices);
-            var output = DispatchDeferredGpuOp<T>(backend, checked(numIndices * embeddingDim), outputShape, result =>
+            // Released after the queued kernels (DisposeAfterQueuedUse), not when this method returns.
+            var ids32 = fusedFloatIds ? null : new DeviceFloatIds(backend, numIndices);
+            Tensor<T> output;
+            try
             {
-                if (fusedFloatIds)
+                var rowOnes = fusedFloatIds ? null : GetCachedOnesBuffer(backend, embeddingDim);   // engine-owned
+                if (!fusedFloatIds && rowOnes is null) return base.TensorEmbeddingLookupFromFloatIndices(embeddings, floatIndices);
+                output = DispatchDeferredGpuOp<T>(backend, checked(numIndices * embeddingDim), outputShape, result =>
                 {
-                    cuda!.EmbeddingFromFloatIds(idBuffer.Buffer, table.Buffer, result, numIndices, embeddingDim, vocabSize);
-                    return;
-                }
-                // Read each id as the CPU does (round half to even, NaN ignored), select rows through ids clamped into
-                // the table (resident_index_select has no bounds check), then zero the rows whose id was outside it.
-                ids32!.Normalize(idBuffer.Buffer);
-                ids32.ClampAndMarkInvalid(vocabSize);
-                indexBackend!.ConvertIndicesToInt32(ids32.Clamped, ids32.Int32, numIndices);
-                indexBackend.IndexSelect(table.Buffer, ids32.Int32, result,
-                    outerSize: 1, sourceAxis: vocabSize, indexAxis: numIndices, innerSize: embeddingDim);
-                ids32.ZeroInvalidRows(result, rowOnes!, embeddingDim);
-            });
+                    if (fusedFloatIds)
+                    {
+                        cuda!.EmbeddingFromFloatIds(idBuffer.Buffer, table.Buffer, result, numIndices, embeddingDim, vocabSize);
+                        return;
+                    }
+                    // Read each id as the CPU does (round half to even, NaN ignored), select rows through ids clamped into
+                    // the table (resident_index_select has no bounds check), then zero the rows whose id was outside it.
+                    ids32!.Normalize(idBuffer.Buffer);
+                    ids32.ClampAndMarkInvalid(vocabSize);
+                    indexBackend!.ConvertIndicesToInt32(ids32.Clamped, ids32.Int32, numIndices);
+                    indexBackend.IndexSelect(table.Buffer, ids32.Int32, result,
+                        outerSize: 1, sourceAxis: vocabSize, indexAxis: numIndices, innerSize: embeddingDim);
+                    ids32.ZeroInvalidRows(result, rowOnes!, embeddingDim);
+                });
+            }
+            finally
+            {
+                ids32?.DisposeAfterQueuedUse();
+            }
             Autodiff.DifferentiableOps.RecordUnary("TensorEmbeddingLookupFromFloatIndices", output, embeddings,
                 Autodiff.BackwardFunctions<T>.TensorEmbeddingLookupFromFloatIndicesBackward,
                 new object[] { floatIndices, vocabSize, embeddingDim });
@@ -2502,11 +2511,25 @@ public partial class DirectGpuTensorEngine
         {
             _backend = backend;
             _count = count;
-            _normalized = AllocateOutputBuffer(backend, count);
-            _mask = AllocateOutputBuffer(backend, count);
-            _clamped = AllocateOutputBuffer(backend, count);
-            _invalid = AllocateOutputBuffer(backend, count);
-            _int32 = backend.AllocateIntBuffer(count);
+            // Five allocations in a row: if a later one throws (device OOM), the ones already made would never reach
+            // Dispose, because the caller's `using` never receives an object, and both callers catch and fall back. Under
+            // memory pressure that leaked up to four count-sized buffers per call. Release the partial set, then rethrow.
+            try
+            {
+                _normalized = AllocateOutputBuffer(backend, count);
+                _mask = AllocateOutputBuffer(backend, count);
+                _clamped = AllocateOutputBuffer(backend, count);
+                _invalid = AllocateOutputBuffer(backend, count);
+                _int32 = backend.AllocateIntBuffer(count);
+            }
+            catch
+            {
+                _normalized.Dispose();
+                _mask.Dispose();
+                _clamped.Dispose();
+                _invalid.Dispose();
+                throw;
+            }
         }
 
         private OwnedBuffer _rows;
@@ -2557,6 +2580,20 @@ public partial class DirectGpuTensorEngine
             if (_hasRows) _rows.Dispose();
         }
 
+        /// <summary>
+        /// Releases every scratch buffer only after work already queued on the backend can no longer read it, for a
+        /// caller that returns while the kernels using these buffers are still queued.
+        /// </summary>
+        internal void DisposeAfterQueuedUse()
+        {
+            _normalized.DisposeAfterQueuedUse(_backend);
+            _mask.DisposeAfterQueuedUse(_backend);
+            _clamped.DisposeAfterQueuedUse(_backend);
+            _invalid.DisposeAfterQueuedUse(_backend);
+            DisposeBufferAfterQueuedUse(_backend, _int32);
+            if (_hasRows) _rows.DisposeAfterQueuedUse(_backend);
+        }
+
         private const float NoId = -1f;
     }
 
@@ -2573,16 +2610,24 @@ public partial class DirectGpuTensorEngine
             var ids = floatIndices.IsContiguous ? floatIndices : floatIndices.Contiguous();
             using var gradBuffer = GetOrAllocateBuffer(backend, gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous());
             using var idBuffer = GetOrAllocateBuffer(backend, ids);
-            using var ids32 = new DeviceFloatIds(backend, numIndices);
-            return DispatchDeferredGpuOp<T>(backend, checked(vocabSize * embeddingDim), new[] { vocabSize, embeddingDim }, result =>
+            // Released after the queued kernels (DisposeAfterQueuedUse), not when this method returns.
+            var ids32 = new DeviceFloatIds(backend, numIndices);
+            try
             {
-                backend.Fill(result, 0f, vocabSize * embeddingDim);
-                // resident_index_add gathers per destination row, so an id outside the table (-1 for NaN) matches none.
-                ids32.Normalize(idBuffer.Buffer);
-                indexBackend.ConvertIndicesToInt32(ids32.Normalized, ids32.Int32, numIndices);
-                indexBackend.IndexAdd(result, ids32.Int32, gradBuffer.Buffer, result,
-                    outerSize: 1, sourceAxis: numIndices, destinationAxis: vocabSize, innerSize: embeddingDim);
-            });
+                return DispatchDeferredGpuOp<T>(backend, checked(vocabSize * embeddingDim), new[] { vocabSize, embeddingDim }, result =>
+                {
+                    backend.Fill(result, 0f, vocabSize * embeddingDim);
+                    // resident_index_add gathers per destination row, so an id outside the table (-1 for NaN) matches none.
+                    ids32.Normalize(idBuffer.Buffer);
+                    indexBackend.ConvertIndicesToInt32(ids32.Normalized, ids32.Int32, numIndices);
+                    indexBackend.IndexAdd(result, ids32.Int32, gradBuffer.Buffer, result,
+                        outerSize: 1, sourceAxis: numIndices, destinationAxis: vocabSize, innerSize: embeddingDim);
+                });
+            }
+            finally
+            {
+                ids32.DisposeAfterQueuedUse();
+            }
         }
         catch (Exception ex)
         {
