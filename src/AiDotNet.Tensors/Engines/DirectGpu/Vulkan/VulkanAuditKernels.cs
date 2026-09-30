@@ -423,7 +423,7 @@ void main() {
     public static string GridsampleBackwardGrid => @"#version 450
 layout(local_size_x = 256) in;
 layout(set=0, binding=0) buffer B0 { float gradOut[]; };
-layout(set=0, binding=1) buffer B1 { float input[]; };
+layout(set=0, binding=1) buffer B1 { float inputValues[]; };
 layout(set=0, binding=2) buffer B2 { float grid[]; };
 layout(set=0, binding=3) buffer B3 { float gradGrid[]; };
 layout(push_constant) uniform PC {
@@ -457,8 +457,8 @@ void main() {
         int in00 = (h0>=0&&h0<H&&w0>=0&&w0<W); int in01 = (h0>=0&&h0<H&&w1>=0&&w1<W);
         int in10 = (h1>=0&&h1<H&&w0>=0&&w0<W); int in11 = (h1>=0&&h1<H&&w1>=0&&w1<W);
         for (int c = 0; c < C; c++) {
-            float v00 = in00 ? input[((b*C+c)*H+h0)*W+w0] : 0.0; float v01 = in01 ? input[((b*C+c)*H+h0)*W+w1] : 0.0;
-            float v10 = in10 ? input[((b*C+c)*H+h1)*W+w0] : 0.0; float v11 = in11 ? input[((b*C+c)*H+h1)*W+w1] : 0.0;
+            float v00 = in00 ? inputValues[((b*C+c)*H+h0)*W+w0] : 0.0; float v01 = in01 ? inputValues[((b*C+c)*H+h0)*W+w1] : 0.0;
+            float v10 = in10 ? inputValues[((b*C+c)*H+h1)*W+w0] : 0.0; float v11 = in11 ? inputValues[((b*C+c)*H+h1)*W+w1] : 0.0;
             float dH = (1.0-lw)*(v10-v00) + lw*(v11-v01); float dW = (1.0-lh)*(v01-v00) + lh*(v11-v10);
             float go = gradOut[((b*C+c)*outH+oh)*outW+ow];
             gradGx += go * dW * float((W-1))*0.5; gradGy += go * dH * float((H-1))*0.5;
@@ -470,9 +470,9 @@ void main() {
 
     public static string TakeAlongDimF => @"#version 450
 layout(local_size_x = 256) in;
-layout(set=0, binding=0) buffer B0 { float input[]; };
+layout(set=0, binding=0) buffer B0 { float inputValues[]; };
 layout(set=0, binding=1) buffer B1 { float indices[]; };
-layout(set=0, binding=2) buffer B2 { float output[]; };
+layout(set=0, binding=2) buffer B2 { float outputValues[]; };
 layout(push_constant) uniform PC {
     int outerSize;
     int axisOut;
@@ -493,8 +493,8 @@ void main() {
 
     int idx = int(gl_GlobalInvocationID.x); int total = outerSize*axisOut*innerSize; if (idx >= total) return;
     int inner = idx % innerSize; int outer = (idx / innerSize) / axisOut; int srcJ = int(indices[idx]);
-    if (srcJ < 0 || srcJ >= axisIn) { output[idx] = 0.0; return; }
-    output[idx] = input[(outer * axisIn + srcJ) * innerSize + inner];
+    if (srcJ < 0 || srcJ >= axisIn) { outputValues[idx] = 0.0; return; }
+    outputValues[idx] = inputValues[(outer * axisIn + srcJ) * innerSize + inner];
 
 }";
 
@@ -502,7 +502,7 @@ void main() {
 layout(local_size_x = 256) in;
 layout(set=0, binding=0) buffer B0 { float a[]; };
 layout(set=0, binding=1) buffer B1 { float b[]; };
-layout(set=0, binding=2) buffer B2 { float output[]; };
+layout(set=0, binding=2) buffer B2 { float outputValues[]; };
 layout(push_constant) uniform PC {
     int outerSize;
     int innerSize;
@@ -522,15 +522,15 @@ void main() {
     int idx = int(gl_GlobalInvocationID.x); if (idx >= outerSize * innerSize) return;
     int inner = idx % innerSize; int outer = idx / innerSize; int p = outer * 3 * innerSize + inner;
     float a0=a[p],a1=a[p+innerSize],a2=a[p+2*innerSize]; float b0=b[p],b1=b[p+innerSize],b2=b[p+2*innerSize];
-    output[p]=a1*b2-a2*b1; output[p+innerSize]=a2*b0-a0*b2; output[p+2*innerSize]=a0*b1-a1*b0;
+    outputValues[p]=a1*b2-a2*b1; outputValues[p+innerSize]=a2*b0-a0*b2; outputValues[p+2*innerSize]=a0*b1-a1*b0;
 
 }";
 
     public static string Ldexp => @"#version 450
 layout(local_size_x = 256) in;
-layout(set=0, binding=0) buffer B0 { float input[]; };
+layout(set=0, binding=0) buffer B0 { float inputValues[]; };
 layout(set=0, binding=1) buffer B1 { int exponents[]; };
-layout(set=0, binding=2) buffer B2 { float output[]; };
+layout(set=0, binding=2) buffer B2 { float outputValues[]; };
 layout(push_constant) uniform PC {
     int size;
 };
@@ -546,7 +546,7 @@ float p210_lgamma(float x) {
 
 void main() {
 
-    int idx = int(gl_GlobalInvocationID.x); if (idx >= size) return; output[idx] = ldexp(input[idx], exponents[idx]);
+    int idx = int(gl_GlobalInvocationID.x); if (idx >= size) return; outputValues[idx] = ldexp(inputValues[idx], exponents[idx]);
 
 }";
 
@@ -554,7 +554,7 @@ void main() {
 layout(local_size_x = 256) in;
 layout(set=0, binding=0) buffer B0 { float a[]; };
 layout(set=0, binding=1) buffer B1 { float b[]; };
-layout(set=0, binding=2) buffer B2 { float output[]; };
+layout(set=0, binding=2) buffer B2 { float outputValues[]; };
 layout(push_constant) uniform PC {
     int am;
     int an;
@@ -575,7 +575,7 @@ void main() {
 
     int idx = int(gl_GlobalInvocationID.x); int outCols = an*bq; int total=(am*bp)*outCols; if (idx>=total) return;
     int oc=idx%outCols; int orow=idx/outCols; int i=orow/bp; int k=orow%bp; int j=oc/bq; int l=oc%bq;
-    output[idx] = a[i*an+j] * b[k*bq+l];
+    outputValues[idx] = a[i*an+j] * b[k*bq+l];
 
 }";
 
@@ -583,7 +583,7 @@ void main() {
 layout(local_size_x = 256) in;
 layout(set=0, binding=0) buffer B0 { float seq[]; };
 layout(set=0, binding=1) buffer B1 { float values[]; };
-layout(set=0, binding=2) buffer B2 { float output[]; };
+layout(set=0, binding=2) buffer B2 { float outputValues[]; };
 layout(push_constant) uniform PC {
     int seqLen;
     int numValues;
@@ -603,7 +603,7 @@ void main() {
 
     int idx = int(gl_GlobalInvocationID.x); if (idx >= numValues) return; float v = values[idx]; int lo=0, hi=seqLen;
     while (lo < hi) { int mid=(lo+hi)>>1; int cond=(right!=0)?(seq[mid]<=v):(seq[mid]<v); if (cond) lo=mid+1; else hi=mid; }
-    output[idx] = float(lo);
+    outputValues[idx] = float(lo);
 
 }";
 
@@ -611,7 +611,7 @@ void main() {
 layout(local_size_x = 256) in;
 layout(set=0, binding=0) buffer B0 { float a[]; };
 layout(set=0, binding=1) buffer B1 { float b[]; };
-layout(set=0, binding=2) buffer B2 { float output[]; };
+layout(set=0, binding=2) buffer B2 { float outputValues[]; };
 layout(push_constant) uniform PC {
     int size;
 };
@@ -630,18 +630,18 @@ void main() {
     int idx = int(gl_GlobalInvocationID.x); if (idx >= size) return; float av=a[idx], bv=b[idx];
     uint ua=floatBitsToUint(av), ub=floatBitsToUint(bv);
     int aNan=(((ua>>23)&0xFFu)==0xFFu)&&((ua&0x7FFFFFu)!=0u); int bNan=(((ub>>23)&0xFFu)==0xFFu)&&((ub&0x7FFFFFu)!=0u);
-    if (aNan||bNan) { output[idx]=uintBitsToFloat(0x7FC00000u); return; }
-    if (av==bv) { output[idx]=bv; return; }
-    if (av==0.0) { output[idx]=uintBitsToFloat(bv>0.0?0x00000001u:0x80000001u); return; }
+    if (aNan||bNan) { outputValues[idx]=uintBitsToFloat(0x7FC00000u); return; }
+    if (av==bv) { outputValues[idx]=bv; return; }
+    if (av==0.0) { outputValues[idx]=uintBitsToFloat(bv>0.0?0x00000001u:0x80000001u); return; }
     uint r=ua;
     if (bv>av) r=(av>0.0)?(r+1u):(r-1u); else r=(av>0.0)?(r-1u):(r+1u);
-    output[idx]=uintBitsToFloat(r);
+    outputValues[idx]=uintBitsToFloat(r);
 
 }";
 
     public static string IndexWrite => @"#version 450
 layout(local_size_x = 256) in;
-layout(set=0, binding=0) buffer B0 { float output[]; };
+layout(set=0, binding=0) buffer B0 { float outputValues[]; };
 layout(set=0, binding=1) buffer B1 { int indices[]; };
 layout(set=0, binding=2) buffer B2 { float source[]; };
 layout(push_constant) uniform PC {
@@ -668,7 +668,7 @@ void main() {
     int inner=idx%innerSize; int dstJ=(idx/innerSize)%dstAxis; int outer=(idx/innerSize)/dstAxis; int last=-1;
     for (int j=0;j<idxAxis;j++) if (indices[j]==dstJ) last=j;
     if (last<0) return;
-    output[idx]=(mode==0)?source[(outer*idxAxis+last)*innerSize+inner]:fillValue;
+    outputValues[idx]=(mode==0)?source[(outer*idxAxis+last)*innerSize+inner]:fillValue;
 
 }";
 
@@ -676,7 +676,7 @@ void main() {
 layout(local_size_x = 256) in;
 layout(set=0, binding=0) buffer B0 { float x1[]; };
 layout(set=0, binding=1) buffer B1 { float x2[]; };
-layout(set=0, binding=2) buffer B2 { float output[]; };
+layout(set=0, binding=2) buffer B2 { float outputValues[]; };
 layout(push_constant) uniform PC {
     int m;
     int n;
@@ -697,14 +697,14 @@ void main() {
 
     int idx = int(gl_GlobalInvocationID.x); if (idx>=m*n) return; int j=idx%n; int i=idx/n; float sum=0.0;
     for (int k=0;k<d;k++){ float diff=abs(x1[i*d+k]-x2[j*d+k]); if (p==1.0) sum+=diff; else if (p==2.0) sum+=diff*diff; else sum+=pow(diff,p); }
-    output[idx]=(p==1.0)?sum:(p==2.0)?sqrt(sum):pow(sum,1.0/p);
+    outputValues[idx]=(p==1.0)?sum:(p==2.0)?sqrt(sum):pow(sum,1.0/p);
 
 }";
 
     public static string Pdist => @"#version 450
 layout(local_size_x = 256) in;
-layout(set=0, binding=0) buffer B0 { float input[]; };
-layout(set=0, binding=1) buffer B1 { float output[]; };
+layout(set=0, binding=0) buffer B0 { float inputValues[]; };
+layout(set=0, binding=1) buffer B1 { float outputValues[]; };
 layout(push_constant) uniform PC {
     int n;
     int d;
@@ -723,15 +723,15 @@ float p210_lgamma(float x) {
 void main() {
 
     int flat = int(gl_GlobalInvocationID.x); if (flat>=n*n) return; int j=flat%n; int i=flat/n; if (i>=j) return; float sum=0.0;
-    for (int k=0;k<d;k++){ float diff=abs(input[i*d+k]-input[j*d+k]); if (p==1.0) sum+=diff; else if (p==2.0) sum+=diff*diff; else sum+=pow(diff,p); }
-    float dist=(p==1.0)?sum:(p==2.0)?sqrt(sum):pow(sum,1.0/p); int outIdx=i*n-(i*(i+1))/2+(j-i-1); output[outIdx]=dist;
+    for (int k=0;k<d;k++){ float diff=abs(inputValues[i*d+k]-inputValues[j*d+k]); if (p==1.0) sum+=diff; else if (p==2.0) sum+=diff*diff; else sum+=pow(diff,p); }
+    float dist=(p==1.0)?sum:(p==2.0)?sqrt(sum):pow(sum,1.0/p); int outIdx=i*n-(i*(i+1))/2+(j-i-1); outputValues[outIdx]=dist;
 
 }";
 
     public static string Histc => @"#version 450
 #extension GL_EXT_shader_atomic_float : enable
 layout(local_size_x = 256) in;
-layout(set=0, binding=0) buffer B0 { float input[]; };
+layout(set=0, binding=0) buffer B0 { float inputValues[]; };
 layout(set=0, binding=1) buffer B1 { uint hist[]; };
 layout(push_constant) uniform PC {
     int n;
@@ -751,7 +751,7 @@ float p210_lgamma(float x) {
 
 void main() {
 
-    int idx = int(gl_GlobalInvocationID.x); if (idx>=n) return; float x=input[idx]; if (!(x>=mn&&x<=mx)) return;
+    int idx = int(gl_GlobalInvocationID.x); if (idx>=n) return; float x=inputValues[idx]; if (!(x>=mn&&x<=mx)) return;
     float bw=(mx-mn)/float(bins); int b=int(((x-mn)/bw)); if (b>=bins) b=bins-1; if (b<0) b=0; atomicAdd(hist[b], 1.0);
 
 }";
@@ -928,7 +928,7 @@ void main() {
     public static string CopyBlock2d => @"#version 450
 layout(local_size_x = 256) in;
 layout(set=0, binding=0) buffer B0 { float block[]; };
-layout(set=0, binding=1) buffer B1 { float output[]; };
+layout(set=0, binding=1) buffer B1 { float outputValues[]; };
 layout(push_constant) uniform PC {
     int blockRows;
     int blockCols;
@@ -948,13 +948,13 @@ float p210_lgamma(float x) {
 
 void main() {
 
-    int idx = int(gl_GlobalInvocationID.x); if (idx>=blockRows*blockCols) return; int j=idx%blockCols; int i=idx/blockCols; output[(rowOff+i)*totalCols+(colOff+j)]=block[i*blockCols+j];
+    int idx = int(gl_GlobalInvocationID.x); if (idx>=blockRows*blockCols) return; int j=idx%blockCols; int i=idx/blockCols; outputValues[(rowOff+i)*totalCols+(colOff+j)]=block[i*blockCols+j];
 
 }";
 
     public static string ScatterReduce => @"#version 450
 layout(local_size_x = 256) in;
-layout(set=0, binding=0) buffer B0 { uint output[]; };
+layout(set=0, binding=0) buffer B0 { uint outputValues[]; };
 layout(set=0, binding=1) buffer B1 { float source[]; };
 layout(set=0, binding=2) buffer B2 { int indexb[]; };
 layout(push_constant) uniform PC { int outerSize; int srcDim; int dstDim; int innerSize; int mode; };
@@ -962,9 +962,9 @@ void main() {
     int idx = int(gl_GlobalInvocationID.x); int total = outerSize*srcDim*innerSize; if (idx>=total) return;
     int inner=idx%innerSize; int tmp=idx/innerSize; int outer=tmp/srcDim; int t=indexb[idx];
     if (t<0||t>=dstDim) return; int dst=(outer*dstDim+t)*innerSize+inner; float val=source[idx];
-    uint old=output[dst]; bool ok=false;
+    uint old=outputValues[dst]; bool ok=false;
     while(!ok){ float pf=uintBitsToFloat(old); float nv=(mode==0)?(pf+val):(mode==1)?(pf*val):(mode==2)?max(pf,val):min(pf,val);
-        uint des=floatBitsToUint(nv); uint prev=atomicCompSwap(output[dst], old, des); ok=(prev==old); old=prev; }
+        uint des=floatBitsToUint(nv); uint prev=atomicCompSwap(outputValues[dst], old, des); ok=(prev==old); old=prev; }
 }
 ";
 
@@ -1000,7 +1000,7 @@ void main() {
     public static string ClassifyFloat => @"#version 450
 layout(local_size_x = 256) in;
 layout(set=0, binding=0) buffer B0 { float a[]; };
-layout(set=0, binding=1) buffer B1 { float output[]; };
+layout(set=0, binding=1) buffer B1 { float result[]; };
 layout(push_constant) uniform PC {
     int mode;
     int size;
@@ -1018,8 +1018,9 @@ float p210_lgamma(float x) {
 void main() {
 
     int idx = int(gl_GlobalInvocationID.x); if (idx>=size) return; uint bits=floatBitsToUint(a[idx]); uint expo=(bits>>23)&0xFFu; uint mant=bits&0x7FFFFFu;
-    int isNan=(expo==0xFFu)&&(mant!=0u); int isInf=(expo==0xFFu)&&(mant==0u); float r;
-    if (mode==0) r=isNan?1.0:0.0; else if (mode==1) r=isInf?1.0:0.0; else r=(!isNan&&!isInf)?1.0:0.0; output[idx]=r;
+    // GLSL converts no bool to int implicitly, and reserves the old buffer name: both kept this from compiling.
+    bool isNan=(expo==0xFFu)&&(mant!=0u); bool isInf=(expo==0xFFu)&&(mant==0u); float r;
+    if (mode==0) r=isNan?1.0:0.0; else if (mode==1) r=isInf?1.0:0.0; else r=(!isNan&&!isInf)?1.0:0.0; result[idx]=r;
 
 }";
 

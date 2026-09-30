@@ -19,6 +19,9 @@ internal sealed class VulkanGlslCompiler : IDisposable
 
     public bool IsAvailable => _available;
 
+    /// <summary>The compiler's message for the most recent failed compile on this instance, or null.</summary>
+    public string? LastError { get; private set; }
+
     public VulkanGlslCompiler()
     {
         try
@@ -84,6 +87,7 @@ internal sealed class VulkanGlslCompiler : IDisposable
                 IntPtr errPtr = ShadercNativeBindings.shaderc_result_get_error_message(result);
                 string errorMsg = errPtr != IntPtr.Zero ? Marshal.PtrToStringAnsi(errPtr) ?? "Unknown error" : "Unknown error";
                 System.Diagnostics.Debug.WriteLine($"[VulkanGlslCompiler] GLSL compilation failed: {errorMsg}");
+                LastError = errorMsg;
                 return null;
             }
 
