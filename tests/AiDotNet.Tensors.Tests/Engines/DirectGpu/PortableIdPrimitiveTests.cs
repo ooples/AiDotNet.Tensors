@@ -27,8 +27,12 @@ public sealed class PortableIdPrimitiveTests
     {
         using var engine = new DirectGpuTensorEngine();
         var backend = engine.IsGpuAvailable ? engine.GetBackend() : null;
-        Skip.If(backend is null, "needs a DirectGpu backend.");
-        CheckAll(backend!);
+        // The engine takes the first available backend (cuda, opencl, hip); only an OpenCL selection exercises the
+        // OpenCL kernels this test is named for.
+        Skip.IfNot(backend is AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClBackend,
+            $"needs the OpenCL backend; the engine selected {backend?.GetType().Name ?? "none"}.");
+        if (backend is AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClBackend openCl)
+            CheckAll(openCl);
     }
 
     [SkippableFact]
