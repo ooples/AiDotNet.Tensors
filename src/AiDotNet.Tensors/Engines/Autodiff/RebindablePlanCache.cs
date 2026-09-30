@@ -255,6 +255,7 @@ internal static class RebindablePlanCache<T>
             foreach (var source in sources)
                 if (grads.TryGetValue(source, out var grad))
                     filtered[source] = grad;
+            DroppedGradients<T>.Stash(grads, filtered);
             return filtered;
         }
 

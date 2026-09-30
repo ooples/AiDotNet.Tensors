@@ -2027,6 +2027,7 @@ internal static class CompiledBackwardWalkHelpers<T>
                 if (state.Grads.TryGetValue(sources[i], out var grad))
                     filtered[sources[i]] = grad;
             }
+            DroppedGradients<T>.Stash(state.Grads, filtered);
             return filtered;
         }
 

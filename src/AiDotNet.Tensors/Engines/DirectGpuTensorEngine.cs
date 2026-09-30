@@ -2548,6 +2548,23 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// download becomes weakly held, so the device memory is released when the tensor is collected and a host read
     /// still downloads it. Neither a download nor a leak.
     /// </summary>
+    /// <summary>
+    /// Frees the device buffer of a tensor nothing will read again (a gradient backward dropped), returning it to its
+    /// pool at once. Only a tensor covering its whole vector qualifies, so the buffer is the vector's own. Its pending
+    /// download is replaced by the released-intermediate error, so a read that should not happen fails loudly.
+    /// </summary>
+    internal void ReleaseDeadDeviceStorage<T>(Tensor<T> tensor)
+    {
+        var vector = tensor.DataVector;
+        if (vector._deviceState is not { Buffer: { } buffer } state) return;
+        if (!tensor.IsContiguous || tensor._storageOffset != 0 || tensor.Length != vector.Length) return;
+        Helpers.HostSync.Release(vector, ReleasedIntermediateMessage);
+        if (tensor.GetBackingArrayForCacheLookupUnsafe() is { } array) Helpers.HostSync.Release(array, ReleasedIntermediateMessage);
+        state.Buffer = null;
+        state.DeviceValid = false;
+        buffer.Dispose();
+    }
+
     internal void DetachToTensorLifetime(IEnumerable<object> keys)
     {
         lock (_activationCacheLock)
