@@ -24,6 +24,16 @@ namespace AiDotNet.Tensors.Engines.Simd;
 /// </summary>
 internal static class PadeSigmoid
 {
+    /// <summary>
+    /// Input clamp applied before range reduction: float exp's range. It keeps n within
+    /// [-126, 126], where 2^n is a normal float built from its exponent bits, so the reduction and
+    /// the exponent always agree and +/-infinity saturate instead of becoming NaN.
+    /// </summary>
+    private const float ReductionLimit = 87.0f;
+
+    /// <summary>Largest |n| whose 2^n is a normal float (exponent field n + 127 in [1, 253]).</summary>
+    private const float MaxExponent = 126.0f;
+
 #if NET5_0_OR_GREATER
     /// <summary>
     /// Padé [3,3] fused sigmoid: 8 floats at a time, single divide, no exp call.
@@ -34,7 +44,13 @@ internal static class PadeSigmoid
     internal static Vector256<float> Sigmoid8(Vector256<float> x)
     {
         // sigmoid(x) = 1/(1+exp(-x)) = Q(-r) / (Q(-r) + 2^n * P(-r))
-        var negX = Avx.Subtract(Vector256<float>.Zero, x);
+        // Clamp BEFORE range reduction, to float exp's range, so r and n always agree. Reducing first
+        // and clamping n to +/-20 afterwards computed r = inf - inf*ln2 = NaN for x = +/-inf
+        // (sigmoid(-inf) returned NaN, not 0) and left 2^n out of step with r for every |x| past
+        // ~13.9, saturating there at 9.5e-7 instead of ~0. x is the SECOND operand of Max/Min, which
+        // return their second operand when either is NaN, so NaN still propagates.
+        var limit = Vector256.Create(ReductionLimit);
+        var negX = Avx.Min(limit, Avx.Max(Avx.Subtract(Vector256<float>.Zero, limit), Avx.Subtract(Vector256<float>.Zero, x)));
 
         // Range reduction: -x = n*ln2 + r
         var log2e = Vector256.Create(1.44269504088896341f);
@@ -42,10 +58,8 @@ internal static class PadeSigmoid
         var n = Avx.RoundToNearestInteger(Avx.Multiply(negX, log2e));
         var r = Fma.MultiplyAddNegated(n, ln2, negX);
 
-        // Clamp n to [-20, 20] to prevent 2^n overflow in IEEE bit manipulation.
-        // This is off the critical path (r computation doesn't depend on clamped n).
-        // For |n| > 20, sigmoid is < 1e-6 or > 1-1e-6, so clamping n is safe.
-        n = Avx.Max(Vector256.Create(-20.0f), Avx.Min(Vector256.Create(20.0f), n));
+        // With |negX| <= 87, n is already within +/-126; the clamp only guards the bit construction.
+        n = Avx.Max(Vector256.Create(-MaxExponent), Avx.Min(Vector256.Create(MaxExponent), n));
 
         // Padé [3,3]: P(r) = 1 + r/2 + r²/10 + r³/120
         //              Q(r) = 1 - r/2 + r²/10 - r³/120
@@ -63,7 +77,7 @@ internal static class PadeSigmoid
         var P = Avx.Add(even, odd);
         var Q = Avx.Subtract(even, odd);
 
-        // 2^n via IEEE bit manipulation (n is clamped, so nInt+127 is in [107, 147])
+        // 2^n via IEEE bit manipulation (n is clamped, so nInt+127 is in [1, 253])
         var nInt = Avx.ConvertToVector256Int32(n);
         var pow2n = Avx2.ShiftLeftLogical(
             Avx2.Add(nInt, Vector256.Create(127)), 23).AsSingle();
@@ -83,14 +97,16 @@ internal static class PadeSigmoid
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static Vector512<float> Sigmoid16(Vector512<float> x)
     {
-        var negX = Avx512F.Subtract(Vector512<float>.Zero, x);
+        // Same clamp-before-reduction as Sigmoid8.
+        var limit = Vector512.Create(ReductionLimit);
+        var negX = Avx512F.Min(limit, Avx512F.Max(Avx512F.Subtract(Vector512<float>.Zero, limit), Avx512F.Subtract(Vector512<float>.Zero, x)));
 
         var log2e = Vector512.Create(1.44269504088896341f);
         var ln2 = Vector512.Create(0.6931471805599453f);
         var n = Avx512F.RoundScale(Avx512F.Multiply(negX, log2e), 0);
         var r = Avx512F.FusedMultiplyAddNegated(n, ln2, negX);
 
-        n = Avx512F.Max(Vector512.Create(-20.0f), Avx512F.Min(Vector512.Create(20.0f), n));
+        n = Avx512F.Max(Vector512.Create(-MaxExponent), Avx512F.Min(Vector512.Create(MaxExponent), n));
 
         var r2 = Avx512F.Multiply(r, r);
         var r3 = Avx512F.Multiply(r2, r);
