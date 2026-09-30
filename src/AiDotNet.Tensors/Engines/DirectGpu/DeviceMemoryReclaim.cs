@@ -64,6 +64,26 @@ internal static class DeviceMemoryReclaim
     internal static bool ProcessExiting => Volatile.Read(ref s_processExiting) != 0;
 
     /// <summary>Collects unreachable managed owners and waits for their finalizers to queue their device frees.</summary>
+    /// <summary>
+    /// Device bytes a backend may allocate from the driver (pool misses) before it asks for a young-generation
+    /// collection. A dead result's buffer returns to the pool only when the GC finalizes it, and a GPU loop allocates so
+    /// little managed memory that collections can be hundreds of steps apart: device memory grew by every step's dead
+    /// results until one happened (measured on OpenCL: 20-330 MB for a ~10 MB working set). A gen-0 collection on a GPU
+    /// loop's small managed heap costs well under a millisecond.
+    /// </summary>
+    internal const long CollectAfterDriverBytes = 64L << 20;
+
+    /// <summary>
+    /// Counts <paramref name="bytes"/> of driver allocation against <paramref name="bytesSinceCollection"/>, and runs a
+    /// gen-0 collection once they pass <see cref="CollectAfterDriverBytes"/>, so dead results return to the pool.
+    /// </summary>
+    internal static void OnDriverAllocation(ref long bytesSinceCollection, long bytes)
+    {
+        if (Interlocked.Add(ref bytesSinceCollection, bytes) < CollectAfterDriverBytes) return;
+        Interlocked.Exchange(ref bytesSinceCollection, 0);
+        GC.Collect(0, GCCollectionMode.Forced, blocking: false);
+    }
+
     internal static void CollectUnreachable()
     {
         GC.Collect();

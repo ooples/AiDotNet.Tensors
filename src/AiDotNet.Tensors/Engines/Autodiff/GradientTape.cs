@@ -1527,6 +1527,17 @@ public sealed class GradientTape<T> : IDisposable
                 Compilation.AutoTrainingCompiler.TryCompileBackward(this, loss, sources?.ToArray());
             }
 
+            // The gradients the filter dropped reach no caller: return their device buffers to the pool now (the
+            // loss's seed included, which is made fresh each backward). Not under create-graph, where they are part
+            // of the higher-order graph.
+            if (!createGraph && _engine is DirectGpuTensorEngine)
+            {
+                var dropped = new List<Tensor<T>>();
+                foreach (var pair in grads)
+                    if (!filtered.ContainsKey(pair.Key) && pair.Value is not null) dropped.Add(pair.Value);
+                ReleaseDroppedGradients(dropped, ForwardStorageOfEntries(), filtered, loss);
+            }
+
             if (!_options.Persistent)
             {
                 _entries.Reset();
@@ -1742,6 +1753,36 @@ public sealed class GradientTape<T> : IDisposable
         return false;
     }
 
+    /// <summary>
+    /// Returns the device buffers of the gradients a backward pass dropped (intermediate tensors' gradients, which
+    /// no caller receives) to the GPU engine's pool. The GC would free them eventually; freeing them here keeps a
+    /// training loop's device memory near its working set, as PyTorch frees its graph after backward. A dropped
+    /// gradient is skipped when its storage is shared with anything that outlives backward: a returned gradient (a
+    /// reshape's gradient is a view of its output's), the loss, or a forward tensor.
+    /// </summary>
+    private void ReleaseDroppedGradients(List<Tensor<T>> dropped, HashSet<object> forwardStorage,
+        Dictionary<Tensor<T>, Tensor<T>> result, Tensor<T> loss)
+    {
+                if (dropped.Count == 0 || _engine is not DirectGpuTensorEngine gpu) return;
+        var kept = forwardStorage;
+        kept.Add(loss.DataVector);
+        foreach (var gradient in result.Values)
+            if (gradient is not null) kept.Add(gradient.DataVector);
+        if (_retainGrad is not null)
+            foreach (var t in _retainGrad)
+                if (t.Grad is { } g) kept.Add(g.DataVector);
+        var released = new HashSet<object>(ReferenceEqualityComparer<object>.Instance);
+        int zzKept = 0, zzNoDev = 0;
+        foreach (var gradient in dropped)
+        {
+            var storage = gradient.DataVector;
+            if (kept.Contains(storage)) { zzKept++; continue; }
+            if (!released.Add(storage)) continue;
+            if (storage._deviceState?.Buffer is null) zzNoDev++;
+            gpu.ReleaseDeadDeviceStorage(gradient);
+        }
+    }
+
     private Dictionary<Tensor<T>, Tensor<T>> ComputeGradientsViaGraph(
         Tensor<T> loss,
         IReadOnlyList<Tensor<T>>? sources)
@@ -1818,7 +1859,7 @@ public sealed class GradientTape<T> : IDisposable
                             var compiledResult = walker(_entries, loss, sources, _engine);
                             if (compiledResult is not null)
                             {
-                                CleanupAfterCachedReplay(compiledResult, sources);
+                                CleanupAfterCachedReplay(compiledResult, sources, loss);
                                 return compiledResult;
                             }
                         }
@@ -1831,7 +1872,7 @@ public sealed class GradientTape<T> : IDisposable
                         // below — clear GradFn / .Grad on intermediates so
                         // they don't pin one full backward's worth of
                         // gradient tensors across successive calls.
-                        CleanupAfterCachedReplay(cached, sources);
+                        CleanupAfterCachedReplay(cached, sources, loss);
                         return cached;
                     }
                 }
@@ -1950,6 +1991,11 @@ public sealed class GradientTape<T> : IDisposable
             // Execute the chain
             var result = chain.Execute(
                 loss, sources, engine, useScratch: acquiredScratch, retainedTensors: _retainGrad);
+            // The chain returned only the requested gradients; the others it computed go back to the pool below, once
+            // the cleanup has proven them unshared (ReleaseDroppedGradients).
+            var droppedByChain = DifferentiableOps._isBackwardCreateGraph ? null : DroppedGradients<T>.Take();
+            if (DifferentiableOps._isBackwardCreateGraph) DroppedGradients<T>.Take();
+            HashSet<object>? forwardStorage = null;
 
             // Build rebindable plan for fresh-tape callers (closes the
             // consumer fresh-tape gap from issue #327). MUST run AFTER
@@ -2114,6 +2160,20 @@ public sealed class GradientTape<T> : IDisposable
                 //     and may be re-executed on the next backward)
                 bool canPoolNodes = !DifferentiableOps._isBackwardCreateGraph;
 
+                // Gradients this cleanup drops belong to no caller: once backward is done they are dead, and their device
+                // buffers go back to the pool now rather than when the GC finds them (see ReleaseDroppedGradients).
+                List<Tensor<T>>? droppedGrads = _engine is DirectGpuTensorEngine && !DifferentiableOps._isBackwardCreateGraph
+                    ? (droppedByChain ??= new List<Tensor<T>>()) : null;
+                if (droppedGrads is not null) forwardStorage = new HashSet<object>(ReferenceEqualityComparer<object>.Instance);
+                void DropGrad(Tensor<T> t)
+                {
+                    if (droppedGrads is not null && t.Grad is { } dropped) droppedGrads.Add(dropped);
+                    t.Grad = null;
+                }
+                void NoteForward(Tensor<T>? t)
+                {
+                    if (forwardStorage is not null && t is not null) forwardStorage.Add(t.DataVector);
+                }
                 bool canPoolIntermediates = canPoolNodes;
                 foreach (var node in topoOrder)
                 {
@@ -2133,6 +2193,12 @@ public sealed class GradientTape<T> : IDisposable
                     // already be null when the streaming backward released it after
                     // consuming it — nothing left to clean in that case.
                     var nodeOutput = node.Output;
+                    NoteForward(nodeOutput);
+                    NoteForward(node.Input0);
+                    NoteForward(node.Input1);
+                    NoteForward(node.Input2);
+                    if (node.InputsOverflow is not null)
+                        foreach (var inp in node.InputsOverflow) NoteForward(inp);
                     if (nodeOutput is not null)
                     {
                         nodeOutput.GradFn = null;
@@ -2141,7 +2207,7 @@ public sealed class GradientTape<T> : IDisposable
                         // consumed it and pooling is safe again.
                         nodeOutput._pinnedByTape = false;
                         if (!ShouldKeepGrad(nodeOutput))
-                            nodeOutput.Grad = null;
+                            DropGrad(nodeOutput);
                     }
                     if (node.Input0 is not null) node.Input0._pinnedByTape = false;
                     if (node.Input1 is not null) node.Input1._pinnedByTape = false;
@@ -2164,7 +2230,7 @@ public sealed class GradientTape<T> : IDisposable
                     {
                         in0.GradFn = null;
                         if (!ShouldKeepGrad(in0))
-                            in0.Grad = null;
+                            DropGrad(in0);
                     }
                     else if (in0 is not null && sourceSet is not null && !ShouldKeepGrad(in0))
                     {
@@ -2173,7 +2239,7 @@ public sealed class GradientTape<T> : IDisposable
                         // backward anyway, so clearing here is a no-op for
                         // nested-tape inputs — but matches the behavior of
                         // the non-Persistent leak-fix path.
-                        in0.Grad = null;
+                        DropGrad(in0);
                     }
 
                     if (node.Input1 is not null)
@@ -2182,11 +2248,11 @@ public sealed class GradientTape<T> : IDisposable
                         {
                             node.Input1.GradFn = null;
                             if (!ShouldKeepGrad(node.Input1))
-                                node.Input1.Grad = null;
+                                DropGrad(node.Input1);
                         }
                         else if (sourceSet is not null && !ShouldKeepGrad(node.Input1))
                         {
-                            node.Input1.Grad = null;
+                            DropGrad(node.Input1);
                         }
                     }
                     if (node.Input2 is not null)
@@ -2195,11 +2261,11 @@ public sealed class GradientTape<T> : IDisposable
                         {
                             node.Input2.GradFn = null;
                             if (!ShouldKeepGrad(node.Input2))
-                                node.Input2.Grad = null;
+                                DropGrad(node.Input2);
                         }
                         else if (sourceSet is not null && !ShouldKeepGrad(node.Input2))
                         {
-                            node.Input2.Grad = null;
+                            DropGrad(node.Input2);
                         }
                     }
                     if (node.InputsOverflow is not null)
@@ -2211,11 +2277,11 @@ public sealed class GradientTape<T> : IDisposable
                             {
                                 inp.GradFn = null;
                                 if (!ShouldKeepGrad(inp))
-                                    inp.Grad = null;
+                                    DropGrad(inp);
                             }
                             else if (sourceSet is not null && !ShouldKeepGrad(inp))
                             {
-                                inp.Grad = null;
+                                DropGrad(inp);
                             }
                         }
                     }
@@ -2325,6 +2391,13 @@ public sealed class GradientTape<T> : IDisposable
                 BackwardScratch<T>.ClearStepsRange(stepCount);
             }
 
+            if (droppedByChain is { Count: > 0 } && _engine is DirectGpuTensorEngine)
+            {
+                var keptForward = ForwardStorageOfEntries();
+                if (forwardStorage is not null) keptForward.UnionWith(forwardStorage);
+                ReleaseDroppedGradients(droppedByChain, keptForward, result, loss);
+            }
+
             return result;
         }
         finally
@@ -2349,9 +2422,14 @@ public sealed class GradientTape<T> : IDisposable
     // CI repro: xNorm, q, k, attn-softmax, ctx, residual, h2-relu).
     private void CleanupAfterCachedReplay(
         Dictionary<Tensor<T>, Tensor<T>> result,
-        IReadOnlyList<Tensor<T>>? sources)
+        IReadOnlyList<Tensor<T>>? sources,
+        Tensor<T> loss)
     {
-        if (DifferentiableOps._isBackwardCreateGraph) return;
+        if (DifferentiableOps._isBackwardCreateGraph)
+        {
+            DroppedGradients<T>.Take();   // nothing is freed under create-graph; just empty the slot
+            return;
+        }
         HashSet<Tensor<T>>? sourceSet = null;
         if (sources is not null)
         {
@@ -2371,6 +2449,10 @@ public sealed class GradientTape<T> : IDisposable
             var o = _entries[i].Output;
             if (o is not null) intermediates.Add(o);
         }
+        // As in the graph walk: the gradients the replay did not return, and those dropped below, go back to the pool
+        // once they are proven unshared. Always take the replay's slot, so a CPU run leaves nothing behind in it.
+        var fromReplay = DroppedGradients<T>.Take();
+        List<Tensor<T>>? replayDropped = _engine is DirectGpuTensorEngine ? (fromReplay ?? new List<Tensor<T>>()) : null;
 
         for (int i = 0; i < _entries.Count; i++)
         {
@@ -2388,7 +2470,11 @@ public sealed class GradientTape<T> : IDisposable
                 output._pinnedByTape = false;
                 bool keepGrad = sourceSet?.Contains(output) == true
                     || (_retainGrad is not null && _retainGrad.Contains(output));
-                if (!keepGrad) output.Grad = null;
+                if (!keepGrad)
+                {
+                    if (replayDropped is not null && output.Grad is { } dropped) replayDropped.Add(dropped);
+                    output.Grad = null;
+                }
                 GradNodePool<T>.Return(fn);
             }
 
@@ -2411,6 +2497,27 @@ public sealed class GradientTape<T> : IDisposable
                     CleanupCachedReplayInput(inp, sourceSet, intermediates);
             }
         }
+
+        if (replayDropped is not null && replayDropped.Count > 0)
+            ReleaseDroppedGradients(replayDropped, ForwardStorageOfEntries(), result, loss);
+    }
+
+    /// <summary>The storage of every tensor the recorded forward read or wrote: none of it may be freed as a gradient.</summary>
+    private HashSet<object> ForwardStorageOfEntries()
+    {
+        var forwardStorage = new HashSet<object>(ReferenceEqualityComparer<object>.Instance);
+        for (int i = 0; i < _entries.Count; i++)
+        {
+            ref var entry = ref _entries[i];
+            if (entry.Output is { } o) forwardStorage.Add(o.DataVector);
+            if (entry.Input0 is { } a) forwardStorage.Add(a.DataVector);
+            if (entry.InputCount >= 2 && entry.Input1 is { } b) forwardStorage.Add(b.DataVector);
+            if (entry.InputCount >= 3 && entry.Input2 is { } c) forwardStorage.Add(c.DataVector);
+            if (entry.InputsOverflow is not null)
+                foreach (var inp in entry.InputsOverflow)
+                    if (inp is not null) forwardStorage.Add(inp.DataVector);
+        }
+        return forwardStorage;
     }
 
     private void CleanupCachedReplayInput(

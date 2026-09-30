@@ -78,8 +78,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         // error instead of crashing inside Execute1D.
         private bool _fusedAdvancedKernelsAvailable;
         private OpenClCommandQueue? _defaultStream;
-        private const int MaxPooledBufferElements = 1_048_576;
-        private const int MaxPooledBuffersPerSize = 4;
+        // The pool is a caching allocator bounded by bytes (a quarter of device memory, set once the device is known),
+        // not by a count per size: a steady training loop frees many buffers of one size per step, and each one the
+        // pool refused went back to the driver behind a completion marker while the host ran steps ahead of the device.
+        // An allocation that runs out of memory drains the pool and retries (AllocateReclaiming).
+        private const int MaxPooledBufferElements = int.MaxValue;
+        private const int PooledMemoryDivisor = 4;
+        private long _driverBytesSinceCollection;   // pool misses since the last collection (DeviceMemoryReclaim)
+        private const int MaxPooledBuffersPerSize = 4096;
         private readonly GpuBufferPool<DirectOpenClGpuBuffer> _bufferPool =
             new GpuBufferPool<DirectOpenClGpuBuffer>(MaxPooledBuffersPerSize, MaxPooledBufferElements);
         private const string OfflineTuningEnvVar = "AIDOTNET_GPU_TUNE";
@@ -269,6 +275,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 }
 
                 GlobalMemoryBytes = (long)_context.GlobalMemSize;
+                _bufferPool.MaxPooledElements = GlobalMemoryBytes / PooledMemoryDivisor / sizeof(float);
                 LocalMemoryBytes = (long)_context.LocalMemSize;
                 // Issue #285: per-allocation cap. Drivers cap individual buffers
                 // well below total VRAM (typical ~1 GB on consumer AMD/Intel).
@@ -1308,6 +1315,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (_context == null)
                 throw new InvalidOperationException("OpenCL context not available");
             GpuLaunchProbe.OnUpload(data, sizeof(float), GpuBackendType.OpenCl);
+            DrainCollectedBuffers();
 
             var affinity = GpuBufferPoolAffinity.ForNativeQueue(_context.CommandQueue);
             if (_bufferPool.TryRent(data.Length, affinity, out var pooled) && pooled != null)
@@ -1318,6 +1326,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
             var context = _context;
             var buffer = AllocateReclaiming(() => new DirectOpenClBuffer(context, data));
+            DeviceMemoryReclaim.OnDriverAllocation(ref _driverBytesSinceCollection, (long)data.Length * sizeof(float));
             return new DirectOpenClGpuBuffer(buffer, ReturnOpenClBufferToPool);
         }
 
@@ -1325,6 +1334,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         {
             if (_context == null)
                 throw new InvalidOperationException("OpenCL context not available");
+            DrainCollectedBuffers();
 
             var affinity = GpuBufferPoolAffinity.ForNativeQueue(_context.CommandQueue);
             if (_bufferPool.TryRent(size, affinity, out var pooled) && pooled != null)
@@ -1332,7 +1342,23 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
             var context = _context;
             var buffer = AllocateReclaiming(() => new DirectOpenClBuffer(context, size));
+            DeviceMemoryReclaim.OnDriverAllocation(ref _driverBytesSinceCollection, (long)size * sizeof(float));
             return new DirectOpenClGpuBuffer(buffer, ReturnOpenClBufferToPool);
+        }
+
+        /// <summary>
+        /// Runs the frees queued by buffers the GC collected, and releases retired buffers whose last use completed.
+        /// Every allocation does this, the pooled ones included: it
+        /// used to happen only on a pool miss, and a steady training loop almost never misses, so the device memory of
+        /// every collected result waited for the next miss (measured on an MLP with a ~10 MB working set: 20-330 MB
+        /// live, and steps of 38-160 ms whenever a miss finally freed hundreds of buffers at once).
+        /// </summary>
+        private void DrainCollectedBuffers()
+        {
+            if (!DirectOpenClGpuBuffer.PendingFrees.IsEmpty) DirectOpenClGpuBuffer.PendingFrees.Drain();
+            // A freed buffer whose last kernel may still be queued is retired behind a marker and released once the
+            // marker completes; that reaping, too, ran only on a pool miss.
+            _context?.ReapCompletedResources();
         }
 
         /// <summary>
@@ -13994,10 +14020,21 @@ KERNEL VARIANTS (A/B testing):
             _size = buffer.Length;
         }
 
-        // An undisposed buffer (a result nothing references any more) frees its device memory through the queue; a
-        // pooled buffer is referenced by its pool, so it is never finalized while pooled.
+        // An undisposed buffer (a result nothing references any more) goes back to its pool, like one disposed
+        // explicitly: the pool hands it out again on the queue it last ran on, where in-order execution makes reuse
+        // safe at once (PyTorch's caching allocator relies on the same stream order). Releasing it to the driver
+        // instead waited on a completion marker, and a training loop that never synchronizes runs many steps ahead of
+        // the device: every step's results sat in the retirement list (measured: ~500 retired buffers, 20-330 MB live
+        // for a ~10 MB working set). The return runs on the next allocating thread, not the finalizer thread; a pooled
+        // buffer is referenced by its pool, so it is never finalized while pooled.
         ~DirectOpenClGpuBuffer()
         {
+            if (_returnToPool is not null && Interlocked.CompareExchange(ref _poolState, 1, 0) == 0)
+            {
+                GC.ReRegisterForFinalize(this);   // rented again later, it must be collectable again
+                PendingFrees.Enqueue(() => _returnToPool(this));
+                return;
+            }
             if (Interlocked.Exchange(ref _poolState, 2) == 2) return;
             var inner = Buffer;
             PendingFrees.Enqueue(inner.Dispose);
