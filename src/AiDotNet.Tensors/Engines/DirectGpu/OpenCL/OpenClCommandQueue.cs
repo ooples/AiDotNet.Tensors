@@ -89,6 +89,7 @@ public sealed class OpenClCommandQueue : IGpuStream
         {
             throw new InvalidOperationException($"Failed to create OpenCL command queue: {err}");
         }
+        DirectOpenClContext.LiveQueues.TryAdd(_handle, 0);
     }
 
     /// <inheritdoc/>
@@ -238,6 +239,7 @@ public sealed class OpenClCommandQueue : IGpuStream
             {
                 // Continue with native release; disposal remains best-effort after a device error.
             }
+            DirectOpenClContext.LiveQueues.TryRemove(_handle, out _);
             try { OpenClNativeBindings.ReleaseCommandQueue(_handle); }
             catch { /* Ignore destruction errors during disposal. */ }
         }

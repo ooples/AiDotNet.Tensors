@@ -2520,81 +2520,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// BEFORE the snapshot (cross-tape cached intermediates an outer scope still
     /// wants) are preserved.
     /// </summary>
-    // Op results created while a gradient tape records. They own their device buffers and never enter the activation
-    // cache, so the tape's dispose-time release (EvictActivationsCreatedAfter, Release mode) - which walks that cache -
-    // never saw them: a dead intermediate stayed readable (downloaded on a host read) and kept its device memory until
-    // finalization. Each record carries the cache's timestamp so "created after the tape's snapshot" means the same
-    // thing for both. Weak: recording must not extend a result's lifetime.
-    private sealed class TapeOwnedResult
-    {
-        public long Timestamp;
-        public int ThreadId;
-        public WeakReference Target = null!;
-        public Func<object, HashSet<object>?, bool> Release = null!;
-    }
-
-    private readonly List<TapeOwnedResult> _tapeOwnedResults = new();
-
-    private void RecordTapeOwnedResult<T>(Tensor<T> tensor)
-    {
-        var record = new TapeOwnedResult
-        {
-            Timestamp = System.Threading.Interlocked.Increment(ref _activationCacheTimestamp),
-            ThreadId = System.Environment.CurrentManagedThreadId,
-            Target = new WeakReference(tensor),
-            Release = static (target, protect) => ReleaseTapeOwnedResult((Tensor<T>)target, protect),
-        };
-        lock (_tapeOwnedResults)
-        {
-            // Only a Release-mode eviction drains this log, so a tape that never releases (MaterializeThenFree,
-            // DropScratch, or no eviction) would grow it without bound. Drop collected targets whenever it doubles:
-            // amortized O(1) per record, and nothing still alive is dropped.
-            if (_tapeOwnedResults.Count >= _tapeOwnedPruneAt)
-            {
-                _tapeOwnedResults.RemoveAll(static r => !r.Target.IsAlive);
-                _tapeOwnedPruneAt = Math.Max(TapeOwnedPruneFloor, _tapeOwnedResults.Count * 2);
-            }
-            _tapeOwnedResults.Add(record);
-        }
-    }
-
-    private const int TapeOwnedPruneFloor = 1024;
-    private int _tapeOwnedPruneAt = TapeOwnedPruneFloor;
-
-    /// <summary>
-    /// Releases a dead tape intermediate that owns its buffer: marks its pending host copy released (a host read
-    /// throws the Retain message) and unbinds the device buffer so no later op reads it. Kept (protected) or retained
-    /// results, and results whose host copy is already current, are left alone.
-    /// </summary>
-    private static bool ReleaseTapeOwnedResult<T>(Tensor<T> tensor, HashSet<object>? protect)
-    {
-        object vector = tensor.DataVector;
-        var array = tensor.GetBackingArrayForCacheLookupUnsafe();
-        if (protect is not null && (protect.Contains(vector) || (array is not null && protect.Contains(array)))) return false;
-        if (Helpers.HostSync.IsRetained(vector) || (array is not null && Helpers.HostSync.IsRetained(array))) return false;
-        bool released = false;
-        if (Helpers.HostSync.IsPending(vector)) released |= Helpers.HostSync.Release(vector, ReleasedIntermediateMessage);
-        if (array is not null && Helpers.HostSync.IsPending(array)) released |= Helpers.HostSync.Release(array, ReleasedIntermediateMessage);
-        if (!released) return false;
-        tensor._gpuBuffer = null;
-        tensor._gpuBackend = null;
-        tensor._gpuBufferVersion = -1;
-        return true;
-    }
-
-    /// <summary>Releases this thread's tape-owned results created after <paramref name="snapshot"/>; prunes the log.</summary>
-    private void ReleaseTapeOwnedResultsCreatedAfter(long snapshot, HashSet<object>? protect)
-    {
-        int thread = System.Environment.CurrentManagedThreadId;
-        List<TapeOwnedResult> mine;
-        lock (_tapeOwnedResults)
-        {
-            mine = _tapeOwnedResults.FindAll(r => r.ThreadId == thread && r.Timestamp > snapshot);
-            _tapeOwnedResults.RemoveAll(r => !r.Target.IsAlive || (r.ThreadId == thread && r.Timestamp > snapshot));
-        }
-        foreach (var record in mine)
-            if (record.Target.Target is { } target) record.Release(target, protect);
-    }
 
     internal long ActivationCacheTimestampSnapshot()
         => System.Threading.Interlocked.Read(ref _activationCacheTimestamp);
@@ -2736,7 +2661,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     internal void EvictActivationsCreatedAfter(long snapshot, HashSet<object>? protect, ActivationReleaseMode mode)
     {
-        if (mode == ActivationReleaseMode.Release) ReleaseTapeOwnedResultsCreatedAfter(snapshot, protect);
         // The activation timestamp counter is process-wide, so "created after my snapshot"
         // also matches a CONCURRENT tape's activations on another thread. Free only THIS
         // thread's entries — disposing another thread's in-flight buffer is a use-after-free
@@ -4115,7 +4039,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // which strongly owned it, so the cache had to materialize (download) every result before it could free it:
         // at every tape dispose and every pressure eviction, plus the cache bookkeeping on every op.
         NoteOwnedResultAllocation(outputBuffer.SizeInBytes);
-        if (Autodiff.GradientTape<T>.Current is not null) RecordTapeOwnedResult(tensor);
+        // Not released when the tape ends: a result the caller holds stays valid, as in PyTorch, and returns to the pool
+        // when it is collected. The gradients backward computes but does not return are freed as soon as backward ends
+        // (GradientTape.ReleaseDroppedGradients).
         if (TrackOwnedResultBytes) TrackOwnedResult(outputBuffer);
         return tensor;
     }

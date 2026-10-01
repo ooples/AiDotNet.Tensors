@@ -1347,8 +1347,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         }
 
         /// <summary>
-        /// Runs the frees queued by buffers the GC collected, and releases retired buffers whose last use completed.
-        /// Every allocation does this, the pooled ones included: it
+        /// Runs the frees queued by buffers the GC collected (returning them to their pool). Every allocation does this, the pooled ones included: it
         /// used to happen only on a pool miss, and a steady training loop almost never misses, so the device memory of
         /// every collected result waited for the next miss (measured on an MLP with a ~10 MB working set: 20-330 MB
         /// live, and steps of 38-160 ms whenever a miss finally freed hundreds of buffers at once).
@@ -1356,9 +1355,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         private void DrainCollectedBuffers()
         {
             if (!DirectOpenClGpuBuffer.PendingFrees.IsEmpty) DirectOpenClGpuBuffer.PendingFrees.Drain();
-            // A freed buffer whose last kernel may still be queued is retired behind a marker and released once the
-            // marker completes; that reaping, too, ran only on a pool miss.
-            _context?.ReapCompletedResources();
+            // Retired buffers (released behind a completion marker) are still reaped only on a pool miss: polling every
+            // marker on every allocation cost about a second per GPU test in a long run.
         }
 
         /// <summary>
