@@ -115,7 +115,10 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
             List<TBuffer>? undersized = null;
             while (affinityBuffers.TryTake(out var candidate))
             {
+                // Debited as it leaves the bag, like the count: an undersized candidate goes back through Return, which
+                // credits it again, so debiting only the chosen one counted every passed-over buffer twice.
                 Interlocked.Decrement(ref bucket.Count);
+                Interlocked.Add(ref _pooledElements, -candidate.Capacity);
 
                 // Power-of-two bucketing can contain different physical capacities (for example,
                 // both 6272 and 8192 elements in bucket 8192). Keep searching instead of turning
@@ -127,7 +130,6 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
                 }
 
                 RestoreUndersizedCandidates(undersized, affinity);
-                Interlocked.Add(ref _pooledElements, -candidate.Capacity);
                 candidate.MarkRented(size);
                 buffer = candidate;
                 return true;

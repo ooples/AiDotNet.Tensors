@@ -14044,19 +14044,25 @@ KERNEL VARIANTS (A/B testing):
             _size = buffer.Length;
         }
 
+        // A wrapper for a device buffer the GC collected: it enters the pool as pooled, like a disposed buffer.
+        private static DirectOpenClGpuBuffer Pooled(DirectOpenClBuffer buffer, Action<DirectOpenClGpuBuffer> returnToPool)
+            => new DirectOpenClGpuBuffer(buffer, returnToPool) { _poolState = 1 };
+
         // An undisposed buffer (a result nothing references any more) goes back to its pool, like one disposed
         // explicitly: the pool hands it out again on the queue it last ran on, where in-order execution makes reuse
         // safe at once (PyTorch's caching allocator relies on the same stream order). Releasing it to the driver
         // instead waited on a completion marker, and a training loop that never synchronizes runs many steps ahead of
         // the device: every step's results sat in the retirement list (measured: ~500 retired buffers, 20-330 MB live
         // for a ~10 MB working set). The return runs on the next allocating thread, not the finalizer thread; a pooled
-        // buffer is referenced by its pool, so it is never finalized while pooled.
+        // buffer is referenced by its pool, so it is never finalized while pooled. The device buffer goes back in a fresh
+        // wrapper: resurrecting this one would promote it past generation 0, where the periodic gen-0 collection could
+        // no longer reclaim it on its next lease. The inner buffer has no finalizer and keeps the queue it last ran on.
         ~DirectOpenClGpuBuffer()
         {
-            if (_returnToPool is not null && Interlocked.CompareExchange(ref _poolState, 1, 0) == 0)
+            if (_returnToPool is { } returnToPool && Interlocked.CompareExchange(ref _poolState, 2, 0) == 0)
             {
-                GC.ReRegisterForFinalize(this);   // rented again later, it must be collectable again
-                PendingFrees.Enqueue(() => _returnToPool(this));
+                var pooledBuffer = Buffer;
+                PendingFrees.Enqueue(() => returnToPool(Pooled(pooledBuffer, returnToPool)));
                 return;
             }
             if (Interlocked.Exchange(ref _poolState, 2) == 2) return;
