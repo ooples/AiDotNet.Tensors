@@ -110,6 +110,8 @@ internal static class FusedOptimizerCheckpointSerializer
         writer.Write(extras.LambDisableBiasCorrection);
         // Selects decoupled (AdamW) vs L2 decay for AMSGrad - an algorithm choice, so it must round-trip.
         writer.Write(extras.DecoupledWeightDecay);
+        // Format version 9: AMSGrad's bias-correction switch (Reddi et al. 2018, Algorithm 2 when set).
+        writer.Write(extras.AmsgradDisableBiasCorrection);
     }
 
     private static FusedOptimizerExtras ReadExtras(BinaryReader reader)
@@ -140,6 +142,7 @@ internal static class FusedOptimizerCheckpointSerializer
             LambMaxTrustRatio = reader.ReadSingle(),
             LambDisableBiasCorrection = reader.ReadBoolean(),
             DecoupledWeightDecay = reader.ReadBoolean(),
+            AmsgradDisableBiasCorrection = reader.ReadBoolean(),
         };
 
     private static void WriteLrSchedules(BinaryWriter writer, FusedLrScheduleCheckpoint[] schedules)

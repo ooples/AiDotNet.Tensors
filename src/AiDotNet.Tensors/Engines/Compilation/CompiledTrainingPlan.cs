@@ -4297,12 +4297,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                                     // AdamW(amsgrad): p *= 1 - lr*wd, then AMSGrad without decay (FusedOptimizerExtras).
                                     if (wd != 0f) gpuBe.Scale(gpuP, gpuP, 1f - lr * wd, len);
                                     gpuBe.AmsgradUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!, gpuVMax[p]!,
-                                        lr, b1, b2, epsVal, 0f, _optimizerStep, len);
+                                        AmsLr(extras, lr, b1, b2), b1, b2, AmsEps(extras, epsVal, b1, b2), 0f, _optimizerStep, len);
                                 }
                                 else
                                 {
                                     gpuBe.AmsgradUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!, gpuVMax[p]!,
-                                        lr, b1, b2, epsVal, wd, _optimizerStep, len);
+                                        AmsLr(extras, lr, b1, b2), b1, b2, AmsEps(extras, epsVal, b1, b2), wd, _optimizerStep, len);
                                 }
                                 break;
                             case OptimizerType.Nadam:
@@ -4449,7 +4449,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                             else if (wd != 0f)
                                 for (int i = 0; i < len; i++) pGrad[i] += wd * pParam[i];
                             FusedOptimizer.AMSGradUpdateSimd(pParam, pGrad, pM, pV, pVMax, len,
-                                lr, b1, b2, epsVal, _optimizerStep);
+                                AmsLr(extras, lr, b1, b2), b1, b2, AmsEps(extras, epsVal, b1, b2), _optimizerStep);
                             break;
                         // #76: float-only kernel-backed optimizers. Buffer slots:
                         // pM=first moment/velocity, pV=second moment/accumulator
@@ -4986,12 +4986,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                                     // AdamW(amsgrad): p *= 1 - lr*wd, then AMSGrad without decay (FusedOptimizerExtras).
                                     if (wd != 0f) gpuBe.Scale(gpuP, gpuP, 1f - lr * wd, len);
                                     gpuBe.AmsgradUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!, gpuVMax[p]!,
-                                        lr, b1, b2, epsVal, 0f, _optimizerStep, len);
+                                        AmsLr(extras, lr, b1, b2), b1, b2, AmsEps(extras, epsVal, b1, b2), 0f, _optimizerStep, len);
                                 }
                                 else
                                 {
                                     gpuBe.AmsgradUpdate(gpuP, gradBuf, gpuM[p]!, gpuV[p]!, gpuVMax[p]!,
-                                        lr, b1, b2, epsVal, wd, _optimizerStep, len);
+                                        AmsLr(extras, lr, b1, b2), b1, b2, AmsEps(extras, epsVal, b1, b2), wd, _optimizerStep, len);
                                 }
                                 break;
                             case OptimizerType.Nadam:
@@ -5106,7 +5106,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                             else if (wd != 0f)
                                 for (int i = 0; i < len; i++) pGrad[i] += wd * pParam[i];
                             FusedOptimizer.AMSGradUpdateSimd(pParam, pGrad, pM, pV, pVMax, len,
-                                lr, b1, b2, epsVal, _optimizerStep);
+                                AmsLr(extras, lr, b1, b2), b1, b2, AmsEps(extras, epsVal, b1, b2), _optimizerStep);
                             break;
                         // #76: float-only kernel-backed optimizers (see ConfigureOptimizerFloat
                         // for the buffer-slot / hyperparameter-mapping rationale).
@@ -5399,7 +5399,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                             else if (wd != 0f)
                                 for (int i = 0; i < len; i++) pGrad[i] += wd * pParam[i];
                             FusedOptimizer.AMSGradUpdateSimd(pParam, pGrad, pM, pV, pVMax, len,
-                                lr, b1, b2, epsVal, _optimizerStep);
+                                AmsLr(extras, lr, b1, b2), b1, b2, AmsEps(extras, epsVal, b1, b2), _optimizerStep);
                             break;
                         default:
                             throw new NotSupportedException(
@@ -5590,7 +5590,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                             else if (wd != 0f)
                                 for (int i = 0; i < len; i++) pGrad[i] += wd * pParam[i];
                             FusedOptimizer.AMSGradUpdateSimd(pParam, pGrad, pM, pV, pVMax, len,
-                                lr, b1, b2, epsVal, _optimizerStep);
+                                AmsLr(extras, lr, b1, b2), b1, b2, AmsEps(extras, epsVal, b1, b2), _optimizerStep);
                             break;
                         default:
                             throw new NotSupportedException(
@@ -5995,6 +5995,40 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         return result;
     }
 
+    // AMSGrad with AmsgradDisableBiasCorrection (Reddi et al. 2018, Algorithm 2): the bias-corrected kernels compute
+    // the uncorrected update exactly when given a rescaled learning rate and epsilon (FusedOptimizer.ToUncorrectedAmsgrad).
+    // The step is the one about to run, so this is evaluated per step, like the kernels' own corrections.
+    private float AmsLr(FusedOptimizerExtras extras, float lr, float b1, float b2)
+    {
+        if (!extras.AmsgradDisableBiasCorrection) return lr;
+        float eps = 0f;
+        FusedOptimizer.ToUncorrectedAmsgrad(ref lr, ref eps, b1, b2, _optimizerStep);
+        return lr;
+    }
+
+    private float AmsEps(FusedOptimizerExtras extras, float eps, float b1, float b2)
+    {
+        if (!extras.AmsgradDisableBiasCorrection) return eps;
+        float lr = 0f;
+        FusedOptimizer.ToUncorrectedAmsgrad(ref lr, ref eps, b1, b2, _optimizerStep);
+        return eps;
+    }
+
+    private double AmsLr(FusedOptimizerExtras extras, double lr, double b1, double b2)
+    {
+        if (!extras.AmsgradDisableBiasCorrection) return lr;
+        double eps = 0.0;
+        FusedOptimizer.ToUncorrectedAmsgrad(ref lr, ref eps, b1, b2, _optimizerStep);
+        return lr;
+    }
+
+    private double AmsEps(FusedOptimizerExtras extras, double eps, double b1, double b2)
+    {
+        if (!extras.AmsgradDisableBiasCorrection) return eps;
+        double lr = 0.0;
+        FusedOptimizer.ToUncorrectedAmsgrad(ref lr, ref eps, b1, b2, _optimizerStep);
+        return eps;
+    }
     private static FusedOptimizerExtras CloneFusedOptimizerExtras(FusedOptimizerExtras extras)
         => new FusedOptimizerExtras
         {
@@ -6031,6 +6065,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             // uncorrected LAMB plan checkpointed and restored as plain LAMB.
             LambMaxTrustRatio = extras.LambMaxTrustRatio,
             LambDisableBiasCorrection = extras.LambDisableBiasCorrection,
+            AmsgradDisableBiasCorrection = extras.AmsgradDisableBiasCorrection,
             DecoupledWeightDecay = extras.DecoupledWeightDecay,
         };
 

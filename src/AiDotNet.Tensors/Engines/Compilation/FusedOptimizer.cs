@@ -1,4 +1,4 @@
-﻿using System.Runtime.CompilerServices;
+using System.Runtime.CompilerServices;
 using AiDotNet.Tensors.Engines.Simd;
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
@@ -1250,6 +1250,29 @@ internal static class FusedOptimizer
         }
     }
 
+    /// <summary>
+    /// Rescales the learning rate and epsilon so the bias-corrected AMSGrad kernels compute the UNCORRECTED update
+    /// (Reddi et al. 2018, Algorithm 2). The corrected kernel computes lr*(m/bc1)/(sqrt(vMax/bc2)+eps); with
+    /// lr' = lr*bc1/sqrt(bc2) and eps' = eps/sqrt(bc2) that is exactly lr*m/(sqrt(vMax)+eps). This keeps one kernel
+    /// per backend (CPU and every GPU) instead of a second shader variant. L2 decay is folded into the gradient
+    /// before the kernel and decoupled decay is applied with the unscaled rate, so neither is affected.
+    /// </summary>
+    internal static void ToUncorrectedAmsgrad(ref float lr, ref float eps, float beta1, float beta2, int step)
+    {
+        double bc1 = 1.0 - System.Math.Pow(beta1, step);
+        double sqrtBc2 = System.Math.Sqrt(1.0 - System.Math.Pow(beta2, step));
+        lr = (float)(lr * bc1 / sqrtBc2);
+        eps = (float)(eps / sqrtBc2);
+    }
+
+    /// <inheritdoc cref="ToUncorrectedAmsgrad(ref float, ref float, float, float, int)"/>
+    internal static void ToUncorrectedAmsgrad(ref double lr, ref double eps, double beta1, double beta2, int step)
+    {
+        double bc1 = 1.0 - System.Math.Pow(beta1, step);
+        double sqrtBc2 = System.Math.Sqrt(1.0 - System.Math.Pow(beta2, step));
+        lr = lr * bc1 / sqrtBc2;
+        eps = eps / sqrtBc2;
+    }
     /// <summary>AVX2 AMSGrad: Adam with max of past squared gradients</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static unsafe void AMSGradUpdateSimd(
@@ -2863,6 +2886,13 @@ public sealed class FusedOptimizerExtras
     /// </summary>
     public bool DecoupledWeightDecay { get; init; }
 
+    /// <summary>
+    /// AMSGrad without bias correction: Reddi, Kale and Kumar (2018), Algorithm 2. Default <c>false</c> keeps
+    /// PyTorch's <c>amsgrad=True</c> (first moment over 1 - beta1^t, running max over 1 - beta2^t). Every backend's
+    /// AMSGrad kernel implements the corrected form, so the uncorrected one is reached exactly through
+    /// <see cref="FusedOptimizer.ToUncorrectedAmsgrad(ref float, ref float, float, float, int)"/>.
+    /// </summary>
+    public bool AmsgradDisableBiasCorrection { get; init; }
     /// <summary>
     /// Validates the hyperparameters that would otherwise produce undefined or
     /// divergent fused-optimizer math, throwing <see cref="ArgumentOutOfRangeException"/>
