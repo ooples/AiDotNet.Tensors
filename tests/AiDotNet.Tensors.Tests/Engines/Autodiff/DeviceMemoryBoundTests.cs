@@ -43,7 +43,7 @@ public sealed class DeviceMemoryBoundTests : IClassFixture<DirectGpuTensorEngine
     public void SteadyTrainingLoop_KeepsDeviceMemoryBounded()
     {
         Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
-        var gpu = _fixture.Engine!;
+        if (_fixture.Engine is not { } gpu) return;   // IsAvailable implies an engine; this satisfies the compiler
         Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClBackend,
             "the device allocation counters are maintained by the OpenCL backend.");
         var previous = AiDotNetEngine.Current;
@@ -102,8 +102,13 @@ public sealed class DeviceMemoryBoundTests : IClassFixture<DirectGpuTensorEngine
     [SkippableFact]
     public void WarmTrainingStep_AllocatesLittleManagedMemory()
     {
+#if !NET5_0_OR_GREATER
+        // .NET Framework 4.7.1 has no per-thread allocation counter, so the bound cannot be measured here. A counter
+        // stubbed to zero would pass without measuring; net10.0 runs the real check.
+        Skip.If(true, "GC.GetAllocatedBytesForCurrentThread does not exist on .NET Framework.");
+#else
         Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
-        var gpu = _fixture.Engine!;
+        if (_fixture.Engine is not { } gpu) return;   // IsAvailable implies an engine; this satisfies the compiler
         var previous = AiDotNetEngine.Current;
         AiDotNetEngine.Current = gpu;
         try
@@ -125,6 +130,7 @@ public sealed class DeviceMemoryBoundTests : IClassFixture<DirectGpuTensorEngine
         {
             AiDotNetEngine.Current = previous;
         }
+#endif
     }
 
     private static void MlpStep(DirectGpuTensorEngine gpu, Tensor<float> x, Tensor<float> w1, Tensor<float> w2)
