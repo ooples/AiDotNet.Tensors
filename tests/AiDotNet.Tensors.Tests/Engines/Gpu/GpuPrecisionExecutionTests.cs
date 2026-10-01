@@ -34,6 +34,8 @@ public sealed class GpuPrecisionExecutionTests
         using var fixture = new Fixture();
         var a = new Tensor<int>(new[] { 1, 2, 3, 4 }, new[] { 2, 2 });
         var b = new Tensor<int>(new[] { 5, 6, 7, 8 }, new[] { 2, 2 });
+        // Speed-first is an explicit choice for int; without a scope an int is preserved.
+        using var policy = new GpuExecutionPolicyScope(GpuExecutionPolicy.Default);
 
         var result = fixture.Engine.TensorMatMul(a, b);
 
@@ -43,9 +45,25 @@ public sealed class GpuPrecisionExecutionTests
     }
 
     [Fact]
+    public void Default_IntegerMatMulAboveTheFloat32LimitStaysExact()
+    {
+        if (GpuExecutionPolicyScope.ExactTypesSpeedFirstByDefault) return; // process opted out of the default
+        using var fixture = new Fixture();
+        // 2^24 + 1 is the first integer FP32 cannot represent; through FP32 it would come back as 2^24.
+        var a = new Tensor<int>(new[] { 16777217, 0, 0, 16777217 }, new[] { 2, 2 });
+        var identity = new Tensor<int>(new[] { 1, 0, 0, 1 }, new[] { 2, 2 });
+
+        var result = fixture.Engine.TensorMatMul(a, identity);
+
+        Assert.Equal(new[] { 16777217, 0, 0, 16777217 }, result.GetDataArray());
+        Assert.Equal(0, fixture.Backend.Fp32GemmCalls);
+        Assert.Equal(GpuExecutionRoute.Cpu, GpuPrecisionDiagnostics.LastPlan!.Route);
+    }
+
+    [Fact]
     public void Default_DoubleMatMulIsPreservedWithoutAScope()
     {
-        if (GpuExecutionPolicyScope.DoubleSpeedFirstByDefault) return; // process opted out of the default
+        if (GpuExecutionPolicyScope.ExactTypesSpeedFirstByDefault) return; // process opted out of the default
         using var fixture = new Fixture();
         var a = new Tensor<double>(new[] { 0.1d, 0.2d, 0.3d, 0.4d }, new[] { 2, 2 });
         var b = new Tensor<double>(new[] { 0.5d, 0.6d, 0.7d, 0.8d }, new[] { 2, 2 });
@@ -168,6 +186,7 @@ public sealed class GpuPrecisionExecutionTests
     public void SpeedFirst_LongAndDecimalMatMulReturnTheDeclaredTypes()
     {
         using var fixture = new Fixture();
+        using var policy = new GpuExecutionPolicyScope(GpuExecutionPolicy.Default);
         var longLeft = new Tensor<long>(new long[] { 1, 2, 3, 4 }, new[] { 2, 2 });
         var longIdentity = new Tensor<long>(new long[] { 1, 0, 0, 1 }, new[] { 2, 2 });
         Assert.Equal(longLeft.GetDataArray(), fixture.Engine.TensorMatMul(longLeft, longIdentity).GetDataArray());

@@ -30,32 +30,44 @@ public sealed class GpuPrecisionPolicyTests
         => Assert.Equal(-1, CuBlasNative.CUBLAS_GEMM_DEFAULT);
 
     [Fact]
-    public void SpeedFirst_DefaultConvertsEveryOrdinaryPublicTypeExceptDoubleThroughFp32()
+    public void Default_KeepsFloatOnTheFp32Route()
     {
         var backend = CreateBackend(Fp32());
 
         AssertGpuPlan<float>(backend, GpuScalarType.Float32);
-        AssertGpuPlan<int>(backend, GpuScalarType.Float32);
-        AssertGpuPlan<long>(backend, GpuScalarType.Float32);
-        AssertGpuPlan<decimal>(backend, GpuScalarType.Float32);
-
-        Assert.Contains("Generic", Plan<int>(backend).FallbackReason);
     }
 
     [Fact]
-    public void ExplicitSpeedFirstScope_StillConvertsDoubleThroughFp32()
+    public void ExplicitSpeedFirstScope_StillConvertsTheExactTypesThroughFp32()
     {
         var backend = CreateBackend(Fp32());
         using var policy = new GpuExecutionPolicyScope(GpuExecutionPolicy.Default);
 
         AssertGpuPlan<double>(backend, GpuScalarType.Float32);
+        AssertGpuPlan<int>(backend, GpuScalarType.Float32);
+        AssertGpuPlan<long>(backend, GpuScalarType.Float32);
+        AssertGpuPlan<decimal>(backend, GpuScalarType.Float32);
         Assert.Contains("Float64", Plan<double>(backend).FallbackReason);
+        Assert.Contains("Generic", Plan<int>(backend).FallbackReason);
+    }
+
+    [Fact]
+    public void WithoutAScope_IntLongAndDecimalArePreservedOnCpu()
+    {
+        if (GpuExecutionPolicyScope.ExactTypesSpeedFirstByDefault) return; // process opted out of the default
+        var backend = CreateBackend(Fp32(), Fp16());
+
+        foreach (var plan in new[] { Plan<int>(backend), Plan<long>(backend), Plan<decimal>(backend) })
+        {
+            Assert.Equal(GpuExecutionRoute.Cpu, plan.Route);
+            Assert.Contains("PreserveInputType", plan.FallbackReason);
+        }
     }
 
     [Fact]
     public void WithoutAScope_DoubleIsPreserved_OnCpuWhenTheBackendHasNoFp64Route()
     {
-        if (GpuExecutionPolicyScope.DoubleSpeedFirstByDefault) return; // process opted out of the default
+        if (GpuExecutionPolicyScope.ExactTypesSpeedFirstByDefault) return; // process opted out of the default
         var backend = CreateBackend(Fp32(), Fp16());
 
         var plan = Plan<double>(backend);
@@ -68,7 +80,7 @@ public sealed class GpuPrecisionPolicyTests
     [Fact]
     public void WithoutAScope_DoubleIsPreserved_OnTheGpuWhenTheBackendAdvertisesFp64()
     {
-        if (GpuExecutionPolicyScope.DoubleSpeedFirstByDefault) return; // process opted out of the default
+        if (GpuExecutionPolicyScope.ExactTypesSpeedFirstByDefault) return; // process opted out of the default
         var backend = CreateBackend(Fp32(), Fp64());
 
         AssertGpuPlan<double>(backend, GpuScalarType.Float64);
