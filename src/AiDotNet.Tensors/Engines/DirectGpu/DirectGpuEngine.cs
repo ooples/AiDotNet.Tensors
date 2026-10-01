@@ -52,7 +52,7 @@ public sealed class DirectGpuEngine : IDisposable
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static bool ShouldFallbackForPrecision<T>()
     {
-        if (Gpu.GpuExecutionPolicyScope.CurrentPolicy.AccuracyMode == Gpu.GpuAccuracyMode.PreserveInputType)
+        if (Gpu.GpuExecutionPolicyScope.EffectivePolicyFor(typeof(T)).AccuracyMode == Gpu.GpuAccuracyMode.PreserveInputType)
             return typeof(T) != typeof(float);
 
         return StrictFp64Fallback && typeof(T) == typeof(double);

@@ -7608,6 +7608,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> FusedLinear<T>(Tensor<T> input, Tensor<T> weights, Tensor<T>? bias, FusedActivationType activation, FusedActivationParams? activationParams = null)
     {
+        // The fused GEMM+bias+activation kernels compute in FP32; a type the policy preserves (double by
+        // default) keeps its precision on the CPU path.
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>())
+            return base.FusedLinear(input, weights, bias, activation, activationParams);
         // GPU-RESIDENT compiled-step path first (no per-call alloc, no download → capture-safe). Falls through to
         // the eager path below when not on the resident step / unsupported activation / no bias.
         if (TryFusedLinearResidentInto(input, weights, bias, activation, activationParams, out var resident) && resident is not null)
@@ -14961,7 +14965,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Non-float stays on CpuEngine under a tape: the norm kernels compute in FP32, so a double training step
         // would silently lose its precision (a double finite-difference gradcheck cannot resolve it). Float runs
         // and records on the device.
-        if (typeof(T) != typeof(float) && IsTapeActive<T>()) return base.LayerNorm(input, gamma, beta, epsilon, out mean, out variance);
+        if ((typeof(T) != typeof(float) && IsTapeActive<T>()) || DirectGpuEngine.ShouldFallbackForPrecision<T>())
+            return base.LayerNorm(input, gamma, beta, epsilon, out mean, out variance);
         // AiDotNet#1331: under GraphMode, the base CpuEngine.LayerNorm has the
         // lazy-graph recording branch that emits a backward node for the
         // compiled plan. The GPU eager path below would silently bypass
@@ -15254,7 +15259,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Non-float stays on CpuEngine under a tape: the norm kernels compute in FP32, so a double training step
         // would silently lose its precision (a double finite-difference gradcheck cannot resolve it). Float runs
         // and records on the device.
-        if (typeof(T) != typeof(float) && IsTapeActive<T>()) return base.RMSNorm(input, gamma, epsilon, out rms);
+        if ((typeof(T) != typeof(float) && IsTapeActive<T>()) || DirectGpuEngine.ShouldFallbackForPrecision<T>()) return base.RMSNorm(input, gamma, epsilon, out rms);
         // Graph traces and anomaly mode take the base path (it records the graph node / checks every op).
         if (Compilation.GraphMode.IsActive || Autodiff.AnomalyModeScope.IsActive) return base.RMSNorm(input, gamma, epsilon, out rms);
         if (!TryGetBackend(out var backend))
@@ -15349,7 +15354,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Non-float stays on CpuEngine under a tape: the norm kernels compute in FP32, so a double training step
         // would silently lose its precision (a double finite-difference gradcheck cannot resolve it). Float runs
         // and records on the device.
-        if (typeof(T) != typeof(float) && IsTapeActive<T>()) return base.GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
+        if ((typeof(T) != typeof(float) && IsTapeActive<T>()) || DirectGpuEngine.ShouldFallbackForPrecision<T>()) return base.GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
         if (Compilation.GraphMode.IsActive) return base.GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
         if (!TryGetBackend(out var backend))
             return base.GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
@@ -15415,7 +15420,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Non-float stays on CpuEngine under a tape: the norm kernels compute in FP32, so a double training step
         // would silently lose its precision (a double finite-difference gradcheck cannot resolve it). Float runs
         // and records on the device.
-        if (typeof(T) != typeof(float) && IsTapeActive<T>()) return base.InstanceNorm(input, gamma, beta, epsilon, out mean, out variance);
+        if ((typeof(T) != typeof(float) && IsTapeActive<T>()) || DirectGpuEngine.ShouldFallbackForPrecision<T>()) return base.InstanceNorm(input, gamma, beta, epsilon, out mean, out variance);
         if (Compilation.GraphMode.IsActive) return base.InstanceNorm(input, gamma, beta, epsilon, out mean, out variance);
         if (!TryGetBackend(out var backend))
             return base.InstanceNorm(input, gamma, beta, epsilon, out mean, out variance);
@@ -22329,7 +22334,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Non-float stays on CpuEngine under a tape: the norm kernels compute in FP32, so a double training step
         // would silently lose its precision (a double finite-difference gradcheck cannot resolve it). Float runs
         // and records on the device.
-        if (typeof(T) != typeof(float) && IsTapeActive<T>()) return base.LayerNorm(input, gamma, beta, epsilon, out mean, out variance);
+        // Outside a tape the same holds whenever the policy preserves the type (double by default).
+        if ((typeof(T) != typeof(float) && IsTapeActive<T>()) || DirectGpuEngine.ShouldFallbackForPrecision<T>())
+            return base.LayerNorm(input, gamma, beta, epsilon, out mean, out variance);
         if (!TryGetBackend(out var backend) || input.Rank < 2)
             return base.LayerNorm(input, gamma, beta, epsilon, out mean, out variance);
 
@@ -22436,7 +22443,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Non-float stays on CpuEngine under a tape: the norm kernels compute in FP32, so a double training step
         // would silently lose its precision (a double finite-difference gradcheck cannot resolve it). Float runs
         // and records on the device.
-        if (typeof(T) != typeof(float) && IsTapeActive<T>()) return base.GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
+        if ((typeof(T) != typeof(float) && IsTapeActive<T>()) || DirectGpuEngine.ShouldFallbackForPrecision<T>()) return base.GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
         if (!TryGetBackend(out var backend) || input.Rank < 2)
             return base.GroupNorm(input, numGroups, gamma, beta, epsilon, out mean, out variance);
 
@@ -22490,7 +22497,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Non-float stays on CpuEngine under a tape: the norm kernels compute in FP32, so a double training step
         // would silently lose its precision (a double finite-difference gradcheck cannot resolve it). Float runs
         // and records on the device.
-        if (typeof(T) != typeof(float) && IsTapeActive<T>()) return base.InstanceNorm(input, gamma, beta, epsilon, out mean, out variance);
+        if ((typeof(T) != typeof(float) && IsTapeActive<T>()) || DirectGpuEngine.ShouldFallbackForPrecision<T>()) return base.InstanceNorm(input, gamma, beta, epsilon, out mean, out variance);
         if (!TryGetBackend(out var backend) || input.Rank < 4)
             return base.InstanceNorm(input, gamma, beta, epsilon, out mean, out variance);
 
@@ -22539,7 +22546,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Non-float stays on CpuEngine under a tape: the norm kernels compute in FP32, so a double training step
         // would silently lose its precision (a double finite-difference gradcheck cannot resolve it). Float runs
         // and records on the device.
-        if (typeof(T) != typeof(float) && IsTapeActive<T>()) return base.RMSNorm(input, gamma, epsilon, out rms);
+        if ((typeof(T) != typeof(float) && IsTapeActive<T>()) || DirectGpuEngine.ShouldFallbackForPrecision<T>()) return base.RMSNorm(input, gamma, epsilon, out rms);
         // An active tape no longer sends RMSNorm to the host: the device result records the same tape node as the
         // CPU path, and its backward dispatches to the GPU RMSNormBackward kernel. (Graph traces and anomaly mode
         // still take the base path, which records the graph node / checks every op.)
@@ -22763,6 +22770,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> Softmax<T>(Tensor<T> input, int axis)
     {
+        // The softmax kernel computes in FP32; a type the policy preserves (double by default) stays exact on CPU.
+        if (DirectGpuEngine.ShouldFallbackForPrecision<T>()) return base.Softmax(input, axis);
         if (!TryGetBackend(out var backend))
         {
             if (ThrowOnGpuKernelFallback)

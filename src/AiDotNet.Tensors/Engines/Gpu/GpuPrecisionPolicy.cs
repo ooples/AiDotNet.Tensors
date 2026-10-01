@@ -180,7 +180,48 @@ public sealed class GpuExecutionPolicyScope : IDisposable
     public static GpuExecutionPolicyScope? Current => s_current.Value;
 
     /// <summary>Gets the active policy, defaulting to speed-first automatic selection.</summary>
+    /// <remarks>
+    /// Element-type-agnostic. Routing decisions should use <see cref="EffectivePolicyFor"/>, which applies
+    /// the per-type default for code running without an explicit scope.
+    /// </remarks>
     public static GpuExecutionPolicy CurrentPolicy => Current?.Policy ?? GpuExecutionPolicy.Default;
+
+    /// <summary>
+    /// Opt-out restoring the former process-wide default of narrowing <c>double</c> through FP32 on the GPU
+    /// when no scope is active. Set <c>AIDOTNET_DIRECTGPU_DOUBLE_SPEED_FIRST=1</c>.
+    /// </summary>
+    internal static readonly bool DoubleSpeedFirstByDefault =
+        Environment.GetEnvironmentVariable("AIDOTNET_DIRECTGPU_DOUBLE_SPEED_FIRST") == "1";
+
+    /// <summary>
+    /// The policy that governs an operation on <paramref name="elementType"/>: the active scope's policy
+    /// when one exists, otherwise the per-type default.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Without a scope, <c>double</c> defaults to <see cref="GpuExecutionPolicy.Preserve"/>: a native FP64
+    /// route where the backend has one, the CPU otherwise. A caller who chose <c>Tensor&lt;double&gt;</c>
+    /// asked for double precision, and narrowing it silently through FP32 cost about seven significant
+    /// digits on every GPU operation (element-wise, GEMM, softmax and norms all measured ~1e-7 relative
+    /// error, and finite-difference gradient checks over a double model became meaningless). Every other
+    /// element type keeps <see cref="GpuExecutionPolicy.Default"/>.
+    /// </para>
+    /// <para>
+    /// An explicit <see cref="GpuExecutionPolicyScope"/> always wins, so speed-first double is one scope
+    /// away: <c>using var _ = new GpuExecutionPolicyScope(GpuExecutionPolicy.Default);</c>. An active
+    /// <see cref="AutocastScope"/> is an explicit request too and also lifts the double default.
+    /// </para>
+    /// </remarks>
+    public static GpuExecutionPolicy EffectivePolicyFor(Type elementType)
+    {
+        if (Current is { } scope) return scope.Policy;
+        // An active AutocastScope is itself an explicit request for reduced precision, so it lifts the
+        // double default exactly as an explicit speed-first policy scope would.
+        if (AutocastScope.IsEnabled) return GpuExecutionPolicy.Default;
+        return elementType == typeof(double) && !DoubleSpeedFirstByDefault
+            ? GpuExecutionPolicy.Preserve
+            : GpuExecutionPolicy.Default;
+    }
 
     /// <summary>Gets this scope's policy.</summary>
     public GpuExecutionPolicy Policy { get; }
@@ -337,7 +378,7 @@ public static class GpuPrecisionPlanner
         if (backend is null) throw new ArgumentNullException(nameof(backend));
         if (string.IsNullOrWhiteSpace(operationName)) throw new ArgumentException("Operation name required.", nameof(operationName));
 
-        var policy = GpuExecutionPolicyScope.CurrentPolicy;
+        var policy = GpuExecutionPolicyScope.EffectivePolicyFor(typeof(T));
         var requested = AutocastScope.IsEnabled
             ? FromPrecisionMode(AutocastScope.ActivePrecision)
             : policy.ComputePreference;

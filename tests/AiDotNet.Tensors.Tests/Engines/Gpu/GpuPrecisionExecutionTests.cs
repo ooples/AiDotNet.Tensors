@@ -16,6 +16,8 @@ public sealed class GpuPrecisionExecutionTests
         using var fixture = new Fixture();
         var a = new Tensor<double>(new[] { 1d, 2d, 3d, 4d }, new[] { 2, 2 });
         var b = new Tensor<double>(new[] { 5d, 6d, 7d, 8d }, new[] { 2, 2 });
+        // Speed-first is an explicit choice for double; without a scope a double is preserved.
+        using var policy = new GpuExecutionPolicyScope(GpuExecutionPolicy.Default);
 
         var result = fixture.Engine.TensorMatMul(a, b);
 
@@ -38,6 +40,22 @@ public sealed class GpuPrecisionExecutionTests
         Assert.Equal(new[] { 19, 22, 43, 50 }, result.GetDataArray());
         Assert.Equal(1, fixture.Backend.Fp32GemmCalls);
         Assert.Equal(typeof(int), GpuPrecisionDiagnostics.LastPlan!.PublicType);
+    }
+
+    [Fact]
+    public void Default_DoubleMatMulIsPreservedWithoutAScope()
+    {
+        if (GpuExecutionPolicyScope.DoubleSpeedFirstByDefault) return; // process opted out of the default
+        using var fixture = new Fixture();
+        var a = new Tensor<double>(new[] { 0.1d, 0.2d, 0.3d, 0.4d }, new[] { 2, 2 });
+        var b = new Tensor<double>(new[] { 0.5d, 0.6d, 0.7d, 0.8d }, new[] { 2, 2 });
+
+        var result = fixture.Engine.TensorMatMul(a, b);
+
+        Assert.Equal(0, fixture.Backend.Fp32GemmCalls);
+        Assert.Equal(0, fixture.Backend.Fp16GemmCalls);
+        Assert.Equal(GpuExecutionRoute.Cpu, GpuPrecisionDiagnostics.LastPlan!.Route);
+        Assert.Equal(0.1 * 0.5 + 0.2 * 0.7, result.GetDataArray()[0], 15);
     }
 
     [Fact]
@@ -135,6 +153,8 @@ public sealed class GpuPrecisionExecutionTests
         }
         var left = new Tensor<double>(leftValues, new[] { 2, 3, 2, 2 });
         var right = new Tensor<double>(rightValues, new[] { 2, 3, 2, 2 });
+        // This pins the batched-GEMM collapse on the GPU route, which double reaches under speed-first.
+        using var policy = new GpuExecutionPolicyScope(GpuExecutionPolicy.Default);
 
         var result = fixture.Engine.TensorMatMul(left, right);
 

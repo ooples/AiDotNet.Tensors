@@ -24068,15 +24068,18 @@ public partial class CpuEngine : ITensorLevelEngine
         var varData = new T[features];
         var outputData = new T[batch * features];
 
-        // Compute mean per feature
+        // Compute mean per feature, accumulated relative to the feature's first value: summing the raw
+        // values lets a large common offset swamp the low digits (a float feature at 1e5 + U(0,1) came
+        // out ~6x past the precision its inputs carry). Mean = K + sum(x - K) / n is exact algebra.
         for (int f = 0; f < features; f++)
         {
+            T shift = batch > 0 ? inputData[f] : numOps.Zero;
             T sum = numOps.Zero;
             for (int b = 0; b < batch; b++)
             {
-                sum = numOps.Add(sum, inputData[b * features + f]);
+                sum = numOps.Add(sum, numOps.Subtract(inputData[b * features + f], shift));
             }
-            meanData[f] = numOps.Divide(sum, numOps.FromDouble(batch));
+            meanData[f] = numOps.Add(shift, numOps.Divide(sum, numOps.FromDouble(batch)));
         }
 
         // Compute variance per feature
@@ -25561,7 +25564,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // Float fast path: SIMD mean, variance, and normalize via Vector256
         // with FMA — fused into a SINGLE pass over the input using
-        // <c>Var[X] = E[X²] - E[X]²</c>. Writes directly into an uninitialized
+        // <c>Var[X] = E[(X-K)²] - E[X-K]²</c> with K the row's first element (ShiftedMoments; the
+        // unshifted form cancels catastrophically for large-mean rows). Writes directly into an uninitialized
         // rented output tensor, avoiding the 786 KB zero-init cost of
         // <c>new float[batchSize * featureSize]</c> that previously dominated
         // per-call overhead on BERT LayerNorm (measured: engine wrap was
@@ -25832,6 +25836,34 @@ public partial class CpuEngine : ITensorLevelEngine
         }
     }
 
+    /// <summary>
+    /// Mean and variance of a row from sums accumulated relative to <paramref name="shift"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The fused single pass needs sum and sum-of-squares together, but the textbook
+    /// Var = E[x^2] - E[x]^2 over the raw values cancels catastrophically when the row's mean is large
+    /// next to its spread: both terms round to the same float and every significant digit of the
+    /// difference is lost. A float LayerNorm over values of 1000 + U(0,1) was off by up to 167 in
+    /// absolute terms (the variance came out as zero or noise), and 60 + U(0,1) by 7e-3.
+    /// </para>
+    /// <para>
+    /// Accumulating x - K with K any value of the row (here its first element) removes the large
+    /// common offset before squaring - the "shifted data" algorithm (Chan, Golub and LeVeque, 1983).
+    /// The error then scales with the row's spread instead of its magnitude, at the cost of one
+    /// subtract per loaded vector, and it stays a single fused pass.
+    /// </para>
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void ShiftedMoments(float shift, float shiftedSum, float shiftedSumSq, int count, out float mean, out float variance)
+    {
+        float shiftedMean = shiftedSum / count;
+        mean = shift + shiftedMean;
+        variance = shiftedSumSq / count - shiftedMean * shiftedMean;
+        // Rounding can still leave a near-constant row's variance a hair below zero; zero it.
+        if (variance < 0f) variance = 0f;
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void ProcessRow(
         float[] fInput, float[] fGamma, float[] fBeta,
@@ -25848,14 +25880,20 @@ public partial class CpuEngine : ITensorLevelEngine
         // FFN up MatMul's FP throughput jump from AVX2→AVX-512).
         if (AiDotNet.Tensors.Engines.Simd.CpuFeatures.HasAVX512F && fs >= 16)
         {
-            // Pass 1 (fused): sum AND sum-of-squares, 16 floats/op.
+            // Pass 1 (fused): sum AND sum-of-squares, 16 floats/op, of the row SHIFTED by its first
+            // element (see ShiftedVariance below - the unshifted E[x^2] - E[x]^2 cancels away every
+            // significant digit once the row's mean is large next to its spread).
+            float shift512 = fInput[off];
+            var vShift512 = System.Runtime.Intrinsics.Vector512.Create(shift512);
             var vSum512 = System.Runtime.Intrinsics.Vector512<float>.Zero;
             var vSumSq512 = System.Runtime.Intrinsics.Vector512<float>.Zero;
             int f512 = 0;
             for (; f512 + 16 <= fs; f512 += 16)
             {
-                var v = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector512<float>>(
-                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fInput[off + f512]));
+                var v = System.Runtime.Intrinsics.X86.Avx512F.Subtract(
+                    System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector512<float>>(
+                        ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fInput[off + f512])),
+                    vShift512);
                 vSum512 = System.Runtime.Intrinsics.X86.Avx512F.Add(vSum512, v);
                 vSumSq512 = System.Runtime.Intrinsics.X86.Avx512F.FusedMultiplyAdd(v, v, vSumSq512);
             }
@@ -25867,13 +25905,11 @@ public partial class CpuEngine : ITensorLevelEngine
                 System.Runtime.Intrinsics.X86.Avx.Add(vSumSq512.GetLower(), vSumSq512.GetUpper()));
             for (; f512 < fs; f512++)
             {
-                float x = fInput[off + f512];
+                float x = fInput[off + f512] - shift512;
                 sum512 += x;
                 sumSq512 += x * x;
             }
-            m = sum512 / fs;
-            v2 = sumSq512 / fs - m * m;
-            if (v2 < 0f) v2 = 0f;
+            ShiftedMoments(shift512, sum512, sumSq512, fs, out m, out v2);
             fMean[b] = m;
             fVar[b] = v2;
 
@@ -25952,28 +25988,37 @@ public partial class CpuEngine : ITensorLevelEngine
                 var v7 = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(
                     ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fInput[off + 56]));
 
-                // Pass 1: 4-way unrolled fused sum + sumSq across the 8 vectors.
-                var s0 = System.Runtime.Intrinsics.X86.Avx.Add(v0, v1);
-                var s1 = System.Runtime.Intrinsics.X86.Avx.Add(v2v, v3);
-                var s2 = System.Runtime.Intrinsics.X86.Avx.Add(v4, v5);
-                var s3 = System.Runtime.Intrinsics.X86.Avx.Add(v6, v7);
+                // Pass 1: 4-way unrolled fused sum + sumSq across the 8 vectors, shifted by the row's
+                // first element (see ShiftedMoments). v0..v7 stay unshifted for pass 2.
+                float shift_ = fInput[off];
+                var vShift_ = System.Runtime.Intrinsics.Vector256.Create(shift_);
+                var u0 = System.Runtime.Intrinsics.X86.Avx.Subtract(v0, vShift_);
+                var u1 = System.Runtime.Intrinsics.X86.Avx.Subtract(v1, vShift_);
+                var u2 = System.Runtime.Intrinsics.X86.Avx.Subtract(v2v, vShift_);
+                var u3 = System.Runtime.Intrinsics.X86.Avx.Subtract(v3, vShift_);
+                var u4 = System.Runtime.Intrinsics.X86.Avx.Subtract(v4, vShift_);
+                var u5 = System.Runtime.Intrinsics.X86.Avx.Subtract(v5, vShift_);
+                var u6 = System.Runtime.Intrinsics.X86.Avx.Subtract(v6, vShift_);
+                var u7 = System.Runtime.Intrinsics.X86.Avx.Subtract(v7, vShift_);
+                var s0 = System.Runtime.Intrinsics.X86.Avx.Add(u0, u1);
+                var s1 = System.Runtime.Intrinsics.X86.Avx.Add(u2, u3);
+                var s2 = System.Runtime.Intrinsics.X86.Avx.Add(u4, u5);
+                var s3 = System.Runtime.Intrinsics.X86.Avx.Add(u6, u7);
                 var vSum_ = System.Runtime.Intrinsics.X86.Avx.Add(
                     System.Runtime.Intrinsics.X86.Avx.Add(s0, s1),
                     System.Runtime.Intrinsics.X86.Avx.Add(s2, s3));
 
-                var sq0 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(v0, v0, System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(v1, v1, System.Runtime.Intrinsics.Vector256<float>.Zero));
-                var sq1 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(v2v, v2v, System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(v3, v3, System.Runtime.Intrinsics.Vector256<float>.Zero));
-                var sq2 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(v4, v4, System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(v5, v5, System.Runtime.Intrinsics.Vector256<float>.Zero));
-                var sq3 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(v6, v6, System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(v7, v7, System.Runtime.Intrinsics.Vector256<float>.Zero));
+                var sq0 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(u0, u0, System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(u1, u1, System.Runtime.Intrinsics.Vector256<float>.Zero));
+                var sq1 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(u2, u2, System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(u3, u3, System.Runtime.Intrinsics.Vector256<float>.Zero));
+                var sq2 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(u4, u4, System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(u5, u5, System.Runtime.Intrinsics.Vector256<float>.Zero));
+                var sq3 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(u6, u6, System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(u7, u7, System.Runtime.Intrinsics.Vector256<float>.Zero));
                 var vSumSq_ = System.Runtime.Intrinsics.X86.Avx.Add(
                     System.Runtime.Intrinsics.X86.Avx.Add(sq0, sq1),
                     System.Runtime.Intrinsics.X86.Avx.Add(sq2, sq3));
 
                 float sum_ = SimdKernels.HorizontalSum(vSum_);
                 float sumSq_ = SimdKernels.HorizontalSum(vSumSq_);
-                m = sum_ / 64f;
-                v2 = sumSq_ / 64f - m * m;
-                if (v2 < 0f) v2 = 0f;
+                ShiftedMoments(shift_, sum_, sumSq_, 64, out m, out v2);
                 fMean[b] = m;
                 fVar[b] = v2;
 
@@ -26041,6 +26086,10 @@ public partial class CpuEngine : ITensorLevelEngine
             // bottlenecked on the FMA latency (4 cycles per dependency on
             // Zen 2). Four parallel chains let the OoO engine fully saturate
             // both FMA ports — 1.5–2× speedup on this pass alone for fs >= 32.
+            //
+            // Every value is accumulated SHIFTED by the row's first element (see ShiftedMoments).
+            float shift = fInput[off];
+            var vShift = System.Runtime.Intrinsics.Vector256.Create(shift);
             var vSum0 = System.Runtime.Intrinsics.Vector256<float>.Zero;
             var vSum1 = System.Runtime.Intrinsics.Vector256<float>.Zero;
             var vSum2 = System.Runtime.Intrinsics.Vector256<float>.Zero;
@@ -26053,14 +26102,14 @@ public partial class CpuEngine : ITensorLevelEngine
             int fs32 = fs & ~31;
             for (; f < fs32; f += 32)
             {
-                var v0 = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(
-                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fInput[off + f]));
-                var v1 = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(
-                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fInput[off + f + 8]));
-                var v2v = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(
-                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fInput[off + f + 16]));
-                var v3 = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(
-                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fInput[off + f + 24]));
+                var v0 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(
+                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fInput[off + f])), vShift);
+                var v1 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(
+                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fInput[off + f + 8])), vShift);
+                var v2v = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(
+                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fInput[off + f + 16])), vShift);
+                var v3 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(
+                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fInput[off + f + 24])), vShift);
                 vSum0 = System.Runtime.Intrinsics.X86.Avx.Add(vSum0, v0);
                 vSum1 = System.Runtime.Intrinsics.X86.Avx.Add(vSum1, v1);
                 vSum2 = System.Runtime.Intrinsics.X86.Avx.Add(vSum2, v2v);
@@ -26073,8 +26122,8 @@ public partial class CpuEngine : ITensorLevelEngine
             // Tail: handle remaining 8-vector chunks with a single accumulator.
             for (; f + 8 <= fs; f += 8)
             {
-                var v = System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(
-                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fInput[off + f]));
+                var v = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Runtime.Intrinsics.Vector256<float>>(
+                    ref System.Runtime.CompilerServices.Unsafe.As<float, byte>(ref fInput[off + f])), vShift);
                 vSum0 = System.Runtime.Intrinsics.X86.Avx.Add(vSum0, v);
                 vSumSq0 = System.Runtime.Intrinsics.X86.Fma.MultiplyAdd(v, v, vSumSq0);
             }
@@ -26089,17 +26138,11 @@ public partial class CpuEngine : ITensorLevelEngine
             float sumSq = SimdKernels.HorizontalSum(vSumSq);
             for (; f < fs; f++)
             {
-                float x = fInput[off + f];
+                float x = fInput[off + f] - shift;
                 sum += x;
                 sumSq += x * x;
             }
-            m = sum / fs;
-            v2 = sumSq / fs - m * m;
-            // Numerical-safety clamp: E[X²] - E[X]² can go slightly negative
-            // in float32 for near-uniform rows due to catastrophic
-            // cancellation. Clamp to 0 — any invStd > 0 maps such rows to
-            // zero output, which is the correct degenerate LayerNorm result.
-            if (v2 < 0f) v2 = 0f;
+            ShiftedMoments(shift, sum, sumSq, fs, out m, out v2);
             fMean[b] = m;
             fVar[b] = v2;
 
@@ -26506,12 +26549,16 @@ public partial class CpuEngine : ITensorLevelEngine
                 var vsq3 = System.Runtime.Intrinsics.Vector256<double>.Zero;
                 int f = 0;
                 int simdLen = fs & ~15;
+                // Accumulate relative to the row's first element (see ShiftedMoments): the raw
+                // E[x^2] - E[x]^2 loses precision in proportion to the row's mean over its spread.
+                double shiftD = ip[0];
+                var vShiftD = System.Runtime.Intrinsics.Vector256.Create(shiftD);
                 for (; f < simdLen; f += 16)
                 {
-                    var x0 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(ip + f);
-                    var x1 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(ip + f + 4);
-                    var x2 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(ip + f + 8);
-                    var x3 = System.Runtime.Intrinsics.X86.Avx.LoadVector256(ip + f + 12);
+                    var x0 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(ip + f), vShiftD);
+                    var x1 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(ip + f + 4), vShiftD);
+                    var x2 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(ip + f + 8), vShiftD);
+                    var x3 = System.Runtime.Intrinsics.X86.Avx.Subtract(System.Runtime.Intrinsics.X86.Avx.LoadVector256(ip + f + 12), vShiftD);
                     vsum0 = System.Runtime.Intrinsics.X86.Avx.Add(vsum0, x0);
                     vsum1 = System.Runtime.Intrinsics.X86.Avx.Add(vsum1, x1);
                     vsum2 = System.Runtime.Intrinsics.X86.Avx.Add(vsum2, x2);
@@ -26523,7 +26570,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
                 for (; f < fs; f++)
                 {
-                    double x = ip[f];
+                    double x = ip[f] - shiftD;
                     sum += x;
                     sumSq += x * x;
                 }
@@ -26537,9 +26584,10 @@ public partial class CpuEngine : ITensorLevelEngine
                 sumSq += HorizontalSumD(vsq0);
 
                 double invFs = 1.0 / fs;
-                double m = sum * invFs;
-                double v = sumSq * invFs - m * m;
-                if (v < 0.0) v = 0.0;  // numerical-safety clamp (matches FP32 BN kernel).
+                double shiftedMean = sum * invFs;
+                double m = shiftD + shiftedMean;
+                double v = sumSq * invFs - shiftedMean * shiftedMean;
+                if (v < 0.0) v = 0.0;  // numerical-safety clamp for near-constant rows.
                 mean[b] = m;
                 variance[b] = v;
                 double invStd = 1.0 / Math.Sqrt(v + epsilon);
@@ -26585,17 +26633,19 @@ public partial class CpuEngine : ITensorLevelEngine
             return;
         }
 #endif
-        // Scalar fallback (net471 / non-x86): same E[X²]−E[X]² structure.
+        // Scalar fallback (net471 / non-x86): same shifted single pass.
         double sumS = 0.0, sumSqS = 0.0;
+        double shiftS = fs > 0 ? input[off] : 0.0;
         for (int f = 0; f < fs; f++)
         {
-            double x = input[off + f];
+            double x = input[off + f] - shiftS;
             sumS += x;
             sumSqS += x * x;
         }
         double invFsS = 1.0 / fs;
-        double mS = sumS * invFsS;
-        double vS = sumSqS * invFsS - mS * mS;
+        double shiftedMeanS = sumS * invFsS;
+        double mS = shiftS + shiftedMeanS;
+        double vS = sumSqS * invFsS - shiftedMeanS * shiftedMeanS;
         if (vS < 0.0) vS = 0.0;
         mean[b] = mS;
         variance[b] = vS;
