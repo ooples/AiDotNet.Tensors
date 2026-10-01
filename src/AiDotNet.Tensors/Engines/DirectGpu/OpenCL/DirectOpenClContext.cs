@@ -40,6 +40,15 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         private readonly List<RetiredMemoryObject> _retiredMemoryObjects = new List<RetiredMemoryObject>();
         private readonly List<PendingHostTransfer> _pendingHostTransfers = new List<PendingHostTransfer>();
         private readonly ConcurrentDictionary<IntPtr, byte> _completedQueues = new ConcurrentDictionary<IntPtr, byte>();
+
+        /// <summary>
+        /// Every command queue not yet released, across all contexts. A buffer remembers the last queue it ran on and
+        /// is retired behind a marker enqueued there; if that queue belonged to an engine since disposed, enqueueing on
+        /// the released handle faults the process (0xC0000005, seen when a collected buffer from an earlier engine was
+        /// freed by the next allocation). A retirement whose queue is not live releases at once, which OpenCL makes
+        /// safe: a released memory object is deleted only after the commands using it complete.
+        /// </summary>
+        internal static readonly ConcurrentDictionary<IntPtr, byte> LiveQueues = new ConcurrentDictionary<IntPtr, byte>();
         // Per-context ordering complements OpenClNativeBindings' process-wide native creation
         // gate. It prevents duplicate first-touch work within this context, while the bindings
         // gate also protects different contexts, profiling probes, and explicit streams from an
@@ -166,7 +175,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 IntPtr lastQueue = memory.LastSubmissionQueue;
                 memory.LastSubmissionQueue = IntPtr.Zero;
 
-                if (_disposed || lastQueue == IntPtr.Zero || IsQueueKnownComplete(lastQueue))
+                if (_disposed || lastQueue == IntPtr.Zero || IsQueueKnownComplete(lastQueue) || !LiveQueues.ContainsKey(lastQueue))
                 {
                     releaseImmediately = true;
                 }
@@ -265,6 +274,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 if (err != OpenClNativeBindings.CL_SUCCESS)
                     throw new InvalidOperationException($"Failed to finish OpenCL command queue during disposal: {err}");
                 _completedQueues.TryAdd(queue, 0);
+                LiveQueues.TryRemove(queue, out _);
             }
             ReapCompletedResources();
         }
@@ -567,6 +577,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 // call that uses the freed context handle.
                 if (_disposed) return IntPtr.Zero;
                 q = OpenClNativeBindings.CreateCommandQueue(_context, _device, properties, out err);
+                if (err == OpenClNativeBindings.CL_SUCCESS && q != IntPtr.Zero) LiveQueues.TryAdd(q, 0);
             }
             if (err != OpenClNativeBindings.CL_SUCCESS || q == IntPtr.Zero)
             {
@@ -648,6 +659,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                         if (q == IntPtr.Zero) continue;
                         OpenClNativeBindings.Finish(q);
                         _completedQueues.TryAdd(q, 0);
+                        LiveQueues.TryRemove(q, out _);
                     }
                 }
 
@@ -659,6 +671,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                         if (q == IntPtr.Zero) continue;
                         OpenClNativeBindings.Finish(q);
                         _completedQueues.TryAdd(q, 0);
+                        LiveQueues.TryRemove(q, out _);
                     }
                 }
             }

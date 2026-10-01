@@ -52,8 +52,13 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     private AmdGpuArchitecture _architecture;
     private string _architectureTarget = string.Empty;
     private bool _disposed;
-    private const int MaxPooledBufferElements = 16_777_216;
-    private const int MaxPooledBuffersPerSize = 4;
+    // A caching allocator bounded by bytes (a quarter of device memory, set once the device is known), not by a count
+    // per size: see the OpenCL backend, where four per size sent every extra buffer of a training step back to the
+    // driver. An allocation that runs out of memory drains the pool and retries (HipMallocReclaiming).
+    private const int MaxPooledBufferElements = int.MaxValue;
+    private const int MaxPooledBuffersPerSize = 4096;
+    private const int PooledMemoryDivisor = 4;
+    private long _driverBytesSinceCollection;   // pool misses since the last collection (DeviceMemoryReclaim)
     private readonly GpuBufferPool<HipGpuBuffer> _bufferPool =
         new GpuBufferPool<HipGpuBuffer>(MaxPooledBuffersPerSize, MaxPooledBufferElements);
     private readonly HipPinnedBufferPool _pinnedPool = new();
@@ -292,6 +297,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             DeviceName = _deviceProps.Name?.Trim() ?? "Unknown AMD GPU";
             ComputeUnits = _deviceProps.MultiProcessorCount;
             GlobalMemoryBytes = (long)(ulong)_deviceProps.TotalGlobalMem;
+            _bufferPool.MaxPooledElements = GlobalMemoryBytes / PooledMemoryDivisor / sizeof(float);
             LocalMemoryBytes = (long)(ulong)_deviceProps.SharedMemPerBlock;
             // Issue #285: same approach as CUDA — total VRAM as conservative
             // upper bound. The guard only catches requests > total VRAM;
@@ -1391,6 +1397,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         GpuBufferSizeGuard.EnsureFits("HIP", (long)data.Length * sizeof(float), MaxBufferAllocBytes, DeviceName);
         GpuLaunchProbe.OnUpload(data, sizeof(float), GpuBackendType.Hip);
 
+        DrainCollectedBuffers();
         if (_bufferPool.TryRent(data.Length, out var pooled) && pooled != null)
         {
             fixed (float* dataPtr = data)
@@ -1427,13 +1434,27 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     /// hipMalloc that first runs the frees queued by collected buffers, and on out-of-memory collects unreachable
     /// buffers, runs their frees, drains the pool and retries once (see <see cref="DeviceMemoryReclaim"/>).
     /// </summary>
+    // Returns the buffers the GC collected to the pool before renting, so a steady loop reuses them at once instead of
+    // only when a pool miss drains the queue.
+    private static void DrainCollectedBuffers()
+    {
+        if (HipGpuBuffer.PendingFrees.IsEmpty) return;
+        // A collected buffer re-enters the pool without the implicit device synchronization hipFree performed. On one
+        // in-order stream the next use is ordered after every earlier one; once a caller has its own streams, queued work
+        // there may still be reading it, so wait for the device before anything can rent it again.
+        if (HipGpuBuffer.SecondaryStreamsInUse)
+            HipNativeBindings.CheckError(HipNativeBindings.hipDeviceSynchronize(), "hipDeviceSynchronize");
+        HipGpuBuffer.PendingFrees.Drain();
+    }
+
     private HipError HipMallocReclaiming(ref IntPtr devicePtr, UIntPtr sizeBytes)
     {
-        if (!HipGpuBuffer.PendingFrees.IsEmpty) HipGpuBuffer.PendingFrees.Drain();
+        DrainCollectedBuffers();
         var result = HipNativeBindings.hipMalloc(ref devicePtr, sizeBytes); // lgtm[cs/call-to-unmanaged-code] HIP interop requires native driver calls.
+        if (result == HipError.Success) DeviceMemoryReclaim.OnDriverAllocation(ref _driverBytesSinceCollection, (long)(ulong)sizeBytes);
         if (result != HipError.ErrorOutOfMemory) return result;
         DeviceMemoryReclaim.CollectUnreachable();
-        HipGpuBuffer.PendingFrees.Drain();
+        DrainCollectedBuffers();
         _bufferPool.DrainAll();
         return HipNativeBindings.hipMalloc(ref devicePtr, sizeBytes); // lgtm[cs/call-to-unmanaged-code] HIP interop requires native driver calls.
     }
@@ -1445,6 +1466,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         // Issue #285: per-allocation cap check before hipMalloc.
         GpuBufferSizeGuard.EnsureFits("HIP", (long)size * sizeof(float), MaxBufferAllocBytes, DeviceName);
 
+        DrainCollectedBuffers();
         if (_bufferPool.TryRent(size, out var pooled) && pooled != null)
         {
             var zeroResult = HipNativeBindings.hipMemset(pooled.Handle, 0, sizeBytes); // lgtm[cs/call-to-unmanaged-code] HIP interop requires native driver calls.
@@ -1472,6 +1494,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         GpuBufferSizeGuard.EnsureFits("HIP", sizeInBytes, MaxBufferAllocBytes, DeviceName);
         var sizeBytes = (UIntPtr)sizeInBytes;
 
+        DrainCollectedBuffers();
         if (_bufferPool.TryRent(size, out var pooled) && pooled != null)
             return pooled;
 
@@ -9907,12 +9930,14 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     /// <inheritdoc/>
     public IGpuStream CreateStream(GpuStreamType streamType)
     {
+        HipGpuBuffer.SecondaryStreamsInUse = true;
         return new HipStream(this, streamType);
     }
 
     /// <inheritdoc/>
     public IGpuStream CreateStream(GpuStreamType streamType, int priority)
     {
+        HipGpuBuffer.SecondaryStreamsInUse = true;
         return new HipStream(this, streamType, priority);
     }
 
@@ -12431,24 +12456,56 @@ internal sealed class HipGpuBuffer : IGpuBuffer, IPoolableGpuBuffer
         if (Interlocked.Exchange(ref _poolState, 2) == 2)
             return;
 
-        if (Handle != IntPtr.Zero)
-        {
-            var result = HipNativeBindings.hipFree(Handle);
-            if (result != HipError.Success)
-            {
-                System.Diagnostics.Debug.WriteLine($"hipFree warning: {result}");
-            }
-        }
+        if (Handle != IntPtr.Zero) FreeAfterQueuedWork(Handle);
         GC.SuppressFinalize(this);
     }
 
-    // An undisposed buffer (a result nothing references any more) frees its device memory through the queue. A buffer
-    // in the pool is referenced by the pool, so it is never finalized while pooled.
+    // A pooled buffer is reused without synchronizing because the next use is ordered behind the last on the same
+    // stream; a real free is not ordered at all, so it first waits for the device. Frees are rare once the caching
+    // pool holds the working set (a rejected return, a drain under memory pressure, an engine disposing).
+    private static void FreeAfterQueuedWork(IntPtr handle)
+    {
+        var syncResult = HipNativeBindings.hipDeviceSynchronize();
+        if (syncResult != HipError.Success)
+            System.Diagnostics.Debug.WriteLine($"hipDeviceSynchronize before hipFree warning: {syncResult}");
+        var result = HipNativeBindings.hipFree(handle);
+        if (result != HipError.Success)
+            System.Diagnostics.Debug.WriteLine($"hipFree warning: {result}");
+    }
+
+    /// <summary>
+    /// Set once any HIP backend creates a stream of its own. Until then every kernel and copy runs on one in-order
+    /// stream, so a collected buffer can be reused at once; after it, work on another stream may still be reading it.
+    /// </summary>
+    internal static volatile bool SecondaryStreamsInUse;
+
+    // A wrapper for a native allocation the GC collected: it enters the pool as pooled, like a disposed buffer.
+    private static HipGpuBuffer Pooled(IntPtr handle, int capacity, HipBackend owningBackend, Action<HipGpuBuffer> returnToPool)
+    {
+        var buffer = new HipGpuBuffer(handle, capacity, owningBackend, returnToPool);
+        buffer._poolState = 1;
+        return buffer;
+    }
+
+    // An undisposed buffer (a result nothing references any more) goes back to its pool, like one disposed explicitly,
+    // so the next allocation reuses it rather than a hipFree and a hipMalloc (see the OpenCL buffer). The return runs
+    // on the next allocating thread. The native allocation goes back in a fresh wrapper: resurrecting this one would
+    // promote it past generation 0, where the periodic gen-0 collection could no longer reclaim it on its next lease.
+    // A buffer in the pool is referenced by the pool, so it is never finalized while pooled; one without a pool frees
+    // its device memory through the queue.
     ~HipGpuBuffer()
     {
+        if (_returnToPool is { } returnToPool && Handle != IntPtr.Zero && Interlocked.CompareExchange(ref _poolState, 2, 0) == 0)
+        {
+            IntPtr pooledHandle = Handle;
+            int capacity = Capacity;
+            HipBackend backend = OwningBackend;
+            PendingFrees.Enqueue(() => returnToPool(Pooled(pooledHandle, capacity, backend, returnToPool)));
+            return;
+        }
         if (Interlocked.Exchange(ref _poolState, 2) == 2 || Handle == IntPtr.Zero) return;
         var handle = Handle;
-        PendingFrees.Enqueue(() => HipNativeBindings.hipFree(handle));
+        PendingFrees.Enqueue(() => FreeAfterQueuedWork(handle));
     }
 
     public void Dispose()

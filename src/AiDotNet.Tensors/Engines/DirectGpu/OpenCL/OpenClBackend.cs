@@ -78,8 +78,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         // error instead of crashing inside Execute1D.
         private bool _fusedAdvancedKernelsAvailable;
         private OpenClCommandQueue? _defaultStream;
-        private const int MaxPooledBufferElements = 1_048_576;
-        private const int MaxPooledBuffersPerSize = 4;
+        // The pool is a caching allocator bounded by bytes (a quarter of device memory, set once the device is known),
+        // not by a count per size: a steady training loop frees many buffers of one size per step, and each one the
+        // pool refused went back to the driver behind a completion marker while the host ran steps ahead of the device.
+        // An allocation that runs out of memory drains the pool and retries (AllocateReclaiming).
+        private const int MaxPooledBufferElements = int.MaxValue;
+        private const int PooledMemoryDivisor = 4;
+        private long _driverBytesSinceCollection;   // pool misses since the last collection (DeviceMemoryReclaim)
+        private const int MaxPooledBuffersPerSize = 4096;
         private readonly GpuBufferPool<DirectOpenClGpuBuffer> _bufferPool =
             new GpuBufferPool<DirectOpenClGpuBuffer>(MaxPooledBuffersPerSize, MaxPooledBufferElements);
         private const string OfflineTuningEnvVar = "AIDOTNET_GPU_TUNE";
@@ -269,6 +275,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                 }
 
                 GlobalMemoryBytes = (long)_context.GlobalMemSize;
+                _bufferPool.MaxPooledElements = GlobalMemoryBytes / PooledMemoryDivisor / sizeof(float);
                 LocalMemoryBytes = (long)_context.LocalMemSize;
                 // Issue #285: per-allocation cap. Drivers cap individual buffers
                 // well below total VRAM (typical ~1 GB on consumer AMD/Intel).
@@ -1308,6 +1315,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (_context == null)
                 throw new InvalidOperationException("OpenCL context not available");
             GpuLaunchProbe.OnUpload(data, sizeof(float), GpuBackendType.OpenCl);
+            DrainCollectedBuffers();
 
             var affinity = GpuBufferPoolAffinity.ForNativeQueue(_context.CommandQueue);
             if (_bufferPool.TryRent(data.Length, affinity, out var pooled) && pooled != null)
@@ -1318,6 +1326,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
             var context = _context;
             var buffer = AllocateReclaiming(() => new DirectOpenClBuffer(context, data));
+            DeviceMemoryReclaim.OnDriverAllocation(ref _driverBytesSinceCollection, (long)data.Length * sizeof(float));
             return new DirectOpenClGpuBuffer(buffer, ReturnOpenClBufferToPool);
         }
 
@@ -1325,6 +1334,7 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         {
             if (_context == null)
                 throw new InvalidOperationException("OpenCL context not available");
+            DrainCollectedBuffers();
 
             var affinity = GpuBufferPoolAffinity.ForNativeQueue(_context.CommandQueue);
             if (_bufferPool.TryRent(size, affinity, out var pooled) && pooled != null)
@@ -1332,7 +1342,21 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
             var context = _context;
             var buffer = AllocateReclaiming(() => new DirectOpenClBuffer(context, size));
+            DeviceMemoryReclaim.OnDriverAllocation(ref _driverBytesSinceCollection, (long)size * sizeof(float));
             return new DirectOpenClGpuBuffer(buffer, ReturnOpenClBufferToPool);
+        }
+
+        /// <summary>
+        /// Runs the frees queued by buffers the GC collected (returning them to their pool). Every allocation does this, the pooled ones included: it
+        /// used to happen only on a pool miss, and a steady training loop almost never misses, so the device memory of
+        /// every collected result waited for the next miss (measured on an MLP with a ~10 MB working set: 20-330 MB
+        /// live, and steps of 38-160 ms whenever a miss finally freed hundreds of buffers at once).
+        /// </summary>
+        private void DrainCollectedBuffers()
+        {
+            if (!DirectOpenClGpuBuffer.PendingFrees.IsEmpty) DirectOpenClGpuBuffer.PendingFrees.Drain();
+            // Retired buffers (released behind a completion marker) are still reaped only on a pool miss: polling every
+            // marker on every allocation cost about a second per GPU test in a long run.
         }
 
         /// <summary>
@@ -8664,6 +8688,37 @@ KERNEL VARIANTS (A/B testing):
             ((DirectOpenClGpuBuffer)buffer).Buffer.CopyFromHost(floatData);
         }
 
+        // Read-only int tables a kernel takes by buffer (shapes, strides, permutations), cached by content. Never written
+        // after upload, so sharing one buffer across calls and queues is safe. Bounded: when full the cache starts a new
+        // generation. An evicted table is not freed then: a caller on another thread may hold it without having bound it
+        // to a kernel yet, so no queued use protects it. It is freed at the next eviction, a full generation of new
+        // tables later, by when every call that looked it up has submitted its kernel (each binds its table in the same
+        // call), so its release is retired behind those kernels like any freed buffer.
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<string, IGpuBuffer> _constantIntTables = new();
+        private readonly object _constantIntTablesGate = new();
+        private List<IGpuBuffer> _evictedConstantIntTables = new();
+        private const int MaxConstantIntTables = 1024;
+
+        private IGpuBuffer ConstantIntTable(int[] values)
+        {
+            string key = string.Join(",", values);
+            if (_constantIntTables.TryGetValue(key, out var cached)) return cached;
+            lock (_constantIntTablesGate)
+            {
+                // Lookup, eviction and insertion are one step, so no two callers evict at once or drop a fresh table.
+                if (_constantIntTables.TryGetValue(key, out cached)) return cached;
+                if (_constantIntTables.Count >= MaxConstantIntTables)
+                {
+                    foreach (var stale in _evictedConstantIntTables) stale.Dispose();
+                    _evictedConstantIntTables = new List<IGpuBuffer>(_constantIntTables.Values);
+                    _constantIntTables.Clear();
+                }
+                var table = AllocateIntBuffer(values);
+                _constantIntTables[key] = table;
+                return table;
+            }
+        }
+
         public IGpuBuffer AllocateIntBuffer(int[] data)
         {
             if (_context == null)
@@ -9146,9 +9201,12 @@ KERNEL VARIANTS (A/B testing):
             for (int i = shape.Length - 2; i >= 0; i--)
                 permutedStrides[i] = permutedStrides[i + 1] * permutedShape[i + 1];
 
-            using var inputStridesBuffer = AllocateIntBuffer(strides);
-            using var outputStridesBuffer = AllocateIntBuffer(permutedStrides);
-            using var permutationBuffer = AllocateIntBuffer(permutation);
+            // The tables depend only on the shape and permutation, which a training step repeats every step: cached,
+            // so a warm step uploads nothing (each call uploaded three small tables: 12 of a Transformer step's 22
+            // host/device crossings).
+            var inputStridesBuffer = ConstantIntTable(strides);
+            var outputStridesBuffer = ConstantIntTable(permutedStrides);
+            var permutationBuffer = ConstantIntTable(permutation);
             var kernel = _kernelCache["permute_general"];
             kernel.SetArg(0, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
             kernel.SetArg(1, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
@@ -13883,6 +13941,13 @@ KERNEL VARIANTS (A/B testing):
             DisposeCompiledCodegenKernels();
             _dynamicGemm?.Dispose();
             _bufferPool.Dispose();
+            lock (_constantIntTablesGate)
+            {
+                foreach (var table in _constantIntTables.Values) table.Dispose();
+                _constantIntTables.Clear();
+                foreach (var table in _evictedConstantIntTables) table.Dispose();
+                _evictedConstantIntTables.Clear();
+            }
 
             // Snapshot both collections to arrays before disposing their members.
             // A child's Dispose() (or a concurrent GPU finalizer under load) can
@@ -13994,10 +14059,27 @@ KERNEL VARIANTS (A/B testing):
             _size = buffer.Length;
         }
 
-        // An undisposed buffer (a result nothing references any more) frees its device memory through the queue; a
-        // pooled buffer is referenced by its pool, so it is never finalized while pooled.
+        // A wrapper for a device buffer the GC collected: it enters the pool as pooled, like a disposed buffer.
+        private static DirectOpenClGpuBuffer Pooled(DirectOpenClBuffer buffer, Action<DirectOpenClGpuBuffer> returnToPool)
+            => new DirectOpenClGpuBuffer(buffer, returnToPool) { _poolState = 1 };
+
+        // An undisposed buffer (a result nothing references any more) goes back to its pool, like one disposed
+        // explicitly: the pool hands it out again on the queue it last ran on, where in-order execution makes reuse
+        // safe at once (PyTorch's caching allocator relies on the same stream order). Releasing it to the driver
+        // instead waited on a completion marker, and a training loop that never synchronizes runs many steps ahead of
+        // the device: every step's results sat in the retirement list (measured: ~500 retired buffers, 20-330 MB live
+        // for a ~10 MB working set). The return runs on the next allocating thread, not the finalizer thread; a pooled
+        // buffer is referenced by its pool, so it is never finalized while pooled. The device buffer goes back in a fresh
+        // wrapper: resurrecting this one would promote it past generation 0, where the periodic gen-0 collection could
+        // no longer reclaim it on its next lease. The inner buffer has no finalizer and keeps the queue it last ran on.
         ~DirectOpenClGpuBuffer()
         {
+            if (_returnToPool is { } returnToPool && Interlocked.CompareExchange(ref _poolState, 2, 0) == 0)
+            {
+                var pooledBuffer = Buffer;
+                PendingFrees.Enqueue(() => returnToPool(Pooled(pooledBuffer, returnToPool)));
+                return;
+            }
             if (Interlocked.Exchange(ref _poolState, 2) == 2) return;
             var inner = Buffer;
             PendingFrees.Enqueue(inner.Dispose);

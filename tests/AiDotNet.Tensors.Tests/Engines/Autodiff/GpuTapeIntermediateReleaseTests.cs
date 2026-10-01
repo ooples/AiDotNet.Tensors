@@ -1,5 +1,6 @@
 // Copyright (c) AiDotNet. All rights reserved.
 
+using System.Collections.Generic;
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.DirectGpu;
@@ -12,8 +13,9 @@ namespace AiDotNet.Tensors.Tests.Engines.Autodiff;
 /// <summary>
 /// A GPU tape used to download EVERY step intermediate to the host before freeing it -- at tape dispose and after
 /// each intermediate's last backward use -- in case something read it later (measured: ~3 GB device-to-host per
-/// training step on a 26.8M-parameter LM, over half the step). Intermediates are now released PyTorch-style: freed
-/// without a host copy, a later read throws a clear error, and GradientTape.Retain keeps the ones a caller needs.
+/// training step on a 26.8M-parameter LM, over half the step). Now, as in PyTorch, a forward result the caller holds
+/// stays valid after the tape and is freed when it is no longer referenced; nothing is downloaded at the tape's end.
+/// The gradients backward computes but does not return are freed into the device pool as soon as backward ends.
 /// </summary>
 [Collection("VulkanGlobalState")]
 public sealed class GpuTapeIntermediateReleaseTests : IClassFixture<DirectGpuTensorEngineTestFixture>, IDisposable
@@ -66,7 +68,7 @@ public sealed class GpuTapeIntermediateReleaseTests : IClassFixture<DirectGpuTen
     }
 
     [SkippableFact]
-    public void Intermediates_AreReleasedWithoutDownload_AndReadingOneAfterTheTapeThrows()
+    public void Intermediates_StayReadableAfterTheTape_AndNothingIsDownloadedAtItsEnd()
     {
         Skip.IfNot(_fixture.IsAvailable, "No GPU device.");
         IEngine gpu = _fixture.Engine!;
@@ -115,15 +117,21 @@ public sealed class GpuTapeIntermediateReleaseTests : IClassFixture<DirectGpuTen
             Assert.True(backwardReadbackBytes <= 64, $"backward read back {backwardReadbackBytes} bytes: {backwardSites}");
             Assert.True(disposeReadbackBytes == 0, $"tape dispose read back {disposeReadbackBytes} bytes: {disposeSites}");
 
-            // A released intermediate fails loudly instead of returning undefined contents...
-            var ex = Assert.Throws<InvalidOperationException>(() => h.ToArray());
-            Assert.Contains("GradientTape.Retain", ex.Message);
-            // ...every time: a failed read must not leave a zero-filled host array behind for the next one...
-            Assert.Throws<InvalidOperationException>(() => h.ToArray());
-            // ...including when it is fed to another GPU op (its device buffer may already belong to someone else).
-            Assert.Throws<InvalidOperationException>(() => gpu.TensorAdd(h, h).ToArray());
+            // A forward result the caller still holds keeps its values after the tape, as in PyTorch: read directly, and
+            // fed to another GPU op (its device buffer must not have been handed to anyone else).
+            float[] expectedH;
+            {
+                IEngine cpu = new CpuEngine();
+                expectedH = cpu.TensorMatMul(x, w).ToArray();
+            }
+            var hValues = h.ToArray();
+            for (int i = 0; i < hValues.Length; i++)
+                Assert.True(Math.Abs(hValues[i] - expectedH[i]) < 1e-4f, $"h[{i}] after the tape: {hValues[i]} vs {expectedH[i]}");
+            var doubled = gpu.TensorAdd(h, h).ToArray();
+            for (int i = 0; i < doubled.Length; i++)
+                Assert.True(Math.Abs(doubled[i] - 2 * expectedH[i]) < 1e-3f, $"(h + h)[{i}] after the tape: {doubled[i]}");
 
-            // A retained intermediate survives with its values; inputs and parameters are untouched.
+            // A retained intermediate survives with its values too; inputs and parameters are untouched.
             var aValues = a.ToArray();
             for (int i = 0; i < aValues.Length; i++)
                 Assert.True(Math.Abs(aValues[i] - expectedA[i]) < 1e-4f, $"retained a[{i}]: {aValues[i]} vs {expectedA[i]}");

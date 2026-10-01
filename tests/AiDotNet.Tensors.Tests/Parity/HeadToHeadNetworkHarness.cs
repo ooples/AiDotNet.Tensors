@@ -327,7 +327,49 @@ internal static class HeadToHeadNetworkHarness
         }
     }
 
-    private static SideResult TrainTensors(JsonElement spec, string work, DirectGpuTensorEngine? gpu)
+    /// <summary>
+    /// The host/device crossings of one warmed-up training step of <paramref name="network"/> on the GPU engine,
+    /// grouped by engine operation, with random weights and data (no PyTorch run needed). For finding the residency
+    /// gaps of each network the head-to-head trains.
+    /// </summary>
+    internal static Dictionary<string, int> MeasureStepCrossings(string root, string network, DirectGpuTensorEngine gpu, int warmupSteps)
+    {
+        var spec = ReadJson(Path.Combine(root, "parity", "networks", network + ".json"));
+        string work = Path.Combine(Path.GetTempPath(), "aidotnet-residency", network);
+        Directory.CreateDirectory(work);
+        var rng = new Random(spec.GetProperty("seed").GetInt32());
+        void WriteRandom(string file, int count, float scale)
+        {
+            using var writer = new BinaryWriter(File.Create(Path.Combine(work, file)));
+            for (int i = 0; i < count; i++) writer.Write((float)((rng.NextDouble() * 2 - 1) * scale));
+        }
+        // More than any spec's parameter count (ResNet-18: 11.2M) and batch; readers consume what they need.
+        const int RandomParameterFloats = 12_000_000, RandomDataFloats = 2_000_000;
+        const float ParameterScale = 0.05f;
+        WriteRandom("weights.bin", RandomParameterFloats, ParameterScale);
+        WriteRandom("data.bin", RandomDataFloats, 1f);
+        var previous = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = gpu;
+        try
+        {
+            var capture = new StepCrossingCapture(warmupSteps);
+            TrainTensors(spec, work, gpu, capture);
+            return capture.Crossings ?? throw new InvalidOperationException("the measured step never ran.");
+        }
+        finally
+        {
+            AiDotNetEngine.Current = previous;
+        }
+    }
+
+    private sealed class StepCrossingCapture
+    {
+        internal StepCrossingCapture(int measuredStep) => MeasuredStep = measuredStep;
+        internal int MeasuredStep { get; }
+        internal Dictionary<string, int>? Crossings { get; set; }
+    }
+
+    private static SideResult TrainTensors(JsonElement spec, string work, DirectGpuTensorEngine? gpu, StepCrossingCapture? capture = null)
     {
         IEngine engine = AiDotNetEngine.Current;
         Tensor<float> Place(Tensor<float> tensor) => gpu is null ? tensor : gpu.UploadToGpu(tensor, GpuTensorRole.General);
@@ -540,8 +582,8 @@ internal static class HeadToHeadNetworkHarness
         var sources = parameters.Select(p => p.Tensor).ToArray();
         var allAxes = new[] { 0, 1 };
 
-        int warmup = spec.GetProperty("warmupSteps").GetInt32();
-        int measured = spec.GetProperty("measuredSteps").GetInt32();
+        int warmup = capture?.MeasuredStep ?? spec.GetProperty("warmupSteps").GetInt32();
+        int measured = capture is null ? spec.GetProperty("measuredSteps").GetInt32() : 1;
         int lossSteps = spec.GetProperty("lossAgreementSteps").GetInt32();
         var phases = new Dictionary<string, List<double>>
         {
@@ -553,6 +595,10 @@ internal static class HeadToHeadNetworkHarness
         for (int step = 0; step < warmup + measured; step++)
         {
             Sync();
+            // Disposed on failure too, so a throwing step leaves no scope registered on this thread collecting transfers.
+            using var crossingScope = capture is not null && step == capture.MeasuredStep
+                ? AiDotNet.Tensors.Engines.Diagnostics.GpuResidencyScope.Begin(captureOperations: true)
+                : null;
             sw.Restart();
             using var tape = new GradientTape<float>();
             var h = x;
@@ -587,6 +633,14 @@ internal static class HeadToHeadNetworkHarness
             }
             Sync();
             double t3 = sw.Elapsed.TotalMilliseconds;
+            if (crossingScope is not null && capture is not null)
+            {
+                crossingScope.Dispose();   // closed here, before the report is read; the using is then a no-op
+                capture.Crossings = crossingScope.Events
+                    .Where(e => e.Kind != AiDotNet.Tensors.Engines.Diagnostics.GpuTransferKind.Synchronize)
+                    .GroupBy(e => $"{e.Kind} {e.Operation ?? "<outside the engine>"}")
+                    .ToDictionary(g => g.Key, g => g.Count(), StringComparer.Ordinal);
+            }
 
             if (step < lossSteps) losses.Add(loss.GetFlat(0));
             if (step >= warmup)

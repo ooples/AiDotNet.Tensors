@@ -50,8 +50,28 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
     private readonly ConcurrentDictionary<int, Bucket> _buckets = new();
     private readonly int _maxPerSize;
     private readonly int _maxSize;
+    // Elements parked in the pool, against MaxPooledElements. A per-size count alone let a training loop return far
+    // more buffers of one size than it kept, and every extra one went back to the driver behind a completion marker.
+    private long _pooledElements;
+
+    /// <summary>
+    /// The most elements the pool keeps parked across all sizes: a caching allocator's budget. A buffer returned past
+    /// it is released to the driver. Unlimited by default; a backend sets it from its device memory.
+    /// </summary>
+    internal long MaxPooledElements { get; set; } = long.MaxValue;
     private readonly object _lifecycleGate = new();
     private int _disposed;
+
+    /// <summary>Buffers currently parked in the pool (returned and not yet rented again): device memory the pool holds.</summary>
+    internal int PooledCount
+    {
+        get
+        {
+            int count = 0;
+            foreach (var bucket in _buckets.Values) count += Volatile.Read(ref bucket.Count);
+            return count;
+        }
+    }
 
     public GpuBufferPool(int maxPerSize, int maxSize)
     {
@@ -95,7 +115,10 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
             List<TBuffer>? undersized = null;
             while (affinityBuffers.TryTake(out var candidate))
             {
+                // Debited as it leaves the bag, like the count: an undersized candidate goes back through Return, which
+                // credits it again, so debiting only the chosen one counted every passed-over buffer twice.
                 Interlocked.Decrement(ref bucket.Count);
+                Interlocked.Add(ref _pooledElements, -candidate.Capacity);
 
                 // Power-of-two bucketing can contain different physical capacities (for example,
                 // both 6272 and 8192 elements in bucket 8192). Keep searching instead of turning
@@ -157,9 +180,10 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
             int bucketKey = NextPowerOfTwo(buffer.Capacity);
             var bucket = _buckets.GetOrAdd(bucketKey, _ => new Bucket());
             int count = Interlocked.Increment(ref bucket.Count);
-            if (count > _maxPerSize)
+            if (count > _maxPerSize || Interlocked.Add(ref _pooledElements, buffer.Capacity) > MaxPooledElements)
             {
                 Interlocked.Decrement(ref bucket.Count);
+                if (count <= _maxPerSize) Interlocked.Add(ref _pooledElements, -buffer.Capacity);
                 buffer.Release();
                 return;
             }
@@ -191,6 +215,7 @@ internal sealed class GpuBufferPool<TBuffer> : IDisposable where TBuffer : class
                 while (affinityBuffers.TryTake(out var buffer))
                 {
                     Interlocked.Decrement(ref bucket.Count);
+                    Interlocked.Add(ref _pooledElements, -buffer.Capacity);
                     buffer.Release();
                     released++;
                 }
