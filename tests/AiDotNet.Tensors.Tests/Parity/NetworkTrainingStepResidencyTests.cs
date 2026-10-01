@@ -1,3 +1,4 @@
+#if NET5_0_OR_GREATER
 using System.Linq;
 using AiDotNet.Tensors.Engines;
 using Xunit;
@@ -38,3 +39,4 @@ public sealed class NetworkTrainingStepResidencyTests
             string.Join("; ", leaks.Select(kv => $"{kv.Value}x {kv.Key}")));
     }
 }
+#endif
