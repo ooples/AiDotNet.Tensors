@@ -12,7 +12,8 @@ internal enum FusedLrScheduleKind
     LinearWarmupCosine = 8,
     LinearWarmupDecay = 9,
     LinearWarmupPhasedDecay = 10,
-    LinearWarmupLegacyEagerDecay = 11
+    LinearWarmupLegacyEagerDecay = 11,
+    External = 12
 }
 
 internal sealed class FusedLrScheduleCheckpoint
@@ -35,6 +36,9 @@ internal sealed class FusedLrScheduleCheckpoint
     public LrSchedule ToSchedule()
     {
         Validate();
+        // An external rate stays external, so the caller can keep setting it on the restored plan.
+        if (Kind == FusedLrScheduleKind.External)
+            return new ExternalLrSchedule(Doubles[0]);
         return new RestoredLrSchedule(Kind, Doubles, Ints);
     }
 
@@ -48,6 +52,7 @@ internal sealed class FusedLrScheduleCheckpoint
         (int reqD, int reqI) = Kind switch
         {
             FusedLrScheduleKind.Constant => (1, 0),
+            FusedLrScheduleKind.External => (1, 0),
             FusedLrScheduleKind.NoamScaled => (2, 0),
             FusedLrScheduleKind.Cosine => (2, 1),
             FusedLrScheduleKind.OneCycleResolved => (3, 2),
@@ -73,6 +78,8 @@ internal sealed class FusedLrScheduleCheckpoint
                 throw new System.IO.InvalidDataException(
                     $"Serialized LR schedule kind {Kind} contains a non-finite value at double {i}.");
         }
+        if (Kind == FusedLrScheduleKind.External && Doubles[0] < 0.0)
+            throw new System.IO.InvalidDataException("Serialized external learning rate is negative.");
         if ((Kind == FusedLrScheduleKind.LinearWarmupPhasedDecay || Kind == FusedLrScheduleKind.LinearWarmupLegacyEagerDecay)
             && (Ints[0] < 0 || !Enum.IsDefined(typeof(WarmupDecayMode), Ints[2])
                 || (Ints[2] != (int)WarmupDecayMode.Constant && Ints[1] < Ints[0])))

@@ -992,6 +992,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
 
     // A read-only view, so a caller cannot cast the result back to the array and rewrite the plan's parameter slots.
     private System.Collections.ObjectModel.ReadOnlyCollection<Tensor<T>>? _optimizedParametersView;
+
+    /// <inheritdoc/>
+    public IReadOnlyList<LrSchedule> LearningRateSchedules =>
+        _optimizerRuntimeState is { } state ? Array.AsReadOnly(state.Schedules) : Array.Empty<LrSchedule>();
     private FusedOptimizerRuntimeState? _optimizerRuntimeState;
 
     private int _nonFiniteStepsSkipped;
@@ -1525,13 +1529,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             if (!ReferenceEquals(source._parameters[p], _parameters[p]))
                 throw new ArgumentException($"Parameter {p} is a different tensor in the previous plan.", nameof(previous));
         }
-        if (source._optimizerRuntimeState is null)
+        if (source._optimizerRuntimeState is not { } sourceState)
             throw new InvalidOperationException("The previous plan has no configured optimizer to continue.");
         if (!TryShareMomentsWith(source))
         {
             var checkpoint = source.CaptureFusedOptimizerCheckpoint()
                 ?? throw new InvalidOperationException("The previous plan has no configured optimizer to continue.");
-            RestoreFusedOptimizerCheckpoint(checkpoint);
+            // Keep the source's schedule instances rather than rebuilding them from the checkpoint: a caller driving
+            // an ExternalLrSchedule holds that instance, and a copy would stop following it after the switch.
+            RestoreFusedOptimizerCheckpoint(checkpoint, sourceState.Schedules);
         }
         _l2Regularization = source._l2Regularization;
     }
@@ -5653,7 +5659,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         return checkpoint;
     }
 
-    internal void RestoreFusedOptimizerCheckpoint(FusedOptimizerCheckpoint checkpoint)
+    internal void RestoreFusedOptimizerCheckpoint(FusedOptimizerCheckpoint checkpoint, LrSchedule[]? liveSchedules = null)
     {
         if (checkpoint is null) throw new ArgumentNullException(nameof(checkpoint));
         ValidateCheckpointEnums(checkpoint);
@@ -5665,13 +5671,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // allocated buffers, so a payload that fails part-way must not leave a half-restored plan behind: put the
         // previous optimizer back (or none, if there was none) and report the payload as invalid.
         var previous = CaptureFusedOptimizerCheckpoint();
+        var previousSchedules = _optimizerRuntimeState?.Schedules;
         var previousMomentMode = _momentStorageMode;
         var previousBlockSize = _int8MomentBlockSize;
         var previousMinQuantizedLength = _int8MinQuantizedLength;
         var previousMaxGradNorm = _maxGradNorm;
         try
         {
-            RestoreFusedOptimizerCheckpointCore(checkpoint);
+            RestoreFusedOptimizerCheckpointCore(checkpoint, liveSchedules);
         }
         // Every failure rolls back, not only data errors: an enum-valid but unsupported combination (int8 moments
         // with SGDMomentum, or weight decay with int8 moments) throws NotSupportedException from ConfigureOptimizer
@@ -5681,7 +5688,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         {
             if (previous is not null)
             {
-                RestoreFusedOptimizerCheckpointCore(previous);
+                RestoreFusedOptimizerCheckpointCore(previous, previousSchedules);
             }
             else
             {
@@ -5729,7 +5736,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         InvalidateCapturedStepGraph();
     }
 
-    private void RestoreFusedOptimizerCheckpointCore(FusedOptimizerCheckpoint checkpoint)
+    /// <param name="liveSchedules">Schedule instances to configure with in place of the checkpoint's, one per
+    /// serialized schedule, so an <see cref="ExternalLrSchedule"/> the caller holds stays the one the plan reads.</param>
+    private void RestoreFusedOptimizerCheckpointCore(FusedOptimizerCheckpoint checkpoint, LrSchedule[]? liveSchedules = null)
     {
         if (checkpoint.Parameters.Length != _parameters.Length)
             throw new InvalidDataException(
@@ -5742,7 +5751,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
 
         var schedules = new LrSchedule[checkpoint.Schedules.Length];
         for (int i = 0; i < schedules.Length; i++)
-            schedules[i] = checkpoint.Schedules[i].ToSchedule();
+        {
+            schedules[i] = liveSchedules is { } live && live.Length == schedules.Length
+                ? live[i]
+                : checkpoint.Schedules[i].ToSchedule();
+        }
 
         if (checkpoint.IsGrouped)
         {

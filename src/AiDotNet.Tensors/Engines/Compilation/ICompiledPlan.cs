@@ -754,4 +754,12 @@ public interface ICompiledTrainingPlanIntrospection<T>
     /// still attached to a model exactly when these are the model's live parameter tensors (reference identity).
     /// </summary>
     IReadOnlyList<Tensor<T>> OptimizedParameters { get; }
+
+    /// <summary>
+    /// The learning-rate schedules the optimizer update evaluates - one per parameter group, or one for an ungrouped
+    /// plan - and empty before an optimizer is configured. These are the live instances, so after
+    /// <c>ImportOptimizerState</c> a caller driving an <see cref="ExternalLrSchedule"/> gets the one the restored plan
+    /// reads.
+    /// </summary>
+    IReadOnlyList<LrSchedule> LearningRateSchedules { get; }
 }
