@@ -11,7 +11,7 @@
 
 ### Performance
 
-* **gpu:** a caching device allocator keeps training-loop device memory flat ([#1074](https://github.com/ooples/AiDotNet.Tensors/issues/1074)) ([a9c0482](https://github.com/ooples/AiDotNet.Tensors/commit/a9c04823e1e2f71861e21e3fc547496a0fdaadb5))
+* **gpu:** a caching device allocator keeps a warm, fixed-shape training loop's device memory flat, with the pool bounded at a quarter of device memory ([#1074](https://github.com/ooples/AiDotNet.Tensors/issues/1074)) ([a9c0482](https://github.com/ooples/AiDotNet.Tensors/commit/a9c04823e1e2f71861e21e3fc547496a0fdaadb5))
 
 ## [0.133.2](https://github.com/ooples/AiDotNet.Tensors/compare/v0.133.1...v0.133.2) (2026-09-30)
 
