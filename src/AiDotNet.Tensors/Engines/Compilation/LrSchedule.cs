@@ -144,6 +144,55 @@ public abstract class LrSchedule
     /// <param name="factor">Multiplicative scale on the schedule (default 1.0, paper-faithful); must be &gt; 0.</param>
     public static LrSchedule Noam(int modelDimension, int warmupSteps, double factor = 1.0)
         => new NoamLr(modelDimension, warmupSteps, factor);
+
+    /// <summary>
+    /// A learning rate the caller sets, read on every optimizer step. Use it when the rate follows a host-side
+    /// scheduler whose cadence is not one step per optimizer update - a schedule stepped at epoch ends, for example -
+    /// so changing the rate does not mean reconfiguring the plan, which would restart its optimizer moments.
+    /// </summary>
+    /// <param name="learningRate">The initial rate: finite and not negative.</param>
+    public static ExternalLrSchedule External(double learningRate) => new ExternalLrSchedule(learningRate);
+}
+
+/// <summary>
+/// A learning rate set by the caller (see <see cref="LrSchedule.External"/>). The plan reads
+/// <see cref="LearningRate"/> on each optimizer step, so a new value applies from the next step on.
+/// </summary>
+/// <remarks>
+/// <para>Checkpoints keep it an external schedule: <c>ImportOptimizerState</c> restores one holding the saved rate, and
+/// <see cref="ICompiledTrainingPlanIntrospection{T}.LearningRateSchedules"/> hands that instance back so the caller can
+/// keep driving the restored plan. <c>ContinueOptimizerFrom</c> keeps using the same instance.</para>
+/// </remarks>
+public sealed class ExternalLrSchedule : LrSchedule
+{
+    private double _learningRate;
+
+    /// <summary>Creates the schedule at <paramref name="learningRate"/>.</summary>
+    /// <param name="learningRate">The initial rate: finite and not negative.</param>
+    public ExternalLrSchedule(double learningRate)
+    {
+        LearningRate = learningRate;
+    }
+
+    /// <summary>The rate the next optimizer step uses: finite and not negative.</summary>
+    public double LearningRate
+    {
+        get => System.Threading.Volatile.Read(ref _learningRate);
+        set
+        {
+            if (double.IsNaN(value) || double.IsInfinity(value) || value < 0.0)
+                throw new System.ArgumentOutOfRangeException(nameof(value), value,
+                    "The learning rate must be finite and not negative.");
+            System.Threading.Volatile.Write(ref _learningRate, value);
+        }
+    }
+
+    /// <inheritdoc/>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public override double GetLr(int step) => LearningRate;
+
+    internal override FusedLrScheduleCheckpoint? TryCaptureCheckpoint()
+        => new(FusedLrScheduleKind.External, new[] { LearningRate }, System.Array.Empty<int>());
 }
 
 internal sealed class ConstantLr : LrSchedule
