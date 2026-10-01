@@ -2945,6 +2945,14 @@ public sealed class FusedOptimizerExtras
         if (!(LambMaxTrustRatio >= 0f) || float.IsInfinity(LambMaxTrustRatio))
             throw new ArgumentOutOfRangeException(nameof(LambMaxTrustRatio), LambMaxTrustRatio,
                 "LAMB LambMaxTrustRatio must be finite and >= 0 (0 disables the clip).");
+        // The exact betas divide (1 - beta) by (1 - (float)beta) and take a square root of the beta2 ratio: a value
+        // of 1 zeroes the learning rate and one above 1 makes it NaN. The negated range check also rejects NaN.
+        if (AmsgradExactBeta1 is double exactBeta1 && !(exactBeta1 >= 0.0 && exactBeta1 < 1.0))
+            throw new ArgumentOutOfRangeException(nameof(AmsgradExactBeta1), exactBeta1,
+                "AMSGrad AmsgradExactBeta1 must be in [0, 1).");
+        if (AmsgradExactBeta2 is double exactBeta2 && !(exactBeta2 >= 0.0 && exactBeta2 < 1.0))
+            throw new ArgumentOutOfRangeException(nameof(AmsgradExactBeta2), exactBeta2,
+                "AMSGrad AmsgradExactBeta2 must be in [0, 1).");
     }
 }
 

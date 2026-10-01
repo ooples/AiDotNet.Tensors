@@ -159,6 +159,50 @@ public class AMSGradPaperModeTests
     public void Float_plan_with_exact_betas_matches_the_exact_reference(bool decoupled)
         => AssertClose(Reference(true, decoupled, exact: true), RunFloat(true, decoupled, exact: true), 2e-5, Label(true, decoupled) + "/exact");
 
+    [Theory]
+    [InlineData(1.0, null)]
+    [InlineData(-0.1, null)]
+    [InlineData(double.NaN, null)]
+    [InlineData(null, 1.0)]
+    [InlineData(null, 1.5)]
+    [InlineData(null, double.PositiveInfinity)]
+    public void Exact_betas_outside_zero_to_one_are_rejected(double? exactBeta1, double? exactBeta2)
+    {
+        // beta = 1 would zero the learning rate and beta2 > 1 would make it NaN on every step.
+        var extras = new FusedOptimizerExtras { AmsgradDisableBiasCorrection = true, AmsgradExactBeta1 = exactBeta1, AmsgradExactBeta2 = exactBeta2 };
+        Assert.Throws<ArgumentOutOfRangeException>(() => extras.Validate());
+    }
+
+    [Fact]
+    public void Exact_betas_inside_zero_to_one_are_accepted()
+        => new FusedOptimizerExtras { AmsgradDisableBiasCorrection = true, AmsgradExactBeta1 = 0.0, AmsgradExactBeta2 = 0.999 }.Validate();
+
+    [Fact]
+    public void A_version_2_optimizer_state_payload_is_refused_rather_than_misread()
+    {
+        // Version 2 was written in more than one layout (the AMSGrad extras were added without a bump), so its
+        // fields cannot be located reliably; the reader must refuse it. The header is magic then version, both Int32.
+        var engine = new CpuEngine();
+        var weight = new Tensor<float>(new[] { 1f, -2f, 3f }, new[] { 3 });
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            engine.ReduceSum(engine.TensorMultiply(weight, weight), null);
+            plan = scope.CompileTraining(new[] { weight });
+        }
+        using (plan)
+        {
+            plan.ConfigureOptimizer(OptimizerType.AMSGrad, 0.01f, 0.9f, 0.999f, 1e-8f, 0f, Extras(true, false, exact: true));
+            plan.Step();
+            byte[] state = plan.ExportOptimizerState() ?? throw new InvalidOperationException("AMSGrad plan exported no state.");
+            plan.ImportOptimizerState(state);   // the current version round-trips
+
+            BitConverter.GetBytes(2).CopyTo(state, 4);
+            var refused = Assert.ThrowsAny<Exception>(() => plan.ImportOptimizerState(state));
+            Assert.Contains("version 2", refused.ToString());
+        }
+    }
+
     [Fact]
     public void The_two_conventions_really_differ_so_the_flag_is_observable()
     {
