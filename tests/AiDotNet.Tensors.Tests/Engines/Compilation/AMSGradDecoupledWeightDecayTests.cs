@@ -189,7 +189,11 @@ public class AMSGradDecoupledWeightDecayTests
         var prior = AiDotNetEngine.Current;
         DirectGpuTensorEngine? gpu = null;
         try { gpu = new DirectGpuTensorEngine(); } catch (Exception ex) when (ex is PlatformNotSupportedException or DllNotFoundException) { }
-        Skip.IfNot(gpu is not null && gpu.IsGpuAvailable, "GPU backend did not resolve.");
+        bool resolved = gpu is not null && gpu.IsGpuAvailable;
+        // The POCL lane sets this so the AMSGrad device path cannot pass CI by skipping.
+        if (!resolved && string.Equals(Environment.GetEnvironmentVariable("AIDOTNET_REQUIRE_GPU_TESTS"), "1", StringComparison.Ordinal))
+            throw new InvalidOperationException("GPU tests required (AIDOTNET_REQUIRE_GPU_TESTS=1) but no GPU backend resolved.");
+        Skip.IfNot(resolved, "GPU backend did not resolve.");
         try
         {
             AiDotNetEngine.Current = gpu!;
