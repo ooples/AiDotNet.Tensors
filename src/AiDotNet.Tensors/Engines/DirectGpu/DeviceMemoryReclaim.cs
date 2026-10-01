@@ -65,23 +65,61 @@ internal static class DeviceMemoryReclaim
 
     /// <summary>Collects unreachable managed owners and waits for their finalizers to queue their device frees.</summary>
     /// <summary>
-    /// Device bytes a backend may allocate from the driver (pool misses) before it asks for a young-generation
-    /// collection. A dead result's buffer returns to the pool only when the GC finalizes it, and a GPU loop allocates so
+    /// Device bytes a backend may hand out (pool hits and driver allocations alike) before it asks for a
+    /// young-generation collection. A dead result's buffer returns to the pool only when the GC finalizes it, and a GPU loop allocates so
     /// little managed memory that collections can be hundreds of steps apart: device memory grew by every step's dead
     /// results until one happened (measured on OpenCL: 20-330 MB for a ~10 MB working set). A gen-0 collection on a GPU
     /// loop's small managed heap costs well under a millisecond.
     /// </summary>
-    internal const long CollectAfterDriverBytes = 64L << 20;
+    internal const long CollectAfterDeviceBytes = 64L << 20;
 
     /// <summary>
-    /// Counts <paramref name="bytes"/> of driver allocation against <paramref name="bytesSinceCollection"/>, and runs a
-    /// gen-0 collection once they pass <see cref="CollectAfterDriverBytes"/>, so dead results return to the pool.
+    /// Driver allocation past which a backend collects on the spot rather than waiting for a step boundary: a
+    /// collection in the middle of a step promotes the step's live results to an older generation, where young
+    /// collections no longer reclaim them, so it is the backstop, not the rule.
     /// </summary>
-    internal static void OnDriverAllocation(ref long bytesSinceCollection, long bytes)
+    internal const long CollectNowAfterDeviceBytes = 4 * CollectAfterDeviceBytes;
+
+    private static int s_collectionDue;
+    // Device bytes handed out since the last collection, across every backend: one collection serves them all.
+    private static long s_driverBytesSinceCollection;
+
+    /// <summary>
+    /// Counts <paramref name="bytes"/> handed out since the last collection, pool hits included: a warm loop's
+    /// allocations are almost all pool hits, and counting only driver allocations left collections to the managed
+    /// heap's own pace (about every 100 steps once results stopped carrying host arrays), so a hundred steps of dead
+    /// results had to be covered by device memory. Past
+    /// <see cref="CollectAfterDeviceBytes"/> a gen-0 collection is due at the next step boundary
+    /// (<see cref="CollectIfDueAtStepBoundary"/>); past <see cref="CollectNowAfterDeviceBytes"/> it runs now.
+    /// </summary>
+    internal static void OnDeviceAllocation(long bytes)
     {
-        if (Interlocked.Add(ref bytesSinceCollection, bytes) < CollectAfterDriverBytes) return;
-        Interlocked.Exchange(ref bytesSinceCollection, 0);
-        GC.Collect(0, GCCollectionMode.Forced, blocking: false);
+        long since = Interlocked.Add(ref s_driverBytesSinceCollection, bytes);
+        if (since < CollectAfterDeviceBytes) return;
+        if (since < CollectNowAfterDeviceBytes)
+        {
+            Volatile.Write(ref s_collectionDue, 1);
+            return;
+        }
+        Interlocked.Exchange(ref s_driverBytesSinceCollection, 0);
+        Volatile.Write(ref s_collectionDue, 0);
+        GC.Collect(0, GCCollectionMode.Forced, blocking: true);
+    }
+
+    /// <summary>
+    /// Runs the gen-0 collection a backend asked for, at a point where the finished step's intermediates are dead (an
+    /// outermost gradient tape ending): they are collected young and their buffers return to the pool by the next
+    /// allocation. Collecting inside an allocation promoted them instead (measured on OpenCL: device memory grew by
+    /// 574 MB over 300 steps once results stopped carrying host arrays).
+    /// </summary>
+    internal static void CollectIfDueAtStepBoundary()
+    {
+        if (Interlocked.Exchange(ref s_collectionDue, 0) == 0) return;
+        Interlocked.Exchange(ref s_driverBytesSinceCollection, 0);
+        GC.Collect(0, GCCollectionMode.Forced, blocking: true);
+        // The collected buffers come back through their finalizers. Waiting for them (they only queue a pool return)
+        // lets the next step's allocations find them in the pool instead of going to the driver.
+        GC.WaitForPendingFinalizers();
     }
 
     internal static void CollectUnreachable()
