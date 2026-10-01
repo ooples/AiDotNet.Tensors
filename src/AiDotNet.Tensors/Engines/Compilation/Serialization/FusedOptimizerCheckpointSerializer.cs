@@ -112,6 +112,21 @@ internal static class FusedOptimizerCheckpointSerializer
         writer.Write(extras.DecoupledWeightDecay);
         // Format version 9: AMSGrad's bias-correction switch (Reddi et al. 2018, Algorithm 2 when set).
         writer.Write(extras.AmsgradDisableBiasCorrection);
+        WriteNullableDouble(writer, extras.AmsgradExactBeta1);
+        WriteNullableDouble(writer, extras.AmsgradExactBeta2);
+    }
+
+    private static void WriteNullableDouble(BinaryWriter writer, double? value)
+    {
+        writer.Write(value.HasValue);
+        writer.Write(value ?? 0.0);
+    }
+
+    private static double? ReadNullableDouble(BinaryReader reader)
+    {
+        bool present = reader.ReadBoolean();
+        double value = reader.ReadDouble();
+        return present ? value : null;
     }
 
     private static FusedOptimizerExtras ReadExtras(BinaryReader reader)
@@ -143,6 +158,8 @@ internal static class FusedOptimizerCheckpointSerializer
             LambDisableBiasCorrection = reader.ReadBoolean(),
             DecoupledWeightDecay = reader.ReadBoolean(),
             AmsgradDisableBiasCorrection = reader.ReadBoolean(),
+            AmsgradExactBeta1 = ReadNullableDouble(reader),
+            AmsgradExactBeta2 = ReadNullableDouble(reader),
         };
 
     private static void WriteLrSchedules(BinaryWriter writer, FusedLrScheduleCheckpoint[] schedules)

@@ -6002,7 +6002,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     {
         if (!extras.AmsgradDisableBiasCorrection) return lr;
         float eps = 0f;
-        FusedOptimizer.ToUncorrectedAmsgrad(ref lr, ref eps, b1, b2, _optimizerStep);
+        FusedOptimizer.ToUncorrectedAmsgrad(ref lr, ref eps, b1, b2, _optimizerStep, extras.AmsgradExactBeta1, extras.AmsgradExactBeta2);
         return lr;
     }
 
@@ -6010,7 +6010,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     {
         if (!extras.AmsgradDisableBiasCorrection) return eps;
         float lr = 0f;
-        FusedOptimizer.ToUncorrectedAmsgrad(ref lr, ref eps, b1, b2, _optimizerStep);
+        FusedOptimizer.ToUncorrectedAmsgrad(ref lr, ref eps, b1, b2, _optimizerStep, extras.AmsgradExactBeta1, extras.AmsgradExactBeta2);
         return eps;
     }
 
@@ -6018,7 +6018,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     {
         if (!extras.AmsgradDisableBiasCorrection) return lr;
         double eps = 0.0;
-        FusedOptimizer.ToUncorrectedAmsgrad(ref lr, ref eps, b1, b2, _optimizerStep);
+        FusedOptimizer.ToUncorrectedAmsgrad(ref lr, ref eps, b1, b2, _optimizerStep, extras.AmsgradExactBeta1, extras.AmsgradExactBeta2);
         return lr;
     }
 
@@ -6026,7 +6026,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     {
         if (!extras.AmsgradDisableBiasCorrection) return eps;
         double lr = 0.0;
-        FusedOptimizer.ToUncorrectedAmsgrad(ref lr, ref eps, b1, b2, _optimizerStep);
+        FusedOptimizer.ToUncorrectedAmsgrad(ref lr, ref eps, b1, b2, _optimizerStep, extras.AmsgradExactBeta1, extras.AmsgradExactBeta2);
         return eps;
     }
     private static FusedOptimizerExtras CloneFusedOptimizerExtras(FusedOptimizerExtras extras)
@@ -6066,6 +6066,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             LambMaxTrustRatio = extras.LambMaxTrustRatio,
             LambDisableBiasCorrection = extras.LambDisableBiasCorrection,
             AmsgradDisableBiasCorrection = extras.AmsgradDisableBiasCorrection,
+            AmsgradExactBeta1 = extras.AmsgradExactBeta1,
+            AmsgradExactBeta2 = extras.AmsgradExactBeta2,
             DecoupledWeightDecay = extras.DecoupledWeightDecay,
         };
 

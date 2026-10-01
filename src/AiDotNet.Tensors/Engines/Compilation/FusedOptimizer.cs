@@ -1256,22 +1256,34 @@ internal static class FusedOptimizer
     /// lr' = lr*bc1/sqrt(bc2) and eps' = eps/sqrt(bc2) that is exactly lr*m/(sqrt(vMax)+eps). This keeps one kernel
     /// per backend (CPU and every GPU) instead of a second shader variant. L2 decay is folded into the gradient
     /// before the kernel and decoupled decay is applied with the unscaled rate, so neither is affected.
+    /// <para>
+    /// <paramref name="exactBeta1"/>/<paramref name="exactBeta2"/> are the caller's betas before float narrowing.
+    /// The kernels weight each gradient by 1 - beta computed from the narrowed beta (1 - (float)0.999 is 0.00099998713,
+    /// not 0.001). Bias correction divides that error out, but the uncorrected update keeps it, so with the exact
+    /// betas m and vMax are rescaled by c1 = (1 - beta1)/(1 - (float)beta1) and c2 = (1 - beta2)/(1 - (float)beta2):
+    /// both moments are linear in those coefficients (the decay factors are unchanged), so lr·c1/sqrt(c2) and
+    /// eps/sqrt(c2) give the exact-coefficient update.
+    /// </para>
     /// </summary>
-    internal static void ToUncorrectedAmsgrad(ref float lr, ref float eps, float beta1, float beta2, int step)
+    internal static void ToUncorrectedAmsgrad(ref float lr, ref float eps, float beta1, float beta2, int step,
+        double? exactBeta1 = null, double? exactBeta2 = null)
     {
-        double bc1 = 1.0 - System.Math.Pow(beta1, step);
-        double sqrtBc2 = System.Math.Sqrt(1.0 - System.Math.Pow(beta2, step));
-        lr = (float)(lr * bc1 / sqrtBc2);
-        eps = (float)(eps / sqrtBc2);
+        double scaledLr = lr, scaledEps = eps;
+        ToUncorrectedAmsgrad(ref scaledLr, ref scaledEps, beta1, beta2, step, exactBeta1, exactBeta2);
+        lr = (float)scaledLr;
+        eps = (float)scaledEps;
     }
 
-    /// <inheritdoc cref="ToUncorrectedAmsgrad(ref float, ref float, float, float, int)"/>
-    internal static void ToUncorrectedAmsgrad(ref double lr, ref double eps, double beta1, double beta2, int step)
+    /// <inheritdoc cref="ToUncorrectedAmsgrad(ref float, ref float, float, float, int, double?, double?)"/>
+    internal static void ToUncorrectedAmsgrad(ref double lr, ref double eps, double beta1, double beta2, int step,
+        double? exactBeta1 = null, double? exactBeta2 = null)
     {
         double bc1 = 1.0 - System.Math.Pow(beta1, step);
         double sqrtBc2 = System.Math.Sqrt(1.0 - System.Math.Pow(beta2, step));
-        lr = lr * bc1 / sqrtBc2;
-        eps = eps / sqrtBc2;
+        double c1 = exactBeta1 is double e1 ? (1.0 - e1) / (1.0 - beta1) : 1.0;
+        double sqrtC2 = exactBeta2 is double e2 ? System.Math.Sqrt((1.0 - e2) / (1.0 - beta2)) : 1.0;
+        lr = lr * bc1 * c1 / (sqrtBc2 * sqrtC2);
+        eps = eps / (sqrtBc2 * sqrtC2);
     }
     /// <summary>AVX2 AMSGrad: Adam with max of past squared gradients</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -2893,6 +2905,16 @@ public sealed class FusedOptimizerExtras
     /// <see cref="FusedOptimizer.ToUncorrectedAmsgrad(ref float, ref float, float, float, int)"/>.
     /// </summary>
     public bool AmsgradDisableBiasCorrection { get; init; }
+
+    /// <summary>
+    /// With <see cref="AmsgradDisableBiasCorrection"/>: the caller's beta1 before it was narrowed to float. The plan
+    /// then weights gradients by the exact 1 - beta1 instead of 1 - (float)beta1, an error bias correction would
+    /// cancel but the uncorrected update keeps. Null (default) uses the float beta as given.
+    /// </summary>
+    public double? AmsgradExactBeta1 { get; init; }
+
+    /// <summary>As <see cref="AmsgradExactBeta1"/>, for beta2 (1 - (float)0.999 is 1.3e-5 relative off 0.001).</summary>
+    public double? AmsgradExactBeta2 { get; init; }
     /// <summary>
     /// Validates the hyperparameters that would otherwise produce undefined or
     /// divergent fused-optimizer math, throwing <see cref="ArgumentOutOfRangeException"/>

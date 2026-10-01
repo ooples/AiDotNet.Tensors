@@ -38,8 +38,10 @@ internal static class PlanFormatConstants
     /// selects the algorithm, so version 7 plans (which lack it) are rejected rather than read misaligned.
     /// Version 9 adds AMSGrad's bias-correction switch (Reddi et al. 2018, Algorithm 2 when set). It changes the
     /// update rule, so version 8 plans are rejected rather than read misaligned.
+    /// Version 10 adds AMSGrad's exact betas (AmsgradExactBeta1/2): the paper variant then weights gradients by the
+    /// caller's 1 - beta rather than 1 - (float)beta, so version 9 plans are rejected rather than read misaligned.
     /// </remarks>
-    internal const ushort CurrentFormatVersion = 9;
+    internal const ushort CurrentFormatVersion = 10;
 
     /// <summary>
     /// Tensor-codec version. Semantically distinct from the format version:
