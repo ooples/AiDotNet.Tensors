@@ -28,8 +28,12 @@ public class AMSGradPaperModeTests
     // ConfigureOptimizer takes lr/betas/eps/wd as float, so the reference runs on those float-rounded values. Without
     // bias correction nothing cancels the rounding: the first step is lr·(1-b1)/sqrt(1-b2), and 1-(float)0.999 is off
     // by 1.3e-5 relative.
-    private static double[] Reference(bool paper, bool decoupled)
+    // exact: the plan was given the unnarrowed betas (AmsgradExactBeta1/2), so each gradient is weighted by the exact
+    // 1 - beta while the decay factors stay the float-narrowed betas the kernel multiplies by.
+    private static double[] Reference(bool paper, bool decoupled, bool exact = false)
     {
+        double oneMinusB1 = exact ? 1 - AMSGradPaperModeTests.B1 : 1 - (double)(float)AMSGradPaperModeTests.B1;
+        double oneMinusB2 = exact ? 1 - AMSGradPaperModeTests.B2 : 1 - (double)(float)AMSGradPaperModeTests.B2;
         double Lr = (float)AMSGradPaperModeTests.Lr, B1 = (float)AMSGradPaperModeTests.B1;
         double B2 = (float)AMSGradPaperModeTests.B2, Eps = (float)AMSGradPaperModeTests.Eps, Wd = (float)AMSGradPaperModeTests.Wd;
         var w = (double[])Init.Clone();
@@ -45,8 +49,8 @@ public class AMSGradPaperModeTests
                 double g = 2 * w[i];
                 if (decoupled) w[i] *= 1 - Lr * Wd;
                 else g += Wd * w[i];
-                m[i] = B1 * m[i] + (1 - B1) * g;
-                v[i] = B2 * v[i] + (1 - B2) * g * g;
+                m[i] = B1 * m[i] + oneMinusB1 * g;
+                v[i] = B2 * v[i] + oneMinusB2 * g * g;
                 vMax[i] = Math.Max(vMax[i], v[i]);
                 w[i] -= Lr * (m[i] / bc1) / (Math.Sqrt(vMax[i] / bc2) + Eps);
             }
@@ -54,10 +58,16 @@ public class AMSGradPaperModeTests
         return w;
     }
 
-    private static FusedOptimizerExtras Extras(bool paper, bool decoupled)
-        => new FusedOptimizerExtras { AmsgradDisableBiasCorrection = paper, DecoupledWeightDecay = decoupled };
+    private static FusedOptimizerExtras Extras(bool paper, bool decoupled, bool exact = false)
+        => new FusedOptimizerExtras
+        {
+            AmsgradDisableBiasCorrection = paper,
+            DecoupledWeightDecay = decoupled,
+            AmsgradExactBeta1 = exact ? B1 : null,
+            AmsgradExactBeta2 = exact ? B2 : null,
+        };
 
-    private static double[] RunFloat(bool paper, bool decoupled)
+    private static double[] RunFloat(bool paper, bool decoupled, bool exact = false)
     {
         var engine = new CpuEngine();
         var weight = new Tensor<float>(new[] { Init.Length });
@@ -71,7 +81,7 @@ public class AMSGradPaperModeTests
         using (plan)
         {
             plan.ConfigureOptimizer(OptimizerType.AMSGrad, (float)Lr, (float)B1, (float)B2, (float)Eps, (float)Wd,
-                Extras(paper, decoupled));
+                Extras(paper, decoupled, exact));
             for (int s = 0; s < Steps; s++) plan.Step();
         }
         var result = new double[Init.Length];
@@ -79,7 +89,7 @@ public class AMSGradPaperModeTests
         return result;
     }
 
-    private static double[] RunDouble(bool paper, bool decoupled)
+    private static double[] RunDouble(bool paper, bool decoupled, bool exact = false)
     {
         var engine = new CpuEngine();
         var weight = new Tensor<double>(new[] { Init.Length });
@@ -93,7 +103,7 @@ public class AMSGradPaperModeTests
         using (plan)
         {
             plan.ConfigureOptimizer(OptimizerType.AMSGrad, (float)Lr, (float)B1, (float)B2, (float)Eps, (float)Wd,
-                Extras(paper, decoupled));
+                Extras(paper, decoupled, exact));
             for (int s = 0; s < Steps; s++) plan.Step();
         }
         var result = new double[Init.Length];
@@ -127,6 +137,72 @@ public class AMSGradPaperModeTests
     public void Double_plan_matches_the_reference(bool paper, bool decoupled)
         => AssertClose(Reference(paper, decoupled), RunDouble(paper, decoupled), 1e-6, Label(paper, decoupled));
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void Double_plan_with_exact_betas_weights_gradients_by_the_exact_one_minus_beta(bool decoupled)
+    {
+        // The double plan computes in double, so it must land on the exact-coefficient reference to rounding.
+        AssertClose(Reference(true, decoupled, exact: true), RunDouble(true, decoupled, exact: true), 1e-9, Label(true, decoupled) + "/exact");
+        // Control: without the exact betas the plan keeps 1 - (float)beta and misses that reference, so the
+        // tolerance above can tell the two apart.
+        var narrowed = RunDouble(true, decoupled);
+        var exactReference = Reference(true, decoupled, exact: true);
+        double gap = 0;
+        for (int i = 0; i < narrowed.Length; i++) gap = Math.Max(gap, Math.Abs(narrowed[i] - exactReference[i]));
+        Assert.True(gap > 1e-7, $"narrowed and exact betas agreed to {gap} - the exact-beta rescaling is unobservable");
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void Float_plan_with_exact_betas_matches_the_exact_reference(bool decoupled)
+        => AssertClose(Reference(true, decoupled, exact: true), RunFloat(true, decoupled, exact: true), 2e-5, Label(true, decoupled) + "/exact");
+
+    [Theory]
+    [InlineData(1.0, null)]
+    [InlineData(-0.1, null)]
+    [InlineData(double.NaN, null)]
+    [InlineData(null, 1.0)]
+    [InlineData(null, 1.5)]
+    [InlineData(null, double.PositiveInfinity)]
+    public void Exact_betas_outside_zero_to_one_are_rejected(double? exactBeta1, double? exactBeta2)
+    {
+        // beta = 1 would zero the learning rate and beta2 > 1 would make it NaN on every step.
+        var extras = new FusedOptimizerExtras { AmsgradDisableBiasCorrection = true, AmsgradExactBeta1 = exactBeta1, AmsgradExactBeta2 = exactBeta2 };
+        Assert.Throws<ArgumentOutOfRangeException>(() => extras.Validate());
+    }
+
+    [Fact]
+    public void Exact_betas_inside_zero_to_one_are_accepted()
+        => new FusedOptimizerExtras { AmsgradDisableBiasCorrection = true, AmsgradExactBeta1 = 0.0, AmsgradExactBeta2 = 0.999 }.Validate();
+
+    [Fact]
+    public void A_version_2_optimizer_state_payload_is_refused_rather_than_misread()
+    {
+        // Version 2 was written in more than one layout (the AMSGrad extras were added without a bump), so its
+        // fields cannot be located reliably; the reader must refuse it. The header is magic then version, both Int32.
+        var engine = new CpuEngine();
+        var weight = new Tensor<float>(new[] { 1f, -2f, 3f }, new[] { 3 });
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            engine.ReduceSum(engine.TensorMultiply(weight, weight), null);
+            plan = scope.CompileTraining(new[] { weight });
+        }
+        using (plan)
+        {
+            plan.ConfigureOptimizer(OptimizerType.AMSGrad, 0.01f, 0.9f, 0.999f, 1e-8f, 0f, Extras(true, false, exact: true));
+            plan.Step();
+            byte[] state = plan.ExportOptimizerState() ?? throw new InvalidOperationException("AMSGrad plan exported no state.");
+            plan.ImportOptimizerState(state);   // the current version round-trips
+
+            BitConverter.GetBytes(2).CopyTo(state, 4);
+            var refused = Assert.ThrowsAny<Exception>(() => plan.ImportOptimizerState(state));
+            Assert.Contains("version 2", refused.ToString());
+        }
+    }
+
     [Fact]
     public void The_two_conventions_really_differ_so_the_flag_is_observable()
     {
@@ -150,7 +226,7 @@ public class AMSGradPaperModeTests
         }
         using (plan)
         {
-            plan.ConfigureOptimizer(OptimizerType.AMSGrad, 0.01f, 0.9f, 0.999f, 1e-8f, 0f, Extras(true, false));
+            plan.ConfigureOptimizer(OptimizerType.AMSGrad, 0.01f, 0.9f, 0.999f, 1e-8f, 0f, Extras(true, false, exact: true));
             plan.Step();
             var compiled = Assert.IsType<CompiledTrainingPlan<float>>(plan);
             var checkpoint = Assert.IsType<FusedOptimizerCheckpoint>(compiled.CaptureFusedOptimizerCheckpoint());
@@ -164,6 +240,8 @@ public class AMSGradPaperModeTests
             var restored = FusedOptimizerCheckpointSerializer.Read(reader);
             Assert.NotNull(restored);
             Assert.True(restored is not null && restored.Extras.AmsgradDisableBiasCorrection);
+            Assert.Equal(B1, restored?.Extras.AmsgradExactBeta1);
+            Assert.Equal(B2, restored?.Extras.AmsgradExactBeta2);
         }
     }
 
