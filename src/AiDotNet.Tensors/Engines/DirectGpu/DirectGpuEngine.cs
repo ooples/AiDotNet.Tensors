@@ -1292,6 +1292,9 @@ public sealed class DirectGpuEngine : IDisposable
     {
         if (!IsAvailable || _backend == null)
             return null;
+        // Same precision gate as every other entry point: a type the policy keeps exact must not be narrowed to float.
+        if (ShouldFallbackForPrecision<T>())
+            return null;
 
         float[] floatData = ToFloatArray(data);
         return _backend.AllocateBuffer(floatData);

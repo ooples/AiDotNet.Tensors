@@ -44,10 +44,10 @@ public sealed class GpuPrecisionExecutionTests
         Assert.Equal(typeof(int), GpuPrecisionDiagnostics.LastPlan!.PublicType);
     }
 
-    [Fact]
+    [SkippableFact]
     public void Default_IntegerMatMulAboveTheFloat32LimitStaysExact()
     {
-        if (GpuExecutionPolicyScope.ExactTypesSpeedFirstByDefault) return; // process opted out of the default
+        Skip.If(GpuExecutionPolicyScope.ExactTypesSpeedFirstByDefault, "This process opted out of the exact-type default.");
         using var fixture = new Fixture();
         // 2^24 + 1 is the first integer FP32 cannot represent; through FP32 it would come back as 2^24.
         var a = new Tensor<int>(new[] { 16777217, 0, 0, 16777217 }, new[] { 2, 2 });
@@ -60,10 +60,10 @@ public sealed class GpuPrecisionExecutionTests
         Assert.Equal(GpuExecutionRoute.Cpu, GpuPrecisionDiagnostics.LastPlan!.Route);
     }
 
-    [Fact]
+    [SkippableFact]
     public void Default_DoubleMatMulIsPreservedWithoutAScope()
     {
-        if (GpuExecutionPolicyScope.ExactTypesSpeedFirstByDefault) return; // process opted out of the default
+        Skip.If(GpuExecutionPolicyScope.ExactTypesSpeedFirstByDefault, "This process opted out of the exact-type default.");
         using var fixture = new Fixture();
         var a = new Tensor<double>(new[] { 0.1d, 0.2d, 0.3d, 0.4d }, new[] { 2, 2 });
         var b = new Tensor<double>(new[] { 0.5d, 0.6d, 0.7d, 0.8d }, new[] { 2, 2 });

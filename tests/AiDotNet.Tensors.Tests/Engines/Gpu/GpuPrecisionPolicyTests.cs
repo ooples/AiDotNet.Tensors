@@ -51,10 +51,10 @@ public sealed class GpuPrecisionPolicyTests
         Assert.Contains("Generic", Plan<int>(backend).FallbackReason);
     }
 
-    [Fact]
+    [SkippableFact]
     public void WithoutAScope_IntLongAndDecimalArePreservedOnCpu()
     {
-        if (GpuExecutionPolicyScope.ExactTypesSpeedFirstByDefault) return; // process opted out of the default
+        Skip.If(GpuExecutionPolicyScope.ExactTypesSpeedFirstByDefault, "This process opted out of the exact-type default.");
         var backend = CreateBackend(Fp32(), Fp16());
 
         foreach (var plan in new[] { Plan<int>(backend), Plan<long>(backend), Plan<decimal>(backend) })
@@ -64,10 +64,10 @@ public sealed class GpuPrecisionPolicyTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void WithoutAScope_DoubleIsPreserved_OnCpuWhenTheBackendHasNoFp64Route()
     {
-        if (GpuExecutionPolicyScope.ExactTypesSpeedFirstByDefault) return; // process opted out of the default
+        Skip.If(GpuExecutionPolicyScope.ExactTypesSpeedFirstByDefault, "This process opted out of the exact-type default.");
         var backend = CreateBackend(Fp32(), Fp16());
 
         var plan = Plan<double>(backend);
@@ -77,10 +77,10 @@ public sealed class GpuPrecisionPolicyTests
         Assert.Contains("PreserveInputType", plan.FallbackReason);
     }
 
-    [Fact]
+    [SkippableFact]
     public void WithoutAScope_DoubleIsPreserved_OnTheGpuWhenTheBackendAdvertisesFp64()
     {
-        if (GpuExecutionPolicyScope.ExactTypesSpeedFirstByDefault) return; // process opted out of the default
+        Skip.If(GpuExecutionPolicyScope.ExactTypesSpeedFirstByDefault, "This process opted out of the exact-type default.");
         var backend = CreateBackend(Fp32(), Fp64());
 
         AssertGpuPlan<double>(backend, GpuScalarType.Float64);
