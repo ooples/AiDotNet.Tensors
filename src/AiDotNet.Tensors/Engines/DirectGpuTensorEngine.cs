@@ -3301,18 +3301,48 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// For a backend that cannot address a sub-range of a buffer (only CUDA implements IGpuBufferViews; OpenCL
     /// sub-buffers need offsets aligned to the device's base-address alignment, which a flat parameter layout does not
     /// have): a ParameterBuffer view's elements copied out of the flat array's device buffer. The caller updates
-    /// <paramref name="staged"/> and copies it back at <paramref name="offset"/>. Both copies stay on the device; the
-    /// view used to be declined, so its optimizer step ran on the host.
+    /// <see cref="StagedFlatParameter.Staged"/> and copies it back at <see cref="StagedFlatParameter.Offset"/>, then
+    /// disposes the result. Both copies stay on the device; the view used to be declined, so its optimizer step ran on
+    /// the host. Returns <c>null</c> when the parameter is not such a view.
     /// </summary>
-    internal bool TryStageFlatParameter(Tensor<float> param, out IGpuBuffer staged, out IGpuBuffer flatBuffer, out int offset)
+    internal StagedFlatParameter? TryStageFlatParameter(Tensor<float> param)
     {
-        staged = null!; flatBuffer = null!; offset = 0;
-        if (!TryGetBackend(out var be) || be is IGpuBufferViews || !param.IsContiguous) return false;
-        if (!TryGetFlatParameterView(param, out var flat, out offset)) return false;
-        flatBuffer = AcquireFlatDeviceBuffer(flat, be);
-        staged = be.AllocateBuffer(param.Length);
-        be.Copy(flatBuffer, offset, staged, 0, param.Length);
-        return true;
+        if (!TryGetBackend(out var be) || be is IGpuBufferViews || !param.IsContiguous) return null;
+        if (!TryGetFlatParameterView(param, out var flat, out int offset)) return null;
+        var flatBuffer = AcquireFlatDeviceBuffer(flat, be);
+        var staged = be.AllocateBuffer(param.Length);
+        try
+        {
+            be.Copy(flatBuffer, offset, staged, 0, param.Length);
+        }
+        catch
+        {
+            staged.Dispose();
+            throw;
+        }
+        return new StagedFlatParameter(staged, flatBuffer, offset);
+    }
+
+    /// <summary>A flat parameter's elements staged in their own device buffer; disposing it returns that buffer.</summary>
+    internal sealed class StagedFlatParameter : IDisposable
+    {
+        internal StagedFlatParameter(IGpuBuffer staged, IGpuBuffer flatBuffer, int offset)
+        {
+            Staged = staged;
+            FlatBuffer = flatBuffer;
+            Offset = offset;
+        }
+
+        /// <summary>The staged copy the optimizer updates.</summary>
+        internal IGpuBuffer Staged { get; }
+
+        /// <summary>The flat array's device buffer the update is copied back into.</summary>
+        internal IGpuBuffer FlatBuffer { get; }
+
+        /// <summary>The parameter's offset in the flat array.</summary>
+        internal int Offset { get; }
+
+        public void Dispose() => Staged.Dispose();
     }
 
     internal IGpuBuffer? AcquireParameterBuffer(Tensor<float> param, out IDirectGpuBackend backend)
@@ -26624,8 +26654,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         _csrBufferCache.Clear();
 
-        foreach (var matrix in _adaptivePoolMatrices.Values) matrix.Dispose();
-        _adaptivePoolMatrices.Clear();
+        lock (_adaptivePoolMatricesGate)
+        {
+            // A backward may still have queued a pooling GEMM that reads one of these.
+            foreach (var entry in _adaptivePoolMatrices) DisposeBufferAfterQueuedUse(entry.Key.Item1, entry.Value);
+            _adaptivePoolMatrices.Clear();
+        }
 
         lock (_occupancyBufferCacheGate)
         {

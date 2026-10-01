@@ -8689,24 +8689,34 @@ KERNEL VARIANTS (A/B testing):
         }
 
         // Read-only int tables a kernel takes by buffer (shapes, strides, permutations), cached by content. Never written
-        // after upload, so sharing one buffer across calls and queues is safe. Bounded: when full it is cleared, and the
-        // released tables are retired behind their last kernels like any freed buffer.
+        // after upload, so sharing one buffer across calls and queues is safe. Bounded: when full the cache starts a new
+        // generation. An evicted table is not freed then: a caller on another thread may hold it without having bound it
+        // to a kernel yet, so no queued use protects it. It is freed at the next eviction, a full generation of new
+        // tables later, by when every call that looked it up has submitted its kernel (each binds its table in the same
+        // call), so its release is retired behind those kernels like any freed buffer.
         private readonly System.Collections.Concurrent.ConcurrentDictionary<string, IGpuBuffer> _constantIntTables = new();
+        private readonly object _constantIntTablesGate = new();
+        private List<IGpuBuffer> _evictedConstantIntTables = new();
         private const int MaxConstantIntTables = 1024;
 
         private IGpuBuffer ConstantIntTable(int[] values)
         {
             string key = string.Join(",", values);
             if (_constantIntTables.TryGetValue(key, out var cached)) return cached;
-            if (_constantIntTables.Count >= MaxConstantIntTables)
+            lock (_constantIntTablesGate)
             {
-                foreach (var stale in _constantIntTables.Values) stale.Dispose();
-                _constantIntTables.Clear();
+                // Lookup, eviction and insertion are one step, so no two callers evict at once or drop a fresh table.
+                if (_constantIntTables.TryGetValue(key, out cached)) return cached;
+                if (_constantIntTables.Count >= MaxConstantIntTables)
+                {
+                    foreach (var stale in _evictedConstantIntTables) stale.Dispose();
+                    _evictedConstantIntTables = new List<IGpuBuffer>(_constantIntTables.Values);
+                    _constantIntTables.Clear();
+                }
+                var table = AllocateIntBuffer(values);
+                _constantIntTables[key] = table;
+                return table;
             }
-            var table = AllocateIntBuffer(values);
-            if (_constantIntTables.TryAdd(key, table)) return table;
-            table.Dispose();
-            return _constantIntTables[key];
         }
 
         public IGpuBuffer AllocateIntBuffer(int[] data)
@@ -13931,8 +13941,13 @@ KERNEL VARIANTS (A/B testing):
             DisposeCompiledCodegenKernels();
             _dynamicGemm?.Dispose();
             _bufferPool.Dispose();
-            foreach (var table in _constantIntTables.Values) table.Dispose();
-            _constantIntTables.Clear();
+            lock (_constantIntTablesGate)
+            {
+                foreach (var table in _constantIntTables.Values) table.Dispose();
+                _constantIntTables.Clear();
+                foreach (var table in _evictedConstantIntTables) table.Dispose();
+                _evictedConstantIntTables.Clear();
+            }
 
             // Snapshot both collections to arrays before disposing their members.
             // A child's Dispose() (or a concurrent GPU finalizer under load) can

@@ -4762,17 +4762,6 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         if (deviceInfo.Type == TensorDevice.CPU)
             return Cpu();
 
-        // Validate that the requested backend type matches the available backend
-        var directGpu = Engines.Engine.DirectGpu;
-        if (directGpu is not null && directGpu.IsAvailable && directGpu.Backend is not null)
-        {
-            var actualType = directGpu.Backend.DeviceType;   // the backend's typed device, not a match on its name
-            if (deviceInfo.Type != actualType && deviceInfo.Type != TensorDevice.CUDA)
-                throw new NotSupportedException(
-                    $"Requested device type {deviceInfo.Type} but the active GPU backend is {actualType}. " +
-                    $"Use To(DeviceInfo.{actualType}({deviceInfo.Index})) instead.");
-        }
-
         // Place onto the SAME backend the active dispatcher executes on, so placement and execution can't
         // diverge (a tensor moved here is used by ops running on AiDotNetEngine.Current). Fall back to the
         // global per-device backend registry only when the current engine is not a GPU dispatcher.
@@ -4783,6 +4772,14 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         backend ??= Engines.DirectGpu.DirectGpuEngine.CreateBackendForDevice(deviceInfo.Index);
         if (backend is null)
             throw new InvalidOperationException($"No GPU backend available at device index {deviceInfo.Index}.");
+
+        // Validate against the backend that will hold the buffer: the global DirectGpu engine can be a different,
+        // independently created backend from the dispatcher's placement backend.
+        var actualType = backend.DeviceType;   // the backend's typed device, not a match on its name
+        if (deviceInfo.Type != actualType && deviceInfo.Type != TensorDevice.CUDA)
+            throw new NotSupportedException(
+                $"Requested device type {deviceInfo.Type} but the placement backend is {actualType}. " +
+                $"Use To(DeviceInfo.{actualType}({deviceInfo.Index})) instead.");
 
         var logicalData = IsContiguous ? GetDataArray() : GetFlattenedData();
         var floatData = Engines.DirectGpu.DirectGpuEngine.ToFloatArray(logicalData);

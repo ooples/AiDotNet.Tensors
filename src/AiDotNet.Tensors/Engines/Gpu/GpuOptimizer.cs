@@ -165,15 +165,18 @@ public static class GpuOptimizer
         var pBuf = DirectGpuTensorEngine.IsFlatParameterView(param)
             ? gpuEngine.AcquireParameterBuffer(param, out _)
             : param.TryGetGpuBuffer() ?? gpuEngine.AcquireParameterBuffer(param, out _);
-        if (pBuf is null && gpuEngine.TryStageFlatParameter(param, out var staged, out var flatBuffer, out int flatOffset))
+        if (pBuf is null && gpuEngine.TryStageFlatParameter(param) is { } staged)
         {
-            // A flat-parameter view on a backend without sub-buffer views: update a device copy, write it back.
-            backend.AdamWUpdate(staged, gBuf, mBuf, vBuf,
-                learningRate, beta1, beta2, epsilon, weightDecay, step, param.Length);
-            backend.Copy(staged, 0, flatBuffer, flatOffset, param.Length);
-            staged.Dispose();
+            // A flat-parameter view on a backend without sub-buffer views: update a device copy, write it back. The
+            // staging buffer is returned even when the update or the copy back throws.
+            using (staged)
+            {
+                backend.AdamWUpdate(staged.Staged, gBuf, mBuf, vBuf,
+                    learningRate, beta1, beta2, epsilon, weightDecay, step, param.Length);
+                backend.Copy(staged.Staged, 0, staged.FlatBuffer, staged.Offset, param.Length);
+            }
             MarkGpuUpdated(backend, m, v);
-            MarkParameterUpdated(gpuEngine, backend, param, flatBuffer);
+            MarkParameterUpdated(gpuEngine, backend, param, staged.FlatBuffer);
             return true;
         }
         if (pBuf is null) { GpuLaunchProbe.OnFallback("TryAdamWStep-parameter-not-placeable", null); return false; }

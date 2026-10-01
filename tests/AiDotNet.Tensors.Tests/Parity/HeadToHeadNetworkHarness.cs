@@ -595,7 +595,8 @@ internal static class HeadToHeadNetworkHarness
         for (int step = 0; step < warmup + measured; step++)
         {
             Sync();
-            var crossingScope = capture is not null && step == capture.MeasuredStep
+            // Disposed on failure too, so a throwing step leaves no scope registered on this thread collecting transfers.
+            using var crossingScope = capture is not null && step == capture.MeasuredStep
                 ? AiDotNet.Tensors.Engines.Diagnostics.GpuResidencyScope.Begin(captureOperations: true)
                 : null;
             sw.Restart();
@@ -632,10 +633,10 @@ internal static class HeadToHeadNetworkHarness
             }
             Sync();
             double t3 = sw.Elapsed.TotalMilliseconds;
-            if (crossingScope is not null)
+            if (crossingScope is not null && capture is not null)
             {
-                crossingScope.Dispose();
-                capture!.Crossings = crossingScope.Events
+                crossingScope.Dispose();   // closed here, before the report is read; the using is then a no-op
+                capture.Crossings = crossingScope.Events
                     .Where(e => e.Kind != AiDotNet.Tensors.Engines.Diagnostics.GpuTransferKind.Synchronize)
                     .GroupBy(e => $"{e.Kind} {e.Operation ?? "<outside the engine>"}")
                     .ToDictionary(g => g.Key, g => g.Count(), StringComparer.Ordinal);

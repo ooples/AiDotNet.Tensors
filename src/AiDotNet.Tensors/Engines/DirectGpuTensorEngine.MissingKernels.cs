@@ -5285,9 +5285,22 @@ public partial class DirectGpuTensorEngine
     // The pooling matrices depend only on the sizes, which a training step repeats: uploaded once per backend and size
     // pair instead of on every backward (ResNet-18's last two host/device crossings per step).
     private readonly System.Collections.Concurrent.ConcurrentDictionary<(IDirectGpuBackend, int, int), IGpuBuffer> _adaptivePoolMatrices = new();
+    private readonly object _adaptivePoolMatricesGate = new();
 
+    // Created under a lock: GetOrAdd may run its factory on several threads and keep one result, which leaked the
+    // device buffers the others allocated.
     private IGpuBuffer CachedAdaptivePoolMatrix(IDirectGpuBackend backend, int inSize, int outSize)
-        => _adaptivePoolMatrices.GetOrAdd((backend, inSize, outSize), key => key.Item1.AllocateBuffer(AdaptivePoolMatrix(key.Item2, key.Item3)));
+    {
+        var key = (backend, inSize, outSize);
+        if (_adaptivePoolMatrices.TryGetValue(key, out var cached)) return cached;
+        lock (_adaptivePoolMatricesGate)
+        {
+            if (_adaptivePoolMatrices.TryGetValue(key, out cached)) return cached;
+            var created = backend.AllocateBuffer(AdaptivePoolMatrix(inSize, outSize));
+            _adaptivePoolMatrices[key] = created;
+            return created;
+        }
+    }
 
     private static float[] AdaptivePoolMatrix(int inSize, int outSize)
     {
