@@ -5255,8 +5255,8 @@ public partial class DirectGpuTensorEngine
             if (gradOutput.Length != checked(planes * outH * outW)) return null;
             var upstream = gradOutput.IsContiguous ? gradOutput : (Tensor<T>)gradOutput.Contiguous();
             using var bufG = GetOrAllocateBuffer(backend, upstream);
-            using var rowPool = new OwnedBuffer(backend.AllocateBuffer(AdaptivePoolMatrix(inH, outH)), ownsBuffer: true);
-            using var colPool = new OwnedBuffer(backend.AllocateBuffer(AdaptivePoolMatrix(inW, outW)), ownsBuffer: true);
+            var rowPool = new OwnedBuffer(CachedAdaptivePoolMatrix(backend, inH, outH), ownsBuffer: false);
+            var colPool = new OwnedBuffer(CachedAdaptivePoolMatrix(backend, inW, outW), ownsBuffer: false);
             int total = checked(planes * inH * inW);
             return DispatchDeferredGpuOp<T>(backend, total, (int[])inputShape.Clone(), output =>
             {
@@ -5282,6 +5282,13 @@ public partial class DirectGpuTensorEngine
     /// Row-major [outSize, inSize] pooling matrix of adaptive average pooling along one axis: row o holds
     /// 1 / windowLength over [floor(o*in/out), ceil((o+1)*in/out)), the same window CpuEngine uses.
     /// </summary>
+    // The pooling matrices depend only on the sizes, which a training step repeats: uploaded once per backend and size
+    // pair instead of on every backward (ResNet-18's last two host/device crossings per step).
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<(IDirectGpuBackend, int, int), IGpuBuffer> _adaptivePoolMatrices = new();
+
+    private IGpuBuffer CachedAdaptivePoolMatrix(IDirectGpuBackend backend, int inSize, int outSize)
+        => _adaptivePoolMatrices.GetOrAdd((backend, inSize, outSize), key => key.Item1.AllocateBuffer(AdaptivePoolMatrix(key.Item2, key.Item3)));
+
     private static float[] AdaptivePoolMatrix(int inSize, int outSize)
     {
         var matrix = new float[checked(outSize * inSize)];

@@ -21566,7 +21566,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         batchCount = 0;
         m = n = k = 0;
         outputShape = Array.Empty<int>();
-        if (a.Rank < 3 || b.Rank != a.Rank || !a.IsContiguous || !b.IsContiguous)
+        // Views (attention's permuted keys, head splits) are fine: the operands are fetched with GetOrAllocateBuffer,
+        // which materializes a permuted or sliced view on the device. Requiring contiguous operands sent every attention
+        // batched matmul to the host engine, downloading both.
+        if (a.Rank < 3 || b.Rank != a.Rank)
             return false;
 
         int rank = a.Rank;
@@ -21652,8 +21655,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return base.TensorMatMul(a, b);
             }
 
+            // The resident path reads the operands' buffers directly, so it needs them in row-major order; a view
+            // takes the materializing path below.
             if (typeof(T) == typeof(float) && ResidentStepActive && !Gpu.AutocastScope.IsEnabled
-                && batchPlan.InputStorage == Gpu.GpuScalarType.Float32)
+                && batchPlan.InputStorage == Gpu.GpuScalarType.Float32 && a.IsContiguous && b.IsContiguous)
             {
                 var aR = ResolveResidentBufferNoUpload(backend, a, batch * Mb * Kb);
                 var bR = ResolveResidentBufferNoUpload(backend, b, batch * Kb * Nb);
@@ -26336,7 +26341,25 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     Tensor<T> IEngine.TensorSlice<T>(Tensor<T> tensor, int[] start, int[] length)
     {
-        if (IsTapeActive<T>()) return base.TensorSlice(tensor, start, length);
+        if (IsTapeActive<T>())
+        {
+            // Under a tape the slice used to take the host path, which downloads the whole input: an LSTM reads each
+            // step's input and every gate by a slice, so most of its training step crossed the boundary. Slice on the
+            // device and record the same backward the host path records.
+            if (!Compilation.GraphMode.IsActive)
+            {
+                Tensor<T>? onDevice;
+                using (new Autodiff.NoGradScope<T>())
+                    onDevice = TryDeviceRectSlice(tensor, start, length);
+                if (onDevice is not null)
+                {
+                    Autodiff.DifferentiableOps.RecordUnary("TensorSlice", onDevice, tensor,
+                        Autodiff.BackwardFunctions<T>.SliceBackward, new object[] { (int[])start.Clone() });
+                    return onDevice;
+                }
+            }
+            return base.TensorSlice(tensor, start, length);
+        }
         if (TryDeviceRectSlice(tensor, start, length) is { } resident) return resident;
         if (ThrowOnGpuKernelFallback)
             throw new NotSupportedException("TensorSlice has no eligible GPU route for the selected input.");
@@ -26600,6 +26623,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             entry.Dispose();
         }
         _csrBufferCache.Clear();
+
+        foreach (var matrix in _adaptivePoolMatrices.Values) matrix.Dispose();
+        _adaptivePoolMatrices.Clear();
 
         lock (_occupancyBufferCacheGate)
         {

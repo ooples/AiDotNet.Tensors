@@ -8688,6 +8688,27 @@ KERNEL VARIANTS (A/B testing):
             ((DirectOpenClGpuBuffer)buffer).Buffer.CopyFromHost(floatData);
         }
 
+        // Read-only int tables a kernel takes by buffer (shapes, strides, permutations), cached by content. Never written
+        // after upload, so sharing one buffer across calls and queues is safe. Bounded: when full it is cleared, and the
+        // released tables are retired behind their last kernels like any freed buffer.
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<string, IGpuBuffer> _constantIntTables = new();
+        private const int MaxConstantIntTables = 1024;
+
+        private IGpuBuffer ConstantIntTable(int[] values)
+        {
+            string key = string.Join(",", values);
+            if (_constantIntTables.TryGetValue(key, out var cached)) return cached;
+            if (_constantIntTables.Count >= MaxConstantIntTables)
+            {
+                foreach (var stale in _constantIntTables.Values) stale.Dispose();
+                _constantIntTables.Clear();
+            }
+            var table = AllocateIntBuffer(values);
+            if (_constantIntTables.TryAdd(key, table)) return table;
+            table.Dispose();
+            return _constantIntTables[key];
+        }
+
         public IGpuBuffer AllocateIntBuffer(int[] data)
         {
             if (_context == null)
@@ -9170,9 +9191,12 @@ KERNEL VARIANTS (A/B testing):
             for (int i = shape.Length - 2; i >= 0; i--)
                 permutedStrides[i] = permutedStrides[i + 1] * permutedShape[i + 1];
 
-            using var inputStridesBuffer = AllocateIntBuffer(strides);
-            using var outputStridesBuffer = AllocateIntBuffer(permutedStrides);
-            using var permutationBuffer = AllocateIntBuffer(permutation);
+            // The tables depend only on the shape and permutation, which a training step repeats every step: cached,
+            // so a warm step uploads nothing (each call uploaded three small tables: 12 of a Transformer step's 22
+            // host/device crossings).
+            var inputStridesBuffer = ConstantIntTable(strides);
+            var outputStridesBuffer = ConstantIntTable(permutedStrides);
+            var permutationBuffer = ConstantIntTable(permutation);
             var kernel = _kernelCache["permute_general"];
             kernel.SetArg(0, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
             kernel.SetArg(1, ((DirectOpenClGpuBuffer)output).Buffer.Handle);
@@ -13907,6 +13931,8 @@ KERNEL VARIANTS (A/B testing):
             DisposeCompiledCodegenKernels();
             _dynamicGemm?.Dispose();
             _bufferPool.Dispose();
+            foreach (var table in _constantIntTables.Values) table.Dispose();
+            _constantIntTables.Clear();
 
             // Snapshot both collections to arrays before disposing their members.
             // A child's Dispose() (or a concurrent GPU finalizer under load) can
