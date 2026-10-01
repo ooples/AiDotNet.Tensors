@@ -2922,6 +2922,9 @@ public sealed class GradientTape<T> : IDisposable
             if (_keptKeys is not null) _snapshotEngine.DetachToTensorLifetime(_keptKeys);
             _snapshotEngine.ReclaimDetachedResultsOverBudget();
         }
+        // The step this tape recorded is over and its intermediates are dead: run the young collection a GPU backend
+        // asked for here, so they are collected young and their buffers return to the pool (see DeviceMemoryReclaim).
+        if (_parent is null) Engines.DirectGpu.DeviceMemoryReclaim.CollectIfDueAtStepBoundary();
 
         // A tape may be disposed before backward, or after a cleanup path that
         // visited only reachable nodes. Release any entry-owned saved-state pins

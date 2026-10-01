@@ -216,7 +216,9 @@ public sealed class StreamingTensorJournalTests
             var destination = activation ? gpu.TensorMultiplyScalar(seed, 1.0f) : seed;
             if (!activation) gpu.RegisterResidentParamBuffer(destination);
             Assert.Equal(new float[] { 1, 2, 3, 4 }, destination.ToArray());
-            Assert.True(gpu.IsDeviceResidentArray(destination.GetReadOnlyDataArray()));
+            // Primed: a device copy exists, keyed by the host array (a registered parameter or an activation-cache
+            // entry) or owned by the tensor's storage (an op result).
+            Assert.True(gpu.IsDeviceResidentArray(destination.GetReadOnlyDataArray()) || destination.TryGetGpuBuffer() is not null);
             int autogradVersion = destination.Version;
 
             using var journal = new StreamingTensorJournal<float>(16);

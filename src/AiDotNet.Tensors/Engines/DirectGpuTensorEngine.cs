@@ -4298,6 +4298,52 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
     }
 
+    /// <summary>
+    /// <see cref="TryRunUnary{T}(Tensor{T}, Action{IDirectGpuBackend, IGpuBuffer, IGpuBuffer, int}, string)"/>
+    /// returning the result as a device-owned tensor instead of a host array. The array form allocates every result's
+    /// host array up front (uninitialized, but on the large-object heap for anything over 85 KB). A GPU training loop
+    /// allocated about 4 MB of such arrays per step, which drove a full gen-2 collection every ~11 steps with a 60-70 ms
+    /// pause (measured on OpenCL). The tensor form allocates its host array only if something reads it.
+    /// </summary>
+    private Tensor<T>? TryRunUnaryTensor<T>(Tensor<T> input, Action<IDirectGpuBackend, IGpuBuffer, IGpuBuffer, int> op,
+        [System.Runtime.CompilerServices.CallerMemberName] string callerName = "")
+    {
+        if (!IsGpuPrecisionSafe(input) || !TryGetBackend(out var backend))
+            return null;
+        var precisionOperation = PrecisionOperationForUnary(callerName);
+        var precisionPlan = Gpu.GpuPrecisionPlanner.CreatePlan<T>(backend, precisionOperation, callerName);
+        if (precisionPlan.Route == Gpu.GpuExecutionRoute.Cpu)
+        {
+            Gpu.GpuPrecisionDiagnostics.Publish(precisionPlan);
+            return null;
+        }
+        // Inputs over the per-buffer cap go through the chunked array path, as before.
+        if (precisionPlan.InputStorage != Gpu.GpuScalarType.Float32)
+            return TryRunUnary(input, op, callerName) is { } array ? new Tensor<T>(array, input.Shape._dims) : null;
+        try
+        {
+            using var bufferA = GetOrAllocateBuffer(backend, input);
+            var bufferB = AllocateFullyWrittenOutputBuffer(backend, input.Length);
+            try
+            {
+                op(backend, bufferA.Buffer, bufferB.Buffer, input.Length);
+                var result = DeferTensorResult<T>(backend, bufferB.Buffer, input.Length, (int[])input.Shape._dims.Clone());
+                bufferB.RelinquishOwnership();
+                Gpu.GpuPrecisionDiagnostics.Publish(precisionPlan);
+                return result;
+            }
+            catch
+            {
+                bufferB.Dispose();
+                throw;
+            }
+        }
+        catch (AiDotNet.Tensors.Engines.DirectGpu.GpuBufferTooLargeException)
+        {
+            return TryRunUnary(input, op, callerName) is { } array ? new Tensor<T>(array, input.Shape._dims) : null;
+        }
+    }
+
     private T[]? TryRunUnaryGpu<T>(
         IDirectGpuBackend backend,
         Tensor<T> input,
@@ -19739,10 +19785,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Sigmoid(input, output, size));
-            if (result != null)
+            var output = TryRunUnaryTensor(tensor, static (backend, input, output, size) => backend.Sigmoid(input, output, size));
+            if (output != null)
             {
-                var output = new Tensor<T>(result, tensor.Shape._dims);
                 Autodiff.DifferentiableOps.RecordUnary("Sigmoid", output, tensor,
                     Autodiff.BackwardFunctions<T>.SigmoidBackward);
                 return output;
@@ -19759,10 +19804,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Relu(input, output, size));
-            if (result != null)
+            var output = TryRunUnaryTensor(tensor, static (backend, input, output, size) => backend.Relu(input, output, size));
+            if (output != null)
             {
-                var output = new Tensor<T>(result, tensor.Shape._dims);
                 Autodiff.DifferentiableOps.RecordUnary("ReLU", output, tensor,
                     Autodiff.BackwardFunctions<T>.ReLUBackward);
                 return output;
@@ -19779,10 +19823,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Gelu(input, output, size));
-            if (result != null)
+            var output = TryRunUnaryTensor(tensor, static (backend, input, output, size) => backend.Gelu(input, output, size));
+            if (output != null)
             {
-                var output = new Tensor<T>(result, tensor.Shape._dims);
                 Autodiff.DifferentiableOps.RecordUnary("GELU", output, tensor,
                     Autodiff.BackwardFunctions<T>.GELUBackward);
                 return output;
@@ -19799,10 +19842,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Silu(input, output, size));
-            if (result != null)
+            var output = TryRunUnaryTensor(tensor, static (backend, input, output, size) => backend.Silu(input, output, size));
+            if (output != null)
             {
-                var output = new Tensor<T>(result, tensor.Shape._dims);
                 Autodiff.DifferentiableOps.RecordUnary("Swish", output, tensor,
                     Autodiff.BackwardFunctions<T>.SwishBackward);
                 return output;
@@ -19833,10 +19875,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Tanh(input, output, size));
-            if (result != null)
+            var output = TryRunUnaryTensor(tensor, static (backend, input, output, size) => backend.Tanh(input, output, size));
+            if (output != null)
             {
-                var output = new Tensor<T>(result, tensor.Shape._dims);
                 Autodiff.DifferentiableOps.RecordUnary("Tanh", output, tensor,
                     Autodiff.BackwardFunctions<T>.TanhBackward);
                 return output;
@@ -19914,10 +19955,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Mish(input, output, size));
-            if (result != null)
+            var output = TryRunUnaryTensor(tensor, static (backend, input, output, size) => backend.Mish(input, output, size));
+            if (output != null)
             {
-                var output = new Tensor<T>(result, tensor.Shape._dims);
                 Autodiff.DifferentiableOps.RecordUnary("Mish", output, tensor,
                     Autodiff.BackwardFunctions<T>.MishBackward);
                 return output;
@@ -19934,10 +19974,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Hardswish(input, output, size));
-            if (result != null)
+            var output = TryRunUnaryTensor(tensor, static (backend, input, output, size) => backend.Hardswish(input, output, size));
+            if (output != null)
             {
-                var output = new Tensor<T>(result, tensor.Shape._dims);
                 Autodiff.DifferentiableOps.RecordUnary("HardSwish", output, tensor,
                     Autodiff.BackwardFunctions<T>.HardSwishBackward);
                 return output;
@@ -20276,10 +20315,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Exp(input, output, size));
-            if (result != null)
+            var output = TryRunUnaryTensor(tensor, static (backend, input, output, size) => backend.Exp(input, output, size));
+            if (output != null)
             {
-                var output = new Tensor<T>(result, tensor.Shape._dims);
                 Autodiff.DifferentiableOps.RecordUnary("TensorExp", output, tensor, Autodiff.BackwardFunctions<T>.ExpBackward);
                 return output;
             }
@@ -20292,10 +20330,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Log(input, output, size));
-            if (result != null)
+            var output = TryRunUnaryTensor(tensor, static (backend, input, output, size) => backend.Log(input, output, size));
+            if (output != null)
             {
-                var output = new Tensor<T>(result, tensor.Shape._dims);
                 Autodiff.DifferentiableOps.RecordUnary("TensorLog", output, tensor, Autodiff.BackwardFunctions<T>.LogBackward);
                 return output;
             }
@@ -20308,10 +20345,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Sqrt(input, output, size));
-            if (result != null)
+            var output = TryRunUnaryTensor(tensor, static (backend, input, output, size) => backend.Sqrt(input, output, size));
+            if (output != null)
             {
-                var output = new Tensor<T>(result, tensor.Shape._dims);
                 Autodiff.DifferentiableOps.RecordUnary("TensorSqrt", output, tensor, Autodiff.BackwardFunctions<T>.SqrtBackward);
                 return output;
             }
@@ -20324,10 +20360,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Abs(input, output, size));
-            if (result != null)
+            var output = TryRunUnaryTensor(tensor, static (backend, input, output, size) => backend.Abs(input, output, size));
+            if (output != null)
             {
-                var output = new Tensor<T>(result, tensor.Shape._dims);
                 Autodiff.DifferentiableOps.RecordUnary("TensorAbs", output, tensor, Autodiff.BackwardFunctions<T>.AbsBackward);
                 return output;
             }
@@ -20354,10 +20389,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         try
         {
-            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Negate(input, output, size));
-            if (result != null)
+            var output = TryRunUnaryTensor(tensor, static (backend, input, output, size) => backend.Negate(input, output, size));
+            if (output != null)
             {
-                var output = new Tensor<T>(result, tensor.Shape._dims);
                 Autodiff.DifferentiableOps.RecordUnary("TensorNegate", output, tensor, Autodiff.BackwardFunctions<T>.NegateBackward);
                 return output;
             }
@@ -20374,10 +20408,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Swish(input, output, size));
-            if (result != null)
+            var output = TryRunUnaryTensor(tensor, static (backend, input, output, size) => backend.Swish(input, output, size));
+            if (output != null)
             {
-                var output = new Tensor<T>(result, tensor.Shape._dims);
                 Autodiff.DifferentiableOps.RecordUnary("Swish", output, tensor, Autodiff.BackwardFunctions<T>.SwishBackward);
                 return output;
             }
@@ -20390,10 +20423,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor, (backend, input, output, size) => backend.Elu(input, output, (float)alpha, size));
-            if (result != null)
+            var output = TryRunUnaryTensor(tensor, (backend, input, output, size) => backend.Elu(input, output, (float)alpha, size));
+            if (output != null)
             {
-                var output = new Tensor<T>(result, tensor.Shape._dims);
                 Autodiff.DifferentiableOps.RecordUnary("ELU", output, tensor,
                     Autodiff.BackwardFunctions<T>.ELUBackward, new object[] { alpha });
                 return output;
@@ -20407,10 +20439,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(input, static (backend, inp, output, size) => backend.Softplus(inp, output, size));
-            if (result != null)
+            var output = TryRunUnaryTensor(input, static (backend, inp, output, size) => backend.Softplus(inp, output, size));
+            if (output != null)
             {
-                var output = new Tensor<T>(result, input.Shape._dims);
                 Autodiff.DifferentiableOps.RecordUnary("Softplus", output, input,
                     Autodiff.BackwardFunctions<T>.SoftplusBackward);
                 return output;
@@ -20426,10 +20457,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             const float alpha = 1.6732632423543772f;
             const float scale = 1.0507009873554805f;
-            var result = TryRunUnary(tensor, (backend, input, output, size) => backend.Selu(input, output, alpha, scale, size));
-            if (result != null)
+            var output = TryRunUnaryTensor(tensor, (backend, input, output, size) => backend.Selu(input, output, alpha, scale, size));
+            if (output != null)
             {
-                var output = new Tensor<T>(result, tensor.Shape._dims);
                 Autodiff.DifferentiableOps.RecordUnary("SELU", output, tensor,
                     Autodiff.BackwardFunctions<T>.SELUBackward);
                 return output;
@@ -20443,10 +20473,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Hardsigmoid(input, output, size));
-            if (result != null)
+            var output = TryRunUnaryTensor(tensor, static (backend, input, output, size) => backend.Hardsigmoid(input, output, size));
+            if (output != null)
             {
-                var output = new Tensor<T>(result, tensor.Shape._dims);
                 Autodiff.DifferentiableOps.RecordUnary("HardSigmoid", output, tensor,
                     Autodiff.BackwardFunctions<T>.HardSigmoidBackward);
                 return output;
@@ -20460,10 +20489,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Relu6(input, output, size));
-            if (result != null)
+            var output = TryRunUnaryTensor(tensor, static (backend, input, output, size) => backend.Relu6(input, output, size));
+            if (output != null)
             {
-                var output = new Tensor<T>(result, tensor.Shape._dims);
                 Autodiff.DifferentiableOps.RecordUnary("ReLU6", output, tensor,
                     Autodiff.BackwardFunctions<T>.ReLU6Backward);
                 return output;
@@ -20947,10 +20975,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Sin(input, output, size));
-            if (result != null)
+            var output = TryRunUnaryTensor(tensor, static (backend, input, output, size) => backend.Sin(input, output, size));
+            if (output != null)
             {
-                var output = new Tensor<T>(result, tensor.Shape._dims);
                 Autodiff.DifferentiableOps.RecordUnary("Sin", output, tensor, Autodiff.BackwardFunctions<T>.SinBackward);
                 return output;
             }
@@ -20963,10 +20990,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Cos(input, output, size));
-            if (result != null)
+            var output = TryRunUnaryTensor(tensor, static (backend, input, output, size) => backend.Cos(input, output, size));
+            if (output != null)
             {
-                var output = new Tensor<T>(result, tensor.Shape._dims);
                 Autodiff.DifferentiableOps.RecordUnary("Cos", output, tensor, Autodiff.BackwardFunctions<T>.CosBackward);
                 return output;
             }
@@ -20983,10 +21009,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Asin(input, output, size));
-            if (result != null)
+            var output = TryRunUnaryTensor(tensor, static (backend, input, output, size) => backend.Asin(input, output, size));
+            if (output != null)
             {
-                var output = new Tensor<T>(result, tensor.Shape._dims);
                 Autodiff.DifferentiableOps.RecordUnary("TensorAsin", output, tensor, Autodiff.BackwardFunctions<T>.AsinBackward);
                 return output;
             }
@@ -20999,10 +21024,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Acos(input, output, size));
-            if (result != null)
+            var output = TryRunUnaryTensor(tensor, static (backend, input, output, size) => backend.Acos(input, output, size));
+            if (output != null)
             {
-                var output = new Tensor<T>(result, tensor.Shape._dims);
                 Autodiff.DifferentiableOps.RecordUnary("TensorAcos", output, tensor, Autodiff.BackwardFunctions<T>.AcosBackward);
                 return output;
             }
@@ -21015,10 +21039,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Atan(input, output, size));
-            if (result != null)
+            var output = TryRunUnaryTensor(tensor, static (backend, input, output, size) => backend.Atan(input, output, size));
+            if (output != null)
             {
-                var output = new Tensor<T>(result, tensor.Shape._dims);
                 Autodiff.DifferentiableOps.RecordUnary("TensorAtan", output, tensor, Autodiff.BackwardFunctions<T>.AtanBackward);
                 return output;
             }
@@ -21095,10 +21118,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (TryGetBackend(out var backend))
             {
                 float scalarF = scalar is float f ? f : Convert.ToSingle(scalar);
-                var result = TryRunUnary(tensor, (b, input, output, size) => b.Scale(input, output, scalarF, size));
-                if (result != null)
+                var output = TryRunUnaryTensor(tensor, (b, input, output, size) => b.Scale(input, output, scalarF, size));
+                if (output != null)
                 {
-                    var output = new Tensor<T>(result, tensor.Shape._dims);
                     Autodiff.DifferentiableOps.RecordUnary("TensorMultiplyScalar", output, tensor,
                         Autodiff.BackwardFunctions<T>.MultiplyScalarBackward, new object[] { scalar as object ?? new object() });
                     return output;
@@ -21122,10 +21144,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Floor(input, output, size));
-            if (result != null)
+            var output = TryRunUnaryTensor(tensor, static (backend, input, output, size) => backend.Floor(input, output, size));
+            if (output != null)
             {
-                var output = new Tensor<T>(result, tensor.Shape._dims);
                 Autodiff.DifferentiableOps.RecordUnary("Floor", output, tensor, Autodiff.BackwardFunctions<T>.SignBackward);
                 return output;
             }
@@ -21138,10 +21159,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Ceiling(input, output, size));
-            if (result != null)
+            var output = TryRunUnaryTensor(tensor, static (backend, input, output, size) => backend.Ceiling(input, output, size));
+            if (output != null)
             {
-                var output = new Tensor<T>(result, tensor.Shape._dims);
                 Autodiff.DifferentiableOps.RecordUnary("Ceiling", output, tensor, Autodiff.BackwardFunctions<T>.SignBackward);
                 return output;
             }
@@ -21301,10 +21321,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Sign(input, output, size));
-            if (result != null)
+            var output = TryRunUnaryTensor(tensor, static (backend, input, output, size) => backend.Sign(input, output, size));
+            if (output != null)
             {
-                var output = new Tensor<T>(result, tensor.Shape._dims);
                 Autodiff.DifferentiableOps.RecordUnary("Sign", output, tensor, Autodiff.BackwardFunctions<T>.SignBackward);
                 return output;
             }
@@ -23926,10 +23945,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         try
         {
-            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Sigmoid(input, output, size));
-            if (result != null)
+            var output = TryRunUnaryTensor(tensor, static (backend, input, output, size) => backend.Sigmoid(input, output, size));
+            if (output != null)
             {
-                var output = new Tensor<T>(result, tensor.Shape._dims);
                 Autodiff.DifferentiableOps.RecordUnary("Sigmoid", output, tensor,
                     Autodiff.BackwardFunctions<T>.SigmoidBackward);
                 return output;
@@ -23980,10 +23998,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         try
         {
-            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Relu(input, output, size));
-            if (result != null)
+            var output = TryRunUnaryTensor(tensor, static (backend, input, output, size) => backend.Relu(input, output, size));
+            if (output != null)
             {
-                var output = new Tensor<T>(result, tensor.Shape._dims);
                 Autodiff.DifferentiableOps.RecordUnary("ReLU", output, tensor,
                     Autodiff.BackwardFunctions<T>.ReLUBackward);
                 return output;
@@ -24026,10 +24043,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         try
         {
-            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Gelu(input, output, size));
-            if (result != null)
+            var output = TryRunUnaryTensor(tensor, static (backend, input, output, size) => backend.Gelu(input, output, size));
+            if (output != null)
             {
-                var output = new Tensor<T>(result, tensor.Shape._dims);
                 Autodiff.DifferentiableOps.RecordUnary("GELU", output, tensor,
                     Autodiff.BackwardFunctions<T>.GELUBackward);
                 return output;
@@ -24045,10 +24061,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return base.Mish(tensor);
         try
         {
-            var result = TryRunUnary(tensor, static (backend, input, output, size) => backend.Mish(input, output, size));
-            if (result != null)
+            var output = TryRunUnaryTensor(tensor, static (backend, input, output, size) => backend.Mish(input, output, size));
+            if (output != null)
             {
-                var output = new Tensor<T>(result, tensor.Shape._dims);
                 Autodiff.DifferentiableOps.RecordUnary("Mish", output, tensor,
                     Autodiff.BackwardFunctions<T>.MishBackward);
                 return output;
@@ -24089,10 +24104,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return base.HardSwish(input);
         try
         {
-            var result = TryRunUnary(input, static (backend, inp, output, size) => backend.Hardswish(inp, output, size));
-            if (result != null)
+            var output = TryRunUnaryTensor(input, static (backend, inp, output, size) => backend.Hardswish(inp, output, size));
+            if (output != null)
             {
-                var output = new Tensor<T>(result, input.Shape._dims);
                 Autodiff.DifferentiableOps.RecordUnary("HardSwish", output, input,
                     Autodiff.BackwardFunctions<T>.HardSwishBackward);
                 return output;

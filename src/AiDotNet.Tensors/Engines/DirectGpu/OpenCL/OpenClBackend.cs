@@ -84,7 +84,6 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
         // An allocation that runs out of memory drains the pool and retries (AllocateReclaiming).
         private const int MaxPooledBufferElements = int.MaxValue;
         private const int PooledMemoryDivisor = 4;
-        private long _driverBytesSinceCollection;   // pool misses since the last collection (DeviceMemoryReclaim)
         private const int MaxPooledBuffersPerSize = 4096;
         private readonly GpuBufferPool<DirectOpenClGpuBuffer> _bufferPool =
             new GpuBufferPool<DirectOpenClGpuBuffer>(MaxPooledBuffersPerSize, MaxPooledBufferElements);
@@ -1321,12 +1320,13 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
             if (_bufferPool.TryRent(data.Length, affinity, out var pooled) && pooled != null)
             {
                 pooled.Buffer.CopyFromHost(data);
+                DeviceMemoryReclaim.OnDeviceAllocation((long)data.Length * sizeof(float));
                 return pooled;
             }
 
             var context = _context;
             var buffer = AllocateReclaiming(() => new DirectOpenClBuffer(context, data));
-            DeviceMemoryReclaim.OnDriverAllocation(ref _driverBytesSinceCollection, (long)data.Length * sizeof(float));
+            DeviceMemoryReclaim.OnDeviceAllocation((long)data.Length * sizeof(float));
             return new DirectOpenClGpuBuffer(buffer, ReturnOpenClBufferToPool);
         }
 
@@ -1338,11 +1338,14 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
             var affinity = GpuBufferPoolAffinity.ForNativeQueue(_context.CommandQueue);
             if (_bufferPool.TryRent(size, affinity, out var pooled) && pooled != null)
+            {
+                DeviceMemoryReclaim.OnDeviceAllocation((long)size * sizeof(float));
                 return pooled;
+            }
 
             var context = _context;
             var buffer = AllocateReclaiming(() => new DirectOpenClBuffer(context, size));
-            DeviceMemoryReclaim.OnDriverAllocation(ref _driverBytesSinceCollection, (long)size * sizeof(float));
+            DeviceMemoryReclaim.OnDeviceAllocation((long)size * sizeof(float));
             return new DirectOpenClGpuBuffer(buffer, ReturnOpenClBufferToPool);
         }
 

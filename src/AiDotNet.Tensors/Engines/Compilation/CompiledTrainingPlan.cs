@@ -6002,7 +6002,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     {
         if (!extras.AmsgradDisableBiasCorrection) return lr;
         float eps = 0f;
-        FusedOptimizer.ToUncorrectedAmsgrad(ref lr, ref eps, b1, b2, _optimizerStep);
+        FusedOptimizer.ToUncorrectedAmsgrad(ref lr, ref eps, b1, b2, _optimizerStep, extras.AmsgradExactBeta1, extras.AmsgradExactBeta2);
         return lr;
     }
 
@@ -6010,7 +6010,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     {
         if (!extras.AmsgradDisableBiasCorrection) return eps;
         float lr = 0f;
-        FusedOptimizer.ToUncorrectedAmsgrad(ref lr, ref eps, b1, b2, _optimizerStep);
+        FusedOptimizer.ToUncorrectedAmsgrad(ref lr, ref eps, b1, b2, _optimizerStep, extras.AmsgradExactBeta1, extras.AmsgradExactBeta2);
         return eps;
     }
 
@@ -6018,7 +6018,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     {
         if (!extras.AmsgradDisableBiasCorrection) return lr;
         double eps = 0.0;
-        FusedOptimizer.ToUncorrectedAmsgrad(ref lr, ref eps, b1, b2, _optimizerStep);
+        FusedOptimizer.ToUncorrectedAmsgrad(ref lr, ref eps, b1, b2, _optimizerStep, extras.AmsgradExactBeta1, extras.AmsgradExactBeta2);
         return lr;
     }
 
@@ -6026,7 +6026,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     {
         if (!extras.AmsgradDisableBiasCorrection) return eps;
         double lr = 0.0;
-        FusedOptimizer.ToUncorrectedAmsgrad(ref lr, ref eps, b1, b2, _optimizerStep);
+        FusedOptimizer.ToUncorrectedAmsgrad(ref lr, ref eps, b1, b2, _optimizerStep, extras.AmsgradExactBeta1, extras.AmsgradExactBeta2);
         return eps;
     }
     private static FusedOptimizerExtras CloneFusedOptimizerExtras(FusedOptimizerExtras extras)
@@ -6066,6 +6066,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             LambMaxTrustRatio = extras.LambMaxTrustRatio,
             LambDisableBiasCorrection = extras.LambDisableBiasCorrection,
             AmsgradDisableBiasCorrection = extras.AmsgradDisableBiasCorrection,
+            AmsgradExactBeta1 = extras.AmsgradExactBeta1,
+            AmsgradExactBeta2 = extras.AmsgradExactBeta2,
             DecoupledWeightDecay = extras.DecoupledWeightDecay,
         };
 
@@ -6184,7 +6186,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     // "AOPT": identifies an ExportOptimizerState payload so a wrong byte array fails loudly on import.
     private const int OptimizerStateMagic = 0x54504F41;
     // 2: the optimizer extras gained LAMB's trust-ratio clip and bias-correction switch (plan format 7).
-    private const int OptimizerStateVersion = 2;
+    // 3: the extras gained AMSGrad's decoupled-decay switch (format 8), bias-correction switch (format 9) and exact
+    //    betas (format 10). Each also changed this payload's layout without a bump, so "version 2" names more than
+    //    one layout and a reader cannot tell which it holds: every version 2 payload is rejected, never misread.
+    private const int OptimizerStateVersion = 3;
 
     /// <inheritdoc/>
     public bool IsCompatibleWith(PlanCompatibilityInfo info)

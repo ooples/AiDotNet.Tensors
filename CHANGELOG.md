@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.134.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.134.0...v0.134.1) (2026-10-01)
+
+
+### Bug Fixes
+
+* **compilation:** weight paper amsgrad gradients by the caller's exact 1 - beta ([#1079](https://github.com/ooples/AiDotNet.Tensors/issues/1079)) ([b6b909f](https://github.com/ooples/AiDotNet.Tensors/commit/b6b909fbdf8a00ec29c9ca2bc2e8e5f6a3240eb1))
+
+
+### Performance
+
+* **gpu:** no gen-2 GC pauses in GPU training loops ([#1078](https://github.com/ooples/AiDotNet.Tensors/issues/1078)) ([a44706b](https://github.com/ooples/AiDotNet.Tensors/commit/a44706b9c04804473cf186d2c6b45010d8d779ad))
+
+## [0.134.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.133.2...v0.134.0) (2026-10-01)
+
+
+### Features
+
+* add paper-faithful amsgrad mode to the fused training plan ([#1077](https://github.com/ooples/AiDotNet.Tensors/issues/1077)) ([033a0d7](https://github.com/ooples/AiDotNet.Tensors/commit/033a0d760f36a244d99af74c0ecb12c9719e8aed))
+* **compilation:** add an external learning rate the caller drives between steps ([#1075](https://github.com/ooples/AiDotNet.Tensors/issues/1075)) ([654842b](https://github.com/ooples/AiDotNet.Tensors/commit/654842bc426f8b19a19292f99e82e024dd444230))
+
+
+### Performance
+
+* **gpu:** a caching device allocator keeps a warm, fixed-shape training loop's device memory flat, with the pool bounded at a quarter of device memory ([#1074](https://github.com/ooples/AiDotNet.Tensors/issues/1074)) ([a9c0482](https://github.com/ooples/AiDotNet.Tensors/commit/a9c04823e1e2f71861e21e3fc547496a0fdaadb5))
+
 ## [0.133.2](https://github.com/ooples/AiDotNet.Tensors/compare/v0.133.1...v0.133.2) (2026-09-30)
 
 

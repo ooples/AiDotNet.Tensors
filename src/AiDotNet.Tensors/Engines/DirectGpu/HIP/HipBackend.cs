@@ -58,7 +58,6 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     private const int MaxPooledBufferElements = int.MaxValue;
     private const int MaxPooledBuffersPerSize = 4096;
     private const int PooledMemoryDivisor = 4;
-    private long _driverBytesSinceCollection;   // pool misses since the last collection (DeviceMemoryReclaim)
     private readonly GpuBufferPool<HipGpuBuffer> _bufferPool =
         new GpuBufferPool<HipGpuBuffer>(MaxPooledBuffersPerSize, MaxPooledBufferElements);
     private readonly HipPinnedBufferPool _pinnedPool = new();
@@ -1451,7 +1450,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     {
         DrainCollectedBuffers();
         var result = HipNativeBindings.hipMalloc(ref devicePtr, sizeBytes); // lgtm[cs/call-to-unmanaged-code] HIP interop requires native driver calls.
-        if (result == HipError.Success) DeviceMemoryReclaim.OnDriverAllocation(ref _driverBytesSinceCollection, (long)(ulong)sizeBytes);
+        if (result == HipError.Success) DeviceMemoryReclaim.OnDeviceAllocation((long)(ulong)sizeBytes);
         if (result != HipError.ErrorOutOfMemory) return result;
         DeviceMemoryReclaim.CollectUnreachable();
         DrainCollectedBuffers();
@@ -1469,6 +1468,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         DrainCollectedBuffers();
         if (_bufferPool.TryRent(size, out var pooled) && pooled != null)
         {
+            DeviceMemoryReclaim.OnDeviceAllocation((long)size * sizeof(float));
             var zeroResult = HipNativeBindings.hipMemset(pooled.Handle, 0, sizeBytes); // lgtm[cs/call-to-unmanaged-code] HIP interop requires native driver calls.
             HipNativeBindings.CheckError(zeroResult, "hipMemset");
             return pooled;
