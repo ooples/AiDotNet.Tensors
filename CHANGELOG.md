@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.134.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.134.0...v0.134.1) (2026-10-01)
+
+
+### Bug Fixes
+
+* **compilation:** weight paper amsgrad gradients by the caller's exact 1 - beta ([#1079](https://github.com/ooples/AiDotNet.Tensors/issues/1079)) ([b6b909f](https://github.com/ooples/AiDotNet.Tensors/commit/b6b909fbdf8a00ec29c9ca2bc2e8e5f6a3240eb1))
+
+
+### Performance
+
+* **gpu:** no gen-2 GC pauses in GPU training loops ([#1078](https://github.com/ooples/AiDotNet.Tensors/issues/1078)) ([a44706b](https://github.com/ooples/AiDotNet.Tensors/commit/a44706b9c04804473cf186d2c6b45010d8d779ad))
+
 ## [0.134.0](https://github.com/ooples/AiDotNet.Tensors/compare/v0.133.2...v0.134.0) (2026-10-01)
 
 
