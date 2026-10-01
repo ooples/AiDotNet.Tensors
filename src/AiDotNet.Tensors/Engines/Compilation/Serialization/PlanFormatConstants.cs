@@ -36,8 +36,10 @@ internal static class PlanFormatConstants
     /// int8 moment-storage minimum quantized length (smaller parameters keep fp32 moments).
     /// Version 8 adds the AMSGrad decoupled-weight-decay switch (AdamW + AMSGrad) to the fused-optimizer extras. It
     /// selects the algorithm, so version 7 plans (which lack it) are rejected rather than read misaligned.
+    /// Version 9 adds AMSGrad's bias-correction switch (Reddi et al. 2018, Algorithm 2 when set). It changes the
+    /// update rule, so version 8 plans are rejected rather than read misaligned.
     /// </remarks>
-    internal const ushort CurrentFormatVersion = 8;
+    internal const ushort CurrentFormatVersion = 9;
 
     /// <summary>
     /// Tensor-codec version. Semantically distinct from the format version:
