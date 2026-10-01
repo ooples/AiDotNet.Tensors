@@ -193,7 +193,9 @@ public class CompiledTrainingCowIsolationTests
 
         Task TrainAsync(Tensor<double> parameter, double learningRate)
         {
-            return Task.Run(() =>
+            // A dedicated thread per worker: the barrier below needs both workers running at once, and a thread-pool
+            // task can wait longer than the barrier's timeout to start when a long parallel test run saturates the pool.
+            return Task.Factory.StartNew(() =>
             {
                 var engine = new CpuEngine();
                 var input = new Tensor<double>(new[] { 2.0 }, new[] { 1, 1 });
@@ -215,7 +217,7 @@ public class CompiledTrainingCowIsolationTests
                     bothPlansReady.SignalAndWait(TimeSpan.FromSeconds(30)),
                     "Both concurrent training plans should reach the step barrier.");
                 plan.Step();
-            });
+            }, System.Threading.CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
         }
 
         await Task.WhenAll(TrainAsync(first, 0.1), TrainAsync(second, 0.05));

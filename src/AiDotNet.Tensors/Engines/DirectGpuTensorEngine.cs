@@ -1735,8 +1735,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Contiguous() below would download the whole flat array to slice this view on the host.
         // Every view into a flat ParameterBuffer -- including the one at offset 0, which the persistent-cache path
         // below would otherwise re-upload from the (stale) host copy over the device-authoritative flat buffer.
-        if (TryResolveDeviceParameterView(backend, tensor, out var parameterView))
-            return new OwnedBuffer(parameterView, ownsBuffer: false);
+        if (TryResolveDeviceParameterView(backend, tensor, out var parameterView, out bool parameterViewOwned))
+            return new OwnedBuffer(parameterView, ownsBuffer: parameterViewOwned);
         // A permuted view of a tensor whose data is only on the device: permute on the device. Contiguous() below
         // would download the base, permute it on the host and upload the result.
         if (!tensor.IsContiguous && TryPermuteViewOnDevice(backend, tensor, out var permuted))
@@ -2889,8 +2889,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // device-to-host download, so a weight whose current value lives on the device (a parameter the optimizer
         // updated in place, or a GPU-computed table such as RoPE's cos/sin) was downloaded on EVERY forward only to
         // find its buffer already cached (measured: every HRE LM step re-read the RoPE tables).
-        if (TryResolveDeviceParameterView(backend, weights, out var parameterView))
-            return new OwnedBuffer(parameterView, ownsBuffer: false);
+        if (TryResolveDeviceParameterView(backend, weights, out var parameterView, out bool parameterViewOwned))
+            return new OwnedBuffer(parameterView, ownsBuffer: parameterViewOwned);
         var key = weights.GetBackingArrayForCacheLookupUnsafe();
         if (key is not null && TryGetVersionedPersistentBuffer(key, weights.GpuCacheVersion, out var cached))
             return new OwnedBuffer(cached, ownsBuffer: false);
@@ -3279,6 +3279,42 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// when current, else its persistent weight buffer at the current host version (uploading the host weights once
     /// when neither exists). Returns null when the parameter cannot be placed on the device (views, no backend).
     /// </summary>
+    /// <summary>
+    /// The device buffer holding a ParameterBuffer's whole flat array: the cached one while the flat array is
+    /// device-authoritative (pending host download), else a fresh upload of the host copy, cached for every view.
+    /// </summary>
+    private IGpuBuffer AcquireFlatDeviceBuffer(float[] flat, IDirectGpuBackend be)
+    {
+        lock (_persistentBufferLock)
+        {
+            if (_persistentBufferCache.TryGetValue(flat, out var entry) && Helpers.HostSync.IsPending(flat))
+                return entry.Buffer;
+            if (entry is not null && _persistentBufferCache.TryRemove(flat, out var stale))
+                _retiredWeightBuffers.Add(stale.Buffer);   // disposed past a synchronize (see GetOrCacheWeightBuffer)
+            var flatBuffer = be.AllocateBuffer(flat);
+            _persistentBufferCache[flat] = new GpuBufferCacheEntry(flatBuffer, PersistentTensorRole.Weights);
+            return flatBuffer;
+        }
+    }
+
+    /// <summary>
+    /// For a backend that cannot address a sub-range of a buffer (only CUDA implements IGpuBufferViews; OpenCL
+    /// sub-buffers need offsets aligned to the device's base-address alignment, which a flat parameter layout does not
+    /// have): a ParameterBuffer view's elements copied out of the flat array's device buffer. The caller updates
+    /// <paramref name="staged"/> and copies it back at <paramref name="offset"/>. Both copies stay on the device; the
+    /// view used to be declined, so its optimizer step ran on the host.
+    /// </summary>
+    internal bool TryStageFlatParameter(Tensor<float> param, out IGpuBuffer staged, out IGpuBuffer flatBuffer, out int offset)
+    {
+        staged = null!; flatBuffer = null!; offset = 0;
+        if (!TryGetBackend(out var be) || be is IGpuBufferViews || !param.IsContiguous) return false;
+        if (!TryGetFlatParameterView(param, out var flat, out offset)) return false;
+        flatBuffer = AcquireFlatDeviceBuffer(flat, be);
+        staged = be.AllocateBuffer(param.Length);
+        be.Copy(flatBuffer, offset, staged, 0, param.Length);
+        return true;
+    }
+
     internal IGpuBuffer? AcquireParameterBuffer(Tensor<float> param, out IDirectGpuBackend backend)
     {
         backend = null!;
@@ -3289,23 +3325,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // A view into the model's flat ParameterBuffer: the WHOLE flat array lives on the device as one buffer and
             // each parameter is a view of it. While the flat array is device-authoritative (pending host download) the
             // existing buffer is current; otherwise the host copy is, so it is uploaded once for every parameter.
+            // A backend without sub-buffer views updates the parameter through a staged copy (TryStageFlatParameter).
             if (be is not IGpuBufferViews views) return null;
-            IGpuBuffer flatBuffer;
-            lock (_persistentBufferLock)
-            {
-                if (_persistentBufferCache.TryGetValue(flat, out var entry) && Helpers.HostSync.IsPending(flat))
-                {
-                    flatBuffer = entry.Buffer;
-                }
-                else
-                {
-                    if (entry is not null && _persistentBufferCache.TryRemove(flat, out var stale))
-                        _retiredWeightBuffers.Add(stale.Buffer);   // disposed past a synchronize (see GetOrCacheWeightBuffer)
-                    flatBuffer = be.AllocateBuffer(flat);
-                    _persistentBufferCache[flat] = new GpuBufferCacheEntry(flatBuffer, PersistentTensorRole.Weights);
-                }
-            }
-            return views.TryCreateView(flatBuffer, offset, param.Length);
+            return views.TryCreateView(AcquireFlatDeviceBuffer(flat, be), offset, param.Length);
         }
         if (param._storageOffset != 0) return null;
         if (param._gpuBuffer is not null && ReferenceEquals(param._gpuBackend, be) && param._gpuBuffer.Handle != IntPtr.Zero
@@ -3428,19 +3450,30 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// A device view for a ParameterBuffer parameter whose flat array is device-authoritative (an on-device optimizer
     /// updated it), so reads never download the flat array to slice it on the host.
     /// </summary>
-    private bool TryResolveDeviceParameterView<T>(IDirectGpuBackend backend, Tensor<T> t, out IGpuBuffer view)
+    private bool TryResolveDeviceParameterView<T>(IDirectGpuBackend backend, Tensor<T> t, out IGpuBuffer view, out bool owned)
     {
         view = null!;
-        if (typeof(T) != typeof(float) || backend is not IGpuBufferViews views) return false;
+        owned = false;
+        if (typeof(T) != typeof(float)) return false;
         if (!TryGetFlatParameterView((Tensor<float>)(object)t, out var flat, out int offset)) return false;
         if (!Helpers.HostSync.IsPending(flat)) return false;
         IGpuBuffer? flatBuffer = null;
         lock (_persistentBufferLock)
             if (_persistentBufferCache.TryGetValue(flat, out var entry)) flatBuffer = entry.Buffer;
         if (flatBuffer is null) return false;
-        var v = views.TryCreateView(flatBuffer, offset, t.Length);
-        if (v is null) return false;
-        view = v;
+        if (backend is IGpuBufferViews views)
+        {
+            var v = views.TryCreateView(flatBuffer, offset, t.Length);
+            if (v is null) return false;
+            view = v;
+            return true;
+        }
+        // No sub-buffer views: copy the view's elements out of the flat buffer on the device, rather than downloading
+        // the whole flat array to slice it on the host.
+        var copy = backend.AllocateBuffer(t.Length);
+        backend.Copy(flatBuffer, offset, copy, 0, t.Length);
+        view = copy;
+        owned = true;
         return true;
     }
 
@@ -3950,17 +3983,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         // Create GPU-resident tensor with ZERO CPU allocation.
         // The backing array is only allocated when CPU code actually accesses the data.
-        var deviceType = backend.BackendName?.ToUpperInvariant() switch
-        {
-            "CUDA" or "NVIDIA" => TensorDevice.CUDA,
-            "OPENCL" => TensorDevice.OpenCL,
-            "HIP" or "ROCM" => TensorDevice.HIP,
-            "VULKAN" => TensorDevice.Vulkan,
-            "METAL" or "MPS" => TensorDevice.Metal,
-            "WEBGPU" => TensorDevice.WebGPU,
-            "DIRECTML" or "DML" => TensorDevice.DirectML,
-            _ => TensorDevice.CUDA
-        };
+        var deviceType = backend.DeviceType;   // the backend's typed device, not a match on its name
         var tensor = Tensor<T>.CreateGpuResident(shape, deviceType);
         tensor._gpuBuffer = outputBuffer;
         tensor._gpuBackend = backend;
@@ -27708,17 +27731,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private Tensor<Complex<T>> DeferSplitComplexResult<T>(
         IDirectGpuBackend backend, IGpuBuffer outputBuffer, int elementCount, int[] shape)
     {
-        var deviceType = backend.BackendName?.ToUpperInvariant() switch
-        {
-            "CUDA" or "NVIDIA" => TensorDevice.CUDA,
-            "OPENCL" => TensorDevice.OpenCL,
-            "HIP" or "ROCM" => TensorDevice.HIP,
-            "VULKAN" => TensorDevice.Vulkan,
-            "METAL" or "MPS" => TensorDevice.Metal,
-            "WEBGPU" => TensorDevice.WebGPU,
-            "DIRECTML" or "DML" => TensorDevice.DirectML,
-            _ => TensorDevice.CUDA
-        };
+        var deviceType = backend.DeviceType;   // the backend's typed device, not a match on its name
 
         var tensor = Tensor<Complex<T>>.CreateGpuResident(shape, deviceType);
         tensor._gpuBuffer = outputBuffer;

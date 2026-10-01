@@ -4766,15 +4766,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         var directGpu = Engines.Engine.DirectGpu;
         if (directGpu is not null && directGpu.IsAvailable && directGpu.Backend is not null)
         {
-            var actualType = directGpu.Backend.BackendName?.ToUpperInvariant() switch
-            {
-                "CUDA" or "NVIDIA" => TensorDevice.CUDA,
-                "OPENCL" => TensorDevice.OpenCL,
-                "HIP" or "ROCM" => TensorDevice.HIP,
-                "VULKAN" => TensorDevice.Vulkan,
-                "METAL" or "MPS" => TensorDevice.Metal,
-                _ => TensorDevice.CUDA
-            };
+            var actualType = directGpu.Backend.DeviceType;   // the backend's typed device, not a match on its name
             if (deviceInfo.Type != actualType && deviceInfo.Type != TensorDevice.CUDA)
                 throw new NotSupportedException(
                     $"Requested device type {deviceInfo.Type} but the active GPU backend is {actualType}. " +
@@ -4878,17 +4870,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // goes completely flat (7.70→7.70 vs 7.70→1.31 non-resident on the same graph). This is the default GPU
         // path for the TimeSeries family (AIDOTNET_GPU_RESIDENT_PARAMS != 0), so it silently mistrained on GPU.
         _gpuBufferVersion = GpuCacheVersion;
-        _device = backend.BackendName?.ToUpperInvariant() switch
-        {
-            "CUDA" or "NVIDIA" => TensorDevice.CUDA,
-            "OPENCL" => TensorDevice.OpenCL,
-            "HIP" or "ROCM" => TensorDevice.HIP,
-            "VULKAN" => TensorDevice.Vulkan,
-            "METAL" or "MPS" => TensorDevice.Metal,
-            "WEBGPU" => TensorDevice.WebGPU,
-            "DIRECTML" or "DML" => TensorDevice.DirectML,
-            _ => TensorDevice.CUDA
-        };
+        _device = backend.DeviceType;   // the backend's typed device, not a match on its name
         // Device-owned from here on: a device-side write (MarkModified) arms a download into the host slice.
         Helpers.ResidentHostMirror.Attach(this);
 
