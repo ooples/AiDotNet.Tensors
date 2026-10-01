@@ -49,7 +49,7 @@ public class PerGroupOptimizerTypeTests
         OptimizerType fallback,
         IReadOnlyList<OptimizerType>? groupTypes,
         int steps,
-        IReadOnlyList<float>? groupWeightDecays = null,
+        IReadOnlyList<double>? groupWeightDecays = null,
         float weightDecay = 0f,
         FusedOptimizerExtras? extras = null)
     {
@@ -169,7 +169,7 @@ public class PerGroupOptimizerTypeTests
             fallback: OptimizerType.LARS,
             groupTypes: new[] { OptimizerType.LARS, OptimizerType.SGDMomentum },
             steps,
-            groupWeightDecays: new[] { decay, 0f },
+            groupWeightDecays: new double[] { decay, 0 },
             extras: new FusedOptimizerExtras { Momentum = 0.9f, TrustCoefficient = 0.001f });
 
         // The bias must match a pure SGD-with-momentum, zero-decay run — i.e. it saw neither LARS's trust ratio
@@ -213,7 +213,7 @@ public class PerGroupOptimizerTypeTests
 
         var (a, b) = RunTwoGroups(
             initA, initB, OptimizerType.SGD, groupTypes: null, steps,
-            groupWeightDecays: new[] { 0f, decay });
+            groupWeightDecays: new double[] { 0, decay });
 
         var (refNoDecayA, _) = RunTwoGroups(initA, initB, OptimizerType.SGD, null, steps, weightDecay: 0f);
         var (_, refDecayB) = RunTwoGroups(initA, initB, OptimizerType.SGD, null, steps, weightDecay: decay);
@@ -278,7 +278,7 @@ public class PerGroupOptimizerTypeTests
             fallback: OptimizerType.SGD,
             groupTypes: badTypes ? new[] { OptimizerType.SGD } : null,
             steps: 1,
-            groupWeightDecays: badTypes ? null : new[] { 0f }));
+            groupWeightDecays: badTypes ? null : new double[] { 0 }));
     }
 
     /// <summary>
@@ -328,8 +328,8 @@ public class PerGroupOptimizerTypeTests
         var initA = Seed(8, seed: 91);
         var initB = Seed(8, seed: 92);
         var groupTypes = new[] { OptimizerType.SGD, OptimizerType.Adam };
-        var groupWds = new[] { 0f, 0.02f };
-
+        // The float values a float plan uses, widened: the plan narrows them to float and stores what it used.
+        var groupWds = new double[] { 0f, 0.02f };
         var engine = new CpuEngine();
         var a = new Tensor<float>(new[] { initA.Length });
         var b = new Tensor<float>(new[] { initB.Length });

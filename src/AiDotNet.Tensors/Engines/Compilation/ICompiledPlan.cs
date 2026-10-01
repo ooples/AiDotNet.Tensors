@@ -442,11 +442,11 @@ public interface ICompiledTrainingPlan<T> : IDisposable
     /// <param name="weightDecay">Weight decay (AdamW/LAMB). Default: 0.</param>
     void ConfigureOptimizer(
         OptimizerType optimizerType,
-        float learningRate,
-        float beta1 = 0.9f,
-        float beta2 = 0.999f,
-        float eps = 1e-8f,
-        float weightDecay = 0f,
+        double learningRate,
+        double beta1 = 0.9,
+        double beta2 = 0.999,
+        double eps = 1e-8,
+        double weightDecay = 0,
         FusedOptimizerExtras? extras = null);
 
     /// <summary>
@@ -536,10 +536,10 @@ public interface ICompiledTrainingPlan<T> : IDisposable
     void ConfigureOptimizer(
         OptimizerType optimizerType,
         LrSchedule schedule,
-        float beta1 = 0.9f,
-        float beta2 = 0.999f,
-        float eps = 1e-8f,
-        float weightDecay = 0f,
+        double beta1 = 0.9,
+        double beta2 = 0.999,
+        double eps = 1e-8,
+        double weightDecay = 0,
         FusedOptimizerExtras? extras = null);
 
     /// <summary>
@@ -565,10 +565,10 @@ public interface ICompiledTrainingPlan<T> : IDisposable
         OptimizerType optimizerType,
         System.Collections.Generic.IReadOnlyList<LrSchedule> groupSchedules,
         System.Collections.Generic.IReadOnlyList<int> paramToGroup,
-        float beta1 = 0.9f,
-        float beta2 = 0.999f,
-        float eps = 1e-8f,
-        float weightDecay = 0f,
+        double beta1 = 0.9,
+        double beta2 = 0.999,
+        double eps = 1e-8,
+        double weightDecay = 0,
         FusedOptimizerExtras? extras = null);
 
     /// <summary>
@@ -609,11 +609,11 @@ public interface ICompiledTrainingPlan<T> : IDisposable
         System.Collections.Generic.IReadOnlyList<OptimizerType>? groupOptimizerTypes,
         System.Collections.Generic.IReadOnlyList<LrSchedule> groupSchedules,
         System.Collections.Generic.IReadOnlyList<int> paramToGroup,
-        float beta1 = 0.9f,
-        float beta2 = 0.999f,
-        float eps = 1e-8f,
-        float weightDecay = 0f,
-        System.Collections.Generic.IReadOnlyList<float>? groupWeightDecays = null,
+        double beta1 = 0.9,
+        double beta2 = 0.999,
+        double eps = 1e-8,
+        double weightDecay = 0,
+        System.Collections.Generic.IReadOnlyList<double>? groupWeightDecays = null,
         FusedOptimizerExtras? extras = null);
 
     /// <summary>

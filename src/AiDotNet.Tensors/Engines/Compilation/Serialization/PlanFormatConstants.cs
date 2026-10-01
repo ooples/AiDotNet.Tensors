@@ -40,8 +40,10 @@ internal static class PlanFormatConstants
     /// update rule, so version 8 plans are rejected rather than read misaligned.
     /// Version 10 adds AMSGrad's exact betas (AmsgradExactBeta1/2): the paper variant then weights gradients by the
     /// caller's 1 - beta rather than 1 - (float)beta, so version 9 plans are rejected rather than read misaligned.
+    /// Version 11 writes the fused optimizer's beta1, beta2, epsilon and weight decay as double instead of float, so a
+    /// double plan keeps the caller's exact hyperparameters; version 10 plans are rejected rather than read misaligned.
     /// </remarks>
-    internal const ushort CurrentFormatVersion = 10;
+    internal const ushort CurrentFormatVersion = 11;
 
     /// <summary>
     /// Tensor-codec version. Semantically distinct from the format version:

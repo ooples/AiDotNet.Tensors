@@ -279,7 +279,7 @@ public class ProximalL1FusedTests
                 new[] { OptimizerType.ProximalL1 },
                 new[] { LrSchedule.Constant(0.05) },
                 new[] { 0 },
-                groupWeightDecays: new[] { 0.01f },
+                groupWeightDecays: new double[] { 0.01f },
                 extras: new FusedOptimizerExtras { L1 = 1.0f }));
 
             Assert.Contains("does not support weightDecay", error.Message);

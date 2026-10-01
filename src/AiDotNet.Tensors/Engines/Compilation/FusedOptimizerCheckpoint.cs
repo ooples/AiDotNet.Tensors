@@ -231,10 +231,12 @@ internal sealed class FusedOptimizerCheckpoint
     public OptimizerType OptimizerType { get; set; }
     public bool IsGrouped { get; set; }
     public int OptimizerStep { get; set; }
-    public float Beta1 { get; set; }
-    public float Beta2 { get; set; }
-    public float Epsilon { get; set; }
-    public float WeightDecay { get; set; }
+    // Double, as the caller configured them: a double plan updates in double, and narrowing these to float made it
+    // drift from eager training by the rounding of every hyperparameter (a float plan converts once, as before).
+    public double Beta1 { get; set; }
+    public double Beta2 { get; set; }
+    public double Epsilon { get; set; }
+    public double WeightDecay { get; set; }
     public FusedMomentStorageMode MomentStorageMode { get; set; }
     public int Int8MomentBlockSize { get; set; }
     public int Int8MinQuantizedLength { get; set; }
@@ -257,7 +259,7 @@ internal sealed class FusedOptimizerCheckpoint
     /// <summary>
     /// Per-group weight decay, or null when every group uses <see cref="WeightDecay"/>.
     /// </summary>
-    public float[]? GroupWeightDecays { get; set; }
+    public double[]? GroupWeightDecays { get; set; }
 
     public FusedOptimizerScalarCheckpoint Scalars { get; set; } = new FusedOptimizerScalarCheckpoint();
     public FusedOptimizerParameterCheckpoint[] Parameters { get; set; } = System.Array.Empty<FusedOptimizerParameterCheckpoint>();
