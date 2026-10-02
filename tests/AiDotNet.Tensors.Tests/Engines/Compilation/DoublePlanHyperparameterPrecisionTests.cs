@@ -116,27 +116,86 @@ public class DoublePlanHyperparameterPrecisionTests
             plan.Step();
             byte[] current = plan.ExportOptimizerState() ?? throw new InvalidOperationException("no state");
 
-            // Version 3 wrote beta1, beta2, epsilon and weight decay as float. For an ungrouped plan that is the only
-            // layout difference: magic, version, then hasCheckpoint (bool), type (int), grouped (bool), step (int),
-            // then the four values. Transcode the current export into that layout.
-            const int header = 4 + 4, before = 1 + 4 + 1 + 4;
-            int at = header + before;
-            Assert.Equal(4, BitConverter.ToInt32(current, 4));
-            var legacy = new byte[current.Length - (4 * sizeof(double)) + (4 * sizeof(float))];
-            Buffer.BlockCopy(current, 0, legacy, 0, at);
-            BitConverter.GetBytes(3).CopyTo(legacy, 4);
-            for (int k = 0; k < 4; k++)
-                BitConverter.GetBytes((float)BitConverter.ToDouble(current, at + (k * sizeof(double))))
-                    .CopyTo(legacy, at + (k * sizeof(float)));
-            Buffer.BlockCopy(current, at + (4 * sizeof(double)), legacy, at + (4 * sizeof(float)),
-                current.Length - at - (4 * sizeof(double)));
-
-            plan.ImportOptimizerState(legacy);
+            plan.ImportOptimizerState(ToVersion3(current, groupWeightDecays: null));
             var restored = Assert.IsType<CompiledTrainingPlan<double>>(plan).CaptureFusedOptimizerCheckpoint();
             Assert.NotNull(restored);
             Assert.Equal((double)(float)B1, restored!.Beta1);
             Assert.Equal((double)(float)Eps, restored.Epsilon);
             Assert.Equal(1, restored.OptimizerStep);
         }
+    }
+
+    [Fact]
+    public void Grouped_optimizer_state_exported_with_float_weight_decays_still_imports()
+    {
+        double[] groupDecays = { 0.01, 0.025 };
+        var engine = new CpuEngine();
+        var a = new Tensor<double>(new[] { 3 });
+        var b = new Tensor<double>(new[] { 2 });
+        for (int i = 0; i < 3; i++) a[i] = Init[i];
+        for (int i = 0; i < 2; i++) b[i] = Init[3 + i];
+        ICompiledTrainingPlan<double> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            engine.TensorAdd(engine.ReduceSum(engine.TensorMultiply(a, a), null),
+                engine.ReduceSum(engine.TensorMultiply(b, b), null));
+            plan = scope.CompileTraining(new[] { a, b });
+        }
+        using (plan)
+        {
+            plan.ConfigureOptimizerGrouped(OptimizerType.AdamW, null,
+                new[] { LrSchedule.Constant(Lr), LrSchedule.Constant(Lr) }, new[] { 0, 1 }, B1, B2, Eps, Wd,
+                groupDecays);
+            plan.Step();
+            byte[] current = plan.ExportOptimizerState() ?? throw new InvalidOperationException("no state");
+
+            plan.ImportOptimizerState(ToVersion3(current, groupDecays));
+            var restored = Assert.IsType<CompiledTrainingPlan<double>>(plan).CaptureFusedOptimizerCheckpoint();
+            Assert.NotNull(restored);
+            Assert.True(restored!.IsGrouped);
+            Assert.Equal((double)(float)B1, restored.Beta1);
+            Assert.Equal((double)(float)Wd, restored.WeightDecay);
+            Assert.Equal(new[] { (double)(float)groupDecays[0], (double)(float)groupDecays[1] }, restored.GroupWeightDecays);
+        }
+    }
+
+    /// <summary>
+    /// Transcodes a current (version 4) optimizer-state export into version 3, which wrote beta1, beta2, epsilon and
+    /// weight decay, and the per-group weight decays, as float. The four values follow magic, version, hasCheckpoint
+    /// (bool), type (int), grouped (bool) and step (int). The group decays are the length-prefixed array holding
+    /// <paramref name="groupWeightDecays"/>, located by its exact bytes; null leaves the -1 marker, which both layouts share.
+    /// </summary>
+    private static byte[] ToVersion3(byte[] current, double[]? groupWeightDecays)
+    {
+        const int at = 4 + 4 + 1 + 4 + 1 + 4;
+        Assert.Equal(4, BitConverter.ToInt32(current, 4));
+        var legacy = new System.Collections.Generic.List<byte>(current.Length);
+        legacy.AddRange(new ArraySegment<byte>(current, 0, at));
+        for (int b = 0; b < 4; b++) legacy[4 + b] = BitConverter.GetBytes(3)[b];
+        for (int k = 0; k < 4; k++)
+            legacy.AddRange(BitConverter.GetBytes((float)BitConverter.ToDouble(current, at + (k * sizeof(double)))));
+        int rest = at + (4 * sizeof(double));
+        if (groupWeightDecays is null)
+        {
+            legacy.AddRange(new ArraySegment<byte>(current, rest, current.Length - rest));
+            return legacy.ToArray();
+        }
+
+        var pattern = new System.Collections.Generic.List<byte>(BitConverter.GetBytes(groupWeightDecays.Length));
+        foreach (double wd in groupWeightDecays) pattern.AddRange(BitConverter.GetBytes(wd));
+        int found = -1;
+        for (int i = rest; i <= current.Length - pattern.Count && found < 0; i++)
+        {
+            int j = 0;
+            while (j < pattern.Count && current[i + j] == pattern[j]) j++;
+            if (j == pattern.Count) found = i;
+        }
+        Assert.True(found >= 0, "the export does not contain the configured group weight decays");
+        legacy.AddRange(new ArraySegment<byte>(current, rest, found - rest));
+        legacy.AddRange(BitConverter.GetBytes(groupWeightDecays.Length));
+        foreach (double wd in groupWeightDecays) legacy.AddRange(BitConverter.GetBytes((float)wd));
+        int after = found + pattern.Count;
+        legacy.AddRange(new ArraySegment<byte>(current, after, current.Length - after));
+        return legacy.ToArray();
     }
 }
