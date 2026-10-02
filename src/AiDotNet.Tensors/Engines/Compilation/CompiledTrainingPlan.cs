@@ -1301,11 +1301,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         /// <summary>
         /// Per-group weight decay, or null when every group uses <see cref="WeightDecay"/>.
         /// </summary>
-        public float[]? GroupWeightDecays;
-        public float Beta1;
-        public float Beta2;
-        public float Epsilon;
-        public float WeightDecay;
+        public double[]? GroupWeightDecays;
+        public double Beta1;
+        public double Beta2;
+        public double Epsilon;
+        public double WeightDecay;
         public FusedOptimizerExtras Extras = new FusedOptimizerExtras();
         public FusedMomentStorageMode MomentStorageMode;
         public int Int8MomentBlockSize;
@@ -2972,11 +2972,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
 
     public unsafe void ConfigureOptimizer(
         OptimizerType optimizerType,
-        float learningRate,
-        float beta1 = 0.9f,
-        float beta2 = 0.999f,
-        float eps = 1e-8f,
-        float weightDecay = 0f,
+        double learningRate,
+        double beta1 = 0.9,
+        double beta2 = 0.999,
+        double eps = 1e-8,
+        double weightDecay = 0,
         FusedOptimizerExtras? extras = null)
     {
         ConfigureOptimizer(
@@ -2989,10 +2989,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     public unsafe void ConfigureOptimizer(
         OptimizerType optimizerType,
         LrSchedule schedule,
-        float beta1 = 0.9f,
-        float beta2 = 0.999f,
-        float eps = 1e-8f,
-        float weightDecay = 0f,
+        double beta1 = 0.9,
+        double beta2 = 0.999,
+        double eps = 1e-8,
+        double weightDecay = 0,
         FusedOptimizerExtras? extras = null)
     {
         if (schedule is null) throw new ArgumentNullException(nameof(schedule));
@@ -3007,7 +3007,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         ex.Validate();
         if (typeof(T) == typeof(float))
         {
-            ConfigureOptimizerFloat(optimizerType, schedule, beta1, beta2, eps, weightDecay, ex);
+            // A float plan updates in float: the hyperparameters narrow once here, exactly as they did when the
+            // public signature took float.
+            ConfigureOptimizerFloat(optimizerType, schedule, (float)beta1, (float)beta2, (float)eps, (float)weightDecay, ex);
             return;
         }
         if (typeof(T) == typeof(double))
@@ -3026,10 +3028,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         OptimizerType optimizerType,
         System.Collections.Generic.IReadOnlyList<LrSchedule> groupSchedules,
         System.Collections.Generic.IReadOnlyList<int> paramToGroup,
-        float beta1 = 0.9f,
-        float beta2 = 0.999f,
-        float eps = 1e-8f,
-        float weightDecay = 0f,
+        double beta1 = 0.9,
+        double beta2 = 0.999,
+        double eps = 1e-8,
+        double weightDecay = 0,
         FusedOptimizerExtras? extras = null)
         => ConfigureOptimizerGrouped(
             optimizerType, groupOptimizerTypes: null, groupSchedules, paramToGroup,
@@ -3041,11 +3043,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         System.Collections.Generic.IReadOnlyList<OptimizerType>? groupOptimizerTypes,
         System.Collections.Generic.IReadOnlyList<LrSchedule> groupSchedules,
         System.Collections.Generic.IReadOnlyList<int> paramToGroup,
-        float beta1 = 0.9f,
-        float beta2 = 0.999f,
-        float eps = 1e-8f,
-        float weightDecay = 0f,
-        System.Collections.Generic.IReadOnlyList<float>? groupWeightDecays = null,
+        double beta1 = 0.9,
+        double beta2 = 0.999,
+        double eps = 1e-8,
+        double weightDecay = 0,
+        System.Collections.Generic.IReadOnlyList<double>? groupWeightDecays = null,
         FusedOptimizerExtras? extras = null)
     {
         if (groupSchedules is null) throw new ArgumentNullException(nameof(groupSchedules));
@@ -3127,7 +3129,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         for (int g = 0; g < groupSchedules.Count; g++)
         {
             OptimizerType groupType = groupOptimizerTypes?[g] ?? optimizerType;
-            float groupWeightDecay = groupWeightDecays?[g] ?? weightDecay;
+            double groupWeightDecay = groupWeightDecays?[g] ?? weightDecay;
             ValidatePlanOptimizerSupport(groupType, isFloatPlan, hasGpuParams, nesterov);
             ValidateWeightDecayCompatibility(groupType, groupWeightDecay);
         }
@@ -3160,13 +3162,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         OptimizerType[]? groupTypes = groupOptimizerTypes is null
             ? null
             : System.Linq.Enumerable.ToArray(groupOptimizerTypes);
-        float[]? groupWds = groupWeightDecays is null
+        double[]? groupWds = groupWeightDecays is null
             ? null
             : System.Linq.Enumerable.ToArray(groupWeightDecays);
 
         if (typeof(T) == typeof(float))
         {
-            ConfigureOptimizerFloatGrouped(optimizerType, groupTypes, groupSchedules, canonicalParamToGroup, beta1, beta2, eps, weightDecay, groupWds, ex);
+            ConfigureOptimizerFloatGrouped(optimizerType, groupTypes, groupSchedules, canonicalParamToGroup,
+                (float)beta1, (float)beta2, (float)eps, (float)weightDecay,
+                groupWds is null ? null : System.Array.ConvertAll(groupWds, wd => (float)wd), ex);
             return;
         }
         if (typeof(T) == typeof(double))
@@ -3179,7 +3183,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
 
     private static void ValidateWeightDecayCompatibility(
         OptimizerType optimizerType,
-        float weightDecay)
+        double weightDecay)
     {
         if (optimizerType == OptimizerType.ProximalL1 && weightDecay != 0f)
             throw new NotSupportedException(
@@ -4841,7 +4845,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             Schedules = schedules,
             ParamToGroup = paramGroup,
             GroupOptimizerTypes = groupOptimizerTypes is null ? null : (OptimizerType[])groupOptimizerTypes.Clone(),
-            GroupWeightDecays = groupWeightDecays is null ? null : (float[])groupWeightDecays.Clone(),
+            GroupWeightDecays = groupWeightDecays is null ? null : System.Array.ConvertAll(groupWeightDecays, wd => (double)wd),
             Beta1 = beta1,
             Beta2 = beta2,
             Epsilon = eps,
@@ -5211,7 +5215,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     }
 
     private unsafe void ConfigureOptimizerDouble(
-        OptimizerType optimizerType, LrSchedule schedule, float beta1, float beta2, float eps, float weightDecay,
+        OptimizerType optimizerType, LrSchedule schedule, double beta1, double beta2, double eps, double weightDecay,
         FusedOptimizerExtras extras)
     {
         LeaveSharedMoments();
@@ -5423,8 +5427,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         OptimizerType[]? groupOptimizerTypes,
         System.Collections.Generic.IReadOnlyList<LrSchedule> groupSchedules,
         System.Collections.Generic.IReadOnlyList<int> paramToGroup,
-        float beta1, float beta2, float eps, float weightDecay,
-        float[]? groupWeightDecays,
+        double beta1, double beta2, double eps, double weightDecay,
+        double[]? groupWeightDecays,
         FusedOptimizerExtras extras)
     {
         LeaveSharedMoments();
@@ -5511,7 +5515,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             Schedules = schedules,
             ParamToGroup = paramGroup,
             GroupOptimizerTypes = groupOptimizerTypes is null ? null : (OptimizerType[])groupOptimizerTypes.Clone(),
-            GroupWeightDecays = groupWeightDecays is null ? null : (float[])groupWeightDecays.Clone(),
+            GroupWeightDecays = groupWeightDecays is null ? null : (double[])groupWeightDecays.Clone(),
             Beta1 = beta1,
             Beta2 = beta2,
             Epsilon = eps,
@@ -5630,7 +5634,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             IsGrouped = rt.IsGrouped,
             // Copies, not shared references: the runtime state stays live and mutable after capture.
             GroupOptimizerTypes = rt.GroupOptimizerTypes is null ? null : (OptimizerType[])rt.GroupOptimizerTypes.Clone(),
-            GroupWeightDecays = rt.GroupWeightDecays is null ? null : (float[])rt.GroupWeightDecays.Clone(),
+            GroupWeightDecays = rt.GroupWeightDecays is null ? null : (double[])rt.GroupWeightDecays.Clone(),
             OptimizerStep = _optimizerStep,
             Beta1 = rt.Beta1,
             Beta2 = rt.Beta2,
@@ -6168,10 +6172,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             if (reader.ReadInt32() != OptimizerStateMagic)
                 throw new InvalidDataException("The payload is not compiled optimizer state (bad magic).");
             int version = reader.ReadInt32();
-            if (version != OptimizerStateVersion)
+            // Version 3 wrote the hyperparameters as float; it is still read, so state exported before they became
+            // double imports unchanged (with the float-rounded values it was saved with).
+            if (version != OptimizerStateVersion && version != SingleHyperparameterOptimizerStateVersion)
                 throw new InvalidDataException(
                     $"Compiled optimizer state version {version} is not supported (expected {OptimizerStateVersion}).");
-            checkpoint = FusedOptimizerCheckpointSerializer.Read(reader);
+            checkpoint = FusedOptimizerCheckpointSerializer.Read(reader, doubleHyperparameters: version >= OptimizerStateVersion);
         }
         catch (EndOfStreamException ex)
         {
@@ -6189,7 +6195,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     // 3: the extras gained AMSGrad's decoupled-decay switch (format 8), bias-correction switch (format 9) and exact
     //    betas (format 10). Each also changed this payload's layout without a bump, so "version 2" names more than
     //    one layout and a reader cannot tell which it holds: every version 2 payload is rejected, never misread.
-    private const int OptimizerStateVersion = 3;
+    private const int OptimizerStateVersion = 4;
+    private const int SingleHyperparameterOptimizerStateVersion = 3;
 
     /// <inheritdoc/>
     public bool IsCompatibleWith(PlanCompatibilityInfo info)

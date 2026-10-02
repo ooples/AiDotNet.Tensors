@@ -28,7 +28,7 @@ internal static class FusedOptimizerCheckpointSerializer
         // distinguishable from an empty array, and so a restore cannot silently rebuild a heterogeneous plan
         // as a uniform one — every group quietly switched to the fallback optimizer, mid-run, with no error.
         WriteOptimizerTypeArray(writer, checkpoint.GroupOptimizerTypes);
-        WriteFloatArray(writer, checkpoint.GroupWeightDecays);
+        WriteDoubleArray(writer, checkpoint.GroupWeightDecays);
         WriteScalars(writer, checkpoint.Scalars);
 
         writer.Write(checkpoint.Parameters.Length);
@@ -36,19 +36,24 @@ internal static class FusedOptimizerCheckpointSerializer
             WriteParameter(writer, checkpoint.Parameters[i]);
     }
 
-    internal static FusedOptimizerCheckpoint? Read(BinaryReader reader)
+    /// <param name="reader">The reader positioned at the checkpoint.</param>
+    /// <param name="doubleHyperparameters">Whether beta1, beta2, epsilon and weight decay were written as double (every
+    /// writer since they became double). False reads the older single-precision layout, so optimizer state exported
+    /// before the change still imports.</param>
+    internal static FusedOptimizerCheckpoint? Read(BinaryReader reader, bool doubleHyperparameters = true)
     {
         if (!reader.ReadBoolean()) return null;
+        double ReadHyperparameter() => doubleHyperparameters ? reader.ReadDouble() : reader.ReadSingle();
 
         var checkpoint = new FusedOptimizerCheckpoint
         {
             OptimizerType = (OptimizerType)reader.ReadInt32(),
             IsGrouped = reader.ReadBoolean(),
             OptimizerStep = reader.ReadInt32(),
-            Beta1 = reader.ReadSingle(),
-            Beta2 = reader.ReadSingle(),
-            Epsilon = reader.ReadSingle(),
-            WeightDecay = reader.ReadSingle(),
+            Beta1 = ReadHyperparameter(),
+            Beta2 = ReadHyperparameter(),
+            Epsilon = ReadHyperparameter(),
+            WeightDecay = ReadHyperparameter(),
             MomentStorageMode = (FusedMomentStorageMode)reader.ReadInt32(),
             Int8MomentBlockSize = reader.ReadInt32(),
             Int8MinQuantizedLength = reader.ReadInt32(),
@@ -57,7 +62,9 @@ internal static class FusedOptimizerCheckpointSerializer
             Schedules = ReadLrSchedules(reader),
             ParamToGroup = ReadIntArray(reader),
             GroupOptimizerTypes = ReadOptimizerTypeArray(reader),
-            GroupWeightDecays = ReadFloatArray(reader),
+            GroupWeightDecays = doubleHyperparameters
+                ? ReadDoubleArray(reader)
+                : ReadFloatArray(reader) is { } singles ? System.Array.ConvertAll(singles, wd => (double)wd) : null,
             Scalars = ReadScalars(reader),
         };
 
