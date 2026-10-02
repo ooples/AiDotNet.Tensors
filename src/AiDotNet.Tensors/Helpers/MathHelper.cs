@@ -1029,12 +1029,11 @@ public static class MathHelper
     /// </remarks>
     public static T Tanh<T>(T x)
     {
+        // Math.Tanh, as Sin and Cos do. The previous (e^2x - 1) / (e^2x + 1) overflowed to
+        // Inf / Inf = NaN once e^2x left the type's range (x > ~44 in float, ~355 in double),
+        // where tanh is exactly 1, and lost relative precision near 0 to the cancellation in e^2x - 1.
         var numOps = GetNumericOperations<T>();
-        T exp2x = numOps.Exp(numOps.Multiply(numOps.FromDouble(2), x));
-        return numOps.Divide(
-            numOps.Subtract(exp2x, numOps.One),
-            numOps.Add(exp2x, numOps.One)
-        );
+        return numOps.FromDouble(Math.Tanh(numOps.ToDouble(x)));
     }
 
     /// <summary>
