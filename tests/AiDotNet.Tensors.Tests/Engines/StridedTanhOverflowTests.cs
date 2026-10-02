@@ -82,4 +82,59 @@ public class StridedTanhOverflowTests
             Assert.Equal((float)Math.Tanh(x), actual, 6);
         }
     }
+
+    [Fact]
+    public void LstmSequence_DoubleLargeCell_SaturatesInsteadOfNaN()
+    {
+        // Drives the generic (non-float) recurrence, where the two TanhScalar calls live. With every
+        // weight zero each gate is sigmoid(0) = 0.5 and the candidate is tanh(0) = 0, so the new cell
+        // is 0.5 * c0 = 500 and the hidden output is 0.5 * tanh(500) = 0.5 exactly. The old formula
+        // gave e^1000 = Inf, Inf / Inf = NaN.
+        var engine = new CpuEngine();
+        var input = new Tensor<double>(new[] { 1, 1, 1 });
+        var h0 = new Tensor<double>(new[] { 1, 1 });
+        var c0 = new Tensor<double>(new[] { 1000d }, new[] { 1, 1 });
+        var wIh = new Tensor<double>(new[] { 4, 1 });
+        var wHh = new Tensor<double>(new[] { 4, 1 });
+
+        var output = engine.LstmSequenceForward(input, h0, c0, wIh, wHh, null, null,
+            out _, out var finalCell);
+
+        Assert.False(double.IsNaN(output[0]), "the hidden output was NaN");
+        Assert.Equal(0.5d, output[0], 12);
+        Assert.Equal(500d, finalCell[0], 12);
+    }
+
+#if NET5_0_OR_GREATER
+    [Fact]
+    public void Gelu_OnAStridedHalfView_IsFiniteForLargeInputs()
+    {
+        // The strided GELU path clamped its tanh argument to +-20, which keeps e^2z finite in float and
+        // double but not in Half: e^40 is ~2.4e17, far above Half's 65504, so Inf / Inf = NaN from z ~ 5.5.
+        var engine = new CpuEngine();
+        var values = new[] { -8.0, -4.0, -1.0, 0.0, 0.5, 2.0, 4.0, 6.0, 8.0, 12.0 };
+        var data = new Half[2 * values.Length];
+        for (int i = 0; i < values.Length; i++)
+        {
+            data[i] = (Half)values[i];
+            data[values.Length + i] = (Half)values[i];
+        }
+
+        var view = engine.TensorPermute(new Tensor<Half>(data, new[] { 2, values.Length }), new[] { 1, 0 });
+        Assert.False(view.IsContiguous);
+        var output = engine.GELU(view);
+
+        for (int i = 0; i < values.Length; i++)
+        {
+            double x = (double)(Half)values[i];
+            double expected = 0.5 * x * (1 + Math.Tanh(0.7978845608 * (x + 0.044715 * x * x * x)));
+            for (int j = 0; j < 2; j++)
+            {
+                double actual = (double)output[i * 2 + j];
+                Assert.False(double.IsNaN(actual), $"gelu({x}) was NaN");
+                Assert.Equal(expected, actual, Math.Max(0.01, Math.Abs(expected) * 0.002));
+            }
+        }
+    }
+#endif
 }

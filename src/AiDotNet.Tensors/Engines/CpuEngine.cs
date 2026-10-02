@@ -11562,15 +11562,10 @@ public partial class CpuEngine : ITensorLevelEngine
                 {
                     T v = srcRaw[idxBuf[i]];
                     T z = ops.Multiply(ops.FromDouble(0.7978845608), ops.Add(v, ops.Multiply(ops.FromDouble(0.044715), ops.Multiply(v, ops.Multiply(v, v)))));
-                    // Clamp the tanh argument to ±20 (tanh(±20) == ±1 to T's
-                    // precision) so exp(2z) can't overflow to Inf and make
-                    // (e^{2z}−1)/(e^{2z}+1) = Inf/Inf = NaN — same guard as the
-                    // SIMD GELU kernels (SimdKernels.GELUUnsafe).
-                    double zd = ops.ToDouble(z);
-                    if (zd > 20.0) z = ops.FromDouble(20.0);
-                    else if (zd < -20.0) z = ops.FromDouble(-20.0);
-                    T e2z = ops.Exp(ops.Multiply(ops.FromDouble(2.0), z));
-                    T th = ops.Divide(ops.Subtract(e2z, ops.One), ops.Add(e2z, ops.One));
+                    // MathHelper.Tanh, like the strided Tanh and Mish paths. The old ±20 clamp kept
+                    // (e^{2z}−1)/(e^{2z}+1) finite in float and double but not in Half, where e^{2z}
+                    // passes 65504 from z ~ 5.5 and Inf / Inf gave NaN.
+                    T th = MathHelper.Tanh(z);
                     T cdf = ops.Divide(ops.Add(ops.One, th), ops.FromDouble(2.0));
                     dstArr[i] = ops.Multiply(v, cdf);
                 }
