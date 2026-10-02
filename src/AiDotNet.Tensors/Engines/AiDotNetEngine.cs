@@ -365,11 +365,25 @@ public static class AiDotNetEngine
     /// context, cuBLAS handle, and kernel modules. Swaps FIRST then disposes, so a concurrent reader
     /// of <see cref="Current"/> never observes a disposed engine.
     /// </summary>
+    /// <remarks>
+    /// A plain <see cref="CpuEngine"/> that is already current is kept. <see cref="Current"/> is process-wide and read
+    /// on every operation, so replacing it swaps the engine under work running on other threads; a training step that
+    /// straddled the swap lost its update (measured in AiDotNet: 3 of 20 steps while another thread reset to CPU). A
+    /// CPU engine carries no state a reset would clear, so the swap bought nothing. The swap is a compare-exchange, so
+    /// two concurrent resets demote (and dispose) a GPU engine once and install one CPU engine.
+    /// </remarks>
     private static void SwitchToCpuEngine()
     {
-        var demoted = Current as DirectGpuTensorEngine;
-        Current = new CpuEngine();
-        demoted?.Dispose();
+        while (true)
+        {
+            var observed = Volatile.Read(ref _current);
+            if (observed is not null && observed.GetType() == typeof(CpuEngine)) return;
+            if (ReferenceEquals(Interlocked.CompareExchange(ref _current, new CpuEngine(), observed), observed))
+            {
+                (observed as DirectGpuTensorEngine)?.Dispose();
+                return;
+            }
+        }
     }
 
     /// <summary>
@@ -378,6 +392,10 @@ public static class AiDotNetEngine
     /// <remarks>
     /// <para>
     /// This is useful for testing or when you explicitly want to disable GPU acceleration.
+    /// </para>
+    /// <para>
+    /// When the current engine already is a plain <see cref="CpuEngine"/> it is kept rather than replaced, so a reset
+    /// never swaps the engine under work running on another thread.
     /// </para>
     /// </remarks>
     public static void ResetToCpu()
