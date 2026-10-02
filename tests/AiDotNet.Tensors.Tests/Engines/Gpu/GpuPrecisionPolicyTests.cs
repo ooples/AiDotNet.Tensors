@@ -30,18 +30,60 @@ public sealed class GpuPrecisionPolicyTests
         => Assert.Equal(-1, CuBlasNative.CUBLAS_GEMM_DEFAULT);
 
     [Fact]
-    public void SpeedFirst_DefaultConvertsEveryOrdinaryPublicTypeThroughFp32()
+    public void Default_KeepsFloatOnTheFp32Route()
     {
         var backend = CreateBackend(Fp32());
 
         AssertGpuPlan<float>(backend, GpuScalarType.Float32);
+    }
+
+    [Fact]
+    public void ExplicitSpeedFirstScope_StillConvertsTheExactTypesThroughFp32()
+    {
+        var backend = CreateBackend(Fp32());
+        using var policy = new GpuExecutionPolicyScope(GpuExecutionPolicy.Default);
+
         AssertGpuPlan<double>(backend, GpuScalarType.Float32);
         AssertGpuPlan<int>(backend, GpuScalarType.Float32);
         AssertGpuPlan<long>(backend, GpuScalarType.Float32);
         AssertGpuPlan<decimal>(backend, GpuScalarType.Float32);
-
         Assert.Contains("Float64", Plan<double>(backend).FallbackReason);
         Assert.Contains("Generic", Plan<int>(backend).FallbackReason);
+    }
+
+    [SkippableFact]
+    public void WithoutAScope_IntLongAndDecimalArePreservedOnCpu()
+    {
+        Skip.If(GpuExecutionPolicyScope.ExactTypesSpeedFirstByDefault, "This process opted out of the exact-type default.");
+        var backend = CreateBackend(Fp32(), Fp16());
+
+        foreach (var plan in new[] { Plan<int>(backend), Plan<long>(backend), Plan<decimal>(backend) })
+        {
+            Assert.Equal(GpuExecutionRoute.Cpu, plan.Route);
+            Assert.Contains("PreserveInputType", plan.FallbackReason);
+        }
+    }
+
+    [SkippableFact]
+    public void WithoutAScope_DoubleIsPreserved_OnCpuWhenTheBackendHasNoFp64Route()
+    {
+        Skip.If(GpuExecutionPolicyScope.ExactTypesSpeedFirstByDefault, "This process opted out of the exact-type default.");
+        var backend = CreateBackend(Fp32(), Fp16());
+
+        var plan = Plan<double>(backend);
+
+        Assert.Equal(GpuExecutionRoute.Cpu, plan.Route);
+        Assert.Equal(GpuScalarType.Float64, plan.MultiplyType);
+        Assert.Contains("PreserveInputType", plan.FallbackReason);
+    }
+
+    [SkippableFact]
+    public void WithoutAScope_DoubleIsPreserved_OnTheGpuWhenTheBackendAdvertisesFp64()
+    {
+        Skip.If(GpuExecutionPolicyScope.ExactTypesSpeedFirstByDefault, "This process opted out of the exact-type default.");
+        var backend = CreateBackend(Fp32(), Fp64());
+
+        AssertGpuPlan<double>(backend, GpuScalarType.Float64);
     }
 
     [Fact]
@@ -136,6 +178,8 @@ public sealed class GpuPrecisionPolicyTests
     public void ThirdPartyBackendWithoutPrecisionInterfaceRemainsFp32Compatible()
     {
         var backend = MockDirectGpuBackend.Create(new MockBackendState());
+        // Speed-first explicitly: without a scope a double is preserved, which is not what this pins.
+        using var policy = new GpuExecutionPolicyScope(GpuExecutionPolicy.Default);
 
         var plan = Plan<double>(backend);
 

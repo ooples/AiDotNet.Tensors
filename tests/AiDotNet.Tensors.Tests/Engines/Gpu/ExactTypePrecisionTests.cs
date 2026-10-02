@@ -10,13 +10,12 @@ namespace AiDotNet.Tensors.Tests.Engines.Gpu;
 /// </summary>
 /// <remarks>
 /// <para>
-/// The default policy is SpeedFirst, and it converts every ordinary public type through FP32 -
-/// <c>float</c>, <c>double</c>, <c>int</c>, <c>long</c> and <c>decimal</c> alike. That is deliberate
-/// and <see cref="GpuPrecisionPolicyTests.SpeedFirst_DefaultConvertsEveryOrdinaryPublicTypeThroughFp32"/>
-/// asserts it by name. The consequence is easy to walk into and worth stating plainly: on a machine
-/// with a GPU, <c>0.1234567890123456m + 1e-16m</c> returns <c>0.1234568</c> under the default policy,
-/// and <c>16777217</c> comes back as <c>16777216</c> for <c>int</c> and <c>long</c>, since
-/// <c>2^24 + 1</c> is the first integer FP32 cannot represent.
+/// Under a speed-first policy every ordinary public type converts through FP32 - <c>double</c>,
+/// <c>int</c>, <c>long</c> and <c>decimal</c> alike - so on a machine with a GPU
+/// <c>0.1234567890123456m + 1e-16m</c> returns <c>0.1234568</c> and <c>16777217</c> comes back as
+/// <c>16777216</c> for <c>int</c> and <c>long</c>, since <c>2^24 + 1</c> is the first integer FP32 cannot
+/// represent. Those four types are therefore preserved by default when no scope is active
+/// (<see cref="GpuExecutionPolicyScope.EffectivePolicyFor"/>); speed-first is an explicit opt-in.
 /// </para>
 /// <para>
 /// <c>Preserve</c> is the documented way out, and these pin that it actually delivers exact values

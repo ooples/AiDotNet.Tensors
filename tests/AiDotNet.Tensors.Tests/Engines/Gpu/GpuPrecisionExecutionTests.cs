@@ -16,6 +16,8 @@ public sealed class GpuPrecisionExecutionTests
         using var fixture = new Fixture();
         var a = new Tensor<double>(new[] { 1d, 2d, 3d, 4d }, new[] { 2, 2 });
         var b = new Tensor<double>(new[] { 5d, 6d, 7d, 8d }, new[] { 2, 2 });
+        // Speed-first is an explicit choice for double; without a scope a double is preserved.
+        using var policy = new GpuExecutionPolicyScope(GpuExecutionPolicy.Default);
 
         var result = fixture.Engine.TensorMatMul(a, b);
 
@@ -32,12 +34,46 @@ public sealed class GpuPrecisionExecutionTests
         using var fixture = new Fixture();
         var a = new Tensor<int>(new[] { 1, 2, 3, 4 }, new[] { 2, 2 });
         var b = new Tensor<int>(new[] { 5, 6, 7, 8 }, new[] { 2, 2 });
+        // Speed-first is an explicit choice for int; without a scope an int is preserved.
+        using var policy = new GpuExecutionPolicyScope(GpuExecutionPolicy.Default);
 
         var result = fixture.Engine.TensorMatMul(a, b);
 
         Assert.Equal(new[] { 19, 22, 43, 50 }, result.GetDataArray());
         Assert.Equal(1, fixture.Backend.Fp32GemmCalls);
         Assert.Equal(typeof(int), GpuPrecisionDiagnostics.LastPlan!.PublicType);
+    }
+
+    [SkippableFact]
+    public void Default_IntegerMatMulAboveTheFloat32LimitStaysExact()
+    {
+        Skip.If(GpuExecutionPolicyScope.ExactTypesSpeedFirstByDefault, "This process opted out of the exact-type default.");
+        using var fixture = new Fixture();
+        // 2^24 + 1 is the first integer FP32 cannot represent; through FP32 it would come back as 2^24.
+        var a = new Tensor<int>(new[] { 16777217, 0, 0, 16777217 }, new[] { 2, 2 });
+        var identity = new Tensor<int>(new[] { 1, 0, 0, 1 }, new[] { 2, 2 });
+
+        var result = fixture.Engine.TensorMatMul(a, identity);
+
+        Assert.Equal(new[] { 16777217, 0, 0, 16777217 }, result.GetDataArray());
+        Assert.Equal(0, fixture.Backend.Fp32GemmCalls);
+        Assert.Equal(GpuExecutionRoute.Cpu, GpuPrecisionDiagnostics.LastPlan!.Route);
+    }
+
+    [SkippableFact]
+    public void Default_DoubleMatMulIsPreservedWithoutAScope()
+    {
+        Skip.If(GpuExecutionPolicyScope.ExactTypesSpeedFirstByDefault, "This process opted out of the exact-type default.");
+        using var fixture = new Fixture();
+        var a = new Tensor<double>(new[] { 0.1d, 0.2d, 0.3d, 0.4d }, new[] { 2, 2 });
+        var b = new Tensor<double>(new[] { 0.5d, 0.6d, 0.7d, 0.8d }, new[] { 2, 2 });
+
+        var result = fixture.Engine.TensorMatMul(a, b);
+
+        Assert.Equal(0, fixture.Backend.Fp32GemmCalls);
+        Assert.Equal(0, fixture.Backend.Fp16GemmCalls);
+        Assert.Equal(GpuExecutionRoute.Cpu, GpuPrecisionDiagnostics.LastPlan!.Route);
+        Assert.Equal(0.1 * 0.5 + 0.2 * 0.7, result.GetDataArray()[0], 15);
     }
 
     [Fact]
@@ -135,6 +171,8 @@ public sealed class GpuPrecisionExecutionTests
         }
         var left = new Tensor<double>(leftValues, new[] { 2, 3, 2, 2 });
         var right = new Tensor<double>(rightValues, new[] { 2, 3, 2, 2 });
+        // This pins the batched-GEMM collapse on the GPU route, which double reaches under speed-first.
+        using var policy = new GpuExecutionPolicyScope(GpuExecutionPolicy.Default);
 
         var result = fixture.Engine.TensorMatMul(left, right);
 
@@ -148,6 +186,7 @@ public sealed class GpuPrecisionExecutionTests
     public void SpeedFirst_LongAndDecimalMatMulReturnTheDeclaredTypes()
     {
         using var fixture = new Fixture();
+        using var policy = new GpuExecutionPolicyScope(GpuExecutionPolicy.Default);
         var longLeft = new Tensor<long>(new long[] { 1, 2, 3, 4 }, new[] { 2, 2 });
         var longIdentity = new Tensor<long>(new long[] { 1, 0, 0, 1 }, new[] { 2, 2 });
         Assert.Equal(longLeft.GetDataArray(), fixture.Engine.TensorMatMul(longLeft, longIdentity).GetDataArray());
