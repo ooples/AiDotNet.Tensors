@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.134.3](https://github.com/ooples/AiDotNet.Tensors/compare/v0.134.2...v0.134.3) (2026-10-02)
+
+
+### Bug Fixes
+
+* **engines:** engine tanh copies returned nan above x ~44 in float ([#1087](https://github.com/ooples/AiDotNet.Tensors/issues/1087)) ([4d783dd](https://github.com/ooples/AiDotNet.Tensors/commit/4d783dd7ca970685f55b33603875d841a148b25f))
+* **helpers:** mathhelper.tanh returned nan above x ~44 in float ([#1085](https://github.com/ooples/AiDotNet.Tensors/issues/1085)) ([23a5c67](https://github.com/ooples/AiDotNet.Tensors/commit/23a5c674b1f8a5eedf60680036660d5354e2c5c5))
+
 ## [0.134.2](https://github.com/ooples/AiDotNet.Tensors/compare/v0.134.1...v0.134.2) (2026-10-02)
 
 
