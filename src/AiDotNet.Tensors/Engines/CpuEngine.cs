@@ -10870,7 +10870,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var idxBuf = new int[tensor.Length];
                 tensor.FillStorageIndices(idxBuf);
                 for (int i = 0; i < tensor.Length; i++)
-                    { T v = srcRaw[idxBuf[i]]; T e2v = ops.Exp(ops.Multiply(ops.FromDouble(2.0), v)); dstArr[i] = ops.Divide(ops.Subtract(e2v, ops.One), ops.Add(e2v, ops.One)); }
+                    { dstArr[i] = MathHelper.Tanh(srcRaw[idxBuf[i]]); } // (e^2v - 1) / (e^2v + 1) was Inf / Inf = NaN once e^2v overflowed (v > ~44 in float)
                 DifferentiableOps.RecordUnary("Tanh", resultS, tensor, BackwardFunctions<T>.TanhBackward);
                 { var c = tensor; AutoTracer.RecordOp("Tanh", resultS, eng => eng.Tanh(c)); }
                 return resultS;
@@ -11656,7 +11656,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var idxBuf = new int[tensor.Length];
                 tensor.FillStorageIndices(idxBuf);
                 for (int i = 0; i < tensor.Length; i++)
-                    { T v = srcRaw[idxBuf[i]]; T sp = ops.Log(ops.Add(ops.One, ops.Exp(v))); T e2sp = ops.Exp(ops.Multiply(ops.FromDouble(2.0), sp)); T th = ops.Divide(ops.Subtract(e2sp, ops.One), ops.Add(e2sp, ops.One)); dstArr[i] = ops.Multiply(v, th); }
+                    { T v = srcRaw[idxBuf[i]]; T sp = ops.Log(ops.Add(ops.One, ops.Exp(v))); T th = MathHelper.Tanh(sp); dstArr[i] = ops.Multiply(v, th); }
                 DifferentiableOps.RecordUnary("Mish", resultS, tensor, BackwardFunctions<T>.MishBackward);
                 { var c = tensor; AutoTracer.RecordOp("Mish", resultS, eng => eng.Mish(c)); }
                 return resultS;

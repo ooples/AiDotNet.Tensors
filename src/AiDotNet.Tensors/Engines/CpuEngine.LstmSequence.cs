@@ -931,11 +931,11 @@ public partial class CpuEngine
 
                     T iAct = Sigmoid(opsT, iGate);
                     T fAct = Sigmoid(opsT, fGate);
-                    T gAct = TanhScalar(opsT, gGate);
+                    T gAct = TanhScalar(gGate);
                     T oAct = Sigmoid(opsT, oGate);
 
                     T cNew = opsT.Add(opsT.Multiply(fAct, cPrevSpan[hOff + h]), opsT.Multiply(iAct, gAct));
-                    T hNew = opsT.Multiply(oAct, TanhScalar(opsT, cNew));
+                    T hNew = opsT.Multiply(oAct, TanhScalar(cNew));
 
                     cCurrSpan[hOff + h] = cNew;
                     hCurrSpan[hOff + h] = hNew;
@@ -1016,12 +1016,12 @@ public partial class CpuEngine
         return ops.Divide(ops.One, ops.Add(ops.One, expNeg));
     }
 
-    /// <summary>Hyperbolic tangent over the generic numeric abstraction: (e^2x - 1) / (e^2x + 1).</summary>
+    /// <summary>Hyperbolic tangent over the generic numeric abstraction, saturating to +/-1.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static T TanhScalar<T>(INumericOperations<T> ops, T x)
+    private static T TanhScalar<T>(T x)
     {
-        // tanh(x) = (e^2x - 1) / (e^2x + 1)
-        var e2x = ops.Exp(ops.Multiply(ops.FromDouble(2.0), x));
-        return ops.Divide(ops.Subtract(e2x, ops.One), ops.Add(e2x, ops.One));
+        // (e^2x - 1) / (e^2x + 1) overflowed to Inf / Inf = NaN once e^2x left T's range (x > ~44 in float),
+        // where tanh is exactly 1: a saturated LSTM cell state produced NaN hidden states.
+        return MathHelper.Tanh(x);
     }
 }
