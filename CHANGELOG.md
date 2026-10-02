@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.134.2](https://github.com/ooples/AiDotNet.Tensors/compare/v0.134.1...v0.134.2) (2026-10-02)
+
+
+### Bug Fixes
+
+* **compilation:** keep a double plan's optimizer hyperparameters in double ([#1083](https://github.com/ooples/AiDotNet.Tensors/issues/1083)) ([16d3ddc](https://github.com/ooples/AiDotNet.Tensors/commit/16d3ddcb010bd946244879d22c64ecb99d5ff5a8))
+* **engines:** ResetToCpu keeps a cpu engine that is already current ([#1082](https://github.com/ooples/AiDotNet.Tensors/issues/1082)) ([2f2f8cb](https://github.com/ooples/AiDotNet.Tensors/commit/2f2f8cb5de1075d52635064fe27121819f98ee08))
+* **precision:** exact large-offset norms on CPU; preserve double/int/long/decimal on the GPU by default ([#1081](https://github.com/ooples/AiDotNet.Tensors/issues/1081)) ([5da848e](https://github.com/ooples/AiDotNet.Tensors/commit/5da848e3b8d702d90f8b4380c788b325b565d64a))
+
 ## [0.134.1](https://github.com/ooples/AiDotNet.Tensors/compare/v0.134.0...v0.134.1) (2026-10-01)
 
 
