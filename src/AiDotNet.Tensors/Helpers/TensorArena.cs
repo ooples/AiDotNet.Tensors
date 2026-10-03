@@ -706,8 +706,12 @@ public sealed class TensorArena : IDisposable
         return arr;
     }
 
-    // Flat tensor ring buffer — sequential scan is faster than dictionary hash for <10 sizes
+    // Flat tensor ring buffer — sequential scan is faster than dictionary hash for <10 sizes.
+    // A slot is keyed by element TYPE as well as element count: one arena can serve float and double
+    // operations (a float model whose preprocessing runs in double, a mixed-precision step), and a
+    // count-only key handed a Tensor<double> to a Tensor<float> request, failing the cast below.
     private object[]? _tensorRing;
+    private Type?[]? _tensorRingTypes;
     private int[]? _tensorRingSizes;
     private int[]? _tensorRingCursors;
     private int _tensorRingCount;
@@ -728,14 +732,17 @@ public sealed class TensorArena : IDisposable
         if (_tensorRing == null)
         {
             _tensorRing = new object[MaxTensorRingSlots];
+            _tensorRingTypes = new Type?[MaxTensorRingSlots];
             _tensorRingSizes = new int[MaxTensorRingSlots];
             _tensorRingCursors = new int[MaxTensorRingSlots];
         }
 
-        // Linear scan for matching size (fast for <10 entries)
+        // Linear scan for matching element type and size (fast for <10 entries)
         for (int i = 0; i < _tensorRingCount; i++)
         {
-            if (_tensorRingSizes![i] == totalSize && _tensorRing[i] is List<object> bucket)
+            if (_tensorRingSizes![i] == totalSize
+                && ReferenceEquals(_tensorRingTypes![i], typeof(T))
+                && _tensorRing[i] is List<object> bucket)
             {
                 int cursor = _tensorRingCursors![i];
                 if (cursor < bucket.Count)
@@ -799,6 +806,7 @@ public sealed class TensorArena : IDisposable
             var newBucket = new List<object>(4) { tensor };
             int idx = _tensorRingCount++;
             _tensorRing[idx] = newBucket;
+            _tensorRingTypes![idx] = typeof(T);
             _tensorRingSizes![idx] = totalSize;
             _tensorRingCursors![idx] = 1;
             return tensor;
@@ -992,6 +1000,7 @@ public sealed class TensorArena : IDisposable
         if (_tensorRing != null)
         {
             Array.Clear(_tensorRing, 0, _tensorRingCount);
+            if (_tensorRingTypes != null) Array.Clear(_tensorRingTypes, 0, _tensorRingCount);
             _tensorRingCount = 0;
         }
 
