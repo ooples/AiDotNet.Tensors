@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.134.4](https://github.com/ooples/AiDotNet.Tensors/compare/v0.134.3...v0.134.4) (2026-10-03)
+
+
+### Bug Fixes
+
+* **arena:** key the tensor ring by element type as well as count ([#1088](https://github.com/ooples/AiDotNet.Tensors/issues/1088)) ([b0d4b64](https://github.com/ooples/AiDotNet.Tensors/commit/b0d4b64911337d048a6ed107d9a101c435002fd3))
+
 ## [0.134.3](https://github.com/ooples/AiDotNet.Tensors/compare/v0.134.2...v0.134.3) (2026-10-02)
 
 
