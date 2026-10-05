@@ -246,6 +246,61 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
         }
     }
     [SkippableFact]
+    public void MultiTensorSumOfSquaresAndClip_MatchExactValues_AndDetectNonFinite()
+    {
+        SkipIfNoDirectGpu();
+        var cuda = Gpu.TestBackend as AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend;
+        Skip.If(cuda is null, "Multi-tensor gradient kernels are CUDA-only.");
+
+        // Ragged sizes across chunk boundaries (chunk = 256), more chunks than the reduction's block cap.
+        int[] sizes = { 1, 255, 256, 257, 4096, 300_000 };
+        var host = sizes.Select((n, t) => Enumerable.Range(0, n).Select(i => DeterministicValue(t * 1_000_003 + i)).ToArray()).ToArray();
+        double exact = host.Sum(a => a.Sum(v => (double)v * v));
+        var buffers = host.Select(a => cuda!.AllocateBuffer(a)).ToList();
+        var sumSq = cuda!.AllocateBuffer(2);
+        var scale = cuda.AllocateBuffer(1);
+        try
+        {
+            double Read() => BitConverter.ToDouble(cuda.DownloadByteBuffer(sumSq, sizeof(double)), 0);
+
+            cuda.MultiTensorSumOfSquares(buffers, sizes, sumSq);
+            Assert.True(Math.Abs(Read() - exact) <= 1e-9 * exact, $"sum of squares {Read()} vs exact {exact}");
+
+            // clip_grad_norm_: every element scaled by min(1, max / (norm + 1e-6)).
+            double norm = Math.Sqrt(exact);
+            float maxNorm = (float)(norm / 4);
+            cuda.ClipScaleFromSumOfSquares(sumSq, maxNorm, scale);
+            cuda.MultiTensorScaleByDeviceScalar(buffers, sizes, scale);
+            double coefficient = Math.Min(1.0, maxNorm / (norm + 1e-6));
+            for (int t = 0; t < sizes.Length; t++)
+            {
+                var scaled = cuda.DownloadBuffer(buffers[t]);
+                for (int i = 0; i < sizes[t]; i += Math.Max(1, sizes[t] / 64))
+                    Assert.True(Math.Abs(scaled[i] - host[t][i] * coefficient) <= 1e-6 * (1 + Math.Abs(host[t][i])),
+                        $"tensor {t}[{i}]: {scaled[i]} vs {host[t][i] * coefficient}");
+            }
+
+            // 3e30 squared overflows float but not double: still finite, so the step must not be discarded. (A new
+            // buffer for tensor 0, which has one element; the cached pointer table must notice the new handle.)
+            buffers[0].Dispose();
+            buffers[0] = cuda.AllocateBuffer(new[] { 3e30f });
+            cuda.MultiTensorSumOfSquares(buffers, sizes, sumSq);
+            Assert.False(double.IsInfinity(Read()) || double.IsNaN(Read()), "a finite gradient read as non-finite");
+
+            // One NaN anywhere makes the whole sum non-finite.
+            buffers[0].Dispose();
+            buffers[0] = cuda.AllocateBuffer(new[] { float.NaN });
+            cuda.MultiTensorSumOfSquares(buffers, sizes, sumSq);
+            Assert.True(double.IsNaN(Read()) || double.IsInfinity(Read()), "a NaN gradient read as finite");
+        }
+        finally
+        {
+            foreach (var b in buffers) b.Dispose();
+            sumSq.Dispose();
+            scale.Dispose();
+        }
+    }
+    [SkippableFact]
     public void HardsigmoidBackward_IsBitIdenticalAtBoundariesAndStaysResident()
     {
         SkipIfNoDirectGpu();

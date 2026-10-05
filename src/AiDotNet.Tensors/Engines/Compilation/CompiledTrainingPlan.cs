@@ -294,6 +294,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         _clipSumSq = null;
         _clipTmp = null;
         _clipSquares = null;
+        _finitenessSumSquares?.Dispose();
+        _finitenessSumSquares = null;
+        _finitenessBackend = null;
 
         // Free the captured training-step graph, if any.
         InvalidateCapturedStepGraph();
@@ -1141,7 +1144,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             }
         }
 
-        if (gradientsFinite)
+        if (gradientsFinite && TryMultiTensorFiniteness(gpuGradients, gpuBackends, lengths, out bool deviceGradientsFinite))
+        {
+            gradientsFinite = deviceGradientsFinite;
+        }
+        else if (gradientsFinite)
         {
             // Aggregate every gradient mask on-device and synchronize only once per backend. The
             // accumulator begins as all ones; multiplying a 0/1 mask into its prefix preserves a
@@ -1225,6 +1232,51 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         }
 
         MarkOptimizerStepDiscarded();
+        return true;
+    }
+
+    private Engines.DirectGpu.IGpuBuffer? _finitenessSumSquares;
+    private Engines.DirectGpu.IDirectGpuBackend? _finitenessBackend;
+
+    /// <summary>
+    /// CUDA: every device gradient is finite exactly when their double-accumulated sum of squares is (a float squared
+    /// cannot overflow a double), so one multi-tensor reduction and an 8-byte read replace a classify and a multiply
+    /// per gradient (AiDotNet #1804). False when the gradients are not all on one CUDA backend; the per-tensor mask
+    /// path then runs.
+    /// </summary>
+    private bool TryMultiTensorFiniteness(
+        Engines.DirectGpu.IGpuBuffer?[] gpuGradients,
+        Engines.DirectGpu.IDirectGpuBackend?[] gpuBackends,
+        int[] lengths,
+        out bool allFinite)
+    {
+        allFinite = true;
+        Engines.DirectGpu.CUDA.CudaBackend? cuda = null;
+        var buffers = new List<Engines.DirectGpu.IGpuBuffer>(gpuGradients.Length);
+        var sizes = new List<int>(gpuGradients.Length);
+        for (int p = 0; p < gpuGradients.Length; p++)
+        {
+            if (gpuGradients[p] is not { } gradient || lengths[p] <= 0)
+                continue;
+            if (gpuBackends[p] is not Engines.DirectGpu.CUDA.CudaBackend owner)
+                return false;
+            if (cuda is null) cuda = owner;
+            else if (!ReferenceEquals(cuda, owner)) return false;
+            buffers.Add(gradient);
+            sizes.Add(lengths[p]);
+        }
+        if (cuda is null)
+            return false;
+
+        if (_finitenessSumSquares is null || !ReferenceEquals(_finitenessBackend, cuda))
+        {
+            _finitenessSumSquares?.Dispose();
+            _finitenessSumSquares = cuda.AllocateBuffer(2);
+            _finitenessBackend = cuda;
+        }
+        cuda.MultiTensorSumOfSquares(buffers, sizes, _finitenessSumSquares);
+        double sumSquares = BitConverter.ToDouble(cuda.DownloadByteBuffer(_finitenessSumSquares, sizeof(double)), 0);
+        allFinite = !double.IsNaN(sumSquares) && !double.IsInfinity(sumSquares);
         return true;
     }
 
@@ -8955,6 +9007,41 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             _clipSquares = null;
         }
         _clipScratchBackend = cb;
+
+        // CUDA: the whole clip in four device operations, whatever the tensor count: one multi-tensor sum of
+        // squares, the coefficient computed on the device, one multi-tensor scale. The per-tensor loop below issued
+        // a fill + square + reduce + add and a scale per gradient, ~630 launches per N-BEATS step (AiDotNet #1804).
+        if (cb is Engines.DirectGpu.CUDA.CudaBackend multiCuda)
+        {
+            var buffers = new List<Engines.DirectGpu.IGpuBuffer>(gradients.Length);
+            var sizes = new List<int>(gradients.Length);
+            var owners = new List<Tensor<T>>(gradients.Length);
+            for (int p = 0; p < gradients.Length; p++)
+            {
+                var g = gradients[p];
+                if (g == null || g.Length == 0) continue;
+                var buf = g.TryGetGpuBuffer();
+                if (buf is null) continue;
+                buffers.Add(buf);
+                sizes.Add(g.Length);
+                owners.Add(g);
+            }
+            if (buffers.Count == 0) return true;
+            var sumSquares = _clipSumSq is { Size: >= 2 } existing ? existing : null;
+            if (sumSquares is null)
+            {
+                _clipSumSq?.Dispose();
+                sumSquares = _clipSumSq = cb.AllocateBuffer(2);
+            }
+            var scale = _clipTmp ??= cb.AllocateBuffer(1);
+            multiCuda.MultiTensorSumOfSquares(buffers, sizes, sumSquares);
+            multiCuda.ClipScaleFromSumOfSquares(sumSquares, (float)maxNorm, scale);
+            multiCuda.MultiTensorScaleByDeviceScalar(buffers, sizes, scale);
+            for (int p = 0; p < owners.Count; p++)
+                (_engine as Engines.DirectGpuTensorEngine)?.BindResidentBuffer(owners[p], buffers[p], cb);
+            return true;
+        }
+
         var sumSq = _clipSumSq ??= cb.AllocateBuffer(1);
         var tmp = _clipTmp ??= cb.AllocateBuffer(1);
         {

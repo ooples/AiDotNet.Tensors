@@ -1007,6 +1007,95 @@ extern ""C"" __global__ __launch_bounds__(256) void sparse_proximal_l1_update(
     else if (p < -threshold) param[i] = p + threshold;
     else                     param[i] = 0.0f;
 }
+
+// ---- Multi-tensor gradient reductions for the compiled training step -----------------------------------------
+// One launch over every gradient tensor instead of a fill + square + reduce + add (and a scale) per tensor: the
+// per-tensor form issued ~630 launches per N-BEATS step (AiDotNet #1804). Same chunk table as the multi-tensor
+// optimizers: block b covers elements [chunkStart[b], chunkStart[b] + blockDim.x) of tensor chunkTensor[b].
+
+__device__ __forceinline__ void mt_atomic_add_double(double* address, double value)
+{
+#if __CUDA_ARCH__ >= 600
+    atomicAdd(address, value);
+#else
+    unsigned long long* p = (unsigned long long*)address;
+    unsigned long long old = *p, assumed;
+    do
+    {
+        assumed = old;
+        old = atomicCAS(p, assumed, __double_as_longlong(value + __longlong_as_double(assumed)));
+    } while (assumed != old);
+#endif
+}
+
+// Sum of squares of every element of every tensor, accumulated in double. A float squared cannot overflow a double,
+// so the result is finite exactly when every element is finite: one reduction serves both the global-norm clip and
+// the non-finite-gradient check. *out must be zeroed before the launch.
+extern ""C"" __global__ __launch_bounds__(256) void multi_tensor_sum_squares(
+    const unsigned long long* __restrict__ ptrs,
+    const int* __restrict__ sizes,
+    const int* __restrict__ chunkTensor,
+    const int* __restrict__ chunkStart,
+    int totalChunks,
+    double* __restrict__ out)
+{
+    __shared__ double warpSums[8];
+    // A bounded grid strides over the chunks and accumulates locally, so the result takes one atomic per block
+    // rather than one per chunk: ~10k chunk-atomics on one address serialized to ~300 us per call.
+    double v = 0.0;
+    for (int c = blockIdx.x; c < totalChunks; c += gridDim.x)
+    {
+        int t = chunkTensor[c];
+        int i = chunkStart[c] + threadIdx.x;
+        if (i < sizes[t])
+        {
+            double x = (double)((const float*)ptrs[t])[i];
+            v += x * x;
+        }
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1)
+        v += __shfl_down_sync(0xFFFFFFFF, v, o);
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    if (lane == 0)
+        warpSums[warp] = v;
+    __syncthreads();
+    if (warp == 0)
+    {
+        v = lane < (int)((blockDim.x + 31) >> 5) ? warpSums[lane] : 0.0;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1)
+            v += __shfl_down_sync(0xFFFFFFFF, v, o);
+        if (lane == 0)
+            mt_atomic_add_double(out, v);
+    }
+}
+
+// PyTorch clip_grad_norm_ coefficient on the device: min(1, maxNorm / (sqrt(sumSq) + 1e-6)). A non-finite norm
+// leaves the gradients unscaled (1); the non-finite check then discards the step.
+extern ""C"" __global__ void clip_scale_from_sum_squares(
+    const double* __restrict__ sumSquares, float maxNorm, float* __restrict__ scale)
+{
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    double norm = sqrt(*sumSquares);
+    double c = isfinite(norm) ? (double)maxNorm / (norm + 1e-6) : 1.0;
+    *scale = (float)(c < 1.0 ? c : 1.0);
+}
+
+// Every element of every tensor multiplied by the device scalar *scale.
+extern ""C"" __global__ __launch_bounds__(256) void multi_tensor_scale_by_device_scalar(
+    const unsigned long long* __restrict__ ptrs,
+    const int* __restrict__ sizes,
+    const int* __restrict__ chunkTensor,
+    const int* __restrict__ chunkStart,
+    const float* __restrict__ scale)
+{
+    int t = chunkTensor[blockIdx.x];
+    int i = chunkStart[blockIdx.x] + threadIdx.x;
+    if (i < sizes[t])
+        ((float*)ptrs[t])[i] *= *scale;
+}
 ";
     }
 
@@ -1023,6 +1112,9 @@ extern ""C"" __global__ __launch_bounds__(256) void sparse_proximal_l1_update(
             "adamw_update",
             "adam_multi_tensor_update",
             "adamw_multi_tensor_update",
+            "multi_tensor_sum_squares",
+            "clip_scale_from_sum_squares",
+            "multi_tensor_scale_by_device_scalar",
             "adam_bf16_update",
             "adamw_bf16_update",
             "rmsprop_update",

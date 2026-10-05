@@ -13471,6 +13471,142 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         dst[o + 7] = (byte)((a >> 56) & 0xFF);
     }
 
+    /// <summary>
+    /// Pointer, size and chunk tables for the multi-tensor gradient kernels, kept across calls. A compiled training
+    /// plan's gradient buffers are stable from step to step, so the tables are built and uploaded once and reused;
+    /// rebuilding them per call would cost seven allocations and uploads, more than the kernels themselves.
+    /// </summary>
+    private sealed class MultiTensorTable : IDisposable
+    {
+        public IntPtr[] Handles = Array.Empty<IntPtr>();
+        public int[] Sizes = Array.Empty<int>();
+        public IGpuBuffer? Pointers, SizesBuffer, ChunkTensor, ChunkStart;
+        public int TotalChunks;
+
+        public bool Matches(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes)
+        {
+            if (Handles.Length != tensors.Count) return false;
+            for (int i = 0; i < Handles.Length; i++)
+                if (Handles[i] != tensors[i].Handle || Sizes[i] != sizes[i]) return false;
+            return true;
+        }
+
+        public void Dispose()
+        {
+            Pointers?.Dispose(); SizesBuffer?.Dispose(); ChunkTensor?.Dispose(); ChunkStart?.Dispose();
+            Pointers = SizesBuffer = ChunkTensor = ChunkStart = null;
+        }
+    }
+
+    private MultiTensorTable? _gradientTable;
+
+    // Upper bound on the multi-tensor reduction's grid: enough blocks to fill the device, few enough that the one
+    // atomic per block does not serialize.
+    private const int MultiTensorReductionMaxBlocks = 1024;
+
+    private MultiTensorTable GetGradientTable(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes)
+    {
+        if (tensors is null) throw new ArgumentNullException(nameof(tensors));
+        if (sizes is null) throw new ArgumentNullException(nameof(sizes));
+        if (sizes.Count != tensors.Count)
+            throw new ArgumentException("Every tensor needs a size.", nameof(sizes));
+        if (_gradientTable is { } cached && cached.Matches(tensors, sizes))
+            return cached;
+
+        int n = tensors.Count;
+        var addresses = new byte[n * sizeof(ulong)];
+        var handles = new IntPtr[n];
+        var sizeArray = new int[n];
+        int totalChunks = 0;
+        for (int t = 0; t < n; t++)
+        {
+            int size = sizes[t];
+            if (size <= 0) throw new ArgumentOutOfRangeException(nameof(sizes), "Every tensor size must be positive.");
+            if (tensors[t].Size < size) throw new ArgumentException("A tensor buffer is smaller than its size.", nameof(tensors));
+            handles[t] = tensors[t].Handle;
+            WriteAddress(addresses, t, handles[t]);
+            sizeArray[t] = size;
+            totalChunks += (size + MultiTensorChunk - 1) / MultiTensorChunk;
+        }
+        var chunkTensor = new int[totalChunks];
+        var chunkStart = new int[totalChunks];
+        int c = 0;
+        for (int t = 0; t < n; t++)
+        {
+            int chunks = (sizeArray[t] + MultiTensorChunk - 1) / MultiTensorChunk;
+            for (int k = 0; k < chunks; k++) { chunkTensor[c] = t; chunkStart[c] = k * MultiTensorChunk; c++; }
+        }
+
+        _gradientTable?.Dispose();
+        var table = new MultiTensorTable { Handles = handles, Sizes = sizeArray, TotalChunks = totalChunks };
+        using (PushContext())
+        {
+            table.Pointers = AllocateByteBuffer(addresses.Length);
+            UploadByteBuffer(table.Pointers, addresses);
+            table.SizesBuffer = AllocateIntBuffer(sizeArray);
+            table.ChunkTensor = AllocateIntBuffer(chunkTensor);
+            table.ChunkStart = AllocateIntBuffer(chunkStart);
+        }
+        _gradientTable = table;
+        return table;
+    }
+
+    /// <summary>
+    /// Sum of squares of every element of every tensor, in one launch, written as a double to
+    /// <paramref name="sumOfSquares"/> (at least two float slots). Accumulated in double, so it is finite exactly when
+    /// every element is: one reduction serves the global-norm clip and the non-finite-gradient check.
+    /// </summary>
+    public unsafe void MultiTensorSumOfSquares(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes, IGpuBuffer sumOfSquares)
+    {
+        if (sumOfSquares is null) throw new ArgumentNullException(nameof(sumOfSquares));
+        if (sumOfSquares.Size < 2) throw new ArgumentException("The double result needs two float slots.", nameof(sumOfSquares));
+        Fill(sumOfSquares, 0f, 2);
+        if (tensors is null || tensors.Count == 0) return;
+        var table = GetGradientTable(tensors, sizes);
+        if (!_kernelCache.TryGetValue("multi_tensor_sum_squares", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: multi_tensor_sum_squares");
+        using var _ = PushContext();
+        IntPtr pH = table.Pointers!.Handle, sH = table.SizesBuffer!.Handle, ctH = table.ChunkTensor!.Handle, csH = table.ChunkStart!.Handle;
+        IntPtr outH = sumOfSquares.Handle;
+        int totalChunks = table.TotalChunks;
+        void** args = stackalloc void*[6];
+        args[0] = &pH; args[1] = &sH; args[2] = &ctH; args[3] = &csH; args[4] = &totalChunks; args[5] = &outH;
+        LaunchKernel(kernel, (uint)Math.Min(totalChunks, MultiTensorReductionMaxBlocks), MultiTensorChunk, args);
+    }
+
+    /// <summary>
+    /// The clip_grad_norm_ coefficient min(1, maxNorm / (norm + 1e-6)) from <see cref="MultiTensorSumOfSquares"/>'s
+    /// result, computed on the device into <paramref name="scale"/> (one float). A non-finite norm yields 1.
+    /// </summary>
+    public unsafe void ClipScaleFromSumOfSquares(IGpuBuffer sumOfSquares, float maxNorm, IGpuBuffer scale)
+    {
+        if (sumOfSquares is null) throw new ArgumentNullException(nameof(sumOfSquares));
+        if (scale is null) throw new ArgumentNullException(nameof(scale));
+        if (!_kernelCache.TryGetValue("clip_scale_from_sum_squares", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: clip_scale_from_sum_squares");
+        using var _ = PushContext();
+        IntPtr sH = sumOfSquares.Handle, cH = scale.Handle;
+        void** args = stackalloc void*[3];
+        args[0] = &sH; args[1] = &maxNorm; args[2] = &cH;
+        LaunchKernel(kernel, 1, 1, args);
+    }
+
+    /// <summary>Multiplies every element of every tensor by the device scalar <paramref name="scale"/>, in one launch.</summary>
+    public unsafe void MultiTensorScaleByDeviceScalar(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes, IGpuBuffer scale)
+    {
+        if (scale is null) throw new ArgumentNullException(nameof(scale));
+        if (tensors is null || tensors.Count == 0) return;
+        var table = GetGradientTable(tensors, sizes);
+        if (!_kernelCache.TryGetValue("multi_tensor_scale_by_device_scalar", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: multi_tensor_scale_by_device_scalar");
+        using var _ = PushContext();
+        IntPtr pH = table.Pointers!.Handle, sH = table.SizesBuffer!.Handle, ctH = table.ChunkTensor!.Handle, csH = table.ChunkStart!.Handle;
+        IntPtr scH = scale.Handle;
+        void** args = stackalloc void*[5];
+        args[0] = &pH; args[1] = &sH; args[2] = &ctH; args[3] = &csH; args[4] = &scH;
+        LaunchKernel(kernel, (uint)table.TotalChunks, MultiTensorChunk, args);
+    }
+
     public unsafe void AdamUpdateBf16(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
         float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
     {
@@ -17488,6 +17624,14 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             return;
 
         _disposed = true;
+
+        // The multi-tensor table holds device buffers: free them only on an explicit dispose, never from the
+        // finalizer (the context may already be gone).
+        if (disposing)
+        {
+            _gradientTable?.Dispose();
+            _gradientTable = null;
+        }
 
         // Drop the diagnostics registrations for these handles. The registry is process-lifetime but
         // kernel handles are not, and a driver may reuse a freed handle address -- a stale entry
