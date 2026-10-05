@@ -5028,10 +5028,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     /// <summary>Pool a transient when inside a compiled action (stable buffer by (action,local)); else normal alloc.
     /// Exposed for the static AllocateOutputBuffer routing.</summary>
-    internal IGpuBuffer RentActionScratchOrAllocate(IDirectGpuBackend backend, int length)
-        => ScratchPoolingActive ? RentActionScratch(backend, length) : backend.AllocateBuffer(length);
+    internal IGpuBuffer RentActionScratchOrAllocate(IDirectGpuBackend backend, int length, bool fullyWritten = false)
+        => ScratchPoolingActive ? RentActionScratch(backend, length, fullyWritten) : backend.AllocateBuffer(length);
 
-    private IGpuBuffer RentActionScratch(IDirectGpuBackend backend, int length)
+    private IGpuBuffer RentActionScratch(IDirectGpuBackend backend, int length, bool fullyWritten = false)
     {
         long key = ((long)_currentScratchAction << 32) | (uint)_currentScratchLocal++;
         if (_actionScratchPool.TryGetValue(key, out var b) && b is not null
@@ -5039,6 +5039,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             // Re-zero on reuse to preserve the alloc-zero invariant (accumulate / partial-write ops read it).
             // Capturable cuMemsetD8Async on _stream (CudaBackend.MemsetBuffer); Fill/cuMemsetD32 aborts capture.
+            // An op that overwrites every output element (GEMM with beta 0, elementwise, row reductions) needs no
+            // zeroed buffer: the memset was a captured graph node per op per step (AiDotNet #1804: 525 per N-BEATS step).
+            if (fullyWritten) return b;
             if (backend is DirectGpu.CUDA.CudaBackend cudaZ) cudaZ.MemsetBuffer(b, 0, (long)length * sizeof(float));
             else backend.Fill(b, 0f, length);
             return b;
@@ -5069,7 +5072,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // single-threaded in practice). Set on EnterCompiledCapturePath, cleared when its depth returns to 0.
     private static DirectGpuTensorEngine? s_residentScratchEngine;
 
-    private IGpuBuffer GetOrCreateResidentBuffer<T>(IDirectGpuBackend backend, Tensor<T> t, int length)
+    private IGpuBuffer GetOrCreateResidentBuffer<T>(IDirectGpuBackend backend, Tensor<T> t, int length, bool fullyWritten = false)
     {
         // PR #638 (CUDA-700 fix): the reused buffer MUST hold at least `length` elements. A pooled backing array
         // reused at a LARGER shape — or a tensor whose prior resident/cached buffer was allocated smaller — would
@@ -5098,7 +5101,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // captured graph (cuGraphLaunch fails). The caller binds the pooled buffer to `t` (BindResidentBuffer),
         // so SAME-tensor consumers resolve it via t._gpuBuffer; the (action,local) key gives determinism.
         if (ScratchPoolingActive)
-            return RentActionScratch(backend, length);
+            return RentActionScratch(backend, length, fullyWritten);
         var buf = backend.AllocateBuffer(length);
         if (arr is not null) CacheActivation(arr, buf, t._shape, backend, hostVersion: t.GpuCacheVersion);
         return buf;
@@ -5400,7 +5403,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             var output = new Tensor<T>(new T[(long)rows * cols], outShape);
-            var outBuf = GetOrCreateResidentBuffer(backend, output, rows * cols);
+            var outBuf = GetOrCreateResidentBuffer(backend, output, rows * cols, fullyWritten: true);
             if (outBuf.Handle == System.IntPtr.Zero || outBuf.Size < (long)rows * cols) return null;
             // STABLE ones (filled in the pre-pass; cuMemsetD32 isn't capturable) so capture only does the GEMM.
             var ones = GetCachedOnesBuffer(backend, onesOnRight ? cols : rows);
@@ -5572,7 +5575,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             using var bufA = GetResidentOrPersistentInputBuffer(backend, a);
             using var bufB = GetResidentOrPersistentInputBuffer(backend, b);
-            var outBuf = GetOrCreateResidentBuffer(backend, output, M * N);
+            var outBuf = GetOrCreateResidentBuffer(backend, output, M * N, fullyWritten: true);
             backend.Gemm(bufA.Buffer, bufB.Buffer, outBuf, M, N, K, 1.0f, 0.0f);
             ResidentSyncCheck("MatMul");
             BindResidentBuffer(output, outBuf, backend);
@@ -5630,7 +5633,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             float scalarF = (float)(object)scalar!;
             using var bufIn = GetResidentOrPersistentInputBuffer(backend, a);
-            var outBuf = GetOrCreateResidentBuffer(backend, output, output.Length);
+            var outBuf = GetOrCreateResidentBuffer(backend, output, output.Length, fullyWritten: true);
             backend.Scale(bufIn.Buffer, outBuf, scalarF, output.Length);
             ResidentSyncCheck("MultiplyScalar");
             BindResidentBuffer(output, outBuf, backend);
@@ -5657,7 +5660,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             using var bufA = GetResidentOrPersistentInputBuffer(backend, a);
             using var bufB = GetResidentOrPersistentInputBuffer(backend, b);
-            var outBuf = GetOrCreateResidentBuffer(backend, output, output.Length);
+            var outBuf = GetOrCreateResidentBuffer(backend, output, output.Length, fullyWritten: true);
             op(backend, bufA.Buffer, bufB.Buffer, outBuf, output.Length);
             ResidentSyncCheck(opName);
             BindResidentBuffer(output, outBuf, backend);
@@ -5679,7 +5682,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             using var bufA = GetResidentOrPersistentInputBuffer(backend, a);
             using var bufB = GetResidentOrPersistentInputBuffer(backend, b);
-            var outBuf = GetOrCreateResidentBuffer(backend, output, output.Length);
+            var outBuf = GetOrCreateResidentBuffer(backend, output, output.Length, fullyWritten: true);
             backend.Multiply(bufA.Buffer, bufB.Buffer, outBuf, output.Length);
             ResidentSyncCheck("Multiply");
             BindResidentBuffer(output, outBuf, backend);
@@ -5814,7 +5817,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             // optimizer) so capture/replay don't re-upload it (the transient GetOrAllocateBuffer path would
             // cuMemcpyHtoD every step → aborts the CUDA-graph capture).
             using var bufBias = GetResidentOrPersistentInputBuffer(backend, bias);
-            var outBuf = GetOrCreateResidentBuffer(backend, output, full.Length);
+            var outBuf = GetOrCreateResidentBuffer(backend, output, full.Length, fullyWritten: true);
             backend.BiasAdd(bufFull.Buffer, bufBias.Buffer, outBuf, M, N);
             BindResidentBuffer(output, outBuf, backend);
             return true;
@@ -5906,7 +5909,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 using var bA = GetResidentOrPersistentInputBuffer(backend, left);
                 using var bB = GetResidentOrPersistentInputBuffer(backend, right);
-                var destBuf = GetOrCreateResidentBuffer(backend, destination, left.Length);
+                var destBuf = GetOrCreateResidentBuffer(backend, destination, left.Length, fullyWritten: true);
                 // PR #638 (CUDA-700 guard): never launch the kernel over a buffer smaller than the op length —
                 // that is the out-of-bounds access that faults the context. If any operand is undersized (a stale
                 // pooled buffer slipped through), fall back to the host path, which reallocates correctly.
@@ -5989,7 +5992,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             try
             {
                 using var bA = GetResidentOrPersistentInputBuffer(backend, input);
-                var destBuf = GetOrCreateResidentBuffer(backend, destination, input.Length);
+                var destBuf = GetOrCreateResidentBuffer(backend, destination, input.Length, fullyWritten: true);
                 op(backend, bA.Buffer, destBuf, ToFloatScalar(scalar), input.Length);
                 BindResidentBuffer(destination, destBuf, backend);
                 return true;
@@ -6616,7 +6619,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         try
         {
             using var inBuf = GetResidentOrPersistentInputBuffer(backend, input);
-            var outBuf = GetOrCreateResidentBuffer(backend, output, input.Length);
+            var outBuf = GetOrCreateResidentBuffer(backend, output, input.Length, fullyWritten: true);
             if (inBuf.Buffer.Handle == System.IntPtr.Zero || inBuf.Buffer.Size < input.Length
                 || outBuf.Handle == System.IntPtr.Zero || outBuf.Size < input.Length)
             { AliasDiag($"{opName}-resident SKIP gate3 inH={(long)inBuf.Buffer.Handle:X} inSz={inBuf.Buffer.Size} outH={(long)outBuf.Handle:X} outSz={outBuf.Size} need={input.Length}"); return false; }
@@ -18093,7 +18096,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (inResid is not null)
             {
                 var rOut = new Tensor<T>(new T[outerSize], outputShape);
-                var rOutBuf = GetOrCreateResidentBuffer(backend, rOut, outerSize);
+                var rOutBuf = GetOrCreateResidentBuffer(backend, rOut, outerSize, fullyWritten: true);
                 if (rOutBuf.Handle != System.IntPtr.Zero && rOutBuf.Size >= outerSize)
                 {
                     switch (op)
@@ -20187,7 +20190,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 return null;
             }
             var output = new Tensor<T>(new T[(long)M * N], outShape);
-            var outBuf = GetOrCreateResidentBuffer(backend, output, M * N);
+            var outBuf = GetOrCreateResidentBuffer(backend, output, M * N, fullyWritten: true);
             if (outBuf.Handle == System.IntPtr.Zero || outBuf.Size < (long)M * N) return null;
             backend.Gemm(bufA, bufB, outBuf, M, N, K);
             ResidentSyncCheck("MatMulResident");
@@ -20229,8 +20232,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 if (bufG is null || bufA is null || bufB is null) return false;
                 var outA = new Tensor<T>(new T[(long)M * K], new[] { M, K });
                 var outB = new Tensor<T>(new T[(long)K * N], new[] { K, N });
-                var outBufA = GetOrCreateResidentBuffer(backend, outA, M * K);
-                var outBufB = GetOrCreateResidentBuffer(backend, outB, K * N);
+                var outBufA = GetOrCreateResidentBuffer(backend, outA, M * K, fullyWritten: true);
+                var outBufB = GetOrCreateResidentBuffer(backend, outB, K * N, fullyWritten: true);
                 if (outBufA.Handle == IntPtr.Zero || outBufA.Size < (long)M * K
                     || outBufB.Handle == IntPtr.Zero || outBufB.Size < (long)K * N) return false;
                 cuda.MatMulTransposed(bufG, bufB, outBufA, M, K, N);   // dA[M,K] = dY[M,N] · B[K,N]ᵀ
@@ -20657,7 +20660,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     if (gR is not null && iR is not null)
                     {
                         var rOut = new Tensor<T>(new T[gradOutput.Length], gradOutput.Shape._dims);
-                        var oResBuf = GetOrCreateResidentBuffer(backend, rOut, gradOutput.Length);
+                        var oResBuf = GetOrCreateResidentBuffer(backend, rOut, gradOutput.Length, fullyWritten: true);
                         if (oResBuf.Handle != System.IntPtr.Zero && oResBuf.Size >= gradOutput.Length)
                         {
                             backend.ReluBackward(gR, iR, oResBuf, gradOutput.Length);
@@ -22153,7 +22156,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 if (inResid is not null)
                 {
                     var rOut = new Tensor<T>(new T[tensor.Length], new[] { cols, rows });
-                    var rOutBuf = GetOrCreateResidentBuffer(backend, rOut, tensor.Length);
+                    var rOutBuf = GetOrCreateResidentBuffer(backend, rOut, tensor.Length, fullyWritten: true);
                     if (rOutBuf.Handle != System.IntPtr.Zero && rOutBuf.Size >= tensor.Length)
                     {
                         backend.Transpose(inResid, rOutBuf, rows, cols);
@@ -24342,7 +24345,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 // cache eviction (issue #226) and aborts replay. Fresh output → its resident buffer becomes a
                 // graph alloc node under capture; downstream reads it on-device with no re-upload.
                 var outT = new Tensor<T>(new T[a.Length], a.Shape._dims);
-                var outBuf = GetOrCreateResidentBuffer(beCh, outT, a.Length);
+                var outBuf = GetOrCreateResidentBuffer(beCh, outT, a.Length, fullyWritten: true);
                 if (abuf.Buffer.Handle != System.IntPtr.Zero && bbuf.Buffer.Handle != System.IntPtr.Zero
                     && outBuf.Handle != System.IntPtr.Zero && outBuf.Size >= a.Length)
                 {

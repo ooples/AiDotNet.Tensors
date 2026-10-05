@@ -84,6 +84,27 @@ internal static class DifferentiableOps
     [ThreadStatic]
     internal static object?[]? _indexedGrads;
 
+    /// <summary>
+    /// Non-zero while a compiled step runs a backward whose gradient buffers are NOT zeroed beforehand: the first
+    /// contribution a buffer receives in this generation is copied in, later ones are added. A compiled plan sets it
+    /// only when every backward action accumulates through <see cref="AccumulateGrad{T}"/> (all-generic), where the
+    /// write order is fixed, so each buffer's first writer is the same every step. Replaces a memset of every
+    /// gradient buffer plus an add for every contribution with one copy per buffer (AiDotNet #1804: 836 memsets and
+    /// 393 adds per N-BEATS step on GPU).
+    /// </summary>
+    [ThreadStatic]
+    internal static int GradWriteGeneration;
+
+    private static int s_gradWriteGenerationCounter;
+
+    /// <summary>A process-wide unique, non-zero generation, so a buffer's mark from an earlier step or plan can never
+    /// be mistaken for the current one.</summary>
+    internal static int NextGradWriteGeneration()
+    {
+        int generation = System.Threading.Interlocked.Increment(ref s_gradWriteGenerationCounter);
+        return generation != 0 ? generation : System.Threading.Interlocked.Increment(ref s_gradWriteGenerationCounter);
+    }
+
     /// <summary>Sets the indexed gradient array for the current backward pass.</summary>
     internal static void SetIndexedGrads(object?[] grads) => _indexedGrads = grads;
 
@@ -562,6 +583,31 @@ internal static class DifferentiableOps
     /// when they end up as the first-write slot.
     /// </para>
     /// </summary>
+    /// <summary>True, and marks the buffer written, when this is its first contribution in the current
+    /// <see cref="GradWriteGeneration"/>; false outside a generation or for later contributions.</summary>
+    private static bool ClaimFirstWrite<T>(Tensor<T> buffer)
+    {
+        int generation = GradWriteGeneration;
+        if (generation == 0 || buffer._gradWriteGeneration == generation) return false;
+        buffer._gradWriteGeneration = generation;
+        return true;
+    }
+
+    /// <summary>The step's first contribution to a gradient buffer that was not zeroed: copied in, not added.</summary>
+    private static Tensor<T> CopyFirstWrite<T>(Tensor<T> tensor, Tensor<T> buffer, Tensor<T> contribution, IEngine engine)
+    {
+        if (!buffer.IsContiguous)
+        {
+            var previous = buffer;
+            buffer = buffer.Contiguous();
+            buffer._gradWriteGeneration = GradWriteGeneration;
+            ReplaceAccumulatorBufferOwner(tensor, previous, buffer);
+        }
+        if (!ReferenceEquals(contribution, buffer))
+            engine.TensorCopy(contribution, buffer);
+        return buffer;
+    }
+
     internal static bool AccumulateGradPoolable<T>(
         Dictionary<Tensor<T>, Tensor<T>> grads,
         Tensor<T> tensor,
@@ -699,6 +745,10 @@ internal static class DifferentiableOps
                     // back through the original GradFn lineage.
                     accumulated = engine.TensorAdd(existing, grad);
                 }
+                else if (ClaimFirstWrite(existing))
+                {
+                    accumulated = CopyFirstWrite(tensor, existing, GradForInPlace(), engine);
+                }
                 else
                 {
                     // Defensive: if the existing slot is somehow
@@ -755,6 +805,12 @@ internal static class DifferentiableOps
                 var accumulated = engine.TensorAdd(existingDict, grad);
                 grads[tensor] = accumulated;
                 tensor.Grad = accumulated;
+            }
+            else if (ClaimFirstWrite(existingDict))
+            {
+                var written = CopyFirstWrite(tensor, existingDict, GradForInPlace(), engine);
+                grads[tensor] = written;
+                tensor.Grad = written;
             }
             else
             {

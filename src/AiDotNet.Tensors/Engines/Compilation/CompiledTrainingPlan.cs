@@ -164,6 +164,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
 
     // Indices of gradient buffers that need zeroing (used by generic/accumulating backward only)
     private readonly int[]? _genericGradIndices;
+
+    /// <summary>Gradient buffers no backward action wrote in the last uncaptured run of the captured step body (null
+    /// until one ran): the only ones that body zeroes per step. See RunGpuStepBodyForCapture.</summary>
+    private int[]? _unwrittenGradIndices;
     // #1624 liveness pooling: re-zero schedule indexed by backward action index.
     // _gradPoolReZeroByStep[i] (when non-null) lists physical-buffer indices into
     // _preAllocatedGrads to clear BEFORE backward action i runs, because that
@@ -2559,32 +2563,30 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // pending download). Without that, a host read -- or a host-path op that reads the accumulator, like an
         // in-place add whose contribution is not resident -- saw the PREVIOUS step's values: measured as gradients
         // exactly doubling on the second uncaptured step. Host bookkeeping only, so it is capture-safe.
-        if (_genericGradIndices != null)
+        // Gradient buffers are NOT zeroed every step. The backward here is all-generic (_graphStepEligible), so every
+        // contribution goes through AccumulateGrad in a fixed order: under GradWriteGeneration the first contribution
+        // a buffer receives copies in and later ones add (AiDotNet #1804: a memset per gradient buffer plus an add per
+        // contribution, 836 + 393 per N-BEATS step). Only buffers the backward never writes must hold zeros: all of
+        // them before the first run, then exactly the ones an uncaptured run found unwritten.
+        int gradWriteGeneration = Autodiff.DifferentiableOps.NextGradWriteGeneration();
+        var zeroIndices = _unwrittenGradIndices;
+        int zeroCount = zeroIndices?.Length ?? _preAllocatedGrads.Length;
+        for (int z = 0; z < zeroCount; z++)
         {
-            for (int i = 0; i < _genericGradIndices.Length; i++)
+            int i = zeroIndices is null ? z : zeroIndices[z];
+            if (_preAllocatedGrads[i].TryGetGpuBuffer() is { } gb)
             {
-                int idx = _genericGradIndices[i];
-                if (_preAllocatedGrads[idx].TryGetGpuBuffer() is { } gb)
-                {
-                    ZeroDeviceBuffer(backend, gb, _preAllocatedGrads[idx].Length, esz);
-                    residentEngine?.BindResidentBuffer(_preAllocatedGrads[idx], gb, backend);
-                }
+                ZeroDeviceBuffer(backend, gb, _preAllocatedGrads[i].Length, esz);
+                residentEngine?.BindResidentBuffer(_preAllocatedGrads[i], gb, backend);
             }
-        }
-        else
-        {
-            for (int i = 0; i < _preAllocatedGrads.Length; i++)
-                if (_preAllocatedGrads[i].TryGetGpuBuffer() is { } gb)
-                {
-                    ZeroDeviceBuffer(backend, gb, _preAllocatedGrads[i].Length, esz);
-                    residentEngine?.BindResidentBuffer(_preAllocatedGrads[i], gb, backend);
-                }
         }
         if (_lossGradSeed.TryGetGpuBuffer() is { } seedBuf && _lossGradDest?.TryGetGpuBuffer() is { } destBuf)
         {
             if (cb is not null) cb.CopyBufferDtoD(seedBuf, destBuf, (long)_lossGradSeed.Length * esz);
             else backend.Copy(seedBuf, destBuf, _lossGradSeed.Length);
             residentEngine?.BindResidentBuffer(_lossGradDest, destBuf, backend);
+            if (_lossGradDest is { } seededDestination)
+                seededDestination._gradWriteGeneration = gradWriteGeneration;   // the seed is its first write
         }
 
         var bwd = _backwardActions;
@@ -2594,17 +2596,35 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // Logging its index + name + producing op turns "the THREW op moved" into a concrete backward work-item.
         bool bwdDiag = System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1" && IsCapturing();
         var bwdNames = ProfBackwardStepNames;
-        for (int i = 0; i < bwd.Length; i++)
+        Autodiff.DifferentiableOps.GradWriteGeneration = gradWriteGeneration;
+        try
         {
-            de?.SetCurrentScratchAction(fwd.Length + i);   // backward actions keyed in a namespace above forward
-            bwd[i](engine);
-            if (bwdDiag && cb!.StreamCaptureStatusRaw() == 2)
+            for (int i = 0; i < bwd.Length; i++)
             {
-                string nm = i < bwdNames.Length ? bwdNames[i] : "?";
-                try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphcapture_diag.txt"),
-                    $"[CAPTURE-INVALIDATED-BY] backwardAction#{i} name={nm} op={Engines.DirectGpuTensorEngine.s_currentBackwardOp}" + System.Environment.NewLine); } catch { }
-                bwdDiag = false;   // log only the FIRST invalidation
+                de?.SetCurrentScratchAction(fwd.Length + i);   // backward actions keyed in a namespace above forward
+                bwd[i](engine);
+                if (bwdDiag && cb!.StreamCaptureStatusRaw() == 2)
+                {
+                    string nm = i < bwdNames.Length ? bwdNames[i] : "?";
+                    try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphcapture_diag.txt"),
+                        $"[CAPTURE-INVALIDATED-BY] backwardAction#{i} name={nm} op={Engines.DirectGpuTensorEngine.s_currentBackwardOp}" + System.Environment.NewLine); } catch { }
+                    bwdDiag = false;   // log only the FIRST invalidation
+                }
             }
+        }
+        finally
+        {
+            Autodiff.DifferentiableOps.GradWriteGeneration = 0;
+        }
+        // An uncaptured run executed the backward for real, so it knows which buffers nothing wrote; later steps
+        // (and the capture) zero only those. A captured run only recorded, so its marks are not evidence.
+        if (!capturingNow)
+        {
+            var unwritten = new List<int>();
+            for (int i = 0; i < _preAllocatedGrads.Length; i++)
+                if (_preAllocatedGrads[i]._gradWriteGeneration != gradWriteGeneration)
+                    unwritten.Add(i);
+            _unwrittenGradIndices = unwritten.ToArray();
         }
         de?.SetCurrentScratchAction(-1);   // grad clip + optimizer (run after) must NOT pool
         if (FailInsideNextCaptureForTesting && IsCapturing())

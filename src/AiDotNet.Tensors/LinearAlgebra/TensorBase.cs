@@ -968,6 +968,13 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     internal int _gradIndex = -1;
 
     /// <summary>
+    /// The compiled-step write generation (<see cref="Engines.Autodiff.DifferentiableOps.GradWriteGeneration"/>) in
+    /// which this tensor, used as a pre-allocated gradient buffer, last received a contribution. A contribution in a
+    /// newer generation is the step's first write and is copied in; later ones in the same generation add.
+    /// </summary>
+    internal int _gradWriteGeneration;
+
+    /// <summary>
     /// Optional GPU buffer reference for GPU-resident tensors.
     /// When non-null, this tensor's authoritative data is on the GPU — the CPU-side
     /// _data array may be empty/stale until explicitly synchronized.
