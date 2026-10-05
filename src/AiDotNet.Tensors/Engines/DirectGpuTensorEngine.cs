@@ -20115,6 +20115,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // current tensor version and its cache owner is still live. ResolveResidentBufferNoUpload
         // deliberately omits this gate for capture-time metadata views, so using it here could
         // execute eager arithmetic against a stale pre-mutation buffer.
+        //
+        // The kernel reads each buffer as a dense a.Length array, so a STRIDED VIEW (a permute or slice,
+        // or any nonzero storage offset) must not take this route: a view shares its source's device
+        // buffer, which holds the SOURCE layout, so the kernel would combine the un-permuted storage.
+        // Adding two permuted matmul results gave a wrong sum here (AiDotNet #1804: the N-BEATS
+        // forecast aggregation). Declining sends the view to TryRunBinary, whose input resolution
+        // permutes it on the device.
+        if (!a.IsContiguous || a._storageOffset != 0 || !b.IsContiguous || b._storageOffset != 0)
+            return null;
         if (a._gpuBuffer is null || !ReferenceEquals(a._gpuBackend, backend)
             || a._gpuBufferVersion != a.GpuCacheVersion || !IsCachedGpuBufferLive(a, backend)
             || a._gpuBuffer.Handle == System.IntPtr.Zero || a._gpuBuffer.Size < a.Length

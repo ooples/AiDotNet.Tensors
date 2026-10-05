@@ -143,6 +143,52 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
         Assert.Equal(4f, refreshed[1], 5);
     }
 
+    [SkippableTheory]
+    [InlineData(12, 64, 256)]   // AiDotNet #1804: N-BEATS forecast [H, B] -> permuted [B, H]
+    [InlineData(12, 12, 256)]   // square: the permuted view has the same shape as its source
+    public void EagerResidentBinary_PermutedResidentOperands_MatchCpu(int rows, int cols, int inner)
+    {
+        SkipIfNoDirectGpu();
+        var gpu = Gpu;
+        var cpu = new CpuEngine();
+        Tensor<float> Make(int r, int c, int seed) =>
+            new Tensor<float>(Enumerable.Range(0, r * c).Select(i => DeterministicValue(seed + i)).ToArray(), [r, c]);
+        var weights = Make(rows, inner, 1);
+        var thetaA = Make(inner, cols, 50_000);
+        var thetaB = Make(inner, cols, 90_000);
+
+        // Each operand is a permuted VIEW of a matmul result. On the GPU engine the matmul result is
+        // device-resident and its permute shares that buffer, so the eager resident shortcut sees two
+        // live device buffers that hold the SOURCE [rows, cols] layout, not the view's [cols, rows].
+        foreach (bool subtract in new[] { false, true })
+        {
+            Tensor<float> Run(IEngine e, bool contiguousLeft)
+            {
+                var left = contiguousLeft
+                    ? e.TensorMatMul(Make(cols, inner, 7), Make(inner, rows, 9))
+                    : e.TensorPermute(e.TensorMatMul(weights, thetaA), new[] { 1, 0 });
+                var right = e.TensorPermute(e.TensorMatMul(weights, thetaB), new[] { 1, 0 });
+                return subtract ? e.TensorSubtract(left, right) : e.TensorAdd(left, right);
+            }
+
+            foreach (bool contiguousLeft in new[] { false, true })
+            {
+                var expected = Run(cpu, contiguousLeft).ToArray();
+                var actual = Run(gpu, contiguousLeft).ToArray();
+                Assert.Equal(expected.Length, actual.Length);
+                for (int i = 0; i < expected.Length; i++)
+                {
+                    // The operands are GEMM results (O(1) magnitude) whose float32 summation order differs
+                    // between the GPU and CPU, so an element that nearly cancels carries ~1e-6 absolute
+                    // round-off that a relative bound cannot absorb. A layout error is O(1) (1 to 36 on
+                    // these shapes before the fix), five orders above this bound.
+                    Assert.True(Math.Abs(expected[i] - actual[i]) <= 1e-4f * (1f + Math.Abs(expected[i])),
+                        $"{(subtract ? "Subtract" : "Add")} contiguousLeft={contiguousLeft} [{rows},{cols}] index {i}: " +
+                        $"cpu={expected[i]} gpu={actual[i]}");
+                }
+            }
+        }
+    }
     [SkippableFact]
     public void HardsigmoidBackward_IsBitIdenticalAtBoundariesAndStaysResident()
     {
