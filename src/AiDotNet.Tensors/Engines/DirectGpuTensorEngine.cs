@@ -2127,6 +2127,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     private OwnedBuffer UploadTensor<T>(IDirectGpuBackend backend, Tensor<T> tensor)
     {
+        // A strided view (permute, slice, nonzero storage offset) shares its source's backing array and
+        // device buffer, so every lookup below would return the SOURCE layout, and the host fallback would
+        // upload the source's raw storage. Kernels behind this path read the buffer as dense, so a view
+        // gave a wrong result (an innermost-axis IEngine.ReduceSum of a permuted resident tensor was off by
+        // 3.7, #1090). GetOrAllocateBuffer resolves views: it permutes or slices on the device, else
+        // materializes the view's logical layout.
+        if (!tensor.IsContiguous || tensor._storageOffset != 0)
+            return GetOrAllocateBuffer(backend, tensor);
+
         int hostVersion = tensor.GpuCacheVersion;
         // Fast path: tensor has a GPU buffer from a previous GPU operation, and
         // the tensor's CPU-side Version hasn't advanced since the upload. Stale-
@@ -2204,6 +2213,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     private IGpuBuffer UploadTensorRaw<T>(IDirectGpuBackend backend, Tensor<T> tensor)
     {
+        // The fresh-upload branch below caches the buffer under the tensor's backing array. A strided view
+        // shares that array with its source, so caching the view's layout there would poison the source's
+        // entry. Upload a dense copy instead: it has its own array, which keeps the cached buffer alive and
+        // correctly keyed.
+        if (!tensor.IsContiguous || tensor._storageOffset != 0)
+            tensor = (Tensor<T>)tensor.Contiguous();
+
         var owned = UploadTensor(backend, tensor);
         if (owned.OwnsBuffer)
         {

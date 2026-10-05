@@ -190,6 +190,36 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
         }
     }
     [SkippableFact]
+    public void IEngineReduceSum_InnermostAxisOfPermutedResidentView_MatchesCpu_AndLeavesSourceIntact()
+    {
+        SkipIfNoDirectGpu();
+        IEngine gpu = Gpu;   // AiDotNet calls the engine through IEngine: the explicit implementation is the path under test
+        IEngine cpu = new CpuEngine();
+        Tensor<float> Make(int r, int c, int seed) =>
+            new Tensor<float>(Enumerable.Range(0, r * c).Select(i => DeterministicValue(seed + i)).ToArray(), [r, c]);
+        var weights = Make(12, 256, 1);
+        var theta = Make(256, 64, 50_000);
+
+        // [12,64] device-resident matmul result, then a permuted [64,12] view of it. Reducing the view's
+        // innermost axis takes the raw-upload SumAxis kernel, which read the view's shared source buffer
+        // as if it were the view (#1090: off by 3.7).
+        var expected = cpu.ReduceSum(cpu.TensorPermute(cpu.TensorMatMul(weights, theta), new[] { 1, 0 }), new[] { 1 }, false).ToArray();
+        var source = gpu.TensorMatMul(weights, theta);
+        var actual = gpu.ReduceSum(gpu.TensorPermute(source, new[] { 1, 0 }), new[] { 1 }, false).ToArray();
+        Assert.Equal(expected.Length, actual.Length);
+        for (int i = 0; i < expected.Length; i++)
+            Assert.True(Math.Abs(expected[i] - actual[i]) <= 1e-4f * (1f + Math.Abs(expected[i])),
+                $"ReduceSum(view) row {i}: cpu={expected[i]} gpu={actual[i]}");
+
+        // The view shares its source's backing array, which keys the upload caches. Uploading the view must
+        // not overwrite the source's cached buffer: reducing the SOURCE afterwards must still be right.
+        var expectedSource = cpu.ReduceSum(cpu.TensorMatMul(weights, theta), new[] { 1 }, false).ToArray();
+        var actualSource = gpu.ReduceSum(source, new[] { 1 }, false).ToArray();
+        for (int i = 0; i < expectedSource.Length; i++)
+            Assert.True(Math.Abs(expectedSource[i] - actualSource[i]) <= 1e-4f * (1f + Math.Abs(expectedSource[i])),
+                $"ReduceSum(source) row {i} after the view upload: cpu={expectedSource[i]} gpu={actualSource[i]}");
+    }
+    [SkippableFact]
     public void HardsigmoidBackward_IsBitIdenticalAtBoundariesAndStaysResident()
     {
         SkipIfNoDirectGpu();
