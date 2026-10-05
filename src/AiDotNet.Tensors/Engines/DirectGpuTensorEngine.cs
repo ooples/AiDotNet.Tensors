@@ -20197,6 +20197,90 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         catch (Exception ex) { AliasDiag($"MatMulResident FELLBACK M={M} N={N} K={K}: {ex.GetType().Name}: {ex.Message}"); return null; }
     }
 
+    /// <summary>
+    /// Both gradients of the 2-D matmul <c>Y[M,N] = A[M,K] · B[K,N]</c>, each as one GEMM with a transpose flag:
+    /// <c>dA = dY · Bᵀ</c> and <c>dB = Aᵀ · dY</c>. The generic backward materialized Bᵀ and Aᵀ with a transpose
+    /// kernel each and then multiplied, two extra launches and temporaries per matmul per step (149 transpose_2d per
+    /// AiDotNet N-BEATS step, #1804). CUDA float only; returns false otherwise, and in a resident (captured) step
+    /// when an operand is not already device-resident, so the caller keeps its generic path.
+    /// </summary>
+    internal bool TryMatMulBackward2D<T>(
+        Tensor<T> gradOutput, Tensor<T> a, Tensor<T> b, out Tensor<T>? gradA, out Tensor<T>? gradB)
+    {
+        gradA = null;
+        gradB = null;
+        if (typeof(T) != typeof(float) || Gpu.AutocastScope.IsEnabled) return false;
+        if (!TryGetBackend(out var backend) || backend is not DirectGpu.CUDA.CudaBackend cuda) return false;
+        if (a.Rank != 2 || b.Rank != 2 || gradOutput.Rank != 2) return false;
+        if (!a.IsContiguous || !b.IsContiguous || !gradOutput.IsContiguous
+            || a._storageOffset != 0 || b._storageOffset != 0 || gradOutput._storageOffset != 0) return false;
+        int M = a._shape[0], K = a._shape[1], N = b._shape[1];
+        if (b._shape[0] != K || gradOutput._shape[0] != M || gradOutput._shape[1] != N) return false;
+
+        try
+        {
+            if (ResidentStepActive)
+            {
+                // Captured step: read the operands' existing resident buffers (no upload, capture-safe) and write
+                // into fresh resident-bound outputs, exactly as TryMatMulResident does.
+                var bufG = ResolveResidentBufferNoUpload(backend, gradOutput, M * N);
+                var bufA = ResolveResidentBufferNoUpload(backend, a, M * K);
+                var bufB = ResolveResidentBufferNoUpload(backend, b, K * N);
+                if (bufG is null || bufA is null || bufB is null) return false;
+                var outA = new Tensor<T>(new T[(long)M * K], new[] { M, K });
+                var outB = new Tensor<T>(new T[(long)K * N], new[] { K, N });
+                var outBufA = GetOrCreateResidentBuffer(backend, outA, M * K);
+                var outBufB = GetOrCreateResidentBuffer(backend, outB, K * N);
+                if (outBufA.Handle == IntPtr.Zero || outBufA.Size < (long)M * K
+                    || outBufB.Handle == IntPtr.Zero || outBufB.Size < (long)K * N) return false;
+                cuda.MatMulTransposed(bufG, bufB, outBufA, M, K, N);   // dA[M,K] = dY[M,N] · B[K,N]ᵀ
+                cuda.MatMulTransposedA(bufA, bufG, outBufB, K, N, M);  // dB[K,N] = A[M,K]ᵀ · dY[M,N]
+                ResidentSyncCheck("MatMulBackward2D");
+                BindResidentBuffer(outA, outBufA, backend);
+                BindResidentBuffer(outB, outBufB, backend);
+                gradA = outA;
+                gradB = outB;
+                return true;
+            }
+
+            using var ownedG = GetOrAllocateBuffer(backend, gradOutput);
+            using var ownedA = GetOrAllocateBuffer(backend, a);
+            using var ownedB = GetOrAllocateBuffer(backend, b);
+            var bufOutA = AllocateOutputBuffer(backend, M * K);
+            OwnedBuffer bufOutB;
+            try
+            {
+                bufOutB = AllocateOutputBuffer(backend, K * N);
+            }
+            catch
+            {
+                bufOutA.Dispose();
+                throw;
+            }
+            try
+            {
+                cuda.MatMulTransposed(ownedG.Buffer, ownedB.Buffer, bufOutA.Buffer, M, K, N);
+                cuda.MatMulTransposedA(ownedA.Buffer, ownedG.Buffer, bufOutB.Buffer, K, N, M);
+            }
+            catch
+            {
+                bufOutA.Dispose();
+                bufOutB.Dispose();
+                throw;
+            }
+            gradA = DeferTensorResult<T>(backend, bufOutA.Buffer, M * K, new[] { M, K });
+            gradB = DeferTensorResult<T>(backend, bufOutB.Buffer, K * N, new[] { K, N });
+            return true;
+        }
+        catch (Exception ex)
+        {
+            AliasDiag($"MatMulBackward2D FELLBACK M={M} N={N} K={K}: {ex.GetType().Name}: {ex.Message}");
+            gradA = null;
+            gradB = null;
+            return false;
+        }
+    }
+
     public override Tensor<T> TensorAdd<T>(Tensor<T> a, Tensor<T> b)
     {
         DeviceDispatch.EnforceStrict(a, b); // no-op unless strict mode is enabled

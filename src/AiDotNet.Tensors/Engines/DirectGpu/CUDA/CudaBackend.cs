@@ -2321,6 +2321,44 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             "cublasSgemm(MatMulTransposed)");
     }
 
+    /// <summary>
+    /// Row-major <c>C[M,N] = alpha · A[K,M]ᵀ · B[K,N] + beta · C</c> in one cuBLAS GEMM, without materializing Aᵀ.
+    /// The matmul backward's weight gradient (<c>dW = Xᵀ · dY</c>) is this shape; forming it as a transpose kernel
+    /// plus a GEMM cost a transpose_2d launch and a temporary per matmul per step (AiDotNet #1804).
+    /// </summary>
+    public void MatMulTransposedA(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
+    {
+        if (!IsAvailable)
+            throw new InvalidOperationException("CUDA backend is not available.");
+        ValidateGemmArgs(A, B, C, M, N, K);
+
+        using var _ = PushContext();
+        ApplyDeterministicGemmMathMode();
+        float alphaVal = alpha;
+        float betaVal = beta;
+
+        // Column-major views of the row-major bytes:
+        //   A_row[K,M] === A_col[M,K]   (ld = M)
+        //   B_row[K,N] === B_col[N,K]   (ld = N)
+        //   C_row[M,N] === C_col[N,M]   (ld = N)
+        // (Aᵀ · B)_row === (Bᵀ · A)_col... in column-major: C_col[N,M] = B_col[N,K] · A_col[M,K]ᵀ, so
+        //   op(first)  = None      on B_col (N×K)
+        //   op(second) = Transpose on A_col (M×K → K×M)
+        //   m=N, n=M, k=K.
+        CuBlasNative.CheckCublasStatus(
+            CuBlasNative.cublasSgemm(
+                _cublasHandle,
+                CublasOperation.None,
+                CublasOperation.Transpose,
+                N, M, K,
+                ref alphaVal,
+                B.Handle, N,
+                A.Handle, M,
+                ref betaVal,
+                C.Handle, N),
+            "cublasSgemm(MatMulTransposedA)");
+    }
+
     public IGpuBuffer MatMul(IGpuBuffer A, IGpuBuffer B, int M, int N, int K)
     {
         ValidateGemmArgs(A, B, null, M, N, K);

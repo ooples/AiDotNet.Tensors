@@ -861,6 +861,21 @@ internal static class BackwardFunctions<T>
             var a2D = engine.Reshape(inputs[0], new[] { Mflat, Kflat });
             var g2D = engine.Reshape(gradOutput, new[] { Mflat, Nflat });
 
+            // GPU: both gradients as single GEMMs with transpose flags, no materialized transposes (AiDotNet
+            // #1804). Only when nothing records these ops (no outer tape, not tracing a graph): the helper writes
+            // its outputs directly and does not record a backward of its own.
+            if (needsInputGradient && needsWeightGradient
+                && engine is DirectGpuTensorEngine gpuBackward
+                && !DifferentiableOps.IsRecording<T>()
+                && !Compilation.GraphMode.IsActive
+                && gpuBackward.TryMatMulBackward2D(g2D, a2D, inputs[1], out var gpuGradA, out var gpuGradB)
+                && gpuGradA is not null && gpuGradB is not null)
+            {
+                DifferentiableOps.AccumulateGrad(grads, inputs[0], engine.Reshape(gpuGradA, (int[])inputs[0]._shape.Clone()), engine);
+                DifferentiableOps.AccumulateGrad(grads, inputs[1], gpuGradB, engine);
+                return;
+            }
+
             // Explicit transpose + TensorMatMul. Two earlier alternatives
             // both lost wall time:
             //   1. Direct SimdGemm.Sgemm with trans flags → falls to

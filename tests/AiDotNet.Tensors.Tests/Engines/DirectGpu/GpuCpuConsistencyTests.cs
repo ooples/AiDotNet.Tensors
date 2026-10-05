@@ -300,6 +300,65 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
             scale.Dispose();
         }
     }
+    [SkippableTheory]
+    [InlineData(64, 96, 256)]   // N-BEATS first FC layer, batch 64 (AiDotNet #1804)
+    [InlineData(7, 13, 5)]      // ragged, below any tile size
+    [InlineData(300, 1, 129)]   // degenerate K
+    public void MatMulBackward2D_TransposeFlagGemms_MatchCpuGradients(int m, int k, int n)
+    {
+        SkipIfNoDirectGpu();
+        var gpu = Gpu;
+        Tensor<float> Make(int r, int c, int seed) =>
+            new Tensor<float>(Enumerable.Range(0, r * c).Select(i => DeterministicValue(seed + i)).ToArray(), [r, c]);
+        var a = Make(m, k, 11);
+        var b = Make(k, n, 22_222);
+        var g = Make(m, n, 333_333);
+
+        Skip.IfNot(gpu.TryMatMulBackward2D(g, a, b, out var gradA, out var gradB), "CUDA float backend required.");
+        Assert.NotNull(gradA);
+        Assert.NotNull(gradB);
+
+        // Reference in double: dA = G·Bᵀ, dB = Aᵀ·G.
+        var ga = gradA.ToArray();
+        var gb = gradB.ToArray();
+        var ah = a.ToArray(); var bh = b.ToArray(); var gh = g.ToArray();
+        for (int i = 0; i < m; i++)
+            for (int j = 0; j < k; j++)
+            {
+                double s = 0; for (int q = 0; q < n; q++) s += (double)gh[i * n + q] * bh[j * n + q];
+                Assert.True(Math.Abs(ga[i * k + j] - s) <= 1e-4 * (1 + Math.Abs(s)), $"dA[{i},{j}] gpu={ga[i * k + j]} exact={s}");
+            }
+        for (int i = 0; i < k; i++)
+            for (int j = 0; j < n; j++)
+            {
+                double s = 0; for (int q = 0; q < m; q++) s += (double)ah[q * k + i] * gh[q * n + j];
+                Assert.True(Math.Abs(gb[i * n + j] - s) <= 1e-4 * (1 + Math.Abs(s)), $"dB[{i},{j}] gpu={gb[i * n + j]} exact={s}");
+            }
+    }
+
+    [SkippableFact]
+    public void MatMulTapeGradients_OnGpu_MatchCpu()
+    {
+        SkipIfNoDirectGpu();
+        Tensor<float> Make(int r, int c, int seed) =>
+            new Tensor<float>(Enumerable.Range(0, r * c).Select(i => DeterministicValue(seed + i)).ToArray(), [r, c]);
+        (float[] dA, float[] dB) Run(IEngine e)
+        {
+            var a = Make(48, 33, 5);
+            var b = Make(33, 17, 70_000);
+            using var tape = new GradientTape<float>();
+            var y = e.TensorMatMul(a, b);
+            var loss = e.ReduceSum(e.TensorMultiply(y, y), null);
+            var grads = tape.ComputeGradients(loss, new[] { a, b });
+            return (grads[a].ToArray(), grads[b].ToArray());
+        }
+        var (cpuA, cpuB) = Run(new CpuEngine());
+        var (gpuA, gpuB) = Run(Gpu);
+        for (int i = 0; i < cpuA.Length; i++)
+            Assert.True(Math.Abs(cpuA[i] - gpuA[i]) <= 1e-3f * (1 + Math.Abs(cpuA[i])), $"dA[{i}] cpu={cpuA[i]} gpu={gpuA[i]}");
+        for (int i = 0; i < cpuB.Length; i++)
+            Assert.True(Math.Abs(cpuB[i] - gpuB[i]) <= 1e-3f * (1 + Math.Abs(cpuB[i])), $"dB[{i}] cpu={cpuB[i]} gpu={gpuB[i]}");
+    }
     [SkippableFact]
     public void HardsigmoidBackward_IsBitIdenticalAtBoundariesAndStaysResident()
     {
