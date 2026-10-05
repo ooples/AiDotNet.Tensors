@@ -132,6 +132,9 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     internal static readonly object GpuDispatchLock = new();
 
     private const int DefaultBlockSize = 256;
+
+    /// <summary>Shortest row SumAxis reduces with one block per row; see <see cref="SumAxis"/>.</summary>
+    internal const int SumAxisRowsMinReduce = 32;
     private const int MaxRnnBlockSize = 1024;
     // FP16 (Half) element width in bytes — used to validate half-buffer sizes before launching FP16-native kernels.
     private const int Fp16ByteWidth = 2;
@@ -5011,11 +5014,20 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (TryDirectPtxRowSum(A, B, outerSize, reduceSize))
             return;
 
-        if (!_kernelCache.TryGetValue("sum_axis", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: sum_axis");
+        // Rows of at least SumAxisRowsMinReduce elements take one block per row (sum_axis_rows): coalesced
+        // reads and a parallel in-row reduction. sum_axis gives each row to a single thread, which is
+        // uncoalesced, and serial when there are few rows. It was 97.8% of GPU time in N-BEATS training, whose
+        // bias and basis gradients are ≤256 rows (#1804). Short rows keep sum_axis: a block per 2-element row
+        // would idle most of its threads.
+        bool blockPerRow = reduceSize >= SumAxisRowsMinReduce;
+        string kernelName = blockPerRow ? "sum_axis_rows" : "sum_axis";
+        if (!_kernelCache.TryGetValue(kernelName, out var kernel))
+            throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
 
         using var _ = PushContext();
-        uint grid = (uint)((outerSize + DefaultBlockSize - 1) / DefaultBlockSize);
+        uint grid = blockPerRow
+            ? (uint)outerSize
+            : (uint)((outerSize + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr inputPtr = A.Handle;
         IntPtr outputPtr = B.Handle;
         int outer = outerSize;

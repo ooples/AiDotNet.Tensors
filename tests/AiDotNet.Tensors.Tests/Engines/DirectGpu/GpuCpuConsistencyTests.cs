@@ -219,6 +219,32 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
             Assert.True(Math.Abs(expectedSource[i] - actualSource[i]) <= 1e-4f * (1f + Math.Abs(expectedSource[i])),
                 $"ReduceSum(source) row {i} after the view upload: cpu={expectedSource[i]} gpu={actualSource[i]}");
     }
+    [SkippableTheory]
+    [InlineData(1, 65536)]     // one long row: the old one-thread-per-row kernel ran it serially
+    [InlineData(8, 1_000_000)] // few, very long rows
+    [InlineData(256, 64)]      // N-BEATS bias-gradient shape (AiDotNet #1804)
+    [InlineData(1000, 32)]     // shortest row the block-per-row kernel takes
+    [InlineData(1000, 31)]     // longest row that stays on the one-thread-per-row kernel
+    [InlineData(100000, 2)]    // many tiny rows
+    public void IEngineReduceSum_InnermostAxis_MatchesExactRowSums(int rows, int columns)
+    {
+        SkipIfNoDirectGpu();
+        IEngine gpu = Gpu;
+        var data = new float[rows * columns];
+        for (int i = 0; i < data.Length; i++) data[i] = DeterministicValue(i);
+        var actual = gpu.ReduceSum(new Tensor<float>(data, [rows, columns]), new[] { 1 }, false).ToArray();
+
+        Assert.Equal(rows, actual.Length);
+        for (int r = 0; r < rows; r++)
+        {
+            double exact = 0;
+            for (int c = 0; c < columns; c++) exact += data[r * columns + c];
+            // float32 accumulation over up to 1e6 terms in either order: bound relative to the row's
+            // magnitude. A wrong row or a dropped element is O(1) off.
+            Assert.True(Math.Abs(actual[r] - exact) <= 1e-4 * (1 + Math.Abs(exact)) + 1e-6 * columns,
+                $"[{rows},{columns}] row {r}: exact={exact} gpu={actual[r]}");
+        }
+    }
     [SkippableFact]
     public void HardsigmoidBackward_IsBitIdenticalAtBoundariesAndStaysResident()
     {
