@@ -179,6 +179,114 @@ public class FusedOptimizerNonFiniteGradientTests
         }
     }
 
+    /// <summary>
+    /// loss = sum(big * xBig) + sum(small * xSmall) with grad-norm clipping on: the chunked, parallel clip passes and the
+    /// parallel finiteness gate run on the big gradient (several clip chunks). A non-finite value in EITHER gradient must
+    /// discard the whole step -- including an infinity, which the clip's zero scale turns into a NaN in place -- and a
+    /// finite step must update every element.
+    /// </summary>
+    private static (ICompiledTrainingPlan<float> plan, Tensor<float> big, Tensor<float> small) BuildClippedPlan(
+        int badBigIndex, int badSmallIndex, float bad)
+    {
+        const int bigLen = 3 * 65536 + 11, smallLen = 24;
+        var big = new Tensor<float>(new[] { bigLen });
+        var xBig = new Tensor<float>(new[] { bigLen });
+        var small = new Tensor<float>(new[] { smallLen });
+        var xSmall = new Tensor<float>(new[] { smallLen });
+        for (int i = 0; i < bigLen; i++) { big[i] = 0.5f + (i % 7) * 0.01f; xBig[i] = 0.25f + (i % 5) * 0.1f; }
+        for (int i = 0; i < smallLen; i++) { small[i] = 1.0f + 0.1f * i; xSmall[i] = 0.5f; }
+        if (badBigIndex >= 0) xBig[badBigIndex] = bad;
+        if (badSmallIndex >= 0) xSmall[badSmallIndex] = bad;
+
+        var engine = new CpuEngine();
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            var a = engine.ReduceSum(engine.TensorMultiply(big, xBig), null);
+            var b = engine.ReduceSum(engine.TensorMultiply(small, xSmall), null);
+            engine.TensorAdd(a, b);
+            plan = scope.CompileTraining(new[] { big, small });
+        }
+        plan.SetMaxGradNorm(1.0);
+        plan.ConfigureOptimizer(OptimizerType.AdamW, learningRate: 0.01, weightDecay: 0.01);
+        return (plan, big, small);
+    }
+
+    [Theory]
+    [InlineData(0, -1)]
+    [InlineData(131_073, -1)]
+    [InlineData(3 * 65536 + 10, -1)]
+    [InlineData(-1, 0)]
+    [InlineData(-1, 23)]
+    public void ClippedStep_NonFiniteGradientAnywhere_IsDiscarded(int badBigIndex, int badSmallIndex)
+    {
+        foreach (float bad in new[] { float.NaN, float.PositiveInfinity, float.NegativeInfinity })
+        {
+            var (plan, big, small) = BuildClippedPlan(badBigIndex, badSmallIndex, bad);
+            using (plan)
+            {
+                var bigBefore = Snapshot(big);
+                var smallBefore = Snapshot(small);
+                plan.Step();
+                Assert.True(plan.LastStepSkippedNonFiniteGradients, $"{bad} at big[{badBigIndex}] / small[{badSmallIndex}] was not discarded");
+                for (int i = 0; i < big.Length; i++)
+                    Assert.True(bigBefore[i].Equals(big[i]), $"big[{i}] changed on a discarded step");
+                for (int i = 0; i < small.Length; i++)
+                    Assert.True(smallBefore[i].Equals(small[i]), $"small[{i}] changed on a discarded step");
+            }
+        }
+    }
+
+    [Fact]
+    public void UnclippedStepAfterAClippedStep_InfiniteGradient_IsDiscarded()
+    {
+        // Step 1 clips; step 2 runs with clipping off on a gradient that is now infinite. Nothing the clip learned in
+        // step 1 may carry over to step 2.
+        const int bigLen = 2 * 65536 + 5;
+        var big = new Tensor<float>(new[] { bigLen });
+        var xBig = new Tensor<float>(new[] { bigLen });
+        for (int i = 0; i < bigLen; i++) { big[i] = 1f; xBig[i] = 0.5f; }
+        var engine = new CpuEngine();
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            engine.ReduceSum(engine.TensorMultiply(big, xBig), null);
+            plan = scope.CompileTraining(new[] { big });
+        }
+        using (plan)
+        {
+            plan.SetMaxGradNorm(1.0);
+            plan.ConfigureOptimizer(OptimizerType.AdamW, learningRate: 0.01);
+            plan.Step();
+            Assert.False(plan.LastStepSkippedNonFiniteGradients);
+
+            plan.SetMaxGradNorm(0);
+            xBig[70_000] = float.PositiveInfinity;
+            var before = Snapshot(big);
+            plan.Step();
+            Assert.True(plan.LastStepSkippedNonFiniteGradients, "an unclipped step with an infinite gradient was not discarded");
+            for (int i = 0; i < big.Length; i++)
+                Assert.True(before[i].Equals(big[i]), $"big[{i}] changed on a discarded step");
+        }
+    }
+
+    [Fact]
+    public void ClippedStep_FiniteGradients_Update()
+    {
+        var (plan, big, small) = BuildClippedPlan(-1, -1, 0f);
+        using (plan)
+        {
+            var bigBefore = Snapshot(big);
+            var smallBefore = Snapshot(small);
+            plan.Step();
+            Assert.False(plan.LastStepSkippedNonFiniteGradients);
+            int changed = 0;
+            for (int i = 0; i < big.Length; i++) if (!bigBefore[i].Equals(big[i])) changed++;
+            Assert.Equal(big.Length, changed);
+            for (int i = 0; i < small.Length; i++) Assert.NotEqual(smallBefore[i], small[i]);
+        }
+    }
+
     [Fact]
     public void FiniteGradient_StillUpdates_AndReportsNoSkip()
     {
