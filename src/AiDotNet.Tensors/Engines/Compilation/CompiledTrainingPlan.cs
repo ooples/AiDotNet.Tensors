@@ -1254,7 +1254,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
 
             fixed (float* pGrad = &gradients[gradOffsets[p]])
             {
-                gradientsFinite = FusedOptimizer.AllFiniteSimd(pGrad, lengths[p]);
+                gradientsFinite = FusedOptimizer.AllFiniteParallel(pGrad, lengths[p]);
             }
         }
 
@@ -8912,7 +8912,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             if (tensor.IsContiguous && offset == 0 && arr is double[] dNorm)
                 totalNormSq += SumSquaresVectorized(dNorm, len);
             else if (tensor.IsContiguous && offset == 0 && arr is float[] fNorm)
-                totalNormSq += SumSquaresVectorized(fNorm, len);
+                totalNormSq += SumSquaresChunked(fNorm, len);
             else if (tensor.IsContiguous && arr is not null)
                 for (int i = 0; i < len; i++)
                 {
@@ -8945,7 +8945,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             }
             else if (offset == 0 && arr is float[] fScale)
             {
-                ScaleInPlaceVectorized(fScale, len, (float)(maxNorm / (totalNorm + 1e-6)));
+                ScaleInPlaceChunked(fScale, len, (float)(maxNorm / (totalNorm + 1e-6)));
                 tensor.IncrementVersion();
             }
             else
@@ -9014,7 +9014,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         return s;
     }
 
-    internal static double SumSquaresVectorized(float[] a, int len)
+    internal static double SumSquaresVectorized(float[] a, int len) => SumSquaresRange(a, 0, len);
+
+    /// <summary>Sum of squares of a[start..end), accumulated in double -- <see cref="SumSquaresVectorized(float[], int)"/>
+    /// over a sub-range, with the same arithmetic.</summary>
+    internal static double SumSquaresRange(float[] a, int start, int end)
     {
         // Widen each float lane to double BEFORE squaring so the accumulation matches
         // the prior scalar path (double v = (double)arr[i]; sum += v*v) — squaring in
@@ -9023,8 +9027,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         int w = System.Numerics.Vector<float>.Count;
         var accLo = System.Numerics.Vector<double>.Zero;
         var accHi = System.Numerics.Vector<double>.Zero;
-        int i = 0;
-        for (; i <= len - w; i += w)
+        int i = start;
+        for (; i <= end - w; i += w)
         {
             var v = new System.Numerics.Vector<float>(a, i);
             System.Numerics.Vector.Widen(v, out var lo, out var hi);
@@ -9033,8 +9037,61 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         }
         double s = System.Numerics.Vector.Dot(accLo, System.Numerics.Vector<double>.One)
                  + System.Numerics.Vector.Dot(accHi, System.Numerics.Vector<double>.One);
-        for (; i < len; i++) { double v = a[i]; s += v * v; }
+        for (; i < end; i++) { double v = a[i]; s += v * v; }
         return s;
+    }
+
+    /// <summary>
+    /// Elements per partial sum of the chunked gradient-norm reduction. FIXED, never derived from the thread count:
+    /// the chunk partials are added in chunk order, so the norm depends on this constant and on nothing else -- the
+    /// same bits on any machine and at any MaxDegreeOfParallelism. A gradient of at most this many elements is one
+    /// chunk, summed exactly as before chunking existed.
+    /// </summary>
+    internal const int ClipChunkElements = 1 << 16;
+
+    /// <summary>
+    /// <see cref="SumSquaresVectorized(float[], int)"/> over fixed <see cref="ClipChunkElements"/>-element chunks summed
+    /// in parallel on the persistent pool, partials added in chunk order. The clip's two passes over a large dense
+    /// weight were serial (a 401K-element gradient: ~55 us to sum, ~70 us to scale, every step).
+    /// </summary>
+    internal static double SumSquaresChunked(float[] a, int len)
+    {
+        int chunks = (len + ClipChunkElements - 1) / ClipChunkElements;
+        if (chunks <= 1) return SumSquaresRange(a, 0, len);
+        var partials = System.Buffers.ArrayPool<double>.Shared.Rent(chunks);
+        try
+        {
+            Helpers.PersistentParallelExecutor.Instance.Execute(chunks, c =>
+                partials[c] = SumSquaresRange(a, c * ClipChunkElements, Math.Min(len, (c + 1) * ClipChunkElements)));
+            double s = 0.0;
+            for (int c = 0; c < chunks; c++) s += partials[c];
+            return s;
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<double>.Shared.Return(partials);
+        }
+    }
+
+    /// <summary><see cref="ScaleInPlaceVectorized(float[], int, float)"/> over the same chunks, in parallel. Each element
+    /// is one multiply whichever chunk or lane computes it, so the result is identical to the serial pass.</summary>
+    internal static void ScaleInPlaceChunked(float[] a, int len, float scale)
+    {
+        int chunks = (len + ClipChunkElements - 1) / ClipChunkElements;
+        if (chunks <= 1) { ScaleInPlaceVectorized(a, len, scale); return; }
+        Helpers.PersistentParallelExecutor.Instance.Execute(chunks, c =>
+        {
+            int start = c * ClipChunkElements, end = Math.Min(len, start + ClipChunkElements);
+            int w = System.Numerics.Vector<float>.Count;
+            var vs = new System.Numerics.Vector<float>(scale);
+            int i = start;
+            for (; i <= end - w; i += w)
+            {
+                var v = new System.Numerics.Vector<float>(a, i);
+                (v * vs).CopyTo(a, i);
+            }
+            for (; i < end; i++) a[i] *= scale;
+        });
     }
 
     internal static void ScaleInPlaceVectorized(double[] a, int len, double scale)
@@ -9233,7 +9290,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             if (g == null) continue;
             if (g.TryGetGpuBuffer() is null || g._gpuBackend is not Engines.DirectGpu.IDirectGpuBackend gcb)
             {
-                Engines.DirectGpu.GpuLaunchProbe.OnFallback("TryClipGradientsGlobalL2Gpu-gradient-not-device-resident", null);
+                // A fallback only on a GPU engine. On the CPU engine host gradients are the normal case, and recording
+                // it (a formatted key + a ConcurrentDictionary update) cost every CPU training step ~1% of its time.
+                if (_engine is Engines.DirectGpuTensorEngine)
+                    Engines.DirectGpu.GpuLaunchProbe.OnFallback("TryClipGradientsGlobalL2Gpu-gradient-not-device-resident", null);
                 return false;
             }
             cb ??= gcb;

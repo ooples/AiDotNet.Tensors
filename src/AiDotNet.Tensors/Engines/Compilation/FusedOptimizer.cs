@@ -128,6 +128,28 @@ internal static class FusedOptimizer
     }
 
     /// <summary>
+    /// <see cref="AllFiniteSimd(float*, int)"/> split over the persistent pool for a large gradient, with the same
+    /// element-parallel chunking (<see cref="ChunkPlan"/>) as the update kernels. A boolean, so the answer cannot
+    /// depend on the split; a chunk that finds a non-finite value lets the others skip their scan.
+    /// </summary>
+    internal static unsafe bool AllFiniteParallel(float* values, int length)
+    {
+        int nChunks = ChunkPlan(length, FloatSimdWidth, out int chunk);
+        if (nChunks <= 1) return AllFiniteSimd(values, length);
+        nint pv = (nint)values;
+        var nonFinite = new int[1];
+        AiDotNet.Tensors.Helpers.PersistentParallelExecutor.Instance.Execute(nChunks, c =>
+        {
+            if (System.Threading.Volatile.Read(ref nonFinite[0]) != 0) return;
+            int s = c * chunk;
+            int e = s + chunk; if (e > length) e = length;
+            if (s < e && !AllFiniteSimd((float*)pv + s, e - s))
+                System.Threading.Volatile.Write(ref nonFinite[0], 1);
+        });
+        return nonFinite[0] == 0;
+    }
+
+    /// <summary>
     /// Double-precision counterpart to <see cref="AllFiniteSimd(float*, int)"/>.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
