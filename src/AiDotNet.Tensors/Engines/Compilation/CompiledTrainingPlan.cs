@@ -2898,6 +2898,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
 
         // Cache raw arrays on first call — avoids AsWritableSpan()/GetDataArray() per step
         var gradArrays = _cachedGradArrays;
+        bool firstEagerStep = gradArrays == null;
         if (gradArrays == null)
         {
             gradArrays = new T[_preAllocatedGrads.Length][];
@@ -2927,7 +2928,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // Only zero gradient buffers used by generic (accumulating) backward delegates.
         // Specialized backward delegates overwrite completely (TryGemmEx beta=0, SIMD ReLU).
         // At large sizes, this saves significant time by skipping unnecessary clears.
-        if (_genericGradIndices != null)
+        // The first step still clears everything: the buffers are rented uninitialized, and one that no delegate
+        // writes (a gradient nothing produces) must read as zero from then on.
+        if (_genericGradIndices != null && !firstEagerStep)
         {
             for (int i = 0; i < _genericGradIndices.Length; i++)
             {
@@ -6929,6 +6932,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         var backwardActions = new List<Action<IEngine>>();
         var backwardStepNames = new List<string>();
         int genericBackwardCount = 0;
+        var genericAccumulatedTensors = new HashSet<Tensor<T>>();
 
         // Gradient relevance: a tensor's gradient can reach a parameter only when the tensor was COMPUTED FROM one.
         // The traced input batch, the labels, and everything derived from them alone (a label normaliser, a mask)
@@ -7012,6 +7016,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             {
                 genericBackwardCount++;
                 backwardStepNames.Add($"generic:{step.OpName}");
+                // A generic backward ADDS its contributions into its inputs' gradient buffers, so those buffers are
+                // the ones the step must zero first (see genericGradIndices below).
+                foreach (var genericInput in step.Inputs)
+                    if (genericInput is not null) genericAccumulatedTensors.Add(genericInput);
                 var stepCopy = step;
                 var gradAcc = gradMap;
                 backwardActions.Add(eng =>
@@ -7160,8 +7168,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // other buffer is fully overwritten by its beta=0 delegate and stays skipped.
         // When there are no multi-consumer tensors this yields an empty array — the
         // exact skip-all fast path as before, so feed-forward graphs are unchanged.
+        //
+        // A plan that ALSO has generic backward actions (a loss whose ops have no specialization -- LogSoftmax, a
+        // per-axis ReduceSum -- in front of specialized dense layers) used to clear EVERY buffer every step, the
+        // parameter gradients included, although the specialized delegates overwrite those. A generic backward
+        // accumulates only into its own inputs' gradients, so adding those buffers to the set keeps every
+        // accumulation target zeroed and leaves the overwritten ones alone. (The FP16 heterogeneous backward does
+        // not run these actions, so a plan with one keeps the clear-all.)
         int[]? genericGradIndices;
-        if (!useGradPool && genericBackwardCount == 0)
+        if (!useGradPool && (genericBackwardCount == 0 || fp16HeteroOrder is null))
         {
             // allGrads holds the distinct physical grad buffers (id == index), so a
             // reverse map gives each multi-consumer tensor's grad-buffer index.
@@ -7174,6 +7189,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             {
                 if (kv.Value <= 1) continue; // single-consumer buffers are overwritten, no zeroing needed
                 if (gradMap.TryGetValue(kv.Key, out var gradBuf)
+                    && gradBufferIndex.TryGetValue(gradBuf, out int bufIdx)
+                    && seenGradIndices.Add(bufIdx))
+                    accumulatingGradIndices.Add(bufIdx);
+            }
+            foreach (var accumulated in genericAccumulatedTensors)
+            {
+                if (gradMap.TryGetValue(accumulated, out var gradBuf)
                     && gradBufferIndex.TryGetValue(gradBuf, out int bufIdx)
                     && seenGradIndices.Add(bufIdx))
                     accumulatingGradIndices.Add(bufIdx);

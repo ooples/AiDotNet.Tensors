@@ -248,4 +248,68 @@ public sealed class CompiledFusedLinearBackwardTests : IDisposable
 
         Assert.Equal(Count(normaliseFromData: false), Count(normaliseFromData: true));
     }
+
+    /// <summary>
+    /// A loss with an unspecialized (generic, accumulating) backward -- LogSoftmax -- in front of specialized dense
+    /// layers. The step zeroes only the buffers an accumulating backward adds into; the logits gradient is one of
+    /// them, so a step that skipped it would add this step's gradient onto the previous one. Stepping three times at
+    /// fixed weights pins that every step's gradients equal the reference, not a multiple of it.
+    /// </summary>
+    [Fact]
+    public void GenericLossBackward_RepeatedStepsDoNotAccumulate()
+    {
+        const int rows = 32, inF = 48, hid = 40, outF = 10;
+        var engine = new CpuEngine();
+        var x = Rand([rows, inF], 41, 1f);
+        var target = Rand([rows, outF], 42, 1f);
+        var w1 = Rand([inF, hid], 43, 0.2f); var b1 = Rand([hid], 44, 0.1f);
+        var w2 = Rand([hid, outF], 45, 0.2f); var b2 = Rand([outF], 46, 0.1f);
+        var parameters = new[] { w1, b1, w2, b2 };
+
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.EnableTraining(parameters))
+        {
+            var h = engine.ReLU(engine.FusedLinear(x, w1, b1, FusedActivationType.None));
+            var z = engine.FusedLinear(h, w2, b2, FusedActivationType.None);
+            var loss = engine.ReduceSum(engine.TensorMultiply(engine.TensorLogSoftmax(z, 1), target), null);
+            plan = scope.CompileTraining(parameters, loss);
+        }
+
+        // Reference: L = sum(logsoftmax(z) * T)  =>  dL/dz[r,j] = T[r,j] - softmax(z)[r,j] * sum_j T[r,j].
+        var z1 = MatMul(D(x), D(w1), rows, inF, hid);
+        var b1d = D(b1);
+        for (int r = 0; r < rows; r++) for (int j = 0; j < hid; j++) z1[r * hid + j] += b1d[j];
+        var hRef = z1.Select(v => Math.Max(v, 0)).ToArray();
+        var zRef = MatMul(hRef, D(w2), rows, hid, outF);
+        var b2d = D(b2); var td = D(target);
+        var dZ = new double[rows * outF];
+        for (int r = 0; r < rows; r++)
+        {
+            double max = double.NegativeInfinity;
+            for (int j = 0; j < outF; j++) max = Math.Max(max, zRef[r * outF + j] + b2d[j]);
+            double sumExp = 0, sumT = 0;
+            for (int j = 0; j < outF; j++) { sumExp += Math.Exp(zRef[r * outF + j] + b2d[j] - max); sumT += td[r * outF + j]; }
+            for (int j = 0; j < outF; j++)
+                dZ[r * outF + j] = td[r * outF + j] - Math.Exp(zRef[r * outF + j] + b2d[j] - max) / sumExp * sumT;
+        }
+        var dW2 = MatMul(Transpose(hRef, rows, hid), dZ, hid, rows, outF);
+        var db2 = ColumnSums(dZ, rows, outF);
+        var dH = MatMul(dZ, Transpose(D(w2), hid, outF), rows, outF, hid);
+        var dZ1 = dH.Select((g, i) => z1[i] > 0 ? g : 0).ToArray();
+        var dW1 = MatMul(Transpose(D(x), rows, inF), dZ1, inF, rows, hid);
+        var db1 = ColumnSums(dZ1, rows, hid);
+
+        using (plan)
+        {
+            for (int step = 0; step < 3; step++)
+            {
+                plan.Step();
+                var g = plan.Gradients;
+                AssertClose(dW1, g[0], $"step {step} dW1");
+                AssertClose(db1, g[1], $"step {step} db1");
+                AssertClose(dW2, g[2], $"step {step} dW2");
+                AssertClose(db2, g[3], $"step {step} db2");
+            }
+        }
+    }
 }
