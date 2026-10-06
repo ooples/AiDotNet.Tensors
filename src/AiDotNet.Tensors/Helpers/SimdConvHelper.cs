@@ -1131,6 +1131,19 @@ internal static class SimdConvHelper
         int outWidth = width + 2 * padW - (dilationW * 2 + 1) + 1;
         int outputSize = outHeight * outWidth;
 
+        // Default (Auto) route: every output position on the SIMD path, over a zero-padded copy of each image.
+        // The OcBlock kernels below only vectorize the interior 8-column chunks and fall to a scalar, bounds-checked
+        // loop for the border rows, border columns and the column tail. On small maps that scalar loop is most of
+        // the work (14x14: 100 of 196 outputs), so it, not the FMA count, set the cost of the conv. An explicit
+        // AIDOTNET_CONV3X3_VARIANT keeps the legacy kernels reachable for A/B.
+        if (UseFma && dilationH == 1 && dilationW == 1 && ActiveConv3x3Variant == Conv3x3Variant.Auto
+            && outHeight > 0 && outWidth > 0)
+        {
+            Conv3x3Stride1PaddedTiled(input, kernel, output, batch, inChannels, height, width,
+                outChannels, padH, padW, outHeight, outWidth);
+            return;
+        }
+
         // #209 close-parity A/B: select Conv3x3 variant.
         // Pad=1 dilation=1 are required by the OcBlock kernels.
         bool padOneNoDilation = padH == 1 && padW == 1 && dilationH == 1 && dilationW == 1;
@@ -1195,6 +1208,231 @@ internal static class SimdConvHelper
             CpuParallelSettings.LightweightParallel(totalTasks, RunTask);
         else
             for (int task = 0; task < totalTasks; task++) RunTask(task);
+    }
+
+    [ThreadStatic] private static float[]? t_conv3x3PaddedImage;
+
+    /// <summary>
+    /// 3x3 stride-1 dilation-1 convolution (any padding) computed entirely with AVX2 FMAs. Each task copies one
+    /// image into a zero-padded scratch whose row stride is a whole number of 8-wide column chunks plus the two
+    /// halo columns, so every output position (borders included) is an unconditional vector FMA chain and the
+    /// last, partial column chunk is written with a masked store. Each kernel call holds TWO output channels x
+    /// FOUR output rows of accumulators (8 ymm) plus the six broadcast weights of one kernel row (6 ymm): one
+    /// input vector load feeds two FMAs and one weight broadcast is reused across four rows.
+    /// </summary>
+    /// <remarks>
+    /// Per output element the reduction order is input channel, then kernel row, then kernel column, with one FMA
+    /// per tap -- the same order as the interior path of the OcBlock kernels, so interior outputs are
+    /// bit-identical to them; padded taps add an exact 0. Tasks are (image, run of output-channel pairs) and each
+    /// output element is written by exactly one task, so the result does not depend on the thread count.
+    /// </remarks>
+    private static unsafe void Conv3x3Stride1PaddedTiled(
+        float* input, float* kernel, float* output,
+        int batch, int inChannels, int height, int width,
+        int outChannels, int padH, int padW, int outHeight, int outWidth)
+    {
+        int colChunks = (outWidth + 7) >> 3;
+        int paddedW = colChunks * 8 + 2;
+        int paddedH = outHeight + 2;
+        int plane = paddedH * paddedW;
+        int imageLen = checked(inChannels * plane);
+        int ocPairs = (outChannels + 1) >> 1;
+        int outPlane = outHeight * outWidth;
+        long inputImage = (long)inChannels * height * width;
+        long outputImage = (long)outChannels * outPlane;
+        int kernelPerOc = inChannels * 9;
+
+        // Give the pool ~4 tasks per participant, but keep whole runs of channel pairs per task so the image
+        // padding (inChannels * plane copies) is amortized over as many output channels as the split allows.
+        long participants = Math.Max(1, CpuParallelSettings.MaxDegreeOfParallelism);
+        int pairsPerTask = (int)Math.Max(1, Math.Min(ocPairs, (long)batch * ocPairs / (4 * participants)));
+        int groups = (ocPairs + pairsPerTask - 1) / pairsPerTask;
+        int totalTasks = checked(batch * groups);
+        long totalFmas = (long)batch * outChannels * inChannels * outPlane * 9L;
+        bool useParallel = totalTasks >= 2 && totalFmas >= 100_000L && CpuParallelSettings.MaxDegreeOfParallelism > 1;
+
+        void RunTask(int task)
+        {
+            int b = task / groups, g = task - b * groups;
+            var scratch = t_conv3x3PaddedImage;
+            if (scratch is null || scratch.Length < imageLen)
+            {
+                scratch = new float[imageLen];
+                t_conv3x3PaddedImage = scratch;
+            }
+            fixed (float* padded = scratch)
+            {
+                PadImageForConv3x3(input + b * inputImage, padded, inChannels, height, width,
+                    padH, padW, paddedH, paddedW);
+                float* outImage = output + b * outputImage;
+                int pairEnd = Math.Min(ocPairs, (g + 1) * pairsPerTask);
+                for (int pair = g * pairsPerTask; pair < pairEnd; pair++)
+                {
+                    int oc0 = pair * 2;
+                    // An odd last channel runs the pair kernel with itself as the partner and drops the copy.
+                    bool hasSecond = oc0 + 1 < outChannels;
+                    float* k0 = kernel + (long)oc0 * kernelPerOc;
+                    float* k1 = hasSecond ? k0 + kernelPerOc : k0;
+                    float* o0 = outImage + (long)oc0 * outPlane;
+                    float* o1 = hasSecond ? o0 + outPlane : null;
+                    Conv3x3PairPlane(padded, plane, paddedW, k0, k1, inChannels, o0, o1,
+                        outHeight, outWidth, colChunks);
+                }
+            }
+        }
+
+        if (useParallel)
+            CpuParallelSettings.LightweightParallel(totalTasks, RunTask);
+        else
+            for (int task = 0; task < totalTasks; task++) RunTask(task);
+    }
+
+    /// <summary>Copies one [channels, height, width] image into a zero-bordered [channels, paddedH, paddedW] plane set.</summary>
+    private static unsafe void PadImageForConv3x3(
+        float* src, float* dst, int channels, int height, int width,
+        int padH, int padW, int paddedH, int paddedW)
+    {
+        int right = paddedW - padW - width;
+        long rowBytes = (long)width * sizeof(float);
+        for (int c = 0; c < channels; c++)
+        {
+            float* srcPlane = src + (long)c * height * width;
+            float* dstPlane = dst + (long)c * paddedH * paddedW;
+            for (int r = 0; r < paddedH; r++)
+            {
+                float* dstRow = dstPlane + (long)r * paddedW;
+                int ih = r - padH;
+                if ((uint)ih >= (uint)height)
+                {
+                    new Span<float>(dstRow, paddedW).Clear();
+                    continue;
+                }
+                if (padW > 0) new Span<float>(dstRow, padW).Clear();
+                Buffer.MemoryCopy(srcPlane + (long)ih * width, dstRow + padW, rowBytes, rowBytes);
+                if (right > 0) new Span<float>(dstRow + padW + width, right).Clear();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Writes one or two full output planes from a padded image (see <see cref="Conv3x3Stride1PaddedTiled"/>).
+    /// <paramref name="out1"/> null means single-channel: the pair kernel runs with k1 == k0 and the second copy
+    /// is discarded.
+    /// </summary>
+    private static unsafe void Conv3x3PairPlane(
+        float* padded, int plane, int paddedW, float* k0, float* k1, int inChannels,
+        float* out0, float* out1, int outHeight, int outWidth, int colChunks)
+    {
+        int tailValid = outWidth - (colChunks - 1) * 8;
+        var tailMask = Vector256.LessThan(
+            Vector256.Create(0, 1, 2, 3, 4, 5, 6, 7), Vector256.Create(tailValid)).AsSingle();
+        for (int c = 0; c < colChunks; c++)
+        {
+            int ow = c * 8;
+            bool full = c < colChunks - 1 || tailValid == 8;
+            int oh = 0;
+            for (; oh + 4 <= outHeight; oh += 4)
+                Conv3x3PairRows4(padded + oh * paddedW + ow, plane, paddedW, k0, k1, inChannels,
+                    out0 + oh * outWidth + ow, out1 == null ? null : out1 + oh * outWidth + ow,
+                    outWidth, full, tailMask);
+            for (; oh < outHeight; oh++)
+                Conv3x3PairRow1(padded + oh * paddedW + ow, plane, paddedW, k0, k1, inChannels,
+                    out0 + oh * outWidth + ow, out1 == null ? null : out1 + oh * outWidth + ow,
+                    full, tailMask);
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void StoreConvChunk(float* dst, Vector256<float> v, bool full, Vector256<float> mask)
+    {
+        if (full) Avx.Store(dst, v);
+        else Avx.MaskStore(dst, mask, v);
+    }
+
+    /// <summary>Two output channels x four output rows x one 8-wide column chunk.</summary>
+    [MethodImpl(HotInline)]
+    private static unsafe void Conv3x3PairRows4(
+        float* src, int plane, int paddedW, float* k0, float* k1, int inChannels,
+        float* dst0, float* dst1, int outWidth, bool full, Vector256<float> mask)
+    {
+        var a0 = Vector256<float>.Zero; var a1 = Vector256<float>.Zero;
+        var a2 = Vector256<float>.Zero; var a3 = Vector256<float>.Zero;
+        var b0 = Vector256<float>.Zero; var b1 = Vector256<float>.Zero;
+        var b2 = Vector256<float>.Zero; var b3 = Vector256<float>.Zero;
+        for (int ic = 0; ic < inChannels; ic++)
+        {
+            float* s = src + (long)ic * plane;
+            float* w0 = k0 + ic * 9;
+            float* w1 = k1 + ic * 9;
+            for (int kh = 0; kh < 3; kh++)
+            {
+                var p0 = Vector256.Create(w0[kh * 3]);
+                var p1 = Vector256.Create(w0[kh * 3 + 1]);
+                var p2 = Vector256.Create(w0[kh * 3 + 2]);
+                var q0 = Vector256.Create(w1[kh * 3]);
+                var q1 = Vector256.Create(w1[kh * 3 + 1]);
+                var q2 = Vector256.Create(w1[kh * 3 + 2]);
+                float* r = s + kh * paddedW;
+                Vector256<float> x;
+                x = Avx.LoadVector256(r);     a0 = Fma.MultiplyAdd(x, p0, a0); b0 = Fma.MultiplyAdd(x, q0, b0);
+                x = Avx.LoadVector256(r + 1); a0 = Fma.MultiplyAdd(x, p1, a0); b0 = Fma.MultiplyAdd(x, q1, b0);
+                x = Avx.LoadVector256(r + 2); a0 = Fma.MultiplyAdd(x, p2, a0); b0 = Fma.MultiplyAdd(x, q2, b0);
+                r += paddedW;
+                x = Avx.LoadVector256(r);     a1 = Fma.MultiplyAdd(x, p0, a1); b1 = Fma.MultiplyAdd(x, q0, b1);
+                x = Avx.LoadVector256(r + 1); a1 = Fma.MultiplyAdd(x, p1, a1); b1 = Fma.MultiplyAdd(x, q1, b1);
+                x = Avx.LoadVector256(r + 2); a1 = Fma.MultiplyAdd(x, p2, a1); b1 = Fma.MultiplyAdd(x, q2, b1);
+                r += paddedW;
+                x = Avx.LoadVector256(r);     a2 = Fma.MultiplyAdd(x, p0, a2); b2 = Fma.MultiplyAdd(x, q0, b2);
+                x = Avx.LoadVector256(r + 1); a2 = Fma.MultiplyAdd(x, p1, a2); b2 = Fma.MultiplyAdd(x, q1, b2);
+                x = Avx.LoadVector256(r + 2); a2 = Fma.MultiplyAdd(x, p2, a2); b2 = Fma.MultiplyAdd(x, q2, b2);
+                r += paddedW;
+                x = Avx.LoadVector256(r);     a3 = Fma.MultiplyAdd(x, p0, a3); b3 = Fma.MultiplyAdd(x, q0, b3);
+                x = Avx.LoadVector256(r + 1); a3 = Fma.MultiplyAdd(x, p1, a3); b3 = Fma.MultiplyAdd(x, q1, b3);
+                x = Avx.LoadVector256(r + 2); a3 = Fma.MultiplyAdd(x, p2, a3); b3 = Fma.MultiplyAdd(x, q2, b3);
+            }
+        }
+        StoreConvChunk(dst0, a0, full, mask);
+        StoreConvChunk(dst0 + outWidth, a1, full, mask);
+        StoreConvChunk(dst0 + 2 * outWidth, a2, full, mask);
+        StoreConvChunk(dst0 + 3 * outWidth, a3, full, mask);
+        if (dst1 != null)
+        {
+            StoreConvChunk(dst1, b0, full, mask);
+            StoreConvChunk(dst1 + outWidth, b1, full, mask);
+            StoreConvChunk(dst1 + 2 * outWidth, b2, full, mask);
+            StoreConvChunk(dst1 + 3 * outWidth, b3, full, mask);
+        }
+    }
+
+    /// <summary>Two output channels x one output row x one 8-wide column chunk (the row remainder).</summary>
+    [MethodImpl(HotInline)]
+    private static unsafe void Conv3x3PairRow1(
+        float* src, int plane, int paddedW, float* k0, float* k1, int inChannels,
+        float* dst0, float* dst1, bool full, Vector256<float> mask)
+    {
+        var a = Vector256<float>.Zero;
+        var b = Vector256<float>.Zero;
+        for (int ic = 0; ic < inChannels; ic++)
+        {
+            float* s = src + (long)ic * plane;
+            float* w0 = k0 + ic * 9;
+            float* w1 = k1 + ic * 9;
+            for (int kh = 0; kh < 3; kh++)
+            {
+                float* r = s + kh * paddedW;
+                var x0 = Avx.LoadVector256(r);
+                var x1 = Avx.LoadVector256(r + 1);
+                var x2 = Avx.LoadVector256(r + 2);
+                a = Fma.MultiplyAdd(x0, Vector256.Create(w0[kh * 3]), a);
+                a = Fma.MultiplyAdd(x1, Vector256.Create(w0[kh * 3 + 1]), a);
+                a = Fma.MultiplyAdd(x2, Vector256.Create(w0[kh * 3 + 2]), a);
+                b = Fma.MultiplyAdd(x0, Vector256.Create(w1[kh * 3]), b);
+                b = Fma.MultiplyAdd(x1, Vector256.Create(w1[kh * 3 + 1]), b);
+                b = Fma.MultiplyAdd(x2, Vector256.Create(w1[kh * 3 + 2]), b);
+            }
+        }
+        StoreConvChunk(dst0, a, full, mask);
+        if (dst1 != null) StoreConvChunk(dst1, b, full, mask);
     }
 
     /// <summary>
