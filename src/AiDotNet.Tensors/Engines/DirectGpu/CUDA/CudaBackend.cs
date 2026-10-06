@@ -5999,6 +5999,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         IGpuBuffer? workspace = null;
         try
         {
+            // AIDOTNET_CUBLAS_WORKSPACE=0: kill switch back to cuBLAS's internal allocator (and per-slice capture GEMMs).
             if (System.Environment.GetEnvironmentVariable("AIDOTNET_CUBLAS_WORKSPACE") == "0") throw new InvalidOperationException("cuBLAS workspace disabled");
             workspace = AllocateBuffer(CublasWorkspaceFloats);
             var status = CuBlasNative.cublasSetWorkspace(h, workspace.Handle, (UIntPtr)((ulong)CublasWorkspaceFloats * sizeof(float)));
