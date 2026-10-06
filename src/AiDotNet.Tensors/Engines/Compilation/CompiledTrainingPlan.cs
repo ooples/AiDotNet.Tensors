@@ -10295,6 +10295,44 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             };
         }
 
+        // MaxPool2D backward for a graph-mode pool node, which saves only its geometry ([poolSize, stride], no
+        // indices): the CPU engine re-scans the forward input for each window's winner and writes the gradient
+        // straight into the plan's buffer. The node's own backward replays the whole forward under a tape and
+        // accumulates a fresh tensor -- measured 4.6 ms of a 20 ms parity-CNN step, against a pass over the input.
+        if (step.OpType == OpType.MaxPool2D && step.Inputs.Length == 1
+            && step.SavedState is { Length: 2 } geometry
+            && geometry[0] is int[] { Length: 2 } recomputePool
+            && geometry[1] is int[] { Length: 2 } recomputeStride
+            && step.Inputs[0].Rank == 4 && step.Inputs[0].IsContiguous
+            && engine is CpuEngine && !engine.SupportsGpu)
+        {
+            var input = step.Inputs[0];
+            var output = step.OutputBuffer;
+            if (!gradMap.TryGetValue(output, out var gradOut) || !gradMap.TryGetValue(input, out var gradIn))
+                return null;
+            bool accum = consumerCount.TryGetValue(input, out int poolInputConsumers) && poolInputConsumers > 1;
+            int pH = recomputePool[0], pW = recomputePool[1], sH = recomputeStride[0], sW = recomputeStride[1];
+            return eng =>
+            {
+                if (eng is CpuEngine cpu && !eng.SupportsGpu)
+                {
+                    cpu.MaxPool2DBackwardRecomputeInto(gradIn, gradOut, input, pH, pW, sH, sW, accum);
+                }
+                else
+                {
+                    // Another engine at replay: recover the winners with its own indexed pool, outside any tape.
+                    Tensor<int> winners;
+                    using (new NoGradScope<T>())
+                        eng.MaxPool2DWithTensorIndices(input, recomputePool, recomputeStride, out winners);
+                    var grad = eng.MaxPool2DBackwardWithTensorIndices(gradOut, winners, input._shape,
+                        recomputePool, recomputeStride);
+                    if (accum) eng.TensorAddInto(gradIn, gradIn, grad);
+                    else grad.AsSpan().CopyTo(gradIn.AsWritableSpan());
+                }
+                input.Grad = gradIn;
+            };
+        }
+
         // MaxPool2D backward: scatter gradOutput into gradInput at saved
         // max-index positions. Tier 1.5 — saves the alloc + AccumulateGrad
         // per MaxPool layer.

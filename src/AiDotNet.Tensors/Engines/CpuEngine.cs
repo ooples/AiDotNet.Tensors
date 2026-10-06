@@ -16666,14 +16666,13 @@ public partial class CpuEngine : ITensorLevelEngine
                 maxIndices = new int[batch, channels, outputHeight, outputWidth, 2];
                 var captured = input;
                 int ph = poolH, pw = poolW, sh = strideH, sw = strideW;
-                // No backwardFn / savedState: this branch is gated to
-                // GradientTape<T>.Current is null (inference-only trace), so
-                // replay never runs a backward. Recording
-                // MaxPool2DWithIndicesBackward + the zero-filled maxIndices
-                // here would (a) pin a potentially large
-                // int[batch, channels, outH, outW, 2] for the lifetime of
-                // the lazy graph / compiled plan, and (b) hand any future
-                // backward consumer corrupt all-zero routing indices.
+                // No saved indices: recording MaxPool2DWithIndicesBackward + the
+                // zero-filled maxIndices here would (a) pin a potentially large
+                // int[batch, channels, outH, outW, 2] for the lifetime of the
+                // lazy graph / compiled plan, and (b) hand any backward consumer
+                // corrupt all-zero routing indices. A compiled training plan
+                // recovers the winners from the input instead (see the backward
+                // and saved geometry below).
                 return scope.RecordUnary(LazyNodeType.MaxPool2D, "MaxPool2DWithIndices", input,
                     new[] { batch, channels, outputHeight, outputWidth },
                     (eng, output) =>
@@ -16690,7 +16689,11 @@ public partial class CpuEngine : ITensorLevelEngine
                             DirectGpuTensorEngine.CopyResultInto(eng, eager, output);
                         }
                     },
-                    BackwardFunctions<T>.ReplayUnderTape(eng => eng.MaxPool2DWithTensorIndices(captured, new[] { ph, pw }, new[] { sh, sw }, out _)));
+                    BackwardFunctions<T>.ReplayUnderTape(eng => eng.MaxPool2DWithTensorIndices(captured, new[] { ph, pw }, new[] { sh, sw }, out _)),
+                    // The pool geometry (no indices): lets a compiled CPU training plan run the backward as one
+                    // re-scan of the input written straight into the gradient buffer (MaxPool2DBackwardRecomputeInto)
+                    // instead of replaying the forward under a tape, and lets the serializer rebuild the real pool.
+                    new object[] { new[] { ph, pw }, new[] { sh, sw } });
             }
         }
 
@@ -17025,6 +17028,137 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }, deterministicSafe: true);
         return result;
+    }
+
+    /// <summary>
+    /// Unpadded MaxPool2D backward that finds each window's winner by re-scanning the forward INPUT, then writes the
+    /// input gradient straight into <paramref name="gradInput"/>. The winner rule is exactly the one
+    /// <c>MaxPool2DWithTensorIndices</c> records (start below every finite value, strict greater-than in row-major
+    /// window order, so the first maximum wins and NaN never does; a window with no winner routes to plane index 0),
+    /// so the gradient is the one the tape would produce from saved indices -- without saving them, without a
+    /// replayed forward, and without a temporary gradient tensor.
+    /// </summary>
+    /// <remarks>
+    /// Per input plane the contributions land in output (row-major) order onto zero, exactly as the saved-index
+    /// scatter does; with <paramref name="accumulate"/> that plane-sized sum is formed in scratch first and then added
+    /// to the caller's value once per cell (<c>existing + sum</c>, as a separate scatter plus TensorAddInto would),
+    /// so either way the result is bit-identical to the indexed path. Planes are independent, so the result does not
+    /// depend on the thread count.
+    /// </remarks>
+    internal void MaxPool2DBackwardRecomputeInto<T>(
+        Tensor<T> gradInput, Tensor<T> gradOutput, Tensor<T> input,
+        int poolH, int poolW, int strideH, int strideW, bool accumulate)
+    {
+        if (gradInput == null) throw new ArgumentNullException(nameof(gradInput));
+        if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (input.Rank != 4 || gradOutput.Rank != 4)
+            throw new ArgumentException("MaxPool2D backward needs rank-4 [batch, channels, height, width] tensors.");
+        if (poolH <= 0 || poolW <= 0 || strideH <= 0 || strideW <= 0)
+            throw new ArgumentException("Pool size and stride must be positive.");
+        int batch = input._shape[0], channels = input._shape[1];
+        int height = input._shape[2], width = input._shape[3];
+        int outH = gradOutput._shape[2], outW = gradOutput._shape[3];
+        if (gradOutput._shape[0] != batch || gradOutput._shape[1] != channels
+            || outH != (height - poolH) / strideH + 1 || outW != (width - poolW) / strideW + 1)
+            throw new ArgumentException("Output gradient shape does not match an unpadded pool of the input.", nameof(gradOutput));
+        if (gradInput.Length != input.Length)
+            throw new ArgumentException("Input gradient must have the input's shape.", nameof(gradInput));
+
+        int planes = checked(batch * channels);
+        int inPlane = height * width, outPlane = outH * outW;
+        var src = input.GetCpuBackingForStridedRead(out int srcOff);
+        var go = gradOutput.GetCpuBackingForStridedRead(out int goOff);
+        var gi = gradInput.GetCpuBackingForContiguousWrite(out int giOff);
+        if (typeof(T) == typeof(float) && src is not null && go is not null && gi is not null
+            && input.IsContiguous && gradOutput.IsContiguous)
+        {
+            var x = (float[])(object)src;
+            var g = (float[])(object)go;
+            var d = (float[])(object)gi;
+            // A window that tiles its input without overlap owns its cells, so the plane is written in one pass
+            // (each owned cell gets 0 + g or 0); only uncovered remainder rows/columns need a separate zero.
+            bool tiles = !accumulate && strideH == poolH && strideW == poolW;
+            CpuParallelSettings.ParallelForOrSerial(0, planes, (long)planes * inPlane, plane =>
+            {
+                int xBase = srcOff + plane * inPlane, gBase = goOff + plane * outPlane;
+                // Accumulating: scatter this plane into zeroed scratch, then add it to the destination once.
+                float[]? scratch = accumulate ? System.Buffers.ArrayPool<float>.Shared.Rent(inPlane) : null;
+                float[] dst = scratch ?? d;
+                int dBase = scratch is null ? giOff + plane * inPlane : 0;
+                if (!tiles)
+                    Array.Clear(dst, dBase, inPlane);
+                if (tiles)
+                {
+                    int coveredH = outH * poolH, coveredW = outW * poolW;
+                    for (int r = 0; r < coveredH; r++)
+                        if (coveredW < width) Array.Clear(dst, dBase + r * width + coveredW, width - coveredW);
+                    if (coveredH < height) Array.Clear(dst, dBase + coveredH * width, (height - coveredH) * width);
+                }
+                for (int oh = 0; oh < outH; oh++)
+                {
+                    int ih0 = oh * strideH;
+                    for (int ow = 0; ow < outW; ow++)
+                    {
+                        int iw0 = ow * strideW;
+                        float maxVal = float.MinValue;
+                        int maxIdx = 0;
+                        for (int kh = 0; kh < poolH; kh++)
+                        {
+                            int row = (ih0 + kh) * width;
+                            for (int kw = 0; kw < poolW; kw++)
+                            {
+                                float v = x[xBase + row + iw0 + kw];
+                                if (v > maxVal) { maxVal = v; maxIdx = row + iw0 + kw; }
+                            }
+                        }
+                        if (tiles)
+                        {
+                            for (int kh = 0; kh < poolH; kh++)
+                            {
+                                int row = dBase + (ih0 + kh) * width + iw0;
+                                for (int kw = 0; kw < poolW; kw++) dst[row + kw] = 0f;
+                            }
+                        }
+                        dst[dBase + maxIdx] += g[gBase + oh * outW + ow];
+                    }
+                }
+                if (scratch is not null)
+                {
+                    int target = giOff + plane * inPlane;
+                    for (int i = 0; i < inPlane; i++) d[target + i] += scratch[i];
+                    System.Buffers.ArrayPool<float>.Shared.Return(scratch);
+                }
+            });
+            return;
+        }
+
+        // Any other element type or layout: the saved-index scatter on a materialised index tensor.
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var xs = input.IsContiguous ? input : input.Contiguous();
+        var xData = xs.GetFlattenedData();
+        var flat = new int[gradOutput.Length];
+        for (int plane = 0; plane < planes; plane++)
+        {
+            int xBase = plane * inPlane;
+            for (int oh = 0; oh < outH; oh++)
+            for (int ow = 0; ow < outW; ow++)
+            {
+                T maxVal = numOps.MinValue;
+                int maxIdx = 0;
+                for (int kh = 0; kh < poolH; kh++)
+                for (int kw = 0; kw < poolW; kw++)
+                {
+                    int idx = (oh * strideH + kh) * width + ow * strideW + kw;
+                    if (numOps.GreaterThan(xData[xBase + idx], maxVal)) { maxVal = xData[xBase + idx]; maxIdx = idx; }
+                }
+                flat[plane * outPlane + oh * outW + ow] = maxIdx;
+            }
+        }
+        var grad = MaxPool2DBackwardWithTensorIndices(gradOutput, new Tensor<int>(flat, (int[])gradOutput._shape.Clone()),
+            input._shape, new[] { poolH, poolW }, new[] { strideH, strideW });
+        if (accumulate) TensorAddInto(gradInput, gradInput, grad);
+        else grad.AsSpan().CopyTo(gradInput.AsWritableSpan());
     }
 
     /// <summary>
