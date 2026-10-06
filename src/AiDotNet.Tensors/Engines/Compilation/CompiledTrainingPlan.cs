@@ -406,6 +406,20 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     /// environment switch is read once per process, so this is how a single test process compares a captured plan
     /// against an eager one (the parity oracle for capture).
     /// </summary>
+    /// <summary>
+    /// Why whole-step CUDA-graph capture was abandoned for this plan, or null while it is still eligible or engaged.
+    /// A failed capture used to be swallowed: the plan trained eagerly for the rest of its life (paying a launch, copy
+    /// or sync per op) and nothing said so. Measured on the PyTorch parity MLP and CNN, every run took that path.
+    /// </summary>
+    public string? GraphCaptureFailureReason { get; private set; }
+
+    private void RecordGraphCaptureFailure(string reason)
+    {
+        GraphCaptureFailureReason = reason;
+        System.Diagnostics.Trace.TraceWarning(
+            "CUDA graph capture of the compiled training step failed; this plan trains without graph replay from now on. " + reason);
+    }
+
     internal void DisableGraphStep()
     {
         InvalidateCapturedStepGraph();
@@ -2152,8 +2166,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                         using (AiDotNet.Tensors.Engines.DirectGpu.GpuMemoryTracker.BeginCapture("StepGraphCapture"))
                             exec = cb.CaptureGraph(() => RunGpuStepBodyForCapture(cb));
                     }
-                    catch
+                    catch (Exception captureFailure)
                     {
+                        RecordGraphCaptureFailure(captureFailure.GetType().Name + ": " + captureFailure.Message);
                         // A throw during pre-residency/capture (not just exec==Zero) must also roll back the
                         // graph-lifetime state — otherwise eviction stays suspended (pins every offload buffer,
                         // risking OOM) and the embedding stays in externally-managed mode (the eager fallback
@@ -2175,6 +2190,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                     }
                     if (exec == IntPtr.Zero)
                     {
+                        RecordGraphCaptureFailure("the captured stream produced no graph (an op in the step body is not "
+                            + "capturable: a host read, a synchronous copy or an allocation; AIDOTNET_GRAPH_CAPTURE_DEBUG=1 names it)");
                         // Capture failed → the graph is permanently abandoned for this plan. Resume the
                         // eviction suspension we took above right now: StepEager doesn't need stable device
                         // pointers, and leaving it suspended for the plan's whole lifetime pins every offload
