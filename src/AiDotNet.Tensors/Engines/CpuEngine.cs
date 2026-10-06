@@ -8739,6 +8739,12 @@ public partial class CpuEngine : ITensorLevelEngine
                 {
                     float* inBase = (float*)ipIn + idx * hw;
                     float* outBase = (float*)ipOut + idx * ohow;
+                    if (st == 2)
+                    {
+                        for (int oh = 0; oh < oH; oh++)
+                            MaxPool2x2Stride2Row(inBase + oh * 2 * w, inBase + oh * 2 * w + w, outBase + oh * oW, oW);
+                        return;
+                    }
                     for (int oh = 0; oh < oH; oh++)
                     {
                         float* r0 = inBase + oh * st * w;
@@ -8762,6 +8768,12 @@ public partial class CpuEngine : ITensorLevelEngine
                 {
                     float* inBase = pIn + idx * hw;
                     float* outBase = pOut + idx * ohow;
+                    if (st == 2)
+                    {
+                        for (int oh = 0; oh < oH; oh++)
+                            MaxPool2x2Stride2Row(inBase + oh * 2 * w, inBase + oh * 2 * w + w, outBase + oh * oW, oW);
+                        continue;
+                    }
                     for (int oh = 0; oh < oH; oh++)
                     {
                         float* r0 = inBase + oh * st * w;
@@ -17123,7 +17135,13 @@ public partial class CpuEngine : ITensorLevelEngine
                         if (coveredW < width) Array.Clear(dst, dBase + r * width + coveredW, width - coveredW);
                     if (coveredH < height) Array.Clear(dst, dBase + coveredH * width, (height - coveredH) * width);
                 }
-                for (int oh = 0; oh < outH; oh++)
+                int ohStart = 0;
+                if (tiles && poolH == 2 && poolW == 2 && strideH == 2 && strideW == 2)
+                {
+                    MaxPool2x2Stride2TilesBackwardPlane(x, xBase, g, gBase, dst, dBase, width, outH, outW);
+                    ohStart = outH;
+                }
+                for (int oh = ohStart; oh < outH; oh++)
                 {
                     int ih0 = oh * strideH;
                     for (int ow = 0; ow < outW; ow++)

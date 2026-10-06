@@ -47,6 +47,8 @@ public class MaxPoolRecomputeBackwardTests
     [InlineData(1, 3, 9, 9, 3, 2)]    // overlapping windows: a cell can win twice
     [InlineData(2, 2, 6, 10, 2, 3)]   // stride wider than the window: gaps between windows
     [InlineData(1, 1, 3, 3, 3, 1)]    // one window covering the whole plane
+    [InlineData(2, 3, 6, 34, 2, 2)]   // 17 windows per row: two 8-window vector blocks plus a scalar tail
+    [InlineData(1, 2, 5, 35, 2, 2)]   // vector blocks with an uncovered last row and column
     public void MatchesSavedIndexBackward(int n, int c, int h, int w, int pool, int stride)
     {
         var engine = new CpuEngine();
@@ -58,6 +60,7 @@ public class MaxPoolRecomputeBackwardTests
         var strides = new[] { stride, stride };
         engine.MaxPool2DWithTensorIndices(x, pools, strides, out var indices);
         var gradOut = Rnd(indices._shape, 12);
+        if (gradOut.Length > 3) gradOut[3] = -0f;   // its winner must receive 0 + (-0) = +0, as the scatter writes it
         var expected = engine.MaxPool2DBackwardWithTensorIndices(gradOut, indices, x._shape, pools, strides);
 
         var actual = new Tensor<float>(x._shape);
@@ -72,6 +75,40 @@ public class MaxPoolRecomputeBackwardTests
         var expectedSum = new Tensor<float>(x._shape);
         for (int i = 0; i < expectedSum.Length; i++) expectedSum[i] = prior[i] + expected[i];
         AssertBitEqual(expectedSum, accumulated, "accumulate");
+    }
+
+    /// <summary>
+    /// The 2x2 stride-2 forward (MaxPool2DInto, the compiled plan's replay) runs eight windows per AVX step. It must
+    /// keep the scalar rule exactly: start from the window's first tap and take a later tap only when strictly
+    /// greater, so a NaN first tap survives, a later NaN never replaces, and -0/+0 ties keep the first.
+    /// </summary>
+    [Theory]
+    [InlineData(2, 3, 6, 34)]   // 17 windows per row: two vector blocks plus a scalar tail
+    [InlineData(1, 2, 5, 35)]   // odd height and width: the last row and column are not covered
+    [InlineData(64, 16, 28, 28)] // the parity CNN's pool (parallel path)
+    public void ForwardMatchesScalarRule(int n, int c, int h, int w)
+    {
+        var engine = new CpuEngine();
+        var x = Grid(new[] { n, c, h, w }, 41, 5);
+        x[0] = float.NaN;                       // NaN first tap: the window's max is NaN
+        x[3] = float.NaN;                       // NaN later tap: never replaces
+        x[4] = -0f; x[5] = 0f; x[w + 4] = -0f; x[w + 5] = -0f;   // a -0/+0 tie keeps the first (-0)
+        int oh = (h - 2) / 2 + 1, ow = (w - 2) / 2 + 1;
+        var y = new Tensor<float>(new[] { n, c, oh, ow });
+        engine.MaxPool2DInto(y, x, 2, 2, 0);
+        for (int p = 0; p < n * c; p++)
+        for (int r = 0; r < oh; r++)
+        for (int col = 0; col < ow; col++)
+        {
+            int b0 = p * h * w + 2 * r * w + 2 * col;
+            float m = x[b0];
+            float v = x[b0 + 1]; if (v > m) m = v;
+            v = x[b0 + w]; if (v > m) m = v;
+            v = x[b0 + w + 1]; if (v > m) m = v;
+            float got = y[(p * oh + r) * ow + col];
+            Assert.True(BitConverter.SingleToInt32Bits(m) == BitConverter.SingleToInt32Bits(got),
+                $"plane {p} ({r},{col}): expected {m:R} got {got:R}");
+        }
     }
 
     [Fact]
