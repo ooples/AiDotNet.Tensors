@@ -526,7 +526,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // graph references: retire the graph here, where the mutation actually happens. (It used to be retired at the
         // top of every optimizer update, even when every parameter was updated on the device and the graph stayed
         // valid -- so a graph was captured every warmup cycle and never replayed.)
-        if (_stepGraphExec != IntPtr.Zero) InvalidateCapturedStepGraph();
+        if (_stepGraphExec != IntPtr.Zero)
+        {
+            InvalidateCapturedStepGraph();
+            // This optimizer path writes weights on the host every step, so any graph is retired by the next update:
+            // capturing again would rebuild it every step, which measured 23% slower than not capturing (parity MLP,
+            // 8.64 vs 7.02 ms/step). Stop capturing and say why; a device-side optimizer keeps the graph alive.
+            _graphStepDisabled = true;
+            RecordGraphCaptureFailure("the optimizer updates parameters on the host every step, which retires the "
+                + "captured graph each time; train with a device-resident optimizer update to keep graph replay");
+        }
         _parameters[p].IncrementVersion();
         (_engine as Engines.DirectGpuTensorEngine)?.InvalidateResidentWeightBuffer(_parameters[p]);
     }

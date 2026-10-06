@@ -21521,12 +21521,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (source is not null && destination is not null && typeof(T) == typeof(float)
             && source.Length == destination.Length && destination.IsContiguous && destination._storageOffset == 0
-            && !Compilation.GraphMode.IsActive && TryGetBackend(out var backend)
-            && ResolveResidentBufferNoUpload(backend, destination, destination.Length, includePersistentWeightCache: false) is { } destinationBuffer
-            && destinationBuffer.Handle != IntPtr.Zero)
+            && !Compilation.GraphMode.IsActive && TryGetBackend(out var backend))
         {
             try
             {
+                // A destination with no device buffer yet gets one: the copy overwrites every element, so it needs no
+                // upload of its stale host values. Falling back to the host copy here downloaded the source, which
+                // inside a captured training step is a host read that aborts CUDA graph capture.
+                var destinationBuffer = ResolveResidentBufferNoUpload(backend, destination, destination.Length, includePersistentWeightCache: false);
+                if (destinationBuffer is null || destinationBuffer.Handle == IntPtr.Zero)
+                    destinationBuffer = GetOrCreateResidentBuffer(backend, destination, destination.Length, fullyWritten: true);
                 using var sourceBuffer = GetOrAllocateBuffer(backend, source.IsContiguous ? source : (Tensor<T>)source.Contiguous());
                 if (!ReferenceEquals(sourceBuffer.Buffer, destinationBuffer))
                     backend.Copy(sourceBuffer.Buffer, destinationBuffer, destination.Length);
@@ -21539,7 +21543,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             catch (Exception ex)
             {
                 GpuLaunchProbe.OnFallback("TensorCopy", ex);
+                AliasDiag($"TensorCopy host fallback: threw {ex.GetType().Name}: {ex.Message} caller="
+                    + new System.Diagnostics.StackTrace(1, false).ToString().Replace(System.Environment.NewLine, " <- "));
             }
+        }
+        else if (System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1")
+        {
+            AliasDiag($"TensorCopy host fallback: float={typeof(T) == typeof(float)} sameLen={source?.Length == destination?.Length} "
+                + $"dstContig={destination?.IsContiguous} dstOffset0={destination?._storageOffset == 0} graphMode={Compilation.GraphMode.IsActive} "
+                + $"caller={new System.Diagnostics.StackTrace(1, false).ToString().Replace(System.Environment.NewLine, " <- ")}");
         }
         base.TensorCopy(source!, destination!);
     }

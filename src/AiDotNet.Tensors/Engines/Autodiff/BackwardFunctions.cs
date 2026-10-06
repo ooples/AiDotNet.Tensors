@@ -3957,8 +3957,17 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        // Sign has zero gradient everywhere
-        var zero = TensorPool<T>.RentZeroed(inputs[0]._shape);
+        // Sign has zero gradient everywhere. Adding zero to an existing gradient is a no-op.
+        if (grads.ContainsKey(inputs[0])) return;
+
+        // The input still needs an (all-zero) entry, as PyTorch's sign backward returns zeros_like. On a GPU engine
+        // build it on the device from the upstream gradient (same shape: Sign is elementwise); a host zero tensor had
+        // to be uploaded, and inside a captured training step that upload aborted CUDA graph capture (the
+        // cross-entropy loss's supervised-row count goes through Sign). A non-finite upstream gradient makes this NaN
+        // rather than 0, but such a gradient has already poisoned the step, which the fused step discards.
+        var zero = engine.SupportsGpu
+            ? engine.TensorMultiplyScalar(gradOutput, MathHelper.GetNumericOperations<T>().Zero)
+            : TensorPool<T>.RentZeroed(inputs[0]._shape);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], zero, engine);
     }
 
