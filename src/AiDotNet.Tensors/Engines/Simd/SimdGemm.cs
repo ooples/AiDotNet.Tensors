@@ -1718,6 +1718,17 @@ internal static partial class SimdGemm
 #if NET5_0_OR_GREATER
         if (Avx2.IsSupported && Fma.IsSupported && m >= Mr && n > 0)
         {
+            // Small-M (training-batch) GEMMs: the direct kernel fanned over both output axes. Ahead of the
+            // paths below, which split only rows (too few at m <= 192) or pack A in one task per K panel.
+            // Partition-independent results; see SimdGemm.DirectParallel2D.cs.
+            // Gated on shape only (allowParallel just picks the chunk count), so a gated GEMM computes the same
+            // bits whether or not it may fan out.
+            if (UseDirectParallel2D && clearedOutput && !transA && !transB
+                && m <= DirectParallel2DMaxM && k <= DirectParallel2DMaxK && n >= Nr
+                && (long)m * k * n >= ParallelWorkThreshold
+                && TrySgemmDirectParallel2D(a, lda, b, ldb, c, m, k, n, allowParallel))
+                return;
+
             // Iter 34: small-matmul fast path — no packing, direct 6×16 FMA
             // with fully vectorized masked edge kernels (proper fix for iter
             // 29's scalar-edge disaster). Targets per-head-attention shapes
