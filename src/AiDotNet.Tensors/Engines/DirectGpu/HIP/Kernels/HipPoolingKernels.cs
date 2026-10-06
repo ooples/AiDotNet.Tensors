@@ -302,9 +302,9 @@ extern ""C"" __global__ __launch_bounds__(256) void adaptive_avgpool2d(
     if (ow >= outWidth || oh >= outHeight || b >= batch) return;
 
     int hStart = (oh * inHeight) / outHeight;
-    int hEnd = ((oh + 1) * inHeight) / outHeight;
+    int hEnd = ((oh + 1) * inHeight + outHeight - 1) / outHeight;
     int wStart = (ow * inWidth) / outWidth;
-    int wEnd = ((ow + 1) * inWidth) / outWidth;
+    int wEnd = ((ow + 1) * inWidth + outWidth - 1) / outWidth;
 
     float sum = 0.0f;
     int count = 0;
@@ -724,9 +724,9 @@ extern ""C"" __global__ __launch_bounds__(256) void adaptive_max_pool2d(
     int c = (idx / (outWidth * outHeight)) % channels;
     int b = idx / (outWidth * outHeight * channels);
     int hStart = (oh * inHeight) / outHeight;
-    int hEnd = ((oh + 1) * inHeight) / outHeight;
+    int hEnd = ((oh + 1) * inHeight + outHeight - 1) / outHeight;
     int wStart = (ow * inWidth) / outWidth;
-    int wEnd = ((ow + 1) * inWidth) / outWidth;
+    int wEnd = ((ow + 1) * inWidth + outWidth - 1) / outWidth;
     float maxV = -INFINITY;
     for (int ih = hStart; ih < hEnd; ih++) {
         for (int iw = wStart; iw < wEnd; iw++) {

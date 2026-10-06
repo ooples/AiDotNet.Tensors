@@ -361,6 +361,20 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
     }
 
     [SkippableFact]
+    public void AdaptiveAvgPool_NonDividingBins_MatchCpu()
+    {
+        // 7 -> 4 does not divide: each bin is [floor(o*in/out), ceil((o+1)*in/out)) and neighbours overlap. The GPU
+        // kernels ended bins at floor((o+1)*in/out) and dropped rows (parity CNN logits off by 1e-2 vs PyTorch).
+        SkipIfNoDirectGpu();
+        var input = new Tensor<float>(Enumerable.Range(0, 2 * 3 * 7 * 7).Select(i => DeterministicValue(31 + i)).ToArray(), [2, 3, 7, 7]);
+        var cpu = new CpuEngine().AdaptiveAvgPool2D(input, 4, 4).ToArray();
+        var gpu = Gpu.AdaptiveAvgPool2D(input, 4, 4).ToArray();
+        Assert.Equal(cpu.Length, gpu.Length);
+        for (int i = 0; i < cpu.Length; i++)
+            Assert.True(Math.Abs(cpu[i] - gpu[i]) <= 1e-5f * (1 + Math.Abs(cpu[i])), $"[{i}] cpu={cpu[i]} gpu={gpu[i]}");
+    }
+
+    [SkippableFact]
     public void RectSlices_OnNonLastAxes_ForwardAndAccumulatedGradients_MatchCpu()
     {
         // Two OVERLAPPING rectangles over non-last axes of one tensor (the AdaptiveAveragePoolingLayer
