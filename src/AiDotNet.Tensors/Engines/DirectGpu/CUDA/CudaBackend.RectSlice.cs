@@ -14,16 +14,16 @@ public sealed partial class CudaBackend : IRectSliceKernels
     {
         public int Rank;
         public int Total;
-        public fixed int OutDims[IRectSliceKernels.MaxRank];
-        public fixed int FullStrides[IRectSliceKernels.MaxRank];
-        public fixed int Starts[IRectSliceKernels.MaxRank];
+        public fixed int OutDims[RectSliceLimits.MaxRank];
+        public fixed int FullStrides[RectSliceLimits.MaxRank];
+        public fixed int Starts[RectSliceLimits.MaxRank];
     }
 
     public unsafe void RectSlice(IGpuBuffer full, IGpuBuffer slice, int[] fullShape, int[] start, int[] length, bool scatter)
     {
         int rank = fullShape.Length;
-        if (rank < 1 || rank > IRectSliceKernels.MaxRank || start.Length != rank || length.Length != rank)
-            throw new ArgumentException($"RectSlice supports rank 1..{IRectSliceKernels.MaxRank} with matching start/length.");
+        if (rank < 1 || rank > RectSliceLimits.MaxRank || start.Length != rank || length.Length != rank)
+            throw new ArgumentException($"RectSlice supports rank 1..{RectSliceLimits.MaxRank} with matching start/length.");
         if (!_kernelCache.TryGetValue("rect_slice_nd", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: rect_slice_nd");
 

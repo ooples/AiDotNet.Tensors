@@ -106,15 +106,20 @@ internal interface ISpiralConvKernels
         IGpuBuffer gradWeights, int v, int inC, int spiralLength, int outC);
 }
 
+/// <summary>Limits of <see cref="IRectSliceKernels"/>. A class rather than interface constants: net471 has no
+/// static interface members.</summary>
+internal static class RectSliceLimits
+{
+    /// <summary>Largest rank <see cref="IRectSliceKernels.RectSlice"/> handles.</summary>
+    internal const int MaxRank = 8;
+}
+
 /// <summary>
 /// Rectangular N-d slice gather/scatter in one launch (rank &lt;= 8). Replaces the per-contiguous-row
 /// device copy loop, which issued one memcpy per row: a [64, 32, 7, 7] height slice was 4,096 API calls.
 /// </summary>
 internal interface IRectSliceKernels
 {
-    /// <summary>Largest rank <see cref="RectSlice"/> handles.</summary>
-    const int MaxRank = 8;
-
     /// <summary>
     /// <paramref name="scatter"/> false: <paramref name="slice"/> = <paramref name="full"/>[start : start + length].
     /// <paramref name="scatter"/> true: writes <paramref name="slice"/> into that window of <paramref name="full"/>

@@ -61,7 +61,12 @@ public partial class DirectGpuTensorEngine
         if (_lstmTrainCaches.TryGetValue(key, out var c) && c.B == b && c.T == t && c.In == inSize && c.H == h)
             return c;
         var created = new LstmTrainCache(backend, b, t, inSize, h);
-        _lstmTrainCaches.AddOrUpdate(key, created);
+        // Remove + Add rather than AddOrUpdate, which net471's ConditionalWeakTable lacks.
+        lock (_lstmTrainCaches)
+        {
+            _lstmTrainCaches.Remove(key);
+            _lstmTrainCaches.Add(key, created);
+        }
         return created;
     }
 

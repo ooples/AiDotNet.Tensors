@@ -5045,7 +5045,7 @@ public partial class DirectGpuTensorEngine
             int rowCount = rowSize == 0 ? 0 : source.Length / rowSize;
             var sourceShape = (int[])source._shape.Clone();
             using var sourceBuffer = GetOrAllocateBuffer(backend, source);
-            var rect = rank <= IRectSliceKernels.MaxRank ? backend as IRectSliceKernels : null;
+            var rect = rank <= RectSliceLimits.MaxRank ? backend as IRectSliceKernels : null;
             return DispatchDeferredGpuOp<T>(backend, total, (int[])inputShape.Clone(), output =>
             {
                 backend.Fill(output, 0f, total);
