@@ -2663,25 +2663,29 @@ internal static partial class SimdGemm
                 c.Length, m, k, n);
         }
 
-        const int MRf = 4;
-        int mFull = (m / MRf) * MRf;
-        int numFullBlocks = mFull / MRf;
+        // Rows [0, mFull) -- mFull a multiple of 4, the boundary of the original 4x8 kernel -- are each one FMA
+        // chain over p = 0..k-1, now computed six rows x sixteen columns at a time (12 accumulators: the 4x8
+        // kernel's 4 left FMA latency exposed, ~150 GFLOP/s on 16 threads at the [784x64]x[64x512] dW of a dense
+        // layer). Same chain per element, so the result is bit-identical to the 4x8 kernel. Rows [mFull, m) keep
+        // the scalar loop below, as before.
+        int mFull = (m / 4) * 4;
+        int numFullBlocks = (mFull + TransAMr - 1) / TransAMr;   // the last block may hold 2 or 4 rows
         int cores = Math.Max(1, Helpers.CpuParallelSettings.MaxDegreeOfParallelism);
         int numChunks = Math.Min(cores, Math.Max(1, (numFullBlocks + 1) / 2));
         numChunks = CapDirectChunksByWork(numChunks, (long)m * k * n);
         fixed (float* pA = a, pB = b, pC = c)
         {
             IntPtr ipA = (IntPtr)pA, ipB = (IntPtr)pB, ipC = (IntPtr)pC;
-            int kCap = k, nCap = n, mCap = m;
+            int kCap = k, nCap = n, mCap = m, mFullCap = mFull;
             if (numChunks <= 1 || numFullBlocks == 0)
-                SgemmTransABlock(pA, pB, pC, 0, numFullBlocks, kCap, nCap, mCap);
+                SgemmTransABlock(pA, pB, pC, 0, numFullBlocks, kCap, nCap, mCap, mFullCap);
             else
             {
                 int blocksPerChunk = (numFullBlocks + numChunks - 1) / numChunks;
                 Helpers.PersistentParallelExecutor.Instance.Execute(numChunks, chunk =>
                 {
                     int bs = chunk * blocksPerChunk, be = Math.Min(bs + blocksPerChunk, numFullBlocks);
-                    if (bs < be) SgemmTransABlock((float*)ipA, (float*)ipB, (float*)ipC, bs, be, kCap, nCap, mCap);
+                    if (bs < be) SgemmTransABlock((float*)ipA, (float*)ipB, (float*)ipC, bs, be, kCap, nCap, mCap, mFullCap);
                 });
             }
             for (int i = mFull; i < m; i++)
@@ -2697,84 +2701,148 @@ internal static partial class SimdGemm
         }
     }
 
-    private static unsafe void SgemmTransABlock(float* A, float* B, float* C, int blockStart, int blockEnd, int k, int n, int m)
-    {
-        const int MRf = 4;
+    /// <summary>Rows per register block of the transposed-A kernel below.</summary>
+    private const int TransAMr = 6;
 
-        // THE COLUMN LOOP IS 8 WIDE AND n NEED NOT BE. It used to run `j < n; j += 8` and finish
-        // every step with a full-width Avx.Store, so when n was not a multiple of 8 the final step
-        // wrote 8 - n % 8 floats past the end of each of the four C rows it touched. That is two
-        // separate defects, and the quieter one is the worse.
-        //
-        // WRONG RESULTS. The j loop is OUTSIDE the four row stores, so the spill from row i at the
-        // last j overwrites the start of row i+1 -- which an EARLIER j step had already written
-        // correctly, and which no later step rewrites. Every row but the last of each block came
-        // back wrong. Measured on the pre-fix code at m=4 k=3 n=13: C[1,0] is 0.33678542 where the
-        // product is 0.694251873.
-        //
-        // HEAP CORRUPTION. The spill from the last row of the last block has no next row to land
-        // in; it goes past the end of C. Writing past a managed array corrupts the GC heap and
-        // nothing fails at the call: the process dies at some later, unrelated allocation as
-        // "Internal CLR error (0x80131506)" / ExecutionEngineException, reported against whatever
-        // code happened to trigger that collection. This is how it was found -- as a test-host death
-        // two classes away from any GEMM, via
-        // SgemmDirectParallelMIntoTransA_SizesAgainstTheTransposedA, whose M=4 K=3 N=5 case stores
-        // 8 floats at offset 15 of a 20-element C.
-        //
-        // The load has the same shape of bug: it reads a full 8 floats from B, whose rows are also
-        // only n wide.
-        //
-        // The header used to declare "n % 8 == 0". The internal dispatch does gate on that, but this
-        // kernel's public entry point does not: it validates operand LENGTHS and lets any n through.
-        //
-        // The full-width blocks below are untouched -- the tail is peeled into its own masked block
-        // so the hot path keeps its unmasked load and store.
-        int nFull = (n / 8) * 8;
+    /// <summary>
+    /// C[i, :] = sum over p of At[i, p] * B[p, :] for the 6-row blocks [blockStart, blockEnd) of rows [0, mFull), with
+    /// A stored [k, m] (lda = m), B [k, n] and C [m, n]. Each block is swept in 16-column strips (12 accumulators; the
+    /// six A values for row block i0 at step p are contiguous at A + p*m + i0); the last block may hold fewer than six
+    /// rows and the last strip fewer than sixteen columns.
+    /// <para>
+    /// n NEED NOT BE A MULTIPLE OF 8, and the column tail is MASKED on both the B load and the C store. The 4x8
+    /// kernel this replaces once stored a full 8 floats on its last column step: the spill from row i overwrote the
+    /// start of row i+1 (written earlier, never rewritten) and the spill from the last row ran past the end of C,
+    /// corrupting the GC heap ("Internal CLR error" at some later allocation). Its B load over-read the same way.
+    /// The public entry validates operand LENGTHS only and lets any n through, so the tail must stay masked.
+    /// </para>
+    /// </summary>
+    private static unsafe void SgemmTransABlock(float* A, float* B, float* C, int blockStart, int blockEnd, int k, int n, int m, int mFull)
+    {
+        int nFull = (n / 16) * 16;
         int nTail = n - nFull;
-        var tailMask = _partialNrMasks[nTail].AsSingle();
+        int lane0N = nTail >= 8 ? 8 : nTail;
+        int lane1N = nTail >= 8 ? nTail - 8 : 0;
+        var mask0 = _partialNrMasks[lane0N].AsSingle();
+        var mask1 = _partialNrMasks[lane1N].AsSingle();
 
         for (int blk = blockStart; blk < blockEnd; blk++)
         {
-            int i0 = blk * MRf;
-            for (int j = 0; j < nFull; j += 8)
+            int i0 = blk * TransAMr;
+            int mc = Math.Min(TransAMr, mFull - i0);
+            float* cRow = C + (long)i0 * n;
+            if (mc == TransAMr)
             {
-                var c0 = Vector256<float>.Zero; var c1 = Vector256<float>.Zero;
-                var c2 = Vector256<float>.Zero; var c3 = Vector256<float>.Zero;
-                float* bj = B + j;
-                for (int p = 0; p < k; p++)
-                {
-                    var b0 = Avx.LoadVector256(bj + (long)p * n);
-                    float* ap = A + (long)p * m + i0;
-                    c0 = Fma.MultiplyAdd(Vector256.Create(ap[0]), b0, c0);
-                    c1 = Fma.MultiplyAdd(Vector256.Create(ap[1]), b0, c1);
-                    c2 = Fma.MultiplyAdd(Vector256.Create(ap[2]), b0, c2);
-                    c3 = Fma.MultiplyAdd(Vector256.Create(ap[3]), b0, c3);
-                }
-                Avx.Store(C + (long)(i0 + 0) * n + j, c0);
-                Avx.Store(C + (long)(i0 + 1) * n + j, c1);
-                Avx.Store(C + (long)(i0 + 2) * n + j, c2);
-                Avx.Store(C + (long)(i0 + 3) * n + j, c3);
+                for (int j = 0; j < nFull; j += 16)
+                    TransAKernel6x16(A + i0, m, B + j, n, cRow + j, k);
             }
-
+            else
+            {
+                for (int j = 0; j < nFull; j += 16)
+                    TransAKernelRows(A + i0, m, B + j, n, cRow + j, k, mc,
+                        Vector256<float>.AllBitsSet, Vector256<float>.AllBitsSet, lane1Any: true, masked: false);
+            }
             if (nTail > 0)
+                TransAKernelRows(A + i0, m, B + nFull, n, cRow + nFull, k, mc, mask0, mask1, lane1Any: lane1N > 0, masked: true);
+        }
+    }
+
+    /// <summary>Six rows x sixteen columns of C = At*B, overwriting C; pA points at row i0 of At (A + i0), lda = m,
+    /// and C's row stride equals B's (n).</summary>
+    [MethodImpl(HotInline)]
+    private static unsafe void TransAKernel6x16(float* pA, int lda, float* pB, int ldb, float* pC, int k)
+    {
+        var c00 = Vector256<float>.Zero; var c01 = Vector256<float>.Zero;
+        var c10 = Vector256<float>.Zero; var c11 = Vector256<float>.Zero;
+        var c20 = Vector256<float>.Zero; var c21 = Vector256<float>.Zero;
+        var c30 = Vector256<float>.Zero; var c31 = Vector256<float>.Zero;
+        var c40 = Vector256<float>.Zero; var c41 = Vector256<float>.Zero;
+        var c50 = Vector256<float>.Zero; var c51 = Vector256<float>.Zero;
+        for (int p = 0; p < k; p++)
+        {
+            var b0 = Avx.LoadVector256(pB);
+            var b1 = Avx.LoadVector256(pB + 8);
+            var a0 = Vector256.Create(pA[0]);
+            c00 = Fma.MultiplyAdd(a0, b0, c00); c01 = Fma.MultiplyAdd(a0, b1, c01);
+            var a1 = Vector256.Create(pA[1]);
+            c10 = Fma.MultiplyAdd(a1, b0, c10); c11 = Fma.MultiplyAdd(a1, b1, c11);
+            var a2 = Vector256.Create(pA[2]);
+            c20 = Fma.MultiplyAdd(a2, b0, c20); c21 = Fma.MultiplyAdd(a2, b1, c21);
+            var a3 = Vector256.Create(pA[3]);
+            c30 = Fma.MultiplyAdd(a3, b0, c30); c31 = Fma.MultiplyAdd(a3, b1, c31);
+            var a4 = Vector256.Create(pA[4]);
+            c40 = Fma.MultiplyAdd(a4, b0, c40); c41 = Fma.MultiplyAdd(a4, b1, c41);
+            var a5 = Vector256.Create(pA[5]);
+            c50 = Fma.MultiplyAdd(a5, b0, c50); c51 = Fma.MultiplyAdd(a5, b1, c51);
+            pA += lda;
+            pB += ldb;
+        }
+        Avx.Store(pC + 0, c00); Avx.Store(pC + 8, c01); pC += ldb;
+        Avx.Store(pC + 0, c10); Avx.Store(pC + 8, c11); pC += ldb;
+        Avx.Store(pC + 0, c20); Avx.Store(pC + 8, c21); pC += ldb;
+        Avx.Store(pC + 0, c30); Avx.Store(pC + 8, c31); pC += ldb;
+        Avx.Store(pC + 0, c40); Avx.Store(pC + 8, c41); pC += ldb;
+        Avx.Store(pC + 0, c50); Avx.Store(pC + 8, c51);
+    }
+
+    /// <summary>
+    /// The general case of <see cref="TransAKernel6x16"/>: <paramref name="mc"/> (1..6) rows and, when
+    /// <paramref name="masked"/>, a column tail selected by <paramref name="mask0"/> / <paramref name="mask1"/>
+    /// (loads and stores both masked, so lanes outside the mask are never read or written).
+    /// </summary>
+    private static unsafe void TransAKernelRows(float* pA, int lda, float* pB, int ldb, float* pC, int k, int mc,
+        Vector256<float> mask0, Vector256<float> mask1, bool lane1Any, bool masked)
+    {
+        var c00 = Vector256<float>.Zero; var c01 = Vector256<float>.Zero;
+        var c10 = Vector256<float>.Zero; var c11 = Vector256<float>.Zero;
+        var c20 = Vector256<float>.Zero; var c21 = Vector256<float>.Zero;
+        var c30 = Vector256<float>.Zero; var c31 = Vector256<float>.Zero;
+        var c40 = Vector256<float>.Zero; var c41 = Vector256<float>.Zero;
+        var c50 = Vector256<float>.Zero; var c51 = Vector256<float>.Zero;
+        for (int p = 0; p < k; p++)
+        {
+            Vector256<float> b0, b1;
+            if (masked)
             {
-                var c0 = Vector256<float>.Zero; var c1 = Vector256<float>.Zero;
-                var c2 = Vector256<float>.Zero; var c3 = Vector256<float>.Zero;
-                float* bj = B + nFull;
-                for (int p = 0; p < k; p++)
-                {
-                    var b0 = Avx.MaskLoad(bj + (long)p * n, tailMask);
-                    float* ap = A + (long)p * m + i0;
-                    c0 = Fma.MultiplyAdd(Vector256.Create(ap[0]), b0, c0);
-                    c1 = Fma.MultiplyAdd(Vector256.Create(ap[1]), b0, c1);
-                    c2 = Fma.MultiplyAdd(Vector256.Create(ap[2]), b0, c2);
-                    c3 = Fma.MultiplyAdd(Vector256.Create(ap[3]), b0, c3);
-                }
-                Avx.MaskStore(C + (long)(i0 + 0) * n + nFull, tailMask, c0);
-                Avx.MaskStore(C + (long)(i0 + 1) * n + nFull, tailMask, c1);
-                Avx.MaskStore(C + (long)(i0 + 2) * n + nFull, tailMask, c2);
-                Avx.MaskStore(C + (long)(i0 + 3) * n + nFull, tailMask, c3);
+                b0 = Avx.MaskLoad(pB, mask0);
+                b1 = lane1Any ? Avx.MaskLoad(pB + 8, mask1) : Vector256<float>.Zero;
             }
+            else
+            {
+                b0 = Avx.LoadVector256(pB);
+                b1 = Avx.LoadVector256(pB + 8);
+            }
+            var a0 = Vector256.Create(pA[0]);
+            c00 = Fma.MultiplyAdd(a0, b0, c00); c01 = Fma.MultiplyAdd(a0, b1, c01);
+            if (mc > 1) { var a1 = Vector256.Create(pA[1]); c10 = Fma.MultiplyAdd(a1, b0, c10); c11 = Fma.MultiplyAdd(a1, b1, c11); }
+            if (mc > 2) { var a2 = Vector256.Create(pA[2]); c20 = Fma.MultiplyAdd(a2, b0, c20); c21 = Fma.MultiplyAdd(a2, b1, c21); }
+            if (mc > 3) { var a3 = Vector256.Create(pA[3]); c30 = Fma.MultiplyAdd(a3, b0, c30); c31 = Fma.MultiplyAdd(a3, b1, c31); }
+            if (mc > 4) { var a4 = Vector256.Create(pA[4]); c40 = Fma.MultiplyAdd(a4, b0, c40); c41 = Fma.MultiplyAdd(a4, b1, c41); }
+            if (mc > 5) { var a5 = Vector256.Create(pA[5]); c50 = Fma.MultiplyAdd(a5, b0, c50); c51 = Fma.MultiplyAdd(a5, b1, c51); }
+            pA += lda;
+            pB += ldb;
+        }
+        TransAStoreRow(pC, mask0, mask1, c00, c01, masked);
+        if (mc > 1) TransAStoreRow(pC + ldb, mask0, mask1, c10, c11, masked);
+        if (mc > 2) TransAStoreRow(pC + 2L * ldb, mask0, mask1, c20, c21, masked);
+        if (mc > 3) TransAStoreRow(pC + 3L * ldb, mask0, mask1, c30, c31, masked);
+        if (mc > 4) TransAStoreRow(pC + 4L * ldb, mask0, mask1, c40, c41, masked);
+        if (mc > 5) TransAStoreRow(pC + 5L * ldb, mask0, mask1, c50, c51, masked);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void TransAStoreRow(float* row, Vector256<float> m0, Vector256<float> m1,
+        Vector256<float> v0, Vector256<float> v1, bool masked)
+    {
+        if (masked)
+        {
+            Avx.MaskStore(row, m0, v0);
+            Avx.MaskStore(row + 8, m1, v1);
+        }
+        else
+        {
+            Avx.Store(row, v0);
+            Avx.Store(row + 8, v1);
         }
     }
 
