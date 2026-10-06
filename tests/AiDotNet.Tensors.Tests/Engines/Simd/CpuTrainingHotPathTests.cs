@@ -1,4 +1,6 @@
 using System;
+using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 using Xunit;
@@ -92,6 +94,56 @@ public class CpuTrainingHotPathTests
                 for (int j = 0; j < inner; j++)
                     expected += data[(o * kept + c) * inner + j];
             Assert.Equal(expected, result[c]);
+        }
+    }
+
+    /// <summary>
+    /// Adaptive average pool backward on non-dividing bins (7 -> 4 overlaps windows) under a tape, twice, so the
+    /// second step reuses a recycled arena buffer: each input gradient must equal the sum over the windows that
+    /// contain it of upstream / window size, with no residue from the first step.
+    /// </summary>
+    [Fact]
+    public void AdaptiveAvgPool2DBackward_NonDividingBins_MatchesWindowSums_AcrossSteps()
+    {
+        var engine = new CpuEngine();
+        int batch = 3, channels = 5, inH = 7, inW = 7, outH = 4, outW = 4;
+        // One arena across both steps, Reset between them like a training loop: step 2's gradient buffer is the
+        // recycled step-1 buffer, so a missing per-plane clear shows up as step-1 residue.
+        using var arena = TensorArena.Create();
+        for (int step = 0; step < 2; step++)
+        {
+            if (step > 0) arena.Reset();
+            var input = new Tensor<float>(new[] { batch, channels, inH, inW });
+            var data = RandomFloats(input.Length, 31 + step);
+            for (int i = 0; i < data.Length; i++) input[i] = data[i];
+            var weights = new Tensor<float>(new[] { batch, channels, outH, outW });
+            var w = RandomFloats(weights.Length, 77 + step);
+            for (int i = 0; i < w.Length; i++) weights[i] = w[i];
+
+            Tensor<float> inputGrad;
+            using (var tape = new GradientTape<float>())
+            {
+                var pooled = engine.AdaptiveAvgPool2D(input, outH, outW);
+                var loss = engine.ReduceSum(engine.TensorMultiply(pooled, weights), null);
+                var grads = tape.ComputeGradients(loss, new[] { input });
+                inputGrad = grads[input];
+            }
+
+            var expected = new double[input.Length];
+            for (int plane = 0; plane < batch * channels; plane++)
+            for (int oh = 0; oh < outH; oh++)
+            for (int ow = 0; ow < outW; ow++)
+            {
+                int hs = (int)Math.Floor((double)oh * inH / outH), he = (int)Math.Ceiling((double)(oh + 1) * inH / outH);
+                int ws = (int)Math.Floor((double)ow * inW / outW), we = (int)Math.Ceiling((double)(ow + 1) * inW / outW);
+                double g = w[(plane * outH + oh) * outW + ow] / ((he - hs) * (we - ws));
+                for (int ih = hs; ih < he; ih++)
+                    for (int iw = ws; iw < we; iw++)
+                        expected[(plane * inH + ih) * inW + iw] += g;
+            }
+            for (int i = 0; i < expected.Length; i++)
+                Assert.True(Math.Abs(expected[i] - inputGrad[i]) < 1e-5,
+                    $"step {step} [{i}]: expected {expected[i]}, got {inputGrad[i]}");
         }
     }
 

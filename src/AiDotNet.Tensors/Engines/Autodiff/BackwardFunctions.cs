@@ -2664,7 +2664,9 @@ internal static class BackwardFunctions<T>
         {
             // Native float, parallel over (batch, channel) planes; window bounds computed once. The generic
             // loop below dispatched every element through INumericOperations and ran on one thread.
-            var gradF = TensorPool<T>.RentZeroed(inShape);
+            // Step-arena tensor (recycled across steps, like AutoTensorCache's backward outputs); TensorPool.Rent
+            // would allocate every call because nothing returns these. Each plane clears its own slice below.
+            var gradF = TensorAllocator.RentUninitialized<T>(inShape);
             var upstream = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
             var hStarts = new int[outH]; var hEnds = new int[outH];
             var wStarts = new int[outW]; var wEnds = new int[outW];
@@ -2688,6 +2690,7 @@ internal static class BackwardFunctions<T>
             {
                 var src = new ReadOnlySpan<float>(srcAll, plane * outPlane, outPlane);
                 var dst = new Span<float>(dstAll, plane * inPlane, inPlane);
+                dst.Clear();
                 for (int oh = 0; oh < outH; oh++)
                 {
                     int hs = hStarts[oh], he = hEnds[oh];
