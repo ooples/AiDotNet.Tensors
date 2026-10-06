@@ -2660,6 +2660,55 @@ internal static class BackwardFunctions<T>
             return;
         }
 
+        if (typeof(T) == typeof(float))
+        {
+            // Native float, parallel over (batch, channel) planes; window bounds computed once. The generic
+            // loop below dispatched every element through INumericOperations and ran on one thread.
+            var gradF = TensorPool<T>.RentZeroed(inShape);
+            var upstream = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
+            var hStarts = new int[outH]; var hEnds = new int[outH];
+            var wStarts = new int[outW]; var wEnds = new int[outW];
+            for (int oh = 0; oh < outH; oh++)
+            {
+                hStarts[oh] = (int)Math.Floor((double)oh * inH / outH);
+                hEnds[oh] = (int)Math.Ceiling((double)(oh + 1) * inH / outH);
+            }
+            for (int ow = 0; ow < outW; ow++)
+            {
+                wStarts[ow] = (int)Math.Floor((double)ow * inW / outW);
+                wEnds[ow] = (int)Math.Ceiling((double)(ow + 1) * inW / outW);
+            }
+            int planes = batch * channels;
+            int inPlane = inH * inW, outPlane = outH * outW;
+            CpuParallelSettings.ParallelForOrSerial(0, planes, (long)planes * inPlane, plane =>
+            {
+                var src = System.Runtime.InteropServices.MemoryMarshal.CreateReadOnlySpan(
+                    ref System.Runtime.CompilerServices.Unsafe.As<T, float>(
+                        ref System.Runtime.InteropServices.MemoryMarshal.GetReference(upstream.AsSpan())),
+                    upstream.Length).Slice(plane * outPlane, outPlane);
+                var dst = System.Runtime.InteropServices.MemoryMarshal.CreateSpan(
+                    ref System.Runtime.CompilerServices.Unsafe.As<T, float>(
+                        ref System.Runtime.InteropServices.MemoryMarshal.GetReference(gradF.AsWritableSpan())),
+                    gradF.Length).Slice(plane * inPlane, inPlane);
+                for (int oh = 0; oh < outH; oh++)
+                {
+                    int hs = hStarts[oh], he = hEnds[oh];
+                    for (int ow = 0; ow < outW; ow++)
+                    {
+                        int ws = wStarts[ow], we = wEnds[ow];
+                        float g = src[oh * outW + ow] / ((he - hs) * (we - ws));
+                        for (int ih = hs; ih < he; ih++)
+                        {
+                            var row = dst.Slice(ih * inW + ws, we - ws);
+                            for (int iw = 0; iw < row.Length; iw++) row[iw] += g;
+                        }
+                    }
+                }
+            });
+            DifferentiableOps.AccumulateGrad(grads, inputs[0], gradF, engine);
+            return;
+        }
+
         var inputGrad = TensorPool<T>.RentZeroed(inShape);
         for (int b = 0; b < batch; b++)
         for (int c = 0; c < channels; c++)
