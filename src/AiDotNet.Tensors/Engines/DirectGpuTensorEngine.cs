@@ -23566,7 +23566,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     public override Tensor<T> AdaptiveAvgPool2D<T>(Tensor<T> input, int outputHeight, int outputWidth)
     {
-        if (!TryGetBackend(out var backend) || input.Rank != 4)
+        // Under GraphMode the input is a lazy placeholder with no buffer yet: base records the lazy node, whose
+        // replay closure calls back into this method with GraphMode off and so runs the kernel below.
+        if (Compilation.GraphMode.IsActive || !TryGetBackend(out var backend) || input.Rank != 4)
             return base.AdaptiveAvgPool2D(input, outputHeight, outputWidth);
 
         try
