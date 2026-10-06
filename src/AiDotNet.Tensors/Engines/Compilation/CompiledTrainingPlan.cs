@@ -7993,7 +7993,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         if (step.OpType == OpType.Swish && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            return eng => { if (eng is CpuEngine cpu) cpu.SwishInto(o, inp); else { var r = eng.Swish(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
+            return eng => { if (eng is CpuEngine cpu && !eng.SupportsGpu) cpu.SwishInto(o, inp); else { var r = eng.Swish(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
         // ELU forward: pinned SIMD ELUUnsafe
@@ -8017,7 +8017,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             double alpha = step.SavedState != null && step.SavedState.Length > 0 ? (double)step.SavedState[0] : 1.0;
-            return eng => { if (eng is CpuEngine cpu) cpu.ELUInto(o, inp, alpha); else { var r = eng.ELU(inp, alpha); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
+            return eng => { if (eng is CpuEngine cpu && !eng.SupportsGpu) cpu.ELUInto(o, inp, alpha); else { var r = eng.ELU(inp, alpha); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
         // Log forward: pinned LogUnsafe — bypass EnsureMaterialized
@@ -8039,7 +8039,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         if (step.OpType == OpType.TensorLog && step.Inputs.Length == 1)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            return eng => { if (eng is CpuEngine cpu) cpu.TensorLogInto(o, inp); else { var r = eng.TensorLog(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
+            return eng => { if (eng is CpuEngine cpu && !eng.SupportsGpu) cpu.TensorLogInto(o, inp); else { var r = eng.TensorLog(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
         // Exp forward: VML → SIMD fallback, pinned GCHandle
@@ -8067,7 +8067,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         if (step.OpType == OpType.TensorExp && step.Inputs.Length == 1)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            return eng => { if (eng is CpuEngine cpu) cpu.TensorExpInto(o, inp); else { var r = eng.TensorExp(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
+            return eng => { if (eng is CpuEngine cpu && !eng.SupportsGpu) cpu.TensorExpInto(o, inp); else { var r = eng.TensorExp(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
         // Mish forward: pinned MishUnsafe — bypass EnsureMaterialized
@@ -8089,7 +8089,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         if (step.OpType == OpType.Mish && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            return eng => { if (eng is CpuEngine cpu) cpu.MishInto(o, inp); else { var r = eng.Mish(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
+            return eng => { if (eng is CpuEngine cpu && !eng.SupportsGpu) cpu.MishInto(o, inp); else { var r = eng.Mish(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
         // BatchNorm inference: direct SIMD kernel (bypasses all allocation)
@@ -8229,7 +8229,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 var capDilation = dilation;
                 return eng =>
                 {
-                    if (eng is CpuEngine cpuEng)
+                    if (eng is CpuEngine cpuEng && !eng.SupportsGpu)
                         cpuEng.Conv2DInto(o, inp, kernel, capStride, capPadding, capDilation);
                     else
                     {
@@ -8246,7 +8246,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             var defDilation = new[] { 1, 1 };
             return eng =>
             {
-                if (eng is CpuEngine cpuEng)
+                if (eng is CpuEngine cpuEng && !eng.SupportsGpu)
                     cpuEng.Conv2DInto(o, inp, kernel, defStride, defPadding, defDilation);
                 else
                 {
@@ -8290,7 +8290,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             var capOutPad = new[] { 0, 0 };
             return eng =>
             {
-                if (eng is CpuEngine cpuEng)
+                if (eng is CpuEngine cpuEng && !eng.SupportsGpu)
                     cpuEng.ConvTranspose2DInto(o, inp, kernel, capStride, capPadding, capOutPad);
                 else
                 {
@@ -8341,7 +8341,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             return eng =>
             {
                 Tensor<T> freshMean, freshVar;
-                if (eng is CpuEngine cpuEng)
+                if (eng is CpuEngine cpuEng && !eng.SupportsGpu)
                     cpuEng.GroupNormInto(o, inp, numGroupsGN, gamma, beta, epsilonGN, out freshMean, out freshVar);
                 else
                 {
@@ -8440,21 +8440,21 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         if (step.OpType == OpType.TensorSqrt && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            return eng => { if (eng is CpuEngine cpu) cpu.TensorSqrtInto(o, inp); else { var r = eng.TensorSqrt(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
+            return eng => { if (eng is CpuEngine cpu && !eng.SupportsGpu) cpu.TensorSqrtInto(o, inp); else { var r = eng.TensorSqrt(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
         // Sin forward: VML/SIMD via CpuEngine.TensorSinInto
         if (step.OpType == OpType.Sin && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            return eng => { if (eng is CpuEngine cpu) cpu.TensorSinInto(o, inp); else { var r = eng.TensorSin(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
+            return eng => { if (eng is CpuEngine cpu && !eng.SupportsGpu) cpu.TensorSinInto(o, inp); else { var r = eng.TensorSin(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
         // Cos forward: VML/SIMD via CpuEngine.TensorCosInto
         if (step.OpType == OpType.Cos && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            return eng => { if (eng is CpuEngine cpu) cpu.TensorCosInto(o, inp); else { var r = eng.TensorCos(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
+            return eng => { if (eng is CpuEngine cpu && !eng.SupportsGpu) cpu.TensorCosInto(o, inp); else { var r = eng.TensorCos(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
         // Softplus forward: SIMD SoftplusUnsafe with pinned arrays
@@ -9872,7 +9872,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             var capDilation = dilation;
             return eng =>
             {
-                if (eng is CpuEngine cpu)
+                if (eng is CpuEngine cpu && !eng.SupportsGpu)
                 {
                     cpu.Conv2DBackwardInputInto(gradInput, gradOut, kernel, inShape,
                         capStride, capPadding, capDilation, accumInput);
@@ -9929,7 +9929,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             bool accumBeta = consumerCount.ContainsKey(betaT) && consumerCount[betaT] > 1;
             return eng =>
             {
-                if (eng is CpuEngine cpu)
+                if (eng is CpuEngine cpu && !eng.SupportsGpu)
                 {
                     cpu.BatchNormBackwardInto(gradInput, gradGamma, gradBeta,
                         gradOut, input, gammaT, meanT, varianceT, epsilonD,

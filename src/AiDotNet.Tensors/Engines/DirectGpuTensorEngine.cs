@@ -24558,6 +24558,43 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // GPU-accelerated Conv2D (non-Tensor-prefix)
     // ──────────────────────────────────────────────────────────────
 
+    [ThreadStatic] private static bool t_inPerAxisConv2D;
+
+    /// <summary>
+    /// The per-axis (int[]) overload, which ConvolutionalLayer and every recorded Conv2D closure call. Not overriding
+    /// it made GPU CNN training run CpuEngine's im2col/SIMD convolution (44% of the step, plus the activation download
+    /// feeding it). Under a tape the convolution now runs on the device with the tape suppressed and records the same
+    /// Conv2DBackward the host path records, whose input/kernel gradients dispatch to the GPU kernels. Graph-mode
+    /// recording stays with the base (it records the lazy node; that node's replay calls back here). The reentrancy
+    /// guard covers the GPU kernel declining: the base FusedConv2D then composes through this overload, which must
+    /// reach the host implementation instead of recursing.
+    /// </summary>
+    public override Tensor<T> Conv2D<T>(Tensor<T> input, Tensor<T> kernel, int[] stride, int[] padding, int[] dilation)
+    {
+        if (t_inPerAxisConv2D || Compilation.GraphMode.IsActive
+            || stride.Length != 2 || padding.Length != 2 || dilation.Length != 2)
+            return base.Conv2D(input, kernel, stride, padding, dilation);
+
+        t_inPerAxisConv2D = true;
+        try
+        {
+            if (!IsTapeActive<T>())
+                return FusedConv2D(input, kernel, null, stride[0], stride[1], padding[0], padding[1], dilation[0], dilation[1],
+                    FusedActivationType.None);
+
+            Tensor<T> result;
+            using (new Autodiff.NoGradScope<T>())
+                result = FusedConv2D(input, kernel, null, stride[0], stride[1], padding[0], padding[1], dilation[0], dilation[1],
+                    FusedActivationType.None);
+            Autodiff.DifferentiableOps.RecordBinary("Conv2D", result, input, kernel, Autodiff.BackwardFunctions<T>.Conv2DBackward,
+                new object[] { (int[])stride.Clone(), (int[])padding.Clone(), (int[])dilation.Clone() });
+            return result;
+        }
+        finally
+        {
+            t_inPerAxisConv2D = false;
+        }
+    }
     public override Tensor<T> Conv2D<T>(Tensor<T> input, Tensor<T> kernel, int stride, int padding, int dilation)
     {
         return FusedConv2D(input, kernel, null, stride, stride, padding, padding, dilation, dilation, FusedActivationType.None);
