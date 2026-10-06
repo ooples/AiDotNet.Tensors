@@ -11,6 +11,8 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd;
 /// Covers the CPU training hot paths that were rewritten for parallel dispatch: the 3x3 stride-1 conv's flat
 /// (batch item, channel block) loop and Tensor.Sum's keep-one-axis reduction (every bias gradient).
 /// </summary>
+// The forced-variant cases set SimdConvHelper.ActiveConv3x3Variant, which is process-wide static state.
+[Collection("ConvPerfSerial")]
 public class CpuTrainingHotPathTests
 {
     private static float[] RandomFloats(int length, int seed)
@@ -32,7 +34,39 @@ public class CpuTrainingHotPathTests
     [InlineData(3, 5, 9, 6)]
     [InlineData(5, 4, 11, 3)]
     [InlineData(1, 8, 32, 32)]
-    public unsafe void Conv3x3Stride1_BatchedTasks_MatchNaiveReference(int batch, int inC, int hw, int outC)
+    public void Conv3x3Stride1_BatchedTasks_MatchNaiveReference(int batch, int inC, int hw, int outC)
+        => AssertConv3x3MatchesNaive(batch, inC, hw, outC);
+
+    // Auto picks the variant from the batch-wide task count against Environment.ProcessorCount, and
+    // AIDOTNET_CONV3X3_VARIANT can pin one for the whole process, so the Auto cases above cannot promise each
+    // variant ran. These force each one. Block4/Block2 need FMA (they fall back to per-channel without it).
+    [SkippableFact]
+    public void Conv3x3Stride1_ForcedBlock4_MatchesNaiveReference()
+    {
+        Skip.IfNot(System.Runtime.Intrinsics.X86.Fma.IsSupported, "Block4 falls back to per-channel without FMA.");
+        WithVariant(SimdConvHelper.Conv3x3Variant.Block4, () => AssertConv3x3MatchesNaive(4, 3, 12, 8));
+    }
+
+    [SkippableFact]
+    public void Conv3x3Stride1_ForcedBlock2_MatchesNaiveReference()
+    {
+        Skip.IfNot(System.Runtime.Intrinsics.X86.Fma.IsSupported, "Block2 falls back to per-channel without FMA.");
+        WithVariant(SimdConvHelper.Conv3x3Variant.Block2, () => AssertConv3x3MatchesNaive(3, 5, 9, 6));
+    }
+
+    [Fact]
+    public void Conv3x3Stride1_ForcedPerChannel_MatchesNaiveReference()
+        => WithVariant(SimdConvHelper.Conv3x3Variant.PerChannel, () => AssertConv3x3MatchesNaive(5, 4, 11, 3));
+
+    private static void WithVariant(SimdConvHelper.Conv3x3Variant variant, Action body)
+    {
+        var saved = SimdConvHelper.ActiveConv3x3Variant;
+        SimdConvHelper.ActiveConv3x3Variant = variant;
+        try { body(); }
+        finally { SimdConvHelper.ActiveConv3x3Variant = saved; }
+    }
+
+    private static unsafe void AssertConv3x3MatchesNaive(int batch, int inC, int hw, int outC)
     {
         var input = RandomFloats(batch * inC * hw * hw, 11);
         var kernel = RandomFloats(outC * inC * 9, 23);
