@@ -6796,6 +6796,9 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int strideH, int strideW, int padH, int padW,
         int dilationH, int dilationW)
     {
+        if (TryConv2DBackwardInputGemm(gradOutput, kernel, gradInput, batch, inChannels, inHeight, inWidth,
+                outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW))
+            return;
         if (!_kernelCache.TryGetValue("conv2d_backward_input", out var cudaKernel))
             throw new InvalidOperationException("CUDA kernel not found: conv2d_backward_input");
 
@@ -6837,6 +6840,9 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int strideH, int strideW, int padH, int padW,
         int dilationH, int dilationW)
     {
+        if (TryConv2DBackwardKernelGemm(input, gradOutput, gradKernel, batch, inChannels, inHeight, inWidth,
+                outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW))
+            return;
         if (!_kernelCache.TryGetValue("conv2d_backward_kernel", out var cudaKernel))
             throw new InvalidOperationException("CUDA kernel not found: conv2d_backward_kernel");
 
