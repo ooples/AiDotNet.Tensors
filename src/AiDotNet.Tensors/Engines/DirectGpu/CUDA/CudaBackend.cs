@@ -170,7 +170,28 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     // a pool thread would still hold that engine's now-dangling handle and the NEXT engine would reuse it →
     // use-after-free → fatal host crash. ThreadLocal(trackAllValues:true) is scoped to THIS engine and lets
     // Dispose() enumerate every thread's handle for cublasDestroy.
-    private sealed class ThreadCublas { public IntPtr Handle; public bool IsDeterministic; public IntPtr Stream; }
+    private sealed class ThreadCublas
+    {
+        public IntPtr Handle;
+        public bool IsDeterministic;
+        public IntPtr Stream;
+        // Held for the handle's lifetime: cuBLAS keeps the raw pointer.
+        public IGpuBuffer? Workspace;
+    }
+
+    // Per-handle cuBLAS workspace (PyTorch sets one the same way). 8 MiB covers the fp32 GEMM algorithms used here.
+    private const int CublasWorkspaceFloats = 2 * 1024 * 1024;
+
+    /// <summary>True when the calling thread's cuBLAS handle has its own workspace, so cuBLAS needs no allocation
+    /// inside a stream capture and the strided-batched GEMM can be captured.</summary>
+    private bool CurrentCublasHasWorkspace
+    {
+        get
+        {
+            _ = _cublasHandle;   // materialize this thread's handle
+            return _threadCublas?.Value?.Workspace is not null;
+        }
+    }
     private ThreadLocal<ThreadCublas>? _threadCublas;
     // The default fp32 GEMM math mode chosen at init (TF32 tensor-op on Ampere+, else PEDANTIC), captured
     // so every per-thread handle applies the same mode on creation.
@@ -2403,7 +2424,10 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         // Softmax/attention frontier). Under capture, issue `batchCount` SEQUENTIAL cublasSgemm calls on _stream
         // (each is capturable); the strided-batched fast path stays for the non-captured (eager) steps where it
         // saturates the SMs. Same arg order as the strided call and BatchedGemmFanout's per-slice cublasSgemm.
-        if (IsStreamCapturing())
+        // With a handle-owned workspace (CreateThreadCublas) cuBLAS allocates nothing during capture, so the strided
+        // call captures as ONE node; the per-slice loop remains only for a handle without one. The loop cost the
+        // parity Transformer 2,570 small GEMMs per training step (10.7 of its 14.7 ms of GPU time).
+        if (IsStreamCapturing() && !CurrentCublasHasWorkspace)
         {
             for (int b = 0; b < batchCount; b++)
             {
@@ -5972,7 +5996,26 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         bool det = GpuDeterminism.IsActive;
         int initMode = det ? CuBlasNative.CUBLAS_PEDANTIC_MATH : _initGemmMathMode;
         CuBlasNative.CheckCublasStatus(CuBlasNative.cublasSetMathMode(h, initMode), "cublasSetMathMode(per-thread)");
-        return new ThreadCublas { Handle = h, IsDeterministic = det, Stream = _stream };
+        IGpuBuffer? workspace = null;
+        try
+        {
+            if (System.Environment.GetEnvironmentVariable("AIDOTNET_CUBLAS_WORKSPACE") == "0") throw new InvalidOperationException("cuBLAS workspace disabled");
+            workspace = AllocateBuffer(CublasWorkspaceFloats);
+            var status = CuBlasNative.cublasSetWorkspace(h, workspace.Handle, (UIntPtr)((ulong)CublasWorkspaceFloats * sizeof(float)));
+            if ((int)status != 0)   // CUBLAS_STATUS_SUCCESS
+            {
+                workspace.Dispose();
+                workspace = null;
+            }
+        }
+        catch (Exception ex) when (ex is EntryPointNotFoundException or DllNotFoundException or InvalidOperationException)
+        {
+            // An older cuBLAS without cublasSetWorkspace: keep the internal allocator (and the per-slice
+            // capture fallback in BatchedGemm).
+            workspace?.Dispose();
+            workspace = null;
+        }
+        return new ThreadCublas { Handle = h, IsDeterministic = det, Stream = _stream, Workspace = workspace };
     }
 
     // Device frees DEFERRED from buffer FINALIZERS. Calling the CUDA driver (cuCtxPushCurrent /
