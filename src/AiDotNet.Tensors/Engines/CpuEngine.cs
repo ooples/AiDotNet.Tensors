@@ -16810,7 +16810,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = TensorAllocator.Rent<T>([batch, channels, outputHeight, outputWidth]);
         var outputData = result.GetDataArray();
         var inputData = input.GetFlattenedData();
-        var flatIndices = new int[outputData.Length];
+        // Sized from the logical output: a pooled backing array can be longer than result.Length.
+        var flatIndices = new int[result.Length];
         int inPlane = height * width, outPlane = outputHeight * outputWidth;
 
         if (typeof(T) == typeof(float))
