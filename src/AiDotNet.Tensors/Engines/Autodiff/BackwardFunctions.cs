@@ -2700,16 +2700,14 @@ internal static class BackwardFunctions<T>
             }
             int planes = batch * channels;
             int inPlane = inH * inW, outPlane = outH * outW;
+            // GetDataArray is the backing array of the freshly rented gradient and a dense copy for an offset
+            // view, so both index from 0. Arrays rather than MemoryMarshal.CreateSpan, which net471 lacks.
+            var srcAll = (float[])(object)upstream.GetDataArray();
+            var dstAll = (float[])(object)gradF.GetDataArray();
             CpuParallelSettings.ParallelForOrSerial(0, planes, (long)planes * inPlane, plane =>
             {
-                var src = System.Runtime.InteropServices.MemoryMarshal.CreateReadOnlySpan(
-                    ref System.Runtime.CompilerServices.Unsafe.As<T, float>(
-                        ref System.Runtime.InteropServices.MemoryMarshal.GetReference(upstream.AsSpan())),
-                    upstream.Length).Slice(plane * outPlane, outPlane);
-                var dst = System.Runtime.InteropServices.MemoryMarshal.CreateSpan(
-                    ref System.Runtime.CompilerServices.Unsafe.As<T, float>(
-                        ref System.Runtime.InteropServices.MemoryMarshal.GetReference(gradF.AsWritableSpan())),
-                    gradF.Length).Slice(plane * inPlane, inPlane);
+                var src = new ReadOnlySpan<float>(srcAll, plane * outPlane, outPlane);
+                var dst = new Span<float>(dstAll, plane * inPlane, inPlane);
                 for (int oh = 0; oh < outH; oh++)
                 {
                     int hs = hStarts[oh], he = hEnds[oh];
