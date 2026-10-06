@@ -16251,6 +16251,34 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(float))
         {
+#if !NET471
+            // 3x3 stride-1 dilation-1 kernels whose per-image GEMM is small: the direct FMA kernel (one task per
+            // (oc, ic) pair summing over every image). The im2col + per-image GEMM route below fans one native
+            // call per image across the pool, and those calls serialise on the native compute gate.
+            if (kernelHeight == 3 && kernelWidth == 3 && strideH == 1 && strideW == 1
+                && dilationH == 1 && dilationW == 1 && padH >= 0 && padW >= 0
+                && outputHeight == height + 2 * padH - 2 && outputWidth == width + 2 * padW - 2
+                && outputHeight > 0 && outputWidth > 0
+                && (long)outChannels * inChannels * 9 * outputHeight * outputWidth < ConvBackwardParallelBatchMaxPerImage
+                && SimdConvHelper.CanUseDirectKernelGrad)
+            {
+                var gradOutputData = (float[])(object)gradOutput.GetFlattenedData();
+                var inputData = (float[])(object)input.GetFlattenedData();
+                var destData = (float[])(object)dest._storage.GetDataArray();
+                unsafe
+                {
+                    fixed (float* pIn = inputData)
+                    fixed (float* pGrad = gradOutputData)
+                    fixed (float* pDest = &destData[dest._storageOffset])
+                    {
+                        SimdConvHelper.Conv3x3KernelGradStride1(pIn, pGrad, pDest,
+                            batch, inChannels, height, width, outChannels, padH, padW,
+                            outputHeight, outputWidth, accumulate);
+                    }
+                }
+                return;
+            }
+#endif
             int colH = inChannels * kernelHeight * kernelWidth;
             int colW = outputHeight * outputWidth;
             int totalLen = outChannels * colH;

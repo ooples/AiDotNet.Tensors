@@ -1287,6 +1287,124 @@ internal static class SimdConvHelper
             for (int task = 0; task < totalTasks; task++) RunTask(task);
     }
 
+    /// <summary>True when <see cref="Conv3x3KernelGradStride1"/> can run (AVX2 + FMA).</summary>
+    internal static bool CanUseDirectKernelGrad => UseAvx2 && UseFma;
+
+    /// <summary>
+    /// Kernel gradient of a 3x3 stride-1 dilation-1 convolution (any padding), computed directly with AVX2 FMAs:
+    /// <c>dK[oc, ic, kh, kw] = sum_b sum_oh sum_ow dY[b, oc, oh, ow] * Xpad[b, ic, oh + kh, ow + kw]</c>.
+    /// Every image is first copied into the same zero-padded layout the forward kernel uses, then each task owns
+    /// one (oc, ic) pair: nine vector accumulators (one per tap) run over every image, row and 8-wide column chunk
+    /// (the last, partial chunk's gradient is loaded masked so columns past the row contribute nothing), and are
+    /// reduced to the nine outputs at the end. Writes or (with <paramref name="accumulate"/>) adds into dK.
+    /// </summary>
+    /// <remarks>
+    /// This replaces, for small per-image work, an im2col plus one native GEMM PER IMAGE fanned across the pool:
+    /// the native calls serialise on the process-wide native compute gate, and every image's partial result was
+    /// copied into a fresh array and summed on one thread. Here each dK element is produced by exactly one task in
+    /// a fixed order (lane-wise over the images, rows and chunks; then lanes 0..7; then taps), so the result does
+    /// not depend on the thread count and is identical from run to run.
+    /// </remarks>
+    internal static unsafe void Conv3x3KernelGradStride1(
+        float* input, float* gradOutput, float* gradKernel,
+        int batch, int inChannels, int height, int width,
+        int outChannels, int padH, int padW, int outHeight, int outWidth, bool accumulate)
+    {
+        int colChunks = (outWidth + 7) >> 3;
+        int paddedW = colChunks * 8 + 2;
+        int paddedH = outHeight + 2;
+        int plane = paddedH * paddedW;
+        long paddedImage = (long)inChannels * plane;
+        long inputImage = (long)inChannels * height * width;
+        int outPlane = outHeight * outWidth;
+        long gradImage = (long)outChannels * outPlane;
+        long paddedLen = checked(batch * paddedImage);
+        int tailValid = outWidth - (colChunks - 1) * 8;
+        var tailMask = Vector256.LessThan(
+            Vector256.Create(0, 1, 2, 3, 4, 5, 6, 7), Vector256.Create(tailValid)).AsSingle();
+
+        var pool = System.Buffers.ArrayPool<float>.Shared;
+        float[] paddedArr = pool.Rent(checked((int)paddedLen));
+        try
+        {
+            fixed (float* padded = paddedArr)
+            {
+                float* paddedBase = padded;
+                long padWork = paddedLen;
+                if (batch > 1 && padWork >= 32 * 1024 && CpuParallelSettings.MaxDegreeOfParallelism > 1)
+                    CpuParallelSettings.LightweightParallel(batch, b =>
+                        PadImageForConv3x3(input + b * inputImage, paddedBase + b * paddedImage, inChannels, height,
+                            width, padH, padW, paddedH, paddedW));
+                else
+                    for (int b = 0; b < batch; b++)
+                        PadImageForConv3x3(input + b * inputImage, paddedBase + b * paddedImage, inChannels, height,
+                            width, padH, padW, paddedH, paddedW);
+
+                int tasks = checked(outChannels * inChannels);
+                long totalFmas = (long)tasks * batch * outPlane * 9L;
+                void RunTask(int task)
+                {
+                    int oc = task / inChannels, ic = task - oc * inChannels;
+                    var a0 = Vector256<float>.Zero; var a1 = Vector256<float>.Zero; var a2 = Vector256<float>.Zero;
+                    var a3 = Vector256<float>.Zero; var a4 = Vector256<float>.Zero; var a5 = Vector256<float>.Zero;
+                    var a6 = Vector256<float>.Zero; var a7 = Vector256<float>.Zero; var a8 = Vector256<float>.Zero;
+                    for (int b = 0; b < batch; b++)
+                    {
+                        float* xPlane = paddedBase + b * paddedImage + (long)ic * plane;
+                        float* gPlane = gradOutput + b * gradImage + (long)oc * outPlane;
+                        for (int oh = 0; oh < outHeight; oh++)
+                        {
+                            float* gRow = gPlane + oh * outWidth;
+                            float* r0 = xPlane + oh * paddedW;
+                            float* r1 = r0 + paddedW;
+                            float* r2 = r1 + paddedW;
+                            for (int c = 0; c < colChunks; c++)
+                            {
+                                int ow = c * 8;
+                                var g = c < colChunks - 1 || tailValid == 8
+                                    ? Avx.LoadVector256(gRow + ow)
+                                    : Avx.MaskLoad(gRow + ow, tailMask);
+                                a0 = Fma.MultiplyAdd(g, Avx.LoadVector256(r0 + ow), a0);
+                                a1 = Fma.MultiplyAdd(g, Avx.LoadVector256(r0 + ow + 1), a1);
+                                a2 = Fma.MultiplyAdd(g, Avx.LoadVector256(r0 + ow + 2), a2);
+                                a3 = Fma.MultiplyAdd(g, Avx.LoadVector256(r1 + ow), a3);
+                                a4 = Fma.MultiplyAdd(g, Avx.LoadVector256(r1 + ow + 1), a4);
+                                a5 = Fma.MultiplyAdd(g, Avx.LoadVector256(r1 + ow + 2), a5);
+                                a6 = Fma.MultiplyAdd(g, Avx.LoadVector256(r2 + ow), a6);
+                                a7 = Fma.MultiplyAdd(g, Avx.LoadVector256(r2 + ow + 1), a7);
+                                a8 = Fma.MultiplyAdd(g, Avx.LoadVector256(r2 + ow + 2), a8);
+                            }
+                        }
+                    }
+                    float* dst = gradKernel + (long)task * 9;
+                    StoreKernelGradTap(dst + 0, a0, accumulate); StoreKernelGradTap(dst + 1, a1, accumulate);
+                    StoreKernelGradTap(dst + 2, a2, accumulate); StoreKernelGradTap(dst + 3, a3, accumulate);
+                    StoreKernelGradTap(dst + 4, a4, accumulate); StoreKernelGradTap(dst + 5, a5, accumulate);
+                    StoreKernelGradTap(dst + 6, a6, accumulate); StoreKernelGradTap(dst + 7, a7, accumulate);
+                    StoreKernelGradTap(dst + 8, a8, accumulate);
+                }
+
+                if (tasks >= 2 && totalFmas >= 100_000L && CpuParallelSettings.MaxDegreeOfParallelism > 1)
+                    CpuParallelSettings.LightweightParallel(tasks, RunTask);
+                else
+                    for (int task = 0; task < tasks; task++) RunTask(task);
+            }
+        }
+        finally
+        {
+            pool.Return(paddedArr);
+        }
+    }
+
+    /// <summary>Reduces one tap's eight lanes in lane order (0..7) and stores or adds it.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void StoreKernelGradTap(float* dst, Vector256<float> acc, bool accumulate)
+    {
+        float s = acc.GetElement(0);
+        s += acc.GetElement(1); s += acc.GetElement(2); s += acc.GetElement(3);
+        s += acc.GetElement(4); s += acc.GetElement(5); s += acc.GetElement(6); s += acc.GetElement(7);
+        *dst = accumulate ? *dst + s : s;
+    }
     /// <summary>Copies one [channels, height, width] image into a zero-bordered [channels, paddedH, paddedW] plane set.</summary>
     private static unsafe void PadImageForConv3x3(
         float* src, float* dst, int channels, int height, int width,
