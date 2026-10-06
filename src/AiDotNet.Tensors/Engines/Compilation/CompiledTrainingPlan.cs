@@ -6799,6 +6799,19 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // Conv2D -> channel-bias add [-> ReLU]: one forward and one backward action per chain on a CPU float plan
         // (see DetectConvBiasActivationFusion). Off under grad pooling, whose re-zero schedule is planned per
         // backward action of the unfused stream, and on GPU engines, which keep the capturable generic path.
+        // The tensors whose gradient can matter: the parameters and everything computed from one. A tensor outside
+        // this set (the network input, a constant) feeds no parameter's gradient, and the plan exposes only the
+        // parameters' gradients, so a backward may skip computing the gradient INTO it. Used by the Conv2D
+        // backwards below, where the input gradient of the first layer is a whole extra convolution.
+        var requiresGradTensors = new HashSet<Tensor<T>>(parameters);
+        foreach (var fwdStep in forwardSteps)
+            foreach (var fwdInput in fwdStep.Inputs)
+                if (fwdInput is not null && requiresGradTensors.Contains(fwdInput))
+                {
+                    requiresGradTensors.Add(fwdStep.OutputBuffer);
+                    break;
+                }
+
         var convEpilogueForwardSpecs = new Dictionary<int, Action<IEngine>>();
         var convEpilogueBackwardSpecs = new Dictionary<int, Action<IEngine>>();
         var consumedByConvEpilogue = new HashSet<int>();
@@ -6806,7 +6819,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             && engine is CpuEngine && !engine.SupportsGpu
             && Environment.GetEnvironmentVariable("AIDOTNET_CONV_EPILOGUE_FUSION") != "0")
         {
-            DetectConvBiasActivationFusion(forwardSteps, consumerCount, gradMap,
+            DetectConvBiasActivationFusion(forwardSteps, consumerCount, gradMap, requiresGradTensors,
                 convEpilogueForwardSpecs, convEpilogueBackwardSpecs, consumedByConvEpilogue);
         }
 
@@ -7014,7 +7027,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             // On a GPU engine, skip the host BLAS specialization (preferGenericForGpu) so the backward
             // runs on the GPU stream and the fixed sequence stays CUDA-graph-capturable.
             var action = preferGenericForGpu ? null : BuildSpecializedBackward(step, gradMap, consumerCount, engine, pinnedHandles,
-                dWPeeled: dWPeeledIndices.Contains(i));
+                dWPeeled: dWPeeledIndices.Contains(i), requiresGrad: requiresGradTensors);
             if (action != null)
             {
                 backwardActions.Add(action);
@@ -9355,7 +9368,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         Dictionary<Tensor<T>, int> consumerCount,
         IEngine engine,
         List<GCHandle>? handleTracker = null,
-        bool dWPeeled = false)
+        bool dWPeeled = false,
+        HashSet<Tensor<T>>? requiresGrad = null)
     {
         // Per-branch type checks below — same pattern as TryBuildSpecializedForward.
         // PR #319: extend the MatMul backward to cover double via
@@ -10053,6 +10067,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             var gradKernel = gradMap[kernel];
             bool accumInput = consumerCount.ContainsKey(input) && consumerCount[input] > 1;
             bool accumKernel = consumerCount.ContainsKey(kernel) && consumerCount[kernel] > 1;
+            // An input no parameter feeds (the network input) needs no gradient: skip that whole convolution.
+            bool needInputGrad = requiresGrad is null || requiresGrad.Contains(input);
             // Capture shapes so the closure doesn't walk Tensor.Shape every
             // Step (microoptimization but matters at 19+ Conv calls per iter).
             var inShape = (int[])input._shape.Clone();
@@ -10064,22 +10080,26 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             {
                 if (eng is CpuEngine cpu && !eng.SupportsGpu)
                 {
-                    cpu.Conv2DBackwardInputInto(gradInput, gradOut, kernel, inShape,
-                        capStride, capPadding, capDilation, accumInput);
+                    if (needInputGrad)
+                        cpu.Conv2DBackwardInputInto(gradInput, gradOut, kernel, inShape,
+                            capStride, capPadding, capDilation, accumInput);
                     cpu.Conv2DBackwardKernelInto(gradKernel, gradOut, input, kShape,
                         capStride, capPadding, capDilation, accumKernel);
                 }
                 else
                 {
                     // Non-CpuEngine fallback — match the eager path semantics.
-                    var gi = eng.Conv2DBackwardInput(gradOut, kernel, inShape, capStride, capPadding, capDilation);
-                    if (accumInput) eng.TensorAddInto(gradInput, gradInput, gi);
-                    else gi.AsSpan().CopyTo(gradInput.AsWritableSpan());
+                    if (needInputGrad)
+                    {
+                        var gi = eng.Conv2DBackwardInput(gradOut, kernel, inShape, capStride, capPadding, capDilation);
+                        if (accumInput) eng.TensorAddInto(gradInput, gradInput, gi);
+                        else gi.AsSpan().CopyTo(gradInput.AsWritableSpan());
+                    }
                     var gk = eng.Conv2DBackwardKernel(gradOut, input, kShape, capStride, capPadding, capDilation);
                     if (accumKernel) eng.TensorAddInto(gradKernel, gradKernel, gk);
                     else gk.AsSpan().CopyTo(gradKernel.AsWritableSpan());
                 }
-                input.Grad = gradInput;
+                if (needInputGrad) input.Grad = gradInput;
                 kernel.Grad = gradKernel;
             };
         }
@@ -11366,6 +11386,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         List<CompiledStep<T>> steps,
         Dictionary<Tensor<T>, int> consumerCount,
         Dictionary<Tensor<T>, Tensor<T>> gradMap,
+        HashSet<Tensor<T>> requiresGrad,
         Dictionary<int, Action<IEngine>> forwardSpecs,
         Dictionary<int, Action<IEngine>> backwardSpecs,
         HashSet<int> consumed)
@@ -11427,6 +11448,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             bool accumX = consumerCount.TryGetValue(x, out int xConsumers) && xConsumers > 1;
             bool accumKernel = consumerCount.TryGetValue(kernel, out int kConsumers) && kConsumers > 1;
             bool accumBias = consumerCount.TryGetValue(bias, out int bConsumers) && bConsumers > 1;
+            // An input no parameter feeds (the network input) needs no gradient: skip that whole convolution.
+            bool needInputGrad = requiresGrad.Contains(x);
             var xShape = (int[])x._shape.Clone();
             var kShape = (int[])kernel._shape.Clone();
             var convOutF = (Tensor<float>)(object)convOut;
@@ -11455,8 +11478,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 if (eng is CpuEngine cpu && !eng.SupportsGpu)
                 {
                     cpu.ChannelBiasActivationBackwardInto(gradConvOutF, gradBiasF, gradYF, yF, relu, accumBias);
-                    cpu.Conv2DBackwardInputInto(gradX, gradConvOut, kernel, xShape,
-                        capStride, capPadding, capDilation, accumX);
+                    if (needInputGrad)
+                        cpu.Conv2DBackwardInputInto(gradX, gradConvOut, kernel, xShape,
+                            capStride, capPadding, capDilation, accumX);
                     cpu.Conv2DBackwardKernelInto(gradKernel, gradConvOut, x, kShape,
                         capStride, capPadding, capDilation, accumKernel);
                 }
@@ -11466,7 +11490,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                         "The fused Conv2D/bias/activation backward was compiled for a CPU engine and cannot replay on "
                         + eng.GetType().Name + ".");
                 }
-                x.Grad = gradX;
+                if (needInputGrad) x.Grad = gradX;
                 kernel.Grad = gradKernel;
                 bias.Grad = gradBias;
             };

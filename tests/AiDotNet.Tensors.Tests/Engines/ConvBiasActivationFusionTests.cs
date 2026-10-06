@@ -192,6 +192,66 @@ public class ConvBiasActivationFusionTests
         }
     }
 
+    /// <summary>
+    /// A conv backward skips the gradient INTO an input no parameter feeds (the network input). When the caller
+    /// asks for that input's gradient by listing it as a parameter, it must still be computed: through the fused
+    /// conv/bias/ReLU chain and through a plain Conv2D (no bias add), each against the eager tape.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void InputGradientIsComputedWhenRequested(bool withBias)
+    {
+        var priorEngine = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = new CpuEngine();
+        try
+        {
+            var net = new Net();
+            var engine = new CpuEngine();
+            var parameters = new[] { net.X, net.K1, net.B1 };
+            Tensor<float> Forward(IEngine e)
+            {
+                var z = e.Conv2D(net.X, net.K1, 1, 1, 1);
+                if (withBias) z = e.TensorChannelBiasAdd(z, net.B1);
+                else z = e.TensorMultiply(z, z);
+                var h = e.ReLU(z);
+                return e.ReduceSum(e.TensorMultiply(h, h), null);
+            }
+            float[] tapeDx;
+            using (var t = new GradientTape<float>())
+            {
+                var loss = Forward(engine);
+                tapeDx = t.ComputeGradients(loss, new[] { net.X })[net.X].GetFlattenedData();
+            }
+            ICompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.Enable())
+            {
+                Forward(new CpuEngine());
+                plan = scope.CompileTraining(withBias ? parameters : new[] { net.X, net.K1 });
+            }
+            try
+            {
+                plan.Step();
+                var dx = plan.Gradients[0].AsSpan();
+                Assert.Equal(tapeDx.Length, dx.Length);
+                double maxAbs = 0;
+                for (int i = 0; i < dx.Length; i++) maxAbs = Math.Max(maxAbs, Math.Abs(tapeDx[i]));
+                Assert.True(maxAbs > 0, "the reference input gradient is all zero, so this test would prove nothing");
+                for (int i = 0; i < dx.Length; i++)
+                    Assert.True(Math.Abs(tapeDx[i] - dx[i]) <= 1e-4f * (1f + Math.Abs(tapeDx[i])),
+                        $"dX element {i}: tape {tapeDx[i]:R} plan {dx[i]:R}");
+            }
+            finally
+            {
+                plan.Dispose();
+            }
+        }
+        finally
+        {
+            AiDotNetEngine.Current = priorEngine;
+        }
+    }
+
     /// <summary>The fused plan also matches the eager tape (so the comparison above is not two wrong plans).</summary>
     [Fact]
     public void FusedPlanMatchesTape()
