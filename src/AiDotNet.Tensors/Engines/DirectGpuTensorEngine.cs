@@ -1709,6 +1709,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             throw new InvalidOperationException(ReleasedIntermediateMessage);
     }
 
+    private static readonly bool s_staleDropTrace = System.Environment.GetEnvironmentVariable("AIDOTNET_STALE_DROP_TRACE") == "1";
+
     private OwnedBuffer GetOrAllocateBuffer<T>(IDirectGpuBackend backend, Tensor<T> tensor)
     {
         ThrowIfReleased(tensor);
@@ -1777,6 +1779,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (staleArray is not null)
                 InvalidateActivationCacheEntry(staleArray);
             InvalidateActivationCacheEntry(tensor.DataVector);
+            if (s_staleDropTrace && tensor.Length > 0)
+                AliasDiag($"STALE-DROP len={tensor.Length} gpuVer={tensor._gpuBufferVersion} hostVer={tensor.GpuCacheVersion} caller="
+                    + new System.Diagnostics.StackTrace(1, false).ToString().Replace(System.Environment.NewLine, " <- "));
             tensor._gpuBuffer = null;
             tensor._gpuBackend = null;
             tensor._gpuBufferVersion = -1;
@@ -1898,6 +1903,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     public void InvalidateResidentWeightBuffer<T>(LinearAlgebra.Tensor<T> tensor)
     {
+        if (s_staleDropTrace)
+            AliasDiag($"INVALIDATE-WEIGHT len={tensor.Length} caller=" + new System.Diagnostics.StackTrace(1, false).ToString().Replace(System.Environment.NewLine, " <- "));
         // DROP (do not materialize) any pending deferred device->host download FIRST. The host
         // weight array was just updated IN PLACE by the CPU-side optimizer, so a pending download
         // holds STALE pre-step device data; letting InvalidateGpuCacheForTensor force-materialize it
@@ -2152,6 +2159,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (staleArray is not null)
                 InvalidateActivationCacheEntry(staleArray);
             InvalidateActivationCacheEntry(tensor.DataVector);
+            if (s_staleDropTrace && tensor.Length > 0)
+                AliasDiag($"STALE-DROP len={tensor.Length} gpuVer={tensor._gpuBufferVersion} hostVer={tensor.GpuCacheVersion} caller="
+                    + new System.Diagnostics.StackTrace(1, false).ToString().Replace(System.Environment.NewLine, " <- "));
             tensor._gpuBuffer = null;
             tensor._gpuBackend = null;
             tensor._gpuBufferVersion = -1;

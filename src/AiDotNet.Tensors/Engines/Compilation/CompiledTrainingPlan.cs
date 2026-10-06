@@ -520,6 +520,51 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     /// HypergradientSGD/DAdaptationSGD/ScheduleFreeSGD branches and ScheduleFree's pre-forward
     /// y-update, which previously left Version and the resident caches stale (#739 review).
     /// </summary>
+    /// <summary>
+    /// Makes an in-place device update of parameter <paramref name="p"/> authoritative everywhere it is looked up,
+    /// through the engine's single path for that (the eager GpuOptimizer already uses it). Binding the buffer alone
+    /// left the persistent weight cache stamped with the pre-update version, so the next forward judged the updated
+    /// device buffer stale, re-uploaded the old host weights over it and disposed it: every float32 parameter that was
+    /// GPU-resident at the first step (one Predict before Train is enough) silently lost its first two updates, then
+    /// fell to the host optimizer.
+    /// </summary>
+    private void CommitDeviceParameterUpdate(Engines.DirectGpuTensorEngine engine, int p,
+        Engines.DirectGpu.IGpuBuffer buffer, Engines.DirectGpu.IDirectGpuBackend backend)
+    {
+        if (typeof(T) == typeof(float))
+            engine.CommitParameterUpdatedOnDevice((Tensor<float>)(object)_parameters[p], buffer, backend, syncPoint: null);
+    }
+
+    /// <summary>
+    /// Host wins after a host write. A GPU plan binds every parameter to a persistent device buffer and updates it there,
+    /// so between steps the device copy is authoritative. A host write in between (SetParameters, a user edit through
+    /// AsWritableSpan + IncrementVersion) advances the host version past the bound buffer's; upload those values into
+    /// the SAME buffer before the step, so the step reads them and a captured graph's baked pointers stay valid.
+    /// </summary>
+    private void UploadHostWrittenParameters()
+    {
+        if (typeof(T) != typeof(float) || _engine is not Engines.DirectGpuTensorEngine gte) return;
+        for (int p = 0; p < _parameters.Length; p++)
+        {
+            var parameter = _parameters[p];
+            var buffer = parameter._gpuBuffer;
+            if (buffer is null || buffer.Handle == IntPtr.Zero || parameter._gpuBackend is not { } backend) continue;
+            if (parameter._gpuBufferVersion == parameter.GpuCacheVersion) continue;
+
+            if (backend is Engines.DirectGpu.CUDA.CudaBackend cuda && buffer.Size >= parameter.Length)
+            {
+                var host = (float[])(object)parameter.ToArray();
+                cuda.UploadBufferInPlace(host, buffer);
+                gte.CommitParameterUpdatedOnDevice((Tensor<float>)(object)parameter, buffer, backend, syncPoint: null);
+            }
+            else
+            {
+                // No in-place upload on this backend: drop the binding so the next forward re-uploads the host values.
+                gte.InvalidateResidentWeightBuffer(parameter);
+            }
+        }
+    }
+
     private void MarkHostWeightMutated(int p)
     {
         // A host-side weight write invalidates the parameter's resident device buffer (below), which a captured step
@@ -2090,6 +2135,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Tensor<T> Step()
     {
+        UploadHostWrittenParameters();
         lock (_stepSync)
             return StepCore();
     }
@@ -3593,8 +3639,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             // so the fused on-device optimizer mutates the SAME buffer the resident forward down-cast reads. If we
             // read TryGetGpuBuffer() first and pinned after, the optimizer would update a transient buffer the
             // forward never sees → the weights never change → flat loss. Only meaningful on the FP16 hetero path.
-            if (ResidentFp16TrainingEnabled && _fp16HeteroOrder is not null
-                && _engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine rde)
+            // Bind every parameter to the persistent weight buffer the GPU forward reads (this used to happen only for
+            // resident FP16 training), so the optimizer below updates it ON THE DEVICE. Unbound, a float32 parameter took
+            // the host update path: weights round-tripped every step and each host write retired the captured step
+            // graph. Bound, the parity MLP trains in 3.42 ms/step instead of 6.81, with the graph replaying.
+            if (_engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine rde)
                 rde.RegisterResidentParamBuffer(_parameters[p]);
             var paramGpuBuf = _parameters[p].TryGetGpuBuffer();
             var paramBackend = _parameters[p]._gpuBackend;
@@ -4272,7 +4321,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                     {
                         _parameters[p]._gpuBufferVersion = _parameters[p].GpuCacheVersion;
                         if (_engine is Engines.DirectGpuTensorEngine rebindEngine && gpuParam[p] is { } gpBind && gpuBackends[p] is { } beBind)
+                        {
                             rebindEngine.BindResidentBuffer(_parameters[p], gpBind, beBind);
+                            CommitDeviceParameterUpdate(rebindEngine, p, gpBind, beBind);
+                        }
                     }
                     return;
                 }
@@ -4468,7 +4520,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                     // Re-registering re-arms the download against the CURRENT device buffer (HostSync
                     // .Register TryAdds, so it's a no-op if a read is still pending, and re-arms after one fired).
                     if (_engine is Engines.DirectGpuTensorEngine _rebindEngine)
+                    {
                         _rebindEngine.BindResidentBuffer(_parameters[p], gpuP, gpuBe);
+                        CommitDeviceParameterUpdate(_rebindEngine, p, gpuP, gpuBe);
+                    }
                     continue;
                 }
 
@@ -4775,8 +4830,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             // GPU fast path — same logic as ConfigureOptimizerFloat. See
             // there for the full rationale on per-param GPU/CPU dispatch.
             // Pin BEFORE reading the buffer so the optimizer and the resident forward share the SAME param buffer.
-            if (ResidentFp16TrainingEnabled && _fp16HeteroOrder is not null
-                && _engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine rde)
+            // Bind every parameter to the persistent weight buffer the GPU forward reads (this used to happen only for
+            // resident FP16 training), so the optimizer below updates it ON THE DEVICE. Unbound, a float32 parameter took
+            // the host update path: weights round-tripped every step and each host write retired the captured step
+            // graph. Bound, the parity MLP trains in 3.42 ms/step instead of 6.81, with the graph replaying.
+            if (_engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine rde)
                 rde.RegisterResidentParamBuffer(_parameters[p]);
             var paramGpuBuf = _parameters[p].TryGetGpuBuffer();
             var paramBackend = _parameters[p]._gpuBackend;
