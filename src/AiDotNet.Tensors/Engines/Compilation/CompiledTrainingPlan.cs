@@ -6796,6 +6796,20 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 slicePrefixForwardSpecs, slicePrefixBackwardSpecs, consumedBySlicePrefix);
         }
 
+        // Conv2D -> channel-bias add [-> ReLU]: one forward and one backward action per chain on a CPU float plan
+        // (see DetectConvBiasActivationFusion). Off under grad pooling, whose re-zero schedule is planned per
+        // backward action of the unfused stream, and on GPU engines, which keep the capturable generic path.
+        var convEpilogueForwardSpecs = new Dictionary<int, Action<IEngine>>();
+        var convEpilogueBackwardSpecs = new Dictionary<int, Action<IEngine>>();
+        var consumedByConvEpilogue = new HashSet<int>();
+        if (typeof(T) == typeof(float) && !useGradPool && !preferGenericForGpu
+            && engine is CpuEngine && !engine.SupportsGpu
+            && Environment.GetEnvironmentVariable("AIDOTNET_CONV_EPILOGUE_FUSION") != "0")
+        {
+            DetectConvBiasActivationFusion(forwardSteps, consumerCount, gradMap,
+                convEpilogueForwardSpecs, convEpilogueBackwardSpecs, consumedByConvEpilogue);
+        }
+
         // Phase G.12: layer-level dW batching. Detect MatMul backward
         // steps with identical (M, N, K) shapes, peel out their dW
         // computation, and dispatch all same-shape dW GEMMs in a
@@ -6872,6 +6886,18 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             {
                 forwardEmitKinds[i] = ForwardEmit.Skip;
                 continue;  // Slice step — already handled by the fused MatMul above
+            }
+            if (convEpilogueForwardSpecs.TryGetValue(i, out var convEpilogueFwd))
+            {
+                allForwardActions.Add(convEpilogueFwd);
+                forwardEmitKinds[i] = ForwardEmit.Fixed;
+                forwardFixedActions[i] = convEpilogueFwd;
+                continue;
+            }
+            if (consumedByConvEpilogue.Contains(i))
+            {
+                forwardEmitKinds[i] = ForwardEmit.Skip;
+                continue;  // bias add / ReLU of a fused conv chain: written by the conv's action
             }
             if (fusedStepIndices.Contains(i))
             {
@@ -6964,6 +6990,17 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 continue;
             }
             if (consumedBySlicePrefix.Contains(i))
+            {
+                continue;
+            }
+            // Fused Conv2D -> bias add [-> ReLU]: the chain's whole backward runs at its last step.
+            if (convEpilogueBackwardSpecs.TryGetValue(i, out var convEpilogueBwd))
+            {
+                backwardActions.Add(convEpilogueBwd);
+                backwardStepNames.Add("fused:Conv2D+ChannelBias" + (step.OpType == OpType.ReLU ? "+ReLU" : ""));
+                continue;
+            }
+            if (consumedByConvEpilogue.Contains(i))
             {
                 continue;
             }
@@ -11308,6 +11345,137 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     /// backward work.
     /// </para>
     /// </summary>
+    /// <summary>
+    /// Finds <c>Conv2D -> TensorChannelBiasAdd [-> ReLU]</c> chains on a CPU float plan and replaces the chain's
+    /// forward and backward with one action each. Forward: the convolution into its own output buffer (the same
+    /// call its specialized forward makes), then one pass act(conv + bias) straight into the chain's last output
+    /// (<see cref="CpuEngine.ChannelBiasActivationInto"/>); the bias-add and ReLU steps emit nothing. Backward: one
+    /// pass forming the pre-activation gradient into the convolution output's gradient buffer and the bias gradient
+    /// (<see cref="CpuEngine.ChannelBiasActivationBackwardInto"/>), then the convolution's input and kernel
+    /// gradients exactly as the specialized Conv2D backward computes them. Bit-identical to the unfused chain.
+    /// Steps are matched by dataflow, not adjacency: the plan's order may interleave unrelated steps.
+    /// </summary>
+    /// <remarks>
+    /// The bias-add (and ReLU) input buffers are never written, so the chain is only fused when each intermediate
+    /// has exactly one consumer (the next op of the chain) and every gradient buffer involved is distinct. The
+    /// forward action sits at the convolution's index (its output is written there, so step observers and the
+    /// forward-buffer sanitizer see a real write); the backward action sits at the chain's LAST index, which in
+    /// reverse order is where the output gradient is complete.
+    /// </remarks>
+    private static void DetectConvBiasActivationFusion(
+        List<CompiledStep<T>> steps,
+        Dictionary<Tensor<T>, int> consumerCount,
+        Dictionary<Tensor<T>, Tensor<T>> gradMap,
+        Dictionary<int, Action<IEngine>> forwardSpecs,
+        Dictionary<int, Action<IEngine>> backwardSpecs,
+        HashSet<int> consumed)
+    {
+        if (typeof(T) != typeof(float)) return;
+
+        // The unique consumer step of each tensor read by exactly one step.
+        var soleConsumer = new Dictionary<Tensor<T>, int>();
+        for (int s = 0; s < steps.Count; s++)
+            foreach (var inp in steps[s].Inputs)
+                if (inp is not null && consumerCount.TryGetValue(inp, out int n) && n == 1)
+                    soleConsumer[inp] = s;
+
+        for (int convIdx = 0; convIdx < steps.Count; convIdx++)
+        {
+            var conv = steps[convIdx];
+            if (conv.OpType != OpType.Conv2D || conv.Inputs.Length != 2 || conv.BackwardFn == null) continue;
+            if (conv.SavedState is not { Length: >= 3 } convState
+                || convState[0] is not int[] stride || convState[1] is not int[] padding
+                || convState[2] is not int[] dilation) continue;
+            var x = conv.Inputs[0];
+            var kernel = conv.Inputs[1];
+            var convOut = conv.OutputBuffer;
+            if (x.Rank != 4 || kernel.Rank != 4 || convOut.Rank != 4
+                || !x.IsContiguous || !kernel.IsContiguous || !convOut.IsContiguous) continue;
+            if (!soleConsumer.TryGetValue(convOut, out int biasIdx) || biasIdx <= convIdx || consumed.Contains(biasIdx)) continue;
+
+            var biasStep = steps[biasIdx];
+            if (biasStep.OpName != "TensorChannelBiasAdd" || biasStep.Inputs.Length != 2
+                || !ReferenceEquals(biasStep.Inputs[0], convOut) || biasStep.BackwardFn == null) continue;
+            var bias = biasStep.Inputs[1];
+            var biasOut = biasStep.OutputBuffer;
+            if (bias.Rank != 1 || bias._shape[0] != convOut._shape[1] || !bias.IsContiguous
+                || !biasOut.IsContiguous || biasOut.Length != convOut.Length) continue;
+
+            // Extend through a ReLU when the bias-add output feeds only that ReLU.
+            int last = biasIdx;
+            bool relu = false;
+            if (soleConsumer.TryGetValue(biasOut, out int reluIdx) && reluIdx > biasIdx && !consumed.Contains(reluIdx))
+            {
+                var reluStep = steps[reluIdx];
+                if (reluStep.OpType == OpType.ReLU && reluStep.Inputs.Length == 1
+                    && ReferenceEquals(reluStep.Inputs[0], biasOut) && reluStep.BackwardFn != null
+                    && reluStep.OutputBuffer.IsContiguous && reluStep.OutputBuffer.Length == biasOut.Length)
+                {
+                    relu = true;
+                    last = reluIdx;
+                }
+            }
+            var y = steps[last].OutputBuffer;
+
+            if (!gradMap.TryGetValue(y, out var gradY) || !gradMap.TryGetValue(convOut, out var gradConvOut)
+                || !gradMap.TryGetValue(bias, out var gradBias) || !gradMap.TryGetValue(x, out var gradX)
+                || !gradMap.TryGetValue(kernel, out var gradKernel)) continue;
+            // Every buffer this writes or reads must be its own: an alias would let one write clobber another read.
+            var distinct = new HashSet<Tensor<T>> { gradY, gradConvOut, gradBias, gradX, gradKernel };
+            if (distinct.Count != 5 || !gradY.IsContiguous || !gradConvOut.IsContiguous) continue;
+
+            bool accumX = consumerCount.TryGetValue(x, out int xConsumers) && xConsumers > 1;
+            bool accumKernel = consumerCount.TryGetValue(kernel, out int kConsumers) && kConsumers > 1;
+            bool accumBias = consumerCount.TryGetValue(bias, out int bConsumers) && bConsumers > 1;
+            var xShape = (int[])x._shape.Clone();
+            var kShape = (int[])kernel._shape.Clone();
+            var convOutF = (Tensor<float>)(object)convOut;
+            var biasF = (Tensor<float>)(object)bias;
+            var yF = (Tensor<float>)(object)y;
+            var gradYF = (Tensor<float>)(object)gradY;
+            var gradConvOutF = (Tensor<float>)(object)gradConvOut;
+            var gradBiasF = (Tensor<float>)(object)gradBias;
+            var capStride = stride; var capPadding = padding; var capDilation = dilation;
+
+            forwardSpecs[convIdx] = eng =>
+            {
+                if (eng is CpuEngine cpu && !eng.SupportsGpu)
+                {
+                    cpu.Conv2DInto(convOut, x, kernel, capStride, capPadding, capDilation);
+                    cpu.ChannelBiasActivationInto(yF, convOutF, biasF, relu);
+                }
+                else
+                {
+                    var z = eng.TensorChannelBiasAdd(eng.Conv2D(x, kernel, capStride, capPadding, capDilation), bias);
+                    (relu ? eng.ReLU(z) : z).AsSpan().CopyTo(y.AsWritableSpan());
+                }
+            };
+            backwardSpecs[last] = eng =>
+            {
+                if (eng is CpuEngine cpu && !eng.SupportsGpu)
+                {
+                    cpu.ChannelBiasActivationBackwardInto(gradConvOutF, gradBiasF, gradYF, yF, relu, accumBias);
+                    cpu.Conv2DBackwardInputInto(gradX, gradConvOut, kernel, xShape,
+                        capStride, capPadding, capDilation, accumX);
+                    cpu.Conv2DBackwardKernelInto(gradKernel, gradConvOut, x, kShape,
+                        capStride, capPadding, capDilation, accumKernel);
+                }
+                else
+                {
+                    throw new InvalidOperationException(
+                        "The fused Conv2D/bias/activation backward was compiled for a CPU engine and cannot replay on "
+                        + eng.GetType().Name + ".");
+                }
+                x.Grad = gradX;
+                kernel.Grad = gradKernel;
+                bias.Grad = gradBias;
+            };
+            consumed.Add(convIdx);
+            consumed.Add(biasIdx);
+            if (relu) consumed.Add(reluIdx);
+        }
+    }
+
     private static void DetectMatMulSlicePrefixFusion(
         List<CompiledStep<T>> forwardSteps,
         Dictionary<Tensor<T>, int> consumerCount,

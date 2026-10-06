@@ -1,0 +1,227 @@
+using System;
+using AiDotNet.Tensors.Engines;
+using AiDotNet.Tensors.Engines.Autodiff;
+using AiDotNet.Tensors.Engines.Compilation;
+using AiDotNet.Tensors.Helpers;
+using AiDotNet.Tensors.LinearAlgebra;
+using Xunit;
+
+namespace AiDotNet.Tensors.Tests.Engines;
+
+/// <summary>
+/// A compiled CPU training plan runs each Conv2D -> TensorChannelBiasAdd [-> ReLU] chain as one forward action
+/// (the conv, then one bias+ReLU pass) and one backward action (one pass for the pre-activation and bias gradients,
+/// then the conv gradients). The fusion is meant to be bit-identical to the unfused chain, so these compare the
+/// kernels against the separate engine ops and the fused plan against the same plan compiled with the fusion off
+/// (AIDOTNET_CONV_EPILOGUE_FUSION=0), bit for bit, over several steps.
+/// </summary>
+[Collection("EngineCurrentGlobalState")]
+public class ConvBiasActivationFusionTests
+{
+    private static Tensor<float> Rnd(int[] shape, int seed, float scale = 1f)
+    {
+        var rng = new Random(seed);
+        var t = new Tensor<float>(shape);
+        for (int i = 0; i < t.Length; i++) t[i] = (float)(rng.NextDouble() * 2 - 1) * scale;
+        return t;
+    }
+
+    private static void AssertBitEqual(ReadOnlySpan<float> expected, ReadOnlySpan<float> actual, string what)
+    {
+        Assert.Equal(expected.Length, actual.Length);
+        for (int i = 0; i < expected.Length; i++)
+            Assert.True(BitConverter.SingleToInt32Bits(expected[i]) == BitConverter.SingleToInt32Bits(actual[i]),
+                $"{what}: element {i} expected {expected[i]:R} got {actual[i]:R}");
+    }
+
+    [Theory]
+    [InlineData(2, 3, 5, 7, true)]     // spatial 35: vector body plus a scalar tail
+    [InlineData(3, 4, 4, 4, true)]     // spatial 16: vector only
+    [InlineData(2, 2, 1, 3, true)]     // spatial 3: scalar only
+    [InlineData(2, 3, 5, 7, false)]
+    public void ForwardMatchesSeparateOps(int n, int c, int h, int w, bool relu)
+    {
+        var engine = new CpuEngine();
+        var x = Rnd(new[] { n, c, h, w }, 1);
+        var b = Rnd(new[] { c }, 2);
+        // Special values: a NaN sum, a -0 sum (input -b), exact zeros.
+        x[0] = float.NaN; x[1] = -b[0]; x[2] = 0f;
+        var expected = engine.TensorChannelBiasAdd(x, b);
+        if (relu) expected = engine.ReLU(expected);
+        var actual = new Tensor<float>(x._shape);
+        engine.ChannelBiasActivationInto(actual, x, b, relu);
+        AssertBitEqual(expected.AsSpan(), actual.AsSpan(), "forward");
+    }
+
+    [Theory]
+    [InlineData(2, 3, 5, 7, true, false)]
+    [InlineData(3, 4, 4, 4, true, true)]
+    [InlineData(2, 2, 1, 3, false, false)]
+    [InlineData(2, 3, 5, 7, false, true)]
+    public void BackwardMatchesSeparateOps(int n, int c, int h, int w, bool relu, bool accumulateBias)
+    {
+        var engine = new CpuEngine();
+        var y = Rnd(new[] { n, c, h, w }, 3);
+        var dy = Rnd(new[] { n, c, h, w }, 4);
+        y[0] = 0f; y[1] = -0f; y[2] = float.NaN; dy[3] = -0f; dy[4] = -0f; y[4] = 1f;
+        if (relu) for (int i = 0; i < y.Length; i++) if (y[i] < 0) y[i] = 0f;   // a ReLU output is never negative
+
+        // Reference: the ReLU backward mask, the identity gradient landing on a zeroed buffer, the bias reduction.
+        var masked = new float[dy.Length];
+        for (int i = 0; i < masked.Length; i++) masked[i] = relu ? (y[i] > 0 ? dy[i] : 0f) : dy[i];
+        var expectedDz = new float[masked.Length];
+        for (int i = 0; i < masked.Length; i++) expectedDz[i] = 0f + masked[i];
+        var expectedDb = new Tensor<float>(new[] { n, c, h, w }, new Vector<float>(masked)).Sum(new[] { 0, 2, 3 });
+        var priorDb = Rnd(new[] { c }, 5);
+        var expectedBias = new float[c];
+        for (int i = 0; i < c; i++) expectedBias[i] = accumulateBias ? priorDb[i] + expectedDb[i] : expectedDb[i];
+
+        var dz = new Tensor<float>(y._shape);
+        for (int i = 0; i < dz.Length; i++) dz[i] = 77f;   // stale contents must be fully replaced
+        var db = new Tensor<float>(new[] { c });
+        priorDb.AsSpan().CopyTo(db.AsWritableSpan());
+        engine.ChannelBiasActivationBackwardInto(dz, db, dy, y, relu, accumulateBias);
+        AssertBitEqual(expectedDz, dz.AsSpan(), "pre-activation gradient");
+        AssertBitEqual(expectedBias, db.AsSpan(), "bias gradient");
+    }
+
+    [Fact]
+    public void BackwardIsIndependentOfThreadCount()
+    {
+        var engine = new CpuEngine();
+        var y = Rnd(new[] { 16, 8, 14, 14 }, 6);
+        var dy = Rnd(new[] { 16, 8, 14, 14 }, 7);
+        int prior = CpuParallelSettings.MaxDegreeOfParallelism;
+        try
+        {
+            CpuParallelSettings.MaxDegreeOfParallelism = 1;
+            var dz1 = new Tensor<float>(y._shape); var db1 = new Tensor<float>(new[] { 8 });
+            engine.ChannelBiasActivationBackwardInto(dz1, db1, dy, y, true, false);
+            CpuParallelSettings.MaxDegreeOfParallelism = Math.Max(2, Environment.ProcessorCount);
+            var dz2 = new Tensor<float>(y._shape); var db2 = new Tensor<float>(new[] { 8 });
+            engine.ChannelBiasActivationBackwardInto(dz2, db2, dy, y, true, false);
+            AssertBitEqual(dz1.AsSpan(), dz2.AsSpan(), "dz");
+            AssertBitEqual(db1.AsSpan(), db2.AsSpan(), "db");
+        }
+        finally
+        {
+            CpuParallelSettings.MaxDegreeOfParallelism = prior;
+        }
+    }
+
+    private sealed class Net
+    {
+        public Tensor<float> X = Rnd(new[] { 3, 2, 9, 9 }, 11);
+        public Tensor<float> K1 = Rnd(new[] { 4, 2, 3, 3 }, 12, 0.5f);
+        public Tensor<float> B1 = Rnd(new[] { 4 }, 13, 0.2f);
+        public Tensor<float> K2 = Rnd(new[] { 4, 4, 3, 3 }, 14, 0.5f);
+        public Tensor<float> B2 = Rnd(new[] { 4 }, 15, 0.2f);
+        public Tensor<float> W = Rnd(new[] { 64, 3 }, 16, 0.5f);
+        public Tensor<float> Coef = Rnd(new[] { 3, 3 }, 17);
+        public Tensor<float>[] Parameters => new[] { K1, B1, K2, B2, W };
+
+        /// <param name="sharedBias">conv2 reuses conv1's bias, so the bias has two consumers (accumulates).</param>
+        /// <param name="secondRelu">conv2's bias add feeds a ReLU (conv+bias+ReLU) or not (conv+bias).</param>
+        public void Forward(IEngine e, bool sharedBias, bool secondRelu)
+        {
+            var h = e.ReLU(e.TensorChannelBiasAdd(e.Conv2D(X, K1, 1, 1, 1), B1));
+            h = e.MaxPool2DWithIndices(h, new[] { 2, 2 }, new[] { 2, 2 }, out _);
+            h = e.TensorChannelBiasAdd(e.Conv2D(h, K2, 1, 1, 1), sharedBias ? B1 : B2);
+            if (secondRelu) h = e.ReLU(h);
+            else h = e.TensorMultiply(h, h);
+            var logits = e.TensorMatMul(e.Reshape(h, new[] { 3, 64 }), W);
+            e.ReduceSum(e.TensorMultiply(logits, Coef), null);
+        }
+    }
+
+    private static float[][] RunPlan(Net net, bool fusion, bool sharedBias, bool secondRelu, int steps)
+    {
+        var prior = Environment.GetEnvironmentVariable("AIDOTNET_CONV_EPILOGUE_FUSION");
+        Environment.SetEnvironmentVariable("AIDOTNET_CONV_EPILOGUE_FUSION", fusion ? null : "0");
+        ICompiledTrainingPlan<float> plan;
+        try
+        {
+            using var scope = GraphMode.Enable();
+            net.Forward(new CpuEngine(), sharedBias, secondRelu);
+            plan = scope.CompileTraining(net.Parameters);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("AIDOTNET_CONV_EPILOGUE_FUSION", prior);
+        }
+        try
+        {
+            float[][] grads = Array.Empty<float[]>();
+            for (int s = 0; s < steps; s++)
+            {
+                plan.Step();
+                grads = Array.ConvertAll(plan.Gradients, g => g.AsSpan().ToArray());
+            }
+            return grads;
+        }
+        finally
+        {
+            plan.Dispose();
+        }
+    }
+
+    [Theory]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    public void FusedPlanMatchesUnfusedPlan(bool sharedBias, bool secondRelu)
+    {
+        var priorEngine = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = new CpuEngine();
+        try
+        {
+            var net = new Net();
+            for (int steps = 1; steps <= 2; steps++)
+            {
+                var unfused = RunPlan(net, fusion: false, sharedBias, secondRelu, steps);
+                var fused = RunPlan(net, fusion: true, sharedBias, secondRelu, steps);
+                Assert.Equal(unfused.Length, fused.Length);
+                for (int p = 0; p < unfused.Length; p++)
+                    AssertBitEqual(unfused[p], fused[p], $"after {steps} step(s), parameter {p}");
+            }
+        }
+        finally
+        {
+            AiDotNetEngine.Current = priorEngine;
+        }
+    }
+
+    /// <summary>The fused plan also matches the eager tape (so the comparison above is not two wrong plans).</summary>
+    [Fact]
+    public void FusedPlanMatchesTape()
+    {
+        var priorEngine = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = new CpuEngine();
+        try
+        {
+            var net = new Net();
+            var engine = new CpuEngine();
+            float[][] tape;
+            using (var t = new GradientTape<float>())
+            {
+                var h = engine.ReLU(engine.TensorChannelBiasAdd(engine.Conv2D(net.X, net.K1, 1, 1, 1), net.B1));
+                h = engine.MaxPool2DWithTensorIndices(h, new[] { 2, 2 }, new[] { 2, 2 }, out _);
+                h = engine.ReLU(engine.TensorChannelBiasAdd(engine.Conv2D(h, net.K2, 1, 1, 1), net.B2));
+                var logits = engine.TensorMatMul(engine.Reshape(h, new[] { 3, 64 }), net.W);
+                var loss = engine.ReduceSum(engine.TensorMultiply(logits, net.Coef), null);
+                var g = t.ComputeGradients(loss, net.Parameters);
+                tape = Array.ConvertAll(net.Parameters, p => g[p].GetFlattenedData());
+            }
+            var fused = RunPlan(net, fusion: true, sharedBias: false, secondRelu: true, steps: 1);
+            for (int p = 0; p < tape.Length; p++)
+                for (int i = 0; i < tape[p].Length; i++)
+                    Assert.True(Math.Abs(tape[p][i] - fused[p][i]) <= 1e-4f * (1f + Math.Abs(tape[p][i])),
+                        $"parameter {p} element {i}: tape {tape[p][i]:R} plan {fused[p][i]:R}");
+        }
+        finally
+        {
+            AiDotNetEngine.Current = priorEngine;
+        }
+    }
+}
