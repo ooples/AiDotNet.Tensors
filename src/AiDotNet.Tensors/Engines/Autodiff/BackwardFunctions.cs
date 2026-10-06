@@ -55,17 +55,19 @@ internal static class BackwardFunctions<T>
     internal static BackwardFunction<T> ReplayUnderTape(Func<IEngine, Tensor<T>> compute)
         => (gradOutput, inputs, output, savedState, engine, grads) =>
         {
-            Dictionary<Tensor<T>, Tensor<T>> g;
             using (var tape = new GradientTape<T>())
             {
                 var result = compute(engine);
-                g = tape.ComputeGradients(result, inputs, createGraph: false,
+                var g = tape.ComputeGradients(result, inputs, createGraph: false,
                     seedOverride: new[] { new KeyValuePair<Tensor<T>, Tensor<T>>(result, gradOutput) });
-            }
-            foreach (var input in inputs)
-            {
-                if (input is not null && g.TryGetValue(input, out var gi) && gi is not null)
-                    DifferentiableOps.AccumulateGrad(grads, input, gi, engine);
+                // Accumulate while the inner tape is alive. Its gradients are GPU intermediates the tape releases on
+                // dispose; reading them after the using block read a released buffer (inside a CUDA graph capture that
+                // aborted the capture of every CNN training step - the compiled MaxPool backward replays through here).
+                foreach (var input in inputs)
+                {
+                    if (input is not null && g.TryGetValue(input, out var gi) && gi is not null)
+                        DifferentiableOps.AccumulateGrad(grads, input, gi, engine);
+                }
             }
         };
 
