@@ -361,6 +361,70 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
     }
 
     [SkippableFact]
+    public void FusedLstmSequenceTrain_ForwardAndGradients_MatchDecomposedCpu()
+    {
+        // TryLstmSequenceTrain (persistent-RNN forward + BPTT kernels, one tape node) against the same LSTM written
+        // as per-step CPU ops: output and the gradients of input, both packed weights and the bias.
+        SkipIfNoDirectGpu();
+        int b = 3, t = 5, inSize = 4, h = 6;
+        Tensor<float> Make(int[] shape, int seed, float scale) =>
+            new Tensor<float>(Enumerable.Range(0, shape.Aggregate(1, (x, y) => x * y))
+                .Select(i => DeterministicValue(seed + i) * scale).ToArray(), shape);
+        var x = Make([b, t, inSize], 3, 1f);
+        var wIh = Make([4 * h, inSize], 900, 0.4f);
+        var wHh = Make([4 * h, h], 1900, 0.4f);
+        var bias = Make([4 * h], 2900, 0.2f);
+
+        (float[] y, float[] dx, float[] dwi, float[] dwh, float[] db) Reference()
+        {
+            var cpu = new CpuEngine();
+            using var tape = new GradientTape<float>();
+            var hPrev = new Tensor<float>([b, h]);
+            var cPrev = new Tensor<float>([b, h]);
+            var wiT = cpu.TensorTranspose(wIh); var whT = cpu.TensorTranspose(wHh);
+            var bias2 = cpu.Reshape(bias, [1, 4 * h]);
+            var steps = new List<Tensor<float>>();
+            for (int s = 0; s < t; s++)
+            {
+                var gates = cpu.TensorAdd(cpu.TensorAdd(cpu.TensorMatMul(cpu.TensorSliceAxis(x, 1, s), wiT),
+                    cpu.TensorMatMul(hPrev, whT)), bias2);
+                var ig = cpu.Sigmoid(cpu.TensorSlice(gates, [0, 0], [b, h]));
+                var fg = cpu.Sigmoid(cpu.TensorSlice(gates, [0, h], [b, h]));
+                var gg = cpu.Tanh(cpu.TensorSlice(gates, [0, 2 * h], [b, h]));
+                var og = cpu.Sigmoid(cpu.TensorSlice(gates, [0, 3 * h], [b, h]));
+                cPrev = cpu.TensorAdd(cpu.TensorMultiply(fg, cPrev), cpu.TensorMultiply(ig, gg));
+                hPrev = cpu.TensorMultiply(og, cpu.Tanh(cPrev));
+                steps.Add(cpu.Reshape(hPrev, [b, 1, h]));
+            }
+            var y = cpu.TensorConcatenate(steps.ToArray(), axis: 1);
+            var loss = cpu.ReduceSum(cpu.TensorMultiply(y, y), null);
+            var g = tape.ComputeGradients(loss, new[] { x, wIh, wHh, bias });
+            return (y.ToArray(), g[x].ToArray(), g[wIh].ToArray(), g[wHh].ToArray(), g[bias].ToArray());
+        }
+
+        (float[] y, float[] dx, float[] dwi, float[] dwh, float[] db) Fused()
+        {
+            using var tape = new GradientTape<float>();
+            var fused = Gpu.TryLstmSequenceTrain(x, wIh, wHh, bias);
+            Skip.If(fused is null, "fused LSTM training op not available on this backend");
+            if (fused is not { } y) throw new InvalidOperationException("unreachable: skipped above");
+            var loss = Gpu.ReduceSum(Gpu.TensorMultiply(y, y), null);
+            var g = tape.ComputeGradients(loss, new[] { x, wIh, wHh, bias });
+            return (y.ToArray(), g[x].ToArray(), g[wIh].ToArray(), g[wHh].ToArray(), g[bias].ToArray());
+        }
+
+        var expected = Reference();
+        var actual = Fused();
+        foreach (var (name, e, a) in new[] { ("y", expected.y, actual.y), ("dx", expected.dx, actual.dx),
+                     ("dWih", expected.dwi, actual.dwi), ("dWhh", expected.dwh, actual.dwh), ("dBias", expected.db, actual.db) })
+        {
+            Assert.Equal(e.Length, a.Length);
+            for (int i = 0; i < e.Length; i++)
+                Assert.True(Math.Abs(e[i] - a[i]) <= 1e-4f * (1 + Math.Abs(e[i])), $"{name}[{i}] cpu={e[i]} gpu={a[i]}");
+        }
+    }
+
+    [SkippableFact]
     public void AdaptiveAvgPool_NonDividingBins_MatchCpu()
     {
         // 7 -> 4 does not divide: each bin is [floor(o*in/out), ceil((o+1)*in/out)) and neighbours overlap. The GPU
