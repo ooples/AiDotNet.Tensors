@@ -9173,6 +9173,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // transformer train wall-clock).
         if (typeof(T) != typeof(float) && typeof(T) != typeof(double)) return null;
 
+        // Every unary specialization below WRITES its input's gradient (CopyTo, or Array.Clear then fill) rather
+        // than accumulating into it. That is only correct when this step is the input's sole consumer. With more
+        // consumers it erases the gradient the others contributed: AdaptiveAveragePoolingLayer's non-dividing path
+        // takes several TensorSlices of one tensor, and the fused step kept only the last slice's gradient (conv
+        // update cosine 0.25-0.5 against the eager tape and PyTorch). The generic backward accumulates, so a
+        // multi-consumer unary step takes it.
+        if (step.Inputs.Length == 1
+            && consumerCount.TryGetValue(step.Inputs[0], out int unaryConsumers) && unaryConsumers > 1)
+            return null;
+
         // Specialized backward delegates capture raw zero-based arrays. Apply
         // the same centralized eligibility contract as specialized forward:
         // parameter views, Memory<T> slices with a base offset, and native/GPU

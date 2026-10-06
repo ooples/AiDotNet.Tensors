@@ -26069,6 +26069,16 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 handedOff = true;
                 return fast;
             }
+            // One launch for any rectangle. The row loop below issues one device copy per contiguous row, which
+            // made slice-heavy training host-bound (1.2 M copies for 10 CNN steps); it stays only for backends
+            // without the kernel.
+            if (tensor.Rank <= IRectSliceKernels.MaxRank && backend is IRectSliceKernels rect)
+            {
+                rect.RectSlice(input, output, tensor.Shape._dims, start, length, scatter: false);
+                var single = DeferTensorResult<T>(backend, output, total, (int[])length.Clone());
+                handedOff = true;
+                return single;
+            }
             var sourceStrides = new int[tensor.Rank];
             sourceStrides[tensor.Rank - 1] = 1;
             for (int d = tensor.Rank - 2; d >= 0; d--)

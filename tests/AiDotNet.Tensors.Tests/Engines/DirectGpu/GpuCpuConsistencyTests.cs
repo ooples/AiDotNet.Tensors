@@ -359,6 +359,33 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
         for (int i = 0; i < cpuB.Length; i++)
             Assert.True(Math.Abs(cpuB[i] - gpuB[i]) <= 1e-3f * (1 + Math.Abs(cpuB[i])), $"dB[{i}] cpu={cpuB[i]} gpu={gpuB[i]}");
     }
+
+    [SkippableFact]
+    public void RectSlices_OnNonLastAxes_ForwardAndAccumulatedGradients_MatchCpu()
+    {
+        // Two OVERLAPPING rectangles over non-last axes of one tensor (the AdaptiveAveragePoolingLayer
+        // pattern): the forward exercises the one-launch rect_slice_nd gather, the backward its scatter and the
+        // accumulation of both slices' gradients into the shared input.
+        SkipIfNoDirectGpu();
+        (float[] s1, float[] s2, float[] dx) Run(IEngine e)
+        {
+            var x = new Tensor<float>(Enumerable.Range(0, 4 * 3 * 7 * 7).Select(i => DeterministicValue(17 + i)).ToArray(), [4, 3, 7, 7]);
+            using var tape = new GradientTape<float>();
+            var a = e.TensorSlice(x, [0, 1, 1, 0], [4, 2, 3, 7]);
+            var b = e.TensorSlice(x, [1, 0, 2, 2], [3, 3, 4, 4]);
+            var loss = e.TensorAdd(e.ReduceSum(e.TensorMultiply(a, a), null), e.ReduceSum(e.TensorMultiply(b, b), null));
+            var grads = tape.ComputeGradients(loss, new[] { x });
+            return (a.ToArray(), b.ToArray(), grads[x].ToArray());
+        }
+        var cpu = Run(new CpuEngine());
+        var gpu = Run(Gpu);
+        foreach (var (name, c, g) in new[] { ("slice1", cpu.s1, gpu.s1), ("slice2", cpu.s2, gpu.s2), ("dx", cpu.dx, gpu.dx) })
+        {
+            Assert.Equal(c.Length, g.Length);
+            for (int i = 0; i < c.Length; i++)
+                Assert.True(Math.Abs(c[i] - g[i]) <= 1e-5f * (1 + Math.Abs(c[i])), $"{name}[{i}] cpu={c[i]} gpu={g[i]}");
+        }
+    }
     [SkippableFact]
     public void HardsigmoidBackward_IsBitIdenticalAtBoundariesAndStaysResident()
     {

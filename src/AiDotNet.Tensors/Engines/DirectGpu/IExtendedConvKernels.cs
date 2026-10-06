@@ -106,6 +106,22 @@ internal interface ISpiralConvKernels
         IGpuBuffer gradWeights, int v, int inC, int spiralLength, int outC);
 }
 
+/// <summary>
+/// Rectangular N-d slice gather/scatter in one launch (rank &lt;= 8). Replaces the per-contiguous-row
+/// device copy loop, which issued one memcpy per row: a [64, 32, 7, 7] height slice was 4,096 API calls.
+/// </summary>
+internal interface IRectSliceKernels
+{
+    /// <summary>Largest rank <see cref="RectSlice"/> handles.</summary>
+    const int MaxRank = 8;
+
+    /// <summary>
+    /// <paramref name="scatter"/> false: <paramref name="slice"/> = <paramref name="full"/>[start : start + length].
+    /// <paramref name="scatter"/> true: writes <paramref name="slice"/> into that window of <paramref name="full"/>
+    /// (other elements untouched). <paramref name="fullShape"/> is the contiguous row-major shape of <paramref name="full"/>.
+    /// </summary>
+    void RectSlice(IGpuBuffer full, IGpuBuffer slice, int[] fullShape, int[] start, int[] length, bool scatter);
+}
 /// <summary>Adaptive max pooling 2D (NCHW) (#775).</summary>
 internal interface IAdaptiveMaxPool2DKernels
 {
