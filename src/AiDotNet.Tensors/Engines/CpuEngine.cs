@@ -16753,6 +16753,9 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousOutput);
 
+        if (!GraphMode.IsActive)
+            return MaxPool2DWithTensorIndicesEager(input, poolSize, stride, out maxIndices);
+
         Tensor<T> result;
         int[,,,,] coordinateIndices;
         using (new NoGradScope<T>())
@@ -16776,6 +16779,97 @@ public partial class CpuEngine : ITensorLevelEngine
                         int w = coordinateIndices[b, c, oh, ow, 1];
                         flatIndices[flat++] = h * inputWidth + w;
                     }
+
+        maxIndices = new Tensor<int>(flatIndices, (int[])result._shape.Clone());
+        DifferentiableOps.RecordUnary("MaxPool2D", result, input,
+            BackwardFunctions<T>.MaxPool2DTensorIndicesBackward,
+            new object[] { maxIndices, poolSize, stride });
+        return result;
+    }
+
+    /// <summary>
+    /// Eager max pool that writes the flat argmax (ih * inputWidth + iw) straight into its index tensor. The route
+    /// above pools through <see cref="MaxPool2DWithIndices{T}"/>, which allocates an int[B, C, oH, oW, 2] coordinate
+    /// array, and then converts it into a second flat array: two index buffers and an extra pass per call, on every
+    /// training step of every CNN. Same window walk, same strict greater-than (the first maximum wins, NaN never
+    /// replaces), same recorded backward; float runs natively instead of through INumericOperations.
+    /// </summary>
+    private Tensor<T> MaxPool2DWithTensorIndicesEager<T>(
+        Tensor<T> input, int[] poolSize, int[] stride, out Tensor<int> maxIndices)
+    {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        int batch = input._shape[0], channels = input._shape[1];
+        int height = input._shape[2], width = input._shape[3];
+        int poolH = poolSize[0], poolW = poolSize[1];
+        int strideH = stride[0], strideW = stride[1];
+        if (poolH > height || poolW > width)
+            throw new ArgumentException($"Pool size ({poolH}x{poolW}) cannot exceed input spatial dimensions ({height}x{width})");
+        int outputHeight = (height - poolH) / strideH + 1;
+        int outputWidth = (width - poolW) / strideW + 1;
+        if (outputHeight <= 0 || outputWidth <= 0)
+            throw new ArgumentException($"Invalid output dimensions ({outputHeight}x{outputWidth}). Check pool size and stride.");
+
+        var result = TensorAllocator.Rent<T>([batch, channels, outputHeight, outputWidth]);
+        var outputData = result.GetDataArray();
+        var inputData = input.GetFlattenedData();
+        var flatIndices = new int[outputData.Length];
+        int inPlane = height * width, outPlane = outputHeight * outputWidth;
+
+        if (typeof(T) == typeof(float))
+        {
+            var src = (float[])(object)inputData;
+            var dst = (float[])(object)outputData;
+            CpuParallelSettings.ParallelForOrSerial(0, batch * channels, outputData.Length, plane =>
+            {
+                int inBase = plane * inPlane, outBase = plane * outPlane;
+                for (int oh = 0; oh < outputHeight; oh++)
+                for (int ow = 0; ow < outputWidth; ow++)
+                {
+                    float maxVal = float.MinValue;
+                    int maxIdx = 0;
+                    for (int kh = 0; kh < poolH; kh++)
+                    {
+                        int ih = oh * strideH + kh;
+                        int row = inBase + ih * width;
+                        for (int kw = 0; kw < poolW; kw++)
+                        {
+                            int iw = ow * strideW + kw;
+                            float val = src[row + iw];
+                            if (val > maxVal) { maxVal = val; maxIdx = ih * width + iw; }
+                        }
+                    }
+                    dst[outBase + oh * outputWidth + ow] = maxVal;
+                    flatIndices[outBase + oh * outputWidth + ow] = maxIdx;
+                }
+            });
+        }
+        else
+        {
+            var numOps = MathHelper.GetNumericOperations<T>();
+            CpuParallelSettings.ParallelForOrSerial(0, batch * channels, outputData.Length, plane =>
+            {
+                int inBase = plane * inPlane, outBase = plane * outPlane;
+                for (int oh = 0; oh < outputHeight; oh++)
+                for (int ow = 0; ow < outputWidth; ow++)
+                {
+                    T maxVal = numOps.MinValue;
+                    int maxIdx = 0;
+                    for (int kh = 0; kh < poolH; kh++)
+                    {
+                        int ih = oh * strideH + kh;
+                        int row = inBase + ih * width;
+                        for (int kw = 0; kw < poolW; kw++)
+                        {
+                            int iw = ow * strideW + kw;
+                            T val = inputData[row + iw];
+                            if (numOps.GreaterThan(val, maxVal)) { maxVal = val; maxIdx = ih * width + iw; }
+                        }
+                    }
+                    outputData[outBase + oh * outputWidth + ow] = maxVal;
+                    flatIndices[outBase + oh * outputWidth + ow] = maxIdx;
+                }
+            });
+        }
 
         maxIndices = new Tensor<int>(flatIndices, (int[])result._shape.Clone());
         DifferentiableOps.RecordUnary("MaxPool2D", result, input,
