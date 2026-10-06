@@ -9759,8 +9759,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             };
         }
 
-        // ReLU backward: mask = input > 0, grad = gradOut * mask
-        // Phase 5.2: Use bitmask (1 bit/element) instead of full input tensor (32x memory savings)
+        // ReLU backward: gradIn = output > 0 ? gradOut : 0 (output > 0 <=> input > 0 for ReLU), in ONE vectorised
+        // pass, chunked across the pool. This used to rebuild a 1-bit mask from the output every step and then
+        // apply it, two serial scalar passes; the mask saved no memory because the output it is built from is
+        // kept alive for exactly this step anyway. Same values as the mask route, including +0 for inactive lanes.
         if (step.OpType == OpType.ReLU && step.Inputs.Length == 1
             && step.Inputs[0].IsContiguous && typeof(T) == typeof(float))
         {
@@ -9773,28 +9775,24 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             var gradOut = gradMap[output];
             var gradIn = gradMap[input];
 
-            // Pre-allocate bitmask at compile time (32x smaller than storing full input)
-            byte[]? reluBitmask = null;
-
             return eng =>
             {
-                // Create bitmask from forward output (output > 0 ↔ input > 0 for ReLU).
-                // PR #341 review: the allocating overload returned a fresh
-                // array that we silently dropped on the floor — the
-                // pre-allocated reluBitmask stayed all-zero and
-                // ApplyReluBackwardFromBitmask wrote zeros into gradIn,
-                // killing ReLU gradient flow. The FillReluBitmask overload
-                // writes into the pre-allocated buffer, preserving the
-                // intended allocation-free replay semantics.
-                var outputData = TryGetLiveFloatBacking(output)!;
-                int len = output.Length;
-                reluBitmask ??= new byte[(len + 7) / 8];
-                ActivationCheckpoint.FillReluBitmask(outputData, reluBitmask, len);
-
-                // Apply backward using bitmask
-                var gradOutData = TryGetLiveFloatBacking(gradOut)!;
-                var gradInData = TryGetLiveFloatBacking(gradIn)!;
-                ActivationCheckpoint.ApplyReluBackwardFromBitmask(gradOutData, reluBitmask, gradInData, len);
+                var outputData = TryGetLiveFloatBacking(output) ?? throw new InvalidOperationException("ReLU backward: the forward output has no live host buffer.");
+                var gradOutData = TryGetLiveFloatBacking(gradOut) ?? throw new InvalidOperationException("ReLU backward: the output gradient has no live host buffer.");
+                var gradInData = TryGetLiveFloatBacking(gradIn) ?? throw new InvalidOperationException("ReLU backward: the input gradient has no live host buffer.");
+                int len = Math.Min(output.Length, Math.Min(gradOutData.Length, gradInData.Length));
+                const int ReluBackwardChunk = 64 * 1024;
+                int chunks = (len + ReluBackwardChunk - 1) / ReluBackwardChunk;
+                CpuParallelSettings.ParallelForOrSerial(0, chunks, len, chunk =>
+                {
+                    int start = chunk * ReluBackwardChunk;
+                    int count = Math.Min(ReluBackwardChunk, len - start);
+                    unsafe
+                    {
+                        fixed (float* g = gradOutData, o = outputData, d = gradInData)
+                            Simd.SimdKernels.ReluBackwardUnsafe(g + start, o + start, d + start, count);
+                    }
+                });
                 input.Grad = gradIn;
             };
         }
