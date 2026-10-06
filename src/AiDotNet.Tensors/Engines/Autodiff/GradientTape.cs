@@ -1535,7 +1535,14 @@ public sealed class GradientTape<T> : IDisposable
                 var dropped = new List<Tensor<T>>();
                 foreach (var pair in grads)
                     if (!filtered.ContainsKey(pair.Key) && pair.Value is not null) dropped.Add(pair.Value);
-                ReleaseDroppedGradients(dropped, ForwardStorageOfEntries(), filtered, loss);
+                // A seed gradient belongs to the CALLER (a replayed op's upstream gradient, a plan's gradient buffer), not
+                // to this tape: never free it. Freeing it released the compiled CNN's MaxPool-output gradient buffer, which
+                // the plan writes again the next step (inside a CUDA graph capture that aborted every CNN step's capture).
+                var keepForward = ForwardStorageOfEntries();
+                if (seedOverride is not null)
+                    foreach (var seed in seedOverride)
+                        if (seed.Value is not null) keepForward.Add(seed.Value.DataVector);
+                ReleaseDroppedGradients(dropped, keepForward, filtered, loss);
             }
 
             if (!_options.Persistent)

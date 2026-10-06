@@ -2625,6 +2625,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     internal void ReleaseDeadDeviceStorage<T>(Tensor<T> tensor)
     {
+        if (s_staleDropTrace)
+            AliasDiag($"RELEASE-DEAD len={tensor.Length} caller=" + new System.Diagnostics.StackTrace(1, false).ToString().Replace(System.Environment.NewLine, " <- "));
         var vector = tensor.DataVector;
         if (vector._deviceState is not { Buffer: { } buffer } state) return;
         if (!tensor.IsContiguous || tensor._storageOffset != 0 || tensor.Length != vector.Length) return;
@@ -21527,6 +21529,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// device buffer stale, so a consumer reading the device buffer directly -- the fused GPU optimizer reads moments
     /// and gradients through TryGetGpuBuffer -- never saw the copy.
     /// </summary>
+    private static bool IsReleasedTensor<T>(Tensor<T>? t) => t is not null
+        && ((t.GetBackingArrayForCacheLookupUnsafe() is { } arr && Helpers.HostSync.IsReleased(arr)) || Helpers.HostSync.IsReleased(t.DataVector));
+
     void IEngine.TensorCopy<T>(Tensor<T> source, Tensor<T> destination)
     {
         if (source is not null && destination is not null && typeof(T) == typeof(float)
@@ -21553,7 +21558,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             catch (Exception ex)
             {
                 GpuLaunchProbe.OnFallback("TensorCopy", ex);
-                AliasDiag($"TensorCopy host fallback: threw {ex.GetType().Name}: {ex.Message} caller="
+                AliasDiag($"TensorCopy host fallback: srcReleased={IsReleasedTensor(source)} dstReleased={IsReleasedTensor(destination)} threw {ex.GetType().Name}: {ex.Message} caller="
                     + new System.Diagnostics.StackTrace(1, false).ToString().Replace(System.Environment.NewLine, " <- "));
             }
         }

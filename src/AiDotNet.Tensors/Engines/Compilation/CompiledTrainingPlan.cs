@@ -541,6 +541,22 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     /// AsWritableSpan + IncrementVersion) advances the host version past the bound buffer's; upload those values into
     /// the SAME buffer before the step, so the step reads them and a captured graph's baked pointers stay valid.
     /// </summary>
+    /// <summary>
+    /// The plan's gradient buffers live as long as the plan, but they are created during the trace, where the tape's
+    /// activation eviction can mark them as released step intermediates. A later write then failed ("GPU intermediate
+    /// of a finished GradientTape step"), which inside a CUDA graph capture aborted the capture of every CNN training
+    /// step. Like the arena and array pools re-issuing an object to a new owner, the plan clears those marks.
+    /// </summary>
+    private void ClearPlanBufferReleaseMarks()
+    {
+        if (_liveGradientMap is { } live)
+            foreach (var buffer in live.Values)
+                buffer?.ClearReleaseMarks();
+        if (_preAllocatedGrads is { } pre)
+            foreach (var buffer in pre)
+                buffer?.ClearReleaseMarks();
+    }
+
     private void UploadHostWrittenParameters()
     {
         if (typeof(T) != typeof(float) || _engine is not Engines.DirectGpuTensorEngine gte) return;
@@ -2161,6 +2177,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Tensor<T> Step()
     {
+        ClearPlanBufferReleaseMarks();
         UploadHostWrittenParameters();
         lock (_stepSync)
             return StepCore();
@@ -3126,6 +3143,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         var protect = new HashSet<object>(ReferenceEqualityComparer<object>.Instance);
         for (int i = 0; i < _gradients.Length; i++)
             AddActivationCacheKeys(protect, _gradients[i]);
+        // Every live gradient-map entry, not only the parameters' compile-time buffers: the backward can REPLACE an
+        // entry with a donated contribution (an activation's gradient, a first-write copy), and an unprotected one was
+        // released here as a dead intermediate. The next step's first write into it then failed, which inside a CUDA
+        // graph capture aborted the capture of every CNN training step.
+        if (_liveGradientMap is { } live)
+            foreach (var entry in live.Values)
+                AddActivationCacheKeys(protect, entry);
         AddActivationCacheKeys(protect, _lossGradDest);
         AddActivationCacheKeys(protect, _lossGradSeed);
         return protect;
