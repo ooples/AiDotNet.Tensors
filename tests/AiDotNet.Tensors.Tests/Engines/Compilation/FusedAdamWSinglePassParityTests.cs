@@ -17,6 +17,19 @@ public class FusedAdamWSinglePassParityTests
 {
     public static TheoryData<int> Lengths => new() { 1, 3, 4, 7, 8, 9, 15, 16, 17, 31, 100, 257, 1024, 4099 };
 
+    // Long enough to split into element-parallel chunks on the pool (several chunks of >= the parallel threshold),
+    // with SIMD tails, so the chunked dispatch is pinned bit-for-bit against the serial two-pass reference.
+    public static TheoryData<int> ParallelLengths => new() { 65_539, 100_003, 401_413 };
+
+    [Theory]
+    [MemberData(nameof(ParallelLengths))]
+    public void FusedAdamW_Float_ParallelChunks_BitIdenticalToTwoPass(int len)
+    {
+        Assert.True(len >= 2 * FusedOptimizer.ParallelThreshold,
+            $"length {len} no longer splits into parallel chunks at threshold {FusedOptimizer.ParallelThreshold}");
+        FusedAdamW_Float_BitIdenticalToTwoPass(len);
+    }
+
     // The step-taking Adam/AdamW kernels now delegate to a bc1/bc2-taking overload
     // so a per-parameter loop can hoist the two step-global Math.Pow to once/step.
     // These pin the wrapper's bias-correction formula: the step overload must be
