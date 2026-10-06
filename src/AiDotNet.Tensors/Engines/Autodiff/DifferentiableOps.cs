@@ -831,7 +831,8 @@ internal static class DifferentiableOps
                     }
                     else
                     {
-                        engine.TensorAddInPlace(existing, GradForInPlace());
+                        using (new NoGradScope<T>()) // accumulation is not a recorded op; skips the in-place op's pre-mutation clone
+                            engine.TensorAddInPlace(existing, GradForInPlace());
                         accumulated = existing;
                     }
                 }
@@ -887,7 +888,8 @@ internal static class DifferentiableOps
                 }
                 else
                 {
-                    engine.TensorAddInPlace(existingDict, GradForInPlace());
+                    using (new NoGradScope<T>()) // accumulation is not a recorded op; skips the in-place op's pre-mutation clone
+                        engine.TensorAddInPlace(existingDict, GradForInPlace());
                     tensor.Grad = existingDict;
                 }
             }

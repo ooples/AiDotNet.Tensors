@@ -3243,7 +3243,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Save input before mutation when tape is active (for backward pass)
         Tensor<T>? savedA = null;
         var tape = GradientTape<T>.Current;
-        if (tape is not null && tape.Options.RecordInPlace)
+        if (tape is not null && tape.Options.RecordInPlace && !NoGradScope<T>.IsSuppressed)
             savedA = a.Clone();
 
         // Increment version BEFORE mutation so prior tape entries detect the change
@@ -5923,7 +5923,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         Tensor<T>? savedA = null;
         var mulTape = GradientTape<T>.Current;
-        if (mulTape is not null && mulTape.Options.RecordInPlace)
+        if (mulTape is not null && mulTape.Options.RecordInPlace && !NoGradScope<T>.IsSuppressed)
             savedA = a.Clone();
 
         a.IncrementVersion();
@@ -6106,7 +6106,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         Tensor<T>? savedASub = null;
         var subTape = GradientTape<T>.Current;
-        if (subTape is not null && subTape.Options.RecordInPlace)
+        if (subTape is not null && subTape.Options.RecordInPlace && !NoGradScope<T>.IsSuppressed)
             savedASub = a.Clone();
 
         a.IncrementVersion();
@@ -11046,7 +11046,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         Tensor<T>? savedInput = null;
         var sigTape = GradientTape<T>.Current;
-        if (sigTape is not null && sigTape.Options.RecordInPlace)
+        if (sigTape is not null && sigTape.Options.RecordInPlace && !NoGradScope<T>.IsSuppressed)
             savedInput = tensor.Clone();
 
         tensor.IncrementVersion();
@@ -11097,7 +11097,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         Tensor<T>? savedInput = null;
         var sigTape = GradientTape<T>.Current;
-        if (sigTape is not null && sigTape.Options.RecordInPlace)
+        if (sigTape is not null && sigTape.Options.RecordInPlace && !NoGradScope<T>.IsSuppressed)
             savedInput = tensor.Clone();
 
         tensor.IncrementVersion();
@@ -11342,7 +11342,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         Tensor<T>? savedInput = null;
         var reluTape = GradientTape<T>.Current;
-        if (reluTape is not null && reluTape.Options.RecordInPlace)
+        if (reluTape is not null && reluTape.Options.RecordInPlace && !NoGradScope<T>.IsSuppressed)
             savedInput = tensor.Clone();
 
         tensor.IncrementVersion();
@@ -11393,7 +11393,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         Tensor<T>? savedInput = null;
         var reluTape = GradientTape<T>.Current;
-        if (reluTape is not null && reluTape.Options.RecordInPlace)
+        if (reluTape is not null && reluTape.Options.RecordInPlace && !NoGradScope<T>.IsSuppressed)
             savedInput = tensor.Clone();
 
         tensor.IncrementVersion();
