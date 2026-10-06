@@ -585,7 +585,33 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         (_engine as Engines.DirectGpuTensorEngine)?.InvalidateResidentWeightBuffer(_parameters[p]);
     }
 
-    public Tensor<T>[] Gradients => _gradients;
+    /// <summary>
+    /// Each parameter's gradient from the most recent step, index-aligned with the parameters.
+    /// </summary>
+    /// <remarks>
+    /// Resolved from the live gradient map on every read. The backward can REPLACE a parameter's map entry (an
+    /// out-of-place accumulation, a first-write copy, a contiguity fix-up) instead of adding into the buffer this
+    /// array was built with at compile time; the snapshot then kept only the first contribution. Every
+    /// multi-consumer parameter was wrong (CNN conv layers ~0.4x, LSTM input/forget/candidate gates ~0.5x against
+    /// PyTorch) while the update itself, which reads the live map, was right.
+    /// </remarks>
+    public Tensor<T>[] Gradients
+    {
+        get
+        {
+            if (_liveGradientMap is { } live)
+            {
+                for (int i = 0; i < _parameters.Length && i < _gradients.Length; i++)
+                {
+                    if (live.TryGetValue(_parameters[i], out var current) && !ReferenceEquals(current, _gradients[i]))
+                        _gradients[i] = current;
+                }
+            }
+            return _gradients;
+        }
+    }
+
+    private Dictionary<Tensor<T>, Tensor<T>>? _liveGradientMap;
     public int ForwardStepCount => _forwardActions.Length;
     public int BackwardStepCount => _backwardActions.Length;
 
@@ -7223,6 +7249,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 forwardFixedActions,
                 storageLeases);
             storageLeases = null;
+            plan._liveGradientMap = gradMap;
             scope.ReleaseStorageLeases();
             return plan;
         }
