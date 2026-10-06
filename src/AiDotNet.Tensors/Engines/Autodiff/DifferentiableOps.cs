@@ -662,6 +662,63 @@ internal static class DifferentiableOps
         | MethodImplOptions.AggressiveOptimization
 #endif
     )]
+    /// <summary>
+    /// Adds a slice's gradient into ONLY its region of <paramref name="tensor"/>'s existing accumulator, instead of
+    /// materializing a full-size zero tensor and adding all of it. A recurrence that slices one tensor per step (an
+    /// LSTM's per-timestep input) otherwise does O(T * size) work per sequence in backward; on the CPU that made a
+    /// hoisted-projection LSTM 2.4x slower than the per-step form it was meant to beat.
+    /// </summary>
+    /// <param name="regionStart">Start of the region per axis of the full tensor (rank = tensor rank).</param>
+    /// <param name="regionShape">The region's shape per axis of the full tensor; <paramref name="contribution"/> holds
+    /// exactly its elements in row-major order (an axis slice's dropped axis has extent 1 here).</param>
+    /// <returns>False (nothing done) unless the in-place path applies: CPU engine, no create-graph, an existing
+    /// contiguous host accumulator that does not overlap the contribution. The caller then takes its full-size path.</returns>
+    internal static bool TryAccumulateRegion<T>(
+        Dictionary<Tensor<T>, Tensor<T>> grads, Tensor<T> tensor, Tensor<T> contribution,
+        int[] regionStart, int[] regionShape, IEngine engine)
+    {
+        if (_isBackwardCreateGraph || engine.SupportsGpu || engine is not CpuEngine) return false;
+        int idx = tensor._gradIndex;
+        bool indexed = idx >= 0 && _indexedGrads != null && idx < _indexedGrads.Length;
+        Tensor<T>? existing = indexed
+            ? (Tensor<T>?)_indexedGrads![idx]
+            : (grads.TryGetValue(tensor, out var found) ? found : null);
+        if (existing is null || !existing.IsContiguous || existing.HasPendingGpuData
+            || existing.Length != tensor.Length || existing.Rank != regionStart.Length) return false;
+        var source = contribution.IsContiguous ? contribution : contribution.Contiguous();
+        if (HasOverlappingStorage(existing, source)) return false;
+
+        var numOps = global::AiDotNet.Tensors.Helpers.MathHelper.GetNumericOperations<T>();
+        var dest = existing.AsWritableSpan();
+        if (ClaimFirstWrite(existing)) dest.Clear();   // stale buffer from an earlier step: this is its first write
+        var src = source.AsSpan();
+        var fullShape = existing._shape;
+        int rank = fullShape.Length;
+        int rowLength = regionShape[rank - 1];
+        int rows = rowLength == 0 ? 0 : src.Length / rowLength;
+        for (int row = 0; row < rows; row++)
+        {
+            int remaining = row;
+            int offset = regionStart[rank - 1];
+            int stride = fullShape[rank - 1];
+            for (int d = rank - 2; d >= 0; d--)
+            {
+                int coordinate = remaining % regionShape[d];
+                remaining /= regionShape[d];
+                offset += (regionStart[d] + coordinate) * stride;
+                stride *= fullShape[d];
+            }
+            int srcRow = row * rowLength;
+            for (int j = 0; j < rowLength; j++)
+                dest[offset + j] = numOps.Add(dest[offset + j], src[srcRow + j]);
+        }
+
+        if (indexed) _indexedGrads![idx] = existing;
+        grads[tensor] = existing;
+        tensor.Grad = existing;
+        return true;
+    }
+
     internal static void AccumulateGrad<T>(
         Dictionary<Tensor<T>, Tensor<T>> grads,
         Tensor<T> tensor,

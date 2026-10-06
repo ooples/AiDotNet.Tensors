@@ -2225,6 +2225,9 @@ internal static class BackwardFunctions<T>
             DifferentiableOps.AccumulateGrad(grads, inputs[0], deviceGrad, engine);
             return;
         }
+        if (gradOutput.Rank == inputShape.Length
+            && DifferentiableOps.TryAccumulateRegion(grads, inputs[0], gradOutput, start, gradOutput._shape, engine))
+            return;
 
         // Issue #327: write directly into a fresh zero-init buffer
         // instead of going through engine.TensorSetSlice (which Rent's
@@ -6071,6 +6074,16 @@ internal static class BackwardFunctions<T>
         var axis = (int)savedState[0];
         var index = (int)savedState[1];
         var inputShape = inputs[0]._shape;
+        int normalizedAxis = axis < 0 ? axis + inputShape.Length : axis;
+        if (normalizedAxis >= 0 && normalizedAxis < inputShape.Length)
+        {
+            var regionStart = new int[inputShape.Length];
+            var regionShape = (int[])inputShape.Clone();
+            regionStart[normalizedAxis] = index;
+            regionShape[normalizedAxis] = 1;
+            if (DifferentiableOps.TryAccumulateRegion(grads, inputs[0], gradOutput, regionStart, regionShape, engine))
+                return;
+        }
         var grad = new Tensor<T>(inputShape); // zero-initialized
         // Place gradOutput into grad at the correct slice
         engine.TensorSetSliceAxis(grad, gradOutput, axis, index);
