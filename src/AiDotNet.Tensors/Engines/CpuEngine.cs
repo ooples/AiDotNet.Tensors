@@ -16684,11 +16684,13 @@ public partial class CpuEngine : ITensorLevelEngine
                         }
                         else
                         {
-                            var eager = eng.MaxPool2DWithIndices(captured, new[] { ph, pw }, new[] { sh, sw }, out _);
+                            // The tensor-index form keeps the argmax on the device on a GPU engine; the int[,,,,] form
+                            // downloaded it on every replay, a host read that aborted CUDA graph capture of every CNN step.
+                            var eager = eng.MaxPool2DWithTensorIndices(captured, new[] { ph, pw }, new[] { sh, sw }, out _);
                             DirectGpuTensorEngine.CopyResultInto(eng, eager, output);
                         }
                     },
-                    BackwardFunctions<T>.ReplayUnderTape(eng => eng.MaxPool2DWithIndices(captured, new[] { ph, pw }, new[] { sh, sw }, out _)));
+                    BackwardFunctions<T>.ReplayUnderTape(eng => eng.MaxPool2DWithTensorIndices(captured, new[] { ph, pw }, new[] { sh, sw }, out _)));
             }
         }
 
