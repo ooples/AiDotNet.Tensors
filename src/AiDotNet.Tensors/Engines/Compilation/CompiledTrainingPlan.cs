@@ -2898,6 +2898,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
 
         // Cache raw arrays on first call — avoids AsWritableSpan()/GetDataArray() per step
         var gradArrays = _cachedGradArrays;
+        // The first step zeroes every gradient buffer; later steps zero only the accumulating ones (below).
+        bool firstGradBind = gradArrays == null;
         if (gradArrays == null)
         {
             gradArrays = new T[_preAllocatedGrads.Length][];
@@ -2927,7 +2929,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // Only zero gradient buffers used by generic (accumulating) backward delegates.
         // Specialized backward delegates overwrite completely (TryGemmEx beta=0, SIMD ReLU).
         // At large sizes, this saves significant time by skipping unnecessary clears.
-        if (_genericGradIndices != null)
+        if (_genericGradIndices != null && !firstGradBind)
         {
             for (int i = 0; i < _genericGradIndices.Length; i++)
             {
@@ -2938,7 +2940,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         }
         else
         {
-            // First call: clear everything (safe fallback)
+            // First call (or no accumulating set): clear everything (safe fallback)
             for (int i = 0; i < gradArrays.Length; i++)
             {
                 Array.Clear(gradArrays[i], 0, _preAllocatedGrads[i].Length);
@@ -6929,6 +6931,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         var backwardActions = new List<Action<IEngine>>();
         var backwardStepNames = new List<string>();
         int genericBackwardCount = 0;
+        // Steps whose backward is the generic accumulator: AccumulateGrad ADDS into their inputs' gradient buffers.
+        var genericBackwardSteps = new List<CompiledStep<T>>();
         for (int i = forwardSteps.Count - 1; i >= 0; i--)
         {
             if (fusedStepIndices.Contains(i)) continue;
@@ -6982,6 +6986,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             else
             {
                 genericBackwardCount++;
+                genericBackwardSteps.Add(step);
                 backwardStepNames.Add($"generic:{step.OpName}");
                 var stepCopy = step;
                 var gradAcc = gradMap;
@@ -7131,8 +7136,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // other buffer is fully overwritten by its beta=0 delegate and stays skipped.
         // When there are no multi-consumer tensors this yields an empty array — the
         // exact skip-all fast path as before, so feed-forward graphs are unchanged.
+        //
+        // A plan that mixes specialized and generic backward actions zeroes the same way plus the gradient buffers
+        // of every generic step's inputs, because AccumulateGrad ADDS into those. It used to clear EVERY buffer
+        // instead (one generic step anywhere was enough): on the parity CNN that was 1.5 ms of a 15 ms step, most
+        // of it activation gradients that a specialized beta=0 delegate overwrites anyway. Buffers that nothing
+        // writes (a step without a backward, a dead output) keep the zeros of the full clear on the first step.
+        // A GPU engine keeps the full clear for mixed plans: there the clear also invalidates every buffer's stale
+        // device copy, which this host-side accounting does not model.
         int[]? genericGradIndices;
-        if (!useGradPool && genericBackwardCount == 0)
+        if (!useGradPool && (genericBackwardCount == 0 || !engine.SupportsGpu))
         {
             // allGrads holds the distinct physical grad buffers (id == index), so a
             // reverse map gives each multi-consumer tensor's grad-buffer index.
@@ -7141,19 +7154,26 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
 
             var accumulatingGradIndices = new List<int>();
             var seenGradIndices = new HashSet<int>();
-            foreach (var kv in consumerCount)
+            void MarkAccumulating(Tensor<T> tensor)
             {
-                if (kv.Value <= 1) continue; // single-consumer buffers are overwritten, no zeroing needed
-                if (gradMap.TryGetValue(kv.Key, out var gradBuf)
+                if (gradMap.TryGetValue(tensor, out var gradBuf)
                     && gradBufferIndex.TryGetValue(gradBuf, out int bufIdx)
                     && seenGradIndices.Add(bufIdx))
                     accumulatingGradIndices.Add(bufIdx);
             }
+            foreach (var kv in consumerCount)
+            {
+                if (kv.Value <= 1) continue; // single-consumer buffers are overwritten, no zeroing needed
+                MarkAccumulating(kv.Key);
+            }
+            foreach (var genericStep in genericBackwardSteps)
+                foreach (var genericInput in genericStep.Inputs)
+                    if (genericInput is not null) MarkAccumulating(genericInput);
             genericGradIndices = accumulatingGradIndices.ToArray();
         }
         else
         {
-            genericGradIndices = null; // clear-all (unchanged: generic backward or grad pooling)
+            genericGradIndices = null; // clear-all (grad pooling, or a mixed plan on a GPU engine)
         }
 
         // #1624 drift guard: the re-zero schedule (indexed by backward ACTION index)
