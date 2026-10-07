@@ -98,6 +98,51 @@ public class CompiledFusedLstmTrainingTests
         }
     }
 
+    /// <summary>
+    /// The usual training graph: the data batch is NOT a parameter. The plan's gradient-relevance filter must let the
+    /// fused node skip the input gradient (a whole GEMM per step) -- so the data tensor never receives a gradient --
+    /// while the weight gradients stay bit-identical to an eager tape asked for the same weights.
+    /// </summary>
+    [Fact]
+    public void CompiledFusedLstm_DataInputNotASource_InputGradientSkipped_WeightsMatchEagerBitExact()
+    {
+        var engine = new CpuEngine();
+        var eager = new Inputs();
+        var eagerSources = new[] { eager.WIh, eager.WHh, eager.BIh };
+        var eagerGrads = new float[eagerSources.Length][];
+        using (var tape = new GradientTape<float>())
+        {
+            var loss = Forward(engine, eager, returnSequences: true, withState: false);
+            var grads = tape.ComputeGradients(loss, sources: eagerSources);
+            for (int i = 0; i < eagerSources.Length; i++) eagerGrads[i] = grads[eagerSources[i]].ToArray();
+        }
+
+        var compiled = new Inputs();
+        var sources = new[] { compiled.WIh, compiled.WHh, compiled.BIh };
+        ICompiledTrainingPlan<float> plan;
+        using (var scope = GraphMode.Enable())
+        {
+            Forward(engine, compiled, returnSequences: true, withState: false);
+            plan = scope.CompileTraining(sources);
+        }
+        using (plan)
+        {
+            plan.ConfigureOptimizer(OptimizerType.SGD, learningRate: 0.0f);
+            for (int step = 0; step < 3; step++)
+            {
+                plan.Step();
+                for (int i = 0; i < sources.Length; i++)
+                {
+                    var g = sources[i].Grad;
+                    Assert.True(g is not null, $"source {i} has no gradient at step {step}");
+                    if (g is not null) AssertBitEqual(eagerGrads[i], g.ToArray(), $"source {i} grad step {step}");
+                }
+                Assert.True(compiled.X.Grad is null,
+                    $"step {step}: the data input received a gradient; the plan computed a gradient nothing reads");
+            }
+        }
+    }
+
     private static int Bits(float v) => System.BitConverter.ToInt32(System.BitConverter.GetBytes(v), 0);
 
     private static void AssertBitEqual(float[] expected, float[] actual, string what)

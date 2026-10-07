@@ -7125,6 +7125,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 backwardStepNames.Add($"generic:{step.OpName}");
                 var stepCopy = step;
                 var gradAcc = gradMap;
+                // The same relevance rule, one level down: a generic backward that asks
+                // DifferentiableOps.IsGradientRequired (MatMul, Conv2D, Linear, the fused LSTM, ...) skips the
+                // gradient INTO an input no parameter feeds -- the data batch's gradient, typically a whole extra
+                // GEMM per step that nothing reads. The eager tape installs the same filter for its requested sources.
+                var relevance = gradRequired;
                 backwardActions.Add(eng =>
                 {
                     // PR #638 A0: tag the producing op so the capture-path invalidation log can name it.
@@ -7134,8 +7139,17 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                     // ARBITRARY gradient buffer (gradAcc.Values.First()) and would have pushed it through the step.
                     if (!gradAcc.TryGetValue(stepCopy.OutputBuffer, out var gradOut))
                         return;
-                    stepCopy.BackwardFn(gradOut, stepCopy.Inputs, stepCopy.OutputBuffer,
-                        stepCopy.SavedState ?? Array.Empty<object>(), eng, gradAcc);
+                    if (relevance is null)
+                    {
+                        stepCopy.BackwardFn(gradOut, stepCopy.Inputs, stepCopy.OutputBuffer,
+                            stepCopy.SavedState ?? Array.Empty<object>(), eng, gradAcc);
+                        return;
+                    }
+                    using (DifferentiableOps.PushGradientRelevance(relevance))
+                    {
+                        stepCopy.BackwardFn(gradOut, stepCopy.Inputs, stepCopy.OutputBuffer,
+                            stepCopy.SavedState ?? Array.Empty<object>(), eng, gradAcc);
+                    }
                 });
             }
         }
