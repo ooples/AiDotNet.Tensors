@@ -45,7 +45,10 @@ internal static class FusedOptimizer
     /// the tensor runs inline on the caller thread with no closure allocation. Overridable via
     /// AIDOTNET_FUSED_OPT_PARALLEL_MIN.
     /// </summary>
-    private const int DefaultParallelThreshold = 1 << 18; // 262144 elements
+    /// <remarks>2^15: AdamW is bound by its per-element divide and square root, not memory -- a 401K-element
+    /// dense weight measured 352 us serial and 40 us over 12 pool chunks of >= 32K elements (~25 us of work each,
+    /// several times the pool dispatch). The previous 2^18 floor left any tensor under 512K elements serial.</remarks>
+    private const int DefaultParallelThreshold = 1 << 15; // 32768 elements
 
     internal static int ParallelThreshold =
         int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_FUSED_OPT_PARALLEL_MIN"), out var _mn) && _mn > 0
@@ -122,6 +125,28 @@ internal static class FusedOptimizer
         }
 
         return true;
+    }
+
+    /// <summary>
+    /// <see cref="AllFiniteSimd(float*, int)"/> split over the persistent pool for a large gradient, with the same
+    /// element-parallel chunking (<see cref="ChunkPlan"/>) as the update kernels. A boolean, so the answer cannot
+    /// depend on the split; a chunk that finds a non-finite value lets the others skip their scan.
+    /// </summary>
+    internal static unsafe bool AllFiniteParallel(float* values, int length)
+    {
+        int nChunks = ChunkPlan(length, FloatSimdWidth, out int chunk);
+        if (nChunks <= 1) return AllFiniteSimd(values, length);
+        nint pv = (nint)values;
+        var nonFinite = new int[1];
+        AiDotNet.Tensors.Helpers.PersistentParallelExecutor.Instance.Execute(nChunks, c =>
+        {
+            if (System.Threading.Volatile.Read(ref nonFinite[0]) != 0) return;
+            int s = c * chunk;
+            int e = s + chunk; if (e > length) e = length;
+            if (s < e && !AllFiniteSimd((float*)pv + s, e - s))
+                System.Threading.Volatile.Write(ref nonFinite[0], 1);
+        });
+        return nonFinite[0] == 0;
     }
 
     /// <summary>
@@ -896,7 +921,9 @@ internal static class FusedOptimizer
             return;
         }
         nint pP = (nint)param, pG = (nint)grad, pM = (nint)m, pV = (nint)v;
-        System.Threading.Tasks.Parallel.For(0, nChunks, c =>
+        // The persistent pool, not the TPL: Parallel.For paid its scheduling and worker wake-up on every call,
+        // which ate most of the gain (401K-element AdamW: 384 us serial, 208 us over a 16-way Parallel.For).
+        AiDotNet.Tensors.Helpers.PersistentParallelExecutor.Instance.Execute(nChunks, c =>
         {
             int s = c * chunk;
             int e = s + chunk; if (e > length) e = length;

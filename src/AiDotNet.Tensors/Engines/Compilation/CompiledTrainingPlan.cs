@@ -1254,7 +1254,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
 
             fixed (float* pGrad = &gradients[gradOffsets[p]])
             {
-                gradientsFinite = FusedOptimizer.AllFiniteSimd(pGrad, lengths[p]);
+                gradientsFinite = FusedOptimizer.AllFiniteParallel(pGrad, lengths[p]);
             }
         }
 
@@ -2929,6 +2929,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // Only zero gradient buffers used by generic (accumulating) backward delegates.
         // Specialized backward delegates overwrite completely (TryGemmEx beta=0, SIMD ReLU).
         // At large sizes, this saves significant time by skipping unnecessary clears.
+        // The first step still clears everything: the buffers are rented uninitialized, and one that no delegate
+        // writes (a gradient nothing produces) must read as zero from then on.
         if (_genericGradIndices != null && !firstGradBind)
         {
             for (int i = 0; i < _genericGradIndices.Length; i++)
@@ -6972,11 +6974,26 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         int genericBackwardCount = 0;
         // Steps whose backward is the generic accumulator: AccumulateGrad ADDS into their inputs' gradient buffers.
         var genericBackwardSteps = new List<CompiledStep<T>>();
+
+        // Gradient relevance: a tensor's gradient can reach a parameter only when the tensor was COMPUTED FROM one
+        // (requiresGradTensors, above). The traced input batch, the labels, and everything derived from them alone
+        // have gradients nothing reads: the optimizer reads parameter gradients only, and the only reader of a
+        // tensor's gradient is its producer's backward, which is itself irrelevant. The plan used to run every
+        // step's backward regardless -- for a dense first layer that is the full dX = dY.W^T GEMM over the input
+        // features (784x512 on the parity MLP, about a third of the whole backward), computed and discarded.
+        // PyTorch skips it because the input does not require grad; this is the same rule, derived from the graph.
+        // Whole steps are not pruned under gradient pooling (its re-zero schedule is indexed by the unpruned action
+        // stream) or for an FP16 heterogeneous graph (its Half nodes are not in forwardSteps, so a path through them
+        // would be missed).
+        HashSet<Tensor<T>>? gradRequired =
+            parameters.Length > 0 && !useGradPool && fp16HeteroOrder is null ? requiresGradTensors : null;
         for (int i = forwardSteps.Count - 1; i >= 0; i--)
         {
             if (fusedStepIndices.Contains(i)) continue;
             var step = forwardSteps[i];
             if (step.BackwardFn == null) continue;
+            // No parameter upstream of this step's output: its backward only produces gradients nothing reads.
+            if (gradRequired is not null && !gradRequired.Contains(step.OutputBuffer)) continue;
 
             // Phase G.7: analytic loss-MatMul backward (replaces standard
             // spec for MatMuls whose gradOut is `α * ones` due to a
@@ -7188,15 +7205,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // When there are no multi-consumer tensors this yields an empty array — the
         // exact skip-all fast path as before, so feed-forward graphs are unchanged.
         //
-        // A plan that mixes specialized and generic backward actions zeroes the same way plus the gradient buffers
-        // of every generic step's inputs, because AccumulateGrad ADDS into those. It used to clear EVERY buffer
-        // instead (one generic step anywhere was enough): on the parity CNN that was 1.5 ms of a 15 ms step, most
-        // of it activation gradients that a specialized beta=0 delegate overwrites anyway. Buffers that nothing
-        // writes (a step without a backward, a dead output) keep the zeros of the full clear on the first step.
-        // A GPU engine keeps the full clear for mixed plans: there the clear also invalidates every buffer's stale
-        // device copy, which this host-side accounting does not model.
+        // A plan that mixes specialized and generic backward actions (a loss whose ops have no specialization --
+        // LogSoftmax, a per-axis ReduceSum -- in front of specialized layers) zeroes the same way plus the gradient
+        // buffers of every generic step's inputs, because AccumulateGrad ADDS into those. It used to clear EVERY
+        // buffer instead (one generic step anywhere was enough), the parameter gradients included, although the
+        // specialized beta=0 delegates overwrite those: on the parity CNN that was 1.5 ms of a 15 ms step. Buffers
+        // that nothing writes keep the zeros of the full clear on the first step. A GPU engine keeps the full clear
+        // for mixed plans: there the clear also invalidates every buffer's stale device copy, which this host-side
+        // accounting does not model. The FP16 heterogeneous backward does not run these actions either.
         int[]? genericGradIndices;
-        if (!useGradPool && (genericBackwardCount == 0 || !engine.SupportsGpu))
+        if (!useGradPool && (genericBackwardCount == 0 || (!engine.SupportsGpu && fp16HeteroOrder is null)))
         {
             // allGrads holds the distinct physical grad buffers (id == index), so a
             // reverse map gives each multi-consumer tensor's grad-buffer index.
@@ -8932,7 +8950,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             if (tensor.IsContiguous && offset == 0 && arr is double[] dNorm)
                 totalNormSq += SumSquaresVectorized(dNorm, len);
             else if (tensor.IsContiguous && offset == 0 && arr is float[] fNorm)
-                totalNormSq += SumSquaresVectorized(fNorm, len);
+                totalNormSq += SumSquaresChunked(fNorm, len);
             else if (tensor.IsContiguous && arr is not null)
                 for (int i = 0; i < len; i++)
                 {
@@ -8965,11 +8983,54 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             }
             else if (offset == 0 && arr is float[] fScale)
             {
-                ScaleInPlaceVectorized(fScale, len, (float)(maxNorm / (totalNorm + 1e-6)));
+                ScaleInPlaceChunked(fScale, len, (float)(maxNorm / (totalNorm + 1e-6)));
                 tensor.IncrementVersion();
             }
             else
                 tensor.ScaleLogicalInPlace(scale);
+        }
+    }
+
+    // Below this many FMAs a linear-backward GEMM stays on the direct managed kernel: BlasManaged's thin-M kernels
+    // start at 1M FMAs and its general strategy path loses to SimdGemm on small shapes (measured on the parity MLP's
+    // last layer, [64x128]x[128x10]: dW 15 µs managed-direct vs 65 µs through BlasManaged).
+    private const long LinearBackwardBlasMinWork = 1L << 20;
+
+    /// <summary>
+    /// C[m,n] := op(A)[m,k] · op(B)[k,n] (row-major, overwriting C) for the specialized linear backward. Routes like the
+    /// MatMul specialization -- BlasProvider.TryGemmEx, which honours deterministic mode (managed, reproducible across
+    /// thread counts) and native/autotune routing otherwise -- except for small GEMMs, which take the direct managed
+    /// kernel (see <see cref="LinearBackwardBlasMinWork"/>).
+    /// </summary>
+    private static void LinearBackwardGemm(
+        float[] a, int lda, bool transA, float[] b, int ldb, bool transB, float[] c, int m, int k, int n)
+    {
+        if ((long)m * k * n >= LinearBackwardBlasMinWork
+            && BlasProvider.TryGemmEx(m, n, k, a, 0, lda, transA, b, 0, ldb, transB, c, 0, n))
+            return;
+        SimdGemm.Sgemm(a, lda, transA, b, ldb, transB, c.AsSpan(0, m * n), m, k, n);
+    }
+
+    /// <summary>
+    /// dst[j] = Σ_r src[r·cols + j] for r = 0..rows-1, summed in row order from zero -- the same per-element order as
+    /// the scalar bias-gradient loop it replaces, so the result is bit-identical to it.
+    /// </summary>
+    private static void SumRowsInto(float[] src, int rows, int cols, float[] dst)
+    {
+        int w = System.Numerics.Vector<float>.Count;
+        int j = 0;
+        for (; j + w <= cols; j += w)
+        {
+            var acc = System.Numerics.Vector<float>.Zero;
+            for (int r = 0; r < rows; r++)
+                acc += new System.Numerics.Vector<float>(src, r * cols + j);
+            acc.CopyTo(dst, j);
+        }
+        for (; j < cols; j++)
+        {
+            float s = 0f;
+            for (int r = 0; r < rows; r++) s += src[r * cols + j];
+            dst[j] = s;
         }
     }
 
@@ -8991,7 +9052,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         return s;
     }
 
-    internal static double SumSquaresVectorized(float[] a, int len)
+    internal static double SumSquaresVectorized(float[] a, int len) => SumSquaresRange(a, 0, len);
+
+    /// <summary>Sum of squares of a[start..end), accumulated in double -- <see cref="SumSquaresVectorized(float[], int)"/>
+    /// over a sub-range, with the same arithmetic.</summary>
+    internal static double SumSquaresRange(float[] a, int start, int end)
     {
         // Widen each float lane to double BEFORE squaring so the accumulation matches
         // the prior scalar path (double v = (double)arr[i]; sum += v*v) — squaring in
@@ -9000,8 +9065,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         int w = System.Numerics.Vector<float>.Count;
         var accLo = System.Numerics.Vector<double>.Zero;
         var accHi = System.Numerics.Vector<double>.Zero;
-        int i = 0;
-        for (; i <= len - w; i += w)
+        int i = start;
+        for (; i <= end - w; i += w)
         {
             var v = new System.Numerics.Vector<float>(a, i);
             System.Numerics.Vector.Widen(v, out var lo, out var hi);
@@ -9010,8 +9075,61 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         }
         double s = System.Numerics.Vector.Dot(accLo, System.Numerics.Vector<double>.One)
                  + System.Numerics.Vector.Dot(accHi, System.Numerics.Vector<double>.One);
-        for (; i < len; i++) { double v = a[i]; s += v * v; }
+        for (; i < end; i++) { double v = a[i]; s += v * v; }
         return s;
+    }
+
+    /// <summary>
+    /// Elements per partial sum of the chunked gradient-norm reduction. FIXED, never derived from the thread count:
+    /// the chunk partials are added in chunk order, so the norm depends on this constant and on nothing else -- the
+    /// same bits on any machine and at any MaxDegreeOfParallelism. A gradient of at most this many elements is one
+    /// chunk, summed exactly as before chunking existed.
+    /// </summary>
+    internal const int ClipChunkElements = 1 << 16;
+
+    /// <summary>
+    /// <see cref="SumSquaresVectorized(float[], int)"/> over fixed <see cref="ClipChunkElements"/>-element chunks summed
+    /// in parallel on the persistent pool, partials added in chunk order. The clip's two passes over a large dense
+    /// weight were serial (a 401K-element gradient: ~55 us to sum, ~70 us to scale, every step).
+    /// </summary>
+    internal static double SumSquaresChunked(float[] a, int len)
+    {
+        int chunks = (len + ClipChunkElements - 1) / ClipChunkElements;
+        if (chunks <= 1) return SumSquaresRange(a, 0, len);
+        var partials = System.Buffers.ArrayPool<double>.Shared.Rent(chunks);
+        try
+        {
+            Helpers.PersistentParallelExecutor.Instance.Execute(chunks, c =>
+                partials[c] = SumSquaresRange(a, c * ClipChunkElements, Math.Min(len, (c + 1) * ClipChunkElements)));
+            double s = 0.0;
+            for (int c = 0; c < chunks; c++) s += partials[c];
+            return s;
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<double>.Shared.Return(partials);
+        }
+    }
+
+    /// <summary><see cref="ScaleInPlaceVectorized(float[], int, float)"/> over the same chunks, in parallel. Each element
+    /// is one multiply whichever chunk or lane computes it, so the result is identical to the serial pass.</summary>
+    internal static void ScaleInPlaceChunked(float[] a, int len, float scale)
+    {
+        int chunks = (len + ClipChunkElements - 1) / ClipChunkElements;
+        if (chunks <= 1) { ScaleInPlaceVectorized(a, len, scale); return; }
+        Helpers.PersistentParallelExecutor.Instance.Execute(chunks, c =>
+        {
+            int start = c * ClipChunkElements, end = Math.Min(len, start + ClipChunkElements);
+            int w = System.Numerics.Vector<float>.Count;
+            var vs = new System.Numerics.Vector<float>(scale);
+            int i = start;
+            for (; i <= end - w; i += w)
+            {
+                var v = new System.Numerics.Vector<float>(a, i);
+                (v * vs).CopyTo(a, i);
+            }
+            for (; i < end; i++) a[i] *= scale;
+        });
     }
 
     internal static void ScaleInPlaceVectorized(double[] a, int len, double scale)
@@ -9210,7 +9328,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             if (g == null) continue;
             if (g.TryGetGpuBuffer() is null || g._gpuBackend is not Engines.DirectGpu.IDirectGpuBackend gcb)
             {
-                Engines.DirectGpu.GpuLaunchProbe.OnFallback("TryClipGradientsGlobalL2Gpu-gradient-not-device-resident", null);
+                // A fallback only on a GPU engine. On the CPU engine host gradients are the normal case, and recording
+                // it (a formatted key + a ConcurrentDictionary update) cost every CPU training step ~1% of its time.
+                if (_engine is Engines.DirectGpuTensorEngine)
+                    Engines.DirectGpu.GpuLaunchProbe.OnFallback("TryClipGradientsGlobalL2Gpu-gradient-not-device-resident", null);
                 return false;
             }
             cb ??= gcb;
@@ -9677,6 +9798,112 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
 
                 inputA.Grad = gradA;
                 if (!dWPeeled) inputB.Grad = gradB;
+            };
+        }
+
+        // FusedLinear backward (float, no fused activation): Y = X·W (+ b). Writes dW, db and -- only when X can reach
+        // a parameter -- dX straight into the plan's gradient buffers. The generic BackwardFunctions path served every
+        // dense layer: it rented a zero-filled tensor per gradient from AutoTensorCache, ran the GEMM into it, then
+        // AccumulateGrad added it into the plan buffer the step had just cleared -- three passes over each gradient
+        // where one write suffices -- and it always computed dX, including the dX of the first layer whose input is
+        // the data batch. One generic action also forces the step to clear EVERY gradient buffer up front.
+        // Overwrite (beta = 0) semantics require each written operand to have exactly one consumer, the same rule as
+        // the MatMul specialization above; a shared operand takes the accumulating generic backward instead.
+        if (typeof(T) == typeof(float) && step.OpType == OpType.FusedLinear
+            && (step.Inputs.Length == 2 || step.Inputs.Length == 3)
+            && step.Inputs[0].Rank >= 2 && step.Inputs[1].Rank == 2
+            && (step.SavedState is null || step.SavedState.Length == 0
+                || (step.SavedState[0] is FusedActivationType linAct && linAct == FusedActivationType.None)))
+        {
+            var linIn = step.Inputs[0];
+            var linW = step.Inputs[1];
+            var linB = step.Inputs.Length == 3 ? step.Inputs[2] : null;
+            var linOut = step.OutputBuffer;
+            int linK = linW._shape[0], linN = linW._shape[1];
+            int linRows = linIn.Length / Math.Max(1, linK);
+            if (linIn._shape[linIn.Rank - 1] != linK || linOut.Length != linRows * linN
+                || (linB is not null && linB.Length != linN))
+                return null;
+
+            bool linNeedX = requiresGrad is null || requiresGrad.Contains(linIn);
+            bool linNeedW = requiresGrad is null || requiresGrad.Contains(linW);
+            bool SoleConsumer(Tensor<T> t) => !consumerCount.TryGetValue(t, out int uses) || uses <= 1;
+            if ((linNeedX && !SoleConsumer(linIn)) || (linNeedW && !SoleConsumer(linW)))
+                return null;
+            if (!gradMap.TryGetValue(linOut, out var linGradOut)
+                || (linNeedX && !gradMap.ContainsKey(linIn))
+                || (linNeedW && !gradMap.ContainsKey(linW)))
+                return null;
+            Tensor<T>? linGradB = null;
+            if (linB is not null && (requiresGrad is null || requiresGrad.Contains(linB)))
+            {
+                if (!SoleConsumer(linB) || !gradMap.TryGetValue(linB, out linGradB))
+                    return null;
+            }
+            var linGradIn = linNeedX ? gradMap[linIn] : null;
+            var linGradW = linNeedW ? gradMap[linW] : null;
+
+            return eng =>
+            {
+                var dY = TryGetLiveFloatBacking(linGradOut) ?? throw new InvalidOperationException("FusedLinear backward: the output gradient has no live host buffer.");
+                if (linGradW is not null)
+                {
+                    // dW[K,N] = Xᵀ[K,rows] · dY[rows,N]
+                    var x = TryGetLiveFloatBacking(linIn) ?? throw new InvalidOperationException("FusedLinear backward: the input has no live host buffer.");
+                    var dW = TryGetLiveFloatBacking(linGradW) ?? throw new InvalidOperationException("FusedLinear backward: the weight gradient has no live host buffer.");
+                    LinearBackwardGemm(x, linK, true, dY, linN, false, dW, linK, linRows, linN);
+                    linW.Grad = linGradW;
+                }
+                if (linGradIn is not null)
+                {
+                    // dX[rows,K] = dY[rows,N] · Wᵀ[N,K]
+                    var w = TryGetLiveFloatBacking(linW) ?? throw new InvalidOperationException("FusedLinear backward: the weight has no live host buffer.");
+                    var dX = TryGetLiveFloatBacking(linGradIn) ?? throw new InvalidOperationException("FusedLinear backward: the input gradient has no live host buffer.");
+                    LinearBackwardGemm(dY, linN, false, w, linN, true, dX, linRows, linN, linK);
+                    linIn.Grad = linGradIn;
+                }
+                if (linGradB is not null && linB is not null)
+                {
+                    var dB = TryGetLiveFloatBacking(linGradB) ?? throw new InvalidOperationException("FusedLinear backward: the bias gradient has no live host buffer.");
+                    SumRowsInto(dY, linRows, linN, dB);
+                    linB.Grad = linGradB;
+                }
+            };
+        }
+
+        // LogSoftmax backward (float, rank 2, softmax over the last axis): dX = dY - exp(Y) * rowsum(dY). The generic
+        // BackwardFunctions path ran it as five engine ops (exp, axis reduce, broadcast, multiply, subtract), each
+        // renting its result and dispatching through the broadcast machinery, then an AccumulateGrad: ~120 us per step
+        // for a 64x10 classifier head whose arithmetic is ~1 us. This computes the same values with the same
+        // arithmetic -- exp through the engine's own TensorExpInto kernel, each row sum in order from zero, then a
+        // float multiply and a float subtract per element -- straight into the input's gradient buffer.
+        if (typeof(T) == typeof(float) && step.OpType == OpType.LogSoftmax && step.Inputs.Length == 1
+            && step.Inputs[0].Rank == 2 && step.Inputs[0].IsContiguous && step.OutputBuffer.IsContiguous
+            && (step.SavedState is not { Length: > 0 } || (step.SavedState[0] is int lsmAxis && (lsmAxis == 1 || lsmAxis == -1)))
+            && engine is CpuEngine lsmCpu && !engine.SupportsGpu)
+        {
+            var lsmIn = step.Inputs[0];
+            var lsmOut = step.OutputBuffer;
+            if ((consumerCount.TryGetValue(lsmIn, out int lsmUses) && lsmUses > 1)
+                || !gradMap.TryGetValue(lsmOut, out var lsmGradOut) || !gradMap.TryGetValue(lsmIn, out var lsmGradIn)
+                || lsmOut.Length != lsmIn.Length)
+                return null;
+            int lsmRows = lsmIn._shape[0], lsmCols = lsmIn._shape[1];
+            var softmaxScratch = new Tensor<T>(lsmIn._shape);
+            return eng =>
+            {
+                lsmCpu.TensorExpInto(softmaxScratch, lsmOut);
+                var s = TryGetLiveFloatBacking(softmaxScratch) ?? throw new InvalidOperationException("LogSoftmax backward: the softmax scratch has no live host buffer.");
+                var dY = TryGetLiveFloatBacking(lsmGradOut) ?? throw new InvalidOperationException("LogSoftmax backward: the output gradient has no live host buffer.");
+                var dX = TryGetLiveFloatBacking(lsmGradIn) ?? throw new InvalidOperationException("LogSoftmax backward: the input gradient has no live host buffer.");
+                for (int r = 0; r < lsmRows; r++)
+                {
+                    int o = r * lsmCols;
+                    float rowSum = 0f;
+                    for (int c = 0; c < lsmCols; c++) rowSum += dY[o + c];
+                    for (int c = 0; c < lsmCols; c++) dX[o + c] = dY[o + c] - s[o + c] * rowSum;
+                }
+                lsmIn.Grad = lsmGradIn;
             };
         }
 
