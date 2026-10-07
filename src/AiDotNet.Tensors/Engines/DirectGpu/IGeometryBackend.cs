@@ -43,9 +43,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu
             int mode, float padValue);
 
         /// <summary>
-        /// 2D GridSample on NHWC float tensors. Input
-        /// <c>[N, H, W, C]</c>, grid <c>[N, outH, outW, 2]</c>, output
-        /// <c>[N, outH, outW, C]</c>.
+        /// 2D GridSample on NCHW float tensors. Input
+        /// <c>[N, C, H, W]</c>, grid <c>[N, outH, outW, 2]</c>, output
+        /// <c>[N, C, outH, outW]</c>.
         /// </summary>
         void GridSample2D(IGpuBuffer input, IGpuBuffer grid, IGpuBuffer output,
             int N, int H, int W, int C, int outH, int outW,
