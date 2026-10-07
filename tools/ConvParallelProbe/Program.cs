@@ -198,6 +198,8 @@ internal static class Program
         Measure("BatchMatMul [S,D]x[D,4D]", (long)S * 4 * D, () => eng.BatchMatMul(x, w1));
         Measure("BatchMatMul [H,S,Dh]x[H,Dh,S]", (long)H * S * S, () => eng.BatchMatMul(qh, kht));
         Measure("Softmax [H,S,S]", (long)H * S * S, () => eng.Softmax(scores, -1));
+        var softmaxOut = Rand(new[] { H, S, S }, rng);
+        Measure("SoftmaxInto [H,S,S]", 0, () => eng.SoftmaxInto(softmaxOut, scores, -1));
         Measure("TensorAdd [S,D]", (long)S * D, () => eng.TensorAdd(x, x));
         Measure("LayerNorm [S,D]", (long)S * D, () => eng.LayerNorm(x, gamma, beta, 1e-5, out _, out _));
         Measure("SwishInPlace [S,4D]", 0, () => eng.SwishInPlace(h1));
