@@ -119,6 +119,85 @@ public class ConvBiasActivationFusionTests
         AssertBitEqual(expected.AsSpan(), actual.AsSpan(), "fused conv forward");
     }
 
+    /// <summary>
+    /// The pool + ReLU + bias backward in one pass against the max-pool backward into a separate activation-gradient
+    /// buffer followed by the ReLU/bias backward, bit for bit. Covers the vector 2x2 path (16 and 17 windows per row),
+    /// odd sizes with uncovered remainder rows/columns, a 3x3 tiling pool (scalar path), all-zero windows (ties: the
+    /// first tap wins), and NaN / -inf windows, which have no winner and send their gradient to plane cell 0.
+    /// </summary>
+    [Theory]
+    [InlineData(3, 4, 28, 28, 2, false, false)]
+    [InlineData(2, 3, 9, 9, 2, false, true)]
+    [InlineData(2, 3, 6, 34, 2, true, false)]
+    [InlineData(2, 2, 10, 11, 3, true, true)]
+    [InlineData(1, 2, 2, 2, 2, true, false)]
+    public void PoolReluBiasBackwardMatchesSeparateOps(int n, int c, int h, int w, int pool, bool specials, bool accumulateBias)
+    {
+        var engine = new CpuEngine();
+        var y = Rnd(new[] { n, c, h, w }, 31);
+        for (int i = 0; i < y.Length; i++) if (y[i] < 0) y[i] = 0f;   // a ReLU output
+        for (int i = 0; i < Math.Min(y.Length, 2 * w); i++) y[i] = 0f;   // whole windows of zeros (ties)
+        if (specials)
+        {
+            // Not a ReLU output, but the kernel must still match: windows with no winner and a -0 tie.
+            int plane = h * w;
+            for (int i = 0; i < pool; i++)
+                for (int j = 0; j < pool; j++) y[plane + i * w + j] = float.NaN;
+            for (int i = 0; i < pool; i++)
+                for (int j = pool; j < 2 * pool && j < w; j++) y[plane + i * w + j] = float.NegativeInfinity;
+            if (2 * plane < y.Length) y[2 * plane] = -0f;
+        }
+        int oh = (h - pool) / pool + 1, ow = (w - pool) / pool + 1;
+        var gPool = Rnd(new[] { n, c, oh, ow }, 32);
+        gPool[1] = -0f;
+        var priorDb = Rnd(new[] { c }, 33);
+
+        var gradY = new Tensor<float>(y._shape);
+        engine.MaxPool2DBackwardRecomputeInto(gradY, gPool, y, pool, pool, pool, pool, accumulate: false);
+        var expectedDz = new Tensor<float>(y._shape);
+        var expectedDb = new Tensor<float>(new[] { c });
+        priorDb.AsSpan().CopyTo(expectedDb.AsWritableSpan());
+        engine.ChannelBiasActivationBackwardInto(expectedDz, expectedDb, gradY, y, true, accumulateBias);
+
+        var dz = new Tensor<float>(y._shape);
+        for (int i = 0; i < dz.Length; i++) dz[i] = 77f;   // stale contents must be fully replaced
+        var db = new Tensor<float>(new[] { c });
+        priorDb.AsSpan().CopyTo(db.AsWritableSpan());
+        engine.MaxPoolReluBiasBackwardInto(dz, db, gPool, y, pool, pool, accumulateBias);
+        AssertBitEqual(expectedDz.AsSpan(), dz.AsSpan(), "pre-activation gradient");
+        AssertBitEqual(expectedDb.AsSpan(), db.AsSpan(), "bias gradient");
+    }
+
+    /// <summary>The compiled plan with the pool backward folded into the conv chain's, against it kept separate.</summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void PoolFusedPlanMatchesUnfusedPool(bool sharedBias)
+    {
+        var priorEngine = AiDotNetEngine.Current;
+        var priorFlag = Environment.GetEnvironmentVariable("AIDOTNET_CONV_POOL_BACKWARD_FUSION");
+        AiDotNetEngine.Current = new CpuEngine();
+        try
+        {
+            var net = new Net();
+            for (int steps = 1; steps <= 2; steps++)
+            {
+                Environment.SetEnvironmentVariable("AIDOTNET_CONV_POOL_BACKWARD_FUSION", "0");
+                var separate = RunPlan(net, fusion: true, sharedBias, secondRelu: true, steps);
+                Environment.SetEnvironmentVariable("AIDOTNET_CONV_POOL_BACKWARD_FUSION", null);
+                var fused = RunPlan(net, fusion: true, sharedBias, secondRelu: true, steps);
+                Assert.Equal(separate.Length, fused.Length);
+                for (int p = 0; p < separate.Length; p++)
+                    AssertBitEqual(separate[p], fused[p], $"after {steps} step(s), parameter {p}");
+            }
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("AIDOTNET_CONV_POOL_BACKWARD_FUSION", priorFlag);
+            AiDotNetEngine.Current = priorEngine;
+        }
+    }
+
     /// <summary>A non-default 3x3 variant routes the conv off the tiled kernel; the entry must still be exact.</summary>
     [Fact]
     public void FusedConvForwardMatchesTwoPassOnLegacyVariant()

@@ -17093,6 +17093,63 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>
+    /// One plane of the float max-pool backward that re-scans the forward input for each window's winner (first
+    /// maximum, starting from float.MinValue with a strict greater-than, so NaN never wins and a window with no winner
+    /// sends its gradient to plane cell 0) and writes <c>0 + g</c> there. With <paramref name="tiles"/> (stride equal
+    /// to the pool, not accumulating) each window owns its cells and writes them in one pass, and only the uncovered
+    /// remainder rows/columns are cleared; otherwise the whole plane is cleared first and the gradients are added.
+    /// </summary>
+    [MethodImpl(Compatibility.MethodImplHelper.Hot)]
+    private static void MaxPoolBackwardRecomputePlane(
+        float[] x, int xBase, float[] g, int gBase, float[] dst, int dBase,
+        int height, int width, int outH, int outW, int poolH, int poolW, int strideH, int strideW, bool tiles)
+    {
+        if (!tiles)
+            Array.Clear(dst, dBase, height * width);
+        if (tiles)
+        {
+            int coveredH = outH * poolH, coveredW = outW * poolW;
+            for (int r = 0; r < coveredH; r++)
+                if (coveredW < width) Array.Clear(dst, dBase + r * width + coveredW, width - coveredW);
+            if (coveredH < height) Array.Clear(dst, dBase + coveredH * width, (height - coveredH) * width);
+        }
+        int ohStart = 0;
+        if (tiles && poolH == 2 && poolW == 2 && strideH == 2 && strideW == 2)
+        {
+            MaxPool2x2Stride2TilesBackwardPlane(x, xBase, g, gBase, dst, dBase, width, outH, outW);
+            ohStart = outH;
+        }
+        for (int oh = ohStart; oh < outH; oh++)
+        {
+            int ih0 = oh * strideH;
+            for (int ow = 0; ow < outW; ow++)
+            {
+                int iw0 = ow * strideW;
+                float maxVal = float.MinValue;
+                int maxIdx = 0;
+                for (int kh = 0; kh < poolH; kh++)
+                {
+                    int row = (ih0 + kh) * width;
+                    for (int kw = 0; kw < poolW; kw++)
+                    {
+                        float v = x[xBase + row + iw0 + kw];
+                        if (v > maxVal) { maxVal = v; maxIdx = row + iw0 + kw; }
+                    }
+                }
+                if (tiles)
+                {
+                    for (int kh = 0; kh < poolH; kh++)
+                    {
+                        int row = dBase + (ih0 + kh) * width + iw0;
+                        for (int kw = 0; kw < poolW; kw++) dst[row + kw] = 0f;
+                    }
+                }
+                dst[dBase + maxIdx] += g[gBase + oh * outW + ow];
+            }
+        }
+    }
+
+    /// <summary>
     /// Unpadded MaxPool2D backward that finds each window's winner by re-scanning the forward INPUT, then writes the
     /// input gradient straight into <paramref name="gradInput"/>. The winner rule is exactly the one
     /// <c>MaxPool2DWithTensorIndices</c> records (start below every finite value, strict greater-than in row-major
@@ -17148,49 +17205,8 @@ public partial class CpuEngine : ITensorLevelEngine
                 float[]? scratch = accumulate ? System.Buffers.ArrayPool<float>.Shared.Rent(inPlane) : null;
                 float[] dst = scratch ?? d;
                 int dBase = scratch is null ? giOff + plane * inPlane : 0;
-                if (!tiles)
-                    Array.Clear(dst, dBase, inPlane);
-                if (tiles)
-                {
-                    int coveredH = outH * poolH, coveredW = outW * poolW;
-                    for (int r = 0; r < coveredH; r++)
-                        if (coveredW < width) Array.Clear(dst, dBase + r * width + coveredW, width - coveredW);
-                    if (coveredH < height) Array.Clear(dst, dBase + coveredH * width, (height - coveredH) * width);
-                }
-                int ohStart = 0;
-                if (tiles && poolH == 2 && poolW == 2 && strideH == 2 && strideW == 2)
-                {
-                    MaxPool2x2Stride2TilesBackwardPlane(x, xBase, g, gBase, dst, dBase, width, outH, outW);
-                    ohStart = outH;
-                }
-                for (int oh = ohStart; oh < outH; oh++)
-                {
-                    int ih0 = oh * strideH;
-                    for (int ow = 0; ow < outW; ow++)
-                    {
-                        int iw0 = ow * strideW;
-                        float maxVal = float.MinValue;
-                        int maxIdx = 0;
-                        for (int kh = 0; kh < poolH; kh++)
-                        {
-                            int row = (ih0 + kh) * width;
-                            for (int kw = 0; kw < poolW; kw++)
-                            {
-                                float v = x[xBase + row + iw0 + kw];
-                                if (v > maxVal) { maxVal = v; maxIdx = row + iw0 + kw; }
-                            }
-                        }
-                        if (tiles)
-                        {
-                            for (int kh = 0; kh < poolH; kh++)
-                            {
-                                int row = dBase + (ih0 + kh) * width + iw0;
-                                for (int kw = 0; kw < poolW; kw++) dst[row + kw] = 0f;
-                            }
-                        }
-                        dst[dBase + maxIdx] += g[gBase + oh * outW + ow];
-                    }
-                }
+                MaxPoolBackwardRecomputePlane(x, xBase, g, gBase, dst, dBase, height, width, outH, outW,
+                    poolH, poolW, strideH, strideW, tiles);
                 if (scratch is not null)
                 {
                     int target = giOff + plane * inPlane;

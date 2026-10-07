@@ -7010,7 +7010,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             if (convEpilogueBackwardSpecs.TryGetValue(i, out var convEpilogueBwd))
             {
                 backwardActions.Add(convEpilogueBwd);
-                backwardStepNames.Add("fused:Conv2D+ChannelBias" + (step.OpType == OpType.ReLU ? "+ReLU" : ""));
+                backwardStepNames.Add("fused:Conv2D+ChannelBias" + (step.OpType == OpType.MaxPool2D ? "+ReLU+MaxPool2D"
+                    : step.OpType == OpType.ReLU ? "+ReLU" : ""));
                 continue;
             }
             if (consumedByConvEpilogue.Contains(i))
@@ -11432,6 +11433,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         HashSet<int> consumed)
     {
         if (typeof(T) != typeof(float)) return;
+        // AIDOTNET_CONV_POOL_BACKWARD_FUSION=0 keeps a following max pool's backward separate (A/B and tests).
+        bool poolBackwardFusion = Environment.GetEnvironmentVariable("AIDOTNET_CONV_POOL_BACKWARD_FUSION") != "0";
 
         // The unique consumer step of each tensor read by exactly one step.
         var soleConsumer = new Dictionary<Tensor<T>, int>();
@@ -11485,6 +11488,34 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             var distinct = new HashSet<Tensor<T>> { gradY, gradConvOut, gradBias, gradX, gradKernel };
             if (distinct.Count != 5 || !gradY.IsContiguous || !gradConvOut.IsContiguous) continue;
 
+            // A ReLU activation read only by a tiling max pool (stride = pool, the graph-mode node that saves just
+            // its geometry): the pool's backward joins the chain's, so each plane's pool gradient is scattered,
+            // ReLU-masked and bias-reduced in one pass and the activation gradient (gradY) is never written. The
+            // pool's forward stays its own action; the chain's backward then runs at the pool's position.
+            int poolIdx = -1, poolH = 0, poolW = 0;
+            Tensor<float>? gradPoolOutF = null;
+            if (relu && poolBackwardFusion && y.Rank == 4 && y.IsContiguous
+                && soleConsumer.TryGetValue(y, out int candidatePool) && candidatePool > last
+                && !consumed.Contains(candidatePool))
+            {
+                var pool = steps[candidatePool];
+                if (pool.OpType == OpType.MaxPool2D && pool.Inputs.Length == 1 && ReferenceEquals(pool.Inputs[0], y)
+                    && pool.SavedState is { Length: 2 } poolGeometry
+                    && poolGeometry[0] is int[] { Length: 2 } poolSize && poolGeometry[1] is int[] { Length: 2 } poolStride
+                    && poolSize[0] > 0 && poolSize[1] > 0 && poolSize[0] == poolStride[0] && poolSize[1] == poolStride[1]
+                    && pool.OutputBuffer.Rank == 4
+                    && pool.OutputBuffer._shape[2] == (y._shape[2] - poolSize[0]) / poolSize[0] + 1
+                    && pool.OutputBuffer._shape[3] == (y._shape[3] - poolSize[1]) / poolSize[1] + 1
+                    && gradMap.TryGetValue(pool.OutputBuffer, out var gradPoolOut) && gradPoolOut.IsContiguous
+                    && !distinct.Contains(gradPoolOut))
+                {
+                    poolIdx = candidatePool;
+                    poolH = poolSize[0];
+                    poolW = poolSize[1];
+                    gradPoolOutF = (Tensor<float>)(object)gradPoolOut;
+                }
+            }
+
             bool accumX = consumerCount.TryGetValue(x, out int xConsumers) && xConsumers > 1;
             bool accumKernel = consumerCount.TryGetValue(kernel, out int kConsumers) && kConsumers > 1;
             bool accumBias = consumerCount.TryGetValue(bias, out int bConsumers) && bConsumers > 1;
@@ -11525,11 +11556,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                     (relu ? eng.ReLU(z) : z).AsSpan().CopyTo(y.AsWritableSpan());
                 }
             };
-            backwardSpecs[last] = eng =>
+            backwardSpecs[poolIdx >= 0 ? poolIdx : last] = eng =>
             {
                 if (eng is CpuEngine cpu && !eng.SupportsGpu)
                 {
-                    cpu.ChannelBiasActivationBackwardInto(gradConvOutF, gradBiasF, gradYF, yF, relu, accumBias);
+                    if (gradPoolOutF is not null)
+                        cpu.MaxPoolReluBiasBackwardInto(gradConvOutF, gradBiasF, gradPoolOutF, yF, poolH, poolW, accumBias);
+                    else
+                        cpu.ChannelBiasActivationBackwardInto(gradConvOutF, gradBiasF, gradYF, yF, relu, accumBias);
                     if (needInputGrad)
                         cpu.Conv2DBackwardInputInto(gradX, gradConvOut, kernel, xShape,
                             capStride, capPadding, capDilation, accumX);
