@@ -7776,6 +7776,25 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             };
         }
 
+        // Batched MatMul forward (float, [b.., M, K] x [b.., K, N], equal batch dims): one sequential GEMM per batch
+        // slice over the pool, straight into the plan's output buffer -- the same per-slice kernel call the engine's
+        // batched matmul makes (bit-identical), without its rented result and the copy into the plan buffer.
+        if (typeof(T) == typeof(float) && step.OpType == OpType.TensorMatMul && step.Inputs.Length == 2
+            && TryGetBatchedMatMulDims(step, out int fbBatch, out int fbM, out int fbK, out int fbN))
+        {
+            var fbA = step.Inputs[0];
+            var fbB = step.Inputs[1];
+            var fbOut = step.OutputBuffer;
+            var fbJob = new BatchedGemmJob(fbBatch, fbM, fbK, fbN, false, false, accumulate: false);
+            return eng =>
+            {
+                fbJob.Run(
+                    TryGetLiveFloatBacking(fbA) ?? throw new InvalidOperationException("Batched MatMul forward: A has no live host buffer."),
+                    TryGetLiveFloatBacking(fbB) ?? throw new InvalidOperationException("Batched MatMul forward: B has no live host buffer."),
+                    TryGetLiveFloatBacking(fbOut) ?? throw new InvalidOperationException("Batched MatMul forward: the output has no live host buffer."));
+                fbOut.IncrementVersion();
+            };
+        }
         // MatMul forward (ND × 2D): collapse A's leading dims into M and
         // run a single 2D SGEMM directly into the pre-allocated output
         // buffer. Critical for the consumer Transformer's rank-3
@@ -9324,6 +9343,86 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         }
     }
     /// <summary>
+    /// Shape of a batched MatMul step the batched specializations serve: both operands of equal rank >= 3, equal
+    /// batch dims, A [.., M, K], B [.., K, N], and every operand and the output contiguous with zero offset.
+    /// </summary>
+    private static bool TryGetBatchedMatMulDims(CompiledStep<T> step, out int batch, out int m, out int k, out int n)
+    {
+        batch = m = k = n = 0;
+        var a = step.Inputs[0];
+        var b = step.Inputs[1];
+        var c = step.OutputBuffer;
+        if (a is null || b is null || c is null) return false;
+        int r = a.Rank;
+        if (r < 3 || b.Rank != r || c.Rank != r) return false;
+        if (!a.IsContiguous || !b.IsContiguous || !c.IsContiguous
+            || a._storageOffset != 0 || b._storageOffset != 0 || c._storageOffset != 0) return false;
+        batch = 1;
+        for (int i = 0; i < r - 2; i++)
+        {
+            if (a._shape[i] != b._shape[i] || a._shape[i] != c._shape[i]) return false;
+            batch *= a._shape[i];
+        }
+        m = a._shape[r - 2];
+        k = a._shape[r - 1];
+        n = b._shape[r - 1];
+        if (b._shape[r - 2] != k || c._shape[r - 2] != m || c._shape[r - 1] != n) return false;
+        return batch > 0 && m > 0 && k > 0 && n > 0;
+    }
+
+    /// <summary>
+    /// C_i[m,n] = op(A_i)[m,k] · op(B_i)[k,n] for every batch slice i, one sequential GEMM per slice spread over the
+    /// pool (each slice's reduction is done by one thread in a fixed order, so the result does not depend on the
+    /// thread count). With <c>accumulate</c> the products go to an owned scratch that is then added into C.
+    /// Reused across steps: the body delegate is built once.
+    /// </summary>
+    private sealed class BatchedGemmJob
+    {
+        private readonly int _batch, _m, _k, _n;
+        private readonly bool _transA, _transB;
+        private readonly int _strideA, _strideB, _strideC;
+        private readonly float[]? _scratch;
+        private readonly Action<int> _body;
+        private float[] _a = Array.Empty<float>(), _b = Array.Empty<float>(), _c = Array.Empty<float>();
+
+        internal BatchedGemmJob(int batch, int m, int k, int n, bool transA, bool transB, bool accumulate)
+        {
+            _batch = batch; _m = m; _k = k; _n = n; _transA = transA; _transB = transB;
+            _strideA = m * k; _strideB = k * n; _strideC = m * n;
+            _scratch = accumulate ? new float[batch * m * n] : null;
+            _body = Slice;
+        }
+
+        private void Slice(int i)
+        {
+            var c = new Span<float>(_c, i * _strideC, _strideC);
+            c.Clear();
+            SimdGemm.SgemmAddInternal(
+                new ReadOnlySpan<float>(_a, i * _strideA, _strideA), _transA ? _m : _k, _transA,
+                new ReadOnlySpan<float>(_b, i * _strideB, _strideB), _transB ? _k : _n, _transB,
+                c, _m, _k, _n, allowParallel: false, clearedOutput: true);
+        }
+
+        internal void Run(float[] a, float[] b, float[] c)
+        {
+            _a = a; _b = b; _c = _scratch ?? c;
+            try
+            {
+                CpuParallelSettings.ParallelForOrSerial(0, _batch, (long)_batch * _strideC, _body, deterministicSafe: true);
+            }
+            finally
+            {
+                _a = _b = Array.Empty<float>();
+                _c = Array.Empty<float>();
+            }
+            if (_scratch is not null)
+            {
+                var d = new Span<float>(c, 0, _batch * _strideC);
+                SimdKernels.VectorAdd(d, new ReadOnlySpan<float>(_scratch, 0, _batch * _strideC), d);
+            }
+        }
+    }
+    /// <summary>
     /// C[m,n] := op(A)[m,k] · op(B)[k,n] (row-major, overwriting C) for the specialized linear backward. Routes like the
     /// MatMul specialization -- BlasProvider.TryGemmEx, which honours deterministic mode (managed, reproducible across
     /// thread counts) and native/autotune routing otherwise -- except for small GEMMs, which take the direct managed
@@ -9870,6 +9969,47 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             && ((consumerCount.TryGetValue(step.Inputs[0], out int consumersA) && consumersA > 1)
                 || (consumerCount.TryGetValue(step.Inputs[1], out int consumersB) && consumersB > 1));
 
+        // Batched MatMul backward (float, [b.., M, K] x [b.., K, N] with equal batch dims): attention's scores and
+        // context products in every transformer. The generic path materialized each transposed operand, ran the
+        // batched engine matmul into a rented result and accumulated it through the gradient dictionary: measured
+        // 1.3 ms per call on the parity transformer (4 per step). Here each needed gradient is one sequential GEMM per
+        // batch slice, the slices spread over the pool, straight into the gradient buffer (or, for an operand with
+        // other consumers, into an owned scratch that is then added). Not bit-identical to the generic path (it
+        // packs the transposed operand instead of materializing it); within float rounding.
+        if (typeof(T) == typeof(float) && step.OpType == OpType.TensorMatMul && step.Inputs.Length == 2
+            && engine is CpuEngine && !engine.SupportsGpu
+            && TryGetBatchedMatMulDims(step, out int bmBatch, out int bmM, out int bmK, out int bmN))
+        {
+            var bmA = step.Inputs[0];
+            var bmB = step.Inputs[1];
+            if (!gradMap.TryGetValue(step.OutputBuffer, out var bmGradOut) || !bmGradOut.IsContiguous) return null;
+            bool bmNeedA = requiresGrad is null || requiresGrad.Contains(bmA);
+            bool bmNeedB = (requiresGrad is null || requiresGrad.Contains(bmB)) && !ReferenceEquals(bmA, bmB);
+            if (ReferenceEquals(bmA, bmB)) return null;
+            Tensor<T>? bmGradA = null, bmGradB = null;
+            if (bmNeedA && (!gradMap.TryGetValue(bmA, out bmGradA) || !bmGradA.IsContiguous)) return null;
+            if (bmNeedB && (!gradMap.TryGetValue(bmB, out bmGradB) || !bmGradB.IsContiguous)) return null;
+            bool Shared(Tensor<T> x) => consumerCount.TryGetValue(x, out int uses) && uses > 1;
+            // dA_b[M,K] = dC_b[M,N] · B_bᵀ ; dB_b[K,N] = A_bᵀ · dC_b
+            var jobA = bmGradA is null ? null : new BatchedGemmJob(bmBatch, bmM, bmN, bmK, false, true, Shared(bmA));
+            var jobB = bmGradB is null ? null : new BatchedGemmJob(bmBatch, bmK, bmM, bmN, true, false, Shared(bmB));
+            return eng =>
+            {
+                var dC = TryGetLiveFloatBacking(bmGradOut) ?? throw new InvalidOperationException("Batched MatMul backward: the output gradient has no live host buffer.");
+                if (jobA is not null && bmGradA is not null)
+                {
+                    jobA.Run(dC, TryGetLiveFloatBacking(bmB) ?? throw new InvalidOperationException("Batched MatMul backward: B has no live host buffer."),
+                        TryGetLiveFloatBacking(bmGradA) ?? throw new InvalidOperationException("Batched MatMul backward: dA has no live host buffer."));
+                    bmA.Grad = bmGradA;
+                }
+                if (jobB is not null && bmGradB is not null)
+                {
+                    jobB.Run(TryGetLiveFloatBacking(bmA) ?? throw new InvalidOperationException("Batched MatMul backward: A has no live host buffer."), dC,
+                        TryGetLiveFloatBacking(bmGradB) ?? throw new InvalidOperationException("Batched MatMul backward: dB has no live host buffer."));
+                    bmB.Grad = bmGradB;
+                }
+            };
+        }
         // MatMul backward with a SHARED operand (float, [.., K] x [K, N]): a weight reused across time steps (every
         // RNN cell), one activation feeding several projections (attention's Q/K/V), a tied embedding. The overwrite
         // specialization below cannot serve these and they took the generic backward, which rents a fresh result per
