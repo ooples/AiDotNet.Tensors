@@ -2937,7 +2937,11 @@ public partial class CpuEngine : ITensorLevelEngine
                 // (disjoint output rows → deterministicSafe).
                 if (batchSize < maxDeg && m >= 2 && batchTotalWork >= Helpers.PersistentParallelExecutor.DefaultSerialGrainSize)
                 {
-                    int blocksPerSlice = Math.Min(m, Math.Max(1, (maxDeg + batchSize - 1) / batchSize));
+                    // Split by PHYSICAL cores: on a 16-core/32-thread 3950X, cutting each head into
+                    // ceil(32/12) = 3 row blocks ran the [12,256,64]x[12,64,256] attention product in
+                    // 0.19-0.20 ms, against 0.10-0.11 ms for ceil(16/12) = 2 (#653, 3 alternating rounds).
+                    int splitDeg = Math.Min(maxDeg, Helpers.CpuParallelSettings.PhysicalCoreCount);
+                    int blocksPerSlice = Math.Min(m, Math.Max(1, (splitDeg + batchSize - 1) / batchSize));
                     int totalItems = batchSize * blocksPerSlice;
                     Helpers.CpuParallelSettings.ParallelForOrSerial(0, totalItems, batchTotalWork, item =>
                     {
