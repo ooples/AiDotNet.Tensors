@@ -32975,6 +32975,11 @@ public partial class CpuEngine : ITensorLevelEngine
                     else shapeList.Add(input._shape[i]);
                 }
                 var outShape = shapeList.Count > 0 ? shapeList.ToArray() : new[] { 1 };
+                if (typeof(T) == typeof(float) && this is not DirectGpuTensorEngine && !GraphMode.IsInferenceTrace)
+                {
+                    var compiledMean = TryRecordReduceMeanFloat(scope, (Tensor<float>)(object)input, axes, keepDims, outShape);
+                    if (compiledMean is not null) return (Tensor<T>)(object)compiledMean;
+                }
                 return scope.RecordUnary(LazyNodeType.ReduceMean, "ReduceMean", input, outShape,
                     (eng, output) => { var r = eng.ReduceMean(captured, capturedAxes, capturedKeepDims); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.ReduceMeanBackward, new object[] { axes, keepDims });
