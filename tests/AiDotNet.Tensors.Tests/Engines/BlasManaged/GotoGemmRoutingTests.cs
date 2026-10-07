@@ -89,4 +89,47 @@ public sealed class GotoGemmRoutingTests
             CpuParallelSettings.MaxDegreeOfParallelism = before;
         }
     }
+
+    // The routed per-tile kernel writes C first (overwrite kernel on the first K-panel, tail strips
+    // zeroed per tile), so BlasManaged no longer clears C before it. A NaN-filled destination proves
+    // every element is written: any cell left to a "+=" over stale memory stays NaN.
+    [Theory]
+    [InlineData(256, 768, 768)]
+    [InlineData(250, 768, 520)]
+    [InlineData(256, 3072, 768)]
+    public void RoutedPath_OverwritesAGarbageDestination(int m, int k, int n)
+    {
+        int before = CpuParallelSettings.MaxDegreeOfParallelism;
+        try
+        {
+            CpuParallelSettings.MaxDegreeOfParallelism = 16;
+            var rng = RandomHelper.CreateSeededRandom(9);
+            var a = new float[m * k];
+            var b = new float[k * n];
+            var c = new float[m * n];
+            for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() - 0.5);
+            for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() - 0.5);
+            for (int i = 0; i < c.Length; i++) c[i] = float.NaN;
+
+            AiDotNet.Tensors.Engines.BlasManaged.BlasManaged.Gemm<float>(
+                a, k, false, b, n, false, c, n, m, n, k,
+                new BlasOptions<float> { PackingMode = PackingMode.DisableAutotune, BetaZero = true });
+
+            double worst = 0;
+            for (int i = 0; i < m; i++)
+                for (int j = 0; j < n; j++)
+                {
+                    double expected = 0;
+                    for (int p = 0; p < k; p++) expected += (double)a[i * k + p] * b[p * n + j];
+                    float actual = c[i * n + j];
+                    Assert.False(float.IsNaN(actual), $"C[{i},{j}] was never written");
+                    worst = Math.Max(worst, Math.Abs(expected - actual));
+                }
+            Assert.True(worst < 1e-3, $"max |C - C_ref| = {worst:E3}");
+        }
+        finally
+        {
+            CpuParallelSettings.MaxDegreeOfParallelism = before;
+        }
+    }
 }

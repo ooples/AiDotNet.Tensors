@@ -658,9 +658,9 @@ public static partial class BlasManaged
             && (long)m * n * k >= GotoGemmFp32.ParallelMinWork && GotoGemmFp32.BeatsPackBoth(m, n, k)
             && GotoGemmFp32.IsAvailable)
         {
-            // GotoGemm accumulates into a pre-zeroed C; under beta=0 the global clear was
-            // skipped, so zero the tile here (this path is not converted to write-first).
-            if (betaZero) ClearOutputTile(c, ldc, m, n);
+            // RunParallel and the CCX pool write C first: each tile's first K-panel uses the overwrite
+            // kernel and zeroes its own tail strips, so no global clear (a serial memset of all of C, up
+            // paired A/B 1.11x on a 256x768x3072 GEMM at 16 threads, #653). Only the bf16 path still needs one.
             var gepi = options.Epilogue;
             {
                 var gfa = MemoryMarshal.Cast<T, float>(a);
@@ -678,6 +678,7 @@ public static partial class BlasManaged
                         // changing ⇒ never default; falls through to exact fp32 for smaller/wide-N shapes.
                         if (s_gemmBf16 && GotoGemmFp32.ShouldUseBf16(m, n, k))
                         {
+                            if (betaZero) ClearOutputTile(c, ldc, m, n);
                             GotoGemmFp32.RunParallelBf16(pa, lda, pb, ldb, pc, ldc, m, n, k, gmc, gnc, gkc);
                         }
                         // CCX-aware pinned pool for large BALANCED shapes (per-CCX L3-resident B-strips →

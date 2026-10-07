@@ -829,6 +829,10 @@ internal static class Program
         var packBF = goto_.GetField("s_packBTicks", SF);
         var kernF = goto_.GetField("s_kernTicks", SF);
         var tailF = goto_.GetField("s_tailTicks", SF);
+        var runParF = goto_.GetField("s_runParallelTicks", SF);
+        var tileF = goto_.GetField("s_tileTicks", SF);
+        var lagF = goto_.GetField("s_tileLagTicks", SF);
+        var tileCountF = goto_.GetField("s_tileCount", SF);
         var resetM = goto_.GetMethod("ResetTiming", SF);
         if (timingF == null || packF == null || packAF == null || packBF == null || kernF == null || resetM == null)
         {
@@ -850,6 +854,10 @@ internal static class Program
         double pack = (long)(packF.GetValue(null) ?? 0L) * f, packA = (long)(packAF.GetValue(null) ?? 0L) * f;
         double packB = (long)(packBF.GetValue(null) ?? 0L) * f, kern = (long)(kernF.GetValue(null) ?? 0L) * f;
         double tail = tailF is null ? 0 : (long)(tailF.GetValue(null) ?? 0L) * f;
+        double runPar = runParF is null ? 0 : (long)(runParF.GetValue(null) ?? 0L) * f;
+        double tiles = tileF is null ? 0 : (long)(tileF.GetValue(null) ?? 0L) * f;
+        double lag = lagF is null ? 0 : (long)(lagF.GetValue(null) ?? 0L) * f;
+        long tileCount = tileCountF is null ? 0 : (long)(tileCountF.GetValue(null) ?? 0L);
         double wall = sw.Elapsed.TotalMilliseconds;
         double budget = wall * maxdop;
         double gflops = reps * 2.0 * M * K * N / (wall / 1000.0) / 1e9;
@@ -857,7 +865,9 @@ internal static class Program
             $"GOTOPROFILE M={M} K={K} N={N} maxdop={maxdop} wall_ms_per_call={wall / reps:F3} GFLOPs={gflops:F0} | " +
             $"kernel={100 * kern / budget:F0}% packA={100 * packA / budget:F0}% packB={100 * packB / budget:F0}% tails={100 * tail / budget:F0}% " +
             $"other/idle={100 * (budget - pack - kern - tail) / budget:F0}% of thread budget | kernel GFLOPs/thread-busy=" +
-            $"{reps * 2.0 * M * K * N / (kern / 1000.0) / 1e9:F0} (sink={o[0]:E1})");
+            $"{reps * 2.0 * M * K * N / (kern / 1000.0) / 1e9:F0} | outside_runparallel_ms_per_call={(wall - runPar) / reps:F3} " +
+            $"runparallel_ms_per_call={runPar / reps:F3} tiles_per_call={(double)tileCount / reps:F0} mean_tile_ms={(tileCount > 0 ? tiles / tileCount : 0):F3} " +
+            $"mean_tile_start_lag_ms={(tileCount > 0 ? lag / tileCount : 0):F3} (sink={o[0]:E1})");
         return 0;
     }
     private static int RunGemmProfile(CpuEngine eng, string[] a)

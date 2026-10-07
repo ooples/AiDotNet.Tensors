@@ -137,7 +137,8 @@ internal static class GotoGemmFp32
     // the microkernel?" without profiler pseudo-frame ambiguity.
     internal static bool s_timing;
     internal static long s_packTicks, s_kernTicks, s_packBTicks, s_packATicks, s_tailTicks;
-    internal static void ResetTiming() { s_packTicks = 0; s_kernTicks = 0; s_packBTicks = 0; s_packATicks = 0; s_tailTicks = 0; }
+    internal static long s_runParallelTicks, s_tileTicks, s_tileLagTicks, s_tileCount;
+    internal static void ResetTiming() { s_packTicks = 0; s_kernTicks = 0; s_packBTicks = 0; s_packATicks = 0; s_tailTicks = 0; s_runParallelTicks = 0; s_tileTicks = 0; s_tileLagTicks = 0; s_tileCount = 0; }
     /// <summary>Format the pack-vs-kernel timing as a string for the caller (bench) to log — src must not
     /// write to Console directly.</summary>
     internal static string ReportTiming()
@@ -351,6 +352,8 @@ internal static class GotoGemmFp32
         // cache. Each tile runs its full K-loop independently (disjoint C ⇒ no races, deterministic).
         nint ai = (nint)a, bi = (nint)b, ci = (nint)c;
         int numIcL = numIc, mcL = mc, ncL = nc, kcL = kc, mL = m, nL = n, kL = k, ldaL = lda, ldbL = ldb, ldcL = ldc;
+        bool timing = s_timing;
+        long enter = timing ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         CpuParallelSettings.ParallelForOrSerial(0, totalTiles, (long)m * n * k, tileIdx =>
         {
             int ic = (int)(tileIdx % numIcL) * mcL;
@@ -358,8 +361,16 @@ internal static class GotoGemmFp32
             int effMc = Math.Min(mcL, mL - ic);
             int effNc = Math.Min(ncL, nL - jc);
             if (effMc <= 0 || effNc <= 0) return;
+            long start = timing ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             RunTile((float*)ai, ldaL, (float*)bi, ldbL, (float*)ci, ldcL, ic, jc, effMc, effNc, kL, mcL, ncL, kcL);
+            if (timing)
+            {
+                Interlocked.Add(ref s_tileTicks, System.Diagnostics.Stopwatch.GetTimestamp() - start);
+                Interlocked.Add(ref s_tileLagTicks, start - enter);
+                Interlocked.Increment(ref s_tileCount);
+            }
         }, deterministicSafe: true);
+        if (timing) Interlocked.Add(ref s_runParallelTicks, System.Diagnostics.Stopwatch.GetTimestamp() - enter);
     }
 
     /// <summary>Deep-K + short-M is UNDER-PARALLELIZED (few (m/mc)·(n/nc) tiles for many cores). Split-K
