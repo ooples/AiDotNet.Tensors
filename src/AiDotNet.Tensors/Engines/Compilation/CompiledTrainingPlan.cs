@@ -2137,6 +2137,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
 
     private int[]? _actionToStepIndex;
 
+    /// <summary>One label per forward action ("generic:Op", "specialized:Op", "fused:..."), parallel to the replayed
+    /// action array; positional labels when a builder appended an action without one. Diagnostics and tests.</summary>
+    internal string[] ForwardActionNames { get; private set; } = Array.Empty<string>();
+
+    /// <summary>One label per backward action, as <see cref="ForwardActionNames"/>.</summary>
+    internal string[] BackwardActionNames { get; private set; } = Array.Empty<string>();
+
     /// <summary>Per-step action census (AIDOTNET_PLAN_CENSUS=1); null when the diagnostic is off.</summary>
     private PlanCensus? _census;
 
@@ -7573,11 +7580,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             storageLeases = null;
             plan._liveGradientMap = gradMap;
             plan._eagerFirstWriteCandidates = eagerFirstWriteCandidates;
+            plan.ForwardActionNames = CensusNames(forwardActionNames, forwardActions.Length);
+            plan.BackwardActionNames = CensusNames(backwardStepNames, plan._backwardActions.Length);
             if (PlanCensus.Enabled)
-                plan._census = new PlanCensus(
-                    CensusNames(forwardActionNames, forwardActions.Length),
-                    CensusNames(backwardStepNames, plan._backwardActions.Length),
-                    forwardSteps.Count);
+                plan._census = new PlanCensus(plan.ForwardActionNames, plan.BackwardActionNames, forwardSteps.Count);
             scope.ReleaseStorageLeases();
             return plan;
         }
@@ -9302,6 +9308,22 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     }
 
     /// <summary>
+    /// dest[m,n] (+)= op(A)[m,k] · op(B)[k,n] for the shared-operand MatMul backward: overwrites <paramref name="dest"/>
+    /// when <paramref name="scratch"/> is null (the operand's only consumer), else computes into the scratch and adds
+    /// it into <paramref name="dest"/>.
+    /// </summary>
+    private static void SharedOperandGemm(float[] a, int lda, bool transA, float[] b, int ldb, bool transB,
+        float[] dest, float[]? scratch, int m, int k, int n)
+    {
+        var target = scratch ?? dest;
+        LinearBackwardGemm(a, lda, transA, b, ldb, transB, target, m, k, n);
+        if (scratch is not null)
+        {
+            var d = new Span<float>(dest, 0, m * n);
+            SimdKernels.VectorAdd(d, new ReadOnlySpan<float>(scratch, 0, m * n), d);
+        }
+    }
+    /// <summary>
     /// C[m,n] := op(A)[m,k] · op(B)[k,n] (row-major, overwriting C) for the specialized linear backward. Routes like the
     /// MatMul specialization -- BlasProvider.TryGemmEx, which honours deterministic mode (managed, reproducible across
     /// thread counts) and native/autotune routing otherwise -- except for small GEMMs, which take the direct managed
@@ -9847,6 +9869,59 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         bool matMulOperandShared = step.OpType == OpType.TensorMatMul && step.Inputs.Length == 2
             && ((consumerCount.TryGetValue(step.Inputs[0], out int consumersA) && consumersA > 1)
                 || (consumerCount.TryGetValue(step.Inputs[1], out int consumersB) && consumersB > 1));
+
+        // MatMul backward with a SHARED operand (float, [.., K] x [K, N]): a weight reused across time steps (every
+        // RNN cell), one activation feeding several projections (attention's Q/K/V), a tied embedding. The overwrite
+        // specialization below cannot serve these and they took the generic backward, which rents a fresh result per
+        // GEMM, transposes through the engine, and accumulates through the gradient dictionary: measured 87 us per
+        // call on the parity LSTM, 132 calls per step, 11.5 ms of a 24 ms step. Here each needed gradient is one
+        // GEMM: straight into its buffer when this step is the operand's only consumer, else into a scratch owned by
+        // the action and then ADDED into the buffer (the step zeroes multi-consumer gradient buffers, so the sum over
+        // consumers is exact). An operand no parameter depends on gets no gradient at all. Not bit-identical to the
+        // generic path (different GEMM routing and summation order); within float rounding.
+        if (typeof(T) == typeof(float) && matMulOperandShared && engine is CpuEngine && !engine.SupportsGpu
+            && step.Inputs[0].Rank >= 2 && step.Inputs[1].Rank == 2
+            && step.Inputs[0].IsContiguous && step.Inputs[1].IsContiguous && step.OutputBuffer.IsContiguous
+            && !ReferenceEquals(step.Inputs[0], step.Inputs[1]))
+        {
+            var smA = step.Inputs[0];
+            var smB = step.Inputs[1];
+            var smOut = step.OutputBuffer;
+            int smK = smA._shape[smA.Rank - 1], smN = smB._shape[1];
+            if (smB._shape[0] != smK) return null;
+            int smM = smA.Length / Math.Max(1, smK);
+            if (!gradMap.TryGetValue(smOut, out var smGradOut) || !smGradOut.IsContiguous || smOut.Length != smM * smN)
+                return null;
+            bool smNeedA = requiresGrad is null || requiresGrad.Contains(smA);
+            bool smNeedB = requiresGrad is null || requiresGrad.Contains(smB);
+            Tensor<T>? smGradA = null, smGradB = null;
+            if (smNeedA && (!gradMap.TryGetValue(smA, out smGradA) || !smGradA.IsContiguous)) return null;
+            if (smNeedB && (!gradMap.TryGetValue(smB, out smGradB) || !smGradB.IsContiguous)) return null;
+            bool SharedOperand(Tensor<T> t) => consumerCount.TryGetValue(t, out int uses) && uses > 1;
+            float[]? smScratchA = smNeedA && SharedOperand(smA) ? new float[smM * smK] : null;
+            float[]? smScratchB = smNeedB && SharedOperand(smB) ? new float[smK * smN] : null;
+
+            return eng =>
+            {
+                var dC = TryGetLiveFloatBacking(smGradOut) ?? throw new InvalidOperationException("MatMul backward: the output gradient has no live host buffer.");
+                if (smGradA is not null)
+                {
+                    // dA[M,K] = dC[M,N] · Bᵀ[N,K]
+                    var b = TryGetLiveFloatBacking(smB) ?? throw new InvalidOperationException("MatMul backward: B has no live host buffer.");
+                    var dA = TryGetLiveFloatBacking(smGradA) ?? throw new InvalidOperationException("MatMul backward: dA has no live host buffer.");
+                    SharedOperandGemm(dC, smN, false, b, smN, true, dA, smScratchA, smM, smN, smK);
+                    smA.Grad = smGradA;
+                }
+                if (smGradB is not null)
+                {
+                    // dB[K,N] = Aᵀ[K,M] · dC[M,N]
+                    var a = TryGetLiveFloatBacking(smA) ?? throw new InvalidOperationException("MatMul backward: A has no live host buffer.");
+                    var dB = TryGetLiveFloatBacking(smGradB) ?? throw new InvalidOperationException("MatMul backward: dB has no live host buffer.");
+                    SharedOperandGemm(a, smK, true, dC, smN, false, dB, smScratchB, smK, smM, smN);
+                    smB.Grad = smGradB;
+                }
+            };
+        }
 
         // MatMul backward (double): dA = dC @ B^T, dB = A^T @ dC — transposed BLAS, zero alloc.
         // Mirrors the float branch with cblas_dgemm via TryGemmEx's double overload;
