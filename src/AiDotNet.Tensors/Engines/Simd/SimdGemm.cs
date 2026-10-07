@@ -242,6 +242,90 @@ internal static partial class SimdGemm
         int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_JIT_SMALLK_MAXM"), out var jmm) && jmm > 0
             ? jmm : 2048;
 
+    /// <summary>
+    /// C[m,n] = op(A)·op(B) (overwrite) through the small-K asm panel kernel, for the layouts of a linear layer's
+    /// forward and input gradient. (The weight gradient, Aᵀ·B with a deep reduction, is not routed here yet.) Returns false (nothing written) when the shape is outside the band where this wins:
+    /// <list type="bullet">
+    /// <item>no transpose: <see cref="TryJitSmallK"/>;</item>
+    /// <item>B transposed (dX = dY·Wᵀ): Wᵀ is materialized into pooled scratch (it is the small operand) and the
+    /// product runs as no-transpose. [2048,128]x[128,64]: 79-83 µs vs 222-241 µs through BlasProvider (3990X).</item>
+    /// </list>
+    /// <paramref name="lda"/>/<paramref name="ldb"/> are the row strides of A and B as stored.
+    /// </summary>
+    internal static bool TryGemmSmallJit(
+        float[] a, int lda, bool transA, float[] b, int ldb, bool transB, float[] c, int m, int k, int n)
+    {
+#if !NET471
+        if (!_jitSmallK || !JitGemmAvx2.Available || m <= 0 || n <= 0 || k <= 0) return false;
+        if (!transA && !transB)
+            return lda == k && ldb == n && TryJitSmallK(a.AsSpan(0, m * k), b.AsSpan(0, k * n), c.AsSpan(0, m * n), m, n, k);
+
+        if (!transA && transB)
+        {
+            // B is stored [n, k]; Bᵀ [k, n] is the small operand.
+            if (lda != k || ldb != k || (long)k * n > SmallJitMaxTransposeElements || !InJitSmallKBand(m, n, k))
+                return false;
+            var bt = System.Buffers.ArrayPool<float>.Shared.Rent(k * n);
+            try
+            {
+                for (int j = 0; j < n; j++)
+                {
+                    int src = j * k;
+                    for (int i = 0; i < k; i++) bt[i * n + j] = b[src + i];
+                }
+                JitGemmAvx2.RunJit(a.AsSpan(0, m * k), bt.AsSpan(0, k * n), c.AsSpan(0, m * n), m, n, k);
+            }
+            finally { System.Buffers.ArrayPool<float>.Shared.Return(bt); }
+            return true;
+        }
+
+#endif
+        return false;
+    }
+
+
+
+    /// <summary>Shapes the small-K panel kernel wins at: shallow k, enough rows to parallelize, and either total work
+    /// under <see cref="JitSmallKMaxWork"/> or B re-read traffic under <see cref="JitSmallKMaxBTrafficBytes"/>.</summary>
+    private static bool InJitSmallKBand(int m, int n, int k)
+    {
+        long work = (long)m * n * k;
+        long bTraffic = (long)(m / 6) * k * n * sizeof(float);
+        return k <= JitSmallKMaxK && m >= 6 && m <= JitSmallKMaxM && n >= 16 && work >= JitSmallKMinWork
+            && (work <= JitSmallKMaxWork || bTraffic <= JitSmallKMaxBTrafficBytes);
+    }
+
+    // B re-read traffic ceiling for the panel route (bytes): the giant-M regressions were at 22-33 MB.
+    internal static readonly long JitSmallKMaxBTrafficBytes =
+        long.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_JIT_SMALLK_MAXBTRAFFIC"), out var jbt) && jbt > 0
+            ? jbt : 16L * 1024 * 1024;
+
+    // Transposed-B operand ceiling for TryGemmSmallJit (elements): the transpose is a per-call copy of the small side.
+    private const long SmallJitMaxTransposeElements = 64 * 1024;
+
+    /// <summary>
+    /// C = A·B (overwrite; A [m,k], B [k,n], C [m,n], all row-major contiguous) through the small-K asm panel
+    /// kernel, when the shape is in the band where it wins. B is read as passed (no identity cache), so callers whose
+    /// B changes between calls -- a compiled training plan's weights, updated in place by the optimizer -- may use it.
+    /// Returns false (nothing written) outside the band or when the kernel is unavailable.
+    /// </summary>
+    internal static bool TryJitSmallK(System.ReadOnlySpan<float> a, System.ReadOnlySpan<float> b, System.Span<float> c,
+        int m, int n, int k)
+    {
+#if !NET471
+        long work = (long)m * n * k;
+        // The work ceiling stands in for B re-read traffic, (m/6)*k*n*4 bytes, which is what regressed at giant M
+        // (22-33 MB). A shape just over the ceiling with modest traffic -- the [2048,64]x[64,128] FFN GEMM, 16.8M MACs
+        // and 11 MB -- is admitted on the traffic test.
+        if (_jitSmallK && JitGemmAvx2.Available && InJitSmallKBand(m, n, k))
+        {
+            JitGemmAvx2.RunJit(a, b.Slice(0, k * n), c, m, n, k);
+            return true;
+        }
+#endif
+        return false;
+    }
+
     // ─── Stale-weight invalidation epoch ────────────────────────────────────
     // The identity-keyed weight caches (pre-packed B below on net5+, the
     // Conv2D kernel-transpose cache in CpuEngine) never re-read the weight
@@ -518,13 +602,8 @@ internal static partial class SimdGemm
         // bake-off shows the panel-parallel at 227-234 GF/s vs ~100 for managed
         // (serial OR parallel) and 135-165 for OpenBLAS at these shapes, while
         // below the work gate (e.g. bs=8's 2.1M) the cached-B/managed path wins.
-        if (_jitSmallK && JitGemmAvx2.Available
-            && k <= JitSmallKMaxK && m >= 6 && m <= JitSmallKMaxM && n >= 16
-            && (long)m * n * k >= JitSmallKMinWork && (long)m * n * k <= JitSmallKMaxWork)
-        {
-            JitGemmAvx2.RunJit(a, b.AsSpan(0, k * n), c, m, n, k);
+        if (TryJitSmallK(a, b.AsSpan(0, k * n), c, m, n, k))
             return;
-        }
 #endif
 
         // Cache-eligibility gate: if n > Nc, the outer loop iterates jc multiple
