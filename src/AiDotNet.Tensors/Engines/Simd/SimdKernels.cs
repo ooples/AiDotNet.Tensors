@@ -1505,6 +1505,34 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>
+        /// <c>output[i] = input[i] * scale + bias</c> (one fused multiply-add per element). Used by the
+        /// normalization layers after the per-group / per-row statistics are folded into one scale and bias.
+        /// </summary>
+        [MethodImpl(HotInline)]
+        internal static unsafe void AffineUnsafe(float* input, float* output, int length, float scale, float bias)
+        {
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Fma.IsSupported && length >= 8)
+            {
+                var vs = Vector256.Create(scale);
+                var vb = Vector256.Create(bias);
+                for (; i + 32 <= length; i += 32)
+                {
+                    Avx.Store(output + i, Fma.MultiplyAdd(Avx.LoadVector256(input + i), vs, vb));
+                    Avx.Store(output + i + 8, Fma.MultiplyAdd(Avx.LoadVector256(input + i + 8), vs, vb));
+                    Avx.Store(output + i + 16, Fma.MultiplyAdd(Avx.LoadVector256(input + i + 16), vs, vb));
+                    Avx.Store(output + i + 24, Fma.MultiplyAdd(Avx.LoadVector256(input + i + 24), vs, vb));
+                }
+                for (; i + 8 <= length; i += 8)
+                    Avx.Store(output + i, Fma.MultiplyAdd(Avx.LoadVector256(input + i), vs, vb));
+            }
+#endif
+            for (; i < length; i++)
+                output[i] = input[i] * scale + bias;
+        }
+
+        /// <summary>
         /// Pointer-based Tanh with zero bounds-checking.
         /// </summary>
         [MethodImpl(HotInline)]
@@ -1514,11 +1542,17 @@ namespace AiDotNet.Tensors.Engines.Simd
             // MKL VML path: SVML tanh, zero-overhead function pointer
             if (VmlProvider.TryTanh(input, output, length))
                 return;
-#endif
 
             // The former 2*FastSigmoid256(2*x)-1 path cancelled near zero and exceeded the
-            // public parity contract by hundreds of ULP. Keep VML above when available; the
-            // portable path must use libm until an equivalently accurate vector approximation exists.
+            // public parity contract by hundreds of ULP. AccurateTanh is a Cephes-style vector
+            // tanh verified exhaustively over every finite float (AccurateTanhTests).
+            if (AccurateTanh.IsSupported)
+            {
+                AccurateTanh.Tanh(input, output, length);
+                return;
+            }
+#endif
+
             for (int i = 0; i < length; i++)
             {
                 output[i] = MathF.Tanh(input[i]);
@@ -3151,8 +3185,8 @@ namespace AiDotNet.Tensors.Engines.Simd
 
             // Extract exponent and mantissa via integer bit manipulation
             var xi = x.AsInt64();
-            // Exponent: shift right 52, subtract bias 1023
-            var eLong = Avx2.Subtract(Avx2.ShiftRightLogical(xi, 52), Vector256.Create(1023L));
+            // Biased exponent field (0..2047); the 1023 bias is removed after conversion to double below.
+            var eLong = Avx2.ShiftRightLogical(xi, 52);
             // Mantissa: clear exponent bits, set exponent to bias (1023 << 52)
             var mantissaBits = Avx2.Or(
                 Avx2.And(xi, Vector256.Create(0x000FFFFFFFFFFFFFL)),
@@ -3170,11 +3204,12 @@ namespace AiDotNet.Tensors.Engines.Simd
             var eMask = Avx2.And(gtSqrt2.AsInt64(), Vector256.Create(1L));
             eLong = Avx2.Add(eLong, eMask);
 
-            // Convert int64 exponent to double via int32 (safe — exponents fit in int32)
-            var eLow = Vector128.Create(
-                (int)eLong.GetElement(0), (int)eLong.GetElement(1),
-                (int)eLong.GetElement(2), (int)eLong.GetElement(3));
-            var e = Avx.ConvertToVector256Double(eLow);
+            // int64 -> double without leaving the vector unit: the biased exponent (0..2048) placed in the
+            // mantissa of 2^52 is exactly 2^52 + eBiased, so subtracting 2^52 + 1023 yields the unbiased
+            // exponent. The previous four scalar GetElement extracts per vector dominated this kernel.
+            var e = Avx.Subtract(
+                Avx2.Or(eLong, Vector256.Create(0x4330000000000000L)).AsDouble(),
+                Vector256.Create(4503599627370496.0 + 1023.0));
 
             // f = m - 1.0
             var one = Vector256.Create(1.0);

@@ -152,16 +152,40 @@ internal sealed class PersistentParallelExecutor
     // starved the dispatcher; the periodic yield removes that (verified: 64-chunk/32-
     // worker dispatch stays ~equal to Parallel.For instead of the 1.8× regression the
     // busy-spin showed). Env override AIDOTNET_PPE_WARMWINDOW_US sets the window in
-    // microseconds; 0 disables (park immediately). Default 200 µs.
-    private static readonly long _warmWindowTicks = ComputeWarmWindowTicks();
+    // microseconds; 0 disables (park immediately). Settable at run time through
+    // CpuParallelSettings.WorkerSpinTime.
+    //
+    // Default 200 µs. An OpenMP-style 200 ms block time was measured and rejected: interleaved against
+    // libtorch in one process, a 1M-element subtract issued 10 ms after the previous op took 576 µs with
+    // a 200 ms spin against 128 µs parking. The spinning workers cost the busy main thread more than the
+    // wake-up they save.
+    internal const long DefaultWarmWindowMicros = 200;
+
+    private static long _warmWindowTicks = ComputeWarmWindowTicks();
 
     private static long ComputeWarmWindowTicks()
     {
-        long micros = 200;
+        long micros = DefaultWarmWindowMicros;
         if (int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_PPE_WARMWINDOW_US"), out var us) && us >= 0)
             micros = us;
-        // ticks = seconds * frequency = (micros / 1e6) * Stopwatch.Frequency
-        return (long)(micros * (System.Diagnostics.Stopwatch.Frequency / 1_000_000.0));
+        return MicrosToTicks(micros);
+    }
+
+    // ticks = seconds * frequency = (micros / 1e6) * Stopwatch.Frequency
+    private static long MicrosToTicks(long micros)
+        => (long)(micros * (System.Diagnostics.Stopwatch.Frequency / 1_000_000.0));
+
+    /// <summary>
+    /// How long a worker keeps spinning for the next dispatch before it parks. Zero parks immediately.
+    /// </summary>
+    internal static TimeSpan WarmWindow
+    {
+        get => TimeSpan.FromSeconds(System.Threading.Volatile.Read(ref _warmWindowTicks) / (double)System.Diagnostics.Stopwatch.Frequency);
+        set
+        {
+            if (value < TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(value), "Spin time cannot be negative.");
+            System.Threading.Volatile.Write(ref _warmWindowTicks, MicrosToTicks((long)(value.Ticks / 10)));
+        }
     }
 
     // Timestamp (Stopwatch ticks) of the most recent dispatch. Workers read this to
@@ -236,7 +260,7 @@ internal sealed class PersistentParallelExecutor
             // being dispatched to (recency window), but yield the core periodically so
             // we never oversubscribe the dispatcher, and give up to a blocking park
             // once the pool goes idle past the window.
-            long warm = _warmWindowTicks;
+            long warm = System.Threading.Volatile.Read(ref _warmWindowTicks);
             // Only warm-spin when the last dispatch left spare cores (workersNeeded <
             // _numWorkers). When a dispatch saturates the machine, spinning steals the
             // core the dispatcher needs → oversubscription; park instead so the wakeup

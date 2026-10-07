@@ -147,7 +147,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Check for division by zero before calling TensorPrimitivesHelper
         var numOps = MathHelper.GetNumericOperations<T>();
         var bArray = b.GetDataArray();
-        for (int i = 0; i < bArray.Length; i++)
+        for (int i = 0; i < b.Length; i++)
         {
             if (numOps.Equals(bArray[i], numOps.Zero))
             {
@@ -1821,7 +1821,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // scratch buffer reused across rows — earlier passes allocated a
         // fresh row[] per outer-loop iteration, which dominated runtime on
         // large vectors and produced O(rows × cols) GC churn.
-        if (typeof(T) == typeof(float) && bArray.Length >= 16)
+        if (typeof(T) == typeof(float) && b.Length >= 16)
         {
             var bFloat = (float[])(object)bArray;
             var aFloat = (float[])(object)aArray;
@@ -1838,7 +1838,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
             finally { ArrayPool<float>.Shared.Return(rowData, clearArray: false); }
         }
-        else if (typeof(T) == typeof(double) && bArray.Length >= 8)
+        else if (typeof(T) == typeof(double) && b.Length >= 8)
         {
             var bDouble = (double[])(object)bArray;
             var aDouble = (double[])(object)aArray;
@@ -3117,19 +3117,9 @@ public partial class CpuEngine : ITensorLevelEngine
             }
             else
             {
-                // Fallback: SimdKernels with parallel chunking for large arrays.
-                // Bandwidth-bound threshold: one core hits ~4 GB/s on a bulk
-                // add of non-L2-resident data, DRAM delivers 50+ GB/s across
-                // channels. AddRootCauseDiag measured 3.25× speedup moving
-                // from 1 → 4 chunks at length=196608 (BERT residual add).
-                // Old threshold length/500_000 required a 3 MB add before
-                // splitting — far past the point where parallelism helps.
-                // Target ~64 KB per chunk (fits in L1) with a cap at the
-                // thread-pool size.
-                const int kElemsPerChunk = 16 * 1024; // 64 KB at float32
-                int addChunks = Math.Min(
-                    CpuParallelSettings.MaxDegreeOfParallelism,
-                    Math.Max(1, length / kElemsPerChunk));
+                // Fallback: SimdKernels with parallel chunking for large arrays, at the shared
+                // elementwise grain (see CpuParallelSettings.ElementwiseGrainSize).
+                int addChunks = CpuParallelSettings.ElementwiseChunkCount(length);
                 if (addChunks >= 2)
                 {
                     int chunkSize = (length + addChunks - 1) / addChunks;
@@ -3167,7 +3157,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 double* pA = (double*)pinA.Pointer;
                 double* pB = (double*)pinB.Pointer;
                 double* pR = (double*)pinR.Pointer;
-                int subChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 250_000));
+                int subChunks = CpuParallelSettings.ElementwiseChunkCount(length);
                 if (subChunks >= 2)
                 {
                     int chunkSize = (length + subChunks - 1) / subChunks;
@@ -3288,7 +3278,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
 
             // Fallback: SimdKernels with parallel chunking for large arrays
-            int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            int numChunks = CpuParallelSettings.ElementwiseChunkCount(length);
             if (numChunks >= 2)
             {
                 int chunkSize = (length + numChunks - 1) / numChunks;
@@ -3323,7 +3313,7 @@ public partial class CpuEngine : ITensorLevelEngine
             double* pA = (double*)pinA.Pointer;
             double* pB = (double*)pinB.Pointer;
 
-            int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            int numChunks = CpuParallelSettings.ElementwiseChunkCount(length);
             if (numChunks >= 2)
             {
                 int chunkSize = (length + numChunks - 1) / numChunks;
@@ -4418,7 +4408,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var meanData = new T[batch * numGroups];
         var varData = new T[batch * numGroups];
 
-        CpuParallelSettings.ParallelForOrSerial(0, batch * numGroups, outputData.Length, idx =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch * numGroups, output.Length, idx =>
         {
             int b = idx / numGroups;
             int g = idx % numGroups;
@@ -5475,7 +5465,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var fSrc = (float[])(object)input.GetDataArray();
                 var fDst = (float[])(object)destination.GetDataArray();
-                for (int i = 0; i < fSrc.Length; i++) fDst[i] = MathF.Sin(fSrc[i]);
+                for (int i = 0; i < input.Length; i++) fDst[i] = MathF.Sin(fSrc[i]);
             }
             return;
         }
@@ -5506,7 +5496,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var fSrc = (float[])(object)input.GetDataArray();
                 var fDst = (float[])(object)destination.GetDataArray();
-                for (int i = 0; i < fSrc.Length; i++) fDst[i] = MathF.Cos(fSrc[i]);
+                for (int i = 0; i < input.Length; i++) fDst[i] = MathF.Cos(fSrc[i]);
             }
             return;
         }
@@ -5665,7 +5655,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
                 else
                 {
-                    int subChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 500_000));
+                    int subChunks = CpuParallelSettings.ElementwiseChunkCount(length);
                     if (subChunks >= 2)
                     {
                         int chunkSize = (length + subChunks - 1) / subChunks;
@@ -5698,7 +5688,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 double* pA = (double*)pinA.Pointer;
                 double* pB = (double*)pinB.Pointer;
                 double* pR = (double*)pinR.Pointer;
-                int subChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 250_000));
+                int subChunks = CpuParallelSettings.ElementwiseChunkCount(length);
                 if (subChunks >= 2)
                 {
                     int chunkSize = (length + subChunks - 1) / subChunks;
@@ -5824,7 +5814,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
                 else
                 {
-                    int mulChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 500_000));
+                    int mulChunks = CpuParallelSettings.ElementwiseChunkCount(length);
                     if (mulChunks >= 2)
                     {
                         int chunkSize = (length + mulChunks - 1) / mulChunks;
@@ -5856,7 +5846,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 double* pA = (double*)pinA.Pointer;
                 double* pB = (double*)pinB.Pointer;
                 double* pR = (double*)pinR.Pointer;
-                int mulChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 250_000));
+                int mulChunks = CpuParallelSettings.ElementwiseChunkCount(length);
                 if (mulChunks >= 2)
                 {
                     int chunkSize = (length + mulChunks - 1) / mulChunks;
@@ -5965,7 +5955,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return;
             }
 
-            int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            int numChunks = CpuParallelSettings.ElementwiseChunkCount(length);
             if (numChunks >= 2)
             {
                 int chunkSize = (length + numChunks - 1) / numChunks;
@@ -5998,7 +5988,7 @@ public partial class CpuEngine : ITensorLevelEngine
             double* pA = (double*)pinA.Pointer;
             double* pB = (double*)pinB.Pointer;
 
-            int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            int numChunks = CpuParallelSettings.ElementwiseChunkCount(length);
             if (numChunks >= 2)
             {
                 int chunkSize = (length + numChunks - 1) / numChunks;
@@ -6134,7 +6124,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return;
             }
 
-            int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            int numChunks = CpuParallelSettings.ElementwiseChunkCount(length);
             if (numChunks >= 2)
             {
                 int chunkSize = (length + numChunks - 1) / numChunks;
@@ -6167,7 +6157,7 @@ public partial class CpuEngine : ITensorLevelEngine
             double* pA = (double*)pinA.Pointer;
             double* pB = (double*)pinB.Pointer;
 
-            int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            int numChunks = CpuParallelSettings.ElementwiseChunkCount(length);
             if (numChunks >= 2)
             {
                 int chunkSize = (length + numChunks - 1) / numChunks;
@@ -6231,7 +6221,7 @@ public partial class CpuEngine : ITensorLevelEngine
             using var pinA = aMem.Pin();
             float* pA = (float*)pinA.Pointer;
 
-            int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            int numChunks = CpuParallelSettings.ElementwiseChunkCount(length);
             if (numChunks >= 2)
             {
                 int chunkSize = (length + numChunks - 1) / numChunks;
@@ -6259,7 +6249,7 @@ public partial class CpuEngine : ITensorLevelEngine
             using var pinA = aMem.Pin();
             double* pA = (double*)pinA.Pointer;
 
-            int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            int numChunks = CpuParallelSettings.ElementwiseChunkCount(length);
             if (numChunks >= 2)
             {
                 int chunkSize = (length + numChunks - 1) / numChunks;
@@ -6326,7 +6316,7 @@ public partial class CpuEngine : ITensorLevelEngine
             float* pA = (float*)pinA.Pointer;
             float* pD = (float*)pinD.Pointer;
 
-            int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            int numChunks = CpuParallelSettings.ElementwiseChunkCount(length);
             if (numChunks >= 2)
             {
                 int chunkSize = (length + numChunks - 1) / numChunks;
@@ -6357,7 +6347,7 @@ public partial class CpuEngine : ITensorLevelEngine
             double* pA = (double*)pinA.Pointer;
             double* pD = (double*)pinD.Pointer;
 
-            int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            int numChunks = CpuParallelSettings.ElementwiseChunkCount(length);
             if (numChunks >= 2)
             {
                 int chunkSize = (length + numChunks - 1) / numChunks;
@@ -6558,7 +6548,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
                 else
                 {
-                    int subChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 500_000));
+                    int subChunks = CpuParallelSettings.ElementwiseChunkCount(length);
                     if (subChunks >= 2)
                     {
                         int chunkSize = (length + subChunks - 1) / subChunks;
@@ -6590,7 +6580,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 double* pA = (double*)pinA.Pointer;
                 double* pB = (double*)pinB.Pointer;
                 double* pR = (double*)pinR.Pointer;
-                int subChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 250_000));
+                int subChunks = CpuParallelSettings.ElementwiseChunkCount(length);
                 if (subChunks >= 2)
                 {
                     int chunkSize = (length + subChunks - 1) / subChunks;
@@ -7480,7 +7470,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 {
                     var fSrc = (float[])(object)tensor.GetDataArray();
                     var fDst = (float[])(object)result.GetDataArray();
-                    for (int i = 0; i < fSrc.Length; i++) fDst[i] = MathF.Sin(fSrc[i]);
+                    for (int i = 0; i < tensor.Length; i++) fDst[i] = MathF.Sin(fSrc[i]);
                 }
             }
         }
@@ -7535,7 +7525,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 {
                     var fSrc = (float[])(object)tensor.GetDataArray();
                     var fDst = (float[])(object)result.GetDataArray();
-                    for (int i = 0; i < fSrc.Length; i++) fDst[i] = MathF.Cos(fSrc[i]);
+                    for (int i = 0; i < tensor.Length; i++) fDst[i] = MathF.Cos(fSrc[i]);
                 }
             }
         }
@@ -9130,7 +9120,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var inputData = input.GetDataArray();
         var outputData = result.GetDataArray();
 
-        CpuParallelSettings.ParallelForOrSerial(0, batch * channels, outputData.Length, idx =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch * channels, result.Length, idx =>
         {
             int b = idx / channels;
             int c = idx % channels;
@@ -9257,7 +9247,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Generic fallback
         var inputData = input.GetDataArray();
         var outputData = output.GetDataArray();
-        CpuParallelSettings.ParallelForOrSerial(0, batch * channels, outputData.Length, idx =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch * channels, output.Length, idx =>
         {
             int b = idx / channels, c = idx % channels;
             int inputBaseOffset = (b * channels + c) * height * width;
@@ -9410,7 +9400,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Generic fallback
         var inputData = input.GetDataArray();
         var outputData = output.GetDataArray();
-        CpuParallelSettings.ParallelForOrSerial(0, batch * channels, outputData.Length, idx =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch * channels, output.Length, idx =>
         {
             int b = idx / channels, c = idx % channels;
             int inputBaseOffset = (b * channels + c) * height * width;
@@ -11177,7 +11167,7 @@ public partial class CpuEngine : ITensorLevelEngine
             using var pin = mem.Pin();
             double* p = (double*)pin.Pointer;
 
-            int sigChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 250_000));
+            int sigChunks = CpuParallelSettings.ElementwiseChunkCount(length);
             if (sigChunks >= 2)
             {
                 int chunkSize = (length + sigChunks - 1) / sigChunks;
@@ -11307,7 +11297,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var srcArr = (float[])(object)tensor._storage.GetDataArray();
             var dstArr = (float[])(object)result._storage.GetDataArray();
             int sOff = tensor._storageOffset, dOff = result._storageOffset;
-            int reluChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            int reluChunks = CpuParallelSettings.ElementwiseChunkCount(length);
             if (reluChunks >= 2)
             {
                 fixed (float* pSrcFix = srcArr, pDstFix = dstArr)
@@ -16746,7 +16736,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var inputData = input.GetFlattenedData();
         var outputData = result.GetDataArray();
 
-        CpuParallelSettings.ParallelForOrSerial(0, batch * channels, outputData.Length, idx =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch * channels, result.Length, idx =>
         {
             int b = idx / channels;
             int c = idx % channels;
@@ -16955,7 +16945,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = AutoTensorCache.RentOrAllocate<T>(inputShape);
         var gradIn = result.GetDataArray();
-        for (int i = 0; i < gradIn.Length; i++) gradIn[i] = numOps.Zero;
+        for (int i = 0; i < result.Length; i++) gradIn[i] = numOps.Zero;
         var gradOut = gradOutput.GetFlattenedData();
         var flatIndices = maxIndices.GetFlattenedData();
         // Validate every index first, so a bad one surfaces as an ArgumentException rather than from inside the
@@ -16966,7 +16956,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 throw new ArgumentException(
                     $"Max index {flatIndices[o]} at output {o} is outside the {inputShape[2]}x{inputShape[3]} input plane.",
                     nameof(maxIndices));
-        CpuParallelSettings.ParallelForOrSerial(0, planes, gradIn.Length, p =>
+        CpuParallelSettings.ParallelForOrSerial(0, planes, result.Length, p =>
         {
             int inBase = p * planeSize, outBase = p * outPlane;
             for (int o = 0; o < outPlane; o++)
@@ -16998,7 +16988,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var inData = source.GetFlattenedData();
         var outData = result.GetDataArray();
         int planeSize = height * width, outPlane = outputHeight * outputWidth;
-        CpuParallelSettings.ParallelForOrSerial(0, batch * channels, outData.Length, p =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch * channels, result.Length, p =>
         {
             int inBase = p * planeSize, outBase = p * outPlane;
             for (int oh = 0; oh < outputHeight; oh++)
@@ -18323,7 +18313,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var outputData = result.GetDataArray();
 
         // Parallel over batch * outChannels for maximum parallelism
-        CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels, outputData.Length, idx =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels, result.Length, idx =>
         {
             int b = idx / outChannels;
             int oc = idx % outChannels;
@@ -18543,7 +18533,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = TensorAllocator.Rent<T>([batch, outChannels, outputHeight, outputWidth]);
         var outputData = result.GetDataArray();
 
-        CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels, outputData.Length, idx =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels, result.Length, idx =>
         {
             int b = idx / outChannels;
             int oc = idx % outChannels;
@@ -20171,7 +20161,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var gradInputData = gradInput.GetDataArray();
         var gradOutputData = gradOutput.GetDataArray();
         var gridData = grid.GetDataArray();
-        for (int i = 0; i < gradInputData.Length; i++) gradInputData[i] = numOps.Zero;
+        for (int i = 0; i < gradInput.Length; i++) gradInputData[i] = numOps.Zero;
 
         // Parallel over batch — each task writes a DISJOINT gradInput[b] slice (NCHW), so no locks.
         CpuParallelSettings.ParallelForOrSerial(0, batch,
@@ -20256,7 +20246,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var inputData = input.GetDataArray();
         var gridData = grid.GetDataArray();
 
-        CpuParallelSettings.ParallelForOrSerial(0, batch, gradOutputData.Length, b =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch, gradOutput.Length, b =>
         {
             for (int oh = 0; oh < outHeight; oh++)
             {
@@ -20413,7 +20403,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var outputData = result.GetDataArray();
 
         // Parallel over batch * outChannels for maximum parallelism
-        CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels, outputData.Length, idx =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels, result.Length, idx =>
         {
             int b = idx / outChannels;
             int oc = idx % outChannels;
@@ -21479,7 +21469,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var outputData = result.GetDataArray();
 
         // Parallel over batch * channels
-        CpuParallelSettings.ParallelForOrSerial(0, batch * channels, outputData.Length, idx =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch * channels, result.Length, idx =>
         {
             int b = idx / channels;
             int c = idx % channels;
@@ -21566,7 +21556,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var localMaxIndices = new int[batch, channels, outputDepth, outputHeight, outputWidth, 3];
 
         // Parallel over batch * channels
-        CpuParallelSettings.ParallelForOrSerial(0, batch * channels, outputData.Length, idx =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch * channels, result.Length, idx =>
         {
             int b = idx / channels;
             int c = idx % channels;
@@ -21865,7 +21855,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var outputData = result.GetDataArray();
 
         // Parallel over batch * channels
-        CpuParallelSettings.ParallelForOrSerial(0, batch * channels, outputData.Length, idx =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch * channels, result.Length, idx =>
         {
             int b = idx / channels;
             int c = idx % channels;
@@ -22901,9 +22891,9 @@ public partial class CpuEngine : ITensorLevelEngine
                         int chanOff = batchOffset + channel * spatialSize;
                         float scale = gammaData[channel] * invStd;
                         float bias = betaData[channel] - groupMean * scale;
-                        // Fused: output = input * scale + bias (single pass, JIT auto-vectorizes)
-                        for (int s = 0; s < spatialSize; s++)
-                            outputData[chanOff + s] = inputData[chanOff + s] * scale + bias;
+                        // Fused output = input * scale + bias. Explicit FMA vectors: RyuJIT does not
+                        // auto-vectorize the scalar loop this replaced.
+                        SimdKernels.AffineUnsafe(inputData + chanOff, outputData + chanOff, spatialSize, scale, bias);
                     }
                 }
             });
@@ -23351,7 +23341,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // Hard mode: create one-hot and use straight-through estimator
         var softData = softResult.GetDataArray();
-        var hardData = new T[softData.Length];
+        var hardData = new T[softResult.Length];
         int outerSize = 1, axisSize = shape[axis], innerSize = 1;
         for (int i = 0; i < axis; i++) outerSize *= shape[i];
         for (int i = axis + 1; i < rank; i++) innerSize *= shape[i];
@@ -23602,7 +23592,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var inputData = input.GetFlattenedData();
         var outputData = output.GetDataArray();
         var shape = output._shape;
-        var gradInputData = new T[outputData.Length];
+        var gradInputData = new T[output.Length];
 
         // Precompute factorials for derivative
         var factorials = new double[order + 1];
@@ -23758,7 +23748,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var gradOutputData = gradOutput.GetFlattenedData();
         var outputData = output.GetDataArray();
         var shape = output._shape;
-        var gradInputData = new T[outputData.Length];
+        var gradInputData = new T[output.Length];
 
         int outerSize = 1, axisSize = shape[axis], innerSize = 1;
         for (int i = 0; i < axis; i++) outerSize *= shape[i];
@@ -27074,7 +27064,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var outputData = output.GetDataArray();
 
         // Fused mean + variance + normalize per batch*group
-        CpuParallelSettings.ParallelForOrSerial(0, batch * numGroups, outputData.Length, idx =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch * numGroups, output.Length, idx =>
         {
             int b = idx / numGroups;
             int g = idx % numGroups;
@@ -32462,7 +32452,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var fData = (float[])(object)input.GetDataArray();
                 float maxVal = float.MinValue;
                 int maxIdx = 0;
-                for (int i = 0; i < fData.Length; i++)
+                for (int i = 0; i < input.Length; i++)
                     if (fData[i] > maxVal) { maxVal = fData[i]; maxIdx = i; }
                 maxIndices = new[] { maxIdx };
                 float fMax = maxVal;
@@ -33347,9 +33337,9 @@ public partial class CpuEngine : ITensorLevelEngine
         // has that sum as its denominator. Passing the raw variance was wrong by
         // (variance + epsilon)/variance — negligible at the 1e-8 default, 17.5x at epsilon 0.5.
         T eps = numOps.FromDouble(epsilon);
-        var logVarData = new T[varianceData.Length];
-        var varPlusEpsData = new T[varianceData.Length];
-        for (int i = 0; i < varianceData.Length; i++)
+        var logVarData = new T[variance.Length];
+        var varPlusEpsData = new T[variance.Length];
+        for (int i = 0; i < variance.Length; i++)
         {
             varPlusEpsData[i] = numOps.Add(varianceData[i], eps);
             logVarData[i] = numOps.Log(varPlusEpsData[i]);
@@ -33550,7 +33540,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var inputData = input.GetFlattenedData();
         var outputData = output.GetDataArray();
-        CpuParallelSettings.ParallelForOrSerial(0, flatBatch, outputData.Length, fb =>
+        CpuParallelSettings.ParallelForOrSerial(0, flatBatch, output.Length, fb =>
         {
             for (int oh = 0; oh < newHeight; oh++)
             {
@@ -33808,7 +33798,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var inputData = input.GetFlattenedData();
         var outputData = output.GetDataArray();
-        CpuParallelSettings.ParallelForOrSerial(0, batch * newChannels, outputData.Length, boc =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch * newChannels, output.Length, boc =>
         {
             int b = boc / newChannels;
             int oc = boc % newChannels;
@@ -34317,7 +34307,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var resultData = result.GetDataArray();
 
         // Initialize to zero
-        for (int i = 0; i < resultData.Length; i++)
+        for (int i = 0; i < result.Length; i++)
             resultData[i] = numOps.Zero;
 
         for (int b = 0; b < batch; b++)
@@ -34539,7 +34529,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var inputData = input.GetFlattenedData();
         var outputData = output.GetDataArray();
-        CpuParallelSettings.ParallelForOrSerial(0, batch * channels, outputData.Length, bc =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch * channels, output.Length, bc =>
         {
             int inBase = bc * inputHeight * inputWidth + top * inputWidth + left;
             int outBase = bc * height * width;
@@ -34726,7 +34716,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Single fill of the whole output with padValue (Span<T>.Fill is
         // available across all target frameworks via System.Memory).
         outputData.AsSpan().Fill(padValue);
-        CpuParallelSettings.ParallelForOrSerial(0, batchSize, outputData.Length, b =>
+        CpuParallelSettings.ParallelForOrSerial(0, batchSize, output.Length, b =>
         {
             int inBase = b * height * width;
             int outBase = b * newHeight * newWidth + padTop * newWidth + padLeft;
@@ -35951,7 +35941,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = AutoTensorCache.RentOrAllocate<T>(destination._shape);
         var destData = destination.GetDataArray();
         var resultData = result.GetDataArray();
-        Array.Copy(destData, resultData, destData.Length);
+        Array.Copy(destData, resultData, destination.Length);
 
         int sourceTotal = source._shape.Aggregate(1, (a, b) => a * b);
         var sourceData = source.GetFlattenedData();
@@ -38050,9 +38040,9 @@ public partial class CpuEngine : ITensorLevelEngine
             // under-fills the buffer and the rented tail would otherwise leak stale pooled data (a
             // dirty buffer from an earlier op → intermittent NaN). Zero any unwritten remainder so the
             // fast path honors RentOrAllocate's "caller fully overwrites" contract. This is free on the
-            // normal (fully-filled) path: offset == data.Length makes the clear a zero-length no-op.
-            if (offset < data.Length)
-                Array.Clear(data, offset, data.Length - offset);
+            // normal (fully-filled) path: offset == result.Length makes the clear a zero-length no-op.
+            if (offset < result.Length)
+                Array.Clear(data, offset, result.Length - offset);
         }
         else
         {
@@ -38228,7 +38218,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var tensorData = tensor.GetFlattenedData();
         var resultData = result.GetDataArray();
 
-        CpuParallelSettings.ParallelForOrSerial(0, outerSize * innerSize, resultData.Length, flatIdx =>
+        CpuParallelSettings.ParallelForOrSerial(0, outerSize * innerSize, result.Length, flatIdx =>
         {
             int outer = flatIdx / innerSize;
             int inner = flatIdx % innerSize;
@@ -38283,7 +38273,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var tensorData = tensor.GetFlattenedData();
         var resultData = result.GetDataArray();
 
-        CpuParallelSettings.ParallelForOrSerial(0, outerSize * innerSize, resultData.Length, flatIdx =>
+        CpuParallelSettings.ParallelForOrSerial(0, outerSize * innerSize, result.Length, flatIdx =>
         {
             int outer = flatIdx / innerSize;
             int inner = flatIdx % innerSize;
@@ -38600,7 +38590,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (outerCount > 64)
         {
-            CpuParallelSettings.ParallelForOrSerial(0, outerCount, resultData.Length, outer =>
+            CpuParallelSettings.ParallelForOrSerial(0, outerCount, result.Length, outer =>
             {
                 int srcOffset = outer * axisSize * stride + index * stride;
                 int dstOffset = outer * stride;
@@ -38635,7 +38625,7 @@ public partial class CpuEngine : ITensorLevelEngine
         T step = numOps.Divide(range, divisor);
 
         var resultData = result.GetDataArray();
-        CpuParallelSettings.ParallelForOrSerial(0, count, resultData.Length, i =>
+        CpuParallelSettings.ParallelForOrSerial(0, count, result.Length, i =>
         {
             T value = numOps.Add(start, numOps.Multiply(numOps.FromDouble(i), step));
             resultData[i] = value;
@@ -38698,7 +38688,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var bData = b.GetReadOnlyDataArray();
         var resultData = result.GetDataArray();
 
-        CpuParallelSettings.ParallelForOrSerial(0, batch, resultData.Length, batchIdx =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch, result.Length, batchIdx =>
         {
             int aBase = batchIdx * M * K;
             int rBase = batchIdx * M * N;
@@ -39078,7 +39068,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var indicesData = indices.GetFlattenedData();
             var tensorData = tensor.GetFlattenedData();
             var resultData = result.GetDataArray();
-            CpuParallelSettings.ParallelForOrSerial(0, numIndices, resultData.Length, i =>
+            CpuParallelSettings.ParallelForOrSerial(0, numIndices, result.Length, i =>
             {
                 int idx = indicesData[i];
                 Array.Copy(tensorData, idx * cols, resultData, i * cols, cols);
@@ -39098,7 +39088,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var tensorData = tensor.GetFlattenedData();
             var resultData = result.GetDataArray();
 
-            CpuParallelSettings.ParallelForOrSerial(0, rows, resultData.Length, i =>
+            CpuParallelSettings.ParallelForOrSerial(0, rows, result.Length, i =>
             {
                 int rowOffset = i * numIndices;
                 int tensorRowOffset = i * tensor._shape[1];
@@ -41713,7 +41703,7 @@ public partial class CpuEngine : ITensorLevelEngine
         float[] source = input.GetFlattenedData();
         float[] realData = real.GetDataArray();
         float[] imaginaryData = imaginary.GetDataArray();
-        for (int i = 0; i < realData.Length; i++)
+        for (int i = 0; i < real.Length; i++)
         {
             realData[i] = source[2 * i];
             imaginaryData[i] = source[(2 * i) + 1];
@@ -41730,7 +41720,7 @@ public partial class CpuEngine : ITensorLevelEngine
         float[] destination = result.GetDataArray();
         float[] outputRealData = outputReal.GetDataArray();
         float[] outputImaginaryData = outputImaginary.GetDataArray();
-        for (int i = 0; i < outputRealData.Length; i++)
+        for (int i = 0; i < outputReal.Length; i++)
         {
             destination[2 * i] = outputRealData[i];
             destination[(2 * i) + 1] = outputImaginaryData[i];
@@ -42492,8 +42482,8 @@ public partial class CpuEngine : ITensorLevelEngine
         // stale region often enough to look correct. It is what made TimeStretch appear "silent" (a
         // NaN output has no detectable dominant frequency) and made the pitch test flaky run to run,
         // since the reading depended on whatever the pool last held.
-        System.Array.Clear(resultData, 0, resultData.Length);
-        System.Array.Clear(windowSumData, 0, windowSumData.Length);
+        System.Array.Clear(resultData, 0, result.Length);
+        System.Array.Clear(windowSumData, 0, windowSum.Length);
 
         // Defence in depth: STFT now refuses to emit a zero-frame spectrogram, but ISTFT can be
         // handed a spectrogram from anywhere, and dividing by numFreqs * numFrames == 0 gave a bare
@@ -44252,7 +44242,7 @@ public partial class CpuEngine : ITensorLevelEngine
             if (typeof(T) == typeof(float))
             {
                 var mArr = (float[])(object)mask.GetDataArray();
-                for (int i = 0; i < mArr.Length; i++) mArr[i] = 1.0f;
+                for (int i = 0; i < mask.Length; i++) mArr[i] = 1.0f;
             }
             else
             {
@@ -44927,7 +44917,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Generic fallback.
         var inputData = input.GetFlattenedData();
         var outputData = output.GetDataArray();
-        CpuParallelSettings.ParallelForOrSerial(0, batch * channels, outputData.Length, idx =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch * channels, output.Length, idx =>
         {
             int inputBaseOffset = idx * inHeight * inWidth;
             int outputBaseOffset = idx * outputHeight * outputWidth;
@@ -44991,7 +44981,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = TensorAllocator.Rent<T>([batch, channels, outputHeight, outputWidth]);
         var resultData = result.GetDataArray();
 
-        CpuParallelSettings.ParallelForOrSerial(0, batch * channels, resultData.Length, idx =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch * channels, result.Length, idx =>
         {
             int b = idx / channels;
             int c = idx % channels;
@@ -45035,66 +45025,63 @@ public partial class CpuEngine : ITensorLevelEngine
     #region JIT Dispatch Helpers
 
     /// <summary>
-    /// Dispatches a JIT-compiled binary operation with multi-threaded parallelism for large arrays.
-    /// For arrays >= 2M elements, splits work across threads with per-chunk JIT kernels.
-    /// For smaller arrays, runs single-threaded JIT kernel.
+    /// Runs a float binary elementwise op (Add / Subtract / Multiply / Divide), split across threads in
+    /// <see cref="CpuParallelSettings.ElementwiseGrainSize"/> chunks.
     /// </summary>
+    /// <remarks>
+    /// Kept under its historical name; it no longer calls the runtime-generated JIT kernels. Measured on
+    /// a 1M-element float subtract in 30 chunks: the JIT kernel 602 µs in parallel and 155 µs serial,
+    /// <see cref="SimdKernels"/> 25.5 µs in parallel and 124 µs serial (libtorch: 32 µs).
+    /// </remarks>
     private static unsafe void JitBinaryDispatch(float* pA, float* pB, float* pR, int length, JitBinaryOp op)
     {
-        // For large arrays, parallelize across threads
-        // Use 500K threshold for bandwidth-bound binary ops
-        int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 500_000));
-        if (numChunks >= 2)
+        int numChunks = CpuParallelSettings.ElementwiseChunkCount(length);
+        if (numChunks < 2)
         {
-            int chunkSize = (length + numChunks - 1) / numChunks;
-            // Align to 32-float boundary for SIMD
-            chunkSize = (chunkSize + 31) & ~31;
+            RunBinary(pA, pB, pR, length, op);
+            return;
+        }
 
-            CpuParallelSettings.ParallelForOrSerial(0, numChunks, length, chunk =>
-            {
-                int start = chunk * chunkSize;
-                int count = Math.Min(chunkSize, length - start);
-                if (count > 0)
-                {
-                    var kernel = CpuJitKernels.GetBinaryKernel(op, count);
-                    kernel(pA + start, pB + start, pR + start, count);
-                }
-            });
-        }
-        else
+        int chunkSize = ((length + numChunks - 1) / numChunks + 31) & ~31;   // 32-float aligned chunks
+        CpuParallelSettings.ParallelForOrSerial(0, numChunks, length, chunk =>
         {
-            var kernel = CpuJitKernels.GetBinaryKernel(op, length);
-            kernel(pA, pB, pR, length);
-        }
+            int start = chunk * chunkSize;
+            int count = Math.Min(chunkSize, length - start);
+            if (count > 0)
+                RunBinary(pA + start, pB + start, pR + start, count, op);
+        }, deterministicSafe: true);
+    }
+
+    private static unsafe void RunBinary(float* a, float* b, float* r, int count, JitBinaryOp op)
+    {
+        if (ReferenceEquals(op, JitBinaryOp.Add)) SimdKernels.VectorAddUnsafe(a, b, r, count);
+        else if (ReferenceEquals(op, JitBinaryOp.Subtract)) SimdKernels.VectorSubtractUnsafe(a, b, r, count);
+        else if (ReferenceEquals(op, JitBinaryOp.Multiply)) SimdKernels.VectorMultiplyUnsafe(a, b, r, count);
+        else if (ReferenceEquals(op, JitBinaryOp.Divide)) SimdKernels.VectorDivideUnsafe(a, b, r, count);
+        else CpuJitKernels.GetBinaryKernel(op, count)(a, b, r, count);   // Min / Max: no SimdKernels pointer form
     }
 
     /// <summary>
-    /// Dispatches a JIT-compiled ReLU with multi-threaded parallelism for large arrays.
+    /// Runs float ReLU split across threads in <see cref="CpuParallelSettings.ElementwiseGrainSize"/>
+    /// chunks, with <see cref="SimdKernels.ReLUUnsafe"/> (see <see cref="JitBinaryDispatch"/>).
     /// </summary>
     private static unsafe void JitUnaryDispatch(float* pSrc, float* pDst, int length)
     {
-        int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 500_000));
-        if (numChunks >= 2)
+        int numChunks = CpuParallelSettings.ElementwiseChunkCount(length);
+        if (numChunks < 2)
         {
-            int chunkSize = (length + numChunks - 1) / numChunks;
-            chunkSize = (chunkSize + 31) & ~31;
+            SimdKernels.ReLUUnsafe(pSrc, pDst, length);
+            return;
+        }
 
-            CpuParallelSettings.ParallelForOrSerial(0, numChunks, length, chunk =>
-            {
-                int start = chunk * chunkSize;
-                int count = Math.Min(chunkSize, length - start);
-                if (count > 0)
-                {
-                    var kernel = CpuJitKernels.GetReLUKernel(count);
-                    kernel(pSrc + start, pDst + start, count);
-                }
-            });
-        }
-        else
+        int chunkSize = ((length + numChunks - 1) / numChunks + 31) & ~31;
+        CpuParallelSettings.ParallelForOrSerial(0, numChunks, length, chunk =>
         {
-            var kernel = CpuJitKernels.GetReLUKernel(length);
-            kernel(pSrc, pDst, length);
-        }
+            int start = chunk * chunkSize;
+            int count = Math.Min(chunkSize, length - start);
+            if (count > 0)
+                SimdKernels.ReLUUnsafe(pSrc + start, pDst + start, count);
+        }, deterministicSafe: true);
     }
 
     #endregion
@@ -45239,9 +45226,9 @@ public partial class CpuEngine : ITensorLevelEngine
         // std = sqrt(variance)
         var variance = ReduceVariance(input, axes, keepDims);
         var varianceData = variance.GetDataArray();
-        var resultData = new T[varianceData.Length];
+        var resultData = new T[variance.Length];
 
-        for (int i = 0; i < varianceData.Length; i++)
+        for (int i = 0; i < variance.Length; i++)
         {
             // Clamp variance to zero before sqrt to handle floating-point roundoff
             // that can produce tiny negative values from reduction operations
@@ -45451,10 +45438,11 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         // Use PersistentParallelExecutor for near-zero dispatch overhead
         // (pre-spawned threads, ManualResetEventSlim) vs Parallel.For (~50us per call)
-        const int parallelThreshold = 262144; // 1MB
-        if (length >= parallelThreshold)
+        // Shared elementwise grain (CpuParallelSettings.ElementwiseGrainSize); the old 256K threshold and
+        // 16-chunk cap left a 1M-element activation on at most 16 threads and anything below 256K serial.
+        int nChunks = CpuParallelSettings.ElementwiseChunkCount(length);
+        if (nChunks >= 2)
         {
-            int nChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, 16);
             int chunkSize = (length + nChunks - 1) / nChunks;
             chunkSize = (chunkSize + 31) & ~31;
 
@@ -45488,10 +45476,9 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         // 256K doubles = 2 MB. Same threshold rationale as the float variant —
         // below this size, persistent-pool dispatch is overhead-dominated.
-        const int parallelThreshold = 131072; // 1MB of doubles
-        if (length >= parallelThreshold)
+        int nChunks = CpuParallelSettings.ElementwiseChunkCount(length);
+        if (nChunks >= 2)
         {
-            int nChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, 16);
             int chunkSize = (length + nChunks - 1) / nChunks;
             // Align chunk to 16-double boundary so each chunk's interior loop
             // doesn't hit unaligned tail in the AVX2 4× unrolled (16 doubles/iter) path.
@@ -46242,12 +46229,12 @@ public partial class CpuEngine : ITensorLevelEngine
             if (channels == tensor.Length)
             {
                 // Element-wise alpha (1D case)
-                for (int i = 0; i < fSrc.Length; i++)
+                for (int i = 0; i < tensor.Length; i++)
                     fDst[i] = fSrc[i] >= 0f ? fSrc[i] : fAlpha[i] * fSrc[i];
             }
             else
             {
-                for (int i = 0; i < fSrc.Length; i++)
+                for (int i = 0; i < tensor.Length; i++)
                 {
                     int channelIdx = channels == 1 ? 0 : (i / spatialSize) % channels;
                     fDst[i] = fSrc[i] >= 0f ? fSrc[i] : fAlpha[channelIdx] * fSrc[i];
@@ -46261,12 +46248,12 @@ public partial class CpuEngine : ITensorLevelEngine
             var dDst = (double[])(object)result.GetDataArray();
             if (channels == tensor.Length)
             {
-                for (int i = 0; i < dSrc.Length; i++)
+                for (int i = 0; i < tensor.Length; i++)
                     dDst[i] = dSrc[i] >= 0.0 ? dSrc[i] : dAlpha[i] * dSrc[i];
             }
             else
             {
-                for (int i = 0; i < dSrc.Length; i++)
+                for (int i = 0; i < tensor.Length; i++)
                 {
                     int channelIdx = channels == 1 ? 0 : (i / spatialSize) % channels;
                     dDst[i] = dSrc[i] >= 0.0 ? dSrc[i] : dAlpha[channelIdx] * dSrc[i];
@@ -46596,9 +46583,9 @@ public partial class CpuEngine : ITensorLevelEngine
 
             // Fill entire output with pad value
             if (fVal == 0f)
-                Array.Clear(dstArr, 0, dstArr.Length);
+                Array.Clear(dstArr, 0, result.Length);
             else
-                for (int i = 0; i < dstArr.Length; i++) dstArr[i] = fVal;
+                for (int i = 0; i < result.Length; i++) dstArr[i] = fVal;
 
             // Copy source rows into padded positions
             for (int r = 0; r < srcRows; r++)
@@ -46614,9 +46601,9 @@ public partial class CpuEngine : ITensorLevelEngine
             int padTop = padding[2];
             int dstCols = newShape[1];
             if (dVal == 0.0)
-                Array.Clear(dstArr, 0, dstArr.Length);
+                Array.Clear(dstArr, 0, result.Length);
             else
-                for (int i = 0; i < dstArr.Length; i++) dstArr[i] = dVal;
+                for (int i = 0; i < result.Length; i++) dstArr[i] = dVal;
             for (int r = 0; r < srcRows; r++)
                 Array.Copy(srcArr, r * srcCols, dstArr, (r + padTop) * dstCols + padLeft, srcCols);
         }
@@ -46763,7 +46750,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var inData = input.GetFlattenedData();
         var outData = output.GetDataArray();
         int totalBC = n * c;
-        CpuParallelSettings.ParallelForOrSerial(0, totalBC, outData.Length, bc =>
+        CpuParallelSettings.ParallelForOrSerial(0, totalBC, output.Length, bc =>
         {
             int inBase = bc * h * w;
             int outBase = bc * outH * outW;

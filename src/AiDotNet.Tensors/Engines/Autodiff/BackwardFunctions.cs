@@ -4093,7 +4093,7 @@ internal static class BackwardFunctions<T>
         for (int i = 0; i < argmax.Length; i++)
         {
             int idx = argmax[i];
-            if (idx >= 0 && idx < resultData.Length)
+            if (idx >= 0 && idx < inputGrad.Length)
                 resultData[idx] = numOps.Add(resultData[idx], gradData[i]);
         }
         DifferentiableOps.AccumulateGrad(grads, inputs[0], inputGrad, engine);

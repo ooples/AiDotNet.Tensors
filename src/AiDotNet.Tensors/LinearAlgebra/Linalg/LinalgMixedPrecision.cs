@@ -107,7 +107,7 @@ public static class LinalgMixedPrecision
         var dst = new Tensor<float>((int[])src._shape.Clone());
         var sd = src.GetDataArray();
         var dd = dst.GetDataArray();
-        for (int i = 0; i < sd.Length; i++) dd[i] = (float)sd[i];
+        for (int i = 0; i < src.Length; i++) dd[i] = (float)sd[i];
         return dst;
     }
 
@@ -116,7 +116,7 @@ public static class LinalgMixedPrecision
         var dst = new Tensor<double>((int[])src._shape.Clone());
         var sd = src.GetDataArray();
         var dd = dst.GetDataArray();
-        for (int i = 0; i < sd.Length; i++) dd[i] = sd[i];
+        for (int i = 0; i < src.Length; i++) dd[i] = sd[i];
         return dst;
     }
 
@@ -169,7 +169,7 @@ public static class LinalgMixedPrecision
     {
         double s = 0;
         var d = t.GetDataArray();
-        for (int i = 0; i < d.Length; i++) s += d[i] * d[i];
+        for (int i = 0; i < t.Length; i++) s += d[i] * d[i];
         return Math.Sqrt(s);
     }
 
@@ -177,6 +177,6 @@ public static class LinalgMixedPrecision
     {
         var aD = a.GetDataArray();
         var bD = b.GetDataArray();
-        for (int i = 0; i < aD.Length; i++) aD[i] += bD[i];
+        for (int i = 0; i < a.Length; i++) aD[i] += bD[i];
     }
 }

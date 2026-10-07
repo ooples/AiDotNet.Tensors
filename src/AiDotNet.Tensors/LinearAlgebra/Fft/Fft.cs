@@ -796,7 +796,7 @@ public static class Fft
         var dst = result.GetDataArray();
         var ops = MathHelper.GetNumericOperations<T>();
         int last = input.Shape[input.Rank - 1];
-        int batch = src.Length / last;
+        int batch = input.Length / last;
         for (int b = 0; b < batch; b++)
         {
             for (int i = 0; i < last; i += 2)

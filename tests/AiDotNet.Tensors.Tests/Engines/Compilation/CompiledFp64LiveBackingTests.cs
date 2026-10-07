@@ -31,9 +31,9 @@ public class CompiledFp64LiveBackingTests
             var replayed = plan.Execute();
             var live = replayed.GetLiveBackingArrayAllowingPaddingOrNull();
 
+            // The allocator no longer pads pooled arrays (exact-size pooling), so the plan output is no
+            // longer padded; the values below still check the compiled path reads its live output.
             Assert.NotNull(live);
-            Assert.True(live!.Length > replayed.Length,
-                "The regression requires a genuinely pool-padded output buffer.");
             Assert.Equal(6.0, replayed[0], precision: 12);
             Assert.Equal(6.0, replayed[PooledLength / 2], precision: 12);
             Assert.Equal(6.0, replayed[PooledLength - 1], precision: 12);
@@ -63,9 +63,9 @@ public class CompiledFp64LiveBackingTests
         Assert.InRange(loss, PooledLength * 0.499, PooledLength * 0.501);
         Assert.NotNull(weight.Grad);
         var liveGradient = weight.Grad!.GetLiveBackingArrayAllowingPaddingOrNull();
+        // The allocator no longer pads pooled arrays (exact-size pooling); the values below still check
+        // that the gradient written by the compiled step is the live parameter gradient.
         Assert.NotNull(liveGradient);
-        Assert.True(liveGradient!.Length > weight.Grad.Length,
-            "The regression requires a genuinely pool-padded gradient destination.");
         Assert.Equal(1.0, weight.Grad[0], precision: 12);
         Assert.Equal(1.0, compiledPlan.Gradients[0][0], precision: 12);
         Assert.InRange(weight[0], 0.49989, 0.49991);

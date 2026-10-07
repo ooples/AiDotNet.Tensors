@@ -167,7 +167,7 @@ public sealed class GradScaler<T>
         var data = grads.GetDataArray();
         // Pass 1: scan — no writes. If we find an overflow, bail before
         // mutating so the tensor stays fully scaled (consistent state).
-        for (int i = 0; i < data.Length; i++)
+        for (int i = 0; i < grads.Length; i++)
         {
             if (HasOverflow(_numOps.Multiply(data[i], invScale)))
             {
@@ -176,7 +176,7 @@ public sealed class GradScaler<T>
             }
         }
         // Pass 2: clean scan complete — write the unscaled values back.
-        for (int i = 0; i < data.Length; i++)
+        for (int i = 0; i < grads.Length; i++)
             data[i] = _numOps.Multiply(data[i], invScale);
         _foundInfOrNan = false;
         return true;
@@ -194,7 +194,7 @@ public sealed class GradScaler<T>
     {
         if (grad is null) return false;
         var data = grad.GetDataArray();
-        for (int i = 0; i < data.Length; i++)
+        for (int i = 0; i < grad.Length; i++)
             if (HasOverflow(data[i])) return true;
         return false;
     }

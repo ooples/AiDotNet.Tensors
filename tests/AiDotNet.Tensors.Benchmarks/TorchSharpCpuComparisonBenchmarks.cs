@@ -880,7 +880,12 @@ public class TorchSharpCpuComparisonBenchmarks
     {
         if (_aiNormInput is null || _aiNormGamma is null || _aiNormBeta is null)
             throw new InvalidOperationException("Setup not called");
-        _cpuEngine.GroupNorm(_aiNormInput, 32, _aiNormGamma, _aiNormBeta, 1e-5, out _, out _);
+        // Pool-return the output and statistics, as the LayerNorm / BatchNorm arms do and as torch's
+        // `using var result` does; without it every call allocated a fresh 8 MB result.
+        var r = _cpuEngine.GroupNorm(_aiNormInput, 32, _aiNormGamma, _aiNormBeta, 1e-5, out var gnMean, out var gnVar);
+        TensorPool.Return(r);
+        TensorPool.Return(gnMean);
+        TensorPool.Return(gnVar);
     }
 
     [Benchmark]

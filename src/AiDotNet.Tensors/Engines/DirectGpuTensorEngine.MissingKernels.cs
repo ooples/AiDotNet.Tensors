@@ -623,7 +623,7 @@ public partial class DirectGpuTensorEngine
             if (!HasResidentIndexStorage(contiguousFaces))
             {
                 var faceData = contiguousFaces.GetDataArray();
-                for (int i = 0; i < faceData.Length; i++)
+                for (int i = 0; i < contiguousFaces.Length; i++)
                     if (faceData[i] < 0 || faceData[i] >= numVertices)
                         throw new ArgumentOutOfRangeException(nameof(faces),
                             $"Face vertex {faceData[i]} at position {i} is out of bounds for {numVertices} vertices.");
@@ -2230,7 +2230,7 @@ public partial class DirectGpuTensorEngine
         if (!HasResidentIndexStorage(contiguousIndices))
         {
             var indexData = contiguousIndices.GetDataArray();
-            for (int i = 0; i < indexData.Length; i++)
+            for (int i = 0; i < contiguousIndices.Length; i++)
                 if ((uint)indexData[i] >= (uint)destinationAxis)
                     throw new ArgumentOutOfRangeException(nameof(indices),
                         $"indices[{i}]={indexData[i]} is out of range for axis length {destinationAxis}.");
@@ -7861,7 +7861,7 @@ public partial class DirectGpuTensorEngine
             if (!HasResidentIndexStorage(contiguousIndices))
             {
                 var indexData = contiguousIndices.GetDataArray();
-                for (int i = 0; i < indexData.Length; i++)
+                for (int i = 0; i < contiguousIndices.Length; i++)
                     if (indexData[i] < 0 || indexData[i] >= axisSize)
                         throw new ArgumentException(
                             $"Index {indexData[i]} is out of bounds for axis size {axisSize}");
@@ -7913,7 +7913,7 @@ public partial class DirectGpuTensorEngine
             if (!HasResidentIndexStorage(contiguousIndices))
             {
                 var indexData = contiguousIndices.GetDataArray();
-                for (int i = 0; i < indexData.Length; i++)
+                for (int i = 0; i < contiguousIndices.Length; i++)
                     if (indexData[i] < 0 || indexData[i] >= axisSize)
                         throw new ArgumentException(
                             $"Index {indexData[i]} is out of bounds for axis size {axisSize}");
@@ -7965,7 +7965,7 @@ public partial class DirectGpuTensorEngine
             if (!HasResidentIndexStorage(contiguousIndices))
             {
                 var indexData = contiguousIndices.GetDataArray();
-                for (int i = 0; i < indexData.Length; i++)
+                for (int i = 0; i < contiguousIndices.Length; i++)
                     if (indexData[i] < 0 || indexData[i] >= columns)
                         throw new IndexOutOfRangeException(
                             $"Index {indexData[i]} is out of bounds for axis size {columns}");
@@ -8026,7 +8026,7 @@ public partial class DirectGpuTensorEngine
             if (!HasResidentIndexStorage(contiguousIndices))
             {
                 int[] indexData = contiguousIndices.GetDataArray();
-                for (int i = 0; i < indexData.Length; i++)
+                for (int i = 0; i < contiguousIndices.Length; i++)
                     if (indexData[i] < 0 || indexData[i] >= sourceAxis)
                         throw new IndexOutOfRangeException(
                             $"indices[{i}]={indexData[i]} out of range for axis size {sourceAxis}");
@@ -8087,7 +8087,7 @@ public partial class DirectGpuTensorEngine
             if (!HasResidentIndexStorage(contiguousIndices))
             {
                 int[] indexData = contiguousIndices.GetDataArray();
-                for (int i = 0; i < indexData.Length; i++)
+                for (int i = 0; i < contiguousIndices.Length; i++)
                     if (indexData[i] < 0 || indexData[i] >= destinationAxis)
                         throw new IndexOutOfRangeException(
                             $"indices[{i}]={indexData[i]} out of range for axis size {destinationAxis}");
@@ -8258,8 +8258,8 @@ public partial class DirectGpuTensorEngine
                 if (!resident)
                 {
                     byte[] values = contiguousIndices.GetDataArray();
-                    var nativeValues = new int[values.Length];
-                    for (int i = 0; i < values.Length; i++)
+                    var nativeValues = new int[contiguousIndices.Length];
+                    for (int i = 0; i < contiguousIndices.Length; i++)
                     {
                         nativeValues[i] = values[i];
                         if (nativeValues[i] >= vocabSize)

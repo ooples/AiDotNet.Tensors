@@ -163,6 +163,38 @@ public static class CpuParallelSettings
     public static int ParallelThreshold { get; set; } = 50000;
 
     /// <summary>
+    /// Elements per parallel chunk for elementwise kernels (add, subtract, multiply, divide, activations).
+    /// </summary>
+    /// <remarks>
+    /// 32,768, the grain libtorch uses (<c>at::internal::GRAIN_SIZE</c>). The previous per-op grains of
+    /// 250K-500K elements put a 1M-element float subtract on two threads: 86 µs against libtorch's 26 µs
+    /// in the same process; at 32K it takes 25 µs. Smaller grains (16K) measured far slower again.
+    /// </remarks>
+    public const int ElementwiseGrainSize = 32 * 1024;
+
+    /// <summary>Number of chunks to split an elementwise kernel of <paramref name="length"/> elements into.</summary>
+    internal static int ElementwiseChunkCount(int length)
+        => Math.Min(MaxDegreeOfParallelism, Math.Max(1, length / ElementwiseGrainSize));
+
+    /// <summary>
+    /// How long a pool worker keeps spinning for the next parallel operation before it parks.
+    /// </summary>
+    /// <remarks>
+    /// <para>Default 200 µs: workers stay hot across the back-to-back operations of a forward or
+    /// training step, then park so an idle pool burns no CPU. Longer windows trade idle CPU for wake-up
+    /// latency on workloads that issue operations a few milliseconds apart; measure before raising it,
+    /// since a spinning worker also takes core time from the thread issuing the next operation.</para>
+    /// <para>The spin yields its core periodically and is skipped when the previous operation already
+    /// used every core. <see cref="TimeSpan.Zero"/> parks immediately. The
+    /// <c>AIDOTNET_PPE_WARMWINDOW_US</c> environment variable sets the initial value in microseconds.</para>
+    /// </remarks>
+    public static TimeSpan WorkerSpinTime
+    {
+        get => PersistentParallelExecutor.WarmWindow;
+        set => PersistentParallelExecutor.WarmWindow = value;
+    }
+
+    /// <summary>
     /// Gets or sets whether AVX2 hardware gather instructions are used for strided memory access.
     /// </summary>
     /// <remarks>

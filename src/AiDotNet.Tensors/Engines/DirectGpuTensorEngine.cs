@@ -571,7 +571,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (GetBackend() is not Engines.DirectGpu.CUDA.CudaBackend cb) return;
         if (t._gpuBuffer is not { } buf || !ReferenceEquals(t._gpuBackend, cb) || buf.Handle == System.IntPtr.Zero) return;
         var data = t.GetDataArray();
-        if (buf.Size < data.Length) return;
+        if (buf.Size < t.Length) return;
         cb.UploadBufferInPlace((float[])(object)data, buf);
         t._gpuBufferVersion = t.GpuCacheVersion;
     }
@@ -592,7 +592,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (t.GetBackingArrayForCacheLookupUnsafe() is { } hostArray) Helpers.HostSync.Remove(hostArray);
         var data = t.GetDataArray();
         if (cb is Engines.DirectGpu.CUDA.CudaBackend cuda && t._gpuBuffer is { } existing && ReferenceEquals(t._gpuBackend, cb)
-            && existing.Handle != System.IntPtr.Zero && existing.Size >= data.Length)
+            && existing.Handle != System.IntPtr.Zero && existing.Size >= t.Length)
         {
             cuda.UploadBufferInPlace((float[])(object)data, existing);
             t._gpuBufferVersion = t.GpuCacheVersion;
@@ -7363,7 +7363,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         var aData = a.GetDataArray();
         var bData = b.GetReadOnlyDataArray();
-        if (aData.Length != bData.Length)
+        if (a.Length != bData.Length)
             return false;
 
         using var bufferA = GetOrAllocateBuffer(backend, a);
@@ -7373,17 +7373,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // reference) can be SMALLER than the logical array when a pooled
         // backing array is reused at a new, larger shape — the cache still
         // maps that reference to the old, smaller buffer. Running the op at
-        // aData.Length would index past the device allocation, and the
+        // a.Length would index past the device allocation, and the
         // short download would then throw "source array was not long enough"
         // in the copy-back (seen crashing eager LayerNormBackward on the GPU
         // when a varying-shape step falls off the fused path). Bail to the
         // correct CPU implementation instead of corrupting device memory.
         // (A LARGER cached buffer — e.g. power-of-two padded — is fine: the op
-        // touches the first aData.Length elements and the copy-back is bounded.)
-        if (bufferA.Buffer.Size < aData.Length || bufferB.Buffer.Size < bData.Length)
+        // touches the first a.Length elements and the copy-back is bounded.)
+        if (bufferA.Buffer.Size < a.Length || bufferB.Buffer.Size < bData.Length)
             return false;
 
-        op(backend, bufferA.Buffer, bufferB.Buffer, aData.Length);
+        op(backend, bufferA.Buffer, bufferB.Buffer, a.Length);
 
         // `a` can be bound to a device buffer of its own that is not the one resolved from its backing array (the
         // compiled resident step binds its gradient accumulators that way). The op above did not touch it, yet the
@@ -7393,9 +7393,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // buffer (ordered before the download, whose stream sync covers it), or drop a binding that cannot hold it.
         if (a._gpuBuffer is { } bound && !ReferenceEquals(bound, bufferA.Buffer) && bound.Handle != bufferA.Buffer.Handle)
         {
-            if (ReferenceEquals(a._gpuBackend, backend) && bound.Handle != System.IntPtr.Zero && bound.Size >= aData.Length)
+            if (ReferenceEquals(a._gpuBackend, backend) && bound.Handle != System.IntPtr.Zero && bound.Size >= a.Length)
             {
-                backend.Copy(bufferA.Buffer, bound, aData.Length);
+                backend.Copy(bufferA.Buffer, bound, a.Length);
             }
             else
             {
@@ -7448,15 +7448,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // See TryRunBinaryInPlace: a stale cached buffer can be smaller than the
         // logical array when a pooled backing array is reused at a larger shape.
         // Bail to the correct CPU path rather than index past the allocation.
-        if (buffer.Buffer.Size < data.Length)
+        if (buffer.Buffer.Size < tensor.Length)
             return false;
 
-        op(backend, buffer.Buffer, data.Length);
+        op(backend, buffer.Buffer, tensor.Length);
 
         // Download result back into tensor's backing array
         float[] resultFloat = backend.DownloadBuffer(buffer.Buffer);
         var resultT = DirectGpuEngine.FromFloatArray<T>(resultFloat);
-        Array.Copy(resultT, data, data.Length);
+        Array.Copy(resultT, data, tensor.Length);
         // Same version-counter contract as TryRunBinaryInPlace: bump
         // Version + sync _gpuBufferVersion so subsequent GPU ops reuse
         // the freshly-written buffer instead of re-uploading.
@@ -16706,7 +16706,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (!HasResidentIndexStorage(contiguousIndices))
             {
                 var indexValues = contiguousIndices.GetDataArray();
-                for (int i = 0; i < indexValues.Length; i++)
+                for (int i = 0; i < contiguousIndices.Length; i++)
                     if (indexValues[i] < 0 || indexValues[i] >= vocabSize)
                         throw new ArgumentOutOfRangeException(nameof(indices),
                             $"Index {indexValues[i]} at position {i} is out of bounds for vocabulary size {vocabSize}.");
@@ -16763,7 +16763,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (!HasResidentIndexStorage(contiguousIndices))
             {
                 var indexValues = contiguousIndices.GetDataArray();
-                for (int i = 0; i < indexValues.Length; i++)
+                for (int i = 0; i < contiguousIndices.Length; i++)
                     if (indexValues[i] < 0 || indexValues[i] >= vocabSize)
                         throw new ArgumentOutOfRangeException(nameof(indices),
                             $"Index {indexValues[i]} at position {i} is out of bounds for vocabulary size {vocabSize}.");
@@ -22934,7 +22934,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (!HasResidentIndexStorage(contiguousIndices))
             {
                 var indexValues = contiguousIndices.GetDataArray();
-                for (int i = 0; i < indexValues.Length; i++)
+                for (int i = 0; i < contiguousIndices.Length; i++)
                     if (indexValues[i] < 0 || indexValues[i] >= sourceRows)
                         throw new ArgumentOutOfRangeException(nameof(indices),
                             $"Index {indexValues[i]} at position {i} is out of bounds for axis size {sourceRows}.");
@@ -22987,7 +22987,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (!HasResidentIndexStorage(contiguousIndices))
             {
                 var indexValues = contiguousIndices.GetDataArray();
-                for (int i = 0; i < indexValues.Length; i++)
+                for (int i = 0; i < contiguousIndices.Length; i++)
                     if (indexValues[i] < 0 || indexValues[i] >= vocabSize)
                         throw new ArgumentOutOfRangeException(nameof(indices),
                             $"Index {indexValues[i]} at position {i} is out of bounds for vocabulary size {vocabSize}.");
@@ -24711,7 +24711,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             if (!HasResidentIndexStorage(contiguousIndices))
             {
                 var indexData = contiguousIndices.GetDataArray();
-                for (int i = 0; i < indexData.Length; i++)
+                for (int i = 0; i < contiguousIndices.Length; i++)
                     if (indexData[i] < 0 || indexData[i] >= axisSize)
                         throw new IndexOutOfRangeException(
                             $"Index {indexData[i]} is out of bounds for axis size {axisSize}");

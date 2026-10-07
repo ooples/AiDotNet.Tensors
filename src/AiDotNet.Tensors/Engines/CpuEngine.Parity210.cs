@@ -3342,9 +3342,9 @@ public partial class CpuEngine
             float[] vsArr = (float[])(object)values.GetDataArray();
             ReadOnlySpan<float> seqSpan = seqArr;
             if (right)
-                for (int i = 0; i < vsArr.Length; i++) dst[i] = Simd.SortKernels.UpperBoundFloat(seqSpan, vsArr[i]);
+                for (int i = 0; i < values.Length; i++) dst[i] = Simd.SortKernels.UpperBoundFloat(seqSpan, vsArr[i]);
             else
-                for (int i = 0; i < vsArr.Length; i++) dst[i] = Simd.SortKernels.LowerBoundFloat(seqSpan, vsArr[i]);
+                for (int i = 0; i < values.Length; i++) dst[i] = Simd.SortKernels.LowerBoundFloat(seqSpan, vsArr[i]);
             return result;
         }
 

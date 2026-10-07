@@ -132,7 +132,7 @@ internal static class LinalgNorms
                     var sv = SvdWrapper.ValuesOnly(slice);
                     double sum = 0;
                     var svD = sv.GetDataArray();
-                    for (int i = 0; i < svD.Length; i++) sum += ToDouble(svD[i]);
+                    for (int i = 0; i < sv.Length; i++) sum += ToDouble(svD[i]);
                     val = sum;
                 }
                 else throw new ArgumentException($"Unknown matrix norm '{s}'.");
@@ -263,7 +263,7 @@ internal static class LinalgNorms
         var inShape = input._shape;
         var inStrides = input._strides;
 
-        int totalOut = outData.Length;
+        int totalOut = result.Length;
         var outCoord = new int[outShape.Length];
 
         // Determine the set of reduced axis indices (in input space).
