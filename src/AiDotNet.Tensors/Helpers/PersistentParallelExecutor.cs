@@ -39,6 +39,9 @@ internal sealed class PersistentParallelExecutor
             && sc >= 0 && sc <= 2047 ? sc : 32;
 
     private readonly int _numWorkers;
+
+    /// <summary>Parked worker threads in the pool (a dispatch's participants are at most this plus the caller).</summary>
+    internal int WorkerCount => _numWorkers;
     private readonly Thread[] _workers;
 
     // Per-worker signaling: workers wait on these to receive work
