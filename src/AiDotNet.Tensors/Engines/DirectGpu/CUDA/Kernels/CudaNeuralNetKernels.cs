@@ -62,19 +62,23 @@ extern ""C"" __global__ __launch_bounds__(256) void gelu_backward(
     gradInput[idx] = gradOutput[idx] * grad;
 }
 
+// dX = S * (dY - sum(dY * S)) with one WARP per row (blockDim.x = 256 => 8 rows per block): the 32 lanes stride the
+// row, so loads are coalesced and the dot product is a warp reduction. One thread per row read each row with a
+// row-length stride per lane and left 255 of every 256 launched threads idle.
 extern ""C"" __global__ __launch_bounds__(256) void softmax_backward(
     const float* __restrict__ gradOutput, const float* __restrict__ output, float* __restrict__ gradInput, int batchSize, int features)
 {
-    int batch = blockIdx.x * blockDim.x + threadIdx.x;
-    if (batch >= batchSize) return;
+    int lane = threadIdx.x & 31;
+    long long row = (long long)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (row >= batchSize) return;
 
-    int baseIdx = batch * features;
+    long long baseIdx = row * (long long)features;
     float dot = 0.0f;
-    for (int f = 0; f < features; f++) {
+    for (int f = lane; f < features; f += 32)
         dot += gradOutput[baseIdx + f] * output[baseIdx + f];
-    }
-    for (int f = 0; f < features; f++) {
-        int idx = baseIdx + f;
+    for (int o = 16; o > 0; o >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, o);
+    for (int f = lane; f < features; f += 32) {
+        long long idx = baseIdx + f;
         gradInput[idx] = output[idx] * (gradOutput[idx] - dot);
     }
 }

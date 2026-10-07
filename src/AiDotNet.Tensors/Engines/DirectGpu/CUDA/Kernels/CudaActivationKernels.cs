@@ -732,6 +732,33 @@ extern ""C"" __global__ __launch_bounds__(256) void softmax(const float* __restr
     }
 }
 
+// Softmax with one WARP per row (blockDim.x = 256 => 8 rows per block), for rows up to ~1K wide (attention scores,
+// class logits). The block-per-row kernel above parks 256 threads and two block barriers on a row of a few dozen
+// elements; here every lane works, nothing synchronizes beyond the warp, and the 32 lanes read the row coalesced.
+// Same stable form: exp(x - max) / sum, with the same zero-sum guard.
+extern ""C"" __global__ __launch_bounds__(256) void softmax_warp_rows(const float* __restrict__ input, float* __restrict__ output, int batchSize, int features)
+{
+    int lane = threadIdx.x & 31;
+    long long row = (long long)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (row >= batchSize) return;
+    const float* in_row = input + row * (long long)features;
+    float* out_row = output + row * (long long)features;
+
+    float maxVal = -INFINITY;
+    for (int f = lane; f < features; f += 32) maxVal = fmaxf(maxVal, in_row[f]);
+    for (int o = 16; o > 0; o >>= 1) maxVal = fmaxf(maxVal, __shfl_xor_sync(0xffffffffu, maxVal, o));
+
+    float sum = 0.0f;
+    for (int f = lane; f < features; f += 32) {
+        float e = expf(in_row[f] - maxVal);
+        out_row[f] = e;
+        sum += e;
+    }
+    for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+    float invSum = (sum > 0.0f) ? (1.0f / sum) : 1.0f;
+    for (int f = lane; f < features; f += 32) out_row[f] *= invSum;
+}
+
 extern ""C"" __global__ __launch_bounds__(256) void add_vectors(const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1417,6 +1444,7 @@ extern ""C"" __global__ __launch_bounds__(256) void max_vectors_vec4(const float
                 "hardtanh",
                 "leaky_relu",
                 "softmax",
+                "softmax_warp_rows",
                 // Activation backward
                 "relu_backward",
                 "leaky_relu_backward",

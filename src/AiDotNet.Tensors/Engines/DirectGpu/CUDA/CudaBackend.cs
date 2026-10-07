@@ -417,6 +417,19 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
 
     private unsafe bool TryStageUpload(IntPtr destination, float[] data, ulong byteSize)
     {
+        fixed (float* src = data)
+            return TryStageUpload(destination, src, byteSize);
+    }
+
+    private unsafe bool TryStageUpload(IntPtr destination, int[] data, ulong byteSize)
+    {
+        fixed (int* src = data)
+            return TryStageUpload(destination, src, byteSize);
+    }
+
+    // The caller keeps the source pinned for the call; the host memcpy into the staging slot completes before return.
+    private unsafe bool TryStageUpload(IntPtr destination, void* source, ulong byteSize)
+    {
         if (_backendStreamCaptureActive || _defaultStream is null || (long)byteSize > MaxStagedUploadSingleBytes)
             return false;
         int bytes = checked((int)byteSize);
@@ -438,8 +451,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         var pinned = _pinnedPool.Rent(bytes);
         try
         {
-            fixed (float* src = data)
-                Buffer.MemoryCopy(src, (void*)pinned, bytes, bytes);
+            Buffer.MemoryCopy(source, (void*)pinned, bytes, bytes);
             CuBlasNative.CheckCudaResult(
                 CudaNativeBindings.cuMemcpyHtoDAsync(destination, pinned, byteSize, _stream),
                 "cuMemcpyHtoDAsync(staged upload)");
@@ -5315,6 +5327,11 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw new ArgumentException($"Host data ({data.Length}) exceeds buffer ({buffer.Size}).");
         using var _ = PushContext();
         ulong byteSize = (ulong)data.Length * sizeof(float);
+        // Staged through a page-locked slot (see TryStageUpload). A copy straight from the pageable managed array
+        // made the driver wait for the stream to drain whenever the copy outgrew its own staging: a training step's
+        // input and label refresh each blocked the host until the PREVIOUS step's graph finished (~0.7 ms per copy
+        // on a 1660 Ti), so the host could never enqueue ahead of the device. Same stream, same order, same bytes.
+        if (TryStageUpload(buffer.Handle, data, byteSize)) return;
         fixed (float* src = data)
             CuBlasNative.CheckCudaResult(
                 CuBlasNative.cuMemcpyHtoD(buffer.Handle, (IntPtr)src, byteSize),
@@ -5337,6 +5354,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         GpuLaunchProbe.OnUpload(data, sizeof(int), GpuBackendType.Cuda);
         using var _ = PushContext();
         ulong byteSize = (ulong)data.Length * sizeof(int);
+        if (TryStageUpload(buffer.Handle, data, byteSize)) return;   // see UploadBufferInPlace
         fixed (int* src = data)
             CuBlasNative.CheckCudaResult(
                 CuBlasNative.cuMemcpyHtoD(buffer.Handle, (IntPtr)src, byteSize),
@@ -5830,8 +5848,23 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
+    // Rows up to this width take the warp-per-row softmax; longer rows (an LM vocabulary) keep a block per row.
+    private const int SoftmaxWarpRowMaxFeatures = 1024;
+
     private unsafe void LaunchSoftmaxKernel(IGpuBuffer input, IGpuBuffer output, int batchSize, int features)
     {
+        if (features <= SoftmaxWarpRowMaxFeatures && batchSize > 0
+            && _kernelCache.TryGetValue("softmax_warp_rows", out var warpKernel))
+        {
+            using var warpScope = PushContext();
+            IntPtr inPtr = input.Handle, outPtr = output.Handle;
+            int rows = batchSize, cols = features;
+            void** wargs = stackalloc void*[4];
+            wargs[0] = &inPtr; wargs[1] = &outPtr; wargs[2] = &rows; wargs[3] = &cols;
+            int rowsPerBlock = DefaultBlockSize / 32;
+            LaunchKernel(warpKernel, (uint)((batchSize + rowsPerBlock - 1) / rowsPerBlock), DefaultBlockSize, wargs);
+            return;
+        }
         if (!_kernelCache.TryGetValue("softmax", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: softmax");
 
@@ -7702,7 +7735,8 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             // Issue #382: route to atomic-free variant.
             if (!_kernelCache.TryGetValue("maxpool2d_backward_deterministic", out var kernelD))
                 throw new InvalidOperationException("CUDA kernel not found: maxpool2d_backward_deterministic");
-            void** argsD = stackalloc void*[9];
+            // The window geometry lets each input cell scan only the windows that contain it (see the kernel).
+            void** argsD = stackalloc void*[15];
             argsD[0] = &gradOutPtr;
             argsD[1] = &indicesPtr;
             argsD[2] = &gradInPtr;
@@ -7712,6 +7746,12 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             argsD[6] = &inWidth;
             argsD[7] = &outH;
             argsD[8] = &outW;
+            argsD[9] = &kernelH;
+            argsD[10] = &kernelW;
+            argsD[11] = &strideH;
+            argsD[12] = &strideW;
+            argsD[13] = &padH;
+            argsD[14] = &padW;
             // Deterministic variant grid: per (b, c, ih, iw) input cell.
             uint gridDX = (uint)((inWidth + blockSize - 1) / blockSize);
             uint gridDY = (uint)((inHeight + blockSize - 1) / blockSize);
@@ -8602,7 +8642,8 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         // (every transformer layer has a LayerNorm — caught by LayerNormGradientCheckTests).
         if (!_kernelCache.TryGetValue("layernorm_grad_params", out var paramKernel))
             throw new InvalidOperationException("CUDA kernel not found: layernorm_grad_params");
-        uint paramGrid = (uint)((normalizedSize + DefaultBlockSize - 1) / DefaultBlockSize);
+        // 32 columns x 32 row lanes per block (see the kernel).
+        uint paramGrid = (uint)((normalizedSize + 31) / 32);
         void** pargs = stackalloc void*[8];
         pargs[0] = &gradOutputPtr;
         pargs[1] = &inputPtr;
@@ -8612,7 +8653,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         pargs[5] = &gradBetaPtr;
         pargs[6] = &batchSize;
         pargs[7] = &normalizedSize;
-        LaunchKernel(paramKernel, paramGrid, DefaultBlockSize, pargs);
+        LaunchKernel2D(paramKernel, paramGrid, 1, 1, 32, 32, pargs);
     }
 
     public unsafe void GroupNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
@@ -10167,7 +10208,8 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw new InvalidOperationException("CUDA kernel not found: softmax_backward");
 
         using var _ = PushContext();
-        uint grid = (uint)batchSize;
+        // One warp per row (see the kernel): DefaultBlockSize / 32 rows per block.
+        uint grid = (uint)((batchSize + DefaultBlockSize / 32 - 1) / (DefaultBlockSize / 32));
         IntPtr gradOutPtr = gradOutput.Handle;
         IntPtr outPtr = output.Handle;
         IntPtr gradInPtr = gradInput.Handle;

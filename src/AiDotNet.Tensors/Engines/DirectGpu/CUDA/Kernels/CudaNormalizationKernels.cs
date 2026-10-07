@@ -269,27 +269,43 @@ extern ""C"" __global__ __launch_bounds__(256) void layernorm_backward(
 
 // Layer Normalization gradient accumulation for gamma and beta
 // 1 thread per feature, serial over batch (batch is typically small)
-extern ""C"" __global__ __launch_bounds__(256) void layernorm_grad_params(
+// blockDim = (32 columns, 32 row lanes), grid.x = ceil(normalizedSize / 32). Each lane sums every 32nd row of its
+// column (a warp reads 32 consecutive columns of one row: coalesced), then lane partials are added in a fixed order,
+// so the result is deterministic. One thread per column looping over every row left a d=64 LayerNorm with ONE
+// block of 64 threads walking 2048 rows serially (107 us per call, the largest kernel of a Transformer step).
+extern ""C"" __global__ __launch_bounds__(1024) void layernorm_grad_params(
     const float* __restrict__ gradOutput, const float* __restrict__ input,
     const float* __restrict__ saveMean, const float* __restrict__ saveInvVar,
     float* __restrict__ gradGamma, float* __restrict__ gradBeta,
     int batchSize, int normalizedSize)
 {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= normalizedSize) return;
+    __shared__ float partGamma[32][33];
+    __shared__ float partBeta[32][33];
+    int tx = threadIdx.x, ty = threadIdx.y;
+    int i = blockIdx.x * 32 + tx;
 
     float dGamma = 0.0f;
     float dBeta = 0.0f;
-    for (int b = 0; b < batchSize; b++) {
-        int idx = b * normalizedSize + i;
-        float mean = saveMean[b];
-        float invVar = saveInvVar[b];
-        float normalized = (input[idx] - mean) * invVar;
-        dGamma += gradOutput[idx] * normalized;
-        dBeta += gradOutput[idx];
+    if (i < normalizedSize) {
+        for (int b = ty; b < batchSize; b += 32) {
+            long long idx = (long long)b * normalizedSize + i;
+            float mean = saveMean[b];
+            float invVar = saveInvVar[b];
+            float normalized = (input[idx] - mean) * invVar;
+            float g = gradOutput[idx];
+            dGamma += g * normalized;
+            dBeta += g;
+        }
     }
-    gradGamma[i] = dGamma;
-    gradBeta[i] = dBeta;
+    partGamma[ty][tx] = dGamma;
+    partBeta[ty][tx] = dBeta;
+    __syncthreads();
+    if (ty == 0 && i < normalizedSize) {
+        float sg = 0.0f, sb = 0.0f;
+        for (int k = 0; k < 32; k++) { sg += partGamma[k][tx]; sb += partBeta[k][tx]; }
+        gradGamma[i] = sg;
+        gradBeta[i] = sb;
+    }
 }
 
 // Group Normalization forward pass

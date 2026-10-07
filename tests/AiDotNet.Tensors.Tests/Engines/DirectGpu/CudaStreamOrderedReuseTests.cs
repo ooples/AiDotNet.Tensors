@@ -156,6 +156,50 @@ public class CudaStreamOrderedReuseTests
         }
     }
 
+    /// <summary>
+    /// The in-place uploads that refresh a captured training step's input, labels and token indices are staged through
+    /// page-locked memory too (a copy from the pageable array made the host wait for the previous step on the device).
+    /// Rewriting ONE buffer every round, with a consumer queued between rewrites, checks both halves of the contract:
+    /// each consumer sees the upload queued before it (stream order), and the host array is reusable on return.
+    /// </summary>
+    [SkippableFact]
+    public void In_place_uploads_into_one_buffer_are_stream_ordered_and_own_their_data()
+    {
+        Skip.IfNot(TryCuda(out var engine, out var cuda), "CUDA backend not available.");
+        using (engine!)
+        {
+            const int n = 1 << 16;
+            const int rounds = 24;
+            var source = new float[n];
+            var indices = new int[n];
+            using var target = cuda!.AllocateBuffer(n);
+            using var intTarget = cuda.AllocateIntBuffer(n);
+            var sinks = new List<AiDotNet.Tensors.Engines.DirectGpu.IGpuBuffer>();
+            try
+            {
+                for (int round = 0; round < rounds; round++)
+                {
+                    for (int i = 0; i < n; i++) { source[i] = round * 10 + (i & 7); indices[i] = round * 3 + i; }
+                    cuda.UploadBufferInPlace(source, target);
+                    cuda.UploadIntBufferInPlace(indices, intTarget);
+                    for (int i = 0; i < n; i++) { source[i] = -1f; indices[i] = -1; }   // the host copies are free on return
+                    var sink = cuda.AllocateBuffer(n);
+                    cuda.Add(target, target, sink, n);   // queued after this round's upload, before the next one
+                    sinks.Add(sink);
+                }
+                for (int round = 0; round < rounds; round++)
+                {
+                    var doubled = cuda.DownloadBuffer(sinks[round]);
+                    for (int i = 0; i < n; i += 61) Assert.Equal(2f * (round * 10 + (i & 7)), doubled[i]);
+                }
+                var lastInts = cuda.DownloadBuffer(intTarget);
+                for (int i = 0; i < n; i += 61)
+                    Assert.Equal((rounds - 1) * 3 + i, System.BitConverter.ToInt32(System.BitConverter.GetBytes(lastInts[i]), 0));
+            }
+            finally { foreach (var sink in sinks) sink.Dispose(); }
+        }
+    }
+
     [SkippableFact]
     public void Reuse_is_ordered_after_queued_work_that_still_reads_the_old_contents()
     {

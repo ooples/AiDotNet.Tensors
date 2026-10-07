@@ -578,6 +578,93 @@ public class GpuFusedKernelCorrectnessTests : IClassFixture<DirectGpuTensorEngin
     }
 
     /// <summary>
+    /// LayerNorm's gamma/beta gradients reduce every row of a column: the CUDA kernel splits the rows over 32 lanes per
+    /// column tile. Covers a tall narrow shape (many rows, one column tile), a width that is not a multiple of 32, and a
+    /// row count below the lane count.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(2048, 64)]
+    [InlineData(37, 100)]
+    [InlineData(5, 33)]
+    public void LayerNormBackward_ParamGradients_GpuMatchesCpu(int rows, int features)
+    {
+        SkipIfNoGpu();
+        var input = RandomTensor(new[] { rows, features }, 300 + features);
+        var gamma = RandomTensor(new[] { features }, 301);
+        var beta = RandomTensor(new[] { features }, 302);
+        var gradOut = RandomTensor(new[] { rows, features }, 303);
+        _cpu.LayerNorm(input, gamma, beta, 1e-5, out var cpuMean, out var cpuVar);
+        var cpuGradIn = _cpu.LayerNormBackward(gradOut, input, gamma, cpuMean, cpuVar, 1e-5, out var cpuGG, out var cpuGB);
+        Gpu.LayerNorm(input, gamma, beta, 1e-5, out var gpuMean, out var gpuVar);
+        var gpuGradIn = Gpu.LayerNormBackward(gradOut, input, gamma, gpuMean, gpuVar, 1e-5, out var gpuGG, out var gpuGB);
+        // Sums over up to 2048 rows: float accumulation order differs between the CPU loop and the lane split.
+        float tol = 1e-4f * rows;
+        AssertTensorsClose(cpuGG, gpuGG, tol);
+        AssertTensorsClose(cpuGB, gpuGB, tol);
+        AssertTensorsClose(cpuGradIn, gpuGradIn, 1e-3f);
+    }
+
+    /// <summary>
+    /// The deterministic CUDA max-pool backward visits only the windows that contain each input cell. Overlapping
+    /// windows (kernel 3, stride 2) route several output gradients to one input cell, and a plain 2x2/2 pool and a
+    /// stride-1 pool cover the non-overlapping and densest cases; each must match the CPU scatter exactly.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(28, 2, 2, true)]
+    [InlineData(13, 3, 2, true)]
+    [InlineData(9, 3, 1, true)]
+    [InlineData(13, 3, 2, false)]
+    public void MaxPool2DBackward_WindowGeometries_GpuMatchesCpu(int size, int pool, int stride, bool deterministic)
+    {
+        SkipIfNoGpu();
+        bool prior = AiDotNetEngine.DeterministicMode;
+        AiDotNetEngine.SetDeterministicMode(deterministic);
+        try
+        {
+            AssertMaxPoolBackwardMatches(size, pool, stride);
+        }
+        finally
+        {
+            AiDotNetEngine.SetDeterministicMode(prior);
+        }
+    }
+
+    private void AssertMaxPoolBackwardMatches(int size, int pool, int stride)
+    {
+        var input = RandomTensor(new[] { 2, 3, size, size }, 400 + size);
+        var cpuOut = _cpu.MaxPool2DWithIndices(input, new[] { pool, pool }, new[] { stride, stride }, out var cpuIdx);
+        var gradOut = RandomTensor(cpuOut.Shape.ToArray(), 401);
+        var cpuGrad = _cpu.MaxPool2DBackward(gradOut, cpuIdx, input.Shape.ToArray(), new[] { pool, pool }, new[] { stride, stride });
+        Gpu.MaxPool2DWithIndices(input, new[] { pool, pool }, new[] { stride, stride }, out var gpuIdx);
+        var gpuGrad = Gpu.MaxPool2DBackward(gradOut, gpuIdx, input.Shape.ToArray(), new[] { pool, pool }, new[] { stride, stride });
+        AssertTensorsClose(cpuGrad, gpuGrad, 1e-5f);
+    }
+
+    /// <summary>
+    /// Softmax rows up to 1K wide run one warp per row on CUDA (wider rows a block per row), and the softmax backward
+    /// always runs one warp per row. Short rows, rows not a multiple of 32, a row count that leaves the last block
+    /// partly empty, the 1024 boundary and a vocabulary-sized row must all match the CPU, forward and backward.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(8192, 32)]
+    [InlineData(9, 7)]
+    [InlineData(13, 1024)]
+    [InlineData(3, 1025)]
+    [InlineData(2, 50257)]
+    public void Softmax_ForwardAndBackward_RowShapes_GpuMatchesCpu(int rows, int features)
+    {
+        SkipIfNoGpu();
+        var input = RandomTensor(new[] { rows, features }, 500 + features);
+        var gradOut = RandomTensor(new[] { rows, features }, 501);
+        var cpuOut = _cpu.Softmax(input, -1);
+        var gpuOut = Gpu.Softmax(input, -1);
+        AssertTensorsClose(cpuOut, gpuOut, 1e-5f);
+        var cpuGrad = _cpu.SoftmaxBackward(gradOut, cpuOut, -1);
+        var gpuGrad = Gpu.SoftmaxBackward(gradOut, cpuOut, -1);
+        AssertTensorsClose(cpuGrad, gpuGrad, 1e-4f);
+    }
+
+    /// <summary>
     /// The CUDA log-softmax kernel reduces each row with one warp: rows shorter than a warp, not a multiple of it,
     /// far longer than it (an LM vocabulary), and a row count that leaves the last block partly empty must all match
     /// the CPU, including a row whose entries span ~100 in log space (where log(softmax) underflows).

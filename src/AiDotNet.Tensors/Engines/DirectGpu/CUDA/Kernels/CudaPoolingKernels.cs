@@ -85,9 +85,16 @@ extern ""C"" __global__ __launch_bounds__(256) void maxpool2d_backward(
 // One thread per (b, c, ih, iw) input cell scans every output position in fixed
 // (oh, ow) order and accumulates gradients from output cells whose indices[outIdx]
 // points to this input cell.
+// Only the output windows that CONTAIN (ih, iw) can have chosen it as their max: window (oh, ow) covers input rows
+// oh*strideH - padH .. + kernelH - 1, so oh runs from ceil((ih + padH - kernelH + 1) / strideH) to
+// floor((ih + padH) / strideH). Scanning every output cell instead made this O(in x out) per plane (CNN 28x28 -> 14x14:
+// 784 x 196 compares per plane, 650 us of a 2 ms training step). The windows are visited in the same (oh, ow) order,
+// so the sum is bit-identical. The exception is input cell 0: a window whose values are all NaN or -inf records
+// index 0 even when it does not contain cell 0, so that one cell keeps the full scan.
 extern ""C"" __global__ __launch_bounds__(256) void maxpool2d_backward_deterministic(
     const float* __restrict__ gradOutput, const int* __restrict__ indices, float* __restrict__ gradInput,
-    int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth)
+    int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth,
+    int kernelH, int kernelW, int strideH, int strideW, int padH, int padW)
 {
     int iw = blockIdx.x * blockDim.x + threadIdx.x;
     int ih = blockIdx.y * blockDim.y + threadIdx.y;
@@ -96,10 +103,18 @@ extern ""C"" __global__ __launch_bounds__(256) void maxpool2d_backward_determini
     if (iw >= inWidth || ih >= inHeight || b >= batch) return;
 
     int targetMaxIdx = ih * inWidth + iw;
+    int ohLo = 0, ohHi = outHeight - 1, owLo = 0, owHi = outWidth - 1;
+    if (targetMaxIdx != 0 && kernelH > 0 && kernelW > 0 && strideH > 0 && strideW > 0) {
+        int th = ih + padH - kernelH + 1, tw = iw + padW - kernelW + 1;
+        ohLo = th <= 0 ? 0 : (th + strideH - 1) / strideH;
+        owLo = tw <= 0 ? 0 : (tw + strideW - 1) / strideW;
+        ohHi = min(outHeight - 1, (ih + padH) / strideH);
+        owHi = min(outWidth - 1, (iw + padW) / strideW);
+    }
     float sum = 0.0f;
     int outBase = (b * channels + c) * outHeight * outWidth;
-    for (int oh = 0; oh < outHeight; oh++) {
-        for (int ow = 0; ow < outWidth; ow++) {
+    for (int oh = ohLo; oh <= ohHi; oh++) {
+        for (int ow = owLo; ow <= owHi; ow++) {
             int outIdx = outBase + oh * outWidth + ow;
             if (indices[outIdx] == targetMaxIdx) {
                 sum += gradOutput[outIdx];
