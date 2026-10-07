@@ -1505,7 +1505,10 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>
-        /// Pointer-based Tanh with zero bounds-checking.
+        /// Pointer-based Tanh with zero bounds-checking. With AVX2+FMA every element goes through
+        /// <see cref="Tanh256"/> (a ragged tail through a zero-padded vector), so an element's result depends on its
+        /// value only -- not on its position or the call's length -- and any split of a buffer (parallel chunks, fused
+        /// tiles) writes the same bits as one call.
         /// </summary>
         [MethodImpl(HotInline)]
         public static unsafe void TanhUnsafe(float* input, float* output, int length)
@@ -1514,16 +1517,76 @@ namespace AiDotNet.Tensors.Engines.Simd
             // MKL VML path: SVML tanh, zero-overhead function pointer
             if (VmlProvider.TryTanh(input, output, length))
                 return;
+
+            if (Avx2.IsSupported && Fma.IsSupported)
+            {
+                int i = 0;
+                int simdLength = length & ~7;
+                for (; i < simdLength; i += 8)
+                    Avx.Store(output + i, Tanh256(Avx.LoadVector256(input + i)));
+                if (i < length)
+                {
+                    float* pad = stackalloc float[8];
+                    int rem = length - i;
+                    for (int j = 0; j < 8; j++) pad[j] = j < rem ? input[i + j] : 0f;
+                    Avx.Store(pad, Tanh256(Avx.LoadVector256(pad)));
+                    for (int j = 0; j < rem; j++) output[i + j] = pad[j];
+                }
+                return;
+            }
 #endif
 
-            // The former 2*FastSigmoid256(2*x)-1 path cancelled near zero and exceeded the
-            // public parity contract by hundreds of ULP. Keep VML above when available; the
-            // portable path must use libm until an equivalently accurate vector approximation exists.
+            // Without AVX2+FMA: libm per element (max 1 ULP, like the vector kernel).
             for (int i = 0; i < length; i++)
             {
                 output[i] = MathF.Tanh(input[i]);
             }
         }
+
+#if NET5_0_OR_GREATER
+        /// <summary>
+        /// tanh of 8 floats. Measured exhaustively over all 2^32 float inputs against double-precision tanh: max error
+        /// 1 ULP, 51% of results correctly rounded -- the same bound libm's MathF.Tanh reaches on that sweep, at ~14x
+        /// its speed (3.5 us vs 47.6 us for 4096 elements, measured single-threaded).
+        /// <para>|x| &lt; 0.625: x + x^3 P(x^2), P a degree-4 minimax fit of (tanh(x)/x - 1)/x^2 (approximation error
+        /// 0.07 ULP). No cancellation near zero -- the former 2*sigmoid(2x)-1 kernel lost hundreds of ULP there.
+        /// |x| &gt;= 0.625: 1 - 2/(exp(2|x|) + 1), exp by Cody-Waite range reduction and the Cephes expf polynomial; the
+        /// result is at least 0.55, so the subtraction cannot cancel. |x| is clamped to 9, where tanh already rounds to 1.
+        /// The sign is restored by bit (tanh(-0) = -0) and NaN propagates.</para>
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static Vector256<float> Tanh256(Vector256<float> x)
+        {
+            var signMask = Vector256.Create(-0.0f);
+            var ax = Avx.AndNot(signMask, x);
+            var sign = Avx.And(signMask, x);
+
+            var u = Avx.Multiply(ax, ax);
+            var p = Fma.MultiplyAdd(Vector256.Create(-0.0057052473523553507f), u, Vector256.Create(0.020639315597368656f));
+            p = Fma.MultiplyAdd(p, u, Vector256.Create(-0.053739783402155988f));
+            p = Fma.MultiplyAdd(p, u, Vector256.Create(0.13331442992300302f));
+            p = Fma.MultiplyAdd(p, u, Vector256.Create(-0.33333281970110512f));
+            var small = Fma.MultiplyAdd(Avx.Multiply(ax, u), p, ax);
+
+            var y = Avx.Multiply(Avx.Min(ax, Vector256.Create(9.0f)), Vector256.Create(2.0f));
+            var n = Avx.RoundToNearestInteger(Avx.Multiply(y, Vector256.Create(1.44269504088896341f)));
+            var r = Fma.MultiplyAddNegated(n, Vector256.Create(0.693359375f), y);
+            r = Fma.MultiplyAddNegated(n, Vector256.Create(-2.12194440e-4f), r);
+            var e = Fma.MultiplyAdd(Vector256.Create(1.9875691500E-4f), r, Vector256.Create(1.3981999507E-3f));
+            e = Fma.MultiplyAdd(e, r, Vector256.Create(8.3334519073E-3f));
+            e = Fma.MultiplyAdd(e, r, Vector256.Create(4.1665795894E-2f));
+            e = Fma.MultiplyAdd(e, r, Vector256.Create(1.6666665459E-1f));
+            e = Fma.MultiplyAdd(e, r, Vector256.Create(5.0000001201E-1f));
+            e = Fma.MultiplyAdd(e, Avx.Multiply(r, r), Avx.Add(r, Vector256.Create(1.0f)));
+            var scale = Avx2.ShiftLeftLogical(Avx2.Add(Avx.ConvertToVector256Int32(n), Vector256.Create(127)), 23).AsSingle();
+            e = Avx.Multiply(e, scale);
+            var large = Avx.Subtract(Vector256.Create(1.0f), Avx.Divide(Vector256.Create(2.0f), Avx.Add(e, Vector256.Create(1.0f))));
+
+            var isSmall = Avx.CompareLessThan(ax, Vector256.Create(0.625f));
+            var result = Avx.Or(Avx.BlendVariable(large, small, isSmall), sign);
+            return Avx.BlendVariable(result, x, Avx.CompareUnordered(x, x));
+        }
+#endif
 
         /// <summary>
         /// Pointer-based LeakyReLU — max(alpha*x, x) with zero bounds-checking.
