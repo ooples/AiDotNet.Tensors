@@ -9833,6 +9833,42 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             };
         }
 
+        // LogSoftmax backward (float, rank 2, softmax over the last axis): dX = dY - exp(Y) * rowsum(dY). The generic
+        // BackwardFunctions path ran it as five engine ops (exp, axis reduce, broadcast, multiply, subtract), each
+        // renting its result and dispatching through the broadcast machinery, then an AccumulateGrad: ~120 us per step
+        // for a 64x10 classifier head whose arithmetic is ~1 us. This computes the same values with the same
+        // arithmetic -- exp through the engine's own TensorExpInto kernel, each row sum in order from zero, then a
+        // float multiply and a float subtract per element -- straight into the input's gradient buffer.
+        if (typeof(T) == typeof(float) && step.OpType == OpType.LogSoftmax && step.Inputs.Length == 1
+            && step.Inputs[0].Rank == 2 && step.Inputs[0].IsContiguous && step.OutputBuffer.IsContiguous
+            && (step.SavedState is not { Length: > 0 } || (step.SavedState[0] is int lsmAxis && (lsmAxis == 1 || lsmAxis == -1)))
+            && engine is CpuEngine lsmCpu && !engine.SupportsGpu)
+        {
+            var lsmIn = step.Inputs[0];
+            var lsmOut = step.OutputBuffer;
+            if ((consumerCount.TryGetValue(lsmIn, out int lsmUses) && lsmUses > 1)
+                || !gradMap.TryGetValue(lsmOut, out var lsmGradOut) || !gradMap.TryGetValue(lsmIn, out var lsmGradIn)
+                || lsmOut.Length != lsmIn.Length)
+                return null;
+            int lsmRows = lsmIn._shape[0], lsmCols = lsmIn._shape[1];
+            var softmaxScratch = new Tensor<T>(lsmIn._shape);
+            return eng =>
+            {
+                lsmCpu.TensorExpInto(softmaxScratch, lsmOut);
+                var s = TryGetLiveFloatBacking(softmaxScratch) ?? throw new InvalidOperationException("LogSoftmax backward: the softmax scratch has no live host buffer.");
+                var dY = TryGetLiveFloatBacking(lsmGradOut) ?? throw new InvalidOperationException("LogSoftmax backward: the output gradient has no live host buffer.");
+                var dX = TryGetLiveFloatBacking(lsmGradIn) ?? throw new InvalidOperationException("LogSoftmax backward: the input gradient has no live host buffer.");
+                for (int r = 0; r < lsmRows; r++)
+                {
+                    int o = r * lsmCols;
+                    float rowSum = 0f;
+                    for (int c = 0; c < lsmCols; c++) rowSum += dY[o + c];
+                    for (int c = 0; c < lsmCols; c++) dX[o + c] = dY[o + c] - s[o + c] * rowSum;
+                }
+                lsmIn.Grad = lsmGradIn;
+            };
+        }
+
         // Issue #338 Phase G.3: Specialized ReduceSum backward for the
         // "sum-all-to-scalar" pattern (the loss reduce at the end of the
         // forward chain). Generic path does ExpandDims + BroadcastGradToShape
