@@ -92,6 +92,43 @@ public class MediumMGemmAndRowBlockConvTests
         }
     }
 
+    [SkippableTheory]
+    [InlineData(512, 64, 512)]     // attention Q·Kᵀ
+    [InlineData(256, 256, 256)]
+    [InlineData(1024, 64, 192)]
+    [InlineData(300, 100, 520)]    // ragged M, K; N tail
+    public void Sgemm_TransposedB_ColumnPanelRoute_MatchesReference(int m, int k, int n)
+    {
+        Skip.IfNot(System.Runtime.Intrinsics.X86.Avx2.IsSupported && System.Runtime.Intrinsics.X86.Fma.IsSupported, "AVX2/FMA");
+        int original = CpuParallelSettings.MaxDegreeOfParallelism;
+        try
+        {
+            CpuParallelSettings.MaxDegreeOfParallelism = Math.Max(4, Environment.ProcessorCount);
+            Assert.True(SimdGemm.PrefersParallelN(m, k, n), "shape must take the column-panel route");
+            var rnd = new Random(m + 13 * k + 7 * n);
+            var a = Rand(rnd, m * k);
+            var bStoredNk = Rand(rnd, n * k);   // B stored [n x k]; C = A·Bᵀ
+            var bKn = new float[k * n];
+            for (int r = 0; r < n; r++) for (int col = 0; col < k; col++) bKn[col * n + r] = bStoredNk[r * k + col];
+            var expected = Reference(a, bKn, m, k, n);
+
+            var c = new float[m * n];
+            for (int i = 0; i < c.Length; i++) c[i] = float.NaN;
+            SimdGemm.Sgemm(a, k, false, bStoredNk, k, true, c, m, k, n);
+            AssertClose(expected, c, k);
+
+            // Engine entry points that route here.
+            var engine = new CpuEngine();
+            var tA = new Tensor<float>(a, new[] { m, k });
+            AssertClose(expected, engine.TensorMatMulTransposed(tA, new Tensor<float>(bStoredNk, new[] { n, k })).ToArray(), k);
+            AssertClose(expected, engine.TensorMatMul(tA, new Tensor<float>(bKn, new[] { k, n })).ToArray(), k);
+        }
+        finally
+        {
+            CpuParallelSettings.MaxDegreeOfParallelism = original;
+        }
+    }
+
     private static float[] Rand(Random rnd, int n)
     {
         var a = new float[n];

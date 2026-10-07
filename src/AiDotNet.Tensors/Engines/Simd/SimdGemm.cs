@@ -1455,6 +1455,35 @@ internal static partial class SimdGemm
         }
 
 #if !NET471
+        // Column-panel direct GEMM where it wins (see PrefersParallelN): ahead of the JIT small-K,
+        // OpenBLAS and M-sliced routes below, which it beats at every shape it accepts. The store
+        // kernels overwrite C, so no Clear is needed.
+        if (!transA && !transB && lda == k && ldb == n && PrefersParallelN(m, k, n))
+        {
+            SgemmDirectParallelN(a, lda, b, ldb, c, m, k, n, clearedOutput: true);
+            return;
+        }
+
+        // A·Bᵀ with B stored [n x k] (attention scores, and x·Wᵀ for weights stored [out x in]):
+        // transpose B once (SIMD, recycled scratch) and take the column-panel path. The transB direct
+        // route re-reads B column-strided for every 6-row block: Q[512x64]·Kᵀ took 291 µs against
+        // 19 µs (transpose) + 59 µs here.
+        if (!transA && transB && lda == k && ldb == k && PrefersParallelN(m, k, n)
+            && (long)k * n * sizeof(float) <= ParallelNMaxABytes)
+        {
+            float[] bt = Helpers.ThreadLocalTensorCache<float>.RentOrAllocateExact(k * n);
+            try
+            {
+                SimdTranspose.Transpose(b.Slice(0, n * k), bt, n, k);
+                SgemmDirectParallelN(a, lda, bt, n, c, m, k, n, clearedOutput: true);
+            }
+            finally
+            {
+                Helpers.ThreadLocalTensorCache<float>.TryReturn(bt);
+            }
+            return;
+        }
+
         // Our JIT'd AVX2 kernel first (opt-in): no transpose, row-major contiguous
         // (lda==k, ldb==n). Beats managed + oneDNN on small-K/N, on our own pool.
         if (_jitGemm && !transA && !transB && lda == k && ldb == n
@@ -1737,9 +1766,8 @@ internal static partial class SimdGemm
             return;
         }
 #if NET5_0_OR_GREATER
-        // Medium-M (between the N-parallel small-M kernel and the M-parallel paths) or N much wider
-        // than M: split N. (For n >= 16m an M split yields at most m/6 row blocks, each streaming all
-        // of B; e.g. a [64x144]·[144x4096] conv GEMM ran on 11 threads at ~150 GFLOP/s.)
+        // Column-panel split where it wins (see PrefersParallelN). Here for SgemmAdd (accumulate) and
+        // the strided entry points; Sgemm checks it before its own fast paths.
         // Every path below slices M (SgemmDirectParallelM needs m >= 64) and SgemmNParallelSmallM
         // takes only m <= 8, so 9 <= m < 64 ran on one thread however large n was — the core GEMM of
         // every conv layer with 9-63 output channels. A [32x144]·[144x4096] GEMM (1x16x64x64 conv,
@@ -2265,19 +2293,29 @@ internal static partial class SimdGemm
 
     /// <summary>
     /// True when a row-major, untransposed <c>[m x k]·[k x n]</c> GEMM takes
-    /// <see cref="SgemmDirectParallelN"/>: medium M (9..63), or N at least 16x M, with K small enough
-    /// for the direct kernel and enough work to parallelize. Callers with their own GEMM routing (the
-    /// im2col conv) use it to pick this path where it wins: measured 2-3x over the BLAS route for
-    /// [32x144]·[144x4096] and [64x144]·[144x4096].
+    /// <see cref="SgemmDirectParallelN"/>: K small enough for the direct kernel, A small enough to
+    /// stream once per column panel (each worker keeps its B panel in L1), and enough work to
+    /// parallelize. Callers with their own GEMM routing (the im2col conv) use it too.
     /// </summary>
+    /// <remarks>
+    /// On a 128-thread host, against the routes it now precedes (M-sliced direct, JIT small-K panel,
+    /// OpenBLAS on our pool), all in µs: [512x64]·[64x512] 168 -> 59, [256x256]·[256x256] 82 -> 42,
+    /// [2048x64]·[64x256] 352 -> 78, [128x512]·[512x512] 194 -> 49, [4096x64]·[64x256] 686 -> 349,
+    /// [1024x64]·[64x128] 80 -> 78, [32x144]·[144x4096] 611 -> 166. M-sliced routes re-read all of B
+    /// for every 6-row block.
+    /// </remarks>
     /// <param name="requireAlignedN">The direct-GEMM gate keeps N a multiple of 8; callers that split N
     /// into their own panels (the row-block conv uses masked edge kernels on each) pass false.</param>
+    /// <summary>Largest A (bytes) re-streamed per column panel by <see cref="SgemmDirectParallelN"/>.</summary>
+    private const long ParallelNMaxABytes = 4L * 1024 * 1024;
+
     internal static bool PrefersParallelN(int m, int k, int n, bool requireAlignedN = true)
     {
 #if NET5_0_OR_GREATER
         return Avx2.IsSupported && Fma.IsSupported
             && AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism > 1   // one un-packed panel over all of N streams B from L3
-            && m > NParallelSmallMMaxM && (m < ParallelDirectMinM || (long)n >= 16L * m)
+            && m > NParallelSmallMMaxM
+            && (long)m * k * sizeof(float) <= ParallelNMaxABytes
             && (!requireAlignedN || n % 8 == 0) && n >= 4 * Nr
             && k <= SmallMatmulKThreshold
             && (long)m * k * n >= ParallelDirectWorkThreshold;

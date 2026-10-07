@@ -13420,6 +13420,17 @@ public partial class CpuEngine : ITensorLevelEngine
             // Below the floor the parallel-dispatch overhead dominates the tiny per-row work, so the
             // legacy single-pass kernel stays faster — keep it for m < BlasManagedParallelMinM.
             const int BlasManagedParallelMinM = 64;
+#if NET5_0_OR_GREATER
+            // Column-panel direct GEMM where it wins (SimdGemm.PrefersParallelN; here m rows, n the inner
+            // dimension, p the output columns): [256x256]·[256x256] 157 µs via the packed path below
+            // against 42 µs, libtorch 85 µs.
+            if (Simd.SimdGemm.PrefersParallelN(m, n, p))
+            {
+                Simd.SimdGemm.Sgemm(aArrF.Slice(0, m * n), n, false, bArrF.Slice(0, n * p), p, false,
+                                    rArrF.AsSpan(0, m * p), m, n, p);
+                return result;
+            }
+#endif
             if (m >= BlasManagedParallelMinM)
             {
                 Engines.BlasManaged.BlasManaged.Gemm<float>(
