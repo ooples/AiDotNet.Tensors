@@ -10070,9 +10070,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                     // Either call failed — fall through to FP32 path.
                 }
 
-                // Small-K panel route first (SimdGemm.TryGemmSmallJit): dA = dC·Bᵀ as a no-transpose product over a
-                // transposed copy of the small B (QKV dX: ~80 vs ~230 µs through TryGemmEx). dB = Aᵀ·dC is not routed
-                // there yet (TryGemmSmallJit declines a transposed A), so it keeps TryGemmEx. Each falls back on its own.
+                // Small-K panel routes first (SimdGemm.TryGemmSmallJit): dA = dC·Bᵀ as a no-transpose product over a
+                // transposed copy of the small B, dB = Aᵀ·dC as a split-k reduction. Each falls back on its own.
                 bool dAJit = dcOff == 0 && bOff == 0 && destAOff == 0
                     && SimdGemm.TryGemmSmallJit(cachedDC, N, false, cachedB!, N, true, cachedDestA!, M, N, K);
                 bool dBJit = !dWPeeled && aOff == 0 && dcOff == 0 && destBOff == 0

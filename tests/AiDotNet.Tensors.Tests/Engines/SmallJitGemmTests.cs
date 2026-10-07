@@ -20,6 +20,8 @@ public class SmallJitGemmTests
         { 2048, 64, 64, false, false },
         { 2048, 128, 64, false, true },     // dX = dY[2048,128] . W[64,128]^T (over the work ceiling, under the traffic one)
         { 2048, 64, 128, false, false },    // the FFN's first GEMM: admitted by the B-traffic test
+        { 64, 2048, 128, true, false },     // dW = X^T[64,2048] . dY[2048,128]: split-k, 16 chunks, m padded to 66
+        { 70, 1900, 50, true, false },      // ragged last chunk; m and n off the panel grid
         { 2000, 96, 40, false, true },      // m and n off the 6x16 panel grid: managed edge strips
     };
 

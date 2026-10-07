@@ -244,11 +244,13 @@ internal static partial class SimdGemm
 
     /// <summary>
     /// C[m,n] = op(A)·op(B) (overwrite) through the small-K asm panel kernel, for the layouts of a linear layer's
-    /// forward and input gradient. (The weight gradient, Aᵀ·B with a deep reduction, is not routed here yet.) Returns false (nothing written) when the shape is outside the band where this wins:
+    /// forward and its two gradients. Returns false (nothing written) when the shape is outside the band where this wins:
     /// <list type="bullet">
     /// <item>no transpose: <see cref="TryJitSmallK"/>;</item>
     /// <item>B transposed (dX = dY·Wᵀ): Wᵀ is materialized into pooled scratch (it is the small operand) and the
     /// product runs as no-transpose. [2048,128]x[128,64]: 79-83 µs vs 222-241 µs through BlasProvider (3990X).</item>
+    /// <item>A transposed (dW = Xᵀ·dY, deep k): split-k over fixed row chunks, each into its own partial, summed in
+    /// chunk order. [64,2048]x[2048,128]: 96-168 µs vs 255-260 µs through BlasProvider (PyTorch 87).</item>
     /// </list>
     /// <paramref name="lda"/>/<paramref name="ldb"/> are the row strides of A and B as stored.
     /// </summary>
@@ -279,6 +281,57 @@ internal static partial class SimdGemm
             return true;
         }
 
+        if (transA && !transB && s_splitKTransA)
+        {
+            // dW = Xᵀ·dY: A stored [k, m] with k the deep reduction (batch rows), C [m, n] small. Split k into fixed
+            // chunks; each transposes its slice of A into a [mPad, rows] scratch (m padded to the panel's 6 rows with
+            // zero rows, so no row falls to the managed edge code) and runs the panel kernel serially into its own
+            // partial; partials are summed in chunk order (deterministic for any thread count).
+            if (lda != m || ldb != n || m < 6 || n < 16 || m > SplitKMaxOutput || n > SplitKMaxOutput
+                || (long)m * n * k < JitSmallKMinWork) return false;
+            int mPad = (m + 5) / 6 * 6;
+            int chunkRows = Math.Min(JitSmallKMaxK, k);
+            int chunks = (k + chunkRows - 1) / chunkRows;
+            if (chunks < 2) return false;
+            var pool = System.Buffers.ArrayPool<float>.Shared;
+            var partial = pool.Rent(chunks * mPad * n);
+            try
+            {
+                Helpers.CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)m * n * k, chunk =>
+                {
+                    int r0 = chunk * chunkRows, rows = Math.Min(chunkRows, k - r0);
+                    var at = pool.Rent(mPad * rows);
+                    try
+                    {
+                        for (int r = 0; r < rows; r++)
+                        {
+                            int src = (r0 + r) * lda;
+                            for (int f = 0; f < m; f++) at[f * rows + r] = a[src + f];
+                        }
+                        if (mPad > m) Array.Clear(at, m * rows, (mPad - m) * rows);
+                        JitGemmAvx2.RunJit(at.AsSpan(0, mPad * rows), b.AsSpan(r0 * n, rows * n),
+                            partial.AsSpan(chunk * mPad * n, mPad * n), mPad, n, rows, forceParallel: false);
+                    }
+                    finally { pool.Return(at); }
+                }, deterministicSafe: true);
+                // c[i, :] = sum over chunks of partial[chunk][i, :], rows split across the pool.
+                Helpers.CpuParallelSettings.ParallelForOrSerial(0, m, (long)m * n * chunks, i =>
+                {
+                    var dst = c.AsSpan(i * n, n);
+                    partial.AsSpan(i * n, n).CopyTo(dst);
+                    for (int ch = 1; ch < chunks; ch++)
+                    {
+                        var src = partial.AsSpan((ch * mPad + i) * n, n);
+                        int w = System.Numerics.Vector<float>.Count, j = 0;
+                        for (; j <= n - w; j += w)
+                            (new System.Numerics.Vector<float>(dst.Slice(j)) + new System.Numerics.Vector<float>(src.Slice(j))).CopyTo(dst.Slice(j));
+                        for (; j < n; j++) dst[j] += src[j];
+                    }
+                }, deterministicSafe: true);
+            }
+            finally { pool.Return(partial); }
+            return true;
+        }
 #endif
         return false;
     }
@@ -299,6 +352,12 @@ internal static partial class SimdGemm
     internal static readonly long JitSmallKMaxBTrafficBytes =
         long.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_JIT_SMALLK_MAXBTRAFFIC"), out var jbt) && jbt > 0
             ? jbt : 16L * 1024 * 1024;
+
+    // Split-k weight-gradient route of TryGemmSmallJit (AIDOTNET_JIT_SPLITK=0 disables) and its output-size ceiling
+    // per dimension (each chunk's partial is mPad x n).
+    private static readonly bool s_splitKTransA =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_JIT_SPLITK") != "0";
+    private const int SplitKMaxOutput = 512;
 
     // Transposed-B operand ceiling for TryGemmSmallJit (elements): the transpose is a per-call copy of the small side.
     private const long SmallJitMaxTransposeElements = 64 * 1024;
