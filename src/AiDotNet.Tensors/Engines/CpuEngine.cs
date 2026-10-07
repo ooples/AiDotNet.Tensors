@@ -31923,9 +31923,14 @@ public partial class CpuEngine : ITensorLevelEngine
         var sourceData = source.GetFlattenedData();
         var outputData = new T[outputShape.Aggregate(1, (a, b) => a * b)];
 
-        // Initialize to zero
-        for (int i = 0; i < outputData.Length; i++)
-            outputData[i] = numOps.Zero;
+        // A fresh array is already zero when the type's zero is default(T) (every numeric T). The explicit loop is
+        // only for types where it is not; for an embedding-table gradient ([vocab, dim], 25M elements for a 49K x 512
+        // tied table) it was a serial interface-call pass over the whole output.
+        if (!EqualityComparer<T>.Default.Equals(numOps.Zero, default!))
+        {
+            for (int i = 0; i < outputData.Length; i++)
+                outputData[i] = numOps.Zero;
+        }
 
         // Calculate strides
         int innerSize = 1;
@@ -31945,6 +31950,14 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 int targetIdx = indicesData[d % indicesData.Length];
                 if (targetIdx < 0 || targetIdx >= outDimSize) continue;
+
+                if (innerSize >= 8)
+                {
+                    // Whole contiguous row: one SIMD span add (rows sharing a target accumulate in index order, as before).
+                    var dst = new Span<T>(outputData, outer * outDimSize * innerSize + targetIdx * innerSize, innerSize);
+                    numOps.Add(dst, new ReadOnlySpan<T>(sourceData, outer * srcDimSize * innerSize + d * innerSize, innerSize), dst);
+                    continue;
+                }
 
                 for (int inner = 0; inner < innerSize; inner++)
                 {
