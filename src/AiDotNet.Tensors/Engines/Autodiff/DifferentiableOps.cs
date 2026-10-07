@@ -719,6 +719,34 @@ internal static class DifferentiableOps
         return true;
     }
 
+    /// <summary>
+    /// For a fused backward that produces an input's whole gradient: the existing host accumulator it may write straight
+    /// into, so the gradient is never staged in a temporary and copied. <paramref name="overwrite"/> is true when this is
+    /// the buffer's first contribution of the step under a <see cref="GradWriteGeneration"/> (the buffer was not zeroed,
+    /// so the caller must store, not add); otherwise the caller adds. Returns null when the direct route does not apply
+    /// -- no existing contiguous host accumulator yet (the eager tape's first contribution), a GPU engine, or a
+    /// create-graph backward -- and the caller passes a contribution tensor to <see cref="AccumulateGrad{T}"/> instead.
+    /// A caller that writes the returned buffer must call <see cref="TensorBase{T}.IncrementVersion"/> afterwards.
+    /// </summary>
+    internal static Tensor<T>? TryGetDirectGradTarget<T>(
+        Dictionary<Tensor<T>, Tensor<T>> grads, Tensor<T> tensor, IEngine engine, out bool overwrite)
+    {
+        overwrite = false;
+        if (_isBackwardCreateGraph || engine.SupportsGpu || engine is not CpuEngine) return null;
+        int idx = tensor._gradIndex;
+        bool indexed = idx >= 0 && _indexedGrads != null && idx < _indexedGrads.Length;
+        Tensor<T>? existing = indexed
+            ? (Tensor<T>?)_indexedGrads![idx]
+            : (grads.TryGetValue(tensor, out var found) ? found : null);
+        if (existing is null || !existing.IsContiguous || existing.HasPendingGpuData
+            || existing.Length != tensor.Length) return null;
+        overwrite = ClaimFirstWrite(existing);
+        if (indexed) _indexedGrads![idx] = existing;
+        grads[tensor] = existing;
+        tensor.Grad = existing;
+        return existing;
+    }
+
     internal static void AccumulateGrad<T>(
         Dictionary<Tensor<T>, Tensor<T>> grads,
         Tensor<T> tensor,
