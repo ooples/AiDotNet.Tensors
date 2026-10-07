@@ -68,6 +68,7 @@ internal static class OpRegistry
 
         // Attention/Embedding
         "Embedding", "Dropout",
+        "MultiHeadAttentionCore",   // fused kernel with its own backward on host float; GPU/other T compose recorded ops
         // Interleaved RoPE: orthogonal rotation, records with ApplyRoPEInterleavedBackward (inverse rotation).
         "ApplyRoPEInterleaved",
         "GridSample", "Unfold", "Fold", "ForwardSplat",

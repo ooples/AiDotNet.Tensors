@@ -617,6 +617,8 @@ public sealed class GpuCpuAutoDifferentialTests : IClassFixture<GpuCpuAutoDiffer
     {
         // Class-index gather (CE/NLL core): GPU-vs-CPU forward + gradient parity and residency in ClassGatherTests.
         "TensorGatherClassValues(Tensor<T>,Tensor<T>)",
+        // Head-interleaved attention core (composed on the GPU): MultiHeadAttentionCoreGpuTests, forward + gradients.
+        "MultiHeadAttentionCore(Tensor<T>,Tensor<T>,Tensor<T>,Int32,Nullable<Double>,Boolean)",
         // Deformable / depthwise / locally-connected conv, 3D / transposed fused conv, FlashAttention
         // backward — GPU-vs-CPU parity in GpuConvKernelCoverageTests (and MaxPool2DBackward in
         // MaxPool2DBackwardGpuCorrectnessTests). These were hidden from this gate by a `public new`
