@@ -643,7 +643,7 @@ public static partial class BlasManaged
         // on PackBoth). With the fix, measured 1.3-2.5x over PackBoth through the engine. A clean GotoBLAS
         // macro-kernel over per-thread L2-resident A/B tiles. Deterministic by construction (each C element
         // computed by one thread in fixed K order ⇒ thread-count-independent, Deterministic/DisableAutotune-
-        // contract safe). C is pre-zeroed above ⇒ zero-then-accumulate yields C := A·B; handles its own M/N
+        // contract safe). Write-first: the first K-panel overwrites C, so no pre-clear is needed; handles its own M/N
         // tails. Gated to float, no trans, no pre-pack, no epilogue, large-shape regime. (The CCX-aware
         // pinned-pool variant beats this ~2x at the kernel level but its win is masked by per-call engine
         // overhead — deferred until that overhead is cut; prototype in tests/CcxGemmBench.)
@@ -657,9 +657,12 @@ public static partial class BlasManaged
             && (long)m * n * k >= GotoGemmFp32.ParallelMinWork && GotoGemmFp32.BeatsPackBoth(m, n, k)
             && GotoGemmFp32.IsAvailable)
         {
-            // GotoGemm accumulates into a pre-zeroed C; under beta=0 the global clear was
-            // skipped, so zero the tile here (this path is not converted to write-first).
-            if (betaZero) ClearOutputTile(c, ldc, m, n);
+            // The fp32 GotoGemm routes (per-tile RunTile, CCX RunTilePackedB / RunMacroPanelStep) are write-first:
+            // the first K-panel stores C through the overwrite kernel and zeroes its scalar tail strips, so a
+            // beta=0 pre-clear of C was a redundant full pass over the output (a [1024, 49152] logits product
+            // spent ~2% of a CPU LM step in it). Still cleared when no panel runs (k <= 0) and before the opt-in
+            // bf16 route, which accumulates.
+            if (betaZero && k <= 0) ClearOutputTile(c, ldc, m, n);
             var gepi = options.Epilogue;
             {
                 var gfa = MemoryMarshal.Cast<T, float>(a);
@@ -677,6 +680,7 @@ public static partial class BlasManaged
                         // changing ⇒ never default; falls through to exact fp32 for smaller/wide-N shapes.
                         if (s_gemmBf16 && GotoGemmFp32.ShouldUseBf16(m, n, k))
                         {
+                            if (betaZero) ClearOutputTile(c, ldc, m, n);
                             GotoGemmFp32.RunParallelBf16(pa, lda, pb, ldb, pc, ldc, m, n, k, gmc, gnc, gkc);
                         }
                         // CCX-aware pinned pool for large BALANCED shapes (per-CCX L3-resident B-strips →

@@ -196,11 +196,31 @@ public sealed class TensorArena : IDisposable
             // anyway — we just skip the allocation + GC. Without this, the
             // cross-arena reuse corrupts those consumers (caught by GroupNorm
             // correctness tests).
-            Array.Clear(arr, 0, arr.Length);
+            ClearLarge(arr);
             HostSync.ClearReleased(arr);   // new owner: no inherited release mark
             return arr;
         }
         return null;
+    }
+
+    // Elements per parallel chunk when clearing a recycled buffer (1 MiB of float).
+    private const int ParallelClearChunk = 256 * 1024;
+
+    /// <summary>
+    /// Zeroes a recycled buffer. Step-sized buffers (a [tokens, vocab] logits tensor is ~200 MB) were cleared with
+    /// one serial memset per rent -- ~10% of a CPU LM training step -- so buffers spanning several chunks are cleared
+    /// in parallel fixed chunks. Same result, every element zero.
+    /// </summary>
+    private static void ClearLarge(Array arr)
+    {
+        int length = arr.Length;
+        int chunks = (length + ParallelClearChunk - 1) / ParallelClearChunk;
+        if (chunks < 4) { Array.Clear(arr, 0, length); return; }
+        CpuParallelSettings.ParallelForOrSerial(0, chunks, length, c =>
+        {
+            int start = c * ParallelClearChunk;
+            Array.Clear(arr, start, Math.Min(ParallelClearChunk, length - start));
+        }, deterministicSafe: true);
     }
 
     private static void ReturnPersistent(Type type, int elementCount, Array arr)
