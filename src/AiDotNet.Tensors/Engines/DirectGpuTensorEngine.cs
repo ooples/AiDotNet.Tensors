@@ -7567,9 +7567,27 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // RecordUnary / RecordBinary calls and causing IEngine-typed callers to
     // skip the tape entirely.
 
+    /// <summary>
+    /// True when a scalar reduction of <paramref name="tensor"/> should run on the device: its current
+    /// value is there and the host copy is not authoritative (device-tagged or awaiting a deferred
+    /// download, updated in place by an on-device optimizer, or an FP16-resident activation).
+    /// </summary>
+    /// <remarks>
+    /// Reductions run where the data lives. Uploading a host tensor to reduce it to one number costs a
+    /// transfer plus a synchronize (about 80 µs for 1,000 elements, against well under 1 µs on the CPU)
+    /// and gains nothing. <see cref="double"/> reductions always take the CPU path so they accumulate in
+    /// fp64: the backend reduce kernels are fp32-only, and a sum of 100K doubles in fp32 loses about
+    /// half its significant digits.
+    /// </remarks>
+    private bool ShouldReduceOnDevice<T>(Tensor<T> tensor)
+    {
+        if (typeof(T) == typeof(double)) return false;
+        return tensor.HasPendingGpuData || IsDeviceAuthoritative(tensor) || IsFp16Resident(tensor);
+    }
+
     T IEngine.TensorSum<T>(Tensor<T> tensor)
     {
-        if (!TryGetBackend(out var backend))
+        if (!ShouldReduceOnDevice(tensor) || !TryGetBackend(out var backend))
             return base.TensorSum(tensor);
 
         using var bufferA = GetOrAllocateBuffer(backend, tensor);
@@ -7580,7 +7598,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     T IEngine.TensorMaxValue<T>(Tensor<T> tensor)
     {
-        if (!TryGetBackend(out var backend))
+        if (!ShouldReduceOnDevice(tensor) || !TryGetBackend(out var backend))
             return base.TensorMaxValue(tensor);
 
         using var bufferA = GetOrAllocateBuffer(backend, tensor);
@@ -7591,7 +7609,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     T IEngine.TensorMinValue<T>(Tensor<T> tensor)
     {
-        if (!TryGetBackend(out var backend))
+        if (!ShouldReduceOnDevice(tensor) || !TryGetBackend(out var backend))
             return base.TensorMinValue(tensor);
 
         using var bufferA = GetOrAllocateBuffer(backend, tensor);
@@ -25402,7 +25420,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // backend implements; only the scalar comes back. It used the fused ReduceSumOfSquares through
         // IGpuBatchExecution, which only Vulkan implements, so on CUDA/OpenCL/HIP every call took the CPU base and
         // downloaded the whole tensor (e.g. every gradient, every step, in global-norm clipping).
-        if (typeof(T) == typeof(float) && tensor.Length > 0 && TryGetBackend(out var backend))
+        if (typeof(T) == typeof(float) && tensor.Length > 0 && ShouldReduceOnDevice(tensor) && TryGetBackend(out var backend))
         {
             try
             {
@@ -26704,7 +26722,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
     T IEngine.TensorMean<T>(Tensor<T> input)
     {
-        if (TryGetBackend(out var b))
+        if (ShouldReduceOnDevice(input) && TryGetBackend(out var b))
         {
             try
             {

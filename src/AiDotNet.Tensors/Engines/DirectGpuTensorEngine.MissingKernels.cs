@@ -3686,7 +3686,7 @@ public partial class DirectGpuTensorEngine
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (input.Length == 0) throw new ArgumentException("NanMedian requires a non-empty tensor");
-        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend))
+        if (typeof(T) != typeof(float) || !ShouldReduceOnDevice(input) || !TryGetBackend(out var backend))
             return base.TensorNanMedian(input);
         try
         {
@@ -4315,7 +4315,7 @@ public partial class DirectGpuTensorEngine
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
         if (input.Length == 0) throw new ArgumentException("Median requires a non-empty tensor");
-        if (typeof(T) != typeof(float) || !TryGetBackend(out var backend))
+        if (typeof(T) != typeof(float) || !ShouldReduceOnDevice(input) || !TryGetBackend(out var backend))
             return base.TensorMedian(input);
         try
         {
@@ -7619,7 +7619,7 @@ public partial class DirectGpuTensorEngine
     public override T TensorTrace<T>(Tensor<T> tensor)
     {
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
-        if (typeof(T) != typeof(float) || tensor.Rank != 2 || !TryGetBatchBackend(out var backend))
+        if (typeof(T) != typeof(float) || tensor.Rank != 2 || !ShouldReduceOnDevice(tensor) || !TryGetBatchBackend(out var backend))
             return base.TensorTrace(tensor);
 
         // trace = sum of the diagonal. Extract the diagonal with the GPU kernel, then GPU reduce-sum;

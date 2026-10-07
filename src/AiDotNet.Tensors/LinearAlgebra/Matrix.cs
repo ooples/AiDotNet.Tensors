@@ -722,16 +722,10 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     /// </remarks>
     public Matrix<T> Subtract(Matrix<T> other)
     {
-        if (this.Rows != other.Rows || this.Columns != other.Columns)
-        {
-            throw new ArgumentException("Matrices must have the same dimensions for subtraction.");
-        }
-
-        Matrix<T> result = new(Rows, Columns);
-        // Use vectorized Subtract operation for SIMD acceleration (5-15x faster with AVX2)
-        _numOps.Subtract(_memory.Span, other._memory.Span, result.AsWritableSpan());
-
-        return result;
+        // Overload resolution picks this over Subtract(MatrixBase<T>) whenever both operands are
+        // Matrix<T>, so it must share the base path: uninitialized pooled result, parallel for large
+        // matrices. It previously zero-filled a fresh result and ran serially, about 2x slower than Add.
+        return (Matrix<T>)base.Subtract(other);
     }
 
     /// <summary>

@@ -30,16 +30,16 @@ internal static class SimdTranspose
         fixed (double* s = src, d = dst)
         {
             nint sp = (nint)s, dp = (nint)d;
-            int rowTiles = (rows + Tile - 1) / Tile;
-            if ((long)rows * cols < ParallelThreshold || rowTiles == 1)
+            int dstRowTiles = (cols + Tile - 1) / Tile;
+            if ((long)rows * cols < ParallelThreshold || dstRowTiles == 1)
             {
-                for (int t = 0; t < rowTiles; t++)
-                    TransposeRowTile((double*)sp, (double*)dp, rows, cols, t * Tile);
+                for (int t = 0; t < dstRowTiles; t++)
+                    TransposeDstRowTile((double*)sp, (double*)dp, rows, cols, t * Tile);
                 return;
             }
 
-            CpuParallelSettings.ParallelForOrSerial(0, rowTiles, (long)rows * cols,
-                t => TransposeRowTile((double*)sp, (double*)dp, rows, cols, t * Tile),
+            CpuParallelSettings.ParallelForOrSerial(0, dstRowTiles, (long)rows * cols,
+                t => TransposeDstRowTile((double*)sp, (double*)dp, rows, cols, t * Tile),
                 deterministicSafe: true);
         }
     }
@@ -50,16 +50,16 @@ internal static class SimdTranspose
         fixed (float* s = src, d = dst)
         {
             nint sp = (nint)s, dp = (nint)d;
-            int rowTiles = (rows + Tile - 1) / Tile;
-            if ((long)rows * cols < ParallelThreshold || rowTiles == 1)
+            int dstRowTiles = (cols + Tile - 1) / Tile;
+            if ((long)rows * cols < ParallelThreshold || dstRowTiles == 1)
             {
-                for (int t = 0; t < rowTiles; t++)
-                    TransposeRowTile((float*)sp, (float*)dp, rows, cols, t * Tile);
+                for (int t = 0; t < dstRowTiles; t++)
+                    TransposeDstRowTile((float*)sp, (float*)dp, rows, cols, t * Tile);
                 return;
             }
 
-            CpuParallelSettings.ParallelForOrSerial(0, rowTiles, (long)rows * cols,
-                t => TransposeRowTile((float*)sp, (float*)dp, rows, cols, t * Tile),
+            CpuParallelSettings.ParallelForOrSerial(0, dstRowTiles, (long)rows * cols,
+                t => TransposeDstRowTile((float*)sp, (float*)dp, rows, cols, t * Tile),
                 deterministicSafe: true);
         }
     }
@@ -71,12 +71,17 @@ internal static class SimdTranspose
             throw new ArgumentException("Source and destination must each hold at least rows * cols elements.");
     }
 
-    private static unsafe void TransposeRowTile(double* src, double* dst, int rows, int cols, int i0)
+    /// <summary>
+    /// Writes destination rows <c>[j0, j0 + Tile)</c> (source columns) in full. Each parallel worker
+    /// therefore owns a contiguous slice of the destination, so the first-touch page faults on a
+    /// freshly allocated result are taken on disjoint pages rather than by every worker on every page.
+    /// </summary>
+    private static unsafe void TransposeDstRowTile(double* src, double* dst, int rows, int cols, int j0)
     {
-        int iEnd = Math.Min(i0 + Tile, rows);
-        for (int j0 = 0; j0 < cols; j0 += Tile)
+        int jEnd = Math.Min(j0 + Tile, cols);
+        for (int i0 = 0; i0 < rows; i0 += Tile)
         {
-            int jEnd = Math.Min(j0 + Tile, cols);
+            int iEnd = Math.Min(i0 + Tile, rows);
             int i = i0;
             if (Avx.IsSupported)
             {
@@ -97,12 +102,17 @@ internal static class SimdTranspose
         }
     }
 
-    private static unsafe void TransposeRowTile(float* src, float* dst, int rows, int cols, int i0)
+    /// <summary>
+    /// Writes destination rows <c>[j0, j0 + Tile)</c> (source columns) in full. Each parallel worker
+    /// therefore owns a contiguous slice of the destination, so the first-touch page faults on a
+    /// freshly allocated result are taken on disjoint pages rather than by every worker on every page.
+    /// </summary>
+    private static unsafe void TransposeDstRowTile(float* src, float* dst, int rows, int cols, int j0)
     {
-        int iEnd = Math.Min(i0 + Tile, rows);
-        for (int j0 = 0; j0 < cols; j0 += Tile)
+        int jEnd = Math.Min(j0 + Tile, cols);
+        for (int i0 = 0; i0 < rows; i0 += Tile)
         {
-            int jEnd = Math.Min(j0 + Tile, cols);
+            int iEnd = Math.Min(i0 + Tile, rows);
             int i = i0;
             if (Avx.IsSupported)
             {
