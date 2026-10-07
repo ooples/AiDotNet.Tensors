@@ -18908,11 +18908,20 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     }
 
     // --- Softmax Variants + Distance ---
-    public void LogSoftmax(IGpuBuffer input, IGpuBuffer output, int outerSize, int innerSize)
+    public unsafe void LogSoftmax(IGpuBuffer input, IGpuBuffer output, int outerSize, int innerSize)
     {
         // Fail-closed direct-PTX fast path (issue #840); returns false until GPU-promoted.
         if (TryDirectPtxLogSoftmax(input, output, outerSize, innerSize)) return;
-        LaunchFusedAxis("log_softmax", input, output, outerSize, innerSize);
+        if (outerSize <= 0 || innerSize <= 0) return;
+        if (!_kernelCache.TryGetValue("log_softmax", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: log_softmax");
+        using var _ = PushContext();
+        IntPtr inPtr = input.Handle, outPtr = output.Handle;
+        void** args = stackalloc void*[4];
+        args[0] = &inPtr; args[1] = &outPtr; args[2] = &outerSize; args[3] = &innerSize;
+        // One warp per row (see the kernel): DefaultBlockSize / 32 rows per block.
+        int rowsPerBlock = DefaultBlockSize / 32;
+        LaunchKernel(kernel, (uint)((outerSize + rowsPerBlock - 1) / rowsPerBlock), DefaultBlockSize, args);
     }
 
     public unsafe void GumbelSoftmax(IGpuBuffer logits, IGpuBuffer output, int outerSize, int innerSize, float temperature, ulong seed)

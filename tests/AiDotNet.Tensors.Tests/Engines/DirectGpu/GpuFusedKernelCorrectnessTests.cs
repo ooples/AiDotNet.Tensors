@@ -577,6 +577,28 @@ public class GpuFusedKernelCorrectnessTests : IClassFixture<DirectGpuTensorEngin
         AssertTensorsClose(cpuResult, gpuResult, 1e-3f);
     }
 
+    /// <summary>
+    /// The CUDA log-softmax kernel reduces each row with one warp: rows shorter than a warp, not a multiple of it,
+    /// far longer than it (an LM vocabulary), and a row count that leaves the last block partly empty must all match
+    /// the CPU, including a row whose entries span ~100 in log space (where log(softmax) underflows).
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(1, 1)]
+    [InlineData(3, 7)]
+    [InlineData(1001, 10)]
+    [InlineData(9, 33)]
+    [InlineData(5, 50257)]
+    public void TensorLogSoftmax_RowShapes_GpuMatchesCpu(int rows, int features)
+    {
+        SkipIfNoGpu();
+        var input = RandomTensor(new[] { rows, features }, 1000 + features);
+        var span = input.AsWritableSpan();
+        for (int i = 0; i < features; i++) span[i] *= 60f;   // row 0 spans ~120: exp underflows for most of it
+        var cpuResult = _cpu.TensorLogSoftmax(input, -1);
+        var gpuResult = Gpu.TensorLogSoftmax(input, -1);
+        AssertTensorsClose(cpuResult, gpuResult, 1e-3f);
+    }
+
     [SkippableFact]
     public void TensorAdd_BroadcastShapes_GpuMatchesCpu()
     {

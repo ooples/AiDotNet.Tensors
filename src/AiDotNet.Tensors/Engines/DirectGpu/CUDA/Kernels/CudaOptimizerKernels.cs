@@ -215,6 +215,64 @@ extern ""C"" __global__ __launch_bounds__(256) void adamw_multi_tensor_update(
 }
 
 // ---------------------------------------------------------------------------
+// Device-stepped optimizer update: the step counter, the non-finite-gradient decision and the learning rate live
+// in device memory, so a training step needs no host read and the whole update can be captured into a CUDA graph
+// (a captured kernel's scalar arguments are frozen at capture; these are read at run time instead).
+//   state[0] = completed (finite) optimizer steps   state[1] = 1 when THIS step is discarded (non-finite gradients)
+//   state[2] = discarded steps in total            state[3] = learning-rate table base: lrTable[k] is step base+1+k
+// ---------------------------------------------------------------------------
+extern ""C"" __global__ void optimizer_step_prepare(
+    const double* __restrict__ sumSquares, int* __restrict__ state)
+{
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    // A float squared cannot overflow a double: the sum is finite exactly when every gradient element is.
+    if (isfinite(*sumSquares)) { state[0] += 1; state[1] = 0; }
+    else { state[1] = 1; state[2] += 1; }
+}
+
+// Same per-element math as adam_multi_tensor_update (decoupled = 0) and adamw_multi_tensor_update (decoupled = 1),
+// with the step and learning rate read from device memory; a discarded step writes nothing.
+extern ""C"" __global__ __launch_bounds__(256) void adam_multi_tensor_update_device_step(
+    const unsigned long long* __restrict__ paramPtrs,
+    const unsigned long long* __restrict__ gradPtrs,
+    const unsigned long long* __restrict__ mPtrs,
+    const unsigned long long* __restrict__ vPtrs,
+    const int* __restrict__ sizes,
+    const int* __restrict__ chunkTensor,
+    const int* __restrict__ chunkStart,
+    const int* __restrict__ state,
+    const float* __restrict__ lrTable,
+    float beta1, float beta2, float epsilon, float weightDecay, int decoupled)
+{
+    if (state[1] != 0) return;
+    int t = chunkTensor[blockIdx.x];
+    int base = chunkStart[blockIdx.x];
+    int i = base + threadIdx.x;
+    int size = sizes[t];
+    if (i >= size) return;
+    int step = state[0];
+    float learningRate = lrTable[step - 1 - state[3]];
+
+    float* __restrict__ param = (float*)paramPtrs[t];
+    const float* __restrict__ gradient = (const float*)gradPtrs[t];
+    float* __restrict__ m = (float*)mPtrs[t];
+    float* __restrict__ v = (float*)vPtrs[t];
+
+    float grad = gradient[i];
+    if (weightDecay > 0.0f) {
+        if (decoupled) param[i] *= (1.0f - learningRate * weightDecay);
+        else grad += weightDecay * param[i];
+    }
+    float mVal = beta1 * m[i] + (1.0f - beta1) * grad;
+    float vVal = beta2 * v[i] + (1.0f - beta2) * grad * grad;
+    m[i] = mVal;
+    v[i] = vVal;
+    float mHat = mVal / (1.0f - powf(beta1, (float)step));
+    float vHat = vVal / (1.0f - powf(beta2, (float)step));
+    param[i] -= learningRate * mHat / (sqrtf(vHat) + epsilon);
+}
+
+// ---------------------------------------------------------------------------
 // Adam optimizer update with bfloat16 moment storage
 // ---------------------------------------------------------------------------
 extern ""C"" __global__ __launch_bounds__(256) void adam_bf16_update(
@@ -1112,6 +1170,8 @@ extern ""C"" __global__ __launch_bounds__(256) void multi_tensor_scale_by_device
             "adamw_update",
             "adam_multi_tensor_update",
             "adamw_multi_tensor_update",
+            "optimizer_step_prepare",
+            "adam_multi_tensor_update_device_step",
             "multi_tensor_sum_squares",
             "clip_scale_from_sum_squares",
             "multi_tensor_scale_by_device_scalar",

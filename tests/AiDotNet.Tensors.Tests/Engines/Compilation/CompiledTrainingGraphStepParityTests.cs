@@ -79,9 +79,10 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
         public bool ReplayedAGraph;
         public string[] StepStates = Array.Empty<string>();
         public float[][] LastGradients = Array.Empty<float[]>();
+        public float[][][] StepGradients = Array.Empty<float[][]>();
     }
 
-    private static Run Train(DirectGpuTensorEngine gpu, bool capture, bool failCapture = false, bool composedMse = false, bool failInsideCapture = false, bool releasedInputBinding = false, bool retireGraphBeforeLastRead = false, bool droppedTargetBinding = false)
+    private static Run Train(DirectGpuTensorEngine gpu, bool capture, bool failCapture = false, bool composedMse = false, bool failInsideCapture = false, bool releasedInputBinding = false, bool retireGraphBeforeLastRead = false, bool droppedTargetBinding = false, bool readGradientsEveryStep = false)
     {
         var x = Rand([Batch, Inputs], 1, 1f);
         var y = Rand([Batch, Outputs], 2, 1f);
@@ -120,6 +121,7 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
             plan.ConfigureOptimizer(OptimizerType.Adam, learningRate: 1e-2f);
             var losses = new double[Steps];
             float[][] lastGradients = Array.Empty<float[]>();
+            var stepGradients = new float[Steps][];
             var states = new string[Steps];
             for (int s = 0; s < Steps; s++)
             {
@@ -159,6 +161,7 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                 states[s] = $"resident={lossTensor.IsGpuResident} pending={lossTensor.HasPendingGpuData} cpuRef={reference:G6}";
                 losses[s] = lossTensor.ToArray()[0];
                 if (s == Steps - 1) lastGradients = plan.Gradients.Select(g => g.ToArray()).ToArray();
+                if (readGradientsEveryStep) stepGradients[s] = plan.Gradients.SelectMany(g => g.ToArray()).ToArray();
             }
             var exec = (IntPtr)typeof(CompiledTrainingPlan<float>)
                 .GetField("_stepGraphExec", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(concrete)!;
@@ -168,6 +171,7 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                 FinalWeights = parameters.Select(p => p.ToArray()).ToArray(),
                 ReplayedAGraph = exec != IntPtr.Zero || retireGraphBeforeLastRead,
                 LastGradients = lastGradients,
+                StepGradients = readGradientsEveryStep ? new[] { stepGradients } : Array.Empty<float[][]>(),
                 StepStates = states,
             };
         }
@@ -203,6 +207,38 @@ public class CompiledTrainingGraphStepParityTests : IDisposable
                 for (int i = 0; i < eager.FinalWeights[p].Length; i++)
                     Assert.True(Math.Abs(eager.FinalWeights[p][i] - captured.FinalWeights[p][i]) <= 1e-5f,
                         $"param {p}[{i}]: captured {captured.FinalWeights[p][i]} != eager {eager.FinalWeights[p][i]}");
+        }
+    }
+
+    /// <summary>
+    /// A replay runs no host code, so nothing re-armed the gradients' host downloads: the first host read after a
+    /// replay downloaded that step's gradients and every later read returned the same (old) values. Reading the
+    /// gradients after EVERY step must see each step's own, exactly as the eager plan reports them.
+    /// </summary>
+    [SkippableFact]
+    public void Gradients_read_after_every_replay_are_that_steps_gradients()
+    {
+        Skip.IfNot(TryGpu(out var gpu) && gpu is not null, "GPU backend did not resolve.");
+        using (gpu)
+        {
+            AiDotNetEngine.Current = gpu;
+            Skip.IfNot(gpu.GetBackend() is AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend,
+                "Whole-step graph capture is CUDA-only.");
+            Skip.If(Environment.GetEnvironmentVariable("AIDOTNET_CUDA_GRAPH_STEP") == "0",
+                "Graph capture is disabled for this process.");
+
+            var eager = Train(gpu, capture: false, readGradientsEveryStep: true);
+            var captured = Train(gpu, capture: true, readGradientsEveryStep: true);
+            Assert.True(captured.ReplayedAGraph, "the captured plan is not replaying a graph after warm-up");
+            var expected = eager.StepGradients[0];
+            var actual = captured.StepGradients[0];
+            for (int s = 0; s < Steps; s++)
+            {
+                Assert.Equal(expected[s].Length, actual[s].Length);
+                for (int i = 0; i < expected[s].Length; i++)
+                    Assert.True(Math.Abs(expected[s][i] - actual[s][i]) <= 1e-5f * Math.Max(1f, Math.Abs(expected[s][i])),
+                        $"step {s} gradient[{i}]: captured {actual[s][i]} != eager {expected[s][i]}");
+            }
         }
     }
 

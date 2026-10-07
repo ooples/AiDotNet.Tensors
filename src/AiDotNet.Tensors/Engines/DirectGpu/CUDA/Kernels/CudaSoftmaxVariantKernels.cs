@@ -16,32 +16,39 @@ public static class CudaSoftmaxVariantKernels
 
 // ============================================================================
 // LogSoftmax: log(softmax(x)) = x - max(x) - log(sum(exp(x - max(x))))
-// Numerically stable, single-pass per row
+// Numerically stable. One WARP per row (blockDim.x = 256 => 8 rows per block): lanes stride the row so every
+// pass is coalesced and a long row (an LM vocabulary) is split 32 ways; a thread-per-row layout read each row
+// with a 4*innerSize-byte stride per lane and left all but outerSize threads idle.
 // ============================================================================
 
 extern ""C"" __global__ __launch_bounds__(256) void log_softmax(
     const float* __restrict__ input, float* __restrict__ output,
     int outerSize, int innerSize)
 {
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    int lane = threadIdx.x & 31;
+    long long row = (long long)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     if (row >= outerSize) return;
 
-    const float* in_row = input + row * innerSize;
-    float* out_row = output + row * innerSize;
+    const float* in_row = input + row * (long long)innerSize;
+    float* out_row = output + row * (long long)innerSize;
 
-    // Pass 1: find max
+    // Pass 1: row max
     float max_val = -INFINITY;
-    for (int j = 0; j < innerSize; j++)
+    for (int j = lane; j < innerSize; j += 32)
         max_val = fmaxf(max_val, in_row[j]);
+    for (int o = 16; o > 0; o >>= 1)
+        max_val = fmaxf(max_val, __shfl_xor_sync(0xffffffffu, max_val, o));
 
-    // Pass 2: compute log(sum(exp))
+    // Pass 2: log(sum(exp(x - max)))
     float sum_exp = 0.0f;
-    for (int j = 0; j < innerSize; j++)
+    for (int j = lane; j < innerSize; j += 32)
         sum_exp += expf(in_row[j] - max_val);
+    for (int o = 16; o > 0; o >>= 1)
+        sum_exp += __shfl_xor_sync(0xffffffffu, sum_exp, o);
     float log_sum = logf(sum_exp);
 
     // Pass 3: write output
-    for (int j = 0; j < innerSize; j++)
+    for (int j = lane; j < innerSize; j += 32)
         out_row[j] = in_row[j] - max_val - log_sum;
 }
 

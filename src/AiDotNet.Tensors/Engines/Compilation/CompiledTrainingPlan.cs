@@ -273,6 +273,18 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     public void Dispose()
     {
         if (_disposed) return;
+        // The last step's loss and gradients may still be pending on the device (deferred readback; callers such as
+        // a model's gradient surface hold the gradient tensors by reference and read them on demand): copy them to
+        // the host while the buffers they live in still exist.
+        if (_gradientsNewerOnDevice) ArmGradientHostDownloads();
+        LandPendingOnHost(_lossOutput);
+        foreach (var gradient in _gradients) LandPendingOnHost(gradient);
+        static void LandPendingOnHost(Tensor<T>? tensor)
+        {
+            if (tensor?.GetBackingArrayForCacheLookupUnsafe() is not { } host || !Helpers.HostSync.IsPending(host)) return;
+            try { Helpers.HostSync.TryMaterialize(host); }
+            catch (Exception) { /* a dead device context: nothing can be read, and disposal must proceed */ }
+        }
         _disposed = true;
         GC.SuppressFinalize(this);
         if (StepTiming.Enabled)
@@ -289,6 +301,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // ConfigureOptimizerFloat / ConfigureOptimizerFloatGrouped after the
         // paramBackend.AllocateBuffer calls; reconfiguring also disposes
         // these via the same list before re-allocating.
+        ReleaseDeviceSteppedOptimizer();
         LeaveSharedMoments();
         foreach (var buf in _gpuOptimizerBuffers)
             buf.Dispose();
@@ -483,9 +496,45 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     /// a plan that recaptures every warmup cycle instead of replaying never advances this.</summary>
     internal static long GraphReplayCount => System.Threading.Interlocked.Read(ref s_graphReplays);
 
-    private void RefreshLossFromCapturedGraph(Engines.DirectGpuTensorEngine gte)
+    private static readonly bool s_syncAfterStepGraph =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_STEP_SYNC") == "1";
+
+    /// <summary>
+    /// Launches the captured step without waiting for it. Everything the host does next is either ordered after it
+    /// on the same stream (the optimizer update, the next step's input upload) or a read that waits for it (a
+    /// download), so the old wait after every launch only kept the host from preparing the next step while the GPU
+    /// ran this one. Work the step forks onto other streams is part of the captured graph and completes with it.
+    /// </summary>
+    private static void LaunchStepGraph(Engines.DirectGpu.CUDA.CudaBackend cb, IntPtr graphExec)
+    {
+        if (s_syncAfterStepGraph) cb.LaunchCapturedGraph(graphExec);
+        else cb.EnqueueCapturedGraph(graphExec);
+    }
+
+    private static readonly bool s_deferredLossReadback =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_DEFERRED_LOSS_READBACK") != "0";
+
+    private void RefreshLossFromCapturedGraph(Engines.DirectGpuTensorEngine gte, bool deferRead = false)
     {
         if (typeof(T) != typeof(float)) return;
+        // Deferred: the device holds this step's loss; the host copy is downloaded when something reads it. Reading
+        // it here blocked the host until the whole step had run on the GPU, every step, whether or not anyone looked
+        // at the loss, so host and device time added up instead of overlapping. A newer registration replaces an
+        // unread older one, so a read always sees the most recent step's loss.
+        // Only after a graph launch: the graph's loss buffer is stable until the next launch overwrites it, whereas the
+        // uncaptured resident step detaches its forward outputs (the loss among them) when it returns.
+        if (deferRead && s_deferredLossReadback && (object?)_lossOutput.GetBackingArrayForCacheLookupUnsafe() is float[] lossArray
+            && _lossOutput._gpuBuffer is { } lossBuffer && lossBuffer.Handle != IntPtr.Zero)
+        {
+            var loss = _lossOutput;
+            Helpers.HostSync.Register(lossArray, _ =>
+            {
+                var values = gte.DownloadResidentBuffer(loss);
+                if (values is null) return;
+                Array.Copy(values, lossArray, Math.Min(lossArray.Length, values.Length));
+            });
+            return;
+        }
         var fresh = gte.DownloadResidentBuffer(_lossOutput);
         if (fresh is null) return;
         var key = _lossOutput.GetBackingArrayForCacheLookupUnsafe();
@@ -632,7 +681,57 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                         _gradients[i] = current;
                 }
             }
+            if (_gradientsNewerOnDevice) ArmGradientHostDownloads();
             return _gradients;
+        }
+    }
+
+    /// <summary>
+    /// True when every current parameter gradient (after the live-map refresh <see cref="Gradients"/> does) is one of
+    /// the buffers the plan allocated at compile time. Those are compiled with the step arena suspended and live as
+    /// long as the plan, so a caller may hold them across steps and read them later. A gradient the backward replaced
+    /// with a step-local tensor (an out-of-place accumulation) can be recycled when the step's arena ends; the caller
+    /// must copy that one within the step.
+    /// </summary>
+    internal bool GradientsArePlanOwned
+    {
+        get
+        {
+            var current = Gradients;
+            if (_planOwnedGradientSet is null)
+            {
+                _planOwnedGradientSet = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+                foreach (var g in _preAllocatedGrads) if (g is not null) _planOwnedGradientSet.Add(g);
+            }
+            foreach (var g in current)
+                if (g is not null && !_planOwnedGradientSet.Contains(g)) return false;
+            return true;
+        }
+    }
+
+    private HashSet<Tensor<T>>? _planOwnedGradientSet;
+
+    // Set by every graph launch: a replay runs no host code, so nothing re-armed the gradients' host downloads and a
+    // host read after the first one returned that earlier step's values. Armed lazily on the next Gradients read
+    // (one registration per tensor, no device work), so a caller that never reads gradients on the host pays nothing.
+    private bool _gradientsNewerOnDevice;
+
+    private void ArmGradientHostDownloads()
+    {
+        _gradientsNewerOnDevice = false;
+        if (typeof(T) != typeof(float)) return;
+        foreach (var gradient in _gradients)
+        {
+            if (gradient?._gpuBuffer is not { } buffer || buffer.Handle == IntPtr.Zero
+                || gradient._gpuBackend is not { } backend
+                || (object?)gradient.GetBackingArrayForCacheLookupUnsafe() is not float[] host)
+                continue;
+            Helpers.HostSync.Register(host, _ =>
+            {
+                if (buffer.Handle == IntPtr.Zero) return;   // released since: the host copy is all that is left
+                var values = backend.DownloadBuffer(buffer);
+                Array.Copy(values, host, Math.Min(host.Length, values.Length));
+            });
         }
     }
 
@@ -1111,7 +1210,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     private int _optimizerStep;
 
     /// <inheritdoc/>
-    public int OptimizerStep => _optimizerStep;
+    public int OptimizerStep
+    {
+        get { SyncDeviceOptimizerCounters(); return _optimizerStep; }
+    }
 
     /// <inheritdoc/>
     public IReadOnlyList<Tensor<T>> OptimizedParameters => _optimizedParametersView ??= Array.AsReadOnly(_parameters);
@@ -1136,13 +1238,21 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     /// not learning" apart from "the model is diverging and its steps are being discarded" -- those
     /// look identical from the loss alone once the weights are already poisoned.
     /// </remarks>
-    public int NonFiniteStepsSkipped => _nonFiniteStepsSkipped;
+    public int NonFiniteStepsSkipped
+    {
+        get { SyncDeviceOptimizerCounters(); return _nonFiniteStepsSkipped; }
+    }
 
     /// <summary>
     /// True when the most recent <see cref="Step"/> discarded its optimizer update because the
     /// gradients were not finite.
     /// </summary>
-    public bool LastStepSkippedNonFiniteGradients { get; private set; }
+    public bool LastStepSkippedNonFiniteGradients
+    {
+        get { SyncDeviceOptimizerCounters(); return _lastStepSkippedNonFiniteGradients; }
+    }
+
+    private bool _lastStepSkippedNonFiniteGradients;
 
     /// <summary>
     /// Resolves the authoritative gradient for every GPU-resident parameter before the optimizer
@@ -1336,7 +1446,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
 
         if (gradientsFinite)
         {
-            LastStepSkippedNonFiniteGradients = false;
+            _lastStepSkippedNonFiniteGradients = false;
             return false;
         }
 
@@ -1403,6 +1513,191 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         return true;
     }
 
+    // ---------------------------------------------------------------------------------------------------------------
+    // Device-stepped optimizer (CUDA, multi-tensor fp32 Adam/AdamW). The host-stepped update read one value back per
+    // step (the non-finite-gradient check), which blocked the host until the whole step had run on the GPU: host and
+    // device time added instead of overlapping, on every model. Here the finiteness decision, the step counter and
+    // the learning rate live in device memory (state[0] completed steps, state[1] this step discarded, state[2]
+    // discarded total, state[3] learning-rate table base; see optimizer_step_prepare), so the update is three kernel
+    // launches and no read. The host mirrors (_optimizerStep, NonFiniteStepsSkipped, LastStepSkippedNonFiniteGradients)
+    // are brought up to date only when something reads them.
+    // ---------------------------------------------------------------------------------------------------------------
+
+    private static readonly bool s_deviceSteppedOptimizer =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_DEVICE_STEP_OPTIMIZER") != "0";
+
+    // Learning rates for this many future steps are kept on the device; the table is refilled (one host read) when
+    // the steps launched since the last read could run past it.
+    private const int DeviceLearningRateTableCapacity = 4096;
+
+    private Engines.DirectGpu.CUDA.MultiTensorOptimizerBinding? _devOptBinding;
+    private Engines.DirectGpu.IGpuBuffer? _devOptState;
+    private Engines.DirectGpu.IGpuBuffer? _devOptLrTable;
+    private Engines.DirectGpu.IGpuBuffer? _devOptSumSquares;
+    private Engines.DirectGpu.CUDA.CudaBackend? _devOptBackend;
+    private LrSchedule? _devOptSchedule;
+    private int _devOptLrBase;            // host copy of state[3]
+    private int _devOptEffectiveAtSync;   // state[0] when the device counters were last read
+    private int _devOptLaunchedSinceSync; // device-stepped updates launched since that read
+    private int _devOptDiscardsSeen;      // state[2] when last read
+    private bool _devOptCountersStale;    // host mirrors lag the device
+
+    /// <summary>
+    /// Runs this step's Adam/AdamW update on the device with no host read, when every parameter, gradient and moment
+    /// is a float32 buffer on one CUDA backend. Returns false (nothing launched) otherwise; the host-stepped path runs.
+    /// Call after <c>_optimizerStep++</c> for the current step.
+    /// </summary>
+    private bool TryDeviceSteppedMultiTensorAdam(
+        OptimizerType optType,
+        Engines.DirectGpu.IGpuBuffer?[] gpuParam,
+        Engines.DirectGpu.IGpuBuffer?[] gpuGrad,
+        Engines.DirectGpu.IDirectGpuBackend?[] gpuBackends,
+        Engines.DirectGpu.IGpuBuffer?[] gpuM,
+        Engines.DirectGpu.IGpuBuffer?[] gpuV,
+        FusedMomentStorageMode[] gpuMomentStorage,
+        int[] lengths,
+        LrSchedule lrSchedule,
+        float beta1, float beta2, float epsilon, float weightDecay)
+    {
+        if (!s_deviceSteppedOptimizer || typeof(T) != typeof(float)) return false;
+        if (optType != OptimizerType.Adam && optType != OptimizerType.AdamW) return false;
+        int count = gpuParam.Length;
+        if (count == 0 || gpuBackends[0] is not Engines.DirectGpu.CUDA.CudaBackend cuda || cuda.IsStreamCapturing())
+            return false;
+        var parameters = new Engines.DirectGpu.IGpuBuffer[count];
+        var gradients = new Engines.DirectGpu.IGpuBuffer[count];
+        var firstMoments = new Engines.DirectGpu.IGpuBuffer[count];
+        var secondMoments = new Engines.DirectGpu.IGpuBuffer[count];
+        for (int p = 0; p < count; p++)
+        {
+            if (!ReferenceEquals(gpuBackends[p], cuda) || lengths[p] <= 0
+                || gpuMomentStorage[p] != FusedMomentStorageMode.Float32
+                || gpuParam[p] is not { } param || gpuGrad[p] is not { } grad
+                || gpuM[p] is not { } m || gpuV[p] is not { } v)
+                return false;
+            parameters[p] = param; gradients[p] = grad; firstMoments[p] = m; secondMoments[p] = v;
+        }
+
+        bool rebind = _devOptBinding is null || !ReferenceEquals(_devOptBackend, cuda)
+            || !ReferenceEquals(_devOptSchedule, lrSchedule)
+            || !_devOptBinding.Matches(parameters, gradients, firstMoments, secondMoments, lengths);
+        if (rebind)
+        {
+            // Settle the counters of the previous device state (this step's attempt is already counted on the host,
+            // not on the device), then start fresh from the exact host values.
+            if (_devOptState is not null)
+            {
+                _optimizerStep--;
+                SyncDeviceOptimizerCounters();
+                _optimizerStep++;
+            }
+            ReleaseDeviceSteppedOptimizer();
+            int completed = _optimizerStep - 1;
+            try
+            {
+                _devOptBinding = cuda.CreateMultiTensorOptimizerBinding(parameters, gradients, firstMoments, secondMoments, lengths);
+                _devOptState = cuda.AllocateIntBuffer(new[] { completed, 0, 0, completed });
+                _devOptLrTable = cuda.AllocateBuffer(DeviceLearningRateTableCapacity);
+                _devOptSumSquares = cuda.AllocateBuffer(2);
+            }
+            catch
+            {
+                ReleaseDeviceSteppedOptimizer();
+                throw;
+            }
+            _devOptBackend = cuda;
+            _devOptSchedule = lrSchedule;
+            _devOptEffectiveAtSync = completed;
+            _devOptLaunchedSinceSync = 0;
+            _devOptDiscardsSeen = 0;
+            _devOptCountersStale = false;
+            FillDeviceLearningRateTable(completed);
+        }
+        else if (_devOptEffectiveAtSync + _devOptLaunchedSinceSync + 1 - _devOptLrBase > DeviceLearningRateTableCapacity)
+        {
+            // This launch could step past the table: read where the device really is and refill from there.
+            _optimizerStep--;
+            SyncDeviceOptimizerCounters();
+            _optimizerStep++;
+            FillDeviceLearningRateTable(_devOptEffectiveAtSync);
+        }
+
+        cuda.MultiTensorSumOfSquares(_devOptBinding!, _devOptSumSquares!);
+        cuda.OptimizerStepPrepare(_devOptSumSquares!, _devOptState!);
+        cuda.AdamMultiTensorUpdateDeviceStep(_devOptBinding!, _devOptState!, _devOptLrTable!,
+            beta1, beta2, epsilon, weightDecay, decoupledWeightDecay: optType == OptimizerType.AdamW);
+        _devOptLaunchedSinceSync++;
+        _devOptCountersStale = true;
+
+        // The same post-update bookkeeping as the host-stepped multi-tensor path: the device buffers are now the
+        // authoritative parameter values.
+        for (int p = 0; p < count; p++)
+        {
+            _parameters[p]._gpuBufferVersion = _parameters[p].GpuCacheVersion;
+            if (_engine is Engines.DirectGpuTensorEngine rebindEngine)
+            {
+                rebindEngine.BindResidentBuffer(_parameters[p], parameters[p], cuda);
+                CommitDeviceParameterUpdate(rebindEngine, p, parameters[p], cuda);
+            }
+        }
+        return true;
+    }
+
+    // Writes lr(base + 1 .. base + capacity) to the device table and state[3] = base. Only called when the device
+    // state is exactly known on the host (fresh, or just read), so the whole state word can be rewritten.
+    private void FillDeviceLearningRateTable(int baseStep)
+    {
+        var cuda = _devOptBackend!;
+        var schedule = _devOptSchedule!;
+        var rates = new float[DeviceLearningRateTableCapacity];
+        for (int k = 0; k < rates.Length; k++)
+            rates[k] = (float)schedule.GetLr(baseStep + 1 + k);
+        cuda.UploadBufferInPlace(rates, _devOptLrTable!);
+        cuda.UploadIntBufferInPlace(
+            new[] { _devOptEffectiveAtSync, _lastStepSkippedNonFiniteGradients ? 1 : 0, _devOptDiscardsSeen, baseStep },
+            _devOptState!);
+        _devOptLrBase = baseStep;
+    }
+
+    /// <summary>Brings the host step counters up to date with the device (one small read) when they lag it.</summary>
+    private void SyncDeviceOptimizerCounters()
+    {
+        if (!_devOptCountersStale || _devOptState is null || _devOptBackend is null) return;
+        var state = new int[4];
+        _devOptBackend.DownloadIntBuffer(_devOptState, state);
+        _nonFiniteStepsSkipped += state[2] - _devOptDiscardsSeen;
+        _devOptDiscardsSeen = state[2];
+        _lastStepSkippedNonFiniteGradients = state[1] != 0;
+        _optimizerStep = state[0];
+        _devOptEffectiveAtSync = state[0];
+        _devOptLaunchedSinceSync = 0;
+        _devOptCountersStale = false;
+    }
+
+    /// <summary>Settles the host counters and frees the device-stepped optimizer state (reconfigure, restore, dispose).</summary>
+    private void LeaveDeviceSteppedOptimizer()
+    {
+        if (_devOptState is not null && _devOptCountersStale)
+        {
+            try { SyncDeviceOptimizerCounters(); }
+            catch (Exception) when (_disposed) { /* a disposing plan has no counters left to report */ }
+        }
+        ReleaseDeviceSteppedOptimizer();
+    }
+
+    private void ReleaseDeviceSteppedOptimizer()
+    {
+        _devOptBinding?.Dispose();
+        _devOptState?.Dispose();
+        _devOptLrTable?.Dispose();
+        _devOptSumSquares?.Dispose();
+        _devOptBinding = null;
+        _devOptState = _devOptLrTable = _devOptSumSquares = null;
+        _devOptBackend = null;
+        _devOptSchedule = null;
+        _devOptCountersStale = false;
+    }
+
     /// <summary>Double-precision CPU counterpart to the float finiteness gate.</summary>
     private unsafe bool TryDiscardNonFiniteOptimizerStep(
         double[][] gradArrays,
@@ -1429,7 +1724,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
 
         if (gradientsFinite)
         {
-            LastStepSkippedNonFiniteGradients = false;
+            _lastStepSkippedNonFiniteGradients = false;
             return false;
         }
 
@@ -1444,7 +1739,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // invisible to both, matching GradScaler's contract.
         _optimizerStep--;
         _nonFiniteStepsSkipped++;
-        LastStepSkippedNonFiniteGradients = true;
+        _lastStepSkippedNonFiniteGradients = true;
     }
 
     private sealed class FusedOptimizerRuntimeScalars
@@ -1784,6 +2079,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         }
 
         var target = _optimizerRuntimeState!;
+        source.SyncDeviceOptimizerCounters();
+        LeaveDeviceSteppedOptimizer();
         _optimizerStep = source._optimizerStep;
         _maxGradNorm = source._maxGradNorm;
         target.Scalars.HypergradientAdjustment = src.Scalars.HypergradientAdjustment;
@@ -2312,8 +2609,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                         return StepResidentOrEager();
                     }
                     _stepGraphExec = exec;
-                    cb.LaunchCapturedGraph(exec);   // executes THIS step on the just-uploaded indices
-                    RefreshLossFromCapturedGraph(gte);
+                    LaunchStepGraph(cb, exec);   // executes THIS step on the just-uploaded indices
+                    _gradientsNewerOnDevice = true;
+                    RefreshLossFromCapturedGraph(gte, deferRead: true);
                     // The optimizer update is run eagerly (NOT captured): its closure
                     // increments _optimizerStep and re-evaluates lrSchedule.GetLr +
                     // Adam/AdamW bias-correction each step, and bakes those scalars into
@@ -2343,9 +2641,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                     _graphStepDisabled = true;
                     return StepEager();
                 }
-                cb.LaunchCapturedGraph(_stepGraphExec);
+                LaunchStepGraph(cb, _stepGraphExec);
+                _gradientsNewerOnDevice = true;
                 System.Threading.Interlocked.Increment(ref s_graphReplays);
-                RefreshLossFromCapturedGraph(gte);
+                RefreshLossFromCapturedGraph(gte, deferRead: true);
                 ApplyL2Regularization();
                 if (_maxGradNorm > 0.0 && !TryClipGradientsGlobalL2Gpu(_gradients, _maxGradNorm))
                     ClipGradientsGlobalL2(_gradients, _maxGradNorm);
@@ -3652,6 +3951,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // buffers. Without this the device memory grows every time the user
         // calls ConfigureOptimizer (e.g., to switch from SGD to Adam mid-run
         // or to retune lr via re-configure with a fresh schedule).
+        LeaveDeviceSteppedOptimizer();
         LeaveSharedMoments();
         foreach (var buf in _gpuOptimizerBuffers)
             buf.Dispose();
@@ -4052,6 +4352,19 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             _optimizerStep++;
             ResolveAuthoritativeGpuGradients(
                 gpuParam, gpuBackends, gpuGrad, gradArrays, gradOffsets, stagedGrads);
+            if (TryDeviceSteppedMultiTensorAdam(optType, gpuParam, gpuGrad, gpuBackends, gpuM, gpuV,
+                    gpuMomentStorage, lengths, lrSchedule, b1, b2, epsVal, wd))
+            {
+                return;
+            }
+            if (_devOptState is not null)
+            {
+                // Back on the host-stepped path: settle the device counters first (this step's attempt is counted on
+                // the host only), so the step number, schedule and bias correction below continue exactly.
+                _optimizerStep--;
+                LeaveDeviceSteppedOptimizer();
+                _optimizerStep++;
+            }
             if (TryDiscardNonFiniteOptimizerStep(
                 gradArrays, gradOffsets, gpuGrad, gpuBackends, gpuFinitenessScratch,
                 gpuFinitenessAggregate, gpuFinitenessReductionLengths,
@@ -4856,6 +5169,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     {
         // CodeRabbit #425: reconfigure releases prior GPU optimizer-state.
         // See ConfigureOptimizerFloat for the rationale.
+        LeaveDeviceSteppedOptimizer();
         LeaveSharedMoments();
         foreach (var buf in _gpuOptimizerBuffers)
             buf.Dispose();
@@ -5495,6 +5809,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         OptimizerType optimizerType, LrSchedule schedule, double beta1, double beta2, double eps, double weightDecay,
         FusedOptimizerExtras extras)
     {
+        LeaveDeviceSteppedOptimizer();
         LeaveSharedMoments();
         foreach (var buf in _gpuOptimizerBuffers)
             buf.Dispose();
@@ -5708,6 +6023,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         double[]? groupWeightDecays,
         FusedOptimizerExtras extras)
     {
+        LeaveDeviceSteppedOptimizer();
         LeaveSharedMoments();
         foreach (var buf in _gpuOptimizerBuffers)
             buf.Dispose();
@@ -5905,6 +6221,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                     "does not provide a checkpoint representation. Use one of the built-in LrSchedule factories.");
         }
 
+        SyncDeviceOptimizerCounters();
         var checkpoint = new FusedOptimizerCheckpoint
         {
             OptimizerType = rt.OptimizerType,
@@ -6007,6 +6324,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     /// <summary>Releases the configured fused optimizer so the plan steps without one, as before configuration.</summary>
     private void ClearFusedOptimizer()
     {
+        LeaveDeviceSteppedOptimizer();
         foreach (var buf in _gpuOptimizerBuffers)
             buf.Dispose();
         _gpuOptimizerBuffers.Clear();

@@ -2061,7 +2061,7 @@ public partial class DirectGpuTensorEngine
             // clamp(x, min, +inf) == max(x, min) exactly (no MaxValue capping of large/inf inputs).
             float minF = ToFloatScalar(min);
             using var bufA = GetOrAllocateBuffer(backend, tensor);
-            var bufOut = AllocateOutputBuffer(backend, tensor.Length);
+            var bufOut = AllocateFullyWrittenOutputBuffer(backend, tensor.Length);
             backend.Clamp(bufA.Buffer, bufOut.Buffer, minF, float.PositiveInfinity, tensor.Length);
             var result = new Tensor<T>(FinishGpuOp<T>(backend, bufOut, tensor.Length), tensor.Shape._dims);
             // Same node and boxed bound CpuEngine records, so the backward sees an identical saved state.
@@ -2084,7 +2084,7 @@ public partial class DirectGpuTensorEngine
             // clamp(x, -inf, max) == min(x, max) exactly.
             float maxF = ToFloatScalar(max);
             using var bufA = GetOrAllocateBuffer(backend, tensor);
-            var bufOut = AllocateOutputBuffer(backend, tensor.Length);
+            var bufOut = AllocateFullyWrittenOutputBuffer(backend, tensor.Length);
             backend.Clamp(bufA.Buffer, bufOut.Buffer, float.NegativeInfinity, maxF, tensor.Length);
             var result = new Tensor<T>(FinishGpuOp<T>(backend, bufOut, tensor.Length), tensor.Shape._dims);
             Autodiff.DifferentiableOps.RecordUnary("TensorClampMax", result, tensor,

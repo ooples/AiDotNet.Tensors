@@ -3042,8 +3042,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private static OwnedBuffer AllocateFullyWrittenOutputBuffer(IDirectGpuBackend backend, int size)
     {
         var eng = s_residentScratchEngine;
+        // fullyWritten: a reused pooled buffer is otherwise re-zeroed, one captured memset node per op per step.
         if (eng is not null && eng.ScratchPoolingActive)
-            return new OwnedBuffer(eng.RentActionScratchOrAllocate(backend, size), ownsBuffer: false);
+            return new OwnedBuffer(eng.RentActionScratchOrAllocate(backend, size, fullyWritten: true), ownsBuffer: false);
         return new OwnedBuffer(AllocateReclaiming(backend, b => b is IUninitializedGpuAllocation uninitialized
             ? uninitialized.AllocateBufferUninitialized(size)
             : b.AllocateBuffer(size)), ownsBuffer: true);
@@ -7670,7 +7671,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             using var bBuf = GetWeightBufferPreferResident(backend, bias, PersistentTensorRole.Biases);
             int[] outShape = (int[])input.Shape._dims.Clone(); outShape[^1] = N;
             var outTensor = new Tensor<T>(new T[(long)M * N], outShape);
-            var outBuf = GetOrCreateResidentBuffer(backend, outTensor, M * N);
+            var outBuf = GetOrCreateResidentBuffer(backend, outTensor, M * N, fullyWritten: true);   // GEMM beta 0 + bias
             if (inBuf.Buffer.Handle == System.IntPtr.Zero || inBuf.Buffer.Size < (long)M * K
                 || wBuf.Buffer.Handle == System.IntPtr.Zero || wBuf.Buffer.Size < (long)K * N
                 || bBuf.Buffer.Handle == System.IntPtr.Zero || bBuf.Buffer.Size < N
@@ -14346,7 +14347,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     if (gR is not null && oR is not null)
                     {
                         var rOut = new Tensor<T>(new T[output.Length], output.Shape.ToArray());
-                        var giBuf = GetOrCreateResidentBuffer(backend, rOut, output.Length);
+                        var giBuf = GetOrCreateResidentBuffer(backend, rOut, output.Length, fullyWritten: true);
                         if (giBuf.Handle != System.IntPtr.Zero && giBuf.Size >= output.Length)
                         {
                             backend.SoftmaxBackward(gR, oR, giBuf, outerSize, features);
@@ -15212,7 +15213,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                         // so it is NOT a cuMemAllocAsync graph node (the 8 small ~32KB in-capture allocs). Pooled ⇒ do
                         // NOT dispose (the pool owns + reuses it across steps/replays); unpooled (eager/eval) ⇒ dispose.
                         invVarPooled = ScratchPoolingActive;
-                        invVarBuf = invVarPooled ? RentActionScratch(backend, batchSize) : backend.AllocateBuffer(batchSize);
+                        invVarBuf = invVarPooled ? RentActionScratch(backend, batchSize, fullyWritten: true) : backend.AllocateBuffer(batchSize);
                         if (invVarBuf is not null && invVarBuf.Handle != System.IntPtr.Zero)
                         {
                             backend.AddScalar(varR, invVarBuf, (float)epsilon, batchSize); // var + eps
@@ -15221,9 +15222,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                             var giT = new Tensor<T>(new T[input.Length], input.Shape.ToArray());
                             var ggT = new Tensor<T>(new T[normalizedSize], gamma.Shape.ToArray());
                             var gbT = new Tensor<T>(new T[normalizedSize], gamma.Shape.ToArray());
-                            var giBuf = GetOrCreateResidentBuffer(backend, giT, input.Length);
-                            var ggBuf = GetOrCreateResidentBuffer(backend, ggT, normalizedSize);
-                            var gbBuf = GetOrCreateResidentBuffer(backend, gbT, normalizedSize);
+                            // Every LayerNormBackward path overwrites all three outputs (the fused-atomic D64 variant
+                            // accumulates in its own workspace and copies out), so pooled buffers need no re-zeroing.
+                            var giBuf = GetOrCreateResidentBuffer(backend, giT, input.Length, fullyWritten: true);
+                            var ggBuf = GetOrCreateResidentBuffer(backend, ggT, normalizedSize, fullyWritten: true);
+                            var gbBuf = GetOrCreateResidentBuffer(backend, gbT, normalizedSize, fullyWritten: true);
                             if (giBuf.Handle != System.IntPtr.Zero && ggBuf.Handle != System.IntPtr.Zero && gbBuf.Handle != System.IntPtr.Zero)
                             {
                                 backend.LayerNormBackward(gR, iR, gamR, meanR, invVarBuf, giBuf, ggBuf, gbBuf,
@@ -21865,7 +21868,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     try
                     {
                         var output = new Tensor<T>(new T[(long)batch * Mb * Nb], batchedOutShape);
-                        var outBuf = GetOrCreateResidentBuffer(backend, output, batch * Mb * Nb);
+                        var outBuf = GetOrCreateResidentBuffer(backend, output, batch * Mb * Nb, fullyWritten: true);   // beta 0
                         if (outBuf.Handle != System.IntPtr.Zero && outBuf.Size >= (long)batch * Mb * Nb)
                         {
                             backend.BatchedGemm(aR, bR, outBuf, Mb, Nb, Kb, batch, 1f, 0f);
@@ -22353,8 +22356,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     // Pooled buffers are first-rented in the pre-residency pass (outside capture); the capture pass hits
                     // the pool (no alloc). Do NOT CacheActivation when pooled (its per-step bookkeeping perturbs the
                     // captured graph — matches GetOrCreateResidentBuffer's resident-miss path).
+                    // A permutation writes every output element, so the pooled buffer needs no re-zeroing.
                     if (ScratchPoolingActive)
-                        outBuf = RentActionScratch(backend, output.Length);
+                        outBuf = RentActionScratch(backend, output.Length, fullyWritten: true);
                     else
                     {
                         outBuf = backend.AllocateBuffer(output.Length);
@@ -25471,7 +25475,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     for (int i = 0; i < axis; i++) outerSize *= tensor.Shape._dims[i];
                     int reduceSize = tensor.Shape._dims[axis];
                     var gi = UploadTensorRaw(b, tensor);
-                    var go = RentActionScratchOrAllocate(b, outerSize);
+                    var go = RentActionScratchOrAllocate(b, outerSize, fullyWritten: true);   // one sum per row
                     b.SumAxis(gi, go, outerSize, reduceSize);
                     int[] outShape;
                     if (keepDims)
@@ -27545,6 +27549,25 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     int outerSize = tensor.Length / features;
                     var source = tensor.IsContiguous ? tensor : (Tensor<T>)tensor.Contiguous();
                     using var input = GetOrAllocateBuffer(backend, source);
+                    if (backend is DirectGpu.CUDA.CudaBackend cudaLogSoftmax)
+                    {
+                        // One fused kernel (the same stable x - max - log(sum(exp(x - max)))) instead of the eight-kernel
+                        // composition below and its six scratch buffers, each a zero-filled allocation.
+                        var fusedOut = AllocateFullyWrittenOutputBuffer(backend, tensor.Length);
+                        try
+                        {
+                            cudaLogSoftmax.LogSoftmax(input.Buffer, fusedOut.Buffer, outerSize, features);
+                        }
+                        catch
+                        {
+                            fusedOut.Dispose();
+                            throw;
+                        }
+                        var fusedResult = DeferTensorResult<T>(backend, fusedOut.Buffer, tensor.Length, tensor.Shape.ToArray());
+                        Autodiff.DifferentiableOps.RecordUnary("LogSoftmax", fusedResult, tensor,
+                            Autodiff.BackwardFunctions<T>.LogSoftmaxBackward, new object[] { normalizedAxis });
+                        return fusedResult;
+                    }
                     var output = AllocateOutputBuffer(backend, tensor.Length);
                     bool handedOff = false;
                     try
