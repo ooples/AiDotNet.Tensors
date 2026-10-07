@@ -151,6 +151,41 @@ public class IntoOpsWriteThroughTests
         Assert.Throws<ArgumentException>(() => _engine.ConcatInto(wrong, new[] { a, b }, 1));
     }
 
+    [Theory]
+    [InlineData(-1)]
+    [InlineData(1)]
+    [InlineData(0)]
+    public void SoftmaxInto_InPlace_MatchesSoftmax(int axis)
+    {
+        var x = Random(new[] { 4, 6, 5 }, 21);
+        var expected = _engine.Softmax(x, axis);
+
+        _engine.SoftmaxInto(x, x, axis);
+
+        AssertSame(expected, x);
+    }
+
+    [Fact]
+    public void SoftmaxInto_InPlace_Double_MatchesSoftmax()
+    {
+        var x = new Tensor<double>(new[] { 3, 7 });
+        for (int i = 0; i < x.Length; i++) x[i] = 0.3 * i - 2.0;
+        var expected = _engine.Softmax(x, -1);
+
+        _engine.SoftmaxInto(x, x, -1);
+
+        for (int i = 0; i < x.Length; i++) Assert.Equal(expected[i], x[i], 12);
+    }
+
+    [Fact]
+    public void SoftmaxInto_RejectsADestinationOfTheWrongShape()
+    {
+        var x = Random(new[] { 4, 6 }, 22);
+        var wrong = new Tensor<float>(new[] { 4, 5 });
+
+        Assert.Throws<ArgumentException>(() => _engine.SoftmaxInto(wrong, x, -1));
+    }
+
 #if NET5_0_OR_GREATER
     [Fact]
     public void IntoOps_DoNotAllocateTheirResult()

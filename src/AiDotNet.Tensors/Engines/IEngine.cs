@@ -2197,7 +2197,7 @@ public interface IEngine
     /// <summary>Transpose tensor into pre-allocated destination.</summary>
     void TransposeInto<T>(Tensor<T> destination, Tensor<T> input, int[] axes);
 
-    /// <summary>Softmax into pre-allocated destination. Zero allocation.</summary>
+    /// <summary>Softmax into pre-allocated destination. Zero allocation. <paramref name="destination"/> may be <paramref name="input"/> itself, for an in-place softmax.</summary>
     void SoftmaxInto<T>(Tensor<T> destination, Tensor<T> input, int axis);
 
     /// <summary>LogSoftmax into pre-allocated destination. Zero allocation.</summary>

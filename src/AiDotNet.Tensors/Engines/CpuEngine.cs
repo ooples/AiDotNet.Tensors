@@ -4988,6 +4988,13 @@ public partial class CpuEngine : ITensorLevelEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (destination == null) throw new ArgumentNullException(nameof(destination));
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        // The kernels below write through raw pointers, so a wrong-sized destination overruns its buffer.
+        if (!ShapesMatch(destination._shape, input._shape))
+        {
+            throw new ArgumentException(
+                $"Destination shape [{string.Join(", ", destination._shape)}] must match the input shape [{string.Join(", ", input._shape)}].",
+                nameof(destination));
+        }
         var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
 
@@ -5068,6 +5075,13 @@ public partial class CpuEngine : ITensorLevelEngine
     public void LogSoftmaxInto<T>(Tensor<T> destination, Tensor<T> input, int axis)
     {
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        // The kernels below write through raw pointers, so a wrong-sized destination overruns its buffer.
+        if (!ShapesMatch(destination._shape, input._shape))
+        {
+            throw new ArgumentException(
+                $"Destination shape [{string.Join(", ", destination._shape)}] must match the input shape [{string.Join(", ", input._shape)}].",
+                nameof(destination));
+        }
         var inputOrig = input;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!input.IsContiguous) input = input.Contiguous();
         var result = TensorLogSoftmax(input, axis);
