@@ -25774,6 +25774,18 @@ public partial class CpuEngine : ITensorLevelEngine
                         (Tensor<float>)(object)beta, epsilon, eagerMp._shape, "LayerNorm");
                     return (Tensor<T>)(object)yF;
                 }
+                if (typeof(T) == typeof(float) && this is not DirectGpuTensorEngine)
+                {
+                    var compiledLn = TryRecordLayerNormFloat(scope, (Tensor<float>)(object)input,
+                        (Tensor<float>)(object)gamma, (Tensor<float>)(object)beta, epsilon,
+                        out var compiledMean, out var compiledVariance);
+                    if (compiledLn is not null)
+                    {
+                        mean = (Tensor<T>)(object)compiledMean!;
+                        variance = (Tensor<T>)(object)compiledVariance!;
+                        return (Tensor<T>)(object)compiledLn;
+                    }
+                }
                 var ci = input; var cg = gamma; var cb = beta; double ce = epsilon;
                 var savedScope = GraphMode.Current;
                 GraphMode.SetCurrent(null);
