@@ -66,6 +66,65 @@ public partial class CpuEngine
     }
 
     /// <summary>
+    /// <c>output = act(conv2d(input, kernel) + bias[c])</c>, <c>act</c> = ReLU or identity: the forward of a compiled
+    /// Conv2D -> TensorChannelBiasAdd [-> ReLU] chain, which needs only the activation (its backward reads the
+    /// activation, never the raw convolution). When the float convolution runs on the SIMD 3x3 route, the bias and
+    /// ReLU are applied as each output chunk is stored, so the convolution output is never written and re-read;
+    /// otherwise the convolution is written into <paramref name="output"/> and the epilogue runs over it in place.
+    /// </summary>
+    /// <remarks>
+    /// Bit-identical to <c>Conv2DInto</c> into a separate buffer followed by <see cref="ChannelBiasActivationInto"/>:
+    /// the convolution takes the same route and summation either way, and the fused store applies
+    /// <c>sum + bias</c> then <c>max(x, +0)</c> exactly as the separate epilogue does.
+    /// </remarks>
+    internal void Conv2DBiasActivationInto(
+        Tensor<float> output, Tensor<float> input, Tensor<float> kernel, Tensor<float> bias, bool relu,
+        int[] stride, int[] padding, int[] dilation)
+    {
+        if (output == null) throw new ArgumentNullException(nameof(output));
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (kernel == null) throw new ArgumentNullException(nameof(kernel));
+        if (bias == null) throw new ArgumentNullException(nameof(bias));
+        if (stride == null || stride.Length != 2 || padding == null || padding.Length != 2
+            || dilation == null || dilation.Length != 2)
+            throw new ArgumentException("Conv2DBiasActivationInto needs two-element stride, padding and dilation.");
+        if (input.Rank != 4 || kernel.Rank != 4 || output.Rank != 4 || bias.Rank != 1
+            || kernel._shape[1] != input._shape[1] || bias._shape[0] != kernel._shape[0]
+            || output._shape[0] != input._shape[0] || output._shape[1] != kernel._shape[0])
+            throw new ArgumentException("Conv2DBiasActivationInto needs input [N, C, H, W], kernel [O, C, kH, kW], bias [O] and output [N, O, oH, oW].");
+
+#if !NET471
+        int strideH = stride[0], strideW = stride[1], padH = padding[0], padW = padding[1];
+        int dilationH = dilation[0], dilationW = dilation[1];
+        int kernelHeight = kernel._shape[2], kernelWidth = kernel._shape[3];
+        int outputHeight = (input._shape[2] + 2 * padH - (dilationH * (kernelHeight - 1) + 1)) / strideH + 1;
+        int outputWidth = (input._shape[3] + 2 * padW - (dilationW * (kernelWidth - 1) + 1)) / strideW + 1;
+        // The route Conv2DInto takes for a plain NCHW float input (Conv2DIntoImpl -> DispatchFloatConv2D ->
+        // Conv2DWithIm2ColFloat), with the epilogue handed to it; any other layout or geometry keeps the two-pass form.
+        bool adaptiveRoute = input.IsContiguous && kernel.IsContiguous && output.IsContiguous && bias.IsContiguous
+            && input.Layout == LinearAlgebra.TensorLayout.Nchw
+            && output._shape[2] == outputHeight && output._shape[3] == outputWidth
+            && ShouldUseAdaptiveFloatConv2D(input.Layout, strideH, strideW, padH, padW, dilationH, dilationW);
+        if (adaptiveRoute)
+        {
+            // False: the chosen strategy wrote the plain convolution, so the epilogue still has to run below.
+            if (Conv2DWithIm2ColFloat(input, kernel, output,
+                    input._shape[0], input._shape[1], input._shape[2], input._shape[3],
+                    kernel._shape[0], kernelHeight, kernelWidth, strideH, padH, dilationH,
+                    outputHeight, outputWidth, bias, relu))
+                return;
+        }
+        else
+        {
+            Conv2DInto(output, input, kernel, stride, padding, dilation);
+        }
+#else
+        Conv2DInto(output, input, kernel, stride, padding, dilation);
+#endif
+        ChannelBiasActivationInto(output, output, bias, relu);
+    }
+
+    /// <summary>
     /// Backward of <see cref="ChannelBiasActivationInto"/>: from the output gradient <paramref name="gradOutput"/>
     /// and the forward output <paramref name="output"/>, writes the pre-activation gradient
     /// <c>gradInput = relu ? (output &gt; 0 ? gradOutput : 0) : gradOutput</c> and the bias gradient

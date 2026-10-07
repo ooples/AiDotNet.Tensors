@@ -11493,6 +11493,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             var xShape = (int[])x._shape.Clone();
             var kShape = (int[])kernel._shape.Clone();
             var convOutF = (Tensor<float>)(object)convOut;
+            var xF = (Tensor<float>)(object)x;
+            var kernelF = (Tensor<float>)(object)kernel;
             var biasF = (Tensor<float>)(object)bias;
             var yF = (Tensor<float>)(object)y;
             var gradYF = (Tensor<float>)(object)gradY;
@@ -11504,8 +11506,18 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             {
                 if (eng is CpuEngine cpu && !eng.SupportsGpu)
                 {
-                    cpu.Conv2DInto(convOut, x, kernel, capStride, capPadding, capDilation);
-                    cpu.ChannelBiasActivationInto(yF, convOutF, biasF, relu);
+                    // Nothing reads the raw convolution once the chain is fused (the backward uses the activation),
+                    // so the conv writes the activation directly. The forward diagnostics inspect each step's own
+                    // output buffer, so under them the convolution is still materialised (same values either way).
+                    if (SanitizeForwardBuffers || ForwardStepObserver is not null)
+                    {
+                        cpu.Conv2DInto(convOut, x, kernel, capStride, capPadding, capDilation);
+                        cpu.ChannelBiasActivationInto(yF, convOutF, biasF, relu);
+                    }
+                    else
+                    {
+                        cpu.Conv2DBiasActivationInto(yF, xF, kernelF, biasF, relu, capStride, capPadding, capDilation);
+                    }
                 }
                 else
                 {

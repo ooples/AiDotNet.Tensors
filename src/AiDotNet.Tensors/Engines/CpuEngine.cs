@@ -10116,7 +10116,12 @@ public partial class CpuEngine : ITensorLevelEngine
     /// Tries in order: oneDNN, fused im2col-GEMM, Winograd, SIMD direct conv, im2col+GEMM fallback.
     /// BLAS-based approaches are preferred over SIMD direct conv for most sizes.
     /// </summary>
-    private void Conv2DWithIm2ColFloat(
+    /// <param name="epilogueBias">When set, the strategy that supports it (the SIMD 3x3 route) writes
+    /// <c>act(conv + bias[oc])</c> instead of the plain convolution, and the method returns true. Every other
+    /// strategy ignores it and writes the plain convolution (returning false); the caller then applies the bias and
+    /// activation itself.</param>
+    /// <param name="epilogueRelu">With <paramref name="epilogueBias"/>: apply ReLU after the bias.</param>
+    private bool Conv2DWithIm2ColFloat(
         Tensor<float> input,
         Tensor<float> kernel,
         Tensor<float> result,
@@ -10131,14 +10136,16 @@ public partial class CpuEngine : ITensorLevelEngine
         int padding,
         int dilation,
         int outputHeight,
-        int outputWidth)
+        int outputWidth,
+        Tensor<float>? epilogueBias = null,
+        bool epilogueRelu = false)
     {
 #if !NET471
         // Strategy 1: Try oneDNN for best performance (uses optimized CPU kernels)
         if (TryConv2DOneDnn(input, kernel, result, batch, inChannels, height, width,
             outChannels, kernelHeight, kernelWidth, stride, padding, dilation, outputHeight, outputWidth))
         {
-            return;
+            return false;
         }
 
         // Strategy 1.5: route to explicit im2col + BLAS GEMM (implicit-GEMM panels).
@@ -10189,7 +10196,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 Conv2DWithImplicitGemmFloat(input, kernel, result, batch, inChannels, height, width,
                     outChannels, kernelHeight, kernelWidth, stride, padding, dilation, outputHeight, outputWidth);
             }
-            return;
+            return false;
         }
 
         // Strategy 2: Try fused im2col-GEMM with cache tiling (BLAS-based, faster for most sizes)
@@ -10206,7 +10213,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 outChannels, kernelHeight, kernelWidth,
                 stride, stride, padding, padding,
                 dilation, dilation, outputHeight, outputWidth);
-            return;
+            return false;
         }
 #endif
 
@@ -10221,21 +10228,23 @@ public partial class CpuEngine : ITensorLevelEngine
                 inputSpan, kernelSpan, outputSpan,
                 batch, inChannels, height, width,
                 outChannels, padding, padding);
-            return;
+            return false;
         }
 
 #if !NET471
         // Strategy 4: Try SIMD direct convolution for small 3x3 kernels with stride=1
         if (TryConv2DSimd(input, kernel, result, batch, inChannels, height, width,
-            outChannels, kernelHeight, kernelWidth, stride, padding, dilation, outputHeight, outputWidth))
+            outChannels, kernelHeight, kernelWidth, stride, padding, dilation, outputHeight, outputWidth,
+            epilogueBias, epilogueRelu, out bool epilogueFused))
         {
-            return;
+            return epilogueFused;
         }
 #endif
 
         // Strategy 5: Fallback to im2col + GEMM (works for all cases)
         Conv2DWithIm2ColGemm(input, kernel, result, batch, inChannels, height, width,
             outChannels, kernelHeight, kernelWidth, stride, padding, dilation, outputHeight, outputWidth);
+        return false;
     }
 
 #if !NET471
@@ -10276,8 +10285,10 @@ public partial class CpuEngine : ITensorLevelEngine
         Tensor<float> input, Tensor<float> kernel, Tensor<float> result,
         int batch, int inChannels, int height, int width,
         int outChannels, int kernelHeight, int kernelWidth,
-        int stride, int padding, int dilation, int outputHeight, int outputWidth)
+        int stride, int padding, int dilation, int outputHeight, int outputWidth,
+        Tensor<float>? epilogueBias, bool epilogueRelu, out bool epilogueFused)
     {
+        epilogueFused = false;
         if (!SimdConvHelper.CanUseSimdConv(kernelHeight, kernelWidth, stride, stride))
         {
             return false;
@@ -10286,11 +10297,22 @@ public partial class CpuEngine : ITensorLevelEngine
         var inputSpan = input.AsSpan();
         var kernelSpan = kernel.AsSpan();
         var outputSpan = result.Data.Span;
+        var biasSpan = epilogueBias is null ? default : epilogueBias.AsSpan();
 
         fixed (float* inputPtr = inputSpan)
         fixed (float* kernelPtr = kernelSpan)
         fixed (float* outputPtr = outputSpan)
+        fixed (float* biasPtr = biasSpan)
         {
+            if (kernelHeight == 3 && kernelWidth == 3 && epilogueBias is not null
+                && SimdConvHelper.TryConv3x3Stride1BiasActivation(
+                    inputPtr, kernelPtr, biasPtr, outputPtr,
+                    batch, inChannels, height, width,
+                    outChannels, padding, padding, dilation, dilation, epilogueRelu))
+            {
+                epilogueFused = true;
+                return true;
+            }
             if (kernelHeight == 3 && kernelWidth == 3)
             {
                 SimdConvHelper.Conv3x3Stride1(

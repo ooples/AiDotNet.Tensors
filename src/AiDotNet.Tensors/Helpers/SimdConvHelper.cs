@@ -1214,6 +1214,53 @@ internal static class SimdConvHelper
     [ThreadStatic] private static float[]? t_conv3x3PaddedImage;
 
     /// <summary>
+    /// The bias add and optional ReLU a <see cref="Conv3x3Stride1PaddedTiled"/> task applies to an output chunk as
+    /// it stores it (<c>max(conv + bias[oc], +0)</c>), so a conv followed by a channel-bias add and a ReLU writes
+    /// its final activation in one pass instead of writing the conv output and re-reading it.
+    /// </summary>
+    private readonly struct ConvStoreEpilogue
+    {
+        public readonly bool Active;
+        public readonly bool Relu;
+        public readonly Vector256<float> Bias0;
+        public readonly Vector256<float> Bias1;
+
+        public ConvStoreEpilogue(float bias0, float bias1, bool relu)
+        {
+            Active = true;
+            Relu = relu;
+            Bias0 = Vector256.Create(bias0);
+            Bias1 = Vector256.Create(bias1);
+        }
+    }
+
+    /// <summary>
+    /// <c>output[n, oc] = act(conv3x3(input)[n, oc] + bias[oc])</c> with <c>act</c> = ReLU or identity, in one pass,
+    /// when <see cref="Conv3x3Stride1"/> would run this convolution on its padded tiled FMA route (stride 1,
+    /// dilation 1, the default variant). Returns false, writing nothing, otherwise; the caller then runs the
+    /// convolution and the epilogue separately.
+    /// </summary>
+    /// <remarks>
+    /// Bit-identical to the convolution followed by <c>CpuEngine.ChannelBiasActivationInto</c>: the conv sum is the
+    /// same register value the plain kernel stores, then <c>sum + bias</c> and <c>max(x, +0)</c> exactly as that
+    /// epilogue computes them, so a NaN or -0 sum becomes +0 under ReLU.
+    /// </remarks>
+    internal static unsafe bool TryConv3x3Stride1BiasActivation(
+        float* input, float* kernel, float* bias, float* output,
+        int batch, int inChannels, int height, int width,
+        int outChannels, int padH, int padW, int dilationH, int dilationW, bool relu)
+    {
+        int outHeight = height + 2 * padH - (dilationH * 2 + 1) + 1;
+        int outWidth = width + 2 * padW - (dilationW * 2 + 1) + 1;
+        if (!(UseFma && dilationH == 1 && dilationW == 1 && ActiveConv3x3Variant == Conv3x3Variant.Auto
+              && outHeight > 0 && outWidth > 0))
+            return false;
+        Conv3x3Stride1PaddedTiled(input, kernel, output, batch, inChannels, height, width,
+            outChannels, padH, padW, outHeight, outWidth, bias, relu);
+        return true;
+    }
+
+    /// <summary>
     /// 3x3 stride-1 dilation-1 convolution (any padding) computed entirely with AVX2 FMAs. Each task copies one
     /// image into a zero-padded scratch whose row stride is a whole number of 8-wide column chunks plus the two
     /// halo columns, so every output position (borders included) is an unconditional vector FMA chain and the
@@ -1230,7 +1277,8 @@ internal static class SimdConvHelper
     private static unsafe void Conv3x3Stride1PaddedTiled(
         float* input, float* kernel, float* output,
         int batch, int inChannels, int height, int width,
-        int outChannels, int padH, int padW, int outHeight, int outWidth)
+        int outChannels, int padH, int padW, int outHeight, int outWidth,
+        float* bias = null, bool relu = false)
     {
         int colChunks = (outWidth + 7) >> 3;
         int paddedW = colChunks * 8 + 2;
@@ -1277,8 +1325,11 @@ internal static class SimdConvHelper
                     float* k1 = hasSecond ? k0 + kernelPerOc : k0;
                     float* o0 = outImage + (long)oc0 * outPlane;
                     float* o1 = hasSecond ? o0 + outPlane : null;
+                    var epilogue = bias == null
+                        ? default
+                        : new ConvStoreEpilogue(bias[oc0], hasSecond ? bias[oc0 + 1] : bias[oc0], relu);
                     Conv3x3PairPlane(padded, plane, paddedW, k0, k1, inChannels, o0, o1,
-                        outHeight, outWidth, colChunks);
+                        outHeight, outWidth, colChunks, epilogue);
                 }
             }
         }
@@ -1444,7 +1495,7 @@ internal static class SimdConvHelper
     [MethodImpl(Hot)]
     private static unsafe void Conv3x3PairPlane(
         float* padded, int plane, int paddedW, float* k0, float* k1, int inChannels,
-        float* out0, float* out1, int outHeight, int outWidth, int colChunks)
+        float* out0, float* out1, int outHeight, int outWidth, int colChunks, ConvStoreEpilogue epilogue)
     {
         int tailValid = outWidth - (colChunks - 1) * 8;
         var tailMask = Vector256.LessThan(
@@ -1457,17 +1508,24 @@ internal static class SimdConvHelper
             for (; oh + 4 <= outHeight; oh += 4)
                 Conv3x3PairRows4(padded + oh * paddedW + ow, plane, paddedW, k0, k1, inChannels,
                     out0 + oh * outWidth + ow, out1 == null ? null : out1 + oh * outWidth + ow,
-                    outWidth, full, tailMask);
+                    outWidth, full, tailMask, epilogue);
             for (; oh < outHeight; oh++)
                 Conv3x3PairRow1(padded + oh * paddedW + ow, plane, paddedW, k0, k1, inChannels,
                     out0 + oh * outWidth + ow, out1 == null ? null : out1 + oh * outWidth + ow,
-                    full, tailMask);
+                    full, tailMask, epilogue);
         }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static unsafe void StoreConvChunk(float* dst, Vector256<float> v, bool full, Vector256<float> mask)
+    private static unsafe void StoreConvChunk(float* dst, Vector256<float> v, bool full, Vector256<float> mask,
+        in ConvStoreEpilogue epilogue, bool second)
     {
+        if (epilogue.Active)
+        {
+            // value + bias, then max(value, +0): the channel-bias add's operand order and the ReLU kernel's maxps.
+            v = Avx.Add(v, second ? epilogue.Bias1 : epilogue.Bias0);
+            if (epilogue.Relu) v = Avx.Max(v, Vector256<float>.Zero);
+        }
         if (full) Avx.Store(dst, v);
         else Avx.MaskStore(dst, mask, v);
     }
@@ -1476,7 +1534,7 @@ internal static class SimdConvHelper
     [MethodImpl(HotInline)]
     private static unsafe void Conv3x3PairRows4(
         float* src, int plane, int paddedW, float* k0, float* k1, int inChannels,
-        float* dst0, float* dst1, int outWidth, bool full, Vector256<float> mask)
+        float* dst0, float* dst1, int outWidth, bool full, Vector256<float> mask, in ConvStoreEpilogue epilogue)
     {
         var a0 = Vector256<float>.Zero; var a1 = Vector256<float>.Zero;
         var a2 = Vector256<float>.Zero; var a3 = Vector256<float>.Zero;
@@ -1514,16 +1572,16 @@ internal static class SimdConvHelper
                 x = Avx.LoadVector256(r + 2); a3 = Fma.MultiplyAdd(x, p2, a3); b3 = Fma.MultiplyAdd(x, q2, b3);
             }
         }
-        StoreConvChunk(dst0, a0, full, mask);
-        StoreConvChunk(dst0 + outWidth, a1, full, mask);
-        StoreConvChunk(dst0 + 2 * outWidth, a2, full, mask);
-        StoreConvChunk(dst0 + 3 * outWidth, a3, full, mask);
+        StoreConvChunk(dst0, a0, full, mask, epilogue, false);
+        StoreConvChunk(dst0 + outWidth, a1, full, mask, epilogue, false);
+        StoreConvChunk(dst0 + 2 * outWidth, a2, full, mask, epilogue, false);
+        StoreConvChunk(dst0 + 3 * outWidth, a3, full, mask, epilogue, false);
         if (dst1 != null)
         {
-            StoreConvChunk(dst1, b0, full, mask);
-            StoreConvChunk(dst1 + outWidth, b1, full, mask);
-            StoreConvChunk(dst1 + 2 * outWidth, b2, full, mask);
-            StoreConvChunk(dst1 + 3 * outWidth, b3, full, mask);
+            StoreConvChunk(dst1, b0, full, mask, epilogue, true);
+            StoreConvChunk(dst1 + outWidth, b1, full, mask, epilogue, true);
+            StoreConvChunk(dst1 + 2 * outWidth, b2, full, mask, epilogue, true);
+            StoreConvChunk(dst1 + 3 * outWidth, b3, full, mask, epilogue, true);
         }
     }
 
@@ -1531,7 +1589,7 @@ internal static class SimdConvHelper
     [MethodImpl(HotInline)]
     private static unsafe void Conv3x3PairRow1(
         float* src, int plane, int paddedW, float* k0, float* k1, int inChannels,
-        float* dst0, float* dst1, bool full, Vector256<float> mask)
+        float* dst0, float* dst1, bool full, Vector256<float> mask, in ConvStoreEpilogue epilogue)
     {
         var a = Vector256<float>.Zero;
         var b = Vector256<float>.Zero;
@@ -1554,8 +1612,8 @@ internal static class SimdConvHelper
                 b = Fma.MultiplyAdd(x2, Vector256.Create(w1[kh * 3 + 2]), b);
             }
         }
-        StoreConvChunk(dst0, a, full, mask);
-        if (dst1 != null) StoreConvChunk(dst1, b, full, mask);
+        StoreConvChunk(dst0, a, full, mask, epilogue, false);
+        if (dst1 != null) StoreConvChunk(dst1, b, full, mask, epilogue, true);
     }
 
     /// <summary>

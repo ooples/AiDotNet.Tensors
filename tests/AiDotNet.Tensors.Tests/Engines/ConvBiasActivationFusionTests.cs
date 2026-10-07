@@ -85,6 +85,56 @@ public class ConvBiasActivationFusionTests
         AssertBitEqual(expectedBias, db.AsSpan(), "bias gradient");
     }
 
+    /// <summary>
+    /// The one-pass conv + bias [+ ReLU] (the epilogue applied in the 3x3 kernel's stores) against the convolution
+    /// into a separate buffer followed by the separate epilogue, bit for bit: odd output-channel counts (the pair
+    /// kernel's discarded partner), widths with a masked column tail, a NaN input (NaN sums become +0 under ReLU),
+    /// a kernel the 3x3 route does not take (two-pass fallback inside the entry), and padding 0 and 2.
+    /// </summary>
+    [Theory]
+    [InlineData(3, 1, 16, 28, 28, 3, 1, true)]    // the parity CNN's first conv
+    [InlineData(2, 16, 32, 14, 14, 3, 1, true)]   // the second (14 = one full chunk + a 6-wide tail)
+    [InlineData(2, 3, 5, 9, 11, 3, 1, true)]      // odd channel count, 11-wide tail
+    [InlineData(2, 3, 5, 9, 11, 3, 1, false)]
+    [InlineData(1, 2, 4, 7, 7, 3, 0, true)]
+    [InlineData(1, 2, 4, 7, 7, 3, 2, true)]
+    [InlineData(2, 3, 4, 9, 9, 5, 2, true)]       // 5x5: not the 3x3 route
+    public void FusedConvForwardMatchesTwoPass(int n, int c, int o, int h, int w, int k, int pad, bool relu)
+    {
+        var engine = new CpuEngine();
+        var x = Rnd(new[] { n, c, h, w }, 21);
+        var kernel = Rnd(new[] { o, c, k, k }, 22, 0.5f);
+        var b = Rnd(new[] { o }, 23, 0.5f);
+        x[5] = float.NaN;
+        var stride = new[] { 1, 1 }; var padding = new[] { pad, pad }; var dilation = new[] { 1, 1 };
+        int oh = h + 2 * pad - k + 1, ow = w + 2 * pad - k + 1;
+        var conv = new Tensor<float>(new[] { n, o, oh, ow });
+        engine.Conv2DInto(conv, x, kernel, stride, padding, dilation);
+        var expected = new Tensor<float>(conv._shape);
+        engine.ChannelBiasActivationInto(expected, conv, b, relu);
+
+        var actual = new Tensor<float>(conv._shape);
+        for (int i = 0; i < actual.Length; i++) actual[i] = 77f;   // stale contents must be fully replaced
+        engine.Conv2DBiasActivationInto(actual, x, kernel, b, relu, stride, padding, dilation);
+        AssertBitEqual(expected.AsSpan(), actual.AsSpan(), "fused conv forward");
+    }
+
+    /// <summary>A non-default 3x3 variant routes the conv off the tiled kernel; the entry must still be exact.</summary>
+    [Fact]
+    public void FusedConvForwardMatchesTwoPassOnLegacyVariant()
+    {
+        var prior = SimdConvHelper.ActiveConv3x3Variant;
+        try
+        {
+            SimdConvHelper.ActiveConv3x3Variant = SimdConvHelper.Conv3x3Variant.Block2;
+            FusedConvForwardMatchesTwoPass(2, 3, 4, 9, 11, 3, 1, true);
+        }
+        finally
+        {
+            SimdConvHelper.ActiveConv3x3Variant = prior;
+        }
+    }
+
     [Fact]
     public void BackwardIsIndependentOfThreadCount()
     {
