@@ -9200,6 +9200,11 @@ internal static class BackwardFunctions<T>
             return;
         }
 
+        if (typeof(T) == typeof(float) && TryRfftAdjointHostFloat(
+                (Tensor<float>)(object)gradOutput, (Tensor<float>)(object)input, n, nFft, engine,
+                (Dictionary<Tensor<float>, Tensor<float>>)(object)grads))
+            return;
+
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradData = gradOutput.GetDataArray();
         int batchSize = gradOutput.Length / (numFreqs * 2);
@@ -9272,6 +9277,11 @@ internal static class BackwardFunctions<T>
             return;
         }
 
+        if (typeof(T) == typeof(float) && TryIrfftAdjointHostFloat(
+                (Tensor<float>)(object)gradOutput, (Tensor<float>)(object)input, numFreqs, nFft, outputLength, engine,
+                (Dictionary<Tensor<float>, Tensor<float>>)(object)grads))
+            return;
+
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradData = gradOutput.GetDataArray();
         int batchSize = gradOutput.Length / outputLength;
@@ -9316,6 +9326,84 @@ internal static class BackwardFunctions<T>
         }
 
         DifferentiableOps.AccumulateGrad(grads, input, result, engine);
+    }
+
+    [ThreadStatic] private static Complex<float>[]? t_fftAdjointRow;
+
+    private static Complex<float>[] FftAdjointRow(int nFft)
+    {
+        var row = t_fftAdjointRow;
+        if (row is null || row.Length != nFft) t_fftAdjointRow = row = new Complex<float>[nFft];
+        return row;
+    }
+
+    /// <summary>
+    /// Host float32 RFFT adjoint: per row, the one-sided gradient zero-padded to nFft, inverse-transformed
+    /// (unnormalized) by the native FFT, real part kept -- the same operator as the generic loop below, which ran the
+    /// legacy FFTCore (cos/sin per butterfly, two vectors allocated per row) serially over every row. Rows run in
+    /// parallel with per-thread scratch. Power-of-two nFft only (the native kernel's fast path; the generic loop routes
+    /// other lengths to Bluestein).
+    /// </summary>
+    private static bool TryRfftAdjointHostFloat(
+        Tensor<float> gradOutput, Tensor<float> input, int n, int nFft, IEngine engine,
+        Dictionary<Tensor<float>, Tensor<float>> grads)
+    {
+        if (engine.SupportsGpu || nFft < 2 || (nFft & (nFft - 1)) != 0 || !gradOutput.IsContiguous) return false;
+        var g = gradOutput.GetCpuBackingForStridedRead(out int gOff);
+        if (g is null) return false;
+        int numFreqs = nFft / 2 + 1;
+        int rows = gradOutput.Length / (numFreqs * 2);
+        var result = new Tensor<float>(input._shape);
+        var r = result.GetCpuBackingForContiguousWrite(out int rOff)!;
+        Helpers.CpuParallelSettings.ParallelForOrSerial(0, rows, (long)rows * nFft * 8, b =>
+        {
+            var buf = FftAdjointRow(nFft);
+            int go = gOff + b * numFreqs * 2;
+            for (int k = 0; k < numFreqs; k++) buf[k] = new Complex<float>(g[go + 2 * k], g[go + 2 * k + 1]);
+            for (int k = numFreqs; k < nFft; k++) buf[k] = default;
+            CpuEngine.NativeFftFloatInPlace(buf, inverse: true);
+            int ro = rOff + b * n;
+            for (int j = 0; j < n; j++) r[ro + j] = buf[j].Real;
+        }, deterministicSafe: true);
+        DifferentiableOps.AccumulateGrad(grads, input, result, engine);
+        return true;
+    }
+
+    /// <summary>
+    /// Host float32 IRFFT adjoint: per row, the real gradient zero-padded to nFft, forward-transformed by the native FFT,
+    /// each kept bin scaled by c_k/nFft (c_k = 1 for self-conjugate bins, whose imaginary gradient is 0, else 2). Same
+    /// operator as the generic loop below; rows in parallel. Power-of-two nFft only.
+    /// </summary>
+    private static bool TryIrfftAdjointHostFloat(
+        Tensor<float> gradOutput, Tensor<float> input, int numFreqs, int nFft, int outputLength, IEngine engine,
+        Dictionary<Tensor<float>, Tensor<float>> grads)
+    {
+        if (engine.SupportsGpu || nFft < 2 || (nFft & (nFft - 1)) != 0 || !gradOutput.IsContiguous) return false;
+        var g = gradOutput.GetCpuBackingForStridedRead(out int gOff);
+        if (g is null) return false;
+        int rows = gradOutput.Length / outputLength;
+        var result = new Tensor<float>(input._shape);
+        var r = result.GetCpuBackingForContiguousWrite(out int rOff)!;
+        float invN = 1f / nFft;
+        Helpers.CpuParallelSettings.ParallelForOrSerial(0, rows, (long)rows * nFft * 8, b =>
+        {
+            var buf = FftAdjointRow(nFft);
+            int go = gOff + b * outputLength;
+            int copy = Math.Min(outputLength, nFft);
+            for (int j = 0; j < copy; j++) buf[j] = new Complex<float>(g[go + j], 0f);
+            for (int j = copy; j < nFft; j++) buf[j] = default;
+            CpuEngine.NativeFftFloatInPlace(buf, inverse: false);
+            int ro = rOff + b * numFreqs * 2;
+            for (int k = 0; k < numFreqs; k++)
+            {
+                bool selfConjugate = k == 0 || (nFft % 2 == 0 && k == nFft / 2);
+                float scale = (selfConjugate ? 1f : 2f) * invN;
+                r[ro + 2 * k] = buf[k].Real * scale;
+                r[ro + 2 * k + 1] = selfConjugate ? 0f : buf[k].Imaginary * scale;
+            }
+        }, deterministicSafe: true);
+        DifferentiableOps.AccumulateGrad(grads, input, result, engine);
+        return true;
     }
 
     /// <summary>

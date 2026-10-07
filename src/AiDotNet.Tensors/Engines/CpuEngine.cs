@@ -51784,6 +51784,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
     [ThreadStatic] private static Dictionary<(int n, bool inverse), Complex<float>[]>? _twiddleCacheFloat;
 
+    /// <summary>The native in-place float FFT (unnormalized; inverse flips the twiddle sign) for host kernels
+    /// outside this class, e.g. the RFFT/IRFFT adjoint backwards.</summary>
+    internal static void NativeFftFloatInPlace(Span<Complex<float>> data, bool inverse) => NativeFFTInPlaceFloatSpan(data, inverse);
+
     private static void NativeFFTInPlaceFloatSpan(Span<Complex<float>> data, bool inverse)
     {
         int n = data.Length;
