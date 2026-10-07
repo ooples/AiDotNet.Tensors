@@ -37,7 +37,7 @@ public class MaxPoolRecomputeBackwardTests
     {
         Assert.Equal(expected.Length, actual.Length);
         for (int i = 0; i < expected.Length; i++)
-            Assert.True(BitConverter.SingleToInt32Bits(expected[i]) == BitConverter.SingleToInt32Bits(actual[i]),
+            Assert.True(TestHelpers.MathCompat.SingleToInt32Bits(expected[i]) == TestHelpers.MathCompat.SingleToInt32Bits(actual[i]),
                 $"{what}: element {i} expected {expected[i]:R} got {actual[i]:R}");
     }
 
@@ -106,7 +106,7 @@ public class MaxPoolRecomputeBackwardTests
             v = x[b0 + w]; if (v > m) m = v;
             v = x[b0 + w + 1]; if (v > m) m = v;
             float got = y[(p * oh + r) * ow + col];
-            Assert.True(BitConverter.SingleToInt32Bits(m) == BitConverter.SingleToInt32Bits(got),
+            Assert.True(TestHelpers.MathCompat.SingleToInt32Bits(m) == TestHelpers.MathCompat.SingleToInt32Bits(got),
                 $"plane {p} ({r},{col}): expected {m:R} got {got:R}");
         }
     }
@@ -177,7 +177,7 @@ public class MaxPoolRecomputeBackwardTests
                     var g = plan.Gradients[0].AsSpan();
                     Assert.Equal(tapeGrad.Length, g.Length);
                     for (int i = 0; i < g.Length; i++)
-                        Assert.True(BitConverter.SingleToInt32Bits(tapeGrad[i]) == BitConverter.SingleToInt32Bits(g[i]),
+                        Assert.True(TestHelpers.MathCompat.SingleToInt32Bits(tapeGrad[i]) == TestHelpers.MathCompat.SingleToInt32Bits(g[i]),
                             $"step {step} element {i}: tape {tapeGrad[i]:R} plan {g[i]:R}");
                 }
             }

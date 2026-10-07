@@ -85,7 +85,7 @@ public class CompiledMixedPlanGradientZeroingTests
                             Assert.True(Math.Abs(got - expected) <= 1e-4f * (1f + Math.Abs(expected)),
                                 $"step {step} parameter {p} element {i}: tape {expected:R} plan {got:R}");
                             if (first is not null)
-                                Assert.True(BitConverter.SingleToInt32Bits(first[p][i]) == BitConverter.SingleToInt32Bits(got),
+                                Assert.True(TestHelpers.MathCompat.SingleToInt32Bits(first[p][i]) == TestHelpers.MathCompat.SingleToInt32Bits(got),
                                     $"step {step} parameter {p} element {i} drifted from step 0: {first[p][i]:R} -> {got:R}");
                         }
                     }

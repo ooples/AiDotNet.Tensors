@@ -30,7 +30,7 @@ public class ConvBiasActivationFusionTests
     {
         Assert.Equal(expected.Length, actual.Length);
         for (int i = 0; i < expected.Length; i++)
-            Assert.True(BitConverter.SingleToInt32Bits(expected[i]) == BitConverter.SingleToInt32Bits(actual[i]),
+            Assert.True(TestHelpers.MathCompat.SingleToInt32Bits(expected[i]) == TestHelpers.MathCompat.SingleToInt32Bits(actual[i]),
                 $"{what}: element {i} expected {expected[i]:R} got {actual[i]:R}");
     }
 
