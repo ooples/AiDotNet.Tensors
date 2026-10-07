@@ -86,6 +86,54 @@ internal sealed class PersistentParallelExecutor
     // Completion signal for the dispatcher
     private readonly ManualResetEventSlim _allDone = new(false);
 
+    // How long the dispatching thread spins on _remaining before blocking on _allDone (Stopwatch ticks).
+    // Blocking made every dispatch pay a kernel wait plus a wake-up handshake (ManualResetEventSlim.Wait's
+    // Monitor slow path on the dispatcher, Set's lock + PulseAll on the last worker): on a CPU training step
+    // that issues dozens of 10-100 us dispatches, ~20% of the dispatching thread went to that machinery. The
+    // participants' chunks are equal-sized, so the woken workers usually finish within microseconds of the
+    // dispatcher. The spin is bounded, so a slow straggler still gets a blocking wait. Env override
+    // AIDOTNET_PPE_COMPLETION_SPIN_US (0 = block immediately, the old behaviour). Default 100 us.
+    private static readonly long _completionSpinTicks = ComputeCompletionSpinTicks();
+
+    private static long ComputeCompletionSpinTicks()
+    {
+        long micros = 100;
+        if (int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_PPE_COMPLETION_SPIN_US"), out var us) && us >= 0)
+            micros = us;
+        return (long)(micros * (System.Diagnostics.Stopwatch.Frequency / 1_000_000.0));
+    }
+
+    /// <summary>
+    /// Waits until every woken worker has decremented <see cref="_remaining"/>: a bounded spin, then the event.
+    /// </summary>
+    /// <remarks>
+    /// The event can carry a STALE set: when the spin sees the count reach zero it returns before the last
+    /// worker's <c>_allDone.Set()</c>, which may then land after the next dispatch's <c>Reset()</c>. So the
+    /// count, never the event, decides completion: after each wake the event is reset and the count re-read.
+    /// The last worker sets the event only AFTER its decrement, so a non-zero count read after the reset
+    /// guarantees that set is still to come -- no wake-up can be lost.
+    /// </remarks>
+    private void WaitForWorkers()
+    {
+        long budget = _completionSpinTicks;
+        if (budget > 0 && Volatile.Read(ref _remaining) != 0)
+        {
+            long start = System.Diagnostics.Stopwatch.GetTimestamp();
+            int spins = 0;
+            while (Volatile.Read(ref _remaining) != 0)
+            {
+                System.Threading.Thread.SpinWait(16);
+                if ((++spins & 0x3F) == 0 && System.Diagnostics.Stopwatch.GetTimestamp() - start >= budget)
+                    break;
+            }
+        }
+        while (Volatile.Read(ref _remaining) != 0)
+        {
+            _allDone.Wait();
+            _allDone.Reset();
+        }
+    }
+
     // Serialize concurrent Execute calls
     private readonly object _executeLock = new();
 
@@ -487,7 +535,7 @@ internal sealed class PersistentParallelExecutor
                 // MaxDoP==1): the main thread already ran every chunk (stride == 1), and
                 // _allDone would never be set — waiting would hang.
                 if (workersNeeded > 0)
-                    _allDone.Wait();
+                    WaitForWorkers();
 
                 _job = null; // release the body's captured references for GC between dispatches
 
@@ -593,7 +641,7 @@ internal sealed class PersistentParallelExecutor
                 Exception? mainException = RunParticipantChunks(job, 0);
 
                 if (workersNeeded > 0)
-                    _allDone.Wait();
+                    WaitForWorkers();
 
                 _job = null; // release the body's captured references for GC between dispatches
 
