@@ -55,6 +55,7 @@ internal static class Program
         if (args.Length > 0 && args[0] == "--resblock") return RunResblock(eng, args);
         if (args.Length > 0 && args[0] == "--attnblock") return RunAttnBlock(eng, args);
         if (args.Length > 0 && args[0] == "--allocops") return RunAllocOps(eng, args);
+        if (args.Length > 0 && args[0] == "--intoaudit") return RunIntoAudit(eng, args);
         if (args.Length > 0 && args[0] == "--act") return RunAct(eng, args);
         if (args.Length > 0 && args[0] == "--gemm") return RunGemm(eng, args);
         if (args.Length > 0 && args[0] == "--gemmverify") return RunGemmVerify(eng, args);
@@ -109,6 +110,49 @@ internal static class Program
     // way --resblock measures the conv mix. This is a perf-SHAPE probe: weights/activations are
     // random and the per-head tensors are allocated at the exact attention GEMM shapes, so it
     // measures the dispatch/parallel behavior of those op shapes (not numerical attention).
+    // In-place forward work: a destination-taking op that still allocates its result and copies it
+    // is slower than the out-of-place op it replaces. Report bytes per call; ~0 is the contract.
+    private static int RunIntoAudit(CpuEngine eng, string[] a)
+    {
+        CpuParallelSettings.MaxDegreeOfParallelism = ArgI(a, "--maxdop", 1);
+        var rng = new Random(0);
+        int S = 256, D = 768, H = 12, Dh = 64;
+        var x = Rand(new[] { S, D }, rng);
+        var y = Rand(new[] { S, D }, rng);
+        var row = Rand(new[] { 1, D }, rng);
+        var w = Rand(new[] { D, D }, rng);
+        var outSD = Rand(new[] { S, D }, rng);
+        var outDS = Rand(new[] { D, S }, rng);
+        var qh = Rand(new[] { H, S, Dh }, rng);
+        var kht = Rand(new[] { H, Dh, S }, rng);
+        var scores = Rand(new[] { H, S, S }, rng);
+        var outHSS = Rand(new[] { H, S, S }, rng);
+        var outCat = Rand(new[] { S, 2 * D }, rng);
+
+        void Audit(string name, Action op)
+        {
+            op(); op();
+            long before = GC.GetTotalAllocatedBytes(true);
+            for (int i = 0; i < 5; i++) op();
+            double kb = (GC.GetTotalAllocatedBytes(true) - before) / 5.0 / 1024.0;
+            Console.WriteLine($"INTO {name,-34} alloc_KB_per_call={kb,10:F1}{(kb > 64 ? "  <-- allocates" : "")}");
+        }
+
+        Audit("MatMulInto rank2", () => eng.MatMulInto(outSD, x, w));
+        Audit("MatMulInto rank3 (per-head)", () => eng.MatMulInto(outHSS, qh, kht));
+        Audit("SoftmaxInto", () => eng.SoftmaxInto(outHSS, scores, -1));
+        Audit("LogSoftmaxInto", () => eng.LogSoftmaxInto(outHSS, scores, -1));
+        Audit("TensorAddInto", () => eng.TensorAddInto(outSD, x, y));
+        Audit("TensorAddInPlace", () => eng.TensorAddInPlace(outSD, x));
+        Audit("TensorBroadcastAddInto [S,D]+[1,D]", () => eng.TensorBroadcastAddInto(outSD, x, row));
+        Audit("TensorBroadcastMultiplyInto", () => eng.TensorBroadcastMultiplyInto(outSD, x, row));
+        Audit("TensorMultiplyInto", () => eng.TensorMultiplyInto(outSD, x, y));
+        Audit("TransposeInto", () => eng.TransposeInto(outDS, x, new[] { 1, 0 }));
+        Audit("ConcatInto", () => eng.ConcatInto(outCat, new[] { x, y }, 1));
+        Audit("GELUInto", () => eng.GELUInto(outSD, x));
+        Audit("SwishInto", () => eng.SwishInto(outSD, x));
+        return 0;
+    }
     // In-place forward work: bytes each attention-block op allocates beyond its own output.
     // Anything above 1.00x is internal scratch the op could take from a reused buffer instead.
     private static int RunAllocOps(CpuEngine eng, string[] a)

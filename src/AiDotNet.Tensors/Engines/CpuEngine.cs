@@ -4827,24 +4827,102 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         // For batched/ND cases, fall back to allocate-copy
+        // Batched shapes (the per-head attention GEMMs) write straight into the destination. Only a
+        // broadcast batch still goes through TensorMatMul and a copy, which allocates the result.
+        if (a.Rank >= 2 && (b.Rank == 2 || (a.Rank == b.Rank && BatchDimsMatch(a._shape, b._shape))))
+        {
+            if (a._shape[a.Rank - 1] != b._shape[b.Rank - 2])
+            {
+                throw new ArgumentException(
+                    $"Matrix dimensions incompatible: inner dimensions {a._shape[a.Rank - 1]} and {b._shape[b.Rank - 2]}.");
+            }
+            var expectedShape = ComputeMatMulOutputShape(a._shape, b._shape);
+            if (!ShapesMatch(destination._shape, expectedShape))
+            {
+                throw new ArgumentException(
+                    $"Destination shape [{string.Join(", ", destination._shape)}] does not match the product shape " +
+                    $"[{string.Join(", ", expectedShape)}].", nameof(destination));
+            }
+            if (typeof(T) == typeof(float))
+            {
+                TensorMatMulFloatInto((Tensor<float>)(object)a, (Tensor<float>)(object)b, (Tensor<float>)(object)destination);
+                return;
+            }
+            if (typeof(T) == typeof(double))
+            {
+                TensorMatMulDoubleInto((Tensor<double>)(object)a, (Tensor<double>)(object)b, (Tensor<double>)(object)destination);
+                return;
+            }
+        }
         var result = TensorMatMul(a, b);
         result.Data.Span.CopyTo(destination.Data.Span);
     }
 
     /// <inheritdoc/>
     /// <remarks>
-    /// Current implementation computes into a temporary tensor then copies to destination.
+    /// Copies each input's slab straight into <paramref name="destination"/>; nothing is allocated for the result.
     /// </remarks>
     public void ConcatInto<T>(Tensor<T> destination, Tensor<T>[] tensors, int axis)
     {
+        if (destination is null) throw new ArgumentNullException(nameof(destination));
+        if (tensors is null) throw new ArgumentNullException(nameof(tensors));
+        if (tensors.Length == 0) throw new ArgumentException("At least one tensor is required.", nameof(tensors));
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
-        var result = Concat(tensors, axis);
-        result.Data.Span.CopyTo(destination.Data.Span);
+
+        int rank = destination.Rank;
+        if (axis < 0) axis += rank;
+        if (axis < 0 || axis >= rank)
+            throw new ArgumentOutOfRangeException(nameof(axis), $"Axis must be in [-{rank}, {rank - 1}] for rank {rank}.");
+
+        int axisTotal = 0;
+        foreach (var tensor in tensors)
+        {
+            if (tensor is null) throw new ArgumentException("Tensors must not contain null.", nameof(tensors));
+            if (tensor.Rank != rank)
+                throw new ArgumentException($"Every tensor must have rank {rank}; got rank {tensor.Rank}.", nameof(tensors));
+            for (int d = 0; d < rank; d++)
+            {
+                if (d != axis && tensor._shape[d] != destination._shape[d])
+                {
+                    throw new ArgumentException(
+                        $"Dimension {d} is {tensor._shape[d]} but the destination has {destination._shape[d]}.", nameof(tensors));
+                }
+            }
+            axisTotal += tensor._shape[axis];
+        }
+        if (axisTotal != destination._shape[axis])
+        {
+            throw new ArgumentException(
+                $"The inputs sum to {axisTotal} along axis {axis} but the destination has {destination._shape[axis]}.",
+                nameof(destination));
+        }
+
+        // Each input contributes one contiguous slab per outer index: [outer][input slab][...].
+        int outer = 1;
+        for (int d = 0; d < axis; d++) outer *= destination._shape[d];
+        int inner = 1;
+        for (int d = axis + 1; d < rank; d++) inner *= destination._shape[d];
+        int destinationRow = axisTotal * inner;
+
+        var dst = destination.AsWritableSpan();
+        int columnOffset = 0;
+        foreach (var tensor in tensors)
+        {
+            var src = tensor.IsContiguous ? tensor.AsSpan() : tensor.Contiguous().AsSpan();
+            int slab = tensor._shape[axis] * inner;
+            for (int o = 0; o < outer; o++)
+            {
+                src.Slice(o * slab, slab).CopyTo(dst.Slice(o * destinationRow + columnOffset, slab));
+            }
+            columnOffset += slab;
+        }
     }
+
+    private static readonly int[] TransposeAxes2D = { 1, 0 };
 
     /// <inheritdoc/>
     /// <remarks>
-    /// Current implementation computes into a temporary tensor then copies to destination.
+    /// Writes straight into <paramref name="destination"/>; nothing is allocated for the result.
     /// </remarks>
     public void TransposeInto<T>(Tensor<T> destination, Tensor<T> input, int[] axes)
     {
@@ -4854,9 +4932,16 @@ public partial class CpuEngine : ITensorLevelEngine
         if (axes == null || axes.Length == 0 ||
             (input.Rank == 2 && axes.Length == 2 && axes[0] == 1 && axes[1] == 0))
         {
-            // Standard 2D transpose
-            var result = TensorTranspose(input);
-            result.Data.Span.CopyTo(destination.Data.Span);
+            // Standard 2D transpose: a strided copy straight into the destination.
+            if (input.Rank != 2)
+                throw new ArgumentException($"A transpose without axes requires a 2D tensor. Got rank {input.Rank}.", nameof(input));
+            if (destination._shape.Length != 2 || destination._shape[0] != input._shape[1] || destination._shape[1] != input._shape[0])
+            {
+                throw new ArgumentException(
+                    $"Destination shape [{string.Join(", ", destination._shape)}] must be [{input._shape[1]}, {input._shape[0]}].",
+                    nameof(destination));
+            }
+            TensorPermuteInto(destination, input, TransposeAxes2D);
             return;
         }
 
@@ -13052,6 +13137,15 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>Eagerly computes the output shape of a matmul without executing it.</summary>
+    /// <summary>Whether two same-rank shapes agree on every batch (leading) dimension.</summary>
+    private static bool BatchDimsMatch(int[] aShape, int[] bShape)
+    {
+        for (int i = 0; i < aShape.Length - 2; i++)
+        {
+            if (aShape[i] != bShape[i]) return false;
+        }
+        return true;
+    }
     private static int[] ComputeMatMulOutputShape(int[] aShape, int[] bShape)
     {
         int aRank = aShape.Length;
