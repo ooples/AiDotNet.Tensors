@@ -4529,7 +4529,11 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         // Swish uses ArrayPool internally for the sigmoid buffer (no GC allocation)
-        numOps.Swish(tensor.AsSpan(), tensor.AsWritableSpan());
+        if (typeof(T) == typeof(float) || typeof(T) == typeof(double))
+            SwishInto(tensor, tensor); // fused, parallel, alias-safe kernel (see SwishBlocked)
+        else
+            numOps.Swish(tensor.AsSpan(), tensor.AsWritableSpan());
+        if (!ReferenceEquals(tensor, tensorOrig)) WriteBackToView(tensorOrig, tensor);
     }
 
     /// <inheritdoc/>
@@ -4588,6 +4592,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.GELU(tensor.AsSpan(), tensor.AsWritableSpan());
+        if (!ReferenceEquals(tensor, tensorOrig)) WriteBackToView(tensorOrig, tensor);
     }
 
     /// <inheritdoc/>
@@ -4652,6 +4657,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Tanh(tensor.AsSpan(), tensor.AsWritableSpan());
+        if (!ReferenceEquals(tensor, tensorOrig)) WriteBackToView(tensorOrig, tensor);
     }
 
     /// <inheritdoc/>
@@ -4708,6 +4714,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.Mish(tensor.AsSpan(), tensor.AsWritableSpan());
+        if (!ReferenceEquals(tensor, tensorOrig)) WriteBackToView(tensorOrig, tensor);
     }
 
     /// <inheritdoc/>
@@ -4760,6 +4767,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         numOps.LeakyReLU(tensor.AsSpan(), alpha, tensor.AsWritableSpan());
+        if (!ReferenceEquals(tensor, tensorOrig)) WriteBackToView(tensorOrig, tensor);
     }
 
     /// <inheritdoc/>
@@ -11165,6 +11173,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 {
                     if (OneDnnProvider.TrySigmoid(ptr, tensor.Length))
                     {
+                        if (!ReferenceEquals(tensor, tensorOrig)) WriteBackToView(tensorOrig, tensor);
                         if (savedInput is not null) DifferentiableOps.RecordUnary("SigmoidInPlace", tensorOrig, savedInput, BackwardFunctions<T>.SigmoidBackward);
                         return;
                     }
@@ -11173,6 +11182,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         SigmoidParallel(tensor);
+        if (!ReferenceEquals(tensor, tensorOrig)) WriteBackToView(tensorOrig, tensor);
         if (savedInput is not null) DifferentiableOps.RecordUnary("SigmoidInPlace", tensorOrig, savedInput, BackwardFunctions<T>.SigmoidBackward);
     }
 #else
@@ -11206,6 +11216,7 @@ public partial class CpuEngine : ITensorLevelEngine
         tensor.IncrementVersion();
 
         SigmoidParallel(tensor);
+        if (!ReferenceEquals(tensor, tensorOrig)) WriteBackToView(tensorOrig, tensor);
         if (savedInput is not null) DifferentiableOps.RecordUnary("SigmoidInPlace", tensorOrig, savedInput, BackwardFunctions<T>.SigmoidBackward);
     }
 #endif
@@ -11461,6 +11472,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 {
                     if (OneDnnProvider.TryReLU(ptr, tensor.Length))
                     {
+                        if (!ReferenceEquals(tensor, tensorOrig)) WriteBackToView(tensorOrig, tensor);
                         if (savedInput is not null) DifferentiableOps.RecordUnary("ReLUInPlace", tensorOrig, savedInput, BackwardFunctions<T>.ReLUBackward);
                         return;
                     }
@@ -11469,6 +11481,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         ReLUParallel(tensor);
+        if (!ReferenceEquals(tensor, tensorOrig)) WriteBackToView(tensorOrig, tensor);
         if (savedInput is not null) DifferentiableOps.RecordUnary("ReLUInPlace", tensorOrig, savedInput, BackwardFunctions<T>.ReLUBackward);
     }
 #else
@@ -11502,6 +11515,7 @@ public partial class CpuEngine : ITensorLevelEngine
         tensor.IncrementVersion();
 
         ReLUParallel(tensor);
+        if (!ReferenceEquals(tensor, tensorOrig)) WriteBackToView(tensorOrig, tensor);
         if (savedInput is not null) DifferentiableOps.RecordUnary("ReLUInPlace", tensorOrig, savedInput, BackwardFunctions<T>.ReLUBackward);
     }
 #endif
@@ -45647,6 +45661,44 @@ public partial class CpuEngine : ITensorLevelEngine
     /// Each chunk is independent — sigmoid then x*sigmoid over the same slice — so
     /// the result is bit-identical to the serial two-pass path.
     /// </summary>
+    /// <summary>
+    /// Copies a contiguous result back through a non-contiguous view. The in-place activations compute
+    /// on a contiguous copy of a view; without this the caller's tensor was left unchanged, silently.
+    /// </summary>
+    private static void WriteBackToView<T>(Tensor<T> view, Tensor<T> contiguous)
+    {
+        for (int i = 0; i < contiguous.Length; i++)
+        {
+            view[i] = contiguous[i];
+        }
+    }
+    // Swish in two SIMD passes through an L1-sized stack block. The passes used to run over the whole
+    // range with sigmoid(x) written into the destination before x * sigmoid(x) was formed, so with
+    // dst == src (SwishInPlace, or SwishInto(t, t)) x was already overwritten and the result was
+    // sigmoid(x)^2. Staging sigmoid in a private block makes the kernel alias-safe.
+    private const int SwishBlock = 1024;
+
+    private static unsafe void SwishBlocked(float* src, float* dst, int length)
+    {
+        float* sig = stackalloc float[SwishBlock];
+        for (int offset = 0; offset < length; offset += SwishBlock)
+        {
+            int n = Math.Min(SwishBlock, length - offset);
+            Simd.SimdKernels.SigmoidUnsafe(src + offset, sig, n);
+            Simd.SimdKernels.VectorMultiplyUnsafe(src + offset, sig, dst + offset, n);
+        }
+    }
+
+    private static unsafe void SwishBlocked(double* src, double* dst, int length)
+    {
+        double* sig = stackalloc double[SwishBlock];
+        for (int offset = 0; offset < length; offset += SwishBlock)
+        {
+            int n = Math.Min(SwishBlock, length - offset);
+            Simd.SimdKernels.SigmoidUnsafe(src + offset, sig, n);
+            Simd.SimdKernels.VectorMultiplyUnsafe(src + offset, sig, dst + offset, n);
+        }
+    }
     private static unsafe void ParallelSwish(float* src, float* dst, int length)
     {
         const int parallelThreshold = 262144; // 1MB of floats — matches ParallelComputeBound(float).
@@ -45668,15 +45720,13 @@ public partial class CpuEngine : ITensorLevelEngine
                 {
                     float* s = (float*)pIn + start;
                     float* d = (float*)pOut + start;
-                    Simd.SimdKernels.SigmoidUnsafe(s, d, count);
-                    Simd.SimdKernels.VectorMultiplyUnsafe(s, d, d, count);
+                    SwishBlocked(s, d, count);
                 }
             });
         }
         else
         {
-            Simd.SimdKernels.SigmoidUnsafe(src, dst, length);
-            Simd.SimdKernels.VectorMultiplyUnsafe(src, dst, dst, length);
+            SwishBlocked(src, dst, length);
         }
     }
 
@@ -45703,15 +45753,13 @@ public partial class CpuEngine : ITensorLevelEngine
                 {
                     double* s = (double*)pIn + start;
                     double* d = (double*)pOut + start;
-                    Simd.SimdKernels.SigmoidUnsafe(s, d, count);
-                    Simd.SimdKernels.VectorMultiplyUnsafe(s, d, d, count);
+                    SwishBlocked(s, d, count);
                 }
             });
         }
         else
         {
-            Simd.SimdKernels.SigmoidUnsafe(src, dst, length);
-            Simd.SimdKernels.VectorMultiplyUnsafe(src, dst, dst, length);
+            SwishBlocked(src, dst, length);
         }
     }
 
