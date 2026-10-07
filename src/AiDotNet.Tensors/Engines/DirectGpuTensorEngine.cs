@@ -26822,19 +26822,28 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // Reuse the resident all-axis implementation above. It composes offset device copies
         // from IDirectGpuBackend instead of depending on the optional IGpuBatchExecution
         // surface, and therefore works on OpenCL as well as the other native backends.
-        if (typeof(T) == typeof(float) && tensors is { Count: 2 } && TryGetBackend(out _))
+        // Any number of inputs: a 2-only gate sent every wider concat (an LSTM's four stacked gate weights, a
+        // multi-branch block's outputs) to the CPU base, which downloads each input, and a download inside the
+        // compiled capture path abandons the step's CUDA graph.
+        if (typeof(T) == typeof(float) && tensors is { Count: > 0 } && TryGetBackend(out _))
         {
             var a = tensors[0];
-            var b = tensors[1];
             int rank = a.Rank;
             int normalizedAxis = axis < 0 ? rank + axis : axis;
-            bool compatible = normalizedAxis >= 0 && normalizedAxis < rank && b.Rank == rank
-                && a.IsContiguous && b.IsContiguous;
-            for (int i = 0; compatible && i < rank; i++)
-                compatible = i == normalizedAxis || a.Shape._dims[i] == b.Shape._dims[i];
+            bool compatible = normalizedAxis >= 0 && normalizedAxis < rank;
+            var inputs = new Tensor<T>[tensors.Count];
+            for (int t = 0; compatible && t < tensors.Count; t++)
+            {
+                var b = tensors[t];
+                if (b is null) { compatible = false; break; }
+                compatible = b.Rank == rank && b.IsContiguous;
+                for (int i = 0; compatible && i < rank; i++)
+                    compatible = i == normalizedAxis || a.Shape._dims[i] == b.Shape._dims[i];
+                inputs[t] = b;
+            }
 
             if (compatible)
-                return ((IEngine)this).TensorConcatenate(new[] { a, b }, axis);
+                return ((IEngine)this).TensorConcatenate(inputs, axis);
         }
         return base.Concat(tensors,axis);
     }

@@ -1123,6 +1123,265 @@ extern ""C"" __global__ __launch_bounds__(1024) void lstm_compute_gate_gradients
     // Gradient to previous cell state
     dPrevC[gid] = dC * f;
 }
+
+// ===========================================================================
+// FUSED TRAINING SEQUENCE KERNELS (cuDNN-style persistent recurrence + GEMM weight gradients)
+// ===========================================================================
+// Used by DirectGpuTensorEngine.TryLstmSequenceTrain. One block owns `rowsPerBlock` batch rows for the whole
+// sequence, so the recurrence needs only block barriers; every thread computes one gate pre-activation for each of
+// its rows, reusing each weight it loads across the rows. The weights are read through a [K, 4H] transpose
+// (K = input + hidden), so a warp's loads are coalesced. The backward runs the recurrence only for the gate
+// gradients and the carried dh/dc, then forms the weight, bias and input gradients as two tiled GEMMs over all
+// timesteps - no atomics, so the result is deterministic.
+//
+// Layouts (G = 4*hidden, gate rows in PyTorch order i, f, g, o):
+//   input/gradInput [batch, T, input]; output/gradOutput [batch, T, hidden]
+//   allH/allC [(T+1), batch, hidden]: slot 0 = initial state, slot t+1 = state after step t
+//   gates/gradGates [T, batch, G]: activated gates / their pre-activation gradients
+//   packedWT [K, G]: packedWT[j*G + g] = j < input ? Wih[g, j] : Whh[g, j - input]
+
+#define LSTM_SEQ_MAX_ROWS 8
+
+extern ""C"" __global__ void lstm_seq_pack_weights_t(
+    const float* __restrict__ Wih, const float* __restrict__ Whh, float* __restrict__ packedWT,
+    int inputSize, int hiddenSize)
+{
+    int G = 4 * hiddenSize;
+    int K = inputSize + hiddenSize;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= K * G) return;
+    int j = idx / G;
+    int g = idx - j * G;
+    packedWT[idx] = j < inputSize ? Wih[g * inputSize + j] : Whh[g * hiddenSize + (j - inputSize)];
+}
+
+extern ""C"" __global__ __launch_bounds__(1024) void lstm_seq_forward_train(
+    const float* __restrict__ input, const float* __restrict__ h_init, const float* __restrict__ c_init,
+    const float* __restrict__ packedWT, const float* __restrict__ bias,
+    float* __restrict__ output, float* __restrict__ allH, float* __restrict__ allC, float* __restrict__ gates,
+    int batch, int timeSteps, int inputSize, int hiddenSize, int rowsPerBlock)
+{
+    extern __shared__ float lstmSeqSmem[];
+    const int H = hiddenSize, G = 4 * hiddenSize, K = inputSize + hiddenSize;
+    const int b0 = blockIdx.x * rowsPerBlock;
+    const int rows = min(rowsPerBlock, batch - b0);
+    float* xh = lstmSeqSmem;                       // [rows][K]: x_t then h_{t-1}
+    float* pre = xh + rowsPerBlock * K;            // [rows][G]
+    float* cs = pre + rowsPerBlock * G;            // [rows][H]
+    const int tid = threadIdx.x, nt = blockDim.x;
+
+    for (int idx = tid; idx < rows * H; idx += nt) {
+        int r = idx / H, k = idx - r * H, b = b0 + r;
+        float h = h_init[b * H + k], c = c_init[b * H + k];
+        xh[r * K + inputSize + k] = h;
+        cs[idx] = c;
+        allH[b * H + k] = h;
+        allC[b * H + k] = c;
+    }
+
+    for (int t = 0; t < timeSteps; t++) {
+        for (int idx = tid; idx < rows * inputSize; idx += nt) {
+            int r = idx / inputSize, i = idx - r * inputSize;
+            xh[r * K + i] = input[((b0 + r) * timeSteps + t) * inputSize + i];
+        }
+        __syncthreads();
+
+        for (int g = tid; g < G; g += nt) {
+            float acc[LSTM_SEQ_MAX_ROWS];
+            float bg = bias[g];
+            #pragma unroll
+            for (int r = 0; r < LSTM_SEQ_MAX_ROWS; r++) acc[r] = bg;
+            #pragma unroll 4
+            for (int j = 0; j < K; j++) {
+                float w = packedWT[j * G + g];
+                #pragma unroll
+                for (int r = 0; r < LSTM_SEQ_MAX_ROWS; r++)
+                    if (r < rows) acc[r] += w * xh[r * K + j];
+            }
+            #pragma unroll
+            for (int r = 0; r < LSTM_SEQ_MAX_ROWS; r++)
+                if (r < rows) pre[r * G + g] = acc[r];
+        }
+        __syncthreads();
+
+        for (int idx = tid; idx < rows * H; idx += nt) {
+            int r = idx / H, k = idx - r * H, b = b0 + r;
+            const float* p = pre + r * G;
+            float ig = sigmoid(p[k]);
+            float fg = sigmoid(p[H + k]);
+            float gg = tanhf(p[2 * H + k]);
+            float og = sigmoid(p[3 * H + k]);
+            float c = fg * cs[idx] + ig * gg;
+            float h = og * tanhf(c);
+            cs[idx] = c;
+            xh[r * K + inputSize + k] = h;
+            output[(b * timeSteps + t) * H + k] = h;
+            int s = ((t + 1) * batch + b) * H + k;
+            allH[s] = h;
+            allC[s] = c;
+            int gb = (t * batch + b) * G;
+            gates[gb + k] = ig;
+            gates[gb + H + k] = fg;
+            gates[gb + 2 * H + k] = gg;
+            gates[gb + 3 * H + k] = og;
+        }
+        __syncthreads();
+    }
+}
+
+extern ""C"" __global__ __launch_bounds__(1024) void lstm_seq_backward_recurrence(
+    const float* __restrict__ gradOutput, const float* __restrict__ allC, const float* __restrict__ gates,
+    const float* __restrict__ Whh, float* __restrict__ gradGates, float* __restrict__ gradHInit,
+    float* __restrict__ gradCInit, int batch, int timeSteps, int hiddenSize, int rowsPerBlock, int splits)
+{
+    extern __shared__ float lstmSeqSmem[];
+    const int H = hiddenSize, G = 4 * hiddenSize;
+    const int b0 = blockIdx.x * rowsPerBlock;
+    const int rows = min(rowsPerBlock, batch - b0);
+    float* dh = lstmSeqSmem;                       // [rows][H]: dL/dh_t carried from step t+1
+    float* dc = dh + rowsPerBlock * H;             // [rows][H]: dL/dc_t carried from step t+1
+    float* dg = dc + rowsPerBlock * H;             // [rows][G]
+    float* part = dg + rowsPerBlock * G;           // [splits][rows][H]
+    const int tid = threadIdx.x, nt = blockDim.x;
+    const int chunk = (G + splits - 1) / splits;
+
+    for (int idx = tid; idx < rows * H; idx += nt) { dh[idx] = 0.0f; dc[idx] = 0.0f; }
+    __syncthreads();
+
+    for (int t = timeSteps - 1; t >= 0; t--) {
+        for (int idx = tid; idx < rows * H; idx += nt) {
+            int r = idx / H, k = idx - r * H, b = b0 + r;
+            int gb = (t * batch + b) * G;
+            float ig = gates[gb + k], fg = gates[gb + H + k], gg = gates[gb + 2 * H + k], og = gates[gb + 3 * H + k];
+            float cT = allC[((t + 1) * batch + b) * H + k];
+            float cPrev = allC[(t * batch + b) * H + k];
+            float dH = gradOutput[(b * timeSteps + t) * H + k] + dh[idx];
+            float tanhC = tanhf(cT);
+            float dO = dH * tanhC * sigmoid_derivative(og);
+            float dC = dc[idx] + dH * og * tanh_derivative(tanhC);
+            float dF = dC * cPrev * sigmoid_derivative(fg);
+            float dI = dC * gg * sigmoid_derivative(ig);
+            float dGg = dC * ig * tanh_derivative(gg);
+            dc[idx] = dC * fg;
+            float* d = dg + r * G;
+            d[k] = dI; d[H + k] = dF; d[2 * H + k] = dGg; d[3 * H + k] = dO;
+            gradGates[gb + k] = dI;
+            gradGates[gb + H + k] = dF;
+            gradGates[gb + 2 * H + k] = dGg;
+            gradGates[gb + 3 * H + k] = dO;
+        }
+        __syncthreads();
+
+        // dh_{t-1}[j] = sum_g Whh[g, j] * dg[g]: the gate range is split `splits` ways, each partial in fixed order.
+        for (int item = tid; item < splits * H; item += nt) {
+            int q = item / H, j = item - q * H;
+            int gEnd = min(G, (q + 1) * chunk);
+            float acc[LSTM_SEQ_MAX_ROWS];
+            #pragma unroll
+            for (int r = 0; r < LSTM_SEQ_MAX_ROWS; r++) acc[r] = 0.0f;
+            #pragma unroll 4
+            for (int g = q * chunk; g < gEnd; g++) {
+                float w = Whh[g * H + j];
+                #pragma unroll
+                for (int r = 0; r < LSTM_SEQ_MAX_ROWS; r++)
+                    if (r < rows) acc[r] += w * dg[r * G + g];
+            }
+            #pragma unroll
+            for (int r = 0; r < LSTM_SEQ_MAX_ROWS; r++)
+                if (r < rows) part[(q * rowsPerBlock + r) * H + j] = acc[r];
+        }
+        __syncthreads();
+
+        for (int idx = tid; idx < rows * H; idx += nt) {
+            int r = idx / H, j = idx - r * H;
+            float s = part[r * H + j];
+            for (int q = 1; q < splits; q++) s += part[(q * rowsPerBlock + r) * H + j];
+            dh[idx] = s;
+        }
+        __syncthreads();
+    }
+
+    for (int idx = tid; idx < rows * H; idx += nt) {
+        int r = idx / H, k = idx - r * H, b = b0 + r;
+        gradHInit[b * H + k] = dh[idx];
+        gradCInit[b * H + k] = dc[idx];
+    }
+}
+
+#define LSTM_SEQ_TILE 16
+
+// [dWih | dWhh | dBias][g, j] = sum over every (t, b) of gradGates[t, b, g] * A[t, b, j], where
+// A = [x_t | h_{t-1} | 1]. One 16x16 output tile per block, summed over (t, b) in a fixed order.
+extern ""C"" __global__ __launch_bounds__(256) void lstm_seq_backward_weights(
+    const float* __restrict__ gradGates, const float* __restrict__ input, const float* __restrict__ allH,
+    float* __restrict__ gradWih, float* __restrict__ gradWhh, float* __restrict__ gradBias,
+    int batch, int timeSteps, int inputSize, int hiddenSize)
+{
+    __shared__ float sG[LSTM_SEQ_TILE][LSTM_SEQ_TILE + 1];
+    __shared__ float sA[LSTM_SEQ_TILE][LSTM_SEQ_TILE + 1];
+    const int H = hiddenSize, G = 4 * hiddenSize, K1 = inputSize + hiddenSize + 1;
+    const int N = timeSteps * batch;
+    const int tilesJ = (K1 + LSTM_SEQ_TILE - 1) / LSTM_SEQ_TILE;
+    const int tg = blockIdx.x / tilesJ, tj = blockIdx.x - tg * tilesJ;
+    const int tx = threadIdx.x % LSTM_SEQ_TILE, ty = threadIdx.x / LSTM_SEQ_TILE;
+    const int g = tg * LSTM_SEQ_TILE + ty;         // output row
+    const int j = tj * LSTM_SEQ_TILE + tx;         // output column
+    float acc = 0.0f;
+    for (int n0 = 0; n0 < N; n0 += LSTM_SEQ_TILE) {
+        // sG[nn][gg] = gradGates[n0 + nn, tg*16 + gg]; sA[nn][jj] = A[n0 + nn, tj*16 + jj]
+        int nn = ty, n = n0 + nn;
+        int gl = tg * LSTM_SEQ_TILE + tx;
+        sG[nn][tx] = (n < N && gl < G) ? gradGates[n * G + gl] : 0.0f;
+        int jl = tj * LSTM_SEQ_TILE + tx;
+        float a = 0.0f;
+        if (n < N && jl < K1) {
+            int t = n / batch, b = n - t * batch;
+            if (jl < inputSize) a = input[(b * timeSteps + t) * inputSize + jl];
+            else if (jl < inputSize + H) a = allH[n * H + (jl - inputSize)];
+            else a = 1.0f;
+        }
+        sA[nn][tx] = a;
+        __syncthreads();
+        #pragma unroll
+        for (int k = 0; k < LSTM_SEQ_TILE; k++) acc += sG[k][ty] * sA[k][tx];
+        __syncthreads();
+    }
+    if (g < G && j < K1) {
+        if (j < inputSize) gradWih[g * inputSize + j] = acc;
+        else if (j < inputSize + H) gradWhh[g * H + (j - inputSize)] = acc;
+        else gradBias[g] = acc;
+    }
+}
+
+// gradInput[b, t, i] = sum_g gradGates[t, b, g] * Wih[g, i]. One 16x16 tile of (t*batch + b, i) per block.
+extern ""C"" __global__ __launch_bounds__(256) void lstm_seq_backward_input(
+    const float* __restrict__ gradGates, const float* __restrict__ Wih, float* __restrict__ gradInput,
+    int batch, int timeSteps, int inputSize, int hiddenSize)
+{
+    __shared__ float sG[LSTM_SEQ_TILE][LSTM_SEQ_TILE + 1];
+    __shared__ float sW[LSTM_SEQ_TILE][LSTM_SEQ_TILE + 1];
+    const int G = 4 * hiddenSize, N = timeSteps * batch;
+    const int tilesI = (inputSize + LSTM_SEQ_TILE - 1) / LSTM_SEQ_TILE;
+    const int tn = blockIdx.x / tilesI, ti = blockIdx.x - tn * tilesI;
+    const int tx = threadIdx.x % LSTM_SEQ_TILE, ty = threadIdx.x / LSTM_SEQ_TILE;
+    const int n = tn * LSTM_SEQ_TILE + ty;
+    const int i = ti * LSTM_SEQ_TILE + tx;
+    float acc = 0.0f;
+    for (int g0 = 0; g0 < G; g0 += LSTM_SEQ_TILE) {
+        int gl = g0 + tx;
+        sG[ty][tx] = (n < N && gl < G) ? gradGates[n * G + gl] : 0.0f;
+        int gr = g0 + ty;
+        sW[ty][tx] = (gr < G && i < inputSize) ? Wih[gr * inputSize + i] : 0.0f;
+        __syncthreads();
+        #pragma unroll
+        for (int k = 0; k < LSTM_SEQ_TILE; k++) acc += sG[ty][k] * sW[k][tx];
+        __syncthreads();
+    }
+    if (n < N && i < inputSize) {
+        int t = n / batch, b = n - t * batch;
+        gradInput[(b * timeSteps + t) * inputSize + i] = acc;
+    }
+}
 ";
     }
 
@@ -1150,7 +1409,12 @@ extern ""C"" __global__ __launch_bounds__(1024) void lstm_compute_gate_gradients
             "lstm_backward_sequence_dInput_deterministic",
             "lstm_accumulate_weight_gradients",
             "lstm_accumulate_weight_gradients_deterministic",
-            "lstm_compute_gate_gradients"
+            "lstm_compute_gate_gradients",
+            "lstm_seq_pack_weights_t",
+            "lstm_seq_forward_train",
+            "lstm_seq_backward_recurrence",
+            "lstm_seq_backward_weights",
+            "lstm_seq_backward_input"
         };
     }
 }

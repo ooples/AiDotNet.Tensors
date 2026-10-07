@@ -17514,6 +17514,146 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         LaunchKernel(kernel, grid, (uint)hiddenSize, args);
     }
 
+    // ----- Fused LSTM training sequence (DirectGpuTensorEngine.TryLstmSequenceTrain) -----
+    // Layouts are documented on the lstm_seq_* kernels in CudaLstmKernels. Unlike LstmForwardSequence /
+    // LstmBackwardSequence (one thread per (batch, hidden) unit, uncoalesced weight reads, ~500 atomics per thread
+    // per step), these run the recurrence with coalesced, row-reused weight loads and form every weight gradient
+    // as a deterministic GEMM over all timesteps.
+
+    private const int LstmSeqMaxRowsPerBlock = 8;          // LSTM_SEQ_MAX_ROWS in the kernel source
+    private const int LstmSeqMaxSharedBytes = 48 * 1024;   // the default dynamic shared memory limit
+
+    private static int LstmSeqThreads(int hiddenSize) => Math.Min(1024, (4 * hiddenSize + 31) / 32 * 32);
+
+    private static int LstmSeqSplits(int hiddenSize) => Math.Max(1, Math.Min(4, LstmSeqThreads(hiddenSize) / hiddenSize));
+
+    private static long LstmSeqForwardSharedBytes(int rows, int inputSize, int hiddenSize)
+        => (long)rows * (inputSize + hiddenSize + 4 * hiddenSize + hiddenSize) * sizeof(float);
+
+    private static long LstmSeqBackwardSharedBytes(int rows, int hiddenSize)
+        => (long)rows * (2 * hiddenSize + 4 * hiddenSize + LstmSeqSplits(hiddenSize) * hiddenSize) * sizeof(float);
+
+    /// <summary>
+    /// Batch rows each block of the fused LSTM sequence kernels owns: enough that the blocks roughly fill the
+    /// device once (each row's recurrence is serial, so more blocks than SMs only queue), capped by the kernel's
+    /// accumulator count and by the shared memory both kernels need. 0 when even one row does not fit.
+    /// </summary>
+    private int LstmSeqRowsPerBlock(int batch, int inputSize, int hiddenSize)
+    {
+        int units = Math.Max(1, ComputeUnits);
+        int rows = Math.Max(1, Math.Min(LstmSeqMaxRowsPerBlock, (batch + units - 1) / units));
+        while (rows > 0 && (LstmSeqForwardSharedBytes(rows, inputSize, hiddenSize) > LstmSeqMaxSharedBytes
+            || LstmSeqBackwardSharedBytes(rows, hiddenSize) > LstmSeqMaxSharedBytes))
+            rows--;
+        return rows;
+    }
+
+    /// <summary>Whether <see cref="LstmSequenceForwardTrain"/> / <see cref="LstmSequenceBackwardTrain"/> cover this shape.</summary>
+    public bool CanRunLstmSequenceTrain(int batch, int inputSize, int hiddenSize)
+        => IsAvailable && batch > 0 && inputSize > 0 && hiddenSize > 0 && hiddenSize <= MaxRnnBlockSize
+            && _kernelCache.ContainsKey("lstm_seq_forward_train")
+            && LstmSeqRowsPerBlock(batch, inputSize, hiddenSize) > 0;
+
+    /// <summary>
+    /// Training forward of a single-layer LSTM over a whole sequence: two launches (a weight transpose into
+    /// <paramref name="packedWeightsT"/> [(input + hidden), 4*hidden], then the persistent recurrence).
+    /// </summary>
+    /// <param name="input">[batch, seqLen, inputSize].</param>
+    /// <param name="hInit">Initial hidden state [batch, hiddenSize].</param>
+    /// <param name="cInit">Initial cell state [batch, hiddenSize].</param>
+    /// <param name="weightsIh">[4*hiddenSize, inputSize], gate rows in PyTorch order i, f, g, o.</param>
+    /// <param name="weightsHh">[4*hiddenSize, hiddenSize], same gate order.</param>
+    /// <param name="bias">[4*hiddenSize], the combined input-hidden + hidden-hidden bias.</param>
+    /// <param name="packedWeightsT">Scratch [(inputSize + hiddenSize) * 4*hiddenSize].</param>
+    /// <param name="output">[batch, seqLen, hiddenSize].</param>
+    /// <param name="allH">Saved [(seqLen + 1), batch, hiddenSize]: slot 0 is hInit, slot t+1 the state after step t.</param>
+    /// <param name="allC">Saved cell states, same layout as <paramref name="allH"/>.</param>
+    /// <param name="gates">Saved activated gates [seqLen, batch, 4*hiddenSize] (i, f, g, o).</param>
+    /// <param name="seqLen">Sequence length.</param>
+    /// <param name="batch">Batch size.</param>
+    /// <param name="inputSize">Input feature size.</param>
+    /// <param name="hiddenSize">Hidden state size.</param>
+    public unsafe void LstmSequenceForwardTrain(
+        IGpuBuffer input, IGpuBuffer hInit, IGpuBuffer cInit, IGpuBuffer weightsIh, IGpuBuffer weightsHh,
+        IGpuBuffer bias, IGpuBuffer packedWeightsT, IGpuBuffer output, IGpuBuffer allH, IGpuBuffer allC,
+        IGpuBuffer gates, int seqLen, int batch, int inputSize, int hiddenSize)
+    {
+        int rows = LstmSeqRowsPerBlock(batch, inputSize, hiddenSize);
+        if (rows <= 0 || hiddenSize > MaxRnnBlockSize)
+            throw new ArgumentException(
+                $"LSTM sequence shape (batch {batch}, input {inputSize}, hidden {hiddenSize}) is not covered; check CanRunLstmSequenceTrain first.");
+        if (!_kernelCache.TryGetValue("lstm_seq_pack_weights_t", out var pack)
+            || !_kernelCache.TryGetValue("lstm_seq_forward_train", out var forward))
+            throw new InvalidOperationException("CUDA kernel not found: lstm_seq_forward_train");
+
+        using var _ = PushContext();
+        IntPtr pWih = weightsIh.Handle, pWhh = weightsHh.Handle, pWT = packedWeightsT.Handle;
+        int packTotal = (inputSize + hiddenSize) * 4 * hiddenSize;
+        void** packArgs = stackalloc void*[5];
+        packArgs[0] = &pWih; packArgs[1] = &pWhh; packArgs[2] = &pWT; packArgs[3] = &inputSize; packArgs[4] = &hiddenSize;
+        LaunchKernel(pack, (uint)((packTotal + DefaultBlockSize - 1) / DefaultBlockSize), (uint)DefaultBlockSize, packArgs);
+
+        IntPtr pIn = input.Handle, pH0 = hInit.Handle, pC0 = cInit.Handle, pBias = bias.Handle;
+        IntPtr pOut = output.Handle, pAllH = allH.Handle, pAllC = allC.Handle, pGates = gates.Handle;
+        void** args = stackalloc void*[14];
+        args[0] = &pIn; args[1] = &pH0; args[2] = &pC0; args[3] = &pWT; args[4] = &pBias;
+        args[5] = &pOut; args[6] = &pAllH; args[7] = &pAllC; args[8] = &pGates;
+        args[9] = &batch; args[10] = &seqLen; args[11] = &inputSize; args[12] = &hiddenSize; args[13] = &rows;
+        LaunchKernelWithSharedMem(forward, (uint)((batch + rows - 1) / rows), (uint)LstmSeqThreads(hiddenSize),
+            (uint)LstmSeqForwardSharedBytes(rows, inputSize, hiddenSize), args);
+    }
+
+    /// <summary>
+    /// Backward of <see cref="LstmSequenceForwardTrain"/>: the BPTT recurrence writes the gate gradients
+    /// (<paramref name="gradGates"/>, [seqLen, batch, 4*hiddenSize]) and the initial-state gradients, then two tiled
+    /// GEMMs over all timesteps form the weight, bias and input gradients. Every output is overwritten (no
+    /// accumulation, so nothing needs zeroing first) and no atomics are used, so the result is deterministic.
+    /// </summary>
+    public unsafe void LstmSequenceBackwardTrain(
+        IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer weightsIh, IGpuBuffer weightsHh,
+        IGpuBuffer allH, IGpuBuffer allC, IGpuBuffer gates, IGpuBuffer gradGates,
+        IGpuBuffer gradInput, IGpuBuffer gradWeightsIh, IGpuBuffer gradWeightsHh, IGpuBuffer gradBias,
+        IGpuBuffer gradHInit, IGpuBuffer gradCInit, int seqLen, int batch, int inputSize, int hiddenSize)
+    {
+        int rows = LstmSeqRowsPerBlock(batch, inputSize, hiddenSize);
+        if (rows <= 0 || hiddenSize > MaxRnnBlockSize)
+            throw new ArgumentException(
+                $"LSTM sequence shape (batch {batch}, input {inputSize}, hidden {hiddenSize}) is not covered; check CanRunLstmSequenceTrain first.");
+        if (!_kernelCache.TryGetValue("lstm_seq_backward_recurrence", out var recurrence)
+            || !_kernelCache.TryGetValue("lstm_seq_backward_weights", out var weights)
+            || !_kernelCache.TryGetValue("lstm_seq_backward_input", out var inputKernel))
+            throw new InvalidOperationException("CUDA kernel not found: lstm_seq_backward_recurrence");
+
+        using var _ = PushContext();
+        int splits = LstmSeqSplits(hiddenSize);
+        IntPtr pGradOut = gradOutput.Handle, pAllC = allC.Handle, pGates = gates.Handle, pWhh = weightsHh.Handle;
+        IntPtr pGradGates = gradGates.Handle, pGradH0 = gradHInit.Handle, pGradC0 = gradCInit.Handle;
+        void** recArgs = stackalloc void*[12];
+        recArgs[0] = &pGradOut; recArgs[1] = &pAllC; recArgs[2] = &pGates; recArgs[3] = &pWhh;
+        recArgs[4] = &pGradGates; recArgs[5] = &pGradH0; recArgs[6] = &pGradC0;
+        recArgs[7] = &batch; recArgs[8] = &seqLen; recArgs[9] = &hiddenSize; recArgs[10] = &rows; recArgs[11] = &splits;
+        LaunchKernelWithSharedMem(recurrence, (uint)((batch + rows - 1) / rows), (uint)LstmSeqThreads(hiddenSize),
+            (uint)LstmSeqBackwardSharedBytes(rows, hiddenSize), recArgs);
+
+        const int tile = 16;
+        IntPtr pIn = input.Handle, pAllH = allH.Handle;
+        IntPtr pGradWih = gradWeightsIh.Handle, pGradWhh = gradWeightsHh.Handle, pGradBias = gradBias.Handle;
+        void** wArgs = stackalloc void*[10];
+        wArgs[0] = &pGradGates; wArgs[1] = &pIn; wArgs[2] = &pAllH;
+        wArgs[3] = &pGradWih; wArgs[4] = &pGradWhh; wArgs[5] = &pGradBias;
+        wArgs[6] = &batch; wArgs[7] = &seqLen; wArgs[8] = &inputSize; wArgs[9] = &hiddenSize;
+        int tilesG = (4 * hiddenSize + tile - 1) / tile;
+        int tilesJ = (inputSize + hiddenSize + 1 + tile - 1) / tile;
+        LaunchKernel(weights, (uint)(tilesG * tilesJ), tile * tile, wArgs);
+
+        IntPtr pWih = weightsIh.Handle, pGradIn = gradInput.Handle;
+        void** iArgs = stackalloc void*[7];
+        iArgs[0] = &pGradGates; iArgs[1] = &pWih; iArgs[2] = &pGradIn;
+        iArgs[3] = &batch; iArgs[4] = &seqLen; iArgs[5] = &inputSize; iArgs[6] = &hiddenSize;
+        int tilesN = (seqLen * batch + tile - 1) / tile;
+        int tilesI = (inputSize + tile - 1) / tile;
+        LaunchKernel(inputKernel, (uint)(tilesN * tilesI), tile * tile, iArgs);
+    }
     public unsafe void GruForwardSequence(
         IGpuBuffer input, IGpuBuffer hInit,
         IGpuBuffer weightsIh, IGpuBuffer weightsHh, IGpuBuffer biasIh, IGpuBuffer biasHh,

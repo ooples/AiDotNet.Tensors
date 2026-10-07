@@ -360,13 +360,19 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
             Assert.True(Math.Abs(cpuB[i] - gpuB[i]) <= 1e-3f * (1 + Math.Abs(cpuB[i])), $"dB[{i}] cpu={cpuB[i]} gpu={gpuB[i]}");
     }
 
-    [SkippableFact]
-    public void FusedLstmSequenceTrain_ForwardAndGradients_MatchDecomposedCpu()
+    [SkippableTheory]
+    [InlineData(3, 5, 4, 6)]
+    // Several batch rows per block with a partial last block, and GEMM tiles that do not divide the input width.
+    [InlineData(50, 7, 19, 64)]
+    // 4*hidden above the 1024-thread block: every gate loop strides, and dh_{t-1} is split three ways.
+    [InlineData(5, 3, 5, 300)]
+    public void FusedLstmSequenceTrain_ForwardAndGradients_MatchDecomposedCpu(int b, int t, int inSize, int h)
     {
-        // TryLstmSequenceTrain (persistent-RNN forward + BPTT kernels, one tape node) against the same LSTM written
-        // as per-step CPU ops: output and the gradients of input, both packed weights and the bias.
+        // TryLstmSequenceTrain (persistent recurrence forward + BPTT, weight/input gradients as GEMMs over all
+        // timesteps, one tape node) against the same LSTM written as per-step CPU ops: output and the gradients of
+        // input, both packed weights and the bias. The fused backward uses no atomics, so it must also be
+        // bit-for-bit repeatable.
         SkipIfNoDirectGpu();
-        int b = 3, t = 5, inSize = 4, h = 6;
         Tensor<float> Make(int[] shape, int seed, float scale) =>
             new Tensor<float>(Enumerable.Range(0, shape.Aggregate(1, (x, y) => x * y))
                 .Select(i => DeterministicValue(seed + i) * scale).ToArray(), shape);
@@ -422,6 +428,13 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
             for (int i = 0; i < e.Length; i++)
                 Assert.True(Math.Abs(e[i] - a[i]) <= 1e-4f * (1 + Math.Abs(e[i])), $"{name}[{i}] cpu={e[i]} gpu={a[i]}");
         }
+
+        var again = Fused();
+        foreach (var (name, first, second) in new[] { ("y", actual.y, again.y), ("dx", actual.dx, again.dx),
+                     ("dWih", actual.dwi, again.dwi), ("dWhh", actual.dwh, again.dwh), ("dBias", actual.db, again.db) })
+            for (int i = 0; i < first.Length; i++)
+                Assert.True(BitConverter.ToInt32(BitConverter.GetBytes(first[i]), 0) == BitConverter.ToInt32(BitConverter.GetBytes(second[i]), 0),
+                    $"{name}[{i}] differs between two identical runs: {first[i]} vs {second[i]}");
     }
 
     [SkippableFact]
