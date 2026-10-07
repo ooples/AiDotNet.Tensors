@@ -92,8 +92,13 @@ public class Conv2DImplicitGemmParityTests
         var padArr = new[] { pad, pad };
         var dilArr = new[] { dilation, dilation };
 
-        // Fused (implicit-GEMM) path is the production default.
-        float[] fused = e.Conv2D(x, kernel, strideArr, padArr, dilArr).ToArray();
+        // Fused (implicit-GEMM) path, pinned: short-wide shapes now default to the full im2col path,
+        // and pinning keeps this a real comparison if that routing ever widens to these shapes.
+        float[] fused;
+        using (CpuEngine.ForceImplicitGemmScope())
+        {
+            fused = e.Conv2D(x, kernel, strideArr, padArr, dilArr).ToArray();
+        }
 
         // Full im2col baseline via a thread-local, auto-restoring scope — no process-wide flag, so
         // this can't perturb a concurrent Conv2D or leak into sibling tests.

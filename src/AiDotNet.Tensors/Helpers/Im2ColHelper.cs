@@ -101,46 +101,49 @@ internal static class Im2ColHelper
 
         int kHW = kernelH * kernelW;
         int colW = outputH * outputW;
-        output.Slice(0, channels * kHW * colW).Clear(); // padding handled once up front
-        long work = (long)channels * kHW * colW;
+        int rows = channels * kHW;
+        long work = (long)rows * colW;
         fixed (float* inP = input)
         fixed (float* outP = output)
         {
             IntPtr inPtr = (IntPtr)inP;
             IntPtr outPtr = (IntPtr)outP;
+            // One task per column-matrix ROW (channel, kh, kw): each clears and fills only its own
+            // row, so the padding no longer needs a serial whole-matrix Clear up front and the work
+            // splits C*kH*kW ways instead of C ways. A 1x16x64x64 3x3 im2col (16 channels, 144 rows)
+            // took 380 µs channel-parallel with the serial clear.
             AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(
-                0, channels, work, c =>
+                0, rows, work, row =>
                 {
-                    float* inputPtr = (float*)inPtr;
-                    float* outputPtr = (float*)outPtr;
-                    int channelOffset = c * height * width;
-                    int rowIdx = c * kHW;
-                    for (int kh = 0; kh < kernelH; kh++)
+                    int c = row / kHW;
+                    int kh = (row % kHW) / kernelW;
+                    int kw = row % kernelW;
+                    float* inputPtr = (float*)inPtr + (long)c * height * width;
+                    float* outRow = (float*)outPtr + (long)row * colW;
+
+                    int ohStart = Math.Max(0, padH - kh);
+                    int ohEnd = Math.Min(outputH, height + padH - kh);
+                    int owStart = Math.Max(0, padW - kw);
+                    int owEnd = Math.Min(outputW, width + padW - kw);
+                    int validWidth = owEnd - owStart;
+                    if (validWidth <= 0 || ohEnd <= ohStart)
                     {
-                        int ohStart = Math.Max(0, padH - kh);
-                        int ohEnd = Math.Min(outputH, height + padH - kh);
-                        for (int kw = 0; kw < kernelW; kw++)
-                        {
-                            int owStart = Math.Max(0, padW - kw);
-                            int owEnd = Math.Min(outputW, width + padW - kw);
-                            int validWidth = owEnd - owStart;
-                            if (validWidth > 0 && ohEnd > ohStart)
-                            {
-                                float* outRow = outputPtr + rowIdx * colW;
-                                for (int oh = ohStart; oh < ohEnd; oh++)
-                                {
-                                    int ih = oh + kh - padH;
-                                    int inputStart = channelOffset + ih * width + (owStart + kw - padW);
-                                    int outputStart = oh * outputW + owStart;
-                                    Buffer.MemoryCopy(
-                                        inputPtr + inputStart,
-                                        outRow + outputStart,
-                                        validWidth * sizeof(float),
-                                        validWidth * sizeof(float));
-                                }
-                            }
-                            rowIdx++;
-                        }
+                        new Span<float>(outRow, colW).Clear();
+                        return;
+                    }
+
+                    // Rows above / below the valid window are all padding.
+                    if (ohStart > 0) new Span<float>(outRow, ohStart * outputW).Clear();
+                    if (ohEnd < outputH) new Span<float>(outRow + ohEnd * outputW, (outputH - ohEnd) * outputW).Clear();
+                    int leftPad = owStart, rightPad = outputW - owEnd;
+                    for (int oh = ohStart; oh < ohEnd; oh++)
+                    {
+                        float* dst = outRow + oh * outputW;
+                        if (leftPad > 0) new Span<float>(dst, leftPad).Clear();
+                        int ih = oh + kh - padH;
+                        new ReadOnlySpan<float>(inputPtr + ih * width + (owStart + kw - padW), validWidth)
+                            .CopyTo(new Span<float>(dst + owStart, validWidth));
+                        if (rightPad > 0) new Span<float>(dst + owEnd, rightPad).Clear();
                     }
                 }, deterministicSafe: true);
         }

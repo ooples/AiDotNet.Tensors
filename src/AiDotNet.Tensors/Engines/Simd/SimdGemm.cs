@@ -1737,6 +1737,19 @@ internal static partial class SimdGemm
             return;
         }
 #if NET5_0_OR_GREATER
+        // Medium-M (between the N-parallel small-M kernel and the M-parallel paths) or N much wider
+        // than M: split N. (For n >= 16m an M split yields at most m/6 row blocks, each streaming all
+        // of B; e.g. a [64x144]·[144x4096] conv GEMM ran on 11 threads at ~150 GFLOP/s.)
+        // Every path below slices M (SgemmDirectParallelM needs m >= 64) and SgemmNParallelSmallM
+        // takes only m <= 8, so 9 <= m < 64 ran on one thread however large n was — the core GEMM of
+        // every conv layer with 9-63 output channels. A [32x144]·[144x4096] GEMM (1x16x64x64 conv,
+        // 32 filters) took 611 µs at 1, 16 and 128 threads alike.
+        if (allowParallel && !transA && !transB && PrefersParallelN(m, k, n))
+        {
+            SgemmDirectParallelN(a, lda, b, ldb, c, m, k, n, clearedOutput);
+            return;
+        }
+
         if (Avx2.IsSupported && Fma.IsSupported && m >= Mr && n > 0)
         {
             // Iter 34: small-matmul fast path — no packing, direct 6×16 FMA
@@ -2246,6 +2259,111 @@ internal static partial class SimdGemm
                             k, mcActual: mcTail, ncActual: ncTail);
                     }
                 }
+            }
+        }
+    }
+
+    /// <summary>
+    /// True when a row-major, untransposed <c>[m x k]·[k x n]</c> GEMM takes
+    /// <see cref="SgemmDirectParallelN"/>: medium M (9..63), or N at least 16x M, with K small enough
+    /// for the direct kernel and enough work to parallelize. Callers with their own GEMM routing (the
+    /// im2col conv) use it to pick this path where it wins: measured 2-3x over the BLAS route for
+    /// [32x144]·[144x4096] and [64x144]·[144x4096].
+    /// </summary>
+    /// <param name="requireAlignedN">The direct-GEMM gate keeps N a multiple of 8; callers that split N
+    /// into their own panels (the row-block conv uses masked edge kernels on each) pass false.</param>
+    internal static bool PrefersParallelN(int m, int k, int n, bool requireAlignedN = true)
+    {
+#if NET5_0_OR_GREATER
+        return Avx2.IsSupported && Fma.IsSupported
+            && AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism > 1   // one un-packed panel over all of N streams B from L3
+            && m > NParallelSmallMMaxM && (m < ParallelDirectMinM || (long)n >= 16L * m)
+            && (!requireAlignedN || n % 8 == 0) && n >= 4 * Nr
+            && k <= SmallMatmulKThreshold
+            && (long)m * k * n >= ParallelDirectWorkThreshold;
+#else
+        return false;
+#endif
+    }
+
+    /// <summary>
+    /// No-pack direct GEMM (row-major, no transpose) with the OUTPUT COLUMNS split across cores:
+    /// each worker owns a contiguous panel of whole <see cref="Nr"/>-wide tiles and runs the same
+    /// 6×16 register kernels over every row of it. Panels are disjoint, so it is race-free for both
+    /// overwrite and accumulate, and each C element is still produced by one thread in the same k
+    /// order — bit-identical for any thread count. For medium M (too few rows to slice) and wide N.
+    /// </summary>
+    private static unsafe void SgemmDirectParallelN(
+        ReadOnlySpan<float> a, int lda,
+        ReadOnlySpan<float> b, int ldb,
+        Span<float> c,
+        int m, int k, int n,
+        bool clearedOutput)
+    {
+        int nTiles = (n + Nr - 1) / Nr;
+        long work = (long)m * k * n;
+        // Enough panels to occupy the machine, but each one carries at least ~64K FMAs.
+        int numChunks = (int)Math.Max(1, Math.Min(Math.Min(nTiles, AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism), work / 65536));
+        int tilesPerChunk = (nTiles + numChunks - 1) / numChunks;
+        numChunks = (nTiles + tilesPerChunk - 1) / tilesPerChunk;
+
+        fixed (float* pAroot = a, pBroot = b, pCroot = c)
+        {
+            IntPtr ipA = (IntPtr)pAroot, ipB = (IntPtr)pBroot, ipC = (IntPtr)pCroot;
+            int mCap = m, kCap = k, nCap = n, ldaCap = lda, ldbCap = ldb, tiles = tilesPerChunk;
+            bool cleared = clearedOutput;
+            AiDotNet.Tensors.Helpers.PersistentParallelExecutor.Instance.Execute(numChunks, chunk =>
+            {
+                int j0 = chunk * tiles * Nr;
+                if (j0 >= nCap) return;
+                int panel = Math.Min(nCap - j0, tiles * Nr);
+                DirectPanel((float*)ipA, ldaCap, (float*)ipB + j0, ldbCap, (float*)ipC + j0, nCap,
+                    mCap, kCap, panel, cleared);
+            });
+        }
+    }
+
+    /// <summary>
+    /// Serial direct GEMM with explicit strides, overwriting C:
+    /// <c>C[m x n] (row stride ldc) = A[m x k] (lda) · B[k x n] (ldb)</c>. For callers that already
+    /// parallelize at a coarser grain (the row-block conv) and need one cache-local GEMM per task.
+    /// </summary>
+    internal static unsafe void SgemmDirectSerialStrided(
+        float* a, int lda, float* b, int ldb, float* c, int ldc, int m, int k, int n)
+        => DirectPanel(a, lda, b, ldb, c, ldc, m, k, n, clearedOutput: true);
+
+    /// <summary>One column panel of <see cref="SgemmDirectParallelN"/>: C[:, 0..panelN) of a row-major C
+    /// with row stride <paramref name="ldc"/>, using the direct 6×16 kernels and masked edges.</summary>
+    private static unsafe void DirectPanel(
+        float* pA, int lda, float* pB, int ldb, float* pC, int ldc,
+        int m, int k, int panelN, bool clearedOutput)
+    {
+        int mFull = (m / Mr) * Mr;
+        for (int i = 0; i < m; i += Mr)
+        {
+            int mc = Math.Min(Mr, m - i);
+            float* pARow = pA + (long)i * lda;
+            float* pCRow = pC + (long)i * ldc;
+            int j = 0;
+            for (; j + Nr <= panelN; j += Nr)
+            {
+                if (mc == Mr)
+                {
+                    if (clearedOutput) DirectKernel6x16Store(pARow, lda, pB + j, ldb, pCRow + j, ldc, k);
+                    else DirectKernel6x16(pARow, lda, pB + j, ldb, pCRow + j, ldc, k);
+                }
+                else if (clearedOutput)
+                    DirectKernelMxNMaskedStore(pARow, lda, pB + j, ldb, pCRow + j, ldc, k, mcActual: mc, ncActual: Nr);
+                else
+                    DirectKernelMxNMasked(pARow, lda, pB + j, ldb, pCRow + j, ldc, k, mcActual: mc, ncActual: Nr);
+            }
+            int ncTail = panelN - j;
+            if (ncTail > 0)
+            {
+                if (clearedOutput)
+                    DirectKernelMxNMaskedStore(pARow, lda, pB + j, ldb, pCRow + j, ldc, k, mcActual: mc, ncActual: ncTail);
+                else
+                    DirectKernelMxNMasked(pARow, lda, pB + j, ldb, pCRow + j, ldc, k, mcActual: mc, ncActual: ncTail);
             }
         }
     }

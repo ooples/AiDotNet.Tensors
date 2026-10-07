@@ -10185,6 +10185,23 @@ public partial class CpuEngine : ITensorLevelEngine
             return;
         }
 
+        // Strategy 1.2: few output channels against many output pixels. The im2col GEMM is then short
+        // and wide, which SimdGemm's N-parallel direct kernel runs at 300+ GFLOP/s, and a single
+        // column-matrix build (row-parallel im2col, recycled buffer) beats both the per-block GEMMs of
+        // the implicit-GEMM path below and the Fused / Winograd / SIMD-direct fallbacks at these
+        // shapes. Measured against libtorch: 1x16x64x64 -> 32 (3x3): 1059 -> 466 µs (libtorch 320);
+        // 1x3x224x224 -> 32: 4867 -> 1921 µs (libtorch 1032).
+        if (!t_forceImplicitGemmForTest
+            && Simd.SimdGemm.PrefersParallelN(outChannels, inChannels * kernelHeight * kernelWidth, outputHeight * outputWidth, requireAlignedN: false))
+        {
+            if (!t_forceFullIm2Col && TryConv2DRowBlockParallelFloat(input, kernel, result, batch, inChannels, height, width,
+                    outChannels, kernelHeight, kernelWidth, stride, padding, dilation, outputHeight, outputWidth))
+                return;
+            Conv2DWithIm2ColGemm(input, kernel, result, batch, inChannels, height, width,
+                outChannels, kernelHeight, kernelWidth, stride, padding, dilation, outputHeight, outputWidth);
+            return;
+        }
+
         // Strategy 1.5: route to explicit im2col + BLAS GEMM (implicit-GEMM panels).
         // MEASURED (diffusion decoder + ResNet shapes, 32-thread CPU, 2026-06): a single
         // im2col + BlasManaged.Gemm runs at ~350-440 GFLOP/s (the GEMM K dimension =
@@ -10286,6 +10303,82 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <summary>
     /// Try Conv2D using Intel oneDNN library.
     /// </summary>
+    /// <summary>
+    /// Conv2D as an implicit GEMM parallel over (image, output-row block): each task builds the column
+    /// panel for its own block of output rows in its own cache, then runs one serial direct GEMM over
+    /// all output channels into its slice of the output. Returns false when the shape does not fit
+    /// (falls back to the full im2col path).
+    /// </summary>
+    /// <remarks>
+    /// The full im2col path builds the whole column matrix in parallel and then multiplies it in
+    /// parallel, so every GEMM panel is read from another core's cache: for 1x16x64x64 -> 32 (3x3)
+    /// im2col and GEMM cost 199 + 252 µs in sequence against 48 + 120 µs each in isolation.
+    /// Keeping a block's panel on the core that consumes it removes that traffic.
+    /// </remarks>
+    private unsafe bool TryConv2DRowBlockParallelFloat(
+        Tensor<float> input, Tensor<float> kernel, Tensor<float> result,
+        int batch, int inChannels, int height, int width,
+        int outChannels, int kernelHeight, int kernelWidth,
+        int stride, int padding, int dilation, int outputHeight, int outputWidth)
+    {
+        if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported || !System.Runtime.Intrinsics.X86.Fma.IsSupported)
+            return false;
+        int threads = CpuParallelSettings.MaxDegreeOfParallelism;
+        if (threads <= 1) return false;
+        int colH = inChannels * kernelHeight * kernelWidth;
+        int colW = outputHeight * outputWidth;
+        if (colH > 512) return false;   // direct kernel keeps a 6 x K A panel in L1
+
+        // Blocks of whole output rows, at least 32 output columns each (two 16-wide kernel tiles), and
+        // small enough to give every thread at least two tasks when the image allows it.
+        int rows = Math.Max(1, (32 + outputWidth - 1) / outputWidth);
+        int maxRowsForBalance = Math.Max(1, batch * outputHeight / Math.Max(1, 2 * threads));
+        rows = Math.Max(rows, Math.Min(maxRowsForBalance, Math.Max(1, 256 / Math.Max(1, outputWidth))));
+        rows = Math.Min(rows, outputHeight);
+        int blocksPerImage = (outputHeight + rows - 1) / rows;
+        int units = batch * blocksPerImage;
+        if (units < 2) return false;
+
+        int inputImage = inChannels * height * width;
+        int outputImage = outChannels * colW;
+        using var pinIn = input.ReadOnlyData.Pin();
+        using var pinK = kernel.ReadOnlyData.Pin();
+        using var pinOut = result.Data.Pin();
+        nint pIn = (nint)pinIn.Pointer, pK = (nint)pinK.Pointer, pOut = (nint)pinOut.Pointer;
+        long work = (long)batch * outChannels * colH * colW;
+
+        CpuParallelSettings.ParallelForOrSerial(0, units, work, u =>
+        {
+            int b = u / blocksPerImage;
+            int oh0 = (u % blocksPerImage) * rows;
+            int oh1 = Math.Min(outputHeight, oh0 + rows);
+            int nc = (oh1 - oh0) * outputWidth;
+            float[] panel = ThreadLocalTensorCache<float>.RentOrAllocateExact(colH * nc);
+            try
+            {
+                Helpers.Im2ColHelper.Im2ColRowBlockFloat(
+                    new ReadOnlySpan<float>((float*)pIn + (long)b * inputImage, inputImage),
+                    panel,
+                    inChannels, height, width, kernelHeight, kernelWidth,
+                    stride, stride, padding, padding, dilation, dilation,
+                    outputHeight, outputWidth, oh0, oh1);
+                fixed (float* pPanel = panel)
+                {
+                    Simd.SimdGemm.SgemmDirectSerialStrided(
+                        (float*)pK, colH,
+                        pPanel, nc,
+                        (float*)pOut + (long)b * outputImage + (long)oh0 * outputWidth, colW,
+                        outChannels, colH, nc);
+                }
+            }
+            finally
+            {
+                ThreadLocalTensorCache<float>.TryReturn(panel);
+            }
+        }, deterministicSafe: true);
+        return true;
+    }
+
     private unsafe bool TryConv2DOneDnn(
         Tensor<float> input, Tensor<float> kernel, Tensor<float> result,
         int batch, int inChannels, int height, int width,
@@ -10376,9 +10469,13 @@ public partial class CpuEngine : ITensorLevelEngine
         int inputSliceSize = inChannels * height * width;
 
 #if !NET471
-        // Use native memory for im2col buffer to reduce GC pressure
-        using var im2colBuffer = new NativeBuffer<float>(sliceSize);
-        var im2colSpan = im2colBuffer.Span;
+        // Recycled exact-size column buffer (this thread's cache, byte-capped). A fresh native buffer
+        // per call paid first-touch page faults on the whole column matrix every conv (2.4 MB for a
+        // 16-channel 64x64 3x3 conv).
+        float[] im2colArray = ThreadLocalTensorCache<float>.RentOrAllocateExact(sliceSize);
+        try
+        {
+        var im2colSpan = im2colArray.AsSpan(0, sliceSize);
 #else
         // Fallback to ArrayPool for .NET Framework
         var pool = System.Buffers.ArrayPool<float>.Shared;
@@ -10402,14 +10499,34 @@ public partial class CpuEngine : ITensorLevelEngine
             // Step 2: GEMM for this batch
             int outputOffset = b * outChannels * colW;
 
-            bool usedBlas = Helpers.BlasProvider.TryGemm(
-                outChannels, colW, colH,
-                kernelSpan.Slice(0, outChannels * colH),
-                colH,
-                im2colSpan.Slice(0, sliceSize),
-                colW,
-                outputSpan.Slice(outputOffset, outChannels * colW),
-                colW);
+            // Few output channels against many output pixels is a short, wide GEMM, where SimdGemm's
+            // N-parallel direct kernel beats the BLAS route 2-3x; everything else stays on BLAS.
+            bool usedBlas;
+#if NET5_0_OR_GREATER
+            bool shortWideGemm = Simd.SimdGemm.PrefersParallelN(outChannels, colH, colW);
+#else
+            bool shortWideGemm = Environment.ProcessorCount < 0;   // no AVX2 SimdGemm path on .NET Framework
+#endif
+            if (shortWideGemm)
+            {
+                Simd.SimdGemm.Sgemm(
+                    kernelSpan.Slice(0, outChannels * colH), colH, false,
+                    im2colSpan.Slice(0, sliceSize), colW, false,
+                    outputSpan.Slice(outputOffset, outChannels * colW),
+                    outChannels, colH, colW);
+                usedBlas = true;
+            }
+            else
+            {
+                usedBlas = Helpers.BlasProvider.TryGemm(
+                    outChannels, colW, colH,
+                    kernelSpan.Slice(0, outChannels * colH),
+                    colH,
+                    im2colSpan.Slice(0, sliceSize),
+                    colW,
+                    outputSpan.Slice(outputOffset, outChannels * colW),
+                    colW);
+            }
 
             if (!usedBlas)
             {
@@ -10421,13 +10538,15 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-#if NET471
         }
         finally
         {
+#if NET471
             pool.Return(im2colArray);
-        }
+#else
+            ThreadLocalTensorCache<float>.TryReturn(im2colArray);
 #endif
+        }
     }
 
     // Test-only override: forces the high-channel float forward conv onto the full-matrix im2col
@@ -10438,6 +10557,20 @@ public partial class CpuEngine : ITensorLevelEngine
     // process-wide switch.
     [ThreadStatic]
     private static bool t_forceFullIm2Col;
+
+    // Test-only twin of t_forceFullIm2Col: keeps the implicit-GEMM path reachable for shapes the
+    // short-wide routing above now sends to the full im2col path, so its parity test still runs it.
+    [ThreadStatic]
+    private static bool t_forceImplicitGemmForTest;
+
+    internal static IDisposable ForceImplicitGemmScope() => new ForceImplicitGemmOverride();
+
+    private sealed class ForceImplicitGemmOverride : IDisposable
+    {
+        private readonly bool _prev;
+        internal ForceImplicitGemmOverride() { _prev = t_forceImplicitGemmForTest; t_forceImplicitGemmForTest = true; }
+        public void Dispose() => t_forceImplicitGemmForTest = _prev;
+    }
 
     /// <summary>Test-only: scope that forces the full im2col conv path on the CURRENT thread until
     /// disposed (restoring the prior value). Used by the implicit-GEMM parity test; thread-local so
@@ -24270,16 +24403,15 @@ public partial class CpuEngine : ITensorLevelEngine
             // + c * spatialSize), so the output only needs to hold the
             // logical extent — and TensorAllocator.Rent(shape, data) below
             // hard-asserts data.Length == product(shape). Issue #310.
-            int logicalLength = input.Length;
-#if NET5_0_OR_GREATER
-            var outF = GC.AllocateUninitializedArray<float>(logicalLength);
-#else
-            var outF = new float[logicalLength];
-#endif
-            BatchNorm4DFloat(inF, gamF, betF, epsF, batch, channels, spatialSize, meanF, varF, outF);
+            // Pooled output (exactly input.Length elements), so a caller that returns the result gets
+            // the buffer back on the next call; a fresh unpooled array cost a Large Object Heap
+            // allocation and its page faults on every call (1.24 ms against libtorch's 0.47 ms for
+            // 32x64x32x32).
+            var resultF = AutoTensorCache.RentOrAllocate<float>(input._shape);
+            BatchNorm4DFloat(inF, gamF, betF, epsF, batch, channels, spatialSize, meanF, varF, resultF.GetDataArray());
             mean = (Tensor<T>)(object)TensorAllocator.Rent<T>(new[] { channels }, (Vector<T>)(object)Vector<float>.FromMemory(meanF));
             variance = (Tensor<T>)(object)TensorAllocator.Rent<T>(new[] { channels }, (Vector<T>)(object)Vector<float>.FromMemory(varF));
-            return (Tensor<T>)(object)TensorAllocator.Rent<T>(input._shape, (Vector<T>)(object)Vector<float>.FromMemory(outF));
+            return (Tensor<T>)(object)resultF;
         }
 
         // Double fast path — mirrors the float kernel's fused single-sweep
@@ -24296,19 +24428,16 @@ public partial class CpuEngine : ITensorLevelEngine
             double epsD = numOps.ToDouble(eps);
             var meanDArr = new double[channels];
             var varDArr  = new double[channels];
-            int logicalLength = input.Length;
-#if NET5_0_OR_GREATER
-            var outDArr = GC.AllocateUninitializedArray<double>(logicalLength);
-#else
-            var outDArr = new double[logicalLength];
-#endif
+            // Pooled output, as in the float path above.
+            var resultD = AutoTensorCache.RentOrAllocate<double>(input._shape);
+            var outDArr = resultD.GetDataArray();
             BatchNorm4DDouble(inD, gamD, betD, epsD, batch, channels, spatialSize, meanDArr, varDArr, outDArr);
             // #478: wrap the freshly-allocated result arrays with FromMemory (zero-copy hand-off, like
             // the float path above) instead of `new Vector<double>(arr)`, which COPIED every array —
             // doubling the output allocation (measured 4x the float path; now ~2x = just the bytes).
             mean = (Tensor<T>)(object)TensorAllocator.Rent<T>(new[] { channels }, (Vector<T>)(object)Vector<double>.FromMemory(meanDArr));
             variance = (Tensor<T>)(object)TensorAllocator.Rent<T>(new[] { channels }, (Vector<T>)(object)Vector<double>.FromMemory(varDArr));
-            return (Tensor<T>)(object)TensorAllocator.Rent<T>(input._shape, (Vector<T>)(object)Vector<double>.FromMemory(outDArr));
+            return (Tensor<T>)(object)resultD;
         }
 
         var meanData = new T[channels];
