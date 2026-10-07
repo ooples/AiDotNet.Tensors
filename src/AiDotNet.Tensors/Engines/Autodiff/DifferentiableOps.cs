@@ -708,9 +708,9 @@ internal static class DifferentiableOps
                 offset += (regionStart[d] + coordinate) * stride;
                 stride *= fullShape[d];
             }
-            int srcRow = row * rowLength;
-            for (int j = 0; j < rowLength; j++)
-                dest[offset + j] = numOps.Add(dest[offset + j], src[srcRow + j]);
+            // One vectorized add per row (it was a virtual numOps.Add per element); element-wise, so bit-identical.
+            var destRow = dest.Slice(offset, rowLength);
+            numOps.Add(destRow, src.Slice(row * rowLength, rowLength), destRow);
         }
 
         if (indexed) _indexedGrads![idx] = existing;
