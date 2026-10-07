@@ -233,6 +233,21 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// edge to eager GradientTape and compiled GraphMode. Keeping both paths
     /// here prevents metadata-only APIs from silently becoming gradient stops.
     /// </summary>
+    /// <summary>
+    /// A row-major view of this contiguous tensor's storage with a new shape, recorded on no tape or graph. For plan
+    /// builders that alias internal buffers (e.g. a reshape's input gradient over its output gradient).
+    /// </summary>
+    internal Tensor<T> ReshapeViewUnrecorded(int[] newShape)
+    {
+        if (!IsContiguous)
+            throw new InvalidOperationException("An unrecorded reshape view needs a contiguous tensor.");
+        int total = 1;
+        for (int i = 0; i < newShape.Length; i++) total *= newShape[i];
+        if (total != Length)
+            throw new ArgumentException($"Cannot view {Length} elements as [{string.Join(", ", newShape)}].");
+        return CreateStorageView((int[])newShape.Clone(), ComputeRowMajorStrides(newShape), _storageOffset);
+    }
+
     private Tensor<T> FinalizeReshapeLikeView(Tensor<T> view, string opName)
     {
         CarryResidencyToShapeOnlyView(view);

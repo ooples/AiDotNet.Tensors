@@ -2025,6 +2025,14 @@ public partial class CpuEngine : ITensorLevelEngine
         if (GraphMode.IsActive)
         {
             var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
+            // A contiguous host tensor reshapes as a view: Tensor.Reshape records a no-op view node whose output shares
+            // the producer's storage, so the compiled plan neither copies the forward nor allocates a buffer for it.
+            // Measured on the parity Transformer (CPU): 32 reshape copies were 2.4 ms of an 11 ms forward. GPU engines
+            // keep the copying node; their device bindings are per tensor, not per storage. Training traces only: an
+            // inference plan's MemoryPlanningPass recycles a tensor's storage once the TENSOR is dead, which a view of
+            // it outlives (measured: GraphCaptureParityTests multi-output ops read a recycled buffer).
+            if (scope != null && tensor.IsContiguous && this is not DirectGpuTensorEngine && !GraphMode.IsInferenceTrace)
+                return tensor.Reshape(newShape);
             if (scope != null)
             {
                 var captured = tensor;

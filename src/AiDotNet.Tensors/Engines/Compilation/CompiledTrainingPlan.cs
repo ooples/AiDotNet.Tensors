@@ -782,6 +782,47 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     /// the re-zero schedule indexed by backward ACTION index, plus the fused-step
     /// and skippable-ReduceSum decision sets for the caller's drift guard.</para>
     /// </summary>
+    /// <summary>
+    /// A reshape that is a view (its output shares its input's storage) has the identity as its backward: the input
+    /// gradient is the output gradient read in the input's shape. When the reshape is the input's only consumer and the
+    /// input is not a parameter, the input's gradient buffer becomes a view of the output's, so the backward step -- a
+    /// copy into a fresh tensor plus a copy into the gradient buffer -- is skipped. Walking the steps in reverse makes a
+    /// chain of reshapes collapse onto the last one's buffer. Measured on the parity Transformer (CPU): 31 reshape
+    /// backwards were 2.3 ms of a 21 ms backward.
+    /// <para>Host engines only: a GPU engine binds device buffers per tensor, not per storage.</para>
+    /// </summary>
+    private static HashSet<CompiledStep<T>>? AliasReshapeViewGradients(
+        List<CompiledStep<T>> forwardSteps,
+        Tensor<T>[] parameters,
+        Dictionary<Tensor<T>, int> consumerCount,
+        IEngine engine,
+        Dictionary<Tensor<T>, Tensor<T>> gradMap,
+        List<Tensor<T>> allGrads)
+    {
+        if (engine.SupportsGpu || engine is Engines.DirectGpuTensorEngine) return null;
+        HashSet<CompiledStep<T>>? aliased = null;
+        var parameterSet = new HashSet<Tensor<T>>(parameters, ReferenceEqualityComparer<Tensor<T>>.Instance);
+        var dropped = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+        for (int i = forwardSteps.Count - 1; i >= 0; i--)
+        {
+            var step = forwardSteps[i];
+            if (step.OpName != "Reshape" || step.Inputs.Length != 1) continue;
+            var input = step.Inputs[0];
+            var output = step.OutputBuffer;
+            if (input is null || parameterSet.Contains(input)) continue;
+            if (!consumerCount.TryGetValue(input, out int consumers) || consumers != 1) continue;
+            if (!input.SharesStorageWith(output) || input.Length != output.Length) continue;
+            if (!gradMap.TryGetValue(output, out var outputGrad) || !outputGrad.IsContiguous) continue;
+            if (!gradMap.TryGetValue(input, out var ownGrad)) continue;
+            gradMap[input] = outputGrad.ReshapeViewUnrecorded(input._shape);
+            dropped.Add(ownGrad);
+            (aliased ??= new HashSet<CompiledStep<T>>(ReferenceEqualityComparer<CompiledStep<T>>.Instance)).Add(step);
+        }
+        if (dropped.Count > 0)
+            allGrads.RemoveAll(g => dropped.Contains(g));
+        return aliased;
+    }
+
     private static int[][] BuildPooledGradMap(
         System.Collections.Generic.HashSet<Tensor<T>> allTensors,
         System.Collections.Generic.List<CompiledStep<T>> forwardSteps,
@@ -1985,6 +2026,35 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     private static int _profStepCount;
     private static long[]? _profPerStepUs;
     private static string[]? _profBackwardStepNames;
+    private static long[]? _profFwdUs;
+    private static string[]? _profFwdNames;
+
+    // Writes "<AIDOTNET_STEP_PROF_PATH>.ops.txt": forward actions and backward delegates ranked by average µs/step,
+    // so a slow step can be attributed to individual ops without an external profiler.
+    private static void DumpPerOpProfile(int steps)
+    {
+        var sb = new System.Text.StringBuilder();
+        void Section(string title, long[]? us, string[]? names)
+        {
+            if (us is null) return;
+            long total = 0;
+            for (int i = 0; i < us.Length; i++) total += us[i];
+            sb.AppendLine($"== {title}: {us.Length} entries, {total / (double)steps:F1} µs/step");
+            var byName = new Dictionary<string, (long Us, int Count)>();
+            for (int i = 0; i < us.Length; i++)
+            {
+                string n = names is not null && i < names.Length ? names[i] : $"#{i}";
+                byName.TryGetValue(n, out var acc);
+                byName[n] = (acc.Us + us[i], acc.Count + 1);
+            }
+            foreach (var kv in byName.OrderByDescending(kv => kv.Value.Us))
+                sb.AppendLine($"  {kv.Value.Us / (double)steps,9:F1} µs  x{kv.Value.Count,-3} {kv.Key}");
+        }
+        Section("forward", _profFwdUs, _profFwdNames);
+        Section("backward", _profPerStepUs, _profBackwardStepNames);
+        System.IO.File.WriteAllText(StepProfDumpPath + ".ops.txt", sb.ToString());
+    }
+
     public static long[] ProfPerStepUs => _profPerStepUs ?? Array.Empty<long>();
     public static string[] ProfBackwardStepNames => _profBackwardStepNames ?? Array.Empty<string>();
     public static long ProfForwardUs => System.Threading.Interlocked.Read(ref _profForwardUs);
@@ -2926,6 +2996,32 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                     if (observer is not null && step is not null) observer(i, name, step.OutputBuffer);
                 }
             }
+            else if (s_stepProf)
+            {
+                // Per-action forward timing (AIDOTNET_STEP_PROF=1), dumped beside the phase totals.
+                var perFwd = _profFwdUs;
+                if (perFwd == null || perFwd.Length != fwd.Length)
+                {
+                    perFwd = new long[fwd.Length];
+                    _profFwdUs = perFwd;
+                    var names = new string[fwd.Length];
+                    var actionToStep = ActionToStepIndex;
+                    for (int i = 0; i < fwd.Length; i++)
+                    {
+                        int idx = actionToStep is not null && i < actionToStep.Length ? actionToStep[i] : i;
+                        names[i] = _forwardSteps is not null && idx >= 0 && idx < _forwardSteps.Length
+                            ? _forwardSteps[idx].OpName : $"#{i}";
+                    }
+                    _profFwdNames = names;
+                }
+                double tickToUsF = 1_000_000.0 / System.Diagnostics.Stopwatch.Frequency;
+                for (int i = 0; i < fwd.Length; i++)
+                {
+                    long si = System.Diagnostics.Stopwatch.GetTimestamp();
+                    fwd[i](engine);
+                    perFwd[i] += (long)((System.Diagnostics.Stopwatch.GetTimestamp() - si) * tickToUsF);
+                }
+            }
             else
             {
                 for (int i = 0; i < fwd.Length; i++)
@@ -3161,6 +3257,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                     System.IO.File.AppendAllText(StepProfDumpPath,
                         $"[STEPPROF] steps={sc} avgUs/step fwd={f / sc} gradZero={gz / sc} bwd={b / sc} opt={o / sc} total={(f + gz + b + o) / sc}"
                         + System.Environment.NewLine);
+                    if (sc % (StepProfDumpInterval * 10) == 0) DumpPerOpProfile(sc);
                 }
                 catch { }
             }
@@ -6725,6 +6822,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 || Environment.GetEnvironmentVariable("AIDOTNET_COMPILED_GRAD_POOL") == "1")
             && !engine.SupportsGpu;
         int[][]? gradPoolReZeroByPosition = null;
+        // Reshape steps whose input gradient is a view of their output gradient; their backward is the identity.
+        HashSet<CompiledStep<T>>? aliasedReshapeSteps = null;
         // Decision sets the pooler used to plan the re-zero schedule; populated by
         // BuildPooledGradMap when pooling, left empty otherwise. Non-null so the
         // drift guard never needs a null-forgiving access.
@@ -6744,6 +6843,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 gradMap[tensor] = grad;
                 allGrads.Add(grad);
             }
+            aliasedReshapeSteps = AliasReshapeViewGradients(forwardSteps, parameters, consumerCount, engine, gradMap, allGrads);
         }
 
         // #1624 prototype: quantify how much the per-traced-tensor gradient buffer
@@ -7061,6 +7161,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             if (step.BackwardFn == null) continue;
             // No parameter upstream of this step's output: its backward only produces gradients nothing reads.
             if (gradRequired is not null && !gradRequired.Contains(step.OutputBuffer)) continue;
+            // A view reshape whose input gradient aliases its output gradient: the gradient is already in place.
+            if (aliasedReshapeSteps is not null && aliasedReshapeSteps.Contains(step)) continue;
 
             // Phase G.7: analytic loss-MatMul backward (replaces standard
             // spec for MatMuls whose gradOut is `α * ones` due to a
