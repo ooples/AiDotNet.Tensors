@@ -573,6 +573,43 @@ internal static class FusedOptimizer
         AdamWUpdateSimd(param, grad, m, v, length, lr, beta1, beta2, eps, weightDecay, bc1, bc2);
     }
 
+    // Elements per parallel chunk of AdamWStepHost: a ~1 MB slice of each of the four arrays.
+    private const int AdamWHostChunk = 256 * 1024;
+
+    /// <summary>
+    /// One AdamW step over host arrays (array + offset form, no unsafe code at the caller): the single-pass
+    /// <see cref="AdamWUpdateSimd(float*, float*, float*, float*, int, float, float, float, float, float, float, float)"/>
+    /// kernel split into fixed chunks across the pool. For eager optimizers that update a parameter tensor in place.
+    /// </summary>
+    internal static unsafe void AdamWStepHost(
+        float[] param, int paramOffset, float[] grad, int gradOffset, float[] m, int mOffset, float[] v, int vOffset,
+        int length, float lr, float beta1, float beta2, float eps, float weightDecay, float bc1, float bc2)
+    {
+        int chunks = System.Math.Max(1, (length + AdamWHostChunk - 1) / AdamWHostChunk);
+        Helpers.CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)length * 4, c =>
+        {
+            int start = c * AdamWHostChunk, count = System.Math.Min(AdamWHostChunk, length - start);
+            fixed (float* pp = param, pg = grad, pm = m, pv = v)
+                AdamWUpdateSimd(pp + paramOffset + start, pg + gradOffset + start, pm + mOffset + start,
+                    pv + vOffset + start, count, lr, beta1, beta2, eps, weightDecay, bc1, bc2);
+        }, deterministicSafe: true);
+    }
+
+    /// <inheritdoc cref="AdamWStepHost(float[], int, float[], int, float[], int, float[], int, int, float, float, float, float, float, float, float)"/>
+    internal static unsafe void AdamWStepHost(
+        double[] param, int paramOffset, double[] grad, int gradOffset, double[] m, int mOffset, double[] v, int vOffset,
+        int length, double lr, double beta1, double beta2, double eps, double weightDecay, double bc1, double bc2)
+    {
+        int chunks = System.Math.Max(1, (length + AdamWHostChunk - 1) / AdamWHostChunk);
+        Helpers.CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)length * 4, c =>
+        {
+            int start = c * AdamWHostChunk, count = System.Math.Min(AdamWHostChunk, length - start);
+            fixed (double* pp = param, pg = grad, pm = m, pv = v)
+                AdamWUpdateSimd(pp + paramOffset + start, pg + gradOffset + start, pm + mOffset + start,
+                    pv + vOffset + start, count, lr, beta1, beta2, eps, weightDecay, bc1, bc2);
+        }, deterministicSafe: true);
+    }
+
     /// <summary>Single-pass fused AdamW with precomputed step-global bias corrections
     /// (bc1 = 1-β1^step, bc2 = 1-β2^step). Bit-identical to the step overload.</summary>
     internal static unsafe void AdamWUpdateSimd(

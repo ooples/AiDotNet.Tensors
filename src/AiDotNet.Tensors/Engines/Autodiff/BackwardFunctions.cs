@@ -995,10 +995,14 @@ internal static class BackwardFunctions<T>
 
                     if (backwardWork >= MatMulBackwardSimdThreshold)
                     {
+                        // Large: the parallel packed BLAS first. SimdGemm's transposed-A path ran the tied LM head's
+                        // dTable = gradCᵀ[49152,1024] · A[1024,512] in 993 ms vs 87 ms through TryGemmEx (3990X).
                         // gradA[M,K] = gradC[M,N] · B[N,K]   (no transposes)
-                        SimdGemm.Sgemm(dCArr, N, false, bArr, K, false, gradAData.AsSpan(0, M * K), M, N, K);
+                        if (!BlasProvider.TryGemmEx(M, K, N, dCArr, 0, N, false, bArr, 0, K, false, gradAData, 0, K))
+                            SimdGemm.Sgemm(dCArr, N, false, bArr, K, false, gradAData.AsSpan(0, M * K), M, N, K);
                         // gradB[N,K] = gradCᵀ[N,M] · A[M,K]   (transA=true)
-                        SimdGemm.Sgemm(dCArr, N, true, aArr, K, false, gradBData.AsSpan(0, N * K), N, M, K);
+                        if (!BlasProvider.TryGemmEx(N, K, M, dCArr, 0, N, true, aArr, 0, K, false, gradBData, 0, K))
+                            SimdGemm.Sgemm(dCArr, N, true, aArr, K, false, gradBData.AsSpan(0, N * K), N, M, K);
 
                         DifferentiableOps.AccumulateGrad(grads, inputs[0], gradATensor, engine);
                         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradBTensor, engine);
@@ -3174,11 +3178,79 @@ internal static class BackwardFunctions<T>
         // over the LAST axis, so a log-softmax over any other axis got a wrong gradient. The axis is recorded by
         // TensorLogSoftmax; tapes recorded before it was saved default to the last axis, which is what they used.
         int axis = savedState is { Length: > 0 } && savedState[0] is int savedAxis ? savedAxis : inputs[0].Rank - 1;
+        if (typeof(T) == typeof(float) && axis == inputs[0].Rank - 1
+            && TryLogSoftmaxBackwardHostFloat((Tensor<float>)(object)gradOutput, (Tensor<float>)(object)inputs[0],
+                (Tensor<float>)(object)output, engine, (Dictionary<Tensor<float>, Tensor<float>>)(object)grads))
+            return;
         var softmax = engine.TensorExp(output);
         var rowSums = engine.ReduceSum(gradOutput, new[] { axis }, keepDims: true);
         var dx = engine.TensorSubtract(gradOutput,
             engine.TensorMultiply(softmax, engine.TensorBroadcastTo(rowSums, output._shape)));
         DifferentiableOps.AccumulateGrad(grads, inputs[0], dx, engine);
+    }
+
+    [ThreadStatic] private static float[]? t_logSoftmaxRow;
+
+    /// <summary>
+    /// Host float32 log-softmax backward over the last axis in one parallel pass over rows:
+    /// dx = g - exp(y) * rowsum(g), written straight into the input's gradient accumulator when it exists. The engine-op
+    /// form ran exp, a row reduce, a broadcast that materialized a full-size tensor, a multiply and a subtract -- five
+    /// passes and three full-size allocations over an LM's [tokens, vocab] logits ([1024, 49152]: 50M floats each).
+    /// False (the caller takes the engine-op form) on a GPU engine, under create-graph, or for a strided layout.
+    /// </summary>
+    private static bool TryLogSoftmaxBackwardHostFloat(
+        Tensor<float> gradOutput, Tensor<float> input, Tensor<float> output, IEngine engine,
+        Dictionary<Tensor<float>, Tensor<float>> grads)
+    {
+        if (engine.SupportsGpu || DifferentiableOps._isBackwardCreateGraph
+            || !gradOutput.IsContiguous || !output.IsContiguous || gradOutput.Length != output.Length) return false;
+        int cols = output._shape[output.Rank - 1];
+        if (cols == 0) return false;
+        int rows = output.Length / cols;
+        var g = gradOutput.GetCpuBackingForStridedRead(out int gOff);
+        var y = output.GetCpuBackingForStridedRead(out int yOff);
+        if (g is null || y is null) return false;
+
+        var target = DifferentiableOps.TryGetDirectGradTarget(grads, input, engine, out bool overwrite);
+        int dOff = 0;
+        float[]? dst = target?.GetCpuBackingForContiguousWrite(out dOff);
+        Tensor<float>? contribution = null;
+        if (target is null || dst is null)
+        {
+            target = null;
+            contribution = new Tensor<float>(input._shape);
+            dst = contribution.GetCpuBackingForContiguousWrite(out dOff)!;
+            overwrite = true;
+        }
+        var d = dst!;
+        Helpers.CpuParallelSettings.ParallelForOrSerial(0, rows, (long)rows * cols * 3, r =>
+        {
+            int go = gOff + r * cols, yo = yOff + r * cols, o = dOff + r * cols;
+            var e = t_logSoftmaxRow is { } cached && cached.Length >= cols ? cached : (t_logSoftmaxRow = new float[cols]);
+            var eSpan = new Span<float>(e, 0, cols);
+            Simd.SimdKernels.Exp(new ReadOnlySpan<float>(y, yo, cols), eSpan);
+            int w = System.Numerics.Vector<float>.Count, c = 0;
+            var acc = System.Numerics.Vector<float>.Zero;
+            for (; c + w <= cols; c += w) acc += new System.Numerics.Vector<float>(g, go + c);
+            float s = System.Numerics.Vector.Dot(acc, System.Numerics.Vector<float>.One);
+            for (; c < cols; c++) s += g[go + c];
+            var vs = new System.Numerics.Vector<float>(s);
+            c = 0;
+            for (; c + w <= cols; c += w)
+            {
+                var v = new System.Numerics.Vector<float>(g, go + c) - new System.Numerics.Vector<float>(e, c) * vs;
+                if (!overwrite) v += new System.Numerics.Vector<float>(d, o + c);
+                v.CopyTo(d, o + c);
+            }
+            for (; c < cols; c++)
+            {
+                float v = g[go + c] - e[c] * s;
+                d[o + c] = overwrite ? v : d[o + c] + v;
+            }
+        }, deterministicSafe: true);
+        if (contribution is not null) DifferentiableOps.AccumulateGrad(grads, input, contribution, engine);
+        else target!.IncrementVersion();
+        return true;
     }
 
     /// <summary>Split backward: scatter chunk gradient back to correct position in input gradient</summary>
@@ -4457,7 +4529,7 @@ internal static class BackwardFunctions<T>
             {
                 // Parallel SimdGemm — bypass possibly-single-threaded BLAS.
                 SimdGemm.Sgemm(maskedArr, N, false, wArr, N, true, gradInputArr.AsSpan(0, M * K), M, N, K);
-                SimdGemm.Sgemm(inArr, K, true, maskedArr, N, false, gradWeightArr.AsSpan(0, K * N), K, M, N);
+                { if (!BlasProvider.TryGemmEx(K, N, M, inArr, 0, K, true, maskedArr, 0, N, false, gradWeightArr, 0, N)) SimdGemm.Sgemm(inArr, K, true, maskedArr, N, false, gradWeightArr.AsSpan(0, K * N), K, M, N); } // packed BLAS first: SimdGemm transposed-A is the slow path
             }
             else
             {
@@ -4554,7 +4626,7 @@ internal static class BackwardFunctions<T>
             // dInput[M,K] = masked[M,N] · Wᵀ[N,K]
             SimdGemm.Sgemm(maskedArr, N, false, wArr, N, true, gradInputArr.AsSpan(0, M * K), M, N, K);
             // dWeight[K,N] = inputᵀ[K,M] · masked[M,N]
-            SimdGemm.Sgemm(inArr, K, true, maskedArr, N, false, gradWeightArr.AsSpan(0, K * N), K, M, N);
+            { if (!BlasProvider.TryGemmEx(K, N, M, inArr, 0, K, true, maskedArr, 0, N, false, gradWeightArr, 0, N)) SimdGemm.Sgemm(inArr, K, true, maskedArr, N, false, gradWeightArr.AsSpan(0, K * N), K, M, N); } // packed BLAS first: SimdGemm transposed-A is the slow path
             used = true;
         }
         else
@@ -6285,9 +6357,12 @@ internal static class BackwardFunctions<T>
                 // Parallel SimdGemm path — guaranteed multi-core on shapes at/above
                 // SimdGemm's internal parallel gate.
                 // dInput[M,K] = dY[M,N] · Wᵀ[N,K]; W is stored [K,N] (ldb=N), transB=true.
-                SimdGemm.Sgemm(gArr, N, false, wArr, N, true, gradInputArr.AsSpan(0, M * K), M, N, K);
-                // dWeight[K,N] = inputᵀ[K,M] · dY[M,N]; input is stored [M,K] (lda=K), transA=true.
-                SimdGemm.Sgemm(inArr, K, true, gArr, N, false, gradWeightArr.AsSpan(0, K * N), K, M, N);
+                if (!BlasProvider.TryGemmEx(M, K, N, gArr, 0, N, false, wArr, 0, N, true, gradInputArr, 0, K))
+                    SimdGemm.Sgemm(gArr, N, false, wArr, N, true, gradInputArr.AsSpan(0, M * K), M, N, K);
+                // dWeight[K,N] = inputᵀ[K,M] · dY[M,N]; input is stored [M,K] (lda=K), transA=true. The packed BLAS
+                // first: SimdGemm's transposed-A path is the slow one (11x on a tied LM head's weight gradient).
+                if (!BlasProvider.TryGemmEx(K, N, M, inArr, 0, K, true, gArr, 0, N, false, gradWeightArr, 0, N))
+                    SimdGemm.Sgemm(inArr, K, true, gArr, N, false, gradWeightArr.AsSpan(0, K * N), K, M, N);
                 used = true;
             }
             else

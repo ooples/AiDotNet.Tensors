@@ -12541,6 +12541,9 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    // Work (M*N*K) at which TensorMatMulTransposed's float path hands the product to the packed BLAS.
+    private const long MatMulTransposedBlasMinWork = 1L << 24;
+
     public virtual Tensor<T> TensorMatMulTransposed<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a is null) throw new ArgumentNullException(nameof(a));
@@ -12609,6 +12612,11 @@ public partial class CpuEngine : ITensorLevelEngine
             // a is [M,K] row-major (lda=K, transA=false). b is stored
             // [N,K] row-major (lda for b = K, transB=true so the kernel
             // treats it as Kᵀ-major and contracts over K).
+            // Large products take the parallel packed BLAS first: a tied LM head's logits [1024,512]·[49152,512]ᵀ ran
+            // 592 ms through SimdGemm vs PyTorch's 207 ms (3990X).
+            bool viaBlas = (long)M * N * K >= MatMulTransposedBlasMinWork
+                && BlasProvider.TryGemmEx(M, N, K, aRaw, aOff, K, false, bRaw, bOff, K, true, rRaw, rOff, N);
+            if (!viaBlas)
             AiDotNet.Tensors.Engines.Simd.SimdGemm.Sgemm(
                 new ReadOnlySpan<float>(aRaw, aOff, M * K),
                 lda: K, transA: false,
