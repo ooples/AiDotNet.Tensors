@@ -1393,49 +1393,82 @@ internal static class SimdConvHelper
                         PadImageForConv3x3(input + b * inputImage, paddedBase + b * paddedImage, inChannels, height,
                             width, padH, padW, paddedH, paddedW);
 
-                int tasks = checked(outChannels * inChannels);
-                long totalFmas = (long)tasks * batch * outPlane * 9L;
+                // Tasks are blocks of (output channel, input channel) pairs. A task walks the images once and, per
+                // image, runs every pair of its block, parking each pair's nine accumulators in an L1 scratch between
+                // images, so an input plane and a gradient plane are fetched once per block instead of once per pair
+                // (a pair-per-task split streamed every image's planes from L2/L3 for each of the oc x ic pairs). Every
+                // accumulator still sums lane-wise over images, rows and chunks in the same order: bit-identical.
+                long targetTasks = 2L * Math.Max(1, CpuParallelSettings.MaxDegreeOfParallelism);
+                int ocBlock = 1, icBlock = 1;
+                while (ocBlock < 8
+                       && (long)((outChannels + 2 * ocBlock - 1) / (2 * ocBlock)) * inChannels >= targetTasks)
+                    ocBlock *= 2;
+                while (icBlock < 4
+                       && (long)((outChannels + ocBlock - 1) / ocBlock) * ((inChannels + 2 * icBlock - 1) / (2 * icBlock)) >= targetTasks)
+                    icBlock *= 2;
+                int ocBlocks = (outChannels + ocBlock - 1) / ocBlock, icBlocks = (inChannels + icBlock - 1) / icBlock;
+                int tasks = checked(ocBlocks * icBlocks);
+                long totalFmas = (long)outChannels * inChannels * batch * outPlane * 9L;
                 [MethodImpl(Hot)]
                 void RunTask(int task)
                 {
-                    int oc = task / inChannels, ic = task - oc * inChannels;
-                    var a0 = Vector256<float>.Zero; var a1 = Vector256<float>.Zero; var a2 = Vector256<float>.Zero;
-                    var a3 = Vector256<float>.Zero; var a4 = Vector256<float>.Zero; var a5 = Vector256<float>.Zero;
-                    var a6 = Vector256<float>.Zero; var a7 = Vector256<float>.Zero; var a8 = Vector256<float>.Zero;
+                    int ob = task / icBlocks, ib = task - ob * icBlocks;
+                    int oc0 = ob * ocBlock, oc1 = Math.Min(outChannels, oc0 + ocBlock);
+                    int ic0 = ib * icBlock, ic1 = Math.Min(inChannels, ic0 + icBlock);
+                    int icCount = ic1 - ic0;
+                    int slots = (oc1 - oc0) * icCount * 9;
+                    Vector256<float>* acc = stackalloc Vector256<float>[slots];
+                    for (int i = 0; i < slots; i++) acc[i] = Vector256<float>.Zero;
                     for (int b = 0; b < batch; b++)
                     {
-                        float* xPlane = paddedBase + b * paddedImage + (long)ic * plane;
-                        float* gPlane = gradOutput + b * gradImage + (long)oc * outPlane;
-                        for (int oh = 0; oh < outHeight; oh++)
+                        for (int oc = oc0; oc < oc1; oc++)
                         {
-                            float* gRow = gPlane + oh * outWidth;
-                            float* r0 = xPlane + oh * paddedW;
-                            float* r1 = r0 + paddedW;
-                            float* r2 = r1 + paddedW;
-                            for (int c = 0; c < colChunks; c++)
+                            float* gPlane = gradOutput + b * gradImage + (long)oc * outPlane;
+                            for (int ic = ic0; ic < ic1; ic++)
                             {
-                                int ow = c * 8;
-                                var g = c < colChunks - 1 || tailValid == 8
-                                    ? Avx.LoadVector256(gRow + ow)
-                                    : Avx.MaskLoad(gRow + ow, tailMask);
-                                a0 = Fma.MultiplyAdd(g, Avx.LoadVector256(r0 + ow), a0);
-                                a1 = Fma.MultiplyAdd(g, Avx.LoadVector256(r0 + ow + 1), a1);
-                                a2 = Fma.MultiplyAdd(g, Avx.LoadVector256(r0 + ow + 2), a2);
-                                a3 = Fma.MultiplyAdd(g, Avx.LoadVector256(r1 + ow), a3);
-                                a4 = Fma.MultiplyAdd(g, Avx.LoadVector256(r1 + ow + 1), a4);
-                                a5 = Fma.MultiplyAdd(g, Avx.LoadVector256(r1 + ow + 2), a5);
-                                a6 = Fma.MultiplyAdd(g, Avx.LoadVector256(r2 + ow), a6);
-                                a7 = Fma.MultiplyAdd(g, Avx.LoadVector256(r2 + ow + 1), a7);
-                                a8 = Fma.MultiplyAdd(g, Avx.LoadVector256(r2 + ow + 2), a8);
+                                float* xPlane = paddedBase + b * paddedImage + (long)ic * plane;
+                                Vector256<float>* s = acc + ((oc - oc0) * icCount + (ic - ic0)) * 9;
+                                var a0 = s[0]; var a1 = s[1]; var a2 = s[2];
+                                var a3 = s[3]; var a4 = s[4]; var a5 = s[5];
+                                var a6 = s[6]; var a7 = s[7]; var a8 = s[8];
+                                for (int oh = 0; oh < outHeight; oh++)
+                                {
+                                    float* gRow = gPlane + oh * outWidth;
+                                    float* r0 = xPlane + oh * paddedW;
+                                    float* r1 = r0 + paddedW;
+                                    float* r2 = r1 + paddedW;
+                                    for (int c = 0; c < colChunks; c++)
+                                    {
+                                        int ow = c * 8;
+                                        var g = c < colChunks - 1 || tailValid == 8
+                                            ? Avx.LoadVector256(gRow + ow)
+                                            : Avx.MaskLoad(gRow + ow, tailMask);
+                                        a0 = Fma.MultiplyAdd(g, Avx.LoadVector256(r0 + ow), a0);
+                                        a1 = Fma.MultiplyAdd(g, Avx.LoadVector256(r0 + ow + 1), a1);
+                                        a2 = Fma.MultiplyAdd(g, Avx.LoadVector256(r0 + ow + 2), a2);
+                                        a3 = Fma.MultiplyAdd(g, Avx.LoadVector256(r1 + ow), a3);
+                                        a4 = Fma.MultiplyAdd(g, Avx.LoadVector256(r1 + ow + 1), a4);
+                                        a5 = Fma.MultiplyAdd(g, Avx.LoadVector256(r1 + ow + 2), a5);
+                                        a6 = Fma.MultiplyAdd(g, Avx.LoadVector256(r2 + ow), a6);
+                                        a7 = Fma.MultiplyAdd(g, Avx.LoadVector256(r2 + ow + 1), a7);
+                                        a8 = Fma.MultiplyAdd(g, Avx.LoadVector256(r2 + ow + 2), a8);
+                                    }
+                                }
+                                s[0] = a0; s[1] = a1; s[2] = a2;
+                                s[3] = a3; s[4] = a4; s[5] = a5;
+                                s[6] = a6; s[7] = a7; s[8] = a8;
                             }
                         }
                     }
-                    float* dst = gradKernel + (long)task * 9;
-                    StoreKernelGradTap(dst + 0, a0, accumulate); StoreKernelGradTap(dst + 1, a1, accumulate);
-                    StoreKernelGradTap(dst + 2, a2, accumulate); StoreKernelGradTap(dst + 3, a3, accumulate);
-                    StoreKernelGradTap(dst + 4, a4, accumulate); StoreKernelGradTap(dst + 5, a5, accumulate);
-                    StoreKernelGradTap(dst + 6, a6, accumulate); StoreKernelGradTap(dst + 7, a7, accumulate);
-                    StoreKernelGradTap(dst + 8, a8, accumulate);
+                    for (int oc = oc0; oc < oc1; oc++)
+                    {
+                        for (int ic = ic0; ic < ic1; ic++)
+                        {
+                            Vector256<float>* s = acc + ((oc - oc0) * icCount + (ic - ic0)) * 9;
+                            float* dst = gradKernel + ((long)oc * inChannels + ic) * 9;
+                            for (int k = 0; k < 9; k++) StoreKernelGradTap(dst + k, s[k], accumulate);
+                        }
+                    }
                 }
 
                 if (tasks >= 2 && totalFmas >= 100_000L && CpuParallelSettings.MaxDegreeOfParallelism > 1)
