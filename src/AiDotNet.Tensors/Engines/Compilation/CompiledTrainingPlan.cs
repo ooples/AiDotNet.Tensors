@@ -2028,6 +2028,30 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     private static string[]? _profBackwardStepNames;
     private static long[]? _profFwdUs;
     private static string[]? _profFwdNames;
+    private static long s_profLastAlloc;
+    private static int s_profLastGc0, s_profLastGc1, s_profLastGc2;
+    private static long s_profLastPause;
+    private bool _profZeroReported;
+
+    private bool[]? _accumulatingGradMask;
+
+    // Kill switch for clearing only accumulated-into buffers on the first-write path (A/B and rollback):
+    // AIDOTNET_COMPILED_ZERO_ACCUMULATING_ONLY=0 restores clearing every non-candidate buffer.
+    private static readonly bool s_zeroAccumulatingOnly =
+        Environment.GetEnvironmentVariable("AIDOTNET_COMPILED_ZERO_ACCUMULATING_ONLY") != "0";
+
+    /// <summary><see cref="_genericGradIndices"/> as a per-buffer mask (built once).</summary>
+    private bool[] AccumulatingGradMask(int count)
+    {
+        var mask = _accumulatingGradMask;
+        if (mask is null || mask.Length != count)
+        {
+            mask = new bool[count];
+            foreach (int idx in _genericGradIndices!) if (idx >= 0 && idx < count) mask[idx] = true;
+            _accumulatingGradMask = mask;
+        }
+        return mask;
+    }
 
     // Writes "<AIDOTNET_STEP_PROF_PATH>.ops.txt": forward actions and backward delegates ranked by average µs/step,
     // so a slow step can be attributed to individual ops without an external profiler.
@@ -3072,9 +3096,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         {
             eagerGradWriteGeneration = Autodiff.DifferentiableOps.NextGradWriteGeneration();
             bool verified = _eagerFirstWriteVerified;
+            // Buffers nothing accumulates into are overwritten whole by their (specialized, beta = 0) writers, exactly
+            // as in the accumulating-only branch below, so they need no clear either. Clearing every non-candidate
+            // instead was 59 of 77 buffers, 3.5M floats and ~2 ms of a 15 ms CPU Transformer step.
+            var accumulating = _genericGradIndices is null || firstGradBind || !s_zeroAccumulatingOnly
+                ? null : AccumulatingGradMask(gradArrays.Length);
             for (int i = 0; i < gradArrays.Length; i++)
             {
                 if (verified && eagerCandidates[i]) continue;   // its first contribution this step copies in
+                if (accumulating is not null && !accumulating[i]) continue;   // overwritten whole by its writer
                 Array.Clear(gradArrays[i], 0, _preAllocatedGrads[i].Length);
                 InvalidateStaleDeviceCopy(_preAllocatedGrads[i]);   // see the note on the full clear below
                 // The zeros ARE this buffer's first write, so every contribution adds onto them (a specialized
@@ -3111,6 +3141,39 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 // against this "eager" reference meaningless.
                 InvalidateStaleDeviceCopy(_preAllocatedGrads[i]);
             }
+        }
+
+        if (s_stepProf && !_profZeroReported && !firstGradBind)
+        {
+            // One line per plan: which zeroing branch runs and how much it clears each step.
+            _profZeroReported = true;
+            long zeroed = 0; int buffers = 0;
+            string mode;
+            if (eagerGradWriteGeneration != 0)
+            {
+                mode = "first-write";
+                var acc = _genericGradIndices is null ? null : AccumulatingGradMask(gradArrays.Length);
+                for (int i = 0; i < gradArrays.Length; i++)
+                    if (!(_eagerFirstWriteVerified && eagerCandidates![i]) && (acc is null || acc[i]))
+                    { zeroed += _preAllocatedGrads[i].Length; buffers++; }
+            }
+            else if (_genericGradIndices != null)
+            {
+                mode = "accumulating-only";
+                foreach (int idx in _genericGradIndices) { zeroed += _preAllocatedGrads[idx].Length; buffers++; }
+            }
+            else
+            {
+                mode = "all";
+                foreach (var g in _preAllocatedGrads) { zeroed += g.Length; buffers++; }
+            }
+            try
+            {
+                System.IO.File.AppendAllText(StepProfDumpPath,
+                    $"[STEPPROF-ZERO] mode={mode} buffers={buffers}/{gradArrays.Length} elements/step={zeroed}"
+                    + System.Environment.NewLine);
+            }
+            catch { }
         }
 
         // Re-seed loss gradient — direct Array.Copy
@@ -3254,9 +3317,24 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 try
                 {
                     long f = _profForwardUs, gz = _profGradZeroUs, b = _profBackwardUs, o = _profOptimUs;
+                    // Allocation and GC rates over the last dump interval: a step that allocates stalls every thread
+                    // in GC (PollGC), which shows up in profiles as time inside whatever op was running.
+                    long allocNow = GC.GetTotalAllocatedBytes(false);
+                    int g0 = GC.CollectionCount(0), g1 = GC.CollectionCount(1), g2 = GC.CollectionCount(2);
+                    string gcPart = s_profLastAlloc == 0 ? "" :
+                        $" allocKB/step={(allocNow - s_profLastAlloc) / 1024 / StepProfDumpInterval}"
+                        + $" gc0={g0 - s_profLastGc0} gc1={g1 - s_profLastGc1} gc2={g2 - s_profLastGc2} (per {StepProfDumpInterval} steps)"
+#if NET7_0_OR_GREATER
+                        + $" gcPauseUs/step={(GC.GetTotalPauseDuration().Ticks - s_profLastPause) / 10 / StepProfDumpInterval}"
+#endif
+                        ;
+#if NET7_0_OR_GREATER
+                    s_profLastPause = GC.GetTotalPauseDuration().Ticks;
+#endif
+                    s_profLastAlloc = allocNow; s_profLastGc0 = g0; s_profLastGc1 = g1; s_profLastGc2 = g2;
                     System.IO.File.AppendAllText(StepProfDumpPath,
                         $"[STEPPROF] steps={sc} avgUs/step fwd={f / sc} gradZero={gz / sc} bwd={b / sc} opt={o / sc} total={(f + gz + b + o) / sc}"
-                        + System.Environment.NewLine);
+                        + gcPart + System.Environment.NewLine);
                     if (sc % (StepProfDumpInterval * 10) == 0) DumpPerOpProfile(sc);
                 }
                 catch { }
@@ -7934,6 +8012,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             //   * large M: native BLAS raw throughput wins, keep TryGemm.
             return eng =>
             {
+                // The small-K panel kernel reads B as passed, so it is correct with in-place weight updates; where it
+                // applies (K <= 128, enough rows) it beats both paths below (QKV [2048,64]x[64,64]: 47 vs 152+ µs).
+                if (SimdGemm.TryJitSmallK(cA.AsSpan(0, M * K), cB.AsSpan(0, K * N), cOut.AsSpan(0, M * N), M, N, K))
+                    return;
                 // Pick the kernel by shape — neither is universally best (measured,
                 // CompiledTrainingPlanGemmPerfBench, Ryzen, AIDOTNET_DISABLE_GPU=1):
                 //   * In BlasManaged's M-axis-parallel ThinMDirect range
@@ -7981,7 +8063,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 var oMem = ((Tensor<float>)(object)output).Data;
                 using var pinI = iMem.Pin();
                 using var pinO = oMem.Pin();
-                SimdKernels.ReLUUnsafe((float*)pinI.Pointer, (float*)pinO.Pointer, input.Length);
+                ParallelRelu((float*)pinI.Pointer, (float*)pinO.Pointer, input.Length);
             };
         }
         // ReLU forward non-float fallback (T=double etc.): route through the
@@ -9204,9 +9286,41 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     /// thread counts) and native/autotune routing otherwise -- except for small GEMMs, which take the direct managed
     /// kernel (see <see cref="LinearBackwardBlasMinWork"/>).
     /// </summary>
+    // Elements per chunk of the parallel ReLU passes: a memory-bound pass of this size is ~10-20 µs, enough to amortize
+    // a dispatch. A single-threaded pass over [2048,128] took ~250 µs in the Transformer step (3990X).
+    private const int ReluChunkElements = 64 * 1024;
+
+    /// <summary>output = max(input, 0), chunked across the pool.</summary>
+    private static unsafe void ParallelRelu(float* input, float* output, int length)
+    {
+        if (length <= ReluChunkElements) { SimdKernels.ReLUUnsafe(input, output, length); return; }
+        int chunks = (length + ReluChunkElements - 1) / ReluChunkElements;
+        nint pi = (nint)input, po = (nint)output;
+        CpuParallelSettings.ParallelForOrSerial(0, chunks, length, c =>
+        {
+            int start = c * ReluChunkElements, count = Math.Min(ReluChunkElements, length - start);
+            SimdKernels.ReLUUnsafe((float*)pi + start, (float*)po + start, count);
+        }, deterministicSafe: true);
+    }
+
+    /// <summary>result = forward > 0 ? grad : 0, chunked across the pool.</summary>
+    private static unsafe void ParallelReluBackward(float* grad, float* forward, float* result, int length)
+    {
+        if (length <= ReluChunkElements) { SimdKernels.ReluBackwardUnsafe(grad, forward, result, length); return; }
+        int chunks = (length + ReluChunkElements - 1) / ReluChunkElements;
+        nint pg = (nint)grad, pf = (nint)forward, pr = (nint)result;
+        CpuParallelSettings.ParallelForOrSerial(0, chunks, length, c =>
+        {
+            int start = c * ReluChunkElements, count = Math.Min(ReluChunkElements, length - start);
+            SimdKernels.ReluBackwardUnsafe((float*)pg + start, (float*)pf + start, (float*)pr + start, count);
+        }, deterministicSafe: true);
+    }
+
     private static void LinearBackwardGemm(
         float[] a, int lda, bool transA, float[] b, int ldb, bool transB, float[] c, int m, int k, int n)
     {
+        if (SimdGemm.TryGemmSmallJit(a, lda, transA, b, ldb, transB, c, m, k, n))
+            return;
         if ((long)m * k * n >= LinearBackwardBlasMinWork
             && BlasProvider.TryGemmEx(m, n, k, a, 0, lda, transA, b, 0, ldb, transB, c, 0, n))
             return;
@@ -9956,11 +10070,25 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                     // Either call failed — fall through to FP32 path.
                 }
 
+                // Small-K panel route first (SimdGemm.TryGemmSmallJit): dA = dC·Bᵀ as a no-transpose product over a
+                // transposed copy of the small B (QKV dX: ~80 vs ~230 µs through TryGemmEx). dB = Aᵀ·dC is not routed
+                // there yet (TryGemmSmallJit declines a transposed A), so it keeps TryGemmEx. Each falls back on its own.
+                bool dAJit = dcOff == 0 && bOff == 0 && destAOff == 0
+                    && SimdGemm.TryGemmSmallJit(cachedDC, N, false, cachedB!, N, true, cachedDestA!, M, N, K);
+                bool dBJit = !dWPeeled && aOff == 0 && dcOff == 0 && destBOff == 0
+                    && SimdGemm.TryGemmSmallJit(cachedA!, K, true, cachedDC, N, false, cachedDestB!, K, M, N);
+                if (dAJit && (dBJit || dWPeeled))
+                {
+                    inputA.Grad = gradA;
+                    if (!dWPeeled) inputB.Grad = gradB;
+                    return;
+                }
+
                 // Phase G.10: batch the two backward GEMMs (dA + dW) into a
                 // single MKL cblas_sgemm_batch call. Skipped when dW
                 // peeling is active for this step (Phase G.12) — the
                 // dW computation is deferred to a layer-batched call.
-                if (!dWPeeled
+                if (!dWPeeled && !dAJit && !dBJit
                     && BlasProvider.IsMklBatchedAvailable
                     && BlasProvider.TryGemmExBatch2(
                         // dA = dC @ B^T  → [M, K]
@@ -9980,7 +10108,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 }
 
                 // dA = dC @ B^T — direct BLAS with engine fallback
-                if (!BlasProvider.TryGemmEx(M, K, N, cachedDC, dcOff, N, false, cachedB!, bOff, N, true, cachedDestA!, destAOff, K))
+                if (!dAJit && !BlasProvider.TryGemmEx(M, K, N, cachedDC, dcOff, N, false, cachedB!, bOff, N, true, cachedDestA!, destAOff, K))
                 {
                     var dA = eng.TensorMatMul(gradOut, inputB.Transpose());
                     dA.AsSpan().CopyTo(gradA.AsWritableSpan());
@@ -9989,7 +10117,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 // step (Phase G.12), skip this GEMM entirely; the dW
                 // computation is deferred to the batched-dW phase
                 // appended after the main backward loop.
-                if (!dWPeeled)
+                if (!dWPeeled && !dBJit)
                 {
                     if (!BlasProvider.TryGemmEx(K, N, M, cachedA!, aOff, K, true, cachedDC, dcOff, N, false, cachedDestB!, destBOff, N))
                     {
@@ -10015,8 +10143,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             && (step.Inputs.Length == 2 || step.Inputs.Length == 3)
             && step.Inputs[0].Rank >= 2 && step.Inputs[1].Rank == 2
             && (step.SavedState is null || step.SavedState.Length == 0
-                || (step.SavedState[0] is FusedActivationType linAct && linAct == FusedActivationType.None)))
+                || (step.SavedState[0] is FusedActivationType linAct
+                    && (linAct == FusedActivationType.None || linAct == FusedActivationType.ReLU))))
         {
+            // ReLU epilogue: dZ = dY where the output is positive, else 0 (relu(z) > 0 exactly when z > 0), written to
+            // a plan-owned scratch that the GEMMs and the bias sum then read in place of dY. Without this the layer
+            // took the generic backward: zero-filled rented gradients, an accumulating GEMM, a separate ReLU backward
+            // and a broadcast bias reduction, then AccumulateGrad copies (2.85 ms vs PyTorch's 1.0 ms for a
+            // [2048,64]->[2048,128] FFN layer, 3990X).
+            bool linRelu = step.SavedState is { Length: > 0 } && step.SavedState[0] is FusedActivationType.ReLU;
             var linIn = step.Inputs[0];
             var linW = step.Inputs[1];
             var linB = step.Inputs.Length == 3 ? step.Inputs[2] : null;
@@ -10044,10 +10179,18 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             }
             var linGradIn = linNeedX ? gradMap[linIn] : null;
             var linGradW = linNeedW ? gradMap[linW] : null;
+            float[]? reluScratch = linRelu ? new float[linRows * linN] : null;
 
             return eng =>
             {
                 var dY = TryGetLiveFloatBacking(linGradOut) ?? throw new InvalidOperationException("FusedLinear backward: the output gradient has no live host buffer.");
+                if (reluScratch is not null)
+                {
+                    var y = TryGetLiveFloatBacking(linOut) ?? throw new InvalidOperationException("FusedLinear backward: the output has no live host buffer.");
+                    fixed (float* pdy = dY, py = y, pdz = reluScratch)
+                        ParallelReluBackward(pdy, py, pdz, reluScratch.Length);
+                    dY = reluScratch;
+                }
                 if (linGradW is not null)
                 {
                     // dW[K,N] = Xᵀ[K,rows] · dY[rows,N]
