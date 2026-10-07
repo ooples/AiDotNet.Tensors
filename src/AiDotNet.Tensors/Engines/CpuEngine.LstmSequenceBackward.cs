@@ -275,6 +275,30 @@ public partial class CpuEngine
     private static int LstmChunkStart(int c, int batch, int chunks) => (int)((long)c * batch / chunks);
 
     /// <summary>
+    /// C := A·B ([m, k]·[k, n], row-major, no transposes) on the parallel BlasManaged dispatcher. Used for the large
+    /// whole-sequence GEMMs when the batch is a single chunk: nothing else runs beside it then, so the GEMM itself must
+    /// spread over the pool, as the kernel did before batch chunking (a single-threaded GEMM there made small-batch
+    /// LSTMs 18-44% slower).
+    /// </summary>
+    private static void LstmSoloGemm(ReadOnlySpan<float> a, int lda, ReadOnlySpan<float> b, int ldb, Span<float> c, int m, int n, int k,
+        bool transA = false)
+        => BlasManaged.BlasManaged.Gemm<float>(a, lda, transA, b, ldb, false, c, n, m, n, k,
+            new BlasManaged.BlasOptions<float> { PackingMode = BlasManaged.PackingMode.DisableAutotune });
+
+    /// <summary>
+    /// The [G, k] weight gradient from the chunks' partials. A single chunk computes its partial directly in the [G, k]
+    /// layout (a transposed-A GEMM, no operand or result transposes), so it is copied as is; several chunks keep the
+    /// [k, G] partials, summed in chunk order and transposed once.
+    /// </summary>
+    private static Tensor<float> LstmWeightGradient(float[][] parts, int chunks, int k, int G)
+    {
+        if (chunks != 1) return SumChunkPartialsTransposed(parts, chunks, k, G);
+        var grad = new Tensor<float>(new[] { G, k });
+        parts[0].AsSpan(0, G * k).CopyTo(grad.AsWritableSpan());
+        return grad;
+    }
+
+    /// <summary>
     /// The fused training forward's arithmetic: forms the transposed weights and the summed bias once, then runs every
     /// batch chunk's input projection and recurrence (<see cref="LstmForwardChunk"/>), writing the saved per-timestep
     /// gates/cells/hiddens/tanh(c) into <paramref name="ws"/> and the hidden outputs into <paramref name="outSpan"/>
@@ -355,11 +379,29 @@ public partial class CpuEngine
         // Wx[b, t] = (bIh + bHh) + x[b, t]·WIhᵀ for the chunk's rows: the bias seeds the accumulating GEMM.
         int rows = nb * seqLen;
         int wxOff = b0 * seqLen * G;
-        for (int r = 0; r < rows; r++)
-            Array.Copy(ws.Bias, 0, wx, wxOff + r * G, G);
-        SimdGemm.SgemmAddInternal(inArr.AsSpan(b0 * seqLen * inFeatures, rows * inFeatures), inFeatures, false,
-            ws.WIhT.AsSpan(0, inFeatures * G), G, false,
-            wx.AsSpan(wxOff, rows * G), rows, inFeatures, G, allowParallel: false);
+        // A batch below two chunks' worth runs as ONE chunk on the calling thread with nothing beside it, so its GEMMs
+        // may use the pool themselves (as before chunking); with several chunks every GEMM stays single-threaded inside
+        // its worker. SgemmAddInternal's own size gate still decides whether a given GEMM actually parallelizes.
+        bool soloChunk = ws.Chunks == 1;
+        if (soloChunk)
+        {
+            LstmSoloGemm(inArr.AsSpan(b0 * seqLen * inFeatures, rows * inFeatures), inFeatures,
+                ws.WIhT.AsSpan(0, inFeatures * G), G, wx.AsSpan(wxOff, rows * G), rows, G, inFeatures);
+            var bias = ws.Bias;
+            for (int r = 0; r < rows; r++)
+            {
+                int off = wxOff + r * G;
+                for (int g = 0; g < G; g++) wx[off + g] += bias[g];
+            }
+        }
+        else
+        {
+            for (int r = 0; r < rows; r++)
+                Array.Copy(ws.Bias, 0, wx, wxOff + r * G, G);
+            SimdGemm.SgemmAddInternal(inArr.AsSpan(b0 * seqLen * inFeatures, rows * inFeatures), inFeatures, false,
+                ws.WIhT.AsSpan(0, inFeatures * G), G, false,
+                wx.AsSpan(wxOff, rows * G), rows, inFeatures, G, allowParallel: false);
+        }
 
         for (int t = 0; t < seqLen; t++)
         {
@@ -746,9 +788,9 @@ public partial class CpuEngine
         // Sum the chunks' partial gradients in chunk order (fixed by the batch size, so thread-count independent), then
         // transpose the [k, G] partial layout back to the [G, k] weight layout.
         if (needWIh)
-            DifferentiableOps.AccumulateGrad(grads, wIh, SumChunkPartialsTransposed(scratch.PartWIh, chunks, inFeatures, G), engine);
+            DifferentiableOps.AccumulateGrad(grads, wIh, LstmWeightGradient(scratch.PartWIh, chunks, inFeatures, G), engine);
         if (needWHh)
-            DifferentiableOps.AccumulateGrad(grads, wHh, SumChunkPartialsTransposed(scratch.PartWHh, chunks, hidden, G), engine);
+            DifferentiableOps.AccumulateGrad(grads, wHh, LstmWeightGradient(scratch.PartWHh, chunks, hidden, G), engine);
 
         if (needBias)
         {
@@ -811,6 +853,8 @@ public partial class CpuEngine
         int G = 4 * hidden;
         int b0 = LstmChunkStart(c, batch, ws.Chunks), b1 = LstmChunkStart(c + 1, batch, ws.Chunks), nb = b1 - b0;
         int rows = nb * seqLen;
+        // One chunk = the whole batch on the calling thread: its GEMMs may use the pool (see LstmForwardChunk).
+        bool soloChunk = ws.Chunks == 1;
         var partWIh = scratch.PartWIh[c];
         var partWHh = scratch.PartWHh[c];
         var partB = scratch.PartB[c];
@@ -863,13 +907,26 @@ public partial class CpuEngine
         if (gradInputPtr != IntPtr.Zero && wIhArr is not null)
         {
             var gi = new Span<float>((float*)gradInputPtr + (long)b0 * seqLen * inFeatures, rows * inFeatures);
-            gi.Clear();
-            SimdGemm.SgemmAddInternal(dgChunk, G, false, wIhArr.AsSpan(0, G * inFeatures), inFeatures, false,
-                gi, rows, G, inFeatures, allowParallel: false, clearedOutput: true);
+            if (soloChunk)
+            {
+                LstmSoloGemm(dgChunk, G, wIhArr.AsSpan(0, G * inFeatures), inFeatures, gi, rows, inFeatures, G);
+            }
+            else
+            {
+                gi.Clear();
+                SimdGemm.SgemmAddInternal(dgChunk, G, false, wIhArr.AsSpan(0, G * inFeatures), inFeatures, false,
+                    gi, rows, G, inFeatures, allowParallel: false, clearedOutput: true);
+            }
         }
 
-        // Partial dWIhᵀ = xᵀ·dgates over the chunk's rows ([in, G]).
-        if (inputArr is not null)
+        // Partial dWIhᵀ = xᵀ·dgates over the chunk's rows ([in, G]). A single chunk instead forms dWIh = dgatesᵀ·x
+        // directly in the [G, in] gradient layout on the parallel dispatcher (see LstmWeightGradient).
+        if (inputArr is not null && soloChunk)
+        {
+            LstmSoloGemm(dgChunk, G, inputArr.AsSpan(b0 * seqLen * inFeatures, rows * inFeatures), inFeatures,
+                partWIh.AsSpan(0, G * inFeatures), G, inFeatures, rows, transA: true);
+        }
+        else if (inputArr is not null)
         {
             var xt = scratch.XT[c];
             int xOff = b0 * seqLen * inFeatures;
@@ -883,7 +940,17 @@ public partial class CpuEngine
         }
 
         // Partial dWHhᵀ = h_{t-1}ᵀ·dgates over the chunk's rows ([hidden, G]); row (b, t) pairs with h_{t-1} of b.
-        if (needWHh)
+        if (needWHh && soloChunk)
+        {
+            // h_{t-1} rows of each sample are contiguous in the saved hiddens; gather them row-major and form
+            // dWHh = dgatesᵀ·h_{t-1} directly in the [G, hidden] layout.
+            var hp = scratch.HT[c];
+            for (int b = b0; b < b1; b++)
+                Array.Copy(hiddens, b * hStride, hp, (b - b0) * seqLen * hidden, seqLen * hidden);
+            LstmSoloGemm(dgChunk, G, hp.AsSpan(0, rows * hidden), hidden, partWHh.AsSpan(0, G * hidden), G, hidden, rows,
+                transA: true);
+        }
+        else if (needWHh)
         {
             var ht = scratch.HT[c];
             for (int b = b0; b < b1; b++)
