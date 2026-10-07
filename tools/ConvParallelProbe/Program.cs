@@ -54,6 +54,7 @@ internal static class Program
         if (args.Length > 0 && args[0] == "--allocbench") return RunAllocBench(eng, args);
         if (args.Length > 0 && args[0] == "--resblock") return RunResblock(eng, args);
         if (args.Length > 0 && args[0] == "--attnblock") return RunAttnBlock(eng, args);
+        if (args.Length > 0 && args[0] == "--allocops") return RunAllocOps(eng, args);
         if (args.Length > 0 && args[0] == "--act") return RunAct(eng, args);
         if (args.Length > 0 && args[0] == "--gemm") return RunGemm(eng, args);
         if (args.Length > 0 && args[0] == "--gemmverify") return RunGemmVerify(eng, args);
@@ -94,7 +95,7 @@ internal static class Program
             s.Stop();
             times[i] = s.Elapsed.TotalMilliseconds;
         }
-        string u = string.Empty; // utilization meter removed with CooperativeGemmScheduler (PR #762)
+        string u = string.Empty;
         Array.Sort(times);
         Console.WriteLine(
             $"CONV inC={inC} outC={outC} sp={sp}x{sp} out.len={o.Length} maxdop={maxdop} " +
@@ -108,6 +109,52 @@ internal static class Program
     // way --resblock measures the conv mix. This is a perf-SHAPE probe: weights/activations are
     // random and the per-head tensors are allocated at the exact attention GEMM shapes, so it
     // measures the dispatch/parallel behavior of those op shapes (not numerical attention).
+    // In-place forward work: bytes each attention-block op allocates beyond its own output.
+    // Anything above 1.00x is internal scratch the op could take from a reused buffer instead.
+    private static int RunAllocOps(CpuEngine eng, string[] a)
+    {
+        int S = ArgI(a, "--s", 256), D = ArgI(a, "--d", 768), H = ArgI(a, "--h", 12);
+        int Dh = D / H;
+        CpuParallelSettings.MaxDegreeOfParallelism = ArgI(a, "--maxdop", 1);
+        var rng = new Random(0);
+        var x = Rand(new[] { S, D }, rng);
+        var w = Rand(new[] { D, D }, rng);
+        var w1 = Rand(new[] { D, 4 * D }, rng);
+        var gamma = Rand(new[] { D }, rng);
+        var beta = Rand(new[] { D }, rng);
+        var qh = Rand(new[] { H, S, Dh }, rng);
+        var kht = Rand(new[] { H, Dh, S }, rng);
+        var scores = Rand(new[] { H, S, S }, rng);
+        var h1 = Rand(new[] { S, 4 * D }, rng);
+
+        void Measure(string name, long outputElements, Action op)
+        {
+            op(); op();
+            long before = GC.GetTotalAllocatedBytes(true);
+            const int n = 5;
+            for (int i = 0; i < n; i++) op();
+            double perCall = (GC.GetTotalAllocatedBytes(true) - before) / (double)n;
+            double outBytes = outputElements * sizeof(float);
+            var times = new double[9];
+            for (int i = 0; i < times.Length; i++)
+            {
+                var sw = Stopwatch.StartNew();
+                op();
+                times[i] = sw.Elapsed.TotalMilliseconds;
+            }
+            Array.Sort(times);
+            Console.WriteLine($"ALLOCOP {name,-28} alloc_KB={perCall / 1024.0,10:F1} output_KB={outBytes / 1024.0,9:F1} ratio={(outBytes > 0 ? perCall / outBytes : 0),6:F2} median_ms={times[times.Length / 2],8:F3}");
+        }
+
+        Measure("BatchMatMul [S,D]x[D,D]", (long)S * D, () => eng.BatchMatMul(x, w));
+        Measure("BatchMatMul [S,D]x[D,4D]", (long)S * 4 * D, () => eng.BatchMatMul(x, w1));
+        Measure("BatchMatMul [H,S,Dh]x[H,Dh,S]", (long)H * S * S, () => eng.BatchMatMul(qh, kht));
+        Measure("Softmax [H,S,S]", (long)H * S * S, () => eng.Softmax(scores, -1));
+        Measure("TensorAdd [S,D]", (long)S * D, () => eng.TensorAdd(x, x));
+        Measure("LayerNorm [S,D]", (long)S * D, () => eng.LayerNorm(x, gamma, beta, 1e-5, out _, out _));
+        Measure("SwishInPlace [S,4D]", 0, () => eng.SwishInPlace(h1));
+        return 0;
+    }
     private static int RunAttnBlock(CpuEngine eng, string[] a)
     {
         int maxdop = ArgI(a, "--maxdop", Environment.ProcessorCount);
@@ -197,6 +244,8 @@ internal static class Program
         if (arena is not null) { arena.Reset(); yy = x0; for (int b = 0; b < blocks; b++) yy = blk(yy); }
         GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
         long allocStart = GC.GetAllocatedBytesForCurrentThread();
+        int gen0Start = GC.CollectionCount(0), gen2Start = GC.CollectionCount(2);
+        double pauseStartMs = GC.GetTotalPauseDuration().TotalMilliseconds;
         for (int i = 0; i < reps; i++)
         {
             if (arena is not null) arena.Reset();
@@ -208,7 +257,10 @@ internal static class Program
         }
         arena?.Dispose();
         long allocBytes = GC.GetAllocatedBytesForCurrentThread() - allocStart;
-        string u = string.Empty; // utilization meter removed with CooperativeGemmScheduler (PR #762)
+        double gen0PerFwd = (GC.CollectionCount(0) - gen0Start) / (double)reps;
+        double gen2PerFwd = (GC.CollectionCount(2) - gen2Start) / (double)reps;
+        double gcPausePerFwd = (GC.GetTotalPauseDuration().TotalMilliseconds - pauseStartMs) / reps;
+        string u = $" gen0_per_fwd={gen0PerFwd:F2} gen2_per_fwd={gen2PerFwd:F2} gc_pause_ms_per_fwd={gcPausePerFwd:F2}";
         Array.Sort(times);
         Console.WriteLine(
             $"ATTNBLOCK S={S} D={D} H={H} Dh={Dh} blocks={blocks} maxdop={maxdop} procs={Environment.ProcessorCount} " +
@@ -269,6 +321,8 @@ internal static class Program
         var times = new double[reps];
         long peakWs = 0;
         long allocStart = GC.GetAllocatedBytesForCurrentThread();
+        int gen0Start = GC.CollectionCount(0), gen2Start = GC.CollectionCount(2);
+        double pauseStartMs = GC.GetTotalPauseDuration().TotalMilliseconds;
         for (int i = 0; i < reps; i++)
         {
             arena?.Reset();
@@ -560,7 +614,7 @@ internal static class Program
             s.Stop();
             times[i] = s.Elapsed.TotalMilliseconds;
         }
-        string u = string.Empty; // utilization meter removed with CooperativeGemmScheduler (PR #762)
+        string u = string.Empty;
         Array.Sort(times);
         Console.WriteLine(
             $"ACT op={op} n={n} maxdop={maxdop} procs={Environment.ProcessorCount} " +
@@ -662,7 +716,7 @@ internal static class Program
             s.Stop();
             times[i] = s.Elapsed.TotalMilliseconds;
         }
-        string u = string.Empty; // utilization meter removed with CooperativeGemmScheduler (PR #762)
+        string u = string.Empty;
         Array.Sort(times);
         Console.WriteLine(
             $"GEMM M={M} K={K} N={N} fma={(double)M * K * N:E1} maxdop={maxdop} procs={Environment.ProcessorCount} " +
@@ -796,7 +850,7 @@ internal static class Program
             s.Stop();
             times[i] = s.Elapsed.TotalMilliseconds;
         }
-        string u = string.Empty; // utilization meter removed with CooperativeGemmScheduler (PR #762)
+        string u = string.Empty;
         Array.Sort(times);
         Console.WriteLine(
             $"RESBLOCK C={C} sp={sp}x{sp} blocks={blocks} maxdop={maxdop} procs={Environment.ProcessorCount} " +
