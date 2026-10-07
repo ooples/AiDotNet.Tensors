@@ -127,8 +127,12 @@ internal static class Program
         var scores = Rand(new[] { H, S, S }, rng);
         var h1 = Rand(new[] { S, 4 * D }, rng);
 
+        // --arena: every call reuses the previous call's buffers, which isolates the cost of fresh
+        // output pages (allocation, page faults) from the kernel itself.
+        using var arena = HasFlag(a, "--arena") ? TensorArena.Create() : null;
         void Measure(string name, long outputElements, Action op)
         {
+            if (arena is not null) { var raw = op; op = () => { arena.Reset(); raw(); }; }
             op(); op();
             long before = GC.GetTotalAllocatedBytes(true);
             const int n = 5;
