@@ -7022,6 +7022,45 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // Track GCHandles for cleanup on Dispose
         var pinnedHandles = new List<GCHandle>();
 
+        // Pointwise fusion (host float plans): every connected set of registered elementwise ops and slices over
+        // buffers of one element count replays as ONE tiled action at its last member's position
+        // (PointwiseFusionPlanner). Members keep writing their own buffers through the same kernels, so the step is
+        // bit-identical to replaying them one by one; what goes is a dispatch per op and a full memory pass per op. A
+        // lone slice also takes its range kernel (a direct copy) instead of the generic engine slice. Steps another
+        // fusion claimed are barriers.
+        var pointwiseGroupAt = new Dictionary<int, (PointwiseGroupKernel Kernel, string Name)>();
+        var pointwiseMembers = new HashSet<int>();
+        if (typeof(T) == typeof(float) && PointwiseKernelRegistry.Enabled && !preferGenericForGpu
+            && engine is CpuEngine && !engine.SupportsGpu && fp16HeteroOrder is null)
+        {
+            var pointwiseGroups = PointwiseFusionPlanner.Plan(forwardSteps, pwStep =>
+                reshapeAliasSteps.Contains(pwStep) ? PointwiseFusionPlanner.StepRole.Transparent
+                : analyticForwardSpecs.ContainsKey(pwStep) || skippableReduceSumForwardIndices.Contains(pwStep)
+                  || slicePrefixForwardSpecs.ContainsKey(pwStep) || consumedBySlicePrefix.Contains(pwStep)
+                  || convEpilogueForwardSpecs.ContainsKey(pwStep) || consumedByConvEpilogue.Contains(pwStep)
+                  || fusedStepIndices.Contains(pwStep)
+                    ? PointwiseFusionPlanner.StepRole.Barrier
+                    : PointwiseFusionPlanner.StepRole.Normal);
+            foreach (var pwGroup in pointwiseGroups)
+            {
+                var pwSpec = new List<(OpType Op, Tensor<float>[] Inputs, Tensor<float> Output, object[]? SavedState)>(pwGroup.Length);
+                var pwLabel = new System.Text.StringBuilder("fused:pointwise[");
+                for (int pwG = 0; pwG < pwGroup.Length; pwG++)
+                {
+                    var pwMember = forwardSteps[pwGroup[pwG]];
+                    var pwInputs = new Tensor<float>[pwMember.Inputs.Length];
+                    for (int pwK = 0; pwK < pwInputs.Length; pwK++) pwInputs[pwK] = (Tensor<float>)(object)pwMember.Inputs[pwK];
+                    pwSpec.Add((pwMember.OpType, pwInputs, (Tensor<float>)(object)pwMember.OutputBuffer, pwMember.SavedState));
+                    if (pwG > 0) pwLabel.Append('+');
+                    pwLabel.Append(pwMember.OpName);
+                    pointwiseMembers.Add(pwGroup[pwG]);
+                }
+                pwLabel.Append(']');
+                var pwKernel = new PointwiseGroupKernel(pwSpec, forwardSteps[pwGroup[0]].OutputBuffer.Length, pinnedHandles);
+                pointwiseGroupAt[pwGroup[pwGroup.Length - 1]] = (pwKernel, pwLabel.ToString());
+            }
+        }
+
         // Build forward actions in original graph order. Fused groups replace their
         // constituent steps at the position of the first fused step in each group,
         // ensuring non-fused producers that appear before a fused block still run first.
@@ -7043,6 +7082,21 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                     analyticForwardSpecs.ContainsKey(i) || skippableReduceSumForwardIndices.Contains(i)
                     || convEpilogueForwardSpecs.ContainsKey(i) || slicePrefixForwardSpecs.ContainsKey(i));
                 forwardEmitKinds[i] = ForwardEmit.Skip;
+                continue;
+            }
+            // A member of a fused elementwise group: the group's one action runs at its last member.
+            if (pointwiseMembers.Contains(i))
+            {
+                forwardEmitKinds[i] = ForwardEmit.Skip;
+                if (pointwiseGroupAt.TryGetValue(i, out var pwEntry))
+                {
+                    var pwRun = pwEntry.Kernel;
+                    Action<IEngine> pwAction = _ => pwRun.Run();
+                    allForwardActions.Add(pwAction);
+                    forwardActionNames.Add(pwEntry.Name);
+                    forwardEmitKinds[i] = ForwardEmit.Fixed;
+                    forwardFixedActions[i] = pwAction;
+                }
                 continue;
             }
             // Phase G.8: analytic forward for MatMul→ReduceSum-loss replaces

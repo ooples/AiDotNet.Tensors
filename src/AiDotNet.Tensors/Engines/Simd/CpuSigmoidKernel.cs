@@ -84,6 +84,38 @@ internal readonly struct CpuSigmoidKernel
         }
     }
 
+    /// <summary>
+    /// Executes the resolved implementation over <c>[start, start + count)</c> of the buffer this value was resolved
+    /// for, writing exactly the bits <see cref="Invoke"/> writes there: the runtime-JIT vector prefix and the scalar tail
+    /// keep their whole-buffer boundary. <paramref name="input"/> and <paramref name="output"/> are the buffers' BASE
+    /// pointers; <paramref name="start"/> must be a multiple of 8.
+    /// </summary>
+    internal unsafe void InvokeRange(float* input, float* output, int start, int count)
+    {
+        if ((start & 7) != 0 || count < 0 || start + count > _length)
+            throw new ArgumentOutOfRangeException(nameof(start), $"Range [{start}, {start + count}) is not 8-aligned within {_length}.");
+        int end = start + count;
+        switch (Kind)
+        {
+            case CpuSigmoidKernelKind.RuntimeJit:
+                int vectorEnd = Math.Min(end, _runtimeJitLength);
+                if (vectorEnd > start)
+                    CpuJitKernels.GetSigmoidKernel(vectorEnd - start)(input + start, output + start, vectorEnd - start);
+                for (int i = Math.Max(start, _runtimeJitLength); i < end; i++)
+                    output[i] = 1.0f / (1.0f + MathF.Exp(-input[i]));
+                return;
+
+            case CpuSigmoidKernelKind.AdaptiveSimd:
+                // Vector prefix of the range, scalar tail: with an 8-aligned start, every range but the last is a whole
+                // number of vectors, so the scalar tail lands on the same elements as the whole-buffer call's.
+                SimdKernels.SigmoidUnsafe(input + start, output + start, count);
+                return;
+
+            default:
+                throw new InvalidOperationException($"Unknown CPU sigmoid kernel kind: {Kind}.");
+        }
+    }
+
     /// <summary>Resolves and executes a one-shot invocation.</summary>
     internal static unsafe void Execute(float* input, float* output, int length)
         => Resolve(length).Invoke(input, output);

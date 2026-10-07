@@ -108,6 +108,8 @@ internal enum OpType : byte
     TensorPermute,
     TensorMultiplyScalar,
     GroupedQueryAttention,
+    // Appended to preserve serialized ordinals: the slice the pointwise-fusion registry serves as a gather.
+    TensorSliceAxis,
 }
 
 internal static class OpTypeParser
@@ -187,6 +189,7 @@ internal static class OpTypeParser
         "TensorPermute" => OpType.TensorPermute,
         "TensorMultiplyScalar" => OpType.TensorMultiplyScalar,
         "GroupedQueryAttention" => OpType.GroupedQueryAttention,
+        "TensorSliceAxis" => OpType.TensorSliceAxis,
         _ => OpType.Unknown,
     };
 }
