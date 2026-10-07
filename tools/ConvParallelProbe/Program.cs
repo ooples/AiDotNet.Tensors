@@ -56,6 +56,7 @@ internal static class Program
         if (args.Length > 0 && args[0] == "--attnblock") return RunAttnBlock(eng, args);
         if (args.Length > 0 && args[0] == "--allocops") return RunAllocOps(eng, args);
         if (args.Length > 0 && args[0] == "--intoaudit") return RunIntoAudit(eng, args);
+        if (args.Length > 0 && args[0] == "--resblockops") return RunResBlockOps(eng, args);
         if (args.Length > 0 && args[0] == "--act") return RunAct(eng, args);
         if (args.Length > 0 && args[0] == "--gemm") return RunGemm(eng, args);
         if (args.Length > 0 && args[0] == "--gemmverify") return RunGemmVerify(eng, args);
@@ -814,6 +815,42 @@ internal static class Program
     // #653 GEMM kernel work: where the routed GotoGemm path spends its time at a given thread count.
     // Pack and kernel ticks are summed across workers, so (pack + kernel) / (wall * threads) is the
     // share of the thread budget doing useful work; the rest is idle, imbalance or dispatch.
+    // Per-op median time of one ResBlock's ops at the --resblock shapes, buffers reused, so a change
+    // that moves the whole block (worker pinning, #653) can be traced to the op that moved.
+    private static int RunResBlockOps(CpuEngine eng, string[] a)
+    {
+        int C = ArgI(a, "--c", 256), sp = ArgI(a, "--sp", 16);
+        CpuParallelSettings.MaxDegreeOfParallelism = ArgI(a, "--maxdop", 16);
+        int groups = Math.Max(1, Math.Min(32, C / 8));
+        var rng = new Random(0);
+        var x = Rand(new[] { 1, C, sp, sp }, rng);
+        var gamma = Rand(new[] { C }, rng);
+        var beta = Rand(new[] { C }, rng);
+        var k1 = Rand(new[] { C, C, 3, 3 }, rng);
+        var h = Rand(new[] { 1, C, sp, sp }, rng);
+        using var arena = TensorArena.Create();
+
+        void Time(string name, Action op)
+        {
+            for (int i = 0; i < 5; i++) { arena.Reset(); op(); }
+            var times = new double[21];
+            for (int i = 0; i < times.Length; i++)
+            {
+                arena.Reset();
+                var sw = Stopwatch.StartNew();
+                op();
+                times[i] = sw.Elapsed.TotalMilliseconds;
+            }
+            Array.Sort(times);
+            Console.WriteLine($"RESOP {name,-12} median_ms={times[times.Length / 2]:F3}");
+        }
+
+        Time("GroupNorm", () => eng.GroupNorm(x, groups, gamma, beta, 1e-5, out _, out _));
+        Time("SwishInPlace", () => eng.SwishInPlace(h));
+        Time("Conv2D", () => eng.Conv2D(x, k1, 1, 1, 1));
+        Time("TensorAdd", () => eng.TensorAdd(x, h));
+        return 0;
+    }
     private static int RunGotoProfile(CpuEngine eng, string[] a)
     {
         int M = ArgI(a, "--m", 256), K = ArgI(a, "--k", 768), N = ArgI(a, "--n", 3072);
