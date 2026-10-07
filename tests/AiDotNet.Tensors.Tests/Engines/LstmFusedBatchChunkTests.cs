@@ -80,6 +80,8 @@ public class LstmFusedBatchChunkTests
     [InlineData(17, 19, false)]   // vector body + scalar tail in every cell row
     [InlineData(40, 64, false)]   // five chunks of 8
     [InlineData(136, 32, true)]   // the 16-chunk cap: chunks of 8 and 9 rows
+    [InlineData(1, 19, true)]     // one chunk: whole-sequence GEMMs on the parallel dispatcher, weight grads unpermuted
+    [InlineData(12, 64, false)]   // one chunk (batch < 16), several rows per step
     public void MultiChunkFused_MatchesDecomposedGraph(int batch, int hidden, bool returnSequences)
     {
         var eng = new CpuEngine();
