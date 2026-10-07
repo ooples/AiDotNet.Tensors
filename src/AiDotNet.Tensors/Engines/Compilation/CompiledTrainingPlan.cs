@@ -9316,6 +9316,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         }, deterministicSafe: true);
     }
 
+    /// <summary>dst[start..+count] += src (accumulate) or = src.</summary>
+    private static void AddOrCopy(float[] src, float[] dst, int start, int count, bool accumulate)
+    {
+        if (!accumulate) { Array.Copy(src, start, dst, start, count); return; }
+        int w = System.Numerics.Vector<float>.Count, i = start, end = start + count;
+        for (; i + w <= end; i += w)
+            (new System.Numerics.Vector<float>(dst, i) + new System.Numerics.Vector<float>(src, i)).CopyTo(dst, i);
+        for (; i < end; i++) dst[i] += src[i];
+    }
+
     private static void LinearBackwardGemm(
         float[] a, int lda, bool transA, float[] b, int ldb, bool transB, float[] c, int m, int k, int n)
     {
@@ -9328,25 +9338,47 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     }
 
     /// <summary>
-    /// dst[j] = Σ_r src[r·cols + j] for r = 0..rows-1, summed in row order from zero -- the same per-element order as
-    /// the scalar bias-gradient loop it replaces, so the result is bit-identical to it.
+    /// dst[j] = Σ_r src[r·cols + j] for r = 0..rows-1. Small inputs sum in row order from zero; large ones sum fixed row
+    /// chunks in parallel and then the chunk partials in order (reproducible for any thread count, not bit-identical
+    /// to the serial order).
     /// </summary>
     private static void SumRowsInto(float[] src, int rows, int cols, float[] dst)
+    {
+        // Large sums: fixed row chunks (a function of the shape only) summed in parallel into partials, then the
+        // partials in chunk order -- reproducible for any thread count. A serial pass over [2048,128] was ~50 us per
+        // dense layer's bias gradient.
+        int chunks = Math.Min(16, rows / 256);
+        if (chunks >= 2 && (long)rows * cols >= 64 * 1024)
+        {
+            var partial = new float[chunks * cols];
+            CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)rows * cols, c =>
+            {
+                int r0 = (int)((long)c * rows / chunks), r1 = (int)((long)(c + 1) * rows / chunks);
+                SumRowRange(src, r0, r1, cols, partial, c * cols);
+            }, deterministicSafe: true);
+            SumRowRange(partial, 0, chunks, cols, dst, 0);
+            return;
+        }
+        SumRowRange(src, 0, rows, cols, dst, 0);
+    }
+
+    /// <summary>dst[dOff + j] = sum over r in [r0, r1) of src[r * cols + j], in row order from zero.</summary>
+    private static void SumRowRange(float[] src, int r0, int r1, int cols, float[] dst, int dOff)
     {
         int w = System.Numerics.Vector<float>.Count;
         int j = 0;
         for (; j + w <= cols; j += w)
         {
             var acc = System.Numerics.Vector<float>.Zero;
-            for (int r = 0; r < rows; r++)
+            for (int r = r0; r < r1; r++)
                 acc += new System.Numerics.Vector<float>(src, r * cols + j);
-            acc.CopyTo(dst, j);
+            acc.CopyTo(dst, dOff + j);
         }
         for (; j < cols; j++)
         {
             float s = 0f;
-            for (int r = 0; r < rows; r++) s += src[r * cols + j];
-            dst[j] = s;
+            for (int r = r0; r < r1; r++) s += src[r * cols + j];
+            dst[dOff + j] = s;
         }
     }
 
@@ -10511,6 +10543,31 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             var gradB = gradMap[inputB];
             bool accumA = consumerCount.ContainsKey(inputA) && consumerCount[inputA] > 1;
             bool accumB = consumerCount.ContainsKey(inputB) && consumerCount[inputB] > 1;
+
+            // Float host buffers of one shape: both gradients in one chunked pass across the pool. The engine add and
+            // the single-threaded span copy took ~170 us per residual add of [64,32,64] (3990X).
+            if (typeof(T) == typeof(float) && !engine.SupportsGpu
+                && gradA.Length == gradOut.Length && gradB.Length == gradOut.Length
+                && TryGetLiveFloatBacking(gradOut) is not null && TryGetLiveFloatBacking(gradA) is not null
+                && TryGetLiveFloatBacking(gradB) is not null)
+            {
+                int addLen = gradOut.Length;
+                return eng =>
+                {
+                    var g = TryGetLiveFloatBacking(gradOut)!;
+                    var ga = TryGetLiveFloatBacking(gradA)!;
+                    var gb = TryGetLiveFloatBacking(gradB)!;
+                    int chunks = Math.Max(1, (addLen + ReluChunkElements - 1) / ReluChunkElements);
+                    CpuParallelSettings.ParallelForOrSerial(0, chunks, 2L * addLen, c =>
+                    {
+                        int start = c * ReluChunkElements, count = Math.Min(ReluChunkElements, addLen - start);
+                        AddOrCopy(g, ga, start, count, accumA);
+                        AddOrCopy(g, gb, start, count, accumB);
+                    }, deterministicSafe: true);
+                    inputA.Grad = gradA;
+                    inputB.Grad = gradB;
+                };
+            }
 
             return eng =>
             {
