@@ -136,8 +136,8 @@ internal static class GotoGemmFp32
     // per-K-panel Stopwatch deltas summed across worker threads — answers "is the cost packing or
     // the microkernel?" without profiler pseudo-frame ambiguity.
     internal static bool s_timing;
-    internal static long s_packTicks, s_kernTicks, s_packBTicks, s_packATicks;
-    internal static void ResetTiming() { s_packTicks = 0; s_kernTicks = 0; s_packBTicks = 0; s_packATicks = 0; }
+    internal static long s_packTicks, s_kernTicks, s_packBTicks, s_packATicks, s_tailTicks;
+    internal static void ResetTiming() { s_packTicks = 0; s_kernTicks = 0; s_packBTicks = 0; s_packATicks = 0; s_tailTicks = 0; }
     /// <summary>Format the pack-vs-kernel timing as a string for the caller (bench) to log — src must not
     /// write to Console directly.</summary>
     internal static string ReportTiming()
@@ -488,7 +488,9 @@ internal static class GotoGemmFp32
                         Interlocked.Add(ref s_packATicks, t1 - tB);
                         Interlocked.Add(ref s_kernTicks, t2 - t1);
                     }
+                    long t3 = timing ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
                     ScalarTails(a, lda, b, ldb, c, ldc, ic, jc, effMc, effNc, mFull, nFull, pc, effKc);
+                    if (timing) Interlocked.Add(ref s_tailTicks, System.Diagnostics.Stopwatch.GetTimestamp() - t3);
                 }
             }
         }
@@ -864,15 +866,32 @@ internal static class GotoGemmFp32
             }
         }
         // M-tail rows [ic+mFull, ic+effMc) for the full-N span [jc, jc+nFull) (the N-tail already done above).
+        // M-tail rows (effMc % Mr of them) across the full-tile columns, as row updates
+        // C[r, cols] += A[r, k] * B[k, cols] over contiguous B rows. The per-element dot product this
+        // replaces walked a column of B at stride ldb - a cache miss per step - and at M=256 (4 tail
+        // rows) took 50% of the 16-thread budget against 18% for the microkernel (#653).
         for (int r = ic + mFull; r < ic + effMc; r++)
         {
-            float* crow = c + (long)r * ldc;
+            float* crow = c + (long)r * ldc + jc;
             float* arow = a + (long)r * lda + pc;
-            for (int col = jc; col < jc + nFull; col++)
+            int vecCols = nFull & ~7;
+            for (int kk = 0; kk < effKc; kk++)
             {
-                float s = 0f;
-                for (int kk = 0; kk < effKc; kk++) s += arow[kk] * b[(long)(pc + kk) * ldb + col];
-                crow[col] += s;
+                float av = arow[kk];
+                float* brow = b + (long)(pc + kk) * ldb + jc;
+                var va = Vector256.Create(av);
+                int col = 0;
+                if (Fma.IsSupported)
+                {
+                    for (; col < vecCols; col += 8)
+                        Avx.Store(crow + col, Fma.MultiplyAdd(va, Avx.LoadVector256(brow + col), Avx.LoadVector256(crow + col)));
+                }
+                else if (Avx.IsSupported)
+                {
+                    for (; col < vecCols; col += 8)
+                        Avx.Store(crow + col, Avx.Add(Avx.LoadVector256(crow + col), Avx.Multiply(va, Avx.LoadVector256(brow + col))));
+                }
+                for (; col < nFull; col++) crow[col] += av * brow[col];
             }
         }
     }

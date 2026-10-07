@@ -61,6 +61,7 @@ internal static class Program
         if (args.Length > 0 && args[0] == "--gemmverify") return RunGemmVerify(eng, args);
         if (args.Length > 0 && args[0] == "--gemmaudit") return RunGemmAudit(eng, args);
         if (args.Length > 0 && args[0] == "--gemmprofile") return RunGemmProfile(eng, args);
+        if (args.Length > 0 && args[0] == "--gotoprofile") return RunGotoProfile(eng, args);
         if (args.Length > 0 && args[0] == "--gpu") return RunGpu(args);
         if (args.Length > 0 && args[0] == "--trainbench") return RunTrainbench(eng, args);
         if (args.Length > 0 && args[0] == "--flashbwd") return RunFlashBwd(eng, args);
@@ -810,6 +811,55 @@ internal static class Program
     // P4 (#653): single-thread pack-vs-kernel attribution via PackBothProfiler (reflection,
     // since it's internal). Answers whether the per-core gap is the RyuJIT microkernel or the
     // pack/blocking overhead — which decides whether a machine-code microkernel is worth it.
+    // #653 GEMM kernel work: where the routed GotoGemm path spends its time at a given thread count.
+    // Pack and kernel ticks are summed across workers, so (pack + kernel) / (wall * threads) is the
+    // share of the thread budget doing useful work; the rest is idle, imbalance or dispatch.
+    private static int RunGotoProfile(CpuEngine eng, string[] a)
+    {
+        int M = ArgI(a, "--m", 256), K = ArgI(a, "--k", 768), N = ArgI(a, "--n", 3072);
+        int maxdop = ArgI(a, "--maxdop", 16);
+        int reps = ArgI(a, "--reps", 40);
+        CpuParallelSettings.MaxDegreeOfParallelism = maxdop;
+        var goto_ = typeof(CpuEngine).Assembly.GetType("AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32");
+        if (goto_ == null) { Console.Error.WriteLine("GotoGemmFp32 not found"); return 2; }
+        const System.Reflection.BindingFlags SF = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static;
+        var timingF = goto_.GetField("s_timing", SF);
+        var packF = goto_.GetField("s_packTicks", SF);
+        var packAF = goto_.GetField("s_packATicks", SF);
+        var packBF = goto_.GetField("s_packBTicks", SF);
+        var kernF = goto_.GetField("s_kernTicks", SF);
+        var tailF = goto_.GetField("s_tailTicks", SF);
+        var resetM = goto_.GetMethod("ResetTiming", SF);
+        if (timingF == null || packF == null || packAF == null || packBF == null || kernF == null || resetM == null)
+        {
+            Console.Error.WriteLine("GotoGemmFp32 timing members not found");
+            return 2;
+        }
+        var rng = new Random(0);
+        var lhs = Rand(new[] { M, K }, rng);
+        var rhs = Rand(new[] { K, N }, rng);
+        var o = eng.BatchMatMul(lhs, rhs);
+        for (int i = 0; i < 5; i++) o = eng.BatchMatMul(lhs, rhs);
+        timingF.SetValue(null, true);
+        resetM.Invoke(null, null);
+        var sw = Stopwatch.StartNew();
+        for (int i = 0; i < reps; i++) o = eng.BatchMatMul(lhs, rhs);
+        sw.Stop();
+        timingF.SetValue(null, false);
+        double f = 1000.0 / Stopwatch.Frequency;
+        double pack = (long)(packF.GetValue(null) ?? 0L) * f, packA = (long)(packAF.GetValue(null) ?? 0L) * f;
+        double packB = (long)(packBF.GetValue(null) ?? 0L) * f, kern = (long)(kernF.GetValue(null) ?? 0L) * f;
+        double tail = tailF is null ? 0 : (long)(tailF.GetValue(null) ?? 0L) * f;
+        double wall = sw.Elapsed.TotalMilliseconds;
+        double budget = wall * maxdop;
+        double gflops = reps * 2.0 * M * K * N / (wall / 1000.0) / 1e9;
+        Console.WriteLine(
+            $"GOTOPROFILE M={M} K={K} N={N} maxdop={maxdop} wall_ms_per_call={wall / reps:F3} GFLOPs={gflops:F0} | " +
+            $"kernel={100 * kern / budget:F0}% packA={100 * packA / budget:F0}% packB={100 * packB / budget:F0}% tails={100 * tail / budget:F0}% " +
+            $"other/idle={100 * (budget - pack - kern - tail) / budget:F0}% of thread budget | kernel GFLOPs/thread-busy=" +
+            $"{reps * 2.0 * M * K * N / (kern / 1000.0) / 1e9:F0} (sink={o[0]:E1})");
+        return 0;
+    }
     private static int RunGemmProfile(CpuEngine eng, string[] a)
     {
         int M = ArgI(a, "--m", 512);
