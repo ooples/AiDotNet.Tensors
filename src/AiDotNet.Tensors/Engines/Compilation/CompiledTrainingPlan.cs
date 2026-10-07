@@ -2030,7 +2030,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     private static string[]? _profFwdNames;
     private static long s_profLastAlloc;
     private static int s_profLastGc0, s_profLastGc1, s_profLastGc2;
+#if NET7_0_OR_GREATER
     private static long s_profLastPause;
+#endif
     private bool _profZeroReported;
 
     private bool[]? _accumulatingGradMask;
@@ -3319,7 +3321,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                     long f = _profForwardUs, gz = _profGradZeroUs, b = _profBackwardUs, o = _profOptimUs;
                     // Allocation and GC rates over the last dump interval: a step that allocates stalls every thread
                     // in GC (PollGC), which shows up in profiles as time inside whatever op was running.
+#if NETCOREAPP3_0_OR_GREATER
                     long allocNow = GC.GetTotalAllocatedBytes(false);
+#else
+                    long allocNow = GC.GetTotalMemory(false);
+#endif
                     int g0 = GC.CollectionCount(0), g1 = GC.CollectionCount(1), g2 = GC.CollectionCount(2);
                     string gcPart = s_profLastAlloc == 0 ? "" :
                         $" allocKB/step={(allocNow - s_profLastAlloc) / 1024 / StepProfDumpInterval}"

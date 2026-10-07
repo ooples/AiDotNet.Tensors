@@ -356,7 +356,9 @@ internal static partial class SimdGemm
 
     // Split-k weight-gradient route of TryGemmSmallJit (AIDOTNET_JIT_SPLITK=0 disables) and its output-size ceiling
     // per dimension (each chunk's partial is mPad x n).
+#if !NET471
     [ThreadStatic] private static float[]? t_splitKScratch;
+#endif
     private static readonly bool s_splitKTransA =
         System.Environment.GetEnvironmentVariable("AIDOTNET_JIT_SPLITK") != "0";
     private const int SplitKMaxOutput = 512;
