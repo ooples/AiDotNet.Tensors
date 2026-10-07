@@ -45111,45 +45111,14 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-        // Float fast path — generic adaptive bin pool, no NumOps boxing.
-        if (typeof(T) == typeof(float)
-            && input.GetDataArray() is float[] inArr
-            && output.GetDataArray() is float[] outArr)
+        // Float fast path — generic adaptive bin pool, no NumOps boxing. Reads and writes the LIVE backings:
+        // GetDataArray() hands back a copy for a pool-padded or offset tensor, and writing a copy drops the result.
+        if (typeof(T) == typeof(float) && output.IsContiguous
+            && input.GetCpuBackingForStridedRead(out int aapInOff) is float[] inArr
+            && output.GetCpuBackingForContiguousWrite(out int aapOutOff) is float[] outArr)
         {
-            int oH = outputHeight, oW = outputWidth, iH = inHeight, iW = inWidth;
-            int totalChannels = batch * channels;
-            Action<int> kernel = [MethodImpl(Compatibility.MethodImplHelper.Hot)] (int bc) =>
-            {
-                int inputBaseOffset = bc * iH * iW;
-                int outputBaseOffset = bc * oH * oW;
-                for (int oh = 0; oh < oH; oh++)
-                {
-                    int startH = (int)Math.Floor((double)oh * iH / oH);
-                    int endH = (int)Math.Ceiling((double)(oh + 1) * iH / oH);
-                    for (int ow = 0; ow < oW; ow++)
-                    {
-                        int startW = (int)Math.Floor((double)ow * iW / oW);
-                        int endW = (int)Math.Ceiling((double)(ow + 1) * iW / oW);
-                        float sum = 0f;
-                        int count = 0;
-                        for (int ih = startH; ih < endH; ih++)
-                        {
-                            int rowOff = inputBaseOffset + ih * iW;
-                            for (int iw = startW; iw < endW; iw++)
-                            {
-                                sum += inArr[rowOff + iw];
-                                count++;
-                            }
-                        }
-                        outArr[outputBaseOffset + oh * oW + ow] = sum / count;
-                    }
-                }
-            };
-            // Issue #319: grain-size dispatch. Adaptive pool reads `iH*iW`
-            // input per channel and writes `oH*oW` per channel. Total work
-            // approximates input element traversal.
-            long adapPoolWork = (long)totalChannels * iH * iW;
-            CpuParallelSettings.LightweightParallel(totalChannels, adapPoolWork, kernel);
+            AdaptiveAvgPool2DFloat(inArr, aapInOff, outArr, aapOutOff, batch * channels,
+                inHeight, inWidth, outputHeight, outputWidth);
             return;
         }
 

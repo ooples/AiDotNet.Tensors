@@ -10410,6 +10410,46 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             };
         }
 
+        // AdaptiveAvgPool2D backward (float, CPU): spread each output gradient over its window straight into the
+        // plan's input-gradient buffer. The node's generic backward rented a fresh input-sized tensor every step (a
+        // large-object-heap array for a conv feature map) and then added it into this buffer, which therefore also
+        // had to be zeroed first: 0.47 ms of a 6.5 ms parity-CNN step for a [64, 32, 14, 14] map. Same kernel and
+        // arithmetic as the generic float path, so the gradient is bit-identical.
+        if (typeof(T) == typeof(float) && step.OpName == "AdaptiveAvgPool2D" && step.Inputs.Length == 1
+            && step.SavedState is { Length: 2 } aapState
+            && aapState[0] is int aapOutH && aapState[1] is int aapOutW
+            && step.Inputs[0].Rank == 4 && step.OutputBuffer.Rank == 4
+            && step.OutputBuffer._shape[2] == aapOutH && step.OutputBuffer._shape[3] == aapOutW
+            && step.BackwardFn is { } genericBackward
+            && engine is CpuEngine && !engine.SupportsGpu)
+        {
+            var input = step.Inputs[0];
+            var output = step.OutputBuffer;
+            if (!gradMap.TryGetValue(output, out var gradOut) || !gradMap.TryGetValue(input, out var gradIn))
+                return null;
+            var gradOutArr = TryGetLiveFloatBacking(gradOut);
+            var gradInArr = TryGetLiveFloatBacking(gradIn);
+            if (gradOutArr is null || gradInArr is null) return null;
+            bool accum = consumerCount.TryGetValue(input, out int aapInputConsumers) && aapInputConsumers > 1;
+            int planes = input._shape[0] * input._shape[1], inH = input._shape[2], inW = input._shape[3];
+            var savedState = step.SavedState;
+            return eng =>
+            {
+                if (eng is CpuEngine && !eng.SupportsGpu)
+                {
+                    CpuEngine.AdaptiveAvgPool2DBackwardFloat(gradOutArr, 0, gradInArr, 0, planes,
+                        inH, inW, aapOutH, aapOutW, accum);
+                }
+                else
+                {
+                    // Another engine at replay: its own backward, accumulated into a cleared buffer unless shared.
+                    if (!accum) gradIn.AsWritableSpan().Clear();
+                    genericBackward(gradOut, step.Inputs, output, savedState, eng, gradMap);
+                }
+                input.Grad = gradIn;
+            };
+        }
+
         // MaxPool2D backward: scatter gradOutput into gradInput at saved
         // max-index positions. Tier 1.5 — saves the alloc + AccumulateGrad
         // per MaxPool layer.

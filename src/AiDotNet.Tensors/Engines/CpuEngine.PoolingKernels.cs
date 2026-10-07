@@ -4,6 +4,7 @@ using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 #endif
+using AiDotNet.Tensors.Helpers;
 
 namespace AiDotNet.Tensors.Engines;
 
@@ -154,5 +155,151 @@ public partial class CpuEngine
             v = r1[iw + 1]; if (v > m) m = v;
             dst[ow] = m;
         }
+    }
+
+    /// <summary>
+    /// Adaptive-pool window bounds for one axis: for output index <c>o</c> of <paramref name="outSize"/>,
+    /// <c>bins[2o] = floor(o * inSize / outSize)</c> and <c>bins[2o + 1] = ceil((o + 1) * inSize / outSize)</c>,
+    /// computed in double exactly as the per-element loops computed them.
+    /// </summary>
+    internal static int[] AdaptivePoolBins(int inSize, int outSize)
+    {
+        var bins = new int[2 * outSize];
+        for (int o = 0; o < outSize; o++)
+        {
+            bins[2 * o] = (int)Math.Floor((double)o * inSize / outSize);
+            bins[2 * o + 1] = (int)Math.Ceiling((double)(o + 1) * inSize / outSize);
+        }
+        return bins;
+    }
+
+    /// <summary>
+    /// Float adaptive average pool of <paramref name="planes"/> contiguous [iH, iW] planes into [oH, oW] planes. Each
+    /// output is <c>sum / count</c>, the sum running from +0 over its window's rows, then columns, and <c>count</c>
+    /// the window's element count: the order and arithmetic of the scalar bin loop, so the result is bit-identical
+    /// to it. The window bounds are computed once per call rather than per output, the planes run in contiguous
+    /// runs (a few per pool participant) instead of one dispatch each, and the loops index through pointers.
+    /// </summary>
+    internal static unsafe void AdaptiveAvgPool2DFloat(
+        float[] input, int inOff, float[] output, int outOff, int planes, int iH, int iW, int oH, int oW)
+    {
+        if (planes <= 0 || oH <= 0 || oW <= 0) return;
+        if (iH <= 0 || iW <= 0)
+            throw new ArgumentException("Adaptive average pooling needs a non-empty input plane.");
+        var hBins = AdaptivePoolBins(iH, oH);
+        var wBins = AdaptivePoolBins(iW, oW);
+        int inPlane = iH * iW, outPlane = oH * oW;
+        if (inOff < 0 || outOff < 0
+            || (long)inOff + (long)planes * inPlane > input.Length
+            || (long)outOff + (long)planes * outPlane > output.Length)
+            throw new ArgumentException("Adaptive average pool buffers are smaller than the planes they hold.");
+        int tasks = AdaptivePoolTaskCount(planes, inPlane);
+        CpuParallelSettings.ParallelForOrSerial(0, tasks, (long)planes * inPlane, [MethodImpl(Compatibility.MethodImplHelper.Hot)] (int task) =>
+        {
+            int p0 = (int)((long)task * planes / tasks), p1 = (int)((long)(task + 1) * planes / tasks);
+            fixed (float* pin = input)
+            fixed (float* pout = output)
+            fixed (int* hb = hBins)
+            fixed (int* wb = wBins)
+            {
+                for (int p = p0; p < p1; p++)
+                {
+                    float* src = pin + inOff + (long)p * inPlane;
+                    float* dst = pout + outOff + (long)p * outPlane;
+                    for (int oh = 0; oh < oH; oh++)
+                    {
+                        int hs = hb[2 * oh], he = hb[2 * oh + 1];
+                        for (int ow = 0; ow < oW; ow++)
+                        {
+                            int ws = wb[2 * ow], we = wb[2 * ow + 1];
+                            float sum = 0f;
+                            for (int ih = hs; ih < he; ih++)
+                            {
+                                float* row = src + ih * iW;
+                                for (int iw = ws; iw < we; iw++) sum += row[iw];
+                            }
+                            dst[oh * oW + ow] = sum / ((he - hs) * (we - ws));
+                        }
+                    }
+                }
+            }
+        }, deterministicSafe: true);
+    }
+
+    /// <summary>
+    /// Float adaptive average pool backward over <paramref name="planes"/> planes: each output gradient is divided by
+    /// its window's element count and added to every cell of its window, in output order (rows, then columns), onto
+    /// a plane that starts at +0 -- the additions and order of the scalar loop, so overlapping windows sum to the
+    /// identical value. Overwrites the input-gradient planes; with <paramref name="accumulate"/> each plane is built
+    /// in scratch and then added to the existing gradient once, as accumulating a separately computed gradient does.
+    /// </summary>
+    internal static unsafe void AdaptiveAvgPool2DBackwardFloat(
+        float[] gradOutput, int gOff, float[] gradInput, int giOff, int planes, int iH, int iW, int oH, int oW,
+        bool accumulate)
+    {
+        if (planes <= 0 || iH <= 0 || iW <= 0) return;
+        if (oH <= 0 || oW <= 0)
+            throw new ArgumentException("Adaptive average pooling needs a non-empty output plane.");
+        var hBins = AdaptivePoolBins(iH, oH);
+        var wBins = AdaptivePoolBins(iW, oW);
+        int inPlane = iH * iW, outPlane = oH * oW;
+        if (gOff < 0 || giOff < 0
+            || (long)giOff + (long)planes * inPlane > gradInput.Length
+            || (long)gOff + (long)planes * outPlane > gradOutput.Length)
+            throw new ArgumentException("Adaptive average pool gradient buffers are smaller than the planes they hold.");
+        int tasks = AdaptivePoolTaskCount(planes, inPlane);
+        CpuParallelSettings.ParallelForOrSerial(0, tasks, (long)planes * inPlane, [MethodImpl(Compatibility.MethodImplHelper.Hot)] (int task) =>
+        {
+            int p0 = (int)((long)task * planes / tasks), p1 = (int)((long)(task + 1) * planes / tasks);
+            float[] scratch = accumulate ? System.Buffers.ArrayPool<float>.Shared.Rent(inPlane) : gradInput;
+            try
+            {
+                fixed (float* pg = gradOutput)
+                fixed (float* pd = gradInput)
+                fixed (float* ps = scratch)
+                fixed (int* hb = hBins)
+                fixed (int* wb = wBins)
+                {
+                    for (int p = p0; p < p1; p++)
+                    {
+                        float* src = pg + gOff + (long)p * outPlane;
+                        float* target = pd + giOff + (long)p * inPlane;
+                        float* dst = accumulate ? ps : target;
+                        new Span<float>(dst, inPlane).Clear();
+                        for (int oh = 0; oh < oH; oh++)
+                        {
+                            int hs = hb[2 * oh], he = hb[2 * oh + 1];
+                            for (int ow = 0; ow < oW; ow++)
+                            {
+                                int ws = wb[2 * ow], we = wb[2 * ow + 1];
+                                float g = src[oh * oW + ow] / ((he - hs) * (we - ws));
+                                for (int ih = hs; ih < he; ih++)
+                                {
+                                    float* row = dst + ih * iW;
+                                    for (int iw = ws; iw < we; iw++) row[iw] += g;
+                                }
+                            }
+                        }
+                        if (accumulate)
+                            for (int i = 0; i < inPlane; i++) target[i] += dst[i];
+                    }
+                }
+            }
+            finally
+            {
+                if (accumulate) System.Buffers.ArrayPool<float>.Shared.Return(scratch);
+            }
+        }, deterministicSafe: true);
+    }
+
+    /// <summary>
+    /// Task count for the adaptive pool kernels: about four contiguous plane runs per pool participant, and no run
+    /// under ~4K input elements, so a tiny pool stays on one task.
+    /// </summary>
+    private static int AdaptivePoolTaskCount(int planes, int inPlane)
+    {
+        long participants = Math.Max(1, CpuParallelSettings.MaxDegreeOfParallelism);
+        long byWork = Math.Max(1, (long)planes * inPlane / 4096);
+        return (int)Math.Max(1, Math.Min(planes, Math.Min(4 * participants, byWork)));
     }
 }
