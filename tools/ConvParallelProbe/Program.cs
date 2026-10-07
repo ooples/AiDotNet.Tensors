@@ -62,6 +62,7 @@ internal static class Program
         if (args.Length > 0 && args[0] == "--gemmverify") return RunGemmVerify(eng, args);
         if (args.Length > 0 && args[0] == "--gemmaudit") return RunGemmAudit(eng, args);
         if (args.Length > 0 && args[0] == "--gemmprofile") return RunGemmProfile(eng, args);
+        if (args.Length > 0 && args[0] == "--fp16b") return RunFp16WeightAb(eng, args);
         if (args.Length > 0 && args[0] == "--gotoprofile") return RunGotoProfile(eng, args);
         if (args.Length > 0 && args[0] == "--gpu") return RunGpu(args);
         if (args.Length > 0 && args[0] == "--trainbench") return RunTrainbench(eng, args);
@@ -909,6 +910,59 @@ internal static class Program
             $"{reps * 2.0 * M * K * N / (kern / 1000.0) / 1e9:F0} | outside_runparallel_ms_per_call={(wall - runPar) / reps:F3} " +
             $"runparallel_ms_per_call={runPar / reps:F3} tiles_per_call={(double)tileCount / reps:F0} mean_tile_ms={(tileCount > 0 ? tiles / tileCount : 0):F3} " +
             $"mean_tile_start_lag_ms={(tileCount > 0 ? lag / tileCount : 0):F3} slowest_tile_ms={tileMax:F3} fastest_tile_ms={tileMin:F3} (sink={o[0]:E1})");
+        return 0;
+    }
+    // #681: a half-resident weight, two ways, alternated in one process so build layout cannot bias it.
+    // "upcast" is what ships: convert the weight into a reused fp32 buffer, then the float GEMM.
+    // "fused" converts inside GotoGemm's B-pack and never materializes the fp32 weight.
+    private static int RunFp16WeightAb(CpuEngine eng, string[] a)
+    {
+        int rounds = ArgI(a, "--rounds", 10);
+        CpuParallelSettings.MaxDegreeOfParallelism = ArgI(a, "--maxdop", Environment.ProcessorCount);
+        var shapes = new (int M, int K, int N)[] { (256, 3072, 12288), (4096, 1280, 5120), (1024, 3072, 768) };
+        var rng = new Random(681);
+        foreach (var (M, K, N) in shapes)
+        {
+            var x = Rand(new[] { M, K }, rng);
+            var wHalf = new Tensor<Half>(new[] { K, N });
+            for (int i = 0; i < wHalf.Length; i++) wHalf[i] = (Half)(rng.NextDouble() - 0.5);
+            var wScratch = new Tensor<float>(new[] { K, N });
+            var halfData = wHalf.GetCpuData();
+            var scratchData = wScratch.GetCpuData();
+
+            Tensor<float> Upcast()
+            {
+                AiDotNet.Tensors.Engines.Simd.SimdKernels.ConvertToSingle(
+                    new ReadOnlySpan<Half>(halfData, 0, K * N), new Span<float>(scratchData, 0, K * N));
+                return eng.TensorMatMul(x, wScratch);
+            }
+            Tensor<float> Fused() => eng.TensorMatMulFp16WeightB(x, wHalf);
+
+            var u = Upcast(); var f = Fused();
+            double maxDiff = 0;
+            for (int i = 0; i < u.Length; i++) maxDiff = Math.Max(maxDiff, Math.Abs(u[i] - f[i]));
+            var ratios = new double[rounds];
+            double upSum = 0, fuSum = 0;
+            for (int r = 0; r < rounds; r++)
+            {
+                bool upcastFirst = r % 2 == 0;
+                double tu = 0, tf = 0;
+                for (int pass = 0; pass < 2; pass++)
+                {
+                    bool runUpcast = (pass == 0) == upcastFirst;
+                    var sw = Stopwatch.StartNew();
+                    var res = runUpcast ? Upcast() : Fused();
+                    double ms = sw.Elapsed.TotalMilliseconds;
+                    if (res[0] == float.PositiveInfinity) Console.Write("");
+                    if (runUpcast) tu = ms; else tf = ms;
+                }
+                ratios[r] = tu / tf;
+                upSum += tu; fuSum += tf;
+            }
+            Array.Sort(ratios);
+            Console.WriteLine($"FP16B {M}x{K}x{N} upcast_mean_ms={upSum / rounds:F2} fused_mean_ms={fuSum / rounds:F2} " +
+                              $"paired_upcast/fused median={ratios[rounds / 2]:F2} range=[{ratios[0]:F2}..{ratios[rounds - 1]:F2}] max|diff|={maxDiff:E2}");
+        }
         return 0;
     }
     private static int RunGemmProfile(CpuEngine eng, string[] a)

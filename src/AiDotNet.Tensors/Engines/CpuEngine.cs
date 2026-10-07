@@ -10804,6 +10804,25 @@ public partial class CpuEngine : ITensorLevelEngine
         var bData = b.GetCpuData();
         var result = new Tensor<float>(new[] { m, n });
         var cData = result.GetCpuData();
+#if NET5_0_OR_GREATER
+        // #681: the tuned per-tile GotoGemm kernel with the half -> float conversion inside its B-pack,
+        // so the weight is never materialized as fp32. Same kernel and K order as the float GEMM.
+        if (System.Runtime.Intrinsics.X86.Avx2.IsSupported && BlasManaged.GotoGemmFp32.IsAvailable
+            && (long)m * n * k >= BlasManaged.GotoGemmFp32.ParallelMinWork)
+        {
+            var (gmc, gnc, gkc) = BlasManaged.GotoGemmFp32.ChooseParallelBlocks(m, n);
+            unsafe
+            {
+                fixed (float* pa = aData)
+                fixed (Half* pb = bData)
+                fixed (float* pc = cData)
+                {
+                    BlasManaged.GotoGemmFp32.RunParallelHalfB(pa, k, (ushort*)pb, n, pc, n, m, n, k, gmc, gnc, gkc);
+                }
+            }
+            return result;
+        }
+#endif
         Simd.SimdGemm.SgemmFp16WeightB(
             new ReadOnlySpan<float>(aData, 0, m * k),
             new ReadOnlySpan<Half>(bData, 0, k * n),
