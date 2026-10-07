@@ -300,8 +300,10 @@ internal static partial class SimdGemm
                 Helpers.CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)m * n * k, chunk =>
                 {
                     int r0 = chunk * chunkRows, rows = Math.Min(chunkRows, k - r0);
-                    var at = pool.Rent(mPad * rows);
-                    try
+                    // Thread-local, not ArrayPool.Shared: per-chunk rent/return from every worker contends on the
+                    // shared pool's locked partitions.
+                    var at = t_splitKScratch is { } cached && cached.Length >= mPad * rows
+                        ? cached : (t_splitKScratch = new float[mPad * rows]);
                     {
                         for (int r = 0; r < rows; r++)
                         {
@@ -312,7 +314,6 @@ internal static partial class SimdGemm
                         JitGemmAvx2.RunJit(at.AsSpan(0, mPad * rows), b.AsSpan(r0 * n, rows * n),
                             partial.AsSpan(chunk * mPad * n, mPad * n), mPad, n, rows, forceParallel: false);
                     }
-                    finally { pool.Return(at); }
                 }, deterministicSafe: true);
                 // c[i, :] = sum over chunks of partial[chunk][i, :], rows split across the pool.
                 Helpers.CpuParallelSettings.ParallelForOrSerial(0, m, (long)m * n * chunks, i =>
@@ -355,6 +356,7 @@ internal static partial class SimdGemm
 
     // Split-k weight-gradient route of TryGemmSmallJit (AIDOTNET_JIT_SPLITK=0 disables) and its output-size ceiling
     // per dimension (each chunk's partial is mPad x n).
+    [ThreadStatic] private static float[]? t_splitKScratch;
     private static readonly bool s_splitKTransA =
         System.Environment.GetEnvironmentVariable("AIDOTNET_JIT_SPLITK") != "0";
     private const int SplitKMaxOutput = 512;
