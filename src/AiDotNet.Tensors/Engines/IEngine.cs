@@ -2797,6 +2797,24 @@ public interface IEngine
     Tensor<T> TensorAtan<T>(Tensor<T> tensor);
 
     /// <summary>
+    /// Computes the element-wise inverse hyperbolic tangent of a tensor.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="tensor">The input tensor.</param>
+    /// <returns>A tensor with atanh(x) for each element.</returns>
+    /// <remarks>
+    /// <para>
+    /// Follows <c>torch.atanh</c> outside the open domain (-1, 1): atanh(1) is +infinity,
+    /// atanh(-1) is -infinity and |x| &gt; 1 is NaN. Nothing is clamped or thrown.
+    /// </para>
+    /// <para>
+    /// Records on the gradient tape with derivative 1/(1 - x^2), which grows without bound as |x|
+    /// approaches 1. It is the inverse of tanh, so it maps a tanh-squashed value (a bounded action or
+    /// a correlation) back to an unbounded one, and the gradient there is as steep as tanh was flat.
+    /// </para>
+    /// </remarks>
+    Tensor<T> TensorAtanh<T>(Tensor<T> tensor);
+    /// <summary>
     /// Computes the element-wise four-quadrant arctangent of <paramref name="y"/> over
     /// <paramref name="x"/>.
     /// </summary>
