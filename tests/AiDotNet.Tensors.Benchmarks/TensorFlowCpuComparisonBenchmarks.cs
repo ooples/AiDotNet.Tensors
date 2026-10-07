@@ -8,7 +8,7 @@ using static Tensorflow.Binding;
 namespace AiDotNet.Tensors.Benchmarks;
 
 [MemoryDiagnoser]
-[SimpleJob(RuntimeMoniker.Net10_0, launchCount: 1, warmupCount: 3, iterationCount: 5)]
+[SimpleJob(RuntimeMoniker.Net10_0, launchCount: 1, warmupCount: 5, iterationCount: 15)]
 public class TensorFlowCpuComparisonBenchmarks
 {
     private static readonly int[] MatrixSizes = [256, 512];

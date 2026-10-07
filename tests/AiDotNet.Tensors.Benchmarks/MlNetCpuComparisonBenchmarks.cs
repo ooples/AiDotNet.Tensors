@@ -11,7 +11,7 @@ using Microsoft.ML.Data;
 namespace AiDotNet.Tensors.Benchmarks;
 
 [MemoryDiagnoser]
-[SimpleJob(RuntimeMoniker.Net10_0, launchCount: 1, warmupCount: 3, iterationCount: 5)]
+[SimpleJob(RuntimeMoniker.Net10_0, launchCount: 1, warmupCount: 5, iterationCount: 15)]
 public class MlNetCpuComparisonBenchmarks
 {
     private static readonly int[] VectorSizes = [100_000, 1_000_000];

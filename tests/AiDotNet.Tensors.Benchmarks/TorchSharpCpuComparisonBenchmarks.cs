@@ -4,13 +4,14 @@ using AiDotNet.Tensors.LinearAlgebra;
 using AiDotNet.Tensors.Engines;
 using BenchmarkDotNet.Attributes;
 using BenchmarkDotNet.Engines;
+using BenchmarkDotNet.Configs;
 using BenchmarkDotNet.Jobs;
 using TorchSharp;
 using TorchTensor = TorchSharp.torch.Tensor;
 
 namespace AiDotNet.Tensors.Benchmarks;
 
-[SimpleJob(RuntimeMoniker.Net10_0, launchCount: 1, warmupCount: 5, iterationCount: 15)]
+[Config(typeof(SteadyAndColdCallConfig))]
 [MemoryDiagnoser]
 [MarkdownExporterAttribute.GitHub]
 public class TorchSharpCpuComparisonBenchmarks
@@ -187,7 +188,14 @@ public class TorchSharpCpuComparisonBenchmarks
         _torchDoubleConvKernel?.Dispose();
     }
 
-    [IterationSetup]
+    // Only the arms that mutate the shared input vectors in place need it reset between iterations.
+    // A class-wide [IterationSetup] forced BenchmarkDotNet to time ONE cold call per iteration for every
+    // benchmark in the suite; the ColdCall job now measures that regime explicitly for all of them.
+    [IterationSetup(Targets = new[]
+    {
+        nameof(AiDotNet_TensorAdd), nameof(AiDotNet_TensorMultiply), nameof(AiDotNet_ReLU), nameof(AiDotNet_Sigmoid),
+        nameof(TorchSharp_Add), nameof(TorchSharp_Add_1Thread), nameof(TorchSharp_Multiply), nameof(TorchSharp_ReLU), nameof(TorchSharp_Sigmoid),
+    })]
     public void IterationSetup()
     {
         foreach (var size in VectorSizes)
@@ -1138,3 +1146,19 @@ public class TorchSharpCpuComparisonBenchmarks
     #endregion
 }
 #endif
+
+/// <summary>
+/// Two jobs: <c>SteadyState</c> (back-to-back calls, as in the ML.NET / TensorFlow.NET suites) and
+/// <c>ColdCall</c> (one invocation per iteration, so the call lands after the pause between iterations,
+/// when thread pools have parked and caches have cooled).
+/// </summary>
+public sealed class SteadyAndColdCallConfig : ManualConfig
+{
+    public SteadyAndColdCallConfig()
+    {
+        var baseJob = Job.Default.WithRuntime(BenchmarkDotNet.Environments.CoreRuntime.Core10_0)
+            .WithLaunchCount(1).WithWarmupCount(5).WithIterationCount(15);
+        AddJob(baseJob.WithId("SteadyState"));
+        AddJob(baseJob.WithInvocationCount(1).WithUnrollFactor(1).WithId("ColdCall"));
+    }
+}
