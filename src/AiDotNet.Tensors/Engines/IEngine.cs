@@ -3703,21 +3703,21 @@ public interface IEngine
         int deformGroups);
 
     /// <summary>
-    /// Computes the gradient of GridSample with respect to the input (NHWC format).
+    /// Computes the gradient of GridSample with respect to the input (NCHW format).
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
-    /// <param name="gradOutput">The gradient flowing back from the output [batch, outH, outW, channels].</param>
+    /// <param name="gradOutput">The gradient flowing back from the output [batch, channels, outH, outW].</param>
     /// <param name="grid">The sampling grid from forward pass [batch, outH, outW, 2].</param>
-    /// <param name="inputShape">The shape of the original input [batch, height, width, channels].</param>
-    /// <returns>The gradient with respect to the input tensor [batch, height, width, channels].</returns>
+    /// <param name="inputShape">The shape of the original input [batch, channels, height, width].</param>
+    /// <returns>The gradient with respect to the input tensor [batch, channels, height, width].</returns>
     Tensor<T> GridSampleBackwardInput<T>(Tensor<T> gradOutput, Tensor<T> grid, int[] inputShape);
 
     /// <summary>
-    /// Computes the gradient of GridSample with respect to the grid (NHWC format).
+    /// Computes the gradient of GridSample with respect to the grid (NCHW input format).
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
-    /// <param name="gradOutput">The gradient flowing back from the output [batch, outH, outW, channels].</param>
-    /// <param name="input">The original input tensor [batch, height, width, channels].</param>
+    /// <param name="gradOutput">The gradient flowing back from the output [batch, channels, outH, outW].</param>
+    /// <param name="input">The original input tensor [batch, channels, height, width].</param>
     /// <param name="grid">The sampling grid from forward pass [batch, outH, outW, 2].</param>
     /// <returns>The gradient with respect to the grid tensor [batch, outH, outW, 2].</returns>
     Tensor<T> GridSampleBackwardGrid<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> grid);
@@ -6093,19 +6093,9 @@ public interface IEngine
     /// <returns>Grid tensor of shape [batch, outputHeight, outputWidth, 2] in [-1, 1] normalized coords.</returns>
     /// <remarks>
     /// <para>
-    /// <b>IMPORTANT: Layout Note</b> - This method and <see cref="GridSample{T}"/> use NHWC layout
-    /// [batch, height, width, channels/coords], which differs from Conv2D, MaxPool2D, and other
-    /// spatial operations that use NCHW layout [batch, channels, height, width].
-    /// </para>
-    /// <para>
-    /// When using these methods with NCHW tensors, you must transpose:
-    /// <code>
-    /// // NCHW to NHWC before GridSample
-    /// var inputNHWC = input.Transpose([0, 2, 3, 1]);
-    /// var output = engine.GridSample(inputNHWC, grid);
-    /// // NHWC to NCHW after GridSample
-    /// var outputNCHW = output.Transpose([0, 3, 1, 2]);
-    /// </code>
+    /// <b>Layout:</b> the grid is [batch, outputHeight, outputWidth, 2] with (x, y) in the last
+    /// dimension, which is what <see cref="GridSample{T}"/> expects. GridSample itself reads and
+    /// writes NCHW [batch, channels, height, width], so no transpose is needed around it.
     /// </para>
     /// </remarks>
     Tensor<T> AffineGrid<T>(Tensor<T> theta, int outputHeight, int outputWidth);
@@ -6114,14 +6104,14 @@ public interface IEngine
     /// Samples an input tensor using a normalized grid with bilinear interpolation.
     /// </summary>
     /// <typeparam name="T">Numeric type.</typeparam>
-    /// <param name="input">Input tensor [batch, height, width, channels] (NHWC format).</param>
+    /// <param name="input">Input tensor [batch, channels, height, width] (NCHW format).</param>
     /// <param name="grid">Sampling grid [batch, outH, outW, 2] with coords in [-1, 1].</param>
-    /// <returns>Sampled output tensor [batch, outH, outW, channels] (NHWC format).</returns>
+    /// <returns>Sampled output tensor [batch, channels, outH, outW] (NCHW format).</returns>
     /// <remarks>
     /// <para>
-    /// <b>IMPORTANT: Layout Note</b> - This method uses NHWC layout [batch, height, width, channels],
-    /// which differs from Conv2D, MaxPool2D, and other spatial operations that use NCHW layout
-    /// [batch, channels, height, width]. Ensure inputs are transposed appropriately.
+    /// <b>Layout:</b> input and output are NCHW [batch, channels, height, width], the same layout
+    /// as Conv2D and MaxPool2D and as PyTorch's <c>torch.nn.functional.grid_sample</c>. Only the
+    /// grid is channels-last: its last dimension holds the (x, y) sampling coordinates.
     /// </para>
     /// <para>
     /// The grid coordinates are normalized to [-1, 1] range where (-1, -1) is the top-left corner
@@ -9865,7 +9855,7 @@ public interface IEngine
     /// mode=<see cref="GridSampleMode.Bilinear"/>,
     /// padding=<see cref="GridSamplePadding.Zeros"/>,
     /// alignCorners=false (torchvision defaults).
-    /// Input is NHWC <c>[N, H, W, C]</c>; grid is <c>[N, outH, outW, 2]</c>.
+    /// Input is NCHW <c>[N, C, H, W]</c>; grid is <c>[N, outH, outW, 2]</c>; output is <c>[N, C, outH, outW]</c>.
     /// </summary>
     Tensor<T> GridSample<T>(Tensor<T> input, Tensor<T> grid,
         GridSampleMode mode, GridSamplePadding padding, bool alignCorners);

@@ -171,7 +171,7 @@ void main() {
 ";
 
     // -----------------------------------------------------------------------
-    // GridSample 2D NHWC — 3 SSBO (input, grid, output).
+    // GridSample 2D, NCHW input/output — 3 SSBO (input, grid, output).
     // -----------------------------------------------------------------------
 
     public static string GridSample2D => Header + @"
