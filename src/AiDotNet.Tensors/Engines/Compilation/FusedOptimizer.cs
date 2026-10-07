@@ -595,6 +595,151 @@ internal static class FusedOptimizer
         }, deterministicSafe: true);
     }
 
+    // Elements per parallel chunk of the gradient-norm helpers. Fixed (not derived from the core count), so the
+    // chunk partials -- and therefore the summation order -- are the same on every machine.
+    private const int GradNormHostChunk = 64 * 1024;
+
+    /// <summary>
+    /// Sum of squares of a host float/double tensor, accumulated in double: SIMD within fixed chunks, chunks in
+    /// parallel, partials added in chunk order (deterministic). The result is non-finite exactly when some element
+    /// is NaN or infinite (a finite float squared cannot overflow a double), so one pass serves both a global-norm
+    /// clip and a NaN/Inf probe. False (nothing computed) for another element type or a tensor without a contiguous
+    /// host backing; the caller keeps its own loop for those.
+    /// </summary>
+    internal static bool TrySumOfSquaresHost<T>(LinearAlgebra.Tensor<T> tensor, out double sumOfSquares)
+    {
+        sumOfSquares = 0;
+        if (tensor.Length == 0) return true;
+        if (!tensor.IsContiguous) return false;
+        int length = tensor.Length;
+        if (typeof(T) == typeof(float))
+        {
+            var a = ((LinearAlgebra.Tensor<float>)(object)tensor).GetCpuBackingForStridedRead(out int off);
+            if (a is null) return false;
+            sumOfSquares = ChunkedSum(length, (s, n) => SumSquaresFloat(a, off + s, n));
+            return true;
+        }
+        if (typeof(T) == typeof(double))
+        {
+            var a = ((LinearAlgebra.Tensor<double>)(object)tensor).GetCpuBackingForStridedRead(out int off);
+            if (a is null) return false;
+            sumOfSquares = ChunkedSum(length, (s, n) => SumSquaresDouble(a, off + s, n));
+            return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Multiplies a host float/double tensor by <paramref name="scale"/> in place (chunked, parallel, SIMD) and bumps
+    /// its version. False (nothing done) under the same conditions as <see cref="TrySumOfSquaresHost{T}"/>.
+    /// </summary>
+    internal static bool TryScaleHost<T>(LinearAlgebra.Tensor<T> tensor, double scale)
+    {
+        if (tensor.Length == 0) return true;
+        if (!tensor.IsContiguous) return false;
+        int length = tensor.Length;
+        int chunks = System.Math.Max(1, (length + GradNormHostChunk - 1) / GradNormHostChunk);
+        if (typeof(T) == typeof(float))
+        {
+            var a = ((LinearAlgebra.Tensor<float>)(object)tensor).GetCpuBackingForContiguousWrite(out int off);
+            if (a is null) return false;
+            float s = (float)scale;
+            Helpers.CpuParallelSettings.ParallelForOrSerial(0, chunks, length, c =>
+            {
+                int start = c * GradNormHostChunk;
+                unsafe
+                {
+                    fixed (float* p = a)
+                        SimdKernels.MultiplyScalarUnsafe(p + off + start, s, p + off + start, System.Math.Min(GradNormHostChunk, length - start));
+                }
+            }, deterministicSafe: true);
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var a = ((LinearAlgebra.Tensor<double>)(object)tensor).GetCpuBackingForContiguousWrite(out int off);
+            if (a is null) return false;
+            Helpers.CpuParallelSettings.ParallelForOrSerial(0, chunks, length, c =>
+            {
+                int start = c * GradNormHostChunk, n = System.Math.Min(GradNormHostChunk, length - start);
+                var span = a.AsSpan(off + start, n);
+                for (int i = 0; i < span.Length; i++) span[i] *= scale;
+            }, deterministicSafe: true);
+        }
+        else return false;
+        tensor.IncrementVersion();
+        return true;
+    }
+
+    private static double ChunkedSum(int length, System.Func<int, int, double> chunkSum)
+    {
+        int chunks = System.Math.Max(1, (length + GradNormHostChunk - 1) / GradNormHostChunk);
+        var partials = new double[chunks];
+        Helpers.CpuParallelSettings.ParallelForOrSerial(0, chunks, length, c =>
+        {
+            int start = c * GradNormHostChunk;
+            partials[c] = chunkSum(start, System.Math.Min(GradNormHostChunk, length - start));
+        }, deterministicSafe: true);
+        double total = 0;
+        for (int c = 0; c < partials.Length; c++) total += partials[c];
+        return total;
+    }
+
+    private static unsafe double SumSquaresFloat(float[] a, int start, int n)
+    {
+        double s = 0;
+        int i = 0;
+        fixed (float* p0 = a)
+        {
+            float* p = p0 + start;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && n >= 8)
+            {
+                var acc0 = Vector256<double>.Zero;
+                var acc1 = Vector256<double>.Zero;
+                for (; i + 8 <= n; i += 8)
+                {
+                    var lo = Avx.ConvertToVector256Double(Sse.LoadVector128(p + i));
+                    var hi = Avx.ConvertToVector256Double(Sse.LoadVector128(p + i + 4));
+                    acc0 = Avx.Add(acc0, Avx.Multiply(lo, lo));
+                    acc1 = Avx.Add(acc1, Avx.Multiply(hi, hi));
+                }
+                var acc = Avx.Add(acc0, acc1);
+                s = acc.GetElement(0) + acc.GetElement(1) + acc.GetElement(2) + acc.GetElement(3);
+            }
+#endif
+            for (; i < n; i++) { double v = p[i]; s += v * v; }
+        }
+        return s;
+    }
+
+    private static unsafe double SumSquaresDouble(double[] a, int start, int n)
+    {
+        double s = 0;
+        int i = 0;
+        fixed (double* p0 = a)
+        {
+            double* p = p0 + start;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && n >= 8)
+            {
+                var acc0 = Vector256<double>.Zero;
+                var acc1 = Vector256<double>.Zero;
+                for (; i + 8 <= n; i += 8)
+                {
+                    var x0 = Avx.LoadVector256(p + i);
+                    var x1 = Avx.LoadVector256(p + i + 4);
+                    acc0 = Avx.Add(acc0, Avx.Multiply(x0, x0));
+                    acc1 = Avx.Add(acc1, Avx.Multiply(x1, x1));
+                }
+                var acc = Avx.Add(acc0, acc1);
+                s = acc.GetElement(0) + acc.GetElement(1) + acc.GetElement(2) + acc.GetElement(3);
+            }
+#endif
+            for (; i < n; i++) s += p[i] * p[i];
+        }
+        return s;
+    }
+
     /// <inheritdoc cref="AdamWStepHost(float[], int, float[], int, float[], int, float[], int, int, float, float, float, float, float, float, float)"/>
     internal static unsafe void AdamWStepHost(
         double[] param, int paramOffset, double[] grad, int gradOffset, double[] m, int mOffset, double[] v, int vOffset,
