@@ -833,6 +833,8 @@ internal static class Program
         var tileF = goto_.GetField("s_tileTicks", SF);
         var lagF = goto_.GetField("s_tileLagTicks", SF);
         var tileCountF = goto_.GetField("s_tileCount", SF);
+        var tileMaxF = goto_.GetField("s_tileMaxTicksSum", SF);
+        var tileMinF = goto_.GetField("s_tileMinTicksSum", SF);
         var resetM = goto_.GetMethod("ResetTiming", SF);
         if (timingF == null || packF == null || packAF == null || packBF == null || kernF == null || resetM == null)
         {
@@ -858,6 +860,8 @@ internal static class Program
         double tiles = tileF is null ? 0 : (long)(tileF.GetValue(null) ?? 0L) * f;
         double lag = lagF is null ? 0 : (long)(lagF.GetValue(null) ?? 0L) * f;
         long tileCount = tileCountF is null ? 0 : (long)(tileCountF.GetValue(null) ?? 0L);
+        double tileMax = tileMaxF is null ? 0 : (long)(tileMaxF.GetValue(null) ?? 0L) * f / reps;
+        double tileMin = tileMinF is null ? 0 : (long)(tileMinF.GetValue(null) ?? 0L) * f / reps;
         double wall = sw.Elapsed.TotalMilliseconds;
         double budget = wall * maxdop;
         double gflops = reps * 2.0 * M * K * N / (wall / 1000.0) / 1e9;
@@ -867,7 +871,7 @@ internal static class Program
             $"other/idle={100 * (budget - pack - kern - tail) / budget:F0}% of thread budget | kernel GFLOPs/thread-busy=" +
             $"{reps * 2.0 * M * K * N / (kern / 1000.0) / 1e9:F0} | outside_runparallel_ms_per_call={(wall - runPar) / reps:F3} " +
             $"runparallel_ms_per_call={runPar / reps:F3} tiles_per_call={(double)tileCount / reps:F0} mean_tile_ms={(tileCount > 0 ? tiles / tileCount : 0):F3} " +
-            $"mean_tile_start_lag_ms={(tileCount > 0 ? lag / tileCount : 0):F3} (sink={o[0]:E1})");
+            $"mean_tile_start_lag_ms={(tileCount > 0 ? lag / tileCount : 0):F3} slowest_tile_ms={tileMax:F3} fastest_tile_ms={tileMin:F3} (sink={o[0]:E1})");
         return 0;
     }
     private static int RunGemmProfile(CpuEngine eng, string[] a)
