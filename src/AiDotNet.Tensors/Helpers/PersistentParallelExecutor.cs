@@ -187,6 +187,7 @@ internal sealed class PersistentParallelExecutor
     /// re-throw first" semantics. Shared by the main thread and every worker (each passed the SAME
     /// immutable <paramref name="job"/>) so both paths behave identically.
     /// </summary>
+    [MethodImpl(Compatibility.MethodImplHelper.Hot)]
     private static Exception? RunParticipantChunks(Job job, int firstChunk)
     {
         Exception? first = null;

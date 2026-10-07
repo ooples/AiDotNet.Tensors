@@ -2688,46 +2688,16 @@ internal static class BackwardFunctions<T>
             // would allocate every call because nothing returns these. Each plane clears its own slice below.
             var gradF = TensorAllocator.RentUninitialized<T>(inShape);
             var upstream = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
-            var hStarts = new int[outH]; var hEnds = new int[outH];
-            var wStarts = new int[outW]; var wEnds = new int[outW];
-            for (int oh = 0; oh < outH; oh++)
+            var srcAll = upstream.GetCpuBackingForStridedRead(out int srcOff) as float[];
+            var dstAll = gradF.GetCpuBackingForContiguousWrite(out int dstOff) as float[];
+            if (srcAll is not null && dstAll is not null)
             {
-                hStarts[oh] = (int)Math.Floor((double)oh * inH / outH);
-                hEnds[oh] = (int)Math.Ceiling((double)(oh + 1) * inH / outH);
+                // Every plane is cleared and written by the kernel, so the uninitialized rental is fully defined.
+                CpuEngine.AdaptiveAvgPool2DBackwardFloat(srcAll, srcOff, dstAll, dstOff, batch * channels,
+                    inH, inW, outH, outW, accumulate: false);
+                DifferentiableOps.AccumulateGrad(grads, inputs[0], gradF, engine);
+                return;
             }
-            for (int ow = 0; ow < outW; ow++)
-            {
-                wStarts[ow] = (int)Math.Floor((double)ow * inW / outW);
-                wEnds[ow] = (int)Math.Ceiling((double)(ow + 1) * inW / outW);
-            }
-            int planes = batch * channels;
-            int inPlane = inH * inW, outPlane = outH * outW;
-            // GetDataArray is the backing array of the freshly rented gradient and a dense copy for an offset
-            // view, so both index from 0. Arrays rather than MemoryMarshal.CreateSpan, which net471 lacks.
-            var srcAll = (float[])(object)upstream.GetDataArray();
-            var dstAll = (float[])(object)gradF.GetDataArray();
-            CpuParallelSettings.ParallelForOrSerial(0, planes, (long)planes * inPlane, plane =>
-            {
-                var src = new ReadOnlySpan<float>(srcAll, plane * outPlane, outPlane);
-                var dst = new Span<float>(dstAll, plane * inPlane, inPlane);
-                dst.Clear();
-                for (int oh = 0; oh < outH; oh++)
-                {
-                    int hs = hStarts[oh], he = hEnds[oh];
-                    for (int ow = 0; ow < outW; ow++)
-                    {
-                        int ws = wStarts[ow], we = wEnds[ow];
-                        float g = src[oh * outW + ow] / ((he - hs) * (we - ws));
-                        for (int ih = hs; ih < he; ih++)
-                        {
-                            var row = dst.Slice(ih * inW + ws, we - ws);
-                            for (int iw = 0; iw < row.Length; iw++) row[iw] += g;
-                        }
-                    }
-                }
-            });
-            DifferentiableOps.AccumulateGrad(grads, inputs[0], gradF, engine);
-            return;
         }
 
         var inputGrad = TensorPool<T>.RentZeroed(inShape);

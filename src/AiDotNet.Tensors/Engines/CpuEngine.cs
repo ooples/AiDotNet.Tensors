@@ -8735,10 +8735,16 @@ public partial class CpuEngine : ITensorLevelEngine
             if (bc >= CpuParallelSettings.MaxDegreeOfParallelism
                 && (long)bc * hw >= PersistentParallelExecutor.DefaultSerialGrainSize)
             {
-                CpuParallelSettings.ParallelForOrSerial(0, bc, (long)bc * hw, idx =>
+                CpuParallelSettings.ParallelForOrSerial(0, bc, (long)bc * hw, [MethodImpl(Compatibility.MethodImplHelper.Hot)] (int idx) =>
                 {
                     float* inBase = (float*)ipIn + idx * hw;
                     float* outBase = (float*)ipOut + idx * ohow;
+                    if (st == 2)
+                    {
+                        for (int oh = 0; oh < oH; oh++)
+                            MaxPool2x2Stride2Row(inBase + oh * 2 * w, inBase + oh * 2 * w + w, outBase + oh * oW, oW);
+                        return;
+                    }
                     for (int oh = 0; oh < oH; oh++)
                     {
                         float* r0 = inBase + oh * st * w;
@@ -8762,6 +8768,12 @@ public partial class CpuEngine : ITensorLevelEngine
                 {
                     float* inBase = pIn + idx * hw;
                     float* outBase = pOut + idx * ohow;
+                    if (st == 2)
+                    {
+                        for (int oh = 0; oh < oH; oh++)
+                            MaxPool2x2Stride2Row(inBase + oh * 2 * w, inBase + oh * 2 * w + w, outBase + oh * oW, oW);
+                        continue;
+                    }
                     for (int oh = 0; oh < oH; oh++)
                     {
                         float* r0 = inBase + oh * st * w;
@@ -10104,7 +10116,12 @@ public partial class CpuEngine : ITensorLevelEngine
     /// Tries in order: oneDNN, fused im2col-GEMM, Winograd, SIMD direct conv, im2col+GEMM fallback.
     /// BLAS-based approaches are preferred over SIMD direct conv for most sizes.
     /// </summary>
-    private void Conv2DWithIm2ColFloat(
+    /// <param name="epilogueBias">When set, the strategy that supports it (the SIMD 3x3 route) writes
+    /// <c>act(conv + bias[oc])</c> instead of the plain convolution, and the method returns true. Every other
+    /// strategy ignores it and writes the plain convolution (returning false); the caller then applies the bias and
+    /// activation itself.</param>
+    /// <param name="epilogueRelu">With <paramref name="epilogueBias"/>: apply ReLU after the bias.</param>
+    private bool Conv2DWithIm2ColFloat(
         Tensor<float> input,
         Tensor<float> kernel,
         Tensor<float> result,
@@ -10119,14 +10136,16 @@ public partial class CpuEngine : ITensorLevelEngine
         int padding,
         int dilation,
         int outputHeight,
-        int outputWidth)
+        int outputWidth,
+        Tensor<float>? epilogueBias = null,
+        bool epilogueRelu = false)
     {
 #if !NET471
         // Strategy 1: Try oneDNN for best performance (uses optimized CPU kernels)
         if (TryConv2DOneDnn(input, kernel, result, batch, inChannels, height, width,
             outChannels, kernelHeight, kernelWidth, stride, padding, dilation, outputHeight, outputWidth))
         {
-            return;
+            return false;
         }
 
         // Strategy 1.5: route to explicit im2col + BLAS GEMM (implicit-GEMM panels).
@@ -10177,7 +10196,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 Conv2DWithImplicitGemmFloat(input, kernel, result, batch, inChannels, height, width,
                     outChannels, kernelHeight, kernelWidth, stride, padding, dilation, outputHeight, outputWidth);
             }
-            return;
+            return false;
         }
 
         // Strategy 2: Try fused im2col-GEMM with cache tiling (BLAS-based, faster for most sizes)
@@ -10194,7 +10213,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 outChannels, kernelHeight, kernelWidth,
                 stride, stride, padding, padding,
                 dilation, dilation, outputHeight, outputWidth);
-            return;
+            return false;
         }
 #endif
 
@@ -10209,21 +10228,23 @@ public partial class CpuEngine : ITensorLevelEngine
                 inputSpan, kernelSpan, outputSpan,
                 batch, inChannels, height, width,
                 outChannels, padding, padding);
-            return;
+            return false;
         }
 
 #if !NET471
         // Strategy 4: Try SIMD direct convolution for small 3x3 kernels with stride=1
         if (TryConv2DSimd(input, kernel, result, batch, inChannels, height, width,
-            outChannels, kernelHeight, kernelWidth, stride, padding, dilation, outputHeight, outputWidth))
+            outChannels, kernelHeight, kernelWidth, stride, padding, dilation, outputHeight, outputWidth,
+            epilogueBias, epilogueRelu, out bool epilogueFused))
         {
-            return;
+            return epilogueFused;
         }
 #endif
 
         // Strategy 5: Fallback to im2col + GEMM (works for all cases)
         Conv2DWithIm2ColGemm(input, kernel, result, batch, inChannels, height, width,
             outChannels, kernelHeight, kernelWidth, stride, padding, dilation, outputHeight, outputWidth);
+        return false;
     }
 
 #if !NET471
@@ -10264,8 +10285,10 @@ public partial class CpuEngine : ITensorLevelEngine
         Tensor<float> input, Tensor<float> kernel, Tensor<float> result,
         int batch, int inChannels, int height, int width,
         int outChannels, int kernelHeight, int kernelWidth,
-        int stride, int padding, int dilation, int outputHeight, int outputWidth)
+        int stride, int padding, int dilation, int outputHeight, int outputWidth,
+        Tensor<float>? epilogueBias, bool epilogueRelu, out bool epilogueFused)
     {
+        epilogueFused = false;
         if (!SimdConvHelper.CanUseSimdConv(kernelHeight, kernelWidth, stride, stride))
         {
             return false;
@@ -10274,11 +10297,22 @@ public partial class CpuEngine : ITensorLevelEngine
         var inputSpan = input.AsSpan();
         var kernelSpan = kernel.AsSpan();
         var outputSpan = result.Data.Span;
+        var biasSpan = epilogueBias is null ? default : epilogueBias.AsSpan();
 
         fixed (float* inputPtr = inputSpan)
         fixed (float* kernelPtr = kernelSpan)
         fixed (float* outputPtr = outputSpan)
+        fixed (float* biasPtr = biasSpan)
         {
+            if (kernelHeight == 3 && kernelWidth == 3 && epilogueBias is not null
+                && SimdConvHelper.TryConv3x3Stride1BiasActivation(
+                    inputPtr, kernelPtr, biasPtr, outputPtr,
+                    batch, inChannels, height, width,
+                    outChannels, padding, padding, dilation, dilation, epilogueRelu))
+            {
+                epilogueFused = true;
+                return true;
+            }
             if (kernelHeight == 3 && kernelWidth == 3)
             {
                 SimdConvHelper.Conv3x3Stride1(
@@ -16251,6 +16285,34 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(float))
         {
+#if !NET471
+            // 3x3 stride-1 dilation-1 kernels whose per-image GEMM is small: the direct FMA kernel (one task per
+            // (oc, ic) pair summing over every image). The im2col + per-image GEMM route below fans one native
+            // call per image across the pool, and those calls serialise on the native compute gate.
+            if (kernelHeight == 3 && kernelWidth == 3 && strideH == 1 && strideW == 1
+                && dilationH == 1 && dilationW == 1 && padH >= 0 && padW >= 0
+                && outputHeight == height + 2 * padH - 2 && outputWidth == width + 2 * padW - 2
+                && outputHeight > 0 && outputWidth > 0
+                && (long)outChannels * inChannels * 9 * outputHeight * outputWidth < ConvBackwardParallelBatchMaxPerImage
+                && SimdConvHelper.CanUseDirectKernelGrad)
+            {
+                var gradOutputData = (float[])(object)gradOutput.GetFlattenedData();
+                var inputData = (float[])(object)input.GetFlattenedData();
+                var destData = (float[])(object)dest._storage.GetDataArray();
+                unsafe
+                {
+                    fixed (float* pIn = inputData)
+                    fixed (float* pGrad = gradOutputData)
+                    fixed (float* pDest = &destData[dest._storageOffset])
+                    {
+                        SimdConvHelper.Conv3x3KernelGradStride1(pIn, pGrad, pDest,
+                            batch, inChannels, height, width, outChannels, padH, padW,
+                            outputHeight, outputWidth, accumulate);
+                    }
+                }
+                return;
+            }
+#endif
             int colH = inChannels * kernelHeight * kernelWidth;
             int colW = outputHeight * outputWidth;
             int totalLen = outChannels * colH;
@@ -16666,14 +16728,13 @@ public partial class CpuEngine : ITensorLevelEngine
                 maxIndices = new int[batch, channels, outputHeight, outputWidth, 2];
                 var captured = input;
                 int ph = poolH, pw = poolW, sh = strideH, sw = strideW;
-                // No backwardFn / savedState: this branch is gated to
-                // GradientTape<T>.Current is null (inference-only trace), so
-                // replay never runs a backward. Recording
-                // MaxPool2DWithIndicesBackward + the zero-filled maxIndices
-                // here would (a) pin a potentially large
-                // int[batch, channels, outH, outW, 2] for the lifetime of
-                // the lazy graph / compiled plan, and (b) hand any future
-                // backward consumer corrupt all-zero routing indices.
+                // No saved indices: recording MaxPool2DWithIndicesBackward + the
+                // zero-filled maxIndices here would (a) pin a potentially large
+                // int[batch, channels, outH, outW, 2] for the lifetime of the
+                // lazy graph / compiled plan, and (b) hand any backward consumer
+                // corrupt all-zero routing indices. A compiled training plan
+                // recovers the winners from the input instead (see the backward
+                // and saved geometry below).
                 return scope.RecordUnary(LazyNodeType.MaxPool2D, "MaxPool2DWithIndices", input,
                     new[] { batch, channels, outputHeight, outputWidth },
                     (eng, output) =>
@@ -16690,7 +16751,11 @@ public partial class CpuEngine : ITensorLevelEngine
                             DirectGpuTensorEngine.CopyResultInto(eng, eager, output);
                         }
                     },
-                    BackwardFunctions<T>.ReplayUnderTape(eng => eng.MaxPool2DWithTensorIndices(captured, new[] { ph, pw }, new[] { sh, sw }, out _)));
+                    BackwardFunctions<T>.ReplayUnderTape(eng => eng.MaxPool2DWithTensorIndices(captured, new[] { ph, pw }, new[] { sh, sw }, out _)),
+                    // The pool geometry (no indices): lets a compiled CPU training plan run the backward as one
+                    // re-scan of the input written straight into the gradient buffer (MaxPool2DBackwardRecomputeInto)
+                    // instead of replaying the forward under a tape, and lets the serializer rebuild the real pool.
+                    new object[] { new[] { ph, pw }, new[] { sh, sw } });
             }
         }
 
@@ -17026,6 +17091,159 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }, deterministicSafe: true);
         return result;
+    }
+
+    /// <summary>
+    /// One plane of the float max-pool backward that re-scans the forward input for each window's winner (first
+    /// maximum, starting from float.MinValue with a strict greater-than, so NaN never wins and a window with no winner
+    /// sends its gradient to plane cell 0) and writes <c>0 + g</c> there. With <paramref name="tiles"/> (stride equal
+    /// to the pool, not accumulating) each window owns its cells and writes them in one pass, and only the uncovered
+    /// remainder rows/columns are cleared; otherwise the whole plane is cleared first and the gradients are added.
+    /// </summary>
+    [MethodImpl(Compatibility.MethodImplHelper.Hot)]
+    private static void MaxPoolBackwardRecomputePlane(
+        float[] x, int xBase, float[] g, int gBase, float[] dst, int dBase,
+        int height, int width, int outH, int outW, int poolH, int poolW, int strideH, int strideW, bool tiles)
+    {
+        if (!tiles)
+            Array.Clear(dst, dBase, height * width);
+        if (tiles)
+        {
+            int coveredH = outH * poolH, coveredW = outW * poolW;
+            for (int r = 0; r < coveredH; r++)
+                if (coveredW < width) Array.Clear(dst, dBase + r * width + coveredW, width - coveredW);
+            if (coveredH < height) Array.Clear(dst, dBase + coveredH * width, (height - coveredH) * width);
+        }
+        int ohStart = 0;
+        if (tiles && poolH == 2 && poolW == 2 && strideH == 2 && strideW == 2)
+        {
+            MaxPool2x2Stride2TilesBackwardPlane(x, xBase, g, gBase, dst, dBase, width, outH, outW);
+            ohStart = outH;
+        }
+        for (int oh = ohStart; oh < outH; oh++)
+        {
+            int ih0 = oh * strideH;
+            for (int ow = 0; ow < outW; ow++)
+            {
+                int iw0 = ow * strideW;
+                float maxVal = float.MinValue;
+                int maxIdx = 0;
+                for (int kh = 0; kh < poolH; kh++)
+                {
+                    int row = (ih0 + kh) * width;
+                    for (int kw = 0; kw < poolW; kw++)
+                    {
+                        float v = x[xBase + row + iw0 + kw];
+                        if (v > maxVal) { maxVal = v; maxIdx = row + iw0 + kw; }
+                    }
+                }
+                if (tiles)
+                {
+                    for (int kh = 0; kh < poolH; kh++)
+                    {
+                        int row = dBase + (ih0 + kh) * width + iw0;
+                        for (int kw = 0; kw < poolW; kw++) dst[row + kw] = 0f;
+                    }
+                }
+                dst[dBase + maxIdx] += g[gBase + oh * outW + ow];
+            }
+        }
+    }
+
+    /// <summary>
+    /// Unpadded MaxPool2D backward that finds each window's winner by re-scanning the forward INPUT, then writes the
+    /// input gradient straight into <paramref name="gradInput"/>. The winner rule is exactly the one
+    /// <c>MaxPool2DWithTensorIndices</c> records (start below every finite value, strict greater-than in row-major
+    /// window order, so the first maximum wins and NaN never does; a window with no winner routes to plane index 0),
+    /// so the gradient is the one the tape would produce from saved indices -- without saving them, without a
+    /// replayed forward, and without a temporary gradient tensor.
+    /// </summary>
+    /// <remarks>
+    /// Per input plane the contributions land in output (row-major) order onto zero, exactly as the saved-index
+    /// scatter does; with <paramref name="accumulate"/> that plane-sized sum is formed in scratch first and then added
+    /// to the caller's value once per cell (<c>existing + sum</c>, as a separate scatter plus TensorAddInto would),
+    /// so either way the result is bit-identical to the indexed path. Planes are independent, so the result does not
+    /// depend on the thread count.
+    /// </remarks>
+    internal void MaxPool2DBackwardRecomputeInto<T>(
+        Tensor<T> gradInput, Tensor<T> gradOutput, Tensor<T> input,
+        int poolH, int poolW, int strideH, int strideW, bool accumulate)
+    {
+        if (gradInput == null) throw new ArgumentNullException(nameof(gradInput));
+        if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (input.Rank != 4 || gradOutput.Rank != 4)
+            throw new ArgumentException("MaxPool2D backward needs rank-4 [batch, channels, height, width] tensors.");
+        if (poolH <= 0 || poolW <= 0 || strideH <= 0 || strideW <= 0)
+            throw new ArgumentException("Pool size and stride must be positive.");
+        int batch = input._shape[0], channels = input._shape[1];
+        int height = input._shape[2], width = input._shape[3];
+        int outH = gradOutput._shape[2], outW = gradOutput._shape[3];
+        if (gradOutput._shape[0] != batch || gradOutput._shape[1] != channels
+            || outH != (height - poolH) / strideH + 1 || outW != (width - poolW) / strideW + 1)
+            throw new ArgumentException("Output gradient shape does not match an unpadded pool of the input.", nameof(gradOutput));
+        if (gradInput.Length != input.Length)
+            throw new ArgumentException("Input gradient must have the input's shape.", nameof(gradInput));
+
+        int planes = checked(batch * channels);
+        int inPlane = height * width, outPlane = outH * outW;
+        var src = input.GetCpuBackingForStridedRead(out int srcOff);
+        var go = gradOutput.GetCpuBackingForStridedRead(out int goOff);
+        var gi = gradInput.GetCpuBackingForContiguousWrite(out int giOff);
+        if (typeof(T) == typeof(float) && src is not null && go is not null && gi is not null
+            && input.IsContiguous && gradOutput.IsContiguous)
+        {
+            var x = (float[])(object)src;
+            var g = (float[])(object)go;
+            var d = (float[])(object)gi;
+            // A window that tiles its input without overlap owns its cells, so the plane is written in one pass
+            // (each owned cell gets 0 + g or 0); only uncovered remainder rows/columns need a separate zero.
+            bool tiles = !accumulate && strideH == poolH && strideW == poolW;
+            CpuParallelSettings.ParallelForOrSerial(0, planes, (long)planes * inPlane, [MethodImpl(Compatibility.MethodImplHelper.Hot)] (int plane) =>
+            {
+                int xBase = srcOff + plane * inPlane, gBase = goOff + plane * outPlane;
+                // Accumulating: scatter this plane into zeroed scratch, then add it to the destination once.
+                float[]? scratch = accumulate ? System.Buffers.ArrayPool<float>.Shared.Rent(inPlane) : null;
+                float[] dst = scratch ?? d;
+                int dBase = scratch is null ? giOff + plane * inPlane : 0;
+                MaxPoolBackwardRecomputePlane(x, xBase, g, gBase, dst, dBase, height, width, outH, outW,
+                    poolH, poolW, strideH, strideW, tiles);
+                if (scratch is not null)
+                {
+                    int target = giOff + plane * inPlane;
+                    for (int i = 0; i < inPlane; i++) d[target + i] += scratch[i];
+                    System.Buffers.ArrayPool<float>.Shared.Return(scratch);
+                }
+            });
+            return;
+        }
+
+        // Any other element type or layout: the saved-index scatter on a materialised index tensor.
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var xs = input.IsContiguous ? input : input.Contiguous();
+        var xData = xs.GetFlattenedData();
+        var flat = new int[gradOutput.Length];
+        for (int plane = 0; plane < planes; plane++)
+        {
+            int xBase = plane * inPlane;
+            for (int oh = 0; oh < outH; oh++)
+            for (int ow = 0; ow < outW; ow++)
+            {
+                T maxVal = numOps.MinValue;
+                int maxIdx = 0;
+                for (int kh = 0; kh < poolH; kh++)
+                for (int kw = 0; kw < poolW; kw++)
+                {
+                    int idx = (oh * strideH + kh) * width + ow * strideW + kw;
+                    if (numOps.GreaterThan(xData[xBase + idx], maxVal)) { maxVal = xData[xBase + idx]; maxIdx = idx; }
+                }
+                flat[plane * outPlane + oh * outW + ow] = maxIdx;
+            }
+        }
+        var grad = MaxPool2DBackwardWithTensorIndices(gradOutput, new Tensor<int>(flat, (int[])gradOutput._shape.Clone()),
+            input._shape, new[] { poolH, poolW }, new[] { strideH, strideW });
+        if (accumulate) TensorAddInto(gradInput, gradInput, grad);
+        else grad.AsSpan().CopyTo(gradInput.AsWritableSpan());
     }
 
     /// <summary>
@@ -44932,45 +45150,14 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-        // Float fast path — generic adaptive bin pool, no NumOps boxing.
-        if (typeof(T) == typeof(float)
-            && input.GetDataArray() is float[] inArr
-            && output.GetDataArray() is float[] outArr)
+        // Float fast path — generic adaptive bin pool, no NumOps boxing. Reads and writes the LIVE backings:
+        // GetDataArray() hands back a copy for a pool-padded or offset tensor, and writing a copy drops the result.
+        if (typeof(T) == typeof(float) && output.IsContiguous
+            && input.GetCpuBackingForStridedRead(out int aapInOff) is float[] inArr
+            && output.GetCpuBackingForContiguousWrite(out int aapOutOff) is float[] outArr)
         {
-            int oH = outputHeight, oW = outputWidth, iH = inHeight, iW = inWidth;
-            int totalChannels = batch * channels;
-            Action<int> kernel = bc =>
-            {
-                int inputBaseOffset = bc * iH * iW;
-                int outputBaseOffset = bc * oH * oW;
-                for (int oh = 0; oh < oH; oh++)
-                {
-                    int startH = (int)Math.Floor((double)oh * iH / oH);
-                    int endH = (int)Math.Ceiling((double)(oh + 1) * iH / oH);
-                    for (int ow = 0; ow < oW; ow++)
-                    {
-                        int startW = (int)Math.Floor((double)ow * iW / oW);
-                        int endW = (int)Math.Ceiling((double)(ow + 1) * iW / oW);
-                        float sum = 0f;
-                        int count = 0;
-                        for (int ih = startH; ih < endH; ih++)
-                        {
-                            int rowOff = inputBaseOffset + ih * iW;
-                            for (int iw = startW; iw < endW; iw++)
-                            {
-                                sum += inArr[rowOff + iw];
-                                count++;
-                            }
-                        }
-                        outArr[outputBaseOffset + oh * oW + ow] = sum / count;
-                    }
-                }
-            };
-            // Issue #319: grain-size dispatch. Adaptive pool reads `iH*iW`
-            // input per channel and writes `oH*oW` per channel. Total work
-            // approximates input element traversal.
-            long adapPoolWork = (long)totalChannels * iH * iW;
-            CpuParallelSettings.LightweightParallel(totalChannels, adapPoolWork, kernel);
+            AdaptiveAvgPool2DFloat(inArr, aapInOff, outArr, aapOutOff, batch * channels,
+                inHeight, inWidth, outputHeight, outputWidth);
             return;
         }
 
