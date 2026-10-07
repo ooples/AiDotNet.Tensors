@@ -6831,6 +6831,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // default so it never touches the production allocation or hot path.
         MaybeMeasureGradPoolBound(allTensors, forwardSteps, parameters);
 
+        // Zero-copy reshapes. Must run before any specialized builder below captures a buffer's backing array.
+        var reshapeAliasSteps = new HashSet<int>();
+        var reshapeGradAliasSteps = new HashSet<int>();
+        if (!engine.SupportsGpu && engine is CpuEngine && fp16HeteroOrder is null
+            && Environment.GetEnvironmentVariable("AIDOTNET_RESHAPE_ALIAS") != "0")
+        {
+            DetectReshapeAliases(forwardSteps, consumerCount, gradMap, aliasGradients: !useGradPool,
+                explicitLoss ?? recordedLastOutput, reshapeAliasSteps, reshapeGradAliasSteps);
+        }
+
         // Phase B integration: detect MatMul→ReLU→MatMul patterns and replace with fused kernel
         var fusedForwardActions = new List<Action<IEngine>>();
         var fusedBackwardActions = new List<Action<IEngine>>();
@@ -7019,6 +7029,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         var forwardFixedActions = new Action<IEngine>?[forwardSteps.Count];
         for (int i = 0; i < forwardSteps.Count; i++)
         {
+            // A zero-copy reshape: its output already shares its input's storage, so it has nothing to compute.
+            if (reshapeAliasSteps.Contains(i))
+            {
+                ThrowIfReshapeAliasConsumed(i, fusedStepIndices, consumedByConvEpilogue, consumedBySlicePrefix,
+                    analyticForwardSpecs.ContainsKey(i) || skippableReduceSumForwardIndices.Contains(i)
+                    || convEpilogueForwardSpecs.ContainsKey(i) || slicePrefixForwardSpecs.ContainsKey(i));
+                forwardEmitKinds[i] = ForwardEmit.Skip;
+                continue;
+            }
             // Phase G.8: analytic forward for MatMul→ReduceSum-loss replaces
             // the full GEMM with a dot-of-sums computation.
             if (analyticForwardSpecs.TryGetValue(i, out var analyticFwdAction))
@@ -7144,6 +7163,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         for (int i = forwardSteps.Count - 1; i >= 0; i--)
         {
             if (fusedStepIndices.Contains(i)) continue;
+            // A zero-copy reshape whose input gradient shares its output gradient's storage: nothing to propagate.
+            if (reshapeGradAliasSteps.Contains(i)) continue;
             var step = forwardSteps[i];
             if (step.BackwardFn == null) continue;
             // No parameter upstream of this step's output: its backward only produces gradients nothing reads.
@@ -9189,6 +9210,96 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     // start at 1M FMAs and its general strategy path loses to SimdGemm on small shapes (measured on the parity MLP's
     // last layer, [64x128]x[128x10]: dW 15 µs managed-direct vs 65 µs through BlasManaged).
     private const long LinearBackwardBlasMinWork = 1L << 20;
+
+    /// <summary>Ops whose output is the input's elements in the same row-major order under another shape.</summary>
+    private static bool IsReshapeLike(string opName)
+        => opName == "Reshape" || opName == "Flatten" || opName == "TensorExpandDims" || opName == "TensorSqueeze";
+
+    /// <summary>
+    /// Turns reshape-like forward steps into storage aliases on a host plan, so they cost nothing per step.
+    /// </summary>
+    /// <remarks>
+    /// <para>FORWARD: a reshape of a contiguous, zero-offset buffer that another forward step produces is the same
+    /// memory under another shape. The output is rebound to share the input's storage
+    /// (<see cref="TensorBase{T}.RebindStorageAsReshapeOf"/>) and the step emits no action. Leaves (the batch input,
+    /// parameters) are left alone: their storage is owned outside the plan and may be replaced between steps.
+    /// Measured on the parity transformer: 32 reshape actions forward, ~1.9 ms of a ~43 ms step, each a full copy.</para>
+    /// <para>BACKWARD: the reshape's backward accumulates its output gradient, reshaped, into its input gradient.
+    /// When the reshape is the input's ONLY consumer that gradient is a plain copy, so the input gradient buffer is
+    /// rebound onto the output gradient's storage instead and the backward step is dropped. A shared input keeps its
+    /// backward (other consumers add into the same buffer), as does the loss output (its gradient is the seed) and
+    /// a gradient-pooled plan (whose re-zero schedule is indexed by the unpruned backward stream). Gradient aliases
+    /// are bound sink-first, so a chain of reshapes resolves to the last one's storage.</para>
+    /// </remarks>
+    private static void DetectReshapeAliases(
+        List<CompiledStep<T>> forwardSteps,
+        Dictionary<Tensor<T>, int> consumerCount,
+        Dictionary<Tensor<T>, Tensor<T>> gradMap,
+        bool aliasGradients,
+        Tensor<T>? lossOutput,
+        HashSet<int> forwardAliased,
+        HashSet<int> gradientAliased)
+    {
+        static bool Flat(Tensor<T> t) => t.IsContiguous && t._storageOffset == 0;
+
+        // A buffer written by more than one step (an in-place op) cannot be aliased: the second write would land in
+        // the reshape's view too.
+        var writers = new Dictionary<Tensor<T>, int>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+        foreach (var s in forwardSteps)
+            if (s.OutputBuffer is not null)
+                writers[s.OutputBuffer] = writers.TryGetValue(s.OutputBuffer, out int w) ? w + 1 : 1;
+
+        var produced = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+        for (int i = 0; i < forwardSteps.Count; i++)
+        {
+            var step = forwardSteps[i];
+            if (IsReshapeLike(step.OpName) && step.Inputs.Length == 1)
+            {
+                var input = step.Inputs[0];
+                var output = step.OutputBuffer;
+                if (input is not null && output is not null && !ReferenceEquals(input, output)
+                    && produced.Contains(input) && writers[input] == 1 && writers[output] == 1
+                    && input.Length > 0 && input.Length == output.Length
+                    && Flat(input) && Flat(output))
+                {
+                    input.AsWritableSpan();   // settle the input's live backing before sharing it
+                    output.RebindStorageAsReshapeOf(input);
+                    forwardAliased.Add(i);
+                }
+            }
+            if (step.OutputBuffer is not null) produced.Add(step.OutputBuffer);
+        }
+
+        if (!aliasGradients) return;
+        for (int i = forwardSteps.Count - 1; i >= 0; i--)
+        {
+            if (!forwardAliased.Contains(i)) continue;
+            var step = forwardSteps[i];
+            var input = step.Inputs[0];
+            var output = step.OutputBuffer;
+            if (ReferenceEquals(output, lossOutput)) continue;
+            if (!consumerCount.TryGetValue(input, out int uses) || uses != 1) continue;
+            if (!gradMap.TryGetValue(input, out var gradIn) || !gradMap.TryGetValue(output, out var gradOut)) continue;
+            if (ReferenceEquals(gradIn, gradOut) || gradIn.Length != gradOut.Length || !Flat(gradIn) || !Flat(gradOut))
+                continue;
+            gradOut.AsWritableSpan();
+            gradIn.RebindStorageAsReshapeOf(gradOut);
+            gradientAliased.Add(i);
+        }
+    }
+
+    /// <summary>
+    /// A reshape alias must never also be claimed by another rewrite: a fused backward that copied the output
+    /// gradient into an input gradient sharing its storage would double it. No detection matches reshape steps
+    /// today; this keeps a future one from doing so silently.
+    /// </summary>
+    private static void ThrowIfReshapeAliasConsumed(int step, HashSet<int> fused, HashSet<int> convEpilogue,
+        HashSet<int> slicePrefix, bool otherSpec)
+    {
+        if (fused.Contains(step) || convEpilogue.Contains(step) || slicePrefix.Contains(step) || otherSpec)
+            throw new InvalidOperationException(
+                $"Compiled plan: forward step {step} is a zero-copy reshape alias and was also claimed by a fusion.");
+    }
 
     /// <summary>
     /// C[m,n] := op(A)[m,k] · op(B)[k,n] (row-major, overwriting C) for the specialized linear backward. Routes like the

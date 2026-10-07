@@ -470,7 +470,26 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     internal void RebindStorageFromGraph(TensorBase<T> source)
         => RebindStorageFromCore(source, graphOwnsStorage: true);
 
-    private void RebindStorageFromCore(TensorBase<T> source, bool graphOwnsStorage)
+    /// <summary>
+    /// Makes this tensor a zero-copy RESHAPE of <paramref name="source"/>: both keep their own shape and share one
+    /// storage. Same rules as <see cref="RebindStorageFrom"/> (contiguous, zero offset on both sides, refcounts moved
+    /// in acquire-then-release order) except that only the element COUNT must match, which is all a contiguous
+    /// row-major reshape requires. Used by the compiled training plan to turn a reshape step into an alias.
+    /// </summary>
+    internal void RebindStorageAsReshapeOf(TensorBase<T> source)
+    {
+        if (source is null) throw new ArgumentNullException(nameof(source));
+        if (source.Length != Length)
+            throw new ArgumentException(
+                $"A reshape alias requires equal element counts. This tensor has {Length}, source has {source.Length}.",
+                nameof(source));
+        // Graph-owned semantics: the plan's tensors may already have been disposed by the code that traced them, in
+        // which case they no longer hold a storage reference to release (the graph scope and the plan's storage
+        // leases own both storages).
+        RebindStorageFromCore(source, graphOwnsStorage: true, requireSameShape: false);
+    }
+
+    private void RebindStorageFromCore(TensorBase<T> source, bool graphOwnsStorage, bool requireSameShape = true)
     {
         if (source is null) throw new ArgumentNullException(nameof(source));
 
@@ -478,12 +497,13 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         // element-for-element or the rebind would leave our `_shape`/`_strides`
         // out of sync with the new storage. We accept any shape permutation
         // the caller claims — strides/shape on `this` are untouched.
-        if (source._shape.Length != _shape.Length)
+        // A reshape alias (requireSameShape: false) checks the element count instead, in its caller.
+        if (requireSameShape && source._shape.Length != _shape.Length)
             throw new ArgumentException(
                 $"Rebind requires same rank. This tensor has rank {_shape.Length}, " +
                 $"source has rank {source._shape.Length}.",
                 nameof(source));
-        for (int i = 0; i < _shape.Length; i++)
+        for (int i = 0; requireSameShape && i < _shape.Length; i++)
         {
             if (_shape[i] != source._shape[i])
                 throw new ArgumentException(
