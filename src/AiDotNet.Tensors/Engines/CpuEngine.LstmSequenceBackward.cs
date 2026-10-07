@@ -232,7 +232,7 @@ public partial class CpuEngine
         // meta carries dims, the returnSequences flag, and the optional-input indices.
         var meta = new int[] { batch, seqLen, inFeatures, hidden, returnSequences ? 1 : 0,
                                idxBIh, idxBHh, idxH0, idxC0 };
-        var savedState = new object[] { gates, cells, hiddens, meta };
+        var savedState = new object[] { gates, cells, hiddens, meta, ws.TanhC };
 
         DifferentiableOps.RecordIfActive<float>(
             "LstmSequenceForward", output, inputsArr, LstmSequenceBackwardFloat, savedState);
@@ -257,6 +257,7 @@ public partial class CpuEngine
         var gates = ws.Gates;
         var cells = ws.Cells;
         var hiddens = ws.Hiddens;
+        var tanhC = ws.TanhC;
 
         // c_0 / h_0.
         for (int b = 0; b < batch; b++)
@@ -316,15 +317,7 @@ public partial class CpuEngine
                 for (int g = 0; g < 4; g++)
                 {
                     int wxg = wxBase + g * hidden, hhg = hhBase + g * hidden, dst = g * bh + b * hidden;
-                    if (bHhArr is not null)
-                    {
-                        int bOff = g * hidden;
-                        for (int h = 0; h < hidden; h++) act[dst + h] = wx[wxg + h] + hh[hhg + h] + bHhArr[bOff + h];
-                    }
-                    else
-                    {
-                        for (int h = 0; h < hidden; h++) act[dst + h] = wx[wxg + h] + hh[hhg + h];
-                    }
+                    GatherGateRow(act, dst, wx, wxg, hh, hhg, bHhArr, g * hidden, hidden);
                 }
             }
 
@@ -340,12 +333,7 @@ public partial class CpuEngine
                 int cPrevRow = (b * (seqLen + 1) + t) * hidden;
                 int cCurRow = (b * (seqLen + 1) + t + 1) * hidden;
                 int gb = b * hidden;
-                for (int h = 0; h < hidden; h++)
-                {
-                    float c = act[1 * bh + gb + h] * cells[cPrevRow + h] + act[0 * bh + gb + h] * act[2 * bh + gb + h];
-                    cells[cCurRow + h] = c;
-                    cbuf[gb + h] = c;
-                }
+                CellUpdateRow(act, 0 * bh + gb, 1 * bh + gb, 2 * bh + gb, cells, cPrevRow, cCurRow, cbuf, gb, hidden);
             }
             TanhExactInPlace(cbuf, 0, bh); // cbuf = tanh(c)
 
@@ -357,21 +345,154 @@ public partial class CpuEngine
                 int outRow = returnSequences ? (b * seqLen + t) * hidden : b * hidden;
                 int gb = b * hidden;
                 bool writeOut = returnSequences || t == seqLen - 1;
-                for (int h = 0; h < hidden; h++)
-                {
-                    float hOut = act[3 * bh + gb + h] * cbuf[gb + h];
-                    gates[gateRow + 0 * hidden + h] = act[0 * bh + gb + h];
-                    gates[gateRow + 1 * hidden + h] = act[1 * bh + gb + h];
-                    gates[gateRow + 2 * hidden + h] = act[2 * bh + gb + h];
-                    gates[gateRow + 3 * hidden + h] = act[3 * bh + gb + h];
-                    hiddens[cCurRow + h] = hOut;
-                    if (writeOut) outSpan[outRow + h] = hOut;
-                }
+                // Saved gates, tanh(c) for the backward, and h = o·tanh(c).
+                for (int g = 0; g < 4; g++)
+                    Array.Copy(act, g * bh + gb, gates, gateRow + g * hidden, hidden);
+                Array.Copy(cbuf, gb, tanhC, (b * seqLen + t) * hidden, hidden);
+                HiddenOutRow(act, 3 * bh + gb, cbuf, gb, hiddens, cCurRow, hidden);
+                if (writeOut) hiddens.AsSpan(cCurRow, hidden).CopyTo(outSpan.Slice(outRow, hidden));
             }
 
             // h_prev ← h_t for the next step.
             for (int b = 0; b < batch; b++)
                 Array.Copy(hiddens, (b * (seqLen + 1) + t + 1) * hidden, hPrev, b * hidden, hidden);
+        }
+    }
+
+    // ── Fused LSTM cell rows, vectorized with System.Numerics.Vector<float> over the hidden axis. Every vector
+    //    expression keeps the scalar form's operand order (no FMA contraction), and the scalar tails are that form,
+    //    so results do not depend on the vector width. ──────────────────────────────────────────────────────────────
+
+    /// <summary>act[dst..] = wx[wxg..] + hh[hhg..] (+ bias[bOff..]) over <paramref name="len"/> elements.</summary>
+    private static void GatherGateRow(float[] act, int dst, float[] wx, int wxg, float[] hh, int hhg,
+        float[]? bias, int bOff, int len)
+    {
+        int h = 0;
+        if (System.Numerics.Vector.IsHardwareAccelerated)
+        {
+            int vw = System.Numerics.Vector<float>.Count;
+            for (; h <= len - vw; h += vw)
+            {
+                var sum = new System.Numerics.Vector<float>(wx, wxg + h) + new System.Numerics.Vector<float>(hh, hhg + h);
+                if (bias is not null) sum += new System.Numerics.Vector<float>(bias, bOff + h);
+                sum.CopyTo(act, dst + h);
+            }
+        }
+        if (bias is not null)
+            for (; h < len; h++) act[dst + h] = wx[wxg + h] + hh[hhg + h] + bias[bOff + h];
+        else
+            for (; h < len; h++) act[dst + h] = wx[wxg + h] + hh[hhg + h];
+    }
+
+    /// <summary>c = f·c_prev + i·g into cells[cCurRow..] and cbuf[cb..] (gate rows of act at iOff/fOff/gOff).</summary>
+    private static void CellUpdateRow(float[] act, int iOff, int fOff, int gOff, float[] cells, int cPrevRow, int cCurRow,
+        float[] cbuf, int cb, int len)
+    {
+        int h = 0;
+        if (System.Numerics.Vector.IsHardwareAccelerated)
+        {
+            int vw = System.Numerics.Vector<float>.Count;
+            for (; h <= len - vw; h += vw)
+            {
+                var c = new System.Numerics.Vector<float>(act, fOff + h) * new System.Numerics.Vector<float>(cells, cPrevRow + h)
+                      + new System.Numerics.Vector<float>(act, iOff + h) * new System.Numerics.Vector<float>(act, gOff + h);
+                c.CopyTo(cells, cCurRow + h);
+                c.CopyTo(cbuf, cb + h);
+            }
+        }
+        for (; h < len; h++)
+        {
+            float c = act[fOff + h] * cells[cPrevRow + h] + act[iOff + h] * act[gOff + h];
+            cells[cCurRow + h] = c;
+            cbuf[cb + h] = c;
+        }
+    }
+
+    /// <summary>h = o·tanh(c) into hiddens[hRow..] (o at act[oOff..], tanh(c) at tanhC[tc..]).</summary>
+    private static void HiddenOutRow(float[] act, int oOff, float[] tanhC, int tc, float[] hiddens, int hRow, int len)
+    {
+        int h = 0;
+        if (System.Numerics.Vector.IsHardwareAccelerated)
+        {
+            int vw = System.Numerics.Vector<float>.Count;
+            for (; h <= len - vw; h += vw)
+                (new System.Numerics.Vector<float>(act, oOff + h) * new System.Numerics.Vector<float>(tanhC, tc + h))
+                    .CopyTo(hiddens, hRow + h);
+        }
+        for (; h < len; h++) hiddens[hRow + h] = act[oOff + h] * tanhC[tc + h];
+    }
+
+    /// <summary>
+    /// One BPTT row: from the saved gates (i|f|g|o at gateRow), c_{t-1}, the forward's tanh(c_t) and the carried
+    /// dh/dc (plus this step's upstream gradient when <paramref name="gradOut"/> is non-null), writes the four
+    /// pre-activation gate gradients to dgatesT[dgtRow..] and dgatesAll[gateRow..] and carries dc to t-1.
+    /// </summary>
+    private static void BpttCellRow(float[] gates, int gateRow, float[] cells, int cPrevRow, float[] tanhC, int tcRow,
+        float[] dhNext, float[] dcNext, int carryRow, float[]? gradOut, int goRow,
+        float[] dgatesT, int dgtRow, float[] dgatesAll, int hidden)
+    {
+        int h = 0;
+        if (System.Numerics.Vector.IsHardwareAccelerated)
+        {
+            int vw = System.Numerics.Vector<float>.Count;
+            var one = System.Numerics.Vector<float>.One;
+            for (; h <= hidden - vw; h += vw)
+            {
+                var ig = new System.Numerics.Vector<float>(gates, gateRow + h);
+                var fg = new System.Numerics.Vector<float>(gates, gateRow + hidden + h);
+                var gg = new System.Numerics.Vector<float>(gates, gateRow + 2 * hidden + h);
+                var og = new System.Numerics.Vector<float>(gates, gateRow + 3 * hidden + h);
+                var cPrev = new System.Numerics.Vector<float>(cells, cPrevRow + h);
+                var tc = new System.Numerics.Vector<float>(tanhC, tcRow + h);
+                var dhTotal = new System.Numerics.Vector<float>(dhNext, carryRow + h)
+                    + (gradOut is null ? System.Numerics.Vector<float>.Zero : new System.Numerics.Vector<float>(gradOut, goRow + h));
+
+                var doPre = dhTotal * tc * og * (one - og);                                   // sigmoid'
+                var dcTotal = new System.Numerics.Vector<float>(dcNext, carryRow + h) + dhTotal * og * (one - tc * tc); // tanh'
+                var diPre = dcTotal * gg * ig * (one - ig);
+                var dgPre = dcTotal * ig * (one - gg * gg);
+                var dfPre = dcTotal * cPrev * fg * (one - fg);
+                (dcTotal * fg).CopyTo(dcNext, carryRow + h);                                    // dc for t-1
+
+                diPre.CopyTo(dgatesT, dgtRow + h);
+                dfPre.CopyTo(dgatesT, dgtRow + hidden + h);
+                dgPre.CopyTo(dgatesT, dgtRow + 2 * hidden + h);
+                doPre.CopyTo(dgatesT, dgtRow + 3 * hidden + h);
+                diPre.CopyTo(dgatesAll, gateRow + h);
+                dfPre.CopyTo(dgatesAll, gateRow + hidden + h);
+                dgPre.CopyTo(dgatesAll, gateRow + 2 * hidden + h);
+                doPre.CopyTo(dgatesAll, gateRow + 3 * hidden + h);
+            }
+        }
+        for (; h < hidden; h++)
+        {
+            float ig = gates[gateRow + 0 * hidden + h];
+            float fg = gates[gateRow + 1 * hidden + h];
+            float gg = gates[gateRow + 2 * hidden + h];
+            float og = gates[gateRow + 3 * hidden + h];
+            float cPrev = cells[cPrevRow + h];
+            float tc = tanhC[tcRow + h];
+            float dhTotal = dhNext[carryRow + h] + (gradOut is null ? 0f : gradOut[goRow + h]);
+
+            // h = o · tanh(c)
+            float doPre = dhTotal * tc * og * (1f - og);                          // sigmoid'
+            float dcTotal = dcNext[carryRow + h] + dhTotal * og * (1f - tc * tc);   // tanh'
+
+            // c = f · c_prev + i · g
+            float diPre = dcTotal * gg * ig * (1f - ig);
+            float dgPre = dcTotal * ig * (1f - gg * gg);
+            float dfPre = dcTotal * cPrev * fg * (1f - fg);
+            dcNext[carryRow + h] = dcTotal * fg;                                   // dc for t-1
+
+            dgatesT[dgtRow + 0 * hidden + h] = diPre;
+            dgatesT[dgtRow + 1 * hidden + h] = dfPre;
+            dgatesT[dgtRow + 2 * hidden + h] = dgPre;
+            dgatesT[dgtRow + 3 * hidden + h] = doPre;
+
+            dgatesAll[gateRow + 0 * hidden + h] = diPre;
+            dgatesAll[gateRow + 1 * hidden + h] = dfPre;
+            dgatesAll[gateRow + 2 * hidden + h] = dgPre;
+            dgatesAll[gateRow + 3 * hidden + h] = doPre;
         }
     }
 
@@ -381,6 +502,7 @@ public partial class CpuEngine
     ///   Gates:   [b, t] post-activation i|f|g|o, row (b*seqLen+t)*G
     ///   Cells:   [b, tc] c_0..c_seqLen, row (b*(seqLen+1)+tc)*hidden  (tc=0 is c0)
     ///   Hiddens: [b, tc] h_0..h_seqLen, row (b*(seqLen+1)+tc)*hidden  (tc=0 is h0)
+    ///   TanhC:   [b, t] tanh(c_t) exactly as the forward used it for h_t, row (b*seqLen+t)*hidden
     /// </summary>
     private sealed class LstmTrainWorkspace
     {
@@ -390,6 +512,7 @@ public partial class CpuEngine
             Gates = new float[batch * seqLen * g];
             Cells = new float[batch * (seqLen + 1) * hidden];
             Hiddens = new float[batch * (seqLen + 1) * hidden];
+            TanhC = new float[batch * seqLen * hidden];
             Wx = new float[batch * seqLen * g];
             WHhT = new float[hidden * g];
             HPrev = new float[bh];
@@ -401,6 +524,7 @@ public partial class CpuEngine
         public float[] Gates { get; }
         public float[] Cells { get; }
         public float[] Hiddens { get; }
+        public float[] TanhC { get; }
         public float[] Wx { get; }
         public float[] WHhT { get; }
         public float[] HPrev { get; }
@@ -438,7 +562,7 @@ public partial class CpuEngine
                                idxBIh, idxBHh, idxH0, idxC0 };
 
         var ws = new LstmTrainWorkspace(batch, seqLen, hidden);
-        var savedState = new object[] { ws.Gates, ws.Cells, ws.Hiddens, meta };
+        var savedState = new object[] { ws.Gates, ws.Cells, ws.Hiddens, meta, ws.TanhC };
         var outputShape = returnSequences ? new[] { batch, seqLen, hidden } : new[] { batch, hidden };
         int outputLength = returnSequences ? batch * seqLen * hidden : batch * hidden;
 
@@ -484,6 +608,7 @@ public partial class CpuEngine
         var cells = (float[])savedState[1];
         var hiddens = (float[])savedState[2];
         var meta = (int[])savedState[3];
+        var tanhC = (float[])savedState[4];   // tanh(c_t) as the forward computed it
         int batch = meta[0], seqLen = meta[1], inFeatures = meta[2], hidden = meta[3];
         bool returnSequences = meta[4] != 0;
         int idxBIh = meta[5], idxBHh = meta[6], idxH0 = meta[7], idxC0 = meta[8];
@@ -496,7 +621,7 @@ public partial class CpuEngine
         var wHhSpan = wHh.GetFlattenedData().AsSpan(); // [G, hidden]
         var wIhSpan = wIh.GetFlattenedData().AsSpan(); // [G, inFeatures]
         var inputSpan = input.GetFlattenedData().AsSpan();
-        var gradOutSpan = gradOutput.GetFlattenedData().AsSpan();
+        var gradOutArr = gradOutput.GetFlattenedData();
 
         // Pool the backward scratch (it otherwise allocates several MB/step — dgatesAll and
         // hPrevAll dominate — churning Gen0 GC during training). Returned at method end.
@@ -521,7 +646,6 @@ public partial class CpuEngine
             {
                 int gateRow = (b * seqLen + t) * G;
                 int cPrevRow = (b * (seqLen + 1) + t) * hidden;
-                int cCurRow = (b * (seqLen + 1) + t + 1) * hidden;
                 int dgtRow = b * G;
                 int carryRow = b * hidden;
 
@@ -530,38 +654,9 @@ public partial class CpuEngine
                 int goRow = returnSequences ? (b * seqLen + t) * hidden : b * hidden;
                 bool feedThisStep = returnSequences || t == seqLen - 1;
 
-                for (int h = 0; h < hidden; h++)
-                {
-                    float ig = gates[gateRow + 0 * hidden + h];
-                    float fg = gates[gateRow + 1 * hidden + h];
-                    float gg = gates[gateRow + 2 * hidden + h];
-                    float og = gates[gateRow + 3 * hidden + h];
-                    float cCur = cells[cCurRow + h];
-                    float cPrev = cells[cPrevRow + h];
-
-                    float dhTotal = dhNext[carryRow + h] + (feedThisStep ? gradOutSpan[goRow + h] : 0f);
-                    float tc = (float)Math.Tanh(cCur);
-
-                    // h = o · tanh(c)
-                    float doPre = dhTotal * tc * og * (1f - og);                 // sigmoid'
-                    float dcTotal = dcNext[carryRow + h] + dhTotal * og * (1f - tc * tc); // tanh'
-
-                    // c = f · c_prev + i · g
-                    float diPre = dcTotal * gg * ig * (1f - ig);
-                    float dgPre = dcTotal * ig * (1f - gg * gg);
-                    float dfPre = dcTotal * cPrev * fg * (1f - fg);
-                    dcNext[carryRow + h] = dcTotal * fg;                          // → dc for t-1
-
-                    dgatesT[dgtRow + 0 * hidden + h] = diPre;
-                    dgatesT[dgtRow + 1 * hidden + h] = dfPre;
-                    dgatesT[dgtRow + 2 * hidden + h] = dgPre;
-                    dgatesT[dgtRow + 3 * hidden + h] = doPre;
-
-                    dgatesAll[gateRow + 0 * hidden + h] = diPre;
-                    dgatesAll[gateRow + 1 * hidden + h] = dfPre;
-                    dgatesAll[gateRow + 2 * hidden + h] = dgPre;
-                    dgatesAll[gateRow + 3 * hidden + h] = doPre;
-                }
+                BpttCellRow(gates, gateRow, cells, cPrevRow, tanhC, (b * seqLen + t) * hidden,
+                    dhNext, dcNext, carryRow, feedThisStep ? gradOutArr : null, goRow,
+                    dgatesT, dgtRow, dgatesAll, hidden);
             }
 
             // dh_prev = dgates_t @ wHh  → [batch, hidden]; carried to t-1 as dhNext.
