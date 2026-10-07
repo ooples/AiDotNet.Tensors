@@ -138,43 +138,12 @@ public partial class CpuEngine
         float[]? h0Arr = h0?.GetFlattenedData();
         float[]? c0Arr = c0?.GetFlattenedData();
 
-        // Saved state (captured by the backward closure → persists past this call).
-        //   gates:   [b, t] post-activation i|f|g|o, row (b*seqLen+t)*G
-        //   cells:   [b, tc] c_0..c_seqLen, row (b*(seqLen+1)+tc)*hidden  (tc=0 is c0)
-        //   hiddens: [b, tc] h_0..h_seqLen, row (b*(seqLen+1)+tc)*hidden  (tc=0 is h0)
-        var gates = new float[totalRows * G];
-        var cells = new float[batch * (seqLen + 1) * hidden];
-        var hiddens = new float[batch * (seqLen + 1) * hidden];
-
-        // c_0 / h_0.
-        for (int b = 0; b < batch; b++)
-        {
-            int baseTc = b * (seqLen + 1) * hidden;
-            for (int h = 0; h < hidden; h++)
-            {
-                cells[baseTc + h] = c0Arr is null ? 0f : c0Arr[b * hidden + h];
-                hiddens[baseTc + h] = h0Arr is null ? 0f : h0Arr[b * hidden + h];
-            }
-        }
-
-        // Wx[b,t,:] = wIh @ x[b,t] (+ bIh), one big GEMM into [totalRows, G].
-        var wx = new float[totalRows * G];
-        GemmBig(inSpan, inFeatures, false, wIhSpan, inFeatures, true,
-                wx.AsSpan(0, totalRows * G), totalRows, inFeatures, G);
-        if (bIhArr is not null)
-        {
-            for (int r = 0; r < totalRows; r++)
-            {
-                int off = r * G;
-                for (int g = 0; g < G; g++) wx[off + g] += bIhArr[g];
-            }
-        }
-
-        // Pre-transpose wHh [G, hidden] → wHhT [hidden, G] for the per-step recurrent GEMM.
-        var wHhT = new float[hidden * G];
-        for (int g = 0; g < G; g++)
-            for (int h = 0; h < hidden; h++)
-                wHhT[h * G + g] = wHhSpan[g * hidden + h];
+        // Saved state + scratch (the saved arrays are captured by the backward closure and persist past this call);
+        // layouts on LstmTrainWorkspace.
+        var ws = new LstmTrainWorkspace(batch, seqLen, hidden);
+        var gates = ws.Gates;
+        var cells = ws.Cells;
+        var hiddens = ws.Hiddens;
 
         var output = returnSequences
             ? new Tensor<float>(new[] { batch, seqLen, hidden })
@@ -222,9 +191,106 @@ public partial class CpuEngine
             return output;
         }
 
+        LstmTrainForwardCoreFloat(inSpan, wIhSpan, wHhSpan, bIhArr, bHhArr, h0Arr, c0Arr,
+            batch, seqLen, inFeatures, hidden, returnSequences, ws, outSpan);
+
+        // Final-state outs (last timestep). The fused node owns gradients via the
+        // returned `output`; final states are passthrough (not differentiated here).
+        if (wantState)
+        {
+            finalHidden = new Tensor<float>(new[] { batch, hidden });
+            finalCell = new Tensor<float>(new[] { batch, hidden });
+            var fhSpan = finalHidden.AsWritableSpan();
+            var fcSpan = finalCell.AsWritableSpan();
+            for (int b = 0; b < batch; b++)
+                for (int h = 0; h < hidden; h++)
+                {
+                    fhSpan[b * hidden + h] = hiddens[(b * (seqLen + 1) + seqLen) * hidden + h];
+                    fcSpan[b * hidden + h] = cells[(b * (seqLen + 1) + seqLen) * hidden + h];
+                }
+        }
+        else
+        {
+            finalHidden = s_emptyState;
+            finalCell = s_emptyState;
+        }
+
+        // Build the differentiable-input array (only the tensors we return grads for).
+        // Order is fixed: input, wIh, wHh, [bIh], [bHh], [h0], [c0].
+        int nInputs = 3 + (bIh is not null ? 1 : 0) + (bHh is not null ? 1 : 0)
+                        + (h0 is not null ? 1 : 0) + (c0 is not null ? 1 : 0);
+        var inputsArr = new Tensor<float>[nInputs];
+        int idx = 0;
+        inputsArr[idx++] = input;
+        inputsArr[idx++] = wIh;
+        inputsArr[idx++] = wHh;
+        int idxBIh = bIh is not null ? idx : -1; if (bIh is not null) inputsArr[idx++] = bIh;
+        int idxBHh = bHh is not null ? idx : -1; if (bHh is not null) inputsArr[idx++] = bHh;
+        int idxH0 = h0 is not null ? idx : -1; if (h0 is not null) inputsArr[idx++] = h0;
+        int idxC0 = c0 is not null ? idx : -1; if (c0 is not null) inputsArr[idx++] = c0;
+
+        // meta carries dims, the returnSequences flag, and the optional-input indices.
+        var meta = new int[] { batch, seqLen, inFeatures, hidden, returnSequences ? 1 : 0,
+                               idxBIh, idxBHh, idxH0, idxC0 };
+        var savedState = new object[] { gates, cells, hiddens, meta };
+
+        DifferentiableOps.RecordIfActive<float>(
+            "LstmSequenceForward", output, inputsArr, LstmSequenceBackwardFloat, savedState);
+
+        return output;
+    }
+
+    /// <summary>
+    /// The fused training forward's arithmetic: seeds c_0/h_0, forms Wx (+ bIh) with one GEMM, then runs the
+    /// recurrence, writing the saved per-timestep gates/cells/hiddens into <paramref name="ws"/> and the hidden
+    /// outputs into <paramref name="outSpan"/> (every position of it). Allocation-free: the eager tape path hands it a
+    /// fresh workspace per call, a compiled-plan node one workspace it reuses every step. Requires seqLen &gt; 0.
+    /// </summary>
+    private static void LstmTrainForwardCoreFloat(
+        ReadOnlySpan<float> inSpan, ReadOnlySpan<float> wIhSpan, ReadOnlySpan<float> wHhSpan,
+        float[]? bIhArr, float[]? bHhArr, float[]? h0Arr, float[]? c0Arr,
+        int batch, int seqLen, int inFeatures, int hidden, bool returnSequences,
+        LstmTrainWorkspace ws, Span<float> outSpan)
+    {
+        int G = 4 * hidden;
+        int totalRows = batch * seqLen;
+        var gates = ws.Gates;
+        var cells = ws.Cells;
+        var hiddens = ws.Hiddens;
+
+        // c_0 / h_0.
+        for (int b = 0; b < batch; b++)
+        {
+            int baseTc = b * (seqLen + 1) * hidden;
+            for (int h = 0; h < hidden; h++)
+            {
+                cells[baseTc + h] = c0Arr is null ? 0f : c0Arr[b * hidden + h];
+                hiddens[baseTc + h] = h0Arr is null ? 0f : h0Arr[b * hidden + h];
+            }
+        }
+
+        // Wx[b,t,:] = wIh @ x[b,t] (+ bIh), one big GEMM into [totalRows, G].
+        var wx = ws.Wx;
+        GemmBig(inSpan, inFeatures, false, wIhSpan, inFeatures, true,
+                wx.AsSpan(0, totalRows * G), totalRows, inFeatures, G);
+        if (bIhArr is not null)
+        {
+            for (int r = 0; r < totalRows; r++)
+            {
+                int off = r * G;
+                for (int g = 0; g < G; g++) wx[off + g] += bIhArr[g];
+            }
+        }
+
+        // Pre-transpose wHh [G, hidden] → wHhT [hidden, G] for the per-step recurrent GEMM.
+        var wHhT = ws.WHhT;
+        for (int g = 0; g < G; g++)
+            for (int h = 0; h < hidden; h++)
+                wHhT[h * G + g] = wHhSpan[g * hidden + h];
+
         // Per-timestep scratch: hh = h_prev @ wHhT, [batch, G].
-        var hPrev = new float[batch * hidden];
-        var hh = new float[batch * G];
+        var hPrev = ws.HPrev;
+        var hh = ws.Hh;
         // seed hPrev with h_0
         for (int b = 0; b < batch; b++)
             Array.Copy(hiddens, b * (seqLen + 1) * hidden, hPrev, b * hidden, hidden);
@@ -233,8 +299,8 @@ public partial class CpuEngine
         // contiguous for ONE vectorized exact activation call (vs scalar Math.Exp/Tanh per
         // element, which dominated the cell). act[g*bh + b*hidden + h]; cbuf holds c for tanh(c).
         int bh = batch * hidden;
-        var act = new float[4 * bh];
-        var cbuf = new float[bh];
+        var act = ws.Act;
+        var cbuf = ws.CBuf;
 
         for (int t = 0; t < seqLen; t++)
         {
@@ -307,30 +373,56 @@ public partial class CpuEngine
             for (int b = 0; b < batch; b++)
                 Array.Copy(hiddens, (b * (seqLen + 1) + t + 1) * hidden, hPrev, b * hidden, hidden);
         }
+    }
 
-        // Final-state outs (last timestep). The fused node owns gradients via the
-        // returned `output`; final states are passthrough (not differentiated here).
-        if (wantState)
+    /// <summary>
+    /// Saved state and scratch of one fused LSTM training forward. Gates/Cells/Hiddens are what the BPTT backward
+    /// reads; the rest is per-call scratch (G = 4 * hidden):
+    ///   Gates:   [b, t] post-activation i|f|g|o, row (b*seqLen+t)*G
+    ///   Cells:   [b, tc] c_0..c_seqLen, row (b*(seqLen+1)+tc)*hidden  (tc=0 is c0)
+    ///   Hiddens: [b, tc] h_0..h_seqLen, row (b*(seqLen+1)+tc)*hidden  (tc=0 is h0)
+    /// </summary>
+    private sealed class LstmTrainWorkspace
+    {
+        public LstmTrainWorkspace(int batch, int seqLen, int hidden)
         {
-            finalHidden = new Tensor<float>(new[] { batch, hidden });
-            finalCell = new Tensor<float>(new[] { batch, hidden });
-            var fhSpan = finalHidden.AsWritableSpan();
-            var fcSpan = finalCell.AsWritableSpan();
-            for (int b = 0; b < batch; b++)
-                for (int h = 0; h < hidden; h++)
-                {
-                    fhSpan[b * hidden + h] = hiddens[(b * (seqLen + 1) + seqLen) * hidden + h];
-                    fcSpan[b * hidden + h] = cells[(b * (seqLen + 1) + seqLen) * hidden + h];
-                }
-        }
-        else
-        {
-            finalHidden = s_emptyState;
-            finalCell = s_emptyState;
+            int g = 4 * hidden, bh = batch * hidden;
+            Gates = new float[batch * seqLen * g];
+            Cells = new float[batch * (seqLen + 1) * hidden];
+            Hiddens = new float[batch * (seqLen + 1) * hidden];
+            Wx = new float[batch * seqLen * g];
+            WHhT = new float[hidden * g];
+            HPrev = new float[bh];
+            Hh = new float[batch * g];
+            Act = new float[4 * bh];
+            CBuf = new float[bh];
         }
 
-        // Build the differentiable-input array (only the tensors we return grads for).
-        // Order is fixed: input, wIh, wHh, [bIh], [bHh], [h0], [c0].
+        public float[] Gates { get; }
+        public float[] Cells { get; }
+        public float[] Hiddens { get; }
+        public float[] Wx { get; }
+        public float[] WHhT { get; }
+        public float[] HPrev { get; }
+        public float[] Hh { get; }
+        public float[] Act { get; }
+        public float[] CBuf { get; }
+    }
+
+    /// <summary>
+    /// Compiled-graph form of the fused training LSTM: one lazy node whose forward runs
+    /// <see cref="LstmTrainForwardCoreFloat"/> straight into the node's output buffer and whose backward is
+    /// <see cref="LstmSequenceBackwardFloat"/>. The node owns one <see cref="LstmTrainWorkspace"/> for its lifetime:
+    /// each replayed forward overwrites the saved gates/cells/hiddens that the same step's backward then reads, so a
+    /// step allocates no saved state. Inputs and saved-state layout are exactly the eager tape node's.
+    /// </summary>
+    private static Tensor<float> RecordLstmSequenceTrainFloat(
+        Compilation.LazyTensorScope scope,
+        Tensor<float> input, Tensor<float>? h0, Tensor<float>? c0,
+        Tensor<float> wIh, Tensor<float> wHh, Tensor<float>? bIh, Tensor<float>? bHh,
+        int batch, int seqLen, int inFeatures, int hidden, bool returnSequences)
+    {
+        // Order is fixed (the backward indexes it through meta): input, wIh, wHh, [bIh], [bHh], [h0], [c0].
         int nInputs = 3 + (bIh is not null ? 1 : 0) + (bHh is not null ? 1 : 0)
                         + (h0 is not null ? 1 : 0) + (c0 is not null ? 1 : 0);
         var inputsArr = new Tensor<float>[nInputs];
@@ -342,16 +434,40 @@ public partial class CpuEngine
         int idxBHh = bHh is not null ? idx : -1; if (bHh is not null) inputsArr[idx++] = bHh;
         int idxH0 = h0 is not null ? idx : -1; if (h0 is not null) inputsArr[idx++] = h0;
         int idxC0 = c0 is not null ? idx : -1; if (c0 is not null) inputsArr[idx++] = c0;
-
-        // meta carries dims, the returnSequences flag, and the optional-input indices.
         var meta = new int[] { batch, seqLen, inFeatures, hidden, returnSequences ? 1 : 0,
                                idxBIh, idxBHh, idxH0, idxC0 };
-        var savedState = new object[] { gates, cells, hiddens, meta };
 
-        DifferentiableOps.RecordIfActive<float>(
-            "LstmSequenceForward", output, inputsArr, LstmSequenceBackwardFloat, savedState);
+        var ws = new LstmTrainWorkspace(batch, seqLen, hidden);
+        var savedState = new object[] { ws.Gates, ws.Cells, ws.Hiddens, meta };
+        var outputShape = returnSequences ? new[] { batch, seqLen, hidden } : new[] { batch, hidden };
+        int outputLength = returnSequences ? batch * seqLen * hidden : batch * hidden;
 
-        return output;
+        return scope.RecordVariadic(Compilation.LazyNodeType.Custom, "LstmSequenceTrain", inputsArr, outputShape,
+            (eng, output) =>
+            {
+                var inSpan = input.GetFlattenedData().AsSpan();
+                var wIhSpan = wIh.GetFlattenedData().AsSpan();
+                var wHhSpan = wHh.GetFlattenedData().AsSpan();
+                float[]? bIhArr = bIh?.GetFlattenedData();
+                float[]? bHhArr = bHh?.GetFlattenedData();
+                float[]? h0Arr = h0?.GetFlattenedData();
+                float[]? c0Arr = c0?.GetFlattenedData();
+                if (output.IsContiguous && output._gpuBuffer is null && !output.HasPendingGpuData)
+                {
+                    // The core writes every output position, so the uninitialized plan buffer needs no clear.
+                    LstmTrainForwardCoreFloat(inSpan, wIhSpan, wHhSpan, bIhArr, bHhArr, h0Arr, c0Arr,
+                        batch, seqLen, inFeatures, hidden, returnSequences, ws, output.AsWritableSpan());
+                    output.IncrementVersion();
+                }
+                else
+                {
+                    var staged = new Tensor<float>(outputShape);
+                    LstmTrainForwardCoreFloat(inSpan, wIhSpan, wHhSpan, bIhArr, bHhArr, h0Arr, c0Arr,
+                        batch, seqLen, inFeatures, hidden, returnSequences, ws, staged.AsWritableSpan().Slice(0, outputLength));
+                    DirectGpuTensorEngine.CopyResultInto(eng, staged, output);
+                }
+            },
+            LstmSequenceBackwardFloat, savedState);
     }
 
     /// <summary>
