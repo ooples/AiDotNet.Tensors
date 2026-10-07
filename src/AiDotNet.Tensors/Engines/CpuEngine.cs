@@ -8735,7 +8735,7 @@ public partial class CpuEngine : ITensorLevelEngine
             if (bc >= CpuParallelSettings.MaxDegreeOfParallelism
                 && (long)bc * hw >= PersistentParallelExecutor.DefaultSerialGrainSize)
             {
-                CpuParallelSettings.ParallelForOrSerial(0, bc, (long)bc * hw, idx =>
+                CpuParallelSettings.ParallelForOrSerial(0, bc, (long)bc * hw, [MethodImpl(Compatibility.MethodImplHelper.Hot)] (int idx) =>
                 {
                     float* inBase = (float*)ipIn + idx * hw;
                     float* outBase = (float*)ipOut + idx * ohow;
@@ -17119,7 +17119,7 @@ public partial class CpuEngine : ITensorLevelEngine
             // A window that tiles its input without overlap owns its cells, so the plane is written in one pass
             // (each owned cell gets 0 + g or 0); only uncovered remainder rows/columns need a separate zero.
             bool tiles = !accumulate && strideH == poolH && strideW == poolW;
-            CpuParallelSettings.ParallelForOrSerial(0, planes, (long)planes * inPlane, plane =>
+            CpuParallelSettings.ParallelForOrSerial(0, planes, (long)planes * inPlane, [MethodImpl(Compatibility.MethodImplHelper.Hot)] (int plane) =>
             {
                 int xBase = srcOff + plane * inPlane, gBase = goOff + plane * outPlane;
                 // Accumulating: scatter this plane into zeroed scratch, then add it to the destination once.
@@ -45118,7 +45118,7 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             int oH = outputHeight, oW = outputWidth, iH = inHeight, iW = inWidth;
             int totalChannels = batch * channels;
-            Action<int> kernel = bc =>
+            Action<int> kernel = [MethodImpl(Compatibility.MethodImplHelper.Hot)] (int bc) =>
             {
                 int inputBaseOffset = bc * iH * iW;
                 int outputBaseOffset = bc * oH * oW;

@@ -1186,6 +1186,7 @@ internal static class SimdConvHelper
         long kernelTaskStride = (long)channelsPerTask * inChannels * 9;
         long outputTaskStride = (long)channelsPerTask * outputSize;
 
+        [MethodImpl(Hot)]
         void RunTask(int task)
         {
             int b = task / numConvTasks, block = task - b * numConvTasks;
@@ -1251,6 +1252,7 @@ internal static class SimdConvHelper
         long totalFmas = (long)batch * outChannels * inChannels * outPlane * 9L;
         bool useParallel = totalTasks >= 2 && totalFmas >= 100_000L && CpuParallelSettings.MaxDegreeOfParallelism > 1;
 
+        [MethodImpl(Hot)]
         void RunTask(int task)
         {
             int b = task / groups, g = task - b * groups;
@@ -1332,7 +1334,7 @@ internal static class SimdConvHelper
                 float* paddedBase = padded;
                 long padWork = paddedLen;
                 if (batch > 1 && padWork >= 32 * 1024 && CpuParallelSettings.MaxDegreeOfParallelism > 1)
-                    CpuParallelSettings.LightweightParallel(batch, b =>
+                    CpuParallelSettings.LightweightParallel(batch, [MethodImpl(Hot)] (int b) =>
                         PadImageForConv3x3(input + b * inputImage, paddedBase + b * paddedImage, inChannels, height,
                             width, padH, padW, paddedH, paddedW));
                 else
@@ -1342,6 +1344,7 @@ internal static class SimdConvHelper
 
                 int tasks = checked(outChannels * inChannels);
                 long totalFmas = (long)tasks * batch * outPlane * 9L;
+                [MethodImpl(Hot)]
                 void RunTask(int task)
                 {
                     int oc = task / inChannels, ic = task - oc * inChannels;
@@ -1406,6 +1409,7 @@ internal static class SimdConvHelper
         *dst = accumulate ? *dst + s : s;
     }
     /// <summary>Copies one [channels, height, width] image into a zero-bordered [channels, paddedH, paddedW] plane set.</summary>
+    [MethodImpl(Hot)]
     private static unsafe void PadImageForConv3x3(
         float* src, float* dst, int channels, int height, int width,
         int padH, int padW, int paddedH, int paddedW)
@@ -1437,6 +1441,7 @@ internal static class SimdConvHelper
     /// <paramref name="out1"/> null means single-channel: the pair kernel runs with k1 == k0 and the second copy
     /// is discarded.
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe void Conv3x3PairPlane(
         float* padded, int plane, int paddedW, float* k0, float* k1, int inChannels,
         float* out0, float* out1, int outHeight, int outWidth, int colChunks)

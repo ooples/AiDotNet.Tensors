@@ -1,4 +1,5 @@
 using System;
+using System.Runtime.CompilerServices;
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -36,7 +37,7 @@ public partial class CpuEngine
             throw new ArgumentException("ChannelBiasActivationInto needs contiguous CPU tensors.");
         int planes = batch * channels;
         if (planes == 0 || spatial == 0) return;
-        CpuParallelSettings.ParallelForOrSerial(0, planes, (long)planes * spatial, plane =>
+        CpuParallelSettings.ParallelForOrSerial(0, planes, (long)planes * spatial, [MethodImpl(Compatibility.MethodImplHelper.Hot)] (int plane) =>
         {
             float bc = b[bOff + plane % channels];
             fixed (float* ps = &src[srcOff + plane * spatial])
@@ -104,7 +105,7 @@ public partial class CpuEngine
             for (int c = 0; c < channels; c++) db[dbOff + c] = accumulateBias ? db[dbOff + c] + 0f : 0f;
             return;
         }
-        CpuParallelSettings.ParallelForOrSerial(0, channels, (long)batch * channels * spatial, c =>
+        CpuParallelSettings.ParallelForOrSerial(0, channels, (long)batch * channels * spatial, [MethodImpl(Compatibility.MethodImplHelper.Hot)] (int c) =>
         {
             float acc = 0f;
             for (int n = 0; n < batch; n++)

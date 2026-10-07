@@ -18,6 +18,7 @@ public partial class CpuEngine
     /// order after its block is stored: the same additions in the same order as the scalar loop, so the plane is
     /// bit-identical. The columns past the last full block of eight windows run the scalar loop.
     /// </summary>
+    [MethodImpl(Compatibility.MethodImplHelper.Hot)]
     private static unsafe void MaxPool2x2Stride2TilesBackwardPlane(
         float[] x, int xBase, float[] g, int gBase, float[] d, int dBase, int width, int outH, int outW)
     {
@@ -93,17 +94,17 @@ public partial class CpuEngine
 
 #if NET5_0_OR_GREATER
     /// <summary>Elements 0, 2, 4, ... of the 16 floats <paramref name="lo"/>:<paramref name="hi"/>, in order.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(Compatibility.MethodImplHelper.HotInline)]
     private static Vector256<float> DeinterleaveEven(Vector256<float> lo, Vector256<float> hi)
         => Avx2.Permute4x64(Avx.Shuffle(lo, hi, 0b10_00_10_00).AsDouble(), 0b11_01_10_00).AsSingle();
 
     /// <summary>Elements 1, 3, 5, ... of the 16 floats <paramref name="lo"/>:<paramref name="hi"/>, in order.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(Compatibility.MethodImplHelper.HotInline)]
     private static Vector256<float> DeinterleaveOdd(Vector256<float> lo, Vector256<float> hi)
         => Avx2.Permute4x64(Avx.Shuffle(lo, hi, 0b11_01_11_01).AsDouble(), 0b11_01_10_00).AsSingle();
 
     /// <summary>Stores a0 b0 a1 b1 ... a7 b7 (16 floats) at <paramref name="dst"/>.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(Compatibility.MethodImplHelper.HotInline)]
     private static unsafe void StoreInterleaved(float* dst, Vector256<float> a, Vector256<float> b)
     {
         var lo = Avx.UnpackLow(a, b);
@@ -119,6 +120,7 @@ public partial class CpuEngine
     /// as the scalar kernel (start from the window's first tap, take a later tap only when strictly greater, so a NaN
     /// first tap stays and a later NaN never replaces), so the output is bit-identical.
     /// </summary>
+    [MethodImpl(Compatibility.MethodImplHelper.Hot)]
     internal static unsafe void MaxPool2x2Stride2Row(float* r0, float* r1, float* dst, int outW)
     {
         int ow = 0;

@@ -2706,7 +2706,7 @@ internal static class BackwardFunctions<T>
             // view, so both index from 0. Arrays rather than MemoryMarshal.CreateSpan, which net471 lacks.
             var srcAll = (float[])(object)upstream.GetDataArray();
             var dstAll = (float[])(object)gradF.GetDataArray();
-            CpuParallelSettings.ParallelForOrSerial(0, planes, (long)planes * inPlane, plane =>
+            CpuParallelSettings.ParallelForOrSerial(0, planes, (long)planes * inPlane, [System.Runtime.CompilerServices.MethodImpl(Compatibility.MethodImplHelper.Hot)] (int plane) =>
             {
                 var src = new ReadOnlySpan<float>(srcAll, plane * outPlane, outPlane);
                 var dst = new Span<float>(dstAll, plane * inPlane, inPlane);

@@ -545,7 +545,7 @@ public static class CpuParallelSettings
         int byWork = (int)Math.Min(count, Math.Max(1, totalWork / workPerChunk));
         int chunks = Math.Min(maxDegree, byWork);
         int from = fromInclusive;
-        PersistentParallelExecutor.Instance.Execute(chunks, maxDegree, chunk =>
+        PersistentParallelExecutor.Instance.Execute(chunks, maxDegree, [System.Runtime.CompilerServices.MethodImpl(Compatibility.MethodImplHelper.Hot)] (int chunk) =>
         {
             using var _region = EnterParallelRegion();
             int cs = from + (int)((long)chunk * count / chunks);
