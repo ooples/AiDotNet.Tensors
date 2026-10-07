@@ -761,8 +761,17 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
             throw new ArgumentException("Matrix dimensions must match for addition.");
 
         var result = CreateInstance(_rows, _cols);
+        var dst = result.AsWritableSpan();
+        if (dst.Length >= ElementwiseParallelMinLength)
+        {
+            Memory<T> a = _memory, b = other._memory, r = result._memory;
+            CpuParallelSettings.ParallelForChunks(dst.Length, ElementwiseParallelGrain(dst.Length),
+                (start, count) => _numOps.Add(a.Span.Slice(start, count), b.Span.Slice(start, count), r.Span.Slice(start, count)));
+            return result;
+        }
+
         // Use vectorized Add operation for SIMD acceleration (5-15x faster with AVX2)
-        _numOps.Add(_memory.Span, other._memory.Span, result.AsWritableSpan());
+        _numOps.Add(_memory.Span, other._memory.Span, dst);
 
         return result;
     }
@@ -879,7 +888,16 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
             throw new ArgumentException("Matrix dimensions must match for subtraction.");
 
         var result = CreateInstance(_rows, _cols);
-        _numOps.Subtract(_memory.Span, other._memory.Span, result.AsWritableSpan());
+        var dst = result.AsWritableSpan();
+        if (dst.Length >= ElementwiseParallelMinLength)
+        {
+            Memory<T> a = _memory, b = other._memory, r = result._memory;
+            CpuParallelSettings.ParallelForChunks(dst.Length, ElementwiseParallelGrain(dst.Length),
+                (start, count) => _numOps.Subtract(a.Span.Slice(start, count), b.Span.Slice(start, count), r.Span.Slice(start, count)));
+            return result;
+        }
+
+        _numOps.Subtract(_memory.Span, other._memory.Span, dst);
         return result;
     }
 
@@ -1204,9 +1222,36 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     public virtual MatrixBase<T> Multiply(T scalar)
     {
         var result = CreateInstance(_rows, _cols);
-        _numOps.MultiplyScalar(_memory.Span, scalar, result.AsWritableSpan());
+        var dst = result.AsWritableSpan();
+        if (dst.Length >= ElementwiseParallelMinLength)
+        {
+            Memory<T> a = _memory, r = result._memory;
+            CpuParallelSettings.ParallelForChunks(dst.Length, ElementwiseParallelGrain(dst.Length),
+                (start, count) => _numOps.MultiplyScalar(a.Span.Slice(start, count), scalar, r.Span.Slice(start, count)));
+            return result;
+        }
+
+        _numOps.MultiplyScalar(_memory.Span, scalar, dst);
         return result;
     }
+
+    /// <summary>
+    /// Element count from which the allocating elementwise operations (<see cref="Add"/>,
+    /// <see cref="Subtract"/>, <see cref="Multiply(T)"/>) split across threads.
+    /// </summary>
+    /// <remarks>
+    /// These operations are bound by memory bandwidth and, because the result is freshly allocated,
+    /// by first-touch page faults on its pages; one core saturates neither. Measured on a 16-core
+    /// Ryzen (double, allocate + add): 90K elements 81 → 45 µs, 250K 329 → 217 µs, 1M 1753 → 1083 µs.
+    /// </remarks>
+    private const int ElementwiseParallelMinLength = 1 << 16;
+
+    /// <summary>
+    /// Minimum chunk size for the parallel elementwise path: two chunks for mid-size matrices and
+    /// 128K-element chunks for large ones. More, smaller chunks measured slower at every size
+    /// (e.g. 250K elements: 16K chunks 493 µs vs two chunks 217 µs).
+    /// </summary>
+    private static int ElementwiseParallelGrain(int length) => Math.Min(1 << 17, Math.Max(1 << 15, length / 2));
 
     /// <summary>
     /// Multiplies this matrix by a scalar value in-place.
@@ -1276,6 +1321,27 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
         var srcSpan = _memory.Span;
         int rows = _rows;
         int cols = _cols;
+
+#if NET5_0_OR_GREATER
+        // AVX register-transpose kernel. Works on spans, so it also covers pooled results whose
+        // rented array is longer than rows * cols (TryGetBackingArray rejects those).
+        if (typeof(T) == typeof(double))
+        {
+            SimdTranspose.Transpose(
+                MemoryMarshal.CreateReadOnlySpan(ref Unsafe.As<T, double>(ref MemoryMarshal.GetReference(srcSpan)), srcSpan.Length),
+                MemoryMarshal.CreateSpan(ref Unsafe.As<T, double>(ref MemoryMarshal.GetReference(resultSpan)), resultSpan.Length),
+                rows, cols);
+            return result;
+        }
+        if (typeof(T) == typeof(float))
+        {
+            SimdTranspose.Transpose(
+                MemoryMarshal.CreateReadOnlySpan(ref Unsafe.As<T, float>(ref MemoryMarshal.GetReference(srcSpan)), srcSpan.Length),
+                MemoryMarshal.CreateSpan(ref Unsafe.As<T, float>(ref MemoryMarshal.GetReference(resultSpan)), resultSpan.Length),
+                rows, cols);
+            return result;
+        }
+#endif
 
         // For small matrices, use simple approach
         if (rows * cols < 4096)

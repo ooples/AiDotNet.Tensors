@@ -1226,6 +1226,7 @@ class Program
         {
             BenchmarkRunner.Run<LinearAlgebraBenchmarks>(BenchConfig);
             BenchmarkRunner.Run<SmallMatrixBenchmarks>(BenchConfig);
+            BenchmarkRunner.Run<ElementWiseBenchmarks>(BenchConfig);
             return;
         }
 
