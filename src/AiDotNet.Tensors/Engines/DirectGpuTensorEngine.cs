@@ -17220,8 +17220,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                     batch, inChannels, inHeight, inWidth, outChannels, outHeight, outWidth,
                     kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW));
         }
-        catch
+        catch (Exception ex)
         {
+            // Recorded, not swallowed: a silent host fallback here moves the weight gradient off the device.
+            if (ThrowOnGpuKernelFallback) throw;
+            GpuLaunchProbe.OnFallback("Conv2DBackwardKernel", ex);
             return base.Conv2DBackwardKernel(gradOutput, input, kernelShape, stride, padding, dilation);
         }
     }

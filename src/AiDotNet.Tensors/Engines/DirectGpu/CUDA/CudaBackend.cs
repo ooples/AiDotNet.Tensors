@@ -6747,10 +6747,10 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw new InvalidOperationException("CUDA kernel not found: conv2d_backward_kernel");
 
         using var _ = PushContext();
-        const int BLOCK = 16;
-        uint gx = (uint)((kernelW + BLOCK - 1) / BLOCK);
-        uint gy = (uint)((kernelH + BLOCK - 1) / BLOCK);
-        uint gz = (uint)(outChannels * inChannels);
+        // One thread per gradKernel element (see the kernel): a flat 1D grid has no 65,535 limit.
+        const int BLOCK = 256;
+        long total = (long)outChannels * inChannels * kernelH * kernelW;
+        uint grid = (uint)((total + BLOCK - 1) / BLOCK);
 
         IntPtr inputPtr = input.Handle;
         IntPtr gradOutputPtr = gradOutput.Handle;
@@ -6774,7 +6774,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         args[15] = &padW;
         args[16] = &dilationH;
         args[17] = &dilationW;
-        LaunchKernel3D(cudaKernel, gx, gy, gz, (uint)BLOCK, (uint)BLOCK, 1, args, 0);
+        LaunchKernel(cudaKernel, grid, BLOCK, args);
     }
 
     public unsafe void Conv1D(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,

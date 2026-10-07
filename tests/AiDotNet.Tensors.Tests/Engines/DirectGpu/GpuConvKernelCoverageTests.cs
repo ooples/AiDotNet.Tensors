@@ -425,4 +425,27 @@ public sealed class GpuConvKernelCoverageTests : IDisposable, IClassFixture<Dire
         AssertClose(_cpu.MaxPool3D(input, pool, stride, pad),
                     Gpu.MaxPool3D(input, pool, stride, pad), "MaxPool3D");
     }
+
+    // ---- Conv2D BACKWARD-KERNEL (weight gradient) ----
+    // The CUDA/HIP kernel used to map outChannels * inChannels onto gridDim.z, which failed to launch past
+    // 65,535 (any 256x256 or wider layer: "cuLaunchKernel3D failed: Invalid value"); the engine then fell
+    // back to the CPU silently and the weight gradient left the device (#1101, resnet18 residency gate).
+    // ThrowOnGpuKernelFallback (set by this class) turns any such fallback into a failure here.
+    [SkippableTheory]
+    [InlineData(2, 3, 2, 7, 7, 3, 1, 1, 1)]      // small
+    [InlineData(2, 257, 256, 4, 4, 3, 1, 1, 1)]  // outC * inC = 65,792: past the old gridDim.z limit
+    [InlineData(1, 256, 512, 4, 4, 1, 2, 0, 1)]  // 1x1 stride-2 downsample, outC * inC = 131,072
+    [InlineData(1, 5, 7, 9, 11, 3, 2, 2, 2)]     // stride 2, dilation 2, non-square
+    public void Conv2DBackwardKernel_Gpu_MatchesCpu(int batch, int inC, int outC, int h, int w, int k, int stride, int pad, int dil)
+    {
+        SkipIfUnavailable();
+        var input = R(41, batch, inC, h, w);
+        var kernel = R(42, outC, inC, k, k);
+        int[] st = { stride, stride }, pd = { pad, pad }, dl = { dil, dil };
+        var gradOut = Like(43, _cpu.Conv2D(input, kernel, st, pd, dl));
+        int[] kShape = { outC, inC, k, k };
+        AssertClose(_cpu.Conv2DBackwardKernel(gradOut, input, kShape, st, pd, dl),
+                    Gpu.Conv2DBackwardKernel(gradOut, input, kShape, st, pd, dl),
+                    $"Conv2DBackwardKernel[{outC}x{inC}x{k}x{k}]");
+    }
 }

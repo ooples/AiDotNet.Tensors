@@ -4380,10 +4380,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             args[17] = &dilationW;
 
 
-            uint gridX = (uint)((kernelW + 15) / 16);
-            uint gridY = (uint)((kernelH + 15) / 16);
-            uint gridZ = (uint)(outChannels * inChannels);
-            LaunchKernel3D(krnl, gridX, gridY, gridZ, 16, 16, 1, args);
+            // One thread per gradKernel element (see the kernel): a flat 1D grid has no 65,535 limit.
+            long total = (long)outChannels * inChannels * kernelH * kernelW;
+            LaunchKernel(krnl, (uint)((total + 255) / 256), 256, args);
             Synchronize();
             }
     }
