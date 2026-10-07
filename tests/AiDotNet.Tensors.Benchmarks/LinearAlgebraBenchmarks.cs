@@ -7,6 +7,7 @@ using MathNet.Numerics.LinearAlgebra;
 using MathNet.Numerics.LinearAlgebra.Double;
 using NumSharp;
 using System.Numerics.Tensors;
+using Tensor = AiDotNet.Tensors.LinearAlgebra.Tensor<double>;
 
 namespace AiDotNet.Tensors.Benchmarks;
 
@@ -39,7 +40,7 @@ public class LinearAlgebraBenchmarks
     private MathNet.Numerics.LinearAlgebra.Matrix<double> _mnMatrix2 = null!;
 
     // AiDotNet tensor over the same data as _aiMatrix1 (for the O(1) view transpose)
-    private Tensor<double> _aiTensor1 = null!;
+    private Tensor _aiTensor1 = null!;
 
     // NumSharp types
     private NDArray _nsVector1 = null!;
@@ -100,7 +101,7 @@ public class LinearAlgebraBenchmarks
         _aiMatrix2 = new AiDotNet.Tensors.LinearAlgebra.Matrix<double>(matData2);
         _mnMatrix1 = DenseMatrix.OfArray(matData1);
         _mnMatrix2 = DenseMatrix.OfArray(matData2);
-        _aiTensor1 = new Tensor<double>((double[])flatMat1.Clone(), new[] { N, N });
+        _aiTensor1 = new Tensor((double[])flatMat1.Clone(), new[] { N, N });
         _nsMatrix1 = np.array(flatMat1).reshape(N, N);
         _nsMatrix2 = np.array(flatMat2).reshape(N, N);
     }
@@ -499,7 +500,7 @@ public class LinearAlgebraBenchmarks
 
     [Benchmark(Description = "Transpose (view) - AiDotNet")]
     [BenchmarkCategory("TransposeView")]
-    public Tensor<double> MatrixTransposeViewAiDotNet()
+    public Tensor MatrixTransposeViewAiDotNet()
     {
         return _aiTensor1.Transpose();
     }
@@ -688,8 +689,8 @@ public class ElementWiseBenchmarks
     private AiDotNet.Tensors.LinearAlgebra.Vector<double> _aiVector1 = null!;
     private AiDotNet.Tensors.LinearAlgebra.Vector<double> _aiVector2 = null!;
 
-    private Tensor<double> _aiTensor1 = null!;
-    private Tensor<double> _aiTensor2 = null!;
+    private Tensor _aiTensor1 = null!;
+    private Tensor _aiTensor2 = null!;
 
     private NDArray _nsVector1 = null!;
     private NDArray _nsVector2 = null!;
@@ -715,8 +716,8 @@ public class ElementWiseBenchmarks
         _aiVector1 = new AiDotNet.Tensors.LinearAlgebra.Vector<double>(_data1);
         _aiVector2 = new AiDotNet.Tensors.LinearAlgebra.Vector<double>(_data2);
 
-        _aiTensor1 = new Tensor<double>((double[])_data1.Clone(), new[] { N });
-        _aiTensor2 = new Tensor<double>((double[])_data2.Clone(), new[] { N });
+        _aiTensor1 = new Tensor((double[])_data1.Clone(), new[] { N });
+        _aiTensor2 = new Tensor((double[])_data2.Clone(), new[] { N });
 
         _nsVector1 = np.array(_data1);
         _nsVector2 = np.array(_data2);
@@ -740,7 +741,7 @@ public class ElementWiseBenchmarks
 
     [Benchmark(Description = "Multiply - AiDotNet")]
     [BenchmarkCategory("Multiply")]
-    public Tensor<double> MultiplyAiDotNet()
+    public Tensor MultiplyAiDotNet()
     {
         return AiDotNetEngine.Current.TensorMultiply(_aiTensor1, _aiTensor2);
     }
@@ -765,7 +766,7 @@ public class ElementWiseBenchmarks
 
     [Benchmark(Description = "Exp - AiDotNet")]
     [BenchmarkCategory("Exp")]
-    public Tensor<double> ExpAiDotNet()
+    public Tensor ExpAiDotNet()
     {
         return AiDotNetEngine.Current.TensorExp(_aiTensor1);
     }
