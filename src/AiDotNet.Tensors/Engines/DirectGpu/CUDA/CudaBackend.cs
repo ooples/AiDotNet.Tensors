@@ -8564,6 +8564,9 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         LaunchKernelWithSharedMem(kernel, gridX, DefaultBlockSize, (uint)(3 * DefaultBlockSize * sizeof(float)), args);
     }
 
+    // Rows up to this width take the warp-per-row LayerNorm kernels; wider rows keep a block per row.
+    private const int LayerNormWarpRowMaxFeatures = 1024;
+
     public unsafe void LayerNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
         IGpuBuffer saveMean, IGpuBuffer saveInvVar, int batchSize, int normalizedSize, float epsilon)
     {
@@ -8572,6 +8575,21 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
                 input, output, gamma, beta, saveMean, saveInvVar, batchSize, epsilon))
             return;
 
+        if (normalizedSize <= LayerNormWarpRowMaxFeatures && batchSize > 0
+            && _kernelCache.TryGetValue("layernorm_forward_warp_rows", out var warpKernel))
+        {
+            using var warpScope = PushContext();
+            IntPtr wIn = input.Handle, wOut = output.Handle, wGamma = gamma.Handle, wBeta = beta.Handle;
+            IntPtr wMean = saveMean.Handle, wInvVar = saveInvVar.Handle;
+            int wRows = batchSize, wCols = normalizedSize;
+            float wEps = epsilon;
+            void** wargs = stackalloc void*[9];
+            wargs[0] = &wIn; wargs[1] = &wOut; wargs[2] = &wGamma; wargs[3] = &wBeta;
+            wargs[4] = &wMean; wargs[5] = &wInvVar; wargs[6] = &wRows; wargs[7] = &wCols; wargs[8] = &wEps;
+            int rowsPerBlock = DefaultBlockSize / 32;
+            LaunchKernel(warpKernel, (uint)((batchSize + rowsPerBlock - 1) / rowsPerBlock), DefaultBlockSize, wargs);
+            return;
+        }
         if (!_kernelCache.TryGetValue("layernorm_forward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: layernorm_forward");
 
@@ -8607,7 +8625,9 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
                 gradInput, gradGamma, gradBeta, batchSize, epsilon))
             return;
 
-        if (!_kernelCache.TryGetValue("layernorm_backward", out var kernel))
+        bool warpRows = normalizedSize <= LayerNormWarpRowMaxFeatures && batchSize > 0
+            && _kernelCache.ContainsKey("layernorm_backward_warp_rows");
+        if (!_kernelCache.TryGetValue(warpRows ? "layernorm_backward_warp_rows" : "layernorm_backward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: layernorm_backward");
 
         using var _ = PushContext();
@@ -8632,8 +8652,21 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         args[8] = &batchSize;
         args[9] = &normalizedSize;
         args[10] = &epsilon;
-        // 2 shared arrays for sumDy and sumDyXmu
-        LaunchKernelWithSharedMem(kernel, gridX, DefaultBlockSize, (uint)(2 * DefaultBlockSize * sizeof(float)), args);
+        if (warpRows)
+        {
+            // layernorm_backward_warp_rows(gradOutput, input, gamma, saveMean, saveInvVar, gradInput, rows, cols):
+            // one warp per row, DefaultBlockSize / 32 rows per block.
+            void** wargs = stackalloc void*[8];
+            wargs[0] = &gradOutputPtr; wargs[1] = &inputPtr; wargs[2] = &gammaPtr; wargs[3] = &saveMeanPtr;
+            wargs[4] = &saveInvVarPtr; wargs[5] = &gradInputPtr; wargs[6] = &batchSize; wargs[7] = &normalizedSize;
+            int rowsPerBlock = DefaultBlockSize / 32;
+            LaunchKernel(kernel, (uint)((batchSize + rowsPerBlock - 1) / rowsPerBlock), DefaultBlockSize, wargs);
+        }
+        else
+        {
+            // 2 shared arrays for sumDy and sumDyXmu
+            LaunchKernelWithSharedMem(kernel, gridX, DefaultBlockSize, (uint)(2 * DefaultBlockSize * sizeof(float)), args);
+        }
 
         // The layernorm_backward kernel above computes ONLY gradInput — it leaves
         // gradGamma/gradBeta untouched (they require a reduction ACROSS the batch, not a
@@ -9849,8 +9882,122 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     // / warmup), reused on the captured replay with no HtoD. Bounded by the few distinct permute shapes.
     private readonly System.Collections.Generic.Dictionary<string, (IGpuBuffer inStr, IGpuBuffer outStr, IGpuBuffer perm)> _permuteMetaCache = new();
 
+    // Mirrors the kernel-side struct PermuteDims (int ndims; int outShape[8]; int inStride[8]), passed by value.
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    private unsafe struct PermuteDims
+    {
+        public int NDims;
+        public fixed int OutShape[8];
+        public fixed int InStride[8];
+    }
+
+    /// <summary>
+    /// Reduces a permutation to its canonical form: size-1 axes dropped and every run of input axes that stays adjacent
+    /// and in order in the output merged into one axis. [B,S,H,D] with (0,2,1,3) stays 4-D; [B,1,S,D] with (0,2,1,3)
+    /// becomes a plain copy; [B,H,S,D] with (0,1,3,2) becomes a 3-D (0,2,1) transpose. Returns the canonical input
+    /// shape and permutation (rank 0 when every axis has extent 1).
+    /// </summary>
+    internal static (int[] Shape, int[] Permutation) CanonicalizePermutation(int[] shape, int[] permutation)
+    {
+        int rank = shape.Length;
+        // Input axes with extent > 1, renumbered densely so axes separated only by dropped ones count as adjacent.
+        var dense = new int[rank];
+        var keptShape = new System.Collections.Generic.List<int>(rank);
+        for (int a = 0; a < rank; a++)
+        {
+            dense[a] = shape[a] == 1 ? -1 : keptShape.Count;
+            if (shape[a] != 1) keptShape.Add(shape[a]);
+        }
+        // Output-order list of the kept input axes.
+        var order = new System.Collections.Generic.List<int>(rank);
+        for (int k = 0; k < rank; k++)
+            if (dense[permutation[k]] >= 0) order.Add(dense[permutation[k]]);
+        // Group consecutive output positions whose input axes are consecutive: (first input axis, merged extent).
+        var groups = new System.Collections.Generic.List<(int First, int Extent)>(order.Count);
+        for (int k = 0; k < order.Count; k++)
+        {
+            int axis = order[k];
+            if (k > 0 && order[k - 1] + 1 == axis)
+            {
+                var last = groups[groups.Count - 1];
+                groups[groups.Count - 1] = (last.First, last.Extent * keptShape[axis]);
+            }
+            else
+            {
+                groups.Add((axis, keptShape[axis]));
+            }
+        }
+        // Canonical input axes are the groups in input order; the permutation lists them in output order.
+        var inputOrder = new int[groups.Count];
+        for (int g = 0; g < groups.Count; g++) inputOrder[g] = g;
+        System.Array.Sort(inputOrder, (a, b) => groups[a].First.CompareTo(groups[b].First));
+        var canonicalShape = new int[groups.Count];
+        var rankOfGroup = new int[groups.Count];
+        for (int i = 0; i < inputOrder.Length; i++)
+        {
+            canonicalShape[i] = groups[inputOrder[i]].Extent;
+            rankOfGroup[inputOrder[i]] = i;
+        }
+        var canonicalPermutation = new int[groups.Count];
+        for (int g = 0; g < groups.Count; g++) canonicalPermutation[g] = rankOfGroup[g];
+        return (canonicalShape, canonicalPermutation);
+    }
+
     public unsafe void Permute(IGpuBuffer input, IGpuBuffer output, int[] shape, int[] permutation)
     {
+        if (shape is null) throw new ArgumentNullException(nameof(shape));
+        if (permutation is null) throw new ArgumentNullException(nameof(permutation));
+        if (shape.Length == permutation.Length && shape.Length > 0)
+        {
+            // Canonical form first, so every permutation that is really a copy, a transpose or a batched transpose
+            // takes that kernel, and the rest take the by-value-geometry kernel (vectorized when the innermost axis
+            // is kept). A pure data movement: bit-identical to the general kernel.
+            var (cShape, cPerm) = CanonicalizePermutation(shape, permutation);
+            int total = 1;
+            for (int i = 0; i < cShape.Length; i++) total *= cShape[i];
+            if (total == 0) return;
+            if (cShape.Length <= 1)
+            {
+                Copy(input, output, total);
+                return;
+            }
+            if (cShape.Length == 2)
+            {
+                Transpose(input, output, cShape[0], cShape[1]);   // the only non-identity 2-axis permutation
+                return;
+            }
+            if (cShape.Length == 3 && cPerm[0] == 0 && cPerm[1] == 2 && cPerm[2] == 1)
+            {
+                BatchedTranspose(input, output, cShape[0], cShape[1], cShape[2]);
+                return;
+            }
+            if (cShape.Length <= 8 && _kernelCache.TryGetValue("permute_dims", out var dimsKernel))
+            {
+                using var dimsScope = PushContext();
+                int n = cShape.Length;
+                var inStrides = new int[n];
+                inStrides[n - 1] = 1;
+                for (int i = n - 2; i >= 0; i--) inStrides[i] = inStrides[i + 1] * cShape[i + 1];
+                PermuteDims dims = default;
+                dims.NDims = n;
+                for (int d = 0; d < n; d++)
+                {
+                    dims.OutShape[d] = cShape[cPerm[d]];
+                    dims.InStride[d] = inStrides[cPerm[d]];
+                }
+                int innermost = dims.OutShape[n - 1];
+                bool vector = cPerm[n - 1] == n - 1 && innermost % 4 == 0
+                    && ((long)input.Handle & 15) == 0 && ((long)output.Handle & 15) == 0;
+                int vec = vector ? 4 : 1;
+                int totalVec = total / vec;
+                IntPtr inPtr = input.Handle, outPtr = output.Handle;
+                void** dargs = stackalloc void*[5];
+                dargs[0] = &inPtr; dargs[1] = &outPtr; dargs[2] = &dims; dargs[3] = &totalVec; dargs[4] = &vec;
+                LaunchKernel(dimsKernel, (uint)((totalVec + DefaultBlockSize - 1) / DefaultBlockSize), DefaultBlockSize, dargs);
+                return;
+            }
+        }
+
         // Handle common fast paths first
         if (shape.Length == 2 && permutation.Length == 2 && permutation[0] == 1 && permutation[1] == 0)
         {

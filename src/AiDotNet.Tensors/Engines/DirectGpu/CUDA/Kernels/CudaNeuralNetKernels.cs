@@ -1840,6 +1840,32 @@ extern ""C"" __global__ __launch_bounds__(256) void permute_general(
 }
 
 // ===========================================================================
+// Permute with its geometry passed BY VALUE (no device stride arrays to load per element) over the canonical form of
+// the permutation (size-1 axes dropped, axes that stay adjacent merged; see CudaBackend.Permute). outShape is the
+// output's shape and inStride[d] the input stride of output axis d. When the innermost axis is kept (inStride of the
+// last axis == 1) and its extent is a multiple of 4, each thread moves a float4: the attention head split/merge
+// [B,S,H,D] <-> [B,H,S,D] is then a strided block copy. A pure copy, so bit-identical to permute_general.
+struct PermuteDims { int ndims; int outShape[8]; int inStride[8]; };
+
+extern ""C"" __global__ __launch_bounds__(256) void permute_dims(
+    const float* __restrict__ input, float* __restrict__ output, PermuteDims p, int totalVec, int vec)
+{
+    int v = blockIdx.x * blockDim.x + threadIdx.x;
+    if (v >= totalVec) return;
+    int outIdx = v * vec;
+    int rem = outIdx;
+    int inIdx = 0;
+    for (int d = p.ndims - 1; d >= 0; d--) {
+        int extent = p.outShape[d];
+        int c = rem % extent;
+        rem /= extent;
+        inIdx += c * p.inStride[d];
+    }
+    if (vec == 4) *reinterpret_cast<float4*>(output + outIdx) = *reinterpret_cast<const float4*>(input + inIdx);
+    else output[outIdx] = input[inIdx];
+}
+
+// ===========================================================================
 // LSTM KERNELS
 // ===========================================================================
 
@@ -2965,6 +2991,7 @@ extern ""C"" __global__ __launch_bounds__(256) void adaptive_avgpool_backward(
                 "transpose_2d",
                 "batched_transpose",
                 "permute_general",
+                "permute_dims",
                 "rect_slice_nd",
                 // LSTM kernels
                 "lstm_cell_forward",

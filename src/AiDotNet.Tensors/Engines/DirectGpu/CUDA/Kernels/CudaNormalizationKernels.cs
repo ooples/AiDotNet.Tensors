@@ -267,6 +267,67 @@ extern ""C"" __global__ __launch_bounds__(256) void layernorm_backward(
     }
 }
 
+// LayerNorm with one WARP per row (blockDim.x = 256 => 8 rows per block), for rows up to ~1K wide. The block-per-row
+// kernels above park 256 threads and a block barrier per reduction on a row of a few dozen elements (a d=64
+// Transformer LayerNorm over 2048 tokens: 30 us forward, 32 us backward for 512 KB of data). Here every lane works and
+// the reductions are warp shuffles. Same math as layernorm_forward / layernorm_backward: two-pass mean then variance,
+// rsqrtf(var / n + eps), and the same gradInput formula.
+extern ""C"" __global__ __launch_bounds__(256) void layernorm_forward_warp_rows(
+    const float* __restrict__ input, float* __restrict__ output,
+    const float* __restrict__ gamma, const float* __restrict__ beta,
+    float* __restrict__ saveMean, float* __restrict__ saveInvVar,
+    int batchSize, int normalizedSize, float epsilon)
+{
+    int lane = threadIdx.x & 31;
+    long long row = (long long)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (row >= batchSize) return;
+    const float* x = input + row * (long long)normalizedSize;
+    float* y = output + row * (long long)normalizedSize;
+
+    float sum = 0.0f;
+    for (int i = lane; i < normalizedSize; i += 32) sum += x[i];
+    for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+    float mean = sum / (float)normalizedSize;
+
+    float var = 0.0f;
+    for (int i = lane; i < normalizedSize; i += 32) { float d = x[i] - mean; var += d * d; }
+    for (int o = 16; o > 0; o >>= 1) var += __shfl_xor_sync(0xffffffffu, var, o);
+    float invVar = rsqrtf(var / (float)normalizedSize + epsilon);
+
+    if (lane == 0) { saveMean[row] = mean; saveInvVar[row] = invVar; }
+    for (int i = lane; i < normalizedSize; i += 32)
+        y[i] = gamma[i] * ((x[i] - mean) * invVar) + beta[i];
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void layernorm_backward_warp_rows(
+    const float* __restrict__ gradOutput, const float* __restrict__ input,
+    const float* __restrict__ gamma, const float* __restrict__ saveMean, const float* __restrict__ saveInvVar,
+    float* __restrict__ gradInput, int batchSize, int normalizedSize)
+{
+    int lane = threadIdx.x & 31;
+    long long row = (long long)blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (row >= batchSize) return;
+    long long base = row * (long long)normalizedSize;
+    float mean = saveMean[row];
+    float invVar = saveInvVar[row];
+
+    float sumDy = 0.0f, sumDyXmu = 0.0f;
+    for (int i = lane; i < normalizedSize; i += 32) {
+        float dy = gradOutput[base + i] * gamma[i];
+        sumDy += dy;
+        sumDyXmu += dy * (input[base + i] - mean);
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        sumDy += __shfl_xor_sync(0xffffffffu, sumDy, o);
+        sumDyXmu += __shfl_xor_sync(0xffffffffu, sumDyXmu, o);
+    }
+    for (int i = lane; i < normalizedSize; i += 32) {
+        float xmu = input[base + i] - mean;
+        float dxhat = gradOutput[base + i] * gamma[i];
+        gradInput[base + i] = invVar * (dxhat - (sumDy + xmu * invVar * invVar * sumDyXmu) / (float)normalizedSize);
+    }
+}
+
 // Layer Normalization gradient accumulation for gamma and beta
 // 1 thread per feature, serial over batch (batch is typically small)
 // blockDim = (32 columns, 32 row lanes), grid.x = ceil(normalizedSize / 32). Each lane sums every 32nd row of its
@@ -519,6 +580,8 @@ extern ""C"" __global__ __launch_bounds__(256) void rmsnorm_grad_gamma(
                 "batchnorm_backward",
                 "layernorm_forward",
                 "layernorm_backward",
+                "layernorm_forward_warp_rows",
+                "layernorm_backward_warp_rows",
                 "layernorm_grad_params",
                 "groupnorm_forward",
                 "instancenorm_forward",

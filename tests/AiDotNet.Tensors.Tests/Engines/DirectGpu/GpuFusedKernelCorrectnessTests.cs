@@ -605,6 +605,64 @@ public class GpuFusedKernelCorrectnessTests : IClassFixture<DirectGpuTensorEngin
     }
 
     /// <summary>
+    /// CUDA permutes are reduced to a canonical form (size-1 axes dropped, adjacent axes merged) and then run as a
+    /// copy, a transpose, a batched transpose or the by-value-geometry kernel (float4 when the innermost axis is kept).
+    /// Each shape below lands on a different one of those; all must equal the CPU permute exactly.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(new[] { 4, 32, 4, 16 }, new[] { 0, 2, 1, 3 })]   // attention head split: innermost kept, float4
+    [InlineData(new[] { 4, 4, 32, 16 }, new[] { 0, 2, 1, 3 })]   // head merge
+    [InlineData(new[] { 3, 5, 7, 6 }, new[] { 0, 2, 1, 3 })]     // innermost kept, not a multiple of 4
+    [InlineData(new[] { 2, 3, 4, 5 }, new[] { 3, 1, 0, 2 })]     // innermost moved
+    [InlineData(new[] { 2, 3, 4, 5 }, new[] { 0, 1, 3, 2 })]     // merges to a batched transpose
+    [InlineData(new[] { 2, 1, 6, 4 }, new[] { 0, 2, 1, 3 })]     // a size-1 axis: a plain copy
+    [InlineData(new[] { 5, 1, 3 }, new[] { 2, 1, 0 })]           // a size-1 axis: a 2-D transpose
+    [InlineData(new[] { 2, 3, 2, 3, 2 }, new[] { 4, 2, 0, 3, 1 })]
+    public void Permute_CanonicalForms_GpuMatchesCpu(int[] shape, int[] permutation)
+    {
+        SkipIfNoGpu();
+        var input = RandomTensor(shape, 700 + shape.Length);
+        var expected = _cpu.TensorPermute(input, permutation).Contiguous().GetDataArray();
+        // The backend kernel itself: the engine's TensorPermute is a strided view outside a resident training step.
+        Skip.IfNot(_fixture.Engine is DirectGpuTensorEngine, "Fixture engine is not a DirectGpuTensorEngine");
+        var backend = ((DirectGpuTensorEngine)Gpu).GetBackend();
+        using var source = backend.AllocateBuffer(input.GetDataArray());
+        using var destination = backend.AllocateBuffer(input.Length);
+        backend.Permute(source, destination, shape, permutation);
+        var actual = backend.DownloadBuffer(destination);
+        Assert.Equal(expected.Length, actual.Length);
+        for (int i = 0; i < expected.Length; i++)
+            Assert.True(expected[i] == actual[i], $"Element [{i}]: expected {expected[i]}, got {actual[i]}");
+    }
+
+    /// <summary>
+    /// LayerNorm rows up to 1K wide run one warp per row on CUDA, forward and backward; wider rows keep a block per row.
+    /// Rows narrower than a warp, not a multiple of it, the 1024 boundary and the first wider row must all match the CPU:
+    /// output, saved mean and variance, and the input gradient.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(2048, 64)]
+    [InlineData(9, 7)]
+    [InlineData(13, 1024)]
+    [InlineData(3, 1025)]
+    public void LayerNorm_ForwardAndBackward_RowShapes_GpuMatchesCpu(int rows, int features)
+    {
+        SkipIfNoGpu();
+        var input = RandomTensor(new[] { rows, features }, 600 + features);
+        var gamma = RandomTensor(new[] { features }, 601);
+        var beta = RandomTensor(new[] { features }, 602);
+        var gradOut = RandomTensor(new[] { rows, features }, 603);
+        var cpuOut = _cpu.LayerNorm(input, gamma, beta, 1e-5, out var cpuMean, out var cpuVar);
+        var gpuOut = Gpu.LayerNorm(input, gamma, beta, 1e-5, out var gpuMean, out var gpuVar);
+        AssertTensorsClose(cpuOut, gpuOut, 1e-4f);
+        AssertTensorsClose(cpuMean, gpuMean, 1e-5f);
+        AssertTensorsClose(cpuVar, gpuVar, 1e-4f);
+        var cpuGradIn = _cpu.LayerNormBackward(gradOut, input, gamma, cpuMean, cpuVar, 1e-5, out _, out _);
+        var gpuGradIn = Gpu.LayerNormBackward(gradOut, input, gamma, gpuMean, gpuVar, 1e-5, out _, out _);
+        AssertTensorsClose(cpuGradIn, gpuGradIn, 1e-3f);
+    }
+
+    /// <summary>
     /// The deterministic CUDA max-pool backward visits only the windows that contain each input cell. Overlapping
     /// windows (kernel 3, stride 2) route several output gradients to one input cell, and a plain 2x2/2 pool and a
     /// stride-1 pool cover the non-overlapping and densest cases; each must match the CPU scatter exactly.
