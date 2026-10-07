@@ -18,7 +18,7 @@ public sealed class PagedAttentionVulkanTests
     {
         get
         {
-            try { return VulkanBackend.Instance.IsAvailable && VulkanBackend.Instance.IsGlslCompilerAvailable; }
+            try { return VulkanBackend.Instance.Initialize() && VulkanBackend.Instance.IsGlslCompilerAvailable; }
             catch { return false; }
         }
     }
