@@ -3819,9 +3819,14 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var arr = output.GetBackingArrayForCacheLookupUnsafe();
         if (arr is not null) if (s_producerDiagEnabled && s_producerOf.Count < ProducerDiagCap) s_producerOf[arr] = op;
     }
+    // Read once: AliasDiag runs on every compiled-step CopyResultInto (each replayed forward op on the CPU engine too),
+    // where a per-call environment lookup was ~2.6% of a CPU LSTM training step. Debug-only, process-stable flag.
+    private static readonly bool s_aliasDiagEnabled =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1";
+
     private static void AliasDiag(string reason)
     {
-        if (System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") != "1") return;
+        if (!s_aliasDiagEnabled) return;
         int n = s_aliasDiag.AddOrUpdate(reason, 1, (_, c) => c + 1);
         if (n <= 3) try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(),
             "aidotnet_graphcapture_diag.txt"), "[ALIAS] " + reason + System.Environment.NewLine); } catch { }

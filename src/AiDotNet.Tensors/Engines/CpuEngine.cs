@@ -36129,24 +36129,7 @@ public partial class CpuEngine : ITensorLevelEngine
         int totalElements = length.Aggregate(1, (a, b) => a * b);
         var tensorData = tensor.GetFlattenedData();
         var resultData = result.GetDataArray();
-
-        // For each output element, find the corresponding input element
-        CpuParallelSettings.ParallelForOrSerial(0, totalElements, totalElements, flatIdx =>
-        {
-            // Convert flat index to output indices and map to input flat index
-            int remaining = flatIdx;
-            int inputFlat = 0;
-            int stride = 1;
-            for (int d = tensor._shape.Length - 1; d >= 0; d--)
-            {
-                int outputIdx = remaining % length[d];
-                remaining /= length[d];
-                inputFlat += (start[d] + outputIdx) * stride;
-                stride *= tensor._shape[d];
-            }
-
-            resultData[flatIdx] = tensorData[inputFlat];
-        });
+        CopySliceRuns(tensorData, tensor._shape, start, length, resultData, totalElements);
 
         // A tape is an immutable record of the FORWARD call. `start` and `length` are mutable
         // caller-owned arrays, and high-throughput callers commonly reuse one buffer across a
@@ -36170,6 +36153,64 @@ public partial class CpuEngine : ITensorLevelEngine
                 eng => eng.TensorSlice(tensor, tracedStart, tracedLength));
         }
         return result;
+    }
+
+    /// <summary>
+    /// Copies the box <paramref name="start"/> + <paramref name="length"/> of a row-major <paramref name="shape"/>
+    /// array into <paramref name="destination"/> (row-major, <paramref name="totalElements"/> long). The trailing axes
+    /// the box covers in full, plus the first axis it does not, are one contiguous run in the source, so the copy is
+    /// one block copy per run instead of a div/mod index walk per element (that walk was most of an LSTM's
+    /// concatenate-backward on the CPU). Pure copies, so the result is bit-identical to the per-element walk.
+    /// </summary>
+    internal static void CopySliceRuns<T>(T[] source, int[] shape, int[] start, int[] length, T[] destination, int totalElements)
+    {
+        if (totalElements <= 0) return;
+        int rank = shape.Length;
+        if (rank == 0) { destination[0] = source[0]; return; }
+
+        // Axes k..rank-1 form one contiguous source run: every axis after k is taken in full.
+        int k = rank - 1;
+        int run = length[k];
+        while (k > 0 && length[k] == shape[k])
+        {
+            k--;
+            run *= length[k];
+        }
+
+        // Source strides, and the run's base offset from the start of the axes inside the run (only axis k can
+        // have a non-zero start there; the later axes are full, so their start is 0).
+        var strides = new int[rank];
+        int stride = 1;
+        for (int d = rank - 1; d >= 0; d--)
+        {
+            strides[d] = stride;
+            stride *= shape[d];
+        }
+        int runBase = start[k] * strides[k];
+        int rows = totalElements / run;
+
+        if (rows == 1)
+        {
+            Array.Copy(source, runBase + OuterOffset(0), destination, 0, run);
+            return;
+        }
+
+        CpuParallelSettings.ParallelForOrSerial(0, rows, totalElements, row =>
+            Array.Copy(source, runBase + OuterOffset(row), destination, row * run, run));
+
+        // Source offset of outer row `row` over axes 0..k-1 (row-major over the box's extents there).
+        int OuterOffset(int row)
+        {
+            int offset = 0;
+            int remaining = row;
+            for (int d = k - 1; d >= 0; d--)
+            {
+                int index = remaining % length[d];
+                remaining /= length[d];
+                offset += (start[d] + index) * strides[d];
+            }
+            return offset;
+        }
     }
 
     /// <inheritdoc/>
@@ -38245,54 +38286,29 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
                 outShape[normAxis] = totalAxis;
                 return scope.RecordVariadic(LazyNodeType.Custom, "Concatenate", captured, outShape,
-                    (eng, output) => { var r = eng.TensorConcatenate(captured, capturedAxis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
+                    (eng, output) =>
+                    {
+                        // Host engines write the concatenation straight into the plan's buffer.
+                        if (eng is not DirectGpuTensorEngine && TryConcatenateInto(captured, capturedAxis, output)) return;
+                        var r = eng.TensorConcatenate(captured, capturedAxis);
+                        DirectGpuTensorEngine.CopyResultInto(eng, r, output);
+                    },
                     BackwardFunctions<T>.ConcatenateBackward, new object[] { capturedAxis });
             }
         }
 
-        // Fast path for contiguous tensors concatenated on the last axis.
-        // Each leading-index row is a contiguous block, so copy one block per
-        // input instead of Tensor<T>.Concatenate's element-wise recursive walk.
+        // Fast path for contiguous tensors concatenated on any axis but the first: each leading-index row of every
+        // input is one contiguous block of shape[axis] * (product of the trailing dims), so copy one block per input
+        // per row instead of Tensor<T>.Concatenate's element-wise recursive walk (an LSTM's per-timestep output
+        // concat along the time axis spent ~13% of its CPU training step in that walk).
         Tensor<T> result;
         int concatRank = tensors[0].Rank;
         int normalizedAxis = axis < 0 ? concatRank + axis : axis;
-        if (normalizedAxis == concatRank - 1 && tensors.All(t => t.IsContiguous))
+        if (normalizedAxis > 0 && normalizedAxis < concatRank && tensors.All(t => t.IsContiguous))
         {
-            var outShape = (int[])tensors[0]._shape.Clone();
-            int outerRows = 1;
-            for (int d = 0; d < concatRank - 1; d++)
-                outerRows *= outShape[d];
-
-            int outputWidth = 0;
-            for (int i = 0; i < tensors.Length; i++)
-            {
-                var shape = tensors[i]._shape;
-                if (shape.Length != concatRank)
-                    throw new ArgumentException("All tensors must have the same rank.", nameof(tensors));
-                for (int d = 0; d < concatRank - 1; d++)
-                {
-                    if (shape[d] != outShape[d])
-                        throw new ArgumentException(
-                            "All tensors must have the same shape except along the concatenation axis.",
-                            nameof(tensors));
-                }
-                outputWidth += shape[concatRank - 1];
-            }
-            outShape[concatRank - 1] = outputWidth;
-
+            var outShape = ConcatenateOutputShape(tensors, normalizedAxis);
             result = AutoTensorCache.RentOrAllocate<T>(outShape);
-            var destination = result.AsWritableSpan();
-            for (int row = 0; row < outerRows; row++)
-            {
-                int destinationOffset = row * outputWidth;
-                for (int i = 0; i < tensors.Length; i++)
-                {
-                    int width = tensors[i]._shape[concatRank - 1];
-                    tensors[i].AsSpan().Slice(row * width, width)
-                        .CopyTo(destination.Slice(destinationOffset, width));
-                    destinationOffset += width;
-                }
-            }
+            ConcatenateContiguousInto(tensors, normalizedAxis, result.AsWritableSpan());
         }
         // Fast path for axis=0 contiguous tensors: direct Array.Copy (any rank)
         else if (axis == 0 && tensors.All(t => t.IsContiguous))
@@ -38331,6 +38347,85 @@ public partial class CpuEngine : ITensorLevelEngine
             savedState: new object[] { axis });
         { var ct = tensors; var ca = axis; AutoTracer.RecordOp("Concatenate", result, eng => eng.TensorConcatenate(ct, ca)); }
         return result;
+    }
+
+    /// <summary>
+    /// The concatenation's output shape along <paramref name="axis"/> (already normalized and in range). Throws when
+    /// the inputs differ in rank or in any extent other than <paramref name="axis"/>.
+    /// </summary>
+    private static int[] ConcatenateOutputShape<T>(Tensor<T>[] tensors, int axis)
+    {
+        var outShape = (int[])tensors[0]._shape.Clone();
+        int rank = outShape.Length;
+        int total = 0;
+        for (int i = 0; i < tensors.Length; i++)
+        {
+            var shape = tensors[i]._shape;
+            if (shape.Length != rank)
+                throw new ArgumentException("All tensors must have the same rank.", nameof(tensors));
+            for (int d = 0; d < rank; d++)
+            {
+                if (d != axis && shape[d] != outShape[d])
+                    throw new ArgumentException(
+                        "All tensors must have the same shape except along the concatenation axis.",
+                        nameof(tensors));
+            }
+            total += shape[axis];
+        }
+        outShape[axis] = total;
+        return outShape;
+    }
+
+    /// <summary>
+    /// Writes the concatenation of contiguous, shape-validated <paramref name="tensors"/> along
+    /// <paramref name="axis"/> into <paramref name="destination"/> (row-major): for each index over the leading axes,
+    /// one block copy per input. Pure copies, bit-identical to the element-wise walk.
+    /// </summary>
+    private static void ConcatenateContiguousInto<T>(Tensor<T>[] tensors, int axis, Span<T> destination)
+    {
+        var firstShape = tensors[0]._shape;
+        int rank = firstShape.Length;
+        int outer = 1;
+        for (int d = 0; d < axis; d++) outer *= firstShape[d];
+        int inner = 1;
+        for (int d = axis + 1; d < rank; d++) inner *= firstShape[d];
+
+        int destinationOffset = 0;
+        for (int row = 0; row < outer; row++)
+        {
+            for (int i = 0; i < tensors.Length; i++)
+            {
+                int block = tensors[i]._shape[axis] * inner;
+                tensors[i].AsSpan().Slice(row * block, block)
+                    .CopyTo(destination.Slice(destinationOffset, block));
+                destinationOffset += block;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Compiled-replay concatenation straight into the plan's output buffer, skipping the temporary result and the
+    /// copy out of it. Only for host data: false (caller takes its general path) when any input or the output is
+    /// not contiguous, the output has a device copy to invalidate, or the shapes do not line up.
+    /// </summary>
+    internal static bool TryConcatenateInto<T>(Tensor<T>[] tensors, int axis, Tensor<T> output)
+    {
+        if (tensors.Length == 0 || !output.IsContiguous || output._gpuBuffer is not null || output.HasPendingGpuData)
+            return false;
+        int rank = tensors[0].Rank;
+        int normalizedAxis = axis < 0 ? rank + axis : axis;
+        if (normalizedAxis < 0 || normalizedAxis >= rank || output.Rank != rank) return false;
+        for (int i = 0; i < tensors.Length; i++)
+            if (!tensors[i].IsContiguous || tensors[i].HasPendingGpuData) return false;
+        int[] outShape;
+        try { outShape = ConcatenateOutputShape(tensors, normalizedAxis); }
+        catch (ArgumentException) { return false; }
+        for (int d = 0; d < rank; d++)
+            if (outShape[d] != output._shape[d]) return false;
+
+        ConcatenateContiguousInto(tensors, normalizedAxis, output.AsWritableSpan());
+        output.IncrementVersion();
+        return true;
     }
 
     /// <inheritdoc/>

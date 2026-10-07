@@ -205,6 +205,27 @@ public partial class CpuEngine
             // the fused kernel multiple times or refreshing out-parameters through side effects.
             // Compiled training takes the same differentiable path. The common single-output
             // inference overload remains one fused replay step.
+            //
+            // Exception: float single-output TRAINING on a host engine records ONE node that runs the fused training
+            // forward and the fused BPTT backward (as the eager tape path does), instead of the per-timestep graph of
+            // ~30 primitives per step whose replay and backward cost several times the whole fused computation.
+            if (!wantState && !GraphMode.IsInferenceTrace && typeof(T) == typeof(float) && seqLen > 0
+                && this is not DirectGpuTensorEngine && GraphMode.Current is { } trainScope)
+            {
+                trainScope.BindEngineIfUnset(this);
+                finalHidden = (Tensor<T>)(object)s_emptyState;
+                finalCell = (Tensor<T>)(object)s_emptyState;
+                return (Tensor<T>)(object)RecordLstmSequenceTrainFloat(trainScope,
+                    (Tensor<float>)(object)input,
+                    (Tensor<float>?)(object?)h0,
+                    (Tensor<float>?)(object?)c0,
+                    (Tensor<float>)(object)wIh,
+                    (Tensor<float>)(object)wHh,
+                    (Tensor<float>?)(object?)bIh,
+                    (Tensor<float>?)(object?)bHh,
+                    batch, seqLen, inFeatures, hidden, returnSequences);
+            }
+
             if (wantState || !GraphMode.IsInferenceTrace)
             {
                 return LstmSequenceForwardGraph(

@@ -168,6 +168,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     /// <summary>Gradient buffers no backward action wrote in the last uncaptured run of the captured step body (null
     /// until one ran): the only ones that body zeroes per step. See RunGpuStepBodyForCapture.</summary>
     private int[]? _unwrittenGradIndices;
+
+    /// <summary>Host-engine eager step: per gradient buffer, true when every writer is a generic backward step, so
+    /// the buffer is not zeroed and its first contribution of the step is copied in (GradWriteGeneration). Null when
+    /// the backward is all-specialized, pooled, or has no such buffer. Entries are cleared by
+    /// <see cref="RecordEagerFirstWriteCoverage"/> when a run shows the buffer is not written.</summary>
+    private bool[]? _eagerFirstWriteCandidates;
+
+    /// <summary>True once one eager step has run with every candidate zeroed and recorded which ones it wrote.</summary>
+    private bool _eagerFirstWriteVerified;
     // #1624 liveness pooling: re-zero schedule indexed by backward action index.
     // _gradPoolReZeroByStep[i] (when non-null) lists physical-buffer indices into
     // _preAllocatedGrads to clear BEFORE backward action i runs, because that
@@ -2755,6 +2764,36 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // scalars are fresh per step rather than frozen at capture time.
     }
 
+    /// <summary>
+    /// After an eager first-write step: a candidate buffer the backward did not write this step received no first
+    /// contribution, so skipping its zeroing would leave a previous step's values in it. Drop it from the candidate
+    /// set for good (it is zeroed from the next step on), then mark the set verified.
+    /// </summary>
+    private void RecordEagerFirstWriteCoverage(int generation)
+    {
+        var candidates = _eagerFirstWriteCandidates;
+        if (candidates is null) return;
+        for (int i = 0; i < candidates.Length; i++)
+        {
+            if (candidates[i] && _preAllocatedGrads[i]._gradWriteGeneration != generation)
+                candidates[i] = false;
+        }
+        _eagerFirstWriteVerified = true;
+    }
+
+    /// <summary>Gradient buffers the eager step currently leaves un-zeroed (first write copies in). Test hook.</summary>
+    internal int EagerFirstWriteCandidateCount
+    {
+        get
+        {
+            var candidates = _eagerFirstWriteCandidates;
+            if (candidates is null) return 0;
+            int n = 0;
+            for (int i = 0; i < candidates.Length; i++) if (candidates[i]) n++;
+            return n;
+        }
+    }
+
     private Tensor<T> StepEager()
     {
         var engine = _engine;
@@ -2926,12 +2965,34 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 : BindInternalStepBuffer(_lossGradDest, "loss gradient destination");
         }
 
+        // Generic (AccumulateGrad) backward on a host engine: buffers whose every writer is a generic backward are
+        // NOT zeroed. Under a GradWriteGeneration their first contribution of the step is copied in and later ones
+        // are added, which is bit-identical to zero-then-add and saves a memset plus an add pass per buffer. The
+        // first run zeroes everything and records which of those buffers the backward actually wrote; any it did
+        // not write keep being zeroed (see RecordEagerFirstWriteCoverage).
+        int eagerGradWriteGeneration = 0;
+        var eagerCandidates = _eagerFirstWriteCandidates;
+        if (eagerCandidates is not null && engine is not Engines.DirectGpuTensorEngine && _fp16HeteroOrder is null)
+        {
+            eagerGradWriteGeneration = Autodiff.DifferentiableOps.NextGradWriteGeneration();
+            bool verified = _eagerFirstWriteVerified;
+            for (int i = 0; i < gradArrays.Length; i++)
+            {
+                if (verified && eagerCandidates[i]) continue;   // its first contribution this step copies in
+                Array.Clear(gradArrays[i], 0, _preAllocatedGrads[i].Length);
+                InvalidateStaleDeviceCopy(_preAllocatedGrads[i]);   // see the note on the full clear below
+                // The zeros ARE this buffer's first write, so every contribution adds onto them (a specialized
+                // delegate that accumulates in place does not claim a first write). A candidate on the verification
+                // run stays unmarked so its first contribution claims it, which is how coverage is recorded.
+                if (!eagerCandidates[i]) _preAllocatedGrads[i]._gradWriteGeneration = eagerGradWriteGeneration;
+            }
+        }
         // Only zero gradient buffers used by generic (accumulating) backward delegates.
         // Specialized backward delegates overwrite completely (TryGemmEx beta=0, SIMD ReLU).
         // At large sizes, this saves significant time by skipping unnecessary clears.
         // The first step still clears everything: the buffers are rented uninitialized, and one that no delegate
         // writes (a gradient nothing produces) must read as zero from then on.
-        if (_genericGradIndices != null && !firstGradBind)
+        else if (_genericGradIndices != null && !firstGradBind)
         {
             for (int i = 0; i < _genericGradIndices.Length; i++)
             {
@@ -2963,6 +3024,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         {
             Array.Copy(seedArr, destArr, seedArr.Length);
             if (_lossGradDest is not null) InvalidateStaleDeviceCopy(_lossGradDest);   // same reason as the gradient clear
+            // The seed is the destination's first write: a contribution arriving there must add, not replace it.
+            if (eagerGradWriteGeneration != 0 && _lossGradDest is not null)
+                _lossGradDest._gradWriteGeneration = eagerGradWriteGeneration;
         }
 
         long t2 = _profileStepEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
@@ -2976,6 +3040,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         var bwd = _backwardActions;
         var bwdProbe = StepProbe;
         if (bwdProbe != null) bwdProbe("BEGIN-BWD");
+        if (eagerGradWriteGeneration != 0) Autodiff.DifferentiableOps.GradWriteGeneration = eagerGradWriteGeneration;
         try
         {
         if (_fp16HeteroOrder is not null)
@@ -3025,7 +3090,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             // otherwise the trace lifecycle is unbalanced and the failing-backward diagnostic is lost.
             _dlTrace.Dispose();
             AiDotNet.Tensors.Engines.DirectGpu.GpuMemoryTracker.DumpDownloadTrace("backward");
+            if (eagerGradWriteGeneration != 0) Autodiff.DifferentiableOps.GradWriteGeneration = 0;
         }
+        if (eagerGradWriteGeneration != 0) RecordEagerFirstWriteCoverage(eagerGradWriteGeneration);
         long t3 = _profileStepEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         if (stepTiming) StepTiming.RecordBackward(Stopwatch.GetTimestamp() - bwdStart);
 
@@ -7245,6 +7312,38 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             genericGradIndices = null; // clear-all (grad pooling, or a mixed plan on a GPU engine)
         }
 
+        // Host-engine first-write set for a backward that is NOT all-specialized: a gradient buffer whose every
+        // writer is a generic backward step (AccumulateGrad) can skip its per-step zeroing, because under a
+        // GradWriteGeneration the first contribution is copied in. A buffer that ANY non-generic action can write
+        // (a specialized/fused/analytic delegate, which neither claims nor respects first-write marks) is excluded
+        // and stays zeroed. consumerCount counts every consuming step, so equality with the generic-only count
+        // means no other consumer exists. Pooled buffers keep their own re-zero schedule.
+        bool[]? eagerFirstWriteCandidates = null;
+        if (!useGradPool && genericBackwardCount > 0 && genericBackwardSteps.Count > 0)
+        {
+            var genericConsumers = new Dictionary<Tensor<T>, int>();
+            foreach (var genericStep in genericBackwardSteps)
+            {
+                foreach (var inp in genericStep.Inputs)
+                    genericConsumers[inp] = genericConsumers.TryGetValue(inp, out int seen) ? seen + 1 : 1;
+            }
+            var gradBufferIndex = new Dictionary<Tensor<T>, int>(allGrads.Count);
+            for (int gi = 0; gi < allGrads.Count; gi++) gradBufferIndex[allGrads[gi]] = gi;
+            var candidates = new bool[allGrads.Count];
+            int candidateCount = 0;
+            foreach (var kv in genericConsumers)
+            {
+                if (!consumerCount.TryGetValue(kv.Key, out int allConsumers) || allConsumers != kv.Value) continue;
+                if (gradMap.TryGetValue(kv.Key, out var gradBuf) && gradBufferIndex.TryGetValue(gradBuf, out int bufIdx)
+                    && !candidates[bufIdx])
+                {
+                    candidates[bufIdx] = true;
+                    candidateCount++;
+                }
+            }
+            if (candidateCount > 0) eagerFirstWriteCandidates = candidates;
+        }
+
         // #1624 drift guard: the re-zero schedule (indexed by backward ACTION index)
         // was planned in BuildPooledGradMap from the fusion/analytic DECISIONS made
         // on a throwaway gradMap. The real passes above re-made those decisions
@@ -7363,6 +7462,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 storageLeases);
             storageLeases = null;
             plan._liveGradientMap = gradMap;
+            plan._eagerFirstWriteCandidates = eagerFirstWriteCandidates;
             scope.ReleaseStorageLeases();
             return plan;
         }

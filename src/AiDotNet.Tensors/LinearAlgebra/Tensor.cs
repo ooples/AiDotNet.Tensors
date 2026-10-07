@@ -482,30 +482,9 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // each step rolls the counter like a car odometer, and srcIdx tracks
         // the current strided source offset incrementally — no divisions at
         // all on the hot path.
-        var srcSpan = _data.AsSpan();
-        int rank = Rank;
-        int length = Length;
-        if (rank == 0 || length == 0) return FinalizeContiguousCopy(result);
-
-        Span<int> counter = stackalloc int[rank];
-        int srcIdx = _storageOffset;
-        for (int flat = 0; flat < length; flat++)
-        {
-            dstSpan[flat] = srcSpan[srcIdx];
-
-            // Increment counter with rightmost-axis carry, and update srcIdx
-            // incrementally using the stride deltas so no mul/div is required
-            // except on a wrap.
-            for (int d = rank - 1; d >= 0; d--)
-            {
-                counter[d]++;
-                srcIdx += _strides[d];
-                if (counter[d] < _shape[d]) break;
-                counter[d] = 0;
-                srcIdx -= _strides[d] * _shape[d];
-            }
-        }
-
+        if (Rank == 0 || Length == 0) return FinalizeContiguousCopy(result);
+        // Run-wise: block copies (or tight strided loops) per innermost run instead of an odometer step per element.
+        CopyStridedToRowMajor(_data.AsSpan(), _storageOffset, _shape, _strides, dstSpan);
         return FinalizeContiguousCopy(result);
     }
 
@@ -567,24 +546,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // Strided fallback. Identical decomposition to Contiguous() so the
         // two methods stay behaviorally consistent — any future
         // optimization that applies to one should be applied to the other.
-        var srcData = _data.GetDataArray();
-        var rowMajorStrides = RowMajorStrides;
-        int rank = Rank;
-        int len = Length;
-        int offset = _storageOffset;
-
-        for (int i = 0; i < len; i++)
-        {
-            int srcIdx = offset;
-            int remaining = i;
-            for (int d = 0; d < rank; d++)
-            {
-                int dimIndex = remaining / rowMajorStrides[d];
-                remaining -= dimIndex * rowMajorStrides[d];
-                srcIdx += dimIndex * _strides[d];
-            }
-            destination[i] = srcData[srcIdx];
-        }
+        CopyStridedToRowMajor(_data.GetDataArray(), _storageOffset, _shape, _strides, destination);
     }
 
     /// <summary>
