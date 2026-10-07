@@ -102,4 +102,70 @@ public class CompiledMixedPlanGradientZeroingTests
             AiDotNetEngine.Current = priorEngine;
         }
     }
+
+    /// <summary>
+    /// After the first step the eager first-write branch clears only the accumulating buffers: the activation
+    /// gradients the fused conv / ReLU / matmul backwards overwrite are left alone. It used to clear every buffer
+    /// except the first-write candidates (2.2 ms of a 7.8 ms step on the parity CNN). Gradients stay bit-identical
+    /// to step 0 over several steps, so nothing that needed its zeroing lost it.
+    /// </summary>
+    [Fact]
+    public void LaterStepsClearOnlyAccumulatingBuffers_GradientsStayBitExact()
+    {
+        var priorEngine = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = new CpuEngine();
+        try
+        {
+            var engine = new CpuEngine();
+            var x = Rnd(new[] { 3, 2, 10, 10 }, 11);
+            var k1 = Rnd(new[] { 4, 2, 3, 3 }, 12, 0.5f);
+            var b1 = Rnd(new[] { 4 }, 13, 0.1f);
+            var k2 = Rnd(new[] { 6, 4, 3, 3 }, 14, 0.5f);
+            var b2 = Rnd(new[] { 6 }, 15, 0.1f);
+            var w = Rnd(new[] { 24, 5 }, 16, 0.5f);
+            var coef = Rnd(new[] { 3, 5 }, 17);
+            var parameters = new[] { k1, b1, k2, b2, w };
+
+            ICompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.Enable())
+            {
+                Forward(engine, x, k1, b1, k2, b2, w, coef, graph: true);
+                plan = scope.CompileTraining(parameters);
+            }
+            try
+            {
+                var concrete = Assert.IsType<CompiledTrainingPlan<float>>(plan);
+                float[][]? first = null;
+                for (int step = 0; step < 4; step++)
+                {
+                    plan.Step();
+                    var now = Array.ConvertAll(plan.Gradients, g => g.AsSpan().ToArray());
+                    if (first is null)
+                    {
+                        first = now;
+                        continue;
+                    }
+                    for (int p = 0; p < parameters.Length; p++)
+                        for (int i = 0; i < first[p].Length; i++)
+                            Assert.True(TestHelpers.MathCompat.SingleToInt32Bits(first[p][i]) == TestHelpers.MathCompat.SingleToInt32Bits(now[p][i]),
+                                $"step {step} parameter {p} element {i} drifted from step 0: {first[p][i]:R} -> {now[p][i]:R}");
+
+                    // The branch under test must be the one that ran, and it must have skipped something.
+                    Assert.True(concrete.LastStepZeroedGradBufferCount >= 0,
+                        "the eager first-write branch did not run; this test exercises nothing");
+                    Assert.True(concrete.LastStepZeroedGradBufferCount < concrete.GradientBufferCount,
+                        $"step {step} cleared {concrete.LastStepZeroedGradBufferCount} of {concrete.GradientBufferCount} gradient buffers; "
+                        + "the buffers the specialized backwards overwrite should be skipped");
+                }
+            }
+            finally
+            {
+                plan.Dispose();
+            }
+        }
+        finally
+        {
+            AiDotNetEngine.Current = priorEngine;
+        }
+    }
 }

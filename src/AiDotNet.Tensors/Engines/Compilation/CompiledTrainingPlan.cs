@@ -2137,6 +2137,19 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
 
     private int[]? _actionToStepIndex;
 
+    /// <summary>Per-step action census (AIDOTNET_PLAN_CENSUS=1); null when the diagnostic is off.</summary>
+    private PlanCensus? _census;
+
+    /// <summary>Census labels for <paramref name="count"/> actions: the recorded names when they line up 1:1 with the
+    /// actions, else positional labels (an action appended without a name must not shift every later label).</summary>
+    private static string[] CensusNames(List<string> names, int count)
+    {
+        if (names.Count == count) return names.ToArray();
+        var fallback = new string[count];
+        for (int i = 0; i < count; i++) fallback[i] = "#" + i.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        return fallback;
+    }
+
     /// <summary>Diagnostic capture: TensorSubtract specialized forward writes
     /// here when AIDOTNET_DEBUG_SUB=1. Used by Pinpoint tests to inspect
     /// what the kernel sees vs writes.</summary>
@@ -2781,6 +2794,31 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         _eagerFirstWriteVerified = true;
     }
 
+    /// <summary>
+    /// The accumulating gradient buffers as a mask over <see cref="_preAllocatedGrads"/> (true = must start the step
+    /// at zero), built once from <see cref="_genericGradIndices"/>; null when that set is unknown (gradient pooling,
+    /// a mixed plan on a GPU engine), in which case every buffer is cleared.
+    /// </summary>
+    private bool[]? AccumulatingGradMask(int bufferCount)
+    {
+        if (_accumulatingGradMask is not null) return _accumulatingGradMask;
+        var indices = _genericGradIndices;
+        if (indices is null) return null;
+        var mask = new bool[bufferCount];
+        foreach (int idx in indices)
+            if ((uint)idx < (uint)bufferCount) mask[idx] = true;
+        _accumulatingGradMask = mask;
+        return mask;
+    }
+
+    private bool[]? _accumulatingGradMask;
+
+    /// <summary>Gradient buffers the last host eager first-write step cleared before its backward. Test hook.</summary>
+    internal int LastStepZeroedGradBufferCount { get; private set; } = -1;
+
+    /// <summary>Distinct physical gradient buffers the plan owns. Test hook.</summary>
+    internal int GradientBufferCount => _preAllocatedGrads.Length;
+
     /// <summary>Gradient buffers the eager step currently leaves un-zeroed (first write copies in). Test hook.</summary>
     internal int EagerFirstWriteCandidateCount
     {
@@ -2833,6 +2871,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // capture timestamps so kept on the hot path.
         long t0 = _profileStepEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         bool stepTiming = StepTiming.Enabled;
+        var census = _census;
+        long censusStepStart = census is not null ? Stopwatch.GetTimestamp() : 0;
 
         // Schedule-Free SGD: write y = (1-β)z + βx into the live parameter
         // backing so the forward/backward evaluate gradients at the
@@ -2926,6 +2966,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                     if (observer is not null && step is not null) observer(i, name, step.OutputBuffer);
                 }
             }
+            else if (census is not null && census.Collecting && fwd.Length == census.ForwardActionCount)
+            {
+                for (int i = 0; i < fwd.Length; i++)
+                {
+                    long a0 = Stopwatch.GetTimestamp();
+                    fwd[i](engine);
+                    census.AddForward(i, Stopwatch.GetTimestamp() - a0);
+                }
+            }
             else
             {
                 for (int i = 0; i < fwd.Length; i++)
@@ -2935,6 +2984,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         long t1 = _profileStepEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         if (stepTiming) StepTiming.RecordForward(Stopwatch.GetTimestamp() - fwdStart);
 
+        long censusGradZeroStart = census is not null ? Stopwatch.GetTimestamp() : 0;
         // Cache raw arrays on first call — avoids AsWritableSpan()/GetDataArray() per step
         var gradArrays = _cachedGradArrays;
         // The first step zeroes every gradient buffer; later steps zero only the accumulating ones (below).
@@ -2976,9 +3026,18 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         {
             eagerGradWriteGeneration = Autodiff.DifferentiableOps.NextGradWriteGeneration();
             bool verified = _eagerFirstWriteVerified;
+            // Buffers outside the accumulating set (_genericGradIndices: multi-consumer tensors and every generic
+            // step's inputs) are written only by specialized delegates that OVERWRITE them (beta = 0), which is the
+            // rule the non-first-write branch below already relies on. This branch used to clear them anyway, every
+            // step: on the parity CNN that zeroed every activation gradient, 2.2 ms of a 7.8 ms in-plan step.
+            // The first step still clears everything (the buffers are rented uninitialized).
+            var zeroMask = firstGradBind ? null : AccumulatingGradMask(gradArrays.Length);
+            int zeroed = 0;
             for (int i = 0; i < gradArrays.Length; i++)
             {
                 if (verified && eagerCandidates[i]) continue;   // its first contribution this step copies in
+                if (zeroMask is not null && !zeroMask[i]) continue;   // fully overwritten by its specialized writer
+                zeroed++;
                 Array.Clear(gradArrays[i], 0, _preAllocatedGrads[i].Length);
                 InvalidateStaleDeviceCopy(_preAllocatedGrads[i]);   // see the note on the full clear below
                 // The zeros ARE this buffer's first write, so every contribution adds onto them (a specialized
@@ -2986,6 +3045,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 // run stays unmarked so its first contribution claims it, which is how coverage is recorded.
                 if (!eagerCandidates[i]) _preAllocatedGrads[i]._gradWriteGeneration = eagerGradWriteGeneration;
             }
+            LastStepZeroedGradBufferCount = zeroed;
         }
         // Only zero gradient buffers used by generic (accumulating) backward delegates.
         // Specialized backward delegates overwrite completely (TryGemmEx beta=0, SIMD ReLU).
@@ -3030,6 +3090,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         }
 
         long t2 = _profileStepEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        census?.AddGradZero(Stopwatch.GetTimestamp() - censusGradZeroStart);
 
         // Backward: specialized delegates (direct BLAS into pre-allocated buffers)
         long bwdStart = stepTiming ? Stopwatch.GetTimestamp() : 0;
@@ -3072,6 +3133,17 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                     var name = i < (_profBackwardStepNames?.Length ?? 0) ? _profBackwardStepNames![i] : $"#{i}";
                     bwdProbe($"AFTER-BWD-{i}:{name}");
                 }
+            }
+        }
+        else if (census is not null && census.Collecting && bwd.Length == census.BackwardActionCount)
+        {
+            for (int i = 0; i < bwd.Length; i++)
+            {
+                long a0 = Stopwatch.GetTimestamp();
+                if (_gradPoolReZeroByStep != null) ApplyGradPoolReZero(i, gradArrays);
+                bwd[i](engine);
+                census.AddBackward(i, Stopwatch.GetTimestamp() - a0);
+                if (bwdProbe != null) bwdProbe($"AFTER-BWD-{i}");
             }
         }
         else
@@ -3137,7 +3209,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         if (bwdProbe != null) bwdProbe("BEGIN-OPT");
         // Fused optimizer update (if configured via ConfigureOptimizer)
         long optStart = stepTiming ? Stopwatch.GetTimestamp() : 0;
+        long censusOptStart = census is not null ? Stopwatch.GetTimestamp() : 0;
         _optimizerUpdate?.Invoke();
+        if (census is not null)
+        {
+            long censusNow = Stopwatch.GetTimestamp();
+            census.AddOptimizer(censusNow - censusOptStart);
+            census.EndStep(censusNow - censusStepStart);
+        }
         if (bwdProbe != null) bwdProbe("END-OPT");
         long t4 = _profileStepEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
 
@@ -6930,6 +7009,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // constituent steps at the position of the first fused step in each group,
         // ensuring non-fused producers that appear before a fused block still run first.
         var allForwardActions = new List<Action<IEngine>>();
+        // One label per forward action, for the plan census (AIDOTNET_PLAN_CENSUS); kept parallel to allForwardActions.
+        var forwardActionNames = new List<string>();
         int genericForwardCount = 0; // engine-dispatched forward actions (for CUDA-graph eligibility)
         int nextFusedGroupIdx = 0; // index into fusedForwardActions
         // The verdict for each step, recorded as it is reached, so a later rebuild replays this
@@ -6943,6 +7024,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             if (analyticForwardSpecs.TryGetValue(i, out var analyticFwdAction))
             {
                 allForwardActions.Add(analyticFwdAction);
+                forwardActionNames.Add("analytic:" + forwardSteps[i].OpName);
                 forwardEmitKinds[i] = ForwardEmit.Fixed;
                 forwardFixedActions[i] = analyticFwdAction;
                 continue;
@@ -6960,6 +7042,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             if (slicePrefixForwardSpecs.TryGetValue(i, out var slicePrefixFwd))
             {
                 allForwardActions.Add(slicePrefixFwd);
+                forwardActionNames.Add("slice-prefix:" + forwardSteps[i].OpName);
                 forwardEmitKinds[i] = ForwardEmit.Fixed;
                 forwardFixedActions[i] = slicePrefixFwd;
                 continue;
@@ -6972,6 +7055,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             if (convEpilogueForwardSpecs.TryGetValue(i, out var convEpilogueFwd))
             {
                 allForwardActions.Add(convEpilogueFwd);
+                forwardActionNames.Add("fused:Conv2D-epilogue");
                 forwardEmitKinds[i] = ForwardEmit.Fixed;
                 forwardFixedActions[i] = convEpilogueFwd;
                 continue;
@@ -6991,6 +7075,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 {
                     var fusedGroupAction = fusedForwardActions[nextFusedGroupIdx];
                     allForwardActions.Add(fusedGroupAction);
+                    forwardActionNames.Add("fused-group:" + forwardSteps[i].OpName);
                     forwardEmitKinds[i] = ForwardEmit.Fixed;
                     forwardFixedActions[i] = fusedGroupAction;
                     nextFusedGroupIdx++;
@@ -7009,9 +7094,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             if (specialized != null)
             {
                 allForwardActions.Add(specialized);
+                forwardActionNames.Add("specialized:" + step.OpName);
             }
             else
             {
+                forwardActionNames.Add("generic:" + step.OpName);
                 var output = step.OutputBuffer;
                 var exec = step.Execute;
                 var opName = step.OpName;
@@ -7069,6 +7156,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             if (analyticBackwardSpecs.TryGetValue(i, out var analyticAction))
             {
                 backwardActions.Add(analyticAction);
+                backwardStepNames.Add($"analytic:{step.OpName}");
                 continue;
             }
             // Phase G.7: skip ReduceSum backward when its output gradient
@@ -7084,6 +7172,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             if (slicePrefixBackwardSpecs.TryGetValue(i, out var slicePrefixBwd))
             {
                 backwardActions.Add(slicePrefixBwd);
+                backwardStepNames.Add($"slice-prefix:{step.OpName}");
                 continue;
             }
             if (consumedBySlicePrefix.Contains(i))
@@ -7463,6 +7552,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             storageLeases = null;
             plan._liveGradientMap = gradMap;
             plan._eagerFirstWriteCandidates = eagerFirstWriteCandidates;
+            if (PlanCensus.Enabled)
+                plan._census = new PlanCensus(
+                    CensusNames(forwardActionNames, forwardActions.Length),
+                    CensusNames(backwardStepNames, plan._backwardActions.Length),
+                    forwardSteps.Count);
             scope.ReleaseStorageLeases();
             return plan;
         }
