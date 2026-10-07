@@ -691,6 +691,7 @@ public class ElementWiseBenchmarks
 
     private Tensor _aiTensor1 = null!;
     private Tensor _aiTensor2 = null!;
+    private IEngine _engine = null!;
 
     private NDArray _nsVector1 = null!;
     private NDArray _nsVector2 = null!;
@@ -716,6 +717,9 @@ public class ElementWiseBenchmarks
         _aiVector1 = new AiDotNet.Tensors.LinearAlgebra.Vector<double>(_data1);
         _aiVector2 = new AiDotNet.Tensors.LinearAlgebra.Vector<double>(_data2);
 
+        // CPU against CPU, as in the TorchSharp / ML.NET / TensorFlow.NET suites: on a GPU host the
+        // module initializer would otherwise make DirectGpuTensorEngine the default.
+        _engine = new CpuEngine();
         _aiTensor1 = new Tensor((double[])_data1.Clone(), new[] { N });
         _aiTensor2 = new Tensor((double[])_data2.Clone(), new[] { N });
 
@@ -743,7 +747,7 @@ public class ElementWiseBenchmarks
     [BenchmarkCategory("Multiply")]
     public Tensor MultiplyAiDotNet()
     {
-        return AiDotNetEngine.Current.TensorMultiply(_aiTensor1, _aiTensor2);
+        return _engine.TensorMultiply(_aiTensor1, _aiTensor2);
     }
 
     #endregion
@@ -768,7 +772,7 @@ public class ElementWiseBenchmarks
     [BenchmarkCategory("Exp")]
     public Tensor ExpAiDotNet()
     {
-        return AiDotNetEngine.Current.TensorExp(_aiTensor1);
+        return _engine.TensorExp(_aiTensor1);
     }
 
     #endregion
@@ -793,7 +797,7 @@ public class ElementWiseBenchmarks
     [BenchmarkCategory("Sum")]
     public double SumAiDotNet()
     {
-        return AiDotNetEngine.Current.TensorSum(_aiTensor1);
+        return _engine.TensorSum(_aiTensor1);
     }
 
     #endregion
@@ -818,7 +822,7 @@ public class ElementWiseBenchmarks
     [BenchmarkCategory("Max")]
     public double MaxAiDotNet()
     {
-        return AiDotNetEngine.Current.TensorMaxValue(_aiTensor1);
+        return _engine.TensorMaxValue(_aiTensor1);
     }
 
     #endregion
