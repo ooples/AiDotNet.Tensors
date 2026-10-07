@@ -801,7 +801,11 @@ public class TorchSharpCpuComparisonBenchmarks
 
     [Benchmark]
     public void AiDotNet_Conv2D()
-        => AiDotNetEngine.Current.Conv2D(_aiConvInput!, _aiConvKernel!, _convStride, _convPadding, _convDilation);
+    {
+        // Pool-return the result like the other arms and like torch's `using var result`.
+        var r = AiDotNetEngine.Current.Conv2D(_aiConvInput!, _aiConvKernel!, _convStride, _convPadding, _convDilation);
+        TensorPool.Return(r);
+    }
 
     [Benchmark]
     public void AiDotNet_Conv2D_ZeroAlloc()

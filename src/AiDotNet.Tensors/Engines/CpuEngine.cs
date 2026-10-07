@@ -8690,7 +8690,10 @@ public partial class CpuEngine : ITensorLevelEngine
             // closure alloc + per-channel delegate dispatch — measured ~25 µs of pure
             // overhead on top of a ~19 µs kernel. Below the grain the direct serial inline
             // below is the fast path (no closure, fully JIT-optimized inner loop).
-            if (bc >= CpuParallelSettings.MaxDegreeOfParallelism
+            // Parallel over channel planes once the work clears the grain. This required
+            // bc >= MaxDegreeOfParallelism, i.e. 128 planes on a 128-thread host, so a 32-channel
+            // pool always ran on one thread (595 µs against libtorch's 79 µs for 1x32x64x64).
+            if (bc >= 2
                 && (long)bc * hw >= PersistentParallelExecutor.DefaultSerialGrainSize)
             {
                 CpuParallelSettings.ParallelForOrSerial(0, bc, (long)bc * hw, idx =>
@@ -8769,7 +8772,10 @@ public partial class CpuEngine : ITensorLevelEngine
             // closure alloc + per-channel delegate dispatch — measured ~25 µs of pure
             // overhead on top of a ~19 µs kernel. Below the grain the direct serial inline
             // below is the fast path (no closure, fully JIT-optimized inner loop).
-            if (bc >= CpuParallelSettings.MaxDegreeOfParallelism
+            // Parallel over channel planes once the work clears the grain. This required
+            // bc >= MaxDegreeOfParallelism, i.e. 128 planes on a 128-thread host, so a 32-channel
+            // pool always ran on one thread (595 µs against libtorch's 79 µs for 1x32x64x64).
+            if (bc >= 2
                 && (long)bc * hw >= PersistentParallelExecutor.DefaultSerialGrainSize)
             {
                 CpuParallelSettings.ParallelForOrSerial(0, bc, (long)bc * hw, idx =>
@@ -8832,10 +8838,13 @@ public partial class CpuEngine : ITensorLevelEngine
         fixed (float* pIn = inArr)
         fixed (float* pOut = outArr)
         {
-            for (int idx = 0; idx < bc; idx++)
+            IntPtr ipIn = (IntPtr)pIn;
+            IntPtr ipOut = (IntPtr)pOut;
+
+            void ProcessPlane(int idx)
             {
-                float* inBase = pIn + idx * h * w;
-                float* outBase = pOut + idx * oH * oW;
+                float* inBase = (float*)ipIn + idx * h * w;
+                float* outBase = (float*)ipOut + idx * oH * oW;
 
                 for (int oh = 0; oh < oH; oh++)
                 {
@@ -8886,6 +8895,13 @@ public partial class CpuEngine : ITensorLevelEngine
                     }
                 }
             }
+
+            // Parallel over channel planes once the work clears the grain; this kernel had no
+            // parallel path at all (see the matching comment on MaxPool2DFloat3x3NoPad).
+            if (bc >= 2 && (long)bc * h * w >= PersistentParallelExecutor.DefaultSerialGrainSize)
+                CpuParallelSettings.ParallelForOrSerial(0, bc, (long)bc * h * w, ProcessPlane);
+            else
+                for (int idx = 0; idx < bc; idx++) ProcessPlane(idx);
         }
     }
 
@@ -8935,7 +8951,10 @@ public partial class CpuEngine : ITensorLevelEngine
             // closure alloc + per-channel delegate dispatch — measured ~25 µs of pure
             // overhead on top of a ~19 µs kernel. Below the grain the direct serial inline
             // below is the fast path (no closure, fully JIT-optimized inner loop).
-            if (bc >= CpuParallelSettings.MaxDegreeOfParallelism
+            // Parallel over channel planes once the work clears the grain. This required
+            // bc >= MaxDegreeOfParallelism, i.e. 128 planes on a 128-thread host, so a 32-channel
+            // pool always ran on one thread (595 µs against libtorch's 79 µs for 1x32x64x64).
+            if (bc >= 2
                 && (long)bc * hw >= PersistentParallelExecutor.DefaultSerialGrainSize)
             {
                 CpuParallelSettings.ParallelForOrSerial(0, bc, (long)bc * hw, idx =>
@@ -43313,6 +43332,15 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> SigmoidBackward<T>(Tensor<T> gradOutput, Tensor<T> output)
     {
+        if (typeof(T) == typeof(float) && gradOutput.Length == output.Length)
+        {
+            unsafe
+            {
+                return (Tensor<T>)(object)RunPooledBinary(
+                    (Tensor<float>)(object)gradOutput, (Tensor<float>)(object)output, SigmoidBackwardPtr);
+            }
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradData = gradOutput.GetFlattenedData();
         var outData = output.GetDataArray();
@@ -43365,6 +43393,89 @@ public partial class CpuEngine : ITensorLevelEngine
         return TensorAllocator.Rent<T>(gradOutput._shape, result);
     }
 
+    private unsafe delegate void FloatBinaryKernel(float* a, float* b, float* result, int count);
+
+    /// <summary>
+    /// Runs a float binary elementwise kernel into a pooled result of <paramref name="a"/>'s shape, split
+    /// across threads at <see cref="CpuParallelSettings.ElementwiseGrainSize"/>.
+    /// </summary>
+    /// <remarks>
+    /// The activation-backward ops used to write into a fresh, unpooled array on one thread, so a
+    /// returned result could never be recycled (a 4 MB LOH allocation per 1M-element call) and the
+    /// kernel used one core: SigmoidBackward took 566 µs against libtorch's 87 µs.
+    /// </remarks>
+    private static unsafe Tensor<float> RunPooledBinary(Tensor<float> a, Tensor<float> b, FloatBinaryKernel kernel)
+    {
+        if (!a.IsContiguous) a = a.Contiguous();
+        if (!b.IsContiguous) b = b.Contiguous();
+        var result = AutoTensorCache.RentOrAllocate<float>(a._shape);
+        using var pinA = a.ReadOnlyData.Pin();
+        using var pinB = b.ReadOnlyData.Pin();
+        using var pinR = result.Data.Pin();
+        nint pa = (nint)pinA.Pointer, pb = (nint)pinB.Pointer, pr = (nint)pinR.Pointer;
+        int length = result.Length;
+        int chunks = CpuParallelSettings.ElementwiseChunkCount(length);
+        if (chunks < 2)
+        {
+            kernel((float*)pa, (float*)pb, (float*)pr, length);
+            return result;
+        }
+
+        int chunkSize = ((length + chunks - 1) / chunks + 31) & ~31;
+        CpuParallelSettings.ParallelForOrSerial(0, chunks, length, c =>
+        {
+            int start = c * chunkSize;
+            int count = Math.Min(chunkSize, length - start);
+            if (count > 0)
+                kernel((float*)pa + start, (float*)pb + start, (float*)pr + start, count);
+        }, deterministicSafe: true);
+        return result;
+    }
+
+    /// <summary><c>result = grad * s * (1 - s)</c>, with <c>s</c> the sigmoid output.</summary>
+    private static unsafe void SigmoidBackwardPtr(float* grad, float* s, float* result, int length)
+    {
+        int i = 0;
+#if NET5_0_OR_GREATER
+        if (System.Runtime.Intrinsics.X86.Fma.IsSupported)
+        {
+            var one = System.Runtime.Intrinsics.Vector256.Create(1.0f);
+            for (; i + 8 <= length; i += 8)
+            {
+                var g = System.Runtime.Intrinsics.X86.Avx.LoadVector256(grad + i);
+                var sv = System.Runtime.Intrinsics.X86.Avx.LoadVector256(s + i);
+                // g*s - g*s*s = g*s*(1 - s)
+                var gs = System.Runtime.Intrinsics.X86.Avx.Multiply(g, sv);
+                System.Runtime.Intrinsics.X86.Avx.Store(result + i,
+                    System.Runtime.Intrinsics.X86.Avx.Multiply(gs, System.Runtime.Intrinsics.X86.Avx.Subtract(one, sv)));
+            }
+        }
+#endif
+        for (; i < length; i++)
+            result[i] = grad[i] * s[i] * (1f - s[i]);
+    }
+
+    /// <summary><c>result = grad * (1 - t²)</c>, with <c>t</c> the tanh output.</summary>
+    private static unsafe void TanhBackwardPtr(float* grad, float* t, float* result, int length)
+    {
+        int i = 0;
+#if NET5_0_OR_GREATER
+        if (System.Runtime.Intrinsics.X86.Fma.IsSupported)
+        {
+            var one = System.Runtime.Intrinsics.Vector256.Create(1.0f);
+            for (; i + 8 <= length; i += 8)
+            {
+                var g = System.Runtime.Intrinsics.X86.Avx.LoadVector256(grad + i);
+                var tv = System.Runtime.Intrinsics.X86.Avx.LoadVector256(t + i);
+                var oneMinusT2 = System.Runtime.Intrinsics.X86.Fma.MultiplyAddNegated(tv, tv, one);   // 1 - t*t
+                System.Runtime.Intrinsics.X86.Avx.Store(result + i, System.Runtime.Intrinsics.X86.Avx.Multiply(g, oneMinusT2));
+            }
+        }
+#endif
+        for (; i < length; i++)
+            result[i] = grad[i] * (1f - t[i] * t[i]);
+    }
+
     private static unsafe void SigmoidBackwardFloat(float[] grad, float[] sigmoid, float[] result, int length)
     {
         // Clamp to the shortest array — grad/sigmoid may be pool-over-allocated (longer than `length`);
@@ -43408,6 +43519,15 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TanhBackward<T>(Tensor<T> gradOutput, Tensor<T> output)
     {
+        if (typeof(T) == typeof(float) && gradOutput.Length == output.Length)
+        {
+            unsafe
+            {
+                return (Tensor<T>)(object)RunPooledBinary(
+                    (Tensor<float>)(object)gradOutput, (Tensor<float>)(object)output, TanhBackwardPtr);
+            }
+        }
+
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradData = gradOutput.GetFlattenedData();
         var outData = output.GetDataArray();

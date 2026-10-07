@@ -202,6 +202,8 @@ internal sealed class PersistentParallelExecutor
     // change. Written on every Execute.
     private int _lastWorkersNeeded;
 
+    private static readonly int s_hardwareThreads = Environment.ProcessorCount;
+
     /// <summary>
     /// Runs one participant's strided chunk set: chunks <paramref name="firstChunk"/>,
     /// firstChunk+Stride, … &lt; <c>job.NumChunks</c>. In normal mode calls <c>job.Action</c> per chunk;
@@ -265,7 +267,12 @@ internal sealed class PersistentParallelExecutor
             // _numWorkers). When a dispatch saturates the machine, spinning steals the
             // core the dispatcher needs → oversubscription; park instead so the wakeup
             // overlaps the (already large, since saturating dispatches are big-work) op.
-            if (warm > 0 && System.Threading.Volatile.Read(ref _lastWorkersNeeded) < _numWorkers && !_workReady[slot].IsSet)
+            // "Saturating" is judged against the MACHINE, not the pool: the team (workers + the
+            // dispatching thread) must leave a hardware thread free. Comparing against _numWorkers made
+            // every dispatch of 33+ chunks park on hosts wider than the 32-worker pool, so the next
+            // dispatch re-woke all 32 parked workers: ~100 µs per dispatch instead of ~14 µs on a
+            // 128-thread host. On machines with no spare thread the behaviour is unchanged.
+            if (warm > 0 && System.Threading.Volatile.Read(ref _lastWorkersNeeded) + 1 < s_hardwareThreads && !_workReady[slot].IsSet)
             {
                 int spins = 0;
                 while (!_workReady[slot].IsSet)
