@@ -51,6 +51,22 @@ internal static class GotoGemmFp32
     internal static bool IsPreferredForThreadBudget(int maxDegreeOfParallelism)
         => maxDegreeOfParallelism >= 48;
 
+    /// <summary>
+    /// Smallest M-block PackBoth will cut to when it is short of parallel work; it parallelises over M
+    /// blocks only (see the Sub-G occupancy floor in <c>AutotuneDispatcher.FallbackToHeuristic</c>).
+    /// </summary>
+    internal const int PackBothMinMc = 64;
+
+    /// <summary>
+    /// True when PackBoth cannot occupy the thread budget for this M: it splits only along M, at no
+    /// fewer than <see cref="PackBothMinMc"/> rows, so a transformer-sized M of 256 yields 4 blocks and
+    /// stays at 4 threads however many cores there are. This per-tile kernel splits M and N, so on these
+    /// shapes it scales where PackBoth plateaus (#653, M256 K768 N768 at 16 threads: 2.34 ms on PackBoth
+    /// vs 1.07 ms here). Large-M GEMMs - the Conv3D backward behind the 48-thread budget gate - give
+    /// PackBoth enough blocks and are unaffected.
+    /// </summary>
+    internal static bool PackBothUnderOccupies(int m, int threadBudget)
+        => threadBudget > 1 && (m + PackBothMinMc - 1) / PackBothMinMc < threadBudget;
     /// <summary>Shape regime where the per-tile GotoBLAS path beats the PackBoth strategy (measured on the
     /// 3990X via --ab-prod): large/balanced (M≥512) OR wide-K (K≥2N, e.g. MLP-fc2). PackBoth's wide-N
     /// N-axis path wins the small-M wide-N shapes (DiT QKV M256×N3456, MLP-fc1 M256×N4608 — GotoGemm was
