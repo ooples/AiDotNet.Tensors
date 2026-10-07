@@ -4243,6 +4243,14 @@ public sealed partial class CudaBackend
         return false;
     }
 
+    /// <summary>Registry candidate entry: one row-normalization operation, gated only by shape support.</summary>
+    internal bool TryDirectPtxRowNormalizationCandidate(
+        DirectPtxRowNormalizationOperation operation, int rows, float epsilon,
+        IGpuBuffer tensor0, IGpuBuffer tensor1, IGpuBuffer? tensor2 = null, IGpuBuffer? tensor3 = null,
+        IGpuBuffer? tensor4 = null, IGpuBuffer? tensor5 = null) =>
+        TryDirectPtxRowNormalization(operation, rows, epsilon, tensor0, tensor1, tensor2, tensor3, tensor4, tensor5,
+            registryAdmitted: true);
+
     internal bool TryDirectPtxLayerNormD64(
         IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
         IGpuBuffer saveMean, IGpuBuffer saveInvVar, int rows, float epsilon) =>
@@ -4470,9 +4478,10 @@ public sealed partial class CudaBackend
         IGpuBuffer? tensor4 = null,
         IGpuBuffer? tensor5 = null,
         IGpuBuffer? tensor6 = null,
-        IGpuBuffer? tensor7 = null)
+        IGpuBuffer? tensor7 = null,
+        bool registryAdmitted = false)
     {
-        if (!IsDirectPtxRowNormalizationAdmitted(operation, rows))
+        if (!IsDirectPtxRowNormalizationAdmitted(operation, rows, registryAdmitted))
             return false;
 
         try
@@ -4530,10 +4539,24 @@ public sealed partial class CudaBackend
         }
     }
 
+    // registryAdmitted: the tuned-kernel registry is invoking this kernel as a CANDIDATE. The environment flag,
+    // the validated-architecture list and the per-shape promotion list are all stand-ins for evidence the
+    // registry gathers itself on this device (correctness against the reference, then paired timing), so they
+    // are skipped; the shape-support check still applies.
     private bool IsDirectPtxRowNormalizationAdmitted(
         DirectPtxRowNormalizationOperation operation,
-        int rows)
+        int rows,
+        bool registryAdmitted = false)
     {
+        if (registryAdmitted)
+        {
+            if (!IsAvailable || !PtxRowNormalizationD64Kernel.IsSupportedRows(rows))
+            {
+                DirectPtxLastError = "normalization-shape-not-implemented";
+                return false;
+            }
+            return true;
+        }
         if (!DirectPtxFeatureGate.IsNormalizationEnabled)
         {
             DirectPtxLastError = "normalization-feature-disabled";
