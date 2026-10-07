@@ -5,6 +5,7 @@ using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 #endif
 using AiDotNet.Tensors.Helpers;
+using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines;
 
@@ -265,21 +266,7 @@ public partial class CpuEngine
                         float* src = pg + gOff + (long)p * outPlane;
                         float* target = pd + giOff + (long)p * inPlane;
                         float* dst = accumulate ? ps : target;
-                        new Span<float>(dst, inPlane).Clear();
-                        for (int oh = 0; oh < oH; oh++)
-                        {
-                            int hs = hb[2 * oh], he = hb[2 * oh + 1];
-                            for (int ow = 0; ow < oW; ow++)
-                            {
-                                int ws = wb[2 * ow], we = wb[2 * ow + 1];
-                                float g = src[oh * oW + ow] / ((he - hs) * (we - ws));
-                                for (int ih = hs; ih < he; ih++)
-                                {
-                                    float* row = dst + ih * iW;
-                                    for (int iw = ws; iw < we; iw++) row[iw] += g;
-                                }
-                            }
-                        }
+                        AdaptiveAvgPoolBackwardPlane(src, dst, iH, iW, oH, oW, hb, wb);
                         if (accumulate)
                             for (int i = 0; i < inPlane; i++) target[i] += dst[i];
                     }
@@ -290,6 +277,91 @@ public partial class CpuEngine
                 if (accumulate) System.Buffers.ArrayPool<float>.Shared.Return(scratch);
             }
         }, deterministicSafe: true);
+    }
+
+    /// <summary>
+    /// One plane of <see cref="AdaptiveAvgPool2DBackwardFloat"/>: clears <paramref name="dst"/> ([iH, iW]) to +0, then
+    /// adds each output gradient divided by its window's element count to every cell of its window, in output order
+    /// (rows, then columns). <paramref name="hb"/> / <paramref name="wb"/> are <see cref="AdaptivePoolBins"/>.
+    /// </summary>
+    [MethodImpl(Compatibility.MethodImplHelper.Hot)]
+    private static unsafe void AdaptiveAvgPoolBackwardPlane(
+        float* src, float* dst, int iH, int iW, int oH, int oW, int* hb, int* wb)
+    {
+        new Span<float>(dst, iH * iW).Clear();
+        for (int oh = 0; oh < oH; oh++)
+        {
+            int hs = hb[2 * oh], he = hb[2 * oh + 1];
+            for (int ow = 0; ow < oW; ow++)
+            {
+                int ws = wb[2 * ow], we = wb[2 * ow + 1];
+                float g = src[oh * oW + ow] / ((he - hs) * (we - ws));
+                for (int ih = hs; ih < he; ih++)
+                {
+                    float* row = dst + ih * iW;
+                    for (int iw = ws; iw < we; iw++) row[iw] += g;
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// The backward of <c>AdaptiveAvgPool2D(ReLU(z))</c> down to <c>z</c> and the bias, for a fused conv chain whose
+    /// activation feeds only an adaptive average pool: per channel, per image, the pool gradient is spread over the
+    /// dz plane and the ReLU mask and bias reduction run over that plane while it is in cache, so the activation's
+    /// gradient is never written to memory and re-read.
+    /// </summary>
+    /// <remarks>
+    /// Bit-identical to <see cref="AdaptiveAvgPool2DBackwardFloat"/> (not accumulating) into a separate buffer
+    /// followed by <see cref="ChannelBiasActivationBackwardInto"/> with ReLU: the same per-plane code
+    /// (<see cref="AdaptiveAvgPoolBackwardPlane"/>, <see cref="ReluBiasBackwardPlane"/>), and each channel's bias sum
+    /// runs over its planes in batch order.
+    /// </remarks>
+    internal unsafe void AdaptiveAvgPoolReluBiasBackwardInto(
+        Tensor<float> gradInput, Tensor<float> gradBias, Tensor<float> gradPoolOutput, Tensor<float> activation,
+        bool accumulateBias)
+    {
+        if (gradInput == null) throw new ArgumentNullException(nameof(gradInput));
+        if (gradBias == null) throw new ArgumentNullException(nameof(gradBias));
+        if (gradPoolOutput == null) throw new ArgumentNullException(nameof(gradPoolOutput));
+        if (activation == null) throw new ArgumentNullException(nameof(activation));
+        if (activation.Rank != 4 || gradPoolOutput.Rank != 4)
+            throw new ArgumentException("AdaptiveAvgPoolReluBiasBackwardInto needs rank-4 tensors.");
+        int batch = activation._shape[0], channels = activation._shape[1];
+        int iH = activation._shape[2], iW = activation._shape[3];
+        int oH = gradPoolOutput._shape[2], oW = gradPoolOutput._shape[3];
+        if (gradPoolOutput._shape[0] != batch || gradPoolOutput._shape[1] != channels || oH <= 0 || oW <= 0
+            || iH <= 0 || iW <= 0 || gradInput.Length != activation.Length || gradBias.Length != channels)
+            throw new ArgumentException("AdaptiveAvgPoolReluBiasBackwardInto: the pool gradient, input gradient and bias gradient do not match the activation.");
+        var y = activation.GetCpuBackingForStridedRead(out int yOff);
+        var g = gradPoolOutput.GetCpuBackingForStridedRead(out int gOff);
+        var dz = gradInput.GetCpuBackingForContiguousWrite(out int dzOff);
+        var db = gradBias.GetCpuBackingForContiguousWrite(out int dbOff);
+        if (y is null || g is null || dz is null || db is null || !activation.IsContiguous || !gradPoolOutput.IsContiguous)
+            throw new ArgumentException("AdaptiveAvgPoolReluBiasBackwardInto needs contiguous CPU tensors.");
+        var hBins = AdaptivePoolBins(iH, oH);
+        var wBins = AdaptivePoolBins(iW, oW);
+        int inPlane = iH * iW, outPlane = oH * oW;
+        if (channels == 0) return;
+        CpuParallelSettings.ParallelForOrSerial(0, channels, (long)batch * channels * inPlane, [MethodImpl(Compatibility.MethodImplHelper.Hot)] (int c) =>
+        {
+            float acc = 0f;
+            fixed (float* py0 = y)
+            fixed (float* pg0 = g)
+            fixed (float* pz0 = dz)
+            fixed (int* hb = hBins)
+            fixed (int* wb = wBins)
+            {
+                for (int n = 0; n < batch; n++)
+                {
+                    int plane = n * channels + c;
+                    float* pz = pz0 + dzOff + (long)plane * inPlane;
+                    AdaptiveAvgPoolBackwardPlane(pg0 + gOff + (long)plane * outPlane, pz, iH, iW, oH, oW, hb, wb);
+                    ReluBiasBackwardPlane(pz, py0 + yOff + (long)plane * inPlane, pz, inPlane, relu: true, ref acc);
+                }
+            }
+            db[dbOff + c] = accumulateBias ? db[dbOff + c] + acc : acc;
+        });
     }
 
     /// <summary>

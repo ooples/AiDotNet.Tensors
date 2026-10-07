@@ -168,6 +168,118 @@ public class ConvBiasActivationFusionTests
         AssertBitEqual(expectedDb.AsSpan(), db.AsSpan(), "bias gradient");
     }
 
+    /// <summary>
+    /// The adaptive-average-pool + ReLU + bias backward in one pass against the pool backward into a separate buffer
+    /// followed by the ReLU/bias backward, bit for bit: overlapping windows (14 -> 4), global pooling (-> 1x1),
+    /// upsampling (3 -> 5), zero activations and bias accumulation.
+    /// </summary>
+    [Theory]
+    [InlineData(3, 4, 14, 14, 4, 4, false)]
+    [InlineData(2, 3, 7, 9, 1, 1, true)]
+    [InlineData(2, 2, 3, 3, 5, 5, false)]
+    [InlineData(2, 3, 5, 7, 3, 2, true)]
+    public void AdaptiveAvgPoolReluBiasBackwardMatchesSeparateOps(int n, int c, int h, int w, int oh, int ow, bool accumulateBias)
+    {
+        var engine = new CpuEngine();
+        var y = Rnd(new[] { n, c, h, w }, 41);
+        for (int i = 0; i < y.Length; i++) if (y[i] < 0) y[i] = 0f;   // a ReLU output, about half zeros
+        var gPool = Rnd(new[] { n, c, oh, ow }, 42);
+        gPool[0] = -0f;
+        var priorDb = Rnd(new[] { c }, 43);
+
+        var gradY = new float[y.Length];
+        CpuEngine.AdaptiveAvgPool2DBackwardFloat(gPool.GetDataArray(), 0, gradY, 0, n * c, h, w, oh, ow, accumulate: false);
+        var gradYT = new Tensor<float>(y._shape, new Vector<float>(gradY));
+        var expectedDz = new Tensor<float>(y._shape);
+        var expectedDb = new Tensor<float>(new[] { c });
+        priorDb.AsSpan().CopyTo(expectedDb.AsWritableSpan());
+        engine.ChannelBiasActivationBackwardInto(expectedDz, expectedDb, gradYT, y, true, accumulateBias);
+
+        var dz = new Tensor<float>(y._shape);
+        for (int i = 0; i < dz.Length; i++) dz[i] = 77f;
+        var db = new Tensor<float>(new[] { c });
+        priorDb.AsSpan().CopyTo(db.AsWritableSpan());
+        engine.AdaptiveAvgPoolReluBiasBackwardInto(dz, db, gPool, y, accumulateBias);
+        AssertBitEqual(expectedDz.AsSpan(), dz.AsSpan(), "pre-activation gradient");
+        AssertBitEqual(expectedDb.AsSpan(), db.AsSpan(), "bias gradient");
+    }
+
+    /// <summary>
+    /// Conv -> bias -> ReLU -> AdaptiveAvgPool2D -> dense: the plan with the adaptive pool's backward folded into the
+    /// conv chain's, against it kept separate (bit for bit, two steps) and against the eager tape.
+    /// </summary>
+    [Fact]
+    public void AdaptiveAvgPoolFusedPlanMatchesUnfusedAndTape()
+    {
+        var priorEngine = AiDotNetEngine.Current;
+        var priorFlag = Environment.GetEnvironmentVariable("AIDOTNET_CONV_POOL_BACKWARD_FUSION");
+        AiDotNetEngine.Current = new CpuEngine();
+        var x = Rnd(new[] { 3, 2, 9, 9 }, 51);
+        var k = Rnd(new[] { 4, 2, 3, 3 }, 52, 0.5f);
+        var b = Rnd(new[] { 4 }, 53, 0.2f);
+        var wt = Rnd(new[] { 16, 3 }, 54, 0.5f);
+        var coef = Rnd(new[] { 3, 3 }, 55);
+        var parameters = new[] { k, b, wt };
+        Tensor<float> Forward(IEngine e)
+        {
+            var h = e.ReLU(e.TensorChannelBiasAdd(e.Conv2D(x, k, 1, 1, 1), b));
+            h = e.AdaptiveAvgPool2D(h, 2, 2);
+            var logits = e.TensorMatMul(e.Reshape(h, new[] { 3, 16 }), wt);
+            return e.ReduceSum(e.TensorMultiply(logits, coef), null);
+        }
+        float[][] Run(bool fusePool, int steps)
+        {
+            Environment.SetEnvironmentVariable("AIDOTNET_CONV_POOL_BACKWARD_FUSION", fusePool ? null : "0");
+            ICompiledTrainingPlan<float> plan;
+            using (var scope = GraphMode.Enable())
+            {
+                Forward(new CpuEngine());
+                plan = scope.CompileTraining(parameters);
+            }
+            try
+            {
+                float[][] grads = Array.Empty<float[]>();
+                for (int s = 0; s < steps; s++)
+                {
+                    plan.Step();
+                    grads = Array.ConvertAll(plan.Gradients, g => g.AsSpan().ToArray());
+                }
+                return grads;
+            }
+            finally
+            {
+                plan.Dispose();
+            }
+        }
+        try
+        {
+            float[][] tape;
+            using (var t = new GradientTape<float>())
+            {
+                var loss = Forward(new CpuEngine());
+                var g = t.ComputeGradients(loss, parameters);
+                tape = Array.ConvertAll(parameters, p => g[p].GetFlattenedData());
+            }
+            var firstStep = Run(fusePool: true, steps: 1);
+            for (int p = 0; p < tape.Length; p++)
+                for (int i = 0; i < tape[p].Length; i++)
+                    Assert.True(Math.Abs(tape[p][i] - firstStep[p][i]) <= 1e-4f * (1f + Math.Abs(tape[p][i])),
+                        $"parameter {p} element {i}: tape {tape[p][i]:R} plan {firstStep[p][i]:R}");
+            for (int steps = 1; steps <= 2; steps++)
+            {
+                var separate = Run(fusePool: false, steps);
+                var fused = Run(fusePool: true, steps);
+                for (int p = 0; p < separate.Length; p++)
+                    AssertBitEqual(separate[p], fused[p], $"after {steps} step(s), parameter {p}");
+            }
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("AIDOTNET_CONV_POOL_BACKWARD_FUSION", priorFlag);
+            AiDotNetEngine.Current = priorEngine;
+        }
+    }
+
     /// <summary>The compiled plan with the pool backward folded into the conv chain's, against it kept separate.</summary>
     [Theory]
     [InlineData(false)]

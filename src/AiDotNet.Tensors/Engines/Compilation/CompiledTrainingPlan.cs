@@ -7010,8 +7010,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             if (convEpilogueBackwardSpecs.TryGetValue(i, out var convEpilogueBwd))
             {
                 backwardActions.Add(convEpilogueBwd);
-                backwardStepNames.Add("fused:Conv2D+ChannelBias" + (step.OpType == OpType.MaxPool2D ? "+ReLU+MaxPool2D"
-                    : step.OpType == OpType.ReLU ? "+ReLU" : ""));
+                backwardStepNames.Add("fused:Conv2D+ChannelBias" + (step.OpType == OpType.ReLU ? "+ReLU"
+                    : step.OpName == "TensorChannelBiasAdd" ? "" : "+ReLU+" + step.OpName));
                 continue;
             }
             if (consumedByConvEpilogue.Contains(i))
@@ -11492,14 +11492,28 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             // its geometry): the pool's backward joins the chain's, so each plane's pool gradient is scattered,
             // ReLU-masked and bias-reduced in one pass and the activation gradient (gradY) is never written. The
             // pool's forward stays its own action; the chain's backward then runs at the pool's position.
+            // An adaptive average pool joins the same way (e.g. a final ReLU feeding global average pooling).
             int poolIdx = -1, poolH = 0, poolW = 0;
+            bool poolIsAdaptiveAvg = false;
             Tensor<float>? gradPoolOutF = null;
             if (relu && poolBackwardFusion && y.Rank == 4 && y.IsContiguous
                 && soleConsumer.TryGetValue(y, out int candidatePool) && candidatePool > last
                 && !consumed.Contains(candidatePool))
             {
                 var pool = steps[candidatePool];
-                if (pool.OpType == OpType.MaxPool2D && pool.Inputs.Length == 1 && ReferenceEquals(pool.Inputs[0], y)
+                if (pool.OpName == "AdaptiveAvgPool2D" && pool.Inputs.Length == 1 && ReferenceEquals(pool.Inputs[0], y)
+                    && pool.SavedState is { Length: 2 } aapGeometry
+                    && aapGeometry[0] is int aapH && aapGeometry[1] is int aapW && aapH > 0 && aapW > 0
+                    && pool.OutputBuffer.Rank == 4
+                    && pool.OutputBuffer._shape[2] == aapH && pool.OutputBuffer._shape[3] == aapW
+                    && gradMap.TryGetValue(pool.OutputBuffer, out var gradAapOut) && gradAapOut.IsContiguous
+                    && !distinct.Contains(gradAapOut))
+                {
+                    poolIdx = candidatePool;
+                    poolIsAdaptiveAvg = true;
+                    gradPoolOutF = (Tensor<float>)(object)gradAapOut;
+                }
+                else if (pool.OpType == OpType.MaxPool2D && pool.Inputs.Length == 1 && ReferenceEquals(pool.Inputs[0], y)
                     && pool.SavedState is { Length: 2 } poolGeometry
                     && poolGeometry[0] is int[] { Length: 2 } poolSize && poolGeometry[1] is int[] { Length: 2 } poolStride
                     && poolSize[0] > 0 && poolSize[1] > 0 && poolSize[0] == poolStride[0] && poolSize[1] == poolStride[1]
@@ -11560,7 +11574,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             {
                 if (eng is CpuEngine cpu && !eng.SupportsGpu)
                 {
-                    if (gradPoolOutF is not null)
+                    if (gradPoolOutF is not null && poolIsAdaptiveAvg)
+                        cpu.AdaptiveAvgPoolReluBiasBackwardInto(gradConvOutF, gradBiasF, gradPoolOutF, yF, accumBias);
+                    else if (gradPoolOutF is not null)
                         cpu.MaxPoolReluBiasBackwardInto(gradConvOutF, gradBiasF, gradPoolOutF, yF, poolH, poolW, accumBias);
                     else
                         cpu.ChannelBiasActivationBackwardInto(gradConvOutF, gradBiasF, gradYF, yF, relu, accumBias);
