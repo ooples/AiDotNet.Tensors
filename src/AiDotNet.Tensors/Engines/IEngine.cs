@@ -5548,6 +5548,25 @@ public interface IEngine
     Tensor<T> LayerNorm<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance);
 
     /// <summary>
+    /// Layer normalization into a pre-allocated destination, for inference.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="destination">Receives the normalized tensor; must have the input's shape.</param>
+    /// <param name="input">The input tensor.</param>
+    /// <param name="gamma">Scale parameter; its shape names the trailing dimensions normalized over.</param>
+    /// <param name="beta">Shift parameter with the same shape as gamma.</param>
+    /// <param name="epsilon">Small constant for numerical stability.</param>
+    /// <remarks>
+    /// <para>
+    /// Computes the same values as <see cref="LayerNorm{T}"/> without allocating the output or the
+    /// per-row mean and variance tensors. Nothing is recorded on the gradient tape, so use
+    /// <see cref="LayerNorm{T}"/> when training. <paramref name="destination"/> may be
+    /// <paramref name="input"/> itself.
+    /// </para>
+    /// </remarks>
+    void LayerNormInto<T>(Tensor<T> destination, Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon);
+
+    /// <summary>
     /// Computes the backward pass for layer normalization on tensors of any rank.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>

@@ -25885,6 +25885,65 @@ public partial class CpuEngine : ITensorLevelEngine
         int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_LN_PARALLEL_MINROWS"), out var lnr) && lnr > 0
             ? lnr : 2048;
 
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Float writes through the same one-pass SIMD kernel as <see cref="LayerNorm{T}"/>, with the
+    /// per-row statistics in pooled scratch. Other element types, and a destination that is an offset
+    /// view, compute through <see cref="LayerNorm{T}"/> and copy.
+    /// </remarks>
+    public virtual void LayerNormInto<T>(Tensor<T> destination, Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon)
+    {
+        if (destination is null) throw new ArgumentNullException(nameof(destination));
+        if (input is null) throw new ArgumentNullException(nameof(input));
+        if (gamma is null) throw new ArgumentNullException(nameof(gamma));
+        if (beta is null) throw new ArgumentNullException(nameof(beta));
+        if (!ShapesMatch(destination._shape, input._shape))
+        {
+            throw new ArgumentException(
+                $"Destination shape [{string.Join(", ", destination._shape)}] must match the input shape [{string.Join(", ", input._shape)}].",
+                nameof(destination));
+        }
+        int normalizedDims = gamma._shape.Length;
+        int inputRank = input._shape.Length;
+        if (normalizedDims > inputRank)
+            throw new ArgumentException($"Gamma shape ({string.Join(", ", gamma._shape)}) has more dimensions than input shape ({string.Join(", ", input._shape)})");
+        for (int i = 0; i < normalizedDims; i++)
+        {
+            if (gamma._shape[i] != input._shape[inputRank - normalizedDims + i])
+                throw new ArgumentException($"Gamma shape ({string.Join(", ", gamma._shape)}) does not match the last {normalizedDims} dimensions of input shape ({string.Join(", ", input._shape)})");
+        }
+        if (!ShapesMatch(beta._shape, gamma._shape))
+            throw new ArgumentException($"Beta shape ({string.Join(", ", beta._shape)}) must match gamma shape ({string.Join(", ", gamma._shape)}).", nameof(beta));
+
+        if (typeof(T) == typeof(float) && destination.IsContiguous && destination._storageOffset == 0)
+        {
+            int featureSize = gamma.Length;
+            int batchSize = featureSize == 0 ? 0 : input.Length / featureSize;
+            var fInput = (float[])(object)input.GetReadOnlyDataArray();
+            var fGamma = (float[])(object)gamma.GetReadOnlyDataArray();
+            var fBeta = (float[])(object)beta.GetReadOnlyDataArray();
+            var fOutput = (float[])(object)destination.GetDataArray();
+            var fMean = ArrayPool<float>.Shared.Rent(Math.Max(1, batchSize));
+            var fVar = ArrayPool<float>.Shared.Rent(Math.Max(1, batchSize));
+            try
+            {
+                ProcessBatchesSimd(fInput, fGamma, fBeta, fOutput, fMean, fVar, batchSize, featureSize, (float)epsilon);
+            }
+            finally
+            {
+                ArrayPool<float>.Shared.Return(fMean);
+                ArrayPool<float>.Shared.Return(fVar);
+            }
+            return;
+        }
+
+        Tensor<T> result;
+        using (new NoGradScope<T>())
+        {
+            result = LayerNorm(input, gamma, beta, epsilon, out _, out _);
+        }
+        result.AsSpan().CopyTo(destination.AsWritableSpan());
+    }
     private static void ProcessBatchesSimd(
         float[] fInput, float[] fGamma, float[] fBeta,
         float[] fOutput, float[] fMean, float[] fVar,

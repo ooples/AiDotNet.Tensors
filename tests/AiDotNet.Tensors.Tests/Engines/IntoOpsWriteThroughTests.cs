@@ -186,6 +186,63 @@ public class IntoOpsWriteThroughTests
         Assert.Throws<ArgumentException>(() => _engine.SoftmaxInto(wrong, x, -1));
     }
 
+    [Theory]
+    [InlineData(new[] { 6, 32 }, new[] { 32 })]
+    [InlineData(new[] { 2, 4, 8 }, new[] { 4, 8 })]
+    [InlineData(new[] { 3, 5, 7 }, new[] { 7 })]
+    public void LayerNormInto_MatchesLayerNorm(int[] inputShape, int[] gammaShape)
+    {
+        var x = Random(inputShape, 23);
+        var gamma = Random(gammaShape, 24);
+        var beta = Random(gammaShape, 25);
+        var expected = _engine.LayerNorm(x, gamma, beta, 1e-5, out _, out _);
+        var destination = new Tensor<float>(inputShape);
+
+        _engine.LayerNormInto(destination, x, gamma, beta, 1e-5);
+
+        AssertSame(expected, destination);
+    }
+
+    [Fact]
+    public void LayerNormInto_InPlace_MatchesLayerNorm()
+    {
+        var x = Random(new[] { 4, 16 }, 26);
+        var gamma = Random(new[] { 16 }, 27);
+        var beta = Random(new[] { 16 }, 28);
+        var expected = _engine.LayerNorm(x, gamma, beta, 1e-5, out _, out _);
+
+        _engine.LayerNormInto(x, x, gamma, beta, 1e-5);
+
+        AssertSame(expected, x);
+    }
+
+    [Fact]
+    public void LayerNormInto_Double_MatchesLayerNorm()
+    {
+        var x = new Tensor<double>(new[] { 3, 5 });
+        var gamma = new Tensor<double>(new[] { 5 });
+        var beta = new Tensor<double>(new[] { 5 });
+        for (int i = 0; i < x.Length; i++) x[i] = 0.7 * i - 3.0;
+        for (int i = 0; i < 5; i++) { gamma[i] = 1.0 + 0.1 * i; beta[i] = -0.2 * i; }
+        var expected = _engine.LayerNorm(x, gamma, beta, 1e-5, out _, out _);
+        var destination = new Tensor<double>(new[] { 3, 5 });
+
+        _engine.LayerNormInto(destination, x, gamma, beta, 1e-5);
+
+        for (int i = 0; i < x.Length; i++) Assert.Equal(expected[i], destination[i], 12);
+    }
+
+    [Fact]
+    public void LayerNormInto_RejectsADestinationOfTheWrongShape()
+    {
+        var x = Random(new[] { 4, 16 }, 29);
+        var gamma = Random(new[] { 16 }, 30);
+        var beta = Random(new[] { 16 }, 31);
+
+        Assert.Throws<ArgumentException>(() =>
+            _engine.LayerNormInto(new Tensor<float>(new[] { 4, 15 }), x, gamma, beta, 1e-5));
+    }
+
 #if NET5_0_OR_GREATER
     [Fact]
     public void IntoOps_DoNotAllocateTheirResult()
@@ -217,6 +274,10 @@ public class IntoOpsWriteThroughTests
         Assert.True(AllocatedBy(() => _engine.MatMulInto(scores, q, kT)) < budget, "MatMulInto allocated its result");
         Assert.True(AllocatedBy(() => _engine.TransposeInto(xT, x, new[] { 1, 0 })) < budget, "TransposeInto allocated its result");
         Assert.True(AllocatedBy(() => _engine.ConcatInto(both, new[] { x, x }, 1)) < budget, "ConcatInto allocated its result");
+        var gamma = Random(new[] { 768 }, 32);
+        var beta = Random(new[] { 768 }, 33);
+        var normalized = new Tensor<float>(new[] { 256, 768 });
+        Assert.True(AllocatedBy(() => _engine.LayerNormInto(normalized, x, gamma, beta, 1e-5)) < budget, "LayerNormInto allocated its result");
     }
 
     private static long AllocatedBy(Action op)
