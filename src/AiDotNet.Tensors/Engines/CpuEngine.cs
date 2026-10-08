@@ -2983,6 +2983,26 @@ public partial class CpuEngine : ITensorLevelEngine
             goto batchDone;
         }
 
+        // float64: one sequential AVX GEMM per slice inside the batch-parallel loop -- the float tier's
+        // SgemmSequential pattern. The generic body below issues a full TryGemm dispatch per slice (with its own
+        // parallelism nested inside this loop); at small attention slices (e.g. a double model's 24x24 scores)
+        // that per-call overhead was the whole cost.
+        if (typeof(T) == typeof(double))
+        {
+            var aD = (double[])(object)aData;
+            var bD = (double[])(object)bData;
+            var rD = (double[])(object)rData;
+            Helpers.CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)batchSize * m * n * k, batch =>
+            {
+                Simd.SimdGemm.DgemmSequential(
+                    aD.AsSpan(batch * matrixSizeA, matrixSizeA),
+                    bD.AsSpan(batch * matrixSizeB, matrixSizeB),
+                    rD.AsSpan(batch * matrixSizeResult, matrixSizeResult),
+                    m, k, n);
+            }, deterministicSafe: true);
+            goto batchDone;
+        }
+
         long generalBatchWork = (long)batchSize * m * n * k;
         Helpers.CpuParallelSettings.ParallelForOrSerial(0, batchSize, generalBatchWork, batch =>
         {
