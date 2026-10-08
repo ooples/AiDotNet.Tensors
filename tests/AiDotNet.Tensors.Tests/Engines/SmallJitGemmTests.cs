@@ -30,7 +30,7 @@ public class SmallJitGemmTests
     public async Task MatchesDoubleProduct(int m, int k, int n, bool transA, bool transB)
     {
         await Task.Yield();
-        var rng = new Random(m * 31 + k * 7 + n);
+        var rng = AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(m * 31 + k * 7 + n);
         // A is stored [k, m] when transposed, else [m, k]; B is stored [n, k] when transposed, else [k, n].
         var a = new float[m * k];
         var b = new float[k * n];
@@ -43,7 +43,10 @@ public class SmallJitGemmTests
 #if !NET471
         // Every shape here is inside a route's band: where the panel kernel exists, the route must engage (a silent
         // decline would pass the comparison below vacuously).
-        if (JitGemmAvx2.Available) Assert.True(ran, "the small-K route declined an in-band shape");
+        // Each route has its own switch (AIDOTNET_JIT_SMALLK, and AIDOTNET_JIT_SPLITK for A transposed); a disabled
+        // route declines by design, so the assertion holds only where every switch on the shape's route is on.
+        bool routeEnabled = SimdGemm.JitSmallKEnabled && (!transA || SimdGemm.SplitKTransAEnabled);
+        if (JitGemmAvx2.Available && routeEnabled) Assert.True(ran, "the small-K route declined an in-band shape");
 #endif
         if (!ran)
         {
@@ -75,7 +78,7 @@ public class SmallJitGemmTests
     {
         await Task.Yield();
         const int rows = 2048, inF = 64, outF = 128;
-        var rng = new Random(5);
+        var rng = AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(5);
         Tensor<float> Make(params int[] shape)
         {
             int len = 1; foreach (var d in shape) len *= d;

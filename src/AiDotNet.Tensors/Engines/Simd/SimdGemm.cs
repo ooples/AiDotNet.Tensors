@@ -259,6 +259,12 @@ internal static partial class SimdGemm
     {
 #if !NET471
         if (!_jitSmallK || !JitGemmAvx2.Available || m <= 0 || n <= 0 || k <= 0) return false;
+        // Same operand contract as every other entry here: the paths below slice, index and hand raw spans to the
+        // native kernel, so a short buffer must be rejected before any of that.
+        if (a is null) throw new ArgumentNullException(nameof(a));
+        if (b is null) throw new ArgumentNullException(nameof(b));
+        if (c is null) throw new ArgumentNullException(nameof(c));
+        ValidateGemmOperands(a.Length, lda, transA, b.Length, ldb, transB, c.Length, m, k, n);
         if (!transA && !transB)
             return lda == k && ldb == n && TryJitSmallK(a.AsSpan(0, m * k), b.AsSpan(0, k * n), c.AsSpan(0, m * n), m, n, k);
 
@@ -361,6 +367,12 @@ internal static partial class SimdGemm
 #endif
     private static readonly bool s_splitKTransA =
         System.Environment.GetEnvironmentVariable("AIDOTNET_JIT_SPLITK") != "0";
+
+    /// <summary>Whether the small-K routes of <see cref="TryGemmSmallJit"/> are switched on (AIDOTNET_JIT_SMALLK).</summary>
+    internal static bool JitSmallKEnabled => _jitSmallK;
+
+    /// <summary>Whether its split-k transposed-A route is switched on (AIDOTNET_JIT_SPLITK).</summary>
+    internal static bool SplitKTransAEnabled => s_splitKTransA;
     private const int SplitKMaxOutput = 512;
 
     // Transposed-B operand ceiling for TryGemmSmallJit (elements): the transpose is a per-call copy of the small side.
