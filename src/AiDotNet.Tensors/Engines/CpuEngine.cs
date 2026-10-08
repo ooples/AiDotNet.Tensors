@@ -15171,24 +15171,33 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 int padHt = (kernelHeight - 1) - padH;
                 int padWt = (kernelWidth - 1) - padW;
-                if (strideH == 1 && strideW == 1 && dilationH == 1 && dilationW == 1
+                // Small output planes (deep layers) take the batched im2col path below instead: the transposed conv
+                // there is a [B*colW]-wide GEMM, measured 2.2 ms against 5.3 ms at 256 channels on 8x8.
+                bool smallPlane = outputHeight * outputWidth <= ConvBackwardInputBatchedMaxPlane
+                    && UseBatchedConvBackward(batch, inChannels * kernelHeight * kernelWidth, outputHeight * outputWidth, outChannels);
+                if (!smallPlane && strideH == 1 && strideW == 1 && dilationH == 1 && dilationW == 1
                     && padHt >= 0 && padWt >= 0 && padHt == padWt)
                 {
                     int kHWf = kernelHeight * kernelWidth;
                     var gradOutFloat = (Tensor<float>)(object)gradOutput;
-                    var flippedKernel = new Tensor<float>(new[] { inChannels, outChannels, kernelHeight, kernelWidth });
+                    // Rented, not allocated: at 512 channels the flipped 3x3 kernel is 9.4 MB, a large-object-heap
+                    // allocation per backward call that cost more than the transposed conv itself.
+                    var flippedKernel = Helpers.AutoTensorCache.RentOrAllocate<float>(new[] { inChannels, outChannels, kernelHeight, kernelWidth });
                     var flippedF = (float[])(object)flippedKernel._storage.GetDataArray();
+                    int flippedOff = flippedKernel._storageOffset;
                     var kernelFlip = (float[])(object)kernel.GetFlattenedData();
-                    for (int oc = 0; oc < outChannels; oc++)
-                        for (int ic = 0; ic < inChannels; ic++)
+                    CpuParallelSettings.ParallelForOrSerial(0, inChannels, (long)inChannels * outChannels * kHWf, ic =>
+                    {
+                        for (int oc = 0; oc < outChannels; oc++)
                         {
                             int kBase = oc * inChannels * kHWf + ic * kHWf;
-                            int fBase = ic * outChannels * kHWf + oc * kHWf;
+                            int fBase = flippedOff + ic * outChannels * kHWf + oc * kHWf;
                             for (int kh = 0; kh < kernelHeight; kh++)
                                 for (int kw = 0; kw < kernelWidth; kw++)
                                     flippedF[fBase + kh * kernelWidth + kw] =
                                         kernelFlip[kBase + (kernelHeight - 1 - kh) * kernelWidth + (kernelWidth - 1 - kw)];
                         }
+                    }, deterministicSafe: true);
                     var destFused = (float[])(object)dest._storage.GetDataArray();
                     int destOffFused = dest._storageOffset;
                     int totalFused = batch * inChannels * height * width;
@@ -15218,6 +15227,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         var fusedF = (float[])(object)fusedResult.GetFlattenedData();
                         for (int i = 0; i < totalFused; i++) destFused[destOffFused + i] += fusedF[i];
                     }
+                    Helpers.AutoTensorCache.Return(flippedKernel);
                     return;
                 }
             }
@@ -15237,6 +15247,14 @@ public partial class CpuEngine : ITensorLevelEngine
                 Array.Clear(destF, destOff, batch * inChannels * height * width);
             var gradOutputF = (float[])(object)gradOutput.GetFlattenedData();
             var kernelF = (float[])(object)kernel.GetFlattenedData();
+            if (UseBatchedConvBackward(batch, colH, colW, outChannels))
+            {
+                Conv2DBackwardInputBatchedFloat(
+                    destF, destOff, gradOutputF, kernelF,
+                    batch, inChannels, height, width, outChannels, kernelHeight, kernelWidth,
+                    strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth);
+                return;
+            }
             var pool = System.Buffers.ArrayPool<float>.Shared;
             // #639: rent the transposed-kernel scratch instead of `new float[]` per call.
             // Its size is fixed per layer (only the contents change each step), and the
@@ -16313,6 +16331,15 @@ public partial class CpuEngine : ITensorLevelEngine
                 return;
             }
 #endif
+            if (UseBatchedConvBackward(batch, inChannels * kernelHeight * kernelWidth, outputHeight * outputWidth, outChannels))
+            {
+                Conv2DBackwardKernelBatchedFloat(
+                    (float[])(object)dest._storage.GetDataArray(), dest._storageOffset, accumulate,
+                    (float[])(object)gradOutput.GetFlattenedData(), (float[])(object)input.GetFlattenedData(),
+                    batch, inChannels, height, width, outChannels, kernelHeight, kernelWidth,
+                    strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth);
+                return;
+            }
             int colH = inChannels * kernelHeight * kernelWidth;
             int colW = outputHeight * outputWidth;
             int totalLen = outChannels * colH;
