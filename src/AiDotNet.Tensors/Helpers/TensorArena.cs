@@ -176,7 +176,7 @@ public sealed class TensorArena : IDisposable
     /// <summary>Bytes per MiB, used to render byte counters in the diagnostic messages.</summary>
     private const double BytesPerMiB = 1024.0 * 1024.0;
 
-    private static Array? RentPersistent(Type type, int elementCount)
+    private static Array? RentPersistent(Type type, int elementCount, bool zero = true)
     {
         if (elementCount < PersistThresholdElems) return null;
         var pool = _persistent;
@@ -196,11 +196,31 @@ public sealed class TensorArena : IDisposable
             // anyway — we just skip the allocation + GC. Without this, the
             // cross-arena reuse corrupts those consumers (caught by GroupNorm
             // correctness tests).
-            Array.Clear(arr, 0, arr.Length);
+            if (zero) ClearLarge(arr);
             HostSync.ClearReleased(arr);   // new owner: no inherited release mark
             return arr;
         }
         return null;
+    }
+
+    // Elements per parallel chunk when clearing a recycled buffer (1 MiB of float).
+    private const int ParallelClearChunk = 256 * 1024;
+
+    /// <summary>
+    /// Zeroes a recycled buffer. Step-sized buffers (a [tokens, vocab] logits tensor is ~200 MB) were cleared with
+    /// one serial memset per rent -- ~10% of a CPU LM training step -- so buffers spanning several chunks are cleared
+    /// in parallel fixed chunks. Same result, every element zero.
+    /// </summary>
+    private static void ClearLarge(Array arr)
+    {
+        int length = arr.Length;
+        int chunks = (length + ParallelClearChunk - 1) / ParallelClearChunk;
+        if (chunks < 4) { Array.Clear(arr, 0, length); return; }
+        CpuParallelSettings.ParallelForOrSerial(0, chunks, length, c =>
+        {
+            int start = c * ParallelClearChunk;
+            Array.Clear(arr, start, Math.Min(ParallelClearChunk, length - start));
+        }, deterministicSafe: true);
     }
 
     private static void ReturnPersistent(Type type, int elementCount, Array arr)
@@ -682,6 +702,9 @@ public sealed class TensorArena : IDisposable
         }
 
         int cursor = _cursor[key];
+        // Skip arrays a finished step handed to its caller (see ResetKeeping); they are still in use.
+        if (_heldOver is not null)
+            while (cursor < bucket.Count && _heldOver.Contains(bucket[cursor])) cursor++;
 
         if (cursor < bucket.Count)
         {
@@ -775,6 +798,10 @@ public sealed class TensorArena : IDisposable
                 && _tensorRing[i] is List<object> bucket)
             {
                 int cursor = _tensorRingCursors![i];
+                // Skip wrappers a finished step handed to its caller (see ResetKeeping); they are still in use, and
+                // reissuing one would reshape and overwrite a tensor the caller holds.
+                if (_heldOver is not null)
+                    while (cursor < bucket.Count && _heldOver.Contains(bucket[cursor])) cursor++;
                 if (cursor < bucket.Count)
                 {
                     _tensorRingCursors[i] = cursor + 1;
@@ -790,7 +817,7 @@ public sealed class TensorArena : IDisposable
                     // the normal zero-allocation reuse path below remains unchanged.
                     if (cached.IsDisposed)
                     {
-                        var replacementArray = RentPersistent(typeof(T), totalSize) as T[] ?? new T[totalSize];
+                        var replacementArray = RentPersistent(typeof(T), totalSize, zero: false) as T[] ?? new T[totalSize];
                         _ringBackingArrays.Add((typeof(T), totalSize, replacementArray));
                         TrackBackingBytes<T>(totalSize);
                         cached = LinearAlgebra.Tensor<T>.FromMemory(
@@ -816,7 +843,7 @@ public sealed class TensorArena : IDisposable
                 // Need one more tensor of this size — reuse a persistent-pool
                 // backing array if available (ring tensors are uninitialized:
                 // the caller overwrites every element, so no clear needed).
-                var newArr = RentPersistent(typeof(T), totalSize) as T[] ?? new T[totalSize];
+                var newArr = RentPersistent(typeof(T), totalSize, zero: false) as T[] ?? new T[totalSize];
                 _ringBackingArrays.Add((typeof(T), totalSize, newArr));
                 TrackBackingBytes<T>(totalSize);
                 var newTensor = LinearAlgebra.Tensor<T>.FromMemory(new Memory<T>(newArr, 0, totalSize), shape);
@@ -829,7 +856,7 @@ public sealed class TensorArena : IDisposable
         // New size — add slot
         if (_tensorRingCount < MaxTensorRingSlots)
         {
-            var arr = RentPersistent(typeof(T), totalSize) as T[] ?? new T[totalSize];
+            var arr = RentPersistent(typeof(T), totalSize, zero: false) as T[] ?? new T[totalSize];
             _ringBackingArrays.Add((typeof(T), totalSize, arr));
             TrackBackingBytes<T>(totalSize);
             var tensor = LinearAlgebra.Tensor<T>.FromMemory(new Memory<T>(arr, 0, totalSize), shape);
@@ -910,6 +937,54 @@ public sealed class TensorArena : IDisposable
 
         Reset();
         return LinearAlgebra.Tensor<T>.FromMemory(new Memory<T>(buf, 0, total), shape);
+    }
+
+    // Outputs a finished step handed to its caller (a tape's returned gradients), as backing arrays and tensor
+    // wrappers. Reuse skips them until the NEXT step boundary replaces the set, so they stay valid for one step.
+    private HashSet<object>? _heldOver;
+
+    // Backing arrays a disposed step-owned arena withheld from the cross-arena pool for the same reason, returned to
+    // that pool at the next step boundary on this thread.
+    [ThreadStatic] private static List<(Type Type, int Size, Array Arr)>? t_withheldFromPool;
+
+    /// <summary>
+    /// Ends a step like <see cref="Reset"/>, except that <paramref name="keep"/>, the arrays and tensor wrappers the
+    /// step handed to its caller, are not reissued until the next step boundary.
+    /// </summary>
+    /// <remarks>
+    /// A tape's returned gradients are arena memory, and an optimizer step, a weight clip or gradient logging after
+    /// the tape's scope rents from the arena again. Without this the very next rent of the same size could be handed
+    /// the gradient, reshaped and overwritten in place (issue #1031). Holding them for exactly one step keeps the
+    /// steady state allocation-free: the next step's own outputs take other slots, and these return to the rotation
+    /// when that step ends.
+    /// </remarks>
+    internal void ResetKeeping(HashSet<object>? keep)
+    {
+        _heldOver = keep is { Count: > 0 } ? keep : null;
+        Reset();
+    }
+
+    /// <summary>
+    /// Disposes a step-owned arena like <see cref="Dispose"/>, except that the backing arrays in
+    /// <paramref name="keep"/> are withheld from the cross-arena pool until the next step boundary on this thread.
+    /// </summary>
+    internal void DisposeKeeping(HashSet<object>? keep)
+    {
+        var previous = t_withheldFromPool;
+        t_withheldFromPool = null;
+        if (previous is not null)
+            foreach (var (type, size, arr) in previous) ReturnPersistent(type, size, arr);
+        _heldOver = keep is { Count: > 0 } ? keep : null;
+        Dispose();
+    }
+
+    // Returns an array to the cross-arena pool unless the finished step's caller still holds it.
+    private void ReturnPersistentUnlessHeld(Type type, int size, Array arr)
+    {
+        if (_heldOver is not null && _heldOver.Contains(arr))
+            (t_withheldFromPool ??= new List<(Type, int, Array)>()).Add((type, size, arr));
+        else
+            ReturnPersistent(type, size, arr);
     }
 
     /// <summary>
@@ -1004,12 +1079,12 @@ public sealed class TensorArena : IDisposable
                 var (type, size) = kvp.Key;
                 var bucket = kvp.Value;
                 for (int i = 0; i < bucket.Count; i++)
-                    ReturnPersistent(type, size, bucket[i]);
+                    ReturnPersistentUnlessHeld(type, size, bucket[i]);
             }
             for (int i = 0; i < _ringBackingArrays.Count; i++)
             {
                 var (type, size, arr) = _ringBackingArrays[i];
-                ReturnPersistent(type, size, arr);
+                ReturnPersistentUnlessHeld(type, size, arr);
             }
             // Return the last boundary-carry buffer (#1824). By Dispose the final layer has
             // consumed it and the model output is a fresh detached copy, so the carry is dead.

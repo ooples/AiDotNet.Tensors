@@ -49,6 +49,23 @@ public static class CpuParallelSettings
     /// was wrong). Kept as a knob; the detection is reused elsewhere.</summary>
     public static bool CapGemmAtPhysicalCores { get; set; } = false;
 
+    /// <summary>
+    /// Whether the persistent worker pool pins its threads to distinct physical cores. Defaults to
+    /// <see cref="Helpers.WorkerPinning.Auto"/>; the <c>AIDOTNET_PIN_WORKERS</c> environment variable
+    /// (<c>auto</c>, <c>always</c> or <c>never</c>) sets the starting value. Workers re-read it each time
+    /// they wake, so a change takes effect on the next parallel op.
+    /// </summary>
+    public static WorkerPinning WorkerPinning { get; set; } = ReadWorkerPinning();
+
+    private static WorkerPinning ReadWorkerPinning()
+    {
+        string? value = Environment.GetEnvironmentVariable("AIDOTNET_PIN_WORKERS");
+        return value is not null && Enum.TryParse(value, ignoreCase: true, out WorkerPinning parsed)
+               && Enum.IsDefined(typeof(WorkerPinning), parsed)
+            ? parsed
+            : WorkerPinning.Auto;
+    }
+
     /// <summary>The thread count the GEMM strategies should fan out to: the requested count capped at
     /// physical cores when <see cref="CapGemmAtPhysicalCores"/> (FMA-bound work hates SMT).</summary>
     public static int GemmThreadCount(int requested)
@@ -544,6 +561,11 @@ public static class CpuParallelSettings
         const long workPerChunk = 8 * 1024;
         int byWork = (int)Math.Min(count, Math.Max(1, totalWork / workPerChunk));
         int chunks = Math.Min(maxDegree, byWork);
+        // The pool hands chunks out round-robin with no stealing, so chunks beyond its participants (workers + the
+        // caller) only add per-chunk overhead and an uneven tail: on 128 logical CPUs (32 workers) a 256-head
+        // attention forward split 128 ways took 84-90 us vs 50 us split 33 ways. AIDOTNET_PFOS_CHUNK_CAP=0 disables.
+        if (s_capChunksAtParticipants)
+            chunks = Math.Min(chunks, PersistentParallelExecutor.Instance.WorkerCount + 1);
         int from = fromInclusive;
         PersistentParallelExecutor.Instance.Execute(chunks, maxDegree, [System.Runtime.CompilerServices.MethodImpl(Compatibility.MethodImplHelper.Hot)] (int chunk) =>
         {
@@ -573,6 +595,9 @@ public static class CpuParallelSettings
     /// (e.g. to avoid the pool's dedicated worker threads in a thread-count-sensitive host,
     /// or to A/B benchmark the pool against the .NET ThreadPool).</para>
     /// </summary>
+    private static readonly bool s_capChunksAtParticipants =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_PFOS_CHUNK_CAP") != "0";
+
     public static bool UseCooperativePool { get; set; } =
         System.Environment.GetEnvironmentVariable("AIDOTNET_COOP_POOL") != "0"; // =0 forces raw Parallel.For for A/B
 
@@ -663,6 +688,11 @@ public static class CpuParallelSettings
         const long workPerChunk = 8 * 1024;
         int byWork = (int)Math.Min(count, Math.Max(1, totalWork / workPerChunk));
         int chunks = Math.Min(maxDegree, byWork);
+        // The pool hands chunks out round-robin with no stealing, so chunks beyond its participants (workers + the
+        // caller) only add per-chunk overhead and an uneven tail: on 128 logical CPUs (32 workers) a 256-head
+        // attention forward split 128 ways took 84-90 us vs 50 us split 33 ways. AIDOTNET_PFOS_CHUNK_CAP=0 disables.
+        if (s_capChunksAtParticipants)
+            chunks = Math.Min(chunks, PersistentParallelExecutor.Instance.WorkerCount + 1);
         int from = fromInclusive;
         PersistentParallelExecutor.Instance.Execute<TLocal>(
             chunks,

@@ -385,4 +385,96 @@ public class InverseTrigGradientTests
             Assert.Equal(expected, gx[i], Tolerance);
         }
     }
+
+    // Inverse hyperbolic tangent (#905)
+
+    [Fact]
+    public void Atanh_MatchesTheClosedForm()
+    {
+        var data = new[] { -0.99, -0.5, -0.1, 0.0, 0.1, 0.5, 0.99 };
+        var x = new Tensor<double>(data, new[] { data.Length });
+
+        var atanh = _engine.TensorAtanh(x);
+
+        for (int i = 0; i < data.Length; i++)
+        {
+            Assert.Equal(0.5 * Math.Log((1.0 + data[i]) / (1.0 - data[i])), atanh[i], Tolerance);
+        }
+    }
+
+    [Fact]
+    public void Atanh_KeepsTheDigitsOfATinyInput()
+    {
+        // atanh(x) = x + x^3/3 + ..., so for x = 1e-12 the answer is x to ~24 digits. The textbook
+        // 0.5 * log((1 + x) / (1 - x)) rounds 1 + x first and returns it with ~1e-4 relative error.
+        var x = new Tensor<double>(new[] { 1e-12, -3e-15 }, new[] { 2 });
+
+        var atanh = new CpuEngine().TensorAtanh(x);
+
+        Assert.Equal(1.0, atanh[0] / 1e-12, 12);
+        Assert.Equal(1.0, atanh[1] / -3e-15, 12);
+    }
+
+    [Fact]
+    public void Atanh_FollowsTorchAtAndBeyondTheDomainEdge()
+    {
+        // torch.atanh: +/-inf at +/-1, NaN outside [-1, 1]. Nothing is clamped and nothing throws.
+        var x = new Tensor<double>(new[] { 1.0, -1.0, 1.5, -2.0 }, new[] { 4 });
+
+        var atanh = new CpuEngine().TensorAtanh(x);
+
+        Assert.True(double.IsPositiveInfinity(atanh[0]));
+        Assert.True(double.IsNegativeInfinity(atanh[1]));
+        Assert.True(double.IsNaN(atanh[2]));
+        Assert.True(double.IsNaN(atanh[3]));
+    }
+
+    [Fact]
+    public void TanhOfAtanh_IsTheIdentity()
+    {
+        var data = new[] { -0.9, -0.4, 0.0, 0.4, 0.9 };
+        var x = new Tensor<double>(data, new[] { data.Length });
+
+        var roundTrip = _engine.TensorTanh(_engine.TensorAtanh(x));
+
+        for (int i = 0; i < data.Length; i++)
+        {
+            Assert.Equal(data[i], roundTrip[i], Tolerance);
+        }
+    }
+
+    [Fact]
+    public void Atanh_Gradient_IsInverseOneMinusSquare()
+    {
+        var data = new[] { -0.8, -0.3, 0.0, 0.3, 0.8 };
+        var x = new Tensor<double>(data, new[] { data.Length });
+
+        using var tape = new GradientTape<double>();
+        var loss = _engine.ReduceSum(_engine.TensorAtanh(x), null);
+        var gx = tape.ComputeGradients(loss, new[] { x })[x];
+
+        for (int i = 0; i < data.Length; i++)
+        {
+            Assert.Equal(1.0 / (1.0 - (data[i] * data[i])), gx[i], Tolerance);
+        }
+    }
+
+    [Fact]
+    public void AtanhOfTanh_GradientReachesTheInput_NotSilentlyZero()
+    {
+        // The #905 failure mode: an op that runs but drops its gradient. atanh(tanh(x)) = x, so the
+        // chain rule must deliver exactly 1 to every element - (1 - tanh^2) * 1 / (1 - tanh^2).
+        var data = new[] { -1.5, -0.5, 0.0, 0.5, 1.5 };
+        var x = new Tensor<double>(data, new[] { data.Length });
+
+        using var tape = new GradientTape<double>();
+        var loss = _engine.ReduceSum(_engine.TensorAtanh(_engine.TensorTanh(x)), null);
+        var grads = tape.ComputeGradients(loss, new[] { x });
+
+        Assert.True(grads.ContainsKey(x), "atanh severed the tape: x received no gradient.");
+        for (int i = 0; i < data.Length; i++)
+        {
+            Assert.Equal(1.0, grads[x][i], Tolerance);
+        }
+    }
 }

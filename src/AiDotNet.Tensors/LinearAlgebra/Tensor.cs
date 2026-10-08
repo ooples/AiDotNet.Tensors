@@ -233,6 +233,21 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// edge to eager GradientTape and compiled GraphMode. Keeping both paths
     /// here prevents metadata-only APIs from silently becoming gradient stops.
     /// </summary>
+    /// <summary>
+    /// A row-major view of this contiguous tensor's storage with a new shape, recorded on no tape or graph. For plan
+    /// builders that alias internal buffers (e.g. a reshape's input gradient over its output gradient).
+    /// </summary>
+    internal Tensor<T> ReshapeViewUnrecorded(int[] newShape)
+    {
+        if (!IsContiguous)
+            throw new InvalidOperationException("An unrecorded reshape view needs a contiguous tensor.");
+        int total = 1;
+        for (int i = 0; i < newShape.Length; i++) total *= newShape[i];
+        if (total != Length)
+            throw new ArgumentException($"Cannot view {Length} elements as [{string.Join(", ", newShape)}].");
+        return CreateStorageView((int[])newShape.Clone(), ComputeRowMajorStrides(newShape), _storageOffset);
+    }
+
     private Tensor<T> FinalizeReshapeLikeView(Tensor<T> view, string opName)
     {
         CarryResidencyToShapeOnlyView(view);
@@ -902,6 +917,70 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     {
         get => GetFlat(flatIndex);
         set => SetFlat(flatIndex, value);
+    }
+
+    // Fixed-arity element indexers. C# binds t[i, j], t[i, j, k] and t[i, j, k, l] to these instead of the
+    // `params int[]` indexer, so element access no longer allocates an index array per call. That allocation was
+    // the hot spot in per-element loops: an attention mask read as mask[b, h, i, j] inside the softmax allocated an
+    // int[4] for every score (PerfView allocation stacks: ~80 MB per training step on a 1024-token LM batch).
+    // Same validation, storage-offset/stride addressing and version bump as the params indexer; a SparseTensor still
+    // goes through its own override.
+
+    /// <summary>Gets or sets the element at [i0, i1] of a rank-2 tensor.</summary>
+    public T this[int i0, int i1]
+    {
+        get => this is SparseTensor<T> ? this[new[] { i0, i1 }] : ReadElementAt(ElementIndex(2, i0, i1, 0, 0));
+        set { if (this is SparseTensor<T>) this[new[] { i0, i1 }] = value; else SetElementAt(ElementIndex(2, i0, i1, 0, 0), value); }
+    }
+
+    /// <summary>Gets or sets the element at [i0, i1, i2] of a rank-3 tensor.</summary>
+    public T this[int i0, int i1, int i2]
+    {
+        get => this is SparseTensor<T> ? this[new[] { i0, i1, i2 }] : ReadElementAt(ElementIndex(3, i0, i1, i2, 0));
+        set { if (this is SparseTensor<T>) this[new[] { i0, i1, i2 }] = value; else SetElementAt(ElementIndex(3, i0, i1, i2, 0), value); }
+    }
+
+    /// <summary>Gets or sets the element at [i0, i1, i2, i3] of a rank-4 tensor.</summary>
+    public T this[int i0, int i1, int i2, int i3]
+    {
+        get => this is SparseTensor<T> ? this[new[] { i0, i1, i2, i3 }] : ReadElementAt(ElementIndex(4, i0, i1, i2, i3));
+        set { if (this is SparseTensor<T>) this[new[] { i0, i1, i2, i3 }] = value; else SetElementAt(ElementIndex(4, i0, i1, i2, i3), value); }
+    }
+
+    /// <summary>Materializes, validates rank and bounds, and returns the storage index (offset + strides).</summary>
+    private int ElementIndex(int rank, int i0, int i1, int i2, int i3)
+    {
+        EnsureMaterialized();
+        ThrowIfSparse("Item");
+        if (_shape.Length != rank)
+            throw new ArgumentException("Number of indices must match the tensor's rank.");
+        int idx = _storageOffset;
+        idx += CheckedAxis(0, i0) * _strides[0];
+        idx += CheckedAxis(1, i1) * _strides[1];
+        if (rank > 2) idx += CheckedAxis(2, i2) * _strides[2];
+        if (rank > 3) idx += CheckedAxis(3, i3) * _strides[3];
+        return idx;
+    }
+
+    private int CheckedAxis(int axis, int index)
+    {
+        if ((uint)index >= (uint)_shape[axis])
+            throw new ArgumentOutOfRangeException("indices", $"Index {axis} is out of range.");
+        return index;
+    }
+
+    /// <summary>
+    /// Reads _data AFTER the index is computed: ElementIndex materializes a dropped streaming weight, which replaces
+    /// _data, so `_data[ElementIndex(...)]` (field loaded first) would read the stale, empty storage.
+    /// </summary>
+    private T ReadElementAt(int storageIndex) => _data[storageIndex];
+
+    /// <summary>Element write with the params indexer's ownership, read-only-alias and version semantics.</summary>
+    private void SetElementAt(int storageIndex, T value)
+    {
+        EnsureOwnedForWrite();
+        _storage.AsWritableSpan()[storageIndex] = value;
+        IncrementVersion();
     }
 
     /// <summary>
@@ -2638,6 +2717,9 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         }
     }
 
+    /// <summary>Result size from which <see cref="BroadcastElementwise"/> splits its outer loop across workers.</summary>
+    private const int ParallelBroadcastMinElements = 1 << 16;
+
     private static void BroadcastElementwise(
         Tensor<T> a, Tensor<T> b, Tensor<T> result, int[] broadcastShape, BroadcastOp op)
     {
@@ -2718,6 +2800,33 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // Outer loop walks the (few) non-coalesced leading dims; the inner
         // block is applied with SIMD (float/double) or a tight scalar+enum
         // loop (other T) — never a per-element Func<T,T,T> delegate.
+        //
+        // A large result whose inner block is short -- a per-row scalar such as [B,S,H,D] / [B,S,H,1], which
+        // coalesces to D-long runs -- spends its time in this loop, so the outer range runs in parallel chunks.
+        // Each output block is written by exactly one chunk; there is no reduction, so the result is identical.
+        if (outer > 1 && (long)total >= ParallelBroadcastMinElements)
+        {
+            int[] shapeCopy = broadcastShape, aStrides = aBroadStride.ToArray(), bStrides = bBroadStride.ToArray();
+            int oRank = outerRank, inner = innerLen, aS = aStride, bS = bStride;
+            int chunks = Math.Min(outer, Helpers.CpuParallelSettings.MaxDegreeOfParallelism * 4);
+            Helpers.CpuParallelSettings.ParallelForOrSerial(0, chunks, total, c =>
+            {
+                int o0 = (int)((long)outer * c / chunks), o1 = (int)((long)outer * (c + 1) / chunks);
+                ReadOnlySpan<T> pa = aSrc._data.AsSpan(), pb = bSrc._data.AsSpan();
+                var pr = result._data.AsWritableSpan();
+                Span<int> cd = stackalloc int[shapeCopy.Length];
+                for (int o = o0; o < o1; o++)
+                {
+                    int rem = o;
+                    for (int d = oRank - 1; d >= 0; d--) { cd[d] = rem % shapeCopy[d]; rem /= shapeCopy[d]; }
+                    int ab = aOrigin, bb = bOrigin;
+                    for (int d = 0; d < oRank; d++) { ab += cd[d] * aStrides[d]; bb += cd[d] * bStrides[d]; }
+                    ApplyInner(op, pr, o * inner, pa, ab, aS, pb, bb, bS, inner);
+                }
+            });
+            return;
+        }
+
         Span<int> coord = stackalloc int[maxRank];
         for (int o = 0; o < outer; o++)
         {
@@ -4076,21 +4185,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> BroadcastMultiply(Tensor<T> other)
     {
-        // Check if shapes are already identical - use fast path (element-wise multiply)
-        if (ShapeEquals(_shape, other._shape))
-        {
-            // Element-wise multiplication, not matrix multiplication
-            var fastResult = TensorAllocator.Rent<T>(_shape);
-            var srcSpan = _data.AsSpan();
-            var otherSpan = other._data.AsSpan();
-            var destSpan = fastResult._data.AsWritableSpan();
-            for (int i = 0; i < Length; i++)
-            {
-                destSpan[i] = _numOps.Multiply(srcSpan[i], otherSpan[i]);
-            }
-            return fastResult;
-        }
-
+        // Equal shapes take the same stride-coalescing kernel (one SIMD run when both are contiguous). The former
+        // scalar equal-shape loop read _data from 0, ignoring a view's storage offset.
         int[] broadcastShape = GetBroadcastShape(this._shape, other._shape);
         var result = TensorAllocator.Rent<T>(broadcastShape);
         BroadcastElementwise(this, other, result, broadcastShape, BroadcastOp.Multiply);
@@ -4114,63 +4210,12 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </remarks>
     public Tensor<T> BroadcastDivide(Tensor<T> other)
     {
-        // Check if shapes are already identical - use fast path (element-wise divide)
-        if (ShapeEquals(_shape, other._shape))
-        {
-            var fastResult = TensorAllocator.Rent<T>(_shape);
-            var srcSpan = _data.AsSpan();
-            var otherSpan = other._data.AsSpan();
-            var destSpan = fastResult._data.AsWritableSpan();
-            for (int i = 0; i < Length; i++)
-            {
-                destSpan[i] = _numOps.Divide(srcSpan[i], otherSpan[i]);
-            }
-            return fastResult;
-        }
-
-        // Get broadcast shape
+        // Every shape, equal or broadcast, goes through the stride-coalescing kernel the other three ops use. The
+        // previous body walked result.GetIndices() and read both operands through the rank-indexed indexer per
+        // element, and its equal-shape branch read _data from 0 regardless of a view's storage offset.
         int[] broadcastShape = GetBroadcastShape(this._shape, other._shape);
-        var result = new Tensor<T>(broadcastShape);
-
-        // Pad shapes to same rank for easier indexing
-        int maxRank = broadcastShape.Length;
-        int[] thisShape = new int[maxRank];
-        int[] otherShape = new int[maxRank];
-
-        // Right-align shapes (prepend 1s)
-        int thisOffset = maxRank - this.Rank;
-        int otherOffset = maxRank - other.Rank;
-
-        for (int i = 0; i < maxRank; i++)
-        {
-            thisShape[i] = i < thisOffset ? 1 : this._shape[i - thisOffset];
-            otherShape[i] = i < otherOffset ? 1 : other._shape[i - otherOffset];
-        }
-
-        // Iterate over the result tensor
-        int[] thisIndices = new int[this.Rank];
-        int[] otherIndices = new int[other.Rank];
-
-        foreach (var index in result.GetIndices())
-        {
-            // Map result index to this tensor's index (accounting for broadcasting)
-            for (int i = 0; i < this.Rank; i++)
-            {
-                int broadcastIdx = i + thisOffset;
-                thisIndices[i] = thisShape[broadcastIdx] == 1 ? 0 : index[broadcastIdx];
-            }
-
-            // Map result index to other tensor's index (accounting for broadcasting)
-            for (int i = 0; i < other.Rank; i++)
-            {
-                int broadcastIdx = i + otherOffset;
-                otherIndices[i] = otherShape[broadcastIdx] == 1 ? 0 : index[broadcastIdx];
-            }
-
-            // Perform division
-            result[index] = _numOps.Divide(this[thisIndices], other[otherIndices]);
-        }
-
+        var result = TensorAllocator.Rent<T>(broadcastShape);
+        BroadcastElementwise(this, other, result, broadcastShape, BroadcastOp.Divide);
         return result;
     }
 

@@ -10,7 +10,6 @@ namespace AiDotNet.Tensors.Engines;
 // instead of a per-timestep op chain (the PyTorch-parity LSTM issued ~2,800 kernels per CUDA training step).
 public partial class DirectGpuTensorEngine
 {
-    private const int MaxFusedLstmHidden = 1024;   // CudaBackend.MaxRnnBlockSize: one block holds a batch row
 
     // Per-layer device caches, keyed by the layer's input-weight tensor: stable across steps (a captured graph
     // bakes the pointers) and never shared between two LSTM layers, so a stacked LSTM's second forward cannot
@@ -94,28 +93,27 @@ public partial class DirectGpuTensorEngine
     /// <summary>
     /// Differentiable LSTM over a whole sequence: input [B, T, in], weights wIh [4H, in] and wHh [4H, H] with gate
     /// rows in PyTorch order (input, forget, cell, output), one bias [4H]; h0 = c0 = 0. Returns the hidden sequence
-    /// [B, T, H], or null when this engine cannot run it (non-float, non-CUDA, H &gt; 1024, other shapes, or a lazy
+    /// [B, T, H], or null when this engine cannot run it (non-float, a backend without
+    /// <see cref="IFusedLstmSequenceTraining"/>, H above that backend's limit, other shapes, or a lazy
     /// graph being traced) so the caller keeps its decomposed path. Records one tape node whose backward is the BPTT
     /// kernel.
     /// </summary>
     /// <remarks>
-    /// CUDA only, by an explicit capability check rather than by accident. Every backend exposes
-    /// <c>LstmForwardSequence</c>/<c>LstmBackwardSequence</c>, but this op relies on the CUDA kernels' contract: a
-    /// batch-major [B, T, *] layout and a whole-sequence recurrence synchronized across the full grid (one block per
-    /// batch row, hence H &lt;= 1024). The OpenCL kernel, for one, documents a time-major [T, B, *] layout and
-    /// synchronizes timesteps with a work-group barrier, which orders nothing across work-groups. On HIP, Metal,
-    /// OpenCL, Vulkan and WebGPU the caller's per-timestep ops run instead, on the device.
+    /// An explicit capability check rather than an assumption: every backend exposes
+    /// <c>LstmForwardSequence</c>/<c>LstmBackwardSequence</c>, but only those declaring
+    /// <see cref="IFusedLstmSequenceTraining"/> are verified against the contract this op needs (batch-major
+    /// [B, T, *], PyTorch gate order, full BPTT). Elsewhere the caller's per-timestep ops run instead, on the device.
     /// </remarks>
     public Tensor<T>? TryLstmSequenceTrain<T>(Tensor<T> input, Tensor<T> wIh, Tensor<T> wHh, Tensor<T> bias)
     {
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend)
-            || backend is not Engines.DirectGpu.CUDA.CudaBackend
+            || backend is not IFusedLstmSequenceTraining fused
             || input.Rank != 3 || wIh.Rank != 2 || wHh.Rank != 2 || bias.Length != wIh._shape[0])
             return null;
         int b = input._shape[0], t = input._shape[1], inSize = input._shape[2];
         int gateRows = wIh._shape[0], h = gateRows / 4;
         if (gateRows % 4 != 0 || wIh._shape[1] != inSize || wHh._shape[0] != gateRows || wHh._shape[1] != h
-            || h <= 0 || h > MaxFusedLstmHidden || b <= 0 || t <= 0)
+            || h <= 0 || h > fused.MaxFusedLstmHidden || b <= 0 || t <= 0)
             return null;
 
         // No lazy-graph branch: TryGetBackend refuses the backend while a graph is traced (#350), so a trace never

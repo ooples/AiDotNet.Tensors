@@ -2197,7 +2197,7 @@ public interface IEngine
     /// <summary>Transpose tensor into pre-allocated destination.</summary>
     void TransposeInto<T>(Tensor<T> destination, Tensor<T> input, int[] axes);
 
-    /// <summary>Softmax into pre-allocated destination. Zero allocation.</summary>
+    /// <summary>Softmax into pre-allocated destination. Zero allocation. <paramref name="destination"/> may be <paramref name="input"/> itself, for an in-place softmax.</summary>
     void SoftmaxInto<T>(Tensor<T> destination, Tensor<T> input, int axis);
 
     /// <summary>LogSoftmax into pre-allocated destination. Zero allocation.</summary>
@@ -2796,6 +2796,24 @@ public interface IEngine
     /// </remarks>
     Tensor<T> TensorAtan<T>(Tensor<T> tensor);
 
+    /// <summary>
+    /// Computes the element-wise inverse hyperbolic tangent of a tensor.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="tensor">The input tensor.</param>
+    /// <returns>A tensor with atanh(x) for each element.</returns>
+    /// <remarks>
+    /// <para>
+    /// Follows <c>torch.atanh</c> outside the open domain (-1, 1): atanh(1) is +infinity,
+    /// atanh(-1) is -infinity and |x| &gt; 1 is NaN. Nothing is clamped or thrown.
+    /// </para>
+    /// <para>
+    /// Records on the gradient tape with derivative 1/(1 - x^2), which grows without bound as |x|
+    /// approaches 1. It is the inverse of tanh, so it maps a tanh-squashed value (a bounded action or
+    /// a correlation) back to an unbounded one, and the gradient there is as steep as tanh was flat.
+    /// </para>
+    /// </remarks>
+    Tensor<T> TensorAtanh<T>(Tensor<T> tensor);
     /// <summary>
     /// Computes the element-wise four-quadrant arctangent of <paramref name="y"/> over
     /// <paramref name="x"/>.
@@ -3703,21 +3721,21 @@ public interface IEngine
         int deformGroups);
 
     /// <summary>
-    /// Computes the gradient of GridSample with respect to the input (NHWC format).
+    /// Computes the gradient of GridSample with respect to the input (NCHW format).
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
-    /// <param name="gradOutput">The gradient flowing back from the output [batch, outH, outW, channels].</param>
+    /// <param name="gradOutput">The gradient flowing back from the output [batch, channels, outH, outW].</param>
     /// <param name="grid">The sampling grid from forward pass [batch, outH, outW, 2].</param>
-    /// <param name="inputShape">The shape of the original input [batch, height, width, channels].</param>
-    /// <returns>The gradient with respect to the input tensor [batch, height, width, channels].</returns>
+    /// <param name="inputShape">The shape of the original input [batch, channels, height, width].</param>
+    /// <returns>The gradient with respect to the input tensor [batch, channels, height, width].</returns>
     Tensor<T> GridSampleBackwardInput<T>(Tensor<T> gradOutput, Tensor<T> grid, int[] inputShape);
 
     /// <summary>
-    /// Computes the gradient of GridSample with respect to the grid (NHWC format).
+    /// Computes the gradient of GridSample with respect to the grid (NCHW input format).
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
-    /// <param name="gradOutput">The gradient flowing back from the output [batch, outH, outW, channels].</param>
-    /// <param name="input">The original input tensor [batch, height, width, channels].</param>
+    /// <param name="gradOutput">The gradient flowing back from the output [batch, channels, outH, outW].</param>
+    /// <param name="input">The original input tensor [batch, channels, height, width].</param>
     /// <param name="grid">The sampling grid from forward pass [batch, outH, outW, 2].</param>
     /// <returns>The gradient with respect to the grid tensor [batch, outH, outW, 2].</returns>
     Tensor<T> GridSampleBackwardGrid<T>(Tensor<T> gradOutput, Tensor<T> input, Tensor<T> grid);
@@ -4301,6 +4319,34 @@ public interface IEngine
         Tensor<T> outWeight,
         int numHeads,
         Tensor<bool>? mask = null);
+
+    /// <summary>
+    /// Multi-head scaled dot-product attention on projected, head-interleaved activations:
+    /// <c>out[b, i, h] = softmax(scale * q[b, i, h] . k[b, :, h]^T) v[b, :, h]</c>, where head <c>h</c> owns columns
+    /// <c>h*dim .. (h+1)*dim</c> of the last axis. Equivalent to reshaping each input to
+    /// <c>[batch, seq, heads, dim]</c>, permuting to <c>[batch, heads, seq, dim]</c>, calling
+    /// <see cref="ScaledDotProductAttention{T}(Tensor{T}, Tensor{T}, Tensor{T}, Tensor{bool}?, double?, out Tensor{T}, double)"/>
+    /// and permuting and reshaping the result back, but without the permute copies or the
+    /// <c>[batch, heads, seqQ, seqK]</c> score tensor. Differentiable on the tape and in compiled training plans.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="query">[batch, seqQ, heads * headDim] projected queries.</param>
+    /// <param name="key">[batch, seqK, heads * headDim] projected keys.</param>
+    /// <param name="value">[batch, seqK, heads * valueDim] projected values.</param>
+    /// <param name="numHeads">Number of heads; must divide the query and value widths.</param>
+    /// <param name="scale">Score scale; defaults to <c>1 / sqrt(headDim)</c>.</param>
+    /// <param name="causal">When true, query position <c>i</c> attends only to key positions
+    /// <c>j &lt;= i + (seqK - seqQ)</c>: bottom-right aligned as in FlashAttention-2, so the last query sees every key
+    /// (a decode step over a key cache). Identical to PyTorch's <c>is_causal</c> when seqQ == seqK. A query row that
+    /// sees no key outputs zeros.</param>
+    /// <returns>[batch, seqQ, heads * valueDim] attention output, heads interleaved like the inputs.</returns>
+    Tensor<T> MultiHeadAttentionCore<T>(
+        Tensor<T> query,
+        Tensor<T> key,
+        Tensor<T> value,
+        int numHeads,
+        double? scale = null,
+        bool causal = false);
 
     /// <summary>
     /// Fused LSTM sequence forward (inference only): processes a full
@@ -5530,6 +5576,25 @@ public interface IEngine
     Tensor<T> LayerNorm<T>(Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon, out Tensor<T> mean, out Tensor<T> variance);
 
     /// <summary>
+    /// Layer normalization into a pre-allocated destination, for inference.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="destination">Receives the normalized tensor; must have the input's shape.</param>
+    /// <param name="input">The input tensor.</param>
+    /// <param name="gamma">Scale parameter; its shape names the trailing dimensions normalized over.</param>
+    /// <param name="beta">Shift parameter with the same shape as gamma.</param>
+    /// <param name="epsilon">Small constant for numerical stability.</param>
+    /// <remarks>
+    /// <para>
+    /// Computes the same values as <see cref="LayerNorm{T}"/> without allocating the output or the
+    /// per-row mean and variance tensors. Nothing is recorded on the gradient tape, so use
+    /// <see cref="LayerNorm{T}"/> when training. <paramref name="destination"/> may be
+    /// <paramref name="input"/> itself.
+    /// </para>
+    /// </remarks>
+    void LayerNormInto<T>(Tensor<T> destination, Tensor<T> input, Tensor<T> gamma, Tensor<T> beta, double epsilon);
+
+    /// <summary>
     /// Computes the backward pass for layer normalization on tensors of any rank.
     /// </summary>
     /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
@@ -6093,19 +6158,9 @@ public interface IEngine
     /// <returns>Grid tensor of shape [batch, outputHeight, outputWidth, 2] in [-1, 1] normalized coords.</returns>
     /// <remarks>
     /// <para>
-    /// <b>IMPORTANT: Layout Note</b> - This method and <see cref="GridSample{T}"/> use NHWC layout
-    /// [batch, height, width, channels/coords], which differs from Conv2D, MaxPool2D, and other
-    /// spatial operations that use NCHW layout [batch, channels, height, width].
-    /// </para>
-    /// <para>
-    /// When using these methods with NCHW tensors, you must transpose:
-    /// <code>
-    /// // NCHW to NHWC before GridSample
-    /// var inputNHWC = input.Transpose([0, 2, 3, 1]);
-    /// var output = engine.GridSample(inputNHWC, grid);
-    /// // NHWC to NCHW after GridSample
-    /// var outputNCHW = output.Transpose([0, 3, 1, 2]);
-    /// </code>
+    /// <b>Layout:</b> the grid is [batch, outputHeight, outputWidth, 2] with (x, y) in the last
+    /// dimension, which is what <see cref="GridSample{T}"/> expects. GridSample itself reads and
+    /// writes NCHW [batch, channels, height, width], so no transpose is needed around it.
     /// </para>
     /// </remarks>
     Tensor<T> AffineGrid<T>(Tensor<T> theta, int outputHeight, int outputWidth);
@@ -6114,14 +6169,14 @@ public interface IEngine
     /// Samples an input tensor using a normalized grid with bilinear interpolation.
     /// </summary>
     /// <typeparam name="T">Numeric type.</typeparam>
-    /// <param name="input">Input tensor [batch, height, width, channels] (NHWC format).</param>
+    /// <param name="input">Input tensor [batch, channels, height, width] (NCHW format).</param>
     /// <param name="grid">Sampling grid [batch, outH, outW, 2] with coords in [-1, 1].</param>
-    /// <returns>Sampled output tensor [batch, outH, outW, channels] (NHWC format).</returns>
+    /// <returns>Sampled output tensor [batch, channels, outH, outW] (NCHW format).</returns>
     /// <remarks>
     /// <para>
-    /// <b>IMPORTANT: Layout Note</b> - This method uses NHWC layout [batch, height, width, channels],
-    /// which differs from Conv2D, MaxPool2D, and other spatial operations that use NCHW layout
-    /// [batch, channels, height, width]. Ensure inputs are transposed appropriately.
+    /// <b>Layout:</b> input and output are NCHW [batch, channels, height, width], the same layout
+    /// as Conv2D and MaxPool2D and as PyTorch's <c>torch.nn.functional.grid_sample</c>. Only the
+    /// grid is channels-last: its last dimension holds the (x, y) sampling coordinates.
     /// </para>
     /// <para>
     /// The grid coordinates are normalized to [-1, 1] range where (-1, -1) is the top-left corner
@@ -9865,7 +9920,7 @@ public interface IEngine
     /// mode=<see cref="GridSampleMode.Bilinear"/>,
     /// padding=<see cref="GridSamplePadding.Zeros"/>,
     /// alignCorners=false (torchvision defaults).
-    /// Input is NHWC <c>[N, H, W, C]</c>; grid is <c>[N, outH, outW, 2]</c>.
+    /// Input is NCHW <c>[N, C, H, W]</c>; grid is <c>[N, outH, outW, 2]</c>; output is <c>[N, C, outH, outW]</c>.
     /// </summary>
     Tensor<T> GridSample<T>(Tensor<T> input, Tensor<T> grid,
         GridSampleMode mode, GridSamplePadding padding, bool alignCorners);

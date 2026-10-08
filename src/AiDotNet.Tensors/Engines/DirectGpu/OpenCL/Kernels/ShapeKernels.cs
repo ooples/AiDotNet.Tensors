@@ -49,7 +49,23 @@ __kernel void tile_axis(__global const float* input, __global float* output, int
     int axis = expandedIndex / repeats;
     output[idx] = input[(outer * axisSize + axis) * innerSize + inner];
 }
-__kernel void permute_general(__global const float* input, __global float* output,
+// Rectangular N-d slice in one launch (rank <= 8), the OpenCL port of CUDA's rect_slice_nd. scatter == 0 reads
+// full[start : start + length] into slice; scatter != 0 writes slice back into that window.
+__kernel void rect_slice_nd(__global float* full, __global float* slice,
+    __global const int* outDims, __global const int* fullStrides, __global const int* starts,
+    int rank, int total, int scatter) {
+    int idx = get_global_id(0);
+    if (idx >= total) return;
+    int remaining = idx;
+    int offset = 0;
+    for (int d = rank - 1; d >= 0; d--) {
+        int c = remaining % outDims[d];
+        remaining /= outDims[d];
+        offset += (starts[d] + c) * fullStrides[d];
+    }
+    if (scatter) full[offset] = slice[idx];
+    else slice[idx] = full[offset];
+}__kernel void permute_general(__global const float* input, __global float* output,
     __global const int* inputStrides, __global const int* outputStrides,
     __global const int* permutation, int ndims, int totalSize) {
     int outIdx = get_global_id(0); if (outIdx >= totalSize) return;
@@ -680,7 +696,7 @@ __kernel void next_after(__global const float* a, __global const float* b, __glo
         return new[]
         {
             "concat_axis", "slice_last_axis", "set_slice_last_axis", "stack_2",
-            "pad_2d", "pad_2d_backward", "tile_last_axis", "tile_axis", "permute_general", "repeat_elements",
+            "pad_2d", "pad_2d_backward", "tile_last_axis", "tile_axis", "permute_general", "rect_slice_nd", "repeat_elements",
             "pixel_shuffle", "pixel_shuffle_backward", "crop_2d",
             "eye_kernel", "linspace_kernel", "one_hot_kernel",
             "diag_kernel", "extract_diag_kernel", "triangular_mask",

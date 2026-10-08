@@ -564,10 +564,9 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     /// </remarks>
     public new Vector<T> Clone()
     {
-        // One block copy. The collection-expression spread this replaced walked the yield enumerator element by
-        // element into a growing buffer and copied it again: 750 us for 65K floats, paid by every copy-on-write
-        // detach (an in-place activation on a FusedLinear output whose pre-activation was saved, say).
-        return new Vector<T>(new Memory<T>(AsSpan().ToArray()), false);
+        // One block copy, wrapped without a second copy. The collection expression it replaces walked the
+        // enumerator element by element (~35x slower on 64K floats) and read storage without materializing it.
+        return new Vector<T>(AsSpan().ToArray().AsMemory(), true);
     }
 
     /// <summary>

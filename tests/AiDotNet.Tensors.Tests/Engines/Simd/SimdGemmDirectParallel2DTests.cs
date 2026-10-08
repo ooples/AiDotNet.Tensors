@@ -18,7 +18,7 @@ public class SimdGemmDirectParallel2DTests
 {
     private static float[] Rand(int n, int seed)
     {
-        var rng = new Random(seed);
+        var rng = RandomHelper.CreateSeededRandom(seed);
         var a = new float[n];
         for (int i = 0; i < n; i++) a[i] = (float)(rng.NextDouble() * 2 - 1);
         return a;
@@ -86,6 +86,41 @@ public class SimdGemmDirectParallel2DTests
         }
     }
 
+    [Theory]
+    [InlineData(128, 784, 512)]   // parity-MLP layer 1 forward at batch 128: 21 row blocks + a 2-row tail
+    [InlineData(128, 512, 256)]   // layer 2
+    [InlineData(131, 300, 250)]   // 5-row tail and a 10-column tail in the same call
+    [InlineData(66, 96, 40)]      // n < 3 tiles: some column groups are just the masked tail
+    public void ParallelMOverwrite_MatchesReference_AndIsBitIdenticalAcrossThreadCounts(int m, int k, int n)
+    {
+        // The row x column-group split (with the m % 6 tail rows inside the last row chunk's tasks) must write every
+        // element exactly once, whatever the pool size, and produce the same bits for every partition.
+        var a = Rand(m * k, m * 13 + k);
+        var b = Rand(k * n, n * 7 + k);
+        var expected = Reference(a, b, m, k, n);
+        int before = CpuParallelSettings.MaxDegreeOfParallelism;
+        try
+        {
+            float[]? first = null;
+            foreach (int threads in ThreadCounts)
+            {
+                CpuParallelSettings.MaxDegreeOfParallelism = threads;
+                var c = new float[m * n];
+                for (int i = 0; i < c.Length; i++) c[i] = float.NaN;   // every element must be written
+                SimdGemm.SgemmDirectParallelMOverwrite(a, b, c, m, k, n);
+                AssertMatchesReference(expected, c, k, $"threads={threads} C");
+                if (first is null) first = c;
+                else
+                    for (int i = 0; i < c.Length; i++)
+                        Assert.True(BitConverter.SingleToInt32Bits(first[i]) == BitConverter.SingleToInt32Bits(c[i]),
+                            $"threads={threads}: C[{i}] = {c[i]:G9} differs from {first[i]:G9}");
+            }
+        }
+        finally
+        {
+            CpuParallelSettings.MaxDegreeOfParallelism = before;
+        }
+    }
     [Fact]
     public void Sgemm_RoutesTrainingBatchShapeToTheDirect2DPath()
     {
