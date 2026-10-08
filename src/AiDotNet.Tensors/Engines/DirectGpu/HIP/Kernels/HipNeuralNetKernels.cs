@@ -1531,6 +1531,26 @@ extern ""C"" __global__ __launch_bounds__(256) void batched_transpose(
     B[outIdx] = A[inIdx];
 }
 
+// Rectangular N-d slice in one launch (rank <= 8), the HIP twin of CUDA's rect_slice_nd. scatter == 0 reads
+// full[start : start + length] into slice; scatter != 0 writes slice back into that window. The metadata rides in
+// a by-value parameter struct, so no device metadata buffer is needed.
+struct RectSliceMeta { int rank; int total; int outDims[8]; int fullStrides[8]; int starts[8]; };
+extern ""C"" __global__ __launch_bounds__(256) void rect_slice_nd(
+    float* full, float* slice, RectSliceMeta m, int scatter)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= m.total) return;
+    int remaining = idx;
+    int offset = 0;
+    for (int d = m.rank - 1; d >= 0; d--)
+    {
+        int c = remaining % m.outDims[d];
+        remaining /= m.outDims[d];
+        offset += (m.starts[d] + c) * m.fullStrides[d];
+    }
+    if (scatter) full[offset] = slice[idx];
+    else slice[idx] = full[offset];
+}
 extern ""C"" __global__ __launch_bounds__(256) void permute_general(
     const float* input, float* output,
     const int* inputStrides, const int* outputStrides, const int* permutation,
@@ -2527,7 +2547,7 @@ extern ""C"" __global__ __launch_bounds__(256) void batched_gemm(
             "bfgs_step", "levenberg_marquardt_step", "trust_region_step", "admm_step", "newton_method_step", "dfp_step", "coordinate_descent_step",
             "dropout_dotnet_random_serial", "dropout_forward", "dropout_backward", "embedding_forward", "embedding_backward",
             "embedding_backward_deterministic",
-            "transpose_2d", "batched_transpose", "permute_general",
+            "transpose_2d", "batched_transpose", "permute_general", "rect_slice_nd",
             // LSTM kernels
             "lstm_cell_forward", "lstm_cell_backward", "lstm_gates_precompute",
             // GRU kernels

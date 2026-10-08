@@ -113,15 +113,70 @@ internal static class RectSliceLimits
     /// <summary>Largest rank <see cref="IRectSliceKernels.RectSlice"/> handles.</summary>
     internal const int MaxRank = 8;
 }
+/// <summary>
+/// Validation and metadata shared by every <see cref="IRectSliceKernels"/> implementation, so each backend launches
+/// from the same checks. An out-of-bounds launch is a sticky error on CUDA and HIP that poisons the context for every
+/// engine in the process, so the buffers are checked against the shapes, not just the shapes themselves.
+/// </summary>
+internal static class RectSliceGeometry
+{
+    /// <summary>
+    /// Fills <paramref name="outDims"/>, <paramref name="fullStrides"/> and <paramref name="starts"/> (each at least
+    /// <see cref="RectSliceLimits.MaxRank"/> long; unused entries are zero) and returns the rank and element count.
+    /// </summary>
+    internal static void Build(IGpuBuffer full, IGpuBuffer slice, int[] fullShape, int[] start, int[] length,
+        int[] outDims, int[] fullStrides, int[] starts, out int rank, out int total)
+    {
+        if (full is null) throw new ArgumentNullException(nameof(full));
+        if (slice is null) throw new ArgumentNullException(nameof(slice));
+        if (fullShape is null) throw new ArgumentNullException(nameof(fullShape));
+        if (start is null) throw new ArgumentNullException(nameof(start));
+        if (length is null) throw new ArgumentNullException(nameof(length));
+        rank = fullShape.Length;
+        if (rank < 1 || rank > RectSliceLimits.MaxRank || start.Length != rank || length.Length != rank)
+            throw new ArgumentException($"RectSlice supports rank 1..{RectSliceLimits.MaxRank} with matching start/length.");
+        Array.Clear(outDims, 0, outDims.Length);
+        Array.Clear(fullStrides, 0, fullStrides.Length);
+        Array.Clear(starts, 0, starts.Length);
+        int stride = 1;
+        total = 1;
+        for (int d = rank - 1; d >= 0; d--)
+        {
+            if (start[d] < 0 || length[d] < 1 || start[d] + length[d] > fullShape[d])
+                throw new ArgumentOutOfRangeException(nameof(start), $"Axis {d}: [{start[d]}, +{length[d]}) is outside {fullShape[d]}.");
+            outDims[d] = length[d];
+            fullStrides[d] = stride;
+            starts[d] = start[d];
+            stride = checked(stride * fullShape[d]);
+            total = checked(total * length[d]);
+        }
+        if (full.Size < stride)
+            throw new ArgumentException($"RectSlice: the full buffer holds {full.Size} elements, the shape needs {stride}.", nameof(full));
+        if (slice.Size < total)
+            throw new ArgumentException($"RectSlice: the slice buffer holds {slice.Size} elements, the slice needs {total}.", nameof(slice));
+    }
+
+    /// <summary><see cref="Build(IGpuBuffer, IGpuBuffer, int[], int[], int[], int[], int[], int[], out int, out int)"/>
+    /// into the fixed buffers of a by-value kernel parameter struct (CUDA, HIP).</summary>
+    internal static unsafe void Build(IGpuBuffer full, IGpuBuffer slice, int[] fullShape, int[] start, int[] length,
+        int* outDims, int* fullStrides, int* starts, out int rank, out int total)
+    {
+        var d = new int[RectSliceLimits.MaxRank];
+        var s = new int[RectSliceLimits.MaxRank];
+        var o = new int[RectSliceLimits.MaxRank];
+        Build(full, slice, fullShape, start, length, d, s, o, out rank, out total);
+        for (int i = 0; i < RectSliceLimits.MaxRank; i++) { outDims[i] = d[i]; fullStrides[i] = s[i]; starts[i] = o[i]; }
+    }
+}
 
 /// <summary>
 /// Rectangular N-d slice gather/scatter in one launch (rank &lt;= 8). Replaces the per-contiguous-row
 /// device copy loop, which issued one memcpy per row: a [64, 32, 7, 7] height slice was 4,096 API calls.
 /// </summary>
 /// <remarks>
-/// A capability, not a requirement: implemented by the CUDA backend. A backend without it (HIP, Metal, OpenCL,
-/// Vulkan, WebGPU) keeps the per-row device copy, which gives the same result on the device with more launches,
-/// so the engine checks <c>backend is IRectSliceKernels</c> before taking the one-launch path.
+/// Implemented by all six GPU backends (CUDA, HIP, Metal, OpenCL, Vulkan, WebGPU), each validating through
+/// <see cref="RectSliceGeometry"/>. The engine still checks <c>backend is IRectSliceKernels</c>, so a future backend
+/// without it keeps the per-row device copy, which gives the same result with more launches.
 /// </remarks>
 internal interface IRectSliceKernels
 {

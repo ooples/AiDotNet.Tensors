@@ -199,6 +199,28 @@ kernel void quantum_rotation(
     outImag[gid] = sinAngle * re + cosAngle * im;
 }
 
+// Rectangular N-d slice in one launch (rank <= 8), the Metal port of CUDA's rect_slice_nd. meta holds
+// outDims[8], fullStrides[8], starts[8]. scatter == 0 reads the window into slice; scatter != 0 writes it back.
+kernel void rect_slice_nd(
+    device float* full [[buffer(0)]],
+    device float* slice [[buffer(1)]],
+    device const int* meta [[buffer(2)]],
+    constant uint& rank [[buffer(3)]],
+    constant uint& total [[buffer(4)]],
+    constant uint& scatter [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= total) return;
+    int remaining = (int)gid;
+    int offset = 0;
+    for (int d = (int)rank - 1; d >= 0; --d) {
+        int c = remaining % meta[d];
+        remaining /= meta[d];
+        offset += (meta[16 + d] + c) * meta[8 + d];
+    }
+    if (scatter != 0) full[offset] = slice[gid];
+    else slice[gid] = full[offset];
+}
 kernel void permute_tensor(
     device const float* input [[buffer(0)]],
     device float* output [[buffer(1)]],
