@@ -21,6 +21,13 @@ public sealed partial class CudaBackend : IRectSliceKernels
 
     public unsafe void RectSlice(IGpuBuffer full, IGpuBuffer slice, int[] fullShape, int[] start, int[] length, bool scatter)
     {
+        if (!IsAvailable)
+            throw new InvalidOperationException("CUDA backend is not available.");
+        if (full is null) throw new ArgumentNullException(nameof(full));
+        if (slice is null) throw new ArgumentNullException(nameof(slice));
+        if (fullShape is null) throw new ArgumentNullException(nameof(fullShape));
+        if (start is null) throw new ArgumentNullException(nameof(start));
+        if (length is null) throw new ArgumentNullException(nameof(length));
         int rank = fullShape.Length;
         if (rank < 1 || rank > RectSliceLimits.MaxRank || start.Length != rank || length.Length != rank)
             throw new ArgumentException($"RectSlice supports rank 1..{RectSliceLimits.MaxRank} with matching start/length.");

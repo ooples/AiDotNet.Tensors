@@ -5476,6 +5476,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         // Set cuBLAS to use the specified stream. Read the handle once: the property re-binds it to _stream.
         IntPtr cublas = _cublasHandle;
         CuBlasNative.CheckCublasStatus(CuBlasNative.cublasSetStream(cublas, stream.Handle), "cublasSetStream");
+        ReattachCurrentThreadCublasWorkspace(cublas);
 
         try
         {
@@ -5497,6 +5498,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         {
             // Restore the default stream
             CuBlasNative.cublasSetStream(cublas, _stream);
+            ReattachCurrentThreadCublasWorkspace(cublas);
         }
     }
 
@@ -5975,10 +5977,35 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             if (tc.Stream != stream)
             {
                 CuBlasNative.CheckCublasStatus(CuBlasNative.cublasSetStream(tc.Handle, stream), "cublasSetStream(follow current stream)");
+                ReattachCublasWorkspace(tc);
                 tc.Stream = stream;
             }
             return tc.Handle;
         }
+    }
+
+    // cublasSetStream unconditionally resets a handle's workspace to cuBLAS's default pool (cuBLAS documentation),
+    // so every stream switch re-attaches the handle-owned workspace. Without it the first switch silently dropped
+    // the workspace, and a GEMM captured afterwards allocated inside the capture, which CurrentCublasHasWorkspace
+    // had promised it would not. If cuBLAS refuses, the workspace is released and the handle reports none, so the
+    // capture paths take their per-slice fallback.
+    private static void ReattachCublasWorkspace(ThreadCublas tc)
+    {
+        if (tc.Workspace is not { } workspace) return;
+        var status = CuBlasNative.cublasSetWorkspace(tc.Handle, workspace.Handle,
+            (UIntPtr)((ulong)CublasWorkspaceFloats * sizeof(float)));
+        if ((int)status != 0)
+        {
+            workspace.Dispose();
+            tc.Workspace = null;
+        }
+    }
+
+    // As ReattachCublasWorkspace, for a call site that switched the calling thread's handle by hand.
+    private void ReattachCurrentThreadCublasWorkspace(IntPtr handle)
+    {
+        if (_threadCublas is { IsValueCreated: true } local && local.Value is { } tc && tc.Handle == handle)
+            ReattachCublasWorkspace(tc);
     }
 
     // ThreadLocal factory: build this thread's cuBLAS handle for this engine. Runs on the accessing thread,
@@ -13592,6 +13619,10 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
 
     private MultiTensorTable? _gradientTable;
 
+    // Guards _gradientTable from lookup through launch: a caller rebuilding it disposes the previous table, which
+    // another caller may hold between GetGradientTable and its kernel launch.
+    private readonly object _gradientTableSync = new object();
+
     // Upper bound on the multi-tensor reduction's grid: enough blocks to fill the device, few enough that the one
     // atomic per block does not serialize.
     private const int MultiTensorReductionMaxBlocks = 1024;
@@ -13634,16 +13665,26 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             for (int k = 0; k < chunks; k++) { chunkTensor[c] = t; chunkStart[c] = k * MultiTensorChunk; c++; }
         }
 
-        _gradientTable?.Dispose();
+        // Build the replacement completely before retiring the cached table: a failed allocation or upload disposes
+        // the partial replacement and leaves the previous table intact.
         var table = new MultiTensorTable { Handles = handles, Sizes = sizeArray, TotalChunks = totalChunks };
-        using (PushContext())
+        try
         {
-            table.Pointers = AllocateByteBuffer(addresses.Length);
-            UploadByteBuffer(table.Pointers, addresses);
-            table.SizesBuffer = AllocateIntBuffer(sizeArray);
-            table.ChunkTensor = AllocateIntBuffer(chunkTensor);
-            table.ChunkStart = AllocateIntBuffer(chunkStart);
+            using (PushContext())
+            {
+                table.Pointers = AllocateByteBuffer(addresses.Length);
+                UploadByteBuffer(table.Pointers, addresses);
+                table.SizesBuffer = AllocateIntBuffer(sizeArray);
+                table.ChunkTensor = AllocateIntBuffer(chunkTensor);
+                table.ChunkStart = AllocateIntBuffer(chunkStart);
+            }
         }
+        catch
+        {
+            table.Dispose();
+            throw;
+        }
+        _gradientTable?.Dispose();
         _gradientTable = table;
         return table;
     }
@@ -13659,16 +13700,19 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (sumOfSquares.Size < 2) throw new ArgumentException("The double result needs two float slots.", nameof(sumOfSquares));
         Fill(sumOfSquares, 0f, 2);
         if (tensors is null || tensors.Count == 0) return;
-        var table = GetGradientTable(tensors, sizes);
         if (!_kernelCache.TryGetValue("multi_tensor_sum_squares", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: multi_tensor_sum_squares");
-        using var _ = PushContext();
-        IntPtr pH = table.Pointers!.Handle, sH = table.SizesBuffer!.Handle, ctH = table.ChunkTensor!.Handle, csH = table.ChunkStart!.Handle;
-        IntPtr outH = sumOfSquares.Handle;
-        int totalChunks = table.TotalChunks;
         void** args = stackalloc void*[6];
-        args[0] = &pH; args[1] = &sH; args[2] = &ctH; args[3] = &csH; args[4] = &totalChunks; args[5] = &outH;
-        LaunchKernel(kernel, (uint)Math.Min(totalChunks, MultiTensorReductionMaxBlocks), MultiTensorChunk, args);
+        lock (_gradientTableSync)
+        {
+            var table = GetGradientTable(tensors, sizes);
+            using var _ = PushContext();
+            IntPtr pH = table.Pointers!.Handle, sH = table.SizesBuffer!.Handle, ctH = table.ChunkTensor!.Handle, csH = table.ChunkStart!.Handle;
+            IntPtr outH = sumOfSquares.Handle;
+            int totalChunks = table.TotalChunks;
+            args[0] = &pH; args[1] = &sH; args[2] = &ctH; args[3] = &csH; args[4] = &totalChunks; args[5] = &outH;
+            LaunchKernel(kernel, (uint)Math.Min(totalChunks, MultiTensorReductionMaxBlocks), MultiTensorChunk, args);
+        }
     }
 
     /// <summary>
@@ -13693,15 +13737,18 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     {
         if (scale is null) throw new ArgumentNullException(nameof(scale));
         if (tensors is null || tensors.Count == 0) return;
-        var table = GetGradientTable(tensors, sizes);
         if (!_kernelCache.TryGetValue("multi_tensor_scale_by_device_scalar", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: multi_tensor_scale_by_device_scalar");
-        using var _ = PushContext();
-        IntPtr pH = table.Pointers!.Handle, sH = table.SizesBuffer!.Handle, ctH = table.ChunkTensor!.Handle, csH = table.ChunkStart!.Handle;
-        IntPtr scH = scale.Handle;
         void** args = stackalloc void*[5];
-        args[0] = &pH; args[1] = &sH; args[2] = &ctH; args[3] = &csH; args[4] = &scH;
-        LaunchKernel(kernel, (uint)table.TotalChunks, MultiTensorChunk, args);
+        lock (_gradientTableSync)
+        {
+            var table = GetGradientTable(tensors, sizes);
+            using var _ = PushContext();
+            IntPtr pH = table.Pointers!.Handle, sH = table.SizesBuffer!.Handle, ctH = table.ChunkTensor!.Handle, csH = table.ChunkStart!.Handle;
+            IntPtr scH = scale.Handle;
+            args[0] = &pH; args[1] = &sH; args[2] = &ctH; args[3] = &csH; args[4] = &scH;
+            LaunchKernel(kernel, (uint)table.TotalChunks, MultiTensorChunk, args);
+        }
     }
 
     public unsafe void AdamUpdateBf16(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
@@ -17726,8 +17773,11 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         // finalizer (the context may already be gone).
         if (disposing)
         {
-            _gradientTable?.Dispose();
-            _gradientTable = null;
+            lock (_gradientTableSync)
+            {
+                _gradientTable?.Dispose();
+                _gradientTable = null;
+            }
         }
 
         // Drop the diagnostics registrations for these handles. The registry is process-lifetime but
