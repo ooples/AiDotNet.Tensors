@@ -1137,22 +1137,16 @@ internal static class SimdConvHelper
         bool canUseBlock4 = UseFma && padOneNoDilation && outChannels >= 4 && (outChannels & 3) == 0;
         bool canUseBlock2 = UseFma && padOneNoDilation && outChannels >= 2 && (outChannels & 1) == 0;
 
-        // Auto policy: prefer the variant that gives ~one task per core.
-        //   - 16-core Ryzen, outChannels=32: per-channel = 32 tasks (2× cores),
-        //     block2 = 16 tasks (1× cores), block4 = 8 tasks (0.5× cores).
-        //     block2 maximizes parallelism without over-subscribing.
-        //   - With outChannels >> cores (e.g. 256 oc on 16 cores), per-channel
-        //     is fine; block2/block4 lose nothing on parallelism and gain
-        //     register-resident accumulator amortization.
+        // Auto policy: tasks are (batch item, channel block) pairs, so the whole batch feeds the pool. Prefer the
+        // widest block that still gives every core a task: a wider block reuses each loaded input row across more
+        // register-resident accumulators.
         Conv3x3Variant variant = ActiveConv3x3Variant;
         if (variant == Conv3x3Variant.Auto)
         {
-            int cores = Math.Max(1, Environment.ProcessorCount);
-            // Minimum tasks per core for healthy parallel utilization
-            int minTasks = cores;
-            if (canUseBlock4 && (outChannels / 4) >= minTasks)
+            long cores = Math.Max(1, Environment.ProcessorCount);
+            if (canUseBlock4 && (long)batch * (outChannels / 4) >= cores)
                 variant = Conv3x3Variant.Block4;
-            else if (canUseBlock2 && (outChannels / 2) >= minTasks)
+            else if (canUseBlock2 && (long)batch * (outChannels / 2) >= cores)
                 variant = Conv3x3Variant.Block2;
             else
                 variant = Conv3x3Variant.PerChannel;
@@ -1161,92 +1155,46 @@ internal static class SimdConvHelper
         if (variant == Conv3x3Variant.Block4 && !canUseBlock4) variant = Conv3x3Variant.PerChannel;
         if (variant == Conv3x3Variant.Block2 && !canUseBlock2) variant = Conv3x3Variant.PerChannel;
 
-        // #642: parallelize over the variant's output-channel tasks when the work justifies
-        // it. The old gate compared PER-CHANNEL FMAs (inChannels*outputSize*9) to 500K — but a
-        // task is a BLOCK of channelsPerTask channels, and for small-spatial × high-channel
-        // convs (SD-UNet deep stages, e.g. 256ch @ 8x8) per-channel work is ~150K, so the WHOLE
-        // conv ran serial despite ~64 block4 tasks and ~38M aggregate FMAs. Gate on PER-TASK
-        // work (above dispatch overhead) and task count instead, so deep convs fan to all cores.
+        // One flat parallel loop over (batch item, channel block). #642 gated on per-task work so deep
+        // small-spatial convs fan out; but each batch item was still dispatched separately, so a small layer
+        // (16 channels at 28x28: ~7K FMAs per task) never passed the gate and the whole batch ran on one
+        // thread. Gate on the conv's total work instead and let the pool stride the tasks. MaxDegreeOfParallelism
+        // pinned to 1 still means serial.
         int channelsPerTask = variant == Conv3x3Variant.Block4 ? 4
                             : variant == Conv3x3Variant.Block2 ? 2 : 1;
         int numConvTasks = outChannels / channelsPerTask;
-        long perTaskFmas = (long)channelsPerTask * inChannels * outputSize * 9L;
-        // Honor the MaxDegreeOfParallelism contract (pin-to-1 => serial); the old gate
-        // checked Environment.ProcessorCount and so ignored it.
-        bool useParallel = numConvTasks >= 2
-                          && perTaskFmas >= 100_000L
+        int totalTasks = checked(batch * numConvTasks);
+        long totalFmas = (long)batch * outChannels * inChannels * outputSize * 9L;
+        bool useParallel = totalTasks >= 2
+                          && totalFmas >= 100_000L
                           && CpuParallelSettings.MaxDegreeOfParallelism > 1;
+        long inputBatchStride = (long)inChannels * height * width;
+        long outputBatchStride = (long)outChannels * outputSize;
+        long kernelTaskStride = (long)channelsPerTask * inChannels * 9;
+        long outputTaskStride = (long)channelsPerTask * outputSize;
 
-        for (int b = 0; b < batch; b++)
+        void RunTask(int task)
         {
-            float* inputBatch = input + b * inChannels * height * width;
-            float* outputBatch = output + b * outChannels * outHeight * outWidth;
-
+            int b = task / numConvTasks, block = task - b * numConvTasks;
+            float* inputBatch = input + b * inputBatchStride;
+            float* outputTask = output + b * outputBatchStride + block * outputTaskStride;
+            float* kernelTask = kernel + block * kernelTaskStride;
             if (variant == Conv3x3Variant.Block4)
-            {
-                int numBlocks = outChannels / 4;
-                if (useParallel)
-                {
-                    CpuParallelSettings.LightweightParallel(numBlocks, ocb =>
-                    {
-                        Conv3x3Stride1Pad1_OcBlock4(
-                            inputBatch, kernel + ocb * 4 * inChannels * 9,
-                            outputBatch + ocb * 4 * outputSize,
-                            inChannels, height, width, outHeight, outWidth);
-                    });
-                }
-                else
-                {
-                    for (int ocb = 0; ocb < numBlocks; ocb++)
-                        Conv3x3Stride1Pad1_OcBlock4(
-                            inputBatch, kernel + ocb * 4 * inChannels * 9,
-                            outputBatch + ocb * 4 * outputSize,
-                            inChannels, height, width, outHeight, outWidth);
-                }
-            }
+                Conv3x3Stride1Pad1_OcBlock4(inputBatch, kernelTask, outputTask,
+                    inChannels, height, width, outHeight, outWidth);
             else if (variant == Conv3x3Variant.Block2)
-            {
-                int numBlocks = outChannels / 2;
-                if (useParallel)
-                {
-                    CpuParallelSettings.LightweightParallel(numBlocks, ocb =>
-                    {
-                        Conv3x3Stride1Pad1_OcBlock2(
-                            inputBatch, kernel + ocb * 2 * inChannels * 9,
-                            outputBatch + ocb * 2 * outputSize,
-                            inChannels, height, width, outHeight, outWidth);
-                    });
-                }
-                else
-                {
-                    for (int ocb = 0; ocb < numBlocks; ocb++)
-                        Conv3x3Stride1Pad1_OcBlock2(
-                            inputBatch, kernel + ocb * 2 * inChannels * 9,
-                            outputBatch + ocb * 2 * outputSize,
-                            inChannels, height, width, outHeight, outWidth);
-                }
-            }
-            else if (useParallel)
-            {
-                CpuParallelSettings.LightweightParallel(outChannels, oc =>
-                {
-                    Conv3x3Stride1SingleChannel(
-                        inputBatch, kernel + oc * inChannels * 9,
-                        outputBatch + oc * outputSize,
-                        inChannels, height, width, outHeight, outWidth,
-                        padH, padW, dilationH, dilationW);
-                });
-            }
+                Conv3x3Stride1Pad1_OcBlock2(inputBatch, kernelTask, outputTask,
+                    inChannels, height, width, outHeight, outWidth);
             else
-            {
-                for (int oc = 0; oc < outChannels; oc++)
-                    Conv3x3Stride1SingleChannel(
-                        inputBatch, kernel + oc * inChannels * 9,
-                        outputBatch + oc * outputSize,
-                        inChannels, height, width, outHeight, outWidth,
-                        padH, padW, dilationH, dilationW);
-            }
+                Conv3x3Stride1SingleChannel(inputBatch, kernelTask, outputTask,
+                    inChannels, height, width, outHeight, outWidth,
+                    padH, padW, dilationH, dilationW);
         }
+
+        if (useParallel)
+            CpuParallelSettings.LightweightParallel(totalTasks, RunTask);
+        else
+            for (int task = 0; task < totalTasks; task++) RunTask(task);
     }
 
     /// <summary>

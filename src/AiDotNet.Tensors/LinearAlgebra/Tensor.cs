@@ -1877,6 +1877,50 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             int len = Length;
             int outFlat = 0;
 
+            // Keep-one-axis reduction (every conv/BatchNorm bias gradient: [N, C, H, W] summed over {0, 2, 3}):
+            // each output sums `outer` contiguous runs of `inner` elements, so parallelise over the kept axis.
+            // Each output still accumulates its elements in source row-major order, exactly as the odometer
+            // below does, so results are bit-identical; the odometer walked ~1M elements on one thread.
+            if (outRank == 1 && (typeof(T) == typeof(float) || typeof(T) == typeof(double)))
+            {
+                int keep = 0;
+                while (outStrideForDim[keep] == 0) keep++;
+                int outer = 1, inner = 1, kept = _shape[keep];
+                for (int d = 0; d < keep; d++) outer *= _shape[d];
+                for (int d = keep + 1; d < rank; d++) inner *= _shape[d];
+                if (typeof(T) == typeof(float))
+                {
+                    var s = (float[])(object)GetDataArray();
+                    var r = (float[])(object)result.GetDataArray();
+                    CpuParallelSettings.ParallelForOrSerial(0, kept, len, c =>
+                    {
+                        float acc = 0f;
+                        for (int o = 0; o < outer; o++)
+                        {
+                            int run = (o * kept + c) * inner;
+                            for (int j = 0; j < inner; j++) acc += s[run + j];
+                        }
+                        r[c] = acc;
+                    });
+                }
+                else
+                {
+                    var s = (double[])(object)GetDataArray();
+                    var r = (double[])(object)result.GetDataArray();
+                    CpuParallelSettings.ParallelForOrSerial(0, kept, len, c =>
+                    {
+                        double acc = 0d;
+                        for (int o = 0; o < outer; o++)
+                        {
+                            int run = (o * kept + c) * inner;
+                            for (int j = 0; j < inner; j++) acc += s[run + j];
+                        }
+                        r[c] = acc;
+                    });
+                }
+                return result;
+            }
+
             // Typed fast paths: read the raw backing array (offset-adjusted) and
             // accumulate with the native operator — no INumericOperations virtual
             // dispatch. float/double cover the overwhelmingly common training dtypes.
