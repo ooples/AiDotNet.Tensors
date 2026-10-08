@@ -46,6 +46,24 @@ public partial class CpuEngine
         InverseTrigUnary(tensor, "TensorAtan", Math.Atan,
             static (eng, t) => eng.TensorAtan(t), BackwardFunctions<T>.AtanBackward);
 
+    public virtual Tensor<T> TensorAtanh<T>(Tensor<T> tensor) =>
+        InverseTrigUnary(tensor, "TensorAtanh", AtanhScalar,
+            static (eng, t) => eng.TensorAtanh(t), BackwardFunctions<T>.AtanhBackward);
+
+    /// <summary>atanh with torch.atanh's edges: +/-infinity at +/-1, NaN beyond.</summary>
+    private static double AtanhScalar(double x)
+    {
+#if NET5_0_OR_GREATER
+        return Math.Atanh(x);
+#else
+        // 0.5 * log1p(2x / (1 - x)), with log1p from Kahan's correction. The textbook
+        // 0.5 * log((1 + x) / (1 - x)) loses every digit of a tiny x to the rounding of 1 + x.
+        if (x == 1.0) return double.PositiveInfinity;
+        double u = 2.0 * x / (1.0 - x);
+        double w = 1.0 + u;
+        return w == 1.0 ? x : 0.5 * Math.Log(w) * u / (w - 1.0);
+#endif
+    }
     /// <inheritdoc/>
     public virtual Tensor<T> TensorAtan2<T>(Tensor<T> y, Tensor<T> x)
     {

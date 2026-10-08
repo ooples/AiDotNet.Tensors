@@ -178,7 +178,7 @@ kernel void geometry_pad_4d(
 }
 
 // ----------------------------------------------------------------------------
-// GridSample 2D NHWC.
+// GridSample 2D, NCHW input/output.
 // ----------------------------------------------------------------------------
 
 inline float grid_sample_safe_msl(device const float* src, int n, int y, int x, int c,

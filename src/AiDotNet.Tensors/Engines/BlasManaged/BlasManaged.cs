@@ -658,7 +658,8 @@ public static partial class BlasManaged
             && options.PackedA is null && options.PackedB is null
             && options.NumThreads == 0 // only the default (all-core) budget; explicit -1/>0 requests honored below
             && (options.PackingMode == PackingMode.Auto || options.PackingMode == PackingMode.DisableAutotune)
-            && GotoGemmFp32.IsPreferredForThreadBudget(gotoThreadBudget)
+            && (GotoGemmFp32.IsPreferredForThreadBudget(gotoThreadBudget)
+                || GotoGemmFp32.PackBothUnderOccupies(m, gotoThreadBudget))
             && (long)m * n * k >= GotoGemmFp32.ParallelMinWork && GotoGemmFp32.BeatsPackBoth(m, n, k)
             && GotoGemmFp32.IsAvailable)
         {
