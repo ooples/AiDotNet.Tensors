@@ -405,6 +405,43 @@ public sealed class TensorArena : IDisposable
     private long _liveBackingBytes;
     private long _peakBackingBytes;
 
+    // Scratch growth (new pool / ring buffers) since the last Reset. A training loop is expected to Reset once per
+    // step (GradientTape.Dispose does it); a loop that never does -- hand-written backprop with no tape inside an
+    // arena opened around the whole fit -- turned every op into a new buffer retained until the arena was disposed
+    // (an Ooples Chronos fit reached 74 GB). Past the budget the arena stops growing and callers fall back to
+    // ordinary GC allocation: slower, but bounded. A per-step working set beyond the budget degrades the same way.
+    private long _growthBytesSinceReset;
+    private static bool s_growthCapWarned;
+
+    internal static long UnresetGrowthCapBytes { get; set; } = ResolveUnresetGrowthCap();
+
+    private static long ResolveUnresetGrowthCap()
+    {
+        if (long.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_ARENA_UNRESET_CAP_MB"), out var mb) && mb > 0)
+            return mb * 1024 * 1024;
+        long floor = 2L * 1024 * 1024 * 1024;
+#if NETCOREAPP3_0_OR_GREATER
+        long available = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
+        return Math.Max(floor, available / 4);
+#else
+        return floor;
+#endif
+    }
+
+    /// <summary>True (and the arena declines to grow) once scratch growth since the last Reset exceeds the budget.</summary>
+    private bool GrowthCapReached()
+    {
+        if (_growthBytesSinceReset < UnresetGrowthCapBytes) return false;
+        if (!s_growthCapWarned)
+        {
+            s_growthCapWarned = true;
+            System.Diagnostics.Trace.TraceWarning(
+                $"TensorArena: {(_growthBytesSinceReset >> 20)} MB of scratch rented without a Reset; further rents use " +
+                "ordinary allocation. A training loop inside an arena should Reset it once per step.");
+        }
+        return true;
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void TrackBackingBytes<T>(int elementCount)
     {
@@ -719,9 +756,11 @@ public sealed class TensorArena : IDisposable
         // satisfied without an extra Array.Clear here. (The within-arena reuse
         // path above still clears, because those buffers were handed out earlier
         // THIS lifetime and may hold stale data the caller wrote.)
+        if (GrowthCapReached()) return null;
         var arr = RentPersistent(typeof(T), elementCount) as T[] ?? new T[elementCount];
         bucket.Add(arr);
         TrackBackingBytes<T>(elementCount);
+        _growthBytesSinceReset += (long)elementCount * Unsafe.SizeOf<T>();
         _cursor[key] = cursor + 1;
         return arr;
     }
@@ -806,9 +845,11 @@ public sealed class TensorArena : IDisposable
                 // Need one more tensor of this size — reuse a persistent-pool
                 // backing array if available (ring tensors are uninitialized:
                 // the caller overwrites every element, so no clear needed).
+                if (GrowthCapReached()) return null;
                 var newArr = RentPersistent(typeof(T), totalSize, zero: false) as T[] ?? new T[totalSize];
                 _ringBackingArrays.Add((typeof(T), totalSize, newArr));
                 TrackBackingBytes<T>(totalSize);
+                _growthBytesSinceReset += (long)totalSize * Unsafe.SizeOf<T>();
                 var newTensor = LinearAlgebra.Tensor<T>.FromMemory(new Memory<T>(newArr, 0, totalSize), shape);
                 bucket.Add(newTensor);
                 _tensorRingCursors[i] = cursor + 1;
@@ -819,9 +860,11 @@ public sealed class TensorArena : IDisposable
         // New size — add slot
         if (_tensorRingCount < MaxTensorRingSlots)
         {
+            if (GrowthCapReached()) return null;
             var arr = RentPersistent(typeof(T), totalSize, zero: false) as T[] ?? new T[totalSize];
             _ringBackingArrays.Add((typeof(T), totalSize, arr));
             TrackBackingBytes<T>(totalSize);
+            _growthBytesSinceReset += (long)totalSize * Unsafe.SizeOf<T>();
             var tensor = LinearAlgebra.Tensor<T>.FromMemory(new Memory<T>(arr, 0, totalSize), shape);
             var newBucket = new List<object>(4) { tensor };
             int idx = _tensorRingCount++;
@@ -914,6 +957,7 @@ public sealed class TensorArena : IDisposable
             System.Console.Error.WriteLine($"[ALLOC-DIAG] arenaHit={diag.Hit}({diag.HitBytes / BytesPerMiB:F0}MB) arenaMiss={diag.Miss}({diag.MissBytes / BytesPerMiB:F0}MB) arenaNull={diag.Null}({diag.NullBytes / BytesPerMiB:F0}MB)");
             TensorAllocator.Counters.Reset();
         }
+        _growthBytesSinceReset = 0;
         // Rewind all cursors to 0 — arrays and tensors stay pooled.
         // NOTE: must snapshot the keys before mutating. On .NET Framework
         // (net471), Dictionary<,>.this[key] = value increments the collection
