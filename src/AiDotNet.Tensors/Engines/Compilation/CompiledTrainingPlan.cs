@@ -411,11 +411,6 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     }
 
     /// <summary>
-    /// Keeps THIS plan on the eager step even where whole-step CUDA-graph capture is enabled process-wide. The
-    /// environment switch is read once per process, so this is how a single test process compares a captured plan
-    /// against an eager one (the parity oracle for capture).
-    /// </summary>
-    /// <summary>
     /// Why whole-step CUDA-graph capture was abandoned for this plan, or null while it is still eligible or engaged.
     /// A failed capture used to be swallowed: the plan trained eagerly for the rest of its life (paying a launch, copy
     /// or sync per op) and nothing said so. Measured on the PyTorch parity MLP and CNN, every run took that path.
@@ -429,6 +424,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             "CUDA graph capture of the compiled training step failed; this plan trains without graph replay from now on. " + reason);
     }
 
+    /// <summary>
+    /// Keeps THIS plan on the eager step even where whole-step CUDA-graph capture is enabled process-wide. The
+    /// environment switch is read once per process, so this is how a single test process compares a captured plan
+    /// against an eager one (the parity oracle for capture).
+    /// </summary>
     internal void DisableGraphStep()
     {
         InvalidateCapturedStepGraph();
@@ -520,16 +520,6 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     }
 
     /// <summary>
-    /// GPU weight-cache coherence after a CPU-side in-place parameter mutation. The fused optimizer
-    /// mutates a parameter's host backing IN PLACE via raw pointers (no Version bump), so in a GPU
-    /// resident/capture scope the forward's version-gate is BYPASSED and it keeps reading the STALE
-    /// pre-step device weights (the model trains against frozen weights → accuracy pinned at chance).
-    /// Bump Version AND fully invalidate the resident device buffer so the next forward re-uploads the
-    /// updated host weights. Call after EVERY CPU-side weight write — including the early-return
-    /// HypergradientSGD/DAdaptationSGD/ScheduleFreeSGD branches and ScheduleFree's pre-forward
-    /// y-update, which previously left Version and the resident caches stale (#739 review).
-    /// </summary>
-    /// <summary>
     /// Makes an in-place device update of parameter <paramref name="p"/> authoritative everywhere it is looked up,
     /// through the engine's single path for that (the eager GpuOptimizer already uses it). Binding the buffer alone
     /// left the persistent weight cache stamped with the pre-update version, so the next forward judged the updated
@@ -544,12 +534,6 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             engine.CommitParameterUpdatedOnDevice((Tensor<float>)(object)_parameters[p], buffer, backend, syncPoint: null);
     }
 
-    /// <summary>
-    /// Host wins after a host write. A GPU plan binds every parameter to a persistent device buffer and updates it there,
-    /// so between steps the device copy is authoritative. A host write in between (SetParameters, a user edit through
-    /// AsWritableSpan + IncrementVersion) advances the host version past the bound buffer's; upload those values into
-    /// the SAME buffer before the step, so the step reads them and a captured graph's baked pointers stay valid.
-    /// </summary>
     /// <summary>
     /// The plan's gradient buffers live as long as the plan, but they are created during the trace, where the tape's
     /// activation eviction can mark them as released step intermediates. A later write then failed ("GPU intermediate
@@ -566,6 +550,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 buffer?.ClearReleaseMarks();
     }
 
+    /// <summary>
+    /// Host wins after a host write. A GPU plan binds every parameter to a persistent device buffer and updates it there,
+    /// so between steps the device copy is authoritative. A host write in between (SetParameters, a user edit through
+    /// AsWritableSpan + IncrementVersion) advances the host version past the bound buffer's; upload those values into
+    /// the SAME buffer before the step, so the step reads them and a captured graph's baked pointers stay valid.
+    /// </summary>
     private void UploadHostWrittenParameters()
     {
         if (typeof(T) != typeof(float) || _engine is not Engines.DirectGpuTensorEngine gte) return;
@@ -590,6 +580,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         }
     }
 
+    /// <summary>
+    /// GPU weight-cache coherence after a CPU-side in-place parameter mutation. The fused optimizer
+    /// mutates a parameter's host backing IN PLACE via raw pointers (no Version bump), so in a GPU
+    /// resident/capture scope the forward's version-gate is BYPASSED and it keeps reading the STALE
+    /// pre-step device weights (the model trains against frozen weights → accuracy pinned at chance).
+    /// Bump Version AND fully invalidate the resident device buffer so the next forward re-uploads the
+    /// updated host weights. Call after EVERY CPU-side weight write — including the early-return
+    /// HypergradientSGD/DAdaptationSGD/ScheduleFreeSGD branches and ScheduleFree's pre-forward
+    /// y-update, which previously left Version and the resident caches stale (#739 review).
+    /// </summary>
     private void MarkHostWeightMutated(int p)
     {
         // A host-side weight write invalidates the parameter's resident device buffer (below), which a captured step
@@ -620,19 +620,29 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     /// multi-consumer parameter was wrong (CNN conv layers ~0.4x, LSTM input/forget/candidate gates ~0.5x against
     /// PyTorch) while the update itself, which reads the live map, was right.
     /// </remarks>
+    /// <summary>
+    /// Each parameter's gradient from the last step, as the live gradient map holds it. The backward can replace a
+    /// parameter's map entry (out-of-place accumulation, a first-write copy) rather than add into the plan's buffer,
+    /// so the plan's own array can hold only the first contribution. The result is a separate array: the plan's
+    /// array is what the step's clip, regularization and optimizer were configured against, and a reader must not
+    /// rebind it, least of all outside the step lock.
+    /// </summary>
     public Tensor<T>[] Gradients
     {
         get
         {
-            if (_liveGradientMap is { } live)
+            if (_liveGradientMap is not { } live)
+                return _gradients;
+            Tensor<T>[]? resolved = null;
+            for (int i = 0; i < _parameters.Length && i < _gradients.Length; i++)
             {
-                for (int i = 0; i < _parameters.Length && i < _gradients.Length; i++)
+                if (live.TryGetValue(_parameters[i], out var current) && !ReferenceEquals(current, _gradients[i]))
                 {
-                    if (live.TryGetValue(_parameters[i], out var current) && !ReferenceEquals(current, _gradients[i]))
-                        _gradients[i] = current;
+                    resolved ??= (Tensor<T>[])_gradients.Clone();
+                    resolved[i] = current;
                 }
             }
-            return _gradients;
+            return resolved ?? _gradients;
         }
     }
 
@@ -5337,6 +5347,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                     // (per-layer-LR) GPU path — the path the Transformer's Noam/warmup schedule
                     // takes — trains against frozen weights: loss flat, weights drift, accuracy = chance.
                     _parameters[p]._gpuBufferVersion = _parameters[p].GpuCacheVersion;
+                    // And make the update authoritative in the persistent weight cache, as the non-grouped branch does:
+                    // a cache entry stamped with the pre-update version judged the updated buffer stale and re-uploaded
+                    // the old host weights over it. Every float32 parameter reaches this branch now, not just FP16 plans.
+                    if (_engine is Engines.DirectGpuTensorEngine groupedEngine)
+                    {
+                        groupedEngine.BindResidentBuffer(_parameters[p], gpuP, gpuBe);
+                        CommitDeviceParameterUpdate(groupedEngine, p, gpuP, gpuBe);
+                    }
                     continue;
                 }
 

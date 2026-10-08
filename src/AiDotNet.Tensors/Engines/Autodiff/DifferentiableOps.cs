@@ -654,15 +654,6 @@ internal static class DifferentiableOps
         Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1";
 
     /// <summary>
-    /// Accumulates a gradient for a tensor in the gradient dictionary.
-    /// If the tensor already has a gradient, the new gradient is added to it.
-    /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining
-#if !NETFRAMEWORK
-        | MethodImplOptions.AggressiveOptimization
-#endif
-    )]
-    /// <summary>
     /// Adds a slice's gradient into ONLY its region of <paramref name="tensor"/>'s existing accumulator, instead of
     /// materializing a full-size zero tensor and adding all of it. A recurrence that slices one tensor per step (an
     /// LSTM's per-timestep input) otherwise does O(T * size) work per sequence in backward; on the CPU that made a
@@ -719,6 +710,15 @@ internal static class DifferentiableOps
         return true;
     }
 
+    /// <summary>
+    /// Accumulates a gradient for a tensor in the gradient dictionary.
+    /// If the tensor already has a gradient, the new gradient is added to it.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining
+#if !NETFRAMEWORK
+        | MethodImplOptions.AggressiveOptimization
+#endif
+    )]
     internal static void AccumulateGrad<T>(
         Dictionary<Tensor<T>, Tensor<T>> grads,
         Tensor<T> tensor,
