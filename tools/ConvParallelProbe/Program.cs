@@ -54,11 +54,16 @@ internal static class Program
         if (args.Length > 0 && args[0] == "--allocbench") return RunAllocBench(eng, args);
         if (args.Length > 0 && args[0] == "--resblock") return RunResblock(eng, args);
         if (args.Length > 0 && args[0] == "--attnblock") return RunAttnBlock(eng, args);
+        if (args.Length > 0 && args[0] == "--allocops") return RunAllocOps(eng, args);
+        if (args.Length > 0 && args[0] == "--intoaudit") return RunIntoAudit(eng, args);
+        if (args.Length > 0 && args[0] == "--resblockops") return RunResBlockOps(eng, args);
         if (args.Length > 0 && args[0] == "--act") return RunAct(eng, args);
         if (args.Length > 0 && args[0] == "--gemm") return RunGemm(eng, args);
         if (args.Length > 0 && args[0] == "--gemmverify") return RunGemmVerify(eng, args);
         if (args.Length > 0 && args[0] == "--gemmaudit") return RunGemmAudit(eng, args);
         if (args.Length > 0 && args[0] == "--gemmprofile") return RunGemmProfile(eng, args);
+        if (args.Length > 0 && args[0] == "--fp16b") return RunFp16WeightAb(eng, args);
+        if (args.Length > 0 && args[0] == "--gotoprofile") return RunGotoProfile(eng, args);
         if (args.Length > 0 && args[0] == "--gpu") return RunGpu(args);
         if (args.Length > 0 && args[0] == "--trainbench") return RunTrainbench(eng, args);
         if (args.Length > 0 && args[0] == "--flashbwd") return RunFlashBwd(eng, args);
@@ -94,7 +99,7 @@ internal static class Program
             s.Stop();
             times[i] = s.Elapsed.TotalMilliseconds;
         }
-        string u = string.Empty; // utilization meter removed with CooperativeGemmScheduler (PR #762)
+        string u = string.Empty;
         Array.Sort(times);
         Console.WriteLine(
             $"CONV inC={inC} outC={outC} sp={sp}x{sp} out.len={o.Length} maxdop={maxdop} " +
@@ -108,6 +113,108 @@ internal static class Program
     // way --resblock measures the conv mix. This is a perf-SHAPE probe: weights/activations are
     // random and the per-head tensors are allocated at the exact attention GEMM shapes, so it
     // measures the dispatch/parallel behavior of those op shapes (not numerical attention).
+    // In-place forward work: a destination-taking op that still allocates its result and copies it
+    // is slower than the out-of-place op it replaces. Report bytes per call; ~0 is the contract.
+    private static int RunIntoAudit(CpuEngine eng, string[] a)
+    {
+        CpuParallelSettings.MaxDegreeOfParallelism = ArgI(a, "--maxdop", 1);
+        var rng = new Random(0);
+        int S = 256, D = 768, H = 12, Dh = 64;
+        var x = Rand(new[] { S, D }, rng);
+        var y = Rand(new[] { S, D }, rng);
+        var row = Rand(new[] { 1, D }, rng);
+        var w = Rand(new[] { D, D }, rng);
+        var outSD = Rand(new[] { S, D }, rng);
+        var outDS = Rand(new[] { D, S }, rng);
+        var qh = Rand(new[] { H, S, Dh }, rng);
+        var kht = Rand(new[] { H, Dh, S }, rng);
+        var scores = Rand(new[] { H, S, S }, rng);
+        var outHSS = Rand(new[] { H, S, S }, rng);
+        var outCat = Rand(new[] { S, 2 * D }, rng);
+
+        void Audit(string name, Action op)
+        {
+            op(); op();
+            long before = GC.GetTotalAllocatedBytes(true);
+            for (int i = 0; i < 5; i++) op();
+            double kb = (GC.GetTotalAllocatedBytes(true) - before) / 5.0 / 1024.0;
+            Console.WriteLine($"INTO {name,-34} alloc_KB_per_call={kb,10:F1}{(kb > 64 ? "  <-- allocates" : "")}");
+        }
+
+        Audit("MatMulInto rank2", () => eng.MatMulInto(outSD, x, w));
+        Audit("MatMulInto rank3 (per-head)", () => eng.MatMulInto(outHSS, qh, kht));
+        Audit("SoftmaxInto", () => eng.SoftmaxInto(outHSS, scores, -1));
+        Audit("LogSoftmaxInto", () => eng.LogSoftmaxInto(outHSS, scores, -1));
+        Audit("TensorAddInto", () => eng.TensorAddInto(outSD, x, y));
+        Audit("TensorAddInPlace", () => eng.TensorAddInPlace(outSD, x));
+        Audit("TensorBroadcastAddInto [S,D]+[1,D]", () => eng.TensorBroadcastAddInto(outSD, x, row));
+        Audit("TensorBroadcastMultiplyInto", () => eng.TensorBroadcastMultiplyInto(outSD, x, row));
+        Audit("TensorMultiplyInto", () => eng.TensorMultiplyInto(outSD, x, y));
+        Audit("TransposeInto", () => eng.TransposeInto(outDS, x, new[] { 1, 0 }));
+        Audit("ConcatInto", () => eng.ConcatInto(outCat, new[] { x, y }, 1));
+        Audit("GELUInto", () => eng.GELUInto(outSD, x));
+        Audit("SwishInto", () => eng.SwishInto(outSD, x));
+        return 0;
+    }
+    // In-place forward work: bytes each attention-block op allocates beyond its own output.
+    // Anything above 1.00x is internal scratch the op could take from a reused buffer instead.
+    private static int RunAllocOps(CpuEngine eng, string[] a)
+    {
+        int S = ArgI(a, "--s", 256), D = ArgI(a, "--d", 768), H = ArgI(a, "--h", 12);
+        int Dh = D / H;
+        CpuParallelSettings.MaxDegreeOfParallelism = ArgI(a, "--maxdop", 1);
+        var rng = new Random(0);
+        var x = Rand(new[] { S, D }, rng);
+        var w = Rand(new[] { D, D }, rng);
+        var w1 = Rand(new[] { D, 4 * D }, rng);
+        var gamma = Rand(new[] { D }, rng);
+        var beta = Rand(new[] { D }, rng);
+        var qh = Rand(new[] { H, S, Dh }, rng);
+        var kht = Rand(new[] { H, Dh, S }, rng);
+        var scores = Rand(new[] { H, S, S }, rng);
+        var h1 = Rand(new[] { S, 4 * D }, rng);
+
+        // --arena: every call reuses the previous call's buffers, which isolates the cost of fresh
+        // output pages (allocation, page faults) from the kernel itself.
+        using var arena = HasFlag(a, "--arena") ? TensorArena.Create() : null;
+        void Measure(string name, long outputElements, Action op)
+        {
+            if (arena is not null) { var raw = op; op = () => { arena.Reset(); raw(); }; }
+            op(); op();
+            long before = GC.GetTotalAllocatedBytes(true);
+            const int n = 5;
+            for (int i = 0; i < n; i++) op();
+            double perCall = (GC.GetTotalAllocatedBytes(true) - before) / (double)n;
+            double outBytes = outputElements * sizeof(float);
+            var times = new double[9];
+            for (int i = 0; i < times.Length; i++)
+            {
+                var sw = Stopwatch.StartNew();
+                op();
+                times[i] = sw.Elapsed.TotalMilliseconds;
+            }
+            Array.Sort(times);
+            Console.WriteLine($"ALLOCOP {name,-28} alloc_KB={perCall / 1024.0,10:F1} output_KB={outBytes / 1024.0,9:F1} ratio={(outBytes > 0 ? perCall / outBytes : 0),6:F2} median_ms={times[times.Length / 2],8:F3}");
+        }
+
+        Measure("BatchMatMul [S,D]x[D,D]", (long)S * D, () => eng.BatchMatMul(x, w));
+        Measure("BatchMatMul [S,D]x[D,4D]", (long)S * 4 * D, () => eng.BatchMatMul(x, w1));
+        Measure("BatchMatMul [H,S,Dh]x[H,Dh,S]", (long)H * S * S, () => eng.BatchMatMul(qh, kht));
+        Measure("Softmax [H,S,S]", (long)H * S * S, () => eng.Softmax(scores, -1));
+        var softmaxOut = Rand(new[] { H, S, S }, rng);
+        Measure("SoftmaxInto [H,S,S]", 0, () => eng.SoftmaxInto(softmaxOut, scores, -1));
+        Measure("TensorAdd [S,D]", (long)S * D, () => eng.TensorAdd(x, x));
+        Measure("LayerNorm [S,D]", (long)S * D, () => eng.LayerNorm(x, gamma, beta, 1e-5, out _, out _));
+        Measure("SwishInPlace [S,4D]", 0, () => eng.SwishInPlace(h1));
+        var actOut = Rand(new[] { S, 4 * D }, rng);
+        Measure("GELU [S,4D]", (long)S * 4 * D, () => eng.GELU(h1));
+        Measure("GELUInto [S,4D]", 0, () => eng.GELUInto(actOut, h1));
+        Measure("Tanh [S,4D]", (long)S * 4 * D, () => eng.Tanh(h1));
+        Measure("Sigmoid [S,4D]", (long)S * 4 * D, () => eng.Sigmoid(h1));
+        Measure("ReLU [S,4D]", (long)S * 4 * D, () => eng.ReLU(h1));
+        Measure("Mish [S,4D]", (long)S * 4 * D, () => eng.Mish(h1));
+        return 0;
+    }
     private static int RunAttnBlock(CpuEngine eng, string[] a)
     {
         int maxdop = ArgI(a, "--maxdop", Environment.ProcessorCount);
@@ -197,6 +304,8 @@ internal static class Program
         if (arena is not null) { arena.Reset(); yy = x0; for (int b = 0; b < blocks; b++) yy = blk(yy); }
         GC.Collect(); GC.WaitForPendingFinalizers(); GC.Collect();
         long allocStart = GC.GetAllocatedBytesForCurrentThread();
+        int gen0Start = GC.CollectionCount(0), gen2Start = GC.CollectionCount(2);
+        double pauseStartMs = GC.GetTotalPauseDuration().TotalMilliseconds;
         for (int i = 0; i < reps; i++)
         {
             if (arena is not null) arena.Reset();
@@ -208,7 +317,10 @@ internal static class Program
         }
         arena?.Dispose();
         long allocBytes = GC.GetAllocatedBytesForCurrentThread() - allocStart;
-        string u = string.Empty; // utilization meter removed with CooperativeGemmScheduler (PR #762)
+        double gen0PerFwd = (GC.CollectionCount(0) - gen0Start) / (double)reps;
+        double gen2PerFwd = (GC.CollectionCount(2) - gen2Start) / (double)reps;
+        double gcPausePerFwd = (GC.GetTotalPauseDuration().TotalMilliseconds - pauseStartMs) / reps;
+        string u = $" gen0_per_fwd={gen0PerFwd:F2} gen2_per_fwd={gen2PerFwd:F2} gc_pause_ms_per_fwd={gcPausePerFwd:F2}";
         Array.Sort(times);
         Console.WriteLine(
             $"ATTNBLOCK S={S} D={D} H={H} Dh={Dh} blocks={blocks} maxdop={maxdop} procs={Environment.ProcessorCount} " +
@@ -269,6 +381,8 @@ internal static class Program
         var times = new double[reps];
         long peakWs = 0;
         long allocStart = GC.GetAllocatedBytesForCurrentThread();
+        int gen0Start = GC.CollectionCount(0), gen2Start = GC.CollectionCount(2);
+        double pauseStartMs = GC.GetTotalPauseDuration().TotalMilliseconds;
         for (int i = 0; i < reps; i++)
         {
             arena?.Reset();
@@ -560,7 +674,7 @@ internal static class Program
             s.Stop();
             times[i] = s.Elapsed.TotalMilliseconds;
         }
-        string u = string.Empty; // utilization meter removed with CooperativeGemmScheduler (PR #762)
+        string u = string.Empty;
         Array.Sort(times);
         Console.WriteLine(
             $"ACT op={op} n={n} maxdop={maxdop} procs={Environment.ProcessorCount} " +
@@ -662,7 +776,7 @@ internal static class Program
             s.Stop();
             times[i] = s.Elapsed.TotalMilliseconds;
         }
-        string u = string.Empty; // utilization meter removed with CooperativeGemmScheduler (PR #762)
+        string u = string.Empty;
         Array.Sort(times);
         Console.WriteLine(
             $"GEMM M={M} K={K} N={N} fma={(double)M * K * N:E1} maxdop={maxdop} procs={Environment.ProcessorCount} " +
@@ -706,6 +820,181 @@ internal static class Program
     // P4 (#653): single-thread pack-vs-kernel attribution via PackBothProfiler (reflection,
     // since it's internal). Answers whether the per-core gap is the RyuJIT microkernel or the
     // pack/blocking overhead — which decides whether a machine-code microkernel is worth it.
+    // #653 GEMM kernel work: where the routed GotoGemm path spends its time at a given thread count.
+    // Pack and kernel ticks are summed across workers, so (pack + kernel) / (wall * threads) is the
+    // share of the thread budget doing useful work; the rest is idle, imbalance or dispatch.
+    // Per-op median time of one ResBlock's ops at the --resblock shapes, buffers reused, so a change
+    // that moves the whole block (worker pinning, #653) can be traced to the op that moved.
+    private static int RunResBlockOps(CpuEngine eng, string[] a)
+    {
+        int C = ArgI(a, "--c", 256), sp = ArgI(a, "--sp", 16);
+        CpuParallelSettings.MaxDegreeOfParallelism = ArgI(a, "--maxdop", 16);
+        int groups = Math.Max(1, Math.Min(32, C / 8));
+        var rng = new Random(0);
+        var x = Rand(new[] { 1, C, sp, sp }, rng);
+        var gamma = Rand(new[] { C }, rng);
+        var beta = Rand(new[] { C }, rng);
+        var k1 = Rand(new[] { C, C, 3, 3 }, rng);
+        var h = Rand(new[] { 1, C, sp, sp }, rng);
+        using var arena = TensorArena.Create();
+
+        void Time(string name, Action op)
+        {
+            for (int i = 0; i < 5; i++) { arena.Reset(); op(); }
+            var times = new double[21];
+            for (int i = 0; i < times.Length; i++)
+            {
+                arena.Reset();
+                var sw = Stopwatch.StartNew();
+                op();
+                times[i] = sw.Elapsed.TotalMilliseconds;
+            }
+            Array.Sort(times);
+            Console.WriteLine($"RESOP {name,-12} median_ms={times[times.Length / 2]:F3}");
+        }
+
+        Time("GroupNorm", () => eng.GroupNorm(x, groups, gamma, beta, 1e-5, out _, out _));
+        Time("SwishInPlace", () => eng.SwishInPlace(h));
+        Time("Conv2D", () => eng.Conv2D(x, k1, 1, 1, 1));
+        Time("TensorAdd", () => eng.TensorAdd(x, h));
+        return 0;
+    }
+    private static int RunGotoProfile(CpuEngine eng, string[] a)
+    {
+        int M = ArgI(a, "--m", 256), K = ArgI(a, "--k", 768), N = ArgI(a, "--n", 3072);
+        int maxdop = ArgI(a, "--maxdop", 16);
+        int reps = ArgI(a, "--reps", 40);
+        CpuParallelSettings.MaxDegreeOfParallelism = maxdop;
+        var goto_ = typeof(CpuEngine).Assembly.GetType("AiDotNet.Tensors.Engines.BlasManaged.GotoGemmFp32");
+        if (goto_ == null) { Console.Error.WriteLine("GotoGemmFp32 not found"); return 2; }
+        const System.Reflection.BindingFlags SF = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static;
+        var timingF = goto_.GetField("s_timing", SF);
+        var packF = goto_.GetField("s_packTicks", SF);
+        var packAF = goto_.GetField("s_packATicks", SF);
+        var packBF = goto_.GetField("s_packBTicks", SF);
+        var kernF = goto_.GetField("s_kernTicks", SF);
+        var tailF = goto_.GetField("s_tailTicks", SF);
+        var runParF = goto_.GetField("s_runParallelTicks", SF);
+        var tileF = goto_.GetField("s_tileTicks", SF);
+        var lagF = goto_.GetField("s_tileLagTicks", SF);
+        var tileCountF = goto_.GetField("s_tileCount", SF);
+        var tileMaxF = goto_.GetField("s_tileMaxTicksSum", SF);
+        var tileMinF = goto_.GetField("s_tileMinTicksSum", SF);
+        var resetM = goto_.GetMethod("ResetTiming", SF);
+        if (timingF == null || packF == null || packAF == null || packBF == null || kernF == null || resetM == null)
+        {
+            Console.Error.WriteLine("GotoGemmFp32 timing members not found");
+            return 2;
+        }
+        var rng = new Random(0);
+        var lhs = Rand(new[] { M, K }, rng);
+        var rhs = Rand(new[] { K, N }, rng);
+        var o = eng.BatchMatMul(lhs, rhs);
+        for (int i = 0; i < 5; i++) o = eng.BatchMatMul(lhs, rhs);
+        timingF.SetValue(null, true);
+        resetM.Invoke(null, null);
+        var sw = Stopwatch.StartNew();
+        for (int i = 0; i < reps; i++) o = eng.BatchMatMul(lhs, rhs);
+        sw.Stop();
+        timingF.SetValue(null, false);
+        double f = 1000.0 / Stopwatch.Frequency;
+        double pack = (long)(packF.GetValue(null) ?? 0L) * f, packA = (long)(packAF.GetValue(null) ?? 0L) * f;
+        double packB = (long)(packBF.GetValue(null) ?? 0L) * f, kern = (long)(kernF.GetValue(null) ?? 0L) * f;
+        double tail = tailF is null ? 0 : (long)(tailF.GetValue(null) ?? 0L) * f;
+        double runPar = runParF is null ? 0 : (long)(runParF.GetValue(null) ?? 0L) * f;
+        double tiles = tileF is null ? 0 : (long)(tileF.GetValue(null) ?? 0L) * f;
+        double lag = lagF is null ? 0 : (long)(lagF.GetValue(null) ?? 0L) * f;
+        long tileCount = tileCountF is null ? 0 : (long)(tileCountF.GetValue(null) ?? 0L);
+        double tileMax = tileMaxF is null ? 0 : (long)(tileMaxF.GetValue(null) ?? 0L) * f / reps;
+        double tileMin = tileMinF is null ? 0 : (long)(tileMinF.GetValue(null) ?? 0L) * f / reps;
+        double wall = sw.Elapsed.TotalMilliseconds;
+        double budget = wall * maxdop;
+        double gflops = reps * 2.0 * M * K * N / (wall / 1000.0) / 1e9;
+        Console.WriteLine(
+            $"GOTOPROFILE M={M} K={K} N={N} maxdop={maxdop} wall_ms_per_call={wall / reps:F3} GFLOPs={gflops:F0} | " +
+            $"kernel={100 * kern / budget:F0}% packA={100 * packA / budget:F0}% packB={100 * packB / budget:F0}% tails={100 * tail / budget:F0}% " +
+            $"other/idle={100 * (budget - pack - kern - tail) / budget:F0}% of thread budget | kernel GFLOPs/thread-busy=" +
+            $"{reps * 2.0 * M * K * N / (kern / 1000.0) / 1e9:F0} | outside_runparallel_ms_per_call={(wall - runPar) / reps:F3} " +
+            $"runparallel_ms_per_call={runPar / reps:F3} tiles_per_call={(double)tileCount / reps:F0} mean_tile_ms={(tileCount > 0 ? tiles / tileCount : 0):F3} " +
+            $"mean_tile_start_lag_ms={(tileCount > 0 ? lag / tileCount : 0):F3} slowest_tile_ms={tileMax:F3} fastest_tile_ms={tileMin:F3} (sink={o[0]:E1})");
+        return 0;
+    }
+    // #681: a half-resident weight, two ways, alternated in one process so build layout cannot bias it.
+    // "upcast" is what ships: convert the weight into a reused fp32 buffer, then the float GEMM.
+    // "fused" converts inside GotoGemm's B-pack and never materializes the fp32 weight.
+    private static int RunFp16WeightAb(CpuEngine eng, string[] a)
+    {
+        int rounds = ArgI(a, "--rounds", 10);
+        if (rounds < 2)
+        {
+            Console.Error.WriteLine("fp16b: --rounds must be at least 2 (paired rounds alternate which path runs first).");
+            return 2;
+        }
+        CpuParallelSettings.MaxDegreeOfParallelism = ArgI(a, "--maxdop", Environment.ProcessorCount);
+        double worstDiff = 0;
+        var shapes = new (int M, int K, int N)[] { (256, 3072, 12288), (4096, 1280, 5120), (1024, 3072, 768) };
+        var rng = new Random(681);
+        foreach (var (M, K, N) in shapes)
+        {
+            var x = Rand(new[] { M, K }, rng);
+            var wHalf = new Tensor<Half>(new[] { K, N });
+            for (int i = 0; i < wHalf.Length; i++) wHalf[i] = (Half)(rng.NextDouble() - 0.5);
+            var wScratch = new Tensor<float>(new[] { K, N });
+            var halfData = wHalf.GetCpuData();
+            var scratchData = wScratch.GetCpuData();
+
+            Tensor<float> Upcast()
+            {
+                AiDotNet.Tensors.Engines.Simd.SimdKernels.ConvertToSingle(
+                    new ReadOnlySpan<Half>(halfData, 0, K * N), new Span<float>(scratchData, 0, K * N));
+                return eng.TensorMatMul(x, wScratch);
+            }
+            Tensor<float> Fused() => eng.TensorMatMulFp16WeightB(x, wHalf);
+
+            var u = Upcast(); var f = Fused();
+            double maxDiff = 0;
+            for (int i = 0; i < u.Length; i++)
+            {
+                // A non-finite value in either path is a wrong kernel; NaN would slip past the threshold.
+                if (float.IsNaN(u[i]) || float.IsInfinity(u[i]) || float.IsNaN(f[i]) || float.IsInfinity(f[i]))
+                {
+                    maxDiff = double.PositiveInfinity;
+                    break;
+                }
+                maxDiff = Math.Max(maxDiff, Math.Abs(u[i] - f[i]));
+            }
+            worstDiff = Math.Max(worstDiff, maxDiff);
+            var ratios = new double[rounds];
+            double upSum = 0, fuSum = 0;
+            for (int r = 0; r < rounds; r++)
+            {
+                bool upcastFirst = r % 2 == 0;
+                double tu = 0, tf = 0;
+                for (int pass = 0; pass < 2; pass++)
+                {
+                    bool runUpcast = (pass == 0) == upcastFirst;
+                    var sw = Stopwatch.StartNew();
+                    var res = runUpcast ? Upcast() : Fused();
+                    double ms = sw.Elapsed.TotalMilliseconds;
+                    if (res[0] == float.PositiveInfinity) Console.Write("");
+                    if (runUpcast) tu = ms; else tf = ms;
+                }
+                ratios[r] = tu / tf;
+                upSum += tu; fuSum += tf;
+            }
+            Array.Sort(ratios);
+            Console.WriteLine($"FP16B {M}x{K}x{N} upcast_mean_ms={upSum / rounds:F2} fused_mean_ms={fuSum / rounds:F2} " +
+                              $"paired_upcast/fused median={ratios[rounds / 2]:F2} range=[{ratios[0]:F2}..{ratios[rounds - 1]:F2}] max|diff|={maxDiff:E2} " +
+                              "(both paths allocate a fresh [M,N] result; even rounds run upcast first, odd rounds fused first)");
+        }
+        // Both paths compute the same product; a gap beyond fp32 reassociation noise is a wrong kernel.
+        if (worstDiff > 1e-3)
+        {
+            Console.Error.WriteLine($"fp16b: fused and upcast results differ by {worstDiff:E2}, above 1e-3.");
+            return 1;
+        }
+        return 0;
+    }
     private static int RunGemmProfile(CpuEngine eng, string[] a)
     {
         int M = ArgI(a, "--m", 512);
@@ -796,7 +1085,7 @@ internal static class Program
             s.Stop();
             times[i] = s.Elapsed.TotalMilliseconds;
         }
-        string u = string.Empty; // utilization meter removed with CooperativeGemmScheduler (PR #762)
+        string u = string.Empty;
         Array.Sort(times);
         Console.WriteLine(
             $"RESBLOCK C={C} sp={sp}x{sp} blocks={blocks} maxdop={maxdop} procs={Environment.ProcessorCount} " +

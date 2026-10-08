@@ -152,7 +152,7 @@ public sealed class VulkanGemmTests
     [InlineData(128, 128, 256)]
     public void Gemm_Fp32_MatchesCpuReference(int m, int n, int k)
     {
-        Skip.If(!EnsureReady(needFp16: false), "Vulkan not available on this system.");
+        Skip.If(!EnsureReady(needFp16: false), $"Vulkan not available on this system. {VulkanBackend.Instance.InitializationFailure}");
 
         var a = RandomMatrix(m, k, seed: 11 + m + k);
         var b = RandomMatrix(k, n, seed: 22 + n + k);
@@ -172,7 +172,7 @@ public sealed class VulkanGemmTests
     [InlineData(true, 8)]
     public void UnitPhaseCodebook_IsBitIdenticalToCpu(bool kPsk, int k)
     {
-        Skip.If(!EnsureReady(needFp16: false), "Vulkan GLSL compute is unavailable on this system.");
+        Skip.If(!EnsureReady(needFp16: false), $"Vulkan GLSL compute is unavailable on this system. {VulkanBackend.Instance.InitializationFailure}");
         const int seed = -1729, vocabulary = 5, dimension = 17;
         int length = vocabulary * dimension;
         var expectedReal = new float[length];
@@ -194,7 +194,7 @@ public sealed class VulkanGemmTests
     [InlineData(37, 29, 11)]
     public void MatMulTransposed_Fp32_MatchesCpuReference(int m, int n, int k)
     {
-        Skip.If(!EnsureReady(needFp16: false), "Vulkan not available on this system.");
+        Skip.If(!EnsureReady(needFp16: false), $"Vulkan not available on this system. {VulkanBackend.Instance.InitializationFailure}");
 
         const float alpha = 0.75f;
         const float beta = -0.25f;
@@ -221,7 +221,7 @@ public sealed class VulkanGemmTests
     [InlineData(128, 128, 256)]
     public void GemmFp16In32fOut_MatchesCpuReference(int m, int n, int k)
     {
-        Skip.If(!EnsureReady(needFp16: true), "Vulkan FP16 GEMM (libshaderc) not available on this system.");
+        Skip.If(!EnsureReady(needFp16: true), $"Vulkan FP16 GEMM (libshaderc) not available on this system. {VulkanBackend.Instance.InitializationFailure}");
 
         var a = RandomMatrix(m, k, seed: 1234 + m + k);
         var b = RandomMatrix(k, n, seed: 5678 + n + k);
@@ -248,7 +248,7 @@ public sealed class VulkanGemmTests
     [SkippableFact]
     public void GemmFp16In32fOut_RejectsNonPositiveDimensions()
     {
-        Skip.If(!EnsureReady(needFp16: true), "Vulkan FP16 GEMM not available on this system.");
+        Skip.If(!EnsureReady(needFp16: true), $"Vulkan FP16 GEMM not available on this system. {VulkanBackend.Instance.InitializationFailure}");
 
         using var dummy = _backend.AllocateBuffer(4);
         var half = (IGpuHalfPrecisionBackend)_backend;
