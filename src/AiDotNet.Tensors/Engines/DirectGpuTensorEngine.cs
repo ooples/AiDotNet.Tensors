@@ -7363,6 +7363,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
 
         var aData = a.GetDataArray();
         var bData = b.GetReadOnlyDataArray();
+        // Compared against bData, not b.Length, on purpose: the device op reads bData from index 0, so bData must
+        // be exactly b's elements. A padded backing array or a view's shared source is longer than b and would
+        // be read at the wrong offset; rejecting it costs only a fall back to the correct CPU path.
         if (a.Length != bData.Length)
             return false;
 
