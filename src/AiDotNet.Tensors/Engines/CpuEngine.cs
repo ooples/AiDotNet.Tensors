@@ -9132,7 +9132,12 @@ public partial class CpuEngine : ITensorLevelEngine
                 new object[] { paddedIndices, new[] { poolSize, poolSize }, new[] { stride, stride } });
             return padded;
         }
-        if (tape is not null)
+        // A contiguous unpadded float pool on this CPU engine saves no indices: the fast pool below computes the
+        // output and the backward re-scans the input for each window's winner, against a [b, c, oh, ow, 2] index
+        // array filled per window here and read back per window there.
+        bool recomputeBackward = tape is not null && typeof(T) == typeof(float) && padding == 0 && !SupportsGpu
+            && ReferenceEquals(input, inputOrig) && input.Layout == LinearAlgebra.TensorLayout.Nchw;
+        if (tape is not null && !recomputeBackward)
         {
             var resultWithIdx = MaxPool2DWithIndices(input, new[] { poolSize, poolSize }, new[] { stride, stride }, out var maxIndices);
             DifferentiableOps.RecordUnary("MaxPool2D", resultWithIdx, inputOrig, BackwardFunctions<T>.MaxPool2DBackward,
@@ -9164,6 +9169,9 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 MaxPool2DFloatGeneric(inArr, outArr, bc, h, w, oH, oW, ps, st, pd);
             }
+            if (recomputeBackward)
+                DifferentiableOps.RecordUnary("MaxPool2D", result, inputOrig, BackwardFunctions<T>.MaxPool2DRecomputeBackward,
+                    new object[] { new[] { poolSize, poolSize }, new[] { stride, stride } });
             return result;
         }
 
@@ -41930,6 +41938,13 @@ public partial class CpuEngine : ITensorLevelEngine
         // backward graph has no entry for this op (cf. AiDotNet#1328).
         if (DifferentiableOps.IsTapeActiveForThread<T>() || GraphMode.IsActive)
         {
+            // Float, eager tape, channel bias, ReLU or no activation: one tape entry and one epilogue pass instead of
+            // three entries and three full passes each way. Lazy graph mode keeps the three-op chain its compiled
+            // training plan pattern-matches.
+            if (typeof(T) == typeof(float) && !GraphMode.IsActive && bias is not null
+                && TryConv2DBiasActivationRecorded((Tensor<float>)(object)input, (Tensor<float>)(object)kernel,
+                    (Tensor<float>)(object)bias, strideH, strideW, padH, padW, dilationH, dilationW, activation) is { } fused)
+                return (Tensor<T>)(object)fused;
             var convResult = Conv2D(input, kernel, new[] { strideH, strideW }, new[] { padH, padW }, new[] { dilationH, dilationW });
             if (bias != null)
             {

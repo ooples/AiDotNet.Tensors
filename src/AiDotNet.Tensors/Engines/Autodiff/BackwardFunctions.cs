@@ -1260,6 +1260,39 @@ internal static class BackwardFunctions<T>
         }
     }
 
+    /// <summary>
+    /// Backward of the single tape entry <c>FusedConv2D</c> records for <c>act(conv2d(input, kernel) + bias[c])</c>,
+    /// <c>act</c> = ReLU or identity (inputs: input, kernel, bias). The ReLU mask and the bias reduction run in one
+    /// pass over the output gradient, then the convolution's input and kernel gradients run as
+    /// <see cref="Conv2DBackward"/> does. The ReLU mask reads the activation: <c>y &gt; 0</c> exactly when
+    /// <c>z &gt; 0</c>, so it matches the separate ReLU entry's mask on the pre-activation.
+    /// </summary>
+    internal static void FusedConv2DBiasActivationBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        bool relu = (bool)savedState[3];
+        Tensor<T> gradPreActivation;
+        if (typeof(T) == typeof(float) && engine is CpuEngine cpu && !engine.SupportsGpu
+            && gradOutput.IsContiguous && output.IsContiguous)
+        {
+            gradPreActivation = Helpers.AutoTensorCache.RentOrAllocate<T>(output._shape);
+            var gradBias = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[2]._shape);
+            cpu.ChannelBiasActivationBackwardInto(
+                (Tensor<float>)(object)gradPreActivation, (Tensor<float>)(object)gradBias,
+                (Tensor<float>)(object)gradOutput, (Tensor<float>)(object)output, relu, accumulateBias: false);
+            if (DifferentiableOps.IsGradientRequired(inputs[2]))
+                DifferentiableOps.AccumulateGrad(grads, inputs[2], gradBias, engine);
+        }
+        else
+        {
+            gradPreActivation = relu ? engine.ReluBackward(gradOutput, output) : gradOutput;
+            if (DifferentiableOps.IsGradientRequired(inputs[2]))
+                DifferentiableOps.AccumulateGrad(grads, inputs[2], engine.ReduceSum(gradPreActivation, new[] { 0, 2, 3 }, keepDims: false), engine);
+        }
+        Conv2DBackward(gradPreActivation, new[] { inputs[0], inputs[1] }, output, savedState, engine, grads);
+    }
+
     /// <summary>Conv1D backward: reshapes 3D inputs to 4D, delegates to Conv2DBackward logic, reshapes back</summary>
     internal static void Conv1DBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
@@ -1404,6 +1437,33 @@ internal static class BackwardFunctions<T>
         var stride = (int[])savedState[2];
 
         var grad = engine.MaxPool2DBackward(gradOutput, maxIndices, inputs[0]._shape, poolSize, stride);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+    }
+
+    /// <summary>
+    /// MaxPool2D backward for an unpadded pool recorded without indices (savedState: pool size, stride): the CPU engine
+    /// re-scans the forward input for each window's winner (<see cref="CpuEngine.MaxPool2DBackwardRecomputeInto{T}"/>,
+    /// the same winner rule the indexed pool records); any other engine recovers the winners with its indexed pool.
+    /// </summary>
+    internal static void MaxPool2DRecomputeBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var poolSize = (int[])savedState[0];
+        var stride = (int[])savedState[1];
+        Tensor<T> grad;
+        if (engine is CpuEngine cpu && !engine.SupportsGpu)
+        {
+            grad = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
+            cpu.MaxPool2DBackwardRecomputeInto(grad, gradOutput, inputs[0], poolSize[0], poolSize[1], stride[0], stride[1], accumulate: false);
+        }
+        else
+        {
+            int[,,,,] maxIndices;
+            using (new NoGradScope<T>())
+                engine.MaxPool2DWithIndices(inputs[0], poolSize, stride, out maxIndices);
+            grad = engine.MaxPool2DBackward(gradOutput, maxIndices, inputs[0]._shape, poolSize, stride);
+        }
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
