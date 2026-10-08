@@ -3142,70 +3142,71 @@ internal static partial class SimdGemm
             return;
         }
         int blocksPerChunk = (numFullBlocks + numChunks - 1) / numChunks;
+        numChunks = (numFullBlocks + blocksPerChunk - 1) / blocksPerChunk;
 
-        // Pin the root pointers ONCE before the parallel dispatch — each worker
-        // computes its tile range using offsets, no per-worker Pin().
+        // 2D split: a short M (a linear layer's batch of 128 is 21 six-row blocks, so at most ~11 row chunks) left
+        // most cores idle while every chunk streamed all of B. Column groups of whole 16-wide tiles fill the rest;
+        // each task keeps one narrow B strip hot. The m % Mr tail rows run inside the last row chunk's tasks, not
+        // serially afterwards. Every C element is still computed by exactly one task in the same K order.
+        int nTiles = n / Nr;
+        int colGroups = Math.Max(1, Math.Min(nTiles, cores / numChunks));
+        int tilesPerGroup = nTiles > 0 ? (nTiles + colGroups - 1) / colGroups : 0;
+        if (nTiles > 0) colGroups = (nTiles + tilesPerGroup - 1) / tilesPerGroup;
+        int mcTail = m - mFull;
+
         fixed (float* pAroot = a, pBroot = b, pCroot = c)
         {
             IntPtr ipA = (IntPtr)pAroot;
             IntPtr ipB = (IntPtr)pBroot;
             IntPtr ipC = (IntPtr)pCroot;
-            int kCap = k, nCap = n, ldaCap = lda, ldbCap = ldb;
+            int kCap = k, nCap = n, ldaCap = lda, ldbCap = ldb, rowChunks = numChunks;
 
-            Helpers.PersistentParallelExecutor.Instance.Execute(numChunks, chunk =>
+            Helpers.PersistentParallelExecutor.Instance.Execute(rowChunks * colGroups, task =>
             {
+                int chunk = task / colGroups, group = task % colGroups;
                 int blockStart = chunk * blocksPerChunk;
                 int blockEnd = Math.Min(blockStart + blocksPerChunk, numFullBlocks);
-                if (blockStart >= blockEnd) return;
-
-                int iStart = blockStart * Mr;
-                int iEnd = blockEnd * Mr;
+                bool lastGroup = group == colGroups - 1;
+                int jStart = group * tilesPerGroup * Nr;
+                int jEnd = lastGroup ? nTiles * Nr : Math.Min(jStart + tilesPerGroup * Nr, nTiles * Nr);
+                int ncTail = lastGroup ? nCap - nTiles * Nr : 0;
 
                 float* pA = (float*)ipA;
                 float* pB = (float*)ipB;
                 float* pC = (float*)ipC;
 
-                for (int i = iStart; i < iEnd; i += Mr)
+                for (int i = blockStart * Mr; i < blockEnd * Mr; i += Mr)
                 {
                     float* pARow = pA + i * ldaCap;
                     float* pCRow = pC + i * nCap;
-
-                    int j = 0;
-                    for (; j + Nr <= nCap; j += Nr)
-                    {
+                    for (int j = jStart; j < jEnd; j += Nr)
                         DirectKernel6x16Store(pARow, ldaCap, pB + j, ldbCap, pCRow + j, nCap, kCap);
-                    }
-                    int ncTail = nCap - j;
                     if (ncTail > 0)
                     {
                         DirectKernelMxNMaskedStore(
-                            pARow, ldaCap, pB + j, ldbCap, pCRow + j, nCap,
+                            pARow, ldaCap, pB + jEnd, ldbCap, pCRow + jEnd, nCap,
                             kCap, mcActual: Mr, ncActual: ncTail);
                     }
                 }
-            });
 
-            // Handle the M-edge (≤ Mr-1 leftover rows) on the calling thread.
-            int mcTail = m - mFull;
-            if (mcTail > 0)
-            {
-                float* pARow = pAroot + mFull * lda;
-                float* pCRow = pCroot + mFull * n;
-                int j = 0;
-                for (; j + Nr <= n; j += Nr)
+                if (mcTail > 0 && chunk == rowChunks - 1)
                 {
-                    DirectKernelMxNMaskedStore(
-                        pARow, lda, pBroot + j, ldb, pCRow + j, n,
-                        k, mcActual: mcTail, ncActual: Nr);
+                    float* pARow = pA + mFull * ldaCap;
+                    float* pCRow = pC + mFull * nCap;
+                    for (int j = jStart; j < jEnd; j += Nr)
+                    {
+                        DirectKernelMxNMaskedStore(
+                            pARow, ldaCap, pB + j, ldbCap, pCRow + j, nCap,
+                            kCap, mcActual: mcTail, ncActual: Nr);
+                    }
+                    if (ncTail > 0)
+                    {
+                        DirectKernelMxNMaskedStore(
+                            pARow, ldaCap, pB + jEnd, ldbCap, pCRow + jEnd, nCap,
+                            kCap, mcActual: mcTail, ncActual: ncTail);
+                    }
                 }
-                int ncTail = n - j;
-                if (ncTail > 0)
-                {
-                    DirectKernelMxNMaskedStore(
-                        pARow, lda, pBroot + j, ldb, pCRow + j, n,
-                        k, mcActual: mcTail, ncActual: ncTail);
-                }
-            }
+            });
         }
     }
 
