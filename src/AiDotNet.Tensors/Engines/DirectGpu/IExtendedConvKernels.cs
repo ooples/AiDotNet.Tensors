@@ -118,6 +118,11 @@ internal static class RectSliceLimits
 /// Rectangular N-d slice gather/scatter in one launch (rank &lt;= 8). Replaces the per-contiguous-row
 /// device copy loop, which issued one memcpy per row: a [64, 32, 7, 7] height slice was 4,096 API calls.
 /// </summary>
+/// <remarks>
+/// A capability, not a requirement: implemented by the CUDA backend. A backend without it (HIP, Metal, OpenCL,
+/// Vulkan, WebGPU) keeps the per-row device copy, which gives the same result on the device with more launches,
+/// so the engine checks <c>backend is IRectSliceKernels</c> before taking the one-launch path.
+/// </remarks>
 internal interface IRectSliceKernels
 {
     /// <summary>
@@ -127,6 +132,31 @@ internal interface IRectSliceKernels
     /// </summary>
     void RectSlice(IGpuBuffer full, IGpuBuffer slice, int[] fullShape, int[] start, int[] length, bool scatter);
 }
+/// <summary>
+/// Multi-tensor reductions for a training step's global gradient-norm clip and finiteness check: one launch over
+/// every gradient instead of one chain per tensor (~630 launches per N-BEATS step on the per-tensor loop).
+/// </summary>
+/// <remarks>
+/// A capability, not a requirement: implemented by the CUDA backend. On a backend without it (HIP, Metal, OpenCL,
+/// Vulkan, WebGPU) the compiled training plan runs its per-tensor device loop, which computes the same clip on
+/// the device with more launches.
+/// </remarks>
+internal interface IMultiTensorKernels
+{
+    /// <summary>Writes the sum of squares of every element of every tensor, accumulated in double, to
+    /// <paramref name="sumOfSquares"/> (two floats holding one double).</summary>
+    void MultiTensorSumOfSquares(System.Collections.Generic.IReadOnlyList<IGpuBuffer> tensors,
+        System.Collections.Generic.IReadOnlyList<int> sizes, IGpuBuffer sumOfSquares);
+
+    /// <summary>Writes PyTorch's clip_grad_norm_ coefficient, min(1, maxNorm / (norm + 1e-6)), to
+    /// <paramref name="scale"/> on the device, from a <see cref="MultiTensorSumOfSquares"/> result.</summary>
+    void ClipScaleFromSumOfSquares(IGpuBuffer sumOfSquares, float maxNorm, IGpuBuffer scale);
+
+    /// <summary>Scales every tensor in place by the device scalar <paramref name="scale"/>.</summary>
+    void MultiTensorScaleByDeviceScalar(System.Collections.Generic.IReadOnlyList<IGpuBuffer> tensors,
+        System.Collections.Generic.IReadOnlyList<int> sizes, IGpuBuffer scale);
+}
+
 /// <summary>Adaptive max pooling 2D (NCHW) (#775).</summary>
 internal interface IAdaptiveMaxPool2DKernels
 {
