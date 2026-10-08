@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) AiDotNet. All rights reserved.
 // HIP backend for AMD GPU with real MFMA (Matrix Fused Multiply-Add) support.
 // Target: 25,000+ GFLOPS on MI200, 15,000+ GFLOPS on RX 7900.
 
@@ -11364,6 +11364,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         _disposed = true;
 
         DisposeCompiledCodegenKernels();
+        DisposeMultiTensorTable();
 
         // Dispose the default stream wrapper (does not destroy underlying stream)
         _defaultStream?.Dispose();

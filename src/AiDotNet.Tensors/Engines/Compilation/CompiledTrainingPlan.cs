@@ -9209,10 +9209,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         }
         _clipScratchBackend = cb;
 
-        // CUDA: the whole clip in four device operations, whatever the tensor count: one multi-tensor sum of
-        // squares, the coefficient computed on the device, one multi-tensor scale. The per-tensor loop below issued
-        // a fill + square + reduce + add and a scale per gradient, ~630 launches per N-BEATS step (AiDotNet #1804).
-        if (cb is Engines.DirectGpu.IMultiTensorKernels multiCuda)
+        // Every GPU backend implements IMultiTensorKernels: one multi-tensor sum of squares, the coefficient computed
+        // on the device, one multi-tensor scale (CUDA and HIP launch once each; the others once per tensor). The
+        // per-tensor loop below issued a fill + square + reduce + add and a scale per gradient, ~630 launches per
+        // N-BEATS step (AiDotNet #1804).
+        if (cb is Engines.DirectGpu.IMultiTensorKernels multi)
         {
             var buffers = _clipBuffers;
             var sizes = _clipSizes;
@@ -9238,9 +9239,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 sumSquares = _clipSumSq = cb.AllocateBuffer(2);
             }
             var scale = _clipTmp ??= cb.AllocateBuffer(1);
-            multiCuda.MultiTensorSumOfSquares(buffers, sizes, sumSquares);
-            multiCuda.ClipScaleFromSumOfSquares(sumSquares, (float)maxNorm, scale);
-            multiCuda.MultiTensorScaleByDeviceScalar(buffers, sizes, scale);
+            multi.MultiTensorSumOfSquares(buffers, sizes, sumSquares);
+            multi.ClipScaleFromSumOfSquares(sumSquares, (float)maxNorm, scale);
+            multi.MultiTensorScaleByDeviceScalar(buffers, sizes, scale);
             for (int p = 0; p < owners.Count; p++)
                 (_engine as Engines.DirectGpuTensorEngine)?.BindResidentBuffer(owners[p], buffers[p], cb);
             return true;

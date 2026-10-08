@@ -221,6 +221,52 @@ kernel void rect_slice_nd(
     if (scatter != 0) full[offset] = slice[gid];
     else slice[gid] = full[offset];
 }
+// Global-norm clip, one threadgroup reduction per tensor (no address tables): only threadgroup 0 runs, whatever size
+// the pipeline picked; thread 0 adds the partials in order, and dispatches on one queue run in order, so no atomics.
+kernel void tensor_sum_squares_accumulate(
+    device const float* x [[buffer(0)]],
+    device float* acc [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint group [[threadgroup_position_in_grid]],
+    uint groupSize [[threads_per_threadgroup]])
+{
+    threadgroup float partial[1024];
+    if (group != 0) return;
+    float v = 0.0f;
+    for (uint i = lid; i < n; i += groupSize) { float e = x[i]; v += e * e; }
+    partial[lid] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0)
+    {
+        float s = 0.0f;
+        for (uint j = 0; j < groupSize; ++j) s += partial[j];
+        acc[0] += s;
+    }
+}
+
+// min(1, maxNorm / (norm + 1e-6)); a non-finite norm leaves the gradients unscaled. Tested on the exponent bits:
+// Metal compiles with fast math, which may fold isfinite() to true.
+kernel void clip_scale_from_sum_squares(
+    device const float* acc [[buffer(0)]],
+    device float* scale [[buffer(1)]],
+    constant uint& maxNormBits [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid != 0) return;
+    float norm = sqrt(acc[0]);
+    float c = (as_type<uint>(norm) & 0x7f800000u) != 0x7f800000u ? as_type<float>(maxNormBits) / (norm + 1e-6f) : 1.0f;
+    scale[0] = c < 1.0f ? c : 1.0f;
+}
+
+kernel void scale_by_device_scalar_inplace(
+    device float* x [[buffer(0)]],
+    device const float* scale [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < n) x[gid] *= scale[0];
+}
 // Row-major C[M,N] = alpha · A[K,M]ᵀ · B[K,N] + beta · C, one thread per output (alpha/beta arrive as float bits).
 kernel void matmul_transposed_a(
     device const float* A [[buffer(0)]],

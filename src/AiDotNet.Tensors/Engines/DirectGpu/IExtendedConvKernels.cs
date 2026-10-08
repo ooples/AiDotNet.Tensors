@@ -192,14 +192,16 @@ internal interface IRectSliceKernels
 /// every gradient instead of one chain per tensor (~630 launches per N-BEATS step on the per-tensor loop).
 /// </summary>
 /// <remarks>
-/// A capability, not a requirement: implemented by the CUDA backend. On a backend without it (HIP, Metal, OpenCL,
-/// Vulkan, WebGPU) the compiled training plan runs its per-tensor device loop, which computes the same clip on
-/// the device with more launches.
+/// Implemented by all six GPU backends. CUDA and HIP launch once over every tensor through a device table of buffer
+/// addresses and accumulate in double. OpenCL, Metal, Vulkan and WebGPU cannot address an arbitrary buffer from a
+/// table, so they launch one work-group reduction per tensor, accumulating in float in launch order (deterministic):
+/// one launch per tensor against the four of the plan's per-tensor loop. The <c>sumOfSquares</c> layout is private
+/// to the backend that wrote it; only that backend's <see cref="ClipScaleFromSumOfSquares"/> reads it.
 /// </remarks>
 internal interface IMultiTensorKernels
 {
-    /// <summary>Writes the sum of squares of every element of every tensor, accumulated in double, to
-    /// <paramref name="sumOfSquares"/> (two floats holding one double).</summary>
+    /// <summary>Writes the sum of squares of every element of every tensor to
+    /// <paramref name="sumOfSquares"/> (at least two float slots).</summary>
     void MultiTensorSumOfSquares(System.Collections.Generic.IReadOnlyList<IGpuBuffer> tensors,
         System.Collections.Generic.IReadOnlyList<int> sizes, IGpuBuffer sumOfSquares);
 
@@ -212,6 +214,32 @@ internal interface IMultiTensorKernels
         System.Collections.Generic.IReadOnlyList<int> sizes, IGpuBuffer scale);
 }
 
+/// <summary>Argument checks every <see cref="IMultiTensorKernels"/> implementation shares.</summary>
+internal static class MultiTensorArgs
+{
+    /// <summary>The work-group size of the per-tensor reduction on OpenCL, Metal, Vulkan and WebGPU.</summary>
+    internal const int ReductionGroupSize = 256;
+
+    internal static void Validate(System.Collections.Generic.IReadOnlyList<IGpuBuffer> tensors,
+        System.Collections.Generic.IReadOnlyList<int> sizes)
+    {
+        if (tensors is null) throw new ArgumentNullException(nameof(tensors));
+        if (sizes is null) throw new ArgumentNullException(nameof(sizes));
+        if (sizes.Count != tensors.Count) throw new ArgumentException("Every tensor needs a size.", nameof(sizes));
+        for (int t = 0; t < tensors.Count; t++)
+        {
+            if (tensors[t] is null) throw new ArgumentException($"Tensor {t} is null.", nameof(tensors));
+            if (sizes[t] <= 0) throw new ArgumentOutOfRangeException(nameof(sizes), "Every tensor size must be positive.");
+            if (tensors[t].Size < sizes[t]) throw new ArgumentException($"Tensor {t}'s buffer is smaller than its size.", nameof(tensors));
+        }
+    }
+
+    internal static void ValidateSumBuffer(IGpuBuffer sumOfSquares)
+    {
+        if (sumOfSquares is null) throw new ArgumentNullException(nameof(sumOfSquares));
+        if (sumOfSquares.Size < 2) throw new ArgumentException("The sum of squares needs two float slots.", nameof(sumOfSquares));
+    }
+}
 /// <summary>Adaptive max pooling 2D (NCHW) (#775).</summary>
 internal interface IAdaptiveMaxPool2DKernels
 {
