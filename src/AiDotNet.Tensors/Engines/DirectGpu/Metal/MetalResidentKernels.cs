@@ -221,6 +221,28 @@ kernel void rect_slice_nd(
     if (scatter != 0) full[offset] = slice[gid];
     else slice[gid] = full[offset];
 }
+// Row-major C[M,N] = alpha · A[K,M]ᵀ · B[K,N] + beta · C, one thread per output (alpha/beta arrive as float bits).
+kernel void matmul_transposed_a(
+    device const float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    constant uint& K [[buffer(5)]],
+    constant uint& alphaBits [[buffer(6)]],
+    constant uint& betaBits [[buffer(7)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= M * N) return;
+    uint row = gid / N;
+    uint col = gid % N;
+    float acc = 0.0f;
+    for (uint kk = 0; kk < K; ++kk)
+        acc += A[kk * M + row] * B[kk * N + col];
+    float alpha = as_type<float>(alphaBits);
+    float beta = as_type<float>(betaBits);
+    C[gid] = (beta != 0.0f) ? alpha * acc + beta * C[gid] : alpha * acc;
+}
 kernel void permute_tensor(
     device const float* input [[buffer(0)]],
     device float* output [[buffer(1)]],
