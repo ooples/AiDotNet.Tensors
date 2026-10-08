@@ -53,6 +53,22 @@ internal static class GotoGemmFp32
     internal static bool IsPreferredForThreadBudget(int maxDegreeOfParallelism)
         => maxDegreeOfParallelism >= 48;
 
+    /// <summary>
+    /// Smallest M-block PackBoth will cut to when it is short of parallel work; it parallelises over M
+    /// blocks only (see the Sub-G occupancy floor in <c>AutotuneDispatcher.FallbackToHeuristic</c>).
+    /// </summary>
+    internal const int PackBothMinMc = 64;
+
+    /// <summary>
+    /// True when PackBoth cannot occupy the thread budget for this M: it splits only along M, at no
+    /// fewer than <see cref="PackBothMinMc"/> rows, so a transformer-sized M of 256 yields 4 blocks and
+    /// stays at 4 threads however many cores there are. This per-tile kernel splits M and N, so on these
+    /// shapes it scales where PackBoth plateaus (#653, M256 K768 N768 at 16 threads: 2.34 ms on PackBoth
+    /// vs 1.07 ms here). Large-M GEMMs - the Conv3D backward behind the 48-thread budget gate - give
+    /// PackBoth enough blocks and are unaffected.
+    /// </summary>
+    internal static bool PackBothUnderOccupies(int m, int threadBudget)
+        => threadBudget > 1 && (m + PackBothMinMc - 1) / PackBothMinMc < threadBudget;
     /// <summary>Shape regime where the per-tile GotoBLAS path beats the PackBoth strategy (measured on the
     /// 3990X via --ab-prod): large/balanced (M≥512) OR wide-K (K≥2N, e.g. MLP-fc2). PackBoth's wide-N
     /// N-axis path wins the small-M wide-N shapes (DiT QKV M256×N3456, MLP-fc1 M256×N4608 — GotoGemm was
@@ -122,8 +138,9 @@ internal static class GotoGemmFp32
     // per-K-panel Stopwatch deltas summed across worker threads — answers "is the cost packing or
     // the microkernel?" without profiler pseudo-frame ambiguity.
     internal static bool s_timing;
-    internal static long s_packTicks, s_kernTicks, s_packBTicks, s_packATicks;
-    internal static void ResetTiming() { s_packTicks = 0; s_kernTicks = 0; s_packBTicks = 0; s_packATicks = 0; }
+    internal static long s_packTicks, s_kernTicks, s_packBTicks, s_packATicks, s_tailTicks;
+    internal static long s_runParallelTicks, s_tileTicks, s_tileLagTicks, s_tileCount, s_tileMaxTicksSum, s_tileMinTicksSum;
+    internal static void ResetTiming() { s_packTicks = 0; s_kernTicks = 0; s_packBTicks = 0; s_packATicks = 0; s_tailTicks = 0; s_runParallelTicks = 0; s_tileTicks = 0; s_tileLagTicks = 0; s_tileCount = 0; s_tileMaxTicksSum = 0; s_tileMinTicksSum = 0; }
     /// <summary>Format the pack-vs-kernel timing as a string for the caller (bench) to log — src must not
     /// write to Console directly.</summary>
     internal static string ReportTiming()
@@ -339,6 +356,9 @@ internal static class GotoGemmFp32
         // cache. Each tile runs its full K-loop independently (disjoint C ⇒ no races, deterministic).
         nint ai = (nint)a, bi = (nint)b, ci = (nint)c;
         int numIcL = numIc, mcL = mc, ncL = nc, kcL = kc, mL = m, nL = n, kL = k, ldaL = lda, ldbL = ldb, ldcL = ldc;
+        bool timing = s_timing;
+        long enter = timing ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
+        long callMax = 0, callMin = long.MaxValue;
         CpuParallelSettings.ParallelForOrSerial(0, totalTiles, (long)m * n * k, tileIdx =>
         {
             int ic = (int)(tileIdx % numIcL) * mcL;
@@ -346,8 +366,23 @@ internal static class GotoGemmFp32
             int effMc = Math.Min(mcL, mL - ic);
             int effNc = Math.Min(ncL, nL - jc);
             if (effMc <= 0 || effNc <= 0) return;
+            long start = timing ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
             RunTile((float*)ai, ldaL, (float*)bi, ldbL, (float*)ci, ldcL, ic, jc, effMc, effNc, kL, mcL, ncL, kcL);
+            if (timing)
+            {
+                long dur = System.Diagnostics.Stopwatch.GetTimestamp() - start;
+                Interlocked.Add(ref s_tileTicks, dur);
+                long seenMax; while (dur > (seenMax = Volatile.Read(ref callMax)) && Interlocked.CompareExchange(ref callMax, dur, seenMax) != seenMax) { }
+                long seenMin; while (dur < (seenMin = Volatile.Read(ref callMin)) && Interlocked.CompareExchange(ref callMin, dur, seenMin) != seenMin) { }
+                Interlocked.Add(ref s_tileLagTicks, start - enter);
+                Interlocked.Increment(ref s_tileCount);
+            }
         }, deterministicSafe: true);
+        if (timing)
+        {
+            Interlocked.Add(ref s_runParallelTicks, System.Diagnostics.Stopwatch.GetTimestamp() - enter);
+            if (callMin != long.MaxValue) { Interlocked.Add(ref s_tileMaxTicksSum, callMax); Interlocked.Add(ref s_tileMinTicksSum, callMin); }
+        }
     }
 
     /// <summary>Deep-K + short-M is UNDER-PARALLELIZED (few (m/mc)·(n/nc) tiles for many cores). Split-K
@@ -478,7 +513,9 @@ internal static class GotoGemmFp32
                         Interlocked.Add(ref s_packATicks, t1 - tB);
                         Interlocked.Add(ref s_kernTicks, t2 - t1);
                     }
+                    long t3 = timing ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
                     ScalarTails(a, lda, b, ldb, c, ldc, ic, jc, effMc, effNc, mFull, nFull, pc, effKc);
+                    if (timing) Interlocked.Add(ref s_tailTicks, System.Diagnostics.Stopwatch.GetTimestamp() - t3);
                 }
             }
         }
@@ -864,15 +901,32 @@ internal static class GotoGemmFp32
             }
         }
         // M-tail rows [ic+mFull, ic+effMc) for the full-N span [jc, jc+nFull) (the N-tail already done above).
+        // M-tail rows (effMc % Mr of them) across the full-tile columns, as row updates
+        // C[r, cols] += A[r, k] * B[k, cols] over contiguous B rows. The per-element dot product this
+        // replaces walked a column of B at stride ldb - a cache miss per step - and at M=256 (4 tail
+        // rows) took 50% of the 16-thread budget against 18% for the microkernel (#653).
         for (int r = ic + mFull; r < ic + effMc; r++)
         {
-            float* crow = c + (long)r * ldc;
+            float* crow = c + (long)r * ldc + jc;
             float* arow = a + (long)r * lda + pc;
-            for (int col = jc; col < jc + nFull; col++)
+            int vecCols = nFull & ~7;
+            for (int kk = 0; kk < effKc; kk++)
             {
-                float s = 0f;
-                for (int kk = 0; kk < effKc; kk++) s += arow[kk] * b[(long)(pc + kk) * ldb + col];
-                crow[col] += s;
+                float av = arow[kk];
+                float* brow = b + (long)(pc + kk) * ldb + jc;
+                var va = Vector256.Create(av);
+                int col = 0;
+                if (Fma.IsSupported)
+                {
+                    for (; col < vecCols; col += 8)
+                        Avx.Store(crow + col, Fma.MultiplyAdd(va, Avx.LoadVector256(brow + col), Avx.LoadVector256(crow + col)));
+                }
+                else if (Avx.IsSupported)
+                {
+                    for (; col < vecCols; col += 8)
+                        Avx.Store(crow + col, Avx.Add(Avx.LoadVector256(crow + col), Avx.Multiply(va, Avx.LoadVector256(brow + col))));
+                }
+                for (; col < nFull; col++) crow[col] += av * brow[col];
             }
         }
     }

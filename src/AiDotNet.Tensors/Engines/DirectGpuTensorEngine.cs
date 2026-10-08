@@ -21097,6 +21097,21 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return base.TensorAtan(tensor);
     }
 
+    public override Tensor<T> TensorAtanh<T>(Tensor<T> tensor)
+    {
+        try
+        {
+            var output = TryRunUnaryTensor(tensor, static (backend, input, output, size) => backend.Atanh(input, output, size));
+            if (output != null)
+            {
+                Autodiff.DifferentiableOps.RecordUnary("TensorAtanh", output, tensor, Autodiff.BackwardFunctions<T>.AtanhBackward);
+                return output;
+            }
+        }
+        catch { }
+        return base.TensorAtanh(tensor);
+    }
+
     public override Tensor<T> TensorAtan2<T>(Tensor<T> y, Tensor<T> x)
     {
         // Shape validation, and the exception it throws, belong to the one implementation on the

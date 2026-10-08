@@ -1015,9 +1015,30 @@ public sealed class GradientTape<T> : IDisposable
         // What backward hands back belongs to the caller: the gradients (produced on the device during backward,
         // so inside the release window) and the loss outlive the tape, for as long as the caller holds them.
         KeepAfterTape(loss);
+        HoldOverStepBoundary(loss);
         foreach (var gradient in grads.Values)
-            if (gradient is not null) KeepAfterTape(gradient);
+        {
+            if (gradient is null) continue;
+            KeepAfterTape(gradient);
+            HoldOverStepBoundary(gradient);
+        }
+
         return grads;
+    }
+
+    // What the caller was handed (the loss and the returned gradients), as tensor wrappers and backing arrays, owned
+    // by the OUTERMOST tape. At its dispose the active arena keeps them out of reuse for one more step; see
+    // TensorArena.ResetKeeping.
+    private HashSet<object>? _handedToCaller;
+
+    private void HoldOverStepBoundary(Tensor<T> tensor)
+    {
+        var root = this;
+        while (root._parent is not null) root = root._parent;
+        var held = root._handedToCaller ??= new HashSet<object>(ReferenceEqualityComparer<object>.Instance);
+        held.Add(tensor);
+        var array = tensor.GetBackingArrayForCacheLookupUnsafe();
+        if (array is not null) held.Add(array);
     }
 
     // Activation keys of what the caller keeps past the tape (loss, returned gradients, Retain), owned by the
@@ -2957,9 +2978,13 @@ public sealed class GradientTape<T> : IDisposable
         // previous arena, so the NEXT top-level tape reuses them (zero-alloc after
         // warmup). Otherwise, if this is the top-level tape over an externally-owned
         // long-lived arena, Reset() it per step (the pre-existing #1804 behaviour).
+        // The gradients and loss handed to the caller are arena memory; the step boundary must not hand them out
+        // again while the caller still uses them (an optimizer step or weight clip after this scope, issue #1031).
+        var handedToCaller = _handedToCaller;
+        _handedToCaller = null;
         if (_ownsArena)
         {
-            _ownedArena?.Dispose();
+            _ownedArena?.DisposeKeeping(handedToCaller);
         }
         else if (_parent is null && !_options.SuppressArenaScope)
         {
@@ -2969,7 +2994,7 @@ public sealed class GradientTape<T> : IDisposable
             // rewinds the OUTER tape's arena ring cursors mid-backward and the outer walk
             // then reuses buffers still holding live gradients, corrupting them. Inner tapes
             // set SuppressArenaScope so only the genuine step-boundary tape resets per step.
-            Helpers.TensorArena.Current?.Reset();
+            Helpers.TensorArena.Current?.ResetKeeping(handedToCaller);
         }
     }
 
