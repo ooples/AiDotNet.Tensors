@@ -1035,6 +1035,43 @@ internal static class BackwardFunctions<T>
         // Generic fallback: gradA = gradOut · B, gradB = gradOutᵀ · A.
         // No transpose on B (it's already in [N,K] form), but we need
         // gradOutᵀ for gradB.
+        // float64 host path: the same two GEMMs with the transposes expressed as BLAS flags (dA = dC B, dB = dC^T A).
+        // The generic route below materializes transposed copies and runs plain matmuls; on a double model built on
+        // x W^T layers (AiDotNet Chronos) that backward was over a third of the training step.
+        if (typeof(T) == typeof(double)
+            && inputs[0].Rank == 2 && inputs[1].Rank == 2
+            && gradOutput.Rank == 2
+            && GradientTape<T>.Current is null
+            && !engine.SupportsGpu)
+        {
+            var dC = (Tensor<double>)(object)(gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous());
+            var a = (Tensor<double>)(object)(inputs[0].IsContiguous ? inputs[0] : inputs[0].Contiguous());
+            var b = (Tensor<double>)(object)(inputs[1].IsContiguous ? inputs[1] : inputs[1].Contiguous());
+            var dCArr = dC.GetCpuBackingForStridedRead(out int dCOff);
+            var aArr = a.GetCpuBackingForStridedRead(out int aOff);
+            var bArr = b.GetCpuBackingForStridedRead(out int bOff);
+            if (dCArr is not null && aArr is not null && bArr is not null)
+            {
+                int M = inputs[0]._shape[0], K = inputs[0]._shape[1], N = inputs[1]._shape[0];
+                var gradA = Helpers.AutoTensorCache.RentOrAllocate<double>(inputs[0]._shape);
+                var gradB = Helpers.AutoTensorCache.RentOrAllocate<double>(inputs[1]._shape);
+                var gA = gradA.GetCpuBackingForContiguousWrite(out int gAOff);
+                var gB = gradB.GetCpuBackingForContiguousWrite(out int gBOff);
+                if (gA is not null && gB is not null
+                    && BlasProvider.TryGemmEx(M, K, N, dCArr, dCOff, N, false, bArr, bOff, K, false, gA, gAOff, K)
+                    && BlasProvider.TryGemmEx(N, K, M, dCArr, dCOff, N, true, aArr, aOff, K, false, gB, gBOff, K))
+                {
+                    gradA.IncrementVersion();
+                    gradB.IncrementVersion();
+                    DifferentiableOps.AccumulateGrad(grads, inputs[0], (Tensor<T>)(object)gradA, engine);
+                    DifferentiableOps.AccumulateGrad(grads, inputs[1], (Tensor<T>)(object)gradB, engine);
+                    return;
+                }
+                AutoTensorCache.Return(gradA);
+                AutoTensorCache.Return(gradB);
+            }
+        }
+
         var gradAFallback = engine.TensorMatMul(gradOutput, inputs[1]);
         var gradOutT = TransposeLastTwoDims(gradOutput, engine);
         var gradBFallback = engine.TensorMatMul(gradOutT, inputs[0]);
