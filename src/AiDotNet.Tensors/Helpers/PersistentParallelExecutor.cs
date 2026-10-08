@@ -1,5 +1,6 @@
 using System;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Threading;
 
 namespace AiDotNet.Tensors.Helpers;
@@ -268,6 +269,58 @@ internal sealed class PersistentParallelExecutor
         return first;
     }
 
+#if NET5_0_OR_GREATER
+    // Worker pinning (see WorkerPinning). Resolved once: the physical cores, whether this process may
+    // use all of them, and the process-wide mask that "unpinned" restores.
+    private static readonly AiDotNet.Tensors.Engines.BlasManaged.CpuTopology.Domain[] s_pinCores;
+    private static readonly AiDotNet.Tensors.Engines.BlasManaged.CpuTopology.Domain s_unpinnedDomain;
+    private static readonly bool s_pinEligible;
+
+    // 0 = never applied, 1 = pinned, 2 = unpinned. Per worker thread, so a wake only touches the
+    // affinity when the desired state changed.
+    [ThreadStatic] private static int t_pinState;
+
+    static PersistentParallelExecutor()
+    {
+        s_pinCores = Array.Empty<AiDotNet.Tensors.Engines.BlasManaged.CpuTopology.Domain>();
+        s_unpinnedDomain = default;
+        s_pinEligible = false;
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows) || Environment.ProcessorCount > 64) return;
+        try
+        {
+            ulong processMask = (ulong)(long)System.Diagnostics.Process.GetCurrentProcess().ProcessorAffinity;
+            ulong allProcessors = Environment.ProcessorCount == 64 ? ulong.MaxValue : (1UL << Environment.ProcessorCount) - 1;
+            var cores = AiDotNet.Tensors.Engines.BlasManaged.CpuTopology.DetectPhysicalCores();
+            // A restricted affinity (a container, or a user who pinned the process) is respected: no pinning.
+            if (cores.Length > 1 && (processMask & allProcessors) == allProcessors)
+            {
+                s_pinCores = cores;
+                s_unpinnedDomain = new AiDotNet.Tensors.Engines.BlasManaged.CpuTopology.Domain(
+                    processMask, 0, System.Numerics.BitOperations.PopCount(processMask));
+                s_pinEligible = true;
+            }
+        }
+        catch (Exception ex) when (ex is System.ComponentModel.Win32Exception || ex is InvalidOperationException || ex is PlatformNotSupportedException)
+        {
+            // Pinning is an optimization; without the topology the pool runs unpinned, as before.
+            System.Diagnostics.Trace.TraceWarning($"AiDotNet worker pinning disabled: {ex.GetType().Name}: {ex.Message}");
+        }
+    }
+
+    private static void ApplyPinning(int slot)
+    {
+        if (!s_pinEligible) return;
+        var mode = CpuParallelSettings.WorkerPinning;
+        bool pin = mode == WorkerPinning.Always
+                   || (mode == WorkerPinning.Auto && CpuParallelSettings.MaxDegreeOfParallelism <= s_pinCores.Length);
+        int desired = pin ? 1 : 2;
+        if (t_pinState == desired) return;
+        t_pinState = desired;
+        // Slot i takes core i + 1: the calling thread, which runs participant 0, is left core 0's share.
+        if (pin) AiDotNet.Tensors.Engines.BlasManaged.CpuTopology.TryPinCurrentThread(s_pinCores[(slot + 1) % s_pinCores.Length]);
+        else AiDotNet.Tensors.Engines.BlasManaged.CpuTopology.TryPinCurrentThread(s_unpinnedDomain);
+    }
+#endif
     private void WorkerLoop(int slot)
     {
         while (true)
@@ -317,6 +370,9 @@ internal sealed class PersistentParallelExecutor
             // Wait for work signal (returns immediately if the warm-spin already saw it).
             _workReady[slot].Wait();
             _workReady[slot].Reset();
+#if NET5_0_OR_GREATER
+            ApplyPinning(slot);
+#endif
 
             // Execute all assigned chunks for this worker slot.
             // Chunks are assigned round-robin across all participants (workers + main thread).

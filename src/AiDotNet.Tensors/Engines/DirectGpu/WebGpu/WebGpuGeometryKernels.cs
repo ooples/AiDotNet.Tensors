@@ -191,7 +191,7 @@ struct P {
 ";
 
     // -----------------------------------------------------------------------
-    // GridSample 2D NHWC — 3 SSBO.
+    // GridSample 2D, NCHW input/output — 3 SSBO.
     // -----------------------------------------------------------------------
 
     public static string GridSample2D => @"

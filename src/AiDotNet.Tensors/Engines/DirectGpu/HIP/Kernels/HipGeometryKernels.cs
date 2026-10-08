@@ -2,7 +2,7 @@
 // HIP kernels for the geometry / sampling ops added by Issue #217.
 // Covers Interpolate (nearest/bilinear/area/bicubic on 4D NCHW),
 // Pad (4 modes on 4D NCHW), GridSample (bilinear/nearest/bicubic with
-// zeros/border/reflection padding on 4D NHWC), and AffineGrid3D.
+// zeros/border/reflection padding on 4D NCHW), and AffineGrid3D.
 // Non-float tensors and rank ≠ 4 inputs fall back to CpuEngine.
 //
 // Mode ints map onto the InterpolateMode / PadMode / GridSampleMode /
@@ -206,7 +206,7 @@ extern ""C"" __global__ __launch_bounds__(256) void geometry_pad_4d(
 }
 
 // ----------------------------------------------------------------------------
-// GridSample 2D — NHWC, modes: 0=bilinear, 1=nearest, 2=bicubic.
+// GridSample 2D — NCHW input/output, [N,outH,outW,2] grid, modes: 0=bilinear, 1=nearest, 2=bicubic.
 // padding: 0=zeros, 1=border, 2=reflection.
 // One thread per output (n, oy, ox, c) — but we loop C in-thread to
 // amortise grid-lookup work.

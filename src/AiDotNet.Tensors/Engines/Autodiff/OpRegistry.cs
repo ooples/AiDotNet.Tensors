@@ -31,7 +31,7 @@ internal static class OpRegistry
         // Math
         "TensorExp", "TensorLog", "TensorSqrt", "TensorPower", "TensorPowerTensor",
         "TensorSin", "TensorCos", "TensorCosh", "TensorSinh",
-        "TensorAsin", "TensorAcos", "TensorAtan", "TensorAtan2",
+        "TensorAsin", "TensorAcos", "TensorAtan", "TensorAtan2", "TensorAtanh",
         "TensorFrac", "TensorPow",
 
         // Matrix

@@ -49,6 +49,23 @@ public static class CpuParallelSettings
     /// was wrong). Kept as a knob; the detection is reused elsewhere.</summary>
     public static bool CapGemmAtPhysicalCores { get; set; } = false;
 
+    /// <summary>
+    /// Whether the persistent worker pool pins its threads to distinct physical cores. Defaults to
+    /// <see cref="Helpers.WorkerPinning.Auto"/>; the <c>AIDOTNET_PIN_WORKERS</c> environment variable
+    /// (<c>auto</c>, <c>always</c> or <c>never</c>) sets the starting value. Workers re-read it each time
+    /// they wake, so a change takes effect on the next parallel op.
+    /// </summary>
+    public static WorkerPinning WorkerPinning { get; set; } = ReadWorkerPinning();
+
+    private static WorkerPinning ReadWorkerPinning()
+    {
+        string? value = Environment.GetEnvironmentVariable("AIDOTNET_PIN_WORKERS");
+        return value is not null && Enum.TryParse(value, ignoreCase: true, out WorkerPinning parsed)
+               && Enum.IsDefined(typeof(WorkerPinning), parsed)
+            ? parsed
+            : WorkerPinning.Auto;
+    }
+
     /// <summary>The thread count the GEMM strategies should fan out to: the requested count capped at
     /// physical cores when <see cref="CapGemmAtPhysicalCores"/> (FMA-bound work hates SMT).</summary>
     public static int GemmThreadCount(int requested)
