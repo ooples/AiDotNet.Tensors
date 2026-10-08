@@ -27,7 +27,7 @@ public class GemmOverwritesDirtyOutputTests
         for (int i = 0; i < a.Length; i++) a[i] = (float)(rng.NextDouble() - 0.5);
         for (int i = 0; i < b.Length; i++) b[i] = (float)(rng.NextDouble() - 0.5);
         var c = new float[m * n];
-        Array.Fill(c, float.NaN);
+        for (int i = 0; i < c.Length; i++) c[i] = float.NaN;
 
         int lda = transA ? m : k, ldb = transB ? k : n;
         Assert.True(BlasProvider.TryGemmEx(m, n, k, a, 0, lda, transA, b, 0, ldb, transB, c, 0, n));
@@ -54,7 +54,7 @@ public class GemmOverwritesDirtyOutputTests
         for (int i = 0; i < a.Length; i++) a[i] = rng.NextDouble() - 0.5;
         for (int i = 0; i < b.Length; i++) b[i] = rng.NextDouble() - 0.5;
         var c = new double[m * n];
-        Array.Fill(c, double.NaN);
+        for (int i = 0; i < c.Length; i++) c[i] = double.NaN;
         Assert.True(BlasProvider.TryGemmEx(m, n, k, a, 0, k, false, b, 0, n, false, c, 0, n));
         for (int i = 0; i < m; i++)
             for (int j = 0; j < n; j++)

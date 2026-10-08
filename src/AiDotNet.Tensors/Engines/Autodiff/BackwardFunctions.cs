@@ -2310,6 +2310,7 @@ internal static class BackwardFunctions<T>
 
             if (DifferentiableOps.GetSparseEmbeddingGradsFor(inputs[0]) is null)
             {
+                if (TryScatterRowsIntoGrad(gradOutput, indices, inputs[0], engine, grads)) return;
                 var dense = engine.ScatterAdd(gradOutput, indices, axis, inputShape[axis]);
                 DifferentiableOps.AccumulateGrad(grads, inputs[0], dense, engine);
             }
@@ -2333,8 +2334,46 @@ internal static class BackwardFunctions<T>
         // exceeded the index count, because it wrapped via `indices[d % indices.Length]`: a 4-row
         // source gathered by 3 indices produced uniform garbage instead of per-occurrence sums,
         // and never-selected slices came back nonzero when they must be exactly 0.
+        if (axis == 0 && TryScatterRowsIntoGrad(gradOutput, indices, inputs[0], engine, grads)) return;
         var grad = engine.ScatterAdd(gradOutput, indices, axis, inputShape[axis]);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+    }
+
+    /// <summary>
+    /// Axis-0 gather backward straight into the source's existing gradient accumulator: source row indices[r] +=
+    /// gradOutput row r. A tied embedding table (also the transposed LM-head weight) already holds the head's
+    /// gradient when the gather's backward runs, and the dense route built a fresh [vocab, dim] ScatterAdd result
+    /// (100 MB for a 49K x 512 table, per PerfView allocation stacks the largest per-step allocation left in a CPU LM
+    /// step) only to add it in. Rows are applied in index order, so duplicate indices accumulate exactly as
+    /// ScatterAdd does; out-of-range indices are skipped as ScatterAdd skips them. False when there is no direct
+    /// target (first contribution, GPU engine, create-graph) or the layout does not fit -- the caller takes the
+    /// dense route.
+    /// </summary>
+    private static bool TryScatterRowsIntoGrad(
+        Tensor<T> gradOutput, Tensor<int> indices, Tensor<T> source, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        if (source.Rank < 1 || indices.Rank != 1 || !indices.IsContiguous) return false;
+        int rowsOut = source._shape[0];
+        int inner = rowsOut == 0 ? 0 : source.Length / rowsOut;
+        int count = indices.Length;
+        if (inner == 0 || gradOutput.Length != (long)count * inner) return false;
+        var target = DifferentiableOps.TryGetDirectGradTarget(grads, source, engine, out bool overwrite);
+        if (target is null) return false;
+        var dst = target.GetCpuBackingForContiguousWrite(out int dOff);
+        var g = (gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous()).GetCpuBackingForStridedRead(out int gOff);
+        var idx = indices.GetCpuBackingForStridedRead(out int iOff);
+        if (dst is null || g is null || idx is null) return false;
+        if (overwrite) new Span<T>(dst, dOff, target.Length).Clear();
+        var numOps = MathHelper.GetNumericOperations<T>();
+        for (int r = 0; r < count; r++)
+        {
+            int row = idx[iOff + r];
+            if ((uint)row >= (uint)rowsOut) continue;
+            var d = new Span<T>(dst, dOff + row * inner, inner);
+            numOps.Add(d, new ReadOnlySpan<T>(g, gOff + r * inner, inner), d);
+        }
+        target.IncrementVersion();
+        return true;
     }
 
     /// <summary>ScatterAdd backward: gather grad from destination positions</summary>
@@ -3218,7 +3257,9 @@ internal static class BackwardFunctions<T>
         if (target is null || dst is null)
         {
             target = null;
-            contribution = new Tensor<float>(input._shape);
+            // Every element is written below (overwrite), so an uninitialized step-allocator buffer suffices; `new
+            // Tensor` here was a fresh 200 MB large-object-heap array per LM step (PerfView allocation stacks).
+            contribution = Helpers.AutoTensorCache.RentOrAllocate<float>(input._shape);
             dst = contribution.GetCpuBackingForContiguousWrite(out dOff)!;
             overwrite = true;
         }

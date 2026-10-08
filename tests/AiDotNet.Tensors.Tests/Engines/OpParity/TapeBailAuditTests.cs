@@ -253,9 +253,18 @@ public class TapeBailAuditTests
                 bool started = false;
                 bool completed = false;
                 var body = new List<string>();
+                bool expressionBodied = false;
                 for (int j = i; j < lines.Length && j < i + 400; j++)
                 {
                     body.Add(lines[j]);
+                    // An expression-bodied override (`=> base.Op(...);`) has no braces: it ends at the first line that
+                    // ends with ';' once the `=>` has been seen, provided no block body was opened first.
+                    if (!started && lines[j].Contains("=>")) expressionBodied = true;
+                    if (expressionBodied && !started && lines[j].TrimEnd().EndsWith(";"))
+                    {
+                        completed = true;
+                        break;
+                    }
                     depth += lines[j].Count(c => c == '{') - lines[j].Count(c => c == '}');
                     if (lines[j].Contains('{')) started = true;
                     if (started && depth <= 0)

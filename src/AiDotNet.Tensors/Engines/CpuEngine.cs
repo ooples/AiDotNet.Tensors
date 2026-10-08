@@ -35659,15 +35659,23 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         int numClasses = valuesShape[valuesShape.Length - 1];
-        var grad = new Tensor<T>((int[])valuesShape.Clone());
-        var gradData = grad.GetDataArray();
+        // The gradient is [rows, numClasses] -- for a language-model loss that is the full [tokens, vocab] logits
+        // shape (200 MB at 1024 x 49152), and `new Tensor` put one fresh large-object-heap array per step on the GC
+        // (PerfView allocation stacks: the largest single allocation site of a CPU LM step). It is a backward
+        // intermediate, so it comes from the step allocator, and each row is written in full -- zeroed, then its
+        // class entry set -- so the result does not depend on what the rented buffer held.
+        var grad = Helpers.AutoTensorCache.RentOrAllocate<T>((int[])valuesShape.Clone());
+        var gradData = grad.GetCpuBackingForContiguousWrite(out int gOff)!;
         var upstream = (gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous()).GetReadOnlyDataArray();
         var classData = (classIndices.IsContiguous ? classIndices : classIndices.Contiguous()).GetReadOnlyDataArray();
-        for (int r = 0; r < classData.Length; r++)
+        Helpers.CpuParallelSettings.ParallelForOrSerial(0, classData.Length, (long)classData.Length * numClasses, r =>
         {
+            var row = new Span<T>(gradData, gOff + r * numClasses, numClasses);
+            row.Clear();
             int c = ClassIndexOf(numOps.ToDouble(classData[r]), numClasses);
-            if (c >= 0) gradData[(long)r * numClasses + c] = upstream[r];
-        }
+            if (c >= 0) row[c] = upstream[r];
+        }, deterministicSafe: true);
+        grad.IncrementVersion();
         return grad;
     }
 

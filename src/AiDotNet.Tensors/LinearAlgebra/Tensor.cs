@@ -919,6 +919,70 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         set => SetFlat(flatIndex, value);
     }
 
+    // Fixed-arity element indexers. C# binds t[i, j], t[i, j, k] and t[i, j, k, l] to these instead of the
+    // `params int[]` indexer, so element access no longer allocates an index array per call. That allocation was
+    // the hot spot in per-element loops: an attention mask read as mask[b, h, i, j] inside the softmax allocated an
+    // int[4] for every score (PerfView allocation stacks: ~80 MB per training step on a 1024-token LM batch).
+    // Same validation, storage-offset/stride addressing and version bump as the params indexer; a SparseTensor still
+    // goes through its own override.
+
+    /// <summary>Gets or sets the element at [i0, i1] of a rank-2 tensor.</summary>
+    public T this[int i0, int i1]
+    {
+        get => this is SparseTensor<T> ? this[new[] { i0, i1 }] : ReadElementAt(ElementIndex(2, i0, i1, 0, 0));
+        set { if (this is SparseTensor<T>) this[new[] { i0, i1 }] = value; else SetElementAt(ElementIndex(2, i0, i1, 0, 0), value); }
+    }
+
+    /// <summary>Gets or sets the element at [i0, i1, i2] of a rank-3 tensor.</summary>
+    public T this[int i0, int i1, int i2]
+    {
+        get => this is SparseTensor<T> ? this[new[] { i0, i1, i2 }] : ReadElementAt(ElementIndex(3, i0, i1, i2, 0));
+        set { if (this is SparseTensor<T>) this[new[] { i0, i1, i2 }] = value; else SetElementAt(ElementIndex(3, i0, i1, i2, 0), value); }
+    }
+
+    /// <summary>Gets or sets the element at [i0, i1, i2, i3] of a rank-4 tensor.</summary>
+    public T this[int i0, int i1, int i2, int i3]
+    {
+        get => this is SparseTensor<T> ? this[new[] { i0, i1, i2, i3 }] : ReadElementAt(ElementIndex(4, i0, i1, i2, i3));
+        set { if (this is SparseTensor<T>) this[new[] { i0, i1, i2, i3 }] = value; else SetElementAt(ElementIndex(4, i0, i1, i2, i3), value); }
+    }
+
+    /// <summary>Materializes, validates rank and bounds, and returns the storage index (offset + strides).</summary>
+    private int ElementIndex(int rank, int i0, int i1, int i2, int i3)
+    {
+        EnsureMaterialized();
+        ThrowIfSparse("Item");
+        if (_shape.Length != rank)
+            throw new ArgumentException("Number of indices must match the tensor's rank.");
+        int idx = _storageOffset;
+        idx += CheckedAxis(0, i0) * _strides[0];
+        idx += CheckedAxis(1, i1) * _strides[1];
+        if (rank > 2) idx += CheckedAxis(2, i2) * _strides[2];
+        if (rank > 3) idx += CheckedAxis(3, i3) * _strides[3];
+        return idx;
+    }
+
+    private int CheckedAxis(int axis, int index)
+    {
+        if ((uint)index >= (uint)_shape[axis])
+            throw new ArgumentOutOfRangeException("indices", $"Index {axis} is out of range.");
+        return index;
+    }
+
+    /// <summary>
+    /// Reads _data AFTER the index is computed: ElementIndex materializes a dropped streaming weight, which replaces
+    /// _data, so `_data[ElementIndex(...)]` (field loaded first) would read the stale, empty storage.
+    /// </summary>
+    private T ReadElementAt(int storageIndex) => _data[storageIndex];
+
+    /// <summary>Element write with the params indexer's ownership, read-only-alias and version semantics.</summary>
+    private void SetElementAt(int storageIndex, T value)
+    {
+        EnsureOwnedForWrite();
+        _storage.AsWritableSpan()[storageIndex] = value;
+        IncrementVersion();
+    }
+
     /// <summary>
     /// Returns an enumerator that iterates through all elements in the tensor.
     /// </summary>
