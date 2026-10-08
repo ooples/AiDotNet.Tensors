@@ -727,10 +727,11 @@ public class ElementWiseBenchmarks
         _nsVector2 = np.array(_data2);
     }
 
-    // The TensorPrimitives arms write into the preallocated _result, so they are a non-allocating lower bound.
-    // The NumSharp and AiDotNet arms return a new result as their APIs do, so their time includes that
-    // allocation: compare them with each other, and read MemoryDiagnoser's Allocated column alongside the ratio
-    // to the baseline.
+    // Multiply and Exp: the TensorPrimitives arms write into the preallocated _result, so they are a
+    // non-allocating lower bound, while the NumSharp and AiDotNet arms return a new array as their APIs do, so
+    // their time includes that allocation. Compare those two with each other, and read MemoryDiagnoser's
+    // Allocated column alongside the ratio to the baseline. Sum and Max return a double in every arm, so no
+    // result array is allocated there and the ratios compare like with like.
     #region Multiply Element-wise
 
     [Benchmark(Description = "Multiply - TensorPrimitives", Baseline = true)]
