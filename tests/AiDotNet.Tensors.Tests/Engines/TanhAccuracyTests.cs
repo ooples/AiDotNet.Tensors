@@ -87,6 +87,58 @@ public class TanhAccuracyTests
         for (int i = 0; i < x.Length; i++)
             Assert.True(UlpDistance((float)Math.Tanh(x[i]), y[i]) <= 4, $"x = {x[i]}: got {y[i]}");
     }
-}
 
+    private static double MishRef(double x) => x * Math.Tanh(x > 20 ? x : Math.Log(1 + Math.Exp(x)));
+
+    [Fact]
+    public unsafe void MishUnsafe_IsWithinItsParityBudget_AcrossTheRange()
+    {
+        // Every 64th float bit pattern in [0, 30], both signs; the budget is 64 ULP or 1e-6 absolute.
+        uint maxBits = BitConverter.SingleToUInt32Bits(30f);
+        int count = (int)(maxBits / 64) + 1;
+        var input = new float[2 * count];
+        for (int i = 0; i < count; i++)
+        {
+            float v = BitConverter.UInt32BitsToSingle((uint)i * 64);
+            input[2 * i] = v;
+            input[2 * i + 1] = -v;
+        }
+        var output = new float[input.Length];
+        fixed (float* pi = input)
+        fixed (float* po = output)
+        {
+            SimdKernels.MishUnsafe(pi, po, input.Length);
+        }
+
+        long worstUlp = 0; float worstAt = 0;
+        for (int i = 0; i < input.Length; i++)
+        {
+            double expected = MishRef(input[i]);
+            if (Math.Abs(expected) < 1e-3 && Math.Abs(expected - output[i]) <= 1e-6) continue;
+            long d = UlpDistance((float)expected, output[i]);
+            if (d > worstUlp) { worstUlp = d; worstAt = input[i]; }
+        }
+        _out.WriteLine($"Mish: max ULP (|mish| >= 1e-3, else 1e-6 abs) {worstUlp} at x = {worstAt:R} over {input.Length} values");
+        Assert.True(worstUlp <= 8, $"max ULP {worstUlp} at x = {worstAt:R}");
+    }
+
+    [Fact]
+    public unsafe void MishUnsafe_HandlesSpecialValues()
+    {
+        var input = new[] { 0f, -0f, float.PositiveInfinity, float.NegativeInfinity, float.NaN, 25f, -100f, 0, 0 };
+        var output = new float[input.Length];
+        fixed (float* pi = input)
+        fixed (float* po = output)
+        {
+            SimdKernels.MishUnsafe(pi, po, input.Length);
+        }
+        Assert.Equal(BitConverter.SingleToInt32Bits(0f), BitConverter.SingleToInt32Bits(output[0]));
+        Assert.Equal(BitConverter.SingleToInt32Bits(-0f), BitConverter.SingleToInt32Bits(output[1]));
+        Assert.Equal(float.PositiveInfinity, output[2]);
+        Assert.True(Math.Abs(output[3]) <= 1e-6 || float.IsNaN(output[3]) == false, $"mish(-inf) = {output[3]}");
+        Assert.True(float.IsNaN(output[4]));
+        Assert.Equal(25f, output[5]);
+        Assert.True(Math.Abs(output[6]) <= 1e-6, $"mish(-100) = {output[6]}");
+    }
+}
 #endif

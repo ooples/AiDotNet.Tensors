@@ -212,6 +212,7 @@ internal static class Program
         Measure("Tanh [S,4D]", (long)S * 4 * D, () => eng.Tanh(h1));
         Measure("Sigmoid [S,4D]", (long)S * 4 * D, () => eng.Sigmoid(h1));
         Measure("ReLU [S,4D]", (long)S * 4 * D, () => eng.ReLU(h1));
+        Measure("Mish [S,4D]", (long)S * 4 * D, () => eng.Mish(h1));
         return 0;
     }
     private static int RunAttnBlock(CpuEngine eng, string[] a)

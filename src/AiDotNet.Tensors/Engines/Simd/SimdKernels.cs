@@ -1572,8 +1572,23 @@ namespace AiDotNet.Tensors.Engines.Simd
         }
 
         /// <summary>
-        /// exp for 8 floats in [0, 18] to about 1 ULP: Cephes expf (Cody-Waite ln2 split, minimax degree-5
-        /// polynomial). Only <see cref="AccurateTanh256"/> uses it, so it does not handle overflow.
+        /// Mish for 8 floats: x * tanh(softplus(x)) = x * n / (n + 2), n = e^x (e^x + 2). The identity
+        /// has no cancellation, so the error is the exp's plus a few roundings. x > 20 returns x (tanh of
+        /// the softplus rounds to 1); x is clamped at -80 for the exp, where |mish| is far below 1e-6.
+        /// </summary>
+        [MethodImpl(HotInline)]
+        internal static Vector256<float> AccurateMish256(Vector256<float> x)
+        {
+            var xc = Avx.Max(Avx.Min(x, Vector256.Create(20.0f)), Vector256.Create(-80.0f));
+            var e = AccurateExp256(xc);
+            var n = Avx.Multiply(e, Avx.Add(e, Vector256.Create(2.0f)));
+            var mish = Avx.Multiply(x, Avx.Divide(n, Avx.Add(n, Vector256.Create(2.0f))));
+            var result = Avx.BlendVariable(mish, x, Avx.CompareGreaterThan(x, Vector256.Create(20.0f)));
+            return Avx.BlendVariable(result, x, Avx.CompareUnordered(x, x));
+        }
+        /// <summary>
+        /// exp for 8 floats in [-80, 20] to about 1 ULP: Cephes expf (Cody-Waite ln2 split, minimax degree-5
+        /// polynomial). Callers clamp their input to that range; it does not handle overflow or underflow.
         /// </summary>
         [MethodImpl(HotInline)]
         private static Vector256<float> AccurateExp256(Vector256<float> x)
@@ -1740,9 +1755,18 @@ namespace AiDotNet.Tensors.Engines.Simd
         public static unsafe void MishUnsafe(float* input, float* output, int length)
         {
             // FastExp/FastLog plus the sigmoid tanh identity accumulated errors far beyond
-            // Mish's 64-ULP contract. Preserve the stable large-positive branch and use libm
-            // for the portable implementation until an accuracy-bounded SIMD kernel exists.
-            for (int i = 0; i < length; i++)
+            // Mish's 64-ULP contract. The vector path uses tanh(softplus(x)) = n / (n + 2) with
+            // n = e^x (e^x + 2), which has no cancellation, and the accurate exp from AccurateTanh256.
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx2.IsSupported && Fma.IsSupported)
+            {
+                int simdLength = length & ~7;
+                for (; i < simdLength; i += 8)
+                    Avx.Store(output + i, AccurateMish256(Avx.LoadVector256(input + i)));
+            }
+#endif
+            for (; i < length; i++)
             {
                 float x = input[i];
                 float sp = x > 20f ? x : MathF.Log(1f + MathF.Exp(x));
