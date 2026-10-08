@@ -475,30 +475,15 @@ internal static class HeadToHeadNetworkHarness
                     }
                     case "lstm":
                     {
-                        int steps = shape[0], features = shape[1], hidden = layer.GetProperty("hidden").GetInt32();
+                        int features = shape[1], hidden = layer.GetProperty("hidden").GetInt32();
                         // PyTorch's layout and gate order (i, f, g, o): weight_ih, weight_hh, bias_ih, bias_hh.
                         var weightIh = Parameter(new[] { 4 * hidden, features });
                         var weightHh = Parameter(new[] { 4 * hidden, hidden });
                         var biasIh = Parameter(new[] { 4 * hidden });
                         var biasHh = Parameter(new[] { 4 * hidden });
-                        layers.Add(input =>
-                        {
-                            var h = Place(new Tensor<float>(new[] { batch, hidden }));
-                            var c = Place(new Tensor<float>(new[] { batch, hidden }));
-                            for (int t = 0; t < steps; t++)
-                            {
-                                var xt = engine.Reshape(engine.TensorSlice(input, new[] { 0, t, 0 }, new[] { batch, 1, features }), new[] { batch, features });
-                                var gates = engine.TensorAdd(engine.TensorMatMulTransposed(xt, weightIh), engine.TensorMatMulTransposed(h, weightHh));
-                                gates = AddBias(AddBias(gates, biasIh), biasHh);
-                                var i = engine.Sigmoid(engine.TensorNarrow(gates, 1, 0, hidden));
-                                var f = engine.Sigmoid(engine.TensorNarrow(gates, 1, hidden, hidden));
-                                var g = engine.Tanh(engine.TensorNarrow(gates, 1, 2 * hidden, hidden));
-                                var o = engine.Sigmoid(engine.TensorNarrow(gates, 1, 3 * hidden, hidden));
-                                c = engine.TensorAdd(engine.TensorMultiply(f, c), engine.TensorMultiply(i, g));
-                                h = engine.TensorMultiply(o, engine.Tanh(c));
-                            }
-                            return h;
-                        });
+                        // PyTorch's side runs the fused nn.LSTM, so ours runs the engine's fused sequence op: same
+                        // weights and gate order, one tape node with the exact BPTT backward.
+                        layers.Add(input => engine.LstmSequenceForward(input, null, null, weightIh, weightHh, biasIh, biasHh));
                         shape = new[] { hidden };
                         break;
                     }

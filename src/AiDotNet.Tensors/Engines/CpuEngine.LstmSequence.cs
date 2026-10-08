@@ -92,10 +92,8 @@ public partial class CpuEngine
     /// </para>
     ///
     /// <para>
-    /// <b>Forward-only.</b> This op is intended for the inference path
-    /// (<c>Predict</c>). Calling it under an active <c>GradientTape</c> throws
-    /// — training paths should keep using the existing decomposed
-    /// <c>LSTMLayer.Forward</c> until a fused backward lands in a follow-up PR.
+    /// <b>Training.</b> Under an active <c>GradientTape</c>, float records one tape node whose backward is
+    /// the fused BPTT (exact gradients for the input, both weights and both biases).
     /// </para>
     /// </summary>
     /// <param name="input">[B, seq, in] input sequence.</param>
