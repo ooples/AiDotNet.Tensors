@@ -54,6 +54,28 @@ public sealed class GradientTape<T> : IDisposable
     /// </summary>
     internal static void ResetCurrentForTests() => _current = null;
 
+    /// <summary>
+    /// Makes <paramref name="tape"/> this thread's recording tape until the returned scope is disposed, then restores
+    /// the tape that was current before. For a backward that runs work under a nested tape but must record its result
+    /// on the enclosing one.
+    /// </summary>
+    internal static CurrentTapeScope RecordOn(GradientTape<T>? tape)
+    {
+        var previous = _current;
+        SetCurrentTape(tape);
+        return new CurrentTapeScope(previous);
+    }
+
+    /// <summary>Restores the previously current tape on dispose (see <see cref="RecordOn"/>).</summary>
+    internal readonly struct CurrentTapeScope : IDisposable
+    {
+        private readonly GradientTape<T>? _previous;
+
+        internal CurrentTapeScope(GradientTape<T>? previous) => _previous = previous;
+
+        public void Dispose() => SetCurrentTape(_previous);
+    }
+
     private readonly GradientTape<T>? _parent;
     private readonly TapeEntryArena<T> _entries;
     private readonly GradientTapeOptions _options;
