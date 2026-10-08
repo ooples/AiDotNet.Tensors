@@ -1,3 +1,5 @@
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 // audit-2026-05 phase 5: BCL-portable SIMD bridge for net471.
 //
 // AiDotNet.Tensors targets net10.0;net471. The net10.0 build uses
@@ -25,7 +27,6 @@
 
 using System;
 using System.Numerics;
-using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
 namespace AiDotNet.Tensors.Engines.Simd;
@@ -45,7 +46,7 @@ internal static class SystemNumericsVectorBridge
     // FLOAT — binary element-wise
     // ====================================================================
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static void VectorAdd(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> result)
     {
         if (a.Length != b.Length || a.Length != result.Length)
@@ -66,7 +67,7 @@ internal static class SystemNumericsVectorBridge
             result[i] = a[i] + b[i];
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static void VectorSubtract(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> result)
     {
         if (a.Length != b.Length || a.Length != result.Length)
@@ -87,7 +88,7 @@ internal static class SystemNumericsVectorBridge
             result[i] = a[i] - b[i];
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static void VectorMultiply(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> result)
     {
         if (a.Length != b.Length || a.Length != result.Length)
@@ -108,7 +109,7 @@ internal static class SystemNumericsVectorBridge
             result[i] = a[i] * b[i];
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static void VectorDivide(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> result)
     {
         if (a.Length != b.Length || a.Length != result.Length)
@@ -133,7 +134,7 @@ internal static class SystemNumericsVectorBridge
     // FLOAT — scalar broadcast
     // ====================================================================
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static void AddScalar(ReadOnlySpan<float> a, float scalar, Span<float> result)
     {
         if (a.Length != result.Length)
@@ -154,7 +155,7 @@ internal static class SystemNumericsVectorBridge
             result[i] = a[i] + scalar;
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static void SubtractScalar(ReadOnlySpan<float> a, float scalar, Span<float> result)
     {
         if (a.Length != result.Length)
@@ -175,7 +176,7 @@ internal static class SystemNumericsVectorBridge
             result[i] = a[i] - scalar;
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static void MultiplyScalar(ReadOnlySpan<float> a, float scalar, Span<float> result)
     {
         if (a.Length != result.Length)
@@ -210,7 +211,7 @@ internal static class SystemNumericsVectorBridge
     }
 
     /// <summary>r[i] = a[i] + scalar * b[i] — SAXPY-style fused mul-add.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static void ScalarMultiplyAdd(ReadOnlySpan<float> a, ReadOnlySpan<float> b, float scalar, Span<float> result)
     {
         if (a.Length != b.Length || a.Length != result.Length)
@@ -233,7 +234,7 @@ internal static class SystemNumericsVectorBridge
     }
 
     /// <summary>Alias of the foundation primitive — kept for symmetry with SimdKernels.DotProduct.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static void Saxpy(float alpha, ReadOnlySpan<float> x, ReadOnlySpan<float> y, Span<float> result)
     {
         if (x.Length != y.Length || x.Length != result.Length)
@@ -259,7 +260,7 @@ internal static class SystemNumericsVectorBridge
     // FLOAT — unary element-wise
     // ====================================================================
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static void Sqrt(ReadOnlySpan<float> src, Span<float> result)
     {
         if (src.Length != result.Length)
@@ -279,7 +280,7 @@ internal static class SystemNumericsVectorBridge
             result[i] = (float)Math.Sqrt(src[i]);
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static void Abs(ReadOnlySpan<float> src, Span<float> result)
     {
         if (src.Length != result.Length)
@@ -299,7 +300,7 @@ internal static class SystemNumericsVectorBridge
             result[i] = Math.Abs(src[i]);
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static void Negate(ReadOnlySpan<float> src, Span<float> result)
     {
         if (src.Length != result.Length)
@@ -319,7 +320,7 @@ internal static class SystemNumericsVectorBridge
             result[i] = -src[i];
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static void Clamp(ReadOnlySpan<float> src, float min, float max, Span<float> result)
     {
         if (src.Length != result.Length)
@@ -345,7 +346,7 @@ internal static class SystemNumericsVectorBridge
     // FLOAT — activations
     // ====================================================================
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static void ReLU(ReadOnlySpan<float> src, Span<float> result)
     {
         if (src.Length != result.Length)
@@ -366,7 +367,7 @@ internal static class SystemNumericsVectorBridge
             result[i] = Math.Max(0f, src[i]);
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static void LeakyReLU(ReadOnlySpan<float> src, float alpha, Span<float> result)
     {
         if (src.Length != result.Length)
@@ -396,7 +397,7 @@ internal static class SystemNumericsVectorBridge
     // FLOAT — reductions
     // ====================================================================
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static float Sum(ReadOnlySpan<float> src)
     {
         int length = src.Length;
@@ -415,7 +416,7 @@ internal static class SystemNumericsVectorBridge
         return sum;
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static float Max(ReadOnlySpan<float> src)
     {
         if (src.Length == 0)
@@ -470,7 +471,7 @@ internal static class SystemNumericsVectorBridge
         return anyNaN ? float.NaN : max;
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static float Min(ReadOnlySpan<float> src)
     {
         if (src.Length == 0)
@@ -521,7 +522,7 @@ internal static class SystemNumericsVectorBridge
         return anyNaN ? float.NaN : min;
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static float Dot(ReadOnlySpan<float> a, ReadOnlySpan<float> b)
     {
         if (a.Length != b.Length)
@@ -548,7 +549,7 @@ internal static class SystemNumericsVectorBridge
     // DOUBLE — binary element-wise
     // ====================================================================
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static void VectorAdd(ReadOnlySpan<double> a, ReadOnlySpan<double> b, Span<double> result)
     {
         if (a.Length != b.Length || a.Length != result.Length)
@@ -569,7 +570,7 @@ internal static class SystemNumericsVectorBridge
             result[i] = a[i] + b[i];
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static void VectorSubtract(ReadOnlySpan<double> a, ReadOnlySpan<double> b, Span<double> result)
     {
         if (a.Length != b.Length || a.Length != result.Length)
@@ -590,7 +591,7 @@ internal static class SystemNumericsVectorBridge
             result[i] = a[i] - b[i];
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static void VectorMultiply(ReadOnlySpan<double> a, ReadOnlySpan<double> b, Span<double> result)
     {
         if (a.Length != b.Length || a.Length != result.Length)
@@ -611,7 +612,7 @@ internal static class SystemNumericsVectorBridge
             result[i] = a[i] * b[i];
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static void VectorDivide(ReadOnlySpan<double> a, ReadOnlySpan<double> b, Span<double> result)
     {
         if (a.Length != b.Length || a.Length != result.Length)
@@ -636,7 +637,7 @@ internal static class SystemNumericsVectorBridge
     // DOUBLE — scalar broadcast
     // ====================================================================
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static void AddScalar(ReadOnlySpan<double> a, double scalar, Span<double> result)
     {
         if (a.Length != result.Length)
@@ -657,7 +658,7 @@ internal static class SystemNumericsVectorBridge
             result[i] = a[i] + scalar;
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static void SubtractScalar(ReadOnlySpan<double> a, double scalar, Span<double> result)
     {
         if (a.Length != result.Length)
@@ -678,7 +679,7 @@ internal static class SystemNumericsVectorBridge
             result[i] = a[i] - scalar;
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static void MultiplyScalar(ReadOnlySpan<double> a, double scalar, Span<double> result)
     {
         if (a.Length != result.Length)
@@ -709,7 +710,7 @@ internal static class SystemNumericsVectorBridge
         MultiplyScalar(a, inv, result);
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static void ScalarMultiplyAdd(ReadOnlySpan<double> a, ReadOnlySpan<double> b, double scalar, Span<double> result)
     {
         if (a.Length != b.Length || a.Length != result.Length)
@@ -735,7 +736,7 @@ internal static class SystemNumericsVectorBridge
     // DOUBLE — unary element-wise
     // ====================================================================
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static void Sqrt(ReadOnlySpan<double> src, Span<double> result)
     {
         if (src.Length != result.Length)
@@ -755,7 +756,7 @@ internal static class SystemNumericsVectorBridge
             result[i] = Math.Sqrt(src[i]);
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static void Abs(ReadOnlySpan<double> src, Span<double> result)
     {
         if (src.Length != result.Length)
@@ -775,7 +776,7 @@ internal static class SystemNumericsVectorBridge
             result[i] = Math.Abs(src[i]);
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static void Negate(ReadOnlySpan<double> src, Span<double> result)
     {
         if (src.Length != result.Length)
@@ -795,7 +796,7 @@ internal static class SystemNumericsVectorBridge
             result[i] = -src[i];
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static void Clamp(ReadOnlySpan<double> src, double min, double max, Span<double> result)
     {
         if (src.Length != result.Length)
@@ -821,7 +822,7 @@ internal static class SystemNumericsVectorBridge
     // DOUBLE — activations
     // ====================================================================
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static void ReLU(ReadOnlySpan<double> src, Span<double> result)
     {
         if (src.Length != result.Length)
@@ -842,7 +843,7 @@ internal static class SystemNumericsVectorBridge
             result[i] = Math.Max(0.0, src[i]);
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static void LeakyReLU(ReadOnlySpan<double> src, double alpha, Span<double> result)
     {
         if (src.Length != result.Length)
@@ -872,7 +873,7 @@ internal static class SystemNumericsVectorBridge
     // DOUBLE — reductions
     // ====================================================================
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static double Sum(ReadOnlySpan<double> src)
     {
         int length = src.Length;
@@ -891,7 +892,7 @@ internal static class SystemNumericsVectorBridge
         return sum;
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static double Max(ReadOnlySpan<double> src)
     {
         if (src.Length == 0)
@@ -941,7 +942,7 @@ internal static class SystemNumericsVectorBridge
         return anyNaN ? double.NaN : max;
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static double Min(ReadOnlySpan<double> src)
     {
         if (src.Length == 0)
@@ -991,7 +992,7 @@ internal static class SystemNumericsVectorBridge
         return anyNaN ? double.NaN : min;
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static double Dot(ReadOnlySpan<double> a, ReadOnlySpan<double> b)
     {
         if (a.Length != b.Length)
@@ -1284,7 +1285,7 @@ internal static class SystemNumericsVectorBridge
 
     // ---- span-level transcendental ops -------------------------------------
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static void Exp(ReadOnlySpan<float> src, Span<float> result)
     {
         if (src.Length != result.Length)
@@ -1297,7 +1298,7 @@ internal static class SystemNumericsVectorBridge
         for (int i = simd; i < length; i++) result[i] = (float)Math.Exp(src[i]);
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static void Log(ReadOnlySpan<float> src, Span<float> result)
     {
         if (src.Length != result.Length)
@@ -1310,7 +1311,7 @@ internal static class SystemNumericsVectorBridge
         for (int i = simd; i < length; i++) result[i] = (float)Math.Log(src[i]);
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static void Sigmoid(ReadOnlySpan<float> src, Span<float> result)
     {
         if (src.Length != result.Length)
@@ -1324,7 +1325,7 @@ internal static class SystemNumericsVectorBridge
         for (int i = simd; i < length; i++) result[i] = 1f / (1f + (float)Math.Exp(-src[i]));
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static void Tanh(ReadOnlySpan<float> src, Span<float> result)
     {
         if (src.Length != result.Length)
@@ -1340,7 +1341,7 @@ internal static class SystemNumericsVectorBridge
         for (int i = simd; i < length; i++) result[i] = (float)Math.Tanh(src[i]);
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static void Swish(ReadOnlySpan<float> src, Span<float> result)
     {
         if (src.Length != result.Length)
@@ -1354,7 +1355,7 @@ internal static class SystemNumericsVectorBridge
         for (int i = simd; i < length; i++) result[i] = src[i] * (1f / (1f + (float)Math.Exp(-src[i])));
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static void ELU(ReadOnlySpan<float> src, float alpha, Span<float> result)
     {
         if (src.Length != result.Length)
@@ -1376,7 +1377,7 @@ internal static class SystemNumericsVectorBridge
             result[i] = src[i] > 0f ? src[i] : alpha * ((float)Math.Exp(src[i]) - 1f);
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static void GELU(ReadOnlySpan<float> src, Span<float> result)
     {
         if (src.Length != result.Length)
@@ -1410,7 +1411,7 @@ internal static class SystemNumericsVectorBridge
     // precision — those lanes fall back to libm Math.Sin/Cos.
     private const float TrigReductionLimit = 105414f;
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static void Sin(ReadOnlySpan<float> src, Span<float> result)
     {
         if (src.Length != result.Length)
@@ -1437,7 +1438,7 @@ internal static class SystemNumericsVectorBridge
         for (int i = simd; i < length; i++) result[i] = (float)Math.Sin(src[i]);
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static void Cos(ReadOnlySpan<float> src, Span<float> result)
     {
         if (src.Length != result.Length)
@@ -1473,7 +1474,7 @@ internal static class SystemNumericsVectorBridge
     /// a non-finite exponent, and any block containing a non-positive / subnormal / non-finite base
     /// all route to libm <see cref="Math.Pow(double, double)"/> so the result matches MathF.Pow.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static void Pow(ReadOnlySpan<float> baseValues, float exponent, Span<float> result)
     {
         if (baseValues.Length != result.Length)

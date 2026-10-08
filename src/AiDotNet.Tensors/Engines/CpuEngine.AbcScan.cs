@@ -5,6 +5,8 @@ using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 using AiDotNet.Tensors.LinearAlgebra;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines;
 
@@ -129,6 +131,7 @@ public partial class CpuEngine
     private const int AbcBhGrain = 1;
 
     // ── Double fast path ─────────────────────────────────────────────────────────────────
+    [MethodImpl(Hot)]
     private static void AbcForwardDouble(
         double[] Q, double[] K, double[] V, double[] FG, double[] SK, double[] outp,
         int batch, int seqLen, int modelDim, int numHeads, int headDim, int numSlots, double initScale)
@@ -137,7 +140,7 @@ public partial class CpuEngine
         double scale = 1.0 / Math.Sqrt(headDim);
         // Every (batch, head) pair is fully independent (private slot state, disjoint output region),
         // so the combined (b*numHeads) axis is embarrassingly parallel with no cross-channel reduction.
-        CpuParallelSettings.ParallelForChunks(batch * numHeads, AbcBhGrain, (bhStart, bhCount) =>
+        CpuParallelSettings.ParallelForChunks(batch * numHeads, AbcBhGrain, [MethodImpl(Hot)] (bhStart, bhCount) =>
         {
             var slot = new double[sd];
             var w = new double[numSlots];
@@ -197,6 +200,7 @@ public partial class CpuEngine
         });
     }
 
+    [MethodImpl(Hot)]
     private static void SoftmaxInPlaceDouble(double[] x, int off, int n)
     {
         double max = x[off];
@@ -209,6 +213,7 @@ public partial class CpuEngine
 
     // dScore[i] = y[i] * (dy[i] - sum_j dy[j]*y[j]), the standard softmax Jacobian-vector product.
     // The max subtraction cancels exactly in the true softmax, so it contributes nothing here.
+    [MethodImpl(Hot)]
     private static void SoftmaxBackwardInPlaceDouble(double[] dy, double[] y, int yOff, int n)
     {
         double dotp = 0.0;
@@ -216,6 +221,7 @@ public partial class CpuEngine
         for (int i = 0; i < n; i++) dy[i] = y[yOff + i] * (dy[i] - dotp);
     }
 
+    [MethodImpl(Hot)]
     private static void AbcBackwardDouble(
         double[] dOut, double[] Q, double[] K, double[] V, double[] FG, double[] SK,
         double[] dQ, double[] dK, double[] dV, double[] dFG, double[] dSK,
@@ -225,7 +231,7 @@ public partial class CpuEngine
         double scale = 1.0 / Math.Sqrt(headDim);
         // Parallelize over HEADS only, not (batch*head): dSK[h] is shared by every batch element, so
         // the batch loop stays sequential inside a head to keep the accumulation lock-free.
-        CpuParallelSettings.ParallelForChunks(numHeads, AbcBhGrain, (hStart, hCount) =>
+        CpuParallelSettings.ParallelForChunks(numHeads, AbcBhGrain, [MethodImpl(Hot)] (hStart, hCount) =>
         {
             var slot = new double[sd];
             var slotTraj = new double[seqLen * sd];

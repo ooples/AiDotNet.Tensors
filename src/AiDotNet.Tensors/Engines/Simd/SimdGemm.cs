@@ -369,6 +369,7 @@ internal static partial class SimdGemm
     /// zero-overhead <see cref="FrozenWeightRegistry"/> path instead, which trades
     /// this validation for an explicit MarkDirty contract.
     /// </remarks>
+    [MethodImpl(Hot)]
     internal static ulong ComputeWeightFingerprint(System.ReadOnlySpan<float> data)
     {
         var bits = MemoryMarshal.Cast<float, uint>(data);
@@ -409,6 +410,7 @@ internal static partial class SimdGemm
     /// Pre-pack B into SgemmTiledParallel2D's expected layout. Builds the
     /// full set of per-(pcIter, csIdx) packed buffers. Called on cache miss.
     /// </summary>
+    [MethodImpl(Hot)]
     private static PrePackedB BuildPrePackedB(float[] b, int k, int n, int m)
     {
         // Capture the mutation version BEFORE reading any of b's contents.
@@ -741,6 +743,7 @@ internal static partial class SimdGemm
     /// exactly, just with sbyte instead of float). Each tile is allocated
     /// and packed once at first call; subsequent inferences reuse.
     /// </summary>
+    [MethodImpl(Hot)]
     private static Int8PrePackedB BuildInt8PrePackedB(float[] b, int k, int n, int m)
     {
         // Capture BEFORE reading b — see BuildPrePackedB for the race.
@@ -890,6 +893,7 @@ internal static partial class SimdGemm
     /// per-tile dequant is fast and the float MicroKernel sees identical
     /// input layout to the float-cached path.
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe void SgemmTiledWithInt8Cached(
         System.ReadOnlySpan<float> a,
         Int8PrePackedB cached,
@@ -1062,6 +1066,7 @@ internal static partial class SimdGemm
     /// packing each call. Only PackA runs per-call (A is the activations,
     /// which vary).
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe void SgemmTiledWithCached(
         System.ReadOnlySpan<float> a,
         PrePackedB cached,
@@ -1733,6 +1738,7 @@ internal static partial class SimdGemm
         }
     }
 
+    [MethodImpl(Hot)]
     internal static void SgemmAddInternal(
         ReadOnlySpan<float> a, int lda, bool transA,
         ReadOnlySpan<float> b, int ldb, bool transB,
@@ -2389,6 +2395,7 @@ internal static partial class SimdGemm
 
     /// <summary>One column panel of <see cref="SgemmDirectParallelN"/>: C[:, 0..panelN) of a row-major C
     /// with row stride <paramref name="ldc"/>, using the direct 6×16 kernels and masked edges.</summary>
+    [MethodImpl(Hot)]
     private static unsafe void DirectPanel(
         float* pA, int lda, float* pB, int ldb, float* pC, int ldc,
         int m, int k, int panelN, bool clearedOutput)
@@ -2547,6 +2554,7 @@ internal static partial class SimdGemm
 
     /// <summary>4-row × 8-col register-blocked FP64 microkernel over M-blocks
     /// [blockStart, blockEnd). Any n (the column tail is masked); overwrites C.</summary>
+    [MethodImpl(Hot)]
     private static unsafe void DgemmDirectBlockRange(
         double* A, double* B, double* C, int blockStart, int blockEnd, int k, int n)
     {
@@ -2667,6 +2675,7 @@ internal static partial class SimdGemm
         }
     }
 
+    [MethodImpl(Hot)]
     private static unsafe void DgemmTransABlock(double* A, double* B, double* C, int blockStart, int blockEnd, int k, int n, int m)
     {
         const int MRd = 4;
@@ -2783,6 +2792,7 @@ internal static partial class SimdGemm
         }
     }
 
+    [MethodImpl(Hot)]
     private static unsafe void DgemmTransBBlock(double* A, double* B, double* C, int blockStart, int blockEnd, int k, int n)
     {
         const int MRd = 4, NRd = 2;
@@ -2880,6 +2890,7 @@ internal static partial class SimdGemm
         }
     }
 
+    [MethodImpl(Hot)]
     private static unsafe void SgemmTransABlock(float* A, float* B, float* C, int blockStart, int blockEnd, int k, int n, int m)
     {
         const int MRf = 4;
@@ -3016,6 +3027,7 @@ internal static partial class SimdGemm
         }
     }
 
+    [MethodImpl(Hot)]
     private static unsafe void SgemmTransBBlock(float* A, float* B, float* C, int blockStart, int blockEnd, int k, int n)
     {
         const int MRf = 4, NRf = 2;
@@ -3117,7 +3129,7 @@ internal static partial class SimdGemm
             IntPtr ipC = (IntPtr)pCroot;
             int kCap = k, nCap = n, ldaCap = lda, ldbCap = ldb;
 
-            Helpers.PersistentParallelExecutor.Instance.Execute(numChunks, chunk =>
+            Helpers.PersistentParallelExecutor.Instance.Execute(numChunks, [MethodImpl(Hot)] (chunk) =>
             {
                 int blockStart = chunk * blocksPerChunk;
                 int blockEnd = Math.Min(blockStart + blocksPerChunk, numFullBlocks);
@@ -3982,7 +3994,7 @@ internal static partial class SimdGemm
                 var localCPtr = cPtr;
                 var localCLen = cLen;
 
-                Helpers.CpuParallelSettings.LightweightParallel(actualWorkers, workerId =>
+                Helpers.CpuParallelSettings.LightweightParallel(actualWorkers, [MethodImpl(Hot)] (workerId) =>
                 {
                     int workerNc = localSliceNcs[workerId];
                     int jStart = localSliceJStarts[workerId];
@@ -4248,7 +4260,7 @@ internal static partial class SimdGemm
     /// 6 hoisted row pointers and inner-loop unroll-by-4. Eliminates the JIT's bounds
     /// checks and repeated index calculations, cutting pack A time substantially.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     private static unsafe void PackA(ReadOnlySpan<float> a, float[] packed, int lda, bool transA, int ic, int mc, int pc, int kc)
     {
         int pos = 0;
@@ -4347,7 +4359,7 @@ internal static partial class SimdGemm
     /// the packed buffer as two 256-bit aligned writes. ~8x faster than the
     /// scalar fallback on cached data.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     private static unsafe void PackB(ReadOnlySpan<float> b, float[] packed, int ldb, bool transB, int pc, int kc, int jc, int nc)
     {
         int pos = 0;

@@ -1,4 +1,6 @@
 using System;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -29,6 +31,7 @@ internal static class Avx2Streaming
     /// <summary>
     /// Compute C += op(A) · op(B) directly without packing. C is read-modify-write.
     /// </summary>
+    [MethodImpl(Hot)]
     public static unsafe void RunFp64(
         ReadOnlySpan<double> a, int lda, bool transA,
         ReadOnlySpan<double> b, int ldb, bool transB,
@@ -129,6 +132,7 @@ internal static class Avx2Streaming
     /// same (4 FMAs + 4 B-loads + 1 broadcast), but pipelined.
     /// </para>
     /// </summary>
+    [MethodImpl(Hot)]
     public static unsafe void RunFp32(
         ReadOnlySpan<float> a, int lda, bool transA,
         ReadOnlySpan<float> b, int ldb, bool transB,
@@ -265,6 +269,7 @@ internal static class Avx2Streaming
     /// load feeds four independent accumulators (hides FMA latency, amortizes the load).
     /// C is read-modify-write (caller zeroed it on the first streaming call).
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe void RunFp32Nt(
         ReadOnlySpan<float> a, int lda,
         ReadOnlySpan<float> b, int ldb,
@@ -322,6 +327,7 @@ internal static class Avx2Streaming
     }
 
     /// <summary>FP64 mirror of <see cref="RunFp32Nt"/> (Vector256&lt;double&gt;, 4 lanes).</summary>
+    [MethodImpl(Hot)]
     private static unsafe void RunFp64Nt(
         ReadOnlySpan<double> a, int lda,
         ReadOnlySpan<double> b, int ldb,

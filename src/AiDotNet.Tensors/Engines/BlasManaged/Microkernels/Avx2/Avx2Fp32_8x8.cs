@@ -1,4 +1,6 @@
 using System;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -78,6 +80,7 @@ internal static class Avx2Fp32_8x8
     /// </summary>
     private const int PrefetchDistance = 8;
 
+    [MethodImpl(Hot)]
     public static unsafe void Run(
         ReadOnlySpan<float> packedA,
         ReadOnlySpan<float> packedB,
@@ -206,6 +209,7 @@ internal static class Avx2Fp32_8x8
     /// <param name="c">Output buffer; reads + writes C[0..Mr, 0..Nr=8] tile.</param>
     /// <param name="ldc">Leading dimension of C.</param>
     /// <param name="kc">Number of K-steps to accumulate.</param>
+    [MethodImpl(Hot)]
     public static unsafe void RunStridedB(
         ReadOnlySpan<float> packedA,
         ReadOnlySpan<float> b,

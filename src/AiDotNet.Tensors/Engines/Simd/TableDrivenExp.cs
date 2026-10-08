@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -115,7 +116,7 @@ internal static class TableDrivenExp
     /// <summary>
     /// Process array of floats using table-driven exp.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     internal static unsafe void ExpArray(float* input, float* output, int length)
     {
         int i = 0;

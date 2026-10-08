@@ -19,6 +19,7 @@ using AiDotNet.Tensors.LinearAlgebra;
 using AiDotNet.Tensors.LinearAlgebra.Fft;
 using AiDotNet.Tensors.Operators;
 using static AiDotNet.Tensors.Helpers.CpuParallelSettings;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines;
 
@@ -562,6 +563,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public unsafe Vector<T> StridedGather<T>(Vector<T> source, int offset, int stride, int count = -1)
     {
         if (source == null) throw new ArgumentNullException(nameof(source));
@@ -627,6 +629,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public unsafe void StridedScatter<T>(Vector<T> destination, Vector<T> source, int offset, int stride)
     {
         if (destination == null) throw new ArgumentNullException(nameof(destination));
@@ -1549,6 +1552,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public Vector<T> Fill<T>(int length, T value)
     {
         if (length < 0) throw new ArgumentException("Length must be non-negative.", nameof(length));
@@ -1583,6 +1587,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public void CopyVectorToTensor<T>(Vector<T> source, Tensor<T> destination)
     {
         if (source == null) throw new ArgumentNullException(nameof(source));
@@ -1682,6 +1687,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public Matrix<T> MatrixTranspose<T>(Matrix<T> matrix)
     {
         if (matrix == null) throw new ArgumentNullException(nameof(matrix));
@@ -1744,6 +1750,7 @@ public partial class CpuEngine : ITensorLevelEngine
         return result;
     }
 
+    [MethodImpl(Hot)]
     public Matrix<T> MatrixSubtract<T>(Matrix<T> a, Matrix<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
@@ -1783,6 +1790,7 @@ public partial class CpuEngine : ITensorLevelEngine
         return sum;
     }
 
+    [MethodImpl(Hot)]
     public void SwapColumns<T>(Matrix<T> matrix, int col1, int col2)
     {
         if (matrix == null) throw new ArgumentNullException(nameof(matrix));
@@ -1871,6 +1879,7 @@ public partial class CpuEngine : ITensorLevelEngine
         return result;
     }
 
+    [MethodImpl(Hot)]
     public Vector<T> GetColumn<T>(Matrix<T> matrix, int columnIndex)
     {
         if (matrix == null) throw new ArgumentNullException(nameof(matrix));
@@ -1887,6 +1896,7 @@ public partial class CpuEngine : ITensorLevelEngine
         return new Vector<T>(result);
     }
 
+    [MethodImpl(Hot)]
     public Vector<T> GetRow<T>(Matrix<T> matrix, int rowIndex)
     {
         if (matrix == null) throw new ArgumentNullException(nameof(matrix));
@@ -1903,6 +1913,7 @@ public partial class CpuEngine : ITensorLevelEngine
         return new Vector<T>(result);
     }
 
+    [MethodImpl(Hot)]
     public void SetColumn<T>(Matrix<T> matrix, int columnIndex, Vector<T> values)
     {
         if (matrix == null) throw new ArgumentNullException(nameof(matrix));
@@ -1923,6 +1934,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
     }
 
+    [MethodImpl(Hot)]
     public void SetRow<T>(Matrix<T> matrix, int rowIndex, Vector<T> values)
     {
         if (matrix == null) throw new ArgumentNullException(nameof(matrix));
@@ -1948,6 +1960,7 @@ public partial class CpuEngine : ITensorLevelEngine
     #region Tensor Operations (Phase B: Epic 3)
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> TensorBroadcastTo<T>(Tensor<T> input, int[] targetShape)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
@@ -2009,6 +2022,7 @@ public partial class CpuEngine : ITensorLevelEngine
         return TensorBroadcastAdd(input, new Tensor<T>(targetShape));
     }
 
+    [MethodImpl(Hot)]
     private static bool ShapesEqual1D(int[] a, int[] b)
     {
         if (a.Length != b.Length) return false;
@@ -2048,6 +2062,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> ReorderToNchwc<T>(Tensor<T> tensor, LinearAlgebra.TensorLayout targetLayout)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
@@ -2123,6 +2138,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> ReorderToNchw<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
@@ -2264,7 +2280,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 biasD[c]  = betaD[c] - s * meanD[c];
             }
 
-            CpuParallelSettings.ParallelForOrSerial(0, Nd * Cd, (long)Nd * Cd * spatialD, ncIdx =>
+            CpuParallelSettings.ParallelForOrSerial(0, Nd * Cd, (long)Nd * Cd * spatialD, [MethodImpl(Hot)] (ncIdx) =>
             {
                 int n = ncIdx / Cd;
                 int c = ncIdx % Cd;
@@ -3603,6 +3619,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> TensorBroadcastSubtract<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
@@ -3886,6 +3903,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// because the broadcast is across the middle of the shape, not the trailing
     /// suffix — that case has its own dedicated fast path elsewhere.
     /// </remarks>
+    [MethodImpl(Hot)]
     private static bool TryBroadcastTrailingRepeat<T>(Tensor<T> a, Tensor<T> b, out int tileSize)
     {
         tileSize = 0;
@@ -3968,6 +3986,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <c>spatialSize = product(a._shape[2..])</c>; per plane the kernel runs
     /// <c>r[i] = a[i] OP b[c]</c> — a tight vectorisable inner loop.</para>
     /// </summary>
+    [MethodImpl(Hot)]
     private static bool TryBroadcastChannelRepeat<T>(Tensor<T> a, Tensor<T> b,
         out int batchCount, out int channelCount, out int spatialSize)
     {
@@ -4273,6 +4292,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// position along that axis would have to hold a different sum in the same memory slot.
     /// PyTorch rejects the same case. Materialize with <c>Contiguous()</c> first.
     /// </summary>
+    [MethodImpl(Hot)]
     private static void ThrowIfInPlaceTargetAliasesItself<T>(Tensor<T> target)
     {
         for (int axis = 0; axis < target.Rank; axis++)
@@ -4836,6 +4856,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <remarks>
     /// Current implementation computes into a temporary tensor then copies to destination.
     /// </remarks>
+    [MethodImpl(Hot)]
     public void TransposeInto<T>(Tensor<T> destination, Tensor<T> input, int[] axes)
     {
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
@@ -4888,6 +4909,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public unsafe void SoftmaxInto<T>(Tensor<T> destination, Tensor<T> input, int axis)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
@@ -4931,7 +4953,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 double* pOut = (double*)pinOut.Pointer;
                 int axisSz = axisSize;
                 int outerSz = outerSize;
-                Action<int> rowKernel = row =>
+                Action<int> rowKernel = [MethodImpl(Hot)] (row) =>
                 {
                     double* rIn = pIn + row * axisSz;
                     double* rOut = pOut + row * axisSz;
@@ -7632,6 +7654,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
     // Native double/float row kernels for TensorTrilinearInterpolate (raw-array, no indexer/dispatch).
     // Same clamp, weights, and left-associative 8-corner sum as the generic path => bit-exact.
+    [MethodImpl(Hot)]
     private static void TrilinearRow(double[] g, double[] p, double[] r, int n, int D, int H, int W, int C)
     {
         double z = Math.Max(0, Math.Min(D - 1 - SampleUpperIndexEpsilon, p[n * 3 + 0]));
@@ -7654,6 +7677,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         w100 * g[b100 + c] + w101 * g[b101 + c] + w110 * g[b110 + c] + w111 * g[b111 + c];
     }
 
+    [MethodImpl(Hot)]
     private static void TrilinearRowF(float[] g, float[] p, float[] r, int n, int D, int H, int W, int C)
     {
         double z = Math.Max(0, Math.Min(D - 1 - SampleUpperIndexEpsilon, p[n * 3 + 0]));
@@ -8519,6 +8543,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// costs more than it saves. Measured on a 16-core Ryzen (Sum): 100K elements 8.2 → 4.4 µs,
     /// 1M elements 85 → 9.7 µs; 30K elements is faster serial.
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe double ParallelReduceDouble(double* data, int length,
         DoubleSpanReductionKernel kernel, Func<double, double, double> combine)
     {
@@ -8549,6 +8574,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// Parallel reduction for float arrays. Splits into chunks, reduces each chunk,
     /// then combines results. Used for Max, Min, Sum reductions on large arrays.
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe float ParallelReduceFloat(float* data, int length, float identity,
         UnsafeReductionKernel kernel, Func<float, float, float> combine)
     {
@@ -8628,6 +8654,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <summary>
     /// Helper method to check if two shapes match.
     /// </summary>
+    [MethodImpl(Hot)]
     private bool ShapesMatch(int[] shape1, int[] shape2)
     {
         if (shape1.Length != shape2.Length)
@@ -8651,7 +8678,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     private static unsafe float MaxPool3x3Padded(float* data, int h, int w, int ihStart, int iwStart)
     {
         float m = float.NegativeInfinity;
@@ -8672,6 +8699,7 @@ public partial class CpuEngine : ITensorLevelEngine
         return m;
     }
 
+    [MethodImpl(Hot)]
     private static unsafe void MaxPool2DFloat3x3NoPad(float[] inArr, float[] outArr, int bc, int h, int w, int oH, int oW, int st)
     {
         fixed (float* pIn = inArr)
@@ -8695,7 +8723,7 @@ public partial class CpuEngine : ITensorLevelEngine
             if (bc >= 2
                 && (long)bc * hw >= PersistentParallelExecutor.DefaultSerialGrainSize)
             {
-                CpuParallelSettings.ParallelForOrSerial(0, bc, (long)bc * hw, idx =>
+                CpuParallelSettings.ParallelForOrSerial(0, bc, (long)bc * hw, [MethodImpl(Hot)] (idx) =>
                 {
                     float* inBase = (float*)ipIn + idx * hw;
                     float* outBase = (float*)ipOut + idx * ohow;
@@ -8754,6 +8782,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
     }
 
+    [MethodImpl(Hot)]
     private static unsafe void MaxPool2DFloat2x2NoPad(float[] inArr, float[] outArr, int bc, int h, int w, int oH, int oW, int st)
     {
         fixed (float* pIn = inArr)
@@ -8777,7 +8806,7 @@ public partial class CpuEngine : ITensorLevelEngine
             if (bc >= 2
                 && (long)bc * hw >= PersistentParallelExecutor.DefaultSerialGrainSize)
             {
-                CpuParallelSettings.ParallelForOrSerial(0, bc, (long)bc * hw, idx =>
+                CpuParallelSettings.ParallelForOrSerial(0, bc, (long)bc * hw, [MethodImpl(Hot)] (idx) =>
                 {
                     float* inBase = (float*)ipIn + idx * hw;
                     float* outBase = (float*)ipOut + idx * ohow;
@@ -8824,6 +8853,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
     }
 
+    [MethodImpl(Hot)]
     private static unsafe void MaxPool2DFloat3x3Padded(float[] inArr, float[] outArr, int bc, int h, int w, int oH, int oW, int st, int pd)
     {
         // Compute interior bounds where all 9 kernel elements are valid
@@ -8840,6 +8870,7 @@ public partial class CpuEngine : ITensorLevelEngine
             IntPtr ipIn = (IntPtr)pIn;
             IntPtr ipOut = (IntPtr)pOut;
 
+            [MethodImpl(Hot)]
             void ProcessPlane(int idx)
             {
                 float* inBase = (float*)ipIn + idx * h * w;
@@ -8904,6 +8935,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
     }
 
+    [MethodImpl(Hot)]
     private static unsafe void MaxPool2DFloatGeneric(float[] inArr, float[] outArr, int bc, int h, int w, int oH, int oW, int ps, int st, int pd)
     {
         fixed (float* pIn = inArr)
@@ -8914,6 +8946,7 @@ public partial class CpuEngine : ITensorLevelEngine
             int hw = h * w;
             int ohow = oH * oW;
 
+            [MethodImpl(Hot)]
             void ProcessChannel(float* inBase, float* outBase)
             {
                 for (int oh = 0; oh < oH; oh++)
@@ -9102,7 +9135,7 @@ public partial class CpuEngine : ITensorLevelEngine
             int hD = height, wD = width, oHD = outputHeight, oWD = outputWidth;
             int psD = poolSize, stD = stride, pdD = padding;
             int bcD = batch * channels;
-            CpuParallelSettings.ParallelForOrSerial(0, bcD, (long)bcD * oHD * oWD, idx =>
+            CpuParallelSettings.ParallelForOrSerial(0, bcD, (long)bcD * oHD * oWD, [MethodImpl(Hot)] (idx) =>
             {
                 int inBase = idx * hD * wD;
                 int outBase = idx * oHD * oWD;
@@ -9231,7 +9264,7 @@ public partial class CpuEngine : ITensorLevelEngine
             int hD = height, wD = width, oHD = outputHeight, oWD = outputWidth;
             int psD = poolSize, stD = stride, pdD = padding;
             int bcD = batch * channels;
-            CpuParallelSettings.ParallelForOrSerial(0, bcD, (long)bcD * oHD * oWD, idx =>
+            CpuParallelSettings.ParallelForOrSerial(0, bcD, (long)bcD * oHD * oWD, [MethodImpl(Hot)] (idx) =>
             {
                 int inBase = idx * hD * wD;
                 int outBase = idx * oHD * oWD;
@@ -9335,7 +9368,7 @@ public partial class CpuEngine : ITensorLevelEngine
             int bc = batch * channels;
             int h = height, w = width, oH = outputHeight, oW = outputWidth;
             int ps = poolSize, st = stride, pd = padding;
-            Action<int> poolKernel = idx =>
+            Action<int> poolKernel = [MethodImpl(Hot)] (idx) =>
             {
                 int inputBase = idx * h * w;
                 int outputBase = idx * oH * oW;
@@ -9384,7 +9417,7 @@ public partial class CpuEngine : ITensorLevelEngine
             int bc = batch * channels;
             int h = height, w = width, oH = outputHeight, oW = outputWidth;
             int ps = poolSize, st = stride, pd = padding;
-            Action<int> poolKernel = idx =>
+            Action<int> poolKernel = [MethodImpl(Hot)] (idx) =>
             {
                 int inputBase = idx * h * w;
                 int outputBase = idx * oH * oW;
@@ -10622,6 +10655,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// each output column block is the exact same kernel·im2col reduction, just issued
     /// over disjoint column ranges.
     /// </summary>
+    [MethodImpl(Hot)]
     private void Conv2DWithImplicitGemmFloat(
         Tensor<float> input, Tensor<float> kernel, Tensor<float> result,
         int batch, int inChannels, int height, int width,
@@ -10697,6 +10731,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// so each block fills a ncBlock-wide window of every output row. Used only when
     /// <see cref="Helpers.BlasProvider"/> is unavailable.
     /// </summary>
+    [MethodImpl(Hot)]
     private static void MultiplyMatrixBlockedFloatStrided(
         ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c,
         int m, int k, int n, int ldc)
@@ -10720,6 +10755,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// Same approach as the float version but uses double BLAS routines.
     /// This gives 10-100x speedup over the naive 6-nested-loop implementation.
     /// </summary>
+    [MethodImpl(Hot)]
     private void Conv2DWithIm2ColDouble(
         Tensor<double> input, Tensor<double> kernel, Tensor<double> result,
         int batch, int inChannels, int height, int width,
@@ -10845,6 +10881,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// the fused activation run in the epilogue. Does NOT record on the autodiff tape; the caller uses it
     /// only when <c>LowPrecisionResident</c> is active, T is float, and no tape/graph is recording.
     /// </summary>
+    [MethodImpl(Hot)]
     public Tensor<float> FusedLinearFp16WeightB(
         Tensor<float> input, Tensor<Half> weightHalf, Tensor<float>? bias,
         FusedActivationType activation, FusedActivationParams? activationParams = null)
@@ -10911,6 +10948,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <summary>
     /// Naive Conv2D implementation for non-float types.
     /// </summary>
+    [MethodImpl(Hot)]
     private static void Conv2DNaive<T>(
         Tensor<T> input,
         Tensor<T> kernel,
@@ -12706,6 +12744,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> TensorMatMulTransposed<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a is null) throw new ArgumentNullException(nameof(a));
@@ -12981,6 +13020,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// compound across the inference. Dispatches 2D×2D, ND×2D, and ND×ND
     /// same-rank cases — same shape contracts as the float counterpart.
     /// </summary>
+    [MethodImpl(Hot)]
     internal void TensorMatMulDoubleInto(Tensor<double> a, Tensor<double> b, Tensor<double> output)
     {
         if (!a.IsContiguous) a = a.Contiguous();
@@ -13087,6 +13127,7 @@ public partial class CpuEngine : ITensorLevelEngine
             $"TensorMatMulDoubleInto: unsupported rank combination {a.Rank} and {b.Rank}");
     }
 
+    [MethodImpl(Hot)]
     internal void TensorMatMulFloatInto(Tensor<float> a, Tensor<float> b, Tensor<float> output)
     {
         if (!a.IsContiguous) a = a.Contiguous();
@@ -13230,6 +13271,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// shape or throwing, so the element-wise operators can ask the question cheaply before deciding
     /// whether to stretch or to reject.
     /// </remarks>
+    [MethodImpl(Hot)]
     internal static bool CanBroadcast(int[] shape1, int[] shape2)
     {
         int maxRank = Math.Max(shape1.Length, shape2.Length);
@@ -13242,6 +13284,7 @@ public partial class CpuEngine : ITensorLevelEngine
         return true;
     }
 
+    [MethodImpl(Hot)]
     private static int[] ComputeBroadcastShape(int[] shape1, int[] shape2)
     {
         int maxRank = Math.Max(shape1.Length, shape2.Length);
@@ -13649,11 +13692,12 @@ public partial class CpuEngine : ITensorLevelEngine
         return false;
     }
 
+    [MethodImpl(Hot)]
     private static void TensorMatMulGemvFloat(ReadOnlyMemory<float> matrix, ReadOnlyMemory<float> vector, Memory<float> output, int rows, int cols)
     {
         if ((long)rows * cols >= TensorMatMulGemvParallelThreshold)
         {
-            ParallelForChunks(rows, 256, (start, count) =>
+            ParallelForChunks(rows, 256, [MethodImpl(Hot)] (start, count) =>
             {
                 var matrixSpan = matrix.Span;
                 var vectorSpan = vector.Span;
@@ -13680,11 +13724,12 @@ public partial class CpuEngine : ITensorLevelEngine
         }
     }
 
+    [MethodImpl(Hot)]
     private static void TensorMatMulGemvDouble(ReadOnlyMemory<double> matrix, ReadOnlyMemory<double> vector, Memory<double> output, int rows, int cols)
     {
         if ((long)rows * cols >= TensorMatMulGemvParallelThreshold)
         {
-            ParallelForChunks(rows, 256, (start, count) =>
+            ParallelForChunks(rows, 256, [MethodImpl(Hot)] (start, count) =>
             {
                 var matrixSpan = matrix.Span;
                 var vectorSpan = vector.Span;
@@ -14316,6 +14361,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// single blocked GEMM against the kernel-as-matrix layout. Closes the
     /// gap vs tuned conv runtimes that rely on the same lowering.
     /// </summary>
+    [MethodImpl(Hot)]
     private static void Conv2DIm2colGemm(
         float[] input, float[] kernel, float[] output,
         int batch, int inC, int H, int W,
@@ -14342,6 +14388,7 @@ public partial class CpuEngine : ITensorLevelEngine
         long perImageCost = (long)outC * K * N;
         bool parallelBatch = batch > 1 && perImageCost < 50_000_000L;
 
+        [MethodImpl(Hot)]
         void ProcessImage(int b)
         {
             // Rent a scratch col buffer of size [K, N] = K*N floats.
@@ -14361,6 +14408,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 // paying task-pool dispatch on small shapes (stage3/stage4
                 // im2col is already sub-millisecond).
                 long im2colOps = (long)inC * kH * kW * oH * oW;
+                [MethodImpl(Hot)]
                 void CopyChannel(int ic)
                 {
                     for (int kh = 0; kh < kH; kh++)
@@ -14559,6 +14607,7 @@ public partial class CpuEngine : ITensorLevelEngine
         /// inner r (stride-1 dst writes). Uses <c>Unsafe.Add</c> on array
         /// refs to elide bounds checks.
         /// </summary>
+        [MethodImpl(Hot)]
         static void TransposeFloatSerial(float[] src, int srcOff, float[] dst, int dstOff, int rows, int cols)
         {
             const int BLK = 32;
@@ -14590,11 +14639,12 @@ public partial class CpuEngine : ITensorLevelEngine
         /// set per core (fits in L1). Uses raw array refs to bypass
         /// per-element Span bounds checks inside the parallel closure.
         /// </summary>
+        [MethodImpl(Hot)]
         static void TransposeFloatParallel(float[] src, int srcOff, float[] dst, int dstOff, int rows, int cols)
         {
             const int BLK = 32;
             int numColBlocks = (cols + BLK - 1) / BLK;
-            CpuParallelSettings.ParallelForOrSerial(0, numColBlocks, (long)rows * cols, colBlockIdx =>
+            CpuParallelSettings.ParallelForOrSerial(0, numColBlocks, (long)rows * cols, [MethodImpl(Hot)] (colBlockIdx) =>
             {
                 int cb = colBlockIdx * BLK;
                 int cEnd = Math.Min(cb + BLK, cols);
@@ -14639,6 +14689,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// hit (profiled — Conv2DIntoImpl + b__0 owned 428 s out of the
     /// 1,345 s aggregated CPU-thread time for a single Train iteration).
     /// </summary>
+    [MethodImpl(Hot)]
     private static void Conv2DIm2colGemmDouble(
         double[] input, double[] kernel, double[] output,
         int batch, int inC, int H, int W,
@@ -14943,7 +14994,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var kernelD1x1 = (double[])(object)kernel.GetFlattenedData();
                 var gradInputD1x1 = new double[batch * inputSliceSize1x1];
 
-                CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * inChannels * outChannels * N1x1, b =>
+                CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * inChannels * outChannels * N1x1, [MethodImpl(Hot)] (b) =>
                 {
                     int gradOutOff = b * gradSliceSize1x1;
                     int destSliceOff = b * inputSliceSize1x1;
@@ -15202,7 +15253,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
             }
 
-            CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * colH * colW, b =>
+            CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * colH * colW, [MethodImpl(Hot)] (b) =>
             {
                 var colBuf = poolD.Rent(colW * colH);
                 try
@@ -15306,6 +15357,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// because the inner col2im algorithm is accumulating-only.
     /// </para>
     /// </summary>
+    [MethodImpl(Hot)]
     public void Conv2DBackwardInputInto<T>(
         Tensor<T> dest, Tensor<T> gradOutput, Tensor<T> kernel,
         int[] inputShape, int[] stride, int[] padding, int[] dilation,
@@ -15515,7 +15567,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 int N = outputHeight * outputWidth; // == height*width when 1×1 stride=1 pad=0
                 int inputSliceSize = inChannels * N;
                 int gradSliceSize = outChannels * N;
-                CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * inChannels * outChannels * N, b =>
+                CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * inChannels * outChannels * N, [MethodImpl(Hot)] (b) =>
                 {
                     int gradOutOff = b * gradSliceSize;
                     int destSliceOff = destOff + b * inputSliceSize;
@@ -15699,6 +15751,7 @@ public partial class CpuEngine : ITensorLevelEngine
         private static readonly float[]?[] _slots = new float[]?[MaxSlots];
         private static readonly object _lock = new object();
 
+        [MethodImpl(Hot)]
         public static float[] Rent(int minLen)
         {
             if (minLen <= 0) return Array.Empty<float>();
@@ -15725,6 +15778,7 @@ public partial class CpuEngine : ITensorLevelEngine
             return new float[minLen];
         }
 
+        [MethodImpl(Hot)]
         public static void Return(float[]? arr)
         {
             if (arr is null || arr.Length == 0) return;
@@ -15757,6 +15811,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// the wakeup amortizes and the packed kernel scales, beating the no-pack dispatcher's strided-A
     /// path that only reaches ~12 GF/s here).
     /// </summary>
+    [MethodImpl(Hot)]
     private static void ConvWeightGemmFloat(float[] a, float[] b, float[] c, int m, int n, int k, bool parallel)
     {
         Array.Clear(c, 0, m * n);
@@ -15787,6 +15842,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
     // One Mr-row panel of the packed conv weight GEMM: pack A[m0..m0+mr, :] then stream K into the
     // C[m0..m0+mr, :n] tile (Vector<float> accumulators). packBuf must be ≥ k·ConvSmallGemmMr.
+    [MethodImpl(Hot)]
     private static void ConvWeightGemmPanelFloat(
         float[] a, float[] b, float[] c, int m0, int mr, int n, int k, float[] packBuf)
     {
@@ -15824,6 +15880,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
     // Cache-blocked row-major transpose: src[rows, cols] -> dst[cols, rows]. Used by the
     // K-concat conv-backward path to avoid the cache-hostile transB GEMM (#573 follow-up).
+    [MethodImpl(Hot)]
     private static void TransposeFloatRowMajor(float[] src, float[] dst, int rows, int cols)
     {
         const int Blk = 32;
@@ -15835,7 +15892,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // inside a parallel region.
         int numRowBlocks = (rows + Blk - 1) / Blk;
         AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(
-            0, numRowBlocks, (long)rows * cols, rb =>
+            0, numRowBlocks, (long)rows * cols, [MethodImpl(Hot)] (rb) =>
         {
             int r0 = rb * Blk;
             int rMax = Math.Min(r0 + Blk, rows);
@@ -15852,6 +15909,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }, deterministicSafe: true);
     }
 
+    [MethodImpl(Hot)]
     private static void BuildKConcatStackFloat(
         float[] gradOutputF, float[] inputF, float[] gradOutAllT, float[] im2colAll,
         int batch, int outChannels, int inChannels, int colW, int colH, int batchColW,
@@ -15877,7 +15935,7 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             int kHW = kernelHeight * kernelWidth;
             CpuParallelSettings.ParallelForOrSerial(
-                0, inChannels, (long)inChannels * batch * kHW * colW, c =>
+                0, inChannels, (long)inChannels * batch * kHW * colW, [MethodImpl(Hot)] (c) =>
                 {
                     for (int b = 0; b < batch; b++)
                         Helpers.Im2ColHelper.Im2ColStridedSingleChannelRange(
@@ -15899,6 +15957,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     // #403 Phase F: double counterpart of <see cref="BuildKConcatStackFloat"/>.
+    [MethodImpl(Hot)]
     private static void BuildKConcatStackDouble(
         double[] gradOutputD, double[] inputD, double[] gradOutAll, double[] im2colAll,
         int batch, int outChannels, int inChannels, int colW, int colH, int batchColW,
@@ -15917,7 +15976,7 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             int kHW = kernelHeight * kernelWidth;
             CpuParallelSettings.ParallelForOrSerial(
-                0, inChannels, (long)inChannels * batch * kHW * colW, c =>
+                0, inChannels, (long)inChannels * batch * kHW * colW, [MethodImpl(Hot)] (c) =>
                 {
                     for (int b = 0; b < batch; b++)
                         Helpers.Im2ColHelper.Im2ColStridedSingleChannelRange(
@@ -16301,7 +16360,7 @@ public partial class CpuEngine : ITensorLevelEngine
             // and the main thread returns them after merging.
             var perBatchGradsD = new double[batch][];
             var kPoolD = System.Buffers.ArrayPool<double>.Shared;
-            CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * colH * colW, b =>
+            CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * colH * colW, [MethodImpl(Hot)] (b) =>
             {
                 var im2colBuf = kPoolD.Rent(colH * colW);
                 var localGrad = kPoolD.Rent(outChannels * colH);
@@ -16435,6 +16494,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// the merge step at the end conditions on the flag.
     /// </para>
     /// </summary>
+    [MethodImpl(Hot)]
     public void Conv2DBackwardKernelInto<T>(
         Tensor<T> dest, Tensor<T> gradOutput, Tensor<T> input,
         int[] kernelShape, int[] stride, int[] padding, int[] dilation,
@@ -16716,6 +16776,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
             // Per-image im2col + GEMM into localGrad (overwrite). See the float
             // counterpart ComputeBatchGradF for the channel-parallel rationale.
+            [MethodImpl(Hot)]
             void ComputeBatchGradD(int b, double[] im2colBuf, double[] localGrad, bool channelParallel)
             {
                 Array.Clear(localGrad, 0, totalLen);
@@ -16964,6 +17025,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> MaxPool2DWithTensorIndices<T>(
         Tensor<T> input, int[] poolSize, int[] stride, out Tensor<int> maxIndices)
     {
@@ -17040,7 +17102,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var fGradIn = (float[])(object)gradInputData;
             var fGradOut = (float[])(object)gradOutputData;
             Array.Clear(fGradIn, 0, fGradIn.Length);
-            CpuParallelSettings.ParallelForOrSerial(0, bc, fGradIn.Length, p =>
+            CpuParallelSettings.ParallelForOrSerial(0, bc, fGradIn.Length, [MethodImpl(Hot)] (p) =>
             {
                 int b = p / channels, c = p % channels;
                 for (int oh = 0; oh < outputHeight; oh++)
@@ -17059,7 +17121,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var dGradIn = (double[])(object)gradInputData;
             var dGradOut = (double[])(object)gradOutputData;
             Array.Clear(dGradIn, 0, dGradIn.Length);
-            CpuParallelSettings.ParallelForOrSerial(0, bc, dGradIn.Length, p =>
+            CpuParallelSettings.ParallelForOrSerial(0, bc, dGradIn.Length, [MethodImpl(Hot)] (p) =>
             {
                 int b = p / channels, c = p % channels;
                 for (int oh = 0; oh < outputHeight; oh++)
@@ -17351,7 +17413,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var fGradIn = (float[])(object)gradInputData;
             var fGradOut = (float[])(object)gradOutputData;
             Array.Clear(fGradIn, 0, fGradIn.Length);
-            CpuParallelSettings.ParallelForOrSerial(0, batch * channels, fGradIn.Length, p =>
+            CpuParallelSettings.ParallelForOrSerial(0, batch * channels, fGradIn.Length, [MethodImpl(Hot)] (p) =>
             {
                 int inputBaseOffset = p * height * width;
                 int outputBaseOffset = p * outputHeight * outputWidth;
@@ -17383,7 +17445,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var dGradIn = (double[])(object)gradInputData;
             var dGradOut = (double[])(object)gradOutputData;
             Array.Clear(dGradIn, 0, dGradIn.Length);
-            CpuParallelSettings.ParallelForOrSerial(0, batch * channels, dGradIn.Length, p =>
+            CpuParallelSettings.ParallelForOrSerial(0, batch * channels, dGradIn.Length, [MethodImpl(Hot)] (p) =>
             {
                 int inputBaseOffset = p * height * width;
                 int outputBaseOffset = p * outputHeight * outputWidth;
@@ -17996,7 +18058,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
             else
             {
-            CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels, fOutput.Length, idx =>
+            CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels, fOutput.Length, [MethodImpl(Hot)] (idx) =>
             {
                 int b = idx / outChannels;
                 int oc = idx % outChannels;
@@ -18049,7 +18111,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
             else
             {
-            CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels, dOutput.Length, idx =>
+            CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels, dOutput.Length, [MethodImpl(Hot)] (idx) =>
             {
                 int b = idx / outChannels;
                 int oc = idx % outChannels;
@@ -18165,6 +18227,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// across three upsample stages), so the alloc savings here compound × 10 sampling
     /// steps per Predict.
     /// </summary>
+    [MethodImpl(Hot)]
     public void ConvTranspose2DInto<T>(
         Tensor<T> output, Tensor<T> input, Tensor<T> kernel,
         int[] stride, int[] padding, int[] outputPadding)
@@ -18220,7 +18283,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     strideH, strideW, padH, padW, outputHeight, outputWidth))
             { return; }
             // Naive scalar fallback (parallel per [batch, outChannel])
-            CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels, fOutput.Length, idx =>
+            CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels, fOutput.Length, [MethodImpl(Hot)] (idx) =>
             {
                 int b = idx / outChannels; int oc = idx % outChannels;
                 for (int oh = 0; oh < outputHeight; oh++)
@@ -18263,7 +18326,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     outChannels, kernelHeight, kernelWidth,
                     strideH, strideW, padH, padW, outputHeight, outputWidth))
             { return; }
-            CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels, dOutput.Length, idx =>
+            CpuParallelSettings.ParallelForOrSerial(0, batch * outChannels, dOutput.Length, [MethodImpl(Hot)] (idx) =>
             {
                 int b = idx / outChannels; int oc = idx % outChannels;
                 for (int oh = 0; oh < outputHeight; oh++)
@@ -18303,6 +18366,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public Tensor<T> ConvTranspose2DBackwardInput<T>(Tensor<T> gradOutput, Tensor<T> kernel, int[] inputShape, int[] stride, int[] padding)
     {
         if (gradOutput is null) throw new ArgumentNullException(nameof(gradOutput));
@@ -18872,6 +18936,7 @@ public partial class CpuEngine : ITensorLevelEngine
     private const int DeformScatterLockCount = 16384; // power of two
     private static readonly object[] _deformScatterLocks = CreateDeformScatterLocks();
 
+    [MethodImpl(Hot)]
     private static object[] CreateDeformScatterLocks()
     {
         var locks = new object[DeformScatterLockCount];
@@ -20635,6 +20700,7 @@ public partial class CpuEngine : ITensorLevelEngine
         return result;
     }
 
+    [MethodImpl(Hot)]
     private static bool TryConv3DIm2ColGemm<T>(
         Tensor<T> input,
         Tensor<T> kernel,
@@ -20749,7 +20815,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 // Conv3D's NCDHW result so no full-size flat output temporary is needed.
                 int currentRowStart = rowStart;
                 CpuParallelSettings.ParallelForOrSerial(0, tileRows,
-                    (long)tileRows * outChannels, localRow =>
+                    (long)tileRows * outChannels, [MethodImpl(Hot)] (localRow) =>
                 {
                     int globalRow = currentRowStart + localRow;
                     int b = globalRow / spatial;
@@ -20856,7 +20922,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var fKernel = (float[])(object)kernelData;
             var fGradInput = (float[])(object)gradInputData;
             Array.Clear(fGradInput, 0, fGradInput.Length);
-            CpuParallelSettings.ParallelForOrSerial(0, batch * inChannels, fGradInput.Length, idx =>
+            CpuParallelSettings.ParallelForOrSerial(0, batch * inChannels, fGradInput.Length, [MethodImpl(Hot)] (idx) =>
             {
                 int b = idx / inChannels;
                 int ic = idx % inChannels;
@@ -20900,7 +20966,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var dKernel = (double[])(object)kernelData;
             var dGradInput = (double[])(object)gradInputData;
             Array.Clear(dGradInput, 0, dGradInput.Length);
-            CpuParallelSettings.ParallelForOrSerial(0, batch * inChannels, dGradInput.Length, idx =>
+            CpuParallelSettings.ParallelForOrSerial(0, batch * inChannels, dGradInput.Length, [MethodImpl(Hot)] (idx) =>
             {
                 int b = idx / inChannels;
                 int ic = idx % inChannels;
@@ -21061,7 +21127,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var fGradOut = (float[])(object)gradOutputData;
             var fInput = (float[])(object)inputData;
             var fGradKernel = (float[])(object)gradKernelData;
-            CpuParallelSettings.ParallelForOrSerial(0, outChannels * inChannels, fGradKernel.Length, idx =>
+            CpuParallelSettings.ParallelForOrSerial(0, outChannels * inChannels, fGradKernel.Length, [MethodImpl(Hot)] (idx) =>
             {
                 int oc = idx / inChannels;
                 int ic = idx % inChannels;
@@ -21105,7 +21171,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var dGradOut = (double[])(object)gradOutputData;
             var dInput = (double[])(object)inputData;
             var dGradKernel = (double[])(object)gradKernelData;
-            CpuParallelSettings.ParallelForOrSerial(0, outChannels * inChannels, dGradKernel.Length, idx =>
+            CpuParallelSettings.ParallelForOrSerial(0, outChannels * inChannels, dGradKernel.Length, [MethodImpl(Hot)] (idx) =>
             {
                 int oc = idx / inChannels;
                 int ic = idx % inChannels;
@@ -21296,6 +21362,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
     }
 
+    [MethodImpl(Hot)]
     private static bool TryConv3DBackwardKernelGemm<T>(
         Tensor<T> gradOutput,
         Tensor<T> input,
@@ -21388,7 +21455,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
             var gradKernelData = new T[checked(outChannels * columnsPerRow)];
             CpuParallelSettings.ParallelForOrSerial(0, outChannels,
-                (long)outChannels * columnsPerRow, oc =>
+                (long)outChannels * columnsPerRow, [MethodImpl(Hot)] (oc) =>
             {
                 int destinationBase = oc * columnsPerRow;
                 for (int column = 0; column < columnsPerRow; column++)
@@ -21432,6 +21499,7 @@ public partial class CpuEngine : ITensorLevelEngine
         return true;
     }
 
+    [MethodImpl(Hot)]
     private static void PackConv3DOutputRows<T>(
         T[] source,
         T[] destination,
@@ -21440,7 +21508,7 @@ public partial class CpuEngine : ITensorLevelEngine
         int spatial)
     {
         int rows = checked(batch * spatial);
-        CpuParallelSettings.ParallelForOrSerial(0, rows, (long)rows * channels, row =>
+        CpuParallelSettings.ParallelForOrSerial(0, rows, (long)rows * channels, [MethodImpl(Hot)] (row) =>
         {
             int b = row / spatial;
             int position = row - b * spatial;
@@ -21450,6 +21518,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }, deterministicSafe: true);
     }
 
+    [MethodImpl(Hot)]
     private static void ScatterConv3DColumnsToInput<T>(
         T[] columns,
         T[] gradInput,
@@ -21487,7 +21556,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var source = (float[])(object)columns;
             var destination = (float[])(object)gradInput;
             CpuParallelSettings.ParallelForOrSerial(0, batch * channels,
-                (long)batch * channels * outputSpatial * kernelVolume, index =>
+                (long)batch * channels * outputSpatial * kernelVolume, [MethodImpl(Hot)] (index) =>
             {
                 int b = index / channels;
                 int channel = index - b * channels;
@@ -21525,7 +21594,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var sourceDouble = (double[])(object)columns;
         var destinationDouble = (double[])(object)gradInput;
         CpuParallelSettings.ParallelForOrSerial(0, batch * channels,
-            (long)batch * channels * outputSpatial * kernelVolume, index =>
+            (long)batch * channels * outputSpatial * kernelVolume, [MethodImpl(Hot)] (index) =>
         {
             int b = index / channels;
             int channel = index - b * channels;
@@ -21798,6 +21867,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> MaxPool3DWithTensorIndices<T>(
         Tensor<T> input, int[] poolSize, int[] stride, out Tensor<int> maxIndices)
     {
@@ -21904,6 +21974,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> MaxPool3DBackwardWithTensorIndices<T>(
         Tensor<T> gradOutput, Tensor<int> maxIndices, int[] inputShape, int[] poolSize, int[] stride)
     {
@@ -22192,6 +22263,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public Tensor<T> Upsample3D<T>(Tensor<T> input, int scaleD, int scaleH, int scaleW)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
@@ -22229,7 +22301,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var inputData = input.GetFlattenedData();
 
         // Use parallel processing over batch and channels
-        CpuParallelSettings.ParallelForOrSerial(0, batch * channels, outputData.Length, bc =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch * channels, outputData.Length, [MethodImpl(Hot)] (bc) =>
         {
             int b = bc / channels;
             int c = bc % channels;
@@ -22937,7 +23009,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     IntPtr ipOut = (IntPtr)pOut;
                     int axisSz = axisSize;
                     int outerSz = outerSize;
-                    Helpers.PersistentParallelExecutor.Instance.Execute(numChunks, chunk =>
+                    Helpers.PersistentParallelExecutor.Instance.Execute(numChunks, [MethodImpl(Hot)] (chunk) =>
                     {
                         int startRow = chunk * rowsPerChunk;
                         int endRow = Math.Min(startRow + rowsPerChunk, outerSz);
@@ -23011,6 +23083,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// SIMD-optimized GroupNorm for float. Fuses mean+variance computation
     /// and parallelizes across batch*groups using PersistentParallelExecutor.
     /// </summary>
+    [MethodImpl(Hot)]
     private unsafe void GroupNormFloatPtr(
         float* inputData, float* outputData,
         float* gammaData, float* betaData,
@@ -23030,7 +23103,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Parallelize across batch*groups — each group is independent
         PersistentParallelExecutor.Instance.Execute(
             Math.Min(totalGroups, CpuParallelSettings.MaxDegreeOfParallelism),
-            chunk =>
+            [MethodImpl(Hot)] (chunk) =>
             {
                 int chunkSize = (totalGroups + Math.Min(totalGroups, CpuParallelSettings.MaxDegreeOfParallelism) - 1)
                     / Math.Min(totalGroups, CpuParallelSettings.MaxDegreeOfParallelism);
@@ -23081,7 +23154,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>SIMD-accelerated sum of float array segment.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     private static float SimdSumFloat(float[] data, int offset, int count)
     {
         float sum = 0f;
@@ -23111,7 +23184,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>SIMD-accelerated sum of squared differences: sum((x-mean)^2).</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     private static float SimdSumSquaredDiffFloat(float[] data, int offset, int count, float mean)
     {
         float sumSq = 0f;
@@ -23149,6 +23222,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>Pointer-based softmax — works with both managed arrays and NativeMemory.</summary>
+    [MethodImpl(Hot)]
     private static unsafe void SoftmaxFloatFastPtr(float* pIn, float* pOut, int outerSize, int axisSize)
     {
         {
@@ -23173,7 +23247,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 int axisSz = axisSize;
                 int outerSz = outerSize;
 
-                PersistentParallelExecutor.Instance.Execute(numChunks, chunk =>
+                PersistentParallelExecutor.Instance.Execute(numChunks, [MethodImpl(Hot)] (chunk) =>
                 {
                     int startRow = chunk * rowsPerChunk;
                     int endRow = Math.Min(startRow + rowsPerChunk, outerSz);
@@ -23284,6 +23358,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// SIMD-optimized softmax backward for float with contiguous axis (innerSize == 1).
     /// Per row: dotProduct = sum(gradOut * output), gradIn = output * (gradOut - dotProduct).
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe void SoftmaxBackwardFloat(float[] gradOut, float[] output, float[] gradIn,
         int outerSize, int axisSize)
     {
@@ -23303,6 +23378,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
     }
 
+    [MethodImpl(Hot)]
     private static unsafe void SoftmaxBackwardFloatRow(float[] gradOut, float[] output, float[] gradIn,
         int row, int axisSize)
     {
@@ -23385,6 +23461,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <see cref="SoftmaxBackwardFloatRow"/>. Falls back to scalar when
     /// AVX/FMA aren't available.
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe void SoftmaxBackwardDoubleRow(double[] gradOut, double[] output, double[] gradIn,
         int row, int axisSize)
     {
@@ -23462,6 +23539,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
 #if !NET5_0_OR_GREATER
     // Scalar fallback for non-x86 / net471 — keeps the dispatcher call valid.
+    [MethodImpl(Hot)]
     private static void SoftmaxBackwardDoubleRow(double[] gradOut, double[] output, double[] gradIn,
         int row, int axisSize)
     {
@@ -24537,6 +24615,7 @@ public partial class CpuEngine : ITensorLevelEngine
         });
     }
 
+    [MethodImpl(Hot)]
     private static unsafe void BatchNorm4DFloatChannel(float[] input, float[] gamma, float[] beta, float eps,
         int batch, int channels, int spatialSize, float invCount, int c,
         float[] meanOut, float[] varOut, float[] output)
@@ -24785,6 +24864,7 @@ public partial class CpuEngine : ITensorLevelEngine
         });
     }
 
+    [MethodImpl(Hot)]
     private static unsafe void BatchNorm4DDoubleChannel(double[] input, double[] gamma, double[] beta, double eps,
         int batch, int channels, int spatialSize, double invCount, int c,
         double[] meanOut, double[] varOut, double[] output)
@@ -25218,7 +25298,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var giF = new float[input.Length];
             float elemF = elementsPerChannel;
 
-            CpuParallelSettings.ParallelForOrSerial(0, channels, (long)channels * elementsPerChannel, c =>
+            CpuParallelSettings.ParallelForOrSerial(0, channels, (long)channels * elementsPerChannel, [MethodImpl(Hot)] (c) =>
             {
                 float invStd = 1f / MathF.Sqrt(vaF[c] + epsF);
                 float mean_c = meF[c];
@@ -25385,6 +25465,7 @@ public partial class CpuEngine : ITensorLevelEngine
         });
     }
 
+    [MethodImpl(Hot)]
     private static unsafe void BatchNormBackward4DDoubleChannel(
         double[] gradOutput, double[] input, double[] gamma, double[] mean, double[] variance,
         double eps,
@@ -25933,6 +26014,7 @@ public partial class CpuEngine : ITensorLevelEngine
         int.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_LN_FUSED_MAXBATCH"), out var lfm) && lfm > 0
             ? lfm : 8192;
 
+    [MethodImpl(Hot)]
     internal void LayerNormFloatInto(
         Tensor<float> input, Tensor<float> gamma, Tensor<float> beta,
         double epsilon, Tensor<float> output)
@@ -25991,6 +26073,7 @@ public partial class CpuEngine : ITensorLevelEngine
         int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_LN_PARALLEL_MINROWS"), out var lnr) && lnr > 0
             ? lnr : 2048;
 
+    [MethodImpl(Hot)]
     private static void ProcessBatchesSimd(
         float[] fInput, float[] fGamma, float[] fBeta,
         float[] fOutput, float[] fMean, float[] fVar,
@@ -26035,7 +26118,7 @@ public partial class CpuEngine : ITensorLevelEngine
             int chunks = Math.Max(1, Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, batchSize));
             int chunkSize = (batchSize + chunks - 1) / chunks;
             int totalBatch = batchSize;
-            Helpers.PersistentParallelExecutor.Instance.Execute(chunks, c =>
+            Helpers.PersistentParallelExecutor.Instance.Execute(chunks, [MethodImpl(Hot)] (c) =>
             {
                 int start = c * chunkSize;
                 int end = Math.Min(start + chunkSize, totalBatch);
@@ -26073,7 +26156,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (variance < 0f) variance = 0f;
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     private static void ProcessRow(
         float[] fInput, float[] fGamma, float[] fBeta,
         float[] fOutput, float[] fMean, float[] fVar,
@@ -26559,6 +26642,7 @@ public partial class CpuEngine : ITensorLevelEngine
             // gradInput: per-batch two-pass (sum reductions, then per-element).
             // Safe to parallelize over batches since each batch writes to a
             // disjoint [b*fs, (b+1)*fs) slice of gradInput.
+            [MethodImpl(Hot)]
             void ProcessBatch(int b)
             {
                 int off = b * fs;
@@ -26732,6 +26816,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// the FP32 ProcessBatchesSimd structure; same E[X²]−E[X]² numerical
     /// caveat (clamp small-negative variance to 0).
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe void LayerNormForwardDoubleFusedBatch(
         double[] input, double[] gamma, double[] beta,
         double[] output, double[] mean, double[] variance,
@@ -26870,6 +26955,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// FMA on the inner feature loop. Mirrors the BN-backward kernel
     /// structure at CpuEngine.cs:19580.
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe void LayerNormBackwardDoubleAccumGammaBeta(
         double[] gradOut, double[] input, double[] mean, double[] variance,
         double[] gradGamma, double[] gradBeta,
@@ -26970,6 +27056,7 @@ public partial class CpuEngine : ITensorLevelEngine
     ///   gi[f] = invStd · γ · go − B − C · (x − m)
     /// with B = invStd · sumGrad / fs and C = invStd² · sumGradX / fs.
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe void LayerNormBackwardDoubleRow(
         double[] gradOut, double[] input, double[] gamma,
         double[] mean, double[] variance, double[] gradInput,
@@ -27404,6 +27491,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
             // gradInput: parallel over batch. Each batch writes a disjoint
             // [b*channels*spatialSize, (b+1)*channels*spatialSize) slice.
+            [MethodImpl(Hot)]
             void ProcessBatch(int b)
             {
                 for (int g = 0; g < numGroups; g++)
@@ -27531,6 +27619,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
             }
 
+            [MethodImpl(Hot)]
             void ProcessBatchD(int b)
             {
                 for (int g = 0; g < numGroups; g++)
@@ -27716,7 +27805,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var fSin = (float[])(object)sin.GetDataArray();
             var fOut = (float[])(object)outArr;
             int hd = headDim, half = halfDim, sl = seqLen, sp = startPosition;
-            CpuParallelSettings.ParallelForOrSerial(0, rows, total, row =>
+            CpuParallelSettings.ParallelForOrSerial(0, rows, total, [MethodImpl(Hot)] (row) =>
             {
                 int pos = sp + (row % sl);
                 int baseIdx = row * hd;
@@ -27739,7 +27828,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var dSin = (double[])(object)sin.GetDataArray();
             var dOut = (double[])(object)outArr;
             int hd = headDim, half = halfDim, sl = seqLen, sp = startPosition;
-            CpuParallelSettings.ParallelForOrSerial(0, rows, total, row =>
+            CpuParallelSettings.ParallelForOrSerial(0, rows, total, [MethodImpl(Hot)] (row) =>
             {
                 int pos = sp + (row % sl);
                 int baseIdx = row * hd;
@@ -27885,7 +27974,7 @@ public partial class CpuEngine : ITensorLevelEngine
             int fs = featureSize;
             float invFs = 1f / fs;
 
-            CpuParallelSettings.ParallelForOrSerial(0, batchSize, outputData.Length, b =>
+            CpuParallelSettings.ParallelForOrSerial(0, batchSize, outputData.Length, [MethodImpl(Hot)] (b) =>
             {
                 int offset = b * fs;
                 float sumSq = 0f;
@@ -27910,7 +27999,7 @@ public partial class CpuEngine : ITensorLevelEngine
             int fs = featureSize;
             double invFs = 1.0 / fs;
 
-            CpuParallelSettings.ParallelForOrSerial(0, batchSize, outputData.Length, b =>
+            CpuParallelSettings.ParallelForOrSerial(0, batchSize, outputData.Length, [MethodImpl(Hot)] (b) =>
             {
                 int offset = b * fs;
                 double sumSq = 0.0;
@@ -28009,7 +28098,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
             }
 
-            CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)batchSize * fs, b =>
+            CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)batchSize * fs, [MethodImpl(Hot)] (b) =>
             {
                 int off = b * fs;
                 float invRms = 1f / fRms[b];
@@ -28051,7 +28140,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
             }
 
-            CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)batchSize * fs, b =>
+            CpuParallelSettings.ParallelForOrSerial(0, batchSize, (long)batchSize * fs, [MethodImpl(Hot)] (b) =>
             {
                 int off = b * fs;
                 double invRms = 1.0 / dRms[b];
@@ -28119,6 +28208,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// From "Attention Is All You Need" (Vaswani et al., 2017)
     /// </summary>
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> ScaledDotProductAttentionGqa<T>(
         Tensor<T> query, Tensor<T> key, Tensor<T> value, double scale, bool isCausal, double softcap = 0.0)
     {
@@ -28189,7 +28279,7 @@ public partial class CpuEngine : ITensorLevelEngine
             // which also means every batch size shares one entry.
             int seqQ = query._shape[2];
             int seqK = k._shape[2];
-            mask = _gqaCausalMaskCache.GetOrAdd((1, 1, seqQ, seqK), static key =>
+            mask = _gqaCausalMaskCache.GetOrAdd((1, 1, seqQ, seqK), [MethodImpl(Hot)] static (key) =>
             {
                 var (b0, h0, sq, sk) = key;
                 int offset = sk - sq; // KV-cache offset: query i is at absolute key position i + offset.
@@ -28212,6 +28302,7 @@ public partial class CpuEngine : ITensorLevelEngine
         _gqaCausalMaskCache = new();
 
     // Repeats each KV head across its query-head group: [batch, kvHeads, seq, headDim] -> [batch, qHeads, seq, headDim].
+    [MethodImpl(Hot)]
     private static Tensor<T> BroadcastKvHeads<T>(Tensor<T> kv, int qHeads)
     {
         int batch = kv._shape[0], kvHeads = kv._shape[1], seq = kv._shape[2], headDim = kv._shape[3];
@@ -28233,6 +28324,7 @@ public partial class CpuEngine : ITensorLevelEngine
         return new Tensor<T>(outArr, new[] { batch, qHeads, seq, headDim });
     }
 
+    [MethodImpl(Hot)]
     private static Tensor<bool> CreateCausalAttentionMaskForGraph(
         int batch, int heads, int seqQ, int seqK, int queryOffset)
     {
@@ -28567,6 +28659,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// DiT-XL SDPA wall clock from tens of seconds to tens of milliseconds per forward
     /// pass (Issue #162).
     /// </summary>
+    [MethodImpl(Hot)]
     private Tensor<float> ScaledDotProductAttentionFloat(
         Tensor<float> query,
         Tensor<float> key,
@@ -28609,7 +28702,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // above BLAS's 4096-FMA threshold for typical MHA (seqQ*seqK*d_k = 4.7M for
         // DiT-XL per-head), so each head's GEMM hits either MKL or our blocked AVX2
         // kernel — not the scalar fallback.
-        CpuParallelSettings.ParallelForOrSerial(0, bhCount, (long)bhCount * seqQ * d_k, bh =>
+        CpuParallelSettings.ParallelForOrSerial(0, bhCount, (long)bhCount * seqQ * d_k, [MethodImpl(Hot)] (bh) =>
         {
             int b = bh / heads;
             int h = bh % heads;
@@ -28777,6 +28870,7 @@ public partial class CpuEngine : ITensorLevelEngine
     [ThreadStatic]
     private static float[]? t_sdpaScoresScratch;
 
+    [MethodImpl(Hot)]
     internal void ScaledDotProductAttentionFloatInto(
         float[] qf, int qBase, int qBatchStride, int qHeadStride, int qRowStride,
         float[] kf, int kBase, int kBatchStride, int kHeadStride, int kRowStride,
@@ -28808,7 +28902,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         float scaleF = (float)scaleValue;
         float negInfF = float.NegativeInfinity;
-        CpuParallelSettings.ParallelForOrSerial(0, bhCount, (long)bhCount * seqQ * d_k, bh =>
+        CpuParallelSettings.ParallelForOrSerial(0, bhCount, (long)bhCount * seqQ * d_k, [MethodImpl(Hot)] (bh) =>
         {
             int b = bh / heads;
             int h = bh % heads;
@@ -28996,7 +29090,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var outputData = new double[bhCount * seqQ * d_v];
             double negInfD = double.NegativeInfinity;
 
-            CpuParallelSettings.ParallelForOrSerial(0, bhCount, (long)bhCount * seqQ * d_k, bh =>
+            CpuParallelSettings.ParallelForOrSerial(0, bhCount, (long)bhCount * seqQ * d_k, [MethodImpl(Hot)] (bh) =>
             {
                 int b = bh / heads;
                 int h = bh % heads;
@@ -29312,6 +29406,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// We multiply gradScores by scaleF before the gradQ/gradK GEMMs. One broadcast
     /// scale per head is negligible compared to the GEMMs.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     private Tensor<float> ScaledDotProductAttentionBackwardFloat(
         Tensor<float> gradOutput,
         Tensor<float> query,
@@ -29341,7 +29436,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Parallel.For from churning the GC for each of bhCount workers.
         int scratchLen = seqQ * seqK;
 
-        CpuParallelSettings.ParallelForOrSerial(0, bhCount, (long)bhCount * seqQ * d_k, bh =>
+        CpuParallelSettings.ParallelForOrSerial(0, bhCount, (long)bhCount * seqQ * d_k, [MethodImpl(Hot)] (bh) =>
         {
             int wOff = bh * seqQ * seqK;
             int gOff = bh * seqQ * d_v;
@@ -29492,6 +29587,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// the blocked kernel. That matches what the float path does when
     /// <c>TryGemmEx</c> returns false.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     private Tensor<double> ScaledDotProductAttentionBackwardDouble(
         Tensor<double> gradOutput,
         Tensor<double> query,
@@ -29516,7 +29612,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         int scratchLen = seqQ * seqK;
 
-        CpuParallelSettings.ParallelForOrSerial(0, bhCount, (long)bhCount * seqQ * d_k, bh =>
+        CpuParallelSettings.ParallelForOrSerial(0, bhCount, (long)bhCount * seqQ * d_k, [MethodImpl(Hot)] (bh) =>
         {
             int wOff = bh * seqQ * seqK;
             int gOff = bh * seqQ * d_v;
@@ -30035,6 +30131,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// non-float tensor type, or we can add a tile-threshold check later if the need
     /// arises.
     /// </summary>
+    [MethodImpl(Hot)]
     private Tensor<float> FlashAttentionFloat(
         Tensor<float> query,
         Tensor<float> key,
@@ -30081,7 +30178,7 @@ public partial class CpuEngine : ITensorLevelEngine
             float scaleF  = (float)scaleValue;
             float negInfF = float.NegativeInfinity;
 
-            CpuParallelSettings.ParallelForOrSerial(0, bhCount, (long)bhCount * seqQ * headDim, bh =>
+            CpuParallelSettings.ParallelForOrSerial(0, bhCount, (long)bhCount * seqQ * headDim, [MethodImpl(Hot)] (bh) =>
             {
                 int b = bh / heads;
                 int h = bh % heads;
@@ -30190,6 +30287,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <c>Parallel.For</c> across (batch * heads) demands the sequential GEMM
     /// variant so workers don't nest.
     /// </summary>
+    [MethodImpl(Hot)]
     private Tensor<double> FlashAttentionDouble(
         Tensor<double> query,
         Tensor<double> key,
@@ -30249,7 +30347,7 @@ public partial class CpuEngine : ITensorLevelEngine
             double scaleD = scaleValue;
             double negInfD = double.NegativeInfinity;
 
-            CpuParallelSettings.ParallelForOrSerial(0, bhCount, (long)bhCount * seqQ * headDim, bh =>
+            CpuParallelSettings.ParallelForOrSerial(0, bhCount, (long)bhCount * seqQ * headDim, [MethodImpl(Hot)] (bh) =>
             {
                 int b = bh / heads;
                 int h = bh % heads;
@@ -30645,6 +30743,7 @@ public partial class CpuEngine : ITensorLevelEngine
     // the parallel-region lambda. Lane-then-horizontal summation differs from naive
     // sequential order in the last FP bit — standard for any SIMD/BLAS kernel (PyTorch/
     // oneDNN do the same); attention parity tests use tolerances, not bit-exactness.
+    [MethodImpl(Hot)]
     private static float VDot(float[] a, int ao, float[] b, int bo, int n)
     {
         int i = 0;
@@ -30665,6 +30764,7 @@ public partial class CpuEngine : ITensorLevelEngine
         return sc;
     }
 
+    [MethodImpl(Hot)]
     private static void VAxpy(float[] y, int yo, float scalar, float[] x, int xo, int n)
     {
         int i = 0;
@@ -30688,6 +30788,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// float arithmetic; no virtual dispatch; writes to disjoint per-(b, h)
     /// slices so no locks are needed.
     /// </summary>
+    [MethodImpl(Hot)]
     private static void FlashAttentionBackwardFloat(
         float[] queryData, float[] keyData, float[] valueData, float[] outputData,
         float[] gradOutData, float[] statsData,
@@ -30696,7 +30797,7 @@ public partial class CpuEngine : ITensorLevelEngine
         int batch, int heads, int seqQ, int headDim, int seqK,
         int BLOCK_Q, int BLOCK_KV)
     {
-        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, batch * heads, (long)batch * heads * seqQ * seqK * headDim, bh =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, batch * heads, (long)batch * heads * seqQ * seqK * headDim, [MethodImpl(Hot)] (bh) =>
         {
             int b = bh / heads;
             int h = bh % heads;
@@ -30760,6 +30861,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>Double fast path for <see cref="FlashAttentionBackward{T}"/>. Mirror of the float version.</summary>
+    [MethodImpl(Hot)]
     private static void FlashAttentionBackwardDouble(
         double[] queryData, double[] keyData, double[] valueData, double[] outputData,
         double[] gradOutData, double[] statsData,
@@ -30768,7 +30870,7 @@ public partial class CpuEngine : ITensorLevelEngine
         int batch, int heads, int seqQ, int headDim, int seqK,
         int BLOCK_Q, int BLOCK_KV)
     {
-        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, batch * heads, (long)batch * heads * seqQ * seqK * headDim, bh =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, batch * heads, (long)batch * heads * seqQ * seqK * headDim, [MethodImpl(Hot)] (bh) =>
         {
             int b = bh / heads;
             int h = bh % heads;
@@ -32466,6 +32568,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <param name="axes">The axes to validate</param>
     /// <param name="rank">The tensor rank</param>
     /// <returns>Normalized, validated, and sorted unique axes</returns>
+    [MethodImpl(Hot)]
     private static int[] ValidateAndNormalizeAxes(int[] axes, int rank)
     {
         if (axes == null)
@@ -32495,6 +32598,7 @@ public partial class CpuEngine : ITensorLevelEngine
         return uniqueAxes.OrderBy(a => a).ToArray();
     }
 
+    [MethodImpl(Hot)]
     private static int[] GetReductionOutputShape(int[] inputShape, int[] normalizedAxes, bool keepDims)
     {
         var reducedAxes = new HashSet<int>(normalizedAxes);
@@ -32692,6 +32796,7 @@ public partial class CpuEngine : ITensorLevelEngine
         => ReduceMax(input, axes, keepDims, out _);
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> ReduceMaxWithTensorIndices<T>(
         Tensor<T> input, int[] axes, bool keepDims, out Tensor<int> maxIndices)
     {
@@ -33608,6 +33713,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     // Helper methods for reduction operations
+    [MethodImpl(Hot)]
     private static int[] ComputeStrides(int[] shape)
     {
         var strides = new int[shape.Length];
@@ -33637,6 +33743,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <see cref="ReduceMean{T}"/>). Works for both reduced OUTPUT shapes and
     /// keepDims-style MEAN shapes.
     /// </summary>
+    [MethodImpl(Hot)]
     private static int[] BuildReducedOutStrideForDim(int[] inputShape, int[] outputShape, int[] normalizedAxes)
     {
         int rank = inputShape.Length;
@@ -33670,6 +33777,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// and image super-resolution heads — these typically do 4-5 upsamples
     /// per inference.
     /// </summary>
+    [MethodImpl(Hot)]
     public void UpsampleInto<T>(Tensor<T> output, Tensor<T> input, int scaleH, int scaleW)
     {
         if (output == null) throw new ArgumentNullException(nameof(output));
@@ -33692,7 +33800,7 @@ public partial class CpuEngine : ITensorLevelEngine
             && output.GetDataArray() is float[] outArr)
         {
             int h = height, w = width, sH = scaleH, sW = scaleW, nH = newHeight, nW = newWidth;
-            Action<int> kernel = fb =>
+            Action<int> kernel = [MethodImpl(Hot)] (fb) =>
             {
                 int inBase = fb * h * w;
                 int outBase = fb * nH * nW;
@@ -33717,7 +33825,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var inputData = input.GetFlattenedData();
         var outputData = output.GetDataArray();
-        CpuParallelSettings.ParallelForOrSerial(0, flatBatch, output.Length, fb =>
+        CpuParallelSettings.ParallelForOrSerial(0, flatBatch, output.Length, [MethodImpl(Hot)] (fb) =>
         {
             for (int oh = 0; oh < newHeight; oh++)
             {
@@ -33734,6 +33842,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> Upsample<T>(Tensor<T> input, int scaleH, int scaleW)
     {
         var shape = input._shape;
@@ -33789,7 +33898,7 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var fIn = (float[])(object)inputData;
             var fOut = (float[])(object)outputData;
-            CpuParallelSettings.ParallelForOrSerial(0, flatBatch, fOut.Length, fb =>
+            CpuParallelSettings.ParallelForOrSerial(0, flatBatch, fOut.Length, [MethodImpl(Hot)] (fb) =>
             {
                 for (int oh = 0; oh < newHeight; oh++)
                 {
@@ -33806,7 +33915,7 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var dIn = (double[])(object)inputData;
             var dOut = (double[])(object)outputData;
-            CpuParallelSettings.ParallelForOrSerial(0, flatBatch, dOut.Length, fb =>
+            CpuParallelSettings.ParallelForOrSerial(0, flatBatch, dOut.Length, [MethodImpl(Hot)] (fb) =>
             {
                 for (int oh = 0; oh < newHeight; oh++)
                 {
@@ -33821,7 +33930,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else
         {
-            CpuParallelSettings.ParallelForOrSerial(0, flatBatch, outputData.Length, fb =>
+            CpuParallelSettings.ParallelForOrSerial(0, flatBatch, outputData.Length, [MethodImpl(Hot)] (fb) =>
             {
                 for (int oh = 0; oh < newHeight; oh++)
                 {
@@ -33914,6 +34023,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// Inverts the loop nest from output-major (with div/mod per inner pixel)
     /// to input-major so the inner ow loop becomes linear indexing.
     /// </summary>
+    [MethodImpl(Hot)]
     public void PixelShuffleInto<T>(Tensor<T> output, Tensor<T> input, int upscaleFactor)
     {
         if (output == null) throw new ArgumentNullException(nameof(output));
@@ -33940,7 +34050,7 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             int totalBOC = batch * newChannels;
             int hh = height, ww = width, oH = newHeight, oW = newWidth, rr = r, ch = channels;
-            Action<int> kernel = boc =>
+            Action<int> kernel = [MethodImpl(Hot)] (boc) =>
             {
                 int b = boc / newChannels;
                 int oc = boc % newChannels;
@@ -33975,7 +34085,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var inputData = input.GetFlattenedData();
         var outputData = output.GetDataArray();
-        CpuParallelSettings.ParallelForOrSerial(0, batch * newChannels, output.Length, boc =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch * newChannels, output.Length, [MethodImpl(Hot)] (boc) =>
         {
             int b = boc / newChannels;
             int oc = boc % newChannels;
@@ -34055,6 +34165,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public Tensor<T> PixelShuffleBackward<T>(Tensor<T> gradOutput, int[] inputShape, int upscaleFactor)
     {
         int batch = inputShape[0];
@@ -34070,7 +34181,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var gradOutputData = gradOutput.GetFlattenedData();
         var gradInputData = new T[batch * channels * height * width];
 
-        CpuParallelSettings.ParallelForOrSerial(0, batch, gradInputData.Length, b =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch, gradInputData.Length, [MethodImpl(Hot)] (b) =>
         {
             for (int oc = 0; oc < newChannels; oc++)
             {
@@ -34223,7 +34334,7 @@ public partial class CpuEngine : ITensorLevelEngine
             double[] inp = Unsafe.As<T[], double[]>(ref inData);
             double[] gr = Unsafe.As<T[], double[]>(ref gridData);
             double[] outp = Unsafe.As<T[], double[]>(ref outData);
-            CpuParallelSettings.ParallelForOrSerial(0, batch * lOutH, totalWork, bh =>
+            CpuParallelSettings.ParallelForOrSerial(0, batch * lOutH, totalWork, [MethodImpl(Hot)] (bh) =>
             {
                 int b = bh / lOutH, h = bh % lOutH;
                 for (int w = 0; w < lOutW; w++)
@@ -34259,7 +34370,7 @@ public partial class CpuEngine : ITensorLevelEngine
             float[] inp = Unsafe.As<T[], float[]>(ref inData);
             float[] gr = Unsafe.As<T[], float[]>(ref gridData);
             float[] outp = Unsafe.As<T[], float[]>(ref outData);
-            CpuParallelSettings.ParallelForOrSerial(0, batch * lOutH, totalWork, bh =>
+            CpuParallelSettings.ParallelForOrSerial(0, batch * lOutH, totalWork, [MethodImpl(Hot)] (bh) =>
             {
                 int b = bh / lOutH, h = bh % lOutH;
                 for (int w = 0; w < lOutW; w++)
@@ -34645,6 +34756,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// into the supplied output buffer with row-contiguous BlockCopy/Array
     /// .Copy. Used by detection postprocessing and ROI-based pipelines.
     /// </summary>
+    [MethodImpl(Hot)]
     public void CropInto<T>(Tensor<T> output, Tensor<T> input, int top, int left, int height, int width)
     {
         if (output == null) throw new ArgumentNullException(nameof(output));
@@ -34668,7 +34780,7 @@ public partial class CpuEngine : ITensorLevelEngine
             int totalBC = batch * channels;
             int iH = inputHeight, iW = inputWidth, oH = height, oW = width;
             int t = top, l = left;
-            Action<int> kernel = bc =>
+            Action<int> kernel = [MethodImpl(Hot)] (bc) =>
             {
                 int inBase = bc * iH * iW + t * iW + l;
                 int outBase = bc * oH * oW;
@@ -34689,7 +34801,7 @@ public partial class CpuEngine : ITensorLevelEngine
             int totalBC = batch * channels;
             int iH = inputHeight, iW = inputWidth, oH = height, oW = width;
             int t = top, l = left;
-            Action<int> kernel = bc =>
+            Action<int> kernel = [MethodImpl(Hot)] (bc) =>
             {
                 int inBase = bc * iH * iW + t * iW + l;
                 int outBase = bc * oH * oW;
@@ -34706,7 +34818,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var inputData = input.GetFlattenedData();
         var outputData = output.GetDataArray();
-        CpuParallelSettings.ParallelForOrSerial(0, batch * channels, output.Length, bc =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch * channels, output.Length, [MethodImpl(Hot)] (bc) =>
         {
             int inBase = bc * inputHeight * inputWidth + top * inputWidth + left;
             int outBase = bc * height * width;
@@ -34781,7 +34893,7 @@ public partial class CpuEngine : ITensorLevelEngine
         for (int i = 0; i < gradInputData.Length; i++)
             gradInputData[i] = numOps.Zero;
 
-        CpuParallelSettings.ParallelForOrSerial(0, batch * channels, gradInputData.Length, bc =>
+        CpuParallelSettings.ParallelForOrSerial(0, batch * channels, gradInputData.Length, [MethodImpl(Hot)] (bc) =>
         {
             int b = bc / channels;
             int c = bc % channels;
@@ -34811,6 +34923,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// an ONNX model uses an explicit Pad op before Conv (asymmetric pads,
     /// non-zero pad value, or padding modes Conv2D doesn't support natively).
     /// </summary>
+    [MethodImpl(Hot)]
     public void PadInto<T>(Tensor<T> output, Tensor<T> input, int padTop, int padBottom, int padLeft, int padRight, T padValue)
     {
         if (output == null) throw new ArgumentNullException(nameof(output));
@@ -34844,7 +34957,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
             int h = height, w = width, nH = newHeight, nW = newWidth;
             int pt = padTop, pl = padLeft;
-            Action<int> kernel = b =>
+            Action<int> kernel = [MethodImpl(Hot)] (b) =>
             {
                 int inBase = b * h * w;
                 int outBase = b * nH * nW + pt * nW + pl;
@@ -34873,7 +34986,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
             int h = height, w = width, nH = newHeight, nW = newWidth;
             int pt = padTop, pl = padLeft;
-            Action<int> kernel = b =>
+            Action<int> kernel = [MethodImpl(Hot)] (b) =>
             {
                 int inBase = b * h * w;
                 int outBase = b * nH * nW + pt * nW + pl;
@@ -34893,7 +35006,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Single fill of the whole output with padValue (Span<T>.Fill is
         // available across all target frameworks via System.Memory).
         outputData.AsSpan().Fill(padValue);
-        CpuParallelSettings.ParallelForOrSerial(0, batchSize, output.Length, b =>
+        CpuParallelSettings.ParallelForOrSerial(0, batchSize, output.Length, [MethodImpl(Hot)] (b) =>
         {
             int inBase = b * height * width;
             int outBase = b * newHeight * newWidth + padTop * newWidth + padLeft;
@@ -34956,6 +35069,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public Tensor<T> PadBackward<T>(Tensor<T> gradOutput, int padTop, int padLeft, int[] inputShape)
     {
         int rank = inputShape.Length;
@@ -34973,7 +35087,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var gradOutputData = gradOutput.GetFlattenedData();
         var gradInputData = new T[batchSize * height * width];
 
-        CpuParallelSettings.ParallelForOrSerial(0, batchSize, gradInputData.Length, b =>
+        CpuParallelSettings.ParallelForOrSerial(0, batchSize, gradInputData.Length, [MethodImpl(Hot)] (b) =>
         {
             for (int ih = 0; ih < height; ih++)
             {
@@ -34992,6 +35106,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public Tensor<T> Concat<T>(IReadOnlyList<Tensor<T>> tensors, int axis)
     {
         if (tensors == null || tensors.Count == 0)
@@ -35168,6 +35283,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// SIMD sum of squares (double): sum(x[i] * x[i]) with 4x unrolled FMA accumulation.
     /// Hits L2-regularization terms on Adam/SGD weight decay for fp64 networks.
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe double SumOfSquaresUnsafeDouble(double* data, int length)
     {
         int i = 0;
@@ -35213,6 +35329,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <summary>
     /// SIMD sum of squares: sum(x[i] * x[i]) with 4x unrolled FMA accumulation.
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe float SumOfSquaresUnsafe(float* data, int length)
     {
         int i = 0;
@@ -35263,6 +35380,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// freeze at the trace batch (the #1331 bug class that killed HE_SPARSE_CE training). Backward scatters
     /// the upstream gradient to logP[i, target[i]]. virtual so a GPU engine may override with a kernel.
     /// </summary>
+    [MethodImpl(Hot)]
     public virtual Tensor<float> SparseCEGatherTrueClass(Tensor<float> logP, Tensor<float> targetFloat)
     {
         if (logP == null) throw new ArgumentNullException(nameof(logP));
@@ -35284,7 +35402,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var capLogP = logP; var capTarget = targetFloat; int capV = V, capB = B;
                 return scope.RecordUnary(LazyNodeType.Custom, "SparseCEGatherTrueClass", logP, new[] { B },
-                    (eng, output) =>
+                    [MethodImpl(Hot)] (eng, output) =>
                     {
                         var lp = capLogP.GetDataArray();
                         var tg = capTarget.GetDataArray();          // LIVE target — re-read each replay
@@ -35316,6 +35434,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public Tensor<TValue> TensorEmbeddingLookup<TValue, TIndex>(Tensor<TValue> embeddings, Tensor<TIndex> indices)
         where TIndex : unmanaged
     {
@@ -35370,7 +35489,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     "TensorEmbeddingLookup",
                     embeddings,
                     outputShape,
-                    (eng, output) =>
+                    [MethodImpl(Hot)] (eng, output) =>
                     {
                         // On a GPU engine, gather on-device straight into the output buffer so this embedding is
                         // CUDA-graph-CAPTURABLE (the host Array.Copy gather below can't be recorded into a graph).
@@ -35584,7 +35703,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     LazyNodeType.Custom,
                     "TensorEmbeddingLookupFromFloatIndices",
                     embeddings, floatIndices, outputShape,
-                    (eng, output) =>
+                    [MethodImpl(Hot)] (eng, output) =>
                     {
                         // GPU-resident embedding gather into output's stable buffer (the embedding_forward kernel
                         // casts float→int) — keeps the whole forward chain on-device for CUDA-graph capture. Else
@@ -35638,6 +35757,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <c>Convert.ToInt32</c> before — see the AiDotNet.Tensors PR audit
     /// note on the original int-snapshot pattern).
     /// </summary>
+    [MethodImpl(Hot)]
     private static long[] SnapshotIndicesToLongArray<TIndex>(Tensor<TIndex> indices)
         where TIndex : unmanaged
     {
@@ -35861,6 +35981,7 @@ public partial class CpuEngine : ITensorLevelEngine
     #region Tensor Shape Operations
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public Tensor<T> TensorRepeatElements<T>(Tensor<T> tensor, int repeats, int axis = 0)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
@@ -35889,7 +36010,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var resultData = result.GetDataArray();
 
         // Perform the repeat operation
-        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, outerSize, (long)result.Length, outer =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, outerSize, (long)result.Length, [MethodImpl(Hot)] (outer) =>
         {
             for (int a = 0; a < axisSize; a++)
             {
@@ -35910,6 +36031,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> TensorTile<T>(Tensor<T> tensor, int[] multiples)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
@@ -35966,7 +36088,7 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             // General tiling via per-element index mapping
             int totalElements = result.Length;
-            CpuParallelSettings.ParallelForOrSerial(0, totalElements, totalElements, flatIdx =>
+            CpuParallelSettings.ParallelForOrSerial(0, totalElements, totalElements, [MethodImpl(Hot)] (flatIdx) =>
             {
                 int remaining = flatIdx;
                 int inputFlat = 0;
@@ -35989,6 +36111,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> TensorSlice<T>(Tensor<T> tensor, int[] start, int[] length)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
@@ -36030,7 +36153,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var resultData = result.GetDataArray();
 
         // For each output element, find the corresponding input element
-        CpuParallelSettings.ParallelForOrSerial(0, totalElements, totalElements, flatIdx =>
+        CpuParallelSettings.ParallelForOrSerial(0, totalElements, totalElements, [MethodImpl(Hot)] (flatIdx) =>
         {
             // Convert flat index to output indices and map to input flat index
             int remaining = flatIdx;
@@ -36072,6 +36195,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public Tensor<T> TensorSetSlice<T>(Tensor<T> destination, Tensor<T> source, int[] start)
     {
         if (destination == null) throw new ArgumentNullException(nameof(destination));
@@ -36124,7 +36248,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var sourceData = source.GetFlattenedData();
 
         // Set the slice values
-        CpuParallelSettings.ParallelForOrSerial(0, sourceTotal, sourceTotal, flatIdx =>
+        CpuParallelSettings.ParallelForOrSerial(0, sourceTotal, sourceTotal, [MethodImpl(Hot)] (flatIdx) =>
         {
             // Convert flat index to source indices and map to dest flat index
             int remaining = flatIdx;
@@ -36321,6 +36445,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
     /// <inheritdoc/>
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual void TensorPermuteInto<T>(Tensor<T> output, Tensor<T> tensor, int[] axes)
     {
         if (output == null) throw new ArgumentNullException(nameof(output));
@@ -36523,6 +36648,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
     }
 
+    [MethodImpl(Hot)]
     public virtual Tensor<T> TensorPermute<T>(Tensor<T> tensor, int[] axes)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
@@ -36565,6 +36691,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> TensorExpandDims<T>(Tensor<T> tensor, int axis)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
@@ -36747,6 +36874,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> TensorGather<T>(Tensor<T> source, Tensor<int> indices, int axis = 0)
     {
         if (source == null) throw new ArgumentNullException(nameof(source));
@@ -36817,7 +36945,7 @@ public partial class CpuEngine : ITensorLevelEngine
             for (int d = normalizedAxis + 1; d < source._shape.Length; d++) innerSize *= source._shape[d];
 
             // For indices that are 1D or match the source shape at the gather dimension
-            AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, outerSize, (long)totalOutput, outer =>
+            AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, outerSize, (long)totalOutput, [MethodImpl(Hot)] (outer) =>
             {
                 for (int idxPos = 0; idxPos < indices.Length; idxPos++)
                 {
@@ -36837,6 +36965,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
     }
 
+    [MethodImpl(Hot)]
     private static int[] ComputeGatherOutputShape(int[] sourceShape, int[] indicesShape, int axis)
     {
         // For 1D indices gathering from ND source:
@@ -37263,6 +37392,7 @@ public partial class CpuEngine : ITensorLevelEngine
         });
     }
 
+    [MethodImpl(Hot)]
     private static void FillRandomNormalFloatChunk(
         float[] destination,
         int start,
@@ -37309,6 +37439,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
     }
 
+    [MethodImpl(Hot)]
     private static void FillRandomNormalDoubleChunk(
         double[] destination,
         int start,
@@ -37557,6 +37688,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public Tensor<T> TensorDiagonal<T>(Tensor<T> tensor)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
@@ -37660,6 +37792,7 @@ public partial class CpuEngine : ITensorLevelEngine
         return einsumResult;
     }
 
+    [MethodImpl(Hot)]
     private static bool HasDiagonalOperand(Engines.Einsum.EinsumEquation eq)
     {
         foreach (var op in eq.Operands)
@@ -37925,6 +38058,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public Tensor<T> TensorNorm<T>(Tensor<T> tensor, int axis, bool keepDims = false)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
@@ -38090,6 +38224,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> TensorConcatenate<T>(Tensor<T>[] tensors, int axis = 0)
     {
         if (tensors == null || tensors.Length == 0)
@@ -38233,6 +38368,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T>[] TensorSplit<T>(Tensor<T> tensor, int numSplits, int axis = 0)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
@@ -38692,7 +38828,7 @@ public partial class CpuEngine : ITensorLevelEngine
         var XData = X.GetDataArray();
         var YData = Y.GetDataArray();
 
-        CpuParallelSettings.ParallelForOrSerial(0, height, X.Length + Y.Length, row =>
+        CpuParallelSettings.ParallelForOrSerial(0, height, X.Length + Y.Length, [MethodImpl(Hot)] (row) =>
         {
             T yVal = yData[row];
             int rowOffset = row * width;
@@ -38707,6 +38843,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public Tensor<T> TensorSliceAxis<T>(Tensor<T> tensor, int axis, int index)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
@@ -38890,6 +39027,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public void TensorSetSliceAxis<T>(Tensor<T> destination, Tensor<T> source, int axis, int index)
     {
         if (destination == null) throw new ArgumentNullException(nameof(destination));
@@ -39019,7 +39157,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 double* pOut = (double*)pinOut.Pointer;
                 int axisSz = axisSize;
                 int outerSz = outerSize;
-                Action<int> rowKernel = row =>
+                Action<int> rowKernel = [MethodImpl(Hot)] (row) =>
                 {
                     double* rIn = pIn + row * axisSz;
                     double* rOut = pOut + row * axisSz;
@@ -39088,6 +39226,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// log_softmax(x) = (x - max) - log(sum(exp(x - max)))
     /// </summary>
     /// <summary>Pointer-based log-softmax — works with both managed and NativeMemory.</summary>
+    [MethodImpl(Hot)]
     private static unsafe void LogSoftmaxFloatFastPtr(float* pIn, float* pOut, int outerSize, int axisSize)
     {
         int maxThreads = CpuParallelSettings.MaxDegreeOfParallelism;
@@ -39102,7 +39241,7 @@ public partial class CpuEngine : ITensorLevelEngine
             int numChunks = Math.Min(maxThreads, outerSize);
             int rowsPerChunk = (outerSize + numChunks - 1) / numChunks;
 
-            PersistentParallelExecutor.Instance.Execute(numChunks, chunk =>
+            PersistentParallelExecutor.Instance.Execute(numChunks, [MethodImpl(Hot)] (chunk) =>
             {
                 int startRow = chunk * rowsPerChunk;
                 int endRow = Math.Min(startRow + rowsPerChunk, outerSz);
@@ -39175,6 +39314,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public Tensor<T> TensorScatter<T>(Tensor<T> destination, Tensor<int> indices, Tensor<T> source, int axis)
     {
         GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
@@ -39191,7 +39331,7 @@ public partial class CpuEngine : ITensorLevelEngine
             int batch = result._shape[0];
             int numIndices = indices._shape[1];
 
-            CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * numIndices, b =>
+            CpuParallelSettings.ParallelForOrSerial(0, batch, (long)batch * numIndices, [MethodImpl(Hot)] (b) =>
             {
                 for (int i = 0; i < numIndices; i++)
                 {
@@ -39209,6 +39349,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> TensorIndexSelect<T>(Tensor<T> tensor, Tensor<int> indices, int axis)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
@@ -39265,7 +39406,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var tensorData = tensor.GetFlattenedData();
             var resultData = result.GetDataArray();
 
-            CpuParallelSettings.ParallelForOrSerial(0, rows, result.Length, i =>
+            CpuParallelSettings.ParallelForOrSerial(0, rows, result.Length, [MethodImpl(Hot)] (i) =>
             {
                 int rowOffset = i * numIndices;
                 int tensorRowOffset = i * tensor._shape[1];
@@ -39287,6 +39428,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> TensorStack<T>(Tensor<T>[] tensors, int axis)
     {
         if (tensors == null || tensors.Length == 0)
@@ -39347,7 +39489,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         // General path: copy each tensor with index mapping
-        CpuParallelSettings.ParallelForOrSerial(0, numTensors, result.Length, t =>
+        CpuParallelSettings.ParallelForOrSerial(0, numTensors, result.Length, [MethodImpl(Hot)] (t) =>
         {
             var tensor = tensors[t];
             var tensorData = tensor.IsContiguous ? tensor.GetDataArray() : tensor.GetFlattenedData();
@@ -39372,6 +39514,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T>[] TensorUnstack<T>(Tensor<T> tensor, int axis)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
@@ -39397,6 +39540,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public Tensor<T> TensorMap<T>(Tensor<T> tensor, Func<T, T> func)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
@@ -39467,6 +39611,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> TensorMaskedFill<T>(Tensor<T> tensor, Tensor<Bit> mask, T value)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
@@ -39477,7 +39622,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!tensor._shape.SequenceEqual(mask._shape))
             throw new ArgumentException($"Tensor shape [{string.Join(", ", tensor._shape)}] must match mask shape [{string.Join(", ", mask._shape)}].");
 
-        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var ct = tensor; var cm = mask; var cv = value; var cSaved = new object[1]; return scope.RecordUnary(LazyNodeType.Custom, "MaskedFill", tensor, tensor._shape, (eng, output) => { var r = eng.TensorMaskedFill(ct, cm, cv); DirectGpuTensorEngine.CopyResultInto(eng, r, output); var ms = cm.AsSpan(); var mb = new bool[ms.Length]; for (int i = 0; i < ms.Length; i++) mb[i] = (bool)ms[i]; cSaved[0] = mb; }, BackwardFunctions<T>.MaskedFillBackward, savedState: cSaved); } }
+        if (GraphMode.IsActive) { var scope = GraphMode.Current; scope?.BindEngineIfUnset(this); if (scope is not null) { var ct = tensor; var cm = mask; var cv = value; var cSaved = new object[1]; return scope.RecordUnary(LazyNodeType.Custom, "MaskedFill", tensor, tensor._shape, [MethodImpl(Hot)] (eng, output) => { var r = eng.TensorMaskedFill(ct, cm, cv); DirectGpuTensorEngine.CopyResultInto(eng, r, output); var ms = cm.AsSpan(); var mb = new bool[ms.Length]; for (int i = 0; i < ms.Length; i++) mb[i] = (bool)ms[i]; cSaved[0] = mb; }, BackwardFunctions<T>.MaskedFillBackward, savedState: cSaved); } }
 
         { var ac = AutoTracer.TryGetCompiledPlan<T>("MaskedFill", tensor._shape); if (ac is not null) return ac.Execute(); }
 
@@ -39507,6 +39652,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> TensorMaskedSelect<T>(Tensor<T> tensor, Tensor<Bit> mask)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
@@ -39555,6 +39701,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public Tensor<T> TensorWhere<T>(Tensor<bool> condition, Tensor<T> x, Tensor<T> y)
     {
         if (condition == null) throw new ArgumentNullException(nameof(condition));
@@ -39588,6 +39735,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> TensorWhere<T>(Tensor<Bit> condition, Tensor<T> x, Tensor<T> y)
     {
         if (condition == null) throw new ArgumentNullException(nameof(condition));
@@ -40080,13 +40228,14 @@ public partial class CpuEngine : ITensorLevelEngine
         return result;
     }
 
+    [MethodImpl(Hot)]
     private static void PairwiseDistanceSquaredDouble(double[] x, double[] y, double[] r, int n, int m, int d)
     {
         var xn = new double[n];
         for (int i = 0; i < n; i++) { double s = 0; int b = i * d; for (int k = 0; k < d; k++) s += x[b + k] * x[b + k]; xn[i] = s; }
         var yn = new double[m];
         for (int j = 0; j < m; j++) { double s = 0; int b = j * d; for (int k = 0; k < d; k++) s += y[b + k] * y[b + k]; yn[j] = s; }
-        CpuParallelSettings.ParallelForOrSerial(0, n, (long)n * m * d, i =>
+        CpuParallelSettings.ParallelForOrSerial(0, n, (long)n * m * d, [MethodImpl(Hot)] (i) =>
         {
             int xb = i * d; double xni = xn[i];
             for (int j = 0; j < m; j++)
@@ -40098,13 +40247,14 @@ public partial class CpuEngine : ITensorLevelEngine
         });
     }
 
+    [MethodImpl(Hot)]
     private static void PairwiseDistanceSquaredFloat(float[] x, float[] y, float[] r, int n, int m, int d)
     {
         var xn = new float[n];
         for (int i = 0; i < n; i++) { float s = 0; int b = i * d; for (int k = 0; k < d; k++) s += x[b + k] * x[b + k]; xn[i] = s; }
         var yn = new float[m];
         for (int j = 0; j < m; j++) { float s = 0; int b = j * d; for (int k = 0; k < d; k++) s += y[b + k] * y[b + k]; yn[j] = s; }
-        CpuParallelSettings.ParallelForOrSerial(0, n, (long)n * m * d, i =>
+        CpuParallelSettings.ParallelForOrSerial(0, n, (long)n * m * d, [MethodImpl(Hot)] (i) =>
         {
             int xb = i * d; float xni = xn[i];
             for (int j = 0; j < m; j++)
@@ -40250,6 +40400,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public Tensor<T> Gather<T>(Tensor<T> input, Tensor<int> indices, int axis)
     {
         GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
@@ -40317,6 +40468,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public Tensor<T> Scatter<T>(Tensor<T> input, Tensor<int> indices, Tensor<T> values, int axis)
     {
         GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
@@ -41196,6 +41348,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// dimension. Inference/forward-only (mirrors MlpForward); under a gradient tape
     /// the caller should use the per-layer decomposition.
     /// </summary>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> FusedLinearMaxout<T>(Tensor<T> input, Tensor<T> weights, Tensor<T>? bias, int numPieces)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
@@ -41847,6 +42000,7 @@ public partial class CpuEngine : ITensorLevelEngine
     };
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<float> FftGeneric(
         Tensor<float> input,
         bool inverse = false,
@@ -41985,7 +42139,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // than the scalar loop it was meant to replace despite issuing ~3x fewer FLOPs.
         // Snapshot the thread-local benchmark option before the work fans out to worker threads.
         bool useLegacyFftCore = UseLegacyFftCore;
-        CpuParallelSettings.ParallelForOrSerial(0, batchSize, input.Length, batchIdx =>
+        CpuParallelSettings.ParallelForOrSerial(0, batchSize, input.Length, [MethodImpl(Hot)] (batchIdx) =>
         {
             // One exact-size buffer per signal (was ~6 Vector<T> allocations). Not pooled: ArrayPool.Rent may
             // hand back a longer array and the in-place core keys its transform length off the array length.
@@ -42139,6 +42293,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public void FFT<T>(Tensor<T> inputReal, Tensor<T> inputImag, out Tensor<T> outputReal, out Tensor<T> outputImag)
     {
         if (inputReal == null) throw new ArgumentNullException(nameof(inputReal));
@@ -42171,7 +42326,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         int batchSize = inputReal.Length / n;
 
-        CpuParallelSettings.ParallelForOrSerial(0, batchSize, inputReal.Length, batchIdx =>
+        CpuParallelSettings.ParallelForOrSerial(0, batchSize, inputReal.Length, [MethodImpl(Hot)] (batchIdx) =>
         {
             var realIn = new Vector<T>(n);
             var imagIn = new Vector<T>(n);
@@ -42261,6 +42416,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public void FFT2D<T>(Tensor<T> inputReal, Tensor<T> inputImag, out Tensor<T> outputReal, out Tensor<T> outputImag)
     {
         if (inputReal == null) throw new ArgumentNullException(nameof(inputReal));
@@ -42303,7 +42459,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // FFT along rows (second-to-last dimension)
         int batchSize = inputReal.Length / (height * width);
 
-        CpuParallelSettings.ParallelForOrSerial(0, batchSize, inputReal.Length, batchIdx =>
+        CpuParallelSettings.ParallelForOrSerial(0, batchSize, inputReal.Length, [MethodImpl(Hot)] (batchIdx) =>
         {
             // Process each column
             for (int col = 0; col < width; col++)
@@ -43279,6 +43435,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// <summary>
     /// Reverses the bits of an integer for FFT bit-reversal permutation.
     /// </summary>
+    [MethodImpl(Hot)]
     private static int BitReverse(int x, int bits)
     {
         int result = 0;
@@ -43591,6 +43748,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary><c>result = grad * s * (1 - s)</c>, with <c>s</c> the sigmoid output.</summary>
+    [MethodImpl(Hot)]
     private static unsafe void SigmoidBackwardPtr(float* grad, float* s, float* result, int length)
     {
         int i = 0;
@@ -43614,6 +43772,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary><c>result = grad * (1 - t²)</c>, with <c>t</c> the tanh output.</summary>
+    [MethodImpl(Hot)]
     private static unsafe void TanhBackwardPtr(float* grad, float* t, float* result, int length)
     {
         int i = 0;
@@ -43634,6 +43793,7 @@ public partial class CpuEngine : ITensorLevelEngine
             result[i] = grad[i] * (1f - t[i] * t[i]);
     }
 
+    [MethodImpl(Hot)]
     private static unsafe void SigmoidBackwardFloat(float[] grad, float[] sigmoid, float[] result, int length)
     {
         // Clamp to the shortest array — grad/sigmoid may be pool-over-allocated (longer than `length`);
@@ -43740,6 +43900,7 @@ public partial class CpuEngine : ITensorLevelEngine
         return TensorAllocator.Rent<T>(gradOutput._shape, result);
     }
 
+    [MethodImpl(Hot)]
     private static unsafe void TanhBackwardFloat(float[] grad, float[] tanh, float[] result, int length)
     {
         // Clamp to the shortest array so no read/write can exceed any buffer, even if a caller
@@ -44311,7 +44472,7 @@ public partial class CpuEngine : ITensorLevelEngine
             && meanData is float[] mF && varData is float[] vF && resultData is float[] rF)
         {
             float epsF = (float)epsilon;
-            CpuParallelSettings.ParallelForOrSerial(0, batch * channels, rF.Length, idx =>
+            CpuParallelSettings.ParallelForOrSerial(0, batch * channels, rF.Length, [MethodImpl(Hot)] (idx) =>
             {
                 int b2 = idx / channels;
                 int c2 = idx % channels;
@@ -44629,6 +44790,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> Embedding<T>(Tensor<int> indices, Tensor<T> embeddingTable)
     {
         GraphMode.ThrowIfInferenceUnsupported(GraphCaptureLimitation.HeterogeneousInput);
@@ -44960,7 +45122,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var inArrF = (float[])(object)inputData;
             var outArrF = (float[])(object)resultData;
             float invSp = 1f / spatialSize;
-            Action<int> kernel = bc =>
+            Action<int> kernel = [MethodImpl(Hot)] (bc) =>
             {
                 int offset = bc * spatialSize;
                 float sum = 0f;
@@ -44978,7 +45140,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var inArrD = (double[])(object)inputData;
             var outArrD = (double[])(object)resultData;
             double invSp = 1.0 / spatialSize;
-            Action<int> kernel = bc =>
+            Action<int> kernel = [MethodImpl(Hot)] (bc) =>
             {
                 int offset = bc * spatialSize;
                 double sum = 0.0;
@@ -45036,7 +45198,7 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var inArrF = (float[])(object)inputData;
             var outArrF = (float[])(object)resultData;
-            Action<int> kernel = bc =>
+            Action<int> kernel = [MethodImpl(Hot)] (bc) =>
             {
                 int offset = bc * spatialSize;
                 float maxVal = inArrF[offset];
@@ -45054,7 +45216,7 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var inArrD = (double[])(object)inputData;
             var outArrD = (double[])(object)resultData;
-            Action<int> kernel = bc =>
+            Action<int> kernel = [MethodImpl(Hot)] (bc) =>
             {
                 int offset = bc * spatialSize;
                 double maxVal = inArrD[offset];
@@ -45135,7 +45297,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 int totalChannelsG = batch * channels;
                 int spatialG = inHeight * inWidth;
                 float invG = 1f / spatialG;
-                Action<int> kernelG = bc =>
+                Action<int> kernelG = [MethodImpl(Hot)] (bc) =>
                 {
                     int off = bc * spatialG;
                     float sum = 0f;
@@ -45157,7 +45319,7 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             int oH = outputHeight, oW = outputWidth, iH = inHeight, iW = inWidth;
             int totalChannels = batch * channels;
-            Action<int> kernel = bc =>
+            Action<int> kernel = [MethodImpl(Hot)] (bc) =>
             {
                 int inputBaseOffset = bc * iH * iW;
                 int outputBaseOffset = bc * oH * oW;
@@ -46952,7 +47114,7 @@ public partial class CpuEngine : ITensorLevelEngine
             int hh = h, ww = w, oH = outH, oW = outW;
             // Prefer width/height-major hoisting: per-pixel factor needs 1-fh,
             // fh, 1-fw, fw — hoist the 1-fh products outside the ow loop.
-            Action<int> kernel = bc =>
+            Action<int> kernel = [MethodImpl(Hot)] (bc) =>
             {
                 int inBase = bc * hh * ww;
                 int outBase = bc * oH * oW;
@@ -46996,7 +47158,7 @@ public partial class CpuEngine : ITensorLevelEngine
             // the engine's hot paths (LightweightParallel / ParallelForOrSerial
             // are the documented entry points — raw Parallel.For bypasses both
             // the work threshold and the global concurrency cap).
-            CpuParallelSettings.ParallelForOrSerial(0, total, work, bc =>
+            CpuParallelSettings.ParallelForOrSerial(0, total, work, [MethodImpl(Hot)] (bc) =>
             {
                 int inBase = bc * hh * ww;
                 int outBase = bc * oH * oW;
@@ -47449,6 +47611,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>MaskedFill: fill elements where mask is true with value.</summary>
+    [MethodImpl(Hot)]
     public Tensor<T> TensorMaskedFill<T>(Tensor<T> tensor, bool[] mask, T value)
     {
         var result = new Tensor<T>(tensor.Shape.ToArray());
@@ -47496,6 +47659,7 @@ public partial class CpuEngine : ITensorLevelEngine
         return output;
     }
 
+    [MethodImpl(Hot)]
     private static void CopyTensorRegion<T>(Tensor<T> src, Tensor<T> dst, int[] padding, int rank)
     {
         var srcData = src.GetFlattenedData();
@@ -47633,6 +47797,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// Removes the last N entries from the active tape. Used by fused ops to replace
     /// individual entries with a single fused entry.
     /// </summary>
+    [MethodImpl(Hot)]
     private static void RemoveLastNTapeEntries<T>(int n)
     {
         if (NoGradScope<T>.IsSuppressed) return;
@@ -48479,6 +48644,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// Computes batch count and last-axis size for batched FFT.
     /// For 1D: batch=1, fftSize=length. For multi-D: batch=product of leading dims, fftSize=last dim.
     /// </summary>
+    [MethodImpl(Hot)]
     private static (int batchCount, int fftSize) GetBatchedFFTDims(int[] shape)
     {
         int fftSize = shape[^1]; // Last axis
@@ -49041,6 +49207,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
     // Type-specialized SIMD helpers for NativeNormalizeRows (double/float).
     // Private — the public NativeNormalizeRows<T> entry point dispatches to these.
+    [MethodImpl(Hot)]
     private static void NormalizeRowsDouble(ReadOnlySpan<double> src, Span<double> dst, int rows, int cols)
     {
         Span<double> lanes = stackalloc double[4];
@@ -49101,6 +49268,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
     }
 
+    [MethodImpl(Hot)]
     private static void NormalizeRowsFloat(ReadOnlySpan<float> src, Span<float> dst, int rows, int cols)
     {
         Span<float> lanes = stackalloc float[8];
@@ -50262,6 +50430,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc />
+    [MethodImpl(Hot)]
     public virtual void NativeGather<T>(
         ReadOnlySpan<T> input,
         ReadOnlySpan<int> indices,
@@ -50853,6 +51022,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc />
+    [MethodImpl(Hot)]
     public virtual Tensor<Complex<T>> NativeComplexFFTND<T>(Tensor<T> input, int[] axes)
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
@@ -50893,6 +51063,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc />
+    [MethodImpl(Hot)]
     public virtual Tensor<T> NativeComplexIFFTNDReal<T>(Tensor<Complex<T>> input, int[] axes)
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
@@ -51138,6 +51309,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// For shape [..., H, W] → [..., W, H], iterates batch × H × W with direct index
     /// arithmetic instead of per-element multi-index decomposition.
     /// </summary>
+    [MethodImpl(Hot)]
     private static Tensor<Complex<T>> TransposeLastTwoAxes<T>(Tensor<Complex<T>> input)
     {
         int rank = input.Rank;
@@ -51211,6 +51383,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>Move a given axis to the last position via permute.</summary>
+    [MethodImpl(Hot)]
     private static Tensor<Complex<T>> MoveAxisToLast<T>(Tensor<Complex<T>> input, int axis)
     {
         int rank = input.Rank;
@@ -51223,6 +51396,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>Move axis to last position via data copy. Does NOT record to tape/GraphMode.</summary>
+    [MethodImpl(Hot)]
     private static Tensor<T> MoveAxisToLast<T>(Tensor<T> input, int axis)
     {
         int rank = input.Rank;
@@ -51235,6 +51409,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>Move the last axis back to the original position.</summary>
+    [MethodImpl(Hot)]
     private static Tensor<Complex<T>> MoveAxisFromLast<T>(Tensor<Complex<T>> input, int axis)
     {
         int rank = input.Rank;
@@ -51249,6 +51424,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>Move last axis back to original position via data copy. Does NOT record to tape.</summary>
+    [MethodImpl(Hot)]
     private static Tensor<T> MoveAxisFromLastReal<T>(Tensor<T> input, int axis)
     {
         int rank = input.Rank;
@@ -51263,6 +51439,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>Permute a real tensor (data copy, no tape recording).</summary>
+    [MethodImpl(Hot)]
     private static Tensor<T> PermuteReal<T>(Tensor<T> input, int[] perm)
     {
         int rank = input.Rank;
@@ -51305,6 +51482,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <summary>Permute a complex tensor (data copy, no tape recording).</summary>
+    [MethodImpl(Hot)]
     private static Tensor<Complex<T>> PermuteComplex<T>(Tensor<Complex<T>> input, int[] perm)
     {
         int rank = input.Rank;

@@ -3,6 +3,8 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Text;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines.BlasManaged;
 
@@ -48,6 +50,7 @@ public static class GemmShapeHistogram
     private static readonly ConcurrentDictionary<Key, Stat> Stats = new();
 
     /// <summary>Record a single GEMM call's shape and elapsed ticks (Stopwatch ticks).</summary>
+    [MethodImpl(Hot)]
     public static void Record(int m, int n, int k, bool transA, bool transB, bool isFloat, long elapsedTicks)
     {
         var stat = Stats.GetOrAdd(new Key(m, n, k, transA, transB, isFloat), static _ => new Stat());
@@ -69,6 +72,7 @@ public static class GemmShapeHistogram
     /// Render the top <paramref name="topN"/> shapes by cumulative time, with achieved
     /// GFLOP/s (2·m·n·k·count / total-seconds). Highlights shapes that run well below peak.
     /// </summary>
+    [MethodImpl(Hot)]
     public static string Report(int topN = 40)
     {
         var rows = new List<(Key key, long count, double secs, double gfMean, double gfBest)>();

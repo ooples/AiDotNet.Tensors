@@ -247,7 +247,7 @@ internal static class FusedMultiLayerGemm
     /// <summary>
     /// Computes tile[mr,H] = input[ic:ic+mr, :K] @ W1[K,H] using tiled GEMM.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     private static unsafe void ComputeGemm1Tile(
         float[] input, float[] w1, float[] tile,
         int ic, int mr, int k, int h)
@@ -301,7 +301,7 @@ internal static class FusedMultiLayerGemm
     /// <summary>
     /// Computes output[ic:ic+mr, :N] += tile[mr,H] @ W2[H,N] using packed B.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     private static unsafe void ComputeGemm2FromTile(
         float[] tile, float[] packedW2, float[] output,
         int ic, int mr, int h, int n)
@@ -357,6 +357,7 @@ internal static class FusedMultiLayerGemm
     }
 
     /// <summary>Pack B[H,N] into column-panel layout for GEMM2 micro-kernel access.</summary>
+    [MethodImpl(Hot)]
     private static unsafe void PackBRowMajor(float[] b, float[] packed, int h, int n)
     {
         int nrBlocks = (n + Nr - 1) / Nr;
@@ -384,6 +385,7 @@ internal static class FusedMultiLayerGemm
     }
 
     /// <summary>Fallback: separate GEMM + activation + GEMM when H is too large for L1.</summary>
+    [MethodImpl(Hot)]
     private static void FallbackSeparate(
         float[] input, float[] w1, float[] w2,
         float[] output, float[] activated,

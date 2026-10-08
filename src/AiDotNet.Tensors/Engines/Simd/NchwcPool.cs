@@ -1,5 +1,7 @@
 using System;
 using System.Threading.Tasks;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -25,6 +27,7 @@ internal static class NchwcPool
     /// <summary>
     /// MaxPool on NCHWc8 <c>[N, cg, H, W, 8]</c> → <c>[N, cg, oH, oW, 8]</c>.
     /// </summary>
+    [MethodImpl(Hot)]
     public static void MaxPoolNchwc8(
         float[] input, float[] output,
         int N, int C, int H, int W, int oH, int oW,
@@ -52,7 +55,7 @@ internal static class NchwcPool
         bool useBcl = System.Numerics.Vector<float>.Count == CBlock;
 #endif
 
-        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, N * cg, (long)N * cg * outStrideCg, task =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, N * cg, (long)N * cg * outStrideCg, [MethodImpl(Hot)] (task) =>
         {
             int n = task / cg;
             int ocg = task % cg;
@@ -134,6 +137,7 @@ internal static class NchwcPool
     ///     average (ONNX default <c>count_include_pad = 0</c>).</item>
     /// </list>
     /// </summary>
+    [MethodImpl(Hot)]
     public static void AvgPoolNchwc8(
         float[] input, float[] output,
         int N, int C, int H, int W, int oH, int oW,
@@ -157,7 +161,7 @@ internal static class NchwcPool
         bool useBcl = System.Numerics.Vector<float>.Count == CBlock;
 #endif
 
-        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, N * cg, (long)N * cg * outStrideCg, task =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, N * cg, (long)N * cg * outStrideCg, [MethodImpl(Hot)] (task) =>
         {
             int n = task / cg;
             int ocg = task % cg;
@@ -234,6 +238,7 @@ internal static class NchwcPool
     /// GlobalAvgPool on NCHWc8: <c>[N, cg, H, W, 8]</c> → <c>[N, C]</c> flat,
     /// then reshaped by caller to <c>[N, C, 1, 1]</c>. Divisor is <c>H*W</c>.
     /// </summary>
+    [MethodImpl(Hot)]
     public static void GlobalAvgPoolNchwc8(
         float[] input, float[] output,
         int N, int C, int H, int W)
@@ -252,7 +257,7 @@ internal static class NchwcPool
         bool useBcl = System.Numerics.Vector<float>.Count == CBlock;
 #endif
 
-        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, N * cg, (long)N * cg * inStrideCg, task =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, N * cg, (long)N * cg * inStrideCg, [MethodImpl(Hot)] (task) =>
         {
             int n = task / cg;
             int ocg = task % cg;

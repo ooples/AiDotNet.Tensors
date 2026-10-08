@@ -4,6 +4,8 @@ using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.LinearAlgebra;
 
@@ -200,6 +202,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// fallback when a non-matmul path needs a materialized span/indexer on a no-upcast int8
     /// weight. Clears <see cref="StreamingInt8"/> afterwards (the fp32 copy is now canonical).
     /// </summary>
+    [MethodImpl(Hot)]
     private void DequantizeStreamingInt8()
     {
         var q = StreamingInt8;
@@ -284,6 +287,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// non-matmul path needs a materialized span/indexer on a no-upcast int4 weight. Clears
     /// <see cref="StreamingInt4"/> afterwards (the fp copy is now canonical).
     /// </summary>
+    [MethodImpl(Hot)]
     private void DequantizeStreamingInt4()
     {
         var q = StreamingInt4;
@@ -317,6 +321,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
 
     // Inverse of the store transpose: takes the stored [cols, rows] (= [out, in]) buffer and
     // produces the logical [rows, cols] (= [in, out]). dst[i*cols+j] = src[j*rows+i].
+    [MethodImpl(Hot)]
     private static float[] TransposeRowMajorBack(float[] storedTransposed, int rows, int cols)
     {
         var dst = new float[storedTransposed.Length];
@@ -325,6 +330,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
                 dst[i * cols + j] = storedTransposed[j * rows + i];
         return dst;
     }
+    [MethodImpl(Hot)]
     private static double[] TransposeRowMajorBack(double[] storedTransposed, int rows, int cols)
     {
         var dst = new double[storedTransposed.Length];
@@ -470,6 +476,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     internal void RebindStorageFromGraph(TensorBase<T> source)
         => RebindStorageFromCore(source, graphOwnsStorage: true);
 
+    [MethodImpl(Hot)]
     private void RebindStorageFromCore(TensorBase<T> source, bool graphOwnsStorage)
     {
         if (source is null) throw new ArgumentNullException(nameof(source));
@@ -876,6 +883,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
             $"Got {typeof(T).Name}.");
     }
 
+    [MethodImpl(Hot)]
     private static Vector<T> DeserializeToVector(ReadOnlySpan<byte> src, int length)
     {
         if (typeof(T) == typeof(float))
@@ -2021,6 +2029,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// View constructor that shares an existing TensorStorage (PyTorch model).
     /// When parentStorage is provided, it is shared via AddRef instead of creating a new one.
     /// </summary>
+    [MethodImpl(Hot)]
     internal TensorBase(Vector<T> data, int[] shape, int[] strides, int storageOffset, bool isView, TensorStorage<T>? parentStorage)
     {
         if (shape == null) throw new ArgumentNullException(nameof(shape));
@@ -2163,6 +2172,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// <summary>
     /// Creates a new array containing a copy of the tensor's elements in row-major order.
     /// </summary>
+    [MethodImpl(Hot)]
     public virtual T[] ToArray()
     {
         EnsureMaterialized();
@@ -2187,6 +2197,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// <summary>
     /// Copies data from a source array into this tensor's storage.
     /// </summary>
+    [MethodImpl(Hot)]
     public virtual void CopyFromArray(T[] source)
     {
         EnsureMaterialized();
@@ -2645,6 +2656,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// Copies logical tensor elements into caller-owned contiguous storage
     /// without allocating. Supports non-contiguous views.
     /// </summary>
+    [MethodImpl(Hot)]
     internal void CopyLogicalTo(Span<T> destination)
     {
         EnsureMaterialized();
@@ -2751,6 +2763,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// once per logical coordinate would otherwise mutate zero-stride/broadcast
     /// storage repeatedly and make the result traversal-order dependent.
     /// </summary>
+    [MethodImpl(Hot)]
     private void EnsureNonOverlappingWritableLayout()
     {
         if (IsContiguous || Length <= 1 || Rank == 0)
@@ -3073,6 +3086,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
             }
         }
 
+        [MethodImpl(Hot)]
         internal void DetachForWrite(TensorBase<T> requester)
         {
             lock (_sync)
@@ -3155,6 +3169,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// <summary>
     /// Applies a function to each element. View-safe.
     /// </summary>
+    [MethodImpl(Hot)]
     public TensorBase<TResult> Transform<TResult>(Func<T, TResult> func)
     {
         // Reads element values, so deferred storage has to exist first. The gate is a no-op
@@ -3183,6 +3198,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// <summary>
     /// Applies a function to each element with indices. View-safe.
     /// </summary>
+    [MethodImpl(Hot)]
     public TensorBase<TResult> Transform<TResult>(Func<T, int[], TResult> func)
     {
         // Reads element values, so deferred storage has to exist first. The gate is a no-op
@@ -3204,6 +3220,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     // Index computation
     // ================================================================
 
+    [MethodImpl(Hot)]
     protected void ValidateIndices(int[] indices)
     {
         if (indices.Length != _shape.Length)
@@ -3218,6 +3235,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// <summary>
     /// Converts multi-dimensional indices to a storage index using strides and offset.
     /// </summary>
+    [MethodImpl(Hot)]
     protected int GetFlatIndex(int[] indices)
     {
         int flatIndex = _storageOffset;
@@ -3230,6 +3248,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// Converts a logical flat index (row-major) to a storage index for views.
     /// O(Rank) per call using cached row-major strides.
     /// </summary>
+    [MethodImpl(Hot)]
     private int FlatIndexToStorageIndex(int flatIndex)
     {
         int storageIndex = _storageOffset;
@@ -3247,6 +3266,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// <summary>
     /// Converts a flat index to multi-dimensional indices using shape.
     /// </summary>
+    [MethodImpl(Hot)]
     protected void GetIndices(int flatIndex, int[] indices)
     {
         int remainder = flatIndex;
@@ -3265,6 +3285,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// Computes row-major strides: strides[i] = product of shape[i+1..end].
     /// Example: shape [3,4,5] → strides [20, 5, 1].
     /// </summary>
+    [MethodImpl(Hot)]
     protected static int[] ComputeRowMajorStrides(int[] shape)
     {
         var strides = new int[shape.Length];
@@ -3278,6 +3299,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// <summary>
     /// Checks whether shape+strides represent contiguous row-major layout.
     /// </summary>
+    [MethodImpl(Hot)]
     private static bool CheckContiguous(int[] shape, int[] strides)
     {
         if (shape.Length == 0) return true;
@@ -3294,6 +3316,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// <summary>
     /// Computes the product of all dimensions. Returns 0 for zero-size tensors.
     /// </summary>
+    [MethodImpl(Hot)]
     private static int ComputeProduct(int[] shape)
     {
         if (shape.Length == 0) return 1; // Scalar
@@ -3311,6 +3334,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// Compares two shape arrays for equality without LINQ allocation.
     /// Replaces SequenceEqual which allocates an enumerator per call.
     /// </summary>
+    [MethodImpl(Hot)]
     internal static bool ShapeEquals(int[] a, int[] b)
     {
         if (a.Length != b.Length) return false;
@@ -3326,6 +3350,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// Zero-size dimensions are allowed (empty tensors for empty batches, masks, etc.).
     /// Negative dimensions are rejected.
     /// </summary>
+    [MethodImpl(Hot)]
     private static void ValidateShape(int[] shape)
     {
         for (int i = 0; i < shape.Length; i++)
@@ -3426,6 +3451,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// For contiguous tensors, the callback receives sequential indices.
     /// For strided views, indices follow the stride pattern.
     /// </summary>
+    [MethodImpl(Hot)]
     internal void ForEachStorageIndex(Action<int> action)
     {
         if (IsContiguous)
@@ -3449,6 +3475,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// This is the stride-aware replacement for GetDataArray() in engine code.
     /// Unlike Contiguous(), this returns T[] not Tensor&lt;T&gt;, avoiding tensor allocation.
     /// </summary>
+    [MethodImpl(Hot)]
     internal T[] GetFlattenedData()
     {
         if (IsContiguous && _storageOffset == 0 && _storage.Length == Length)
@@ -3521,6 +3548,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// For sequential iteration this is O(n) total — amortized O(1) per element via
     /// odometer-style coordinate increment (no division/modulo per element).
     /// </summary>
+    [MethodImpl(Hot)]
     internal void FillStorageIndices(int[] indices)
     {
         int rank = _shape.Length;
@@ -3564,7 +3592,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// Computes the storage index for element (outer, axisIdx, inner) in a reduction.
     /// Uses strides directly — no coordinate decomposition needed.
     /// </summary>
-    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining | Hot)]
     internal int ReductionStorageIndex(int outer, int axisIdx, int inner, int axis)
     {
         int idx = _storageOffset + axisIdx * _strides[axis];

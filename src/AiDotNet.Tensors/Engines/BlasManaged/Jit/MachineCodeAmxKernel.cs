@@ -1,3 +1,5 @@
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET5_0_OR_GREATER
 using System;
 
@@ -39,6 +41,7 @@ internal static class MachineCodeAmxKernel
     /// tile t, bytes 48+t = rows for tile t. <paramref name="tiles"/> is (rows, colsb) per tile,
     /// in tmm index order.
     /// </summary>
+    [MethodImpl(Hot)]
     internal static byte[] BuildTileConfig(params (int rows, int colsb)[] tiles)
     {
         var cfg = new byte[64];
@@ -218,6 +221,7 @@ internal static class MachineCodeAmxKernel
     /// zero-padding ragged M/K/N edges (BF16 0x0000 = +0.0). Returns false only if executable
     /// memory is unavailable. MUST run under Intel SDE on hosts lacking AMX.
     /// </summary>
+    [MethodImpl(Hot)]
     internal static unsafe bool TryGemm(
         ReadOnlySpan<ushort> a, ReadOnlySpan<ushort> b, Span<float> c, int m, int k, int n)
     {

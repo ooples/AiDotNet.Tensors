@@ -1,9 +1,10 @@
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 // Copyright (c) AiDotNet. All rights reserved.
 
 #if NET5_0_OR_GREATER
 using System;
 using System.Numerics;
-using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 using AiDotNet.Tensors.NumericOperations;
@@ -39,6 +40,7 @@ public static class BFloat16Kernels
 
     /// <summary>Element-wise <c>dst[i] = x[i] + y[i]</c> on bf16 spans.
     /// Falls back through AVX-512 → AVX2 → Vector&lt;float&gt; → scalar.</summary>
+    [MethodImpl(Hot)]
     public static void VectorAdd(ReadOnlySpan<BFloat16> x, ReadOnlySpan<BFloat16> y, Span<BFloat16> dst)
     {
         int n = x.Length;
@@ -62,6 +64,7 @@ public static class BFloat16Kernels
     }
 
     /// <summary>Element-wise <c>dst[i] = x[i] * y[i]</c>.</summary>
+    [MethodImpl(Hot)]
     public static void VectorMultiply(ReadOnlySpan<BFloat16> x, ReadOnlySpan<BFloat16> y, Span<BFloat16> dst)
     {
         int n = x.Length;
@@ -83,6 +86,7 @@ public static class BFloat16Kernels
 
     /// <summary>Reduce-sum across a bf16 span. Accumulates in <see cref="float"/>
     /// (the standard mixed-precision pattern: storage in bf16, math in float).</summary>
+    [MethodImpl(Hot)]
     public static float ReduceSum(ReadOnlySpan<BFloat16> x)
     {
         int n = x.Length;
@@ -110,6 +114,7 @@ public static class BFloat16Kernels
     /// <summary>Dot product of two bf16 spans, accumulated in float.
     /// Same numerical contract as PyTorch's bf16 matmul reduction:
     /// storage at half precision, accumulation at full precision.</summary>
+    [MethodImpl(Hot)]
     public static float Dot(ReadOnlySpan<BFloat16> x, ReadOnlySpan<BFloat16> y)
     {
         int n = x.Length;
@@ -141,6 +146,7 @@ public static class BFloat16Kernels
     /// <summary>bf16 matmul with float accumulation. <paramref name="c"/> is
     /// written as bf16 (RNE truncate at the end); the inner accumulator is
     /// float so 4096-K transformer layers don't lose precision.</summary>
+    [MethodImpl(Hot)]
     public static void Matmul(
         ReadOnlySpan<BFloat16> a, int aRowStride,
         ReadOnlySpan<BFloat16> b, int bRowStride,
@@ -216,6 +222,7 @@ public static class BFloat16Kernels
     /// truncates back to bf16. The float intermediate is what every
     /// transformer trains with; bf16 storage at the layer boundary is
     /// the memory win.</summary>
+    [MethodImpl(Hot)]
     public static void Gelu(ReadOnlySpan<BFloat16> x, Span<BFloat16> dst)
     {
         if (dst.Length < x.Length)
@@ -233,6 +240,7 @@ public static class BFloat16Kernels
     }
 
     /// <summary>SiLU (swish): x * sigmoid(x). Computed in float.</summary>
+    [MethodImpl(Hot)]
     public static void Silu(ReadOnlySpan<BFloat16> x, Span<BFloat16> dst)
     {
         if (dst.Length < x.Length)
@@ -247,6 +255,7 @@ public static class BFloat16Kernels
 
     /// <summary>Softmax on a row of bf16 values. Reduce/exp in float;
     /// final write is bf16. Stable variant: subtract row-max before exp.</summary>
+    [MethodImpl(Hot)]
     public static void Softmax(ReadOnlySpan<BFloat16> x, Span<BFloat16> dst)
     {
         int n = x.Length;
@@ -271,6 +280,7 @@ public static class BFloat16Kernels
     }
 
     /// <summary>LayerNorm on bf16 row. mean/var in float, scaled output in bf16.</summary>
+    [MethodImpl(Hot)]
     public static void LayerNorm(
         ReadOnlySpan<BFloat16> x, ReadOnlySpan<BFloat16> gamma, ReadOnlySpan<BFloat16> beta,
         Span<BFloat16> dst, float eps = 1e-5f)
@@ -307,7 +317,7 @@ public static class BFloat16Kernels
     /// <summary>Widen 8 bf16 values to a Vector256&lt;float&gt;. The widening
     /// is exact: bf16 occupies the high 16 bits of a float, so we shift
     /// left by 16. Equivalent to AVX-512's <c>VCVTBF16PS</c>.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     private static Vector256<float> Bf16ToFloatX8(ReadOnlySpan<BFloat16> bf)
     {
         // Pack 8 ushort raw bits into a uint vector with the bf16 in the
@@ -328,7 +338,7 @@ public static class BFloat16Kernels
     /// <summary>Narrow a Vector256&lt;float&gt; back to 8 bf16 values with
     /// round-to-nearest-even. AVX-512 BF16 has <c>VCVTNEPS2BF16</c> for
     /// this in hardware; AVX2 falls back to scalar RNE.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     private static void FloatX8ToBf16(Vector256<float> v, Span<BFloat16> dst)
     {
         Span<float> tmp = stackalloc float[8];

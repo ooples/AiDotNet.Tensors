@@ -1,8 +1,9 @@
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 // Copyright (c) AiDotNet. All rights reserved.
 
 #if NET5_0_OR_GREATER
 using System;
-using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -41,6 +42,7 @@ public static class FusedDequantMatmulKernels
     /// where weights are int8-quantized per <see cref="QuantizationHelpers"/>.
     /// Output is float (activations are float; weights dequant on the fly).
     /// </summary>
+    [MethodImpl(Hot)]
     public static void Q8MatMul(
         ReadOnlySpan<float> activations,
         ReadOnlySpan<sbyte> weightsInt8,
@@ -162,6 +164,7 @@ public static class FusedDequantMatmulKernels
     /// payload (two int4 values per byte: lower nibble first, sign-extend
     /// to int8) on the fly; the inner loop is identical to Q8 once unpacked.
     /// </summary>
+    [MethodImpl(Hot)]
     public static void Q4MatMul(
         ReadOnlySpan<float> activations,
         ReadOnlySpan<PackedInt4> weightsInt4,

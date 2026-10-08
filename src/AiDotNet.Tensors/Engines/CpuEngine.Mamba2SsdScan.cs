@@ -5,6 +5,8 @@ using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 using AiDotNet.Tensors.LinearAlgebra;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines;
 
@@ -120,6 +122,7 @@ public partial class CpuEngine
     }
 
     // ── Double fast path ─────────────────────────────────────────────────────────────────
+    [MethodImpl(Hot)]
     private static void Mamba2ForwardDouble(
         double[] X, double[] delta, double[] aLog, double[] B, double[] C, double[] D, double[] outp,
         int batch, int seqLen, int innerDim, int numHeads, int headDim, int sd)
@@ -132,7 +135,7 @@ public partial class CpuEngine
         for (int b = 0; b < batch; b++)
         {
             int bIdx = b;
-            CpuParallelSettings.ParallelForChunks(numHeads, MambaDiGrain, (hStart, hCount) =>
+            CpuParallelSettings.ParallelForChunks(numHeads, MambaDiGrain, [MethodImpl(Hot)] (hStart, hCount) =>
             {
                 var hHead = new double[headDim * sd];
                 int hEnd = hStart + hCount;
@@ -169,6 +172,7 @@ public partial class CpuEngine
         }
     }
 
+    [MethodImpl(Hot)]
     private static void Mamba2BackwardDouble(
         double[] dOut, double[] X, double[] delta, double[] aLog, double[] B, double[] C, double[] D,
         double[] dX, double[] dDelta, double[] dALog, double[] dB, double[] dC, double[] dD,
@@ -185,7 +189,7 @@ public partial class CpuEngine
         for (int b = 0; b < batch; b++)
         {
             int bIdx = b;
-            CpuParallelSettings.ParallelForChunks(numHeads, MambaDiGrain, (hStart, hCount) =>
+            CpuParallelSettings.ParallelForChunks(numHeads, MambaDiGrain, [MethodImpl(Hot)] (hStart, hCount) =>
             {
                 var hHead = new double[hd];
                 var hTrajHead = new double[seqLen * hd];

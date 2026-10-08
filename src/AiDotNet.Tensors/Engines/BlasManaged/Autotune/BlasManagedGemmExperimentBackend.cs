@@ -1,5 +1,6 @@
 using System.Runtime.CompilerServices;
 using AiDotNet.Tensors.Helpers.Autotune;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines.BlasManaged;
 
@@ -79,6 +80,7 @@ internal sealed class BlasManagedGemmExperimentBackend<T> :
         return default;
     }
 
+    [MethodImpl(Hot)]
     public async ValueTask<KernelTuningCorrectnessEvidence> ValidateAsync(
         BlasManagedGemmConfiguration configuration,
         CancellationToken cancellationToken = default)
@@ -149,6 +151,7 @@ internal sealed class BlasManagedGemmExperimentBackend<T> :
         BetaZero = false,
     };
 
+    [MethodImpl(Hot)]
     private void ComputeReference()
     {
         for (int i = 0; i < _m; i++)
@@ -169,6 +172,7 @@ internal sealed class BlasManagedGemmExperimentBackend<T> :
     private T ReadB(int row, int column) =>
         _transB ? _b[column * _ldb + row] : _b[row * _ldb + column];
 
+    [MethodImpl(Hot)]
     private static void FillDeterministically(T[] values, uint state)
     {
         for (int i = 0; i < values.Length; i++)

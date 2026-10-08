@@ -1,5 +1,7 @@
 using System;
 using AiDotNet.Tensors.LinearAlgebra;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines.Simd;
 
@@ -30,6 +32,7 @@ internal static class NchwcReorder
     /// groups. Output shape: <c>[N, C/cBlock, H, W, cBlock]</c>, still
     /// flat-length <c>N·C·H·W</c>.
     /// </summary>
+    [MethodImpl(Hot)]
     public static void ToNchwc(
         ReadOnlySpan<float> src, Span<float> dst,
         int n, int c, int h, int w, int cBlock)
@@ -69,6 +72,7 @@ internal static class NchwcReorder
     /// Inverse of <see cref="ToNchwc"/> — takes an NCHWc tensor back to
     /// NCHW. Same divisibility requirement.
     /// </summary>
+    [MethodImpl(Hot)]
     public static void ToNchw(
         ReadOnlySpan<float> src, Span<float> dst,
         int n, int c, int h, int w, int cBlock)
@@ -106,6 +110,7 @@ internal static class NchwcReorder
     /// so the FMA inner loop is a contiguous outer-product across SIMD
     /// register tiles.
     /// </summary>
+    [MethodImpl(Hot)]
     public static void KernelToOihwIo(
         ReadOnlySpan<float> src, Span<float> dst,
         int outC, int inC, int kH, int kW, int cBlock)

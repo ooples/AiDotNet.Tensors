@@ -1,6 +1,7 @@
 using AiDotNet.Tensors.NumericOperations;
-#if NET5_0_OR_GREATER
 using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
+#if NET5_0_OR_GREATER
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -25,6 +26,7 @@ public static class BFloat16CompensatedKernels
     /// This reduces cancellation and rounding error; it does not promise exact
     /// rounding or bitwise equivalence with a particular BLAS implementation.
     /// </summary>
+    [MethodImpl(Hot)]
     public static float Dot(ReadOnlySpan<BFloat16> x, ReadOnlySpan<BFloat16> y)
     {
         if (x.Length != y.Length) throw new ArgumentException("Span lengths must match.");
@@ -72,6 +74,7 @@ public static class BFloat16CompensatedKernels
         sum = next;
     }
 
+    [MethodImpl(Hot)]
     private static float Ordinary(ReadOnlySpan<BFloat16> x, ReadOnlySpan<BFloat16> y)
     {
         float sum = 0f;

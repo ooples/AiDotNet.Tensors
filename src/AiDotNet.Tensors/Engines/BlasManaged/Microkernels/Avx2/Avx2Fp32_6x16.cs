@@ -1,4 +1,6 @@
 using System;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -56,6 +58,7 @@ internal static class Avx2Fp32_6x16
     /// <param name="c">Output buffer; reads + writes C[0..Mr, 0..Nr] tile.</param>
     /// <param name="ldc">Leading dimension of C.</param>
     /// <param name="kc">Number of K-steps to accumulate.</param>
+    [MethodImpl(Hot)]
     public static unsafe void Run(
         ReadOnlySpan<float> packedA,
         ReadOnlySpan<float> packedB,
@@ -116,6 +119,7 @@ internal static class Avx2Fp32_6x16
     /// native BLAS at large-N shapes (where packedB streams from L2/L3). Prefetch of an address
     /// past the panel end is fault-safe on x86 (a no-op), so no bounds guard is needed.
     /// </summary>
+    [MethodImpl(Hot)]
     public static unsafe void RunPrefetch(
         ReadOnlySpan<float> packedA,
         ReadOnlySpan<float> packedB,
@@ -217,6 +221,7 @@ internal static class Avx2Fp32_6x16
     /// <param name="c">Output buffer; reads + writes C[0..Mr, 0..Nr=16] tile.</param>
     /// <param name="ldc">Leading dimension of C.</param>
     /// <param name="kc">Number of K-steps to accumulate.</param>
+    [MethodImpl(Hot)]
     public static unsafe void RunStridedB(
         ReadOnlySpan<float> packedA,
         ReadOnlySpan<float> b,

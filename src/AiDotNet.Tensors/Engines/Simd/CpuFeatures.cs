@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics.X86;
 #endif
@@ -70,6 +71,7 @@ internal static class CpuFeatures
         Detect();
     }
 
+    [MethodImpl(Hot)]
     private static void Detect()
     {
 #if NET5_0_OR_GREATER

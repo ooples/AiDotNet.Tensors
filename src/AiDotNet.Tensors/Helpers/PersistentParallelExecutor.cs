@@ -1,6 +1,7 @@
 using System;
 using System.Runtime.CompilerServices;
 using System.Threading;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Helpers;
 
@@ -89,6 +90,7 @@ internal sealed class PersistentParallelExecutor
     // Serialize concurrent Execute calls
     private readonly object _executeLock = new();
 
+    [MethodImpl(Hot)]
     private PersistentParallelExecutor()
     {
         // Size the parked pool to the MACHINE width (cores-1, ceiling 32), NOT
@@ -242,6 +244,7 @@ internal sealed class PersistentParallelExecutor
     /// p90 stalls whenever the dispatching thread sat on the pinned core). After the change, the same sqrt
     /// measured 14-15 µs median right after a GC. Windows only; elsewhere this does nothing.
     /// </summary>
+    [MethodImpl(Hot)]
     private static void BindWorkerToCache(int slot)
     {
         if (!s_bindWorkers) return;
@@ -274,6 +277,7 @@ internal sealed class PersistentParallelExecutor
     /// re-throw first" semantics. Shared by the main thread and every worker (each passed the SAME
     /// immutable <paramref name="job"/>) so both paths behave identically.
     /// </summary>
+    [MethodImpl(Hot)]
     private static Exception? RunParticipantChunks(Job job, int firstChunk)
     {
         Exception? first = null;
@@ -326,6 +330,7 @@ internal sealed class PersistentParallelExecutor
     /// of the work. The final Wait still runs, so the last worker's Set always completes before the next
     /// dispatch resets the event.
     /// </summary>
+    [MethodImpl(Hot)]
     private void WaitForWorkers()
     {
         if (System.Threading.Volatile.Read(ref _remaining) != 0)
@@ -343,6 +348,7 @@ internal sealed class PersistentParallelExecutor
         _allDone.Wait();
     }
 
+    [MethodImpl(Hot)]
     private void WorkerLoop(int slot)
     {
 #if NET5_0_OR_GREATER
@@ -458,7 +464,7 @@ internal sealed class PersistentParallelExecutor
     /// combined. Compared against <see cref="DefaultSerialGrainSize"/>
     /// to decide between serial inline and parallel dispatch.</param>
     /// <param name="action">Per-chunk callback.</param>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public void Execute(int numChunks, long totalWork, Action<int> action)
     {
         if (numChunks <= 0) return;
@@ -499,6 +505,7 @@ internal sealed class PersistentParallelExecutor
     /// still wins). The drop-in for a <c>Parallel.For</c> whose <c>ParallelOptions.MaxDegreeOfParallelism</c>
     /// is set per call (e.g. the SpMM row loop's thread pin).
     /// </summary>
+    [MethodImpl(Hot)]
     public void Execute(int numChunks, int maxDop, Action<int> action)
     {
         if (numChunks <= 0)
@@ -639,6 +646,7 @@ internal sealed class PersistentParallelExecutor
     /// calls <paramref name="localFinally"/> ONCE — so a per-worker rented buffer is rented/returned
     /// once per participant, not per chunk. <paramref name="maxDop"/> &lt;= 0 uses the global cap.
     /// </summary>
+    [MethodImpl(Hot)]
     public void Execute<TLocal>(int numChunks, int maxDop,
         Func<TLocal> localInit, Action<int, TLocal> body, Action<TLocal> localFinally)
     {

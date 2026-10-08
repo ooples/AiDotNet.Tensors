@@ -1,4 +1,6 @@
 using System;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET8_0_OR_GREATER
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -48,6 +50,7 @@ internal static class Avx512Fp32_16x16
     /// <summary>
     /// Accumulate packedA · packedB into C[0..Mr, 0..Nr]. C is read-modify-write.
     /// </summary>
+    [MethodImpl(Hot)]
     public static unsafe void Run(
         ReadOnlySpan<float> packedA,
         ReadOnlySpan<float> packedB,

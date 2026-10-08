@@ -1,4 +1,6 @@
 using System;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -60,6 +62,7 @@ internal static class Avx2Tail
     /// buffer and zero-fill the unused cols). Stores only the first
     /// effectiveNr cols of C via MaskStore.
     /// </summary>
+    [MethodImpl(Hot)]
     public static unsafe void RunFp64_4xN(
         ReadOnlySpan<double> packedA,
         ReadOnlySpan<double> packedB,
@@ -158,6 +161,7 @@ internal static class Avx2Tail
     /// <summary>
     /// AVX2 FP32 8×N microkernel where N = effectiveNr ∈ [1, 8].
     /// </summary>
+    [MethodImpl(Hot)]
     public static unsafe void RunFp32_8xN(
         ReadOnlySpan<float> packedA,
         ReadOnlySpan<float> packedB,

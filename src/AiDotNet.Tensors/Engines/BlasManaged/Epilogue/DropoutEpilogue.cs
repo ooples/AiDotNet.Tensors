@@ -1,5 +1,7 @@
 using System;
 using System.Runtime.InteropServices;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines.BlasManaged;
 
@@ -17,6 +19,7 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 /// </summary>
 internal static class DropoutEpilogue
 {
+    [MethodImpl(Hot)]
     public static void Apply<T>(Span<T> c, int ldc, int m, int n, uint seed)
         where T : unmanaged
     {

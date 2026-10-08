@@ -8,6 +8,8 @@ using System.Text.Json;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Helpers.Autotune;
 using BlasManagedLib = AiDotNet.Tensors.Engines.BlasManaged.BlasManaged;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines.BlasManaged;
 
@@ -101,6 +103,7 @@ public static class PrefersManagedCache
     /// its hardware fingerprint matches the current host. No-op on subsequent calls.
     /// Idempotent and thread-safe.
     /// </summary>
+    [MethodImpl(Hot)]
     public static void LoadFromDisk()
     {
         lock (_diskLock)
@@ -142,6 +145,7 @@ public static class PrefersManagedCache
     /// temp-file + rename. Best-effort: failures are swallowed (the cache
     /// remains valid in-memory; persistence is a perf optimization).
     /// </summary>
+    [MethodImpl(Hot)]
     public static void SaveToDisk()
     {
         string? path = DiskPath;
@@ -248,6 +252,7 @@ public static class PrefersManagedCache
         return prefersManaged;
     }
 
+    [MethodImpl(Hot)]
     private static bool MeasureFp32(int m, int n, int k, bool transA, bool transB)
     {
         int aRows = transA ? k : m;
@@ -343,6 +348,7 @@ public static class PrefersManagedCache
         }
     }
 
+    [MethodImpl(Hot)]
     private static bool MeasureFp64(int m, int n, int k, bool transA, bool transB)
     {
         int aRows = transA ? k : m;

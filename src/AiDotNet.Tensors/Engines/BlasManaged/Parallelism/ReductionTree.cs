@@ -1,4 +1,6 @@
 using System;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines.BlasManaged;
 
@@ -32,6 +34,7 @@ internal static class ReductionTree
     /// </summary>
     /// <param name="partials">Array of partial accumulators. Each element is a <see cref="Memory{T}"/> of <paramref name="elementCount"/> doubles.</param>
     /// <param name="elementCount">Number of doubles in each partial slot.</param>
+    [MethodImpl(Hot)]
     public static void ReducePairwiseFp64(Memory<double>[] partials, int elementCount)
     {
         if (partials is null) throw new ArgumentNullException(nameof(partials));
@@ -87,6 +90,7 @@ internal static class ReductionTree
     /// <summary>
     /// FP32 mirror of <see cref="ReducePairwiseFp64"/>.
     /// </summary>
+    [MethodImpl(Hot)]
     public static void ReducePairwiseFp32(Memory<float>[] partials, int elementCount)
     {
         if (partials is null) throw new ArgumentNullException(nameof(partials));

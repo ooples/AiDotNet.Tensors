@@ -2,6 +2,8 @@ using System;
 using System.Runtime.InteropServices;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines.BlasManaged;
 
@@ -79,6 +81,7 @@ public static partial class BlasManaged
             }
     }
 
+    [MethodImpl(Hot)]
     private static void SyrkWriteTriangleFloat(
         Uplo uplo, int i0, int j0, int bm, int bn, float alpha,
         ReadOnlySpan<float> src, int srcStride, float beta, Span<float> c, int ldc)
@@ -94,6 +97,7 @@ public static partial class BlasManaged
         }
     }
 
+    [MethodImpl(Hot)]
     private static void SyrkWriteTriangleDouble(
         Uplo uplo, int i0, int j0, int bm, int bn, double alpha,
         ReadOnlySpan<double> src, int srcStride, double beta, Span<double> c, int ldc)
@@ -111,6 +115,7 @@ public static partial class BlasManaged
 
     private const int SyrkBlock = 64;
 
+    [MethodImpl(Hot)]
     private static void SyrkBlocked<T>(
         Uplo uplo, bool trans, int n, int k, T alpha, ReadOnlySpan<T> a, int lda, T beta,
         Span<T> c, int ldc, in BlasOptions<T> options, INumericOperations<T> ops) where T : unmanaged

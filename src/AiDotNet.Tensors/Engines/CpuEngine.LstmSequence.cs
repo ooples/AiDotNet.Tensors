@@ -12,6 +12,7 @@ using AiDotNet.Tensors.Engines.Simd;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 using AiDotNet.Tensors.LinearAlgebra;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines;
 
@@ -342,6 +343,7 @@ public partial class CpuEngine
             out finalHidden, out finalCell);
     }
 
+    [MethodImpl(Hot)]
     private Tensor<T> LstmSequenceForwardGraph<T>(
         Tensor<T> input,
         Tensor<T>? h0,
@@ -445,6 +447,7 @@ public partial class CpuEngine
     /// (one alloc up front from <see cref="ArrayPool{T}"/>) so the per-step
     /// loop is allocation-free.
     /// </summary>
+    [MethodImpl(Hot)]
     private unsafe Tensor<float> LstmSequenceForwardFloat(
         Tensor<float> input,
         Tensor<float>? h0,
@@ -635,6 +638,7 @@ public partial class CpuEngine
     /// disjoint global row ranges of <paramref name="outArr"/> and the optional final
     /// state arrays — no two ranges overlap, so concurrent chunks need no locking.
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe void RunLstmRecurrenceRange(
         float[] wxBuf, float[] wHhT, float[]? bHhArr, float[]? h0Arr, float[]? c0Arr,
         float[] hPrev, float[] hCurr, float[] cPrev, float[] cCurr, float[] hh,

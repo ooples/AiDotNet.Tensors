@@ -21,6 +21,7 @@ using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 #endif
 using AiDotNet.Tensors.Helpers;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines.Simd;
 
@@ -62,6 +63,7 @@ internal static partial class SimdGemm
     /// per-group dequant. Falls back to a correct scalar integer path off the VNNI fast path /
     /// when <paramref name="groupSize"/> does not tile the rows. Output is overwritten.
     /// </summary>
+    [MethodImpl(Hot)]
     internal static void SgemmWithInt4GroupScaledVnni(
         float[] a,
         sbyte[] wData, float[] groupScales, int groupSize,
@@ -89,7 +91,7 @@ internal static partial class SimdGemm
         int perChunk = (n + numChunks - 1) / numChunks;
         bool vnni = Int4VnniAvailable;
 
-        CpuParallelSettings.LightweightParallel(numChunks, chunk =>
+        CpuParallelSettings.LightweightParallel(numChunks, [MethodImpl(Hot)] (chunk) =>
         {
             int j0 = chunk * perChunk;
             if (j0 >= n) return;
@@ -99,6 +101,7 @@ internal static partial class SimdGemm
         });
     }
 
+    [MethodImpl(Hot)]
     private static void ComputeColumn(
         byte[] aU8, float[] actScale, sbyte[] wData, float[] groupScales, int groupSize,
         float[] c, int m, int k, int n, int j, bool vnni)

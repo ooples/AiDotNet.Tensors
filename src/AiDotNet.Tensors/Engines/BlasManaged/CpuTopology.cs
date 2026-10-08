@@ -1,3 +1,5 @@
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET5_0_OR_GREATER
 using System;
 using System.Collections.Generic;
@@ -44,6 +46,7 @@ internal static class CpuTopology
     }
 
     /// <summary>Enumerate L3 domains. Empty on non-Windows or on failure (caller uses the per-tile path).</summary>
+    [MethodImpl(Hot)]
     internal static Domain[] DetectL3Domains()
     {
         if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return Array.Empty<Domain>();
@@ -85,6 +88,7 @@ internal static class CpuTopology
     /// <summary>Enumerate PHYSICAL cores — one <see cref="Domain"/> per core, Mask = that core's logical
     /// procs (its SMT siblings). Lets a pool pin exactly one thread per physical core (no SMT contention),
     /// matching OpenBLAS's 1-thread-per-core decomposition. Empty on non-Windows / failure.</summary>
+    [MethodImpl(Hot)]
     internal static Domain[] DetectPhysicalCores()
     {
         if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return Array.Empty<Domain>();
@@ -131,6 +135,7 @@ internal static class CpuTopology
     /// The first logical processor of each physical core in the calling thread's processor group that the
     /// process may run on, in core order. Empty on non-Windows or on failure.
     /// </summary>
+    [MethodImpl(Hot)]
     internal static (ushort Group, byte Number)[] UsableCoresInCurrentGroup()
     {
         if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return Array.Empty<(ushort, byte)>();

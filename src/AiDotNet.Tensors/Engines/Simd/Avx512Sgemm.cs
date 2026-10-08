@@ -1,5 +1,7 @@
 using System;
 using System.Threading.Tasks;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET8_0_OR_GREATER
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -73,6 +75,7 @@ internal static class Avx512Sgemm
     /// 16-wide B load and 16 broadcast-FMAs per K step, saturating both
     /// FMA ports on Intel AVX-512 silicon.
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe void Run16x16Tile(
         float* aPtr, int lda,
         float* bPtr, int ldb,
@@ -150,6 +153,7 @@ internal static class Avx512Sgemm
     /// 1/5 the code. Full 5-loop K-block + B-pack remains a future task
     /// when we actually measure GEMMs past 4096×4096.
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe void RunTiledMnAligned(
         ReadOnlySpan<float> a, int lda,
         ReadOnlySpan<float> b, int ldb,
@@ -169,7 +173,7 @@ internal static class Avx512Sgemm
             if (allowParallel && mTiles >= 2)
             {
                 float* aOuter = aPtr; float* bOuter = bPtr; float* cOuter = cPtr;
-                AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, mTiles, (long)m * n * k, mt =>
+                AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, mTiles, (long)m * n * k, [MethodImpl(Hot)] (mt) =>
                 {
                     var packed = new float[16 * kLocal];
                     fixed (float* pPtr = packed)
@@ -214,6 +218,7 @@ internal static class Avx512Sgemm
     /// <c>[16][k]</c> block. After packing, the microkernel reads each row
     /// at stride <c>k</c> with perfect prefetch behaviour.
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe void PackARowMajor16(float* src, int lda, float* dst, int k)
     {
         for (int i = 0; i < 16; i++)

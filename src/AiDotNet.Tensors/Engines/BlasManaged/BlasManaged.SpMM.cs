@@ -3,6 +3,8 @@ using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines.BlasManaged;
 
@@ -66,6 +68,7 @@ public static partial class BlasManaged
         return numThreads; // 0 = auto, >1 = pinned
     }
 
+    [MethodImpl(Hot)]
     private static unsafe void SpMMDouble(
         double alpha, bool csr, ReadOnlySpan<int> ptr, ReadOnlySpan<int> ind, ReadOnlySpan<double> val,
         ReadOnlySpan<double> b, int ldb, int n, double beta, Span<double> c, int ldc,
@@ -80,6 +83,7 @@ public static partial class BlasManaged
             {
                 // Row-local: each output row computed by exactly one worker, in fixed
                 // nonzero order → bit-exact regardless of thread count.
+                [MethodImpl(Hot)]
                 void CsrRow(int i)
                 {
                     int* pp = (int*)ptrA; int* ip = (int*)indA;
@@ -125,6 +129,7 @@ public static partial class BlasManaged
         }
     }
 
+    [MethodImpl(Hot)]
     private static unsafe void SpMMFloat(
         float alpha, bool csr, ReadOnlySpan<int> ptr, ReadOnlySpan<int> ind, ReadOnlySpan<float> val,
         ReadOnlySpan<float> b, int ldb, int n, float beta, Span<float> c, int ldc,
@@ -137,6 +142,7 @@ public static partial class BlasManaged
 
             if (csr)
             {
+                [MethodImpl(Hot)]
                 void CsrRow(int i)
                 {
                     int* pp = (int*)ptrA; int* ip = (int*)indA;

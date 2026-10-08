@@ -4,6 +4,8 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Helpers;
 
@@ -84,6 +86,7 @@ public static class CpuParallelSettings
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool GetLogicalProcessorInformation(IntPtr buffer, ref uint returnLength);
 
+    [MethodImpl(Hot)]
     private static unsafe int DetectPhysicalCoresWindows()
     {
         uint len = 0;
@@ -105,6 +108,7 @@ public static class CpuParallelSettings
     /// <summary>Linux file that lists per-logical-processor topology used for physical-core counting.</summary>
     private const string LinuxCpuInfoPath = "/proc/cpuinfo";
 
+    [MethodImpl(Hot)]
     private static int DetectPhysicalCoresLinux()
     {
         var seen = new HashSet<string>();
@@ -338,6 +342,7 @@ public static class CpuParallelSettings
     /// </remarks>
     /// <param name="count">Number of partitions / iterations.</param>
     /// <param name="body">Body invoked with each partition index.</param>
+    [MethodImpl(Hot)]
     public static void ParallelForRegion(int count, Action<int> body)
     {
         if (count <= 0) return;
@@ -428,6 +433,7 @@ public static class CpuParallelSettings
     /// NOT for recursive/nested fork-join, which a fixed-worker pool serializes by design — keep those
     /// on the TPL or restructure to iterative chunking.
     /// </summary>
+    [MethodImpl(Hot)]
     public static void LightweightInvoke(params Action[] actions)
     {
         if (actions is null) throw new ArgumentNullException(nameof(actions));
@@ -498,6 +504,7 @@ public static class CpuParallelSettings
     /// Grain-size-aware parallel loop with a per-dispatch degree cap. The process-wide cap still
     /// wins, so a global single-thread setting cannot be overridden by a tuned kernel plan.
     /// </summary>
+    [MethodImpl(Hot)]
     public static void ParallelForOrSerial(
         int fromInclusive,
         int toExclusive,
@@ -579,7 +586,7 @@ public static class CpuParallelSettings
         int byWork = (int)Math.Min(count, Math.Max(1, totalWork / workPerChunk));
         int chunks = Math.Min(maxDegree, byWork);
         int from = fromInclusive;
-        PersistentParallelExecutor.Instance.Execute(chunks, maxDegree, chunk =>
+        PersistentParallelExecutor.Instance.Execute(chunks, maxDegree, [MethodImpl(Hot)] (chunk) =>
         {
             using var _region = EnterParallelRegion();
             int cs = from + (int)((long)chunk * count / chunks);
@@ -641,6 +648,7 @@ public static class CpuParallelSettings
     /// <c>Parallel.For</c>'s <c>Func&lt;int, ParallelLoopState, TLocal, TLocal&gt;</c>.</param>
     /// <param name="localFinally">Action invoked once per task with the final
     /// per-task local — typically merges the local into a shared accumulator.</param>
+    [MethodImpl(Hot)]
     public static void ParallelForOrSerial<TLocal>(
         int fromInclusive,
         int toExclusive,
@@ -702,7 +710,7 @@ public static class CpuParallelSettings
             chunks,
             maxDegree,
             localInit,
-            (chunk, local) =>
+            [MethodImpl(Hot)] (chunk, local) =>
             {
                 using var _region = EnterParallelRegion();
                 int cs = from + (int)((long)chunk * count / chunks);

@@ -1,4 +1,6 @@
 using System;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -76,6 +78,7 @@ internal static partial class SimdGemm
     /// inner-loop throughput (especially the m≈1 decode case) for the AVX2-vs-fp32
     /// viability decision.
     /// </remarks>
+    [MethodImpl(Hot)]
     internal static unsafe void MatMulInt8Int8Avx2(
         ReadOnlySpan<byte> aU8, ReadOnlySpan<sbyte> bI8,
         ReadOnlySpan<int> bRowSum,
@@ -147,6 +150,7 @@ internal static partial class SimdGemm
     /// 32 int8 products into int32 per instruction with no int16 saturation. Gated on
     /// <see cref="Int8Int8VnniAvailable"/>; falls back to AVX2 when VNNI is absent.
     /// </summary>
+    [MethodImpl(Hot)]
     internal static unsafe void MatMulInt8Int8Vnni(
         ReadOnlySpan<byte> aU8, ReadOnlySpan<sbyte> bI8,
         ReadOnlySpan<int> bRowSum,
@@ -271,6 +275,7 @@ internal static partial class SimdGemm
         MatMulInt8Int8Scalar(aU8, bI8, bRowSum, actScale, wScale, c, m, k, n);
     }
 
+    [MethodImpl(Hot)]
     private static int[] GetOrBuildBRowSum(sbyte[] bInt8, int n, int k)
     {
         if (s_bRowSumCache.TryGetValue(bInt8, out var cached) && cached.Length == n)
@@ -290,6 +295,7 @@ internal static partial class SimdGemm
     }
 
     /// <summary>Scalar reference (net471 / non-AVX2): same math, no intrinsics.</summary>
+    [MethodImpl(Hot)]
     internal static void MatMulInt8Int8Scalar(
         ReadOnlySpan<byte> aU8, ReadOnlySpan<sbyte> bI8,
         ReadOnlySpan<int> bRowSum,

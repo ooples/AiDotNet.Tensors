@@ -1,4 +1,6 @@
 using System;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -54,6 +56,7 @@ internal static class Avx2Pack
     /// <param name="mc">Rows of A to pack (must be exactly divisible by mr).</param>
     /// <param name="kc">Cols of A to pack (one Kc block).</param>
     /// <param name="mr">Microkernel row-tile width; must be 4 for the AVX2 FP64 SIMD path.</param>
+    [MethodImpl(Hot)]
     public static unsafe void PackA_Fp64(
         ReadOnlySpan<double> a, int lda, bool transA,
         Span<double> packed, int mc, int kc, int mr)
@@ -118,6 +121,7 @@ internal static class Avx2Pack
     /// <param name="mc">Rows of A to pack (must be exactly divisible by mr).</param>
     /// <param name="kc">Cols of A to pack (one Kc block).</param>
     /// <param name="mr">Microkernel row-tile width; must be 8 for the AVX2 FP32 SIMD path.</param>
+    [MethodImpl(Hot)]
     public static unsafe void PackA_Fp32(
         ReadOnlySpan<float> a, int lda, bool transA,
         Span<float> packed, int mc, int kc, int mr)
@@ -188,6 +192,7 @@ internal static class Avx2Pack
     /// <param name="nc">Cols of B to pack (must be exactly divisible by nr).</param>
     /// <param name="kc">Rows of B to pack (one Kc block).</param>
     /// <param name="nr">Microkernel col-tile width; must be 8 or 4 for the AVX2 FP64 SIMD path.</param>
+    [MethodImpl(Hot)]
     public static unsafe void PackB_Fp64(
         ReadOnlySpan<double> b, int ldb, bool transB,
         Span<double> packed, int nc, int kc, int nr)
@@ -286,6 +291,7 @@ internal static class Avx2Pack
     /// Zero-pads the final partial-N stripe for the AVX2 FP64 transB=false
     /// PackB paths. Mirrors the tail loop in <see cref="ScalarPack.PackB{T}"/>.
     /// </summary>
+    [MethodImpl(Hot)]
     private static void PackBTailFp64(
         ReadOnlySpan<double> b, int ldb, Span<double> packed,
         int numFullStripes, int tailCols, int kc, int nr)
@@ -325,6 +331,7 @@ internal static class Avx2Pack
     /// <param name="nc">Cols of B to pack (must be exactly divisible by nr).</param>
     /// <param name="kc">Rows of B to pack (one Kc block).</param>
     /// <param name="nr">Microkernel col-tile width; must be 8 for the AVX2 FP32 SIMD path.</param>
+    [MethodImpl(Hot)]
     public static unsafe void PackB_Fp32(
         ReadOnlySpan<float> b, int ldb, bool transB,
         Span<float> packed, int nc, int kc, int nr)
@@ -413,6 +420,7 @@ internal static class Avx2Pack
     /// permute2x128, then store 8 transposed rows to the packed buffer.
     /// Bit-identical output to <see cref="ScalarPack.PackB{T}"/> for FP32 transB.
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe void PackBTransposedFp32(
         ReadOnlySpan<float> b, int ldb,
         Span<float> packed, int nc, int kc)
@@ -507,6 +515,7 @@ internal static class Avx2Pack
     /// <summary>
     /// FP32 mirror of <see cref="PackBTailFp64"/>.
     /// </summary>
+    [MethodImpl(Hot)]
     private static void PackBTailFp32(
         ReadOnlySpan<float> b, int ldb, Span<float> packed,
         int numFullStripes, int tailCols, int kc, int nr)

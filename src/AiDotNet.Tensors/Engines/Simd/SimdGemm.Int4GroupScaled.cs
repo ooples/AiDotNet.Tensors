@@ -17,6 +17,8 @@
 using System;
 using System.Numerics;
 using AiDotNet.Tensors.Helpers;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines.Simd;
 
@@ -35,6 +37,7 @@ internal static partial class SimdGemm
     /// <param name="groupScales">One fp32 scale per <paramref name="groupSize"/>-element group of the flat weight.</param>
     /// <param name="groupSize">Quantization group size (e.g. 128).</param>
     /// <param name="c">Output <c>C[m,n]</c> row-major (ldc = n); fully overwritten.</param>
+    [MethodImpl(Hot)]
     internal static void SgemmWithInt4GroupScaled(
         float[] a,
         sbyte[] wData, float[] groupScales, int groupSize,
@@ -56,6 +59,7 @@ internal static partial class SimdGemm
             throw new ArgumentException($"output buffer too small: need m*n = {(long)m * n}, got {c.Length}.", nameof(c));
 
         // One output-feature row j: dequant W[j,:] into wf[k], then dot it with every A row.
+        [MethodImpl(Hot)]
         void ComputeRange(int j0, int j1, float[] wf)
         {
             for (int j = j0; j < j1; j++)
@@ -91,6 +95,7 @@ internal static partial class SimdGemm
     }
 
     // fp32 dot of a[aOff .. aOff+len) and w[0 .. len), SIMD-accelerated via System.Numerics.Vector.
+    [MethodImpl(Hot)]
     private static float Dot(float[] a, long aOff, float[] w, int len)
     {
         int vw = Vector<float>.Count;

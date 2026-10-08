@@ -5,6 +5,8 @@ using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 using AiDotNet.Tensors.LinearAlgebra;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines;
 
@@ -104,6 +106,7 @@ public partial class CpuEngine
     }
 
     // ── Double fast path ─────────────────────────────────────────────────────────────────
+    [MethodImpl(Hot)]
     private static void GlaForwardDouble(
         double[] Q, double[] K, double[] V, double[] G, double[] outp,
         int batch, int seqLen, int modelDim, int numHeads, int headDim)
@@ -111,7 +114,7 @@ public partial class CpuEngine
         int hh = headDim * headDim;
         // Every (batch, head) pair is fully independent (private state S, disjoint output region), so the
         // combined (b*numHeads) axis is embarrassingly parallel with no cross-channel reduction.
-        CpuParallelSettings.ParallelForChunks(batch * numHeads, GlaBhGrain, (bhStart, bhCount) =>
+        CpuParallelSettings.ParallelForChunks(batch * numHeads, GlaBhGrain, [MethodImpl(Hot)] (bhStart, bhCount) =>
         {
             var S = new double[hh];
             int bhEnd = bhStart + bhCount;
@@ -151,6 +154,7 @@ public partial class CpuEngine
     /// </summary>
     private const int GlaBhGrain = 1;
 
+    [MethodImpl(Hot)]
     private static void GlaBackwardDouble(
         double[] dOut, double[] Q, double[] K, double[] V, double[] G,
         double[] dQ, double[] dK, double[] dV, double[] dG,
@@ -160,7 +164,7 @@ public partial class CpuEngine
         // Each (batch, head) pair is fully independent: dQ/dK/dV are indexed by an offset that already
         // includes the head, dG by (b,t,h), and S/Straj/dS are per-pair scratch. Parallelize lock-free
         // over the combined (b*numHeads) axis with per-chunk private scratch buffers.
-        CpuParallelSettings.ParallelForChunks(batch * numHeads, GlaBhGrain, (bhStart, bhCount) =>
+        CpuParallelSettings.ParallelForChunks(batch * numHeads, GlaBhGrain, [MethodImpl(Hot)] (bhStart, bhCount) =>
         {
             var Straj = new double[seqLen * hh];
             var S = new double[hh];
@@ -355,6 +359,7 @@ public partial class CpuEngine
     }
 
     // internal: the GPU engine's GlaScan tape node falls back to this when its device backward is unavailable.
+    [MethodImpl(Hot)]
     internal static void GlaScanBackward<T>(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output, object[] savedState,
         IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)

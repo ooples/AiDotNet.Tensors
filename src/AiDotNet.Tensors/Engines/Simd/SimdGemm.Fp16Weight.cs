@@ -2,6 +2,8 @@ using System;
 using System.Buffers;
 using System.Runtime.InteropServices;
 using AiDotNet.Tensors.Helpers;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines.Simd;
 
@@ -19,6 +21,7 @@ internal static partial class SimdGemm
     /// upcast-then-Sgemm. Inference-only; no autodiff. (net471 has no intrinsic tiled kernel — falls back
     /// to a whole-weight upcast + Sgemm, correct but not memory-optimal; net471 is not the perf target.)
     /// </summary>
+    [MethodImpl(Hot)]
     public static void SgemmFp16WeightB(
         ReadOnlySpan<float> a,
         ReadOnlySpan<Half> b,
@@ -97,6 +100,7 @@ internal static partial class SimdGemm
     /// <see cref="MacroKernel"/> over its columns. Mirrors <see cref="SgemmTiledParallelN"/> but moves the
     /// (now conversion-bearing) B-pack INSIDE the worker so the fp16→fp32 decode is parallelized.
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe void Fp16TileParallelN(
         ReadOnlySpan<float> a, ReadOnlySpan<Half> b, Span<float> c,
         int m, int k, int n,
@@ -156,7 +160,7 @@ internal static partial class SimdGemm
                 IntPtr ipB = (IntPtr)bPtr, ipC = (IntPtr)cPtr;
                 int bLen = b.Length, cLen = c.Length;
 
-                CpuParallelSettings.LightweightParallel(actualWorkers, workerId =>
+                CpuParallelSettings.LightweightParallel(actualWorkers, [MethodImpl(Hot)] (workerId) =>
                 {
                     int workerNc = localSliceNcs[workerId];
                     int jStart = localSliceJStarts[workerId];
@@ -205,6 +209,7 @@ internal static partial class SimdGemm
     /// Mirrors <see cref="PackB"/>'s no-transpose layout exactly; the only change is the Half source and
     /// the inline SIMD decode (<see cref="SimdKernels.Fp16To32Vec8"/>) for the full Nr-column rows.
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe void PackBFromHalf(ReadOnlySpan<Half> b, float[] packed, int ldb, int pc, int kc, int jc, int nc)
     {
         int pos = 0;

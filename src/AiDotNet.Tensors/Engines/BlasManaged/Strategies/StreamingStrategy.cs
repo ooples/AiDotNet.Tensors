@@ -2,6 +2,8 @@ using System;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using AiDotNet.Tensors.Helpers;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines.BlasManaged;
 
@@ -175,6 +177,7 @@ internal static class StreamingStrategy
     /// thread accumulates its partial C[M,N] over its K-slice; partials are
     /// reduced in fixed pairwise order. Non-associative — Fast mode only.
     /// </summary>
+    [MethodImpl(Hot)]
     private static void RunKParallel<T>(
         ReadOnlySpan<T> a, int lda, bool transA,
         ReadOnlySpan<T> b, int ldb, bool transB,

@@ -4,6 +4,8 @@ using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines;
 
@@ -179,6 +181,7 @@ public partial class CpuEngine
         }
     }
 
+    [MethodImpl(Hot)]
     private static void MesaForwardFloatStable(
         float[] q, float[] k, float[] v, float[] w0, float[] output, float regularization,
         int batch, int time, int model, int heads, int dim)
@@ -433,11 +436,13 @@ public partial class CpuEngine
         }
     }
 
+    [MethodImpl(Hot)]
     private static void MesaBackwardFloatStable(
         float[] dy, float[] q, float[] k, float[] v, float[] w0,
         float[] dq, float[] dk, float[] dv, float[] dw0, float regularization,
         int batch, int time, int model, int heads, int dim)
     {
+        [MethodImpl(Hot)]
         static double[] ToDouble(float[] source)
         {
             var result = new double[source.Length];

@@ -7,6 +7,8 @@ using System.Runtime.Intrinsics.X86;
 #endif
 using System.Threading;
 using AiDotNet.Tensors.Helpers;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines.BlasManaged;
 
@@ -207,6 +209,7 @@ internal static class GotoGemmFp32
 
     /// <summary>Zero only the M-tail rows + N-tail cols of a C block (the kernel overwrites the aligned
     /// Mr×Nr interior on the first K-panel; only the scalar-tail regions still need pre-zeroing).</summary>
+    [MethodImpl(Hot)]
     private static unsafe void ZeroTailStrips(float* c, int ldc, int ic, int jc, int effMc, int effNc, int mFull, int nFull)
     {
         for (int r = mFull; r < effMc; r++) { float* cr = c + (long)(ic + r) * ldc + jc; for (int col = 0; col < effNc; col++) cr[col] = 0f; }
@@ -226,6 +229,7 @@ internal static class GotoGemmFp32
     /// Single-thread C = A·B (row-major). A[M,K] lda, B[K,N] ldb, C[M,N] ldc (element strides).
     /// C is OVERWRITTEN (zeroed for the first K-panel via the pack-once-then-accumulate structure).
     /// </summary>
+    [MethodImpl(Hot)]
     internal static unsafe void RunSingle(
         float* a, int lda, float* b, int ldb, float* c, int ldc,
         int m, int n, int k, int mc, int nc, int kc)
@@ -359,6 +363,7 @@ internal static class GotoGemmFp32
     /// ((tile×G) work units instead of tiles), then summed in fixed g-order. For the deep-K short-M shapes
     /// (e.g. the DiT MLP down-projection) this fills the cores the per-tile scheme leaves idle. Deterministic
     /// (G is shape-only; each partial is a fixed-K-order tile; the reduction order is fixed).</summary>
+    [MethodImpl(Hot)]
     internal static unsafe void RunParallelSplitK(
         float* a, int lda, float* b, int ldb, float* c, int ldc, int m, int n, int k, int mc, int nc, int kc)
     {
@@ -389,7 +394,7 @@ internal static class GotoGemmFp32
                 }, deterministicSafe: true);
                 // C = Σ_g tmp[g] in fixed g order (deterministic), parallel over rows.
                 nint ci = (nint)c; int mL2 = m, nL2 = n, GL2 = G, ldcL = ldc;
-                CpuParallelSettings.ParallelForOrSerial(0, m, (long)m * n * G, i =>
+                CpuParallelSettings.ParallelForOrSerial(0, m, (long)m * n * G, [MethodImpl(Hot)] (i) =>
                 {
                     float* cp = (float*)ci + (long)i * ldcL;
                     float* t0 = (float*)ti + (long)i * nL2;
@@ -418,6 +423,7 @@ internal static class GotoGemmFp32
     /// the full K, packing this tile's A and B panels into per-call L2 buffers. C is zeroed on the first
     /// K-panel then accumulated, so the tile is self-contained and deterministic (fixed K order). Shared
     /// by RunParallel (TPL tile grid) and the CCX-aware driver (pinned per-CCX dispatch).</summary>
+    [MethodImpl(Hot)]
     internal static unsafe void RunTile(
         float* a, int lda, float* b, int ldb, float* c, int ldc,
         int ic, int jc, int effMc, int effNc, int k, int mc, int nc, int kc)
@@ -493,6 +499,7 @@ internal static class GotoGemmFp32
     /// Packed once per CCX so the CCX's threads reuse it from their shared L3 with no redundant packing.
     /// <paramref name="ntStart"/>/<paramref name="ntStride"/> let the CCX's lanes split the pack work
     /// (lane, threadsPerCcx) so the pack itself is parallel — no serial-pack stall on skewed shapes.</summary>
+    [MethodImpl(Hot)]
     internal static unsafe void PackBPanel(float* b, int ldb, int jc, int effNc, int k, int kc, float* dst,
         int ntStart = 0, int ntStride = 1)
     {
@@ -524,6 +531,7 @@ internal static class GotoGemmFp32
     /// <summary>Pack ONE kc-panel of B[pc:pc+effKc, jc:jc+effNc] into <paramref name="pkB"/> as [nt][kk][col]
     /// (nt-stride = kc·Nr). Lane-strided (ntStart/ntStride) for parallel packing within a CCX. Used by the
     /// 2D-NUMA driver: the panel lives in the CCX's L3 and is reused across that block's ic-blocks.</summary>
+    [MethodImpl(Hot)]
     internal static unsafe void PackBPanelPc(float* b, int ldb, int jc, int effNc, int pc, int effKc, int kc,
         float* pkB, int ntStart, int ntStride)
     {
@@ -544,6 +552,7 @@ internal static class GotoGemmFp32
     /// where B's pc-panel is already packed in <paramref name="pkB"/> (PackBPanelPc, in the CCX's L3) and A's
     /// pc-panel is packed here into a per-lane L2 buffer (PackA6). C is zeroed when <paramref name="firstPc"/>
     /// then accumulated across pc (RMW in L2). Tails read original a,b. Deterministic (fixed K order, disjoint C).</summary>
+    [MethodImpl(Hot)]
     internal static unsafe void RunMacroPanelStep(
         float* a, int lda, float* b, int ldb, float* c, int ldc,
         int ic, int jc, int effMc, int effNc, int pc, int effKc, int mc, int kc, float* pkB, bool firstPc)
@@ -585,6 +594,7 @@ internal static class GotoGemmFp32
     /// <summary>Pack a whole-K A row-block A[ic:ic+effMc, 0:k] ONCE into <paramref name="dst"/>: K-panel p
     /// at p·mTiles·kc·Mr, Mr-tile mt at +mt·kc·Mr, rows kk·Mr (effKc used). mtStart/mtStride let the CCX's
     /// lanes pack in parallel. Used by the 2D CCX grid so each CCX's A-block lives in its own L3.</summary>
+    [MethodImpl(Hot)]
     internal static unsafe void PackAPanel(float* a, int lda, int ic, int effMc, int k, int kc, float* dst,
         int mtStart = 0, int mtStride = 1)
     {
@@ -610,6 +620,7 @@ internal static class GotoGemmFp32
     /// split the Mr×Nr micro-tiles (laneStart/laneStride); each micro-tile is zeroed then accumulated over
     /// the full K (fixed order ⇒ deterministic, disjoint C ⇒ no races). lane 0 does the block's M/N tails
     /// (reads original a,b). mTilesAll/nTilesAll are the block's full Mr/Nr tile counts (pack strides).</summary>
+    [MethodImpl(Hot)]
     internal static unsafe void RunBlockPackedAB(
         float* a, int lda, float* b, int ldb, float* c, int ldc,
         int ic0, int jc0, int effMc, int effNc, int k, int kc,
@@ -648,6 +659,7 @@ internal static class GotoGemmFp32
     /// <summary>Like <see cref="RunTile"/> but B is already packed (by <see cref="PackBPanel"/>) in
     /// <paramref name="packedB"/> — this tile only packs its own A-panel and runs the kernel + tails
     /// (tails read the original b). Deterministic (fixed K order, disjoint C). Used by the CCX driver.</summary>
+    [MethodImpl(Hot)]
     internal static unsafe void RunTilePackedB(
         float* a, int lda, float* b, int ldb, float* c, int ldc,
         int ic, int jc, int effMc, int effNc, int k, int mc, int nc, int kc, float* packedB)
@@ -688,6 +700,7 @@ internal static class GotoGemmFp32
     /// kk-major layout). Each store writes 8 floats (low Mr=6 valid); the +2 overlap is overwritten by the
     /// next column/chunk — the caller MUST pad the pa buffer by 8. Scalar K-tail + scalar fallback (non-AVX).
     /// Shared by RunTile and RunTilePackedB.</summary>
+    [MethodImpl(Hot)]
     private static unsafe void PackA6(float* a, int lda, float* pa, int ic, int pc, int effKc, int mTiles)
     {
         for (int mt = 0; mt < mTiles; mt++)
@@ -742,6 +755,7 @@ internal static class GotoGemmFp32
 
     /// <summary>bf16-B tile: like RunTile but B is packed as bf16 (half the bytes → 2× bandwidth headroom),
     /// A stays fp32, fp32 accumulate. Precision opt-in (bf16 ~3 sig digits). Tails are exact fp32 (small).</summary>
+    [MethodImpl(Hot)]
     internal static unsafe void RunTileBf16(float* a, int lda, float* b, int ldb, float* c, int ldc,
         int ic, int jc, int effMc, int effNc, int k, int mc, int nc, int kc)
     {
@@ -820,6 +834,7 @@ internal static class GotoGemmFp32
         }, deterministicSafe: true);
     }
 
+    [MethodImpl(Hot)]
     private static unsafe void ZeroCBlock(float* c, int ldc, int ic, int jc, int effMc, int effNc)
     {
         for (int r = 0; r < effMc; r++)
@@ -831,6 +846,7 @@ internal static class GotoGemmFp32
 
     // Scalar K-accumulate for the rows/cols not covered by the full mr×nr tiles (the M-tail rows and
     // the N-tail cols). Correct but slow — tails are a small fraction of a well-blocked GEMM.
+    [MethodImpl(Hot)]
     private static unsafe void ScalarTails(
         float* a, int lda, float* b, int ldb, float* c, int ldc,
         int ic, int jc, int effMc, int effNc, int mFull, int nFull, int pc, int effKc)

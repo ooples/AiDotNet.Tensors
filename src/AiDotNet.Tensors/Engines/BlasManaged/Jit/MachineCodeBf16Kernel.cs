@@ -1,3 +1,5 @@
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET5_0_OR_GREATER
 using System;
 
@@ -83,6 +85,7 @@ internal static class MachineCodeBf16Kernel
     /// Disjoint accumulators → bit-stable; no .NET intrinsic exists for VDPBF16PS so the body is
     /// raw EVEX. Verify under Intel SDE on non-AVX-512-BF16 hosts.
     /// </summary>
+    [MethodImpl(Hot)]
     internal static byte[] EmitGemmMicrokernelWindows()
     {
         // Windows x64 ABI: rcx=packedA, rdx=packedB, r8=cTile, r9=kPairs.
@@ -118,6 +121,7 @@ internal static class MachineCodeBf16Kernel
     /// — BF16 0x0000 = +0.0, a no-op), and runs the emitted kernel. Returns false only if
     /// executable memory is unavailable. MUST run under SDE on hosts lacking AVX-512-BF16.
     /// </summary>
+    [MethodImpl(Hot)]
     internal static unsafe bool TryGemm(
         ReadOnlySpan<ushort> a, ReadOnlySpan<ushort> b, Span<float> c, int m, int k, int n)
     {

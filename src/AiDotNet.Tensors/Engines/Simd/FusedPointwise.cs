@@ -1,5 +1,6 @@
 using System;
 using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines.Simd;
 
@@ -19,6 +20,7 @@ internal static class FusedPointwise
     /// Builds a fused delegate from a chain of pointwise operation names.
     /// The delegate applies all operations in sequence to a single element.
     /// </summary>
+    [MethodImpl(Hot)]
     internal static Func<float, float>? BuildFusedDelegate(string[] opChain)
     {
         if (opChain.Length == 0) return null;
@@ -46,7 +48,7 @@ internal static class FusedPointwise
     /// <summary>
     /// Applies a fused pointwise delegate to an entire array in a single pass.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     internal static unsafe void ApplyFused(
         float* input, float* output, int length, Func<float, float> fusedOp)
     {
@@ -67,7 +69,7 @@ internal static class FusedPointwise
     /// <summary>
     /// Applies a fused pointwise delegate in-place.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     internal static unsafe void ApplyFusedInPlace(float* data, int length, Func<float, float> fusedOp)
     {
         int i = 0;

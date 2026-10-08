@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using AiDotNet.Tensors.Helpers;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines.BlasManaged;
 
@@ -336,6 +337,7 @@ internal static class PackBothStrategy
     /// provides a workspace buffer (Layer 5) that cannot be split across threads.
     /// Pack-A and pack-B buffers are already allocated by the caller.
     /// </summary>
+    [MethodImpl(Hot)]
     private static void RunSerial<T>(
         ReadOnlySpan<T> a, int lda, bool transA,
         ReadOnlySpan<T> b, int ldb, bool transB,
@@ -541,6 +543,7 @@ internal static class PackBothStrategy
     ///   pool instance is lazily created on first access, ensuring isolation.
     /// </para>
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe void RunParallelUnsafe<T>(
         T* aPtr, int aLen, int lda, bool transA,
         T* bPtr, int bLen, int ldb, bool transB,
@@ -734,7 +737,7 @@ internal static class PackBothStrategy
                     byte[] packBArr_cap = packBArr;
                     int packBAlignedOffset_cap = packBAlignedOffset;
 
-                    CpuParallelSettings.ParallelForOrSerial(0, numIcBlocks, totalWork, icIdx =>
+                    CpuParallelSettings.ParallelForOrSerial(0, numIcBlocks, totalWork, [MethodImpl(Hot)] (icIdx) =>
                     {
                         int ic = icIdx * mc;
                         int effectiveMc = Math.Min(mc, m - ic);
@@ -920,6 +923,7 @@ internal static class PackBothStrategy
     /// Bit-identical: each C[ir,jc] tile reduces over k in ascending K-panel order; jc blocks
     /// own disjoint C columns so no cross-thread write sync (the tail rows likewise — disjoint columns).
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe void RunNAxisParallelUnsafe(
         float* aPtr, int aLen, int lda,
         float* bPtr, int bLen, int ldb,
@@ -966,7 +970,7 @@ internal static class PackBothStrategy
                 int kL = k, nL = n, bLenL = bLen, cLenL = cLen;
                 long totalWork = (long)m * n * k * 2;
 
-                Action<int> nAxisBody = jcIdx =>
+                Action<int> nAxisBody = [MethodImpl(Hot)] (jcIdx) =>
                 {
                     int jc = jcIdx * ncL;
                     int effNc = Math.Min(ncL, nL - jc);
@@ -1102,6 +1106,7 @@ internal static class PackBothStrategy
     /// Bit-identical: each C[ic,jr] tile still reduces over k in ascending panel order, and
     /// ic blocks own disjoint C rows so there is no cross-thread write contention.
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe void RunParallelSingleRegionUnsafe<T>(
         T* aPtr, int aLen, int lda,
         T* bPtr, int bLen, int ldb,
@@ -1165,7 +1170,7 @@ internal static class PackBothStrategy
             int numIcBlocks = (m + mc - 1) / mc;
             long totalWork = (long)m * n * k;
             int mcCap = mc, mCap = m, ldaCap = lda, aLenCap = aLen, ldcCap = ldc, cLenCap = cLen, mrCap = mr;
-            CpuParallelSettings.ParallelForOrSerial(0, numIcBlocks, totalWork, icIdx =>
+            CpuParallelSettings.ParallelForOrSerial(0, numIcBlocks, totalWork, [MethodImpl(Hot)] (icIdx) =>
             {
                 int ic = icIdx * mcCap;
                 int effMc = Math.Min(mcCap, mCap - ic);
@@ -1237,6 +1242,7 @@ internal static class PackBothStrategy
     /// as M-axis parallel (where each thread owns rows [ic, ic+effectiveMc)).
     /// </para>
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe void Run2DParallelUnsafe<T>(
         T* aPtrInt, int aLen, int lda, bool transA,
         T* bPtrInt, int bLen, int ldb, bool transB,
@@ -1269,7 +1275,7 @@ internal static class PackBothStrategy
             long workPerTile = (long)mc * nc * effectiveKc;
             long totalWork = workPerTile * totalTiles;
 
-            CpuParallelSettings.ParallelForOrSerial(0, totalTiles, totalWork, flatIdx =>
+            CpuParallelSettings.ParallelForOrSerial(0, totalTiles, totalWork, [MethodImpl(Hot)] (flatIdx) =>
             {
                 var (icIdx, jcIdx) = MN2DDriver.UnflattenIndex(flatIdx, numJcBlocks);
                 int ic = icIdx * mc;
@@ -1543,6 +1549,7 @@ internal static class PackBothStrategy
     /// the matching Avx512Tail or Avx2Tail kernel is preferred; if no matching
     /// SIMD tail kernel exists, a scalar column-by-column fallback is used.
     /// </summary>
+    [MethodImpl(Hot)]
     private static void DispatchMicrokernelWithTail<T>(
         ReadOnlySpan<T> packedA, ReadOnlySpan<T> packedB,
         Span<T> c, int ldc, int kc,
