@@ -855,16 +855,18 @@ __kernel void hardsigmoid(
     output[idx] = fmax(0.0f, fmin(1.0f, (x + 3.0f) / 6.0f));
 }
 
-// HardTanh: clamp(x, -1, 1)
+// HardTanh: clamp(x, minVal, maxVal), the same signature as the CUDA/HIP kernel
 __kernel void hardtanh(
     __global const float* input,
     __global float* output,
+    const float minVal,
+    const float maxVal,
     const int size)
 {
     const int idx = get_global_id(0);
     if (idx >= size) return;
 
-    output[idx] = fmax(-1.0f, fmin(1.0f, input[idx]));
+    output[idx] = fmin(fmax(input[idx], minVal), maxVal);
 }
 
 // ===========================================================================
@@ -1061,18 +1063,20 @@ __kernel void hardsigmoid_backward(
     gradInput[idx] = gradOutput[idx] * grad;
 }
 
-// HardTanh backward
+// HardTanh backward: passes the gradient strictly inside (minVal, maxVal)
 __kernel void hardtanh_backward(
     __global const float* gradOutput,
     __global const float* input,
     __global float* gradInput,
+    const float minVal,
+    const float maxVal,
     const int size)
 {
     const int idx = get_global_id(0);
     if (idx >= size) return;
 
     float x = input[idx];
-    float grad = (x > -1.0f && x < 1.0f) ? 1.0f : 0.0f;
+    float grad = (x > minVal && x < maxVal) ? 1.0f : 0.0f;
     gradInput[idx] = gradOutput[idx] * grad;
 }
 
