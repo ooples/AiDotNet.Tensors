@@ -4,6 +4,7 @@
 
 using System;
 using System.Runtime.InteropServices;
+using System.Threading;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
@@ -85,6 +86,22 @@ public static unsafe class VulkanNativeBindings
     public static bool IsPlatformSupported
     {
         get
+        {
+            // Once the loader has been found, the P/Invoke bindings stay bound to it for the process,
+            // so a success is cached: a later change to the process's DLL search order cannot turn an
+            // already-working backend "unsupported" (the #1027 failure mode, there caused by HIP's
+            // SetDefaultDllDirectories before Vulkan was first probed).
+            if (Volatile.Read(ref s_platformSupported) != 0) return true;
+            bool supported = ProbePlatformSupport();
+            if (supported) Volatile.Write(ref s_platformSupported, 1);
+            return supported;
+        }
+    }
+
+    private static int s_platformSupported;
+
+    private static bool ProbePlatformSupport()
+    {
         {
             try
             {
