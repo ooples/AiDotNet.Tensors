@@ -47,6 +47,13 @@ internal abstract class ActivationHandler
     /// <summary>Apply in-place with explicit parametric settings. Default ignores them.</summary>
     public virtual void ApplyInPlace<T>(CpuEngine engine, Tensor<T> input, FusedActivationParams? activationParams)
     {
+        // No parameters: the handler's own in-place form, a true in-place kernel where it has one. This overload used
+        // to allocate a new activated tensor and copy it back for every activation, ReLU included.
+        if (activationParams is null)
+        {
+            ApplyInPlace(engine, input);
+            return;
+        }
         var result = Apply(engine, input, activationParams);
         result.AsSpan().CopyTo(input.AsWritableSpan());
     }

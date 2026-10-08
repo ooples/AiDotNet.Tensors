@@ -1990,6 +1990,21 @@ internal static partial class SimdGemm
                 return;
             }
 
+            // Transposed operands at training-batch scale. The packed path below ran these 3-4x slower than the
+            // direct no-transpose kernels run the same product (a dense layer's backward on a [128, 784] -> 512
+            // layer: dX = dY.W^T in 2.3 ms and dW = X^T.dY in 2.0 ms, against 0.6 ms untransposed). Copy each
+            // transposed operand once into row-major order - O(m.k + k.n) moves against O(m.k.n) multiply-adds -
+            // and dispatch the untransposed product, which then takes the 2-D direct or tall-thin path.
+            long transposedWork = (long)m * k * n;
+            if ((transA || transB) && UseTransposeMaterialization
+                && transposedWork >= ParallelWorkThreshold && transposedWork <= TransposeMaterializeMaxWork
+                && (!transA || (long)m * k <= TransposeMaterializeMaxElements)
+                && (!transB || (long)k * n <= TransposeMaterializeMaxElements))
+            {
+                SgemmWithMaterializedTransposes(a, lda, transA, b, ldb, transB, c, m, k, n, allowParallel, clearedOutput);
+                return;
+            }
+
             SgemmTiled(a, lda, transA, b, ldb, transB, c, m, k, n, allowParallel);
             return;
         }
@@ -2041,6 +2056,93 @@ internal static partial class SimdGemm
     // Above 32M (e.g. 512³ = 134M, 1024² = 1B), the packed SgemmTiled path's
     // better cache reuse wins.
     private const long SmallMatmulWorkThreshold = 32L * 1024 * 1024;
+
+    /// <summary>A/B and test toggle: false sends transposed GEMMs back to the packed path. Not a production setting.</summary>
+    internal static bool UseTransposeMaterialization = true;
+
+    // The transposed-operand route's bounds: past 4G multiply-adds the packed path's cache blocking wins, and an operand
+    // over 16M floats (64 MB) is not worth a scratch copy.
+    private const long TransposeMaterializeMaxWork = 4L * 1024 * 1024 * 1024;
+    private const long TransposeMaterializeMaxElements = 16L * 1024 * 1024;
+
+    // Square tile of the blocked transpose: a 32x32 float tile is 4 KB read and 4 KB written, so both sides stay in L1.
+    private const int TransposeTile = 32;
+
+    /// <summary>
+    /// <c>C = op(A) . op(B)</c> with each transposed operand copied into row-major scratch first, then the untransposed
+    /// product dispatched through <see cref="SgemmAddInternal"/>.
+    /// </summary>
+    private static void SgemmWithMaterializedTransposes(
+        ReadOnlySpan<float> a, int lda, bool transA,
+        ReadOnlySpan<float> b, int ldb, bool transB,
+        Span<float> c, int m, int k, int n, bool allowParallel, bool clearedOutput)
+    {
+        float[]? aRows = null, bRows = null;
+        try
+        {
+            ReadOnlySpan<float> a2 = a, b2 = b;
+            int lda2 = lda, ldb2 = ldb;
+            if (transA)
+            {
+                // A is stored [k, m] (stride lda); op(A) = A^T is [m, k].
+                aRows = ArrayPool<float>.Shared.Rent(m * k);
+                TransposeInto(a, lda, k, m, aRows, allowParallel);
+                a2 = new ReadOnlySpan<float>(aRows, 0, m * k);
+                lda2 = k;
+            }
+            if (transB)
+            {
+                // B is stored [n, k] (stride ldb); op(B) = B^T is [k, n].
+                bRows = ArrayPool<float>.Shared.Rent(k * n);
+                TransposeInto(b, ldb, n, k, bRows, allowParallel);
+                b2 = new ReadOnlySpan<float>(bRows, 0, k * n);
+                ldb2 = n;
+            }
+            SgemmAddInternal(a2, lda2, false, b2, ldb2, false, c, m, k, n, allowParallel, clearedOutput);
+        }
+        finally
+        {
+            if (aRows is not null) ArrayPool<float>.Shared.Return(aRows);
+            if (bRows is not null) ArrayPool<float>.Shared.Return(bRows);
+        }
+    }
+
+    /// <summary>
+    /// <c>dst[c * rows + r] = src[r * ld + c]</c>: the [rows, cols] matrix at <paramref name="src"/> (row stride
+    /// <paramref name="ld"/>) written transposed, as [cols, rows] row-major, in L1-sized tiles; tile rows in parallel
+    /// when allowed and large enough.
+    /// </summary>
+    private static unsafe void TransposeInto(ReadOnlySpan<float> src, int ld, int rows, int cols, float[] dst, bool allowParallel)
+    {
+        int rowTiles = (rows + TransposeTile - 1) / TransposeTile;
+        fixed (float* ps = src)
+        fixed (float* pd = dst)
+        {
+            float* s = ps, d = pd;
+            void Tile(int rt)
+            {
+                int r0 = rt * TransposeTile, r1 = Math.Min(rows, r0 + TransposeTile);
+                for (int c0 = 0; c0 < cols; c0 += TransposeTile)
+                {
+                    int c1 = Math.Min(cols, c0 + TransposeTile);
+                    for (int r = r0; r < r1; r++)
+                    {
+                        float* row = s + (long)r * ld;
+                        for (int col = c0; col < c1; col++)
+                            d[(long)col * rows + r] = row[col];
+                    }
+                }
+            }
+
+            if (allowParallel && rowTiles > 1 && (long)rows * cols >= TransposeParallelElements)
+                Helpers.CpuParallelSettings.LightweightParallel(rowTiles, Tile);
+            else
+                for (int rt = 0; rt < rowTiles; rt++) Tile(rt);
+        }
+    }
+
+    // Below 64K elements (256 KB) the transpose costs less than a parallel dispatch.
+    private const long TransposeParallelElements = 64L * 1024;
 
     // Tall-thin transformer GEMMs (M=2048, K=128, N=384-8192) at
     // 100M-2.1G FMAs were going through SgemmTiled, where at K=128 the inner

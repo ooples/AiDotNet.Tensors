@@ -101,7 +101,13 @@ public partial class CpuEngine
         int outputWidth = (input._shape[3] + 2 * padW - (dilationW * (kernelWidth - 1) + 1)) / strideW + 1;
         // The route Conv2DInto takes for a plain NCHW float input (Conv2DIntoImpl -> DispatchFloatConv2D ->
         // Conv2DWithIm2ColFloat), with the epilogue handed to it; any other layout or geometry keeps the two-pass form.
-        bool adaptiveRoute = input.IsContiguous && kernel.IsContiguous && output.IsContiguous && bias.IsContiguous
+        // A conv DispatchFloatConv2D sends to the batch-wide GEMM goes through Conv2DInto too, so the fused plan
+        // computes the same convolution, bit for bit, as the unfused one.
+        bool batchedRoute = input.Layout == LinearAlgebra.TensorLayout.Nchw
+            && UseBatchedConvForward(input._shape[0], input._shape[1], kernelHeight, kernelWidth,
+                strideH, strideW, outputHeight, outputWidth, kernel._shape[0]);
+        bool adaptiveRoute = !batchedRoute
+            && input.IsContiguous && kernel.IsContiguous && output.IsContiguous && bias.IsContiguous
             && input.Layout == LinearAlgebra.TensorLayout.Nchw
             && output._shape[2] == outputHeight && output._shape[3] == outputWidth
             && ShouldUseAdaptiveFloatConv2D(input.Layout, strideH, strideW, padH, padW, dilationH, dilationW);
