@@ -1531,6 +1531,73 @@ extern ""C"" __global__ __launch_bounds__(256) void batched_transpose(
     B[outIdx] = A[inIdx];
 }
 
+// Global-norm clip over every gradient in one launch each, the HIP twin of CUDA's multi_tensor_* kernels. ptrs holds
+// one device address per tensor; chunk c covers tensor chunkTensor[c] from chunkStart[c], one 256-thread block wide.
+// The sum of squares accumulates in double, so it is finite exactly when every element is; *out must be zeroed first.
+// A shared-memory tree rather than warp shuffles: the wavefront is 32 or 64 wide depending on the AMD target.
+extern ""C"" __global__ __launch_bounds__(256) void multi_tensor_sum_squares(
+    const unsigned long long* ptrs, const int* sizes, const int* chunkTensor, const int* chunkStart,
+    int totalChunks, double* out)
+{
+    __shared__ double partial[256];
+    double v = 0.0;
+    for (int c = blockIdx.x; c < totalChunks; c += gridDim.x)
+    {
+        int t = chunkTensor[c];
+        int i = chunkStart[c] + threadIdx.x;
+        if (i < sizes[t])
+        {
+            double x = (double)((const float*)ptrs[t])[i];
+            v += x * x;
+        }
+    }
+    partial[threadIdx.x] = v;
+    __syncthreads();
+    for (int s = 128; s > 0; s >>= 1)
+    {
+        if ((int)threadIdx.x < s) partial[threadIdx.x] += partial[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) atomicAdd(out, partial[0]);
+}
+
+// min(1, maxNorm / (sqrt(sumSq) + 1e-6)); a non-finite norm leaves the gradients unscaled (1).
+extern ""C"" __global__ void clip_scale_from_sum_squares(const double* sumSquares, float maxNorm, float* scale)
+{
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    double norm = sqrt(*sumSquares);
+    double c = isfinite(norm) ? (double)maxNorm / (norm + 1e-6) : 1.0;
+    *scale = (float)(c < 1.0 ? c : 1.0);
+}
+
+// Every element of every tensor multiplied by the device scalar *scale; one block per chunk.
+extern ""C"" __global__ __launch_bounds__(256) void multi_tensor_scale_by_device_scalar(
+    const unsigned long long* ptrs, const int* sizes, const int* chunkTensor, const int* chunkStart, const float* scale)
+{
+    int t = chunkTensor[blockIdx.x];
+    int i = chunkStart[blockIdx.x] + threadIdx.x;
+    if (i < sizes[t]) ((float*)ptrs[t])[i] *= *scale;
+}
+// Rectangular N-d slice in one launch (rank <= 8), the HIP twin of CUDA's rect_slice_nd. scatter == 0 reads
+// full[start : start + length] into slice; scatter != 0 writes slice back into that window. The metadata rides in
+// a by-value parameter struct, so no device metadata buffer is needed.
+struct RectSliceMeta { int rank; int total; int outDims[8]; int fullStrides[8]; int starts[8]; };
+extern ""C"" __global__ __launch_bounds__(256) void rect_slice_nd(
+    float* full, float* slice, RectSliceMeta m, int scatter)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= m.total) return;
+    int remaining = idx;
+    int offset = 0;
+    for (int d = m.rank - 1; d >= 0; d--)
+    {
+        int c = remaining % m.outDims[d];
+        remaining /= m.outDims[d];
+        offset += (m.starts[d] + c) * m.fullStrides[d];
+    }
+    if (scatter) full[offset] = slice[idx];
+    else slice[idx] = full[offset];
+}
 extern ""C"" __global__ __launch_bounds__(256) void permute_general(
     const float* input, float* output,
     const int* inputStrides, const int* outputStrides, const int* permutation,
@@ -2527,7 +2594,7 @@ extern ""C"" __global__ __launch_bounds__(256) void batched_gemm(
             "bfgs_step", "levenberg_marquardt_step", "trust_region_step", "admm_step", "newton_method_step", "dfp_step", "coordinate_descent_step",
             "dropout_dotnet_random_serial", "dropout_forward", "dropout_backward", "embedding_forward", "embedding_backward",
             "embedding_backward_deterministic",
-            "transpose_2d", "batched_transpose", "permute_general",
+            "transpose_2d", "batched_transpose", "permute_general", "rect_slice_nd", "multi_tensor_sum_squares", "clip_scale_from_sum_squares", "multi_tensor_scale_by_device_scalar",
             // LSTM kernels
             "lstm_cell_forward", "lstm_cell_backward", "lstm_gates_precompute",
             // GRU kernels

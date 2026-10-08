@@ -113,15 +113,70 @@ internal static class RectSliceLimits
     /// <summary>Largest rank <see cref="IRectSliceKernels.RectSlice"/> handles.</summary>
     internal const int MaxRank = 8;
 }
+/// <summary>
+/// Validation and metadata shared by every <see cref="IRectSliceKernels"/> implementation, so each backend launches
+/// from the same checks. An out-of-bounds launch is a sticky error on CUDA and HIP that poisons the context for every
+/// engine in the process, so the buffers are checked against the shapes, not just the shapes themselves.
+/// </summary>
+internal static class RectSliceGeometry
+{
+    /// <summary>
+    /// Fills <paramref name="outDims"/>, <paramref name="fullStrides"/> and <paramref name="starts"/> (each at least
+    /// <see cref="RectSliceLimits.MaxRank"/> long; unused entries are zero) and returns the rank and element count.
+    /// </summary>
+    internal static void Build(IGpuBuffer full, IGpuBuffer slice, int[] fullShape, int[] start, int[] length,
+        int[] outDims, int[] fullStrides, int[] starts, out int rank, out int total)
+    {
+        if (full is null) throw new ArgumentNullException(nameof(full));
+        if (slice is null) throw new ArgumentNullException(nameof(slice));
+        if (fullShape is null) throw new ArgumentNullException(nameof(fullShape));
+        if (start is null) throw new ArgumentNullException(nameof(start));
+        if (length is null) throw new ArgumentNullException(nameof(length));
+        rank = fullShape.Length;
+        if (rank < 1 || rank > RectSliceLimits.MaxRank || start.Length != rank || length.Length != rank)
+            throw new ArgumentException($"RectSlice supports rank 1..{RectSliceLimits.MaxRank} with matching start/length.");
+        Array.Clear(outDims, 0, outDims.Length);
+        Array.Clear(fullStrides, 0, fullStrides.Length);
+        Array.Clear(starts, 0, starts.Length);
+        int stride = 1;
+        total = 1;
+        for (int d = rank - 1; d >= 0; d--)
+        {
+            if (start[d] < 0 || length[d] < 1 || start[d] + length[d] > fullShape[d])
+                throw new ArgumentOutOfRangeException(nameof(start), $"Axis {d}: [{start[d]}, +{length[d]}) is outside {fullShape[d]}.");
+            outDims[d] = length[d];
+            fullStrides[d] = stride;
+            starts[d] = start[d];
+            stride = checked(stride * fullShape[d]);
+            total = checked(total * length[d]);
+        }
+        if (full.Size < stride)
+            throw new ArgumentException($"RectSlice: the full buffer holds {full.Size} elements, the shape needs {stride}.", nameof(full));
+        if (slice.Size < total)
+            throw new ArgumentException($"RectSlice: the slice buffer holds {slice.Size} elements, the slice needs {total}.", nameof(slice));
+    }
+
+    /// <summary><see cref="Build(IGpuBuffer, IGpuBuffer, int[], int[], int[], int[], int[], int[], out int, out int)"/>
+    /// into the fixed buffers of a by-value kernel parameter struct (CUDA, HIP).</summary>
+    internal static unsafe void Build(IGpuBuffer full, IGpuBuffer slice, int[] fullShape, int[] start, int[] length,
+        int* outDims, int* fullStrides, int* starts, out int rank, out int total)
+    {
+        var d = new int[RectSliceLimits.MaxRank];
+        var s = new int[RectSliceLimits.MaxRank];
+        var o = new int[RectSliceLimits.MaxRank];
+        Build(full, slice, fullShape, start, length, d, s, o, out rank, out total);
+        for (int i = 0; i < RectSliceLimits.MaxRank; i++) { outDims[i] = d[i]; fullStrides[i] = s[i]; starts[i] = o[i]; }
+    }
+}
 
 /// <summary>
 /// Rectangular N-d slice gather/scatter in one launch (rank &lt;= 8). Replaces the per-contiguous-row
 /// device copy loop, which issued one memcpy per row: a [64, 32, 7, 7] height slice was 4,096 API calls.
 /// </summary>
 /// <remarks>
-/// A capability, not a requirement: implemented by the CUDA backend. A backend without it (HIP, Metal, OpenCL,
-/// Vulkan, WebGPU) keeps the per-row device copy, which gives the same result on the device with more launches,
-/// so the engine checks <c>backend is IRectSliceKernels</c> before taking the one-launch path.
+/// Implemented by all six GPU backends (CUDA, HIP, Metal, OpenCL, Vulkan, WebGPU), each validating through
+/// <see cref="RectSliceGeometry"/>. The engine still checks <c>backend is IRectSliceKernels</c>, so a future backend
+/// without it keeps the per-row device copy, which gives the same result with more launches.
 /// </remarks>
 internal interface IRectSliceKernels
 {
@@ -137,14 +192,16 @@ internal interface IRectSliceKernels
 /// every gradient instead of one chain per tensor (~630 launches per N-BEATS step on the per-tensor loop).
 /// </summary>
 /// <remarks>
-/// A capability, not a requirement: implemented by the CUDA backend. On a backend without it (HIP, Metal, OpenCL,
-/// Vulkan, WebGPU) the compiled training plan runs its per-tensor device loop, which computes the same clip on
-/// the device with more launches.
+/// Implemented by all six GPU backends. CUDA and HIP launch once over every tensor through a device table of buffer
+/// addresses and accumulate in double. OpenCL, Metal, Vulkan and WebGPU cannot address an arbitrary buffer from a
+/// table, so they launch one work-group reduction per tensor, accumulating in float in launch order (deterministic):
+/// one launch per tensor against the four of the plan's per-tensor loop. The <c>sumOfSquares</c> layout is private
+/// to the backend that wrote it; only that backend's <see cref="ClipScaleFromSumOfSquares"/> reads it.
 /// </remarks>
 internal interface IMultiTensorKernels
 {
-    /// <summary>Writes the sum of squares of every element of every tensor, accumulated in double, to
-    /// <paramref name="sumOfSquares"/> (two floats holding one double).</summary>
+    /// <summary>Writes the sum of squares of every element of every tensor to
+    /// <paramref name="sumOfSquares"/> (at least two float slots).</summary>
     void MultiTensorSumOfSquares(System.Collections.Generic.IReadOnlyList<IGpuBuffer> tensors,
         System.Collections.Generic.IReadOnlyList<int> sizes, IGpuBuffer sumOfSquares);
 
@@ -157,6 +214,32 @@ internal interface IMultiTensorKernels
         System.Collections.Generic.IReadOnlyList<int> sizes, IGpuBuffer scale);
 }
 
+/// <summary>Argument checks every <see cref="IMultiTensorKernels"/> implementation shares.</summary>
+internal static class MultiTensorArgs
+{
+    /// <summary>The work-group size of the per-tensor reduction on OpenCL, Metal, Vulkan and WebGPU.</summary>
+    internal const int ReductionGroupSize = 256;
+
+    internal static void Validate(System.Collections.Generic.IReadOnlyList<IGpuBuffer> tensors,
+        System.Collections.Generic.IReadOnlyList<int> sizes)
+    {
+        if (tensors is null) throw new ArgumentNullException(nameof(tensors));
+        if (sizes is null) throw new ArgumentNullException(nameof(sizes));
+        if (sizes.Count != tensors.Count) throw new ArgumentException("Every tensor needs a size.", nameof(sizes));
+        for (int t = 0; t < tensors.Count; t++)
+        {
+            if (tensors[t] is null) throw new ArgumentException($"Tensor {t} is null.", nameof(tensors));
+            if (sizes[t] <= 0) throw new ArgumentOutOfRangeException(nameof(sizes), "Every tensor size must be positive.");
+            if (tensors[t].Size < sizes[t]) throw new ArgumentException($"Tensor {t}'s buffer is smaller than its size.", nameof(tensors));
+        }
+    }
+
+    internal static void ValidateSumBuffer(IGpuBuffer sumOfSquares)
+    {
+        if (sumOfSquares is null) throw new ArgumentNullException(nameof(sumOfSquares));
+        if (sumOfSquares.Size < 2) throw new ArgumentException("The sum of squares needs two float slots.", nameof(sumOfSquares));
+    }
+}
 /// <summary>Adaptive max pooling 2D (NCHW) (#775).</summary>
 internal interface IAdaptiveMaxPool2DKernels
 {

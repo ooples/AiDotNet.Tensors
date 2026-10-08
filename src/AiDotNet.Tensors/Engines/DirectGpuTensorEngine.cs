@@ -20251,21 +20251,17 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// Both gradients of the 2-D matmul <c>Y[M,N] = A[M,K] · B[K,N]</c>, each as one GEMM with a transpose flag:
     /// <c>dA = dY · Bᵀ</c> and <c>dB = Aᵀ · dY</c>. The generic backward materialized Bᵀ and Aᵀ with a transpose
     /// kernel each and then multiplied, two extra launches and temporaries per matmul per step (149 transpose_2d per
-    /// AiDotNet N-BEATS step, #1804). CUDA float only; returns false otherwise, and in a resident (captured) step
+    /// AiDotNet N-BEATS step, #1804). Float only, on any backend implementing <see cref="DirectGpu.ITransposedAGemm"/>
+    /// (all six); returns false otherwise, and in a resident (captured) step
     /// when an operand is not already device-resident, so the caller keeps its generic path.
     /// </summary>
-    /// <remarks>
-    /// The transposed-operand GEMM is a CUDA capability (cuBLAS takes the transpose flags directly). On HIP, Metal,
-    /// OpenCL, Vulkan and WebGPU the caller's generic path runs instead: a device transpose and a GEMM per gradient,
-    /// the same result on the device with two more launches per matmul.
-    /// </remarks>
     internal bool TryMatMulBackward2D<T>(
         Tensor<T> gradOutput, Tensor<T> a, Tensor<T> b, out Tensor<T>? gradA, out Tensor<T>? gradB)
     {
         gradA = null;
         gradB = null;
         if (typeof(T) != typeof(float) || Gpu.AutocastScope.IsEnabled) return false;
-        if (!TryGetBackend(out var backend) || backend is not DirectGpu.CUDA.CudaBackend cuda) return false;
+        if (!TryGetBackend(out var backend) || backend is not DirectGpu.ITransposedAGemm transposedA) return false;
         if (a.Rank != 2 || b.Rank != 2 || gradOutput.Rank != 2) return false;
         if (!a.IsContiguous || !b.IsContiguous || !gradOutput.IsContiguous
             || a._storageOffset != 0 || b._storageOffset != 0 || gradOutput._storageOffset != 0) return false;
@@ -20288,8 +20284,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var outBufB = GetOrCreateResidentBuffer(backend, outB, K * N, fullyWritten: true);
                 if (outBufA.Handle == IntPtr.Zero || outBufA.Size < (long)M * K
                     || outBufB.Handle == IntPtr.Zero || outBufB.Size < (long)K * N) return false;
-                cuda.MatMulTransposed(bufG, bufB, outBufA, M, K, N);   // dA[M,K] = dY[M,N] · B[K,N]ᵀ
-                cuda.MatMulTransposedA(bufA, bufG, outBufB, K, N, M);  // dB[K,N] = A[M,K]ᵀ · dY[M,N]
+                backend.MatMulTransposed(bufG, bufB, outBufA, M, K, N);  // dA[M,K] = dY[M,N] · B[K,N]ᵀ
+                transposedA.MatMulTransposedA(bufA, bufG, outBufB, K, N, M); // dB[K,N] = A[M,K]ᵀ · dY[M,N]
                 ResidentSyncCheck("MatMulBackward2D");
                 BindResidentBuffer(outA, outBufA, backend);
                 BindResidentBuffer(outB, outBufB, backend);
@@ -20314,8 +20310,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
             try
             {
-                cuda.MatMulTransposed(ownedG.Buffer, ownedB.Buffer, bufOutA.Buffer, M, K, N);
-                cuda.MatMulTransposedA(ownedA.Buffer, ownedG.Buffer, bufOutB.Buffer, K, N, M);
+                backend.MatMulTransposed(ownedG.Buffer, ownedB.Buffer, bufOutA.Buffer, M, K, N);
+                transposedA.MatMulTransposedA(ownedA.Buffer, ownedG.Buffer, bufOutB.Buffer, K, N, M);
             }
             catch
             {

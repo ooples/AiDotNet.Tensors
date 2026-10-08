@@ -314,7 +314,7 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
         var b = Make(k, n, 22_222);
         var g = Make(m, n, 333_333);
 
-        Skip.IfNot(gpu.TryMatMulBackward2D(g, a, b, out var gradA, out var gradB), "CUDA float backend required.");
+        Skip.IfNot(gpu.TryMatMulBackward2D(g, a, b, out var gradA, out var gradB), "A float backend implementing ITransposedAGemm is required.");
         Assert.NotNull(gradA);
         Assert.NotNull(gradB);
 
