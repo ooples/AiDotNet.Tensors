@@ -33,7 +33,7 @@ public class MediumMGemmAndRowBlockConvTests
         {
             CpuParallelSettings.MaxDegreeOfParallelism = Math.Max(4, Environment.ProcessorCount);
             Assert.True(SimdGemm.PrefersParallelN(m, k, n), "shape must take the N-parallel path");
-            var rnd = new Random(m * 7919 + k * 31 + n);
+            var rnd = RandomHelper.CreateSeededRandom(m * 7919 + k * 31 + n);
             var a = Rand(rnd, m * k); var b = Rand(rnd, k * n);
             var expected = Reference(a, b, m, k, n);
 
@@ -65,13 +65,18 @@ public class MediumMGemmAndRowBlockConvTests
     public void RowBlockConv_MatchesFullIm2Col(int batch, int cin, int h, int w, int cout, int stride, int pad, int dil)
     {
         Skip.IfNot(System.Runtime.Intrinsics.X86.Avx2.IsSupported && System.Runtime.Intrinsics.X86.Fma.IsSupported, "AVX2/FMA");
+        // The row-block route belongs to the adaptive conv family, which CpuEngine.ShouldUseAdaptiveFloatConv2D
+        // selects only on Windows (#998: im2col-GEMM is the measured winner on Linux), so elsewhere Conv2D never
+        // reaches it and there is no route to compare.
+        Skip.IfNot(System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows),
+            "the adaptive conv family (and its row-block route) is Windows-only");
         int original = CpuParallelSettings.MaxDegreeOfParallelism;
         try
         {
             CpuParallelSettings.MaxDegreeOfParallelism = Math.Max(4, Environment.ProcessorCount);
             int oh = (h + 2 * pad - dil * 2 - 1) / stride + 1, ow = (w + 2 * pad - dil * 2 - 1) / stride + 1;
             Assert.True(SimdGemm.PrefersParallelN(cout, cin * 9, oh * ow, requireAlignedN: false), "shape must take the row-block conv route");
-            var rnd = new Random(batch * 101 + cin * 7 + h);
+            var rnd = RandomHelper.CreateSeededRandom(batch * 101 + cin * 7 + h);
             var x = new Tensor<float>(Rand(rnd, batch * cin * h * w), new[] { batch, cin, h, w });
             var k = new Tensor<float>(Rand(rnd, cout * cin * 9), new[] { cout, cin, 3, 3 });
             var engine = new CpuEngine();
@@ -110,7 +115,7 @@ public class MediumMGemmAndRowBlockConvTests
         {
             CpuParallelSettings.MaxDegreeOfParallelism = Math.Max(4, Environment.ProcessorCount);
             Assert.True(SimdGemm.PrefersParallelN(m, k, n), "shape must take the column-panel route");
-            var rnd = new Random(m + 13 * k + 7 * n);
+            var rnd = RandomHelper.CreateSeededRandom(m + 13 * k + 7 * n);
             var a = Rand(rnd, m * k);
             var bStoredNk = Rand(rnd, n * k);   // B stored [n x k]; C = A·Bᵀ
             var bKn = new float[k * n];
