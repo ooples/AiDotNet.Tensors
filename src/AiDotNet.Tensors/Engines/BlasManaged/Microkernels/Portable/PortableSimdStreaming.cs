@@ -2,6 +2,7 @@ using System;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines.BlasManaged;
 
@@ -69,6 +70,7 @@ internal static class PortableSimdStreaming
     /// Compute C += op(A) · op(B) without packing. C is read-modify-write.
     /// Bit-identical to <see cref="ScalarStreaming.RunFp64"/>; see the type remarks.
     /// </summary>
+    [MethodImpl(Hot)]
     public static unsafe void RunFp64(
         ReadOnlySpan<double> a, int lda, bool transA,
         ReadOnlySpan<double> b, int ldb, bool transB,

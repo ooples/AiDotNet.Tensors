@@ -1,4 +1,6 @@
 using System;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines.BlasManaged;
 
@@ -41,6 +43,7 @@ internal static class ScalarPack
     /// <param name="mc">Rows of A to pack (must be ≤ Mc panel size, exactly divisible by mr).</param>
     /// <param name="kc">Cols of A to pack (one Kc block).</param>
     /// <param name="mr">Microkernel row-tile width (e.g., 4 for ScalarFp64_4x4).</param>
+    [MethodImpl(Hot)]
     public static void PackA<T>(
         ReadOnlySpan<T> a, int lda, bool transA,
         Span<T> packed, int mc, int kc, int mr) where T : unmanaged
@@ -106,6 +109,7 @@ internal static class ScalarPack
     /// <param name="nc">Cols of B to pack (must be ≤ Nc panel size).</param>
     /// <param name="kc">Rows of B to pack (one Kc block).</param>
     /// <param name="nr">Microkernel column-tile width (e.g., 4 for ScalarFp64_4x4).</param>
+    [MethodImpl(Hot)]
     public static void PackB<T>(
         ReadOnlySpan<T> b, int ldb, bool transB,
         Span<T> packed, int nc, int kc, int nr) where T : unmanaged

@@ -2,6 +2,8 @@ using System;
 using System.Runtime.InteropServices;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines.BlasManaged;
 
@@ -48,6 +50,7 @@ public static partial class BlasManaged
             TrsmRightScalar(uplo, transA, diag, m, n, a, lda, b, ldb, ops);
     }
 
+    [MethodImpl(Hot)]
     private static void TrsmScaleFloat(int m, int n, int ldb, float alpha, Span<float> b)
     {
         if (alpha == 1f) return;
@@ -58,6 +61,7 @@ public static partial class BlasManaged
         }
     }
 
+    [MethodImpl(Hot)]
     private static void TrsmScaleDouble(int m, int n, int ldb, double alpha, Span<double> b)
     {
         if (alpha == 1.0) return;
@@ -79,6 +83,7 @@ public static partial class BlasManaged
     /// Effective-lower (forward, top→bottom) updates rows below; effective-upper
     /// (backward, bottom→top) updates rows above.
     /// </summary>
+    [MethodImpl(Hot)]
     private static void TrsmLeftBlocked<T>(
         Uplo uplo, bool transA, Diag diag, int m, int n,
         ReadOnlySpan<T> a, int lda, Span<T> b, int ldb,
@@ -236,6 +241,7 @@ public static partial class BlasManaged
         }
     }
 
+    [MethodImpl(Hot)]
     private static void TrsmLeftScalarFloat(
         Uplo uplo, bool transA, Diag diag, int m, int n,
         ReadOnlySpan<float> a, int lda, Span<float> b, int ldb)
@@ -279,6 +285,7 @@ public static partial class BlasManaged
         }
     }
 
+    [MethodImpl(Hot)]
     private static void TrsmLeftScalarDouble(
         Uplo uplo, bool transA, Diag diag, int m, int n,
         ReadOnlySpan<double> a, int lda, Span<double> b, int ldb)
@@ -371,6 +378,7 @@ public static partial class BlasManaged
         }
     }
 
+    [MethodImpl(Hot)]
     private static void TrsmRightScalarFloat(
         Uplo uplo, bool transA, Diag diag, int m, int n,
         ReadOnlySpan<float> a, int lda, Span<float> b, int ldb)
@@ -396,6 +404,7 @@ public static partial class BlasManaged
                 }
     }
 
+    [MethodImpl(Hot)]
     private static void TrsmRightScalarDouble(
         Uplo uplo, bool transA, Diag diag, int m, int n,
         ReadOnlySpan<double> a, int lda, Span<double> b, int ldb)

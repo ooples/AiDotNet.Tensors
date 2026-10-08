@@ -9,6 +9,7 @@ using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 using MA = AiDotNet.Tensors.Helpers.MatrixAllocator;
 using VA = AiDotNet.Tensors.Helpers.VectorAllocator;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.LinearAlgebra;
 
@@ -513,6 +514,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// <para><b>For Beginners:</b> This method replaces an entire column of the matrix with new values.
     /// The vector must have the same number of elements as the matrix has rows.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public virtual void SetColumn(int columnIndex, Vector<T> vector)
     {
         if (columnIndex < 0 || columnIndex >= Columns)
@@ -597,6 +599,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// For example, if you have a 3x4 matrix and call GetColumn(2), you'll get a vector with 3 elements containing
     /// all values from the third column (remember that indices start at 0).</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public virtual Vector<T> GetColumn(int col)
     {
         ValidateIndices(0, col);
@@ -619,6 +622,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// (e.g., positions [0,0], [1,1], [2,2], etc.). This method extracts these elements into a vector.
     /// The length of the diagonal vector will be the minimum of the matrix's row and column counts.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public virtual Vector<T> Diagonal()
     {
         int minDimension = Math.Min(Rows, Columns);
@@ -647,6 +651,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// For example, SubMatrix(1, 2, 3, 2) would extract a 3ÃƒÂ¯Ã‚Â¿Ã‚Â½2 matrix starting from position [1,2]
     /// (the 2nd row and 3rd column, since indices start at 0).</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public Matrix<T> SubMatrix(int startRow, int startCol, int numRows, int numCols)
     {
         if (startRow < 0 || startCol < 0 || startRow + numRows > Rows || startCol + numCols > Columns)
@@ -680,6 +685,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// It takes all rows from startRow up to (but not including) endRow, and only includes the columns specified in columnIndices.
     /// This is useful when you need to work with a specific subset of your data.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public Matrix<T> SubMatrix(int startRow, int endRow, List<int> columnIndices)
     {
         if (columnIndices is null)
@@ -1314,6 +1320,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// <para><b>Performance:</b> Uses cache-blocked algorithm with parallel execution for large matrices.
     /// Block size is tuned for L1 cache (32x32 blocks). Parallel execution provides 2-4x speedup on multi-core systems.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public virtual MatrixBase<T> Transpose()
     {
         var result = CreateInstance(_cols, _rows);
@@ -1383,7 +1390,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
             int numRowBlocks = (rows + BlockSize - 1) / BlockSize;
 
             // Parallel processing of row blocks
-            AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numRowBlocks, (long)rows * cols, iiBlock =>
+            AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numRowBlocks, (long)rows * cols, [MethodImpl(Hot)] (iiBlock) =>
             {
                 int ii = iiBlock * BlockSize;
                 int iEnd = Math.Min(ii + BlockSize, rows);
@@ -1463,6 +1470,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// Only works for square matrices (same number of rows and columns).</para>
     /// <para><b>Performance:</b> Zero-allocation transpose with parallel execution for large matrices.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public virtual void TransposeInPlace()
     {
         if (_rows != _cols)
@@ -1512,7 +1520,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
             int numBlocks = (n + BlockSize - 1) / BlockSize;
 
             // Process diagonal and upper-triangular blocks in parallel
-            AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numBlocks, (long)n * n, iiBlock =>
+            AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numBlocks, (long)n * n, [MethodImpl(Hot)] (iiBlock) =>
             {
                 int ii = iiBlock * BlockSize;
                 int iEnd = Math.Min(ii + BlockSize, n);
@@ -1727,6 +1735,7 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     /// This is useful for displaying the matrix contents in a readable format,
     /// for example when debugging or logging.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public override string ToString()
     {
         var sb = new StringBuilder();

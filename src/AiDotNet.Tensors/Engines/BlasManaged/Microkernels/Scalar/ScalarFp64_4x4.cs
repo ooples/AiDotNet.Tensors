@@ -1,4 +1,6 @@
 using System;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines.BlasManaged;
 
@@ -32,6 +34,7 @@ internal static class ScalarFp64_4x4
     /// <param name="c">Output buffer; the kernel reads + writes the C[0..Mr, 0..Nr] tile.</param>
     /// <param name="ldc">Leading dimension of C (cols of the full C matrix, ≥ Nr).</param>
     /// <param name="kc">Number of K-steps to accumulate.</param>
+    [MethodImpl(Hot)]
     public static void Run(
         ReadOnlySpan<double> packedA,
         ReadOnlySpan<double> packedB,
@@ -89,6 +92,7 @@ internal static class ScalarFp64_4x4
     /// <param name="c">Output buffer; reads + writes C[0..Mr, 0..Nr] tile.</param>
     /// <param name="ldc">Leading dimension of C.</param>
     /// <param name="kc">Number of K-steps to accumulate.</param>
+    [MethodImpl(Hot)]
     public static void RunStridedB(
         ReadOnlySpan<double> packedA,
         ReadOnlySpan<double> b,

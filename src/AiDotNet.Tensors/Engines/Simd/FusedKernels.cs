@@ -1,5 +1,6 @@
 using System;
 using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -18,7 +19,7 @@ namespace AiDotNet.Tensors.Engines.Simd;
 internal static class FusedKernels
 {
     /// <summary>Swish/SiLU: x * sigmoid(x) — single pass AVX2</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     internal static unsafe void SwishUnsafe(float* input, float* output, int length)
     {
         int i = 0;
@@ -54,7 +55,7 @@ internal static class FusedKernels
     }
 
     /// <summary>GELU: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3))) — single pass AVX2</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     internal static unsafe void GeluUnsafe(float* input, float* output, int length)
     {
         int i = 0;
@@ -103,7 +104,7 @@ internal static class FusedKernels
     }
 
     /// <summary>Mish: x * tanh(softplus(x)) = x * tanh(log(1 + exp(x))) — single pass AVX2</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     internal static unsafe void MishUnsafe(float* input, float* output, int length)
     {
         int i = 0;
@@ -153,7 +154,7 @@ internal static class FusedKernels
     }
 
     /// <summary>Add + ReLU fused: max(0, a + b) — single pass AVX2</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     internal static unsafe void AddReluUnsafe(float* a, float* b, float* output, int length)
     {
         int i = 0;
@@ -184,7 +185,7 @@ internal static class FusedKernels
     }
 
     /// <summary>RMSNorm: x / sqrt(mean(x^2) + eps) * gamma — fused reduction + normalize</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     internal static unsafe void RMSNormUnsafe(float* input, float* gamma, float* output, int length, float eps)
     {
         // Pass 1: compute mean of squared values
@@ -254,7 +255,7 @@ internal static class FusedKernels
     }
 
     /// <summary>Sigmoid + Multiply (Swish building block): sigmoid(a) * b — single pass AVX2</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     internal static unsafe void SigmoidMulUnsafe(float* a, float* b, float* output, int length)
     {
         int i = 0;
@@ -286,7 +287,7 @@ internal static class FusedKernels
     }
 
     /// <summary>Fused LayerNorm: (x - mean) / sqrt(var + eps) * gamma + beta — 2-pass AVX2</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     internal static unsafe void LayerNormUnsafe(float* input, float* gamma, float* beta, float* output,
         int length, float eps)
     {
@@ -386,7 +387,7 @@ internal static class FusedKernels
     }
 
     /// <summary>Fused Softmax: exp(x - max) / sum(exp(x - max)) — 2-pass AVX2</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     internal static unsafe void SoftmaxUnsafe(float* input, float* output, int length)
     {
         // Pass 1: find max
@@ -463,7 +464,7 @@ internal static class FusedKernels
     }
 
     /// <summary>Fused LogSoftmax: x - max - log(sum(exp(x - max))) — 2-pass AVX2</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     internal static unsafe void LogSoftmaxUnsafe(float* input, float* output, int length)
     {
         float maxVal = float.NegativeInfinity;
@@ -531,7 +532,7 @@ internal static class FusedKernels
     }
 
     /// <summary>Fused BatchNorm inference: (x - mean) / sqrt(var + eps) * gamma + beta — single pass AVX2</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     internal static unsafe void BatchNormInferenceUnsafe(
         float* input, float* output, int length, int channels,
         float* gamma, float* beta, float* runningMean, float* runningVar, float eps)

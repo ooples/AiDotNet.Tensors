@@ -25,6 +25,9 @@ namespace AiDotNet.Tensors.Tests.Helpers;
 /// <c>SpinWait</c> race that could complete before the scheduler runs
 /// a second thread.
 /// </summary>
+// Asserts that a dispatch fans out to workers, which depends on process-wide CpuParallelSettings: runs in
+// the non-parallel collection so a test that lowers MaxDegreeOfParallelism cannot run at the same time.
+[Collection("CpuParallelSettings")]
 public class GrainSizeDispatchTests
 {
     [Fact]

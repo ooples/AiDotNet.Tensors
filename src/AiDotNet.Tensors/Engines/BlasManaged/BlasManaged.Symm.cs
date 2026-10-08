@@ -2,6 +2,8 @@ using System;
 using System.Runtime.InteropServices;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines.BlasManaged;
 
@@ -74,6 +76,7 @@ public static partial class BlasManaged
                 }
     }
 
+    [MethodImpl(Hot)]
     private static void SymmEpilogueFloat(
         int m, int n, float alpha, ReadOnlySpan<float> result, float beta, Span<float> c, int ldc)
     {
@@ -86,6 +89,7 @@ public static partial class BlasManaged
         }
     }
 
+    [MethodImpl(Hot)]
     private static void SymmEpilogueDouble(
         int m, int n, double alpha, ReadOnlySpan<double> result, double beta, Span<double> c, int ldc)
     {

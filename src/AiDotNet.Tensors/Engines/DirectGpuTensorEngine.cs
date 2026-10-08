@@ -270,7 +270,7 @@ public sealed class GpuScope : IDisposable
 /// <para>For concurrent weight updates during inference, consider using separate engine instances
 /// or implementing external synchronization around weight update + invalidation sequences.</para>
 /// </remarks>
-public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDisposable, Engines.Gpu.IInferenceGraphCaptureEngine
+public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDisposable, Engines.Gpu.IInferenceGraphCaptureEngine, Helpers.IRecycledArrayListener
 {
     private readonly DirectGpuEngine? _directGpu;
     private readonly bool _ownsDirectGpu;
@@ -942,6 +942,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         _directGpu = new DirectGpuEngine();
         _ownsDirectGpu = true;
         RegisterAsBackendOwner();
+        Helpers.PooledArrayRecycling.Register(this);
     }
 
     public DirectGpuTensorEngine(DirectGpuEngine directGpu)
@@ -949,6 +950,28 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         _directGpu = directGpu;
         _ownsDirectGpu = false;
         RegisterAsBackendOwner();
+        Helpers.PooledArrayRecycling.Register(this);
+    }
+
+    /// <summary>
+    /// A pooled array is being recycled: its tensor is gone, so a device copy cached under it would be served to
+    /// the next tensor that rents the array (the cache key is the array, and the new storage's GPU-cache version
+    /// can equal the recorded one). Drop the entry, and drop rather than run any pending download into the
+    /// array: its data belongs to nobody now.
+    /// </summary>
+    void Helpers.IRecycledArrayListener.OnArrayRecycled(object array)
+    {
+        if (IsDisposed || !Helpers.HostSync.AnyExists) return;
+        if (Helpers.HostSync.IsPending(array))
+            Helpers.HostSync.Remove(array);
+        if (!_activationCache.ContainsKey(array)) return;
+        ActivationCacheEntry? removed = null;
+        lock (_activationCacheLock)
+        {
+            if (_activationCache.TryRemove(array, out var entry))
+                removed = entry;
+        }
+        removed?.Dispose();
     }
 
     // Which engine placed data on a backend, so a consumer holding only a tensor (its _gpuBackend) can run follow-up
@@ -26693,6 +26716,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public void Dispose()
     {
         IsDisposed = true;
+        Helpers.PooledArrayRecycling.Unregister(this);
         UnregisterAsBackendOwner();
         // Clear activation cache to free GPU memory from cached activations
         ClearActivationCache();

@@ -3,6 +3,7 @@
 using System.Runtime.CompilerServices;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.LinearAlgebra;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines;
 
@@ -115,6 +116,7 @@ public partial class CpuEngine
     /// into a single launch is a performance optimization; it is deliberately separate from this
     /// correctness boundary.
     /// </summary>
+    [MethodImpl(Hot)]
     protected Tensor<T>[] CaptureInferenceKernelOutputs<T>(
         Tensor<T>[] inputs,
         Func<IEngine, Tensor<T>[]> execute,

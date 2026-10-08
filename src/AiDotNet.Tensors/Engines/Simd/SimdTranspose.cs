@@ -1,5 +1,6 @@
-#if NET5_0_OR_GREATER
 using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
+#if NET5_0_OR_GREATER
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics.X86;
 using AiDotNet.Tensors.Helpers;
@@ -24,6 +25,7 @@ internal static class SimdTranspose
     // Below this many elements a parallel dispatch costs more than it saves.
     private const long ParallelThreshold = 1L << 16;
 
+    [MethodImpl(Hot)]
     public static unsafe void Transpose(ReadOnlySpan<double> src, Span<double> dst, int rows, int cols)
     {
         ValidateLengths(src.Length, dst.Length, rows, cols);
@@ -44,6 +46,7 @@ internal static class SimdTranspose
         }
     }
 
+    [MethodImpl(Hot)]
     public static unsafe void Transpose(ReadOnlySpan<float> src, Span<float> dst, int rows, int cols)
     {
         ValidateLengths(src.Length, dst.Length, rows, cols);
@@ -76,6 +79,7 @@ internal static class SimdTranspose
     /// therefore owns a contiguous slice of the destination, so the first-touch page faults on a
     /// freshly allocated result are taken on disjoint pages rather than by every worker on every page.
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe void TransposeDstRowTile(double* src, double* dst, int rows, int cols, int j0)
     {
         int jEnd = Math.Min(j0 + Tile, cols);
@@ -107,6 +111,7 @@ internal static class SimdTranspose
     /// therefore owns a contiguous slice of the destination, so the first-touch page faults on a
     /// freshly allocated result are taken on disjoint pages rather than by every worker on every page.
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe void TransposeDstRowTile(float* src, float* dst, int rows, int cols, int j0)
     {
         int jEnd = Math.Min(j0 + Tile, cols);

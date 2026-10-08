@@ -1,4 +1,6 @@
 using System;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET5_0_OR_GREATER
 using System.Reflection;
 using System.Reflection.Emit;
@@ -81,6 +83,7 @@ internal static class Fp64MicrokernelEmitter
     /// <summary>
     /// Emit a fully-unrolled FP64 4×8 packed microkernel specialized to <paramref name="kc"/>.
     /// </summary>
+    [MethodImpl(Hot)]
     internal static PackedKernel Emit(int kc)
     {
         if (kc <= 0) throw new ArgumentOutOfRangeException(nameof(kc));

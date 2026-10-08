@@ -1,3 +1,4 @@
+using System.Linq;
 using BenchmarkDotNet.Configs;
 using BenchmarkDotNet.Running;
 using AiDotNet.Tensors.Benchmarks;
@@ -1649,6 +1650,16 @@ class Program
         }
 
         // Run all competitive benchmarks (TorchSharp, ML.NET, TensorFlow CPU)
+        // Run a subset of the competitive suites: --vs-all-filter "*Max*" (BenchmarkDotNet glob on the full name)
+        if (args[0] == "--vs-all-filter" && args.Length > 1)
+        {
+            var filtered = BenchConfig.AddFilter(new BenchmarkDotNet.Filters.GlobFilter(args.Skip(1).ToArray()));
+            BenchmarkRunner.Run<TorchSharpCpuComparisonBenchmarks>(filtered);
+            BenchmarkRunner.Run<MlNetCpuComparisonBenchmarks>(filtered);
+            BenchmarkRunner.Run<TensorFlowCpuComparisonBenchmarks>(filtered);
+            return;
+        }
+
         if (args[0] == "--vs-all")
         {
             BenchmarkRunner.Run<TorchSharpCpuComparisonBenchmarks>(BenchConfig);

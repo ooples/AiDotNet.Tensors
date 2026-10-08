@@ -114,6 +114,7 @@ public static class SimdHrrKernels
     /// the thread pool. The span-based overload is kept for hot single-
     /// threaded paths where task-dispatch overhead would dominate.
     /// </summary>
+    [MethodImpl(Hot)]
     public static unsafe void GatherDoubleParallel(
         double[] input, int[] indices, double[] output)
     {
@@ -136,7 +137,7 @@ public static class SimdHrrKernels
         int chunks = Math.Min(maxDop, Math.Max(1, n / ParallelThresholdElements));
         int chunkSize = (n + chunks - 1) / chunks;
 
-        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, chunks, n, chunk =>
+        AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, chunks, n, [MethodImpl(Hot)] (chunk) =>
         {
             int start = chunk * chunkSize;
             int end = Math.Min(start + chunkSize, n);
@@ -173,6 +174,7 @@ public static class SimdHrrKernels
     /// single-precision path.
     /// </summary>
     /// <inheritdoc cref="UnitPhaseCodebookDouble"/>
+    [MethodImpl(Hot)]
     public static void UnitPhaseCodebookFloat(
         Span<float> outR, Span<float> outI,
         int seed, int V, int D,
@@ -199,6 +201,7 @@ public static class SimdHrrKernels
         }
     }
 
+    [MethodImpl(Hot)]
     public static void UnitPhaseCodebookDouble(
         Span<double> outR, Span<double> outI,
         int seed, int V, int D,
@@ -245,6 +248,7 @@ public static class SimdHrrKernels
         }
     }
 
+    [MethodImpl(Hot)]
     private static uint QuantizeHrrTurn(uint turn, uint k)
     {
         uint latticeIndex = (uint)(((ulong)turn * k) >> 32);
@@ -275,6 +279,7 @@ public static class SimdHrrKernels
         652, 326, 163, 81, 41, 20, 10, 5, 3, 1
     ];
 
+    [MethodImpl(Hot)]
     private static void HrrSinCos(uint turn, out float cosine, out float sine)
     {
         uint quadrant = turn >> 30;
@@ -330,6 +335,7 @@ public static class SimdHrrKernels
     /// vs the double path when precision allows.
     /// </summary>
     /// <inheritdoc cref="PhaseCoherenceDecodeDouble"/>
+    [MethodImpl(Hot)]
     public static void PhaseCoherenceDecodeFloat(
         ReadOnlySpan<float> codesR, ReadOnlySpan<float> codesI,
         ReadOnlySpan<float> queryR, ReadOnlySpan<float> queryI,
@@ -407,6 +413,7 @@ public static class SimdHrrKernels
         return acc;
     }
 
+    [MethodImpl(Hot)]
     public static void PhaseCoherenceDecodeDouble(
         ReadOnlySpan<double> codesR, ReadOnlySpan<double> codesI,
         ReadOnlySpan<double> queryR, ReadOnlySpan<double> queryI,
@@ -561,6 +568,7 @@ public static class SimdHrrKernels
     /// kernel structure with Vector256&lt;float&gt; (8-wide).
     /// </summary>
     /// <inheritdoc cref="HRRBindAccumulateDouble"/>
+    [MethodImpl(Hot)]
     public static void HRRBindAccumulateFloat(
         ReadOnlySpan<float> keyCodeR, ReadOnlySpan<float> keyCodeI,
         ReadOnlySpan<float> valPermCodeR, ReadOnlySpan<float> valPermCodeI,
@@ -673,6 +681,7 @@ public static class SimdHrrKernels
         }
     }
 
+    [MethodImpl(Hot)]
     public static void HRRBindAccumulateDouble(
         ReadOnlySpan<double> keyCodeR, ReadOnlySpan<double> keyCodeI,
         ReadOnlySpan<double> valPermCodeR, ReadOnlySpan<double> valPermCodeI,

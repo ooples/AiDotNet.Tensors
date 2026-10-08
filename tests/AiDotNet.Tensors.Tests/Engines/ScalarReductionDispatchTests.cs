@@ -132,9 +132,35 @@ public sealed class GpuEngineScalarReductionDispatchTests
             // A device-resident tensor reduces on the device, whose summation order differs from the CPU's, so the
             // sum is compared with a tolerance; max and min are order-independent and must match exactly.
             float cpuSum = cpu.TensorSum(host);
-            Assert.Equal(cpuSum, gpuEngine.TensorSum(resident), 1e-2f);
-            Assert.Equal(cpu.TensorMaxValue(host), gpuEngine.TensorMaxValue(resident));
-            Assert.Equal(cpu.TensorMinValue(host), gpuEngine.TensorMinValue(resident));
+            float sum, max, min;
+            long fullTensorBytes = (long)length * sizeof(float);
+            using (var scope = AiDotNet.Tensors.Engines.Diagnostics.GpuResidencyScope.Begin(captureOperations: true))
+            {
+                sum = gpuEngine.TensorSum(resident);
+                max = gpuEngine.TensorMaxValue(resident);
+                min = gpuEngine.TensorMinValue(resident);
+
+                // A device reduction downloads only its scalar. A CPU fallback would have to pull the whole tensor
+                // back first, so no single download may be as large as the input.
+                foreach (var transfer in scope.Events)
+                {
+                    Assert.False(transfer.Kind == AiDotNet.Tensors.Engines.Diagnostics.GpuTransferKind.DeviceToHost
+                                 && transfer.Bytes >= fullTensorBytes,
+                        $"A reduction downloaded {transfer.Bytes} bytes ({transfer.Operation}): it ran on the CPU.");
+                }
+            }
+
+            // Positive control: pulling the tensor to the host is a full-size download, and the same check sees it.
+            using (var control = AiDotNet.Tensors.Engines.Diagnostics.GpuResidencyScope.Begin())
+            {
+                _ = resident.ToArray();
+                Assert.True(control.BytesDownloaded >= fullTensorBytes,
+                    $"The residency scope did not record a full download ({control.BytesDownloaded} bytes); the check above proves nothing on this backend.");
+            }
+
+            Assert.Equal(cpuSum, sum, 1e-2f);
+            Assert.Equal(cpu.TensorMaxValue(host), max);
+            Assert.Equal(cpu.TensorMinValue(host), min);
         }
         finally
         {

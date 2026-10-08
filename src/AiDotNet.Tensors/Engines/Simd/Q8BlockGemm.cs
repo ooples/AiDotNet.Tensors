@@ -1,5 +1,6 @@
 using System;
 using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -41,6 +42,7 @@ public static class Q8BlockGemm
     /// (int8, same length) and <paramref name="dstScales"/> (float, rows*K/32). Group size 32,
     /// symmetric, round-half-away-from-zero — identical to GGUF Q8_0 / <c>quantize_row_q8_0</c>.
     /// </summary>
+    [MethodImpl(Hot)]
     public static void QuantizeRows(ReadOnlySpan<float> src, int rows, int k, Span<sbyte> dstQs, Span<float> dstScales)
     {
         if (!IsSupportedK(k)) throw new ArgumentException($"K ({k}) must be a positive multiple of {QK}.", nameof(k));
@@ -116,6 +118,7 @@ public static class Q8BlockGemm
     }
 
 #if NET5_0_OR_GREATER
+    [MethodImpl(Hot)]
     private static unsafe void RowProduct(
         sbyte[] actQs, float[] actScales, sbyte[] wQs, float[] wSc, float[] outArr,
         int i, int k, int n, int bpr)
@@ -165,6 +168,7 @@ public static class Q8BlockGemm
         => RowProductScalar(actQs, actScales, wQs, wSc, outArr, i, k, n, bpr);
 #endif
 
+    [MethodImpl(Hot)]
     private static void RowProductScalar(
         sbyte[] actQs, float[] actScales, sbyte[] wQs, float[] wSc, float[] outArr,
         int i, int k, int n, int bpr)

@@ -1,4 +1,6 @@
 using System;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET8_0_OR_GREATER
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.Arm;
@@ -36,6 +38,7 @@ internal static class NeonStreaming
     /// FP64: 2-wide Vector128&lt;double&gt; blocks with scalar tail for n % 2.
     /// transB=true falls back to <see cref="ScalarStreaming.RunFp64"/>.
     /// </summary>
+    [MethodImpl(Hot)]
     public static unsafe void RunFp64(
         ReadOnlySpan<double> a, int lda, bool transA,
         ReadOnlySpan<double> b, int ldb, bool transB,
@@ -98,6 +101,7 @@ internal static class NeonStreaming
     /// and processes 4-col blocks per inner loop iteration.
     /// transB=true falls back to <see cref="ScalarStreaming.RunFp32"/>.
     /// </summary>
+    [MethodImpl(Hot)]
     public static unsafe void RunFp32(
         ReadOnlySpan<float> a, int lda, bool transA,
         ReadOnlySpan<float> b, int ldb, bool transB,

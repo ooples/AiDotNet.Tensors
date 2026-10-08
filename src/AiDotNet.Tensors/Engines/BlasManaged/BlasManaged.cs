@@ -2,6 +2,8 @@ using System;
 using System.Runtime.InteropServices;
 using System.Threading;
 using AiDotNet.Tensors.Helpers;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines.BlasManaged;
 
@@ -374,6 +376,7 @@ public static partial class BlasManaged
     /// Used both for the default (beta=1) pre-zero and as the localized beta=0 fallback for any
     /// strategy path that read-modify-writes C rather than overwriting it.
     /// </summary>
+    [MethodImpl(Hot)]
     private static void ClearOutputTile<T>(Span<T> c, int ldc, int m, int n) where T : unmanaged
     {
         if (ldc == n)
@@ -1315,6 +1318,7 @@ public static partial class BlasManaged
     /// <param name="m">Logical M dimension (rows of op(A)).</param>
     /// <param name="k">Logical K dimension (cols of op(A)).</param>
     /// <param name="options">Options — currently used for <see cref="BlasOptions{T}.PackingMode"/> selection.</param>
+    [MethodImpl(Hot)]
     public static WeightPackHandle PrePackA<T>(
         ReadOnlySpan<T> a, int lda, bool transA,
         int m, int k,
@@ -1443,6 +1447,7 @@ public static partial class BlasManaged
     /// <param name="k">Logical K dimension (rows of op(B)).</param>
     /// <param name="n">Logical N dimension (cols of op(B)).</param>
     /// <param name="options">Options — currently used for <see cref="BlasOptions{T}.PackingMode"/> selection.</param>
+    [MethodImpl(Hot)]
     public static WeightPackHandle PrePackB<T>(
         ReadOnlySpan<T> b, int ldb, bool transB,
         int k, int n,

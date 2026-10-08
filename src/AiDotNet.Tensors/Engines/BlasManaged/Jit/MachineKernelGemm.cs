@@ -1,4 +1,6 @@
 using System;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET5_0_OR_GREATER
 using System.Buffers;
 using System.Runtime.InteropServices;
@@ -350,6 +352,7 @@ internal static class MachineKernelGemm
     /// (the Span pack API can't be captured by the parallel lambda); A is reused across all panels.
     /// </para>
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe bool RunPacked<T>(
         ReadOnlySpan<T> a, int lda, ReadOnlySpan<T> b, int ldb, Span<T> c, int ldc,
         int m, int n, int k, int Mr, int Nr, nint kernelAddr, nint panelKernelAddr = 0) where T : unmanaged
@@ -391,7 +394,7 @@ internal static class MachineKernelGemm
 
                     int ekcL = ekc;
                     long flopsPerBlock = (long)tpbL * mStripesL * ekcL * MrL * NrL * 2;
-                    CpuParallelSettings.ParallelForOrSerial(0, jcBlocks, (long)jcBlocks * flopsPerBlock, jb =>
+                    CpuParallelSettings.ParallelForOrSerial(0, jcBlocks, (long)jcBlocks * flopsPerBlock, [MethodImpl(Hot)] (jb) =>
                     {
                         int t0 = jb * tpbL;
                         int t1 = Math.Min(t0 + tpbL, nTilesL);

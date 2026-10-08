@@ -1,6 +1,8 @@
 using System;
 using AiDotNet.Tensors.LinearAlgebra;
 using AiDotNet.Tensors.Engines.Compilation;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines;
 
@@ -35,6 +37,7 @@ namespace AiDotNet.Tensors.Engines;
 public partial class CpuEngine
 {
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<byte> TensorGatherPacked(
         Tensor<byte> packed, Tensor<int> indices, int axis, int valuesPerByte)
     {
@@ -89,6 +92,7 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<byte> TensorScatterPacked(
         Tensor<byte> packed, Tensor<int> indices, Tensor<byte> source, int axis, int valuesPerByte)
     {

@@ -11,6 +11,8 @@ using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 using AiDotNet.Tensors.Engines.Compilation;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines;
 
@@ -657,6 +659,7 @@ public partial class CpuEngine
         return 0.5 - 0.5 * Math.Cos(2.0 * Math.PI * n / N);
     }
 
+    [MethodImpl(Hot)]
     private static int Gcd(int a, int b)
     {
         while (b != 0) { int t = b; b = a % b; a = t; }

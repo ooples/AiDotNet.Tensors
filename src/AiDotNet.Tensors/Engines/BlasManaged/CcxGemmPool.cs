@@ -1,3 +1,5 @@
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET5_0_OR_GREATER
 using System;
 using System.Runtime.InteropServices;
@@ -66,6 +68,7 @@ internal static unsafe class CcxGemmPool
     /// <summary>Bench-only: bypass the [2G,4.5G] work window so CCX fires at any size (for spin-barrier A/B).</summary>
     internal static bool s_ignoreWorkGate;
 
+    [MethodImpl(Hot)]
     private static void EnsureInit()
     {
         if (Volatile.Read(ref _initState) != 0) return;
@@ -102,6 +105,7 @@ internal static unsafe class CcxGemmPool
         }
     }
 
+    [MethodImpl(Hot)]
     private static void WorkerLoop(int id)
     {
         int ccx = id / _tpc;
@@ -125,6 +129,7 @@ internal static unsafe class CcxGemmPool
     /// the .NET Barrier. The spin path keeps lanes HOT across the short K-panel intervals instead of
     /// parking them on a kernel event (the cause of the 6/32-busy stall). Bit-exact: pure ordering, no
     /// effect on the reduction.</summary>
+    [MethodImpl(Hot)]
     private static void Sync(int ccx, int lane)
     {
         if (!s_spinBarrier) { _bar[ccx].SignalAndWait(); return; }
@@ -146,6 +151,7 @@ internal static unsafe class CcxGemmPool
     // CCX owns a contiguous thin N-strip → its B lives in its own L3. Lane-parallel pack B ONCE, barrier,
     // then lanes split the ic-blocks (each only packs its own A, SIMD) via RunTilePackedB; barrier guards
     // the shared buffer across the (rare, >1) strips a CCX may own.
+    [MethodImpl(Hot)]
     private static void DoWork(int ccx, int lane)
     {
         int numJc = (_n + _nc - 1) / _nc;
@@ -174,6 +180,7 @@ internal static unsafe class CcxGemmPool
     // CCX's lanes split the M-block's ic-blocks (each packs its A-panel into L2) and accumulate C across pc
     // via RunMacroPanelStep; barrier guards the shared B-panel before the next pc. Cuts A DRAM re-reads to
     // gc× (vs numCcx× for 1D) — the lever for huge squares whose 1D full-K strip would spill L3.
+    [MethodImpl(Hot)]
     private static void DoWork2D(int ccx, int lane)
     {
         int r = ccx / _gc, cc = ccx % _gc;
@@ -203,6 +210,7 @@ internal static unsafe class CcxGemmPool
     private static int RoundUp(int x, int mult) { int r = ((x + mult - 1) / mult) * mult; return r < mult ? mult : r; }
 
     // Pick grid gr·gc = numCcx minimizing block aspect mismatch (balance M/gr vs N/gc).
+    [MethodImpl(Hot)]
     private static (int gr, int gc) ChooseGrid(int m, int n)
     {
         int best = 1; double bestScore = double.MaxValue;
@@ -221,6 +229,7 @@ internal static unsafe class CcxGemmPool
 
     /// <summary>Run C := A·B through the CCX pool, or return false if the caller should use the per-tile
     /// path (pool busy / nested / thread-budget restricted / shape outside the proven win regime).</summary>
+    [MethodImpl(Hot)]
     internal static bool TryRun(float* a, int lda, float* b, int ldb, float* c, int ldc, int m, int n, int k)
     {
         if (s_disable || !IsAvailable) return false;

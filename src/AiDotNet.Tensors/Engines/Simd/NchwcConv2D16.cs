@@ -1,5 +1,7 @@
 using System;
 using System.Threading.Tasks;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET8_0_OR_GREATER
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -23,6 +25,7 @@ internal static class NchwcConv2D16
 {
     public const int CBlock = 16;
 
+    [MethodImpl(Hot)]
     public static void Run(
         float[] input,                       // [N, cgIn, H, W, 16]
         float[] kernel,                      // [cgOut, cgIn, kH, kW, 16_in, 16_out]
@@ -68,7 +71,7 @@ internal static class NchwcConv2D16
 #endif
 
         AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, N * cgOut,
-            (long)N * cgOut * _outStrideCg, task =>
+            (long)N * cgOut * _outStrideCg, [MethodImpl(Hot)] (task) =>
         {
             int n = task / _cgOut;
             int ocg = task % _cgOut;

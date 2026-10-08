@@ -11,6 +11,8 @@ using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines;
 
@@ -83,6 +85,7 @@ public partial class CpuEngine
         return output;
     }
 
+    [MethodImpl(Hot)]
     private static int[] ValidateInterpolate<T>(Tensor<T> input, int[] sizes, InterpolateMode mode)
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
@@ -105,6 +108,7 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
+    [MethodImpl(Hot)]
     public virtual Tensor<T> InterpolateByScale<T>(Tensor<T> input, double[] scaleFactors, InterpolateMode mode, bool alignCorners = false)
     {
         if (input is null) throw new ArgumentNullException(nameof(input));
@@ -146,6 +150,7 @@ public partial class CpuEngine
     /// which uses <c>floor</c> (not rounding) of the fractional source
     /// coordinate.
     /// </summary>
+    [MethodImpl(Hot)]
     private static void InterpolateNearest<T>(Tensor<T> input, Tensor<T> output, bool alignCorners)
     {
         int rank = input.Rank;

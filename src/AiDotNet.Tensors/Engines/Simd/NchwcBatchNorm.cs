@@ -1,7 +1,8 @@
 using System;
-using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -32,6 +33,7 @@ internal static class NchwcBatchNorm
     /// channel-major order; the method packs them on the fly into [C/8, 8] to
     /// match the lane layout.
     /// </summary>
+    [MethodImpl(Hot)]
     public static void RunNchwc8(
         ReadOnlySpan<float> input,
         ReadOnlySpan<float> gamma,
@@ -123,7 +125,7 @@ internal static class NchwcBatchNorm
         }
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     private static void ProcessChannelGroup(
         float[] inArr, float[] outArr,
         int task, int cg, int spatial, int hwC,
@@ -193,6 +195,7 @@ internal static class NchwcBatchNorm
     /// Inference BN on NCHW layout <c>[N, C, H, W]</c>. Shared with the NCHWc
     /// path — we always collapse to pre-combined scale/bias and emit one FMA.
     /// </summary>
+    [MethodImpl(Hot)]
     public static void RunNchw(
         ReadOnlySpan<float> input,
         ReadOnlySpan<float> gamma,
@@ -281,7 +284,7 @@ internal static class NchwcBatchNorm
     /// (which also allocated a fresh float[8] every iteration — the
     /// dominant cost of the old kernel on BN-heavy models).
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     private static void ProcessChannel(
         float[] inArr, float[] outArr,
         int task, int C, int spatial,

@@ -1,5 +1,7 @@
 using System;
 using System.Runtime.InteropServices;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines.BlasManaged;
 
@@ -37,6 +39,7 @@ internal static class ActivationEpilogue
         throw new NotSupportedException($"ActivationEpilogue does not support T={typeof(T).Name}.");
     }
 
+    [MethodImpl(Hot)]
     private static void ApplyFp64(Span<double> c, int ldc, int m, int n, FusedActivationType activation, FusedActivationParams? p = null)
     {
         switch (activation)
@@ -226,6 +229,7 @@ internal static class ActivationEpilogue
         }
     }
 
+    [MethodImpl(Hot)]
     private static void ApplyFp32(Span<float> c, int ldc, int m, int n, FusedActivationType activation, FusedActivationParams? p = null)
     {
         switch (activation)

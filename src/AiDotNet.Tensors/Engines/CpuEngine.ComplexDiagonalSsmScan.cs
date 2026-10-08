@@ -4,6 +4,8 @@ using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines;
 
@@ -123,6 +125,7 @@ public partial class CpuEngine
         EnsureShape(skip, new[] { groups, width }, nameof(skip));
     }
 
+    [MethodImpl(Hot)]
     private static void EnsureShape<T>(Tensor<T> tensor, int[] expected, string paramName)
     {
         if (tensor.Rank != expected.Length)
@@ -197,6 +200,7 @@ public partial class CpuEngine
         }
     }
 
+    [MethodImpl(Hot)]
     private static void ComplexDiagonalSsmScanBackward<T>(
         Tensor<T> gradOutput,
         Tensor<T>[] inputs,

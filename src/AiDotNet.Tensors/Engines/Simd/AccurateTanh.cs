@@ -1,5 +1,6 @@
-#if NET5_0_OR_GREATER
 using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
+#if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 
@@ -23,6 +24,7 @@ internal static class AccurateTanh
 {
     public static bool IsSupported => Avx2.IsSupported && Fma.IsSupported;
 
+    [MethodImpl(Hot)]
     public static unsafe void Tanh(float* input, float* output, int length)
     {
         int i = 0;

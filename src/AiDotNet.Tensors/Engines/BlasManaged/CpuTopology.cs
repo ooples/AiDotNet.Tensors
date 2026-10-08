@@ -1,3 +1,5 @@
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET5_0_OR_GREATER
 using System;
 using System.Collections.Generic;
@@ -23,6 +25,17 @@ internal static class CpuTopology
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool SetThreadGroupAffinity(IntPtr hThread, ref GROUP_AFFINITY ga, IntPtr prev);
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PROCESSOR_NUMBER { public ushort Group; public byte Number; public byte Reserved; }
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetThreadIdealProcessorEx(IntPtr hThread, ref PROCESSOR_NUMBER ideal, IntPtr previous);
+    [DllImport("kernel32.dll")]
+    private static extern void GetCurrentProcessorNumberEx(out PROCESSOR_NUMBER number);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetProcessAffinityMask(IntPtr hProcess, out nuint processMask, out nuint systemMask);
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr GetCurrentProcess();
+
     /// <summary>An L3 cache domain (CCX): the logical cores sharing one last-level cache.</summary>
     internal readonly struct Domain
     {
@@ -33,6 +46,7 @@ internal static class CpuTopology
     }
 
     /// <summary>Enumerate L3 domains. Empty on non-Windows or on failure (caller uses the per-tile path).</summary>
+    [MethodImpl(Hot)]
     internal static Domain[] DetectL3Domains()
     {
         if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return Array.Empty<Domain>();
@@ -74,6 +88,7 @@ internal static class CpuTopology
     /// <summary>Enumerate PHYSICAL cores — one <see cref="Domain"/> per core, Mask = that core's logical
     /// procs (its SMT siblings). Lets a pool pin exactly one thread per physical core (no SMT contention),
     /// matching OpenBLAS's 1-thread-per-core decomposition. Empty on non-Windows / failure.</summary>
+    [MethodImpl(Hot)]
     internal static Domain[] DetectPhysicalCores()
     {
         if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return Array.Empty<Domain>();
@@ -114,6 +129,50 @@ internal static class CpuTopology
             finally { Marshal.FreeHGlobal(buf); }
         }
         catch { return Array.Empty<Domain>(); }
+    }
+
+    /// <summary>
+    /// The first logical processor of each physical core in the calling thread's processor group that the
+    /// process may run on, in core order. Empty on non-Windows or on failure.
+    /// </summary>
+    [MethodImpl(Hot)]
+    internal static (ushort Group, byte Number)[] UsableCoresInCurrentGroup()
+    {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return Array.Empty<(ushort, byte)>();
+        try
+        {
+            GetCurrentProcessorNumberEx(out var here);
+            ulong allowed = ulong.MaxValue;
+            // The process mask describes the primary group only; elsewhere every processor is allowed.
+            if (GetProcessAffinityMask(GetCurrentProcess(), out var processMask, out _) && processMask != 0)
+                allowed = (ulong)processMask;
+            var list = new List<(ushort, byte)>();
+            foreach (var core in DetectPhysicalCores())
+            {
+                if (core.Group != here.Group) continue;
+                ulong usable = core.Mask & allowed;
+                if (usable == 0) continue;
+                list.Add((core.Group, (byte)System.Numerics.BitOperations.TrailingZeroCount(usable)));
+            }
+            return list.ToArray();
+        }
+        catch { return Array.Empty<(ushort, byte)>(); }
+    }
+
+    /// <summary>
+    /// Sets the calling thread's ideal processor: a scheduling hint, not a restriction. The scheduler
+    /// prefers that processor whenever the thread becomes ready, so a thread that is suspended and
+    /// resumed comes back to the core whose caches hold its working set.
+    /// </summary>
+    internal static bool TrySetCurrentThreadIdealProcessor(ushort group, byte number)
+    {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return false;
+        try
+        {
+            var pn = new PROCESSOR_NUMBER { Group = group, Number = number };
+            return SetThreadIdealProcessorEx(GetCurrentThread(), ref pn, IntPtr.Zero);
+        }
+        catch { return false; }
     }
 
     /// <summary>Pin the calling thread to a domain's cores (best-effort; correctness is independent of it).</summary>

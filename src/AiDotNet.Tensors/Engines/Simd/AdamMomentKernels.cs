@@ -1,4 +1,6 @@
 using System;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -86,6 +88,7 @@ internal static class AdamMomentKernels
 #endif
 
     /// <summary>fp32 Adam/AMSGrad step, in place over <paramref name="param"/>/<paramref name="m"/>/<paramref name="v"/> (and <paramref name="vMax"/> when <paramref name="useAmsgrad"/>).</summary>
+    [MethodImpl(Hot)]
     internal static unsafe void AdamStep(
         Span<float> param, ReadOnlySpan<float> grad, Span<float> m, Span<float> v, Span<float> vMax,
         float beta1, float beta2, float oneMinusBeta1, float oneMinusBeta2,
@@ -221,6 +224,7 @@ internal static class AdamMomentKernels
     /// second-moment maximum and applies bias correction in the denominator, matching every GPU
     /// sparse backend.
     /// </summary>
+    [MethodImpl(Hot)]
     internal static void AdamStepSparse(
         Span<float> param, ReadOnlySpan<int> indices, ReadOnlySpan<float> values,
         Span<float> m, Span<float> v, Span<float> vMax,
@@ -264,6 +268,7 @@ internal static class AdamMomentKernels
     }
 
     /// <summary>fp64 Adam/AMSGrad step, in place over <paramref name="param"/>/<paramref name="m"/>/<paramref name="v"/> (and <paramref name="vMax"/> when <paramref name="useAmsgrad"/>).</summary>
+    [MethodImpl(Hot)]
     internal static unsafe void AdamStep(
         Span<double> param, ReadOnlySpan<double> grad, Span<double> m, Span<double> v, Span<double> vMax,
         double beta1, double beta2, double oneMinusBeta1, double oneMinusBeta2,
@@ -371,6 +376,7 @@ internal static class AdamMomentKernels
     }
 
     /// <summary>FP64 counterpart to the sparse FP32 Adam/AMSGrad kernel.</summary>
+    [MethodImpl(Hot)]
     internal static void AdamStepSparse(
         Span<double> param, ReadOnlySpan<int> indices, ReadOnlySpan<double> values,
         Span<double> m, Span<double> v, Span<double> vMax,
@@ -413,6 +419,7 @@ internal static class AdamMomentKernels
         }
     }
 
+    [MethodImpl(Hot)]
     private static void ValidateSparseArguments(
         int parameterLength,
         ReadOnlySpan<int> indices,

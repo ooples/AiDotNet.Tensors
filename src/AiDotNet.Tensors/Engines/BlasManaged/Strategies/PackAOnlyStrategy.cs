@@ -3,6 +3,7 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using AiDotNet.Tensors.Helpers;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines.BlasManaged;
 
@@ -84,6 +85,7 @@ internal static class PackAOnlyStrategy
     /// the microkernel's precision. Only float/double are supported (same set as
     /// <see cref="DispatchStridedMicrokernel{T}"/>).
     /// </summary>
+    [MethodImpl(Hot)]
     private static void EdgeGemm<T>(
         ReadOnlySpan<T> a, int lda, bool transA,
         ReadOnlySpan<T> b, int ldb,
@@ -206,6 +208,7 @@ internal static class PackAOnlyStrategy
     }
 
     /// <summary>Serial body — original Phase B implementation.</summary>
+    [MethodImpl(Hot)]
     private static void RunSerial<T>(
         ReadOnlySpan<T> a, int lda, bool transA,
         ReadOnlySpan<T> b, int ldb,

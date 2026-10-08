@@ -4,6 +4,8 @@ using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines;
 
@@ -122,6 +124,7 @@ public partial class CpuEngine
             }
     }
 
+    [MethodImpl(Hot)]
     protected static void RoutedDiagonalSsmBackward<T>(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output, object[] savedState,
         IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)

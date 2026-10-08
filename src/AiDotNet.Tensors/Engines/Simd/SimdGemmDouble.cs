@@ -25,6 +25,7 @@
 
 using System;
 using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -96,7 +97,7 @@ internal static partial class SimdGemm
     // rows). The packed-B layout is [kc × Nr-stride]: at K-step p the 8
     // col-elements live at packedB[p*Nr + 0..7] (contiguous within the
     // 8-col tile).
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     private static unsafe void DgemmMicroKernel4x8(
         double* pPackedA, double* pPackedB,
         double* pC, int ldc,
@@ -150,7 +151,7 @@ internal static partial class SimdGemm
     // FP64 mirror of FP32 PackA. For full-Mr rows packs 4-element broadcasts
     // contiguously: per K-step p, packed[p*Mr + r] = a[ic+r, pc+p]. The
     // microkernel reads each K iter as a contiguous Mr-element load.
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     private static unsafe void PackADouble(
         ReadOnlySpan<double> a, double[] packed, int lda,
         int ic, int mc, int pc, int kc)
@@ -198,7 +199,7 @@ internal static partial class SimdGemm
     // FP64 mirror of FP32 PackB. For full-Nr columns: per K-step p, packed
     // contains 8 contiguous doubles = the 8 column-elements at B[pc+p, jc..jc+7].
     // The microkernel reads each K iter as two Vector256<double> loads.
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     private static unsafe void PackBDouble(
         ReadOnlySpan<double> b, double[] packed, int ldb,
         int pc, int kc, int jc, int nc)
@@ -242,7 +243,7 @@ internal static partial class SimdGemm
     /// (mc × kc × nc) packed panel. C destination is the [ic:ic+mc, jc:jc+nc]
     /// slice of the global C, accessed via raw pointer + ldc.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     private static unsafe void DgemmMacroKernel(
         double* packedA, double* packedB,
         double* cBase, int ldc,
@@ -317,6 +318,7 @@ internal static partial class SimdGemm
     /// Uses ArrayPool for the packed scratch buffers — eliminates per-call
     /// GC pressure on training-loop hot paths.
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe void DgemmTiledSequential(
         ReadOnlySpan<double> a, ReadOnlySpan<double> b, Span<double> c,
         int m, int k, int n)
@@ -369,6 +371,7 @@ internal static partial class SimdGemm
     /// read-only across all tasks within one (jc, pc) iteration. Mirrors
     /// the FP32 SgemmTiledParallelM (lines ~2482-2562) structure.
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe void DgemmTiledParallelM(
         ReadOnlySpan<double> a, ReadOnlySpan<double> b, Span<double> c,
         int m, int k, int n)
@@ -463,6 +466,7 @@ internal static partial class SimdGemm
     /// strided sample for large). Validates the transparent prepacked-B cache
     /// against in-place weight mutation.
     /// </summary>
+    [MethodImpl(Hot)]
     internal static ulong ComputeWeightFingerprintDouble(System.ReadOnlySpan<double> data)
     {
         var bits = System.Runtime.InteropServices.MemoryMarshal.Cast<double, ulong>(data);
@@ -491,6 +495,7 @@ internal static partial class SimdGemm
     /// weights). The standard <see cref="Dgemm"/> entry auto-uses the cache
     /// when the B array identity matches; this method just primes it.
     /// </summary>
+    [MethodImpl(Hot)]
     internal static PrePackedBDouble BuildPrePackedBDouble(double[] b, int k, int n, int m)
     {
         int numJcIters = (n + DNc - 1) / DNc;
@@ -585,6 +590,7 @@ internal static partial class SimdGemm
     /// (no PackBDouble work). Saves 18-20% of wall time on training-loop
     /// hot paths where the weight matrix is reused.
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe void DgemmTiledWithPrePackedB(
         ReadOnlySpan<double> a, PrePackedBDouble prepacked, Span<double> c,
         int m, int k, int n)
@@ -659,7 +665,7 @@ internal static partial class SimdGemm
     /// pattern. Caller cleared C, so the accumulators store on top of
     /// zero — load-add-store at the bottom is correct.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     private static unsafe void DgemmDirectKernel4x8(
         double* pA, int lda,
         double* pB, int ldb,
@@ -724,6 +730,7 @@ internal static partial class SimdGemm
     /// fallback. Caller ensures C is zeroed and that the gate predicate
     /// <see cref="DgemmShouldUseDirect"/> returned true.
     /// </summary>
+    [MethodImpl(Hot)]
     private static unsafe void DgemmDirect(
         ReadOnlySpan<double> a, ReadOnlySpan<double> b, Span<double> c,
         int m, int k, int n)
@@ -1007,6 +1014,7 @@ internal static partial class SimdGemm
     private const int DgemmBlockSize = 64;
 
 #if NET5_0_OR_GREATER
+    [MethodImpl(Hot)]
     private static unsafe void DgemmAvx2(
         ReadOnlySpan<double> a,
         ReadOnlySpan<double> b,
@@ -1026,6 +1034,7 @@ internal static partial class SimdGemm
             IntPtr bHandle = (IntPtr)bPtr0;
             IntPtr cHandle = (IntPtr)cPtr0;
 
+            [MethodImpl(Hot)]
             void Tile(int iiBlock, int jjBlock)
             {
                 double* aP = (double*)aHandle;
@@ -1077,7 +1086,7 @@ internal static partial class SimdGemm
                 }
                 else
                 {
-                    AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numRowBlocks, (long)m * n * k, ii =>
+                    AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, numRowBlocks, (long)m * n * k, [MethodImpl(Hot)] (ii) =>
                     {
                         for (int jj = 0; jj < numColBlocks; jj++) Tile(ii, jj);
                     });
@@ -1094,6 +1103,7 @@ internal static partial class SimdGemm
 #endif
 
     /// <summary>Pre-AVX2 scalar fallback — row-wise FMA accumulation.</summary>
+    [MethodImpl(Hot)]
     private static void DgemmScalar(
         ReadOnlySpan<double> a,
         ReadOnlySpan<double> b,

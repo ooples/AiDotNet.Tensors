@@ -5,6 +5,8 @@ using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 using AiDotNet.Tensors.LinearAlgebra;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines;
 
@@ -266,6 +268,7 @@ public partial class CpuEngine
     }
 
     // Mean CE = -(1/N) Σ_r Σ_v target[r,v]·(logit[r,v] - logSumExp_r). Numerically stable.
+    [MethodImpl(Hot)]
     private static double FusedCeLossDouble(double[] logits, double[] target, int n, int vocab)
     {
         double total = 0.0;
@@ -304,6 +307,7 @@ public partial class CpuEngine
     }
 
     // Index-target mean CE = -(1/N) Σ_r (logit[r, id_r] - logSumExp_r). Numerically stable.
+    [MethodImpl(Hot)]
     private static double FusedCeLossIndexDouble(double[] logits, int[] ids, int n, int vocab)
     {
         double total = 0.0;
@@ -391,6 +395,7 @@ public partial class CpuEngine
         }
     }
 
+    [MethodImpl(Hot)]
     private static void SoftmaxMinusIndexDouble(
         double[] logits, int[] ids, double[] dLogits, int n, int vocab, double g)
     {
@@ -494,6 +499,7 @@ public partial class CpuEngine
         }
     }
 
+    [MethodImpl(Hot)]
     private static void SoftmaxMinusTargetDouble(
         double[] logits, double[] target, double[] dLogits, int n, int vocab, double g)
     {

@@ -5,6 +5,8 @@ using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 using AiDotNet.Tensors.LinearAlgebra;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines;
 
@@ -118,6 +120,7 @@ public partial class CpuEngine
     }
 
     // ── Double fast path ─────────────────────────────────────────────────────────────────
+    [MethodImpl(Hot)]
     private static void XLstmForwardDouble(
         double[] Q, double[] K, double[] V, double[] I, double[] F, double[] O, double[] outp,
         int batch, int seqLen, int modelDim, int numHeads, int headDim)
@@ -126,7 +129,7 @@ public partial class CpuEngine
         double kappa = 1.0 / Math.Sqrt(headDim);
         // Each (batch, head) pair is independent (private state/scratch, disjoint outputs); parallelize
         // lock-free over the combined (b*numHeads) axis. See GlaForwardDouble.
-        CpuParallelSettings.ParallelForChunks(batch * numHeads, GlaBhGrain, (bhStart, bhCount) =>
+        CpuParallelSettings.ParallelForChunks(batch * numHeads, GlaBhGrain, [MethodImpl(Hot)] (bhStart, bhCount) =>
         {
             var C = new double[hh];
             var n = new double[headDim];
@@ -168,6 +171,7 @@ public partial class CpuEngine
         });
     }
 
+    [MethodImpl(Hot)]
     private static void XLstmBackwardDouble(
         double[] dOut, double[] Q, double[] K, double[] V, double[] I, double[] F, double[] O,
         double[] dQ, double[] dK, double[] dV, double[] dI, double[] dF, double[] dO,
@@ -176,7 +180,7 @@ public partial class CpuEngine
         int hh = headDim * headDim;
         double kappa = 1.0 / Math.Sqrt(headDim);
         // Lock-free over the independent (b*numHeads) axis with per-chunk scratch; see GlaBackwardDouble.
-        CpuParallelSettings.ParallelForChunks(batch * numHeads, GlaBhGrain, (bhStart, bhCount) =>
+        CpuParallelSettings.ParallelForChunks(batch * numHeads, GlaBhGrain, [MethodImpl(Hot)] (bhStart, bhCount) =>
         {
             var Ctraj = new double[seqLen * hh];        // pre-update C entering step t
             var ntraj = new double[seqLen * headDim];   // pre-update n entering step t

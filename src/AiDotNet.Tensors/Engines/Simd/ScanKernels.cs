@@ -14,6 +14,7 @@
 
 using System;
 using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -28,6 +29,7 @@ internal static class ScanKernels
     /// Uses an AVX2 Sklansky block scan when available, scalar otherwise.
     /// Output[i] = Σ_{j ≤ i} input[j].
     /// </summary>
+    [MethodImpl(Hot)]
     public static void PrefixSumFloat(ReadOnlySpan<float> input, Span<float> output)
     {
         int n = input.Length;
@@ -52,6 +54,7 @@ internal static class ScanKernels
     /// In-place running-max of a contiguous <see cref="float"/> span.
     /// Output[i] = max_{j ≤ i} input[j].
     /// </summary>
+    [MethodImpl(Hot)]
     public static void RunningMaxFloat(ReadOnlySpan<float> input, Span<float> output)
     {
         int n = input.Length;
@@ -73,6 +76,7 @@ internal static class ScanKernels
     }
 
     /// <summary>Running-min (symmetric to RunningMax).</summary>
+    [MethodImpl(Hot)]
     public static void RunningMinFloat(ReadOnlySpan<float> input, Span<float> output)
     {
         int n = input.Length;
@@ -94,6 +98,7 @@ internal static class ScanKernels
     }
 
     /// <summary>Running-product (small-magnitude values only; fp32 underflows fast).</summary>
+    [MethodImpl(Hot)]
     public static void PrefixProductFloat(ReadOnlySpan<float> input, Span<float> output)
     {
         int n = input.Length;
@@ -138,6 +143,7 @@ internal static class ScanKernels
         return v;
     }
 
+    [MethodImpl(Hot)]
     private static unsafe void PrefixSumFloatAvx2(ReadOnlySpan<float> input, Span<float> output)
     {
         int n = input.Length;
@@ -169,6 +175,7 @@ internal static class ScanKernels
     // Sklansky trick works for any associative op, but we keep the
     // implementation small for the first landing and revisit if benchmarks
     // flag running-max as a hot path.
+    [MethodImpl(Hot)]
     private static void RunningMaxFloatAvx2(ReadOnlySpan<float> input, Span<float> output)
     {
         float acc = float.NegativeInfinity;
@@ -179,6 +186,7 @@ internal static class ScanKernels
         }
     }
 
+    [MethodImpl(Hot)]
     private static void RunningMinFloatAvx2(ReadOnlySpan<float> input, Span<float> output)
     {
         float acc = float.PositiveInfinity;

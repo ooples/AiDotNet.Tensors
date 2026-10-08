@@ -749,6 +749,7 @@ public static class TensorAllocator
             // sizes are not ArrayPool bucket sizes, so ArrayPool.Return would reject them.
             ThreadLocalTensorCache<T>.TryReturn(pooledArray);
 #else
+            PooledArrayRecycling.Notify(pooledArray);
             ArrayPool<T>.Shared.Return(pooledArray, clearArray: true);
 #endif
         }

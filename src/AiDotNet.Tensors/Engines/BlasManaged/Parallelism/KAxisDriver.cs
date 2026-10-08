@@ -1,4 +1,6 @@
 using System;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines.BlasManaged;
 
@@ -60,6 +62,7 @@ internal static class KAxisDriver
     /// Returns the smallest power-of-two upper bound for <paramref name="numThreads"/>.
     /// Useful when allocating partials arrays sized for ReductionTree.
     /// </summary>
+    [MethodImpl(Hot)]
     public static int RoundUpToPowerOfTwo(int numThreads)
     {
         if (numThreads <= 1) return 1;

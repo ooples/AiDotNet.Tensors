@@ -4,6 +4,7 @@ using System;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines.Simd.Sparse;
 
@@ -40,7 +41,7 @@ internal static class CsrDenseSimd
     /// (row-stride = <paramref name="n"/>). Every output row is
     /// cleared on entry — caller doesn't need to zero ahead.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public static void Multiply(
         int[] rowPtr,
         int[] colIdx,
@@ -104,6 +105,7 @@ internal static class CsrDenseSimd
 
     /// <summary>Double-precision companion. Same loop shape; smaller
     /// SIMD width (4 doubles in AVX-512, 2 in AVX-2).</summary>
+    [MethodImpl(Hot)]
     public static void MultiplyDouble(
         int[] rowPtr,
         int[] colIdx,

@@ -14,6 +14,8 @@ using System;
 using System.IO;
 using System.IO.Compression;
 using AiDotNet.Tensors.LinearAlgebra;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines;
 
@@ -90,6 +92,7 @@ internal static class PngCodec
 {
     private static readonly byte[] Signature = { 137, 80, 78, 71, 13, 10, 26, 10 };
 
+    [MethodImpl(Hot)]
     public static Tensor<byte> Decode(byte[] data)
     {
         for (int i = 0; i < 8; i++)
@@ -184,6 +187,7 @@ internal static class PngCodec
         return new Tensor<byte>(outBytes, new[] { height, width, dstChannels });
     }
 
+    [MethodImpl(Hot)]
     private static void ApplyFilter(byte filter, byte[] row, byte[] prev, int bpp)
     {
         switch (filter)
@@ -220,6 +224,7 @@ internal static class PngCodec
         }
     }
 
+    [MethodImpl(Hot)]
     public static byte[] Encode(Tensor<byte> image)
     {
         int H = image._shape[0], W = image._shape[1], C = image._shape[2];
@@ -287,6 +292,7 @@ internal static class PngCodec
     { d[o] = (byte)(v >> 24); d[o + 1] = (byte)(v >> 16); d[o + 2] = (byte)(v >> 8); d[o + 3] = (byte)v; }
 
     private static readonly uint[] CrcTable = BuildCrcTable();
+    [MethodImpl(Hot)]
     private static uint[] BuildCrcTable()
     {
         var t = new uint[256];
@@ -298,6 +304,7 @@ internal static class PngCodec
         }
         return t;
     }
+    [MethodImpl(Hot)]
     private static uint Crc32(byte[] data, int offset, int length, uint seed)
     {
         uint c = seed ^ 0xFFFFFFFF;
@@ -305,6 +312,7 @@ internal static class PngCodec
         return c ^ 0xFFFFFFFF;
     }
 
+    [MethodImpl(Hot)]
     private static uint Adler32(byte[] data)
     {
         uint a = 1, b = 0;

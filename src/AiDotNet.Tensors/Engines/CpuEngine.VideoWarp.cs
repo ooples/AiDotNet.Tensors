@@ -3,6 +3,8 @@ using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 using AiDotNet.Tensors.LinearAlgebra;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines;
 
@@ -380,6 +382,7 @@ public partial class CpuEngine
         }
     }
 
+    [MethodImpl(Hot)]
     private static double[] ComputeSplatWeights<T>(
         Tensor<T> flow, int height, int width, INumericOperations<T> numOps)
     {

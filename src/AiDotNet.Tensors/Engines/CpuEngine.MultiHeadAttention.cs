@@ -10,6 +10,7 @@ using AiDotNet.Tensors.Engines.Compilation.Serialization;
 using AiDotNet.Tensors.Engines.Simd;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines;
 
@@ -189,6 +190,7 @@ public partial class CpuEngine
     /// constructs <see cref="Tensor{T}"/> wrappers at the boundaries with
     /// <see cref="ScaledDotProductAttention{T}"/>.
     /// </summary>
+    [MethodImpl(Hot)]
     private unsafe Tensor<float> MultiHeadAttentionForwardFloat(
         Tensor<float> input,
         Tensor<float> qWeight, Tensor<float> kWeight, Tensor<float> vWeight, Tensor<float> outWeight,
@@ -361,6 +363,7 @@ public partial class CpuEngine
     /// projection GEMMs write into one allocation; this places <paramref name="source"/> at
     /// <paramref name="destinationColumn"/> within a row of <paramref name="destinationStride"/>.
     /// </remarks>
+    [MethodImpl(Hot)]
     private static void CopyMhaProjection(
         float[] source, float[] destination,
         int rows, int dModel, int destinationStride, int destinationColumn)
@@ -392,6 +395,7 @@ public partial class CpuEngine
     /// <param name="qkv">Fused projection buffer; row r=(b*seq+s) has stride
     /// <paramref name="qkvRowStride"/>; q/k/v blocks start at qCol/kCol/vCol and
     /// within a block the per-head layout is [..., h*dHead + d].</param>
+    [MethodImpl(Hot)]
     private unsafe void MultiHeadAttentionFusedSdpa(
         float[] qkv, int qkvRowStride, int qCol, int kCol, int vCol,
         Tensor<bool>? mask, double scaleValue,
@@ -425,7 +429,7 @@ public partial class CpuEngine
         // One pool keeps workers hot across QKV-GEMM → SDPA → out-proj. Each chunk
         // rents scratch once and strides over its (b,h) slices.
         int _sdpaChunks = Math.Max(1, Math.Min(bhCount, CpuParallelSettings.MaxDegreeOfParallelism));
-        PersistentParallelExecutor.Instance.Execute(_sdpaChunks, chunk =>
+        PersistentParallelExecutor.Instance.Execute(_sdpaChunks, [MethodImpl(Hot)] (chunk) =>
         {
             var scratch = pool.Rent(scratchLen);
             try
@@ -568,7 +572,7 @@ public partial class CpuEngine
     }
 
     /// <summary>Horizontal maximum of an AVX vector — the shift that keeps softmax stable.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     private static unsafe float HMax256(Vector256<float> v)
     {
         float* t = stackalloc float[8]; Avx.Store(t, v);
@@ -681,7 +685,7 @@ public partial class CpuEngine
 
         int chunks = Math.Max(1, Math.Min(bhCount, CpuParallelSettings.MaxDegreeOfParallelism));
 
-        PersistentParallelExecutor.Instance.Execute(chunks, chunk =>
+        PersistentParallelExecutor.Instance.Execute(chunks, [MethodImpl(Hot)] (chunk) =>
         {
             var scratch = pool.Rent(scratchLen);
             try
@@ -828,6 +832,7 @@ public partial class CpuEngine
         return Reshape(TensorMatMul(concat, outWeight), new[] { batch, seqLen, dModel });
     }
 
+    [MethodImpl(Hot)]
     private static Tensor<bool>? ExpandAttentionMaskForGraph(
         Tensor<bool>? mask, int batch, int heads, int seqQ, int seqK)
     {

@@ -2,6 +2,7 @@ using System;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Helpers;
 
@@ -90,6 +91,7 @@ internal sealed class PersistentParallelExecutor
     // Serialize concurrent Execute calls
     private readonly object _executeLock = new();
 
+    [MethodImpl(Hot)]
     private PersistentParallelExecutor()
     {
         // Size the parked pool to the MACHINE width (cores-1, ceiling 32), NOT
@@ -219,6 +221,54 @@ internal sealed class PersistentParallelExecutor
 
     private static readonly int s_hardwareThreads = Environment.ProcessorCount;
 
+#if NET5_0_OR_GREATER
+    private static readonly Lazy<(ushort Group, byte Number)[]> s_workerCores =
+        new(AiDotNet.Tensors.Engines.BlasManaged.CpuTopology.UsableCoresInCurrentGroup);
+
+    private static readonly Lazy<AiDotNet.Tensors.Engines.BlasManaged.CpuTopology.Domain[]> s_l3Domains =
+        new(AiDotNet.Tensors.Engines.BlasManaged.CpuTopology.DetectL3Domains);
+
+    // AIDOTNET_PROC_BIND (named after OpenMP's OMP_PROC_BIND): "false" leaves the workers unbound.
+    private static readonly bool s_bindWorkers =
+        !string.Equals(Environment.GetEnvironmentVariable("AIDOTNET_PROC_BIND"), "false", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Keeps a worker on the cache that holds its working set. Every dispatch hands a worker the same chunk
+    /// of the same buffers, so that data lives in the worker's L2/L3. A .NET GC suspends every managed
+    /// thread, and on resume Windows placed most workers on whichever cores were idle: on a 16-CCX
+    /// Threadripper 3990X, 23 of 31 chunks of a 1M-element sqrt ran on a different CPU after each GC, and
+    /// every line the moved worker wrote had to be pulled out of another CCX first, so the call took
+    /// ~160 µs instead of ~11 µs. (libtorch's OpenMP threads are native and never suspended by the GC.)
+    /// Each worker gets one physical core as its ideal processor (a scheduling hint) and, on machines with
+    /// more than one L3 domain, an affinity to that core's L3 domain: the scheduler can still move it among
+    /// the domain's cores when one is busy, which a single-core pin does not allow (that measured ~2 ms
+    /// p90 stalls whenever the dispatching thread sat on the pinned core). After the change, the same sqrt
+    /// measured 14-15 µs median right after a GC. Windows only; elsewhere this does nothing.
+    /// </summary>
+    [MethodImpl(Hot)]
+    private static void BindWorkerToCache(int slot)
+    {
+        if (!s_bindWorkers) return;
+        var cores = s_workerCores.Value;
+        if (cores.Length < 2) return;
+        // Workers start at the second core: the dispatching thread is not bound and usually runs near the first.
+        var (group, number) = cores[(slot + 1) % cores.Length];
+        AiDotNet.Tensors.Engines.BlasManaged.CpuTopology.TrySetCurrentThreadIdealProcessor(group, number);
+
+        var domains = s_l3Domains.Value;
+        if (domains.Length < 2) return; // one shared L3: nothing to lose by moving between cores
+        ulong bit = 1UL << number;
+        foreach (var d in domains)
+        {
+            if (d.Group == group && (d.Mask & bit) != 0)
+            {
+                AiDotNet.Tensors.Engines.BlasManaged.CpuTopology.TryPinCurrentThread(d);
+                return;
+            }
+        }
+    }
+#endif
+
     /// <summary>
     /// Runs one participant's strided chunk set: chunks <paramref name="firstChunk"/>,
     /// firstChunk+Stride, … &lt; <c>job.NumChunks</c>. In normal mode calls <c>job.Action</c> per chunk;
@@ -228,6 +278,7 @@ internal sealed class PersistentParallelExecutor
     /// re-throw first" semantics. Shared by the main thread and every worker (each passed the SAME
     /// immutable <paramref name="job"/>) so both paths behave identically.
     /// </summary>
+    [MethodImpl(Hot)]
     private static Exception? RunParticipantChunks(Job job, int firstChunk)
     {
         Exception? first = null;
@@ -321,8 +372,41 @@ internal sealed class PersistentParallelExecutor
         else AiDotNet.Tensors.Engines.BlasManaged.CpuTopology.TryPinCurrentThread(s_unpinnedDomain);
     }
 #endif
+    // How long the dispatching thread spins for its workers before blocking (Stopwatch ticks).
+    private static readonly long s_joinSpinTicks = ToStopwatchTicks(TimeSpan.FromMilliseconds(2).Ticks);
+
+    /// <summary>
+    /// Waits for the woken workers of the current dispatch. Spins (bounded) on the completion count
+    /// before blocking: ManualResetEventSlim.Wait gives up after a few microseconds and parks the
+    /// dispatching thread in the kernel, and after a GC or an idle gap the workers routinely finish a few
+    /// microseconds later than that, so every such call paid a kernel wake-up of its own thread on top
+    /// of the work. The final Wait still runs, so the last worker's Set always completes before the next
+    /// dispatch resets the event.
+    /// </summary>
+    [MethodImpl(Hot)]
+    private void WaitForWorkers()
+    {
+        if (System.Threading.Volatile.Read(ref _remaining) != 0)
+        {
+            long start = System.Diagnostics.Stopwatch.GetTimestamp();
+            int spins = 0;
+            while (System.Threading.Volatile.Read(ref _remaining) != 0)
+            {
+                System.Threading.Thread.SpinWait(16);
+                if ((++spins & 0x3F) == 0
+                    && System.Diagnostics.Stopwatch.GetTimestamp() - start >= s_joinSpinTicks)
+                    break;
+            }
+        }
+        _allDone.Wait();
+    }
+
+    [MethodImpl(Hot)]
     private void WorkerLoop(int slot)
     {
+#if NET5_0_OR_GREATER
+        BindWorkerToCache(slot);
+#endif
         while (true)
         {
             // Adaptive cooperative warm-spin: stay hot while the pool is actively
@@ -436,7 +520,7 @@ internal sealed class PersistentParallelExecutor
     /// combined. Compared against <see cref="DefaultSerialGrainSize"/>
     /// to decide between serial inline and parallel dispatch.</param>
     /// <param name="action">Per-chunk callback.</param>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     public void Execute(int numChunks, long totalWork, Action<int> action)
     {
         if (numChunks <= 0) return;
@@ -477,6 +561,7 @@ internal sealed class PersistentParallelExecutor
     /// still wins). The drop-in for a <c>Parallel.For</c> whose <c>ParallelOptions.MaxDegreeOfParallelism</c>
     /// is set per call (e.g. the SpMM row loop's thread pin).
     /// </summary>
+    [MethodImpl(Hot)]
     public void Execute(int numChunks, int maxDop, Action<int> action)
     {
         if (numChunks <= 0)
@@ -591,7 +676,7 @@ internal sealed class PersistentParallelExecutor
                 // MaxDoP==1): the main thread already ran every chunk (stride == 1), and
                 // _allDone would never be set — waiting would hang.
                 if (workersNeeded > 0)
-                    _allDone.Wait();
+                    WaitForWorkers();
 
                 _job = null; // release the body's captured references for GC between dispatches
 
@@ -617,6 +702,7 @@ internal sealed class PersistentParallelExecutor
     /// calls <paramref name="localFinally"/> ONCE — so a per-worker rented buffer is rented/returned
     /// once per participant, not per chunk. <paramref name="maxDop"/> &lt;= 0 uses the global cap.
     /// </summary>
+    [MethodImpl(Hot)]
     public void Execute<TLocal>(int numChunks, int maxDop,
         Func<TLocal> localInit, Action<int, TLocal> body, Action<TLocal> localFinally)
     {
@@ -697,7 +783,7 @@ internal sealed class PersistentParallelExecutor
                 Exception? mainException = RunParticipantChunks(job, 0);
 
                 if (workersNeeded > 0)
-                    _allDone.Wait();
+                    WaitForWorkers();
 
                 _job = null; // release the body's captured references for GC between dispatches
 

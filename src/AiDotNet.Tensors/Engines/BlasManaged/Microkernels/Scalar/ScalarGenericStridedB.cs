@@ -1,4 +1,6 @@
 using System;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines.BlasManaged;
 
@@ -26,6 +28,7 @@ namespace AiDotNet.Tensors.Engines.BlasManaged;
 internal static class ScalarGenericStridedB
 {
     /// <summary>FP32 variant: accumulate packedA·B into the C[0..mr, 0..nr] tile over kc K-steps.</summary>
+    [MethodImpl(Hot)]
     public static void RunFloat(
         ReadOnlySpan<float> packedA, int mr,
         ReadOnlySpan<float> b, int ldb,
@@ -56,6 +59,7 @@ internal static class ScalarGenericStridedB
     }
 
     /// <summary>FP64 variant: accumulate packedA·B into the C[0..mr, 0..nr] tile over kc K-steps.</summary>
+    [MethodImpl(Hot)]
     public static void RunDouble(
         ReadOnlySpan<double> packedA, int mr,
         ReadOnlySpan<double> b, int ldb,

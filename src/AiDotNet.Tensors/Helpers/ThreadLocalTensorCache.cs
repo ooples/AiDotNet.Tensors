@@ -155,6 +155,8 @@ internal static class ThreadLocalTensorCache<T>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static bool TryReturn(T[] array)
     {
+        // The array's owner is gone and the next rent hands it to another tensor: drop device copies keyed by it.
+        PooledArrayRecycling.Notify(array);
         _cache ??= new Dictionary<int, Bucket>();
 
         int size = array.Length;

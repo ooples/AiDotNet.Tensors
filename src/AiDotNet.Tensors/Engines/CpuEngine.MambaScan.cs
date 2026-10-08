@@ -5,6 +5,8 @@ using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.Interfaces;
 using AiDotNet.Tensors.LinearAlgebra;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.Engines;
 
@@ -113,6 +115,7 @@ public partial class CpuEngine
     }
 
     // ── Double fast path ─────────────────────────────────────────────────────────────────
+    [MethodImpl(Hot)]
     private static void MambaScanForwardDouble(
         double[] X, double[] delta, double[] aLog, double[] B, double[] C, double[] D, double[] outp,
         int batch, int seqLen, int innerDim, int stateDim)
@@ -126,7 +129,7 @@ public partial class CpuEngine
         for (int b = 0; b < batch; b++)
         {
             int bb = b;
-            CpuParallelSettings.ParallelForChunks(innerDim, MambaDiGrain, (diStart, diCount) =>
+            CpuParallelSettings.ParallelForChunks(innerDim, MambaDiGrain, [MethodImpl(Hot)] (diStart, diCount) =>
             {
                 var hRow = new double[stateDim];
                 int diEnd = diStart + diCount;
@@ -162,6 +165,7 @@ public partial class CpuEngine
     /// </summary>
     private const int MambaDiGrain = 4;
 
+    [MethodImpl(Hot)]
     private static void MambaScanBackwardDouble(
         double[] dOut, double[] X, double[] delta, double[] aLog, double[] B, double[] C, double[] D,
         double[] dX, double[] dDelta, double[] dALog, double[] dB, double[] dC, double[] dD,
@@ -180,7 +184,7 @@ public partial class CpuEngine
         for (int b = 0; b < batch; b++)
         {
             int bb = b;
-            CpuParallelSettings.ParallelForChunks(innerDim, MambaDiGrain, (diStart, diCount) =>
+            CpuParallelSettings.ParallelForChunks(innerDim, MambaDiGrain, [MethodImpl(Hot)] (diStart, diCount) =>
             {
                 var hTrajRow = new double[seqLen * stateDim]; // this di's state trajectory over time
                 var st = new double[stateDim];

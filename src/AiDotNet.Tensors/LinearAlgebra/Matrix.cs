@@ -1,6 +1,8 @@
 using AiDotNet.Tensors.Helpers;
 using MA = AiDotNet.Tensors.Helpers.MatrixAllocator;
 using VA = AiDotNet.Tensors.Helpers.VectorAllocator;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 
 namespace AiDotNet.Tensors.LinearAlgebra;
 
@@ -677,6 +679,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     /// to form a matrix. Each vector becomes one column in the resulting matrix. All vectors must have
     /// the same length to create a valid matrix.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public static Matrix<T> FromColumnVectors(IEnumerable<IEnumerable<T>> vectors)
     {
         if (vectors == null)
@@ -740,6 +743,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     /// It's like taking a slice from a specific column, starting at a particular row and
     /// continuing for a specified number of elements.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public Vector<T> GetColumnSegment(int columnIndex, int startRow, int length)
     {
         var result = VA.RentUninitialized<T>(length);
@@ -820,6 +824,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     /// <para><b>For Beginners:</b> This method takes all the values in the matrix and puts them into a single vector.
     /// It goes down each column one by one, taking all values from the first column, then the second column, and so on.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public Vector<T> ToColumnVector()
     {
         Vector<T> result = new(Rows * Columns);
@@ -1028,6 +1033,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     /// The function receives the current value and its position (row and column) and returns the new value to use.
     /// This is useful for operations like scaling all values, applying mathematical functions, or conditional transformations.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public Matrix<T> Transform(Func<T, int, int, T> transformer)
     {
         Matrix<T> result = MA.RentUninitialized<T>(Rows, Columns);
@@ -1270,6 +1276,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     /// A vector is essentially a one-dimensional array of numbers. This is useful when you need to process each column
     /// individually, such as in feature extraction or statistical analysis.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public IEnumerable<Vector<T>> GetColumns()
     {
         for (var i = 0; i < Columns; i++)
@@ -1287,6 +1294,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     /// This is useful when you need to process each row individually, such as when each row represents a different
     /// data sample or observation in your dataset.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public IEnumerable<Vector<T>> GetRows()
     {
         for (var i = 0; i < Rows; i++)
@@ -1336,6 +1344,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     /// The resulting matrix will have one fewer column than the original. This is useful in feature selection
     /// when you want to exclude a particular feature (column) from your dataset.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public Matrix<T> RemoveColumn(int columnIndex)
     {
         if (columnIndex < 0 || columnIndex >= Columns)
@@ -1404,6 +1413,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     /// in a row-by-row manner. It's useful when you need to process each element of the matrix sequentially,
     /// regardless of its position in rows or columns.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public IEnumerator<T> GetEnumerator()
     {
         for (int i = 0; i < Rows; i++)
@@ -1477,6 +1487,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     /// (due to row-major storage). This method copies the column data into a new array to enable Span access.
     /// For performance-critical code, prefer GetRowSpan when possible.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public T[] GetColumnAsArray(int columnIndex)
     {
         if (columnIndex < 0 || columnIndex >= Columns)

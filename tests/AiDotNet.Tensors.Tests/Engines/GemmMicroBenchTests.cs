@@ -14,6 +14,9 @@ namespace AiDotNet.Tensors.Tests.Engines;
 /// achieved GFLOP/s — so microkernel changes can be A/B'd without the full-MLP
 /// noise (activations, 3 chained layers, allocation). Env-gated.
 /// </summary>
+// Changes process-wide CpuParallelSettings: runs in the non-parallel collection so it never races the
+// other tests that change or depend on them.
+[Collection("CpuParallelSettings")]
 public class GemmMicroBenchTests
 {
     private readonly ITestOutputHelper _output;

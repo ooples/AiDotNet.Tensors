@@ -1,7 +1,8 @@
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if !NET471
 using System;
 using System.Collections.Generic;
-using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics.X86;
 
@@ -116,6 +117,7 @@ internal static unsafe class JitGemmAvx2
     // First-encounter tuning: time JIT (into c) vs the managed kernel (into a
     // scratch), cache the winner. If managed wins, returns false so the caller
     // runs its own (managed) path into c.
+    [MethodImpl(Hot)]
     private static bool TuneAndRun(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c, int M, int N, int K, (int, int, int) key)
     {
         float[] scratch = System.Buffers.ArrayPool<float>.Shared.Rent(M * N);
@@ -149,6 +151,7 @@ internal static unsafe class JitGemmAvx2
     /// true/false force the PPE-parallel or calling-thread-serial path (benching,
     /// and serial callers already inside a PPE region).
     /// </summary>
+    [MethodImpl(Hot)]
     internal static void RunJit(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c, int M, int N, int K, bool? forceParallel)
     {
         int Mfull = M - M % 6, Nfull = N - N % 16;
@@ -175,7 +178,7 @@ internal static unsafe class JitGemmAvx2
                     int chunks = Math.Max(1, Math.Min(numRB, maxT));
                     int perChunk = (numRB + chunks - 1) / chunks;
                     int totalRB = numRB;
-                    Helpers.PersistentParallelExecutor.Instance.Execute(chunks, chunk =>
+                    Helpers.PersistentParallelExecutor.Instance.Execute(chunks, [MethodImpl(Hot)] (chunk) =>
                     {
                         int lo = chunk * perChunk, hi = Math.Min(lo + perChunk, totalRB);
                         var pk = _panelKernel;
@@ -209,6 +212,7 @@ internal static unsafe class JitGemmAvx2
         if (Mfull < M && Nfull > 0) EdgeBlock(a, b, c, M, N, K, Mfull, M, 0, Nfull);
     }
 
+    [MethodImpl(Hot)]
     private static void EdgeBlock(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c,
         int M, int N, int K, int i0, int i1, int j0, int j1)
     {
@@ -229,6 +233,7 @@ internal static unsafe class JitGemmAvx2
     // ymm14 = A broadcast. 3-base-pointer trick for the 6 strided A rows: rows 0/2/4
     // bases in RCX/RBX/RSI, index RAX=lda*4, so [base] and [base+RAX] cover all rows.
     // Win64 args: RCX=A RDX=B R8=C R9=K ; lda=[rsp+0x28] ldb=[rsp+0x30] ldc=[rsp+0x38].
+    [MethodImpl(Hot)]
     private static byte[] Emit6x16Unpacked()
     {
         var code = new List<byte>(512);
@@ -318,6 +323,7 @@ internal static unsafe class JitGemmAvx2
     // Register map inside: RAX=lda*4, R10=ldb*4, R11=ldc*4 (consts);
     // R12=A base, R13=B column base (advances 64B/cb), R14=C column base (advances 64B/cb),
     // R15=K, RBP=cb counter; RCX/RBX/RSI=A row bases, RDX=B, R8=C, R9=k (per-cb working).
+    [MethodImpl(Hot)]
     private static byte[] Emit6xNPanel()
     {
         var code = new List<byte>(700);

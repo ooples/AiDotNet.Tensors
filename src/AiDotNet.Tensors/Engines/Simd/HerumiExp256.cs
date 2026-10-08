@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -40,6 +41,7 @@ internal static class HerumiExp256
     internal static readonly float[] _table = GenerateTable();
     private static readonly float[] Table = _table;
 
+    [MethodImpl(Hot)]
     private static float[] GenerateTable()
     {
         var t = new float[L];
@@ -62,7 +64,7 @@ internal static class HerumiExp256
     /// <summary>
     /// Core SIMD exp: takes a pre-pinned table pointer to avoid per-vector pinning overhead.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     internal static unsafe Vector256<float> Exp8(Vector256<float> x, float* tablePtr)
     {
         // Detect out-of-range lanes BEFORE clamping so we can fix them after
@@ -116,7 +118,7 @@ internal static class HerumiExp256
     /// <summary>
     /// Process array using 256-entry table exp. Pins the table ONCE for the entire array.
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     internal static unsafe void ExpArray(float* input, float* output, int length)
     {
         int i = 0;

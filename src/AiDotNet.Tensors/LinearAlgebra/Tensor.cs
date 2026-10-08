@@ -1,7 +1,8 @@
 using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Helpers;
-using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Runtime.CompilerServices;
+using static AiDotNet.Tensors.Compatibility.MethodImplHelper;
 #if NET5_0_OR_GREATER
 using System.Runtime.Intrinsics;
 #endif
@@ -436,6 +437,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     private static readonly bool _debugContig =
         Environment.GetEnvironmentVariable("AIDOTNET_DEBUG_CONTIG") == "1";
 
+    [MethodImpl(Hot)]
     public Tensor<T> Contiguous()
     {
         ThrowIfSparse();
@@ -545,6 +547,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// destination are left untouched.
     /// </para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public void CopyTo(Span<T> destination)
     {
         ThrowIfSparse();
@@ -606,6 +609,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// or [3, 4, 1] with axis=2. The data doesn't change — only the metadata does.</para>
     /// <para>This is the inverse of <see cref="Squeeze(int)"/>.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public Tensor<T> ExpandDims(int axis)
     {
         if (axis < 0 || axis > Rank)
@@ -667,6 +671,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// re-reads the only row there is. That is a stride of zero — move forward zero steps when the
     /// index advances.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public Tensor<T> ExpandTo(int[] targetShape)
     {
         ThrowIfSparse();
@@ -747,6 +752,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// a tensor with shape [1, 3, 4] becomes [3, 4] when you squeeze axis 0.</para>
     /// <para>This is the inverse of <see cref="ExpandDims(int)"/>.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public Tensor<T> Squeeze(int axis)
     {
         if (axis < 0 || axis >= Rank)
@@ -776,6 +782,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// Removes all size-1 dimensions. O(1) view — no data copy.
     /// </summary>
     /// <returns>A new tensor view with all size-1 dimensions removed.</returns>
+    [MethodImpl(Hot)]
     public Tensor<T> Squeeze()
     {
         // Count non-one dimensions
@@ -960,6 +967,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </code>
     /// </para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public IEnumerator<T> GetEnumerator()
     {
         // View-safe: iterate logical elements via GetFlat, not raw storage
@@ -1128,6 +1136,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// (width x height x time), fixing the time dimension to a specific value would give you a single 2D frame from that video.
     /// The indices parameter specifies which values to fix for each dimension, starting from the first dimension.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public Tensor<T> SubTensor(params int[] indices)
     {
         if (indices.Length > Rank)
@@ -1302,6 +1311,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// - Regularization terms
     /// </para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public static Tensor<T> CreateIdentity(int size)
     {
         if (size < 1)
@@ -1533,6 +1543,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// 1. If we've processed all dimensions, copy the single value
     /// 2. Otherwise, loop through the current dimension and recursively process the next dimension</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     private void SetSubTensorRecursive(Tensor<T> subTensor, int[] indices, int dimension)
     {
         if (dimension == subTensor.Rank)
@@ -1615,6 +1626,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// This approach allows us to flatten tensors of any number of dimensions, making it very flexible.
     /// </para>
     /// </remarks>
+    [MethodImpl(Hot)]
     private void FlattenHelper(int[] indices, int dimension, ref int index, Vector<T> vector)
     {
         if (dimension == Shape.Length)
@@ -1652,6 +1664,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// 
     /// <para>All input tensors must have the same shape. The resulting tensor will have rank+1 dimensions.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public static Tensor<T> Stack(Tensor<T>[] tensors, int axis = 0)
     {
         if (tensors == null || tensors.Length == 0)
@@ -1717,6 +1730,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// - The value at position i in the permutation array indicates which dimension of the original tensor
     ///   should be placed at position i in the result
     /// </remarks>
+    [MethodImpl(Hot)]
     public Tensor<T> Transpose(int[] permutation)
     {
         ThrowIfSparse();
@@ -2026,6 +2040,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// <para>This is useful when you need to transform your data to fit a specific algorithm's requirements
     /// or to view the same data from a different perspective.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public Tensor<T> Reshape(params int[] newShape)
     {
         ThrowIfSparse();
@@ -2249,6 +2264,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// <para>For example, if your tensor represents a dataset where each row is a data sample,
     /// this method would replace one sample with new data.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public void SetRow(int rowIndex, Vector<T> vector)
     {
         if (_shape.Length < 2)
@@ -2280,10 +2296,12 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// <para>For example, when stacking 3 images of size [28ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â28] along a new first dimension, 
     /// the result will be a tensor of shape [3ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â28 ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â 28].</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     private static void CopyTensorToStack(Tensor<T> source, Tensor<T> destination, int[] destIndices, int stackAxis)
     {
         int[] _sourceIndices = new int[source.Rank];
 
+        [MethodImpl(Hot)]
         void CopyRecursive(int depth)
         {
             if (depth == source.Rank)
@@ -2328,6 +2346,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// <para>For example, if you have a collection of color photos and want to extract just the faces from each photo,
     /// you could use this method to "crop" the relevant portion from each image.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public Tensor<T> GetSubTensor(int batch, int channel, int startHeight, int startWidth, int height, int width)
     {
         if (batch < 0 || batch >= Shape[0]) throw new ArgumentOutOfRangeException(nameof(batch));
@@ -2365,6 +2384,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// <para>For example, in a dataset where each row represents a data sample (like information about 
     /// a person), this method would extract all the information for a single sample.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public Vector<T> GetVector(int index)
     {
         if (_shape.Length < 2)
@@ -2452,6 +2472,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// 
     /// <para>This is primarily used internally to efficiently loop through all elements in a tensor.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     private IEnumerable<int[]> GetIndices()
     {
         int[] index = new int[this.Rank];
@@ -2503,7 +2524,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// this measured 711 µs/call before SIMD. The single-threaded
     /// SIMD body should be ~10× faster (memory-bandwidth bound).</para>
     /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    [MethodImpl(MethodImplOptions.AggressiveInlining | Hot)]
     private static void BiasAddRowsFloatSimd(float[] af, float[] bf, float[] rf, int rows, int cols)
     {
         for (int r = 0; r < rows; r++)
@@ -2543,6 +2564,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         }
     }
 
+    [MethodImpl(Hot)]
     private static int[] GetBroadcastShape(int[] shape1, int[] shape2)
     {
         int maxRank = Math.Max(shape1.Length, shape2.Length);
@@ -2605,6 +2627,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         BroadcastElementwise(a, b, result, result._shape, op);
     }
 
+    [MethodImpl(Hot)]
     private static void ValidateBroadcastOperandShape(
         int[] operandShape, int[] resultShape, string operandName)
     {
@@ -2632,6 +2655,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         }
     }
 
+    [MethodImpl(Hot)]
     private static void BroadcastElementwise(
         Tensor<T> a, Tensor<T> b, Tensor<T> result, int[] broadcastShape, BroadcastOp op)
     {
@@ -2783,6 +2807,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     // Applies the op over a contiguous inner block. aStride / bStride are each
     // 1 (operand advances element-by-element) or 0 (operand is constant across
     // the block — a broadcast axis). Dispatches to typed SIMD for float/double.
+    [MethodImpl(Hot)]
     private static void ApplyInner(
         BroadcastOp op,
         Span<T> r, int rBase, ReadOnlySpan<T> a, int aBase, int aStride,
@@ -2831,6 +2856,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// of the same size — a gap that only mattered once implicit broadcasting made this the path
     /// every stretched operand takes.
     /// </remarks>
+    [MethodImpl(Hot)]
     private static unsafe void ApplyInnerFloat(BroadcastOp op,
         Span<float> r, int rBase, ReadOnlySpan<float> a, int aBase, int aStride,
         ReadOnlySpan<float> b, int bBase, int bStride, int len)
@@ -2888,6 +2914,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         }
     }
 
+    [MethodImpl(Hot)]
     private static unsafe void ApplyInnerDouble(BroadcastOp op,
         Span<double> r, int rBase, ReadOnlySpan<double> a, int aBase, int aStride,
         ReadOnlySpan<double> b, int bBase, int bStride, int len)
@@ -3075,6 +3102,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// This method simply changes the representation from one class to another, making it easier to
     /// use matrix-specific operations if needed.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public Matrix<T> ToMatrix()
     {
         if (Rank != 2)
@@ -3132,6 +3160,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// <para>For example, in a 3ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â4 tensor, the flat index 5 would correspond to position [1,1] 
     /// (second row, second column).</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     private void GetIndicesFromFlatIndex(int flatIndex, int[] indices)
     {
         for (int i = Rank - 1; i >= 0; i--)
@@ -3199,6 +3228,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// <para>For example, in a dataset where each row represents a sample or observation,
     /// this method would extract all features for a single sample.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public Vector<T> GetRow(int rowIndex)
     {
         EnsureMaterialized();
@@ -3247,6 +3277,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// the data is contiguous in memory and this uses a fast bulk copy. For other axes,
     /// elements are gathered with strided access.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public Vector<T> GetVectorAlongAxis(int axis, params int[] fixedIndices)
     {
         if (axis < 0 || axis >= Rank)
@@ -3307,6 +3338,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// <para><b>For Beginners:</b> This is the counterpart to GetVectorAlongAxis - it writes
     /// a 1D vector back into the tensor at the specified position.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public void SetVectorAlongAxis(Vector<T> values, int axis, params int[] fixedIndices)
     {
         if (axis < 0 || axis >= Rank)
@@ -3559,6 +3591,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// 
     /// <para>This creates a new tensor and doesn't modify the original tensor.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public Tensor<T> Transform(Func<T, int, T> transformer)
     {
         // View-safe: iterate logical elements via GetFlat
@@ -3617,6 +3650,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// </list>
     /// </para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public Tensor<T> GetSliceAlongDimension(int index, int dimension)
     {
         ThrowIfSparse();
@@ -3689,6 +3723,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// a grid, cube, or even higher-dimensional structure.
     /// </para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public static Tensor<T> FromVector(Vector<T> vector, int[]? shape = null)
     {
         if (vector == null)
@@ -4190,6 +4225,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     }
 
 
+    [MethodImpl(Hot)]
     public virtual Tensor<T> Transpose()
     {
         ThrowIfSparse();
@@ -4227,6 +4263,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// For example, for a tensor with shape [batch, rows, cols], this will produce
     /// a tensor with shape [batch, cols, rows].</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public Tensor<T> TransposeLast2D()
     {
         ThrowIfSparse();
@@ -4269,6 +4306,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// 
     /// <para>All input tensors must have the same shape except along the concatenation axis.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public static Tensor<T> Concatenate(Tensor<T>[] tensors, int axis)
     {
         if (tensors == null || tensors.Length == 0)
@@ -4365,6 +4403,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     ///
     /// <para>This is a helper method used by the Concatenate method to combine multiple tensors.</para>
     /// </remarks>
+    [MethodImpl(Hot)]
     private static void CopyTensorSlice(Tensor<T> source, int[] sourceShape, Tensor<T> destination, int axis, int destinationOffset)
     {
         int rank = sourceShape.Length;
@@ -4377,6 +4416,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         int sourceStorageOffset = source._storageOffset;
         var sourceData = source._data;
 
+        [MethodImpl(Hot)]
         void CopyRecursive(int depth)
         {
             if (depth == rank)
@@ -4414,6 +4454,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// without worrying about its multi-dimensional structure.
     /// </para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public void SetSlice(int start, Vector<T> slice)
     {
         ThrowIfSparse();
@@ -4444,6 +4485,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// Think of it like cutting through your data from different angles and replacing that slice with new data.
     /// </para>
     /// </remarks>
+    [MethodImpl(Hot)]
     public void SetSlice(int dimension, int index, Tensor<T> slice)
     {
         ThrowIfSparse();
@@ -4479,6 +4521,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         CopyFromArray(destArray);
     }
 
+    [MethodImpl(Hot)]
     private void SetSliceRecursive(T[] dest, T[] source, int[] destShape, int[] sourceShape,
         int[] destStrides, int sliceDim, int sliceIdx, int currentDim, int destOffset, ref int sourceIdx)
     {
@@ -4879,6 +4922,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// materializes it now. Equivalent to PyTorch's <c>tensor.cpu()</c>.
     /// </summary>
     /// <returns>This tensor with CPU data synchronized.</returns>
+    [MethodImpl(Hot)]
     public Tensor<T> Cpu()
     {
         if (!IsGpuResident)
