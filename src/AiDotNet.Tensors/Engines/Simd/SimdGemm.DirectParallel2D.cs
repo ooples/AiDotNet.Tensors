@@ -34,6 +34,9 @@ internal static partial class SimdGemm
     /// paths below the 2D gate. Not a production setting.</summary>
     internal static bool UseDirectParallel2D = true;
 
+    /// <summary>GEMMs the 2D path computed on this thread; a test probe that a gated shape actually took it.</summary>
+    [ThreadStatic] internal static int t_directParallel2DRuns;
+
     /// <summary>
     /// <c>C[m,n] = A[m,k] · B[k,n]</c> (row-major, no transpose, ldc = n, C overwritten) over disjoint output
     /// rectangles in parallel. Every output element is one direct-kernel FMA chain over the full k, so the result
@@ -94,6 +97,7 @@ internal static partial class SimdGemm
             if (items <= 1) body(0);
             else PersistentParallelExecutor.Instance.Execute(items, body);
         }
+        t_directParallel2DRuns++;
         return true;
     }
 }
