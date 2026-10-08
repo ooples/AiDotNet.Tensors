@@ -36973,7 +36973,12 @@ public partial class CpuEngine : ITensorLevelEngine
 
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorGather", source._shape); if (ac is not null) return ac.Execute(); }
 
-        var sourceData = source.GetFlattenedData();
+        // Read a contiguous source in place. GetFlattenedData() copies the WHOLE source, so an embedding lookup of
+        // 1024 rows from a 49K x 512 table copied all 100 MB every forward pass (PerfView main-thread stacks:
+        // TensorGather -> GetFlattenedData -> ToArray, the largest serial copy of the HRE Track B CPU step).
+        T[]? srcBacking = null;
+        int srcOff = 0;
+        if (source.IsContiguous) srcBacking = source.GetCpuBackingForStridedRead(out srcOff);
         var indicesData = indices.GetFlattenedData();
 
         // Fast path: axis=0, 2D source — embedding lookup
@@ -36981,6 +36986,8 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             int embeddingDim = source._shape[1];
             int numIndices = indices.Length;
+            var rowSource = srcBacking ?? source.GetFlattenedData();
+            int rowOff = srcBacking is null ? 0 : srcOff;
             var result = TensorAllocator.Rent<T>([numIndices, embeddingDim]);
             var resultData = result.GetDataArray();
             CpuParallelSettings.ParallelForOrSerial(0, numIndices, (long)numIndices * embeddingDim, i =>
@@ -36988,7 +36995,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 int idx = indicesData[i];
                 if (idx >= 0 && idx < source._shape[0])
                 {
-                    Array.Copy(sourceData, idx * embeddingDim, resultData, i * embeddingDim, embeddingDim);
+                    Array.Copy(rowSource, rowOff + idx * embeddingDim, resultData, i * embeddingDim, embeddingDim);
                 }
             });
 
@@ -36999,6 +37006,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // General path: gather along any axis for any-rank tensor
         {
+            var sourceData = srcBacking is not null && srcOff == 0 ? srcBacking : source.GetFlattenedData();
             // Output shape: for each dimension d, if d == axis then use indices shape, else source shape
             var outShape = ComputeGatherOutputShape(source._shape, indices._shape, normalizedAxis);
             int totalOutput = 1;

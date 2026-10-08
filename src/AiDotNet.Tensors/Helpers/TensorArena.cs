@@ -176,7 +176,7 @@ public sealed class TensorArena : IDisposable
     /// <summary>Bytes per MiB, used to render byte counters in the diagnostic messages.</summary>
     private const double BytesPerMiB = 1024.0 * 1024.0;
 
-    private static Array? RentPersistent(Type type, int elementCount)
+    private static Array? RentPersistent(Type type, int elementCount, bool zero = true)
     {
         if (elementCount < PersistThresholdElems) return null;
         var pool = _persistent;
@@ -196,7 +196,7 @@ public sealed class TensorArena : IDisposable
             // anyway — we just skip the allocation + GC. Without this, the
             // cross-arena reuse corrupts those consumers (caught by GroupNorm
             // correctness tests).
-            ClearLarge(arr);
+            if (zero) ClearLarge(arr);
             HostSync.ClearReleased(arr);   // new owner: no inherited release mark
             return arr;
         }
@@ -780,7 +780,7 @@ public sealed class TensorArena : IDisposable
                     // the normal zero-allocation reuse path below remains unchanged.
                     if (cached.IsDisposed)
                     {
-                        var replacementArray = RentPersistent(typeof(T), totalSize) as T[] ?? new T[totalSize];
+                        var replacementArray = RentPersistent(typeof(T), totalSize, zero: false) as T[] ?? new T[totalSize];
                         _ringBackingArrays.Add((typeof(T), totalSize, replacementArray));
                         TrackBackingBytes<T>(totalSize);
                         cached = LinearAlgebra.Tensor<T>.FromMemory(
@@ -806,7 +806,7 @@ public sealed class TensorArena : IDisposable
                 // Need one more tensor of this size — reuse a persistent-pool
                 // backing array if available (ring tensors are uninitialized:
                 // the caller overwrites every element, so no clear needed).
-                var newArr = RentPersistent(typeof(T), totalSize) as T[] ?? new T[totalSize];
+                var newArr = RentPersistent(typeof(T), totalSize, zero: false) as T[] ?? new T[totalSize];
                 _ringBackingArrays.Add((typeof(T), totalSize, newArr));
                 TrackBackingBytes<T>(totalSize);
                 var newTensor = LinearAlgebra.Tensor<T>.FromMemory(new Memory<T>(newArr, 0, totalSize), shape);
@@ -819,7 +819,7 @@ public sealed class TensorArena : IDisposable
         // New size — add slot
         if (_tensorRingCount < MaxTensorRingSlots)
         {
-            var arr = RentPersistent(typeof(T), totalSize) as T[] ?? new T[totalSize];
+            var arr = RentPersistent(typeof(T), totalSize, zero: false) as T[] ?? new T[totalSize];
             _ringBackingArrays.Add((typeof(T), totalSize, arr));
             TrackBackingBytes<T>(totalSize);
             var tensor = LinearAlgebra.Tensor<T>.FromMemory(new Memory<T>(arr, 0, totalSize), shape);
