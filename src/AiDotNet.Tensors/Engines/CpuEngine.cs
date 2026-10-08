@@ -10375,6 +10375,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 ThreadLocalTensorCache<float>.TryReturn(panel);
             }
         }, deterministicSafe: true);
+        t_rowBlockConvRuns++;
         return true;
     }
 
@@ -10500,24 +10501,22 @@ public partial class CpuEngine : ITensorLevelEngine
 
             // Few output channels against many output pixels is a short, wide GEMM, where SimdGemm's
             // N-parallel direct kernel beats the BLAS route 2-3x; everything else stays on BLAS.
-            bool usedBlas;
+            bool gemmHandled = false;
 #if NET5_0_OR_GREATER
-            bool shortWideGemm = Simd.SimdGemm.PrefersParallelN(outChannels, colH, colW);
-#else
-            bool shortWideGemm = Environment.ProcessorCount < 0;   // no AVX2 SimdGemm path on .NET Framework
-#endif
-            if (shortWideGemm)
+            // No AVX2 SimdGemm on .NET Framework, so this route only exists from .NET 5.
+            if (Simd.SimdGemm.PrefersParallelN(outChannels, colH, colW))
             {
                 Simd.SimdGemm.Sgemm(
                     kernelSpan.Slice(0, outChannels * colH), colH, false,
                     im2colSpan.Slice(0, sliceSize), colW, false,
                     outputSpan.Slice(outputOffset, outChannels * colW),
                     outChannels, colH, colW);
-                usedBlas = true;
+                gemmHandled = true;
             }
-            else
+#endif
+            if (!gemmHandled)
             {
-                usedBlas = Helpers.BlasProvider.TryGemm(
+                gemmHandled = Helpers.BlasProvider.TryGemm(
                     outChannels, colW, colH,
                     kernelSpan.Slice(0, outChannels * colH),
                     colH,
@@ -10527,7 +10526,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     colW);
             }
 
-            if (!usedBlas)
+            if (!gemmHandled)
             {
                 MultiplyMatrixBlockedFloat(
                     kernelSpan,
@@ -10556,6 +10555,19 @@ public partial class CpuEngine : ITensorLevelEngine
     // process-wide switch.
     [ThreadStatic]
     private static bool t_forceFullIm2Col;
+
+    // How many convolutions this thread ran through TryConv2DRowBlockParallelFloat, so a test can prove the
+    // route was taken rather than only that the result matched. Thread-static: tests running in parallel
+    // cannot disturb each other's count.
+#if NET5_0_OR_GREATER
+    [ThreadStatic]
+    private static int t_rowBlockConvRuns;
+
+    internal static int RowBlockConvRunsOnThisThread => t_rowBlockConvRuns;
+#else
+    // The row-block route needs AVX2 SimdGemm, which .NET Framework does not have.
+    internal static int RowBlockConvRunsOnThisThread => 0;
+#endif
 
     // Test-only twin of t_forceFullIm2Col: keeps the implicit-GEMM path reachable for shapes the
     // short-wide routing above now sends to the full im2col path, so its parity test still runs it.
@@ -10588,6 +10600,13 @@ public partial class CpuEngine : ITensorLevelEngine
     // (it is written then immediately consumed, never spilled to DRAM). 8 MB is
     // comfortably below typical shared-L3 while leaving N large enough for an
     // efficient GEMM. Floats, so /4 the byte budget.
+    // Parallel float reductions split work into chunks of a whole number of 32-float blocks, so each chunk starts
+    // on a 128-byte boundary and its SIMD loop needs no head peel.
+    private const int FloatChunkAlignment = 32;
+
+    private static int AlignFloatChunk(int elements)
+        => (elements + FloatChunkAlignment - 1) & ~(FloatChunkAlignment - 1);
+
     private const int FusedConvPanelFloatBudget = 2 * 1024 * 1024; // 8 MB of floats
 
     /// <summary>
@@ -43560,7 +43579,7 @@ public partial class CpuEngine : ITensorLevelEngine
             return result;
         }
 
-        int chunkSize = ((length + chunks - 1) / chunks + 31) & ~31;
+        int chunkSize = AlignFloatChunk((length + chunks - 1) / chunks);
         CpuParallelSettings.ParallelForOrSerial(0, chunks, length, c =>
         {
             int start = c * chunkSize;
@@ -45301,7 +45320,7 @@ public partial class CpuEngine : ITensorLevelEngine
             return;
         }
 
-        int chunkSize = ((length + numChunks - 1) / numChunks + 31) & ~31;   // 32-float aligned chunks
+        int chunkSize = AlignFloatChunk((length + numChunks - 1) / numChunks);
         CpuParallelSettings.ParallelForOrSerial(0, numChunks, length, chunk =>
         {
             int start = chunk * chunkSize;
@@ -45333,7 +45352,7 @@ public partial class CpuEngine : ITensorLevelEngine
             return;
         }
 
-        int chunkSize = ((length + numChunks - 1) / numChunks + 31) & ~31;
+        int chunkSize = AlignFloatChunk((length + numChunks - 1) / numChunks);
         CpuParallelSettings.ParallelForOrSerial(0, numChunks, length, chunk =>
         {
             int start = chunk * chunkSize;

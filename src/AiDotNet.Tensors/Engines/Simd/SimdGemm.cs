@@ -1458,7 +1458,7 @@ internal static partial class SimdGemm
         // Column-panel direct GEMM where it wins (see PrefersParallelN): ahead of the JIT small-K,
         // OpenBLAS and M-sliced routes below, which it beats at every shape it accepts. The store
         // kernels overwrite C, so no Clear is needed.
-        if (!transA && !transB && lda == k && ldb == n && PrefersParallelN(m, k, n))
+        if (UseParallelGemm && !transA && !transB && lda == k && ldb == n && PrefersParallelN(m, k, n))
         {
             SgemmDirectParallelN(a, lda, b, ldb, c, m, k, n, clearedOutput: true);
             return;
@@ -1468,7 +1468,7 @@ internal static partial class SimdGemm
         // transpose B once (SIMD, recycled scratch) and take the column-panel path. The transB direct
         // route re-reads B column-strided for every 6-row block: Q[512x64]·Kᵀ took 291 µs against
         // 19 µs (transpose) + 59 µs here.
-        if (!transA && transB && lda == k && ldb == k && PrefersParallelN(m, k, n)
+        if (UseParallelGemm && !transA && transB && lda == k && ldb == k && PrefersParallelN(m, k, n)
             && (long)k * n * sizeof(float) <= ParallelNMaxABytes)
         {
             float[] bt = Helpers.ThreadLocalTensorCache<float>.RentOrAllocateExact(k * n);
@@ -2291,6 +2291,13 @@ internal static partial class SimdGemm
         }
     }
 
+    /// <summary>Largest A (bytes) re-streamed per column panel by <see cref="SgemmDirectParallelN"/>.</summary>
+    private const long ParallelNMaxABytes = 4L * 1024 * 1024;
+
+    /// <summary>Largest K for <see cref="SgemmDirectParallelN"/>: its 16-wide B panel (K x 16 floats) stays
+    /// in L2. 1024x1024x1024 measured 2190 µs here against 4370 µs on the OpenBLAS route.</summary>
+    private const int ParallelNMaxK = 1024;
+
     /// <summary>
     /// True when a row-major, untransposed <c>[m x k]·[k x n]</c> GEMM takes
     /// <see cref="SgemmDirectParallelN"/>: K small enough for the direct kernel, A small enough to
@@ -2306,13 +2313,6 @@ internal static partial class SimdGemm
     /// </remarks>
     /// <param name="requireAlignedN">The direct-GEMM gate keeps N a multiple of 8; callers that split N
     /// into their own panels (the row-block conv uses masked edge kernels on each) pass false.</param>
-    /// <summary>Largest A (bytes) re-streamed per column panel by <see cref="SgemmDirectParallelN"/>.</summary>
-    private const long ParallelNMaxABytes = 4L * 1024 * 1024;
-
-    /// <summary>Largest K for <see cref="SgemmDirectParallelN"/>: its 16-wide B panel (K x 16 floats) stays
-    /// in L2. 1024x1024x1024 measured 2190 µs here against 4370 µs on the OpenBLAS route.</summary>
-    private const int ParallelNMaxK = 1024;
-
     internal static bool PrefersParallelN(int m, int k, int n, bool requireAlignedN = true)
     {
 #if NET5_0_OR_GREATER

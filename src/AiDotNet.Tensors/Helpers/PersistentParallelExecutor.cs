@@ -170,23 +170,35 @@ internal sealed class PersistentParallelExecutor
         long micros = DefaultWarmWindowMicros;
         if (int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_PPE_WARMWINDOW_US"), out var us) && us >= 0)
             micros = us;
-        return MicrosToTicks(micros);
+        return ToStopwatchTicks(micros * (TimeSpan.TicksPerMillisecond / 1000));
     }
 
-    // ticks = seconds * frequency = (micros / 1e6) * Stopwatch.Frequency
-    private static long MicrosToTicks(long micros)
-        => (long)(micros * (System.Diagnostics.Stopwatch.Frequency / 1_000_000.0));
+    // Exact TimeSpan-tick -> Stopwatch-tick conversion. A positive duration rounds UP, so a small window never
+    // becomes 0, which would park workers immediately instead of spinning; the multiply runs in decimal, so it
+    // neither overflows nor loses the low digits a double would.
+    private static long ToStopwatchTicks(long timeSpanTicks)
+    {
+        if (timeSpanTicks <= 0) return 0;
+        decimal ticks = Math.Ceiling((decimal)timeSpanTicks * System.Diagnostics.Stopwatch.Frequency / TimeSpan.TicksPerSecond);
+        return ticks >= long.MaxValue ? long.MaxValue : (long)ticks;
+    }
+
+    private static TimeSpan FromStopwatchTicks(long stopwatchTicks)
+    {
+        decimal ticks = (decimal)stopwatchTicks * TimeSpan.TicksPerSecond / System.Diagnostics.Stopwatch.Frequency;
+        return TimeSpan.FromTicks(ticks >= long.MaxValue ? long.MaxValue : (long)Math.Ceiling(ticks));
+    }
 
     /// <summary>
     /// How long a worker keeps spinning for the next dispatch before it parks. Zero parks immediately.
     /// </summary>
     internal static TimeSpan WarmWindow
     {
-        get => TimeSpan.FromSeconds(System.Threading.Volatile.Read(ref _warmWindowTicks) / (double)System.Diagnostics.Stopwatch.Frequency);
+        get => FromStopwatchTicks(System.Threading.Volatile.Read(ref _warmWindowTicks));
         set
         {
             if (value < TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(value), "Spin time cannot be negative.");
-            System.Threading.Volatile.Write(ref _warmWindowTicks, MicrosToTicks((long)(value.Ticks / 10)));
+            System.Threading.Volatile.Write(ref _warmWindowTicks, ToStopwatchTicks(value.Ticks));
         }
     }
 
@@ -352,7 +364,10 @@ internal sealed class PersistentParallelExecutor
             // every dispatch of 33+ chunks park on hosts wider than the 32-worker pool, so the next
             // dispatch re-woke all 32 parked workers: ~100 µs per dispatch instead of ~14 µs on a
             // 128-thread host. On machines with no spare thread the behaviour is unchanged.
-            if (warm > 0 && System.Threading.Volatile.Read(ref _lastWorkersNeeded) + 1 < s_hardwareThreads && !_workReady[slot].IsSet)
+            // Only a slot the last dispatch actually used keeps warm: dispatches of a hot loop wake the same
+            // first slots, and a slot outside them would spin for a wake-up that is not coming.
+            int lastWorkers = System.Threading.Volatile.Read(ref _lastWorkersNeeded);
+            if (warm > 0 && slot < lastWorkers && lastWorkers + 1 < s_hardwareThreads && !_workReady[slot].IsSet)
             {
                 int spins = 0;
                 while (!_workReady[slot].IsSet)
