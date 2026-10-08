@@ -84,9 +84,9 @@ public sealed class GpuEngineScalarReductionDispatchTests
     [SkippableFact]
     public void HostResidentDouble_ReductionsMatchCpuFp64Exactly()
     {
-        DirectGpuTensorEngine gpu;
-        try { gpu = new DirectGpuTensorEngine(); }
-        catch { Skip.If(true, "No GPU backend"); return; }
+        // The constructor reports a missing backend through IsGpuAvailable rather than throwing, so a constructor
+        // exception is a real failure and is left to fail the test.
+        var gpu = new DirectGpuTensorEngine();
         if (!gpu.IsGpuAvailable) { gpu.Dispose(); Skip.If(true, "No GPU available"); return; }
 
         try
@@ -111,11 +111,43 @@ public sealed class GpuEngineScalarReductionDispatchTests
     }
 
     [SkippableFact]
+    public void DeviceResidentFloat_ReductionsRunOnTheDeviceAndMatchCpu()
+    {
+        var gpu = new DirectGpuTensorEngine();
+        if (!gpu.IsGpuAvailable) { gpu.Dispose(); Skip.If(true, "No GPU available"); return; }
+
+        try
+        {
+            const int length = 4096;
+            var data = new float[length];
+            var rnd = new Random(5);
+            for (int i = 0; i < length; i++) data[i] = (float)(rnd.NextDouble() * 10 - 5);
+            var host = new Tensor<float>((float[])data.Clone(), new[] { length });
+            var resident = gpu.UploadToGpu(new Tensor<float>((float[])data.Clone(), new[] { length }),
+                AiDotNet.Tensors.Engines.Gpu.GpuTensorRole.General);
+            Assert.True(resident.IsGpuResident, "The uploaded tensor should be device-resident.");
+            IEngine gpuEngine = gpu;
+            IEngine cpu = new CpuEngine();
+
+            // A device-resident tensor reduces on the device, whose summation order differs from the CPU's, so the
+            // sum is compared with a tolerance; max and min are order-independent and must match exactly.
+            float cpuSum = cpu.TensorSum(host);
+            Assert.Equal(cpuSum, gpuEngine.TensorSum(resident), 1e-2f);
+            Assert.Equal(cpu.TensorMaxValue(host), gpuEngine.TensorMaxValue(resident));
+            Assert.Equal(cpu.TensorMinValue(host), gpuEngine.TensorMinValue(resident));
+        }
+        finally
+        {
+            gpu.Dispose();
+        }
+    }
+
+    [SkippableFact]
     public void HostResidentFloat_ReductionsMatchCpu()
     {
-        DirectGpuTensorEngine gpu;
-        try { gpu = new DirectGpuTensorEngine(); }
-        catch { Skip.If(true, "No GPU backend"); return; }
+        // The constructor reports a missing backend through IsGpuAvailable rather than throwing, so a constructor
+        // exception is a real failure and is left to fail the test.
+        var gpu = new DirectGpuTensorEngine();
         if (!gpu.IsGpuAvailable) { gpu.Dispose(); Skip.If(true, "No GPU available"); return; }
 
         try

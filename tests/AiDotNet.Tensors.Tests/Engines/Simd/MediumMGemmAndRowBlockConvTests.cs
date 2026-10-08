@@ -74,10 +74,13 @@ public class MediumMGemmAndRowBlockConvTests
             var k = new Tensor<float>(Rand(rnd, cout * cin * 9), new[] { cout, cin, 3, 3 });
             var engine = new CpuEngine();
 
+            int runsBefore = CpuEngine.RowBlockConvRunsOnThisThread;
             float[] rowBlock = engine.Conv2D(x, k, stride, pad, dil).ToArray();
+            Assert.Equal(runsBefore + 1, CpuEngine.RowBlockConvRunsOnThisThread);
             float[] full;
             using (CpuEngine.ForceFullIm2ColScope())
                 full = engine.Conv2D(x, k, stride, pad, dil).ToArray();
+            Assert.Equal(runsBefore + 1, CpuEngine.RowBlockConvRunsOnThisThread);
 
             Assert.Equal(full.Length, rowBlock.Length);
             // Same products, same k order per element (both run the direct kernel over a panel of the
