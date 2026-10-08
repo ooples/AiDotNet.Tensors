@@ -251,7 +251,6 @@ public partial class CpuEngine
     // thread-static scratch that the forward recompute writes in place (S_t = g * S_{t-1} + v k^T straight into
     // slot t), so there is no state copy per step.
 
-    [ThreadStatic] private static float[]? t_glaTraj;
     [ThreadStatic] private static float[]? t_glaState;
 
     private static float[] GlaScratch(ref float[]? slot, int length)
@@ -343,53 +342,63 @@ public partial class CpuEngine
         int hh = headDim * headDim;
         CpuParallelSettings.ParallelForChunks(batch * numHeads, GlaBhGrain, (bhStart, bhCount) =>
         {
-            var trajArr = GlaScratch(ref t_glaTraj, seqLen * hh);
+            // The trajectory is seqLen * headDim^2 floats (256 MB at seqLen 4096, headDim 128). Rented per chunk, not
+            // cached per thread: a thread-static copy on every pool worker kept the peak pinned for the process.
+            // Every element is written by the forward sweep below before the backward sweep reads it.
+            var trajArr = System.Buffers.ArrayPool<float>.Shared.Rent(seqLen * hh);
             var dSArr = GlaScratch(ref t_glaState, hh);
-            fixed (float* traj = trajArr, dS = dSArr, q = Q, k = K, v = V, dO = dOut, dq = dQ, dk = dK, dv = dV)
+            try
             {
-                for (int bh = bhStart; bh < bhStart + bhCount; bh++)
+                fixed (float* traj = trajArr, dS = dSArr, q = Q, k = K, v = V, dO = dOut, dq = dQ, dk = dK, dv = dV)
                 {
-                    int b = bh / numHeads, h = bh % numHeads, hOff = h * headDim;
-
-                    // Forward recompute: S_t written straight into its trajectory slot.
-                    for (int t = 0; t < seqLen; t++)
+                    for (int bh = bhStart; bh < bhStart + bhCount; bh++)
                     {
-                        int baseOff = (b * seqLen + t) * modelDim + hOff;
-                        float g = G[(b * seqLen + t) * numHeads + h];
-                        float* st = traj + (long)t * hh;
-                        float* sp = t == 0 ? null : st - hh;
-                        for (int di = 0; di < headDim; di++)
-                            GlaDecayAxpy(st + di * headDim, sp is null ? null : sp + di * headDim, g, v[baseOff + di], k + baseOff, headDim);
-                    }
+                        int b = bh / numHeads, h = bh % numHeads, hOff = h * headDim;
 
-                    // Reverse sweep, one fused pass per state row (rows are independent within a step):
-                    //   dS_row += dOut[di] * Q            output backward
-                    //   dQ     += dOut[di] * S_t row
-                    //   dK     += V[di] * dS_row;  dV[di] += <dS_row, K>;  dg += <dS_row, S_{t-1} row>
-                    //   dS_row *= g                        adjoint carried to step t-1
-                    new Span<float>(dS, hh).Clear();
-                    for (int t = seqLen - 1; t >= 0; t--)
-                    {
-                        int baseOff = (b * seqLen + t) * modelDim + hOff;
-                        int gOff = (b * seqLen + t) * numHeads + h;
-                        float g = G[gOff];
-                        float* st = traj + (long)t * hh;
-                        float* sp = t == 0 ? null : st - hh;
-                        float dg = 0f;
-                        for (int di = 0; di < headDim; di++)
+                        // Forward recompute: S_t written straight into its trajectory slot.
+                        for (int t = 0; t < seqLen; t++)
                         {
-                            float* dRow = dS + di * headDim;
-                            float dov = dO[baseOff + di];
-                            GlaAxpy(dRow, dov, q + baseOff, headDim);
-                            GlaAxpy(dq + baseOff, dov, st + di * headDim, headDim);
-                            GlaAxpy(dk + baseOff, v[baseOff + di], dRow, headDim);
-                            dv[baseOff + di] += GlaDot(dRow, k + baseOff, headDim);
-                            if (sp is not null) dg += GlaDot(dRow, sp + di * headDim, headDim);
-                            GlaDecayAxpy(dRow, null, 0f, g, dRow, headDim);
+                            int baseOff = (b * seqLen + t) * modelDim + hOff;
+                            float g = G[(b * seqLen + t) * numHeads + h];
+                            float* st = traj + (long)t * hh;
+                            float* sp = t == 0 ? null : st - hh;
+                            for (int di = 0; di < headDim; di++)
+                                GlaDecayAxpy(st + di * headDim, sp is null ? null : sp + di * headDim, g, v[baseOff + di], k + baseOff, headDim);
                         }
-                        dG[gOff] += dg;
+
+                        // Reverse sweep, one fused pass per state row (rows are independent within a step):
+                        //   dS_row += dOut[di] * Q            output backward
+                        //   dQ     += dOut[di] * S_t row
+                        //   dK     += V[di] * dS_row;  dV[di] += <dS_row, K>;  dg += <dS_row, S_{t-1} row>
+                        //   dS_row *= g                        adjoint carried to step t-1
+                        new Span<float>(dS, hh).Clear();
+                        for (int t = seqLen - 1; t >= 0; t--)
+                        {
+                            int baseOff = (b * seqLen + t) * modelDim + hOff;
+                            int gOff = (b * seqLen + t) * numHeads + h;
+                            float g = G[gOff];
+                            float* st = traj + (long)t * hh;
+                            float* sp = t == 0 ? null : st - hh;
+                            float dg = 0f;
+                            for (int di = 0; di < headDim; di++)
+                            {
+                                float* dRow = dS + di * headDim;
+                                float dov = dO[baseOff + di];
+                                GlaAxpy(dRow, dov, q + baseOff, headDim);
+                                GlaAxpy(dq + baseOff, dov, st + di * headDim, headDim);
+                                GlaAxpy(dk + baseOff, v[baseOff + di], dRow, headDim);
+                                dv[baseOff + di] += GlaDot(dRow, k + baseOff, headDim);
+                                if (sp is not null) dg += GlaDot(dRow, sp + di * headDim, headDim);
+                                GlaDecayAxpy(dRow, null, 0f, g, dRow, headDim);
+                            }
+                            dG[gOff] += dg;
+                        }
                     }
                 }
+            }
+            finally
+            {
+                System.Buffers.ArrayPool<float>.Shared.Return(trajArr);
             }
         });
     }
