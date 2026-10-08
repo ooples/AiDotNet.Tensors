@@ -40916,7 +40916,11 @@ public partial class CpuEngine : ITensorLevelEngine
             if (activation != FusedActivationType.None)
             {
                 savedPreActivation = fusedResult.Clone();
-                ApplyFusedActivationInPlace(fusedResult, activation, activationParams);
+                // Untaped: the fused entry below owns the activation's backward. A recorded in-place
+                // activation would add its own entry (and clone), so removing the last 1-2 entries
+                // would drop it and the bias add, and orphan the matmul entry.
+                using (new NoGradScope<T>())
+                    ApplyFusedActivationInPlace(fusedResult, activation, activationParams);
             }
             RemoveLastNTapeEntries<T>(bias != null ? 2 : 1);
 
