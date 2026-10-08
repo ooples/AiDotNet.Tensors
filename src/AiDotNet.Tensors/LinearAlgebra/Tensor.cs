@@ -1894,6 +1894,28 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // row-major, innermost dim fastest), so results are bit-identical.
         int rank = Rank;
         int outRank = newShape.Length;
+        // Every axis named (a loss written ReduceSum(x, {0, 1, 2, 3})): the rank-0 result is one running sum in
+        // source row-major order, as the recursive fallback accumulates it, so the result is bit-identical. The
+        // fallback allocated an index array and made two indexer round-trips per element: 31 ms for 512K floats.
+        if (outRank == 0 && IsContiguous && _storageOffset == 0
+            && (typeof(T) == typeof(float) || typeof(T) == typeof(double)))
+        {
+            if (typeof(T) == typeof(float))
+            {
+                var s = (float[])(object)GetDataArray();
+                float acc = 0f;
+                for (int i = 0, n = Length; i < n; i++) acc += s[i];
+                ((float[])(object)result.GetDataArray())[0] = acc;
+            }
+            else
+            {
+                var s = (double[])(object)GetDataArray();
+                double acc = 0d;
+                for (int i = 0, n = Length; i < n; i++) acc += s[i];
+                ((double[])(object)result.GetDataArray())[0] = acc;
+            }
+            return result;
+        }
         if (IsContiguous && _storageOffset == 0 && outRank > 0)
         {
             // Row-major strides of the output shape.
