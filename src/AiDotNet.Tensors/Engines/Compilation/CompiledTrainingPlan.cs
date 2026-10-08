@@ -1360,6 +1360,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
 
     private Engines.DirectGpu.IGpuBuffer? _finitenessSumSquares;
     private Engines.DirectGpu.IDirectGpuBackend? _finitenessBackend;
+    private readonly List<Engines.DirectGpu.IGpuBuffer> _finitenessBuffers = new List<Engines.DirectGpu.IGpuBuffer>();
+    private readonly List<int> _finitenessSizes = new List<int>();
+
+    // The multi-tensor clip's per-step argument lists, owned by the plan and cleared per call like its scratch.
+    private readonly List<Engines.DirectGpu.IGpuBuffer> _clipBuffers = new List<Engines.DirectGpu.IGpuBuffer>();
+    private readonly List<int> _clipSizes = new List<int>();
+    private readonly List<Tensor<T>> _clipOwners = new List<Tensor<T>>();
 
     /// <summary>
     /// CUDA: every device gradient is finite exactly when their double-accumulated sum of squares is (a float squared
@@ -1375,8 +1382,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     {
         allFinite = true;
         Engines.DirectGpu.CUDA.CudaBackend? cuda = null;
-        var buffers = new List<Engines.DirectGpu.IGpuBuffer>(gpuGradients.Length);
-        var sizes = new List<int>(gpuGradients.Length);
+        // Plan-owned lists, cleared per step: this runs on every optimizer step.
+        var buffers = _finitenessBuffers;
+        var sizes = _finitenessSizes;
+        buffers.Clear();
+        sizes.Clear();
         for (int p = 0; p < gpuGradients.Length; p++)
         {
             if (gpuGradients[p] is not { } gradient || lengths[p] <= 0)
@@ -2186,10 +2196,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Tensor<T> Step()
     {
-        ClearPlanBufferReleaseMarks();
-        UploadHostWrittenParameters();
+        // The pre-step parameter upload and mark reset are part of the step: under the lock, so a concurrent caller
+        // cannot upload parameters into buffers another thread's StepCore is reading.
         lock (_stepSync)
+        {
+            ClearPlanBufferReleaseMarks();
+            UploadHostWrittenParameters();
             return StepCore();
+        }
     }
 
     private Tensor<T> StepCore()
@@ -9458,11 +9472,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // CUDA: the whole clip in four device operations, whatever the tensor count: one multi-tensor sum of
         // squares, the coefficient computed on the device, one multi-tensor scale. The per-tensor loop below issued
         // a fill + square + reduce + add and a scale per gradient, ~630 launches per N-BEATS step (AiDotNet #1804).
-        if (cb is Engines.DirectGpu.CUDA.CudaBackend multiCuda)
+        if (cb is Engines.DirectGpu.IMultiTensorKernels multiCuda)
         {
-            var buffers = new List<Engines.DirectGpu.IGpuBuffer>(gradients.Length);
-            var sizes = new List<int>(gradients.Length);
-            var owners = new List<Tensor<T>>(gradients.Length);
+            var buffers = _clipBuffers;
+            var sizes = _clipSizes;
+            var owners = _clipOwners;
+            buffers.Clear();
+            sizes.Clear();
+            owners.Clear();
             for (int p = 0; p < gradients.Length; p++)
             {
                 var g = gradients[p];

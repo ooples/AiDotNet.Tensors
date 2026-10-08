@@ -1780,7 +1780,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 InvalidateActivationCacheEntry(staleArray);
             InvalidateActivationCacheEntry(tensor.DataVector);
             if (s_staleDropTrace && tensor.Length > 0)
-                AliasDiag($"STALE-DROP len={tensor.Length} gpuVer={tensor._gpuBufferVersion} hostVer={tensor.GpuCacheVersion} caller="
+                StaleDropDiag($"STALE-DROP len={tensor.Length} gpuVer={tensor._gpuBufferVersion} hostVer={tensor.GpuCacheVersion} caller="
                     + new System.Diagnostics.StackTrace(1, false).ToString().Replace(System.Environment.NewLine, " <- "));
             tensor._gpuBuffer = null;
             tensor._gpuBackend = null;
@@ -1904,7 +1904,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public void InvalidateResidentWeightBuffer<T>(LinearAlgebra.Tensor<T> tensor)
     {
         if (s_staleDropTrace)
-            AliasDiag($"INVALIDATE-WEIGHT len={tensor.Length} caller=" + new System.Diagnostics.StackTrace(1, false).ToString().Replace(System.Environment.NewLine, " <- "));
+            StaleDropDiag($"INVALIDATE-WEIGHT len={tensor.Length} caller=" + new System.Diagnostics.StackTrace(1, false).ToString().Replace(System.Environment.NewLine, " <- "));
         // DROP (do not materialize) any pending deferred device->host download FIRST. The host
         // weight array was just updated IN PLACE by the CPU-side optimizer, so a pending download
         // holds STALE pre-step device data; letting InvalidateGpuCacheForTensor force-materialize it
@@ -2160,7 +2160,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 InvalidateActivationCacheEntry(staleArray);
             InvalidateActivationCacheEntry(tensor.DataVector);
             if (s_staleDropTrace && tensor.Length > 0)
-                AliasDiag($"STALE-DROP len={tensor.Length} gpuVer={tensor._gpuBufferVersion} hostVer={tensor.GpuCacheVersion} caller="
+                StaleDropDiag($"STALE-DROP len={tensor.Length} gpuVer={tensor._gpuBufferVersion} hostVer={tensor.GpuCacheVersion} caller="
                     + new System.Diagnostics.StackTrace(1, false).ToString().Replace(System.Environment.NewLine, " <- "));
             tensor._gpuBuffer = null;
             tensor._gpuBackend = null;
@@ -2626,7 +2626,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     internal void ReleaseDeadDeviceStorage<T>(Tensor<T> tensor)
     {
         if (s_staleDropTrace)
-            AliasDiag($"RELEASE-DEAD len={tensor.Length} caller=" + new System.Diagnostics.StackTrace(1, false).ToString().Replace(System.Environment.NewLine, " <- "));
+            StaleDropDiag($"RELEASE-DEAD len={tensor.Length} caller=" + new System.Diagnostics.StackTrace(1, false).ToString().Replace(System.Environment.NewLine, " <- "));
         var vector = tensor.DataVector;
         if (vector._deviceState is not { Buffer: { } buffer } state) return;
         if (!tensor.IsContiguous || tensor._storageOffset != 0 || tensor.Length != vector.Length) return;
@@ -3823,6 +3823,15 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // where a per-call environment lookup was ~2.6% of a CPU LSTM training step. Debug-only, process-stable flag.
     private static readonly bool s_aliasDiagEnabled =
         System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1";
+
+    // AIDOTNET_STALE_DROP_TRACE=1 writes through its own sink: AliasDiag also requires the capture-debug variable, so
+    // the trace used to pay for its stack walks and then print nothing.
+    private static void StaleDropDiag(string reason)
+    {
+        int n = s_aliasDiag.AddOrUpdate(reason, 1, (_, c) => c + 1);
+        if (n <= 3) try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(),
+            "aidotnet_graphcapture_diag.txt"), "[STALE] " + reason + System.Environment.NewLine); } catch { }
+    }
 
     private static void AliasDiag(string reason)
     {
@@ -16495,6 +16504,27 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     /// <summary>
+    /// A device-resident zero tensor filled on the device, for a backward that needs <c>zeros_like</c> without a host
+    /// upload. On CUDA the fill is a stream memset, which a graph capture records; inside a compiled action the buffer
+    /// comes from the action's stable scratch.
+    /// </summary>
+    /// <returns>False when no GPU backend is available.</returns>
+    internal bool TryResidentZeros<T>(int[] shape, out Tensor<T> zeros)
+    {
+        zeros = Tensor<T>.Empty();
+        if (!TryGetBackend(out var backend))
+            return false;
+        int size = 1;
+        foreach (var dim in shape)
+            size = checked(size * dim);
+        var buffer = RentActionScratchOrAllocate(backend, size, fullyWritten: true);
+        if (backend is DirectGpu.CUDA.CudaBackend cuda) cuda.MemsetBuffer(buffer, 0, (long)size * sizeof(float));
+        else backend.Fill(buffer, 0f, size);
+        zeros = DeferTensorResult<T>(backend, buffer, size, shape);
+        return true;
+    }
+
+    /// <summary>
     /// Creates a GPU-resident tensor filled with zeros.
     /// </summary>
     /// <typeparam name="T">The element type.</typeparam>
@@ -20224,6 +20254,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// AiDotNet N-BEATS step, #1804). CUDA float only; returns false otherwise, and in a resident (captured) step
     /// when an operand is not already device-resident, so the caller keeps its generic path.
     /// </summary>
+    /// <remarks>
+    /// The transposed-operand GEMM is a CUDA capability (cuBLAS takes the transpose flags directly). On HIP, Metal,
+    /// OpenCL, Vulkan and WebGPU the caller's generic path runs instead: a device transpose and a GEMM per gradient,
+    /// the same result on the device with two more launches per matmul.
+    /// </remarks>
     internal bool TryMatMulBackward2D<T>(
         Tensor<T> gradOutput, Tensor<T> a, Tensor<T> b, out Tensor<T>? gradA, out Tensor<T>? gradB)
     {

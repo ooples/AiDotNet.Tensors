@@ -456,7 +456,18 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
             return (a.ToArray(), b.ToArray(), grads[x].ToArray());
         }
         var cpu = Run(new CpuEngine());
-        var gpu = Run(Gpu);
+        // The GPU run must stay on the device: a silent CPU fallback would match the CPU reference trivially.
+        bool savedThrowOnFallback = DirectGpuTensorEngine.ThrowOnGpuKernelFallback;
+        (float[] s1, float[] s2, float[] dx) gpu;
+        try
+        {
+            DirectGpuTensorEngine.ThrowOnGpuKernelFallback = true;
+            gpu = Run(Gpu);
+        }
+        finally
+        {
+            DirectGpuTensorEngine.ThrowOnGpuKernelFallback = savedThrowOnFallback;
+        }
         foreach (var (name, c, g) in new[] { ("slice1", cpu.s1, gpu.s1), ("slice2", cpu.s2, gpu.s2), ("dx", cpu.dx, gpu.dx) })
         {
             Assert.Equal(c.Length, g.Length);

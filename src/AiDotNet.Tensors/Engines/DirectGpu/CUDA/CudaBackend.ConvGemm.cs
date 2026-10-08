@@ -19,16 +19,18 @@ public sealed partial class CudaBackend
     private static readonly bool s_convGemmBackward =
         System.Environment.GetEnvironmentVariable("AIDOTNET_CONV_GEMM_BACKWARD") != "0";
 
-    private IGpuBuffer ConvScratch(ref IGpuBuffer? slot, long floats)
+    private IGpuBuffer? TryConvScratch(ref IGpuBuffer? slot, long floats)
     {
         // Grown only outside a capture (shapes are fixed per plan, so the eager warmup steps size it); a captured
-        // graph bakes the pointer, so it must stay the same buffer afterwards.
+        // graph bakes the pointer, so it must stay the same buffer afterwards. Null when it cannot be sized (too large
+        // for one buffer, or undersized during a capture, where allocating would abort it): the caller falls through
+        // to the direct kernel, as it does when the ones-vector cannot be built.
         if (slot is null || slot.Size < floats)
         {
-            if (IsStreamCapturing())
-                throw new InvalidOperationException("conv GEMM scratch must be sized before capture");
+            if (floats > int.MaxValue || IsStreamCapturing())
+                return null;
             slot?.Dispose();
-            slot = AllocateBuffer(checked((int)floats));
+            slot = AllocateBuffer((int)floats);
         }
         return slot;
     }
@@ -78,8 +80,10 @@ public sealed partial class CudaBackend
         if (!ConvGemmUsable() || batch <= 0) return false;
         int L = outHeight * outWidth, P = inChannels * kernelH * kernelW;
         using var _ = PushContext();
-        var col = ConvScratch(ref _convColScratch, (long)batch * P * L);
-        var partials = ConvScratch(ref _convWeightPartials, (long)batch * outChannels * P);
+        var col = TryConvScratch(ref _convColScratch, (long)batch * P * L);
+        var partials = TryConvScratch(ref _convWeightPartials, (long)batch * outChannels * P);
+        if (col is null || partials is null)
+            return false;
         if (_convOnes is null || _convOnesLength < batch)
         {
             if (IsStreamCapturing()) return false;
@@ -116,7 +120,9 @@ public sealed partial class CudaBackend
         if (!ConvGemmUsable() || batch <= 0) return false;
         int L = outHeight * outWidth, P = inChannels * kernelH * kernelW;
         using var _ = PushContext();
-        var col = ConvScratch(ref _convColScratch, (long)batch * P * L);
+        var col = TryConvScratch(ref _convColScratch, (long)batch * P * L);
+        if (col is null)
+            return false;
 
         ApplyDeterministicGemmMathMode();
         float one = 1f, zero = 0f;

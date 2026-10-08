@@ -52,7 +52,21 @@ public partial class DirectGpuTensorEngine
         public IGpuBuffer GradH0 { get; }
         public IGpuBuffer GradC0 { get; }
         public IGpuBuffer GradBiasHh { get; }
+
+        /// <summary>Counts forwards into these buffers; each forward's backward checks it still owns them.</summary>
+        public int Generation { get; set; }
     }
+
+    // The forward a recorded node ran, compared with LstmTrainCache.Generation by its backward. One layer run twice
+    // in a step (weight sharing, an unrolled loop) writes the same per-layer buffers twice, so the first call's
+    // backward would read the second call's activations: silently wrong gradients. The check turns that into an error.
+    private sealed class LstmForwardStamp
+    {
+        public int Generation { get; set; }
+    }
+
+    private static void StampLstmForward(LstmTrainCache cache, LstmForwardStamp stamp)
+        => stamp.Generation = ++cache.Generation;
 
     private readonly ConditionalWeakTable<object, LstmTrainCache> _lstmTrainCaches = new();
 
@@ -89,7 +103,8 @@ public partial class DirectGpuTensorEngine
             return null;
 
         var cache = GetLstmTrainCache(backend, wIh, b, t, inSize, h);
-        var state = new object[] { cache };
+        var stamp = new LstmForwardStamp();
+        var state = new object[] { cache, stamp };
         var outShape = new[] { b, t, h };
 
         if (GraphMode.IsActive && GraphMode.Current is { } scope)
@@ -102,12 +117,14 @@ public partial class DirectGpuTensorEngine
                 {
                     var gpu = (DirectGpuTensorEngine)eng;
                     var result = gpu.RunLstmForward(capturedInput, capturedWih, capturedWhh, capturedBias, cache);
+                    StampLstmForward(cache, stamp);
                     CopyResultInto(eng, result, output);
                 },
                 LstmSequenceTrainBackward<T>, state);
         }
 
         var outputTensor = RunLstmForward(input, wIh, wHh, bias, cache);
+        StampLstmForward(cache, stamp);
         Autodiff.DifferentiableOps.RecordIfActive("LstmSequenceTrain", outputTensor,
             new[] { input, wIh, wHh, bias }, LstmSequenceTrainBackward<T>, state);
         return outputTensor;
@@ -140,6 +157,14 @@ public partial class DirectGpuTensorEngine
     {
         var gpu = (DirectGpuTensorEngine)engine;
         var c = (LstmTrainCache)savedState[0];
+        var stamp = (LstmForwardStamp)savedState[1];
+        if (stamp.Generation != c.Generation)
+        {
+            throw new InvalidOperationException(
+                "The fused GPU LSTM ran this layer's forward again before this call's backward, and both calls share "
+                + "one set of activation buffers, so these gradients would come from the later call. Run one forward "
+                + "per layer per step on this path, or train the layer through the per-timestep ops.");
+        }
         var backend = gpu.GetBackend() ?? throw new InvalidOperationException("No GPU backend.");
         var cuda = (Engines.DirectGpu.CUDA.CudaBackend)backend;
         var input = inputs[0]; var wIh = inputs[1]; var wHh = inputs[2];

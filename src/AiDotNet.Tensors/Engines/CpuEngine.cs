@@ -16863,6 +16863,11 @@ public partial class CpuEngine : ITensorLevelEngine
         Tensor<T> input, int[] poolSize, int[] stride, out Tensor<int> maxIndices)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
+        if (input.Rank != 4) throw new ArgumentException("MaxPool2D expects NCHW rank-4 input.", nameof(input));
+        if (poolSize is not { Length: 2 } || poolSize[0] <= 0 || poolSize[1] <= 0)
+            throw new ArgumentException("poolSize must contain two positive values.", nameof(poolSize));
+        if (stride is not { Length: 2 } || stride[0] <= 0 || stride[1] <= 0)
+            throw new ArgumentException("stride must contain two positive values.", nameof(stride));
         int batch = input._shape[0], channels = input._shape[1];
         int height = input._shape[2], width = input._shape[3];
         int poolH = poolSize[0], poolW = poolSize[1];
@@ -16892,7 +16897,9 @@ public partial class CpuEngine : ITensorLevelEngine
                 for (int ow = 0; ow < outputWidth; ow++)
                 {
                     float maxVal = float.MinValue;
-                    int maxIdx = 0;
+                    // Seeded inside the window: if nothing beats MinValue (all NaN or -inf), the backward must still
+                    // route this window's gradient to one of its own elements, not to plane position 0.
+                    int maxIdx = oh * strideH * width + ow * strideW;
                     for (int kh = 0; kh < poolH; kh++)
                     {
                         int ih = oh * strideH + kh;
@@ -16919,7 +16926,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 for (int ow = 0; ow < outputWidth; ow++)
                 {
                     T maxVal = numOps.MinValue;
-                    int maxIdx = 0;
+                    int maxIdx = oh * strideH * width + ow * strideW;
                     for (int kh = 0; kh < poolH; kh++)
                     {
                         int ih = oh * strideH + kh;
@@ -47464,8 +47471,10 @@ public partial class CpuEngine : ITensorLevelEngine
                 for (int oh = 0; oh < outH; oh++)
                     for (int ow = 0; ow < outW; ow++)
                     {
-                        int hStart = oh * h / outH, hEnd = (oh + 1) * h / outH;
-                        int wStart = ow * w / outW, wEnd = (ow + 1) * w / outW;
+                        // PyTorch adaptive bins: start = floor(i*In/Out), end = ceil((i+1)*In/Out), the rule every GPU
+                        // kernel uses. A truncated end dropped the last row/column of a bin when In % Out != 0.
+                        int hStart = oh * h / outH, hEnd = ((oh + 1) * h + outH - 1) / outH;
+                        int wStart = ow * w / outW, wEnd = ((ow + 1) * w + outW - 1) / outW;
                         int baseIdx = (batch * c + ch) * h * w;
                         double maxV = double.NegativeInfinity;
                         int maxI = baseIdx + hStart * w + wStart;

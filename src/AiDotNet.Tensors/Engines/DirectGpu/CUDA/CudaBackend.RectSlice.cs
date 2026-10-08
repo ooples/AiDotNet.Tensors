@@ -40,6 +40,12 @@ public sealed partial class CudaBackend : IRectSliceKernels
             total = checked(total * length[d]);
         }
         meta.Total = total;
+        // An out-of-bounds launch is a sticky CUDA error 700 that poisons the shared primary context for every engine
+        // in the process, so the buffers are checked against the shapes before it, not just the shapes themselves.
+        if (full.Size < stride)
+            throw new ArgumentException($"RectSlice: the full buffer holds {full.Size} elements, the shape needs {stride}.", nameof(full));
+        if (slice.Size < total)
+            throw new ArgumentException($"RectSlice: the slice buffer holds {slice.Size} elements, the slice needs {total}.", nameof(slice));
 
         using var _ = PushContext();
         uint gridDim = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);
