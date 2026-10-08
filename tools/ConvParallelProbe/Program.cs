@@ -62,6 +62,7 @@ internal static class Program
         if (args.Length > 0 && args[0] == "--gemmverify") return RunGemmVerify(eng, args);
         if (args.Length > 0 && args[0] == "--gemmaudit") return RunGemmAudit(eng, args);
         if (args.Length > 0 && args[0] == "--gemmprofile") return RunGemmProfile(eng, args);
+        if (args.Length > 0 && args[0] == "--fp16b") return RunFp16WeightAb(eng, args);
         if (args.Length > 0 && args[0] == "--gotoprofile") return RunGotoProfile(eng, args);
         if (args.Length > 0 && args[0] == "--gpu") return RunGpu(args);
         if (args.Length > 0 && args[0] == "--trainbench") return RunTrainbench(eng, args);
@@ -205,6 +206,13 @@ internal static class Program
         Measure("TensorAdd [S,D]", (long)S * D, () => eng.TensorAdd(x, x));
         Measure("LayerNorm [S,D]", (long)S * D, () => eng.LayerNorm(x, gamma, beta, 1e-5, out _, out _));
         Measure("SwishInPlace [S,4D]", 0, () => eng.SwishInPlace(h1));
+        var actOut = Rand(new[] { S, 4 * D }, rng);
+        Measure("GELU [S,4D]", (long)S * 4 * D, () => eng.GELU(h1));
+        Measure("GELUInto [S,4D]", 0, () => eng.GELUInto(actOut, h1));
+        Measure("Tanh [S,4D]", (long)S * 4 * D, () => eng.Tanh(h1));
+        Measure("Sigmoid [S,4D]", (long)S * 4 * D, () => eng.Sigmoid(h1));
+        Measure("ReLU [S,4D]", (long)S * 4 * D, () => eng.ReLU(h1));
+        Measure("Mish [S,4D]", (long)S * 4 * D, () => eng.Mish(h1));
         return 0;
     }
     private static int RunAttnBlock(CpuEngine eng, string[] a)
@@ -909,6 +917,82 @@ internal static class Program
             $"{reps * 2.0 * M * K * N / (kern / 1000.0) / 1e9:F0} | outside_runparallel_ms_per_call={(wall - runPar) / reps:F3} " +
             $"runparallel_ms_per_call={runPar / reps:F3} tiles_per_call={(double)tileCount / reps:F0} mean_tile_ms={(tileCount > 0 ? tiles / tileCount : 0):F3} " +
             $"mean_tile_start_lag_ms={(tileCount > 0 ? lag / tileCount : 0):F3} slowest_tile_ms={tileMax:F3} fastest_tile_ms={tileMin:F3} (sink={o[0]:E1})");
+        return 0;
+    }
+    // #681: a half-resident weight, two ways, alternated in one process so build layout cannot bias it.
+    // "upcast" is what ships: convert the weight into a reused fp32 buffer, then the float GEMM.
+    // "fused" converts inside GotoGemm's B-pack and never materializes the fp32 weight.
+    private static int RunFp16WeightAb(CpuEngine eng, string[] a)
+    {
+        int rounds = ArgI(a, "--rounds", 10);
+        if (rounds < 2)
+        {
+            Console.Error.WriteLine("fp16b: --rounds must be at least 2 (paired rounds alternate which path runs first).");
+            return 2;
+        }
+        CpuParallelSettings.MaxDegreeOfParallelism = ArgI(a, "--maxdop", Environment.ProcessorCount);
+        double worstDiff = 0;
+        var shapes = new (int M, int K, int N)[] { (256, 3072, 12288), (4096, 1280, 5120), (1024, 3072, 768) };
+        var rng = new Random(681);
+        foreach (var (M, K, N) in shapes)
+        {
+            var x = Rand(new[] { M, K }, rng);
+            var wHalf = new Tensor<Half>(new[] { K, N });
+            for (int i = 0; i < wHalf.Length; i++) wHalf[i] = (Half)(rng.NextDouble() - 0.5);
+            var wScratch = new Tensor<float>(new[] { K, N });
+            var halfData = wHalf.GetCpuData();
+            var scratchData = wScratch.GetCpuData();
+
+            Tensor<float> Upcast()
+            {
+                AiDotNet.Tensors.Engines.Simd.SimdKernels.ConvertToSingle(
+                    new ReadOnlySpan<Half>(halfData, 0, K * N), new Span<float>(scratchData, 0, K * N));
+                return eng.TensorMatMul(x, wScratch);
+            }
+            Tensor<float> Fused() => eng.TensorMatMulFp16WeightB(x, wHalf);
+
+            var u = Upcast(); var f = Fused();
+            double maxDiff = 0;
+            for (int i = 0; i < u.Length; i++)
+            {
+                // A non-finite value in either path is a wrong kernel; NaN would slip past the threshold.
+                if (float.IsNaN(u[i]) || float.IsInfinity(u[i]) || float.IsNaN(f[i]) || float.IsInfinity(f[i]))
+                {
+                    maxDiff = double.PositiveInfinity;
+                    break;
+                }
+                maxDiff = Math.Max(maxDiff, Math.Abs(u[i] - f[i]));
+            }
+            worstDiff = Math.Max(worstDiff, maxDiff);
+            var ratios = new double[rounds];
+            double upSum = 0, fuSum = 0;
+            for (int r = 0; r < rounds; r++)
+            {
+                bool upcastFirst = r % 2 == 0;
+                double tu = 0, tf = 0;
+                for (int pass = 0; pass < 2; pass++)
+                {
+                    bool runUpcast = (pass == 0) == upcastFirst;
+                    var sw = Stopwatch.StartNew();
+                    var res = runUpcast ? Upcast() : Fused();
+                    double ms = sw.Elapsed.TotalMilliseconds;
+                    if (res[0] == float.PositiveInfinity) Console.Write("");
+                    if (runUpcast) tu = ms; else tf = ms;
+                }
+                ratios[r] = tu / tf;
+                upSum += tu; fuSum += tf;
+            }
+            Array.Sort(ratios);
+            Console.WriteLine($"FP16B {M}x{K}x{N} upcast_mean_ms={upSum / rounds:F2} fused_mean_ms={fuSum / rounds:F2} " +
+                              $"paired_upcast/fused median={ratios[rounds / 2]:F2} range=[{ratios[0]:F2}..{ratios[rounds - 1]:F2}] max|diff|={maxDiff:E2} " +
+                              "(both paths allocate a fresh [M,N] result; even rounds run upcast first, odd rounds fused first)");
+        }
+        // Both paths compute the same product; a gap beyond fp32 reassociation noise is a wrong kernel.
+        if (worstDiff > 1e-3)
+        {
+            Console.Error.WriteLine($"fp16b: fused and upcast results differ by {worstDiff:E2}, above 1e-3.");
+            return 1;
+        }
         return 0;
     }
     private static int RunGemmProfile(CpuEngine eng, string[] a)

@@ -522,6 +522,128 @@ internal static class GotoGemmFp32
         finally { ArrayPool<float>.Shared.Return(paArr); ArrayPool<float>.Shared.Return(pbArr); }
     }
 
+    /// <summary>
+    /// <see cref="RunParallel"/> with B held as IEEE half (#681): each tile converts its own
+    /// kc x nc panel of B to fp32 inside the B-pack (bit-exact <see cref="Simd.SimdKernels.Fp16To32Vec8"/>),
+    /// so a half-resident weight is never materialized as a whole fp32 matrix. The microkernel, the
+    /// A-pack and the K order are the ones <see cref="RunParallel"/> uses, so C matches converting B
+    /// first and calling <see cref="RunParallel"/>.
+    /// </summary>
+    internal static unsafe void RunParallelHalfB(
+        float* a, int lda, ushort* bHalf, int ldb, float* c, int ldc,
+        int m, int n, int k, int mc, int nc, int kc)
+    {
+        if (k <= 0) { ZeroCBlock(c, ldc, 0, 0, m, n); return; }
+        int numIc = (m + mc - 1) / mc;
+        int numJc = (n + nc - 1) / nc;
+        int totalTiles = numIc * numJc;
+        nint ai = (nint)a, bi = (nint)bHalf, ci = (nint)c;
+        int numIcL = numIc, mcL = mc, ncL = nc, kcL = kc, mL = m, nL = n, kL = k, ldaL = lda, ldbL = ldb, ldcL = ldc;
+        CpuParallelSettings.ParallelForOrSerial(0, totalTiles, (long)m * n * k, tileIdx =>
+        {
+            int ic = (int)(tileIdx % numIcL) * mcL;
+            int jc = (int)(tileIdx / numIcL) * ncL;
+            int effMc = Math.Min(mcL, mL - ic);
+            int effNc = Math.Min(ncL, nL - jc);
+            if (effMc <= 0 || effNc <= 0) return;
+            RunTileHalfB((float*)ai, ldaL, (ushort*)bi, ldbL, (float*)ci, ldcL, ic, jc, effMc, effNc, kL, mcL, ncL, kcL);
+        }, deterministicSafe: true);
+    }
+
+    private static unsafe void RunTileHalfB(
+        float* a, int lda, ushort* bHalf, int ldb, float* c, int ldc,
+        int ic, int jc, int effMc, int effNc, int k, int mc, int nc, int kc)
+    {
+        int nFull = effNc - (effNc % Nr); int nTiles = nFull / Nr;
+        int mFull = effMc - (effMc % Mr); int mTiles = mFull / Mr;
+        float[] paArr = ArrayPool<float>.Shared.Rent(mc * kc + 8);
+        float[] pbArr = ArrayPool<float>.Shared.Rent(kc * nc);
+        try
+        {
+            fixed (float* pa = paArr, pb = pbArr)
+            {
+                var kAcc = Kernel(); var kOw = KernelOw();
+                for (int pc = 0; pc < k; pc += kc)
+                {
+                    int effKc = Math.Min(kc, k - pc);
+                    // B-pack with the fp16 -> fp32 conversion folded in: 16 halves -> two 8-float rows.
+                    for (int nt = 0; nt < nTiles; nt++)
+                    {
+                        float* dst = pb + (long)nt * effKc * Nr; int col0 = jc + nt * Nr;
+                        for (int kk = 0; kk < effKc; kk++)
+                        {
+                            ushort* brow = bHalf + (long)(pc + kk) * ldb + col0; float* d = dst + (long)kk * Nr;
+                            Simd.SimdKernels.Fp16To32Vec8(brow, d);
+                            Simd.SimdKernels.Fp16To32Vec8(brow + 8, d + 8);
+                        }
+                    }
+                    PackA6(a, lda, pa, ic, pc, effKc, mTiles);
+                    var kern = pc == 0 ? kOw : kAcc;
+                    if (pc == 0) ZeroTailStrips(c, ldc, ic, jc, effMc, effNc, mFull, nFull);
+                    for (int nt = 0; nt < nTiles; nt++)
+                    {
+                        float* bp = pb + (long)nt * effKc * Nr; int col0 = jc + nt * Nr;
+                        for (int mt = 0; mt < mTiles; mt++)
+                        {
+                            float* ap = pa + (long)mt * effKc * Mr;
+                            float* cp = c + (long)(ic + mt * Mr) * ldc + col0;
+                            kern(ap, bp, cp, (long)ldc * 4, effKc);
+                        }
+                    }
+                    HalfBTails(a, lda, bHalf, ldb, pb, c, ldc, ic, jc, effMc, effNc, mFull, nFull, pc, effKc);
+                }
+            }
+        }
+        finally { ArrayPool<float>.Shared.Return(paArr); ArrayPool<float>.Shared.Return(pbArr); }
+    }
+
+    /// <summary>
+    /// The tails of <see cref="RunTileHalfB"/>, in the same per-element K order as <see cref="ScalarTails"/>:
+    /// N-tail columns read B as half; M-tail rows read the already-converted packed panel
+    /// (<paramref name="pb"/>, layout [nt][kk][Nr]), so they cost no second conversion.
+    /// </summary>
+    private static unsafe void HalfBTails(
+        float* a, int lda, ushort* bHalf, int ldb, float* pb, float* c, int ldc,
+        int ic, int jc, int effMc, int effNc, int mFull, int nFull, int pc, int effKc)
+    {
+        for (int r = 0; r < effMc; r++)
+        {
+            float* crow = c + (long)(ic + r) * ldc;
+            float* arow = a + (long)(ic + r) * lda + pc;
+            for (int col = jc + nFull; col < jc + effNc; col++)
+            {
+                float s = 0f;
+                for (int kk = 0; kk < effKc; kk++)
+                    s += arow[kk] * (float)BitConverter.UInt16BitsToHalf(bHalf[(long)(pc + kk) * ldb + col]);
+                crow[col] += s;
+            }
+        }
+        int nTiles = nFull / Nr;
+        for (int r = ic + mFull; r < ic + effMc; r++)
+        {
+            float* crow = c + (long)r * ldc + jc;
+            float* arow = a + (long)r * lda + pc;
+            for (int kk = 0; kk < effKc; kk++)
+            {
+                var va = Vector256.Create(arow[kk]);
+                for (int nt = 0; nt < nTiles; nt++)
+                {
+                    float* bseg = pb + ((long)nt * effKc + kk) * Nr;
+                    float* cseg = crow + nt * Nr;
+                    if (Fma.IsSupported)
+                    {
+                        Avx.Store(cseg, Fma.MultiplyAdd(va, Avx.LoadVector256(bseg), Avx.LoadVector256(cseg)));
+                        Avx.Store(cseg + 8, Fma.MultiplyAdd(va, Avx.LoadVector256(bseg + 8), Avx.LoadVector256(cseg + 8)));
+                    }
+                    else
+                    {
+                        Avx.Store(cseg, Avx.Add(Avx.LoadVector256(cseg), Avx.Multiply(va, Avx.LoadVector256(bseg))));
+                        Avx.Store(cseg + 8, Avx.Add(Avx.LoadVector256(cseg + 8), Avx.Multiply(va, Avx.LoadVector256(bseg + 8))));
+                    }
+                }
+            }
+        }
+    }
     /// <summary>Floats needed by <see cref="PackBPanel"/> / <see cref="RunTilePackedB"/> to hold ONE
     /// jc-block's whole-K packed B (numKc panels × nTiles × kc × Nr; last K-panel padded to kc).</summary>
     internal static long PackedBLen(int effNc, int k, int kc)
