@@ -452,15 +452,19 @@ internal static class HeadToHeadNetworkHarness
                         var gamma2 = Parameter(new[] { outChannels });
                         var beta2 = Parameter(new[] { outChannels });
                         bool project = s != 1 || inChannels != outChannels;
-                        var shortcut = project ? Parameter(new[] { outChannels, inChannels, 1, 1 }) : null;
-                        var shortcutGamma = project ? Parameter(new[] { outChannels }) : null;
-                        var shortcutBeta = project ? Parameter(new[] { outChannels }) : null;
+                        // Null when the block has no projection; the three are created together.
+                        var projection = project
+                            ? (Weight: Parameter(new[] { outChannels, inChannels, 1, 1 }),
+                               Gamma: Parameter(new[] { outChannels }),
+                               Beta: Parameter(new[] { outChannels }))
+                            : ((Tensor<float> Weight, Tensor<float> Gamma, Tensor<float> Beta)?)null;
                         layers.Add(h =>
                         {
                             var o = engine.ReLU(BatchNorm(engine.FusedConv2D(h, conv1, null, s, s, 1, 1, 1, 1, FusedActivationType.None), gamma1, beta1));
                             o = BatchNorm(engine.FusedConv2D(o, conv2, null, 1, 1, 1, 1, 1, 1, FusedActivationType.None), gamma2, beta2);
-                            var identity = shortcut is null ? h
-                                : BatchNorm(engine.FusedConv2D(h, shortcut, null, s, s, 0, 0, 1, 1, FusedActivationType.None), shortcutGamma!, shortcutBeta!);
+                            var identity = projection is { } p
+                                ? BatchNorm(engine.FusedConv2D(h, p.Weight, null, s, s, 0, 0, 1, 1, FusedActivationType.None), p.Gamma, p.Beta)
+                                : h;
                             return engine.ReLU(engine.TensorAdd(o, identity));
                         });
                         shape = new[] { outChannels, (shape[1] + 2 - 3) / s + 1, (shape[2] + 2 - 3) / s + 1 };
