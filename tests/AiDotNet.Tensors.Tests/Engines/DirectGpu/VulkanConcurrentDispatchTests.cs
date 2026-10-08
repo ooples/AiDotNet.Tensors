@@ -68,7 +68,7 @@ public sealed class VulkanConcurrentDispatchTests
                     for (int idx = 0; idx < expected.Length; idx++)
                     {
                         float tol = 1e-2f + 1e-3f * Math.Abs(expected[idx]);
-                        if (Math.Abs(expected[idx] - actual[idx]) > tol)
+                        if (float.IsNaN(actual[idx]) || Math.Abs(expected[idx] - actual[idx]) > tol)
                         {
                             Fail($"DequantGemmInt run {run}: [{idx}] expected {expected[idx]}, got {actual[idx]}");
                             return;
@@ -108,7 +108,7 @@ public sealed class VulkanConcurrentDispatchTests
                     var actual = backend.DownloadBuffer(c);
                     for (int idx = 0; idx < expected.Length; idx++)
                     {
-                        if (Math.Abs(expected[idx] - actual[idx]) > 1e-3f + 1e-3f * Math.Abs(expected[idx]))
+                        if (float.IsNaN(actual[idx]) || Math.Abs(expected[idx] - actual[idx]) > 1e-3f + 1e-3f * Math.Abs(expected[idx]))
                         {
                             Fail($"Gemm run {run}: [{idx}] expected {expected[idx]}, got {actual[idx]}");
                             return;

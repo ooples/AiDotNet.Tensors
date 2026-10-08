@@ -1590,13 +1590,13 @@ namespace AiDotNet.Tensors.Engines.Simd
         [MethodImpl(HotInline)]
         internal static Vector256<float> AccurateMish256(Vector256<float> x)
         {
-            var xc = Avx.Max(Avx.Min(x, Vector256.Create(20.0f)), Vector256.Create(-80.0f));
+            var xc = Avx.Max(Avx.Min(x, Vector256.Create(20.0f)), Vector256.Create(AccurateExpMin));
             var e = AccurateExp256(xc);
             var n = Avx.Multiply(e, Avx.Add(e, Vector256.Create(2.0f)));
             var mish = Avx.Multiply(x, Avx.Divide(n, Avx.Add(n, Vector256.Create(2.0f))));
             var result = Avx.BlendVariable(mish, x, Avx.CompareGreaterThan(x, Vector256.Create(20.0f)));
             // Below -80, |mish| underflows to zero; x * n/(n+2) would give -infinity at x = -infinity.
-            result = Avx.BlendVariable(result, Vector256.Create(-0.0f), Avx.CompareLessThan(x, Vector256.Create(-80.0f)));
+            result = Avx.BlendVariable(result, Vector256.Create(-0.0f), Avx.CompareLessThan(x, Vector256.Create(AccurateExpMin)));
             return Avx.BlendVariable(result, x, Avx.CompareUnordered(x, x));
         }
         /// <summary>

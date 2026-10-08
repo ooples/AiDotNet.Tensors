@@ -953,7 +953,16 @@ internal static class Program
 
             var u = Upcast(); var f = Fused();
             double maxDiff = 0;
-            for (int i = 0; i < u.Length; i++) maxDiff = Math.Max(maxDiff, Math.Abs(u[i] - f[i]));
+            for (int i = 0; i < u.Length; i++)
+            {
+                // A non-finite value in either path is a wrong kernel; NaN would slip past the threshold.
+                if (float.IsNaN(u[i]) || float.IsInfinity(u[i]) || float.IsNaN(f[i]) || float.IsInfinity(f[i]))
+                {
+                    maxDiff = double.PositiveInfinity;
+                    break;
+                }
+                maxDiff = Math.Max(maxDiff, Math.Abs(u[i] - f[i]));
+            }
             worstDiff = Math.Max(worstDiff, maxDiff);
             var ratios = new double[rounds];
             double upSum = 0, fuSum = 0;
