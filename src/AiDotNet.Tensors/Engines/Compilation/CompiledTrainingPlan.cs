@@ -2416,6 +2416,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 if (TryRunResidentBody(gte, cb))
                 {
                     ran = true;
+                    _residentBodyRanLast = true;
                     RefreshLossFromCapturedGraph(gte);
                     ApplyL2Regularization();   // before clipping, as the eager and graph steps order it
                     if (_maxGradNorm > 0.0 && !TryClipGradientsGlobalL2Gpu(_gradients, _maxGradNorm))
@@ -2443,8 +2444,21 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 }
             }
         }
+        // A resident step leaves the gradient accumulators, loss seed, forward outputs and external inputs bound to
+        // device buffers. The eager step is host-centric: it zeroes the HOST gradient arrays, so its resident in-place
+        // accumulations landed on the previous step's device gradients (on OpenCL, where a host write to a parameter
+        // drops its device binding and sends the next step here, every compiled gradient after that came back as a
+        // multiple of the true one). Roll the residency back first, as a failed capture does.
+        if (_residentBodyRanLast && _engine is Engines.DirectGpuTensorEngine rollEngine)
+        {
+            RollBackCaptureResidency(rollEngine, deviceHoldsResults: true);
+            _residentBodyRanLast = false;
+        }
         return StepEager();
     }
+
+    // True while the last step ran the resident body, so its device bindings are still in place.
+    private bool _residentBodyRanLast;
 
     // Every tensor the graph reads that it does not produce and does not own as a parameter: the batch input, the
     // TARGET, masks, any caller-fed tensor. Each is bound to a stable device buffer in the capture pre-pass and
