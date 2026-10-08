@@ -2341,6 +2341,24 @@ internal static partial class SimdGemm
     /// overwrite and accumulate, and each C element is still produced by one thread in the same k
     /// order — bit-identical for any thread count. For medium M (too few rows to slice) and wide N.
     /// </summary>
+    // Rows a task must cover before packing its B panel pays: below this the copy is a large share of the work.
+    private const int PackPanelMinRows = 4 * Mr;
+
+    // Depth below which the strided B panel is small enough for L2 to hold whatever its pages (k = 256: 16 KB, measured
+    // 33-44 µs unpacked against ~50 µs packed for 256^3), so the copy only costs.
+    private const int PackPanelMinK = 384;
+
+    [ThreadStatic] private static float[]? t_panelBuffer;
+
+    /// <summary>This thread's reusable B-panel buffer, grown to at least <paramref name="length"/> floats.</summary>
+    private static float[] PanelBuffer(int length)
+    {
+        var buffer = t_panelBuffer;
+        if (buffer is null || buffer.Length < length)
+            t_panelBuffer = buffer = new float[length];
+        return buffer;
+    }
+
     private static unsafe void SgemmDirectParallelN(
         ReadOnlySpan<float> a, int lda,
         ReadOnlySpan<float> b, int ldb,
@@ -2350,7 +2368,12 @@ internal static partial class SimdGemm
     {
         int nTiles = (n + Nr - 1) / Nr;
         long work = (long)m * k * n;
-        int threads = AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism;
+        // The threads this dispatch actually runs on (the pool plus the caller), not the configured maximum: sized from
+        // the 128-thread default, a 512x512x512 product became 32 panels x 4 row parts = 128 tasks for 33
+        // participants (4 tasks on most, 3 on the rest, panels re-read across CCXs), 238-266 us against
+        // 177-217 us sized to the participants, and which split a process ended up favouring was luck.
+        int threads = Math.Min(AiDotNet.Tensors.Helpers.CpuParallelSettings.MaxDegreeOfParallelism,
+            AiDotNet.Tensors.Helpers.PersistentParallelExecutor.Instance.MaxParticipants);
         // Enough panels to occupy the machine, but each one carries at least ~64K FMAs.
         int numChunks = (int)Math.Max(1, Math.Min(Math.Min(nTiles, threads), work / 65536));
         int tilesPerChunk = (nTiles + numChunks - 1) / numChunks;
@@ -2378,8 +2401,29 @@ internal static partial class SimdGemm
                 if (j0 >= nCap || i0 >= mCap) return;
                 int panel = Math.Min(nCap - j0, tiles * Nr);
                 int rows = Math.Min(mCap - i0, rowsPerPart);
-                DirectPanel((float*)ipA + (long)i0 * ldaCap, ldaCap, (float*)ipB + j0, ldbCap,
-                    (float*)ipC + (long)i0 * nCap + j0, nCap, rows, kCap, panel, cleared);
+                float* pA = (float*)ipA + (long)i0 * ldaCap, pC = (float*)ipC + (long)i0 * nCap + j0;
+                if (rows < PackPanelMinRows || kCap < PackPanelMinK)
+                {
+                    DirectPanel(pA, ldaCap, (float*)ipB + j0, ldbCap, pC, nCap, rows, kCap, panel, cleared);
+                    return;
+                }
+                // Copy this task's B column panel into a contiguous buffer first. Read in place, the kernel walks B
+                // down its columns with a stride of ldb floats; at ldb = 1024 (4 KB) or 512 every k row's slice
+                // falls in its own page at the same page offset, and whether those lines then collide in the cache
+                // depends on the physical pages the process happened to get: [128x1024]·[1024x1024] took ~250 µs in
+                // some processes and 2.5-6 ms in others, with all 32 tasks starting together and each running ~20x
+                // slower. Packed, consecutive k rows are adjacent, whatever the pages. Copying is k x panel floats
+                // against rows x k x panel multiply-adds.
+                int ldp = panel;
+                float[] packed = PanelBuffer(kCap * ldp);
+                fixed (float* pPacked = packed)
+                {
+                    float* src = (float*)ipB + j0;
+                    long rowBytes = (long)panel * sizeof(float);
+                    for (int kk = 0; kk < kCap; kk++)
+                        Buffer.MemoryCopy(src + (long)kk * ldbCap, pPacked + (long)kk * ldp, rowBytes, rowBytes);
+                    DirectPanel(pA, ldaCap, pPacked, ldp, pC, nCap, rows, kCap, panel, cleared);
+                }
             });
         }
     }

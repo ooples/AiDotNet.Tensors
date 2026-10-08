@@ -23,6 +23,8 @@ public class MediumMGemmAndRowBlockConvTests
     [InlineData(64, 144, 4096)]    // n >= 16 m
     [InlineData(40, 112, 2000)]    // N not a multiple of the panel width
     [InlineData(17, 241, 2112)]    // ragged M and K
+    [InlineData(128, 1024, 1024)]  // B panel packed (k >= 384, >= 24 rows): the 4 KB-stride shape that aliased
+    [InlineData(96, 512, 1000)]    // packed, last panel narrower than a 16-wide tile
     public void Sgemm_MediumM_MatchesReference_OverwriteAndAccumulate(int m, int k, int n)
     {
         Skip.IfNot(System.Runtime.Intrinsics.X86.Avx2.IsSupported && System.Runtime.Intrinsics.X86.Fma.IsSupported, "AVX2/FMA");

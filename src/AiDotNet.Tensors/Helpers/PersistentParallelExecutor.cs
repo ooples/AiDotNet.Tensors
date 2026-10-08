@@ -18,6 +18,13 @@ internal sealed class PersistentParallelExecutor
 
     internal static PersistentParallelExecutor Instance => LazyInstance.Value;
 
+    /// <summary>
+    /// The most threads one dispatch runs on: the pool's workers plus the calling thread. A split sized from
+    /// <see cref="CpuParallelSettings.MaxDegreeOfParallelism"/> alone (128 on a 128-thread host) hands this pool
+    /// several tasks per participant, and the slowest participant's extra task sets the dispatch's time.
+    /// </summary>
+    internal int MaxParticipants => _numWorkers + 1;
+
     // Per-worker MRES spin count before a parked worker truly blocks.
     //
     // History: #475 set this to 2047 (the MRES max) to keep the resident workers hot so
