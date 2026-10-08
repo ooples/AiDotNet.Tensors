@@ -3149,7 +3149,10 @@ internal static partial class SimdGemm
         // each task keeps one narrow B strip hot. The m % Mr tail rows run inside the last row chunk's tasks, not
         // serially afterwards. Every C element is still computed by exactly one task in the same K order.
         int nTiles = n / Nr;
-        int colGroups = Math.Max(1, Math.Min(nTiles, cores / numChunks));
+        // Total tasks obey the same work cap as the row chunks: a small GEMM fanned over every core costs more in
+        // dispatch than it gains (a transformer backward 64x256x192 went from 5 tasks to 30).
+        int taskCap = CapDirectChunksByWork(cores, (long)m * k * n);
+        int colGroups = Math.Max(1, Math.Min(nTiles, taskCap / numChunks));
         int tilesPerGroup = nTiles > 0 ? (nTiles + colGroups - 1) / colGroups : 0;
         if (nTiles > 0) colGroups = (nTiles + tilesPerGroup - 1) / tilesPerGroup;
         int mcTail = m - mFull;
