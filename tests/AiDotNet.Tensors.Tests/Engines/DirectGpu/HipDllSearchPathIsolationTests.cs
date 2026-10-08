@@ -1,3 +1,4 @@
+#if NET5_0_OR_GREATER
 using System;
 using System.Reflection;
 using System.Runtime.InteropServices;
@@ -32,3 +33,4 @@ public sealed class HipDllSearchPathIsolationTests
         Assert.True(after, "vulkan-1 stopped loading after HIP set up its DLL search path.");
     }
 }
+#endif
