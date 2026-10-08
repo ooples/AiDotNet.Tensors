@@ -71,14 +71,22 @@ public sealed class GotoGemmRoutingTests
             var c = new CpuEngine().BatchMatMul(a, b);
 
             Assert.Equal(new[] { m, n }, c.Shape.ToArray());
+            // The reference reads flat copies: through the rank-2 indexer the 256x768x3072 case made 604M indexer
+            // calls (41 s on a 16-core desktop) and outlasted the CI blame-hang timeout on a loaded 4-vCPU runner.
+            float[] av = a.ToArray(), bv = b.ToArray(), cv = c.ToArray();
             double worst = 0;
+            var row = new double[n];
             for (int i = 0; i < m; i++)
-                for (int j = 0; j < n; j++)
+            {
+                Array.Clear(row, 0, n);
+                for (int p = 0; p < k; p++)
                 {
-                    double expected = 0;
-                    for (int p = 0; p < k; p++) expected += (double)a[i, p] * b[p, j];
-                    worst = Math.Max(worst, Math.Abs(expected - c[i, j]));
+                    double aip = av[i * k + p];
+                    int bRow = p * n;
+                    for (int j = 0; j < n; j++) row[j] += aip * bv[bRow + j];
                 }
+                for (int j = 0; j < n; j++) worst = Math.Max(worst, Math.Abs(row[j] - cv[i * n + j]));
+            }
 
             // K=768 products of values in [-0.5, 0.5] sum to O(5); float accumulation error is ~1e-5,
             // and a mis-tiled or skipped block is off by O(0.1) or more.
