@@ -6001,6 +6001,10 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         {
             // AIDOTNET_CUBLAS_WORKSPACE=0: kill switch back to cuBLAS's internal allocator (and per-slice capture GEMMs).
             if (System.Environment.GetEnvironmentVariable("AIDOTNET_CUBLAS_WORKSPACE") == "0") throw new InvalidOperationException("cuBLAS workspace disabled");
+            // A handle first created inside a stream capture gets no workspace: allocating there would pin the
+            // buffer to the capture. It keeps cuBLAS's internal allocator, and its capture GEMMs take the
+            // per-slice path, as with an older cuBLAS.
+            if (IsStreamCapturing()) throw new InvalidOperationException("cuBLAS workspace not allocated during capture");
             workspace = AllocateBuffer(CublasWorkspaceFloats);
             var status = CuBlasNative.cublasSetWorkspace(h, workspace.Handle, (UIntPtr)((ulong)CublasWorkspaceFloats * sizeof(float)));
             if ((int)status != 0)   // CUBLAS_STATUS_SUCCESS
@@ -13600,6 +13604,11 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             throw new ArgumentException("Every tensor needs a size.", nameof(sizes));
         if (_gradientTable is { } cached && cached.Matches(tensors, sizes))
             return cached;
+        // A rebuild uploads the address table and disposes the cached one, neither of which a stream capture can
+        // record; fail before touching either. The table is built by the eager steps that precede capture.
+        if (IsStreamCapturing())
+            throw new InvalidOperationException(
+                "The multi-tensor gradient table must be built before stream capture; run an eager step first.");
 
         int n = tensors.Count;
         var addresses = new byte[n * sizeof(ulong)];
@@ -17808,8 +17817,12 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         {
             foreach (var tc in _threadCublas.Values)
             {
-                if (tc is not null && tc.Handle != IntPtr.Zero)
+                if (tc is null) continue;
+                if (tc.Handle != IntPtr.Zero)
                     CuBlasNative.cublasDestroy(tc.Handle);
+                // The handle's 8 MiB workspace is the backend's allocation, not cuBLAS's: free it with the handle.
+                tc.Workspace?.Dispose();
+                tc.Workspace = null;
             }
 
             _threadCublas.Dispose();
