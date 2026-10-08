@@ -316,7 +316,7 @@ internal sealed class PersistentParallelExecutor
     }
 
     // How long the dispatching thread spins for its workers before blocking (Stopwatch ticks).
-    private static readonly long s_joinSpinTicks = MicrosToTicks(2_000);
+    private static readonly long s_joinSpinTicks = ToStopwatchTicks(TimeSpan.FromMilliseconds(2).Ticks);
 
     /// <summary>
     /// Waits for the woken workers of the current dispatch. Spins (bounded) on the completion count
