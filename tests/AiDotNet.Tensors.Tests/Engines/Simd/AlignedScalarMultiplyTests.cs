@@ -23,7 +23,7 @@ public class AlignedScalarMultiplyTests
                 foreach (int n in lengths)
                 {
                     var dst = new double[n + 8];
-                    Array.Fill(dst, double.NaN);
+                    for (int i = 0; i < dst.Length; i++) dst[i] = double.NaN;
                     SimdKernels.MultiplyScalar(source.AsSpan(srcOffset, n), -1.75, dst.AsSpan(dstOffset, n));
                     for (int i = 0; i < n; i++)
                         Assert.Equal(source[srcOffset + i] * -1.75, dst[dstOffset + i]);
