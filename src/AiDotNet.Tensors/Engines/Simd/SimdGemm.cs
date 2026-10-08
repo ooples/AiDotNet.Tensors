@@ -2351,6 +2351,7 @@ internal static partial class SimdGemm
     [ThreadStatic] private static float[]? t_panelBuffer;
 
     /// <summary>This thread's reusable B-panel buffer, grown to at least <paramref name="length"/> floats.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static float[] PanelBuffer(int length)
     {
         var buffer = t_panelBuffer;
@@ -2393,7 +2394,9 @@ internal static partial class SimdGemm
             int mCap = m, kCap = k, nCap = n, ldaCap = lda, ldbCap = ldb, tiles = tilesPerChunk;
             bool cleared = clearedOutput;
             int parts = mParts, rowsPerPart = blocksPerPart * Mr;
-            AiDotNet.Tensors.Helpers.PersistentParallelExecutor.Instance.Execute(numChunks * parts, task =>
+            // [MethodImpl(Hot)]: the task body holds the panel-copy loop; at Tier-0 the first calls of a process ran
+            // ~900 µs instead of ~300 µs for 512^3 (the cold-call regime).
+            AiDotNet.Tensors.Helpers.PersistentParallelExecutor.Instance.Execute(numChunks * parts, [MethodImpl(Hot)] (task) =>
             {
                 int chunk = task / parts, part = task % parts;
                 int j0 = chunk * tiles * Nr;

@@ -21,13 +21,13 @@ public enum WorkerPinning
 {
     /// <summary>
     /// Pin while <see cref="CpuParallelSettings.MaxDegreeOfParallelism"/> is at most the physical core
-    /// count, where it measured a win. Above it, and on hosts where core pinning does not apply (more than 64
-    /// logical processors), a host with several L3 caches binds each worker to its L3 domain so the chunk it
-    /// works on stays in that cache across GC suspensions; elsewhere the OS places the workers.
+    /// count, where it measured a win. Above it, and where that pinning does not apply (more than 64 logical
+    /// processors, or a process limited to part of the machine), each worker is still bound to a physical core of
+    /// its own so the chunk it works on stays in that core's caches across GC suspensions.
     /// </summary>
     Auto,
 
-    /// <summary>Always pin workers to physical cores, round-robin (an L3-domain bind where core pinning does not apply).</summary>
+    /// <summary>Always pin workers to physical cores, round-robin (bound to a core of its own where that pinning does not apply).</summary>
     Always,
 
     /// <summary>Never pin or bind; the OS places every worker.</summary>

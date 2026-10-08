@@ -35,6 +35,21 @@ internal static class CpuTopology
     private static extern bool GetProcessAffinityMask(IntPtr hProcess, out nuint processMask, out nuint systemMask);
     [DllImport("kernel32.dll")]
     private static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll")]
+    private static extern uint GetActiveProcessorCount(ushort groupNumber);
+
+    /// <summary>Logical processors of the whole machine, across every processor group (null off Windows).</summary>
+    internal static int? MachineLogicalProcessorCount()
+    {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return null;
+        try
+        {
+            const ushort AllProcessorGroups = 0xFFFF;
+            uint count = GetActiveProcessorCount(AllProcessorGroups);
+            return count == 0 ? null : (int)count;
+        }
+        catch { return null; }
+    }
 
     /// <summary>An L3 cache domain (CCX): the logical cores sharing one last-level cache.</summary>
     internal readonly struct Domain

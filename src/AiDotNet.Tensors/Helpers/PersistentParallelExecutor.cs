@@ -232,56 +232,75 @@ internal sealed class PersistentParallelExecutor
     private static readonly Lazy<(ushort Group, byte Number)[]> s_workerCores =
         new(AiDotNet.Tensors.Engines.BlasManaged.CpuTopology.UsableCoresInCurrentGroup);
 
-    private static readonly Lazy<AiDotNet.Tensors.Engines.BlasManaged.CpuTopology.Domain[]> s_l3Domains =
-        new(AiDotNet.Tensors.Engines.BlasManaged.CpuTopology.DetectL3Domains);
 
-    // Every processor of the first worker's group that the L3 domains cover: the affinity that undoes a cache-domain
-    // bind when the mode later turns binding off on a host where core pinning is not eligible (more than 64 threads).
+    private static readonly Lazy<AiDotNet.Tensors.Engines.BlasManaged.CpuTopology.Domain[]> s_physicalCores =
+        new(AiDotNet.Tensors.Engines.BlasManaged.CpuTopology.DetectPhysicalCores);
+
+    // Every processor of the first worker's group that its physical cores cover: the affinity that undoes a core bind
+    // when the mode later turns binding off on a host where the #653 core pinning is not eligible.
     private static readonly Lazy<AiDotNet.Tensors.Engines.BlasManaged.CpuTopology.Domain?> s_groupDomain = new(() =>
     {
         var cores = s_workerCores.Value;
         if (cores.Length == 0) return null;
         ulong mask = 0;
-        foreach (var d in s_l3Domains.Value)
-            if (d.Group == cores[0].Group) mask |= d.Mask;
+        foreach (var c in s_physicalCores.Value)
+            if (c.Group == cores[0].Group) mask |= c.Mask;
         return mask == 0 ? null
             : new AiDotNet.Tensors.Engines.BlasManaged.CpuTopology.Domain(mask, cores[0].Group, System.Numerics.BitOperations.PopCount(mask));
     });
 
-    private static bool CacheDomainBindingAvailable => s_workerCores.Value.Length >= 2 && s_l3Domains.Value.Length >= 2;
+    private static bool CoreBindingAvailable => s_workerCores.Value.Length >= 2;
+
+    [ThreadStatic] private static bool t_dispatcherHinted;
 
     /// <summary>
-    /// Keeps a worker on the cache that holds its working set. Every dispatch hands a worker the same chunk
-    /// of the same buffers, so that data lives in the worker's L2/L3. A .NET GC suspends every managed
-    /// thread, and on resume Windows placed most workers on whichever cores were idle: on a 16-CCX
-    /// Threadripper 3990X, 23 of 31 chunks of a 1M-element sqrt ran on a different CPU after each GC, and
-    /// every line the moved worker wrote had to be pulled out of another CCX first, so the call took
-    /// ~160 µs instead of ~11 µs. (libtorch's OpenMP threads are native and never suspended by the GC.)
-    /// Each worker gets one physical core as its ideal processor (a scheduling hint) and, on machines with
-    /// more than one L3 domain, an affinity to that core's L3 domain: the scheduler can still move it among
-    /// the domain's cores when one is busy, which a single-core pin does not allow (that measured ~2 ms
-    /// p90 stalls whenever the dispatching thread sat on the pinned core). After the change, the same sqrt
-    /// measured 14-15 µs median right after a GC. Windows only; elsewhere this does nothing. Applied by
-    /// <see cref="ApplyPinning"/> when the mode is not <see cref="WorkerPinning.Never"/> and a single-core pin does
-    /// not apply.
+    /// Gives a dispatching thread core 0 of the worker list as its ideal processor (a hint, not an affinity), once per
+    /// thread, while workers are bound: it runs a chunk of every dispatch and the bound workers hold the other cores,
+    /// so left to chance it shared one of theirs and finished last.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void HintDispatcherCore()
+    {
+        if (t_dispatcherHinted) return;
+        t_dispatcherHinted = true;
+        if (CpuParallelSettings.WorkerPinning == WorkerPinning.Never || !CoreBindingAvailable) return;
+        var (group, number) = s_workerCores.Value[0];
+        AiDotNet.Tensors.Engines.BlasManaged.CpuTopology.TrySetCurrentThreadIdealProcessor(group, number);
+    }
+
+    /// <summary>
+    /// Keeps a worker on its own physical core, so the chunk it is handed every dispatch stays in that core's caches.
+    /// A .NET GC suspends every managed thread, and on resume Windows placed most workers on whichever cores were
+    /// idle: on a 16-CCX Threadripper 3990X, 23 of 31 chunks of a 1M-element sqrt ran on a different CPU after each GC
+    /// and pulled every line they wrote out of another CCX first, ~160 µs instead of ~11 µs (libtorch's OpenMP threads
+    /// are native and never suspended by the GC). Each worker gets one physical core of the process's group as its
+    /// ideal processor and an affinity to that core's hardware threads; the dispatching thread gets core 0 as a hint.
+    /// Measured on that host: the sqrt right after a GC 16-20 µs bound against 169-182 µs unbound, and a 512^3 GEMM
+    /// steady at ~145 µs across processes instead of 150-210 µs. Windows only; elsewhere this does nothing.
+    /// Applied by <see cref="ApplyPinning"/> unless the mode is <see cref="WorkerPinning.Never"/>.
     /// </summary>
     [MethodImpl(Hot)]
-    private static void BindWorkerToCache(int slot)
+    private static void BindWorkerToCore(int slot)
     {
         var cores = s_workerCores.Value;
         if (cores.Length < 2) return;
-        // Workers start at the second core: the dispatching thread is not bound and usually runs near the first.
-        var (group, number) = cores[(slot + 1) % cores.Length];
+        // Core 0 of the list is the dispatching thread's (see HintDispatcherCore); workers take cores 1..n-1 and wrap
+        // within them, never onto core 0. With 32 cores for 32 workers (a process limited to one group of a 128-thread
+        // host) the last worker used to wrap onto core 0 and share it with the dispatcher, which runs a chunk of every
+        // dispatch, and that chunk set the time: a 512^3 GEMM measured ~305 µs bound against ~203 µs unbound.
+        var (group, number) = cores[1 + slot % (cores.Length - 1)];
         AiDotNet.Tensors.Engines.BlasManaged.CpuTopology.TrySetCurrentThreadIdealProcessor(group, number);
 
-        var domains = s_l3Domains.Value;
-        if (domains.Length < 2) return; // one shared L3: nothing to lose by moving between cores
+        // Bind to that physical core: both of its hardware threads, no other worker's. A whole-L3-domain affinity let
+        // the scheduler stack two FMA-bound workers on one core's SMT pair while another core of the domain idled:
+        // under BenchmarkDotNet a 512^3 GEMM took 336 µs bound to the domain against 139 µs bound to the core
+        // (256^3: 47 -> 27 µs; a 1M double exp: 81 -> 56 µs), with the GC-migration fix kept.
         ulong bit = 1UL << number;
-        foreach (var d in domains)
+        foreach (var c in s_physicalCores.Value)
         {
-            if (d.Group == group && (d.Mask & bit) != 0)
+            if (c.Group == group && (c.Mask & bit) != 0)
             {
-                AiDotNet.Tensors.Engines.BlasManaged.CpuTopology.TryPinCurrentThread(d);
+                AiDotNet.Tensors.Engines.BlasManaged.CpuTopology.TryPinCurrentThread(c);
                 return;
             }
         }
@@ -356,6 +375,12 @@ internal sealed class PersistentParallelExecutor
         s_unpinnedDomain = default;
         s_pinEligible = false;
         if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows) || Environment.ProcessorCount > 64) return;
+        // Environment.ProcessorCount honours the process affinity: a process restricted to one 64-processor group
+        // of a 128-thread host (BenchmarkDotNet does this) reports 64 and passes the full-mask check below, while
+        // the physical-core list spans both groups. Pinning there measured 390 µs for a 512^3 GEMM against 203 µs
+        // unpinned. Any process that does not see every processor of the machine counts as restricted.
+        if (AiDotNet.Tensors.Engines.BlasManaged.CpuTopology.MachineLogicalProcessorCount() is int machine
+            && machine > Environment.ProcessorCount) return;
         try
         {
             ulong processMask = (ulong)(long)System.Diagnostics.Process.GetCurrentProcess().ProcessorAffinity;
@@ -379,19 +404,20 @@ internal sealed class PersistentParallelExecutor
 
     // Worker placement, re-evaluated on every wake (CpuParallelSettings.WorkerPinning can change between ops):
     //   Never                                   -> unbound
-    //   core pinning eligible and (Always, or Auto with MaxDegreeOfParallelism <= physical cores)
-    //                                           -> pinned to one physical core (#653: measured a win there)
-    //   otherwise, on a host with several L3 domains -> bound to the worker's L3 domain (BindWorkerToCache)
+    //   #653 core pinning eligible and (Always, or Auto with MaxDegreeOfParallelism <= physical cores)
+    //                                           -> pinned to a physical core, #653's mapping
+    //   otherwise, with physical cores detected -> bound to a physical core (BindWorkerToCore), core 0 left to the
+    //                                              dispatching thread
     //   otherwise                               -> unbound
-    // Core pinning is only eligible up to 64 logical processors with an unrestricted affinity; above that (and above
-    // the core count in Auto) the cache-domain bind is what keeps a worker's chunk in its cache across GC suspensions.
+    // #653's pinning is only eligible up to 64 logical processors with an unrestricted affinity; above that, and above
+    // the core count in Auto, BindWorkerToCore keeps a worker's chunk in its core's caches across GC suspensions.
     private static void ApplyPinning(int slot)
     {
         var mode = CpuParallelSettings.WorkerPinning;
-        int desired;   // 1 = core pin, 2 = unbound, 3 = cache-domain bind
+        int desired;   // 1 = #653 core pin, 2 = unbound, 3 = core bind
         if (mode == WorkerPinning.Never) desired = 2;
         else if (s_pinEligible && (mode == WorkerPinning.Always || CpuParallelSettings.MaxDegreeOfParallelism <= s_pinCores.Length)) desired = 1;
-        else if (CacheDomainBindingAvailable) desired = 3;
+        else if (CoreBindingAvailable) desired = 3;
         else desired = 2;
         if (t_pinState == desired) return;
         int previous = t_pinState;
@@ -403,7 +429,7 @@ internal sealed class PersistentParallelExecutor
         }
         else if (desired == 3)
         {
-            BindWorkerToCache(slot);
+            BindWorkerToCore(slot);
         }
         else if (s_pinEligible)
         {
@@ -671,6 +697,9 @@ internal sealed class PersistentParallelExecutor
 
         lock (_executeLock)
         {
+#if NET5_0_OR_GREATER
+            HintDispatcherCore();
+#endif
             _isExecuting = true;
             try
             {
@@ -791,6 +820,9 @@ internal sealed class PersistentParallelExecutor
 
         lock (_executeLock)
         {
+#if NET5_0_OR_GREATER
+            HintDispatcherCore();
+#endif
             _isExecuting = true;
             try
             {
