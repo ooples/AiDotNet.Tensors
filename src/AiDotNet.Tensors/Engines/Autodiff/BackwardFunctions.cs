@@ -582,6 +582,15 @@ internal static class BackwardFunctions<T>
     private static long MatMulBackwardSimdThreshold => SimdGemm.ParallelWorkThreshold;
 
     /// <summary>
+    /// Whether a float32 matmul backward runs its GEMMs on <see cref="SimdGemm"/>: above
+    /// <see cref="MatMulBackwardSimdThreshold"/>, or at any size when there is no native BLAS to prefer. Without
+    /// BLAS the alternative is the generic engine fallback (two engine matmuls plus a materialized transpose), which
+    /// ran an LSTM's [32,64]x[256,64]^T backward in ~720 us against ~60 us for the two SimdGemm calls.
+    /// </summary>
+    private static bool UseSimdGemmBackward(long backwardWork)
+        => backwardWork >= MatMulBackwardSimdThreshold || !BlasProvider.IsAvailable;
+
+    /// <summary>
     /// Sub-E (#373): backward for <c>C = A · B</c> where B is a frozen weight whose
     /// transpose has been pre-packed by the caller. Used by inference paths that
     /// still want a gradient on A (e.g., feature-extraction with a frozen backbone)
@@ -750,14 +759,14 @@ internal static class BackwardFunctions<T>
                     if (dCArr is not null && aArr is not null && bArr is not null)
                     {
                         bool tryBlas = backwardWork < MatMulBackwardSimdThreshold && BlasProvider.IsAvailable;
-                        if (backwardWork >= MatMulBackwardSimdThreshold || tryBlas)
+                        if (UseSimdGemmBackward(backwardWork) || tryBlas)
                         {
                             var gradATensor = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
                             var gradBTensor = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
                             var gradAData = (float[])(object)gradATensor.GetDataArray();
                             var gradBData = (float[])(object)gradBTensor.GetDataArray();
 
-                            if (backwardWork >= MatMulBackwardSimdThreshold)
+                            if (UseSimdGemmBackward(backwardWork))
                             {
                                 // #573 follow-up: parallel transposed GEMMs via BlasManaged.Gemm —
                                 // the legacy full-trans SimdGemm.Sgemm overload these replaced ran
@@ -993,14 +1002,14 @@ internal static class BackwardFunctions<T>
 
                 long backwardWork = (long)M * K * N;
                 bool tryBlas = backwardWork < MatMulBackwardSimdThreshold && BlasProvider.IsAvailable;
-                if (backwardWork >= MatMulBackwardSimdThreshold || tryBlas)
+                if (UseSimdGemmBackward(backwardWork) || tryBlas)
                 {
                     var gradATensor = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
                     var gradBTensor = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
                     var gradAData = (float[])(object)gradATensor.GetDataArray();
                     var gradBData = (float[])(object)gradBTensor.GetDataArray();
 
-                    if (backwardWork >= MatMulBackwardSimdThreshold)
+                    if (UseSimdGemmBackward(backwardWork))
                     {
                         // gradA[M,K] = gradC[M,N] · B[N,K]   (no transposes)
                         SimdGemm.Sgemm(dCArr, N, false, bArr, K, false, gradAData.AsSpan(0, M * K), M, N, K);
@@ -4441,7 +4450,7 @@ internal static class BackwardFunctions<T>
             // Decide which fast path will run BEFORE renting any buffers.
             long backwardWork = (long)M * K * N;
             bool tryBlas = backwardWork < MatMulBackwardSimdThreshold && BlasProvider.IsAvailable;
-            bool willTryFastPath = backwardWork >= MatMulBackwardSimdThreshold || tryBlas;
+            bool willTryFastPath = UseSimdGemmBackward(backwardWork) || tryBlas;
 
             if (!willTryFastPath)
                 goto fusedReluFallback;
@@ -4460,7 +4469,7 @@ internal static class BackwardFunctions<T>
             var gradWeight = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
             var gradWeightArr = (float[])(object)gradWeight.GetDataArray();
 
-            if (backwardWork >= MatMulBackwardSimdThreshold)
+            if (UseSimdGemmBackward(backwardWork))
             {
                 // Parallel SimdGemm — bypass possibly-single-threaded BLAS.
                 SimdGemm.Sgemm(maskedArr, N, false, wArr, N, true, gradInputArr.AsSpan(0, M * K), M, N, K);
@@ -4537,7 +4546,7 @@ internal static class BackwardFunctions<T>
         // before getting here (BLAS path is only taken outside higher-order AD).
         long backwardWork = (long)M * K * N;
         bool tryBlas = backwardWork < MatMulBackwardSimdThreshold && BlasProvider.IsAvailable;
-        bool willTryFastPath = backwardWork >= MatMulBackwardSimdThreshold || tryBlas;
+        bool willTryFastPath = UseSimdGemmBackward(backwardWork) || tryBlas;
 
         if (!willTryFastPath)
         {
@@ -4556,7 +4565,7 @@ internal static class BackwardFunctions<T>
 
         bool used = false;
 
-        if (backwardWork >= MatMulBackwardSimdThreshold)
+        if (UseSimdGemmBackward(backwardWork))
         {
             // dInput[M,K] = masked[M,N] · Wᵀ[N,K]
             SimdGemm.Sgemm(maskedArr, N, false, wArr, N, true, gradInputArr.AsSpan(0, M * K), M, N, K);
@@ -6266,7 +6275,7 @@ internal static class BackwardFunctions<T>
 
             long backwardWork = (long)M * K * N;
             bool tryBlas = backwardWork < MatMulBackwardSimdThreshold && BlasProvider.IsAvailable;
-            bool willTryFastPath = backwardWork >= MatMulBackwardSimdThreshold || tryBlas;
+            bool willTryFastPath = UseSimdGemmBackward(backwardWork) || tryBlas;
 
             if (!willTryFastPath)
                 goto fusedFallback;
@@ -6287,7 +6296,7 @@ internal static class BackwardFunctions<T>
 
             bool used = false;
 
-            if (backwardWork >= MatMulBackwardSimdThreshold)
+            if (UseSimdGemmBackward(backwardWork))
             {
                 // Parallel SimdGemm path — guaranteed multi-core on shapes at/above
                 // SimdGemm's internal parallel gate.
