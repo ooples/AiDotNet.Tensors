@@ -561,7 +561,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         // Strided fallback. Identical decomposition to Contiguous() so the
         // two methods stay behaviorally consistent — any future
         // optimization that applies to one should be applied to the other.
-        CopyStridedToRowMajor(_data.GetDataArray(), _storageOffset, _shape, _strides, destination);
+        CopyStridedToRowMajor(_data.AsSpan(), _storageOffset, _shape, _strides, destination);
     }
 
     /// <summary>

@@ -55,6 +55,8 @@ internal static class BackwardFunctions<T>
     internal static BackwardFunction<T> ReplayUnderTape(Func<IEngine, Tensor<T>> compute)
         => (gradOutput, inputs, output, savedState, engine, grads) =>
         {
+            // The tape the enclosing backward records on: the outer tape under createGraph, none otherwise.
+            var outer = GradientTape<T>.Current;
             using (var tape = new GradientTape<T>())
             {
                 var result = compute(engine);
@@ -63,10 +65,15 @@ internal static class BackwardFunctions<T>
                 // Accumulate while the inner tape is alive. Its gradients are GPU intermediates the tape releases on
                 // dispose; reading them after the using block read a released buffer (inside a CUDA graph capture that
                 // aborted the capture of every CNN training step - the compiled MaxPool backward replays through here).
-                foreach (var input in inputs)
+                // But record the accumulation on the OUTER context: under a createGraph backward, AccumulateGrad's
+                // out-of-place add belongs on the tape that survives, not on this one, which is disposed below.
+                using (GradientTape<T>.RecordOn(outer))
                 {
-                    if (input is not null && g.TryGetValue(input, out var gi) && gi is not null)
-                        DifferentiableOps.AccumulateGrad(grads, input, gi, engine);
+                    foreach (var input in inputs)
+                    {
+                        if (input is not null && g.TryGetValue(input, out var gi) && gi is not null)
+                            DifferentiableOps.AccumulateGrad(grads, input, gi, engine);
+                    }
                 }
             }
         };
@@ -4099,12 +4106,12 @@ internal static class BackwardFunctions<T>
         if (grads.ContainsKey(inputs[0])) return;
 
         // The input still needs an (all-zero) entry, as PyTorch's sign backward returns zeros_like. On a GPU engine
-        // build it on the device from the upstream gradient (same shape: Sign is elementwise); a host zero tensor had
-        // to be uploaded, and inside a captured training step that upload aborted CUDA graph capture (the
-        // cross-entropy loss's supervised-row count goes through Sign). A non-finite upstream gradient makes this NaN
-        // rather than 0, but such a gradient has already poisoned the step, which the fused step discards.
-        var zero = engine.SupportsGpu
-            ? engine.TensorMultiplyScalar(gradOutput, MathHelper.GetNumericOperations<T>().Zero)
+        // it is filled on the device: a host zero tensor had to be uploaded, and inside a captured training step that
+        // upload aborted CUDA graph capture (the cross-entropy loss's supervised-row count goes through Sign). It is a
+        // fill, not upstream * 0, which is NaN for an infinite or NaN upstream element where the gradient is 0.
+        var zero = engine is DirectGpuTensorEngine gpu && gpu.SupportsGpu
+            && gpu.TryResidentZeros<T>(inputs[0]._shape, out var resident)
+            ? resident
             : TensorPool<T>.RentZeroed(inputs[0]._shape);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], zero, engine);
     }

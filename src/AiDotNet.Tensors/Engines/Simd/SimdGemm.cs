@@ -1633,15 +1633,11 @@ internal static partial class SimdGemm
             return;
         }
 #endif
-        // Native OpenBLAS kernel on OUR pool for large no-transpose contiguous GEMMs.
-        // The bake-off showed OpenBLAS's microkernel at 2-3x the managed RyuJIT kernel,
-        // but routing whole calls to OpenBLAS regressed end-to-end: OpenBLAS spins its
-        // own ~N-thread pool PER CALL, and a many-GEMM model (transformer) pays that
-        // thread-sync floor on every op. The fix: pin OpenBLAS to ONE thread and supply
-        // the parallelism ourselves over the PersistentParallelExecutor (hot, spin-based,
-        // ~zero wakeup) by splitting the M rows into chunks — each chunk a single-thread
-        // OpenBLAS call. We get OpenBLAS's kernel quality with our cheap dispatch.
-        // Top-level only (SgemmSequential, used inside PPE regions, never reaches here).
+        // Native OpenBLAS kernel for large no-transpose contiguous GEMMs: its microkernel measured 2-3x the managed
+        // RyuJIT kernel. The call is ONE native SGEMM parallelised by OpenBLAS's own threads (see
+        // RunOpenBlasParallel for why the earlier pin-to-one-thread, split-M-over-our-pool design was removed);
+        // deterministic mode runs the managed kernel instead. Top-level only (SgemmSequential, used inside PPE
+        // regions, never reaches here).
         if (_openBlasGemm && !transA && !transB && lda == k && ldb == n
             && k >= OpenBlasMinK && (long)m * k * n >= OpenBlasMinWork && Helpers.BlasProvider.HasRawSgemm)
         {

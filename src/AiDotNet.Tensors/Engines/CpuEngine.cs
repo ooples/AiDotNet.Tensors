@@ -16879,6 +16879,11 @@ public partial class CpuEngine : ITensorLevelEngine
         Tensor<T> input, int[] poolSize, int[] stride, out Tensor<int> maxIndices)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
+        if (input.Rank != 4) throw new ArgumentException("MaxPool2D expects NCHW rank-4 input.", nameof(input));
+        if (poolSize is not { Length: 2 } || poolSize[0] <= 0 || poolSize[1] <= 0)
+            throw new ArgumentException("poolSize must contain two positive values.", nameof(poolSize));
+        if (stride is not { Length: 2 } || stride[0] <= 0 || stride[1] <= 0)
+            throw new ArgumentException("stride must contain two positive values.", nameof(stride));
         int batch = input._shape[0], channels = input._shape[1];
         int height = input._shape[2], width = input._shape[3];
         int poolH = poolSize[0], poolW = poolSize[1];
@@ -16891,7 +16896,10 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"Invalid output dimensions ({outputHeight}x{outputWidth}). Check pool size and stride.");
 
         var result = TensorAllocator.Rent<T>([batch, channels, outputHeight, outputWidth]);
-        var outputData = result.GetDataArray();
+        // Write the pooled tensor's own storage at its offset: GetDataArray hands back a copy for a pool-padded or
+        // offset tensor, so results written there were lost.
+        var outputData = result.GetCpuBackingForContiguousWrite(out int outOff)
+            ?? throw new InvalidOperationException("A freshly rented CPU tensor has no contiguous host storage.");
         var inputData = input.GetFlattenedData();
         // Sized from the logical output: a pooled backing array can be longer than result.Length.
         var flatIndices = new int[result.Length];
@@ -16901,14 +16909,16 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var src = (float[])(object)inputData;
             var dst = (float[])(object)outputData;
-            CpuParallelSettings.ParallelForOrSerial(0, batch * channels, outputData.Length, plane =>
+            CpuParallelSettings.ParallelForOrSerial(0, batch * channels, result.Length, plane =>
             {
                 int inBase = plane * inPlane, outBase = plane * outPlane;
                 for (int oh = 0; oh < outputHeight; oh++)
                 for (int ow = 0; ow < outputWidth; ow++)
                 {
                     float maxVal = float.MinValue;
-                    int maxIdx = 0;
+                    // Seeded inside the window: if nothing beats MinValue (all NaN or -inf), the backward must still
+                    // route this window's gradient to one of its own elements, not to plane position 0.
+                    int maxIdx = oh * strideH * width + ow * strideW;
                     for (int kh = 0; kh < poolH; kh++)
                     {
                         int ih = oh * strideH + kh;
@@ -16920,7 +16930,7 @@ public partial class CpuEngine : ITensorLevelEngine
                             if (val > maxVal) { maxVal = val; maxIdx = ih * width + iw; }
                         }
                     }
-                    dst[outBase + oh * outputWidth + ow] = maxVal;
+                    dst[outOff + outBase + oh * outputWidth + ow] = maxVal;
                     flatIndices[outBase + oh * outputWidth + ow] = maxIdx;
                 }
             });
@@ -16928,14 +16938,14 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            CpuParallelSettings.ParallelForOrSerial(0, batch * channels, outputData.Length, plane =>
+            CpuParallelSettings.ParallelForOrSerial(0, batch * channels, result.Length, plane =>
             {
                 int inBase = plane * inPlane, outBase = plane * outPlane;
                 for (int oh = 0; oh < outputHeight; oh++)
                 for (int ow = 0; ow < outputWidth; ow++)
                 {
                     T maxVal = numOps.MinValue;
-                    int maxIdx = 0;
+                    int maxIdx = oh * strideH * width + ow * strideW;
                     for (int kh = 0; kh < poolH; kh++)
                     {
                         int ih = oh * strideH + kh;
@@ -16947,7 +16957,7 @@ public partial class CpuEngine : ITensorLevelEngine
                             if (numOps.GreaterThan(val, maxVal)) { maxVal = val; maxIdx = ih * width + iw; }
                         }
                     }
-                    outputData[outBase + oh * outputWidth + ow] = maxVal;
+                    outputData[outOff + outBase + oh * outputWidth + ow] = maxVal;
                     flatIndices[outBase + oh * outputWidth + ow] = maxIdx;
                 }
             });
@@ -17143,7 +17153,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 int iw0 = ow * strideW;
                 float maxVal = float.MinValue;
-                int maxIdx = 0;
+                int maxIdx = ih0 * width + iw0;   // a winnerless window routes to its own first cell
                 for (int kh = 0; kh < poolH; kh++)
                 {
                     int row = (ih0 + kh) * width;
@@ -17170,7 +17180,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// Unpadded MaxPool2D backward that finds each window's winner by re-scanning the forward INPUT, then writes the
     /// input gradient straight into <paramref name="gradInput"/>. The winner rule is exactly the one
     /// <c>MaxPool2DWithTensorIndices</c> records (start below every finite value, strict greater-than in row-major
-    /// window order, so the first maximum wins and NaN never does; a window with no winner routes to plane index 0),
+    /// window order, so the first maximum wins and NaN never does; a window with no winner routes to its first cell),
     /// so the gradient is the one the tape would produce from saved indices -- without saving them, without a
     /// replayed forward, and without a temporary gradient tensor.
     /// </summary>
@@ -17206,8 +17216,9 @@ public partial class CpuEngine : ITensorLevelEngine
         var src = input.GetCpuBackingForStridedRead(out int srcOff);
         var go = gradOutput.GetCpuBackingForStridedRead(out int goOff);
         var gi = gradInput.GetCpuBackingForContiguousWrite(out int giOff);
+        // gi is null for a strided gradInput (GetCpuBackingForContiguousWrite refuses one); the check is explicit too.
         if (typeof(T) == typeof(float) && src is not null && go is not null && gi is not null
-            && input.IsContiguous && gradOutput.IsContiguous)
+            && input.IsContiguous && gradOutput.IsContiguous && gradInput.IsContiguous)
         {
             var x = (float[])(object)src;
             var g = (float[])(object)go;
@@ -17246,7 +17257,7 @@ public partial class CpuEngine : ITensorLevelEngine
             for (int ow = 0; ow < outW; ow++)
             {
                 T maxVal = numOps.MinValue;
-                int maxIdx = 0;
+                int maxIdx = oh * strideH * width + ow * strideW;   // a winnerless window routes to its first cell
                 for (int kh = 0; kh < poolH; kh++)
                 for (int kw = 0; kw < poolW; kw++)
                 {
@@ -47519,15 +47530,19 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = TensorAllocator.Rent<T>([n, c, outH, outW]);
         var argmax = new int[n * c * outH * outW];
         var inData = input.GetFlattenedData();
-        var outData = result.GetDataArray();
+        // The rented tensor's own storage at its offset; GetDataArray copies a pool-padded one, losing the writes.
+        var outData = result.GetCpuBackingForContiguousWrite(out int outOff)
+            ?? throw new InvalidOperationException("A freshly rented CPU tensor has no contiguous host storage.");
 
         for (int batch = 0; batch < n; batch++)
             for (int ch = 0; ch < c; ch++)
                 for (int oh = 0; oh < outH; oh++)
                     for (int ow = 0; ow < outW; ow++)
                     {
-                        int hStart = oh * h / outH, hEnd = (oh + 1) * h / outH;
-                        int wStart = ow * w / outW, wEnd = (ow + 1) * w / outW;
+                        // PyTorch adaptive bins: start = floor(i*In/Out), end = ceil((i+1)*In/Out), the rule every GPU
+                        // kernel uses. A truncated end dropped the last row/column of a bin when In % Out != 0.
+                        int hStart = oh * h / outH, hEnd = ((oh + 1) * h + outH - 1) / outH;
+                        int wStart = ow * w / outW, wEnd = ((ow + 1) * w + outW - 1) / outW;
                         int baseIdx = (batch * c + ch) * h * w;
                         double maxV = double.NegativeInfinity;
                         int maxI = baseIdx + hStart * w + wStart;
@@ -47539,7 +47554,7 @@ public partial class CpuEngine : ITensorLevelEngine
                                 if (v > maxV) { maxV = v; maxI = idx; }
                             }
                         int outIdx = (batch * c + ch) * outH * outW + oh * outW + ow;
-                        outData[outIdx] = numOps.FromDouble(maxV);
+                        outData[outOff + outIdx] = numOps.FromDouble(maxV);
                         argmax[outIdx] = maxI;
                     }
         DifferentiableOps.RecordUnary("AdaptiveMaxPool2D", result, input,

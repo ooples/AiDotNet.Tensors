@@ -10,7 +10,8 @@ namespace AiDotNet.Tensors.Tests.Engines;
 /// <summary>
 /// A graph-mode MaxPool node saves only its geometry, so a compiled CPU training plan recovers each window's winner
 /// by re-scanning the forward input (<see cref="CpuEngine.MaxPool2DBackwardRecomputeInto{T}"/>). The winner rule must
-/// be exactly the saved-index one (first strict maximum, NaN never wins, an all-NaN/-inf window routes to index 0),
+/// be exactly the saved-index one (first strict maximum, NaN never wins, an all-NaN/-inf window routes to its own
+/// first cell),
 /// and the additions must land in the same order, so these compare bit for bit against the indexed path.
 /// </summary>
 [Collection("EngineCurrentGlobalState")]
@@ -53,7 +54,8 @@ public class MaxPoolRecomputeBackwardTests
     {
         var engine = new CpuEngine();
         var x = Grid(new[] { n, c, h, w }, 11, 5);
-        // Windows with no finite winner: all NaN, and all -inf. Both route to plane index 0 under the indexed rule.
+        // Windows with no finite winner: all NaN, and all -inf. Both route to their own first cell under the indexed
+        // rule (the -inf window at columns 2-3 is the one that tells the window origin from plane index 0).
         x[0] = float.NaN; x[1] = float.NaN; x[w] = float.NaN; x[w + 1] = float.NaN;
         if (h >= 4 && w >= 4) { x[2] = float.NegativeInfinity; x[3] = float.NegativeInfinity; x[w + 2] = float.NegativeInfinity; x[w + 3] = float.NegativeInfinity; }
         var pools = new[] { pool, pool };

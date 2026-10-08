@@ -98,9 +98,18 @@ public class SimdGemmDirectParallel2DTests
         bool before = SimdGemm.UseDirectParallel2D;
         try
         {
+            // Matching bits alone do not prove the route: the per-thread run counter must move for the gated shape,
+            // and must not move when the path is switched off (the control that the counter itself discriminates).
+            SimdGemm.UseDirectParallel2D = false;
+            int runsBeforeControl = SimdGemm.t_directParallel2DRuns;
+            SimdGemm.SgemmAddInternal(a, k, false, b, n, false, new float[m * n], m, k, n, allowParallel: true, clearedOutput: true);
+            Assert.Equal(runsBeforeControl, SimdGemm.t_directParallel2DRuns);
+
             SimdGemm.UseDirectParallel2D = true;
             var routed = new float[m * n];
+            int runsBefore = SimdGemm.t_directParallel2DRuns;
             SimdGemm.SgemmAddInternal(a, k, false, b, n, false, routed, m, k, n, allowParallel: true, clearedOutput: true);
+            Assert.Equal(runsBefore + 1, SimdGemm.t_directParallel2DRuns);
             for (int i = 0; i < routed.Length; i++)
                 Assert.True(BitConverter.SingleToInt32Bits(direct[i]) == BitConverter.SingleToInt32Bits(routed[i]),
                     $"routed C[{i}] = {routed[i]:G9}, direct path {direct[i]:G9}");

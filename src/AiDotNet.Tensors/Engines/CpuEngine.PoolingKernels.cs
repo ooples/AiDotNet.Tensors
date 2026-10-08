@@ -16,9 +16,9 @@ public partial class CpuEngine
     /// windows per AVX step: the two input rows are de-interleaved into the four taps, each window's winner is chosen
     /// with the scalar rule (start at float.MinValue, strict ordered greater-than in tap order, so the first maximum
     /// wins and NaN never does), and the four output cells are written as <c>0 + g</c> on the winner and +0 elsewhere,
-    /// re-interleaved into the two rows. A window with no winner sends its gradient to plane cell 0, added in window
-    /// order after its block is stored: the same additions in the same order as the scalar loop, so the plane is
-    /// bit-identical. The columns past the last full block of eight windows run the scalar loop.
+    /// re-interleaved into the two rows. A window with no winner (all NaN or -inf) sends its gradient to its own first
+    /// tap, as the saved-index forward records it: the same additions in the same order as the scalar loop, so the
+    /// plane is bit-identical. The columns past the last full block of eight windows run the scalar loop.
     /// </summary>
     [MethodImpl(Compatibility.MethodImplHelper.Hot)]
     private static unsafe void MaxPool2x2Stride2TilesBackwardPlane(
@@ -39,7 +39,6 @@ public partial class CpuEngine
                 {
                     var minV = Vector256.Create(float.MinValue);
                     var zero = Vector256<float>.Zero;
-                    var none = Vector256.Create(-1f);
                     var t0 = Vector256.Create(0f); var t1 = Vector256.Create(1f);
                     var t2 = Vector256.Create(2f); var t3 = Vector256.Create(3f);
                     for (; ow + 8 <= outW; ow += 8)
@@ -54,7 +53,8 @@ public partial class CpuEngine
                         var cc = DeinterleaveEven(r1lo, r1hi);
                         var dd = DeinterleaveOdd(r1lo, r1hi);
                         var m = minV;
-                        var sel = none;
+                        // Tap 0 until a tap beats float.MinValue: a winnerless window routes to its own first cell.
+                        var sel = t0;
                         var gt = Avx.Compare(a, m, FloatComparisonMode.OrderedGreaterThanNonSignaling);
                         m = Avx.BlendVariable(m, a, gt); sel = Avx.BlendVariable(sel, t0, gt);
                         gt = Avx.Compare(b, m, FloatComparisonMode.OrderedGreaterThanNonSignaling);
@@ -70,10 +70,6 @@ public partial class CpuEngine
                         var dD = Avx.And(gv, Avx.Compare(sel, t3, FloatComparisonMode.OrderedEqualNonSignaling));
                         StoreInterleaved(d0 + c, dA, dB);
                         StoreInterleaved(d1 + c, dC, dD);
-                        int orphan = Avx.MoveMask(Avx.Compare(sel, none, FloatComparisonMode.OrderedEqualNonSignaling));
-                        if (orphan != 0)
-                            for (int lane = 0; lane < 8; lane++)
-                                if ((orphan & (1 << lane)) != 0) pd[0] += gr[ow + lane];
                     }
                 }
 #endif
@@ -81,13 +77,13 @@ public partial class CpuEngine
                 {
                     int iw0 = 2 * ow;
                     float maxVal = float.MinValue;
-                    int winner = -1;
+                    int winner = 0;   // a winnerless window routes to its own first cell
                     float v = x0[iw0]; if (v > maxVal) { maxVal = v; winner = 0; }
                     v = x0[iw0 + 1]; if (v > maxVal) { maxVal = v; winner = 1; }
                     v = x1[iw0]; if (v > maxVal) { maxVal = v; winner = 2; }
                     v = x1[iw0 + 1]; if (v > maxVal) { winner = 3; }
                     d0[iw0] = 0f; d0[iw0 + 1] = 0f; d1[iw0] = 0f; d1[iw0 + 1] = 0f;
-                    float* target = winner switch { 0 => d0 + iw0, 1 => d0 + iw0 + 1, 2 => d1 + iw0, 3 => d1 + iw0 + 1, _ => pd };
+                    float* target = winner switch { 1 => d0 + iw0 + 1, 2 => d1 + iw0, 3 => d1 + iw0 + 1, _ => d0 + iw0 };
                     *target += gr[ow];
                 }
             }

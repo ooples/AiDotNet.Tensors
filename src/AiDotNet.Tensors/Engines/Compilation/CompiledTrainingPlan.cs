@@ -411,11 +411,6 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     }
 
     /// <summary>
-    /// Keeps THIS plan on the eager step even where whole-step CUDA-graph capture is enabled process-wide. The
-    /// environment switch is read once per process, so this is how a single test process compares a captured plan
-    /// against an eager one (the parity oracle for capture).
-    /// </summary>
-    /// <summary>
     /// Why whole-step CUDA-graph capture was abandoned for this plan, or null while it is still eligible or engaged.
     /// A failed capture used to be swallowed: the plan trained eagerly for the rest of its life (paying a launch, copy
     /// or sync per op) and nothing said so. Measured on the PyTorch parity MLP and CNN, every run took that path.
@@ -429,6 +424,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             "CUDA graph capture of the compiled training step failed; this plan trains without graph replay from now on. " + reason);
     }
 
+    /// <summary>
+    /// Keeps THIS plan on the eager step even where whole-step CUDA-graph capture is enabled process-wide. The
+    /// environment switch is read once per process, so this is how a single test process compares a captured plan
+    /// against an eager one (the parity oracle for capture).
+    /// </summary>
     internal void DisableGraphStep()
     {
         InvalidateCapturedStepGraph();
@@ -520,16 +520,6 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     }
 
     /// <summary>
-    /// GPU weight-cache coherence after a CPU-side in-place parameter mutation. The fused optimizer
-    /// mutates a parameter's host backing IN PLACE via raw pointers (no Version bump), so in a GPU
-    /// resident/capture scope the forward's version-gate is BYPASSED and it keeps reading the STALE
-    /// pre-step device weights (the model trains against frozen weights → accuracy pinned at chance).
-    /// Bump Version AND fully invalidate the resident device buffer so the next forward re-uploads the
-    /// updated host weights. Call after EVERY CPU-side weight write — including the early-return
-    /// HypergradientSGD/DAdaptationSGD/ScheduleFreeSGD branches and ScheduleFree's pre-forward
-    /// y-update, which previously left Version and the resident caches stale (#739 review).
-    /// </summary>
-    /// <summary>
     /// Makes an in-place device update of parameter <paramref name="p"/> authoritative everywhere it is looked up,
     /// through the engine's single path for that (the eager GpuOptimizer already uses it). Binding the buffer alone
     /// left the persistent weight cache stamped with the pre-update version, so the next forward judged the updated
@@ -544,12 +534,6 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             engine.CommitParameterUpdatedOnDevice((Tensor<float>)(object)_parameters[p], buffer, backend, syncPoint: null);
     }
 
-    /// <summary>
-    /// Host wins after a host write. A GPU plan binds every parameter to a persistent device buffer and updates it there,
-    /// so between steps the device copy is authoritative. A host write in between (SetParameters, a user edit through
-    /// AsWritableSpan + IncrementVersion) advances the host version past the bound buffer's; upload those values into
-    /// the SAME buffer before the step, so the step reads them and a captured graph's baked pointers stay valid.
-    /// </summary>
     /// <summary>
     /// The plan's gradient buffers live as long as the plan, but they are created during the trace, where the tape's
     /// activation eviction can mark them as released step intermediates. A later write then failed ("GPU intermediate
@@ -566,6 +550,12 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 buffer?.ClearReleaseMarks();
     }
 
+    /// <summary>
+    /// Host wins after a host write. A GPU plan binds every parameter to a persistent device buffer and updates it there,
+    /// so between steps the device copy is authoritative. A host write in between (SetParameters, a user edit through
+    /// AsWritableSpan + IncrementVersion) advances the host version past the bound buffer's; upload those values into
+    /// the SAME buffer before the step, so the step reads them and a captured graph's baked pointers stay valid.
+    /// </summary>
     private void UploadHostWrittenParameters()
     {
         if (typeof(T) != typeof(float) || _engine is not Engines.DirectGpuTensorEngine gte) return;
@@ -590,6 +580,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         }
     }
 
+    /// <summary>
+    /// GPU weight-cache coherence after a CPU-side in-place parameter mutation. The fused optimizer
+    /// mutates a parameter's host backing IN PLACE via raw pointers (no Version bump), so in a GPU
+    /// resident/capture scope the forward's version-gate is BYPASSED and it keeps reading the STALE
+    /// pre-step device weights (the model trains against frozen weights → accuracy pinned at chance).
+    /// Bump Version AND fully invalidate the resident device buffer so the next forward re-uploads the
+    /// updated host weights. Call after EVERY CPU-side weight write — including the early-return
+    /// HypergradientSGD/DAdaptationSGD/ScheduleFreeSGD branches and ScheduleFree's pre-forward
+    /// y-update, which previously left Version and the resident caches stale (#739 review).
+    /// </summary>
     private void MarkHostWeightMutated(int p)
     {
         // A host-side weight write invalidates the parameter's resident device buffer (below), which a captured step
@@ -620,19 +620,29 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     /// multi-consumer parameter was wrong (CNN conv layers ~0.4x, LSTM input/forget/candidate gates ~0.5x against
     /// PyTorch) while the update itself, which reads the live map, was right.
     /// </remarks>
+    /// <summary>
+    /// Each parameter's gradient from the last step, as the live gradient map holds it. The backward can replace a
+    /// parameter's map entry (out-of-place accumulation, a first-write copy) rather than add into the plan's buffer,
+    /// so the plan's own array can hold only the first contribution. The result is a separate array: the plan's
+    /// array is what the step's clip, regularization and optimizer were configured against, and a reader must not
+    /// rebind it, least of all outside the step lock.
+    /// </summary>
     public Tensor<T>[] Gradients
     {
         get
         {
-            if (_liveGradientMap is { } live)
+            if (_liveGradientMap is not { } live)
+                return _gradients;
+            Tensor<T>[]? resolved = null;
+            for (int i = 0; i < _parameters.Length && i < _gradients.Length; i++)
             {
-                for (int i = 0; i < _parameters.Length && i < _gradients.Length; i++)
+                if (live.TryGetValue(_parameters[i], out var current) && !ReferenceEquals(current, _gradients[i]))
                 {
-                    if (live.TryGetValue(_parameters[i], out var current) && !ReferenceEquals(current, _gradients[i]))
-                        _gradients[i] = current;
+                    resolved ??= (Tensor<T>[])_gradients.Clone();
+                    resolved[i] = current;
                 }
             }
-            return _gradients;
+            return resolved ?? _gradients;
         }
     }
 
@@ -1401,6 +1411,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
 
     private Engines.DirectGpu.IGpuBuffer? _finitenessSumSquares;
     private Engines.DirectGpu.IDirectGpuBackend? _finitenessBackend;
+    private readonly List<Engines.DirectGpu.IGpuBuffer> _finitenessBuffers = new List<Engines.DirectGpu.IGpuBuffer>();
+    private readonly List<int> _finitenessSizes = new List<int>();
+
+    // The multi-tensor clip's per-step argument lists, owned by the plan and cleared per call like its scratch.
+    private readonly List<Engines.DirectGpu.IGpuBuffer> _clipBuffers = new List<Engines.DirectGpu.IGpuBuffer>();
+    private readonly List<int> _clipSizes = new List<int>();
+    private readonly List<Tensor<T>> _clipOwners = new List<Tensor<T>>();
 
     /// <summary>
     /// CUDA: every device gradient is finite exactly when their double-accumulated sum of squares is (a float squared
@@ -1416,8 +1433,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     {
         allFinite = true;
         Engines.DirectGpu.CUDA.CudaBackend? cuda = null;
-        var buffers = new List<Engines.DirectGpu.IGpuBuffer>(gpuGradients.Length);
-        var sizes = new List<int>(gpuGradients.Length);
+        // Plan-owned lists, cleared per step: this runs on every optimizer step.
+        var buffers = _finitenessBuffers;
+        var sizes = _finitenessSizes;
+        buffers.Clear();
+        sizes.Clear();
         for (int p = 0; p < gpuGradients.Length; p++)
         {
             if (gpuGradients[p] is not { } gradient || lengths[p] <= 0)
@@ -2282,10 +2302,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Tensor<T> Step()
     {
-        ClearPlanBufferReleaseMarks();
-        UploadHostWrittenParameters();
+        // The pre-step parameter upload and mark reset are part of the step: under the lock, so a concurrent caller
+        // cannot upload parameters into buffers another thread's StepCore is reading.
         lock (_stepSync)
+        {
+            ClearPlanBufferReleaseMarks();
+            UploadHostWrittenParameters();
             return StepCore();
+        }
     }
 
     private Tensor<T> StepCore()
@@ -2488,6 +2512,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 if (TryRunResidentBody(gte, cb))
                 {
                     ran = true;
+                    _residentBodyRanLast = true;
                     RefreshLossFromCapturedGraph(gte);
                     ApplyL2Regularization();   // before clipping, as the eager and graph steps order it
                     if (_maxGradNorm > 0.0 && !TryClipGradientsGlobalL2Gpu(_gradients, _maxGradNorm))
@@ -2515,8 +2540,21 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 }
             }
         }
+        // A resident step leaves the gradient accumulators, loss seed, forward outputs and external inputs bound to
+        // device buffers. The eager step is host-centric: it zeroes the HOST gradient arrays, so its resident in-place
+        // accumulations landed on the previous step's device gradients (on OpenCL, where a host write to a parameter
+        // drops its device binding and sends the next step here, every compiled gradient after that came back as a
+        // multiple of the true one). Roll the residency back first, as a failed capture does.
+        if (_residentBodyRanLast && _engine is Engines.DirectGpuTensorEngine rollEngine)
+        {
+            RollBackCaptureResidency(rollEngine, deviceHoldsResults: true);
+            _residentBodyRanLast = false;
+        }
         return StepEager();
     }
+
+    // True while the last step ran the resident body, so its device bindings are still in place.
+    private bool _residentBodyRanLast;
 
     // Every tensor the graph reads that it does not produce and does not own as a parameter: the batch input, the
     // TARGET, masks, any caller-fed tensor. Each is bound to a stable device buffer in the capture pre-pass and
@@ -5504,6 +5542,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                     // (per-layer-LR) GPU path — the path the Transformer's Noam/warmup schedule
                     // takes — trains against frozen weights: loss flat, weights drift, accuracy = chance.
                     _parameters[p]._gpuBufferVersion = _parameters[p].GpuCacheVersion;
+                    // And make the update authoritative in the persistent weight cache, as the non-grouped branch does:
+                    // a cache entry stamped with the pre-update version judged the updated buffer stale and re-uploaded
+                    // the old host weights over it. Every float32 parameter reaches this branch now, not just FP16 plans.
+                    if (_engine is Engines.DirectGpuTensorEngine groupedEngine)
+                    {
+                        groupedEngine.BindResidentBuffer(_parameters[p], gpuP, gpuBe);
+                        CommitDeviceParameterUpdate(groupedEngine, p, gpuP, gpuBe);
+                    }
                     continue;
                 }
 
@@ -9712,11 +9758,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // CUDA: the whole clip in four device operations, whatever the tensor count: one multi-tensor sum of
         // squares, the coefficient computed on the device, one multi-tensor scale. The per-tensor loop below issued
         // a fill + square + reduce + add and a scale per gradient, ~630 launches per N-BEATS step (AiDotNet #1804).
-        if (cb is Engines.DirectGpu.CUDA.CudaBackend multiCuda)
+        if (cb is Engines.DirectGpu.IMultiTensorKernels multiCuda)
         {
-            var buffers = new List<Engines.DirectGpu.IGpuBuffer>(gradients.Length);
-            var sizes = new List<int>(gradients.Length);
-            var owners = new List<Tensor<T>>(gradients.Length);
+            var buffers = _clipBuffers;
+            var sizes = _clipSizes;
+            var owners = _clipOwners;
+            buffers.Clear();
+            sizes.Clear();
+            owners.Clear();
             for (int p = 0; p < gradients.Length; p++)
             {
                 var g = gradients[p];
