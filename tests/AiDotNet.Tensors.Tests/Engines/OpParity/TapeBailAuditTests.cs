@@ -235,6 +235,22 @@ public class TapeBailAuditTests
     /// <summary>
     /// Every GPU override's name and its body with line comments stripped, one entry per overload.
     /// </summary>
+    // The code part of a line: a trailing "// ..." comment removed, ignoring "//" inside string and char literals.
+    // Without it "=> X(a, b);   // note" did not end in ';', so the scan ran on into the next member.
+    private static string StripLineComment(string line)
+    {
+        bool inString = false, inChar = false;
+        for (int i = 0; i < line.Length; i++)
+        {
+            char ch = line[i];
+            if ((inString || inChar) && ch == '\\') { i++; continue; }
+            if (!inChar && ch == '"') inString = !inString;
+            else if (!inString && ch == '\'') inChar = !inChar;
+            else if (!inString && !inChar && ch == '/' && i + 1 < line.Length && line[i + 1] == '/')
+                return line.Substring(0, i);
+        }
+        return line;
+    }
     private static IEnumerable<(string Name, string Text)> GpuOverrideBodies(IEnumerable<string> gpuSources)
     {
         var methodRe = new Regex(@"(?:Tensor<T> IEngine\.|public override Tensor<T> |void IEngine\.)([A-Za-z0-9_]+)<T>\s*\(",
@@ -260,7 +276,7 @@ public class TapeBailAuditTests
                     // An expression-bodied override (`=> base.Op(...);`) has no braces: it ends at the first line that
                     // ends with ';' once the `=>` has been seen, provided no block body was opened first.
                     if (!started && lines[j].Contains("=>")) expressionBodied = true;
-                    if (expressionBodied && !started && lines[j].TrimEnd().EndsWith(";"))
+                    if (expressionBodied && !started && StripLineComment(lines[j]).TrimEnd().EndsWith(";"))
                     {
                         completed = true;
                         break;
