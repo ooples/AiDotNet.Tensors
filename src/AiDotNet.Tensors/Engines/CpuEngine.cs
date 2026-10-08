@@ -47545,8 +47545,9 @@ public partial class CpuEngine : ITensorLevelEngine
                     {
                         // PyTorch adaptive bins: start = floor(i*In/Out), end = ceil((i+1)*In/Out), the rule every GPU
                         // kernel uses. A truncated end dropped the last row/column of a bin when In % Out != 0.
-                        int hStart = oh * h / outH, hEnd = ((oh + 1) * h + outH - 1) / outH;
-                        int wStart = ow * w / outW, wEnd = ((ow + 1) * w + outW - 1) / outW;
+                        // long intermediates: (outH-1)*h overflows int for large inputs, wrapping hEnd negative.
+                        int hStart = (int)((long)oh * h / outH), hEnd = (int)(((long)(oh + 1) * h + outH - 1) / outH);
+                        int wStart = (int)((long)ow * w / outW), wEnd = (int)(((long)(ow + 1) * w + outW - 1) / outW);
                         int baseIdx = (batch * c + ch) * h * w;
                         double maxV = double.NegativeInfinity;
                         int maxI = baseIdx + hStart * w + wStart;
