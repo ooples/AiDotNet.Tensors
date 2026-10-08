@@ -157,7 +157,8 @@ public partial class CpuEngine
         var padding = new[] { padH, padW };
         var dilation = new[] { dilationH, dilationW };
         bool relu = activation == FusedActivationType.ReLU;
-        var output = TensorAllocator.Rent<float>([input._shape[0], kernel._shape[0], outputHeight, outputWidth]);
+        // Uninitialized: Conv2DInto writes every element (compiled plans hand it stale reused buffers).
+        var output = TensorAllocator.RentUninitialized<float>([input._shape[0], kernel._shape[0], outputHeight, outputWidth]);
         using (new Autodiff.NoGradScope<float>())
             Conv2DInto(output, input, kernel, stride, padding, dilation);
         // The eager epilogue, not ChannelBiasActivationInto: FusedConv2D's ReLU keeps a NaN (as torch.relu does),

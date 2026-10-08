@@ -191,4 +191,27 @@ public class ConvPoolTapeTests
 
         AssertClose(expected, actual, 1e-4f, "output");
     }
+
+    [Fact]
+    public void FusedConv2D_Float_UnderTape_OverwritesAReusedArenaBuffer()
+    {
+        // The fused tape entry rents its output uninitialized. Inside an arena, the previous step's buffer comes back
+        // with its old contents: fill one with NaN, release it with the tape, and the conv must overwrite every cell.
+        var input = Random(31, 2, 3, 9, 9);
+        var kernel = Random(32, 4, 3, 3, 3);
+        var bias = Random(33, 4);
+        var expected = _engine.FusedConv2D(input, kernel, bias, 1, 1, 1, 1, 1, 1, FusedActivationType.ReLU);
+
+        using var arena = TensorArena.Create();
+        using (new GradientTape<float>())
+        {
+            var stale = TensorAllocator.RentUninitialized<float>(new[] { 2, 4, 9, 9 });
+            for (int i = 0; i < stale.Length; i++) stale.SetFlat(i, float.NaN);
+        }
+        using (new GradientTape<float>())
+        {
+            var actual = _engine.FusedConv2D(input, kernel, bias, 1, 1, 1, 1, 1, 1, FusedActivationType.ReLU);
+            AssertClose(expected, actual, 0f, "output");
+        }
+    }
 }
