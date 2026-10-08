@@ -337,7 +337,7 @@ internal static class HeadToHeadNetworkHarness
         var spec = ReadJson(Path.Combine(root, "parity", "networks", network + ".json"));
         string work = Path.Combine(Path.GetTempPath(), "aidotnet-residency", network);
         Directory.CreateDirectory(work);
-        var rng = new Random(spec.GetProperty("seed").GetInt32());
+        var rng = AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(spec.GetProperty("seed").GetInt32());
         void WriteRandom(string file, int count, float scale)
         {
             using var writer = new BinaryWriter(File.Create(Path.Combine(work, file)));
@@ -576,6 +576,12 @@ internal static class HeadToHeadNetworkHarness
         };
         var losses = new List<double>();
         var sw = new Stopwatch();
+
+        // AiDotNet's training call sites (model bases, Optimize()) open a TensorArena around the loop and every
+        // top-level tape resets it on dispose, so a step reuses the previous step's buffers. Without it every
+        // step's activations and gradients are fresh large-object-heap arrays and the loop measures gen-2 GCs
+        // (one every ~1.5 MLP steps) rather than the framework. CPU only: device buffers don't come from it.
+        using var stepArena = gpu is null ? AiDotNet.Tensors.Helpers.TensorArena.Create() : null;
 
         for (int step = 0; step < warmup + measured; step++)
         {
