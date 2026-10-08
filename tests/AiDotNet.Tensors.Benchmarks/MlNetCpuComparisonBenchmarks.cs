@@ -1,3 +1,4 @@
+using AiDotNet.Tensors.Helpers;
 #if NET8_0_OR_GREATER
 using AiDotNet.Tensors.LinearAlgebra;
 using System.Reflection;
@@ -99,9 +100,11 @@ public class MlNetCpuComparisonBenchmarks
     [Benchmark]
     [Arguments(100_000)]
     [Arguments(1_000_000)]
-    public Tensor<float> AiDotNet_TensorAdd(int size)
+    public void AiDotNet_TensorAdd(int size)
     {
-        return AiDotNetEngine.Current.TensorAdd(_aiVectorsA[size], _aiVectorsB[size]);
+        // The ML.NET arm reuses a preallocated destination; the equivalent here is returning the
+        // pooled result so the next call reuses its buffer instead of allocating a fresh one.
+        TensorPool.Return(AiDotNetEngine.Current.TensorAdd(_aiVectorsA[size], _aiVectorsB[size]));
     }
 
     [Benchmark]
@@ -118,9 +121,11 @@ public class MlNetCpuComparisonBenchmarks
     [Benchmark]
     [Arguments(100_000)]
     [Arguments(1_000_000)]
-    public Tensor<float> AiDotNet_TensorMultiply(int size)
+    public void AiDotNet_TensorMultiply(int size)
     {
-        return AiDotNetEngine.Current.TensorMultiply(_aiVectorsA[size], _aiVectorsB[size]);
+        // The ML.NET arm reuses a preallocated destination; the equivalent here is returning the
+        // pooled result so the next call reuses its buffer instead of allocating a fresh one.
+        TensorPool.Return(AiDotNetEngine.Current.TensorMultiply(_aiVectorsA[size], _aiVectorsB[size]));
     }
 
     [Benchmark]

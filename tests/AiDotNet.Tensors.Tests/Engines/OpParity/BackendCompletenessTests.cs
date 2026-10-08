@@ -30,6 +30,9 @@ namespace AiDotNet.Tensors.Tests.Engines.OpParity;
 /// (2) backend-level — none of the six GPU backends may implement a kernel-surface method as a
 /// bare NotSupported/NotImplemented stub. Both tiers write a full gap report and ratchet a floor.
 /// </summary>
+// Runs real GPU work on the shared CUDA context: serialized with the other GPU tests so it
+// cannot launch during another test's stream capture (CUDA error 901, capture invalidated).
+[Collection("DirectGpuSerial")]
 public sealed class BackendCompletenessTests
 {
     /// <summary>The six concrete GPU backends. All must provide real kernels for every op.</summary>

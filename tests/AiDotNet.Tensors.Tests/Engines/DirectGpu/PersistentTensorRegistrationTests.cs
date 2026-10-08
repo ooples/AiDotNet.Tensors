@@ -29,6 +29,9 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// asserts identity and values; only the byte count is unavailable.
 /// </para>
 /// </remarks>
+// Runs real GPU work on the shared CUDA context: serialized with the other GPU tests so it
+// cannot launch during another test's stream capture (CUDA error 901, capture invalidated).
+[Collection("DirectGpuSerial")]
 public class PersistentTensorRegistrationTests
 {
     private const int Side = 1024;

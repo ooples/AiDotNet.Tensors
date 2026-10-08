@@ -415,8 +415,12 @@ public class TorchSharpCpuComparisonBenchmarks
     [Benchmark]
     [Arguments(256)]
     [Arguments(512)]
-    public Tensor<float> AiDotNet_TensorMatMul(int size)
-        => AiDotNetEngine.Current.TensorMatMul(_aiMatricesA[size], _aiMatricesB[size]);
+    public void AiDotNet_TensorMatMul(int size)
+    {
+        // Pool-return the result like the other arms and like torch's `using var result`.
+        var r = AiDotNetEngine.Current.TensorMatMul(_aiMatricesA[size], _aiMatricesB[size]);
+        TensorPool.Return(r);
+    }
 
     [Benchmark]
     [Arguments(256)]

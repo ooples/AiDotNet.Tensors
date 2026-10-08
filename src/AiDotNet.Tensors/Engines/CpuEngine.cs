@@ -8552,15 +8552,14 @@ public partial class CpuEngine : ITensorLevelEngine
     private static unsafe float ParallelReduceFloat(float* data, int length, float identity,
         UnsafeReductionKernel kernel, Func<float, float, float> combine)
     {
-        const int parallelThreshold = 256 * 1024;
-        int maxThreads = CpuParallelSettings.MaxDegreeOfParallelism;
-        int chunks = Math.Min(maxThreads, Math.Max(1, length / parallelThreshold));
+        // Fixed 32K-element chunks (as ParallelReduceDouble), derived from the length alone so the
+        // combine order never depends on the thread count. A 256K-element chunk floor left a 1M-element
+        // float max on 3 threads: 20 µs against 7 µs for the same-size sum.
+        const int chunkSize = 32 * 1024;
+        int chunks = (length + chunkSize - 1) / chunkSize;
 
         if (chunks < 2)
             return kernel(data, length);
-
-        int chunkSize = (length + chunks - 1) / chunks;
-        chunkSize = (chunkSize + 31) & ~31; // Align to 32 elements
         float[] partials = new float[chunks];
         for (int i = 0; i < chunks; i++) partials[i] = identity;
 
@@ -8573,7 +8572,7 @@ public partial class CpuEngine : ITensorLevelEngine
             int count = Math.Min(chunkSize, totalLength - start);
             if (count > 0)
                 partials[chunk] = kernel((float*)pData + start, count);
-        });
+        }, deterministicSafe: true);
 
         float result = partials[0];
         for (int i = 1; i < chunks; i++)
@@ -12082,9 +12081,9 @@ public partial class CpuEngine : ITensorLevelEngine
             float* pSrc = (float*)pinSrc.Pointer;
             float* pDst = (float*)pinDst.Pointer;
             int len = tensor.Length;
-            const int parallelThreshold = 256 * 1024;
-            int maxThreads = CpuParallelSettings.MaxDegreeOfParallelism;
-            int chunks = Math.Min(maxThreads, Math.Max(1, len / parallelThreshold));
+            // Shared elementwise grain; a 256K-element floor put a 1M-element LeakyReLU on 3 threads
+            // (81 µs against libtorch's 20 µs).
+            int chunks = CpuParallelSettings.ElementwiseChunkCount(len);
             if (chunks >= 2)
             {
                 int chunkSize = (len + chunks - 1) / chunks;
@@ -12097,7 +12096,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     int count = Math.Min(chunkSize, len - start);
                     if (count > 0)
                         SimdKernels.LeakyReLUUnsafe((float*)pIn + start, (float*)pOut + start, count, alphaF);
-                });
+                }, deterministicSafe: true);
             }
             else
             {
@@ -45772,10 +45771,10 @@ public partial class CpuEngine : ITensorLevelEngine
     /// </summary>
     private static unsafe void ParallelSwish(float* src, float* dst, int length)
     {
-        const int parallelThreshold = 262144; // 1MB of floats — matches ParallelComputeBound(float).
-        if (length >= parallelThreshold)
+        // Shared elementwise grain, as ParallelComputeBound.
+        int nChunks = CpuParallelSettings.ElementwiseChunkCount(length);
+        if (nChunks >= 2)
         {
-            int nChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, 16);
             int chunkSize = (length + nChunks - 1) / nChunks;
             chunkSize = (chunkSize + 31) & ~31;
 
@@ -45807,10 +45806,10 @@ public partial class CpuEngine : ITensorLevelEngine
     // across cores instead of being a serial straggler (parity with GELU/Tanh/Sigmoid double paths).
     private static unsafe void ParallelSwish(double* src, double* dst, int length)
     {
-        const int parallelThreshold = 131072; // 1MB of doubles — matches ParallelComputeBound(double).
-        if (length >= parallelThreshold)
+        // Shared elementwise grain, as ParallelComputeBound.
+        int nChunks = CpuParallelSettings.ElementwiseChunkCount(length);
+        if (nChunks >= 2)
         {
-            int nChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, 16);
             int chunkSize = (length + nChunks - 1) / nChunks;
             chunkSize = (chunkSize + 31) & ~31;
 

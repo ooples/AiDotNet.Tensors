@@ -9,6 +9,9 @@ namespace AiDotNet.Tensors.Tests.Engines.Gpu;
 /// <c>GpuStreamScheduler</c> to consumers. Callers may either pass an
 /// owned pool or let the engine create one owned by the scheduler.
 /// </summary>
+// Runs real GPU work on the shared CUDA context: serialized with the other GPU tests so it
+// cannot launch during another test's stream capture (CUDA error 901, capture invalidated).
+[Collection("DirectGpuSerial")]
 public class GetStreamSchedulerTests
 {
     [Fact]

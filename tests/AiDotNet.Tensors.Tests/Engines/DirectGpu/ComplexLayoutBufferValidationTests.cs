@@ -17,6 +17,9 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// backend state or kernel launch is touched, because an undersized packed buffer would otherwise
 /// read or write past the device allocation.
 /// </summary>
+// Runs real GPU work on the shared CUDA context: serialized with the other GPU tests so it
+// cannot launch during another test's stream capture (CUDA error 901, capture invalidated).
+[Collection("DirectGpuSerial")]
 public class ComplexLayoutBufferValidationTests
 {
     [Theory]

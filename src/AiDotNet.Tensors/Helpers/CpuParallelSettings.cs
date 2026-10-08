@@ -180,10 +180,12 @@ public static class CpuParallelSettings
     /// How long a pool worker keeps spinning for the next parallel operation before it parks.
     /// </summary>
     /// <remarks>
-    /// <para>Default 200 µs: workers stay hot across the back-to-back operations of a forward or
-    /// training step, then park so an idle pool burns no CPU. Longer windows trade idle CPU for wake-up
-    /// latency on workloads that issue operations a few milliseconds apart; measure before raising it,
-    /// since a spinning worker also takes core time from the thread issuing the next operation.</para>
+    /// <para>Default 200 ms, the block time OpenMP (and therefore libtorch) uses: after a parallel
+    /// operation the workers keep spinning for the next one, so calls a few milliseconds apart do not pay
+    /// an operating-system wake-up (measured 125-147 µs -> 12-15 µs for a 1M-element op after a 1-5 ms
+    /// pause). The cost is CPU time while the pool is idle inside the window, as with libtorch. Set a
+    /// shorter window (or zero) to favour idle CPU over latency, e.g. when sharing the machine with
+    /// another runtime that also spins.</para>
     /// <para>The spin yields its core periodically and is skipped when the previous operation already
     /// used every core. <see cref="TimeSpan.Zero"/> parks immediately. The
     /// <c>AIDOTNET_PPE_WARMWINDOW_US</c> environment variable sets the initial value in microseconds.</para>

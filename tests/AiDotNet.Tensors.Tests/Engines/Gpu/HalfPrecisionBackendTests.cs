@@ -9,6 +9,9 @@ namespace AiDotNet.Tensors.Tests.Engines.Gpu;
 /// AutocastScope / mixed-precision training paths dispatch through.
 /// CudaBackend implements IGpuHalfPrecisionBackend on Maxwell+ hardware.
 /// </summary>
+// Runs real GPU work on the shared CUDA context: serialized with the other GPU tests so it
+// cannot launch during another test's stream capture (CUDA error 901, capture invalidated).
+[Collection("DirectGpuSerial")]
 public class HalfPrecisionBackendTests
 {
     [Fact]

@@ -15,6 +15,9 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 /// present. The specialization stays disabled by default and fails closed until
 /// three clean promotion runs clear the release gate.
 /// </summary>
+// Runs real GPU work on the shared CUDA context: serialized with the other GPU tests so it
+// cannot launch during another test's stream capture (CUDA error 901, capture invalidated).
+[Collection("DirectGpuSerial")]
 public class DirectPtxTranspose2DTests
 {
     [Fact]

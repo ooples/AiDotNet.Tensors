@@ -14,6 +14,9 @@ namespace AiDotNet.Tensors.Tests.Engines;
 /// must match <see cref="CpuEngine.FusedLinearCrossEntropyWithLogits{T}(Tensor{T},Tensor{T},Tensor{T},Tensor{int})"/>
 /// and the dense overload.
 /// </summary>
+// Runs real GPU work on the shared CUDA context: serialized with the other GPU tests so it
+// cannot launch during another test's stream capture (CUDA error 901, capture invalidated).
+[Collection("DirectGpuSerial")]
 public class FusedLinearCeGpuParityTests
 {
     private static float[] Gen(int n, int s, float scale = 0.5f)

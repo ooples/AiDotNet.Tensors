@@ -6013,12 +6013,37 @@ namespace AiDotNet.Tensors.Engines.Simd
         {
             if (data.Length == 0) throw new ArgumentException("Span must not be empty.");
 #if NET5_0_OR_GREATER
-            double max = double.NegativeInfinity;
-            for (int i = 0; i < data.Length; i++)
+            // 4 independent AVX accumulators (the scalar loop this replaced ran ~5x slower than Sum).
+            // acc = Max(v, acc): x86 MAXPD returns its SECOND operand when either is NaN, so a NaN
+            // element leaves the accumulator unchanged, the same NaN-skipping result as the scalar
+            // `x > acc` comparison below.
+            double result = double.NegativeInfinity;
+            int i = 0;
+            if (Avx.IsSupported && data.Length >= 16)
             {
-                if (data[i] > max) max = data[i];
+                ref double r0 = ref MemoryMarshal.GetReference(data);
+                var acc0 = Vector256.Create(double.NegativeInfinity);
+                var acc1 = acc0; var acc2 = acc0; var acc3 = acc0;
+                int simdLength = data.Length & ~15;
+                for (; i < simdLength; i += 16)
+                {
+                    acc0 = Avx.Max(Vector256.LoadUnsafe(ref r0, (nuint)i), acc0);
+                    acc1 = Avx.Max(Vector256.LoadUnsafe(ref r0, (nuint)(i + 4)), acc1);
+                    acc2 = Avx.Max(Vector256.LoadUnsafe(ref r0, (nuint)(i + 8)), acc2);
+                    acc3 = Avx.Max(Vector256.LoadUnsafe(ref r0, (nuint)(i + 12)), acc3);
+                }
+                var acc = Avx.Max(Avx.Max(acc0, acc1), Avx.Max(acc2, acc3));
+                for (int l = 0; l < 4; l++)
+                {
+                    double v = acc.GetElement(l);
+                    if (v > result) result = v;
+                }
             }
-            return max;
+            for (; i < data.Length; i++)
+            {
+                if (data[i] > result) result = data[i];
+            }
+            return result;
 #else
             return SystemNumericsVectorBridge.Max(data);
 #endif
@@ -6030,12 +6055,37 @@ namespace AiDotNet.Tensors.Engines.Simd
         {
             if (data.Length == 0) throw new ArgumentException("Span must not be empty.");
 #if NET5_0_OR_GREATER
-            double min = double.PositiveInfinity;
-            for (int i = 0; i < data.Length; i++)
+            // 4 independent AVX accumulators (the scalar loop this replaced ran ~5x slower than Sum).
+            // acc = Min(v, acc): x86 MINPD returns its SECOND operand when either is NaN, so a NaN
+            // element leaves the accumulator unchanged, the same NaN-skipping result as the scalar
+            // `x < acc` comparison below.
+            double result = double.PositiveInfinity;
+            int i = 0;
+            if (Avx.IsSupported && data.Length >= 16)
             {
-                if (data[i] < min) min = data[i];
+                ref double r0 = ref MemoryMarshal.GetReference(data);
+                var acc0 = Vector256.Create(double.PositiveInfinity);
+                var acc1 = acc0; var acc2 = acc0; var acc3 = acc0;
+                int simdLength = data.Length & ~15;
+                for (; i < simdLength; i += 16)
+                {
+                    acc0 = Avx.Min(Vector256.LoadUnsafe(ref r0, (nuint)i), acc0);
+                    acc1 = Avx.Min(Vector256.LoadUnsafe(ref r0, (nuint)(i + 4)), acc1);
+                    acc2 = Avx.Min(Vector256.LoadUnsafe(ref r0, (nuint)(i + 8)), acc2);
+                    acc3 = Avx.Min(Vector256.LoadUnsafe(ref r0, (nuint)(i + 12)), acc3);
+                }
+                var acc = Avx.Min(Avx.Min(acc0, acc1), Avx.Min(acc2, acc3));
+                for (int l = 0; l < 4; l++)
+                {
+                    double v = acc.GetElement(l);
+                    if (v < result) result = v;
+                }
             }
-            return min;
+            for (; i < data.Length; i++)
+            {
+                if (data[i] < result) result = data[i];
+            }
+            return result;
 #else
             return SystemNumericsVectorBridge.Min(data);
 #endif

@@ -155,11 +155,13 @@ internal sealed class PersistentParallelExecutor
     // microseconds; 0 disables (park immediately). Settable at run time through
     // CpuParallelSettings.WorkerSpinTime.
     //
-    // Default 200 µs. An OpenMP-style 200 ms block time was measured and rejected: interleaved against
-    // libtorch in one process, a 1M-element subtract issued 10 ms after the previous op took 576 µs with
-    // a 200 ms spin against 128 µs parking. The spinning workers cost the busy main thread more than the
-    // wake-up they save.
-    internal const long DefaultWarmWindowMicros = 200;
+    // Default 200 ms, OpenMP's block time (KMP_BLOCKTIME), which is how libtorch stays fast on calls a
+    // few milliseconds apart. Measured in a process of its own (no other spinning runtime): a 1M-element
+    // subtract 1-5 ms after the previous op took 125-147 µs with the old 200 µs window and 12-15 µs
+    // with 200 ms; a [32768, 64] LayerNorm 189-389 µs against 68-100 µs. (An earlier A/B ran inside a
+    // process that also hosted libtorch, whose own 64 spinning OpenMP threads competed with ours and
+    // made the long window look worse.) Workers yield their core periodically while spinning.
+    internal const long DefaultWarmWindowMicros = 200_000;
 
     private static long _warmWindowTicks = ComputeWarmWindowTicks();
 

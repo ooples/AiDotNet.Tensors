@@ -10,6 +10,9 @@ namespace AiDotNet.Tensors.Tests.Engines.Gpu;
 /// available; consumers downcast a backend reference and dispatch through
 /// it for mixed-precision conv.
 /// </summary>
+// Runs real GPU work on the shared CUDA context: serialized with the other GPU tests so it
+// cannot launch during another test's stream capture (CUDA error 901, capture invalidated).
+[Collection("DirectGpuSerial")]
 public class IGpuMixedPrecisionConvBackendTests
 {
     [Fact]
