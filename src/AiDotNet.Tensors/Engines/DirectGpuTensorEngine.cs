@@ -3828,17 +3828,32 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // the trace used to pay for its stack walks and then print nothing.
     private static void StaleDropDiag(string reason)
     {
-        int n = s_aliasDiag.AddOrUpdate(reason, 1, (_, c) => c + 1);
-        if (n <= 3) try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(),
-            "aidotnet_graphcapture_diag.txt"), "[STALE] " + reason + System.Environment.NewLine); } catch { }
+        if (!s_staleDropTrace) return;
+        WriteGraphCaptureDiag("[STALE] ", reason);
     }
 
     private static void AliasDiag(string reason)
     {
         if (!s_aliasDiagEnabled) return;
+        WriteGraphCaptureDiag("[ALIAS] ", reason);
+    }
+
+    // The one sink both debug traces share: the first three occurrences of each distinct reason, appended to
+    // aidotnet_graphcapture_diag.txt in the temp directory. Callers gate on their own switch first.
+    private static void WriteGraphCaptureDiag(string tag, string reason)
+    {
         int n = s_aliasDiag.AddOrUpdate(reason, 1, (_, c) => c + 1);
-        if (n <= 3) try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(),
-            "aidotnet_graphcapture_diag.txt"), "[ALIAS] " + reason + System.Environment.NewLine); } catch { }
+        if (n > 3) return;
+        try
+        {
+            System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(),
+                "aidotnet_graphcapture_diag.txt"), tag + reason + System.Environment.NewLine);
+        }
+        catch (Exception ex) when (ex is System.IO.IOException || ex is UnauthorizedAccessException)
+        {
+            // A debug trace must never fail the op it is tracing; report the lost line instead of throwing.
+            System.Diagnostics.Trace.TraceWarning($"Graph-capture diagnostic not written ({ex.GetType().Name}): {tag}{reason}");
+        }
     }
 
     private static readonly bool s_residentSyncDebug =
