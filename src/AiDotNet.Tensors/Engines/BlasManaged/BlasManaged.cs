@@ -116,6 +116,7 @@ public static partial class BlasManaged
     private const int ThinMDirectMinM = 64;     // enough Mr=6 blocks to parallelize
     private const int ThinMDirectMaxM = 1024;   // above this the packed path wins
     private const int ThinMDirectMaxN = 512;    // above this B re-stream dominates
+    private const int ThinMDirectTransBMaxN = 1024; // NT kernel: Bᵀ rows read once per row chunk
     private const int ThinMDirectMaxK = 1024;   // tested winning range
     // Tiny GEMMs (e.g. 72×72×48 ≈ 0.25M) gain nothing from the parallel direct kernel
     // and should stay on the strategy/autotune path (which learns + caches a winner for
@@ -150,7 +151,11 @@ public static partial class BlasManaged
         // contiguous vector dimension) — left on the strategy.
         if (transA && transB) return false;
         if (ldc != n || (n & 7) != 0) return false;
-        if (m < ThinMDirectMinM || m > ThinMDirectMaxM || n > ThinMDirectMaxN || k > ThinMDirectMaxK) return false;
+        // B transposed runs the NT dot-product kernel, which reads Bᵀ rows contiguously and does not re-stream a
+        // [k, n] B per row chunk, so its N ceiling is wider: a linear layer's input gradient dY·W at 784 outputs
+        // fell to the streaming strategy at 2.2x the time (128x512x784: 0.38 ms vs 0.17 here).
+        int maxN = transB && !transA ? ThinMDirectTransBMaxN : ThinMDirectMaxN;
+        if (m < ThinMDirectMinM || m > ThinMDirectMaxM || n > maxN || k > ThinMDirectMaxK) return false;
         if ((long)m * n * k < ThinMDirectMinWork) return false; // tiny GEMMs stay on the strategy/autotune path
         // Each operand must be contiguous in its stored (possibly transposed) layout:
         // !transA → A is [m,k] (lda=k); transA → Aᵀ is [k,m] (lda=m). Likewise B.
