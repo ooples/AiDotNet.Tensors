@@ -16815,7 +16815,10 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"Invalid output dimensions ({outputHeight}x{outputWidth}). Check pool size and stride.");
 
         var result = TensorAllocator.Rent<T>([batch, channels, outputHeight, outputWidth]);
-        var outputData = result.GetDataArray();
+        // Write the pooled tensor's own storage at its offset: GetDataArray hands back a copy for a pool-padded or
+        // offset tensor, so results written there were lost.
+        var outputData = result.GetCpuBackingForContiguousWrite(out int outOff)
+            ?? throw new InvalidOperationException("A freshly rented CPU tensor has no contiguous host storage.");
         var inputData = input.GetFlattenedData();
         // Sized from the logical output: a pooled backing array can be longer than result.Length.
         var flatIndices = new int[result.Length];
@@ -16825,7 +16828,7 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var src = (float[])(object)inputData;
             var dst = (float[])(object)outputData;
-            CpuParallelSettings.ParallelForOrSerial(0, batch * channels, outputData.Length, plane =>
+            CpuParallelSettings.ParallelForOrSerial(0, batch * channels, result.Length, plane =>
             {
                 int inBase = plane * inPlane, outBase = plane * outPlane;
                 for (int oh = 0; oh < outputHeight; oh++)
@@ -16846,7 +16849,7 @@ public partial class CpuEngine : ITensorLevelEngine
                             if (val > maxVal) { maxVal = val; maxIdx = ih * width + iw; }
                         }
                     }
-                    dst[outBase + oh * outputWidth + ow] = maxVal;
+                    dst[outOff + outBase + oh * outputWidth + ow] = maxVal;
                     flatIndices[outBase + oh * outputWidth + ow] = maxIdx;
                 }
             });
@@ -16854,7 +16857,7 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            CpuParallelSettings.ParallelForOrSerial(0, batch * channels, outputData.Length, plane =>
+            CpuParallelSettings.ParallelForOrSerial(0, batch * channels, result.Length, plane =>
             {
                 int inBase = plane * inPlane, outBase = plane * outPlane;
                 for (int oh = 0; oh < outputHeight; oh++)
@@ -16873,7 +16876,7 @@ public partial class CpuEngine : ITensorLevelEngine
                             if (numOps.GreaterThan(val, maxVal)) { maxVal = val; maxIdx = ih * width + iw; }
                         }
                     }
-                    outputData[outBase + oh * outputWidth + ow] = maxVal;
+                    outputData[outOff + outBase + oh * outputWidth + ow] = maxVal;
                     flatIndices[outBase + oh * outputWidth + ow] = maxIdx;
                 }
             });
@@ -47182,7 +47185,9 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = TensorAllocator.Rent<T>([n, c, outH, outW]);
         var argmax = new int[n * c * outH * outW];
         var inData = input.GetFlattenedData();
-        var outData = result.GetDataArray();
+        // The rented tensor's own storage at its offset; GetDataArray copies a pool-padded one, losing the writes.
+        var outData = result.GetCpuBackingForContiguousWrite(out int outOff)
+            ?? throw new InvalidOperationException("A freshly rented CPU tensor has no contiguous host storage.");
 
         for (int batch = 0; batch < n; batch++)
             for (int ch = 0; ch < c; ch++)
@@ -47204,7 +47209,7 @@ public partial class CpuEngine : ITensorLevelEngine
                                 if (v > maxV) { maxV = v; maxI = idx; }
                             }
                         int outIdx = (batch * c + ch) * outH * outW + oh * outW + ow;
-                        outData[outIdx] = numOps.FromDouble(maxV);
+                        outData[outOff + outIdx] = numOps.FromDouble(maxV);
                         argmax[outIdx] = maxI;
                     }
         DifferentiableOps.RecordUnary("AdaptiveMaxPool2D", result, input,
