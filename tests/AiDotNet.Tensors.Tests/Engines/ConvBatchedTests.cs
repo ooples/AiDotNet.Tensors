@@ -7,11 +7,11 @@ using Xunit;
 namespace AiDotNet.Tensors.Tests.Engines;
 
 /// <summary>
-/// The float32 conv backward lays the whole batch's im2col columns side by side and runs one GEMM, for strided convs
-/// and for stride-1 input gradients on small output planes. Checked against a direct-loop reference, overwrite and
-/// accumulate.
+/// The float32 conv lays the whole batch's im2col columns side by side and runs one GEMM - forward, kernel and input
+/// gradients - for strided convs and small output planes. Checked against a direct-loop reference; the gradients both
+/// overwriting and accumulating.
 /// </summary>
-public class ConvBackwardBatchedTests
+public class ConvBatchedTests
 {
     private static Tensor<float> Rand(int[] shape, int seed)
     {
@@ -31,6 +31,7 @@ public class ConvBackwardBatchedTests
         { 3, 5, 7, 11, 9, 3, 2, 1, 1 },    // odd channels, non-square
         { 2, 6, 10, 13, 13, 3, 2, 2, 2 },  // dilated, extra padding
         { 2, 4, 6, 9, 7, 5, 3, 1, 1 },     // 5x5 stride 3
+        { 2, 136, 8, 4, 4, 3, 1, 1, 1 },   // colH 1224: the forward GEMM runs on BlasManaged
     };
 
     [Theory]
@@ -64,7 +65,26 @@ public class ConvBackwardBatchedTests
                                 }
                     }
 
+        var refY = new float[dy.Length];
+        for (int b = 0; b < batch; b++)
+            for (int o = 0; o < outC; o++)
+                for (int y = 0; y < oh; y++)
+                    for (int z = 0; z < ow; z++)
+                    {
+                        float sum = 0;
+                        for (int c = 0; c < inC; c++)
+                            for (int i = 0; i < k; i++)
+                                for (int j = 0; j < k; j++)
+                                {
+                                    int ih = y * stride - pad + i * dil, iw = z * stride - pad + j * dil;
+                                    if (ih < 0 || ih >= h || iw < 0 || iw >= w) continue;
+                                    sum += x[((b * inC + c) * h + ih) * w + iw] * kernel[((o * inC + c) * k + i) * k + j];
+                                }
+                        refY[((b * outC + o) * oh + y) * ow + z] = sum;
+                    }
+
         var engine = new CpuEngine();
+        AssertClose(refY, engine.Conv2D(x, kernel, new[] { stride, stride }, new[] { pad, pad }, new[] { dil, dil }), "forward");
         var st = new[] { stride, stride };
         var pd = new[] { pad, pad };
         var dl = new[] { dil, dil };

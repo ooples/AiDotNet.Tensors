@@ -10088,6 +10088,15 @@ public partial class CpuEngine : ITensorLevelEngine
         int outputHeight,
         int outputWidth)
     {
+        if (input.Layout == LinearAlgebra.TensorLayout.Nchw
+            && UseBatchedConvForward(batch, inChannels, kernelHeight, kernelWidth, strideH, strideW, outputHeight, outputWidth, outChannels))
+        {
+            Conv2DForwardBatchedFloat(
+                inputData ?? input.GetReadOnlyDataArray(), kernelData ?? kernel.GetReadOnlyDataArray(), outputData ?? output.GetDataArray(),
+                batch, inChannels, height, width, outChannels, kernelHeight, kernelWidth,
+                strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth);
+            return;
+        }
         if (ShouldUseAdaptiveFloatConv2D(
             input.Layout, strideH, strideW, padH, padW, dilationH, dilationW))
         {
@@ -15174,7 +15183,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 // Small output planes (deep layers) take the batched im2col path below instead: the transposed conv
                 // there is a [B*colW]-wide GEMM, measured 2.2 ms against 5.3 ms at 256 channels on 8x8.
                 bool smallPlane = outputHeight * outputWidth <= ConvBackwardInputBatchedMaxPlane
-                    && UseBatchedConvBackward(batch, inChannels * kernelHeight * kernelWidth, outputHeight * outputWidth, outChannels);
+                    && UseBatchedConv(batch, inChannels * kernelHeight * kernelWidth, outputHeight * outputWidth, outChannels);
                 if (!smallPlane && strideH == 1 && strideW == 1 && dilationH == 1 && dilationW == 1
                     && padHt >= 0 && padWt >= 0 && padHt == padWt)
                 {
@@ -15247,7 +15256,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 Array.Clear(destF, destOff, batch * inChannels * height * width);
             var gradOutputF = (float[])(object)gradOutput.GetFlattenedData();
             var kernelF = (float[])(object)kernel.GetFlattenedData();
-            if (UseBatchedConvBackward(batch, colH, colW, outChannels))
+            if (UseBatchedConv(batch, colH, colW, outChannels))
             {
                 Conv2DBackwardInputBatchedFloat(
                     destF, destOff, gradOutputF, kernelF,
@@ -16331,7 +16340,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return;
             }
 #endif
-            if (UseBatchedConvBackward(batch, inChannels * kernelHeight * kernelWidth, outputHeight * outputWidth, outChannels))
+            if (UseBatchedConv(batch, inChannels * kernelHeight * kernelWidth, outputHeight * outputWidth, outChannels))
             {
                 Conv2DBackwardKernelBatchedFloat(
                     (float[])(object)dest._storage.GetDataArray(), dest._storageOffset, accumulate,

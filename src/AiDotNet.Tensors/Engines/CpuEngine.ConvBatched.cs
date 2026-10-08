@@ -5,8 +5,10 @@ using AiDotNet.Tensors.Helpers;
 namespace AiDotNet.Tensors.Engines;
 
 /// <summary>
-/// The float32 im2col conv backward over the whole batch at once. The per-image path ran one GEMM per image whose
-/// reduction axis was that image's output positions - 16 for a 256->512 stride-2 conv on 8x8 inputs - so each GEMM
+/// The float32 im2col conv over the whole batch at once, forward and backward. The forward's per-image paths ran
+/// strided and small-plane convs 2-15x slower than one batch-wide GEMM. In the backward, the per-image path ran one
+/// GEMM per image whose reduction axis was that image's output positions - 16 for a 256->512 stride-2 conv on 8x8
+/// inputs - so each GEMM
 /// rewrote the full kernel-sized output for a handful of multiply-adds, and the batch-parallel variant then allocated
 /// a kernel-sized gradient per image and summed them serially. Laying the batch's columns side by side gives one GEMM
 /// whose reduction axis is batch x output positions.
@@ -22,7 +24,22 @@ public partial class CpuEngine
     // channels on 32x32) and loses on small ones; the batched path takes output planes up to this many positions.
     private const int ConvBackwardInputBatchedMaxPlane = 64;
 
-    private static bool UseBatchedConvBackward(int batch, int colH, int colW, int outChannels)
+    // The batched forward's GEMM is [outC, colH] x [colH, batch*colW]. SimdGemm's direct kernels win up to this depth
+    // (64->128 stride 2 on 32x32: 1.3 ms against 2.1 ms on BlasManaged); past it BlasManaged's packed kernel does
+    // (512 channels on 4x4, K = 4608: 1.8 ms against 4.2 ms).
+    private const int ConvForwardBatchedSimdGemmMaxK = 1152;
+
+    /// <summary>
+    /// Whether a batched float32 forward conv takes the batch-wide im2col GEMM: strided convs, whose per-image paths
+    /// measured 2-15x slower (64->128 stride 2 on 32x32: 20 ms against 1.3 ms), and small output planes, where the
+    /// Winograd and implicit-GEMM routes are starved for columns. Large stride-1 planes keep the existing dispatch.
+    /// </summary>
+    private static bool UseBatchedConvForward(int batch, int inChannels, int kernelHeight, int kernelWidth,
+        int strideH, int strideW, int outputHeight, int outputWidth, int outChannels)
+        => (strideH > 1 || strideW > 1 || outputHeight * outputWidth <= ConvBackwardInputBatchedMaxPlane)
+           && UseBatchedConv(batch, inChannels * kernelHeight * kernelWidth, outputHeight * outputWidth, outChannels);
+
+    private static bool UseBatchedConv(int batch, int colH, int colW, int outChannels)
         => batch > 1
            && (long)colH * batch * colW <= ConvBackwardBatchedMaxColumnElements
            && (long)outChannels * batch * colW <= ConvBackwardBatchedMaxColumnElements;
@@ -143,6 +160,69 @@ public partial class CpuEngine
         {
             pool.Return(cols);
             pool.Return(packedGrad);
+        }
+    }
+
+    /// <summary>
+    /// Forward conv as one GEMM over the batch: out[outC, batch*colW] = W[outC, colH] . cols[colH, batch*colW], then
+    /// unpacked to [batch, outC, colW]. Overwrites every element of <paramref name="outputF"/>.
+    /// </summary>
+    private static void Conv2DForwardBatchedFloat(
+        float[] inputF, float[] kernelF, float[] outputF,
+        int batch, int inChannels, int height, int width,
+        int outChannels, int kernelHeight, int kernelWidth,
+        int strideH, int strideW, int padH, int padW, int dilationH, int dilationW,
+        int outputHeight, int outputWidth)
+    {
+        int colH = inChannels * kernelHeight * kernelWidth;
+        int colW = outputHeight * outputWidth;
+        int colWAll = batch * colW;
+        int inputSliceSize = inChannels * height * width;
+        var pool = ArrayPool<float>.Shared;
+        var cols = pool.Rent(colH * colWAll);
+        var packedOut = pool.Rent(outChannels * colWAll);
+        try
+        {
+            CpuParallelSettings.ParallelForOrSerial(0, batch * inChannels, (long)colH * colWAll, bc =>
+            {
+                int b = bc / inChannels, c = bc % inChannels;
+                Im2ColHelper.Im2ColStridedSingleChannelRange(
+                    new ReadOnlySpan<float>(inputF, b * inputSliceSize, inputSliceSize),
+                    new Span<float>(cols, 0, colH * colWAll), colWAll, b * colW,
+                    c, c + 1, height, width, kernelHeight, kernelWidth,
+                    strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth);
+            }, deterministicSafe: true);
+
+            Array.Clear(packedOut, 0, outChannels * colWAll);
+            if (colH > ConvForwardBatchedSimdGemmMaxK)
+                Engines.BlasManaged.BlasManaged.Gemm<float>(
+                    new ReadOnlySpan<float>(kernelF, 0, outChannels * colH), colH, false,
+                    new ReadOnlySpan<float>(cols, 0, colH * colWAll), colWAll, false,
+                    new Span<float>(packedOut, 0, outChannels * colWAll), colWAll,
+                    outChannels, colWAll, colH);
+            else if (!BlasProvider.IsAvailable || !BlasProvider.TryGemmEx(
+                    outChannels, colWAll, colH,
+                    kernelF, 0, colH, false,
+                    cols, 0, colWAll, false,
+                    packedOut, 0, colWAll))
+            {
+                Simd.SimdGemm.Sgemm(
+                    new ReadOnlySpan<float>(kernelF, 0, outChannels * colH), colH, false,
+                    new ReadOnlySpan<float>(cols, 0, colH * colWAll), colWAll, false,
+                    new Span<float>(packedOut, 0, outChannels * colWAll),
+                    outChannels, colH, colWAll);
+            }
+
+            CpuParallelSettings.ParallelForOrSerial(0, outChannels, (long)outChannels * colWAll, oc =>
+            {
+                for (int b = 0; b < batch; b++)
+                    Array.Copy(packedOut, oc * colWAll + b * colW, outputF, (b * outChannels + oc) * colW, colW);
+            }, deterministicSafe: true);
+        }
+        finally
+        {
+            pool.Return(cols);
+            pool.Return(packedOut);
         }
     }
 }
