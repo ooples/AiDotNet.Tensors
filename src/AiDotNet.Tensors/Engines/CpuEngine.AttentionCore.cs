@@ -1,5 +1,4 @@
 using System;
-using System.Buffers;
 using System.Collections.Generic;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Engines.Compilation;
@@ -638,62 +637,6 @@ public partial class CpuEngine
         {
             int s = r * srcStride;
             for (int c = 0; c < cols; c++) dst[c * dstStride + r] = src[s + c];
-        }
-    }
-
-    /// <summary>dst[dOff + c] = row . mt[:, c] for c &lt; n, where mt is a [depth, stride] row-major block.</summary>
-    private static void RowTimesMatrix(float[] row, int rowOff, int depth, float[] mt, int stride, float[] dst, int dOff, int n)
-        => GemvRows(row, rowOff, 1, depth, mt, 0, stride, dst, dOff, n, accumulate: false);
-
-    /// <summary>
-    /// dst[dOff + c] (= or +=) sum over d &lt; depth of a[aOff + d * aStride] * m[mOff + d * mStride + c], for c &lt; n:
-    /// a weighted sum of <paramref name="depth"/> rows of m. Every product in the attention forward and backward is
-    /// one of these (scores, P.V, dO.V^T, P^T.dO, dS.K, dS^T.Q). The destination block stays in up to four vector
-    /// registers for the whole depth loop instead of being reloaded and stored once per row.
-    /// </summary>
-    private static void GemvRows(
-        float[] a, int aOff, int aStride, int depth, float[] m, int mOff, int mStride,
-        float[] dst, int dOff, int n, bool accumulate)
-    {
-        int w = System.Numerics.Vector<float>.Count, c = 0;
-        for (; c + 4 * w <= n; c += 4 * w)
-        {
-            System.Numerics.Vector<float> c0, c1, c2, c3;
-            if (accumulate)
-            {
-                c0 = new System.Numerics.Vector<float>(dst, dOff + c);
-                c1 = new System.Numerics.Vector<float>(dst, dOff + c + w);
-                c2 = new System.Numerics.Vector<float>(dst, dOff + c + 2 * w);
-                c3 = new System.Numerics.Vector<float>(dst, dOff + c + 3 * w);
-            }
-            else c0 = c1 = c2 = c3 = System.Numerics.Vector<float>.Zero;
-            for (int d = 0; d < depth; d++)
-            {
-                var s = new System.Numerics.Vector<float>(a[aOff + d * aStride]);
-                int mo = mOff + d * mStride + c;
-                c0 += s * new System.Numerics.Vector<float>(m, mo);
-                c1 += s * new System.Numerics.Vector<float>(m, mo + w);
-                c2 += s * new System.Numerics.Vector<float>(m, mo + 2 * w);
-                c3 += s * new System.Numerics.Vector<float>(m, mo + 3 * w);
-            }
-            c0.CopyTo(dst, dOff + c);
-            c1.CopyTo(dst, dOff + c + w);
-            c2.CopyTo(dst, dOff + c + 2 * w);
-            c3.CopyTo(dst, dOff + c + 3 * w);
-        }
-        for (; c + w <= n; c += w)
-        {
-            var c0 = accumulate ? new System.Numerics.Vector<float>(dst, dOff + c) : System.Numerics.Vector<float>.Zero;
-            for (int d = 0; d < depth; d++)
-                c0 += new System.Numerics.Vector<float>(a[aOff + d * aStride])
-                      * new System.Numerics.Vector<float>(m, mOff + d * mStride + c);
-            c0.CopyTo(dst, dOff + c);
-        }
-        for (; c < n; c++)
-        {
-            float sum = accumulate ? dst[dOff + c] : 0f;
-            for (int d = 0; d < depth; d++) sum += a[aOff + d * aStride] * m[mOff + d * mStride + c];
-            dst[dOff + c] = sum;
         }
     }
 
