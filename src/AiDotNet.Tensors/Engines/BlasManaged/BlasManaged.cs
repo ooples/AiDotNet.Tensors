@@ -660,9 +660,8 @@ public static partial class BlasManaged
             // The fp32 GotoGemm routes (per-tile RunTile, CCX RunTilePackedB / RunMacroPanelStep) are write-first:
             // the first K-panel stores C through the overwrite kernel and zeroes its scalar tail strips, so a
             // beta=0 pre-clear of C was a redundant full pass over the output (a [1024, 49152] logits product
-            // spent ~2% of a CPU LM step in it). Still cleared when no panel runs (k <= 0) and before the opt-in
-            // bf16 route, which accumulates.
-            if (betaZero && k <= 0) ClearOutputTile(c, ldc, m, n);
+            // spent ~2% of a CPU LM step in it). The gate above needs m*n*k >= ParallelMinWork, so k > 0 and a
+            // panel always runs; only the opt-in bf16 route, which accumulates, still clears first.
             var gepi = options.Epilogue;
             {
                 var gfa = MemoryMarshal.Cast<T, float>(a);
