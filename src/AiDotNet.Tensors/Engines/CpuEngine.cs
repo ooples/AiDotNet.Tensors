@@ -40850,13 +40850,18 @@ public partial class CpuEngine : ITensorLevelEngine
             // have to re-run a full matmul to recover it (was 98% of backward time
             // on paper-scale transformers). The saved tensor is a detached clone
             // so the in-place activation below does not corrupt it.
+            // The matmul and bias-add entries go first: the single fused entry below replaces them. The activation then
+            // runs unrecorded, because that entry's backward applies its derivative. Applied while recording, it added
+            // an entry of its own, so the removal took the activation and the bias add and left the matmul's entry
+            // behind on the tape.
+            RemoveLastNTapeEntries<T>(bias != null ? 2 : 1);
             Tensor<T>? savedPreActivation = null;
             if (activation != FusedActivationType.None)
             {
                 savedPreActivation = fusedResult.Clone();
-                ApplyFusedActivationInPlace(fusedResult, activation, activationParams);
+                using (new Autodiff.NoGradScope<T>())
+                    ApplyFusedActivationInPlace(fusedResult, activation, activationParams);
             }
-            RemoveLastNTapeEntries<T>(bias != null ? 2 : 1);
 
             // Record single fused entry with activation info AND the captured
             // pre-activation for backward. #506 review: also carry FusedActivationParams
