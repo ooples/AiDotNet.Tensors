@@ -1223,6 +1223,16 @@ class Program
         }
 
         // Run linear algebra benchmarks
+        // Subset of the linear-algebra suites: --linalg-filter "*VectorScalar*" (BenchmarkDotNet glob on the full name)
+        if (args[0] == "--linalg-filter" && args.Length > 1)
+        {
+            var filtered = BenchConfig.AddFilter(new BenchmarkDotNet.Filters.GlobFilter(args.Skip(1).ToArray()));
+            BenchmarkRunner.Run<LinearAlgebraBenchmarks>(filtered);
+            BenchmarkRunner.Run<SmallMatrixBenchmarks>(filtered);
+            BenchmarkRunner.Run<ElementWiseBenchmarks>(filtered);
+            return;
+        }
+
         if (args[0] == "--linalg")
         {
             BenchmarkRunner.Run<LinearAlgebraBenchmarks>(BenchConfig);

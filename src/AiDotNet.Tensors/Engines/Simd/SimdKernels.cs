@@ -5368,14 +5368,31 @@ namespace AiDotNet.Tensors.Engines.Simd
 
             if (Avx.IsSupported && length >= 16)
             {
-                var vs = Vector256.Create(scalar);
-                int simdLength = length & ~15;
-                for (; i < simdLength; i += 16)
+                // Stores aligned to 32 bytes. .NET aligns array data to 8 bytes only, so whether an unaligned
+                // 32-byte store splits a cache line depended on where the GC placed the destination: 1000 doubles
+                // took 74 ns or 128 ns depending on the process (TensorPrimitives, which aligns, a steady 64 ns).
+                // Leading elements are done scalar until the destination is aligned.
+                unsafe
                 {
-                    WriteVector256Double(result, i, Avx.Multiply(ReadVector256Double(a, i), vs));
-                    WriteVector256Double(result, i + 4, Avx.Multiply(ReadVector256Double(a, i + 4), vs));
-                    WriteVector256Double(result, i + 8, Avx.Multiply(ReadVector256Double(a, i + 8), vs));
-                    WriteVector256Double(result, i + 12, Avx.Multiply(ReadVector256Double(a, i + 12), vs));
+                    fixed (double* pa = a, pr = result)
+                    {
+                        int head = (int)(((32 - ((long)pr & 31)) & 31) / sizeof(double));
+                        if (((long)pr & 7) != 0) head = 0; // not even element-aligned: alignment cannot be reached
+                        for (; i < head; i++) pr[i] = pa[i] * scalar;
+                        var vs = Vector256.Create(scalar);
+                        int simdEnd = i + ((length - i) & ~15);
+                        for (; i < simdEnd; i += 16)
+                        {
+                            var v0 = Avx.Multiply(Avx.LoadVector256(pa + i), vs);
+                            var v1 = Avx.Multiply(Avx.LoadVector256(pa + i + 4), vs);
+                            var v2 = Avx.Multiply(Avx.LoadVector256(pa + i + 8), vs);
+                            var v3 = Avx.Multiply(Avx.LoadVector256(pa + i + 12), vs);
+                            Avx.Store(pr + i, v0);
+                            Avx.Store(pr + i + 4, v1);
+                            Avx.Store(pr + i + 8, v2);
+                            Avx.Store(pr + i + 12, v3);
+                        }
+                    }
                 }
             }
             if (Avx.IsSupported && length - i >= 4)
