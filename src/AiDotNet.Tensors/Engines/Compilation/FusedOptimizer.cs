@@ -573,6 +573,15 @@ internal static class FusedOptimizer
         AdamWUpdateSimd(param, grad, m, v, length, lr, beta1, beta2, eps, weightDecay, bc1, bc2);
     }
 
+    // The AdamW host steps hand raw pointers to the SIMD kernel, so a bad offset or short buffer would read and
+    // write past the array (heap corruption, not an exception). Reject it before any pointer arithmetic.
+    private static void ValidateHostRange<TElement>(TElement[] array, int offset, int length, string name)
+    {
+        if (array is null) throw new System.ArgumentNullException(name);
+        if (offset < 0 || length < 0 || offset > array.Length - length)
+            throw new System.ArgumentOutOfRangeException(name,
+                $"[{offset}, {offset}+{length}) is outside the {array.Length}-element array.");
+    }
     // Elements per parallel chunk of AdamWStepHost: a ~1 MB slice of each of the four arrays.
     private const int AdamWHostChunk = 256 * 1024;
 
@@ -585,6 +594,10 @@ internal static class FusedOptimizer
         float[] param, int paramOffset, float[] grad, int gradOffset, float[] m, int mOffset, float[] v, int vOffset,
         int length, float lr, float beta1, float beta2, float eps, float weightDecay, float bc1, float bc2)
     {
+        ValidateHostRange(param, paramOffset, length, nameof(param));
+        ValidateHostRange(grad, gradOffset, length, nameof(grad));
+        ValidateHostRange(m, mOffset, length, nameof(m));
+        ValidateHostRange(v, vOffset, length, nameof(v));
         int chunks = System.Math.Max(1, (length + AdamWHostChunk - 1) / AdamWHostChunk);
         Helpers.CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)length * 4, c =>
         {
@@ -745,6 +758,10 @@ internal static class FusedOptimizer
         double[] param, int paramOffset, double[] grad, int gradOffset, double[] m, int mOffset, double[] v, int vOffset,
         int length, double lr, double beta1, double beta2, double eps, double weightDecay, double bc1, double bc2)
     {
+        ValidateHostRange(param, paramOffset, length, nameof(param));
+        ValidateHostRange(grad, gradOffset, length, nameof(grad));
+        ValidateHostRange(m, mOffset, length, nameof(m));
+        ValidateHostRange(v, vOffset, length, nameof(v));
         int chunks = System.Math.Max(1, (length + AdamWHostChunk - 1) / AdamWHostChunk);
         Helpers.CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)length * 4, c =>
         {
