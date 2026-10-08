@@ -40898,7 +40898,18 @@ public partial class CpuEngine : ITensorLevelEngine
             Tensor<T>? savedPreActivation = null;
             if (activation != FusedActivationType.None)
             {
-                savedPreActivation = fusedResult.Clone();
+                // A copy into a rented buffer, not Clone(): a clone shares the storage copy-on-write, so the in-place
+                // activation below then detached it into a freshly allocated array - a large-object-heap allocation per
+                // layer per step at [128, 512], and the gen-2 collections that follow.
+                if (fusedResult.IsContiguous)
+                {
+                    savedPreActivation = AutoTensorCache.RentOrAllocate<T>(fusedResult._shape);
+                    fusedResult.AsSpan().CopyTo(savedPreActivation.AsWritableSpan());
+                }
+                else
+                {
+                    savedPreActivation = fusedResult.Clone();
+                }
                 using (new Autodiff.NoGradScope<T>())
                     ApplyFusedActivationInPlace(fusedResult, activation, activationParams);
             }
