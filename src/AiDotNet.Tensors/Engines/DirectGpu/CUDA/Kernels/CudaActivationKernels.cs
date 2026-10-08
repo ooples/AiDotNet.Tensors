@@ -144,12 +144,15 @@ extern ""C"" __global__ __launch_bounds__(256) void hardsigmoid(const float* __r
 }
 
 // Hardtanh: clip(x, min_val, max_val) - default min=-1, max=1
-extern ""C"" __global__ __launch_bounds__(256) void hardtanh(const float* __restrict__ input, float* __restrict__ output, int size)
+// The bounds are parameters: the backend passes the caller's minVal/maxVal. The kernel used to take (input, output,
+// size) and clamp to [-1, 1] while the launch passed (input, output, minVal, maxVal, size), so `size` received minVal's
+// bit pattern and every thread of the grid ran past both buffers.
+extern ""C"" __global__ __launch_bounds__(256) void hardtanh(const float* __restrict__ input, float* __restrict__ output, float minVal, float maxVal, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     float x = input[idx];
-    output[idx] = fminf(fmaxf(x, -1.0f), 1.0f);
+    output[idx] = fminf(fmaxf(x, minVal), maxVal);
 }
 
 // Leaky ReLU: x > 0 ? x : alpha * x
@@ -322,12 +325,13 @@ extern ""C"" __global__ __launch_bounds__(256) void hardsigmoid_backward(const f
 }
 
 // Hardtanh backward
-extern ""C"" __global__ __launch_bounds__(256) void hardtanh_backward(const float* __restrict__ gradOutput, const float* __restrict__ input, float* __restrict__ gradInput, int size)
+// Same signature fix as hardtanh: the launch always passed (gradOutput, input, gradInput, minVal, maxVal, size).
+extern ""C"" __global__ __launch_bounds__(256) void hardtanh_backward(const float* __restrict__ gradOutput, const float* __restrict__ input, float* __restrict__ gradInput, float minVal, float maxVal, int size)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= size) return;
     float x = input[idx];
-    float grad = (x > -1.0f && x < 1.0f) ? 1.0f : 0.0f;
+    float grad = (x > minVal && x < maxVal) ? 1.0f : 0.0f;
     gradInput[idx] = gradOutput[idx] * grad;
 }
 

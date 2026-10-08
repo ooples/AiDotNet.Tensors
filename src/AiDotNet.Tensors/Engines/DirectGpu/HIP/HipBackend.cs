@@ -4433,12 +4433,12 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         int totalPatches = batch * outH * outW;
         int dilationH = 1, dilationW = 1;
 
-        void** args = stackalloc void*[15];
+        void** args = stackalloc void*[16];
         args[0] = &inputPtr; args[1] = &outputPtr;
         args[2] = &batch; args[3] = &channels; args[4] = &height; args[5] = &width;
         args[6] = &kernelH; args[7] = &kernelW; args[8] = &strideH; args[9] = &strideW;
         args[10] = &padH; args[11] = &padW; args[12] = &dilationH; args[13] = &dilationW;
-        args[14] = &outH;
+        args[14] = &outH; args[15] = &outW; // the kernel reads outW as its 16th parameter
 
         uint gridX = (uint)((totalPatches + 255) / 256);
         LaunchKernel(im2colKernel, gridX, 256, args);
@@ -4457,6 +4457,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         IntPtr inputPtr = input.Handle;
         IntPtr outputPtr = output.Handle;
         int outH = (outputH + 2 * padH - kernelH) / strideH + 1;
+        int outW = (outputW + 2 * padW - kernelW) / strideW + 1;
         int totalSize = batch * channels * outputH * outputW;
         int dilationH = 1, dilationW = 1;
 
@@ -4464,12 +4465,12 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         var memsetResult = HipNativeBindings.hipMemset(output.Handle, 0, (nuint)(totalSize * sizeof(float)));
         HipNativeBindings.CheckError(memsetResult, "hipMemset");
 
-        void** args = stackalloc void*[15];
+        void** args = stackalloc void*[16];
         args[0] = &inputPtr; args[1] = &outputPtr;
         args[2] = &batch; args[3] = &channels; args[4] = &outputH; args[5] = &outputW;
         args[6] = &kernelH; args[7] = &kernelW; args[8] = &strideH; args[9] = &strideW;
         args[10] = &padH; args[11] = &padW; args[12] = &dilationH; args[13] = &dilationW;
-        args[14] = &outH;
+        args[14] = &outH; args[15] = &outW; // the kernel reads outW as its 16th parameter
 
         uint gridX = (uint)((totalSize + 255) / 256);
         LaunchKernel(col2imKernel, gridX, 256, args);
@@ -5940,6 +5941,10 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             args[11] = &kernelH;
             args[12] = &kernelW;
             args[13] = &strideH;
+            // The kernel declares strideW and hasBias as its last two parameters; without them it read both from past
+            // the end of this array.
+            args[14] = &strideW;
+            args[15] = &hasBias;
 
 
 
@@ -7258,7 +7263,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
 
     public unsafe float MseLoss(IGpuBuffer predictions, IGpuBuffer targets, int size)
     {
-        if (!_kernelCache.TryGetValue("mse_loss", out var krnl))
+        if (!_kernelCache.TryGetValue("mse_loss_elementwise", out var krnl))
             throw new InvalidOperationException("HIP kernel not found: mse_loss");
 
         using var lossBuffer = AllocateBuffer(size);
@@ -7422,7 +7427,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
     {
         if (predictions is null) throw new ArgumentNullException(nameof(predictions));
         if (targets is null) throw new ArgumentNullException(nameof(targets));
-        if (!_kernelCache.TryGetValue("huber_loss", out var krnl))
+        if (!_kernelCache.TryGetValue("huber_loss_elementwise", out var krnl))
             throw new InvalidOperationException("HIP kernel not found: huber_loss");
 
         using var outputBuffer = AllocateBuffer(size);
@@ -7485,13 +7490,15 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             IntPtr _p0 = predictions.Handle;
             IntPtr _p1 = targets.Handle;
             IntPtr _p2 = outputBuffer.Handle;
-            void** args = stackalloc void*[6];
+            void** args = stackalloc void*[7];
             args[0] = &_p0;
             args[1] = &_p1;
             args[2] = &_p2;
             args[3] = &alpha;
             args[4] = &gamma;
-            args[5] = &size;
+            float epsilon = 1e-7f; // the kernel takes (…, epsilon, size); without it `size` landed in the float slot
+            args[5] = &epsilon;
+            args[6] = &size;
 
 
             uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -7514,13 +7521,15 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             IntPtr _p0 = predictions.Handle;
             IntPtr _p1 = targets.Handle;
             IntPtr _p2 = gradInput.Handle;
-            void** args = stackalloc void*[6];
+            void** args = stackalloc void*[7];
             args[0] = &_p0;
             args[1] = &_p1;
             args[2] = &_p2;
             args[3] = &alpha;
             args[4] = &gamma;
-            args[5] = &size;
+            float epsilon = 1e-7f; // the kernel takes (…, epsilon, size); without it `size` landed in the float slot
+            args[5] = &epsilon;
+            args[6] = &size;
 
 
             uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -7809,11 +7818,13 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             IntPtr _p0 = predictions.Handle;
             IntPtr _p1 = targets.Handle;
             IntPtr _p2 = outputBuffer.Handle;
-            void** args = stackalloc void*[4];
+            void** args = stackalloc void*[5];
             args[0] = &_p0;
             args[1] = &_p1;
             args[2] = &_p2;
-            args[3] = &size;
+            float epsilon = 1e-7f; // the kernel takes (…, epsilon, size); without it `size` landed in the float slot
+            args[3] = &epsilon;
+            args[4] = &size;
 
 
             uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -7836,11 +7847,13 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             IntPtr _p0 = predictions.Handle;
             IntPtr _p1 = targets.Handle;
             IntPtr _p2 = gradInput.Handle;
-            void** args = stackalloc void*[4];
+            void** args = stackalloc void*[5];
             args[0] = &_p0;
             args[1] = &_p1;
             args[2] = &_p2;
-            args[3] = &size;
+            float epsilon = 1e-7f; // the kernel takes (…, epsilon, size); without it `size` landed in the float slot
+            args[3] = &epsilon;
+            args[4] = &size;
 
 
             uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -7968,11 +7981,13 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             IntPtr _p0 = predictions.Handle;
             IntPtr _p1 = targets.Handle;
             IntPtr _p2 = outputBuffer.Handle;
-            void** args = stackalloc void*[4];
+            void** args = stackalloc void*[5];
             args[0] = &_p0;
             args[1] = &_p1;
             args[2] = &_p2;
-            args[3] = &size;
+            float epsilon = 1e-7f; // the kernel takes (…, epsilon, size); without it `size` landed in the float slot
+            args[3] = &epsilon;
+            args[4] = &size;
 
 
             uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -7995,11 +8010,13 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             IntPtr _p0 = predictions.Handle;
             IntPtr _p1 = targets.Handle;
             IntPtr _p2 = gradInput.Handle;
-            void** args = stackalloc void*[4];
+            void** args = stackalloc void*[5];
             args[0] = &_p0;
             args[1] = &_p1;
             args[2] = &_p2;
-            args[3] = &size;
+            float epsilon = 1e-7f; // the kernel takes (…, epsilon, size); without it `size` landed in the float slot
+            args[3] = &epsilon;
+            args[4] = &size;
 
 
             uint grid = (uint)((size + DefaultBlockSize - 1) / DefaultBlockSize);
@@ -8183,7 +8200,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             args[7] = &margin;
 
 
-            uint grid = (uint)((totalSize + DefaultBlockSize - 1) / DefaultBlockSize);
+            uint grid = (uint)((batchSize + DefaultBlockSize - 1) / DefaultBlockSize); // one thread per sample
             LaunchKernel(krnl, grid, DefaultBlockSize, args);
             Synchronize();
             }
@@ -11239,7 +11256,13 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         uint grid = (uint)batch;
 
         // Shared memory size for accumulated hidden gradients (one float per thread)
-        uint sharedMemSize = (uint)(DefaultBlockSize * sizeof(float));
+        uint sharedMemSize = (uint)(4 * hiddenSize * sizeof(float)); // one step's r/z/n/r*n gate gradients
+
+        // The kernel accumulates weight and bias gradients over batch rows and time steps: start them at zero.
+        Fill(gradWeightsIh, 0f, 3 * hiddenSize * inputSize);
+        Fill(gradWeightsHh, 0f, 3 * hiddenSize * hiddenSize);
+        Fill(gradBiasIh, 0f, 3 * hiddenSize);
+        Fill(gradBiasHh, 0f, 3 * hiddenSize);
 
             {
             IntPtr _p0 = gradOutput.Handle;
@@ -11275,8 +11298,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             args[16] = &hiddenSize;
 
 
-            // Use cooperative kernel launch for grid-wide synchronization (grid.sync())
-            LaunchCooperativeKernel(kernel, grid, DefaultBlockSize, sharedMemSize, args);
+                        LaunchKernelWithSharedMem(kernel, grid, (uint)hiddenSize, sharedMemSize, args); // block = one batch row's hidden units
             Synchronize();
             }
     }
