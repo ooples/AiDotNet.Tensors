@@ -11063,7 +11063,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             // Copy the last timestep from allH and allC into hFinal and cFinal
             // allH layout: [(seqLen + 1) * batch * hiddenSize] where index 0 is hInit
             // So final hidden state is at index seqLen (last timestep output)
-            int finalStateOffset = seqLen * batch * hiddenSize;
+            // The kernel stores step t at h_states[t] (t = 0..seqLen-1), as CUDA's does: the final state is step
+            // seqLen - 1.
+            int finalStateOffset = (seqLen - 1) * batch * hiddenSize;
             int stateSize = batch * hiddenSize;
             var byteSize = (UIntPtr)(stateSize * sizeof(float));
 
