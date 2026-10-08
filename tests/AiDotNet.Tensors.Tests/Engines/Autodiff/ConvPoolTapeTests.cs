@@ -116,4 +116,79 @@ public class ConvPoolTapeTests
         AssertClose(indexedOutput, output, 0f, "output");
         AssertClose(indexedGradient, gradient, 0f, "input gradient");
     }
+
+    [Theory]
+    [InlineData(4, 6, 5, 9, 3, 2, 1)]   // strided 3x3: the whole-batch lowered GEMM
+    [InlineData(3, 4, 8, 4, 3, 1, 1)]   // small-plane stride 1
+    [InlineData(2, 5, 7, 8, 1, 2, 0)]   // strided 1x1 projection
+    public void Conv2D_KernelGradient_MatchesANaiveReference(int batch, int inC, int outC, int size, int k, int stride, int pad)
+    {
+        var input = Random(11, batch, inC, size, size);
+        var kernel = Random(12, outC, inC, k, k);
+        int outSize = (size + 2 * pad - k) / stride + 1;
+        var upstream = Random(13, batch, outC, outSize, outSize);
+
+        Tensor<float> gradient;
+        using (var tape = new GradientTape<float>())
+        {
+            var y = _engine.Conv2D(input, kernel, new[] { stride, stride }, new[] { pad, pad }, new[] { 1, 1 });
+            var loss = _engine.ReduceSum(_engine.TensorMultiply(y, upstream), new[] { 0, 1, 2, 3 }, keepDims: false);
+            gradient = tape.ComputeGradients(loss, new[] { kernel })[kernel];
+        }
+
+        // dK[o, c, i, j] = sum over b, oh, ow of dY[b, o, oh, ow] * x[b, c, oh*s + i - p, ow*s + j - p], in double.
+        var expected = new Tensor<float>(new[] { outC, inC, k, k });
+        for (int o = 0; o < outC; o++)
+        for (int c = 0; c < inC; c++)
+        for (int i = 0; i < k; i++)
+        for (int j = 0; j < k; j++)
+        {
+            double acc = 0;
+            for (int b = 0; b < batch; b++)
+            for (int oh = 0; oh < outSize; oh++)
+            for (int ow = 0; ow < outSize; ow++)
+            {
+                int ih = oh * stride + i - pad, iw = ow * stride + j - pad;
+                if (ih < 0 || ih >= size || iw < 0 || iw >= size) continue;
+                acc += (double)upstream[b, o, oh, ow] * input[b, c, ih, iw];
+            }
+            expected[o, c, i, j] = (float)acc;
+        }
+
+        AssertClose(expected, gradient, 1e-4f, "kernel gradient");
+    }
+
+    [Theory]
+    [InlineData(4, 6, 5, 9, 3, 2, 1)]    // strided small plane: the whole-batch lowered GEMM
+    [InlineData(3, 16, 12, 8, 3, 1, 1)]  // stride-1 8x8 plane: the whole-batch lowered GEMM
+    [InlineData(2, 5, 7, 8, 1, 2, 0)]    // strided 1x1 projection
+    [InlineData(1, 6, 5, 9, 3, 2, 1)]    // a single image keeps the per-image route
+    public void Conv2D_Forward_MatchesANaiveReference(int batch, int inC, int outC, int size, int k, int stride, int pad)
+    {
+        var input = Random(21, batch, inC, size, size);
+        var kernel = Random(22, outC, inC, k, k);
+        int outSize = (size + 2 * pad - k) / stride + 1;
+
+        var actual = _engine.Conv2D(input, kernel, new[] { stride, stride }, new[] { pad, pad }, new[] { 1, 1 });
+
+        var expected = new Tensor<float>(new[] { batch, outC, outSize, outSize });
+        for (int b = 0; b < batch; b++)
+        for (int o = 0; o < outC; o++)
+        for (int oh = 0; oh < outSize; oh++)
+        for (int ow = 0; ow < outSize; ow++)
+        {
+            double acc = 0;
+            for (int c = 0; c < inC; c++)
+            for (int i = 0; i < k; i++)
+            for (int j = 0; j < k; j++)
+            {
+                int ih = oh * stride + i - pad, iw = ow * stride + j - pad;
+                if (ih < 0 || ih >= size || iw < 0 || iw >= size) continue;
+                acc += (double)kernel[o, c, i, j] * input[b, c, ih, iw];
+            }
+            expected[b, o, oh, ow] = (float)acc;
+        }
+
+        AssertClose(expected, actual, 1e-4f, "output");
+    }
 }
