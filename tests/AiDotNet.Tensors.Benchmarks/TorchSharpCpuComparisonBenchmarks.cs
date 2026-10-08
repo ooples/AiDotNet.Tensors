@@ -188,6 +188,11 @@ public class TorchSharpCpuComparisonBenchmarks
         _torchDoubleConvKernel?.Dispose();
     }
 
+    // Arms with an iteration setup are timed as ONE call per iteration in every job, SteadyState included:
+    // BenchmarkDotNet forces a single invocation when a setup runs before each iteration. They carry the
+    // ColdCallOnly category so their SteadyState rows are not read as steady-state numbers.
+    private const string ColdCallOnly = "ColdCallOnly";
+
     // Only the arms that mutate the shared input vectors in place need it reset between iterations.
     // A class-wide [IterationSetup] forced BenchmarkDotNet to time ONE cold call per iteration for every
     // benchmark in the suite; the ColdCall job now measures that regime explicitly for all of them.
@@ -438,6 +443,7 @@ public class TorchSharpCpuComparisonBenchmarks
     [Benchmark]
     [Arguments(100_000)]
     [Arguments(1_000_000)]
+    [BenchmarkCategory(ColdCallOnly)]
     public Tensor<float> AiDotNet_TensorAdd(int size)
     {
         _cpuEngine.TensorAddInPlace(_aiVectorsA[size], _aiVectorsB[size]);
@@ -458,6 +464,7 @@ public class TorchSharpCpuComparisonBenchmarks
     [Benchmark]
     [Arguments(100_000)]
     [Arguments(1_000_000)]
+    [BenchmarkCategory(ColdCallOnly)]
     public void TorchSharp_Add(int size)
     {
         torch.add_(_torchVectorsA[size], _torchVectorsB[size]);
@@ -466,6 +473,7 @@ public class TorchSharpCpuComparisonBenchmarks
 
     [Benchmark]
     [Arguments(1_000_000)]
+    [BenchmarkCategory(ColdCallOnly)]
     public void TorchSharp_Add_1Thread(int size)
     {
         int prev = (int)torch.get_num_threads();
@@ -478,6 +486,7 @@ public class TorchSharpCpuComparisonBenchmarks
     [Benchmark]
     [Arguments(100_000)]
     [Arguments(1_000_000)]
+    [BenchmarkCategory(ColdCallOnly)]
     public Tensor<float> AiDotNet_TensorMultiply(int size)
     {
         _cpuEngine.TensorMultiplyInPlace(_aiVectorsA[size], _aiVectorsB[size]);
@@ -487,6 +496,7 @@ public class TorchSharpCpuComparisonBenchmarks
     [Benchmark]
     [Arguments(100_000)]
     [Arguments(1_000_000)]
+    [BenchmarkCategory(ColdCallOnly)]
     public void TorchSharp_Multiply(int size)
     {
         torch.mul_(_torchVectorsA[size], _torchVectorsB[size]);
@@ -586,12 +596,14 @@ public class TorchSharpCpuComparisonBenchmarks
     #region Activations
 
     [Benchmark]
+    [BenchmarkCategory(ColdCallOnly)]
     public void AiDotNet_ReLU()
     {
         _cpuEngine.ReLUInPlace(_aiVectorsA[LargeSize]);
     }
 
     [Benchmark]
+    [BenchmarkCategory(ColdCallOnly)]
     public void TorchSharp_ReLU()
     {
         _torchVectorsA[LargeSize].relu_();
@@ -599,6 +611,7 @@ public class TorchSharpCpuComparisonBenchmarks
     }
 
     [Benchmark]
+    [BenchmarkCategory(ColdCallOnly)]
     public void AiDotNet_Sigmoid()
     {
         _cpuEngine.SigmoidInPlace(_aiVectorsA[LargeSize]);
@@ -613,6 +626,7 @@ public class TorchSharpCpuComparisonBenchmarks
     }
 
     [Benchmark]
+    [BenchmarkCategory(ColdCallOnly)]
     public void TorchSharp_Sigmoid()
     {
         _torchVectorsA[LargeSize].sigmoid_();
