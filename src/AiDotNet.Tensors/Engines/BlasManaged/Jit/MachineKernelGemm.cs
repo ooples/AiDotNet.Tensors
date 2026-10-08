@@ -1,4 +1,5 @@
 using System;
+using System.Threading;
 #if NET5_0_OR_GREATER
 using System.Buffers;
 using System.Runtime.InteropServices;
@@ -147,14 +148,23 @@ internal static class MachineKernelGemm
         }
     }
 
+    /// <summary>
+    /// Marks a lazy kernel init as tried only after its kernel field is stored. The flag used to be set
+    /// first, so a thread on the unlocked fast path could see "tried" with the kernel still 0 and
+    /// silently take the fallback for that call (#685 audit).
+    /// </summary>
+    private static bool Publish(ref bool tried, bool result)
+    {
+        Volatile.Write(ref tried, true);
+        return result;
+    }
     private static bool TryInitMacroFp32()
     {
-        if (_triedMacro32) return _kernMacro32 != 0;
+        if (Volatile.Read(ref _triedMacro32)) return _kernMacro32 != 0;
         lock (_lock)
         {
             if (_triedMacro32) return _kernMacro32 != 0;
-            _triedMacro32 = true;
-            if (!PlatformOk()) return false;
+            if (!PlatformOk()) return Publish(ref _triedMacro32, false);
             try
             {
                 byte[] code = IsWindows
@@ -164,7 +174,7 @@ internal static class MachineKernelGemm
                 if (_memMacro32 is not null) _kernMacro32 = _memMacro32.Pointer;
             }
             catch { _memMacro32 = null; _kernMacro32 = 0; }
-            return _kernMacro32 != 0;
+            return Publish(ref _triedMacro32, _kernMacro32 != 0);
         }
     }
 
@@ -182,12 +192,11 @@ internal static class MachineKernelGemm
 
     private static bool TryInitFp64()
     {
-        if (_tried64) return _kern64 != 0;
+        if (Volatile.Read(ref _tried64)) return _kern64 != 0;
         lock (_lock)
         {
             if (_tried64) return _kern64 != 0;
-            _tried64 = true;
-            if (!PlatformOk()) return false;
+            if (!PlatformOk()) return Publish(ref _tried64, false);
             try
             {
                 byte[] code = IsWindows
@@ -197,18 +206,17 @@ internal static class MachineKernelGemm
                 if (_mem64 is not null) _kern64 = _mem64.Pointer;
             }
             catch { _mem64 = null; _kern64 = 0; }
-            return _kern64 != 0;
+            return Publish(ref _tried64, _kern64 != 0);
         }
     }
 
     private static bool TryInitFp32()
     {
-        if (_tried32) return _kern32 != 0;
+        if (Volatile.Read(ref _tried32)) return _kern32 != 0;
         lock (_lock)
         {
             if (_tried32) return _kern32 != 0;
-            _tried32 = true;
-            if (!PlatformOk()) return false;
+            if (!PlatformOk()) return Publish(ref _tried32, false);
             try
             {
                 byte[] code = IsWindows
@@ -218,7 +226,7 @@ internal static class MachineKernelGemm
                 if (_mem32 is not null) _kern32 = _mem32.Pointer;
             }
             catch { _mem32 = null; _kern32 = 0; }
-            return _kern32 != 0;
+            return Publish(ref _tried32, _kern32 != 0);
         }
     }
 
@@ -229,12 +237,11 @@ internal static class MachineKernelGemm
     /// </summary>
     private static bool TryInitPanelFp32()
     {
-        if (_triedPanel32) return _kernPanel32 != 0;
+        if (Volatile.Read(ref _triedPanel32)) return _kernPanel32 != 0;
         lock (_lock)
         {
             if (_triedPanel32) return _kernPanel32 != 0;
-            _triedPanel32 = true;
-            if (!PlatformOk()) return false;
+            if (!PlatformOk()) return Publish(ref _triedPanel32, false);
             try
             {
                 byte[] code = IsWindows
@@ -244,18 +251,17 @@ internal static class MachineKernelGemm
                 if (_memPanel32 is not null) _kernPanel32 = _memPanel32.Pointer;
             }
             catch { _memPanel32 = null; _kernPanel32 = 0; }
-            return _kernPanel32 != 0;
+            return Publish(ref _triedPanel32, _kernPanel32 != 0);
         }
     }
 
     private static bool TryInitAvx512Fp64()
     {
-        if (_triedZ64) return _kernZ64 != 0;
+        if (Volatile.Read(ref _triedZ64)) return _kernZ64 != 0;
         lock (_lock)
         {
             if (_triedZ64) return _kernZ64 != 0;
-            _triedZ64 = true;
-            if (!PlatformOk()) return false;
+            if (!PlatformOk()) return Publish(ref _triedZ64, false);
             try
             {
                 byte[] code = IsWindows
@@ -265,18 +271,17 @@ internal static class MachineKernelGemm
                 if (_memZ64 is not null) _kernZ64 = _memZ64.Pointer;
             }
             catch { _memZ64 = null; _kernZ64 = 0; }
-            return _kernZ64 != 0;
+            return Publish(ref _triedZ64, _kernZ64 != 0);
         }
     }
 
     private static bool TryInitAvx512Fp32()
     {
-        if (_triedZ32) return _kernZ32 != 0;
+        if (Volatile.Read(ref _triedZ32)) return _kernZ32 != 0;
         lock (_lock)
         {
             if (_triedZ32) return _kernZ32 != 0;
-            _triedZ32 = true;
-            if (!PlatformOk()) return false;
+            if (!PlatformOk()) return Publish(ref _triedZ32, false);
             try
             {
                 byte[] code = IsWindows
@@ -286,7 +291,7 @@ internal static class MachineKernelGemm
                 if (_memZ32 is not null) _kernZ32 = _memZ32.Pointer;
             }
             catch { _memZ32 = null; _kernZ32 = 0; }
-            return _kernZ32 != 0;
+            return Publish(ref _triedZ32, _kernZ32 != 0);
         }
     }
 

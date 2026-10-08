@@ -77,6 +77,21 @@ public sealed unsafe class VulkanDevice : IDisposable
     public bool IsInitialized => _initialized && !_disposed;
 
     /// <summary>
+    /// Why the last <see cref="Initialize"/> failed: the stage and its VkResult, or the exception.
+    /// Empty after a successful initialize. Initialization is lazy, so without this a caller that sees
+    /// <see cref="IsInitialized"/> false cannot tell a missing driver from a transient failure.
+    /// </summary>
+    public string InitializationFailure { get; private set; } = string.Empty;
+
+    private int _lastVkResult;
+
+    /// <summary>Marks a stage that failed without a Vulkan call failing (e.g. no compute-capable device).</summary>
+    private const int NoVkResult = int.MinValue;
+
+    private string DescribeLastVkResult() =>
+        _lastVkResult == NoVkResult ? "no failing Vulkan call; no suitable device or queue" : $"VkResult {_lastVkResult}";
+
+    /// <summary>
     /// Gets the Vulkan logical device handle.
     /// </summary>
     public IntPtr Device => _device;
@@ -175,11 +190,13 @@ public sealed unsafe class VulkanDevice : IDisposable
 
         if (_disposed)
         {
+            InitializationFailure = "The Vulkan device was disposed.";
             return false;
         }
 
         if (!VulkanNativeBindings.IsPlatformSupported)
         {
+            InitializationFailure = "The Vulkan loader (vulkan-1) could not be loaded.";
             return false;
         }
 
@@ -193,40 +210,52 @@ public sealed unsafe class VulkanDevice : IDisposable
                 SetMoltenVKIcdPath();
             }
 
+            _lastVkResult = NoVkResult;
             if (!CreateInstance())
             {
+                InitializationFailure = $"CreateInstance failed ({DescribeLastVkResult()}).";
                 return false;
             }
 
+            _lastVkResult = NoVkResult;
             if (!SelectPhysicalDevice())
             {
+                InitializationFailure = $"SelectPhysicalDevice failed ({DescribeLastVkResult()}).";
                 Cleanup();
                 return false;
             }
 
+            _lastVkResult = NoVkResult;
             if (!CreateLogicalDevice())
             {
+                InitializationFailure = $"CreateLogicalDevice failed ({DescribeLastVkResult()}).";
                 Cleanup();
                 return false;
             }
 
+            _lastVkResult = NoVkResult;
             if (!CreateCommandPool())
             {
+                InitializationFailure = $"CreateCommandPool failed ({DescribeLastVkResult()}).";
                 Cleanup();
                 return false;
             }
 
+            _lastVkResult = NoVkResult;
             if (!CreateFence())
             {
+                InitializationFailure = $"CreateFence failed ({DescribeLastVkResult()}).";
                 Cleanup();
                 return false;
             }
 
             _initialized = true;
+            InitializationFailure = string.Empty;
             return true;
         }
-        catch
+        catch (Exception ex)
         {
+            InitializationFailure = $"{ex.GetType().Name}: {ex.Message}";
             Cleanup();
             return false;
         }
@@ -310,6 +339,7 @@ public sealed unsafe class VulkanDevice : IDisposable
                         };
 
                         var result = VulkanNativeBindings.vkCreateInstance(&createInfo, IntPtr.Zero, out _instance_vk);
+                        _lastVkResult = result;
                         if (result == VulkanNativeBindings.VK_SUCCESS && _instance_vk != IntPtr.Zero)
                         {
                             return true;
@@ -333,6 +363,7 @@ public sealed unsafe class VulkanDevice : IDisposable
                 };
 
                 var fallbackResult = VulkanNativeBindings.vkCreateInstance(&fallbackCreateInfo, IntPtr.Zero, out _instance_vk);
+                _lastVkResult = fallbackResult;
                 return fallbackResult == VulkanNativeBindings.VK_SUCCESS && _instance_vk != IntPtr.Zero;
             }
         }
@@ -553,6 +584,7 @@ public sealed unsafe class VulkanDevice : IDisposable
         };
 
         var result = VulkanNativeBindings.vkCreateDevice(_physicalDevice, &deviceCreateInfo, IntPtr.Zero, out _device);
+        _lastVkResult = result;
         if (result != VulkanNativeBindings.VK_SUCCESS)
         {
             return false;
@@ -573,6 +605,7 @@ public sealed unsafe class VulkanDevice : IDisposable
         };
 
         var result = VulkanNativeBindings.vkCreateCommandPool(_device, &createInfo, IntPtr.Zero, out _commandPool);
+        _lastVkResult = result;
         return result == VulkanNativeBindings.VK_SUCCESS;
     }
 
@@ -586,6 +619,7 @@ public sealed unsafe class VulkanDevice : IDisposable
         };
 
         var result = VulkanNativeBindings.vkCreateFence(_device, &createInfo, IntPtr.Zero, out _fence);
+        _lastVkResult = result;
         return result == VulkanNativeBindings.VK_SUCCESS;
     }
 
