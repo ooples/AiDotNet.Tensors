@@ -706,6 +706,36 @@ public sealed class TensorArena : IDisposable
         return arr;
     }
 
+    /// <summary>
+    /// Gives up every wrapper and buffer this arena has issued so far, leaving them to the garbage collector: the
+    /// tensor ring's wrappers, their backing arrays, and the scratch pool's arrays. A streaming backward that releases
+    /// activations as it goes needs exactly that - while the arena held them, nothing it released could be freed
+    /// before the tape was disposed. Later rents allocate afresh, so the arena loses only this step's reuse.
+    /// </summary>
+    internal void DisownIssued()
+    {
+        if (_disposed) return;
+        if (_tensorRing is not null)
+        {
+            for (int i = 0; i < _tensorRingCount; i++)
+            {
+                if (_tensorRing[i] is List<object> bucket) bucket.Clear();
+                _tensorRingCursors![i] = 0;
+            }
+        }
+        _ringBackingArrays.Clear();
+        foreach (var arrays in _pool.Values) arrays.Clear();
+        // Keys stay (TryAllocate indexes the cursor table by the pool's keys); the cursors restart on empty lists.
+        var keys = new List<(Type, int)>(_cursor.Keys);
+        foreach (var key in keys) _cursor[key] = 0;
+    }
+
+    /// <summary>
+    /// True for the arena a top-level <see cref="Engines.Autodiff.GradientTape{T}"/> created for itself, as opposed
+    /// to one a model base or Optimize() call site opened for a training step and resets per step.
+    /// </summary>
+    internal bool OwnedByTape { get; set; }
+
     // Flat tensor ring buffer — sequential scan is faster than dictionary hash for <10 sizes.
     // A slot is keyed by element TYPE as well as element count: one arena can serve float and double
     // operations (a float model whose preprocessing runs in double, a mixed-precision step), and a

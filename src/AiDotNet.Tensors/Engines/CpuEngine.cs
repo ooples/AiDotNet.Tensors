@@ -40843,6 +40843,10 @@ public partial class CpuEngine : ITensorLevelEngine
             // Fused tape path: use the exact same TensorMatMul code path as unfused
             // to avoid BLAS accumulation divergence, then consolidate tape entries
             // into a single fused entry for backward.
+            // Count the entries the decomposed ops below record rather than assume one each: under an arena or a
+            // strided input they can record more (a contiguous copy, say), and removing a fixed count then left some.
+            var fusedTape = Autodiff.GradientTape<T>.Current;
+            int entriesBeforeFused = fusedTape?.EntryCount ?? 0;
             Tensor<T> fusedResult = TensorMatMul(input, weights);
             if (bias != null) fusedResult = TensorBroadcastAdd(fusedResult, bias);
 
@@ -40850,11 +40854,11 @@ public partial class CpuEngine : ITensorLevelEngine
             // have to re-run a full matmul to recover it (was 98% of backward time
             // on paper-scale transformers). The saved tensor is a detached clone
             // so the in-place activation below does not corrupt it.
-            // The matmul and bias-add entries go first: the single fused entry below replaces them. The activation then
+            // The decomposed ops' entries go first: the single fused entry below replaces them. The activation then
             // runs unrecorded, because that entry's backward applies its derivative. Applied while recording, it added
             // an entry of its own, so the removal took the activation and the bias add and left the matmul's entry
             // behind on the tape.
-            RemoveLastNTapeEntries<T>(bias != null ? 2 : 1);
+            RemoveLastNTapeEntries<T>(fusedTape is null ? 0 : fusedTape.EntryCount - entriesBeforeFused);
             Tensor<T>? savedPreActivation = null;
             if (activation != FusedActivationType.None)
             {

@@ -134,18 +134,16 @@ public sealed class GradientTape<T> : IDisposable
     private bool _ownsArena;
     private Helpers.TensorArena? _ownedArena;
 
-    // Opt-in (default OFF; #734). When enabled, a TOP-LEVEL tape with no arena already
-    // active creates+owns one for its lifetime — extending per-step arena recycling to
-    // custom training loops that go through no model base / Optimize() call site (which
-    // already open their own arena). DEFAULT OFF because a tape-owned arena's tensor ring
-    // pins activation WRAPPERS for reuse, which is fundamentally incompatible with
-    // ComputeGradientsStreaming's activation release (the streaming test asserts the
-    // released activation wrapper becomes collectable). Standard training via the model
-    // bases / Optimize() is UNAFFECTED — those open an explicit arena and still get the
-    // per-step reuse. Enable (AIDOTNET_TAPE_OWNED_ARENA=1) only for hand-rolled loops that
-    // use neither streaming nor gradient checkpointing.
+    // Default ON (AIDOTNET_TAPE_OWNED_ARENA=0 turns it off). A TOP-LEVEL tape with no arena already active creates and
+    // owns one for its lifetime, so a hand-rolled training loop - one that goes through no model base or Optimize()
+    // call site, which open their own arena - recycles its step's buffers too. Without it every activation between
+    // 85 KB and 1 MB was a fresh large-object-heap allocation whose churn forced gen-2 collections: a [128, 512]
+    // ReLU cost ~300 us against ~67 us with the arena, a broadcast add ~298 us against ~17 us.
+    // It was opt-in because the arena holds every activation it issues until the tape is disposed, which defeated
+    // ComputeGradientsStreaming's activation release; a streaming backward now makes the arena give them up first
+    // (TensorArena.DisownIssued). Gradient checkpointing replays each segment under its own nested arena.
     internal static bool EnableTapeOwnedArena { get; set; }
-        = System.Environment.GetEnvironmentVariable("AIDOTNET_TAPE_OWNED_ARENA") == "1";
+        = System.Environment.GetEnvironmentVariable("AIDOTNET_TAPE_OWNED_ARENA") != "0";
 
 
     /// <summary>
@@ -335,6 +333,7 @@ public sealed class GradientTape<T> : IDisposable
             && Helpers.TensorArena.Current is null)
         {
             _ownedArena = Helpers.TensorArena.Create();
+            _ownedArena.OwnedByTape = true;
             _ownsArena = true;
         }
 
@@ -662,6 +661,12 @@ public sealed class GradientTape<T> : IDisposable
             // arena slot for each activation as the reverse walk consumes it. The streaming backward walks
             // the GradFn graph (not _entries), so clearing arena slots never affects the backward itself.
             Dictionary<Tensor<T>, int>? entrySlotOfOutput = null;
+            // A tape-created arena (this tape's, or an enclosing tape's) holds every activation it issued, wrapper and
+            // buffer, until the tape is disposed, so nothing the release below lets go of could be freed during this
+            // backward. That arena gives them up first, losing only this step's reuse. An arena a model base opened
+            // for the step is left alone: it recycles the step's buffers across steps by design, and its owner resets it.
+            if (_releaseStreamingActivations && Helpers.TensorArena.Current is { OwnedByTape: true } tapeArena)
+                tapeArena.DisownIssued();
             if (_releaseStreamingActivations)
             {
                 int entryCount = _entries.Count;
