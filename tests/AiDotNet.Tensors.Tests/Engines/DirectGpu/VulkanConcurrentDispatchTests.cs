@@ -17,6 +17,7 @@ namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
 public sealed class VulkanConcurrentDispatchTests
 {
     private const int M = 8, K = 128, N = 64;
+    private const int Iterations = 60;
 
     private static bool Ready
     {
@@ -28,14 +29,16 @@ public sealed class VulkanConcurrentDispatchTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void DequantGemm_And_Gemm_OnTwoThreads_EachMatchTheirOracle()
     {
-        if (!Ready) return;
+        Skip.IfNot(Ready, $"Vulkan with a GLSL compiler is not available: {VulkanBackend.Instance.InitializationFailure}");
         var backend = VulkanBackend.Instance;
-        var deadline = DateTime.UtcNow.AddSeconds(8);
+        using var start = new Barrier(2);
         int quantRuns = 0, gemmRuns = 0;
         string? failure = null;
+
+        void Fail(string message) => Interlocked.CompareExchange(ref failure, message, null);
 
         var quant = Task.Run(() =>
         {
@@ -53,7 +56,8 @@ public sealed class VulkanConcurrentDispatchTests
                     for (int k = 0; k < K; k++) acc += act[i * K + k] * w[k * N + j];
                     expected[i * N + j] = acc * scales[0];
                 }
-            while (DateTime.UtcNow < deadline && Volatile.Read(ref failure) is null)
+            start.SignalAndWait();
+            for (int run = 0; run < Iterations && Volatile.Read(ref failure) is null; run++)
             {
                 IGpuBuffer? a = null, s = null, wb = null, o = null;
                 try
@@ -66,12 +70,16 @@ public sealed class VulkanConcurrentDispatchTests
                         float tol = 1e-2f + 1e-3f * Math.Abs(expected[idx]);
                         if (Math.Abs(expected[idx] - actual[idx]) > tol)
                         {
-                            Interlocked.CompareExchange(ref failure,
-                                $"DequantGemmInt run {quantRuns}: [{idx}] expected {expected[idx]}, got {actual[idx]}", null);
+                            Fail($"DequantGemmInt run {run}: [{idx}] expected {expected[idx]}, got {actual[idx]}");
                             return;
                         }
                     }
                     quantRuns++;
+                }
+                catch (Exception ex)
+                {
+                    Fail($"DequantGemmInt run {run} threw {ex}");
+                    return;
                 }
                 finally { a?.Dispose(); s?.Dispose(); wb?.Dispose(); o?.Dispose(); }
             }
@@ -89,7 +97,8 @@ public sealed class VulkanConcurrentDispatchTests
             for (int i = 0; i < gm; i++)
                 for (int p = 0; p < gk; p++)
                     for (int j = 0; j < gn; j++) expected[i * gn + j] += ga[i * gk + p] * gb[p * gn + j];
-            while (DateTime.UtcNow < deadline && Volatile.Read(ref failure) is null)
+            start.SignalAndWait();
+            for (int run = 0; run < Iterations && Volatile.Read(ref failure) is null; run++)
             {
                 IGpuBuffer? a = null, b = null, c = null;
                 try
@@ -101,12 +110,16 @@ public sealed class VulkanConcurrentDispatchTests
                     {
                         if (Math.Abs(expected[idx] - actual[idx]) > 1e-3f + 1e-3f * Math.Abs(expected[idx]))
                         {
-                            Interlocked.CompareExchange(ref failure,
-                                $"Gemm run {gemmRuns}: [{idx}] expected {expected[idx]}, got {actual[idx]}", null);
+                            Fail($"Gemm run {run}: [{idx}] expected {expected[idx]}, got {actual[idx]}");
                             return;
                         }
                     }
                     gemmRuns++;
+                }
+                catch (Exception ex)
+                {
+                    Fail($"Gemm run {run} threw {ex}");
+                    return;
                 }
                 finally { a?.Dispose(); b?.Dispose(); c?.Dispose(); }
             }
@@ -114,6 +127,7 @@ public sealed class VulkanConcurrentDispatchTests
 
         Task.WaitAll(quant, gemm);
         Assert.True(failure is null, failure);
-        Assert.True(quantRuns > 0 && gemmRuns > 0, $"both threads must have run (quant {quantRuns}, gemm {gemmRuns})");
+        Assert.Equal(Iterations, quantRuns);
+        Assert.Equal(Iterations, gemmRuns);
     }
 }

@@ -1528,6 +1528,17 @@ namespace AiDotNet.Tensors.Engines.Simd
                 int simdLength = length & ~7;
                 for (; i < simdLength; i += 8)
                     Avx.Store(output + i, AccurateTanh256(Avx.LoadVector256(input + i)));
+                // The last 1-7 elements go through the same kernel via a padded block, so an element's
+                // result never depends on its position in the buffer.
+                if (i < length)
+                {
+                    float* block = stackalloc float[8];
+                    int rem = length - i;
+                    for (int j = 0; j < 8; j++) block[j] = j < rem ? input[i + j] : 0f;
+                    Avx.Store(block, AccurateTanh256(Avx.LoadVector256(block)));
+                    for (int j = 0; j < rem; j++) output[i + j] = block[j];
+                    i = length;
+                }
             }
 #endif
             for (; i < length; i++)
@@ -1574,7 +1585,7 @@ namespace AiDotNet.Tensors.Engines.Simd
         /// <summary>
         /// Mish for 8 floats: x * tanh(softplus(x)) = x * n / (n + 2), n = e^x (e^x + 2). The identity
         /// has no cancellation, so the error is the exp's plus a few roundings. x > 20 returns x (tanh of
-        /// the softplus rounds to 1); x is clamped at -80 for the exp, where |mish| is far below 1e-6.
+        /// the softplus rounds to 1); x below -80 returns -0, where |mish| has underflowed (mish(-inf) = -0).
         /// </summary>
         [MethodImpl(HotInline)]
         internal static Vector256<float> AccurateMish256(Vector256<float> x)
@@ -1584,15 +1595,22 @@ namespace AiDotNet.Tensors.Engines.Simd
             var n = Avx.Multiply(e, Avx.Add(e, Vector256.Create(2.0f)));
             var mish = Avx.Multiply(x, Avx.Divide(n, Avx.Add(n, Vector256.Create(2.0f))));
             var result = Avx.BlendVariable(mish, x, Avx.CompareGreaterThan(x, Vector256.Create(20.0f)));
+            // Below -80, |mish| underflows to zero; x * n/(n+2) would give -infinity at x = -infinity.
+            result = Avx.BlendVariable(result, Vector256.Create(-0.0f), Avx.CompareLessThan(x, Vector256.Create(-80.0f)));
             return Avx.BlendVariable(result, x, Avx.CompareUnordered(x, x));
         }
         /// <summary>
         /// exp for 8 floats in [-80, 20] to about 1 ULP: Cephes expf (Cody-Waite ln2 split, minimax degree-5
-        /// polynomial). Callers clamp their input to that range; it does not handle overflow or underflow.
+        /// polynomial). Inputs outside [<see cref="AccurateExpMin"/>, <see cref="AccurateExpMax"/>] are clamped
+        /// to that range, which keeps the 2^n reconstruction a normal float.
         /// </summary>
+        private const float AccurateExpMin = -80.0f;
+        private const float AccurateExpMax = 20.0f;
+
         [MethodImpl(HotInline)]
         private static Vector256<float> AccurateExp256(Vector256<float> x)
         {
+            x = Avx.Max(Avx.Min(x, Vector256.Create(AccurateExpMax)), Vector256.Create(AccurateExpMin));
             var n = Avx.RoundToNearestInteger(Avx.Multiply(x, Vector256.Create(1.44269504088896341f)));
             var r = Fma.MultiplyAddNegated(n, Vector256.Create(0.693359375f), x);
             r = Fma.MultiplyAddNegated(n, Vector256.Create(-2.12194440e-4f), r);
@@ -1764,6 +1782,16 @@ namespace AiDotNet.Tensors.Engines.Simd
                 int simdLength = length & ~7;
                 for (; i < simdLength; i += 8)
                     Avx.Store(output + i, AccurateMish256(Avx.LoadVector256(input + i)));
+                // Same padded-block tail as TanhUnsafe: one kernel for every element.
+                if (i < length)
+                {
+                    float* block = stackalloc float[8];
+                    int rem = length - i;
+                    for (int j = 0; j < 8; j++) block[j] = j < rem ? input[i + j] : 0f;
+                    Avx.Store(block, AccurateMish256(Avx.LoadVector256(block)));
+                    for (int j = 0; j < rem; j++) output[i + j] = block[j];
+                    i = length;
+                }
             }
 #endif
             for (; i < length; i++)

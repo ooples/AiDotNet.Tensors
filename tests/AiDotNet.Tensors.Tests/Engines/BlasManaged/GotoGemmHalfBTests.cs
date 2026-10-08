@@ -16,13 +16,15 @@ namespace AiDotNet.Tensors.Tests.Engines.BlasManaged;
 [Collection("BlasManaged-Stats-Serial")]
 public sealed class GotoGemmHalfBTests
 {
-    [Theory]
+    [SkippableTheory]
     [InlineData(256, 3072, 1024)]  // transformer FFN-like; whole tiles
+    [InlineData(250, 520, 100)]    // K below the default kc of 256: one partial K panel
     [InlineData(250, 520, 300)]    // M % 6 = 4, N % 16 = 8: both tails
     [InlineData(64, 1000, 777)]    // short M, odd K, N-tail
     public void HalfB_MatchesFloatB_BitForBit_AndADoubleReference(int m, int n, int k)
     {
-        if (!GotoGemmFp32.IsAvailable || !System.Runtime.Intrinsics.X86.Avx2.IsSupported) return;
+        Skip.IfNot(GotoGemmFp32.IsAvailable && System.Runtime.Intrinsics.X86.Avx2.IsSupported,
+            "The per-tile GotoGemm kernel needs AVX2 and its machine-code microkernel.");
         int before = CpuParallelSettings.MaxDegreeOfParallelism;
         try
         {
@@ -83,9 +85,12 @@ public sealed class GotoGemmHalfBTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void TensorMatMulFp16WeightB_MatchesConvertingTheWeightFirst()
     {
+        // Only then does the engine dispatch the fused GotoGemm path this test is about.
+        Skip.IfNot(GotoGemmFp32.IsAvailable && System.Runtime.Intrinsics.X86.Avx2.IsSupported,
+            "The fused fp16-weight path needs AVX2 and the GotoGemm kernel.");
         var engine = new CpuEngine();
         var rng = RandomHelper.CreateSeededRandom(682);
         const int m = 256, k = 768, n = 3072;

@@ -925,7 +925,13 @@ internal static class Program
     private static int RunFp16WeightAb(CpuEngine eng, string[] a)
     {
         int rounds = ArgI(a, "--rounds", 10);
+        if (rounds < 2)
+        {
+            Console.Error.WriteLine("fp16b: --rounds must be at least 2 (paired rounds alternate which path runs first).");
+            return 2;
+        }
         CpuParallelSettings.MaxDegreeOfParallelism = ArgI(a, "--maxdop", Environment.ProcessorCount);
+        double worstDiff = 0;
         var shapes = new (int M, int K, int N)[] { (256, 3072, 12288), (4096, 1280, 5120), (1024, 3072, 768) };
         var rng = new Random(681);
         foreach (var (M, K, N) in shapes)
@@ -948,6 +954,7 @@ internal static class Program
             var u = Upcast(); var f = Fused();
             double maxDiff = 0;
             for (int i = 0; i < u.Length; i++) maxDiff = Math.Max(maxDiff, Math.Abs(u[i] - f[i]));
+            worstDiff = Math.Max(worstDiff, maxDiff);
             var ratios = new double[rounds];
             double upSum = 0, fuSum = 0;
             for (int r = 0; r < rounds; r++)
@@ -968,7 +975,14 @@ internal static class Program
             }
             Array.Sort(ratios);
             Console.WriteLine($"FP16B {M}x{K}x{N} upcast_mean_ms={upSum / rounds:F2} fused_mean_ms={fuSum / rounds:F2} " +
-                              $"paired_upcast/fused median={ratios[rounds / 2]:F2} range=[{ratios[0]:F2}..{ratios[rounds - 1]:F2}] max|diff|={maxDiff:E2}");
+                              $"paired_upcast/fused median={ratios[rounds / 2]:F2} range=[{ratios[0]:F2}..{ratios[rounds - 1]:F2}] max|diff|={maxDiff:E2} " +
+                              "(both paths allocate a fresh [M,N] result; even rounds run upcast first, odd rounds fused first)");
+        }
+        // Both paths compute the same product; a gap beyond fp32 reassociation noise is a wrong kernel.
+        if (worstDiff > 1e-3)
+        {
+            Console.Error.WriteLine($"fp16b: fused and upcast results differ by {worstDiff:E2}, above 1e-3.");
+            return 1;
         }
         return 0;
     }

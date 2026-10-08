@@ -85,6 +85,12 @@ public sealed unsafe class VulkanDevice : IDisposable
 
     private int _lastVkResult;
 
+    /// <summary>Marks a stage that failed without a Vulkan call failing (e.g. no compute-capable device).</summary>
+    private const int NoVkResult = int.MinValue;
+
+    private string DescribeLastVkResult() =>
+        _lastVkResult == NoVkResult ? "no failing Vulkan call; no suitable device or queue" : $"VkResult {_lastVkResult}";
+
     /// <summary>
     /// Gets the Vulkan logical device handle.
     /// </summary>
@@ -204,36 +210,41 @@ public sealed unsafe class VulkanDevice : IDisposable
                 SetMoltenVKIcdPath();
             }
 
+            _lastVkResult = NoVkResult;
             if (!CreateInstance())
             {
-                InitializationFailure = $"CreateInstance failed (VkResult {_lastVkResult}).";
+                InitializationFailure = $"CreateInstance failed ({DescribeLastVkResult()}).";
                 return false;
             }
 
+            _lastVkResult = NoVkResult;
             if (!SelectPhysicalDevice())
             {
-                InitializationFailure = $"SelectPhysicalDevice failed (VkResult {_lastVkResult}).";
+                InitializationFailure = $"SelectPhysicalDevice failed ({DescribeLastVkResult()}).";
                 Cleanup();
                 return false;
             }
 
+            _lastVkResult = NoVkResult;
             if (!CreateLogicalDevice())
             {
-                InitializationFailure = $"CreateLogicalDevice failed (VkResult {_lastVkResult}).";
+                InitializationFailure = $"CreateLogicalDevice failed ({DescribeLastVkResult()}).";
                 Cleanup();
                 return false;
             }
 
+            _lastVkResult = NoVkResult;
             if (!CreateCommandPool())
             {
-                InitializationFailure = $"CreateCommandPool failed (VkResult {_lastVkResult}).";
+                InitializationFailure = $"CreateCommandPool failed ({DescribeLastVkResult()}).";
                 Cleanup();
                 return false;
             }
 
+            _lastVkResult = NoVkResult;
             if (!CreateFence())
             {
-                InitializationFailure = $"CreateFence failed (VkResult {_lastVkResult}).";
+                InitializationFailure = $"CreateFence failed ({DescribeLastVkResult()}).";
                 Cleanup();
                 return false;
             }
