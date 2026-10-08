@@ -40915,12 +40915,15 @@ public partial class CpuEngine : ITensorLevelEngine
             Tensor<T>? savedPreActivation = null;
             if (activation != FusedActivationType.None)
             {
-                savedPreActivation = fusedResult.Clone();
-                // Untaped: the fused entry below owns the activation's backward. A recorded in-place
-                // activation would add its own entry (and clone), so removing the last 1-2 entries
-                // would drop it and the bias add, and orphan the matmul entry.
-                using (new NoGradScope<T>())
-                    ApplyFusedActivationInPlace(fusedResult, activation, activationParams);
+                // The pre-activation is kept as is and the activation is written to a new tensor: cloning it and then
+                // activating in place made the copy-on-write clone copy the whole output first (an extra full pass).
+                // Untaped: the fused entry below owns the activation's backward. A recorded activation would add its
+                // own entry, so removing the last 1-2 entries would drop it and the bias add, and orphan the matmul.
+                savedPreActivation = fusedResult;
+                var handler = ActivationRegistry.Get(activation);
+                if (handler is not null)
+                    using (new NoGradScope<T>())
+                        fusedResult = handler.Apply(this, fusedResult, activationParams);
             }
             RemoveLastNTapeEntries<T>(bias != null ? 2 : 1);
 
