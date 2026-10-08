@@ -582,6 +582,26 @@ internal static class FusedOptimizer
             throw new System.ArgumentOutOfRangeException(name,
                 $"[{offset}, {offset}+{length}) is outside the {array.Length}-element array.");
     }
+    // Elements per parallel chunk of SgdStepHost (256 KB of each array). SGD is bandwidth-bound, so a large layer's
+    // update needs several cores to reach memory bandwidth; small parameters fall to the serial path.
+    private const int SgdHostChunk = 64 * 1024;
+
+    /// <summary>
+    /// One plain-SGD step (param -= lr * grad) over host arrays, the SIMD kernel split into fixed chunks across the
+    /// pool. Element-wise, so the result does not depend on the thread count.
+    /// </summary>
+    internal static unsafe void SgdStepHost(float[] param, float[] grad, int length, float lr)
+    {
+        ValidateHostRange(param, 0, length, nameof(param));
+        ValidateHostRange(grad, 0, length, nameof(grad));
+        int chunks = System.Math.Max(1, (length + SgdHostChunk - 1) / SgdHostChunk);
+        Helpers.CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)length * 3, c =>
+        {
+            int start = c * SgdHostChunk, count = System.Math.Min(SgdHostChunk, length - start);
+            fixed (float* pp = param, pg = grad)
+                SgdUpdateSimd(pp + start, pg + start, count, lr);
+        }, deterministicSafe: true);
+    }
     // Elements per parallel chunk of AdamWStepHost: a ~1 MB slice of each of the four arrays.
     private const int AdamWHostChunk = 256 * 1024;
 
