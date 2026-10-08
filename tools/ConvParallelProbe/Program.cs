@@ -206,6 +206,12 @@ internal static class Program
         Measure("TensorAdd [S,D]", (long)S * D, () => eng.TensorAdd(x, x));
         Measure("LayerNorm [S,D]", (long)S * D, () => eng.LayerNorm(x, gamma, beta, 1e-5, out _, out _));
         Measure("SwishInPlace [S,4D]", 0, () => eng.SwishInPlace(h1));
+        var actOut = Rand(new[] { S, 4 * D }, rng);
+        Measure("GELU [S,4D]", (long)S * 4 * D, () => eng.GELU(h1));
+        Measure("GELUInto [S,4D]", 0, () => eng.GELUInto(actOut, h1));
+        Measure("Tanh [S,4D]", (long)S * 4 * D, () => eng.Tanh(h1));
+        Measure("Sigmoid [S,4D]", (long)S * 4 * D, () => eng.Sigmoid(h1));
+        Measure("ReLU [S,4D]", (long)S * 4 * D, () => eng.ReLU(h1));
         return 0;
     }
     private static int RunAttnBlock(CpuEngine eng, string[] a)
