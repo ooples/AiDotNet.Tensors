@@ -9096,7 +9096,12 @@ public partial class CpuEngine : ITensorLevelEngine
                         if (eng is CpuEngine cpuEng && !eng.SupportsGpu) cpuEng.MaxPool2DInto(output, captured, ps, st, pd);
                         else { var eager = eng.MaxPool2D(captured, ps, st, pd); DirectGpuTensorEngine.CopyResultInto(eng, eager, output); }
                     },
-                    BackwardFunctions<T>.MaxPool2DBackward, new object[] { new[] { poolSize, poolSize }, new[] { stride, stride } });
+                    // The node saves no argmax, so its backward recovers the winners from the input: MaxPool2DBackward
+                    // casts savedState[0] to the indices array, and a compiled plan's first backward threw on it.
+                    pd == 0 ? BackwardFunctions<T>.MaxPool2DRecomputeBackward : BackwardFunctions<T>.MaxPool2DPaddedRecomputeBackward,
+                    pd == 0
+                        ? new object[] { new[] { poolSize, poolSize }, new[] { stride, stride } }
+                        : new object[] { new[] { poolSize, poolSize }, new[] { stride, stride }, pd });
             }
         }
 

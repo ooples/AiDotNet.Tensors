@@ -1476,6 +1476,26 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
+    /// <summary>
+    /// MaxPool2D backward for a padded pool recorded without indices (savedState: pool size, stride, padding): the
+    /// winners are recovered with the same padded indexed pool the eager tape records
+    /// (<see cref="CpuEngine.MaxPool2DPaddedWithTensorIndices{T}"/>), then routed as <see cref="MaxPool2DTensorIndicesBackward"/> does.
+    /// </summary>
+    internal static void MaxPool2DPaddedRecomputeBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var poolSize = (int[])savedState[0];
+        var stride = (int[])savedState[1];
+        int padding = (int)savedState[2];
+        var cpu = engine as CpuEngine ?? new CpuEngine();
+        Tensor<int> maxIndices;
+        using (new NoGradScope<T>())
+            cpu.MaxPool2DPaddedWithTensorIndices(inputs[0], poolSize[0], stride[0], padding, out maxIndices);
+        var grad = engine.MaxPool2DBackwardWithTensorIndices(gradOutput, maxIndices, inputs[0]._shape, poolSize, stride);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+    }
+
     /// <summary>MaxPool2D backward with tensor-resident flat spatial indices.</summary>
     internal static void MaxPool2DTensorIndicesBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
