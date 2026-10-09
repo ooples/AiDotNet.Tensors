@@ -154,7 +154,7 @@ public class CpuDotNetJitEmitterTests
         Assert.Contains("void Kernel(", r.Source);
         Assert.Contains("ReadOnlyMemory<float>", r.Source);
         Assert.Contains("for (int i = 0; i < count; i++)", r.Source);
-        Assert.Contains("MathF.Max", r.Source); // ReLU → Max(x, 0)
+        Assert.Contains("< 0 ? 0 :", r.Source); // ReLU → Max(x, 0)
     }
 
     [Fact]
