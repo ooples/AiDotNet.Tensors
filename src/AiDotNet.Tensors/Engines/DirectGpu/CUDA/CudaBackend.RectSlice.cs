@@ -21,6 +21,13 @@ public sealed partial class CudaBackend : IRectSliceKernels
 
     public unsafe void RectSlice(IGpuBuffer full, IGpuBuffer slice, int[] fullShape, int[] start, int[] length, bool scatter)
     {
+        if (!IsAvailable)
+            throw new InvalidOperationException("CUDA backend is not available.");
+        if (full is null) throw new ArgumentNullException(nameof(full));
+        if (slice is null) throw new ArgumentNullException(nameof(slice));
+        if (fullShape is null) throw new ArgumentNullException(nameof(fullShape));
+        if (start is null) throw new ArgumentNullException(nameof(start));
+        if (length is null) throw new ArgumentNullException(nameof(length));
         int rank = fullShape.Length;
         if (rank < 1 || rank > RectSliceLimits.MaxRank || start.Length != rank || length.Length != rank)
             throw new ArgumentException($"RectSlice supports rank 1..{RectSliceLimits.MaxRank} with matching start/length.");
@@ -40,6 +47,12 @@ public sealed partial class CudaBackend : IRectSliceKernels
             total = checked(total * length[d]);
         }
         meta.Total = total;
+        // An out-of-bounds launch is a sticky CUDA error 700 that poisons the shared primary context for every engine
+        // in the process, so the buffers are checked against the shapes before it, not just the shapes themselves.
+        if (full.Size < stride)
+            throw new ArgumentException($"RectSlice: the full buffer holds {full.Size} elements, the shape needs {stride}.", nameof(full));
+        if (slice.Size < total)
+            throw new ArgumentException($"RectSlice: the slice buffer holds {slice.Size} elements, the slice needs {total}.", nameof(slice));
 
         using var _ = PushContext();
         uint gridDim = (uint)((total + DefaultBlockSize - 1) / DefaultBlockSize);

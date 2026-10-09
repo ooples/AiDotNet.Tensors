@@ -593,6 +593,23 @@ internal static class DifferentiableOps
         return true;
     }
 
+    /// <summary>Marks a buffer stored fresh in the current <see cref="GradWriteGeneration"/> as written, so a later
+    /// contribution adds to it rather than claiming the first write and overwriting it.</summary>
+    private static void MarkWrittenThisStep<T>(Tensor<T> buffer)
+    {
+        int generation = GradWriteGeneration;
+        if (generation != 0) buffer._gradWriteGeneration = generation;
+    }
+
+    /// <summary>True when <paramref name="buffer"/> already holds this step's gradient: outside a
+    /// <see cref="GradWriteGeneration"/> every stored buffer is live, inside one only a buffer written in it is. A
+    /// buffer kept from an earlier compiled step is stale until its first write clears it.</summary>
+    internal static bool IsWrittenThisStep<T>(Tensor<T> buffer)
+    {
+        int generation = GradWriteGeneration;
+        return generation == 0 || buffer._gradWriteGeneration == generation;
+    }
+
     /// <summary>The step's first contribution to a gradient buffer that was not zeroed: copied in, not added.</summary>
     private static Tensor<T> CopyFirstWrite<T>(Tensor<T> tensor, Tensor<T> buffer, Tensor<T> contribution, IEngine engine)
     {
@@ -654,15 +671,6 @@ internal static class DifferentiableOps
         Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1";
 
     /// <summary>
-    /// Accumulates a gradient for a tensor in the gradient dictionary.
-    /// If the tensor already has a gradient, the new gradient is added to it.
-    /// </summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining
-#if !NETFRAMEWORK
-        | MethodImplOptions.AggressiveOptimization
-#endif
-    )]
-    /// <summary>
     /// Adds a slice's gradient into ONLY its region of <paramref name="tensor"/>'s existing accumulator, instead of
     /// materializing a full-size zero tensor and adding all of it. A recurrence that slices one tensor per step (an
     /// LSTM's per-timestep input) otherwise does O(T * size) work per sequence in backward; on the CPU that made a
@@ -719,6 +727,43 @@ internal static class DifferentiableOps
         return true;
     }
 
+    /// <summary>
+    /// For a fused backward that produces an input's whole gradient: the existing host accumulator it may write straight
+    /// into, so the gradient is never staged in a temporary and copied. <paramref name="overwrite"/> is true when this is
+    /// the buffer's first contribution of the step under a <see cref="GradWriteGeneration"/> (the buffer was not zeroed,
+    /// so the caller must store, not add); otherwise the caller adds. Returns null when the direct route does not apply
+    /// -- no existing contiguous host accumulator yet (the eager tape's first contribution), a GPU engine, or a
+    /// create-graph backward -- and the caller passes a contribution tensor to <see cref="AccumulateGrad{T}"/> instead.
+    /// A caller that writes the returned buffer must call <see cref="TensorBase{T}.IncrementVersion"/> afterwards.
+    /// </summary>
+    internal static Tensor<T>? TryGetDirectGradTarget<T>(
+        Dictionary<Tensor<T>, Tensor<T>> grads, Tensor<T> tensor, IEngine engine, out bool overwrite)
+    {
+        overwrite = false;
+        if (_isBackwardCreateGraph || engine.SupportsGpu || engine is not CpuEngine) return null;
+        int idx = tensor._gradIndex;
+        bool indexed = idx >= 0 && _indexedGrads != null && idx < _indexedGrads.Length;
+        Tensor<T>? existing = indexed
+            ? (Tensor<T>?)_indexedGrads![idx]
+            : (grads.TryGetValue(tensor, out var found) ? found : null);
+        if (existing is null || !existing.IsContiguous || existing.HasPendingGpuData
+            || existing.Length != tensor.Length) return null;
+        overwrite = ClaimFirstWrite(existing);
+        if (indexed) _indexedGrads![idx] = existing;
+        grads[tensor] = existing;
+        tensor.Grad = existing;
+        return existing;
+    }
+
+    /// <summary>
+    /// Accumulates a gradient for a tensor in the gradient dictionary.
+    /// If the tensor already has a gradient, the new gradient is added to it.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining
+#if !NETFRAMEWORK
+        | MethodImplOptions.AggressiveOptimization
+#endif
+    )]
     internal static void AccumulateGrad<T>(
         Dictionary<Tensor<T>, Tensor<T>> grads,
         Tensor<T> tensor,
@@ -848,6 +893,7 @@ internal static class DifferentiableOps
                 var stored = needsOutOfPlace
                     ? grad
                     : TakeAccumulatorBuffer(tensor, GradForInPlace(), engine);
+                MarkWrittenThisStep(stored);
                 _indexedGrads[idx] = stored;
                 tensor.Grad = stored;
             }
@@ -899,6 +945,7 @@ internal static class DifferentiableOps
             var stored = needsOutOfPlace
                 ? grad
                 : TakeAccumulatorBuffer(tensor, GradForInPlace(), engine);
+            MarkWrittenThisStep(stored);
             grads[tensor] = stored;
             tensor.Grad = stored;
         }

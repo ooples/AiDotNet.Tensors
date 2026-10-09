@@ -101,7 +101,17 @@ public partial class CpuEngine
         int outputWidth = (input._shape[3] + 2 * padW - (dilationW * (kernelWidth - 1) + 1)) / strideW + 1;
         // The route Conv2DInto takes for a plain NCHW float input (Conv2DIntoImpl -> DispatchFloatConv2D ->
         // Conv2DWithIm2ColFloat), with the epilogue handed to it; any other layout or geometry keeps the two-pass form.
-        bool adaptiveRoute = input.IsContiguous && kernel.IsContiguous && output.IsContiguous && bias.IsContiguous
+        // A conv DispatchFloatConv2D sends to the batch-wide GEMM goes through Conv2DInto too, so the fused plan
+        // computes the same convolution, bit for bit, as the unfused one.
+        // The direct blocked kernel is DispatchFloatConv2D's first choice, so a conv it takes goes through Conv2DInto too.
+        bool batchedRoute = input.Layout == LinearAlgebra.TensorLayout.Nchw
+            && (Engines.Simd.DirectConvAvx2.TryChoose(new Engines.Simd.DirectConvShape(Engines.Simd.DirectConvPass.Forward,
+                    input._shape[0], input._shape[1], kernel._shape[0], input._shape[2], input._shape[3], kernelHeight, kernelWidth,
+                    strideH, strideW, padH, padW, dilationH, dilationW), out _)
+                || UseBatchedConvForward(input._shape[0], input._shape[1], kernelHeight, kernelWidth,
+                    strideH, strideW, outputHeight, outputWidth, kernel._shape[0]));
+        bool adaptiveRoute = !batchedRoute
+            && input.IsContiguous && kernel.IsContiguous && output.IsContiguous && bias.IsContiguous
             && input.Layout == LinearAlgebra.TensorLayout.Nchw
             && output._shape[2] == outputHeight && output._shape[3] == outputWidth
             && ShouldUseAdaptiveFloatConv2D(input.Layout, strideH, strideW, padH, padW, dilationH, dilationW);
@@ -122,6 +132,47 @@ public partial class CpuEngine
         Conv2DInto(output, input, kernel, stride, padding, dilation);
 #endif
         ChannelBiasActivationInto(output, output, bias, relu);
+    }
+
+    /// <summary>
+    /// The eager-tape form of <c>FusedConv2D</c> with a channel bias and ReLU or no activation: computes the
+    /// convolution, bias and activation into a fresh output and records it as one <c>FusedConv2D</c> tape entry
+    /// (<see cref="Autodiff.BackwardFunctions{T}.FusedConv2DBiasActivationBackward"/>). Returns null when the operands
+    /// fall outside that form (another activation, a non-contiguous or channel-packed operand, a device engine), so
+    /// the caller records the separate ops instead.
+    /// </summary>
+    internal Tensor<float>? TryConv2DBiasActivationRecorded(
+        Tensor<float> input, Tensor<float> kernel, Tensor<float> bias,
+        int strideH, int strideW, int padH, int padW, int dilationH, int dilationW, FusedActivationType activation)
+    {
+        if (SupportsGpu || (activation != FusedActivationType.None && activation != FusedActivationType.ReLU))
+            return null;
+        if (input.Rank != 4 || kernel.Rank != 4 || bias.Rank != 1
+            || kernel._shape[1] != input._shape[1] || bias._shape[0] != kernel._shape[0]
+            || !input.IsContiguous || !kernel.IsContiguous || !bias.IsContiguous
+            || input.Layout != LinearAlgebra.TensorLayout.Nchw || kernel.Layout != LinearAlgebra.TensorLayout.Nchw
+            || strideH <= 0 || strideW <= 0 || dilationH <= 0 || dilationW <= 0 || padH < 0 || padW < 0)
+            return null;
+        int kernelHeight = kernel._shape[2], kernelWidth = kernel._shape[3];
+        int outputHeight = (input._shape[2] + 2 * padH - (dilationH * (kernelHeight - 1) + 1)) / strideH + 1;
+        int outputWidth = (input._shape[3] + 2 * padW - (dilationW * (kernelWidth - 1) + 1)) / strideW + 1;
+        if (outputHeight <= 0 || outputWidth <= 0) return null;
+        var stride = new[] { strideH, strideW };
+        var padding = new[] { padH, padW };
+        var dilation = new[] { dilationH, dilationW };
+        bool relu = activation == FusedActivationType.ReLU;
+        // Uninitialized: Conv2DInto writes every element (compiled plans hand it stale reused buffers).
+        var output = TensorAllocator.RentUninitialized<float>([input._shape[0], kernel._shape[0], outputHeight, outputWidth]);
+        using (new Autodiff.NoGradScope<float>())
+            Conv2DInto(output, input, kernel, stride, padding, dilation);
+        // The eager epilogue, not ChannelBiasActivationInto: FusedConv2D's ReLU keeps a NaN (as torch.relu does),
+        // where the compiled plan's matches the standalone ReLU kernel and stores +0.
+        CpuFusedOperations.ApplyBiasActivationNCHWInPlace(output.GetDataArray(), bias.GetReadOnlyDataArray(),
+            output._shape[0], output._shape[1], outputHeight, outputWidth, activation);
+        Autodiff.DifferentiableOps.RecordIfActive("FusedConv2D", output, new[] { input, kernel, bias },
+            Autodiff.BackwardFunctions<float>.FusedConv2DBiasActivationBackward,
+            new object[] { stride, padding, dilation, relu });
+        return output;
     }
 
     /// <summary>

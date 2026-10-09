@@ -1,6 +1,5 @@
 using System;
 using System.Runtime.CompilerServices;
-using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.LinearAlgebra;
 
@@ -11,7 +10,6 @@ namespace AiDotNet.Tensors.Engines;
 // instead of a per-timestep op chain (the PyTorch-parity LSTM issued ~2,800 kernels per CUDA training step).
 public partial class DirectGpuTensorEngine
 {
-    private const int MaxFusedLstmHidden = 1024;   // CudaBackend.MaxRnnBlockSize: one block holds a batch row
 
     // Per-layer device caches, keyed by the layer's input-weight tensor: stable across steps (a captured graph
     // bakes the pointers) and never shared between two LSTM layers, so a stacked LSTM's second forward cannot
@@ -52,6 +50,28 @@ public partial class DirectGpuTensorEngine
         public IGpuBuffer GradH0 { get; }
         public IGpuBuffer GradC0 { get; }
         public IGpuBuffer GradBiasHh { get; }
+
+        /// <summary>Counts forwards into these buffers; each forward's backward checks it still owns them.</summary>
+        public int Generation { get; set; }
+    }
+
+    // The forward a recorded node ran, compared with LstmTrainCache.Generation by its backward. One layer run twice
+    // in a step (weight sharing, an unrolled loop) writes the same per-layer buffers twice, so the first call's
+    // backward would read the second call's activations: silently wrong gradients. The check turns that into an error.
+    private sealed class LstmForwardStamp
+    {
+        public int Generation { get; set; }
+    }
+
+    private static void StampLstmForward(LstmTrainCache cache, LstmForwardStamp stamp)
+        => stamp.Generation = ++cache.Generation;
+
+    // The backward kernel accumulates, so its outputs start at zero: a stream memset on CUDA (capturable), a fill on
+    // any other backend.
+    private static void ZeroLstmGradient(IDirectGpuBackend backend, IGpuBuffer buffer, int length)
+    {
+        if (backend is Engines.DirectGpu.CUDA.CudaBackend cuda) cuda.MemsetBuffer(buffer, 0, (long)length * sizeof(float));
+        else backend.Fill(buffer, 0f, length);
     }
 
     private readonly ConditionalWeakTable<object, LstmTrainCache> _lstmTrainCaches = new();
@@ -73,41 +93,37 @@ public partial class DirectGpuTensorEngine
     /// <summary>
     /// Differentiable LSTM over a whole sequence: input [B, T, in], weights wIh [4H, in] and wHh [4H, H] with gate
     /// rows in PyTorch order (input, forget, cell, output), one bias [4H]; h0 = c0 = 0. Returns the hidden sequence
-    /// [B, T, H], or null when this engine cannot run it (non-float, non-CUDA, H &gt; 1024, other shapes) so the
-    /// caller keeps its decomposed path. Records one tape / lazy-graph node whose backward is the BPTT kernel.
+    /// [B, T, H], or null when this engine cannot run it (non-float, a backend without
+    /// <see cref="IFusedLstmSequenceTraining"/>, H above that backend's limit, other shapes, or a lazy
+    /// graph being traced) so the caller keeps its decomposed path. Records one tape node whose backward is the BPTT
+    /// kernel.
     /// </summary>
+    /// <remarks>
+    /// An explicit capability check rather than an assumption: every backend exposes
+    /// <c>LstmForwardSequence</c>/<c>LstmBackwardSequence</c>, but only those declaring
+    /// <see cref="IFusedLstmSequenceTraining"/> are verified against the contract this op needs (batch-major
+    /// [B, T, *], PyTorch gate order, full BPTT). Elsewhere the caller's per-timestep ops run instead, on the device.
+    /// </remarks>
     public Tensor<T>? TryLstmSequenceTrain<T>(Tensor<T> input, Tensor<T> wIh, Tensor<T> wHh, Tensor<T> bias)
     {
         if (typeof(T) != typeof(float) || !TryGetBackend(out var backend)
-            || backend is not Engines.DirectGpu.CUDA.CudaBackend
+            || backend is not IFusedLstmSequenceTraining fused
             || input.Rank != 3 || wIh.Rank != 2 || wHh.Rank != 2 || bias.Length != wIh._shape[0])
             return null;
         int b = input._shape[0], t = input._shape[1], inSize = input._shape[2];
         int gateRows = wIh._shape[0], h = gateRows / 4;
         if (gateRows % 4 != 0 || wIh._shape[1] != inSize || wHh._shape[0] != gateRows || wHh._shape[1] != h
-            || h <= 0 || h > MaxFusedLstmHidden || b <= 0 || t <= 0)
+            || h <= 0 || h > fused.MaxFusedLstmHidden || b <= 0 || t <= 0)
             return null;
 
+        // No lazy-graph branch: TryGetBackend refuses the backend while a graph is traced (#350), so a trace never
+        // reaches here and records the caller's decomposed ops instead.
         var cache = GetLstmTrainCache(backend, wIh, b, t, inSize, h);
-        var state = new object[] { cache };
-        var outShape = new[] { b, t, h };
-
-        if (GraphMode.IsActive && GraphMode.Current is { } scope)
-        {
-            scope.BindEngineIfUnset(this);
-            var capturedInput = input; var capturedWih = wIh; var capturedWhh = wHh; var capturedBias = bias;
-            return scope.RecordVariadic(LazyNodeType.Custom, "LstmSequenceTrain",
-                new[] { input, wIh, wHh, bias }, outShape,
-                (eng, output) =>
-                {
-                    var gpu = (DirectGpuTensorEngine)eng;
-                    var result = gpu.RunLstmForward(capturedInput, capturedWih, capturedWhh, capturedBias, cache);
-                    CopyResultInto(eng, result, output);
-                },
-                LstmSequenceTrainBackward<T>, state);
-        }
+        var stamp = new LstmForwardStamp();
+        var state = new object[] { cache, stamp };
 
         var outputTensor = RunLstmForward(input, wIh, wHh, bias, cache);
+        StampLstmForward(cache, stamp);
         Autodiff.DifferentiableOps.RecordIfActive("LstmSequenceTrain", outputTensor,
             new[] { input, wIh, wHh, bias }, LstmSequenceTrainBackward<T>, state);
         return outputTensor;
@@ -140,8 +156,15 @@ public partial class DirectGpuTensorEngine
     {
         var gpu = (DirectGpuTensorEngine)engine;
         var c = (LstmTrainCache)savedState[0];
+        var stamp = (LstmForwardStamp)savedState[1];
+        if (stamp.Generation != c.Generation)
+        {
+            throw new InvalidOperationException(
+                "The fused GPU LSTM ran this layer's forward again before this call's backward, and both calls share "
+                + "one set of activation buffers, so these gradients would come from the later call. Run one forward "
+                + "per layer per step on this path, or train the layer through the per-timestep ops.");
+        }
         var backend = gpu.GetBackend() ?? throw new InvalidOperationException("No GPU backend.");
-        var cuda = (Engines.DirectGpu.CUDA.CudaBackend)backend;
         var input = inputs[0]; var wIh = inputs[1]; var wHh = inputs[2];
 
         var gradOutC = gradOutput.IsContiguous ? gradOutput : (Tensor<T>)gradOutput.Contiguous();
@@ -157,11 +180,11 @@ public partial class DirectGpuTensorEngine
         var gWhh = AllocateOutputBuffer(backend, nWhh);
         var gBias = AllocateOutputBuffer(backend, nBias);
         // The kernel accumulates every gradient with atomicAdd: zero them first (capturable memset).
-        cuda.MemsetBuffer(gIn.Buffer, 0, (long)nIn * sizeof(float));
-        cuda.MemsetBuffer(gWih.Buffer, 0, (long)nWih * sizeof(float));
-        cuda.MemsetBuffer(gWhh.Buffer, 0, (long)nWhh * sizeof(float));
-        cuda.MemsetBuffer(gBias.Buffer, 0, (long)nBias * sizeof(float));
-        cuda.MemsetBuffer(c.GradBiasHh, 0, (long)nBias * sizeof(float));
+        ZeroLstmGradient(backend, gIn.Buffer, nIn);
+        ZeroLstmGradient(backend, gWih.Buffer, nWih);
+        ZeroLstmGradient(backend, gWhh.Buffer, nWhh);
+        ZeroLstmGradient(backend, gBias.Buffer, nBias);
+        ZeroLstmGradient(backend, c.GradBiasHh, nBias);
 
         backend.LstmBackwardSequence(bufGradOut.Buffer, c.AllH, c.AllC, c.Gates, c.H0, c.C0,
             bufWih.Buffer, bufWhh.Buffer, bufInput.Buffer,

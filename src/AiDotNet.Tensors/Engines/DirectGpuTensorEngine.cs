@@ -1780,7 +1780,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 InvalidateActivationCacheEntry(staleArray);
             InvalidateActivationCacheEntry(tensor.DataVector);
             if (s_staleDropTrace && tensor.Length > 0)
-                AliasDiag($"STALE-DROP len={tensor.Length} gpuVer={tensor._gpuBufferVersion} hostVer={tensor.GpuCacheVersion} caller="
+                StaleDropDiag($"STALE-DROP len={tensor.Length} gpuVer={tensor._gpuBufferVersion} hostVer={tensor.GpuCacheVersion} caller="
                     + new System.Diagnostics.StackTrace(1, false).ToString().Replace(System.Environment.NewLine, " <- "));
             tensor._gpuBuffer = null;
             tensor._gpuBackend = null;
@@ -1904,7 +1904,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     public void InvalidateResidentWeightBuffer<T>(LinearAlgebra.Tensor<T> tensor)
     {
         if (s_staleDropTrace)
-            AliasDiag($"INVALIDATE-WEIGHT len={tensor.Length} caller=" + new System.Diagnostics.StackTrace(1, false).ToString().Replace(System.Environment.NewLine, " <- "));
+            StaleDropDiag($"INVALIDATE-WEIGHT len={tensor.Length} caller=" + new System.Diagnostics.StackTrace(1, false).ToString().Replace(System.Environment.NewLine, " <- "));
         // DROP (do not materialize) any pending deferred device->host download FIRST. The host
         // weight array was just updated IN PLACE by the CPU-side optimizer, so a pending download
         // holds STALE pre-step device data; letting InvalidateGpuCacheForTensor force-materialize it
@@ -2160,7 +2160,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 InvalidateActivationCacheEntry(staleArray);
             InvalidateActivationCacheEntry(tensor.DataVector);
             if (s_staleDropTrace && tensor.Length > 0)
-                AliasDiag($"STALE-DROP len={tensor.Length} gpuVer={tensor._gpuBufferVersion} hostVer={tensor.GpuCacheVersion} caller="
+                StaleDropDiag($"STALE-DROP len={tensor.Length} gpuVer={tensor._gpuBufferVersion} hostVer={tensor.GpuCacheVersion} caller="
                     + new System.Diagnostics.StackTrace(1, false).ToString().Replace(System.Environment.NewLine, " <- "));
             tensor._gpuBuffer = null;
             tensor._gpuBackend = null;
@@ -2599,7 +2599,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// never read again), so materializing it would be a wasted GPU→CPU transfer that breaks full residency. The
     /// FP16 parity tests gate correctness: a wrongful discard of a still-needed tensor would corrupt the grads.
     /// </summary>
-    internal void EvictActivationsCreatedAfter(long snapshot, HashSet<object>? protect, bool materializePending)
+    /// <returns>The device bytes released.</returns>
+    internal long EvictActivationsCreatedAfter(long snapshot, HashSet<object>? protect, bool materializePending)
         => EvictActivationsCreatedAfter(snapshot, protect,
             materializePending ? ActivationReleaseMode.MaterializeThenFree : ActivationReleaseMode.DropScratch);
 
@@ -2625,11 +2626,12 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     internal void ReleaseDeadDeviceStorage<T>(Tensor<T> tensor)
     {
-        if (s_staleDropTrace)
-            AliasDiag($"RELEASE-DEAD len={tensor.Length} caller=" + new System.Diagnostics.StackTrace(1, false).ToString().Replace(System.Environment.NewLine, " <- "));
         var vector = tensor.DataVector;
         if (vector._deviceState is not { Buffer: { } buffer } state) return;
+        if (_actionScratchBuffers.Contains(buffer)) return;   // the per-action scratch pool owns it
         if (!tensor.IsContiguous || tensor._storageOffset != 0 || tensor.Length != vector.Length) return;
+        if (s_staleDropTrace)
+            StaleDropDiag($"RELEASE-DEAD len={tensor.Length} caller=" + new System.Diagnostics.StackTrace(1, false).ToString().Replace(System.Environment.NewLine, " <- "));
         Helpers.HostSync.Release(vector, ReleasedIntermediateMessage);
         if (tensor.GetBackingArrayForCacheLookupUnsafe() is { } array) Helpers.HostSync.Release(array, ReleasedIntermediateMessage);
         state.Buffer = null;
@@ -2687,7 +2689,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// Evicts this thread's activation-cache entries created after <paramref name="snapshot"/> (except
     /// <paramref name="protect"/>), handling entries whose only valid copy is on the device per <paramref name="mode"/>.
     /// </summary>
-    internal void EvictActivationsCreatedAfter(long snapshot, HashSet<object>? protect, ActivationReleaseMode mode)
+    internal long EvictActivationsCreatedAfter(long snapshot, HashSet<object>? protect, ActivationReleaseMode mode)
     {
         // The activation timestamp counter is process-wide, so "created after my snapshot"
         // also matches a CONCURRENT tape's activations on another thread. Free only THIS
@@ -2697,7 +2699,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         List<ActivationCacheEntry> toDispose;
         lock (_activationCacheLock)
         {
-            if (_activationCache.IsEmpty) return;
+            if (_activationCache.IsEmpty) return 0;
             var entries = _activationCache.ToArray();
             toDispose = new List<ActivationCacheEntry>();
             for (int i = 0; i < entries.Length; i++)
@@ -2733,7 +2735,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 }
             }
         }
-        foreach (var entry in toDispose) entry.Dispose();
+        long released = 0;
+        foreach (var entry in toDispose) { released += entry.Buffer.SizeInBytes; entry.Dispose(); }
+        return released;
     }
 
     /// <summary>
@@ -3824,12 +3828,36 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private static readonly bool s_aliasDiagEnabled =
         System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1";
 
+    // AIDOTNET_STALE_DROP_TRACE=1 writes through its own sink: AliasDiag also requires the capture-debug variable, so
+    // the trace used to pay for its stack walks and then print nothing.
+    private static void StaleDropDiag(string reason)
+    {
+        if (!s_staleDropTrace) return;
+        WriteGraphCaptureDiag("[STALE] ", reason);
+    }
+
     private static void AliasDiag(string reason)
     {
         if (!s_aliasDiagEnabled) return;
+        WriteGraphCaptureDiag("[ALIAS] ", reason);
+    }
+
+    // The one sink both debug traces share: the first three occurrences of each distinct reason, appended to
+    // aidotnet_graphcapture_diag.txt in the temp directory. Callers gate on their own switch first.
+    private static void WriteGraphCaptureDiag(string tag, string reason)
+    {
         int n = s_aliasDiag.AddOrUpdate(reason, 1, (_, c) => c + 1);
-        if (n <= 3) try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(),
-            "aidotnet_graphcapture_diag.txt"), "[ALIAS] " + reason + System.Environment.NewLine); } catch { }
+        if (n > 3) return;
+        try
+        {
+            System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(),
+                "aidotnet_graphcapture_diag.txt"), tag + reason + System.Environment.NewLine);
+        }
+        catch (Exception ex) when (ex is System.IO.IOException || ex is UnauthorizedAccessException)
+        {
+            // A debug trace must never fail the op it is tracing; report the lost line instead of throwing.
+            System.Diagnostics.Trace.TraceWarning($"Graph-capture diagnostic not written ({ex.GetType().Name}): {tag}{reason}");
+        }
     }
 
     private static readonly bool s_residentSyncDebug =
@@ -5033,6 +5061,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // compiled action (_currentScratchAction >= 0); the pre-pass (EnsureResidentBuffer) and the eager optimizer
     // run with action = -1 → normal alloc, so the cached-once persistent buffers are never pooled.
     private readonly System.Collections.Generic.Dictionary<long, IGpuBuffer> _actionScratchPool = new();
+    // The pool's buffers by identity: a tensor wrapping one (a pooled zero gradient, a pooled reduction) does not own it,
+    // so freeing that tensor's storage early must leave the buffer to the pool, whose captured graphs bake its address.
+    private readonly System.Collections.Generic.HashSet<IGpuBuffer> _actionScratchBuffers = new();
     private int _currentScratchAction = -1;
     private int _currentScratchLocal;
 
@@ -5063,9 +5094,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             else backend.Fill(b, 0f, length);
             return b;
         }
-        if (b is not null) { try { b.Dispose(); } catch { } }
+        if (b is not null) { _actionScratchBuffers.Remove(b); try { b.Dispose(); } catch { } }
         var nb = backend.AllocateBuffer(length);   // first pass at this (action,local): record the stable buffer
         _actionScratchPool[key] = nb;
+        _actionScratchBuffers.Add(nb);
         return nb;
     }
 
@@ -5080,6 +5112,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         foreach (var kv in _actionScratchPool)
             { try { kv.Value?.Dispose(); } catch { } }
         _actionScratchPool.Clear();
+        _actionScratchBuffers.Clear();
         _currentScratchAction = -1;
         _currentScratchLocal = 0;
     }
@@ -8723,18 +8756,39 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // the same Conv2D node the base records is added; its backward already dispatches to the device through
         // IEngine.Conv2DBackwardInput/Kernel. Bias and activation are the GPU ops, which record themselves. Graph
         // capture and anomaly mode keep the base path, which they instrument.
-        if (IsTapeActive<T>())
+        // Only float, the type the device kernels compute in: a taped double (a gradient check, say) keeps the exact host
+        // path it always had, rather than the default policy's float down-cast.
+        if (typeof(T) != typeof(float) && IsTapeActive<T>())
+            return base.FusedConv2D(input, kernel, bias, strideH, strideW, padH, padW, dilationH, dilationW, activation);
+        if (Autodiff.GradientTape<T>.Current is { } fusedTape && !Autodiff.NoGradScope<T>.IsSuppressed)
         {
-            // Only float, the type the device kernels compute in: a taped double (a gradient check, say) keeps the
-            // exact host path it always had, rather than the default policy's float down-cast.
-            if (typeof(T) != typeof(float) || Compilation.GraphMode.IsActive || Autodiff.AnomalyModeScope.IsActive
-                || Autodiff.GradientTape<T>.Current is null)
+            // Graph capture and anomaly mode keep the base path, which they instrument.
+            if (Compilation.GraphMode.IsActive || Autodiff.AnomalyModeScope.IsActive)
                 return base.FusedConv2D(input, kernel, bias, strideH, strideW, padH, padW, dilationH, dilationW, activation);
+            fusedTape.BindEngineIfUnset(this);
 
+            // The form CpuEngine records as one FusedConv2D entry (a rank-1 channel bias, no activation or ReLU): the
+            // fused kernel runs untaped and the same node is added, with FusedConv2DBiasActivationBackward and its saved
+            // state, whose engine path (ReluBackward, ReduceSum, Conv2DBackwardInput/Kernel) stays on the device.
+            if (bias is { Rank: 1 } fusedBias
+                && (activation == FusedActivationType.None || activation == FusedActivationType.ReLU))
+            {
+                Tensor<T> fused;
+                using (Autodiff.GradientTape<T>.NoGrad())
+                    fused = FusedConv2D(input, kernel, fusedBias, strideH, strideW, padH, padW, dilationH, dilationW, activation);
+                Autodiff.DifferentiableOps.RecordIfActive("FusedConv2D", fused, new[] { input, kernel, fusedBias },
+                    Autodiff.BackwardFunctions<T>.FusedConv2DBiasActivationBackward,
+                    new object[] { new[] { strideH, strideW }, new[] { padH, padW }, new[] { dilationH, dilationW },
+                        activation == FusedActivationType.ReLU });
+                return fused;
+            }
+
+            // Any other bias or activation: the convolution runs on the device with recording suppressed and the
+            // Conv2D node the base records is added; its backward dispatches to the device through
+            // IEngine.Conv2DBackwardInput/Kernel. Bias and activation are the GPU ops, which record themselves.
             Tensor<T> conv;
             using (Autodiff.GradientTape<T>.NoGrad())
                 conv = FusedConv2D(input, kernel, null, strideH, strideW, padH, padW, dilationH, dilationW, FusedActivationType.None);
-            Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
             Autodiff.DifferentiableOps.RecordBinary("Conv2D", conv, input, kernel, Autodiff.BackwardFunctions<T>.Conv2DBackward,
                 new object[] { new[] { strideH, strideW }, new[] { padH, padW }, new[] { dilationH, dilationW } });
 
@@ -16495,6 +16549,27 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     }
 
     /// <summary>
+    /// A device-resident zero tensor filled on the device, for a backward that needs <c>zeros_like</c> without a host
+    /// upload. On CUDA the fill is a stream memset, which a graph capture records; inside a compiled action the buffer
+    /// comes from the action's stable scratch.
+    /// </summary>
+    /// <returns>False when no GPU backend is available.</returns>
+    internal bool TryResidentZeros<T>(int[] shape, out Tensor<T> zeros)
+    {
+        zeros = Tensor<T>.Empty();
+        if (!TryGetBackend(out var backend))
+            return false;
+        int size = 1;
+        foreach (var dim in shape)
+            size = checked(size * dim);
+        var buffer = RentActionScratchOrAllocate(backend, size, fullyWritten: true);
+        if (backend is DirectGpu.CUDA.CudaBackend cuda) cuda.MemsetBuffer(buffer, 0, (long)size * sizeof(float));
+        else backend.Fill(buffer, 0f, size);
+        zeros = DeferTensorResult<T>(backend, buffer, size, shape);
+        return true;
+    }
+
+    /// <summary>
     /// Creates a GPU-resident tensor filled with zeros.
     /// </summary>
     /// <typeparam name="T">The element type.</typeparam>
@@ -20221,7 +20296,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// Both gradients of the 2-D matmul <c>Y[M,N] = A[M,K] · B[K,N]</c>, each as one GEMM with a transpose flag:
     /// <c>dA = dY · Bᵀ</c> and <c>dB = Aᵀ · dY</c>. The generic backward materialized Bᵀ and Aᵀ with a transpose
     /// kernel each and then multiplied, two extra launches and temporaries per matmul per step (149 transpose_2d per
-    /// AiDotNet N-BEATS step, #1804). CUDA float only; returns false otherwise, and in a resident (captured) step
+    /// AiDotNet N-BEATS step, #1804). Float only, on any backend implementing <see cref="DirectGpu.ITransposedAGemm"/>
+    /// (all six); returns false otherwise, and in a resident (captured) step
     /// when an operand is not already device-resident, so the caller keeps its generic path.
     /// </summary>
     internal bool TryMatMulBackward2D<T>(
@@ -20230,7 +20306,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         gradA = null;
         gradB = null;
         if (typeof(T) != typeof(float) || Gpu.AutocastScope.IsEnabled) return false;
-        if (!TryGetBackend(out var backend) || backend is not DirectGpu.CUDA.CudaBackend cuda) return false;
+        if (!TryGetBackend(out var backend) || backend is not DirectGpu.ITransposedAGemm transposedA) return false;
         if (a.Rank != 2 || b.Rank != 2 || gradOutput.Rank != 2) return false;
         if (!a.IsContiguous || !b.IsContiguous || !gradOutput.IsContiguous
             || a._storageOffset != 0 || b._storageOffset != 0 || gradOutput._storageOffset != 0) return false;
@@ -20253,8 +20329,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 var outBufB = GetOrCreateResidentBuffer(backend, outB, K * N, fullyWritten: true);
                 if (outBufA.Handle == IntPtr.Zero || outBufA.Size < (long)M * K
                     || outBufB.Handle == IntPtr.Zero || outBufB.Size < (long)K * N) return false;
-                cuda.MatMulTransposed(bufG, bufB, outBufA, M, K, N);   // dA[M,K] = dY[M,N] · B[K,N]ᵀ
-                cuda.MatMulTransposedA(bufA, bufG, outBufB, K, N, M);  // dB[K,N] = A[M,K]ᵀ · dY[M,N]
+                backend.MatMulTransposed(bufG, bufB, outBufA, M, K, N);  // dA[M,K] = dY[M,N] · B[K,N]ᵀ
+                transposedA.MatMulTransposedA(bufA, bufG, outBufB, K, N, M); // dB[K,N] = A[M,K]ᵀ · dY[M,N]
                 ResidentSyncCheck("MatMulBackward2D");
                 BindResidentBuffer(outA, outBufA, backend);
                 BindResidentBuffer(outB, outBufB, backend);
@@ -20279,8 +20355,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             }
             try
             {
-                cuda.MatMulTransposed(ownedG.Buffer, ownedB.Buffer, bufOutA.Buffer, M, K, N);
-                cuda.MatMulTransposedA(ownedA.Buffer, ownedG.Buffer, bufOutB.Buffer, K, N, M);
+                backend.MatMulTransposed(ownedG.Buffer, ownedB.Buffer, bufOutA.Buffer, M, K, N);
+                transposedA.MatMulTransposedA(ownedA.Buffer, ownedG.Buffer, bufOutB.Buffer, K, N, M);
             }
             catch
             {

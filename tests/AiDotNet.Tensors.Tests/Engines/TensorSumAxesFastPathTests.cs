@@ -26,6 +26,8 @@ public class TensorSumAxesFastPathTests
         { new[] { 3, 5, 7, 2 },    new[] { 1, 3 } },     // non-adjacent axes
         { new[] { 5, 4 },          new[] { 0 } },        // 2D
         { new[] { 5, 4 },          new[] { 1 } },        // 2D other axis
+        { new[] { 2, 8, 5, 7 },    new[] { 0, 1, 2, 3 } }, // every axis named: a rank-0 result
+        { new[] { 4, 6, 9 },       new[] { 2, 0, 1 } },  // every axis, out of order
     };
 
     [Theory]
@@ -78,6 +80,23 @@ public class TensorSumAxesFastPathTests
         for (int i = 0; i < outLen; i++)
             Assert.True(Math.Abs(Convert.ToDouble(actual[i]) - expected[i]) <= tol,
                 $"[{i}] actual={Convert.ToDouble(actual[i])} expected={expected[i]}");
+    }
+
+    [Fact]
+    public void SumAllAxes_Float_IsOneRowMajorRunningSum_WithARankZeroResult()
+    {
+        // The all-axes reduction keeps the recursive path's accumulation order (source row-major onto +0) and its
+        // rank-0 result shape; it only stops allocating per element.
+        var rng = AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(29);
+        var t = new Tensor<float>(new[] { 8, 64, 32, 32 });
+        for (int i = 0; i < t.Length; i++) t.SetFlat(i, (float)(rng.NextDouble() * 2 - 1));
+        float expected = 0f;
+        for (int i = 0; i < t.Length; i++) expected += t.GetFlat(i);
+
+        var actual = t.Sum(new[] { 0, 1, 2, 3 });
+
+        Assert.Equal(0, actual.Rank);
+        Assert.Equal(expected, actual.GetFlat(0));
     }
 
     [Fact]

@@ -26,6 +26,21 @@ internal static class SimdConvHelper
     // Output channel block size for better cache utilization
     private const int ChannelBlockSize = 4;
 
+    // Below this many FMAs a 3x3 conv (forward or kernel gradient) runs serially: the pool dispatch costs more than
+    // the work it would split.
+    private const long MinParallelConvFmas = 100_000L;
+
+    // Below this many padded elements the per-image padding pass runs serially.
+    private const long MinParallelPadElements = 32 * 1024;
+
+    // Largest output-channel and input-channel blocks one kernel-gradient task accumulates in registers.
+    private const int MaxKernelGradOcBlock = 8;
+    private const int MaxKernelGradIcBlock = 4;
+
+    // Largest padded image a thread keeps cached between calls (16 MiB of floats); a larger one is rented per task
+    // and returned, so a thread does not hold its biggest-ever image for the life of the process.
+    private const int MaxCachedPaddedImageFloats = 4 * 1024 * 1024;
+
     // #209 close-parity A/B testing: choose the Conv3x3Stride1 variant at runtime.
     //   "per-channel"  → existing Conv3x3Stride1SingleChannel kernel (1 oc per task)
     //   "block4"       → Conv3x3Stride1Pad1_OcBlock4 (4 oc per task, register-resident)
@@ -1179,7 +1194,7 @@ internal static class SimdConvHelper
         int totalTasks = checked(batch * numConvTasks);
         long totalFmas = (long)batch * outChannels * inChannels * outputSize * 9L;
         bool useParallel = totalTasks >= 2
-                          && totalFmas >= 100_000L
+                          && totalFmas >= MinParallelConvFmas
                           && CpuParallelSettings.MaxDegreeOfParallelism > 1;
         long inputBatchStride = (long)inChannels * height * width;
         long outputBatchStride = (long)outChannels * outputSize;
@@ -1298,39 +1313,54 @@ internal static class SimdConvHelper
         int groups = (ocPairs + pairsPerTask - 1) / pairsPerTask;
         int totalTasks = checked(batch * groups);
         long totalFmas = (long)batch * outChannels * inChannels * outPlane * 9L;
-        bool useParallel = totalTasks >= 2 && totalFmas >= 100_000L && CpuParallelSettings.MaxDegreeOfParallelism > 1;
+        bool useParallel = totalTasks >= 2 && totalFmas >= MinParallelConvFmas && CpuParallelSettings.MaxDegreeOfParallelism > 1;
 
         [MethodImpl(Hot)]
         void RunTask(int task)
         {
             int b = task / groups, g = task - b * groups;
             var scratch = t_conv3x3PaddedImage;
+            float[]? rented = null;
             if (scratch is null || scratch.Length < imageLen)
             {
-                scratch = new float[imageLen];
-                t_conv3x3PaddedImage = scratch;
-            }
-            fixed (float* padded = scratch)
-            {
-                PadImageForConv3x3(input + b * inputImage, padded, inChannels, height, width,
-                    padH, padW, paddedH, paddedW);
-                float* outImage = output + b * outputImage;
-                int pairEnd = Math.Min(ocPairs, (g + 1) * pairsPerTask);
-                for (int pair = g * pairsPerTask; pair < pairEnd; pair++)
+                if (imageLen <= MaxCachedPaddedImageFloats)
                 {
-                    int oc0 = pair * 2;
-                    // An odd last channel runs the pair kernel with itself as the partner and drops the copy.
-                    bool hasSecond = oc0 + 1 < outChannels;
-                    float* k0 = kernel + (long)oc0 * kernelPerOc;
-                    float* k1 = hasSecond ? k0 + kernelPerOc : k0;
-                    float* o0 = outImage + (long)oc0 * outPlane;
-                    float* o1 = hasSecond ? o0 + outPlane : null;
-                    var epilogue = bias == null
-                        ? default
-                        : new ConvStoreEpilogue(bias[oc0], hasSecond ? bias[oc0 + 1] : bias[oc0], relu);
-                    Conv3x3PairPlane(padded, plane, paddedW, k0, k1, inChannels, o0, o1,
-                        outHeight, outWidth, colChunks, epilogue);
+                    scratch = new float[imageLen];
+                    t_conv3x3PaddedImage = scratch;
                 }
+                else
+                {
+                    scratch = rented = System.Buffers.ArrayPool<float>.Shared.Rent(imageLen);
+                }
+            }
+            try
+            {
+                fixed (float* padded = scratch)
+                {
+                    PadImageForConv3x3(input + b * inputImage, padded, inChannels, height, width,
+                        padH, padW, paddedH, paddedW);
+                    float* outImage = output + b * outputImage;
+                    int pairEnd = Math.Min(ocPairs, (g + 1) * pairsPerTask);
+                    for (int pair = g * pairsPerTask; pair < pairEnd; pair++)
+                    {
+                        int oc0 = pair * 2;
+                        // An odd last channel runs the pair kernel with itself as the partner and drops the copy.
+                        bool hasSecond = oc0 + 1 < outChannels;
+                        float* k0 = kernel + (long)oc0 * kernelPerOc;
+                        float* k1 = hasSecond ? k0 + kernelPerOc : k0;
+                        float* o0 = outImage + (long)oc0 * outPlane;
+                        float* o1 = hasSecond ? o0 + outPlane : null;
+                        var epilogue = bias == null
+                            ? default
+                            : new ConvStoreEpilogue(bias[oc0], hasSecond ? bias[oc0 + 1] : bias[oc0], relu);
+                        Conv3x3PairPlane(padded, plane, paddedW, k0, k1, inChannels, o0, o1,
+                            outHeight, outWidth, colChunks, epilogue);
+                    }
+                }
+            }
+            finally
+            {
+                if (rented is not null) System.Buffers.ArrayPool<float>.Shared.Return(rented);
             }
         }
 
@@ -1384,7 +1414,7 @@ internal static class SimdConvHelper
             {
                 float* paddedBase = padded;
                 long padWork = paddedLen;
-                if (batch > 1 && padWork >= 32 * 1024 && CpuParallelSettings.MaxDegreeOfParallelism > 1)
+                if (batch > 1 && padWork >= MinParallelPadElements && CpuParallelSettings.MaxDegreeOfParallelism > 1)
                     CpuParallelSettings.LightweightParallel(batch, [MethodImpl(Hot)] (int b) =>
                         PadImageForConv3x3(input + b * inputImage, paddedBase + b * paddedImage, inChannels, height,
                             width, padH, padW, paddedH, paddedW));
@@ -1400,10 +1430,10 @@ internal static class SimdConvHelper
                 // accumulator still sums lane-wise over images, rows and chunks in the same order: bit-identical.
                 long targetTasks = 2L * Math.Max(1, CpuParallelSettings.MaxDegreeOfParallelism);
                 int ocBlock = 1, icBlock = 1;
-                while (ocBlock < 8
+                while (ocBlock < MaxKernelGradOcBlock
                        && (long)((outChannels + 2 * ocBlock - 1) / (2 * ocBlock)) * inChannels >= targetTasks)
                     ocBlock *= 2;
-                while (icBlock < 4
+                while (icBlock < MaxKernelGradIcBlock
                        && (long)((outChannels + ocBlock - 1) / ocBlock) * ((inChannels + 2 * icBlock - 1) / (2 * icBlock)) >= targetTasks)
                     icBlock *= 2;
                 int ocBlocks = (outChannels + ocBlock - 1) / ocBlock, icBlocks = (inChannels + icBlock - 1) / icBlock;
@@ -1471,7 +1501,7 @@ internal static class SimdConvHelper
                     }
                 }
 
-                if (tasks >= 2 && totalFmas >= 100_000L && CpuParallelSettings.MaxDegreeOfParallelism > 1)
+                if (tasks >= 2 && totalFmas >= MinParallelConvFmas && CpuParallelSettings.MaxDegreeOfParallelism > 1)
                     CpuParallelSettings.LightweightParallel(tasks, RunTask);
                 else
                     for (int task = 0; task < tasks; task++) RunTask(task);

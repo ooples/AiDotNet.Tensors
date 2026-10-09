@@ -64,7 +64,7 @@ public class Fp16HeteroScratchFreeTests
     // fingerprint) and the resident activation-cache bytes right after the backward. Each run captures its OWN
     // fresh graph (distinct tensors) and clears the activation cache first, so the two runs don't share cache
     // state (a shared snapshot would treat the other run's entries as pre-existing and confound the A/B).
-    private static (double gradNorm, long cacheBytesAfter) RunOnce(DirectGpuTensorEngine gpu, bool scratchFree)
+    private static (double gradNorm, long cacheBytesAfter, long scratchReleased, bool collected) RunOnce(DirectGpuTensorEngine gpu, bool scratchFree)
     {
         var prevEnv = Environment.GetEnvironmentVariable("AIDOTNET_FP16_NO_SCRATCH_FREE");
         Environment.SetEnvironmentVariable("AIDOTNET_FP16_NO_SCRATCH_FREE", scratchFree ? null : "1");
@@ -78,16 +78,18 @@ public class Fp16HeteroScratchFreeTests
             gpu.SuspendActivationEviction();
             try
             {
+                int gen0 = GC.CollectionCount(0);
                 plan.Forward();
                 var grads = plan.Backward();
+                long bytes = gpu.CurrentActivationCacheBytes;
+                bool collected = GC.CollectionCount(0) != gen0;
                 double sum = 0;
                 foreach (var kv in grads.Fp32)
                 {
                     var a = kv.Value.ToArray();
                     for (int i = 0; i < a.Length; i++) sum += (double)a[i] * a[i];
                 }
-                long bytes = gpu.CurrentActivationCacheBytes;
-                return (Math.Sqrt(sum), bytes);
+                return (Math.Sqrt(sum), bytes, plan.ScratchBytesReleasedForTest, collected);
             }
             finally { gpu.ResumeActivationEviction(); }
         }
@@ -168,9 +170,17 @@ public class Fp16HeteroScratchFreeTests
         Assert.True(Math.Abs(on.gradNorm - off.gradNorm) <= 1e-3 * (1 + Math.Abs(off.gradNorm)),
             $"scratch-free changed the gradient norm: on={on.gradNorm} off={off.gradNorm}.");
 
-        // (2) Peak win: with the release on, the per-op backward scratch is gone after each node, so the
-        // resident activation-cache bytes after the backward are strictly lower (the held grads remain).
-        Assert.True(on.cacheBytesAfter < off.cacheBytesAfter,
-            $"scratch-free should lower resident cache bytes: on={on.cacheBytesAfter} off={off.cacheBytesAfter}.");
+        // (2) The release itself: the scratch-free backward frees per-op scratch after each node, the opt-out frees none.
+        // Counted exactly by the eviction, so a garbage collection cannot hide it.
+        Assert.True(on.scratchReleased > 0, $"scratch-free released no backward scratch (off released {off.scratchReleased}).");
+        Assert.Equal(0L, off.scratchReleased);
+
+        // (3) Peak win: with the release on, the resident activation-cache bytes after the backward are strictly lower.
+        // Only comparable when no collection ran during either arm: the opt-out's scratch is garbage the GC releases on
+        // its own, and a collection mid-run made both arms read the same bytes (on=off=557056 in a full run; forcing one
+        // gave 229376 each). The release is asserted above regardless.
+        if (!on.collected && !off.collected)
+            Assert.True(on.cacheBytesAfter < off.cacheBytesAfter,
+                $"scratch-free should lower resident cache bytes: on={on.cacheBytesAfter} off={off.cacheBytesAfter}.");
     }
 }

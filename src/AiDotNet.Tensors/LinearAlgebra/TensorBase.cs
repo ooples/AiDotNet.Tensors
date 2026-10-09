@@ -2714,6 +2714,9 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         int innerStride = steps[0];
         int outerCount = total / innerLength;
         Span<int> counter = stackalloc int[n];
+        // Explicit: the odometer must start at zero, and stackalloc is only zeroed while the assembly keeps locals
+        // init (a [SkipLocalsInit] would leave it holding stack garbage).
+        counter.Clear();
         int src = offset;
         int dst = 0;
         for (int row = 0; row < outerCount; row++)

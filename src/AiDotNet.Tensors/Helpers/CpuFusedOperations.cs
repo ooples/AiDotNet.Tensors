@@ -166,6 +166,15 @@ public static class CpuFusedOperations
         //   * else (training, weights mutated in place by optimizer.Step): pack-fresh
         //     SimdGemm.Sgemm — re-packs B every call so it correctly sees the update
         //     (the cached kernel would serve a stale pack → wrong gradients).
+        // Small-K panel kernel first: it reads B as passed (no identity cache), so it serves training plans, whose
+        // weights the optimizer rewrites in place, as well as inference. A training plan's [2048,64]x[64,64]
+        // projection went through BlasProvider at 152-700 µs depending on the thread cap vs 47 µs here (3990X).
+        if (SimdGemm.TryJitSmallK(A.AsSpan(0, M * K), B.AsSpan(0, K * N), output.AsSpan(0, M * N), M, N, K))
+        {
+            ApplyBiasActivationInPlace(output, bias, M, N, activation, activationParams);
+            return;
+        }
+
         if (M <= SmallMGemmCutover)
         {
             if (allowCachedB)

@@ -40,6 +40,9 @@ internal sealed class PersistentParallelExecutor
             && sc >= 0 && sc <= 2047 ? sc : 32;
 
     private readonly int _numWorkers;
+
+    /// <summary>Parked worker threads in the pool (a dispatch's participants are at most this plus the caller).</summary>
+    internal int WorkerCount => _numWorkers;
     private readonly Thread[] _workers;
 
     // Per-worker signaling: workers wait on these to receive work
@@ -339,11 +342,17 @@ internal sealed class PersistentParallelExecutor
             // we never oversubscribe the dispatcher, and give up to a blocking park
             // once the pool goes idle past the window.
             long warm = _warmWindowTicks;
-            // Only warm-spin when the last dispatch left spare cores (workersNeeded <
-            // _numWorkers). When a dispatch saturates the machine, spinning steals the
-            // core the dispatcher needs → oversubscription; park instead so the wakeup
-            // overlaps the (already large, since saturating dispatches are big-work) op.
-            if (warm > 0 && System.Threading.Volatile.Read(ref _lastWorkersNeeded) < _numWorkers && !_workReady[slot].IsSet)
+            // Only warm-spin when the last dispatch left a spare logical CPU (participants =
+            // workers + the dispatcher < ProcessorCount). When a dispatch saturates the
+            // machine, spinning steals the core the dispatcher needs → oversubscription; park
+            // instead so the wakeup overlaps the (already large) op. The test used to compare
+            // against the POOL size, which the 32-worker ceiling makes much smaller than the
+            // machine on a many-core box: on 128 logical CPUs every dispatch of 33+ chunks
+            // counted as saturating, so all 32 workers parked after it and the next dispatch
+            // paid 32 kernel wake-ups -- measured 130 us per dispatch vs 6.3 us for 32 chunks,
+            // and 65% of a FusedLinear forward on that box.
+            if (warm > 0 && System.Threading.Volatile.Read(ref _lastWorkersNeeded) + 1 < Environment.ProcessorCount
+                && !_workReady[slot].IsSet)
             {
                 int spins = 0;
                 while (!_workReady[slot].IsSet)

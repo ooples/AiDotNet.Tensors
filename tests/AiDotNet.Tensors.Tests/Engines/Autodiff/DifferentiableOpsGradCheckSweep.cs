@@ -336,6 +336,9 @@ public class DifferentiableOpsGradCheckSweep
         // the GLA / GatedDeltaNet / xLSTM gates, which are [B, L, numHeads].
         ["Rwkv7SequenceForward"] = r => [SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r),
                                          SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r), 2],
+        // Fused multi-head attention: rank-3 [batch, seq, heads*headDim]; causal with a longer key sequence so the
+        // bottom-right mask alignment is exercised, and an explicit scale.
+        ["MultiHeadAttentionCore"] = r => [SafeTensor([1, 2, 4], r), SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r), 2, 0.7, true],
         ["GlaScanForward"] = r => [SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r), SafeTensor([1, 3, 4], r),
                                    SafeTensor([1, 3, 2], r), 2],
         // ABC additionally takes per-head slot keys [numHeads, numSlots, headDim] and an initial-state scale.

@@ -55,6 +55,8 @@ internal static class BackwardFunctions<T>
     internal static BackwardFunction<T> ReplayUnderTape(Func<IEngine, Tensor<T>> compute)
         => (gradOutput, inputs, output, savedState, engine, grads) =>
         {
+            // The tape the enclosing backward records on: the outer tape under createGraph, none otherwise.
+            var outer = GradientTape<T>.Current;
             using (var tape = new GradientTape<T>())
             {
                 var result = compute(engine);
@@ -63,10 +65,15 @@ internal static class BackwardFunctions<T>
                 // Accumulate while the inner tape is alive. Its gradients are GPU intermediates the tape releases on
                 // dispose; reading them after the using block read a released buffer (inside a CUDA graph capture that
                 // aborted the capture of every CNN training step - the compiled MaxPool backward replays through here).
-                foreach (var input in inputs)
+                // But record the accumulation on the OUTER context: under a createGraph backward, AccumulateGrad's
+                // out-of-place add belongs on the tape that survives, not on this one, which is disposed below.
+                using (GradientTape<T>.RecordOn(outer))
                 {
-                    if (input is not null && g.TryGetValue(input, out var gi) && gi is not null)
-                        DifferentiableOps.AccumulateGrad(grads, input, gi, engine);
+                    foreach (var input in inputs)
+                    {
+                        if (input is not null && g.TryGetValue(input, out var gi) && gi is not null)
+                            DifferentiableOps.AccumulateGrad(grads, input, gi, engine);
+                    }
                 }
             }
         };
@@ -587,6 +594,15 @@ internal static class BackwardFunctions<T>
     private static long MatMulBackwardSimdThreshold => SimdGemm.ParallelWorkThreshold;
 
     /// <summary>
+    /// Whether a float32 matmul backward runs its GEMMs on <see cref="SimdGemm"/>: above
+    /// <see cref="MatMulBackwardSimdThreshold"/>, or at any size when there is no native BLAS to prefer. Without
+    /// BLAS the alternative is the generic engine fallback (two engine matmuls plus a materialized transpose), which
+    /// ran an LSTM's [32,64]x[256,64]^T backward in ~720 us against ~60 us for the two SimdGemm calls.
+    /// </summary>
+    private static bool UseSimdGemmBackward(long backwardWork)
+        => backwardWork >= MatMulBackwardSimdThreshold || !BlasProvider.IsAvailable;
+
+    /// <summary>
     /// Sub-E (#373): backward for <c>C = A · B</c> where B is a frozen weight whose
     /// transpose has been pre-packed by the caller. Used by inference paths that
     /// still want a gradient on A (e.g., feature-extraction with a frozen backbone)
@@ -755,14 +771,14 @@ internal static class BackwardFunctions<T>
                     if (dCArr is not null && aArr is not null && bArr is not null)
                     {
                         bool tryBlas = backwardWork < MatMulBackwardSimdThreshold && BlasProvider.IsAvailable;
-                        if (backwardWork >= MatMulBackwardSimdThreshold || tryBlas)
+                        if (UseSimdGemmBackward(backwardWork) || tryBlas)
                         {
                             var gradATensor = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
                             var gradBTensor = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
                             var gradAData = (float[])(object)gradATensor.GetDataArray();
                             var gradBData = (float[])(object)gradBTensor.GetDataArray();
 
-                            if (backwardWork >= MatMulBackwardSimdThreshold)
+                            if (UseSimdGemmBackward(backwardWork))
                             {
                                 // #573 follow-up: parallel transposed GEMMs via BlasManaged.Gemm —
                                 // the legacy full-trans SimdGemm.Sgemm overload these replaced ran
@@ -998,19 +1014,23 @@ internal static class BackwardFunctions<T>
 
                 long backwardWork = (long)M * K * N;
                 bool tryBlas = backwardWork < MatMulBackwardSimdThreshold && BlasProvider.IsAvailable;
-                if (backwardWork >= MatMulBackwardSimdThreshold || tryBlas)
+                if (UseSimdGemmBackward(backwardWork) || tryBlas)
                 {
                     var gradATensor = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
                     var gradBTensor = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
                     var gradAData = (float[])(object)gradATensor.GetDataArray();
                     var gradBData = (float[])(object)gradBTensor.GetDataArray();
 
-                    if (backwardWork >= MatMulBackwardSimdThreshold)
+                    if (UseSimdGemmBackward(backwardWork))
                     {
+                        // Large: the parallel packed BLAS first. SimdGemm's transposed-A path ran the tied LM head's
+                        // dTable = gradCᵀ[49152,1024] · A[1024,512] in 993 ms vs 87 ms through TryGemmEx (3990X).
                         // gradA[M,K] = gradC[M,N] · B[N,K]   (no transposes)
-                        SimdGemm.Sgemm(dCArr, N, false, bArr, K, false, gradAData.AsSpan(0, M * K), M, N, K);
+                        if (!BlasProvider.TryGemmEx(M, K, N, dCArr, 0, N, false, bArr, 0, K, false, gradAData, 0, K))
+                            SimdGemm.Sgemm(dCArr, N, false, bArr, K, false, gradAData.AsSpan(0, M * K), M, N, K);
                         // gradB[N,K] = gradCᵀ[N,M] · A[M,K]   (transA=true)
-                        SimdGemm.Sgemm(dCArr, N, true, aArr, K, false, gradBData.AsSpan(0, N * K), N, M, K);
+                        if (!BlasProvider.TryGemmEx(N, K, M, dCArr, 0, N, true, aArr, 0, K, false, gradBData, 0, K))
+                            SimdGemm.Sgemm(dCArr, N, true, aArr, K, false, gradBData.AsSpan(0, N * K), N, M, K);
 
                         DifferentiableOps.AccumulateGrad(grads, inputs[0], gradATensor, engine);
                         DifferentiableOps.AccumulateGrad(grads, inputs[1], gradBTensor, engine);
@@ -1249,6 +1269,39 @@ internal static class BackwardFunctions<T>
         }
     }
 
+    /// <summary>
+    /// Backward of the single tape entry <c>FusedConv2D</c> records for <c>act(conv2d(input, kernel) + bias[c])</c>,
+    /// <c>act</c> = ReLU or identity (inputs: input, kernel, bias). The ReLU mask and the bias reduction run in one
+    /// pass over the output gradient, then the convolution's input and kernel gradients run as
+    /// <see cref="Conv2DBackward"/> does. The ReLU mask reads the activation: <c>y &gt; 0</c> exactly when
+    /// <c>z &gt; 0</c>, so it matches the separate ReLU entry's mask on the pre-activation.
+    /// </summary>
+    internal static void FusedConv2DBiasActivationBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        bool relu = (bool)savedState[3];
+        Tensor<T> gradPreActivation;
+        if (typeof(T) == typeof(float) && engine is CpuEngine cpu && !engine.SupportsGpu
+            && gradOutput.IsContiguous && output.IsContiguous)
+        {
+            gradPreActivation = Helpers.AutoTensorCache.RentOrAllocate<T>(output._shape);
+            var gradBias = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[2]._shape);
+            cpu.ChannelBiasActivationBackwardInto(
+                (Tensor<float>)(object)gradPreActivation, (Tensor<float>)(object)gradBias,
+                (Tensor<float>)(object)gradOutput, (Tensor<float>)(object)output, relu, accumulateBias: false);
+            if (DifferentiableOps.IsGradientRequired(inputs[2]))
+                DifferentiableOps.AccumulateGrad(grads, inputs[2], gradBias, engine);
+        }
+        else
+        {
+            gradPreActivation = relu ? engine.ReluBackward(gradOutput, output) : gradOutput;
+            if (DifferentiableOps.IsGradientRequired(inputs[2]))
+                DifferentiableOps.AccumulateGrad(grads, inputs[2], engine.ReduceSum(gradPreActivation, new[] { 0, 2, 3 }, keepDims: false), engine);
+        }
+        Conv2DBackward(gradPreActivation, new[] { inputs[0], inputs[1] }, output, savedState, engine, grads);
+    }
+
     /// <summary>Conv1D backward: reshapes 3D inputs to 4D, delegates to Conv2DBackward logic, reshapes back</summary>
     internal static void Conv1DBackward(
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
@@ -1393,6 +1446,53 @@ internal static class BackwardFunctions<T>
         var stride = (int[])savedState[2];
 
         var grad = engine.MaxPool2DBackward(gradOutput, maxIndices, inputs[0]._shape, poolSize, stride);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+    }
+
+    /// <summary>
+    /// MaxPool2D backward for an unpadded pool recorded without indices (savedState: pool size, stride): the CPU engine
+    /// re-scans the forward input for each window's winner (<see cref="CpuEngine.MaxPool2DBackwardRecomputeInto{T}"/>,
+    /// the same winner rule the indexed pool records); any other engine recovers the winners with its indexed pool.
+    /// </summary>
+    internal static void MaxPool2DRecomputeBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var poolSize = (int[])savedState[0];
+        var stride = (int[])savedState[1];
+        Tensor<T> grad;
+        if (engine is CpuEngine cpu && !engine.SupportsGpu)
+        {
+            grad = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
+            cpu.MaxPool2DBackwardRecomputeInto(grad, gradOutput, inputs[0], poolSize[0], poolSize[1], stride[0], stride[1], accumulate: false);
+        }
+        else
+        {
+            int[,,,,] maxIndices;
+            using (new NoGradScope<T>())
+                engine.MaxPool2DWithIndices(inputs[0], poolSize, stride, out maxIndices);
+            grad = engine.MaxPool2DBackward(gradOutput, maxIndices, inputs[0]._shape, poolSize, stride);
+        }
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+    }
+
+    /// <summary>
+    /// MaxPool2D backward for a padded pool recorded without indices (savedState: pool size, stride, padding): the
+    /// winners are recovered with the same padded indexed pool the eager tape records
+    /// (<see cref="CpuEngine.MaxPool2DPaddedWithTensorIndices{T}"/>), then routed as <see cref="MaxPool2DTensorIndicesBackward"/> does.
+    /// </summary>
+    internal static void MaxPool2DPaddedRecomputeBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var poolSize = (int[])savedState[0];
+        var stride = (int[])savedState[1];
+        int padding = (int)savedState[2];
+        var cpu = engine as CpuEngine ?? new CpuEngine();
+        Tensor<int> maxIndices;
+        using (new NoGradScope<T>())
+            cpu.MaxPool2DPaddedWithTensorIndices(inputs[0], poolSize[0], stride[0], padding, out maxIndices);
+        var grad = engine.MaxPool2DBackwardWithTensorIndices(gradOutput, maxIndices, inputs[0]._shape, poolSize, stride);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
     }
 
@@ -2318,6 +2418,7 @@ internal static class BackwardFunctions<T>
 
             if (DifferentiableOps.GetSparseEmbeddingGradsFor(inputs[0]) is null)
             {
+                if (TryScatterRowsIntoGrad(gradOutput, indices, inputs[0], engine, grads)) return;
                 var dense = engine.ScatterAdd(gradOutput, indices, axis, inputShape[axis]);
                 DifferentiableOps.AccumulateGrad(grads, inputs[0], dense, engine);
             }
@@ -2341,8 +2442,46 @@ internal static class BackwardFunctions<T>
         // exceeded the index count, because it wrapped via `indices[d % indices.Length]`: a 4-row
         // source gathered by 3 indices produced uniform garbage instead of per-occurrence sums,
         // and never-selected slices came back nonzero when they must be exactly 0.
+        if (axis == 0 && TryScatterRowsIntoGrad(gradOutput, indices, inputs[0], engine, grads)) return;
         var grad = engine.ScatterAdd(gradOutput, indices, axis, inputShape[axis]);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], grad, engine);
+    }
+
+    /// <summary>
+    /// Axis-0 gather backward straight into the source's existing gradient accumulator: source row indices[r] +=
+    /// gradOutput row r. A tied embedding table (also the transposed LM-head weight) already holds the head's
+    /// gradient when the gather's backward runs, and the dense route built a fresh [vocab, dim] ScatterAdd result
+    /// (100 MB for a 49K x 512 table, per PerfView allocation stacks the largest per-step allocation left in a CPU LM
+    /// step) only to add it in. Rows are applied in index order, so duplicate indices accumulate exactly as
+    /// ScatterAdd does; out-of-range indices are skipped as ScatterAdd skips them. False when there is no direct
+    /// target (first contribution, GPU engine, create-graph) or the layout does not fit -- the caller takes the
+    /// dense route.
+    /// </summary>
+    private static bool TryScatterRowsIntoGrad(
+        Tensor<T> gradOutput, Tensor<int> indices, Tensor<T> source, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        if (source.Rank < 1 || indices.Rank != 1 || !indices.IsContiguous) return false;
+        int rowsOut = source._shape[0];
+        int inner = rowsOut == 0 ? 0 : source.Length / rowsOut;
+        int count = indices.Length;
+        if (inner == 0 || gradOutput.Length != (long)count * inner) return false;
+        var target = DifferentiableOps.TryGetDirectGradTarget(grads, source, engine, out bool overwrite);
+        if (target is null) return false;
+        var dst = target.GetCpuBackingForContiguousWrite(out int dOff);
+        var g = (gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous()).GetCpuBackingForStridedRead(out int gOff);
+        var idx = indices.GetCpuBackingForStridedRead(out int iOff);
+        if (dst is null || g is null || idx is null) return false;
+        if (overwrite) new Span<T>(dst, dOff, target.Length).Clear();
+        var numOps = MathHelper.GetNumericOperations<T>();
+        for (int r = 0; r < count; r++)
+        {
+            int row = idx[iOff + r];
+            if ((uint)row >= (uint)rowsOut) continue;
+            var d = new Span<T>(dst, dOff + row * inner, inner);
+            numOps.Add(d, new ReadOnlySpan<T>(g, gOff + r * inner, inner), d);
+        }
+        target.IncrementVersion();
+        return true;
     }
 
     /// <summary>ScatterAdd backward: gather grad from destination positions</summary>
@@ -3186,11 +3325,81 @@ internal static class BackwardFunctions<T>
         // over the LAST axis, so a log-softmax over any other axis got a wrong gradient. The axis is recorded by
         // TensorLogSoftmax; tapes recorded before it was saved default to the last axis, which is what they used.
         int axis = savedState is { Length: > 0 } && savedState[0] is int savedAxis ? savedAxis : inputs[0].Rank - 1;
+        if (typeof(T) == typeof(float) && axis == inputs[0].Rank - 1
+            && TryLogSoftmaxBackwardHostFloat((Tensor<float>)(object)gradOutput, (Tensor<float>)(object)inputs[0],
+                (Tensor<float>)(object)output, engine, (Dictionary<Tensor<float>, Tensor<float>>)(object)grads))
+            return;
         var softmax = engine.TensorExp(output);
         var rowSums = engine.ReduceSum(gradOutput, new[] { axis }, keepDims: true);
         var dx = engine.TensorSubtract(gradOutput,
             engine.TensorMultiply(softmax, engine.TensorBroadcastTo(rowSums, output._shape)));
         DifferentiableOps.AccumulateGrad(grads, inputs[0], dx, engine);
+    }
+
+    [ThreadStatic] private static float[]? t_logSoftmaxRow;
+
+    /// <summary>
+    /// Host float32 log-softmax backward over the last axis in one parallel pass over rows:
+    /// dx = g - exp(y) * rowsum(g), written straight into the input's gradient accumulator when it exists. The engine-op
+    /// form ran exp, a row reduce, a broadcast that materialized a full-size tensor, a multiply and a subtract -- five
+    /// passes and three full-size allocations over an LM's [tokens, vocab] logits ([1024, 49152]: 50M floats each).
+    /// False (the caller takes the engine-op form) on a GPU engine, under create-graph, or for a strided layout.
+    /// </summary>
+    private static bool TryLogSoftmaxBackwardHostFloat(
+        Tensor<float> gradOutput, Tensor<float> input, Tensor<float> output, IEngine engine,
+        Dictionary<Tensor<float>, Tensor<float>> grads)
+    {
+        if (engine.SupportsGpu || DifferentiableOps._isBackwardCreateGraph
+            || !gradOutput.IsContiguous || !output.IsContiguous || gradOutput.Length != output.Length) return false;
+        int cols = output._shape[output.Rank - 1];
+        if (cols == 0) return false;
+        int rows = output.Length / cols;
+        var g = gradOutput.GetCpuBackingForStridedRead(out int gOff);
+        var y = output.GetCpuBackingForStridedRead(out int yOff);
+        if (g is null || y is null) return false;
+
+        var target = DifferentiableOps.TryGetDirectGradTarget(grads, input, engine, out bool overwrite);
+        int dOff = 0;
+        float[]? dst = target?.GetCpuBackingForContiguousWrite(out dOff);
+        Tensor<float>? contribution = null;
+        if (target is null || dst is null)
+        {
+            target = null;
+            // Every element is written below (overwrite), so an uninitialized step-allocator buffer suffices; `new
+            // Tensor` here was a fresh 200 MB large-object-heap array per LM step (PerfView allocation stacks).
+            contribution = Helpers.AutoTensorCache.RentOrAllocate<float>(input._shape);
+            dst = contribution.GetCpuBackingForContiguousWrite(out dOff)!;
+            overwrite = true;
+        }
+        var d = dst!;
+        Helpers.CpuParallelSettings.ParallelForOrSerial(0, rows, (long)rows * cols * 3, r =>
+        {
+            int go = gOff + r * cols, yo = yOff + r * cols, o = dOff + r * cols;
+            var e = t_logSoftmaxRow is { } cached && cached.Length >= cols ? cached : (t_logSoftmaxRow = new float[cols]);
+            var eSpan = new Span<float>(e, 0, cols);
+            Simd.SimdKernels.Exp(new ReadOnlySpan<float>(y, yo, cols), eSpan);
+            int w = System.Numerics.Vector<float>.Count, c = 0;
+            var acc = System.Numerics.Vector<float>.Zero;
+            for (; c + w <= cols; c += w) acc += new System.Numerics.Vector<float>(g, go + c);
+            float s = System.Numerics.Vector.Dot(acc, System.Numerics.Vector<float>.One);
+            for (; c < cols; c++) s += g[go + c];
+            var vs = new System.Numerics.Vector<float>(s);
+            c = 0;
+            for (; c + w <= cols; c += w)
+            {
+                var v = new System.Numerics.Vector<float>(g, go + c) - new System.Numerics.Vector<float>(e, c) * vs;
+                if (!overwrite) v += new System.Numerics.Vector<float>(d, o + c);
+                v.CopyTo(d, o + c);
+            }
+            for (; c < cols; c++)
+            {
+                float v = g[go + c] - e[c] * s;
+                d[o + c] = overwrite ? v : d[o + c] + v;
+            }
+        }, deterministicSafe: true);
+        if (contribution is not null) DifferentiableOps.AccumulateGrad(grads, input, contribution, engine);
+        else target!.IncrementVersion();
+        return true;
     }
 
     /// <summary>Split backward: scatter chunk gradient back to correct position in input gradient</summary>
@@ -3994,16 +4203,18 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        // Sign has zero gradient everywhere. Adding zero to an existing gradient is a no-op.
-        if (grads.ContainsKey(inputs[0])) return;
+        // Sign has zero gradient everywhere, so adding zero to a gradient already written this step is a no-op. A
+        // compiled step's map also holds the previous step's buffers, cleared only by their first write; one whose
+        // only contribution is this Sign must still take the zero, or it keeps last step's values.
+        if (grads.TryGetValue(inputs[0], out var existing) && DifferentiableOps.IsWrittenThisStep(existing)) return;
 
         // The input still needs an (all-zero) entry, as PyTorch's sign backward returns zeros_like. On a GPU engine
-        // build it on the device from the upstream gradient (same shape: Sign is elementwise); a host zero tensor had
-        // to be uploaded, and inside a captured training step that upload aborted CUDA graph capture (the
-        // cross-entropy loss's supervised-row count goes through Sign). A non-finite upstream gradient makes this NaN
-        // rather than 0, but such a gradient has already poisoned the step, which the fused step discards.
-        var zero = engine.SupportsGpu
-            ? engine.TensorMultiplyScalar(gradOutput, MathHelper.GetNumericOperations<T>().Zero)
+        // it is filled on the device: a host zero tensor had to be uploaded, and inside a captured training step that
+        // upload aborted CUDA graph capture (the cross-entropy loss's supervised-row count goes through Sign). It is a
+        // fill, not upstream * 0, which is NaN for an infinite or NaN upstream element where the gradient is 0.
+        var zero = engine is DirectGpuTensorEngine gpu && gpu.SupportsGpu
+            && gpu.TryResidentZeros<T>(inputs[0]._shape, out var resident)
+            ? resident
             : TensorPool<T>.RentZeroed(inputs[0]._shape);
         DifferentiableOps.AccumulateGrad(grads, inputs[0], zero, engine);
     }
@@ -4446,7 +4657,7 @@ internal static class BackwardFunctions<T>
             // Decide which fast path will run BEFORE renting any buffers.
             long backwardWork = (long)M * K * N;
             bool tryBlas = backwardWork < MatMulBackwardSimdThreshold && BlasProvider.IsAvailable;
-            bool willTryFastPath = backwardWork >= MatMulBackwardSimdThreshold || tryBlas;
+            bool willTryFastPath = UseSimdGemmBackward(backwardWork) || tryBlas;
 
             if (!willTryFastPath)
                 goto fusedReluFallback;
@@ -4465,11 +4676,11 @@ internal static class BackwardFunctions<T>
             var gradWeight = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
             var gradWeightArr = (float[])(object)gradWeight.GetDataArray();
 
-            if (backwardWork >= MatMulBackwardSimdThreshold)
+            if (UseSimdGemmBackward(backwardWork))
             {
                 // Parallel SimdGemm — bypass possibly-single-threaded BLAS.
                 SimdGemm.Sgemm(maskedArr, N, false, wArr, N, true, gradInputArr.AsSpan(0, M * K), M, N, K);
-                SimdGemm.Sgemm(inArr, K, true, maskedArr, N, false, gradWeightArr.AsSpan(0, K * N), K, M, N);
+                { if (!BlasProvider.TryGemmEx(K, N, M, inArr, 0, K, true, maskedArr, 0, N, false, gradWeightArr, 0, N)) SimdGemm.Sgemm(inArr, K, true, maskedArr, N, false, gradWeightArr.AsSpan(0, K * N), K, M, N); } // packed BLAS first: SimdGemm transposed-A is the slow path
             }
             else
             {
@@ -4542,7 +4753,7 @@ internal static class BackwardFunctions<T>
         // before getting here (BLAS path is only taken outside higher-order AD).
         long backwardWork = (long)M * K * N;
         bool tryBlas = backwardWork < MatMulBackwardSimdThreshold && BlasProvider.IsAvailable;
-        bool willTryFastPath = backwardWork >= MatMulBackwardSimdThreshold || tryBlas;
+        bool willTryFastPath = UseSimdGemmBackward(backwardWork) || tryBlas;
 
         if (!willTryFastPath)
         {
@@ -4561,12 +4772,12 @@ internal static class BackwardFunctions<T>
 
         bool used = false;
 
-        if (backwardWork >= MatMulBackwardSimdThreshold)
+        if (UseSimdGemmBackward(backwardWork))
         {
             // dInput[M,K] = masked[M,N] · Wᵀ[N,K]
             SimdGemm.Sgemm(maskedArr, N, false, wArr, N, true, gradInputArr.AsSpan(0, M * K), M, N, K);
             // dWeight[K,N] = inputᵀ[K,M] · masked[M,N]
-            SimdGemm.Sgemm(inArr, K, true, maskedArr, N, false, gradWeightArr.AsSpan(0, K * N), K, M, N);
+            { if (!BlasProvider.TryGemmEx(K, N, M, inArr, 0, K, true, maskedArr, 0, N, false, gradWeightArr, 0, N)) SimdGemm.Sgemm(inArr, K, true, maskedArr, N, false, gradWeightArr.AsSpan(0, K * N), K, M, N); } // packed BLAS first: SimdGemm transposed-A is the slow path
             used = true;
         }
         else
@@ -6271,7 +6482,7 @@ internal static class BackwardFunctions<T>
 
             long backwardWork = (long)M * K * N;
             bool tryBlas = backwardWork < MatMulBackwardSimdThreshold && BlasProvider.IsAvailable;
-            bool willTryFastPath = backwardWork >= MatMulBackwardSimdThreshold || tryBlas;
+            bool willTryFastPath = UseSimdGemmBackward(backwardWork) || tryBlas;
 
             if (!willTryFastPath)
                 goto fusedFallback;
@@ -6292,14 +6503,17 @@ internal static class BackwardFunctions<T>
 
             bool used = false;
 
-            if (backwardWork >= MatMulBackwardSimdThreshold)
+            if (UseSimdGemmBackward(backwardWork))
             {
                 // Parallel SimdGemm path — guaranteed multi-core on shapes at/above
                 // SimdGemm's internal parallel gate.
                 // dInput[M,K] = dY[M,N] · Wᵀ[N,K]; W is stored [K,N] (ldb=N), transB=true.
-                SimdGemm.Sgemm(gArr, N, false, wArr, N, true, gradInputArr.AsSpan(0, M * K), M, N, K);
-                // dWeight[K,N] = inputᵀ[K,M] · dY[M,N]; input is stored [M,K] (lda=K), transA=true.
-                SimdGemm.Sgemm(inArr, K, true, gArr, N, false, gradWeightArr.AsSpan(0, K * N), K, M, N);
+                if (!BlasProvider.TryGemmEx(M, K, N, gArr, 0, N, false, wArr, 0, N, true, gradInputArr, 0, K))
+                    SimdGemm.Sgemm(gArr, N, false, wArr, N, true, gradInputArr.AsSpan(0, M * K), M, N, K);
+                // dWeight[K,N] = inputᵀ[K,M] · dY[M,N]; input is stored [M,K] (lda=K), transA=true. The packed BLAS
+                // first: SimdGemm's transposed-A path is the slow one (11x on a tied LM head's weight gradient).
+                if (!BlasProvider.TryGemmEx(K, N, M, inArr, 0, K, true, gArr, 0, N, false, gradWeightArr, 0, N))
+                    SimdGemm.Sgemm(inArr, K, true, gArr, N, false, gradWeightArr.AsSpan(0, K * N), K, M, N);
                 used = true;
             }
             else
@@ -9137,6 +9351,11 @@ internal static class BackwardFunctions<T>
             return;
         }
 
+        if (typeof(T) == typeof(float) && TryRfftAdjointHostFloat(
+                (Tensor<float>)(object)gradOutput, (Tensor<float>)(object)input, n, nFft, engine,
+                (Dictionary<Tensor<float>, Tensor<float>>)(object)grads))
+            return;
+
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradData = gradOutput.GetDataArray();
         int batchSize = gradOutput.Length / (numFreqs * 2);
@@ -9209,6 +9428,11 @@ internal static class BackwardFunctions<T>
             return;
         }
 
+        if (typeof(T) == typeof(float) && TryIrfftAdjointHostFloat(
+                (Tensor<float>)(object)gradOutput, (Tensor<float>)(object)input, numFreqs, nFft, outputLength, engine,
+                (Dictionary<Tensor<float>, Tensor<float>>)(object)grads))
+            return;
+
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradData = gradOutput.GetDataArray();
         int batchSize = gradOutput.Length / outputLength;
@@ -9253,6 +9477,84 @@ internal static class BackwardFunctions<T>
         }
 
         DifferentiableOps.AccumulateGrad(grads, input, result, engine);
+    }
+
+    [ThreadStatic] private static Complex<float>[]? t_fftAdjointRow;
+
+    private static Complex<float>[] FftAdjointRow(int nFft)
+    {
+        var row = t_fftAdjointRow;
+        if (row is null || row.Length != nFft) t_fftAdjointRow = row = new Complex<float>[nFft];
+        return row;
+    }
+
+    /// <summary>
+    /// Host float32 RFFT adjoint: per row, the one-sided gradient zero-padded to nFft, inverse-transformed
+    /// (unnormalized) by the native FFT, real part kept -- the same operator as the generic loop below, which ran the
+    /// legacy FFTCore (cos/sin per butterfly, two vectors allocated per row) serially over every row. Rows run in
+    /// parallel with per-thread scratch. Power-of-two nFft only (the native kernel's fast path; the generic loop routes
+    /// other lengths to Bluestein).
+    /// </summary>
+    private static bool TryRfftAdjointHostFloat(
+        Tensor<float> gradOutput, Tensor<float> input, int n, int nFft, IEngine engine,
+        Dictionary<Tensor<float>, Tensor<float>> grads)
+    {
+        if (engine.SupportsGpu || nFft < 2 || (nFft & (nFft - 1)) != 0 || !gradOutput.IsContiguous) return false;
+        var g = gradOutput.GetCpuBackingForStridedRead(out int gOff);
+        if (g is null) return false;
+        int numFreqs = nFft / 2 + 1;
+        int rows = gradOutput.Length / (numFreqs * 2);
+        var result = new Tensor<float>(input._shape);
+        var r = result.GetCpuBackingForContiguousWrite(out int rOff)!;
+        Helpers.CpuParallelSettings.ParallelForOrSerial(0, rows, (long)rows * nFft * 8, b =>
+        {
+            var buf = FftAdjointRow(nFft);
+            int go = gOff + b * numFreqs * 2;
+            for (int k = 0; k < numFreqs; k++) buf[k] = new Complex<float>(g[go + 2 * k], g[go + 2 * k + 1]);
+            for (int k = numFreqs; k < nFft; k++) buf[k] = default;
+            CpuEngine.NativeFftFloatInPlace(buf, inverse: true);
+            int ro = rOff + b * n;
+            for (int j = 0; j < n; j++) r[ro + j] = buf[j].Real;
+        }, deterministicSafe: true);
+        DifferentiableOps.AccumulateGrad(grads, input, result, engine);
+        return true;
+    }
+
+    /// <summary>
+    /// Host float32 IRFFT adjoint: per row, the real gradient zero-padded to nFft, forward-transformed by the native FFT,
+    /// each kept bin scaled by c_k/nFft (c_k = 1 for self-conjugate bins, whose imaginary gradient is 0, else 2). Same
+    /// operator as the generic loop below; rows in parallel. Power-of-two nFft only.
+    /// </summary>
+    private static bool TryIrfftAdjointHostFloat(
+        Tensor<float> gradOutput, Tensor<float> input, int numFreqs, int nFft, int outputLength, IEngine engine,
+        Dictionary<Tensor<float>, Tensor<float>> grads)
+    {
+        if (engine.SupportsGpu || nFft < 2 || (nFft & (nFft - 1)) != 0 || !gradOutput.IsContiguous) return false;
+        var g = gradOutput.GetCpuBackingForStridedRead(out int gOff);
+        if (g is null) return false;
+        int rows = gradOutput.Length / outputLength;
+        var result = new Tensor<float>(input._shape);
+        var r = result.GetCpuBackingForContiguousWrite(out int rOff)!;
+        float invN = 1f / nFft;
+        Helpers.CpuParallelSettings.ParallelForOrSerial(0, rows, (long)rows * nFft * 8, b =>
+        {
+            var buf = FftAdjointRow(nFft);
+            int go = gOff + b * outputLength;
+            int copy = Math.Min(outputLength, nFft);
+            for (int j = 0; j < copy; j++) buf[j] = new Complex<float>(g[go + j], 0f);
+            for (int j = copy; j < nFft; j++) buf[j] = default;
+            CpuEngine.NativeFftFloatInPlace(buf, inverse: false);
+            int ro = rOff + b * numFreqs * 2;
+            for (int k = 0; k < numFreqs; k++)
+            {
+                bool selfConjugate = k == 0 || (nFft % 2 == 0 && k == nFft / 2);
+                float scale = (selfConjugate ? 1f : 2f) * invN;
+                r[ro + 2 * k] = buf[k].Real * scale;
+                r[ro + 2 * k + 1] = selfConjugate ? 0f : buf[k].Imaginary * scale;
+            }
+        }, deterministicSafe: true);
+        DifferentiableOps.AccumulateGrad(grads, input, result, engine);
+        return true;
     }
 
     /// <summary>

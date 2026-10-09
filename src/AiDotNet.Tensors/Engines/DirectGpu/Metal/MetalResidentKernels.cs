@@ -199,6 +199,98 @@ kernel void quantum_rotation(
     outImag[gid] = sinAngle * re + cosAngle * im;
 }
 
+// Rectangular N-d slice in one launch (rank <= 8), the Metal port of CUDA's rect_slice_nd. meta holds
+// outDims[8], fullStrides[8], starts[8]. scatter == 0 reads the window into slice; scatter != 0 writes it back.
+kernel void rect_slice_nd(
+    device float* full [[buffer(0)]],
+    device float* slice [[buffer(1)]],
+    device const int* meta [[buffer(2)]],
+    constant uint& rank [[buffer(3)]],
+    constant uint& total [[buffer(4)]],
+    constant uint& scatter [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= total) return;
+    int remaining = (int)gid;
+    int offset = 0;
+    for (int d = (int)rank - 1; d >= 0; --d) {
+        int c = remaining % meta[d];
+        remaining /= meta[d];
+        offset += (meta[16 + d] + c) * meta[8 + d];
+    }
+    if (scatter != 0) full[offset] = slice[gid];
+    else slice[gid] = full[offset];
+}
+// Global-norm clip, one threadgroup reduction per tensor (no address tables): only threadgroup 0 runs, whatever size
+// the pipeline picked; thread 0 adds the partials in order, and dispatches on one queue run in order, so no atomics.
+kernel void tensor_sum_squares_accumulate(
+    device const float* x [[buffer(0)]],
+    device float* acc [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint group [[threadgroup_position_in_grid]],
+    uint groupSize [[threads_per_threadgroup]])
+{
+    // 1024 is Metal's per-threadgroup thread ceiling (maxTotalThreadsPerThreadgroup), so lid < 1024 always; the host
+    // dispatches MultiTensorArgs.ReductionGroupSize (256).
+    threadgroup float partial[1024];
+    if (group != 0) return;
+    float v = 0.0f;
+    for (uint i = lid; i < n; i += groupSize) { float e = x[i]; v += e * e; }
+    partial[lid] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid == 0)
+    {
+        float s = 0.0f;
+        for (uint j = 0; j < groupSize; ++j) s += partial[j];
+        acc[0] += s;
+    }
+}
+
+// min(1, maxNorm / (norm + 1e-6)); a non-finite norm leaves the gradients unscaled. Tested on the exponent bits:
+// Metal compiles with fast math, which may fold isfinite() to true.
+kernel void clip_scale_from_sum_squares(
+    device const float* acc [[buffer(0)]],
+    device float* scale [[buffer(1)]],
+    constant uint& maxNormBits [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid != 0) return;
+    float norm = sqrt(acc[0]);
+    float c = (as_type<uint>(norm) & 0x7f800000u) != 0x7f800000u ? as_type<float>(maxNormBits) / (norm + 1e-6f) : 1.0f;
+    scale[0] = c < 1.0f ? c : 1.0f;
+}
+
+kernel void scale_by_device_scalar_inplace(
+    device float* x [[buffer(0)]],
+    device const float* scale [[buffer(1)]],
+    constant uint& n [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < n) x[gid] *= scale[0];
+}
+// Row-major C[M,N] = alpha · A[K,M]ᵀ · B[K,N] + beta · C, one thread per output (alpha/beta arrive as float bits).
+kernel void matmul_transposed_a(
+    device const float* A [[buffer(0)]],
+    device const float* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant uint& M [[buffer(3)]],
+    constant uint& N [[buffer(4)]],
+    constant uint& K [[buffer(5)]],
+    constant uint& alphaBits [[buffer(6)]],
+    constant uint& betaBits [[buffer(7)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= M * N) return;
+    uint row = gid / N;
+    uint col = gid % N;
+    float acc = 0.0f;
+    for (uint kk = 0; kk < K; ++kk)
+        acc += A[kk * M + row] * B[kk * N + col];
+    float alpha = as_type<float>(alphaBits);
+    float beta = as_type<float>(betaBits);
+    C[gid] = (beta != 0.0f) ? alpha * acc + beta * C[gid] : alpha * acc;
+}
 kernel void permute_tensor(
     device const float* input [[buffer(0)]],
     device float* output [[buffer(1)]],
