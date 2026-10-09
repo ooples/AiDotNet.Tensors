@@ -1625,8 +1625,28 @@ public sealed class GradientTape<T> : IDisposable
     private int _cachedGradientRelevanceEntryCount = -1;
     private HashSet<Tensor<T>>? _cachedGradientRelevance;
 
+    private Tensor<T>[]? _cachedGradientLeafSourcesKey;
+    private int _cachedGradientLeafSourcesEntryCount = -1;
+    private Tensor<T>? _cachedGradientLeafSourcesFirstOutput;
+    private Tensor<T>? _cachedGradientLeafSourcesLastOutput;
+    private HashSet<Tensor<T>>? _cachedGradientLeafSources;
+
     private HashSet<Tensor<T>> BuildGradientLeafSources(IReadOnlyList<Tensor<T>> sources)
     {
+        // A persistent tape re-run with the same sources over the same entries gets the same set; retained and
+        // hooked tensors can change between calls, so (as for the relevance cache) those tapes always rebuild.
+        bool canCache = _options.Persistent
+            && (_retainGrad is null || _retainGrad.Count == 0)
+            && (_hooks is null || _hooks.Count == 0);
+        if (canCache && _cachedGradientLeafSources is not null
+            && _cachedGradientLeafSourcesEntryCount == _entries.Count
+            && ReferenceEquals(_cachedGradientLeafSourcesFirstOutput, _entries[0].Output)
+            && ReferenceEquals(_cachedGradientLeafSourcesLastOutput, _entries[_entries.Count - 1].Output)
+            && SourcesMatch(_cachedGradientLeafSourcesKey, sources))
+        {
+            return _cachedGradientLeafSources;
+        }
+
         var leaves = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
         foreach (var source in sources) leaves.Add(source);
         if (_retainGrad is not null)
@@ -1637,6 +1657,14 @@ public sealed class GradientTape<T> : IDisposable
         // pass they would otherwise look like leaves. Outputs of other tapes keep their GradFn.
         for (int e = 0; e < _entries.Count; e++)
             if (_entries[e].Output is { } output) leaves.Add(output);
+        if (canCache)
+        {
+            _cachedGradientLeafSourcesKey = sources.ToArray();
+            _cachedGradientLeafSourcesEntryCount = _entries.Count;
+            _cachedGradientLeafSourcesFirstOutput = _entries.Count > 0 ? _entries[0].Output : null;
+            _cachedGradientLeafSourcesLastOutput = _entries.Count > 0 ? _entries[_entries.Count - 1].Output : null;
+            _cachedGradientLeafSources = leaves;
+        }
         return leaves;
     }
 
