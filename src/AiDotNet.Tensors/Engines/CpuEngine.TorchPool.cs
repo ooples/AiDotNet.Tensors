@@ -297,7 +297,8 @@ public partial class CpuEngine
         if (indices == null) throw new ArgumentNullException(nameof(indices));
         if (outputSize == null || outputSize.Length == 0) throw new ArgumentException("outputSize is required.", nameof(outputSize));
         if (!indices._shape.SequenceEqual(input._shape)) throw new ArgumentException("indices must match the input's shape.", nameof(indices));
-        if (input.Rank < outputSize.Length) throw new ArgumentException($"unpooling {outputSize.Length} axes needs an input of rank ≥ {outputSize.Length}, got {input.Rank}.", nameof(input));
+        // As PyTorch's max_unpool and every pooling plan here: at least one leading (batch or channel) axis.
+        if (input.Rank < outputSize.Length + 1) throw new ArgumentException($"unpooling {outputSize.Length} axes needs an input of rank ≥ {outputSize.Length + 1}, got {input.Rank}.", nameof(input));
         int dims = outputSize.Length, inPlane = input._shape.Skip(input.Rank - dims).Aggregate(1, (a, b) => a * b);
         int outPlane = outputSize.Aggregate(1, (a, b) => a * b), planes = inPlane == 0 ? 0 : input.Length / inPlane;
         var idx = (indices.IsContiguous ? indices : indices.Contiguous()).AsSpan().ToArray();

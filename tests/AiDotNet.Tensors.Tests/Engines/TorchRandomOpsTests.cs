@@ -166,6 +166,35 @@ public class TorchRandomOpsTests
         }
     }
     [Fact]
+    public void Binomial_LargeCounts_UseTheBoundedSampler()
+    {
+        const int N = 20000;
+        var shape = new[] { N };
+        Tensor<double> Fill(double value) => new Tensor<double>(Enumerable.Repeat(value, N).ToArray(), shape);
+        foreach (var (count, p, seed) in new[] { (10000.0, 0.3, 21), (10000.0, 0.9, 22) })
+        {
+            var (m, v) = Moments(_engine.TensorBinomial(Fill(count), Fill(p), seed: seed));
+            double mean = count * p, variance = count * p * (1 - p);
+            Assert.True(Math.Abs(m - mean) <= 6 * Math.Sqrt(variance / N), $"n={count} p={p}: mean {m}, expected {mean}");
+            Assert.True(Math.Abs(v - variance) <= 0.1 * variance, $"n={count} p={p}: variance {v}, expected {variance}");
+        }
+        // 10^12 trials: the waiting-time loop would take ~10^11 steps per draw; BTRS takes a handful.
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var huge = _engine.TensorBinomial(Values(new[] { 4 }, 1e12, 1e12, 1e12, 1e12), Values(new[] { 4 }, 0.5, 0.5, 0.5, 0.5), seed: 23).ToArray();
+        Assert.True(sw.Elapsed.TotalSeconds < 5, $"10^12-trial draws took {sw.Elapsed.TotalSeconds:F1} s");
+        foreach (var h in huge) Assert.InRange(h, 0.5e12 - 1e7, 0.5e12 + 1e7);   // 10 standard deviations
+    }
+
+    [Fact]
+    public void Binomial_RejectsAnUnrepresentableCount()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            _engine.TensorBinomial(Values(new[] { 1 }, double.PositiveInfinity), Values(new[] { 1 }, 0.5), seed: 1));
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            _engine.TensorBinomial(Values(new[] { 1 }, 1e19), Values(new[] { 1 }, 0.5), seed: 1));
+    }
+
+    [Fact]
     public void Binomial_RejectsAFractionalCount()
         => Assert.Throws<ArgumentOutOfRangeException>(() =>
             _engine.TensorBinomial(Values(new[] { 2 }, 3, 2.5), Values(new[] { 2 }, 0.5, 0.5), seed: 1));

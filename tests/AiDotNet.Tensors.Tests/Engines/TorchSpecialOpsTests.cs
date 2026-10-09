@@ -212,4 +212,14 @@ public class TorchSpecialOpsTests
         Close(new[] { -0.5, 1.0 }, _engine.TensorChebyshevPolynomialT(T(new[] { 0.5, 0.3 }), T(new[] { 2.7, -0.7 })), "chebyshev_t", 1e-15);
         Close(new[] { -0.4375, 0.0 }, _engine.TensorLegendrePolynomialP(T(new[] { 0.5, 0.3 }), T(new[] { 3.9, -2.5 })), "legendre_p", 1e-15);
     }
+
+    [Fact]
+    public void Polynomial_RejectsDegreesItCannotEvaluate()
+    {
+        var x = T(new[] { 0.5 });
+        Assert.Throws<ArgumentOutOfRangeException>(() => _engine.TensorChebyshevPolynomialT(x, T(new[] { double.PositiveInfinity })));
+        Assert.Throws<ArgumentOutOfRangeException>(() => _engine.TensorHermitePolynomialH(x, T(new[] { 1e10 })));
+        // A negative degree still evaluates to 0, as in PyTorch.
+        Assert.Equal(0.0, _engine.TensorChebyshevPolynomialT(x, T(new[] { -3.0 })).ToArray()[0]);
+    }
 }

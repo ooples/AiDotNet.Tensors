@@ -119,5 +119,10 @@ public class TorchPoolOpsTests
         Assert.Throws<ArgumentOutOfRangeException>(() => _engine.TensorLpPool(x, 0.0, new[] { 2 }));
         Assert.Throws<ArgumentException>(() => _engine.TensorMaxUnpool(
             new Tensor<double>(new[] { 1.0, 2.0 }, new[] { 2 }), new Tensor<int>(new[] { 0, 1 }, new[] { 2 }), new[] { 2, 2 }));
+        // A leading (batch or channel) axis is required, as for every pooling op and PyTorch's max_unpool.
+        Assert.Throws<ArgumentException>(() => _engine.TensorMaxUnpool(
+            new Tensor<double>(new[] { 1.0, 2.0, 3.0 }, new[] { 3 }), new Tensor<int>(new[] { 0, 2, 4 }, new[] { 3 }), new[] { 7 }));
+        Assert.Equal(new[] { 1, 7 }, _engine.TensorMaxUnpool(
+            new Tensor<double>(new[] { 1.0, 2.0, 3.0 }, new[] { 1, 3 }), new Tensor<int>(new[] { 0, 2, 4 }, new[] { 1, 3 }), new[] { 7 })._shape);
     }
 }

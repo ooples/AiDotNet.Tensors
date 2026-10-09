@@ -373,9 +373,18 @@ public partial class CpuEngine
         Func<IEngine, Tensor<T>> replay)
         => SpecialBinary(opName, x, n, (v, d) => double.IsNaN(d) ? double.NaN : Polynomial(kind, shifted ? 2 * v - 1 : v, PolynomialDegree(d)), null, null, replay);
 
-    // PyTorch casts the degree with static_cast<int64_t>, truncating toward zero (2.7 -> 2, -0.7 -> 0).
+    // The recurrence runs once per degree for each element; 2^20 steps is about a millisecond per element.
+    private const int MaxPolynomialDegree = 1 << 20;
+
+    // PyTorch casts the degree with static_cast<int64_t>, truncating toward zero (2.7 -> 2, -0.7 -> 0); a negative degree
+    // evaluates to 0. A non-finite or larger degree is rejected: the cast is undefined for it, and the recurrence would not
+    // finish in practical time.
     private static int PolynomialDegree(double d)
-        => d >= int.MaxValue ? int.MaxValue : d <= int.MinValue ? int.MinValue : (int)Math.Truncate(d);
+    {
+        if (double.IsInfinity(d) || d > MaxPolynomialDegree)
+            throw new ArgumentOutOfRangeException(nameof(d), $"polynomial degree must be finite and at most {MaxPolynomialDegree}, got {d}.");
+        return d <= int.MinValue ? int.MinValue : (int)Math.Truncate(d);
+    }
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorChebyshevPolynomialT<T>(Tensor<T> x, Tensor<T> n)

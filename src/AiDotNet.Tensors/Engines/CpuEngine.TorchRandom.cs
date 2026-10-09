@@ -40,19 +40,29 @@ public partial class CpuEngine
         }
     }
 
-    // Exact binomial draw by geometric waiting times between successes: O(n·min(p, 1-p)) expected steps.
+    // As PyTorch: geometric waiting times between successes while n·min(p, 1-p) < 10 (exact, about that many steps),
+    // Hörmann's BTRS rejection sampler above it (a bounded expected number of tries, whatever n is).
+    private const double BinomialBtrsThreshold = 10;
+
     private static double SampleBinomial(double count, double p, Random rng)
     {
         // torch.binomial does not validate this and returns fractional draws for a fractional count; a count of
-        // trials must be a whole number, so it is rejected rather than truncated.
-        if (double.IsNaN(count) || count != Math.Floor(count))
-            throw new ArgumentOutOfRangeException(nameof(count), $"count must be a whole number of trials, got {count}.");
+        // trials must be a whole number, so it is rejected rather than truncated. Infinity passes the Floor test and
+        // has no long value, so the count must also fit a long.
+        if (double.IsNaN(count) || double.IsInfinity(count) || count != Math.Floor(count) || count >= 9.2233720368547758E18)
+            throw new ArgumentOutOfRangeException(nameof(count), $"count must be a whole number of trials within the long range, got {count}.");
         long n = (long)count;
         if (n < 0 || p < 0 || p > 1 || double.IsNaN(p)) throw new ArgumentOutOfRangeException(nameof(p), "need count ≥ 0 and 0 ≤ p ≤ 1.");
         if (n == 0 || p == 0) return 0;
         if (p == 1) return n;
         bool flip = p > 0.5;
-        double q = flip ? 1 - p : p, logQ = Math.Log(1 - q);
+        double q = flip ? 1 - p : p;
+        if (n * q >= BinomialBtrsThreshold)
+        {
+            double draw = SampleBinomialBtrs(n, q, rng);
+            return flip ? n - draw : draw;
+        }
+        double logQ = Math.Log(1 - q);
         long successes = 0, position = 0;
         while (true)
         {
@@ -61,6 +71,49 @@ public partial class CpuEngine
             successes++;
         }
         return flip ? n - successes : successes;
+    }
+
+    // Hörmann (1993), "The generation of binomial random variates", BTRS, as PyTorch's sample_binomial_btrs: a draw of
+    // Binomial(n, p) for p <= 0.5 and n·p >= 10.
+    private static double SampleBinomialBtrs(long n, double p, Random rng)
+    {
+        double stddev = Math.Sqrt(n * p * (1 - p));
+        double b = 1.15 + 2.53 * stddev;
+        double a = -0.0873 + 0.0248 * b + 0.01 * p;
+        double c = n * p + 0.5;
+        double vR = 0.92 - 4.2 / b;
+        double r = p / (1 - p);
+        double alpha = (2.83 + 5.1 / b) * stddev;
+        double m = Math.Floor((n + 1) * p);
+        while (true)
+        {
+            double u = rng.NextDouble() - 0.5;
+            double v = rng.NextDouble();
+            double us = 0.5 - Math.Abs(u);
+            double k = Math.Floor((2 * a / us + b) * u + c);
+            if (k < 0 || k > n) continue;
+            if (us >= 0.07 && v <= vR) return k;
+            v = Math.Log(v * alpha / (a / (us * us) + b));
+            double upper = (m + 0.5) * Math.Log((m + 1) / (r * (n - m + 1)))
+                + (n + 1) * Math.Log((n - m + 1) / (n - k + 1))
+                + (k + 0.5) * Math.Log(r * (n - k + 1) / (k + 1))
+                + StirlingTail(m) + StirlingTail(n - m) - StirlingTail(k) - StirlingTail(n - k);
+            if (v <= upper) return k;
+        }
+    }
+
+    // log(k!) - [(k + 1/2) log(k + 1) - (k + 1) + log(2π)/2]: tabulated below 10, the asymptotic series above.
+    private static readonly double[] s_stirlingTail =
+    {
+        0.08106146679532726, 0.04134069595540929, 0.02767792568499834, 0.02079067210376509, 0.01664469118982119,
+        0.01387612882307075, 0.01189670994589177, 0.01041126526197209, 0.009255462182712733, 0.008330563433362871,
+    };
+
+    private static double StirlingTail(double k)
+    {
+        if (k <= 9) return s_stirlingTail[(int)k];
+        double kp1sq = (k + 1) * (k + 1);
+        return (1.0 / 12 - (1.0 / 360 - 1.0 / 1260 / kp1sq) / kp1sq) / (k + 1);
     }
 
     private Tensor<T> Sample<T>(int[] shape, int? seed, Func<Random, double> draw)
