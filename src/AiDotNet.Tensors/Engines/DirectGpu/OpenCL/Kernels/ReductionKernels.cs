@@ -156,43 +156,11 @@ __kernel void max_axis(
     output[outerIdx] = maxVal;
 }
 
-// Argmax along axis
-__kernel void argmax_axis(
-    __global const float* input,
-    __global int* output,
-    const int outerSize,
-    const int reduceSize)
-{
-    const int outerIdx = get_global_id(0);
-    if (outerIdx >= outerSize) return;
-
-    float maxVal = -INFINITY;
-    int maxIdx = 0;
-    for (int i = 0; i < reduceSize; i++) {
-        float val = input[outerIdx * reduceSize + i];
-        if (val > maxVal) {
-            maxVal = val;
-            maxIdx = i;
-        }
-    }
-    output[outerIdx] = maxIdx;
-}
 
 // ============================================================================
 // Extended reductions: mean, variance, std, product, norm, logsumexp, cumsum
 // ============================================================================
 
-__kernel void mean_axis(
-    __global const float* input, __global float* output,
-    int outerSize, int reduceSize)
-{
-    int idx = get_global_id(0);
-    if (idx >= outerSize) return;
-    float sum = 0.0f;
-    int base_idx = idx * reduceSize;
-    for (int j = 0; j < reduceSize; j++) sum += input[base_idx + j];
-    output[idx] = sum / (float)reduceSize;
-}
 
 __kernel void variance_axis(
     __global const float* input, __global float* output,
@@ -335,8 +303,7 @@ __kernel void reduce_sum_of_squares(
             return new string[]
             {
                 "reduce_sum", "reduce_max", "reduce_min",
-                "sum_axis", "max_axis", "argmax_axis",
-                "mean_axis", "variance_axis", "std_axis",
+                "sum_axis", "max_axis", "variance_axis", "std_axis",
                 "product_axis", "norm_axis", "logsumexp_axis",
                 "cumsum_axis", "scalar_minus_tensor", "normalize_l2",
                 "reduce_sum_backward", "reduce_mean_backward",

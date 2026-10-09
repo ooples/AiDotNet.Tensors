@@ -69,6 +69,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         private DirectOpenClContext? _context;
         private readonly OpenClKernelCache _kernelCache;
+
+        /// <summary>Kernel names more than one compiled program registered (see <see cref="OpenClKernelCache.ReregisteredNames"/>).</summary>
+        internal IReadOnlyCollection<string> ReregisteredKernelNames => _kernelCache.ReregisteredNames;
         private readonly List<DirectOpenClProgram> _programs;
         private DynamicGemmKernel? _dynamicGemm;
         private bool _disposed;
@@ -535,20 +538,18 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     try
                     {
                         var mixedPrecisionSource = string.Join("\n\n",
-                            MixedPrecisionKernels.ConvertFp32ToFp16,
-                            MixedPrecisionKernels.ConvertFp16ToFp32,
+                            // The fp16 conversions come from Fp16Kernels (hardware vload_half/vstore_half), registered
+                            // unconditionally below; compiling them here too only competed for the same names.
                             MixedPrecisionKernels.MixedPrecisionForward,
                             MixedPrecisionKernels.MixedPrecisionBackward,
                             MixedPrecisionKernels.AccumulateGradientFp32);
                         var mpProgram = CompileOrLoadCached(mixedPrecisionSource, optimizationFlags, "Mixed precision kernels");
                         _programs.Add(mpProgram);
-                        _kernelCache["convert_fp32_to_fp16"] = new DirectOpenClKernel(_context, mpProgram, "convert_fp32_to_fp16");
-                        _kernelCache["convert_fp16_to_fp32"] = new DirectOpenClKernel(_context, mpProgram, "convert_fp16_to_fp32");
                         _kernelCache["mixed_precision_forward"] = new DirectOpenClKernel(_context, mpProgram, "mixed_precision_forward");
                         _kernelCache["mixed_precision_backward"] = new DirectOpenClKernel(_context, mpProgram, "mixed_precision_backward");
                         _kernelCache["accumulate_gradient_fp32"] = new DirectOpenClKernel(_context, mpProgram, "accumulate_gradient_fp32");
                         _mixedPrecisionKernelsAvailable = true;
-                        WriteDiag("[OpenClBackend] Mixed precision kernels compiled: 5 kernels");
+                        WriteDiag("[OpenClBackend] Mixed precision kernels compiled: 3 kernels");
                     }
                     catch (Exception ex)
                     {
@@ -10298,7 +10299,8 @@ KERNEL VARIANTS (A/B testing):
 
             using var outputBuffer = AllocateBuffer(size);
 
-            var k = _kernelCache["huber_loss"];
+            // The per-element form (predicted, actual, output, delta, size); huber_loss is the per-row mean.
+            var k = _kernelCache["huber_loss_elementwise"];
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)predictions).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)targets).Buffer.Handle);
@@ -10806,7 +10808,6 @@ KERNEL VARIANTS (A/B testing):
             if (gradAnchor is null) throw new ArgumentNullException(nameof(gradAnchor));
             if (gradOther is null) throw new ArgumentNullException(nameof(gradOther));
 
-            int totalSize = batchSize * embeddingDim;
             var k = _kernelCache["contrastive_loss_backward"];
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)anchor).Buffer.Handle);
@@ -10818,7 +10819,7 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, embeddingDim);
             k.SetArg(arg++, margin);
 
-            k.Execute1D(totalSize, Math.Min(256, totalSize));
+            k.Execute1D(batchSize, Math.Min(256, batchSize));   // one work-item per batch row
         }
 
         #endregion
@@ -13802,8 +13803,7 @@ KERNEL VARIANTS (A/B testing):
             if (!_kernelCache.TryGetValue("gru_forward_sequence", out var kernel))
                 throw new InvalidOperationException("OpenCL kernel not found: gru_forward_sequence");
 
-            int totalThreads = batch * hiddenSize;
-            int localSize = CalculateOptimalWorkGroupSize1D(totalThreads);
+            int localSize = GruSequenceWorkGroupSize(hiddenSize);
 
             kernel.SetArg(0u, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
             kernel.SetArg(1u, ((DirectOpenClGpuBuffer)hInit).Buffer.Handle);
@@ -13820,8 +13820,8 @@ KERNEL VARIANTS (A/B testing):
             kernel.SetArg(12u, inputSize);
             kernel.SetArg(13u, hiddenSize);
 
-            int globalSize = ((totalThreads + localSize - 1) / localSize) * localSize;
-            kernel.Execute1D(globalSize, localSize);
+            // One work-group per batch row (the kernel synchronizes a row's hidden units with barriers).
+            kernel.Execute1D(batch * localSize, localSize);
         }
 
         public void GruBackwardSequence(
@@ -13846,8 +13846,17 @@ KERNEL VARIANTS (A/B testing):
             if (!_kernelCache.TryGetValue("gru_backward_sequence", out var kernel))
                 throw new InvalidOperationException("OpenCL kernel not found: gru_backward_sequence");
 
-            int totalThreads = batch * hiddenSize;
-            int localSize = CalculateOptimalWorkGroupSize1D(totalThreads);
+            int localSize = GruSequenceWorkGroupSize(hiddenSize);
+            long localBytes = 4L * hiddenSize * sizeof(float);   // one step's r, z, n and r*n gate gradients
+            if (LocalMemoryBytes > 0 && localBytes > LocalMemoryBytes)
+                throw new InvalidOperationException(
+                    $"GRU backward sequence needs {localBytes} bytes of local memory for hiddenSize {hiddenSize}; the device has {LocalMemoryBytes}.");
+
+            // The kernel accumulates weight and bias gradients over batch rows and steps: start them at zero.
+            Fill(gradWeightsIh, 0f, 3 * hiddenSize * inputSize);
+            Fill(gradWeightsHh, 0f, 3 * hiddenSize * hiddenSize);
+            Fill(gradBiasIh, 0f, 3 * hiddenSize);
+            Fill(gradBiasHh, 0f, 3 * hiddenSize);
 
             kernel.SetArg(0u, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
             kernel.SetArg(1u, ((DirectOpenClGpuBuffer)allH).Buffer.Handle);
@@ -13867,8 +13876,17 @@ KERNEL VARIANTS (A/B testing):
             kernel.SetArg(15u, inputSize);
             kernel.SetArg(16u, hiddenSize);
 
-            int globalSize = ((totalThreads + localSize - 1) / localSize) * localSize;
-            kernel.Execute1D(globalSize, localSize);
+            kernel.SetLocalArg(17u, (int)localBytes);
+            kernel.Execute1D(batch * localSize, localSize);
+        }
+
+        /// <summary>Work-group size for the GRU sequence kernels: one group per batch row whose work-items stride over
+        /// the hidden units, so a group of up to the device limit (a multiple of 64) covers any hidden size.</summary>
+        private int GruSequenceWorkGroupSize(int hiddenSize)
+        {
+            int max = _maxWorkGroupSize > 0 ? (int)Math.Min(_maxWorkGroupSize, 1024UL) : 256;
+            int size = ((hiddenSize + 63) / 64) * 64;
+            return Math.Max(1, Math.Min(size, max));
         }
 
         public void GruCellBackward(

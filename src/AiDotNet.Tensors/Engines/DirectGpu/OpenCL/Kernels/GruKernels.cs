@@ -112,108 +112,61 @@ __kernel void gru_cell_forward(
 // ===========================================================================
 // Processes the entire sequence in a single kernel launch.
 
+// GRU forward over a whole sequence, PyTorch's formulation (reset applied after the hidden matmul):
+//   r = sigmoid(W_ir x + b_ir + W_hr h + b_hr), z = sigmoid(W_iz x + b_iz + W_hz h + b_hz)
+//   n = tanh(W_in x + b_in + r * (W_hn h + b_hn)), h' = (1 - z) * n + z * h
+// One work-group per batch row; its work-items stride over the hidden units, so any hidden size runs and the barrier
+// after each step makes the whole new state visible to the next. Writes go to allH[t + 1] while reads come from
+// allH[t], so a step never overwrites state it is still reading. cacheGates is [T, B, 3, H]: r, z, W_hn h + b_hn.
 __kernel void gru_forward_sequence(
-    __global const float* input,       // [seqLen, batch, input_size]
-    __global const float* hInit,       // [batch, hidden_size]
-    __global const float* weightsIh,   // [3 * hidden_size, input_size]
-    __global const float* weightsHh,   // [3 * hidden_size, hidden_size]
-    __global const float* biasIh,      // [3 * hidden_size]
-    __global const float* biasHh,      // [3 * hidden_size]
-    __global float* output,            // [seqLen, batch, hidden_size]
-    __global float* hFinal,            // [batch, hidden_size]
-    __global float* allH,              // [seqLen + 1, batch, hidden_size] - all hidden states
-    __global float* cacheGates,        // [seqLen, batch, hidden_size, 3] - gate values for backward
-    const int seqLen,
-    const int batch,
-    const int inputSize,
-    const int hiddenSize)
+    __global const float* input, __global const float* hInit,
+    __global const float* weightsIh, __global const float* weightsHh,
+    __global const float* biasIh, __global const float* biasHh,
+    __global float* output, __global float* hFinal, __global float* allH, __global float* cacheGates,
+    const int seqLen, const int batch, const int inputSize, const int hiddenSize)
 {
-    int gid = get_global_id(0);
-    int totalElements = batch * hiddenSize;
-    int b = gid / hiddenSize;
-    int h = gid % hiddenSize;
-    int isValid = (gid < totalElements) ? 1 : 0;
-
-    // Initialize from hInit (only valid threads)
-    float hPrev = 0.0f;
-    if (isValid) {
-        hPrev = hInit[gid];
-        // Store initial state
-        allH[gid] = hPrev;
-    }
-
-    // Barrier to ensure all threads have written initial hidden state
-    // Note: All threads must reach barrier for proper synchronization
+    const int b = get_group_id(0);
+    const int lid = get_local_id(0);
+    const int lsize = get_local_size(0);
+    if (b >= batch) return;
+    const int H = hiddenSize, I = inputSize;
+    const long rowH = (long)b * H;
+    for (int j = lid; j < H; j += lsize) allH[rowH + j] = hInit[rowH + j];
     barrier(CLK_GLOBAL_MEM_FENCE);
-
-    // Process each timestep
-    for (int t = 0; t < seqLen; t++) {
-        if (isValid) {
-            // Compute gate pre-activations
-            float sumR = biasIh[h] + biasHh[h];
-            float sumZ = biasIh[hiddenSize + h] + biasHh[hiddenSize + h];
-            float sumN_input = biasIh[2 * hiddenSize + h];
-            float sumN_hidden = biasHh[2 * hiddenSize + h];
-
-            // Input contribution at this timestep
-            int inputOffset = t * batch * inputSize + b * inputSize;
-            for (int j = 0; j < inputSize; j++) {
-                float inVal = input[inputOffset + j];
-                sumR += inVal * weightsIh[h * inputSize + j];
-                sumZ += inVal * weightsIh[(hiddenSize + h) * inputSize + j];
-                sumN_input += inVal * weightsIh[(2 * hiddenSize + h) * inputSize + j];
+    for (int t = 0; t < seqLen; t++)
+    {
+        __global const float* hPrev = allH + (long)t * batch * H + rowH;
+        __global const float* x = input + ((long)t * batch + b) * I;
+        __global float* gates = cacheGates + ((long)t * batch + b) * 3 * H;
+        for (int j = lid; j < H; j += lsize)
+        {
+            float xr = biasIh[j], xz = biasIh[H + j], xn = biasIh[2 * H + j];
+            for (int i = 0; i < I; i++)
+            {
+                float xi = x[i];
+                xr += weightsIh[(long)j * I + i] * xi;
+                xz += weightsIh[(long)(H + j) * I + i] * xi;
+                xn += weightsIh[(long)(2 * H + j) * I + i] * xi;
             }
-
-            // Previous hidden state contribution for r and z
-            for (int j = 0; j < hiddenSize; j++) {
-                float hVal = (j == h) ? hPrev : allH[t * batch * hiddenSize + b * hiddenSize + j];
-                sumR += hVal * weightsHh[h * hiddenSize + j];
-                sumZ += hVal * weightsHh[(hiddenSize + h) * hiddenSize + j];
+            float hr = biasHh[j], hz = biasHh[H + j], hn = biasHh[2 * H + j];
+            for (int k = 0; k < H; k++)
+            {
+                float hk = hPrev[k];
+                hr += weightsHh[(long)j * H + k] * hk;
+                hz += weightsHh[(long)(H + j) * H + k] * hk;
+                hn += weightsHh[(long)(2 * H + j) * H + k] * hk;
             }
-
-            // Apply activations for r and z
-            float r = sigmoid_fn(sumR);
-            float z = sigmoid_fn(sumZ);
-
-            // Hidden contribution for n gate (gated by reset)
-            for (int j = 0; j < hiddenSize; j++) {
-                float hVal = (j == h) ? hPrev : allH[t * batch * hiddenSize + b * hiddenSize + j];
-                sumN_hidden += (r * hVal) * weightsHh[(2 * hiddenSize + h) * hiddenSize + j];
-            }
-
-            // New gate activation
-            float n = tanh(sumN_input + sumN_hidden);
-
-            // Hidden state update
-            float newH = (1.0f - z) * n + z * hPrev;
-
-            // Store output
-            int outIdx = t * batch * hiddenSize + gid;
-            output[outIdx] = newH;
-
-            // Store all states for backward pass
-            int stateIdx = (t + 1) * batch * hiddenSize + gid;
-            allH[stateIdx] = newH;
-
-            // Cache gate values for backward
-            int gateIdx = (t * batch * hiddenSize + gid) * 3;
-            cacheGates[gateIdx + 0] = r;
-            cacheGates[gateIdx + 1] = z;
-            cacheGates[gateIdx + 2] = n;
-
-            // Update for next iteration
-            hPrev = newH;
+            float r = 1.0f / (1.0f + exp(-(xr + hr)));
+            float z = 1.0f / (1.0f + exp(-(xz + hz)));
+            float n = tanh(xn + r * hn);
+            float hNew = (1.0f - z) * n + z * hPrev[j];
+            gates[j] = r; gates[H + j] = z; gates[2 * H + j] = hn;
+            allH[(long)(t + 1) * batch * H + rowH + j] = hNew;
+            output[((long)t * batch + b) * H + j] = hNew;
         }
-
-        // Barrier to ensure all threads have written new hidden state before next iteration
-        // All threads (valid and invalid) must reach this barrier
         barrier(CLK_GLOBAL_MEM_FENCE);
     }
-
-    // Store final state (only valid threads)
-    if (isValid) {
-        hFinal[gid] = hPrev;
-    }
+    for (int j = lid; j < H; j += lsize) hFinal[rowH + j] = allH[(long)seqLen * batch * H + rowH + j];
 }
 
 // ===========================================================================
@@ -378,185 +331,98 @@ __kernel void gru_backward_prevh(
 // Uses local memory to store accumulated hidden gradients so all threads
 // can access each other's dH values for proper reset-gate gradient computation.
 
-__kernel void gru_backward_sequence(
-    __global const float* gradOutput,  // [seqLen, batch, hidden_size]
-    __global const float* allH,        // [seqLen + 1, batch, hidden_size]
-    __global const float* cacheGates,  // [seqLen, batch, hidden_size, 3]
-    __global const float* weightsIh,   // [3 * hidden_size, input_size]
-    __global const float* weightsHh,   // [3 * hidden_size, hidden_size]
-    __global float* gradInput,         // [seqLen, batch, input_size]
-    __global float* gradHInit,         // [batch, hidden_size]
-    __global float* dH_buffer,         // [batch, hidden_size] - workspace for accumulated gradients
-    __global float* gradWeightsIh,     // [3 * hidden_size, input_size] - accumulated
-    __global float* gradWeightsHh,     // [3 * hidden_size, hidden_size] - accumulated
-    __global float* gradBiasIh,        // [3 * hidden_size] - accumulated
-    __global float* gradBiasHh,        // [3 * hidden_size] - accumulated
-    __global const float* input,       // [seqLen, batch, input_size]
-    const int seqLen,
-    const int batch,
-    const int inputSize,
-    const int hiddenSize,
-    __local float* local_dH)           // Local memory for shared gradient access
+// Float add on global memory through compare-and-swap (OpenCL 1.2 has no float atomic add). Summation order is not
+// fixed, as with CUDA's atomicAdd.
+inline void gru_atomic_add(volatile __global float* addr, float v)
 {
-    int gid = get_global_id(0);
-    int lid = get_local_id(0);
-    int local_size = get_local_size(0);
-    int group_id = get_group_id(0);
-    int totalElements = batch * hiddenSize;
+    union { uint u; float f; } prev, next;
+    do { prev.f = *addr; next.f = prev.f + v; }
+    while (atomic_cmpxchg((volatile __global uint*)addr, prev.u, next.u) != prev.u);
+}
 
-    // Use active-flag pattern to prevent barrier deadlock
-    int isActive = (gid < totalElements) ? 1 : 0;
-
-    int b = isActive ? (gid / hiddenSize) : 0;
-    int h = isActive ? (gid % hiddenSize) : 0;
-
-    // Initialize gradient for recurrence
-    float dH = 0.0f;
-
-    // Process timesteps in reverse (BPTT)
-    for (int t = seqLen - 1; t >= 0; t--) {
-        // Phase 1: Add gradient from output and compute basic gradients
-        float r = 0.0f, z = 0.0f, n = 0.0f, hPrev = 0.0f;
-        float dN = 0.0f, dZ = 0.0f;
-        int gateIdx = 0;
-
-        if (isActive) {
-            // Add gradient from output at this timestep
-            dH += gradOutput[t * batch * hiddenSize + gid];
-
-            // Load cached gate values
-            gateIdx = (t * batch * hiddenSize + gid) * 3;
-            r = cacheGates[gateIdx + 0];
-            z = cacheGates[gateIdx + 1];
-            n = cacheGates[gateIdx + 2];
-
-            // Load hidden state
-            hPrev = allH[t * batch * hiddenSize + gid];
-
-            // Gradient through hidden state update: h_new = (1 - z) * n + z * h_prev
-            dZ = dH * (hPrev - n) * sigmoid_derivative(z);
-            dN = dH * (1.0f - z) * tanh_derivative(n);
-
-            // Store accumulated dH to local memory for other threads to read
-            local_dH[lid] = dH;
-
-            // Also write to global buffer for cross-workgroup access
-            dH_buffer[gid] = dH;
+// Full BPTT for gru_forward_sequence (same formulation, one work-group per batch row, strided hidden units). s is
+// 4 * hiddenSize floats of local memory holding one step's pre-activation gate gradients (r, z, n, r * n). dHBuffer
+// ([B, H]) carries dL/dh back from step t + 1; unit j is always handled by the same work-item, so it needs no barrier.
+// The weight and bias gradients accumulate across batch rows and steps; the host zeroes them first.
+__kernel void gru_backward_sequence(
+    __global const float* gradOutput, __global const float* allH, __global const float* cacheGates,
+    __global const float* weightsIh, __global const float* weightsHh, __global const float* input,
+    __global float* gradInput, __global float* gradHInit, __global float* dHBuffer,
+    __global float* gradWeightsIh, __global float* gradWeightsHh, __global float* gradBiasIh, __global float* gradBiasHh,
+    const int seqLen, const int batch, const int inputSize, const int hiddenSize,
+    __local float* s)
+{
+    const int H = hiddenSize, I = inputSize;
+    __local float* sDr = s;
+    __local float* sDz = s + H;
+    __local float* sDn = s + 2 * H;
+    __local float* sDnr = s + 3 * H;
+    const int b = get_group_id(0);
+    const int lid = get_local_id(0);
+    const int lsize = get_local_size(0);
+    if (b >= batch) return;
+    const long rowH = (long)b * H;
+    __global float* carry = dHBuffer + rowH;
+    for (int j = lid; j < H; j += lsize) carry[j] = 0.0f;
+    for (int t = seqLen - 1; t >= 0; t--)
+    {
+        __global const float* hPrev = allH + (long)t * batch * H + rowH;
+        __global const float* hCur = allH + (long)(t + 1) * batch * H + rowH;
+        __global const float* x = input + ((long)t * batch + b) * I;
+        __global const float* gates = cacheGates + ((long)t * batch + b) * 3 * H;
+        for (int j = lid; j < H; j += lsize)
+        {
+            float r = gates[j], z = gates[H + j], hn = gates[2 * H + j];
+            float dh = gradOutput[((long)t * batch + b) * H + j] + carry[j];
+            float oneMinusZ = 1.0f - z;
+            float nScaled = hCur[j] - z * hPrev[j];                       // (1 - z) * n
+            // dh * (1 - z) * (1 - n^2), written through (1 - z) * n; zero once z saturates at 1.
+            float dnPre = oneMinusZ > 1e-12f ? dh * (oneMinusZ - nScaled * nScaled / oneMinusZ) : 0.0f;
+            sDz[j] = dh * z * (hPrev[j] - hCur[j]);                         // dh * (h - n) * z * (1 - z)
+            sDn[j] = dnPre;
+            sDnr[j] = dnPre * r;
+            sDr[j] = dnPre * hn * r * (1.0f - r);
+            carry[j] = dh * z;                                              // the direct path; matrix paths below
         }
-
-        // Barrier to ensure all threads have written their dH values
         barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
-
-        // Phase 2: Compute reset gate gradient using accumulated hidden gradients
-        float dR = 0.0f;
-        if (isActive) {
-            // Full BPTT: dR[h] = sum_k(dN_k * Wn_hh[k,h]) * hPrev[h] * sigmoid'(r[h])
-            // where dN_k uses the ACCUMULATED gradient dH_k, not just gradOutput
-            float dR_sum = 0.0f;
-            for (int k = 0; k < hiddenSize; k++) {
-                // Get cached gate values for output k
-                int k_gateIdx = (t * batch * hiddenSize + b * hiddenSize + k) * 3;
-                float z_k = cacheGates[k_gateIdx + 1];
-                float n_k = cacheGates[k_gateIdx + 2];
-                float hPrev_k = allH[t * batch * hiddenSize + b * hiddenSize + k];
-
-                // Get accumulated hidden gradient for position k
-                // Try local memory first (same workgroup), fall back to global buffer
-                float dH_k;
-                int k_gid = b * hiddenSize + k;
-                int k_local_idx = k_gid - (group_id * local_size);
-                if (k_local_idx >= 0 && k_local_idx < local_size) {
-                    // Same workgroup - use local memory
-                    dH_k = local_dH[k_local_idx];
-                } else {
-                    // Different workgroup - use global buffer
-                    dH_k = dH_buffer[k_gid];
-                }
-
-                // Compute dN for output k using accumulated gradient
-                float dN_k = dH_k * (1.0f - z_k) * tanh_derivative(n_k);
-                dR_sum += dN_k * weightsHh[(2 * hiddenSize + k) * hiddenSize + h];
+        for (int j = lid; j < H; j += lsize)
+        {
+            float dr = sDr[j], dz = sDz[j], dn = sDn[j], dnr = sDnr[j];
+            float acc = 0.0f;
+            for (int m = 0; m < H; m++)
+                acc += weightsHh[(long)m * H + j] * sDr[m]
+                     + weightsHh[(long)(H + m) * H + j] * sDz[m]
+                     + weightsHh[(long)(2 * H + m) * H + j] * sDnr[m];
+            carry[j] += acc;
+            for (int i = 0; i < I; i++)
+            {
+                float xi = x[i];
+                gru_atomic_add(&gradWeightsIh[(long)j * I + i], dr * xi);
+                gru_atomic_add(&gradWeightsIh[(long)(H + j) * I + i], dz * xi);
+                gru_atomic_add(&gradWeightsIh[(long)(2 * H + j) * I + i], dn * xi);
             }
-            dR = dR_sum * hPrev * sigmoid_derivative(r);
-        }
-
-        // Phase 3: Compute gradient to previous hidden state (full BPTT)
-        // dPrevH[j] = dH[j] * (1-z[j]) + sum_hh(dZ[hh]*Uz[hh,j] + dR[hh]*Ur[hh,j] + dN[hh]*Uh[hh,j]*r[j])
-        if (isActive) {
-            // Direct path: h_t = (1-z)*n + z*h_prev, so dh_prev = dH * z is WRONG
-            // Correct: dh_prev from direct path = dH * (1-z) for n term... wait, let me recalculate
-            // h_t = (1-z)*n + z*h_prev
-            // dL/dh_prev = dL/dh_t * dh_t/dh_prev = dH * z (gradient flows through z*h_prev term)
-            // But we also need gradient through n gate which uses r*h_prev
-            // Actually for OpenCL we use (1-z)*n + z*h_prev, different convention than CUDA
-            // Let me check: dh_prev direct = dH * z (from z*h_prev term)
-            // Hmm, the GRU formula here is h = (1-z)*n + z*h_prev, so dh/dh_prev = z
-            // But CUDA uses h = (1-z)*h_prev + z*h_cand, so dh/dh_prev = (1-z)
-            // The convention differs! OpenCL seems inverted.
-            // Looking at gru_cell_forward: newHVal = (1.0f - z) * n + z * prevHVal
-            // So direct path gradient is dH * z, which is correct for this convention.
-            float dHPrev = dH * z;  // Direct path for this GRU convention
-
-            // Accumulate gradient contributions from all hidden output positions hh
-            for (int hh = 0; hh < hiddenSize; hh++) {
-                // Get gate values for output position hh (from cacheGates buffer)
-                int hh_gateIdx = (t * batch * hiddenSize + b * hiddenSize + hh) * 3;
-                float r_hh = cacheGates[hh_gateIdx + 0];
-                float z_hh = cacheGates[hh_gateIdx + 1];
-                float n_hh = cacheGates[hh_gateIdx + 2];
-
-                // Get accumulated hidden gradient for position hh
-                float dH_hh;
-                int hh_gid = b * hiddenSize + hh;
-                int hh_local_idx = hh_gid - (group_id * local_size);
-                if (hh_local_idx >= 0 && hh_local_idx < local_size) {
-                    dH_hh = local_dH[hh_local_idx];
-                } else {
-                    dH_hh = dH_buffer[hh_gid];
-                }
-
-                // Get h_prev for position hh
-                float hPrev_hh = allH[t * batch * hiddenSize + b * hiddenSize + hh];
-
-                // Recompute gate gradients for output position hh
-                // OpenCL convention: h = (1-z)*n + z*h_prev
-                float dN_hh = dH_hh * (1.0f - z_hh) * tanh_derivative(n_hh);
-                float dZ_hh = dH_hh * (hPrev_hh - n_hh) * sigmoid_derivative(z_hh);
-
-                // Compute dR[hh] properly: dR[hh] = sum_k(dN_k * Wn_hh[k,hh]) * hPrev[hh] * sigmoid'(r[hh])
-                float dR_sum_hh = 0.0f;
-                for (int k = 0; k < hiddenSize; k++) {
-                    int k_gateIdx = (t * batch * hiddenSize + b * hiddenSize + k) * 3;
-                    float z_k = cacheGates[k_gateIdx + 1];
-                    float n_k = cacheGates[k_gateIdx + 2];
-                    int k_gid = b * hiddenSize + k;
-                    int k_local_idx = k_gid - (group_id * local_size);
-                    float dH_k = (k_local_idx >= 0 && k_local_idx < local_size)
-                                 ? local_dH[k_local_idx] : dH_buffer[k_gid];
-                    float dN_k = dH_k * (1.0f - z_k) * tanh_derivative(n_k);
-                    dR_sum_hh += dN_k * weightsHh[(2 * hiddenSize + k) * hiddenSize + hh];
-                }
-                float dR_hh = dR_sum_hh * hPrev_hh * sigmoid_derivative(r_hh);
-
-                // Gradient through gates to prevH[h] (this thread's hidden unit)
-                dHPrev += dZ_hh * weightsHh[(hiddenSize + hh) * hiddenSize + h];
-                dHPrev += dR_hh * weightsHh[hh * hiddenSize + h];
-                // For Wn_hh path, the reset gate is for THIS thread's unit (h), not hh
-                dHPrev += dN_hh * r * weightsHh[(2 * hiddenSize + hh) * hiddenSize + h];
+            for (int k = 0; k < H; k++)
+            {
+                float hk = hPrev[k];
+                gru_atomic_add(&gradWeightsHh[(long)j * H + k], dr * hk);
+                gru_atomic_add(&gradWeightsHh[(long)(H + j) * H + k], dz * hk);
+                gru_atomic_add(&gradWeightsHh[(long)(2 * H + j) * H + k], dnr * hk);
             }
-
-            // Update for next iteration
-            dH = dHPrev;
+            gru_atomic_add(&gradBiasIh[j], dr); gru_atomic_add(&gradBiasIh[H + j], dz); gru_atomic_add(&gradBiasIh[2 * H + j], dn);
+            gru_atomic_add(&gradBiasHh[j], dr); gru_atomic_add(&gradBiasHh[H + j], dz); gru_atomic_add(&gradBiasHh[2 * H + j], dnr);
         }
-
-        // Barrier before next timestep to ensure all threads complete
-        barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+        for (int i = lid; i < I; i += lsize)
+        {
+            float acc = 0.0f;
+            for (int m = 0; m < H; m++)
+                acc += weightsIh[(long)m * I + i] * sDr[m]
+                     + weightsIh[(long)(H + m) * I + i] * sDz[m]
+                     + weightsIh[(long)(2 * H + m) * I + i] * sDn[m];
+            gradInput[((long)t * batch + b) * I + i] = acc;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);   // the next step overwrites the local gradients
     }
-
-    // Store initial state gradient
-    if (isActive) {
-        gradHInit[gid] = dH;
-    }
+    for (int j = lid; j < H; j += lsize) gradHInit[rowH + j] = carry[j];
 }
 
 // ===========================================================================

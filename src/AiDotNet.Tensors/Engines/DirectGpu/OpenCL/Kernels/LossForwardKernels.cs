@@ -26,12 +26,6 @@ __kernel void cross_entropy_loss(__global const float* predictions, __global con
     }
     loss[b] = sample_loss;
 }
-__kernel void mse_loss(__global const float* predictions, __global const float* targets, __global float* loss, int batchSize, int numFeatures) {
-    int b = get_global_id(0); if (b >= batchSize) return;
-    float sum_sq = 0.0f;
-    for (int f = 0; f < numFeatures; f++) { float d = predictions[b * numFeatures + f] - targets[b * numFeatures + f]; sum_sq += d * d; }
-    loss[b] = (numFeatures > 0) ? (sum_sq / (float)numFeatures) : 0.0f;
-}
 __kernel void bce_loss(__global const float* predictions, __global const float* targets, __global float* loss, int size) {
     int idx = get_global_id(0); if (idx >= size) return;
     float p = fmin(fmax(predictions[idx], 1e-7f), 1.0f - 1e-7f); float t = targets[idx];
@@ -129,7 +123,7 @@ __kernel void bce_with_logits_backward(__global const float* gradOutput, __globa
 
     public static string[] GetKernelNames()
     {
-        return new[] { "cross_entropy_loss", "mse_loss", "bce_loss", "dropout_mask", "stateless_dropout_mask", "gaussian_noise",
+        return new[] { "cross_entropy_loss", "bce_loss", "dropout_mask", "stateless_dropout_mask", "gaussian_noise",
             "l1_loss", "huber_loss", "bce_with_logits_loss", "nll_loss", "kl_div_loss",
             "mse_loss_backward", "l1_loss_backward", "huber_loss_backward", "bce_with_logits_backward" };
     }
