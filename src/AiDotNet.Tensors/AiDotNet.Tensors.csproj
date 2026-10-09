@@ -395,6 +395,8 @@
        embedded. -->
   <ItemGroup>
     <EmbeddedResource Include="Engines\BlasManaged\Autotune\prewarm\*.prewarm.json" />
+    <!-- Shipped tuned-kernel registry profiles (per device), see TunedKernelProfiles. -->
+    <EmbeddedResource Include="Helpers\Autotune\TunedKernels\Profiles\*.tuned-profile.json" />
   </ItemGroup>
 
   <!-- Optional signed revocation deny-list (CRL) for signed entitlements, verified by

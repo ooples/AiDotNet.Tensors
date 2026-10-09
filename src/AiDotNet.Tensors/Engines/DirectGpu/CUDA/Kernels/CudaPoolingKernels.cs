@@ -81,13 +81,24 @@ extern ""C"" __global__ __launch_bounds__(256) void maxpool2d_backward(
     atomicAdd(&gradInput[inputIdx], grad);
 }
 
-// maxpool2d_backward — bit-deterministic variant (issue #382).
-// One thread per (b, c, ih, iw) input cell scans every output position in fixed
-// (oh, ow) order and accumulates gradients from output cells whose indices[outIdx]
-// points to this input cell.
+// maxpool2d_backward -- bit-deterministic variant (issue #382).
+// One thread per (b, c, ih, iw) input cell gathers, in fixed ascending (oh, ow) order, the gradients of the output
+// cells whose indices[outIdx] selected this input cell. Atomic-free, so bit-reproducible.
+//
+// Only an output cell whose pooling window covers (ih, iw) can have selected it (the forward stores the window's
+// argmax), so the scan visits only output cells that could cover it instead of the whole output plane. The engine's
+// backward does not know the forward's padding (the stored indices are absolute, so the gradient never needed it),
+// and padH/padW arrive as 0 from there; so the bound covers ANY padding p in [0, P], P = max(padH, kH-1):
+// oh in [ceil((ih-kH+1)/sH), floor((ih+P)/sH)], likewise ow. A window the scan visits that does not actually cover
+// the cell cannot hold its index, so the terms added, and their order, are the same as a full scan's and the result
+// is bit-identical; the cost is O((kH+P)/sH * (kW+P)/sW) per cell instead of O(outH*outW). (Bounding with the passed
+// padding alone dropped gradient for every padded pool reached through the engine: k3 s2 p1 lost 8 of 60 cells.)
+// The one exception is the forward's fallback index 0, stored when no window element compared greater than
+// -INFINITY (an all -inf/NaN window): it can point outside the window, so cell 0 keeps the full scan.
 extern ""C"" __global__ __launch_bounds__(256) void maxpool2d_backward_deterministic(
     const float* __restrict__ gradOutput, const int* __restrict__ indices, float* __restrict__ gradInput,
-    int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth)
+    int batch, int channels, int inHeight, int inWidth, int outHeight, int outWidth,
+    int kernelH, int kernelW, int strideH, int strideW, int padH, int padW)
 {
     int iw = blockIdx.x * blockDim.x + threadIdx.x;
     int ih = blockIdx.y * blockDim.y + threadIdx.y;
@@ -96,10 +107,23 @@ extern ""C"" __global__ __launch_bounds__(256) void maxpool2d_backward_determini
     if (iw >= inWidth || ih >= inHeight || b >= batch) return;
 
     int targetMaxIdx = ih * inWidth + iw;
+    int ohLo = 0, ohHi = outHeight - 1, owLo = 0, owHi = outWidth - 1;
+    if (targetMaxIdx != 0) {
+        int padHMax = padH > kernelH - 1 ? padH : kernelH - 1;
+        int padWMax = padW > kernelW - 1 ? padW : kernelW - 1;
+        int hNum = ih - kernelH + 1;
+        int wNum = iw - kernelW + 1;
+        ohLo = hNum <= 0 ? 0 : (hNum + strideH - 1) / strideH;
+        owLo = wNum <= 0 ? 0 : (wNum + strideW - 1) / strideW;
+        int hHi = (ih + padHMax) / strideH;
+        int wHi = (iw + padWMax) / strideW;
+        if (hHi < ohHi) ohHi = hHi;
+        if (wHi < owHi) owHi = wHi;
+    }
     float sum = 0.0f;
     int outBase = (b * channels + c) * outHeight * outWidth;
-    for (int oh = 0; oh < outHeight; oh++) {
-        for (int ow = 0; ow < outWidth; ow++) {
+    for (int oh = ohLo; oh <= ohHi; oh++) {
+        for (int ow = owLo; ow <= owHi; ow++) {
             int outIdx = outBase + oh * outWidth + ow;
             if (indices[outIdx] == targetMaxIdx) {
                 sum += gradOutput[outIdx];
@@ -107,11 +131,8 @@ extern ""C"" __global__ __launch_bounds__(256) void maxpool2d_backward_determini
         }
     }
     // WRITE (not +=): each thread owns exactly one (b,c,ih,iw) input cell and computes its COMPLETE
-    // gradient in `sum`, so assignment is correct and — unlike +=, which leaves non-max cells holding
-    // whatever stale value the freshly-cuMemAlloc'd buffer carried — it does not depend on gradInput
-    // having been zeroed first. The zeroing (cuMemsetD32 on the null stream) is NOT ordered against
-    // this kernel's non-blocking compute stream, so under load it could lag and += would preserve
-    // garbage (observed: a non-max cell read -1.045 instead of 0). Assignment removes that race.
+    // gradient in `sum`, so assignment is correct and does not depend on gradInput having been zeroed
+    // first (the null-stream zeroing is not ordered against this kernel's non-blocking stream).
     gradInput[((b * channels + c) * inHeight + ih) * inWidth + iw] = sum;
 }
 
