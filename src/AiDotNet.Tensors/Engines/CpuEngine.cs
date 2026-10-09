@@ -3300,7 +3300,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
 
             // Fallback: SimdKernels with parallel chunking for large arrays
-            int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            int numChunks = ElementwiseChunks(length);
             if (numChunks >= 2)
             {
                 int chunkSize = (length + numChunks - 1) / numChunks;
@@ -3335,7 +3335,7 @@ public partial class CpuEngine : ITensorLevelEngine
             double* pA = (double*)pinA.Pointer;
             double* pB = (double*)pinB.Pointer;
 
-            int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            int numChunks = ElementwiseChunks(length);
             if (numChunks >= 2)
             {
                 int chunkSize = (length + numChunks - 1) / numChunks;
@@ -5784,7 +5784,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
                 else
                 {
-                    int subChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 500_000));
+                    int subChunks = ElementwiseChunks(length);
                     if (subChunks >= 2)
                     {
                         int chunkSize = (length + subChunks - 1) / subChunks;
@@ -5943,7 +5943,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
                 else
                 {
-                    int mulChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 500_000));
+                    int mulChunks = ElementwiseChunks(length);
                     if (mulChunks >= 2)
                     {
                         int chunkSize = (length + mulChunks - 1) / mulChunks;
@@ -6084,7 +6084,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return;
             }
 
-            int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            int numChunks = ElementwiseChunks(length);
             if (numChunks >= 2)
             {
                 int chunkSize = (length + numChunks - 1) / numChunks;
@@ -6117,7 +6117,7 @@ public partial class CpuEngine : ITensorLevelEngine
             double* pA = (double*)pinA.Pointer;
             double* pB = (double*)pinB.Pointer;
 
-            int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            int numChunks = ElementwiseChunks(length);
             if (numChunks >= 2)
             {
                 int chunkSize = (length + numChunks - 1) / numChunks;
@@ -6253,7 +6253,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return;
             }
 
-            int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            int numChunks = ElementwiseChunks(length);
             if (numChunks >= 2)
             {
                 int chunkSize = (length + numChunks - 1) / numChunks;
@@ -6286,7 +6286,7 @@ public partial class CpuEngine : ITensorLevelEngine
             double* pA = (double*)pinA.Pointer;
             double* pB = (double*)pinB.Pointer;
 
-            int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            int numChunks = ElementwiseChunks(length);
             if (numChunks >= 2)
             {
                 int chunkSize = (length + numChunks - 1) / numChunks;
@@ -6350,7 +6350,7 @@ public partial class CpuEngine : ITensorLevelEngine
             using var pinA = aMem.Pin();
             float* pA = (float*)pinA.Pointer;
 
-            int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            int numChunks = ElementwiseChunks(length);
             if (numChunks >= 2)
             {
                 int chunkSize = (length + numChunks - 1) / numChunks;
@@ -6378,7 +6378,7 @@ public partial class CpuEngine : ITensorLevelEngine
             using var pinA = aMem.Pin();
             double* pA = (double*)pinA.Pointer;
 
-            int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            int numChunks = ElementwiseChunks(length);
             if (numChunks >= 2)
             {
                 int chunkSize = (length + numChunks - 1) / numChunks;
@@ -6445,7 +6445,7 @@ public partial class CpuEngine : ITensorLevelEngine
             float* pA = (float*)pinA.Pointer;
             float* pD = (float*)pinD.Pointer;
 
-            int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            int numChunks = ElementwiseChunks(length);
             if (numChunks >= 2)
             {
                 int chunkSize = (length + numChunks - 1) / numChunks;
@@ -6476,7 +6476,7 @@ public partial class CpuEngine : ITensorLevelEngine
             double* pA = (double*)pinA.Pointer;
             double* pD = (double*)pinD.Pointer;
 
-            int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            int numChunks = ElementwiseChunks(length);
             if (numChunks >= 2)
             {
                 int chunkSize = (length + numChunks - 1) / numChunks;
@@ -6677,7 +6677,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
                 else
                 {
-                    int subChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 500_000));
+                    int subChunks = ElementwiseChunks(length);
                     if (subChunks >= 2)
                     {
                         int chunkSize = (length + subChunks - 1) / subChunks;
@@ -11413,6 +11413,19 @@ public partial class CpuEngine : ITensorLevelEngine
         }
     }
 
+    /// <summary>
+    /// Elements per parallel chunk for the memory-bound float elementwise kernels (ReLU, add, subtract, multiply,
+    /// and the like). They split at 2M (or 500K) elements per chunk, so every activation of a training-scale CNN
+    /// (65K-524K elements) ran on one thread: a ResNet step spent 4 ms in ReLU against PyTorch's 0.9, whose own
+    /// grain is 32K. Env override: AIDOTNET_ELEMENTWISE_GRAIN.
+    /// </summary>
+    internal static int ElementwiseGrain =
+        int.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_ELEMENTWISE_GRAIN"), out var grain) && grain > 0 ? grain : 64 * 1024;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int ElementwiseChunks(int length)
+        => Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / ElementwiseGrain));
+
     public virtual unsafe Tensor<T> ReLU<T>(Tensor<T> tensor)
     {
         if (tensor == null)
@@ -11477,7 +11490,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var srcArr = (float[])(object)tensor._storage.GetDataArray();
             var dstArr = (float[])(object)result._storage.GetDataArray();
             int sOff = tensor._storageOffset, dOff = result._storageOffset;
-            int reluChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 2_000_000));
+            int reluChunks = ElementwiseChunks(length);
             if (reluChunks >= 2)
             {
                 fixed (float* pSrcFix = srcArr, pDstFix = dstArr)
@@ -45830,7 +45843,7 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         // For large arrays, parallelize across threads
         // Use 500K threshold for bandwidth-bound binary ops
-        int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 500_000));
+        int numChunks = ElementwiseChunks(length);
         if (numChunks >= 2)
         {
             int chunkSize = (length + numChunks - 1) / numChunks;
@@ -45860,7 +45873,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// </summary>
     private static unsafe void JitUnaryDispatch(float* pSrc, float* pDst, int length)
     {
-        int numChunks = Math.Min(CpuParallelSettings.MaxDegreeOfParallelism, Math.Max(1, length / 500_000));
+        int numChunks = ElementwiseChunks(length);
         if (numChunks >= 2)
         {
             int chunkSize = (length + numChunks - 1) / numChunks;
