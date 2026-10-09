@@ -1310,7 +1310,9 @@ public sealed class SparseAdamOptimizer : OptimizerBase
                 }
                 else
                 {
-                    var grad = DenseGradient(gi, pi, p).Span;
+                    var dense = DenseGradient(gi, pi, p);
+                    float[] grad = dense.Array;
+                    int gradOffset = dense.Offset;
                     // Build the sparse view in a single pass over the dense gradient, growing
                     // the per-parameter scratch buffers in place rather than allocating each step.
                     if (!_scratch.TryGetValue((gi, pi), out var pair))
@@ -1320,9 +1322,10 @@ public sealed class SparseAdamOptimizer : OptimizerBase
                     }
                     int cap = pair.idx.Length;
                     int k = 0;
-                    for (int i = 0; i < grad.Length; i++)
+                    for (int i = 0; i < p.Length; i++)
                     {
-                        if (grad[i] == 0f) continue;
+                        float gv = grad[gradOffset + i];
+                        if (gv == 0f) continue;
                         if (k == cap)
                         {
                             // Geometric growth — amortised O(1) per insertion.
@@ -1332,7 +1335,7 @@ public sealed class SparseAdamOptimizer : OptimizerBase
                             cap = newCap;
                         }
                         pair.idx[k] = i;
-                        pair.val[k] = grad[i];
+                        pair.val[k] = gv;
                         k++;
                     }
                     _scratch[(gi, pi)] = pair;

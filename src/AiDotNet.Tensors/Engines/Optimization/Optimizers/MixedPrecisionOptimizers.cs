@@ -256,32 +256,37 @@ public sealed class FP8LionOptimizer : OptimizerBase
                 // the scale only moves when needed) BEFORE any moment is written, so each one is quantized once,
                 // against the scale it is stored with: encoding against the old scale first would clamp a moment
                 // that outgrew it, and re-encoding the clamped byte would keep the clamp.
-                var gb = DenseGradient(gi, pi, p);
-                var grad = gb.Span;
-                float newMaxAbsD = 0f;
-                for (int i = 0; i < p.Length; i++)
+                // One decode pass applies the update and stages the new moments at full precision (pooled scratch,
+                // released before the next parameter); the encode pass then quantizes each once against its scale.
+                var grad = DenseGradient(gi, pi, p).Span;
+                var staged = System.Buffers.ArrayPool<float>.Shared.Rent(p.Length);
+                try
                 {
-                    float mFp32 = E4M3ToFloat(ReadFp8(packed, i)) * scale;
-                    float absM = MathF.Abs(b2 * mFp32 + (1f - b2) * grad[i]);
-                    if (absM > newMaxAbsD) newMaxAbsD = absM;
+                    float newMaxAbsD = 0f;
+                    for (int i = 0; i < p.Length; i++)
+                    {
+                        float mFp32 = E4M3ToFloat(ReadFp8(packed, i)) * scale;
+
+                        float c = b1 * mFp32 + (1f - b1) * grad[i];
+                        float signC = c > 0f ? 1f : (c < 0f ? -1f : 0f);
+                        p[i] -= lr * (signC + wd * p[i]);
+
+                        float mNew = b2 * mFp32 + (1f - b2) * grad[i];
+                        staged[i] = mNew;
+                        float absM = MathF.Abs(mNew);
+                        if (absM > newMaxAbsD) newMaxAbsD = absM;
+                    }
+                    float storeScale = scale;
+                    if (newMaxAbsD > fp8Max * scale * 0.95f || newMaxAbsD < fp8Max * scale * 0.1f)
+                    {
+                        storeScale = newMaxAbsD > 0 ? newMaxAbsD / (fp8Max * 0.5f) : 1f;
+                        slot["m_scale"].FloatValue = storeScale;
+                    }
+                    for (int i = 0; i < p.Length; i++) WriteFp8(packed, i, FloatToE4M3(staged[i] / storeScale));
                 }
-                float storeScale = scale;
-                if (newMaxAbsD > fp8Max * scale * 0.95f || newMaxAbsD < fp8Max * scale * 0.1f)
+                finally
                 {
-                    storeScale = newMaxAbsD > 0 ? newMaxAbsD / (fp8Max * 0.5f) : 1f;
-                    slot["m_scale"].FloatValue = storeScale;
-                }
-
-                for (int i = 0; i < p.Length; i++)
-                {
-                    float mFp32 = E4M3ToFloat(ReadFp8(packed, i)) * scale;
-
-                    float c = b1 * mFp32 + (1f - b1) * grad[i];
-                    float signC = c > 0f ? 1f : (c < 0f ? -1f : 0f);
-                    p[i] -= lr * (signC + wd * p[i]);
-
-                    float mNew = b2 * mFp32 + (1f - b2) * grad[i];
-                    WriteFp8(packed, i, FloatToE4M3(mNew / storeScale));
+                    System.Buffers.ArrayPool<float>.Shared.Return(staged);
                 }
             }
         }
