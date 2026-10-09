@@ -1,6 +1,6 @@
 {
   "torchVersion": "2.11.0",
-  "gapBaseline": 646,
+  "gapBaseline": 578,
   "entries": {
     "Tensor:abs": {
       "status": "mapped",
@@ -98,8 +98,9 @@
       "source": "name-match"
     },
     "Tensor:adjoint": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601::TransposeLast2D",
+      "source": "reviewed"
     },
     "Tensor:align_as": {
       "status": "not-applicable",
@@ -233,16 +234,18 @@
       "source": "reviewed"
     },
     "Tensor:as_strided": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::StridedGather",
+      "source": "reviewed"
     },
     "Tensor:as_strided_": {
       "status": "gap",
       "source": "name-match"
     },
     "Tensor:as_strided_scatter": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::StridedScatter",
+      "source": "reviewed"
     },
     "Tensor:as_subclass": {
       "status": "not-applicable",
@@ -404,8 +407,9 @@
       "source": "name-match"
     },
     "Tensor:ccol_indices": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.SparseTensor\u00601::ColumnPointers",
+      "source": "reviewed"
     },
     "Tensor:cdouble": {
       "status": "mapped",
@@ -496,12 +500,14 @@
       "source": "name-match"
     },
     "Tensor:coalesce": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.SparseTensor\u00601::Coalesce",
+      "source": "reviewed"
     },
     "Tensor:col_indices": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.SparseTensor\u00601::ColumnIndices",
+      "source": "reviewed"
     },
     "Tensor:conj": {
       "status": "mapped",
@@ -579,8 +585,9 @@
       "source": "name-match"
     },
     "Tensor:crow_indices": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.SparseTensor\u00601::RowPointers",
+      "source": "reviewed"
     },
     "Tensor:cuda": {
       "status": "not-applicable",
@@ -635,8 +642,9 @@
       "source": "reviewed"
     },
     "Tensor:dequantize": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A PyTorch eager-quantization (qtensor) entry point; Tensors' quantization is the int8/fp8 kernels (Int8RowScaled, QuantizedGemm), not qtensors.",
+      "source": "reviewed"
     },
     "Tensor:det": {
       "status": "mapped",
@@ -1007,8 +1015,9 @@
       "source": "reviewed"
     },
     "Tensor:hardshrink": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.NN.Activations.Activations::Hardshrink",
+      "source": "reviewed"
     },
     "Tensor:has_names": {
       "status": "not-applicable",
@@ -1540,8 +1549,9 @@
       "source": "name-match"
     },
     "Tensor:maximum": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorMax",
+      "source": "reviewed"
     },
     "Tensor:mean": {
       "status": "mapped",
@@ -1559,8 +1569,9 @@
       "source": "name-match"
     },
     "Tensor:minimum": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorMin",
+      "source": "reviewed"
     },
     "Tensor:mm": {
       "status": "mapped",
@@ -1791,8 +1802,9 @@
       "source": "reviewed"
     },
     "Tensor:orgqr": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::HouseholderProduct",
+      "source": "reviewed"
     },
     "Tensor:ormqr": {
       "status": "gap",
@@ -2068,8 +2080,9 @@
       "source": "name-match"
     },
     "Tensor:row_indices": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.SparseTensor\u00601::RowIndices",
+      "source": "reviewed"
     },
     "Tensor:rsqrt": {
       "status": "mapped",
@@ -2196,8 +2209,9 @@
       "source": "reviewed-alias"
     },
     "Tensor:slice_inverse": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorSliceScatter",
+      "source": "reviewed"
     },
     "Tensor:slice_scatter": {
       "status": "mapped",
@@ -2369,8 +2383,9 @@
       "source": "name-match"
     },
     "Tensor:symeig": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::Eigh",
+      "source": "reviewed"
     },
     "Tensor:t": {
       "status": "mapped",
@@ -2426,8 +2441,9 @@
       "source": "name-match"
     },
     "Tensor:to_dense": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.SparseTensor\u00601::ToDense",
+      "source": "reviewed"
     },
     "Tensor:to_mkldnn": {
       "status": "not-applicable",
@@ -2439,28 +2455,34 @@
       "source": "name-match"
     },
     "Tensor:to_sparse": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.SparseTensor\u00601::FromDense",
+      "source": "reviewed"
     },
     "Tensor:to_sparse_bsc": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.SparseTensor\u00601::ToBsc",
+      "source": "reviewed"
     },
     "Tensor:to_sparse_bsr": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.SparseTensor\u00601::ToBsr",
+      "source": "reviewed"
     },
     "Tensor:to_sparse_coo": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.SparseTensor\u00601::FromDense",
+      "source": "reviewed"
     },
     "Tensor:to_sparse_csc": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.SparseTensor\u00601::ToCsc",
+      "source": "reviewed"
     },
     "Tensor:to_sparse_csr": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.SparseTensor\u00601::ToCsr",
+      "source": "reviewed"
     },
     "Tensor:tolist": {
       "status": "not-applicable",
@@ -2487,8 +2509,9 @@
       "source": "name-match"
     },
     "Tensor:triangular_solve": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::SolveTriangular",
+      "source": "reviewed"
     },
     "Tensor:tril": {
       "status": "mapped",
@@ -2596,8 +2619,9 @@
       "source": "reviewed"
     },
     "Tensor:values": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.SparseTensor\u00601::Values",
+      "source": "reviewed"
     },
     "Tensor:var": {
       "status": "mapped",
@@ -2605,8 +2629,9 @@
       "source": "name-match"
     },
     "Tensor:vdot": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorInner",
+      "source": "reviewed"
     },
     "Tensor:view": {
       "status": "mapped",
@@ -2757,8 +2782,9 @@
       "source": "name-match"
     },
     "aten:affine_grid_generator": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::AffineGrid",
+      "source": "reviewed"
     },
     "aten:alias": {
       "status": "not-applicable",
@@ -2882,8 +2908,9 @@
       "source": "name-match"
     },
     "aten:as_strided": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::StridedGather",
+      "source": "reviewed"
     },
     "aten:as_strided_": {
       "status": "gap",
@@ -2895,8 +2922,9 @@
       "source": "reviewed"
     },
     "aten:as_strided_scatter": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::StridedScatter",
+      "source": "reviewed"
     },
     "aten:asin": {
       "status": "mapped",
@@ -2995,8 +3023,9 @@
       "source": "name-match"
     },
     "aten:binary_cross_entropy_with_logits": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorBCEWithLogitsLoss",
+      "source": "reviewed"
     },
     "aten:bincount": {
       "status": "mapped",
@@ -3166,8 +3195,9 @@
       "source": "name-match"
     },
     "aten:col2im": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Fold",
+      "source": "reviewed"
     },
     "aten:complex": {
       "status": "gap",
@@ -3188,8 +3218,9 @@
       "source": "name-match"
     },
     "aten:constant_pad_nd": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorConstantPad",
+      "source": "reviewed"
     },
     "aten:conv2d": {
       "status": "mapped",
@@ -3920,8 +3951,9 @@
       "source": "name-match"
     },
     "aten:im2col": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Unfold",
+      "source": "reviewed"
     },
     "aten:imag": {
       "status": "gap",
@@ -4182,8 +4214,9 @@
       "source": "reviewed-alias"
     },
     "aten:linalg_ldl_factor_ex": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::LdlFactor",
+      "source": "reviewed"
     },
     "aten:linalg_ldl_solve": {
       "status": "mapped",
@@ -4196,8 +4229,9 @@
       "source": "reviewed-alias"
     },
     "aten:linalg_lu_factor_ex": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::LuFactor",
+      "source": "reviewed"
     },
     "aten:linalg_lu_solve": {
       "status": "mapped",
@@ -4458,8 +4492,9 @@
       "source": "name-match"
     },
     "aten:maximum": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorMax",
+      "source": "reviewed"
     },
     "aten:mean": {
       "status": "mapped",
@@ -4482,8 +4517,9 @@
       "source": "name-match"
     },
     "aten:minimum": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorMin",
+      "source": "reviewed"
     },
     "aten:miopen_batch_norm": {
       "status": "not-applicable",
@@ -5724,8 +5760,9 @@
       "source": "reviewed"
     },
     "aten:triangular_solve": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::SolveTriangular",
+      "source": "reviewed"
     },
     "aten:tril": {
       "status": "mapped",
@@ -5896,8 +5933,9 @@
       "source": "reviewed-alias"
     },
     "aten:vdot": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorInner",
+      "source": "reviewed"
     },
     "aten:view": {
       "status": "mapped",
@@ -6851,8 +6889,9 @@
       "source": "name-match"
     },
     "nn.functional:binary_cross_entropy_with_logits": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorBCEWithLogitsLoss",
+      "source": "reviewed"
     },
     "nn.functional:boolean_dispatch": {
       "status": "not-applicable",
@@ -7632,12 +7671,14 @@
       "source": "name-match"
     },
     "torch:adjoint": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601::TransposeLast2D",
+      "source": "reviewed"
     },
     "torch:affine_grid_generator": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::AffineGrid",
+      "source": "reviewed"
     },
     "torch:alias_copy": {
       "status": "not-applicable",
@@ -7781,8 +7822,9 @@
       "source": "reviewed"
     },
     "torch:as_strided": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::StridedGather",
+      "source": "reviewed"
     },
     "torch:as_strided_": {
       "status": "gap",
@@ -7794,8 +7836,9 @@
       "source": "reviewed"
     },
     "torch:as_strided_scatter": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::StridedScatter",
+      "source": "reviewed"
     },
     "torch:as_tensor": {
       "status": "mapped",
@@ -7936,8 +7979,9 @@
       "source": "name-match"
     },
     "torch:binary_cross_entropy_with_logits": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorBCEWithLogitsLoss",
+      "source": "reviewed"
     },
     "torch:bincount": {
       "status": "mapped",
@@ -8190,8 +8234,9 @@
       "source": "name-match"
     },
     "torch:constant_pad_nd": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorConstantPad",
+      "source": "reviewed"
     },
     "torch:conv1d": {
       "status": "mapped",
@@ -8368,8 +8413,9 @@
       "source": "name-match"
     },
     "torch:dequantize": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A PyTorch eager-quantization (qtensor) entry point; Tensors' quantization is the int8/fp8 kernels (Int8RowScaled, QuantizedGemm), not qtensors.",
+      "source": "reviewed"
     },
     "torch:det": {
       "status": "mapped",
@@ -8458,8 +8504,9 @@
       "source": "name-match"
     },
     "torch:dsmm": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.SparseTensor\u00601::MatrixMultiply",
+      "source": "reviewed"
     },
     "torch:dsplit": {
       "status": "mapped",
@@ -8506,8 +8553,9 @@
       "source": "reviewed"
     },
     "torch:empty_quantized": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A PyTorch eager-quantization (qtensor) entry point; Tensors' quantization is the int8/fp8 kernels (Int8RowScaled, QuantizedGemm), not qtensors.",
+      "source": "reviewed"
     },
     "torch:empty_strided": {
       "status": "gap",
@@ -8848,8 +8896,9 @@
       "source": "reviewed"
     },
     "torch:get_float32_matmul_precision": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "Tensors' float32 GEMMs always run in float32 (no TF32 downgrade switch); reduced precision is chosen explicitly through the Half/BFloat16 APIs.",
+      "source": "reviewed"
     },
     "torch:get_num_interop_threads": {
       "status": "not-applicable",
@@ -9486,8 +9535,9 @@
       "source": "name-match"
     },
     "torch:maximum": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorMax",
+      "source": "reviewed"
     },
     "torch:mean": {
       "status": "mapped",
@@ -9515,8 +9565,9 @@
       "source": "name-match"
     },
     "torch:minimum": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorMin",
+      "source": "reviewed"
     },
     "torch:miopen_batch_norm": {
       "status": "not-applicable",
@@ -9780,8 +9831,9 @@
       "source": "reviewed-alias"
     },
     "torch:orgqr": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::HouseholderProduct",
+      "source": "reviewed"
     },
     "torch:ormqr": {
       "status": "gap",
@@ -9924,16 +9976,19 @@
       "source": "reviewed-alias"
     },
     "torch:quantize_per_channel": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A PyTorch eager-quantization (qtensor) entry point; Tensors' quantization is the int8/fp8 kernels (Int8RowScaled, QuantizedGemm), not qtensors.",
+      "source": "reviewed"
     },
     "torch:quantize_per_tensor": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A PyTorch eager-quantization (qtensor) entry point; Tensors' quantization is the int8/fp8 kernels (Int8RowScaled, QuantizedGemm), not qtensors.",
+      "source": "reviewed"
     },
     "torch:quantize_per_tensor_dynamic": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A PyTorch eager-quantization (qtensor) entry point; Tensors' quantization is the int8/fp8 kernels (Int8RowScaled, QuantizedGemm), not qtensors.",
+      "source": "reviewed"
     },
     "torch:quantized_batch_norm": {
       "status": "not-applicable",
@@ -10304,8 +10359,9 @@
       "source": "reviewed"
     },
     "torch:set_float32_matmul_precision": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "Tensors' float32 GEMMs always run in float32 (no TF32 downgrade switch); reduced precision is chosen explicitly through the Half/BFloat16 APIs.",
+      "source": "reviewed"
     },
     "torch:set_flush_denormal": {
       "status": "not-applicable",
@@ -10390,8 +10446,9 @@
       "source": "reviewed"
     },
     "torch:slice_inverse": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorSliceScatter",
+      "source": "reviewed"
     },
     "torch:slice_scatter": {
       "status": "mapped",
@@ -10418,28 +10475,34 @@
       "source": "name-match"
     },
     "torch:sparse_bsc_tensor": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.SparseTensor\u00601::FromBsc",
+      "source": "reviewed"
     },
     "torch:sparse_bsr_tensor": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.SparseTensor\u00601::FromBsr",
+      "source": "reviewed"
     },
     "torch:sparse_compressed_tensor": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.SparseTensor\u00601",
+      "source": "reviewed"
     },
     "torch:sparse_coo_tensor": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.SparseTensor\u00601",
+      "source": "reviewed"
     },
     "torch:sparse_csc_tensor": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.SparseTensor\u00601::FromCsc",
+      "source": "reviewed"
     },
     "torch:sparse_csr_tensor": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.SparseTensor\u00601::FromCsr",
+      "source": "reviewed"
     },
     "torch:split": {
       "status": "mapped",
@@ -10462,8 +10525,9 @@
       "source": "reviewed"
     },
     "torch:spmm": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.SparseTensor\u00601::MatrixMultiply",
+      "source": "reviewed"
     },
     "torch:sqrt": {
       "status": "mapped",
@@ -10701,8 +10765,9 @@
       "source": "reviewed-alias"
     },
     "torch:triangular_solve": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::SolveTriangular",
+      "source": "reviewed"
     },
     "torch:tril": {
       "status": "mapped",
@@ -10839,8 +10904,9 @@
       "source": "reviewed-alias"
     },
     "torch:vdot": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorInner",
+      "source": "reviewed"
     },
     "torch:view_as_complex": {
       "status": "gap",
@@ -11094,8 +11160,9 @@
       "source": "reviewed-alias"
     },
     "torch.linalg:ldl_factor_ex": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::LdlFactor",
+      "source": "reviewed"
     },
     "torch.linalg:ldl_solve": {
       "status": "mapped",
@@ -11118,8 +11185,9 @@
       "source": "reviewed-alias"
     },
     "torch.linalg:lu_factor_ex": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::LuFactor",
+      "source": "reviewed"
     },
     "torch.linalg:lu_solve": {
       "status": "mapped",
