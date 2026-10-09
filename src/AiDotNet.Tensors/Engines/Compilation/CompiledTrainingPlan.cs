@@ -563,9 +563,20 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 cuda.UploadBufferInPlace(host, buffer);
                 gte.CommitParameterUpdatedOnDevice((Tensor<float>)(object)parameter, buffer, backend, syncPoint: null);
             }
+            else if (buffer.Size >= parameter.Length)
+            {
+                // No in-place host upload on this backend: stage the host values and copy them on the device into the
+                // SAME buffer. Dropping the binding instead made the next forward bind a new buffer while the grouped
+                // optimizer (ConfigureOptimizerFloatGrouped) kept updating the old one, which the commit then made
+                // authoritative again. Queue order puts the copy before any later read of the buffer.
+                var host = (float[])(object)parameter.ToArray();
+                using (var staged = backend.AllocateBuffer(host))
+                    backend.Copy(staged, buffer, parameter.Length);
+                gte.CommitParameterUpdatedOnDevice((Tensor<float>)(object)parameter, buffer, backend, syncPoint: null);
+            }
             else
             {
-                // No in-place upload on this backend: drop the binding so the next forward re-uploads the host values.
+                // The bound buffer is too small for the parameter: drop the binding so the next forward re-uploads.
                 gte.InvalidateResidentWeightBuffer(parameter);
             }
         }
