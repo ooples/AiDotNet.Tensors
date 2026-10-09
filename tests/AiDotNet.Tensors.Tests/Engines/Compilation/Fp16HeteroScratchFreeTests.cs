@@ -60,6 +60,20 @@ public class Fp16HeteroScratchFreeTests
         return (plan.Fp16HeteroOrderForTest, plan.LossOutput);
     }
 
+    // A measurement window a GC landed in is retaken, up to this many times.
+    private const int MaxMeasureAttempts = 5;
+
+    private static double GradNorm(System.Collections.Generic.IEnumerable<System.Collections.Generic.KeyValuePair<Tensor<float>, Tensor<float>>> grads)
+    {
+        double sum = 0;
+        foreach (var kv in grads)
+        {
+            var a = kv.Value.ToArray();
+            for (int i = 0; i < a.Length; i++) sum += (double)a[i] * a[i];
+        }
+        return Math.Sqrt(sum);
+    }
+
     // Run one ISOLATED forward+backward with scratch-free on/off, returning the param-grad L2 norm (correctness
     // fingerprint) and the resident activation-cache bytes right after the backward. Each run captures its OWN
     // fresh graph (distinct tensors) and clears the activation cache first, so the two runs don't share cache
@@ -70,26 +84,27 @@ public class Fp16HeteroScratchFreeTests
         Environment.SetEnvironmentVariable("AIDOTNET_FP16_NO_SCRATCH_FREE", scratchFree ? null : "1");
         try
         {
-            var (order, loss) = CaptureHetero(gpu);
-            gpu.ClearActivationCache(); // isolate this run's cache accounting from the capture + the other run
-            using var plan = MixedPrecisionCompiledPlan.FromCapturedOrder(gpu, order, loss, paging: false);
-            // Replicate the real Step condition: eviction suspended for the whole forward+backward (#226), so
-            // without the scratch-free the per-op backward scratch genuinely accumulates in the cache.
-            gpu.SuspendActivationEviction();
-            try
+            for (int attempt = 1; ; attempt++)
             {
-                plan.Forward();
-                var grads = plan.Backward();
-                double sum = 0;
-                foreach (var kv in grads.Fp32)
+                var (order, loss) = CaptureHetero(gpu);
+                gpu.ClearActivationCache(); // isolate this run's cache accounting from the capture + the other run
+                using var plan = MixedPrecisionCompiledPlan.FromCapturedOrder(gpu, order, loss, paging: false);
+                // Replicate the real Step condition: eviction suspended for the whole forward+backward (#226), so
+                // without the scratch-free the per-op backward scratch genuinely accumulates in the cache.
+                gpu.SuspendActivationEviction();
+                try
                 {
-                    var a = kv.Value.ToArray();
-                    for (int i = 0; i < a.Length; i++) sum += (double)a[i] * a[i];
+                    int collections = GC.CollectionCount(0);
+                    plan.Forward();
+                    var grads = plan.Backward();
+                    long bytes = gpu.CurrentActivationCacheBytes;
+                    // Entries die with their storage, so a GC inside this window frees unreferenced scratch on its own
+                    // and the A/B then measures GC timing instead of the release (net471 showed on=2x off).
+                    if (GC.CollectionCount(0) != collections && attempt < MaxMeasureAttempts) continue;
+                    return (GradNorm(grads.Fp32), bytes);
                 }
-                long bytes = gpu.CurrentActivationCacheBytes;
-                return (Math.Sqrt(sum), bytes);
+                finally { gpu.ResumeActivationEviction(); }
             }
-            finally { gpu.ResumeActivationEviction(); }
         }
         finally { Environment.SetEnvironmentVariable("AIDOTNET_FP16_NO_SCRATCH_FREE", prevEnv); }
     }
@@ -104,28 +119,29 @@ public class Fp16HeteroScratchFreeTests
         Environment.SetEnvironmentVariable("AIDOTNET_FP16_NO_FWD_STORE", store ? null : "1");
         try
         {
-            var (order, loss) = CaptureHetero(gpu);
-            gpu.ClearActivationCache();
-            using var plan = MixedPrecisionCompiledPlan.FromCapturedOrder(gpu, order, loss, paging: false);
-            gpu.SuspendActivationEviction();
-            DirectGpuTensorEngine.TrackOwnedResultBytes = true;
-            gpu.ResetOwnedResultTracking();
-            try
+            for (int attempt = 1; ; attempt++)
             {
-                plan.Forward();
-                // Resident activation storage right after the forward: the activation cache PLUS the results that own
-                // their device buffers (FP32 results are no longer cache entries, so the cache alone undercounts).
-                long bytes = gpu.CurrentActivationCacheBytes + gpu.LiveOwnedResultBytes;
-                var grads = plan.Backward();
-                double sum = 0;
-                foreach (var kv in grads.Fp32)
+                var (order, loss) = CaptureHetero(gpu);
+                gpu.ClearActivationCache();
+                using var plan = MixedPrecisionCompiledPlan.FromCapturedOrder(gpu, order, loss, paging: false);
+                gpu.SuspendActivationEviction();
+                DirectGpuTensorEngine.TrackOwnedResultBytes = true;
+                gpu.ResetOwnedResultTracking();
+                try
                 {
-                    var a = kv.Value.ToArray();
-                    for (int i = 0; i < a.Length; i++) sum += (double)a[i] * a[i];
+                    int collections = GC.CollectionCount(0);
+                    plan.Forward();
+                    // Resident activation storage right after the forward: the activation cache PLUS the results that own
+                    // their device buffers (FP32 results are no longer cache entries, so the cache alone undercounts).
+                    long bytes = gpu.CurrentActivationCacheBytes + gpu.LiveOwnedResultBytes;
+                    // As in RunOnce: a GC inside the window frees entries by itself and skews the A/B.
+                    bool collected = GC.CollectionCount(0) != collections;
+                    var grads = plan.Backward();
+                    if (collected && attempt < MaxMeasureAttempts) continue;
+                    return (GradNorm(grads.Fp32), bytes);
                 }
-                return (Math.Sqrt(sum), bytes);
+                finally { gpu.ResumeActivationEviction(); DirectGpuTensorEngine.TrackOwnedResultBytes = false; }
             }
-            finally { gpu.ResumeActivationEviction(); DirectGpuTensorEngine.TrackOwnedResultBytes = false; }
         }
         finally { Environment.SetEnvironmentVariable("AIDOTNET_FP16_NO_FWD_STORE", prevEnv); }
     }
