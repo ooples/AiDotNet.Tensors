@@ -20,6 +20,31 @@ internal static class OpRegistry
     /// </summary>
     internal static readonly HashSet<string> DifferentiableOps = new(StringComparer.Ordinal)
     {
+        // Activations and index-map ops with their own backward (CpuEngine.TorchMisc)
+        "TensorCelu", "TensorHardtanh", "TensorLogSigmoid", "TensorSoftsign",
+        "TensorRrelu", "TensorMsort", "TensorDiagflat", "TensorDiagonalScatter",
+
+        // Window pooling with its own backward: max routes to the argmax, average splits, Lp scales by
+        // (x/y)^(p-1); unpooling is an index map (CpuEngine.TorchPool)
+        "TensorAdaptiveAvgPool1D", "TensorAdaptiveAvgPool3D", "TensorAdaptiveMaxPool1D", "TensorAdaptiveMaxPool3D",
+        "TensorAdaptiveMaxPoolWithIndices", "TensorMaxPool1DWithIndices", "TensorLpPool", "TensorFractionalMaxPool",
+        "TensorMaxUnpool",
+
+        // Volumetric grid sampling with input and grid adjoints (CpuEngine.TorchGridSample)
+        "TensorGridSample3D",
+
+        // Quantiles: backward to the two order statistics read (CpuEngine.TorchCreation)
+        "TensorQuantile", "TensorNanQuantile",
+
+        // torch.special / element-wise parity ops (backward from the derivative, CpuEngine.TorchSpecial)
+        "TensorErf", "TensorLogit", "TensorSinc", "TensorDeg2Rad",
+        "TensorRad2Deg", "TensorFmax", "TensorFmin", "TensorIgamma",
+        "TensorIgammac", "TensorMvlgamma", "TensorEntr", "TensorErfcx",
+        "TensorNdtr", "TensorLogNdtr", "TensorNdtri", "TensorBesselJ0",
+        "TensorBesselJ1", "TensorBesselY0", "TensorBesselY1", "TensorModifiedBesselI0",
+        "TensorModifiedBesselI1", "TensorModifiedBesselK0", "TensorModifiedBesselK1", "TensorScaledModifiedBesselK0",
+        "TensorScaledModifiedBesselK1", "TensorSphericalBesselJ0", "TensorAiryAi",
+
         // Arithmetic
         "TensorAdd", "TensorSubtract", "TensorMultiply", "TensorDivide",
         "TensorNegate", "TensorAbs", "TensorSign",
@@ -231,6 +256,28 @@ internal static class OpRegistry
     /// </summary>
     internal static readonly HashSet<string> NonDifferentiableOps = new(StringComparer.Ordinal)
     {
+        // Random draws, nonzero_static and unique(dim): constants (CpuEngine.TorchRandom)
+        "TensorBernoulli", "TensorBinomial", "TensorPoisson", "TensorUniform",
+        "TensorCauchy", "TensorExponential", "TensorGeometric", "TensorLogNormal",
+        "TensorMultinomial", "TensorNonzeroStatic", "TensorUniqueDim",
+
+        // Creation, random, window, index and truth-value ops: constants
+        "TensorAll", "TensorAny", "TensorArange", "TensorRange",
+        "TensorLogspace", "TensorZerosLike", "TensorOnesLike", "TensorFullLike",
+        "TensorEmptyLike", "TensorRandLike", "TensorRandnLike", "TensorRandint",
+        "TensorRandintLike", "TensorRandperm", "TensorHannWindow", "TensorHammingWindow",
+        "TensorBlackmanWindow", "TensorBartlettWindow", "TensorKaiserWindow", "TensorTrilIndices",
+        "TensorTriuIndices", "TensorUnravelIndex",
+
+        // Comparisons, indicators, bitwise/integer ops and orthogonal polynomials (PyTorch defines no gradient)
+        "TensorSignbit", "TensorIsPosInf", "TensorIsNegInf", "TensorIsReal",
+        "TensorGreaterEqual", "TensorLessEqual", "TensorHeaviside", "TensorFloorDivide",
+        "TensorGcd", "TensorLcm", "TensorBitwiseAnd", "TensorBitwiseOr",
+        "TensorBitwiseXor", "TensorBitwiseNot", "TensorBitwiseLeftShift", "TensorBitwiseRightShift",
+        "TensorChebyshevPolynomialT", "TensorChebyshevPolynomialU", "TensorChebyshevPolynomialV", "TensorChebyshevPolynomialW",
+        "TensorShiftedChebyshevPolynomialT", "TensorShiftedChebyshevPolynomialU", "TensorShiftedChebyshevPolynomialV", "TensorShiftedChebyshevPolynomialW",
+        "TensorHermitePolynomialH", "TensorHermitePolynomialHe", "TensorLaguerrePolynomialL", "TensorLegendrePolynomialP",
+
         // Comparison (return bool-like tensors, not differentiable)
         "TensorEquals", "TensorNotEquals", "TensorGreaterThan", "TensorLessThan",
         "TensorGreaterOrEqual", "TensorLessOrEqual",
@@ -364,6 +411,10 @@ internal static class OpRegistry
         "STFT", "FFT", "IFFT", "FFT2D", "IFFT2D", "FFTND",
         "GroupNormInto", "ProjectGaussians3DTo2D",
 
+        // Real/complex conversions (CpuEngine.TorchComplex); TensorAngle of a real input is piecewise constant,
+        // so its derivative is zero wherever it exists, as in PyTorch
+        "TensorReal", "TensorImag", "TensorComplex", "TensorViewAsReal", "TensorViewAsComplex", "TensorAngle",
+
         // Native Complex<T> operations (no backward functions implemented yet)
         "NativeComplexFFT", "NativeComplexIFFT", "NativeComplexIFFTReal",
         "NativeComplexMultiply", "NativeComplexConjugate",
@@ -447,6 +498,31 @@ internal static class OpRegistry
     /// </summary>
     internal static readonly HashSet<string> DelegatorOps = new(StringComparer.Ordinal)
     {
+        // Composed from recorded ops (reparameterized normal, constant masks, reshape/permute, matmul, conv, scatter_reduce)
+        "TensorNormal", "TensorAlphaDropout", "TensorFeatureAlphaDropout", "TensorChannelDropout",
+        "TensorBilinear", "TensorChannelShuffle", "TensorPixelUnshuffle", "TensorLocalResponseNorm",
+        "TensorSoftMarginLoss", "TensorRenorm", "TensorNormExceptDim", "TensorGradient",
+        "TensorPadSequence", "TensorIndexReduce", "TensorConvTranspose1D", "TensorConvTbc",
+
+        // Recurrent cells and sequences composed from linear, gate and stack ops (CpuEngine.TorchRnn)
+        "TensorRnnCell", "TensorLstmCell", "TensorGruCell", "TensorRecurrent",
+
+        // General convolution: index-map spread, flip/permute, narrow and Conv2D/Conv3D (CpuEngine.TorchConvolution)
+        "TensorConvolution",
+
+        // Composed from recorded ops (softmax, add/multiply/divide, matmul, batch matmul, reductions)
+        "TensorSoftmin", "TensorRsub", "TensorAddcmul", "TensorAddcdiv",
+        "TensorAddmv", "TensorAddr", "TensorBaddbmm", "TensorAddbmm",
+
+        // Shape and statistics ops composed from recorded ops (narrow, reshape, reductions, matmul, index select)
+        "TensorAmin", "TensorChunk", "TensorSplitWithSizes", "TensorUnflatten",
+        "TensorSelect", "TensorViewAs", "TensorSumToSize", "TensorStdMean",
+        "TensorVarMean", "TensorCov", "TensorCorrcoef", "TensorDiff",
+        "TensorTrapezoid", "TensorCumulativeTrapezoid", "TensorCombinations",
+
+        // Composed from recorded ops (where + ReduceSum / TensorDivide) or the identity
+        "TensorPositive", "TensorNanSum", "TensorNanMean",
+
         // Expressed entirely through tape-connected Unfold/reshape/multiply/reduce primitives.
         "PartialCorrelationVolume",
         // IEngine wrappers that delegate to internal methods
