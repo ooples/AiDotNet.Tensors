@@ -10808,7 +10808,6 @@ KERNEL VARIANTS (A/B testing):
             if (gradAnchor is null) throw new ArgumentNullException(nameof(gradAnchor));
             if (gradOther is null) throw new ArgumentNullException(nameof(gradOther));
 
-            int totalSize = batchSize * embeddingDim;
             var k = _kernelCache["contrastive_loss_backward"];
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)anchor).Buffer.Handle);
@@ -10820,7 +10819,7 @@ KERNEL VARIANTS (A/B testing):
             k.SetArg(arg++, embeddingDim);
             k.SetArg(arg++, margin);
 
-            k.Execute1D(totalSize, Math.Min(256, totalSize));
+            k.Execute1D(batchSize, Math.Min(256, batchSize));   // one work-item per batch row
         }
 
         #endregion
