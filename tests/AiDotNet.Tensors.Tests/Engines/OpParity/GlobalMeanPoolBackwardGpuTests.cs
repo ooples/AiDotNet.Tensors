@@ -45,7 +45,20 @@ public sealed class GlobalMeanPoolBackwardGpuTests
         for (int i = 0; i < gradLen; i++) gradData[i] = i + 1;   // distinct values expose misrouting
         // GlobalMeanPoolBackwardGpu reads gradOutput.Buffer directly, so the gradient must already be
         // GPU-resident — a host tensor throws "Tensor is not GPU-resident".
-        var grad = new Tensor<float>(gradData, new[] { outerCount, innerCount }).Gpu();
+        // Tensor.Gpu places onto AiDotNetEngine.Current's backend. The op runs on the fixture's engine, which has its own
+        // OpenCL context, so a buffer placed while another test's engine was Current failed its launch with
+        // CL_INVALID_CONTEXT (-34): the test passed alone and failed in a full run.
+        Tensor<float> grad;
+        var previous = AiDotNetEngine.Current;
+        AiDotNetEngine.Current = gpu;
+        try
+        {
+            grad = new Tensor<float>(gradData, new[] { outerCount, innerCount }).Gpu();
+        }
+        finally
+        {
+            AiDotNetEngine.Current = previous;
+        }
 
         using var result = ((DirectGpuTensorEngine)gpu).GlobalMeanPoolBackwardGpu(grad, inputShape);
         var actual = result.ToArray();
