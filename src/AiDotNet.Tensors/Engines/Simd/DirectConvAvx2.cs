@@ -53,13 +53,12 @@ internal static class DirectConvAvx2
     public static bool IsSupported => false;
 #endif
 
-    // Interleaved A/B on a 3950X (batch 8, ResNet-18 shapes): the direct kernels lose to the existing routes on 1x1
-    // kernels (64->128 stride 2: 0.46 ms forward against 0.58) and on stride-1 planes past 16x16 (64 channels on
-    // 32x32, where Winograd, the transposed-conv input gradient and the 3x3 kernel-gradient kernel run 1.2 ms against
-    // 1.4-1.6). They win on strided 3x3 convs (64->128 stride 2: forward 2.3 -> 0.8, dX 2.8 -> 1.0, dW 2.8 -> 1.1 ms)
-    // and on small planes (512 channels on 4x4: dX 2.5 -> 1.6, dW 4.2 -> 1.4 ms).
-    private const int MaxStride1PlanePositions = 256;
-
+    // Interleaved A/B on a 3950X (batch 8, ResNet-18 shapes), existing route -> direct, after the register-tile and
+    // L1-chunking work: the direct kernels win every 3x3 pass up to 32x32 planes (64 channels on 32x32: forward 1.42
+    // -> 1.29, dX 1.41 -> 1.18, dW 1.23 -> 1.10 ms; 64->128 stride 2: forward 2.2 -> 0.75, dX 2.5 -> 0.92, dW 2.8 ->
+    // 0.88 ms; 512 channels on 4x4: dW 4.4 -> 1.0 ms) and lose on 1x1 kernels (64->128 stride 2: forward 0.46 -> 0.58).
+    // Larger planes stay on the Winograd / implicit-GEMM routes until measured.
+    private const int MaxStride1PlanePositions = 1024;
     // A strided input gradient runs one stride-1 conv per phase over a grid of (H/stride) x (W/stride); below this
     // many grid positions per image the tiles are too short (256->512 stride 2 on 8x8, a 4x4 grid: 1.2 ms -> 1.4).
     private const int MinStridedPhasePositions = 64;
@@ -111,6 +110,9 @@ internal static class DirectConvAvx2
     public static bool DefaultChoosesDirect(in DirectConvShape shape)
     {
         if (shape.Batch < 2 || shape.KernelHeight * shape.KernelWidth == 1) return false;
+        // A partial input-channel block (an image stem) wastes most of the forward tile; measured slower on 32x32
+        // (3 channels: 0.30 ms existing, 0.41 direct), so it is left to tuning.
+        if (shape.Pass == DirectConvPass.Forward && shape.InChannels % Block != 0) return false;
         bool strided = shape.StrideH > 1 || shape.StrideW > 1;
         int plane = shape.Pass == DirectConvPass.BackwardInput
             ? shape.Height * shape.Width
@@ -631,12 +633,13 @@ internal static class DirectConvAvx2
     private const int KernelGradPositionChunk = 256;
 
     /// <summary>
-    /// One (output block, input block) pair of dW. For each kernel row the tile is 3 kernel columns x 4 input
-    /// channels = 12 accumulators, each a vector over the block's 8 output channels; per position that is one
-    /// gradient load, 12 broadcasts and 12 FMAs (oneDNN's avx2 backward-weights blocking). Positions are swept in
-    /// L1-sized chunks, every tile pass running over a chunk before the next, with the tiles' accumulators parked in
-    /// a small stack buffer between chunks: a whole-plane sweep per pass re-streamed the gradient and input from L2
-    /// once per tile pass (six times for a 3x3 kernel).
+    /// One (output block, input block) pair of dW. For each kernel row the tile is 4 output channels x 3 kernel
+    /// columns = 12 accumulators, each a vector over the block's 8 input channels. Per position that is 3 contiguous
+    /// input loads (one per column: the blocked layout keeps a tap's 8 channels together), 4 gradient broadcasts and
+    /// 12 FMAs. Vectorising over output channels instead needed 12 scalar input broadcasts per position (13 loads per
+    /// 12 FMAs), which left the kernel load-bound. Positions are swept in L1-sized chunks, every pass (kernel row x
+    /// column group x output-channel half) running over a chunk before the next, with each pass's accumulators parked
+    /// in a small stack buffer between chunks: a whole-plane sweep per pass re-streamed the operands from L2.
     /// </summary>
     private static unsafe void BackwardKernelTile(float[] packedInput, float[] packedGrad, int[] offsets, float[] dest, int destOffset,
         bool accumulate, int ob, int ib, int batch, int inChannels, int outBlocks, int paddedW, int planeIn,
@@ -667,68 +670,64 @@ internal static class DirectConvAvx2
                         for (int x0 = 0; x0 < kernelWidth; x0 += 3)
                         {
                             int columns = Math.Min(3, kernelWidth - x0);
-                            for (int c0 = 0; c0 < Block; c0 += 4, pass++)
+                            for (int o0 = 0; o0 < Block; o0 += 4, pass++)
                             {
+                                // Accumulator (j, k): output channel o0+j, kernel column x0+k; lanes = input channels.
                                 float* park = parked + pass * AccumulatorsPerPass * Block;
-                                var a00 = Avx.LoadVector256(park); var a01 = Avx.LoadVector256(park + 8);
-                                var a02 = Avx.LoadVector256(park + 16); var a03 = Avx.LoadVector256(park + 24);
-                                var a10 = Avx.LoadVector256(park + 32); var a11 = Avx.LoadVector256(park + 40);
-                                var a12 = Avx.LoadVector256(park + 48); var a13 = Avx.LoadVector256(park + 56);
-                                var a20 = Avx.LoadVector256(park + 64); var a21 = Avx.LoadVector256(park + 72);
-                                var a22 = Avx.LoadVector256(park + 80); var a23 = Avx.LoadVector256(park + 88);
-                                float* xTap = xb + (y * dilationH * paddedW + x0 * dilationW) * Block + c0;
-                                float* gq = gImage + q0 * Block;
+                                var a00 = Avx.LoadVector256(park); var a01 = Avx.LoadVector256(park + 8); var a02 = Avx.LoadVector256(park + 16);
+                                var a10 = Avx.LoadVector256(park + 24); var a11 = Avx.LoadVector256(park + 32); var a12 = Avx.LoadVector256(park + 40);
+                                var a20 = Avx.LoadVector256(park + 48); var a21 = Avx.LoadVector256(park + 56); var a22 = Avx.LoadVector256(park + 64);
+                                var a30 = Avx.LoadVector256(park + 72); var a31 = Avx.LoadVector256(park + 80); var a32 = Avx.LoadVector256(park + 88);
+                                float* xTap = xb + (y * dilationH * paddedW + x0 * dilationW) * Block;
+                                float* gq = gImage + q0 * Block + o0;
                                 if (columns == 3)
                                 {
                                     for (int q = q0; q < q1; q++, gq += Block)
                                     {
-                                        var gv = Avx.LoadVector256(gq);
                                         float* xs = xTap + oImage[q];
-                                        a00 = Fma.MultiplyAdd(Vector256.Create(xs[0]), gv, a00);
-                                        a01 = Fma.MultiplyAdd(Vector256.Create(xs[1]), gv, a01);
-                                        a02 = Fma.MultiplyAdd(Vector256.Create(xs[2]), gv, a02);
-                                        a03 = Fma.MultiplyAdd(Vector256.Create(xs[3]), gv, a03);
-                                        float* xs1 = xs + step;
-                                        a10 = Fma.MultiplyAdd(Vector256.Create(xs1[0]), gv, a10);
-                                        a11 = Fma.MultiplyAdd(Vector256.Create(xs1[1]), gv, a11);
-                                        a12 = Fma.MultiplyAdd(Vector256.Create(xs1[2]), gv, a12);
-                                        a13 = Fma.MultiplyAdd(Vector256.Create(xs1[3]), gv, a13);
-                                        float* xs2 = xs1 + step;
-                                        a20 = Fma.MultiplyAdd(Vector256.Create(xs2[0]), gv, a20);
-                                        a21 = Fma.MultiplyAdd(Vector256.Create(xs2[1]), gv, a21);
-                                        a22 = Fma.MultiplyAdd(Vector256.Create(xs2[2]), gv, a22);
-                                        a23 = Fma.MultiplyAdd(Vector256.Create(xs2[3]), gv, a23);
+                                        var x0v = Avx.LoadVector256(xs);
+                                        var x1v = Avx.LoadVector256(xs + step);
+                                        var x2v = Avx.LoadVector256(xs + 2 * step);
+                                        var g0 = Vector256.Create(gq[0]);
+                                        a00 = Fma.MultiplyAdd(x0v, g0, a00); a01 = Fma.MultiplyAdd(x1v, g0, a01); a02 = Fma.MultiplyAdd(x2v, g0, a02);
+                                        var g1 = Vector256.Create(gq[1]);
+                                        a10 = Fma.MultiplyAdd(x0v, g1, a10); a11 = Fma.MultiplyAdd(x1v, g1, a11); a12 = Fma.MultiplyAdd(x2v, g1, a12);
+                                        var g2 = Vector256.Create(gq[2]);
+                                        a20 = Fma.MultiplyAdd(x0v, g2, a20); a21 = Fma.MultiplyAdd(x1v, g2, a21); a22 = Fma.MultiplyAdd(x2v, g2, a22);
+                                        var g3 = Vector256.Create(gq[3]);
+                                        a30 = Fma.MultiplyAdd(x0v, g3, a30); a31 = Fma.MultiplyAdd(x1v, g3, a31); a32 = Fma.MultiplyAdd(x2v, g3, a32);
                                     }
                                 }
                                 else
                                 {
                                     for (int q = q0; q < q1; q++, gq += Block)
                                     {
-                                        var gv = Avx.LoadVector256(gq);
                                         float* xs = xTap + oImage[q];
-                                        a00 = Fma.MultiplyAdd(Vector256.Create(xs[0]), gv, a00);
-                                        a01 = Fma.MultiplyAdd(Vector256.Create(xs[1]), gv, a01);
-                                        a02 = Fma.MultiplyAdd(Vector256.Create(xs[2]), gv, a02);
-                                        a03 = Fma.MultiplyAdd(Vector256.Create(xs[3]), gv, a03);
-                                        if (columns > 1)
-                                        {
-                                            float* xs1 = xs + step;
-                                            a10 = Fma.MultiplyAdd(Vector256.Create(xs1[0]), gv, a10);
-                                            a11 = Fma.MultiplyAdd(Vector256.Create(xs1[1]), gv, a11);
-                                            a12 = Fma.MultiplyAdd(Vector256.Create(xs1[2]), gv, a12);
-                                            a13 = Fma.MultiplyAdd(Vector256.Create(xs1[3]), gv, a13);
-                                        }
+                                        var x0v = Avx.LoadVector256(xs);
+                                        var x1v = columns > 1 ? Avx.LoadVector256(xs + step) : Vector256<float>.Zero;
+                                        var g0 = Vector256.Create(gq[0]);
+                                        a00 = Fma.MultiplyAdd(x0v, g0, a00); a01 = Fma.MultiplyAdd(x1v, g0, a01);
+                                        var g1 = Vector256.Create(gq[1]);
+                                        a10 = Fma.MultiplyAdd(x0v, g1, a10); a11 = Fma.MultiplyAdd(x1v, g1, a11);
+                                        var g2 = Vector256.Create(gq[2]);
+                                        a20 = Fma.MultiplyAdd(x0v, g2, a20); a21 = Fma.MultiplyAdd(x1v, g2, a21);
+                                        var g3 = Vector256.Create(gq[3]);
+                                        a30 = Fma.MultiplyAdd(x0v, g3, a30); a31 = Fma.MultiplyAdd(x1v, g3, a31);
                                     }
                                 }
-                                Avx.Store(park, a00); Avx.Store(park + 8, a01); Avx.Store(park + 16, a02); Avx.Store(park + 24, a03);
-                                Avx.Store(park + 32, a10); Avx.Store(park + 40, a11); Avx.Store(park + 48, a12); Avx.Store(park + 56, a13);
-                                Avx.Store(park + 64, a20); Avx.Store(park + 72, a21); Avx.Store(park + 80, a22); Avx.Store(park + 88, a23);
+                                Avx.Store(park, a00); Avx.Store(park + 8, a01); Avx.Store(park + 16, a02);
+                                Avx.Store(park + 24, a10); Avx.Store(park + 32, a11); Avx.Store(park + 40, a12);
+                                Avx.Store(park + 48, a20); Avx.Store(park + 56, a21); Avx.Store(park + 64, a22);
+                                Avx.Store(park + 72, a30); Avx.Store(park + 80, a31); Avx.Store(park + 88, a32);
                             }
                         }
                     }
                 }
             }
 
+            // dW[ob*8 + o0 + j, ib*8 + lane, y, x0 + k] = lane of accumulator (j, k); padded input lanes are dropped.
+            int taps = kernelHeight * kernelWidth;
+            int laneCount = Math.Min(Block, inChannels - ib * Block);
             float* d = pd + destOffset;
             int passIndex = 0;
             for (int y = 0; y < kernelHeight; y++)
@@ -736,35 +735,26 @@ internal static class DirectConvAvx2
                 for (int x0 = 0; x0 < kernelWidth; x0 += 3)
                 {
                     int columns = Math.Min(3, kernelWidth - x0);
-                    for (int c0 = 0; c0 < Block; c0 += 4, passIndex++)
+                    for (int o0 = 0; o0 < Block; o0 += 4, passIndex++)
                     {
                         float* park = parked + passIndex * AccumulatorsPerPass * Block;
-                        int i0 = ib * Block + c0;
-                        for (int column = 0; column < columns; column++)
+                        for (int j = 0; j < 4; j++)
                         {
-                            float* col = park + column * 4 * Block;
-                            StoreKernelColumn(d, accumulate, ob, i0, x0 + column, y, inChannels, kernelHeight, kernelWidth,
-                                Avx.LoadVector256(col), Avx.LoadVector256(col + 8), Avx.LoadVector256(col + 16), Avx.LoadVector256(col + 24));
+                            float* row = d + ((long)(ob * Block + o0 + j) * inChannels + ib * Block) * taps + y * kernelWidth + x0;
+                            for (int k = 0; k < columns; k++)
+                            {
+                                float* acc = park + (j * 3 + k) * Block;
+                                float* target = row + k;
+                                if (accumulate)
+                                    for (int lane = 0; lane < laneCount; lane++) target[(long)lane * taps] += acc[lane];
+                                else
+                                    for (int lane = 0; lane < laneCount; lane++) target[(long)lane * taps] = acc[lane];
+                            }
                         }
                     }
                 }
             }
         }
-    }
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static unsafe void StoreKernelColumn(float* d, bool accumulate, int ob, int i0, int x, int y,
-        int inChannels, int kernelHeight, int kernelWidth,
-        Vector256<float> c0, Vector256<float> c1, Vector256<float> c2, Vector256<float> c3)
-    {
-        int taps = kernelHeight * kernelWidth;
-        float* tap = d + y * kernelWidth + x;
-        // Lane l of input channel i0+c is dW[ob*8+l, i0+c, y, x].
-        long laneStride = (long)inChannels * taps;
-        float* o = tap + ((long)ob * Block * inChannels + i0) * taps;
-        StoreLanes(o, (int)laneStride, accumulate, c0);
-        StoreLanes(o + taps, (int)laneStride, accumulate, c1);
-        StoreLanes(o + 2 * taps, (int)laneStride, accumulate, c2);
-        StoreLanes(o + 3 * taps, (int)laneStride, accumulate, c3);
     }
 #endif
 }
