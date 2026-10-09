@@ -64,6 +64,9 @@ public sealed class SimdGemmSplitKTests
         AssertClose(Reference(a, b, c0, m, k, n), acc, k, $"accumulate {m}x{k}x{n}");
     }
 
+    // BitConverter.SingleToInt32Bits is not on .NET Framework 4.7.1.
+    private static int Bits(float v) => BitConverter.ToInt32(BitConverter.GetBytes(v), 0);
+
     [Fact]
     public void SplitK_IsBitIdentical_AcrossThreadBudgets()
     {
@@ -90,7 +93,7 @@ public sealed class SimdGemmSplitKTests
             {
                 var other = Run(threads);
                 for (int i = 0; i < baseline.Length; i++)
-                    Assert.True(BitConverter.SingleToInt32Bits(baseline[i]) == BitConverter.SingleToInt32Bits(other[i]),
+                    Assert.True(Bits(baseline[i]) == Bits(other[i]),
                         $"[{i}] at {threads} threads: {other[i]:R} vs {baseline[i]:R}");
             }
         }
