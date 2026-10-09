@@ -332,14 +332,15 @@ public partial class CpuEngine
     // (Σ |x|^p over axes)^(1/p), recorded. |x|^p is a power, not exp(p·log|x|), so a zero element has a zero
     // derivative (p > 1) instead of 0·∞. The root of a zero sum has an infinite derivative, so zero sums are
     // shifted to 1 inside the root and back out after it (a constant mask): the norm stays 0 and, as in PyTorch's
-    // norm backward, its gradient is 0 rather than NaN.
+    // norm backward, its gradient is 0 rather than NaN. The mask is 1 - sign(sum) (the sum is never negative), a recorded
+    // op with a zero gradient: reading the sum back to build it was a host copy of a device result, and under graph
+    // capture it read the lazy placeholder.
     private Tensor<T> PNorm<T>(Tensor<T> x, double p, int[] axes, bool keepDims)
     {
         var ops = MathHelper.GetNumericOperations<T>();
         if (p == 1) return ReduceSum(TensorAbs(x), axes, keepDims);
         var sum = ReduceSum(p == 2 ? TensorSquare(x) : TensorPow(TensorAbs(x), ops.FromDouble(p)), axes, keepDims);
-        var sums = (sum.IsContiguous ? sum : sum.Contiguous()).AsSpan().ToArray();
-        var zeroMask = FromDoubles<T>((int[])sum._shape.Clone(), i => ops.ToDouble(sums[i]) == 0 ? 1.0 : 0.0);
+        var zeroMask = ScalarMinusTensor(ops.One, TensorSign(sum));
         var shifted = TensorAdd(sum, zeroMask);
         var root = p == 2 ? TensorSqrt(shifted) : TensorPow(shifted, ops.FromDouble(1 / p));
         return TensorSubtract(root, zeroMask);

@@ -139,6 +139,33 @@ public class TorchRandomOpsTests
     }
 
     [Fact]
+    public void NormExceptDim_CompiledReplay_FollowsTheCurrentZeroRows()
+    {
+        // The zero-sum mask must be a recorded op. Built from a host read of the sum at trace time, it was a frozen
+        // constant: a compiled replay whose zero rows moved kept the trace-time mask and shifted the norms.
+        var v = Values(new[] { 3, 3 }, 0, 0, 0, 1, -2, 0.5, 0, 3, -1);
+        var weights = Values(new[] { 3, 1 }, 1, 2, 3);
+        AiDotNet.Tensors.Engines.Compilation.ICompiledTrainingPlan<double> plan;
+        using (var scope = AiDotNet.Tensors.Engines.Compilation.GraphMode.Enable())
+        {
+            _engine.ReduceSum(_engine.TensorMultiply(_engine.TensorNormExceptDim(v, 3, 0), weights), null, false);
+            plan = scope.CompileTraining(new[] { v });
+        }
+        using (plan)
+        {
+            plan.ConfigureOptimizer(AiDotNet.Tensors.Engines.Compilation.OptimizerType.SGD, learningRate: 0.0);
+            // Row norms 0, 2.0897, 3.0366: loss = 0*1 + 2.0897*2 + 3.0366*3.
+            Assert.Equal(2.089669598190616 * 2 + 3.0365889718756622 * 3, plan.Step().ToArray()[0], 9);
+
+            // Move the zero row: row 0 becomes (1, -2, 0.5) and row 1 becomes zero.
+            var span = v.AsWritableSpan();
+            double[] next = { 1, -2, 0.5, 0, 0, 0, 0, 3, -1 };
+            for (int i = 0; i < next.Length; i++) span[i] = next[i];
+            v.IncrementVersion();
+            Assert.Equal(2.089669598190616 * 1 + 3.0365889718756622 * 3, plan.Step().ToArray()[0], 9);
+        }
+    }
+    [Fact]
     public void Binomial_RejectsAFractionalCount()
         => Assert.Throws<ArgumentOutOfRangeException>(() =>
             _engine.TensorBinomial(Values(new[] { 2 }, 3, 2.5), Values(new[] { 2 }, 0.5, 0.5), seed: 1));
