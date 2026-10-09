@@ -194,7 +194,10 @@ public sealed partial class CudaBackend
     {
         using var _ = PushContext();
         // Its own lock: a gate runs under its slot's lock, and slot creation (which may register external
-        // artifacts into other slots) runs under _tunedSlotsLock, so sharing that lock here could deadlock.
+        // artifacts into other slots) runs under _tunedSlotsLock, so sharing that lock here could deadlock. It covers
+        // the whole measurement, not only the events' creation: gates of different slots tuning concurrently would
+        // otherwise record over each other's start/end events and read each other's elapsed time. Nothing acquires a
+        // slot lock while holding it (run launches a candidate kernel), so the order slot lock -> this lock is safe.
         lock (_tuneEventLock)
         {
             if (_tuneStartEvent == IntPtr.Zero)
@@ -202,21 +205,24 @@ public sealed partial class CudaBackend
                 CuBlasNative.CheckCudaResult(CudaNativeBindings.cuEventCreate(out _tuneStartEvent, 0), "cuEventCreate(tune)");
                 CuBlasNative.CheckCudaResult(CudaNativeBindings.cuEventCreate(out _tuneEndEvent, 0), "cuEventCreate(tune)");
             }
+            CuBlasNative.CheckCudaResult(CudaNativeBindings.cuEventRecord(_tuneStartEvent, _stream), "cuEventRecord(tune)");
+            for (int i = 0; i < repetitions; i++) run();
+            CuBlasNative.CheckCudaResult(CudaNativeBindings.cuEventRecord(_tuneEndEvent, _stream), "cuEventRecord(tune)");
+            CuBlasNative.CheckCudaResult(CudaNativeBindings.cuEventSynchronize(_tuneEndEvent), "cuEventSynchronize(tune)");
+            CuBlasNative.CheckCudaResult(
+                CudaNativeBindings.cuEventElapsedTime(out float ms, _tuneStartEvent, _tuneEndEvent), "cuEventElapsedTime(tune)");
+            return ms;
         }
-        CuBlasNative.CheckCudaResult(CudaNativeBindings.cuEventRecord(_tuneStartEvent, _stream), "cuEventRecord(tune)");
-        for (int i = 0; i < repetitions; i++) run();
-        CuBlasNative.CheckCudaResult(CudaNativeBindings.cuEventRecord(_tuneEndEvent, _stream), "cuEventRecord(tune)");
-        CuBlasNative.CheckCudaResult(CudaNativeBindings.cuEventSynchronize(_tuneEndEvent), "cuEventSynchronize(tune)");
-        CuBlasNative.CheckCudaResult(
-            CudaNativeBindings.cuEventElapsedTime(out float ms, _tuneStartEvent, _tuneEndEvent), "cuEventElapsedTime(tune)");
-        return ms;
     }
 
     private void DisposeTunedKernelResources()
     {
         DisposeExternalKernelModules();
-        if (_tuneStartEvent != IntPtr.Zero) { try { CudaNativeBindings.cuEventDestroy(_tuneStartEvent); } catch { } _tuneStartEvent = IntPtr.Zero; }
-        if (_tuneEndEvent != IntPtr.Zero) { try { CudaNativeBindings.cuEventDestroy(_tuneEndEvent); } catch { } _tuneEndEvent = IntPtr.Zero; }
+        lock (_tuneEventLock)
+        {
+            if (_tuneStartEvent != IntPtr.Zero) { try { CudaNativeBindings.cuEventDestroy(_tuneStartEvent); } catch { } _tuneStartEvent = IntPtr.Zero; }
+            if (_tuneEndEvent != IntPtr.Zero) { try { CudaNativeBindings.cuEventDestroy(_tuneEndEvent); } catch { } _tuneEndEvent = IntPtr.Zero; }
+        }
     }
 
     private bool HasTunedKernel(string name) => _kernelCache.ContainsKey(name);

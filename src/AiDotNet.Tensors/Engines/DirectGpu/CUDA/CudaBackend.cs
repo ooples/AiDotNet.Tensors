@@ -7751,6 +7751,14 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int kernelH, int kernelW,
         int strideH, int strideW, int padH, int padW)
     {
+        // The deterministic kernel bounds each input cell's scan by its covering windows, dividing by the strides; a
+        // zero stride there is undefined on the device, and no pool geometry has one.
+        if (strideH < 1 || strideW < 1)
+            throw new ArgumentOutOfRangeException(strideH < 1 ? nameof(strideH) : nameof(strideW), "Pool strides must be at least 1.");
+        if (kernelH < 1 || kernelW < 1)
+            throw new ArgumentOutOfRangeException(kernelH < 1 ? nameof(kernelH) : nameof(kernelW), "Pool kernel sizes must be at least 1.");
+        if (padH < 0 || padW < 0)
+            throw new ArgumentOutOfRangeException(padH < 0 ? nameof(padH) : nameof(padW), "Pool padding must not be negative.");
         using var _ = PushContext();
         const int blockSize = 16;
         IntPtr gradOutPtr = gradOutput.Handle;
