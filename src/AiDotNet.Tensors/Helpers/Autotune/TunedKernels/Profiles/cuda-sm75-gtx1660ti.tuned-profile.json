@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "device": "cuda:sm75:NVIDIA GeForce GTX 1660 Ti",
+  "entries": [
+    { "op": "Softmax", "shape": "f32:8192x32", "deterministic": true, "candidate": "generated.softmax.lanes16", "speedup": 7.54 },
+    { "op": "SoftmaxBackward", "shape": "f32:8192x32", "deterministic": true, "candidate": "generated.softmax_backward.lanes16", "speedup": 5.68 },
+    { "op": "LayerNorm", "shape": "f32:2048x64", "deterministic": true, "candidate": "generated.layernorm_forward.lanes16", "speedup": 4.37 },
+    { "op": "LayerNorm", "shape": "f32:4096x64", "deterministic": true, "candidate": "generated.layernorm_forward.lanes16", "speedup": 5.10 },
+    { "op": "LayerNormBackward", "shape": "f32:2048x64", "deterministic": true, "candidate": "generated.layernorm_backward.lanes16", "speedup": 3.93 },
+    { "op": "LayerNormGradParameters", "shape": "f32:2048x64", "deterministic": true, "candidate": "generated.layernorm_grad_params.rows32", "speedup": 5.61 },
+    { "op": "Conv2DForward", "shape": "f32:64x1x28x28x16x3x3x1x1x1x1x1x1x28x28", "deterministic": true, "candidate": "nvrtc.conv2d.generic", "speedup": 1.0 },
+    { "op": "Conv2DForward", "shape": "f32:64x16x14x14x32x3x3x1x1x1x1x1x1x14x14", "deterministic": true, "candidate": "cublas.conv2d.im2col_gemm", "speedup": 1.42 },
+    { "op": "Conv2DForward", "shape": "f32:32x16x14x14x32x3x3x1x1x1x1x1x1x14x14", "deterministic": true, "candidate": "cublas.conv2d.im2col_gemm", "speedup": 1.27 },
+    { "op": "Conv2DForward", "shape": "f32:128x16x14x14x32x3x3x1x1x1x1x1x1x14x14", "deterministic": true, "candidate": "cublas.conv2d.im2col_gemm", "speedup": 1.27 }
+  ]
+}
