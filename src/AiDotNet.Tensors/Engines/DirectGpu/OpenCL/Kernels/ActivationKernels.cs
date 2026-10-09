@@ -901,75 +901,9 @@ __kernel void leaky_relu_backward(
     gradInput[idx] = gradOutput[idx] * (x > 0.0f ? 1.0f : alpha);
 }
 
-// Sigmoid backward: grad * sigmoid(x) * (1 - sigmoid(x))
-__kernel void sigmoid_backward(
-    __global const float* gradOutput,
-    __global const float* input,
-    __global float* gradInput,
-    const int size)
-{
-    const int idx = get_global_id(0);
-    if (idx >= size) return;
 
-    float sig = 1.0f / (1.0f + exp(-input[idx]));
-    gradInput[idx] = gradOutput[idx] * sig * (1.0f - sig);
-}
 
-// Tanh backward: grad * (1 - tanh(x)^2)
-__kernel void tanh_backward(
-    __global const float* gradOutput,
-    __global const float* input,
-    __global float* gradInput,
-    const int size)
-{
-    const int idx = get_global_id(0);
-    if (idx >= size) return;
 
-    float t = tanh(input[idx]);
-    gradInput[idx] = gradOutput[idx] * (1.0f - t * t);
-}
-
-// GELU backward (approximation)
-__kernel void gelu_backward(
-    __global const float* gradOutput,
-    __global const float* input,
-    __global float* gradInput,
-    const int size)
-{
-    const int idx = get_global_id(0);
-    if (idx >= size) return;
-
-    const float SQRT_2_OVER_PI = 0.7978845608f;
-    const float COEFF = 0.044715f;
-
-    float x = input[idx];
-    float x2 = x * x;
-    float x3 = x2 * x;
-    float inner = SQRT_2_OVER_PI * (x + COEFF * x3);
-    float t = tanh(inner);
-    float sech2 = 1.0f - t * t;
-    float dInner = SQRT_2_OVER_PI * (1.0f + 3.0f * COEFF * x2);
-
-    float dgelu = 0.5f * (1.0f + t) + 0.5f * x * sech2 * dInner;
-    gradInput[idx] = gradOutput[idx] * dgelu;
-}
-
-// Swish backward: grad * (swish(x) + sigmoid(x) * (1 - swish(x)))
-__kernel void swish_backward(
-    __global const float* gradOutput,
-    __global const float* input,
-    __global float* gradInput,
-    const int size)
-{
-    const int idx = get_global_id(0);
-    if (idx >= size) return;
-
-    float x = input[idx];
-    float sig = 1.0f / (1.0f + exp(-x));
-    float swish_val = x * sig;
-    float dswish = swish_val + sig * (1.0f - swish_val);
-    gradInput[idx] = gradOutput[idx] * dswish;
-}
 
 // Mish backward
 __kernel void mish_backward(
@@ -1533,8 +1467,7 @@ __kernel void clip_by_norm_from_squared_sum(
                 "softmax_fused",
                 "mish", "softplus", "hardswish", "selu", "hardsigmoid", "hardtanh",
                 // Activation backward kernels
-                "relu_backward", "leaky_relu_backward", "sigmoid_backward", "tanh_backward",
-                "gelu_backward", "swish_backward", "mish_backward", "softplus_backward",
+                "relu_backward", "leaky_relu_backward", "mish_backward", "softplus_backward",
                 "hardswish_backward", "selu_backward", "hardsigmoid_backward", "hardtanh_backward",
                 "relu6", "relu6_backward",
                 "prelu", "prelu_backward_input", "prelu_backward_alpha",

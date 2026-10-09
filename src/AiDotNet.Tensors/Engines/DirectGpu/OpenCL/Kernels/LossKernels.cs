@@ -124,7 +124,7 @@ __kernel void loss_cross_entropy_gradient(
 // Formula: loss = 0.5 * diff² if |diff| <= delta, else delta * (|diff| - 0.5*delta)
 // Gradient: d_loss/d_predicted = diff if |diff| <= delta, else delta * sign(diff)
 // ---------------------------------------------------------------------------
-__kernel void huber_loss(
+__kernel void huber_loss_elementwise(
     __global const float* predicted,
     __global const float* actual,
     __global float* output,
@@ -906,7 +906,7 @@ __kernel void elastic_net_gradient(
             // Cross-Entropy Loss (prefixed to avoid collision with NeuralNetKernels)
             "loss_cross_entropy", "loss_cross_entropy_gradient",
             // Huber Loss
-            "huber_loss", "huber_gradient",
+            "huber_loss_elementwise", "huber_gradient",
             // Focal Loss
             "focal_loss", "focal_gradient",
             // Triplet Loss

@@ -69,6 +69,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
 
         private DirectOpenClContext? _context;
         private readonly OpenClKernelCache _kernelCache;
+
+        /// <summary>Kernel names more than one compiled program registered (see <see cref="OpenClKernelCache.ReregisteredNames"/>).</summary>
+        internal IReadOnlyCollection<string> ReregisteredKernelNames => _kernelCache.ReregisteredNames;
         private readonly List<DirectOpenClProgram> _programs;
         private DynamicGemmKernel? _dynamicGemm;
         private bool _disposed;
@@ -535,20 +538,18 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.OpenCL
                     try
                     {
                         var mixedPrecisionSource = string.Join("\n\n",
-                            MixedPrecisionKernels.ConvertFp32ToFp16,
-                            MixedPrecisionKernels.ConvertFp16ToFp32,
+                            // The fp16 conversions come from Fp16Kernels (hardware vload_half/vstore_half), registered
+                            // unconditionally below; compiling them here too only competed for the same names.
                             MixedPrecisionKernels.MixedPrecisionForward,
                             MixedPrecisionKernels.MixedPrecisionBackward,
                             MixedPrecisionKernels.AccumulateGradientFp32);
                         var mpProgram = CompileOrLoadCached(mixedPrecisionSource, optimizationFlags, "Mixed precision kernels");
                         _programs.Add(mpProgram);
-                        _kernelCache["convert_fp32_to_fp16"] = new DirectOpenClKernel(_context, mpProgram, "convert_fp32_to_fp16");
-                        _kernelCache["convert_fp16_to_fp32"] = new DirectOpenClKernel(_context, mpProgram, "convert_fp16_to_fp32");
                         _kernelCache["mixed_precision_forward"] = new DirectOpenClKernel(_context, mpProgram, "mixed_precision_forward");
                         _kernelCache["mixed_precision_backward"] = new DirectOpenClKernel(_context, mpProgram, "mixed_precision_backward");
                         _kernelCache["accumulate_gradient_fp32"] = new DirectOpenClKernel(_context, mpProgram, "accumulate_gradient_fp32");
                         _mixedPrecisionKernelsAvailable = true;
-                        WriteDiag("[OpenClBackend] Mixed precision kernels compiled: 5 kernels");
+                        WriteDiag("[OpenClBackend] Mixed precision kernels compiled: 3 kernels");
                     }
                     catch (Exception ex)
                     {
@@ -10298,7 +10299,8 @@ KERNEL VARIANTS (A/B testing):
 
             using var outputBuffer = AllocateBuffer(size);
 
-            var k = _kernelCache["huber_loss"];
+            // The per-element form (predicted, actual, output, delta, size); huber_loss is the per-row mean.
+            var k = _kernelCache["huber_loss_elementwise"];
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)predictions).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)targets).Buffer.Handle);
