@@ -1,6 +1,6 @@
 {
   "torchVersion": "2.11.0",
-  "gapBaseline": 391,
+  "gapBaseline": 389,
   "entries": {
     "Tensor:abs": {
       "status": "mapped",
@@ -3272,8 +3272,9 @@
       "source": "name-match"
     },
     "aten:convolution": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorConvolution",
+      "source": "reviewed"
     },
     "aten:convolution_backward": {
       "status": "not-applicable",
@@ -8417,8 +8418,9 @@
       "source": "name-match"
     },
     "torch:convolution": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorConvolution",
+      "source": "reviewed"
     },
     "torch:copysign": {
       "status": "mapped",

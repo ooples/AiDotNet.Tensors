@@ -504,6 +504,9 @@ internal static class OpRegistry
         // Recurrent cells and sequences composed from linear, gate and stack ops (CpuEngine.TorchRnn)
         "TensorRnnCell", "TensorLstmCell", "TensorGruCell", "TensorRecurrent",
 
+        // General convolution: index-map spread, flip/permute, narrow and Conv2D/Conv3D (CpuEngine.TorchConvolution)
+        "TensorConvolution",
+
         // Composed from recorded ops (softmax, add/multiply/divide, matmul, batch matmul, reductions)
         "TensorSoftmin", "TensorRsub", "TensorAddcmul", "TensorAddcdiv",
         "TensorAddmv", "TensorAddr", "TensorBaddbmm", "TensorAddbmm",
