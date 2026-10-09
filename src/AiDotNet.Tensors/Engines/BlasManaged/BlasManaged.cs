@@ -426,6 +426,12 @@ public static partial class BlasManaged
         }
     }
 
+    // A^T with many rows and a short K: SimdGemm transposes A along its longer axis and runs the direct kernel, which
+    // beats packing here (CNN dW 3136x64x128: 0.35 -> 0.26 ms).
+    private const int TallTransAMinM = 1024;
+    private const int TallTransAMaxK = 128;
+    private const int TallTransAMinN = 16;
+
     /// <summary>
     /// Two float shape classes where <see cref="Simd.SimdGemm"/> beats this dispatcher by 4-5x, measured head to head
     /// (min of 150): a small output with a long K, which SimdGemm splits over K (a [64,3136]x[3136,128] dense layer:
@@ -442,9 +448,8 @@ public static partial class BlasManaged
             || !options.Epilogue.BiasN.IsEmpty || options.Epilogue.Activation != FusedActivationType.None
             || !options.Epilogue.SkipMxN.IsEmpty || options.Epilogue.DropoutMask != 0)
             return false;
-        bool splitK = !transA && !transB && m >= 6 && m <= 192 && n >= 16 && k > 1024 && (long)m * n <= 64L * 1024
-            && (long)m * k * n >= Simd.SimdGemm.ParallelWorkThreshold;
-        bool tallTransA = transA && !transB && m >= 1024 && k <= 128 && n >= 16;
+        bool splitK = Simd.SimdGemm.QualifiesForSplitK(transA, transB, m, k, n);
+        bool tallTransA = transA && !transB && m >= TallTransAMinM && k <= TallTransAMaxK && n >= TallTransAMinN;
         if (!splitK && !tallTransA) return false;
         var af = MemoryMarshal.Cast<T, float>(a);
         var bf = MemoryMarshal.Cast<T, float>(b);

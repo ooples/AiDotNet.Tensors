@@ -1868,10 +1868,7 @@ internal static partial class SimdGemm
 #if NET5_0_OR_GREATER
         // Not gated on allowParallel: the same shape must sum in the same order on one thread or many. .NET 5+ only,
         // like the direct kernels each slice runs.
-        if (!transA && !transB && UseSplitK && !t_inSplitK
-            && m >= Mr && m <= DirectParallel2DMaxM && n >= Nr && k > DirectParallel2DMaxK
-            && (long)m * n <= SplitKDirectMaxOutput
-            && (long)m * k * n >= ParallelWorkThreshold)
+        if (!t_inSplitK && QualifiesForSplitK(transA, transB, m, k, n))
         {
             SgemmSplitK(a, lda, b, ldb, c, m, k, n, clearedOutput, allowParallel);
             return;
@@ -2085,6 +2082,22 @@ internal static partial class SimdGemm
     /// <summary>A/B and test toggle for <see cref="SgemmSplitK"/>.</summary>
     internal static bool UseSplitK = true;
 
+    /// <summary>
+    /// Whether <see cref="SgemmAddInternal"/> splits this shape over K: a small output (few row/column tiles) with a long
+    /// K. The single source of the gate, so a caller that routes shapes here for split-K (BlasManaged) cannot drift
+    /// from it. Depends on the shape only, never on the thread budget.
+    /// </summary>
+    internal static bool QualifiesForSplitK(bool transA, bool transB, int m, int k, int n)
+    {
+#if NET5_0_OR_GREATER
+        return !transA && !transB && UseSplitK
+            && m >= Mr && m <= DirectParallel2DMaxM && n >= Nr && k > DirectParallel2DMaxK
+            && (long)m * n <= SplitKDirectMaxOutput
+            && (long)m * k * n >= ParallelWorkThreshold;
+#else
+        return false;
+#endif
+    }
     // Largest output (m*n) split over K: a bigger output has enough row/column tiles for the 2-D paths.
     private const long SplitKDirectMaxOutput = 64L * 1024;
 
