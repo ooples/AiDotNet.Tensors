@@ -23,6 +23,9 @@ namespace AiDotNet.Tensors.Engines.DirectGpu.CUDA.Kernels
     /// lane count (softmax) or twice the lane count when L = 32 (LayerNorm, whose reference folds lane+32 first) the
     /// outputs are bit-identical to the reference; longer rows associate differently and agree to rounding.</para>
     /// <para>Inactive tail rows keep executing the shuffles (with neutral values) so the full-warp masks are valid.</para>
+    /// <para>CUDA only for now. The other backends run their established kernels for these ops, unchanged; registry
+    /// dispatch and generated variants for them are tracked per backend: HIP #1113, OpenCL #1114, Vulkan #1115,
+    /// Metal #1116, WebGPU #1117.</para>
     /// </remarks>
     internal static class CudaTunedRowKernels
     {
