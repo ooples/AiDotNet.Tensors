@@ -24807,27 +24807,15 @@ public partial class CpuEngine : ITensorLevelEngine
             float epsF = numOps.ToDouble(eps) is double d ? (float)d : 1e-5f;
             var meanF = new float[channels];
             var varF = new float[channels];
-            // Allocate the output buffer to the LOGICAL extent
-            // (batch * channels * H * W = input.Length), NOT to inF.Length.
-            // The underlying float[] returned by GetDataArray() is allowed
-            // to be SIMD-padded — e.g. for [1, 32, 112, 112] the logical
-            // extent is 401,408 but the padded buffer can be 524,288 (the
-            // next multiple of 32 spatial / 128 channel for AVX-friendly
-            // layouts). The inner BatchNorm4DFloat kernel iterates strictly
-            // in logical-index space (offset = n * channels * spatialSize
-            // + c * spatialSize), so the output only needs to hold the
-            // logical extent — and TensorAllocator.Rent(shape, data) below
-            // hard-asserts data.Length == product(shape). Issue #310.
-            int logicalLength = input.Length;
-#if NET5_0_OR_GREATER
-            var outF = GC.AllocateUninitializedArray<float>(logicalLength);
-#else
-            var outF = new float[logicalLength];
-#endif
-            BatchNorm4DFloat(inF, gamF, betF, epsF, batch, channels, spatialSize, meanF, varF, outF);
+            // Rent the output (arena / thread cache / pool) rather than allocating a fresh array per
+            // call: a new multi-megabyte array put ~77% of BN forward time in kernel page faults.
+            // The rented backing array may be longer than the logical extent; BatchNorm4DFloat walks
+            // logical indices only (offset = n * channels * spatialSize + c * spatialSize). Issue #310.
+            var outTensor = TensorAllocator.RentUninitialized<float>(input._shape);
+            BatchNorm4DFloat(inF, gamF, betF, epsF, batch, channels, spatialSize, meanF, varF, outTensor.GetDataArray());
             mean = (Tensor<T>)(object)TensorAllocator.Rent<T>(new[] { channels }, (Vector<T>)(object)Vector<float>.FromMemory(meanF));
             variance = (Tensor<T>)(object)TensorAllocator.Rent<T>(new[] { channels }, (Vector<T>)(object)Vector<float>.FromMemory(varF));
-            return (Tensor<T>)(object)TensorAllocator.Rent<T>(input._shape, (Vector<T>)(object)Vector<float>.FromMemory(outF));
+            return (Tensor<T>)(object)outTensor;
         }
 
         // Double fast path — mirrors the float kernel's fused single-sweep
@@ -24844,19 +24832,14 @@ public partial class CpuEngine : ITensorLevelEngine
             double epsD = numOps.ToDouble(eps);
             var meanDArr = new double[channels];
             var varDArr  = new double[channels];
-            int logicalLength = input.Length;
-#if NET5_0_OR_GREATER
-            var outDArr = GC.AllocateUninitializedArray<double>(logicalLength);
-#else
-            var outDArr = new double[logicalLength];
-#endif
-            BatchNorm4DDouble(inD, gamD, betD, epsD, batch, channels, spatialSize, meanDArr, varDArr, outDArr);
+            var outTensorD = TensorAllocator.RentUninitialized<double>(input._shape);
+            BatchNorm4DDouble(inD, gamD, betD, epsD, batch, channels, spatialSize, meanDArr, varDArr, outTensorD.GetDataArray());
             // #478: wrap the freshly-allocated result arrays with FromMemory (zero-copy hand-off, like
             // the float path above) instead of `new Vector<double>(arr)`, which COPIED every array —
             // doubling the output allocation (measured 4x the float path; now ~2x = just the bytes).
             mean = (Tensor<T>)(object)TensorAllocator.Rent<T>(new[] { channels }, (Vector<T>)(object)Vector<double>.FromMemory(meanDArr));
             variance = (Tensor<T>)(object)TensorAllocator.Rent<T>(new[] { channels }, (Vector<T>)(object)Vector<double>.FromMemory(varDArr));
-            return (Tensor<T>)(object)TensorAllocator.Rent<T>(input._shape, (Vector<T>)(object)Vector<double>.FromMemory(outDArr));
+            return (Tensor<T>)(object)outTensorD;
         }
 
         var meanData = new T[channels];
@@ -44189,16 +44172,13 @@ public partial class CpuEngine : ITensorLevelEngine
         // Float fast path: SIMD grad * sigmoid * (1 - sigmoid)
         if (gradData is float[] gF && outData is float[] oF)
         {
-#if NET5_0_OR_GREATER
-            var resultArr = GC.AllocateUninitializedArray<float>(length);
-#else
-            var resultArr = new float[length];
-#endif
+            var resultTensor = TensorAllocator.RentUninitialized<float>(gradOutput._shape);
+            var resultArr = resultTensor.GetDataArray();
             // Bound by the LOGICAL length — gF/oF can be pool-over-allocated (longer than the tensor's
             // logical Length) while resultArr is sized to `length`; iterating to grad.Length would write
             // past resultArr (unchecked AVX store -> AccessViolation). See TanhBackward for the mechanism.
             SigmoidBackwardFloat(gF, oF, resultArr, length);
-            return (Tensor<T>)(object)TensorAllocator.Rent<T>(gradOutput._shape, (Vector<T>)(object)Vector<float>.FromMemory(resultArr));
+            return (Tensor<T>)(object)resultTensor;
         }
 
         // Double SIMD path
@@ -44284,18 +44264,15 @@ public partial class CpuEngine : ITensorLevelEngine
         // Float fast path: SIMD grad * (1 - tanh^2)
         if (gradData is float[] gF && outData is float[] oF)
         {
-#if NET5_0_OR_GREATER
-            var resultArr = GC.AllocateUninitializedArray<float>(length);
-#else
-            var resultArr = new float[length];
-#endif
+            var resultTensor = TensorAllocator.RentUninitialized<float>(gradOutput._shape);
+            var resultArr = resultTensor.GetDataArray();
             // Bound by the LOGICAL length: gF/oF come from GetFlattenedData/GetDataArray, which
             // can hand back a pool-OVER-ALLOCATED backing array (physically longer than the tensor's
             // logical Length — see VectorBase.GetDataArray returning the full segment.Array at offset 0).
             // resultArr is sized to `length`, so iterating to grad.Length would write past it (the
             // AVX store has no bounds check -> AccessViolation). Pass the logical length explicitly.
             TanhBackwardFloat(gF, oF, resultArr, length);
-            return (Tensor<T>)(object)TensorAllocator.Rent<T>(gradOutput._shape, (Vector<T>)(object)Vector<float>.FromMemory(resultArr));
+            return (Tensor<T>)(object)resultTensor;
         }
 
         // Double SIMD path
