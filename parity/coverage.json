@@ -1,6 +1,6 @@
 {
   "torchVersion": "2.11.0",
-  "gapBaseline": 441,
+  "gapBaseline": 416,
   "entries": {
     "Tensor:abs": {
       "status": "mapped",
@@ -2745,8 +2745,9 @@
       "source": "reviewed"
     },
     "aten:adaptive_max_pool3d": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorAdaptiveMaxPool3D",
+      "source": "reviewed"
     },
     "aten:adaptive_max_pool3d_backward": {
       "status": "not-applicable",
@@ -3758,8 +3759,9 @@
       "source": "name-match"
     },
     "aten:fractional_max_pool2d": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorFractionalMaxPool",
+      "source": "reviewed"
     },
     "aten:frexp": {
       "status": "mapped",
@@ -4534,12 +4536,14 @@
       "source": "reviewed"
     },
     "aten:max_unpool2d": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorMaxUnpool",
+      "source": "reviewed"
     },
     "aten:max_unpool3d": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorMaxUnpool",
+      "source": "reviewed"
     },
     "aten:maximum": {
       "status": "mapped",
@@ -6881,8 +6885,9 @@
       "source": "reviewed"
     },
     "nn.functional:adaptive_avg_pool1d": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorAdaptiveAvgPool1D",
+      "source": "reviewed"
     },
     "nn.functional:adaptive_avg_pool2d": {
       "status": "mapped",
@@ -6890,16 +6895,19 @@
       "source": "name-match"
     },
     "nn.functional:adaptive_avg_pool3d": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorAdaptiveAvgPool3D",
+      "source": "reviewed"
     },
     "nn.functional:adaptive_max_pool1d": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorAdaptiveMaxPool1D",
+      "source": "reviewed"
     },
     "nn.functional:adaptive_max_pool1d_with_indices": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorAdaptiveMaxPoolWithIndices",
+      "source": "reviewed"
     },
     "nn.functional:adaptive_max_pool2d": {
       "status": "mapped",
@@ -6907,16 +6915,19 @@
       "source": "name-match"
     },
     "nn.functional:adaptive_max_pool2d_with_indices": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorAdaptiveMaxPoolWithIndices",
+      "source": "reviewed"
     },
     "nn.functional:adaptive_max_pool3d": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorAdaptiveMaxPool3D",
+      "source": "reviewed"
     },
     "nn.functional:adaptive_max_pool3d_with_indices": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorAdaptiveMaxPoolWithIndices",
+      "source": "reviewed"
     },
     "nn.functional:affine_grid": {
       "status": "mapped",
@@ -7092,20 +7103,24 @@
       "source": "name-match"
     },
     "nn.functional:fractional_max_pool2d": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorFractionalMaxPool",
+      "source": "reviewed"
     },
     "nn.functional:fractional_max_pool2d_with_indices": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorFractionalMaxPool",
+      "source": "reviewed"
     },
     "nn.functional:fractional_max_pool3d": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorFractionalMaxPool",
+      "source": "reviewed"
     },
     "nn.functional:fractional_max_pool3d_with_indices": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorFractionalMaxPool",
+      "source": "reviewed"
     },
     "nn.functional:gaussian_nll_loss": {
       "status": "mapped",
@@ -7251,16 +7266,19 @@
       "source": "reviewed-alias"
     },
     "nn.functional:lp_pool1d": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorLpPool",
+      "source": "reviewed"
     },
     "nn.functional:lp_pool2d": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorLpPool",
+      "source": "reviewed"
     },
     "nn.functional:lp_pool3d": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorLpPool",
+      "source": "reviewed"
     },
     "nn.functional:margin_ranking_loss": {
       "status": "mapped",
@@ -7273,8 +7291,9 @@
       "source": "name-match"
     },
     "nn.functional:max_pool1d_with_indices": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorMaxPool1DWithIndices",
+      "source": "reviewed"
     },
     "nn.functional:max_pool2d": {
       "status": "mapped",
@@ -7297,16 +7316,19 @@
       "source": "name-match"
     },
     "nn.functional:max_unpool1d": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorMaxUnpool",
+      "source": "reviewed"
     },
     "nn.functional:max_unpool2d": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorMaxUnpool",
+      "source": "reviewed"
     },
     "nn.functional:max_unpool3d": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorMaxUnpool",
+      "source": "reviewed"
     },
     "nn.functional:mish": {
       "status": "mapped",
@@ -7719,12 +7741,14 @@
       "source": "name-match"
     },
     "torch:adaptive_avg_pool1d": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorAdaptiveAvgPool1D",
+      "source": "reviewed"
     },
     "torch:adaptive_max_pool1d": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorAdaptiveMaxPool1D",
+      "source": "reviewed"
     },
     "torch:add": {
       "status": "mapped",
@@ -9645,8 +9669,9 @@
       "source": "name-match"
     },
     "torch:max_pool1d_with_indices": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorMaxPool1DWithIndices",
+      "source": "reviewed"
     },
     "torch:max_pool2d": {
       "status": "mapped",

@@ -24,6 +24,12 @@ internal static class OpRegistry
         "TensorCelu", "TensorHardtanh", "TensorLogSigmoid", "TensorSoftsign",
         "TensorRrelu", "TensorMsort", "TensorDiagflat", "TensorDiagonalScatter",
 
+        // Window pooling with its own backward: max routes to the argmax, average splits, Lp scales by
+        // (x/y)^(p-1); unpooling is an index map (CpuEngine.TorchPool)
+        "TensorAdaptiveAvgPool1D", "TensorAdaptiveAvgPool3D", "TensorAdaptiveMaxPool1D", "TensorAdaptiveMaxPool3D",
+        "TensorAdaptiveMaxPoolWithIndices", "TensorMaxPool1DWithIndices", "TensorLpPool", "TensorFractionalMaxPool",
+        "TensorMaxUnpool",
+
         // Quantiles: backward to the two order statistics read (CpuEngine.TorchCreation)
         "TensorQuantile", "TensorNanQuantile",
 
