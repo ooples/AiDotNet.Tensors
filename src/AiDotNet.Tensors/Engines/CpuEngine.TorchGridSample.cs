@@ -95,6 +95,9 @@ public partial class CpuEngine
         public readonly int[] Offset = new int[8];
         public readonly double[] Weight = new double[8];
         public readonly double[,] WeightGrad = new double[8, 3];
+        // Per-call scratch, reused: Locate runs once per output point and batch, forward and backward.
+        private readonly double[] _coord = new double[3];
+        private readonly double[] _slope = new double[3];
         public int TapCount;
         public int Volume => _size[0] * _size[1] * _size[2];
 
@@ -105,10 +108,11 @@ public partial class CpuEngine
 
         public void Locate(double gx, double gy, double gz)
         {
-            var coord = new double[3];
-            var slope = new double[3];
-            var normalized = new[] { gx, gy, gz };
-            for (int a = 0; a < 3; a++) coord[a] = SourceIndex(normalized[a], _size[a], out slope[a]);
+            var coord = _coord;
+            var slope = _slope;
+            coord[0] = SourceIndex(gx, _size[0], out slope[0]);
+            coord[1] = SourceIndex(gy, _size[1], out slope[1]);
+            coord[2] = SourceIndex(gz, _size[2], out slope[2]);
             TapCount = 0;
             if (_mode == GridSampleMode.Nearest)
             {
