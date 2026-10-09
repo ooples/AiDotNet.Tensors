@@ -40,7 +40,7 @@ public partial class CpuEngine
                 nameof(numHeads));
 
         var shape = new AttentionCoreShape(batch, seqQ, seqK, numHeads, modelQ / numHeads, modelV / numHeads,
-            (float)(scale ?? 1.0 / Math.Sqrt(modelQ / numHeads)), causal);
+            scale ?? 1.0 / Math.Sqrt(modelQ / numHeads), causal);
 
         // The fused kernels are host float32. GPU engines and other element types run the primitive chain, which
         // every backend already differentiates (and a GPU plan can capture).
@@ -92,7 +92,7 @@ public partial class CpuEngine
     /// <summary>Shape and options of one <see cref="MultiHeadAttentionCore{T}"/> call, kept with its graph node.</summary>
     internal sealed class AttentionCoreShape
     {
-        public AttentionCoreShape(int batch, int seqQ, int seqK, int heads, int headDim, int valueDim, float scale, bool causal)
+        public AttentionCoreShape(int batch, int seqQ, int seqK, int heads, int headDim, int valueDim, double scale, bool causal)
         {
             Batch = batch; SeqQ = seqQ; SeqK = seqK; Heads = heads;
             HeadDim = headDim; ValueDim = valueDim; Scale = scale; Causal = causal;
@@ -104,7 +104,10 @@ public partial class CpuEngine
         public int Heads { get; }
         public int HeadDim { get; }
         public int ValueDim { get; }
-        public float Scale { get; }
+        /// <summary>The softmax scale at full precision: the decomposed path runs in the tensor's own type.</summary>
+        public double Scale { get; }
+        /// <summary>The scale the fused host float32 kernels use.</summary>
+        public float ScaleF => (float)Scale;
         public bool Causal { get; }
         public int QueryWidth => Heads * HeadDim;
         public int ValueWidth => Heads * ValueDim;
@@ -202,7 +205,7 @@ public partial class CpuEngine
                 int rows = Math.Min(br, s.SeqQ - i0);
                 for (int r = 0; r < rows; r++)
                 {
-                    ScaleCopy(q, qBase + (i0 + r) * qw, qs, r * hd, hd, s.Scale);
+                    ScaleCopy(q, qBase + (i0 + r) * qw, qs, r * hd, hd, s.ScaleF);
                     rowMax[r] = float.NegativeInfinity;
                     rowSum[r] = 0f;
                 }
@@ -380,7 +383,7 @@ public partial class CpuEngine
                 int rows = Math.Min(br, s.SeqQ - i0);
                 for (int r = 0; r < rows; r++)
                 {
-                    ScaleCopy(q, qBase + (i0 + r) * qw, qs, r * hd, hd, s.Scale);
+                    ScaleCopy(q, qBase + (i0 + r) * qw, qs, r * hd, hd, s.ScaleF);
                     delta[r] = Dot(dO, dOBase + (i0 + r) * vw, o, oBase + (i0 + r) * vw, vd);
                 }
                 Array.Clear(dq, 0, rows * hd);
@@ -424,7 +427,7 @@ public partial class CpuEngine
                 if (dQ.Array is not null)
                     for (int r = 0; r < rows; r++)
                         StoreRow(dq, r * hd, dQ.Array, dQ.Offset + b * s.SeqQ * qw + (i0 + r) * qw + h * hd, hd,
-                            s.Scale, dQ.Overwrite);
+                            s.ScaleF, dQ.Overwrite);
             }
             if (dK.Array is not null)
                 for (int j = 0; j < s.SeqK; j++)
