@@ -65,6 +65,10 @@ public sealed class TorchParityGpuCorrectnessTests : IClassFixture<GpuCpuCorrect
         ["TensorDiagonalScatter"] = (e => Flat(e.TensorDiagonalScatter(W(new[] { 3, 4 }, 13, 5, 6), W(new[] { 3 }, 7, 3, 3), 1)), 0),
         ["TensorAdaptiveAvgPool3D"] = (e => Flat(e.TensorAdaptiveAvgPool3D(W(new[] { 1, 2, 3, 4, 5 }, 127, 37, 60), new[] { 2, 3, 2 })), 1e-6),
         ["TensorAdaptiveMaxPool3D"] = (e => Flat(e.TensorAdaptiveMaxPool3D(W(new[] { 1, 2, 3, 4, 5 }, 127, 37, 60), new[] { 2, 3, 2 })), 0),
+        // Indices as a max pool emits them (plane-local, a leading channel axis); an index repeated within a plane keeps
+        // the last value, as in PyTorch.
+        ["TensorMaxUnpool"] = (e => Flat(e.TensorMaxUnpool(W(new[] { 2, 3 }, 13, 5, 6),
+            new Tensor<int>(new[] { 0, 3, 5, 1, 1, 4 }, new[] { 2, 3 }), new[] { 6 })), 0),
         ["TensorGridSample3D"] = (e => Flat(e.TensorGridSample3D(W(new[] { 1, 2, 3, 4, 5 }, 37, 7, 18), W(new[] { 1, 2, 3, 2, 3 }, 29, 11, 14, 0.09f),
             GridSampleMode.Bilinear, GridSamplePadding.Reflection, true)), 1e-6),
         ["TensorNonzeroStatic"] = (e => e.TensorNonzeroStatic(Ints(new[] { 4, 6 }, 5, 3, 2), 30).ToArray().Select(i => (float)i).ToArray(), 0),

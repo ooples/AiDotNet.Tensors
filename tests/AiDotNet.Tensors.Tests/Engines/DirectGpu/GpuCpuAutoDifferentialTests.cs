@@ -651,12 +651,12 @@ public sealed class GpuCpuAutoDifferentialTests : IClassFixture<GpuCpuAutoDiffer
         "TensorKaiserWindow(Int32,Boolean,Double)",
         "TensorLcm(Tensor<T>,Tensor<T>)",
         "TensorLogspace(Double,Double,Int32,Double)",
+        "TensorMaxUnpool(Tensor<T>,Tensor<Int32>,Int32[])",
         "TensorNonzeroStatic(Tensor<T>,Int32,Int32)",
         "TensorRange(Double,Double,Double)",
         "TensorTrilIndices(Int32,Int32,Int32)",
         "TensorTriuIndices(Int32,Int32,Int32)",
         "TensorViewAsComplex(Tensor<T>)",
-        "",
         // Class-index gather (CE/NLL core): GPU-vs-CPU forward + gradient parity and residency in ClassGatherTests.
         "TensorGatherClassValues(Tensor<T>,Tensor<T>)",
         // Head-interleaved attention core (composed on the GPU): MultiHeadAttentionCoreGpuTests, forward + gradients.

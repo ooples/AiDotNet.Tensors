@@ -20,9 +20,9 @@ public class TorchParityGpuCoverageTests
 {
     private static readonly TimeSpan RegexTimeout = TimeSpan.FromSeconds(5);
 
-    // Type queries that read no tensor data.
+    // Type and shape queries that read no tensor data (BroadcastShapes works on int[] shapes).
     private static readonly string[] Metadata =
-        { "TensorIsFloatingPoint", "TensorIsSigned", "TensorIsComplex", "TensorIsNonzero", "TensorIsSameSize" };
+        { "TensorIsFloatingPoint", "TensorIsSigned", "TensorIsComplex", "TensorIsNonzero", "TensorIsSameSize", "BroadcastShapes" };
 
     [Fact]
     public void EveryHostComputedParityOp_HasAGpuCoverageDecision()
@@ -33,7 +33,9 @@ public class TorchParityGpuCoverageTests
         var files = Directory.GetFiles(engines, "CpuEngine.Torch*.cs");
         Assert.NotEmpty(files);
         var declared = files
-            .SelectMany(f => Regex.Matches(File.ReadAllText(f), @"public virtual [^(]+? (\w+)<T>\(", RegexOptions.None, RegexTimeout)
+            // The identifier just before "(" or "<...>(": any return type (tuples included) and any type-parameter
+            // count, generic or not. A pattern requiring "<T>(" and no "(" in the return type missed eight ops.
+            .SelectMany(f => Regex.Matches(File.ReadAllText(f), @"public virtual .*?\b(\w+)(?:<[\w, ]+>)?\(", RegexOptions.None, RegexTimeout)
                 .Cast<Match>().Select(m => m.Groups[1].Value))
             .Distinct().ToList();
         // new HashSet, not ToHashSet: .NET Framework 4.7.1 has no Enumerable.ToHashSet.

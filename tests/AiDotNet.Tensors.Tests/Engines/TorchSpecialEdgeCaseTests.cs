@@ -73,7 +73,10 @@ public class TorchSpecialEdgeCaseTests
             const double tolerance = 1e-12;
             bool ok = double.IsNaN(e) ? double.IsNaN(a)
                 : double.IsInfinity(e) ? a == e
-                : Math.Abs(a - e) <= tolerance * Math.Abs(e) || Math.Abs(a - e) <= 1e-300;
+                // An absolute allowance only for an exact-zero reference: for a tiny nonzero one (J1(1e-300) = 5e-301)
+                // it would accept a wrong 0.
+                : e == 0 ? Math.Abs(a) <= 1e-300
+                : Math.Abs(a - e) <= tolerance * Math.Abs(e);
             if (!ok) failures.Add($"x={Inputs[i]:R}: expected {e:R}, got {a:R}");
         }
         Assert.True(failures.Count == 0, op + ": " + string.Join("; ", failures));
