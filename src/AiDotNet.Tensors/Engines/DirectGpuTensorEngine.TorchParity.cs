@@ -14,7 +14,8 @@ namespace AiDotNet.Tensors.Engines;
 /// The composed parity ops (listed in <c>OpRegistry.DelegatorOps</c>: the RNN cells and sequences, the general
 /// convolution, bilinear, local response norm, the dropout variants and the rest) are built from engine
 /// primitives that this engine already runs on the device, so they need no override here. Degree/radian
-/// conversion is routed to the device's scalar multiply below.
+/// conversion is routed to the device's scalar multiply below. The reparameterized normal and the dropout variants
+/// compose on the device but draw their noise or keep-mask on the host and upload it, so they record a fallback too.
 /// </para>
 /// <para>
 /// The remaining parity ops compute on the host. They are long-tail PyTorch surface (special functions,
@@ -30,6 +31,7 @@ namespace AiDotNet.Tensors.Engines;
 /// </remarks>
 public partial class DirectGpuTensorEngine
 {
+
 
 
     // ---- CpuEngine.TorchComplex.cs ----
@@ -402,6 +404,13 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <inheritdoc/>
+    public override Tensor<T> TensorNormal<T>(Tensor<T> mean, Tensor<T> std, int? seed = null)
+    {
+        GpuLaunchProbe.OnFallback("TensorNormal: noise drawn on the host", null);
+        return base.TensorNormal<T>(mean, std, seed);
+    }
+
+    /// <inheritdoc/>
     public override Tensor<T> TensorUniform<T>(int[] shape, double low = 0, double high = 1, int? seed = null)
     {
         GpuLaunchProbe.OnFallback("TensorUniform: no device kernel", null);
@@ -441,6 +450,27 @@ public partial class DirectGpuTensorEngine
     {
         GpuLaunchProbe.OnFallback("TensorMultinomial: no device kernel", null);
         return base.TensorMultinomial<T>(probabilities, numSamples, replacement, seed);
+    }
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorAlphaDropout<T>(Tensor<T> tensor, double p, bool training, int? seed = null)
+    {
+        GpuLaunchProbe.OnFallback("TensorAlphaDropout: noise drawn on the host", null);
+        return base.TensorAlphaDropout<T>(tensor, p, training, seed);
+    }
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorFeatureAlphaDropout<T>(Tensor<T> tensor, double p, bool training, int? seed = null)
+    {
+        GpuLaunchProbe.OnFallback("TensorFeatureAlphaDropout: noise drawn on the host", null);
+        return base.TensorFeatureAlphaDropout<T>(tensor, p, training, seed);
+    }
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorChannelDropout<T>(Tensor<T> tensor, double p, bool training, int spatialDims, int? seed = null)
+    {
+        GpuLaunchProbe.OnFallback("TensorChannelDropout: noise drawn on the host", null);
+        return base.TensorChannelDropout<T>(tensor, p, training, spatialDims, seed);
     }
 
     /// <inheritdoc/>
