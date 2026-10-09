@@ -9560,7 +9560,7 @@ KERNEL VARIANTS (A/B testing):
 
         public void Hardtanh(IGpuBuffer A, IGpuBuffer B, float minVal, float maxVal, int size)
         {
-            var k = _kernelCache["hardtanh_forward"];
+            var k = _kernelCache["hardtanh"];
             uint arg = 0;
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)A).Buffer.Handle);
             k.SetArg(arg++, ((DirectOpenClGpuBuffer)B).Buffer.Handle);

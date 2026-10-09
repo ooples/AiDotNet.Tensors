@@ -4,6 +4,7 @@
 
 using System;
 using System.Runtime.InteropServices;
+using System.Threading;
 
 namespace AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
 
@@ -86,13 +87,33 @@ public static unsafe class VulkanNativeBindings
     {
         get
         {
+            // A successful probe keeps the loader module loaded (s_loaderHandle) and is cached, so a later
+            // change to the process's DLL search order cannot turn an already-working backend "unsupported" (the #1027 failure mode, there caused by HIP's
+            // SetDefaultDllDirectories before Vulkan was first probed).
+            if (Volatile.Read(ref s_platformSupported) != 0) return true;
+            bool supported = ProbePlatformSupport();
+            if (supported) Volatile.Write(ref s_platformSupported, 1);
+            return supported;
+        }
+    }
+
+    private static int s_platformSupported;
+
+    // The loader module a successful probe loaded and deliberately never frees.
+    private static IntPtr s_loaderHandle;
+
+    private static bool ProbePlatformSupport()
+    {
+        {
             try
             {
 #if NET5_0_OR_GREATER
                 // .NET 5+ can use NativeLibrary.TryLoad for safe probing
                 if (System.Runtime.InteropServices.NativeLibrary.TryLoad(LibraryName, out var handle))
                 {
-                    System.Runtime.InteropServices.NativeLibrary.Free(handle);
+                    // Keep the loader loaded for the process: the P/Invoke bindings then bind to this
+                    // module, so the cached "supported" cannot outlive a later change to DLL search order.
+                    s_loaderHandle = handle;
                     return true;
                 }
                 return false;
@@ -106,7 +127,7 @@ public static unsafe class VulkanNativeBindings
                     var libHandle = NativeMethods.LoadLibraryW(LibraryName);
                     if (libHandle != IntPtr.Zero)
                     {
-                        NativeMethods.FreeLibrary(libHandle);
+                        s_loaderHandle = libHandle; // kept loaded, as above
                         return true;
                     }
                 }
@@ -115,7 +136,7 @@ public static unsafe class VulkanNativeBindings
                     var libHandle = NativeMethods.dlopen(LibraryName, 0x0001 /* RTLD_LAZY */);
                     if (libHandle != IntPtr.Zero)
                     {
-                        NativeMethods.dlclose(libHandle);
+                        s_loaderHandle = libHandle; // kept loaded, as above
                         return true;
                     }
                 }

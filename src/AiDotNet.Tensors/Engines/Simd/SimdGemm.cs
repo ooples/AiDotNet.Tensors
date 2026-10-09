@@ -1545,47 +1545,26 @@ internal static partial class SimdGemm
         SgemmAddInternal(a, lda, transA, b, ldb, transB, c, m, k, n, allowParallel: UseParallelGemm, clearedOutput: true);
     }
 
-    // Set to 1 once OpenBLAS is pinned single-thread (we own the parallelism).
-    private static int _openBlasThreadsPinned;
-
     /// <summary>
-    /// C[m,n] = A[m,k]·B[k,n] (row-major, no-trans) using OpenBLAS's single-thread
-    /// microkernel, parallelized over M-row chunks on the PersistentParallelExecutor.
-    /// Captures OpenBLAS's kernel quality (2-3x the managed RyuJIT kernel at the MLP/
-    /// transformer shapes) without OpenBLAS's per-call thread-pool spin-up — the
-    /// reason whole-call native routing regressed the many-GEMM transformer.
+    /// C[m,n] = A[m,k]·B[k,n] (row-major, no-trans) through OpenBLAS as ONE native call, parallelised by OpenBLAS's
+    /// own threads (BlasProvider keeps them at the parallel count outside deterministic mode).
+    /// <para>This used to pin OpenBLAS to one thread PROCESS-WIDE on first use and fan M-row chunks across our
+    /// pool. But BlasProvider runs every native call under the single NativeComputeGate (OpenBLAS's buffer table
+    /// is not re-entrant), so the chunks executed one at a time behind a contended lock, and the pin left every
+    /// other native GEMM in the process single-threaded too.</para>
+    /// <para>Deterministic mode pins OpenBLAS to one thread, which would make this call serial; there the managed
+    /// kernel runs instead (its M/N tile splits are deterministic-safe and parallel).</para>
     /// </summary>
     private static unsafe void RunOpenBlasParallel(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c, int m, int k, int n)
     {
-        // Pin OpenBLAS to a single thread once — its internal threading is what we're
-        // replacing with our own pool.
-        if (System.Threading.Interlocked.CompareExchange(ref _openBlasThreadsPinned, 1, 0) == 0)
-            Helpers.BlasProvider.TrySetOpenBlasThreads(1);
-
-        int maxT = Helpers.CpuParallelSettings.MaxDegreeOfParallelism;
-        // One chunk per worker, but keep >= 8 rows/chunk so each single-thread call
-        // amortizes its own (small) entry cost.
-        int chunks = Math.Max(1, Math.Min(maxT, m / 8));
-
-        fixed (float* pa = a, pb = b, pc = c)
+        if (Helpers.BlasProvider.IsDeterministicMode)
         {
-            if (chunks <= 1)
-            {
-                Helpers.BlasProvider.SgemmRaw(m, n, k, pa, k, pb, n, pc, n);
-                return;
-            }
-            nint A = (nint)pa, B = (nint)pb, C = (nint)pc;
-            int kk = k, nn = n, mm = m, per = (m + chunks - 1) / chunks;
-            Helpers.PersistentParallelExecutor.Instance.Execute(chunks, chunk =>
-            {
-                int r0 = chunk * per;
-                if (r0 >= mm) return;
-                int rows = System.Math.Min(per, mm - r0);
-                float* aP = (float*)A + (long)r0 * kk;
-                float* cP = (float*)C + (long)r0 * nn;
-                Helpers.BlasProvider.SgemmRaw(rows, nn, kk, aP, kk, (float*)B, nn, cP, nn);
-            });
+            c.Clear();
+            SgemmAddInternal(a, k, false, b, n, false, c, m, k, n, allowParallel: UseParallelGemm, clearedOutput: true);
+            return;
         }
+        fixed (float* pa = a, pb = b, pc = c)
+            Helpers.BlasProvider.SgemmRaw(m, n, k, pa, k, pb, n, pc, n);
     }
 
     /// <summary>
