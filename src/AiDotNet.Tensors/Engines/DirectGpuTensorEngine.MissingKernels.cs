@@ -7077,6 +7077,25 @@ public partial class DirectGpuTensorEngine
                 input, h0, c0, wIh, wHh, bIh, bHh,
                 wantState, out finalHidden, out finalCell, returnSequences);
 
+        // Training from a zero initial state: the device forward + BPTT pair (TryLstmSequenceTrain), whose backward
+        // stays on the device. The recording path further down downloads the gates and computes every gradient on
+        // the host, so a GPU training step left the device at each LSTM. Biases fold into the one [4H] bias that op
+        // takes, through a recorded add, so each still receives its gradient.
+        if (!wantState && h0 is null && c0 is null && DifferentiableOps.IsRecording<T>())
+        {
+            var bias = bIh is not null && bHh is not null ? TensorAdd(bIh, bHh)
+                : bIh ?? bHh ?? new Tensor<T>(new[] { gateRows });
+            if (TryLstmSequenceTrain(input, wIh, wHh, bias) is { } sequence)
+            {
+                finalHidden = null;
+                finalCell = null;
+                // The last step through a device slice (contiguous): a narrowed view of the time axis is strided, and
+                // reshaping it materialized the view on the host.
+                return returnSequences ? sequence
+                    : Reshape(TensorSlice(sequence, new[] { 0, S - 1, 0 }, new[] { B, 1, Hd }), new[] { B, Hd });
+            }
+        }
+
         // Engine weights/bias/gates (PyTorch i,f,g,o; [4*hidden, *]) match the kernel exactly. The kernel
         // ALSO reads input and writes output in [batch, seq, *] order (inputOffset/output use
         // (b*timeSteps+t)), which is the engine's native layout — so NO sequence transpose is needed. The
