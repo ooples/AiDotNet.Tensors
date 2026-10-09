@@ -1865,7 +1865,9 @@ internal static partial class SimdGemm
             SgemmNParallelSmallM(a, lda, b, ldb, c, m, k, n, clearedOutput);
             return;
         }
-        // Not gated on allowParallel: the same shape must sum in the same order on one thread or many.
+#if NET5_0_OR_GREATER
+        // Not gated on allowParallel: the same shape must sum in the same order on one thread or many. .NET 5+ only,
+        // like the direct kernels each slice runs.
         if (!transA && !transB && UseSplitK
             && m >= Mr && m <= DirectParallel2DMaxM && n >= Nr && k > DirectParallel2DMaxK
             && (long)m * n <= SplitKDirectMaxOutput
@@ -1874,6 +1876,7 @@ internal static partial class SimdGemm
             SgemmSplitK(a, lda, b, ldb, c, m, k, n, clearedOutput, allowParallel);
             return;
         }
+#endif
 #if NET5_0_OR_GREATER
         if (Avx2.IsSupported && Fma.IsSupported && m >= Mr && n > 0)
         {
