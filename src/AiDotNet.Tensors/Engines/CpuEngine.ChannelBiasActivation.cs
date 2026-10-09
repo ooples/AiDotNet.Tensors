@@ -105,8 +105,9 @@ public partial class CpuEngine
         // computes the same convolution, bit for bit, as the unfused one.
         // The direct blocked kernel is DispatchFloatConv2D's first choice, so a conv it takes goes through Conv2DInto too.
         bool batchedRoute = input.Layout == LinearAlgebra.TensorLayout.Nchw
-            && (Engines.Simd.DirectConvAvx2.ShouldUseForward(input._shape[0], input._shape[1], kernel._shape[0],
-                    kernelHeight, kernelWidth, strideH, strideW, outputHeight, outputWidth)
+            && (Engines.Simd.DirectConvAvx2.TryChoose(new Engines.Simd.DirectConvShape(Engines.Simd.DirectConvPass.Forward,
+                    input._shape[0], input._shape[1], kernel._shape[0], input._shape[2], input._shape[3], kernelHeight, kernelWidth,
+                    strideH, strideW, padH, padW, dilationH, dilationW), out _)
                 || UseBatchedConvForward(input._shape[0], input._shape[1], kernelHeight, kernelWidth,
                     strideH, strideW, outputHeight, outputWidth, kernel._shape[0]));
         bool adaptiveRoute = !batchedRoute

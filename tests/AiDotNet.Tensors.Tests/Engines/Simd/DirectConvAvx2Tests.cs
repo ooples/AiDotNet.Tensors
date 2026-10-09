@@ -12,6 +12,7 @@ namespace AiDotNet.Tensors.Tests.Engines.Simd;
 /// covered whatever the routing predicates currently send to them (the engine-level conv suites cover the routed
 /// shapes).
 /// </summary>
+[Collection("EngineCurrentGlobalState")]
 public class DirectConvAvx2Tests
 {
     private static Tensor<float> Random(int seed, params int[] shape)
@@ -170,9 +171,9 @@ public class DirectConvAvx2Tests
         Skip.IfNot(DirectConvAvx2.IsSupported, "needs AVX2 and FMA");
         var engine = new AiDotNet.Tensors.Engines.CpuEngine();
         int[] stride = { 2, 2 }, pad = { 1, 1 }, dil = { 1, 1 };
-        Assert.True(DirectConvAvx2.ShouldUseForward(4, 32, 32, 3, 3, 2, 2, 8, 8));
-        Assert.True(DirectConvAvx2.ShouldUseBackwardInput(4, 32, 32, 16, 16, 3, 3, 2, 2, 1, 1, 1, 1));
-        Assert.True(DirectConvAvx2.ShouldUseBackwardKernel(32, 32, 3, 3, 2, 2, 8, 8));
+        Assert.True(DirectConvAvx2.TryChoose(new DirectConvShape(DirectConvPass.Forward, 4, 32, 32, 16, 16, 3, 3, 2, 2, 1, 1, 1, 1), out _));
+        Assert.True(DirectConvAvx2.TryChoose(new DirectConvShape(DirectConvPass.BackwardInput, 4, 32, 32, 16, 16, 3, 3, 2, 2, 1, 1, 1, 1), out _));
+        Assert.True(DirectConvAvx2.TryChoose(new DirectConvShape(DirectConvPass.BackwardKernel, 4, 32, 32, 16, 16, 3, 3, 2, 2, 1, 1, 1, 1), out _));
 
         var xBig = Random(11, 6, 32, 16, 16); var x = xBig.Slice(0, 1, 5);
         var w = Random(12, 32, 32, 3, 3);

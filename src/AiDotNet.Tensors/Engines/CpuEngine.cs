@@ -10217,7 +10217,8 @@ public partial class CpuEngine : ITensorLevelEngine
     {
 #if NET5_0_OR_GREATER
         if (input.Layout == LinearAlgebra.TensorLayout.Nchw
-            && Simd.DirectConvAvx2.ShouldUseForward(batch, inChannels, outChannels, kernelHeight, kernelWidth, strideH, strideW, outputHeight, outputWidth))
+            && Simd.DirectConvAvx2.TryChoose(new Simd.DirectConvShape(Simd.DirectConvPass.Forward, batch, inChannels, outChannels,
+                height, width, kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW), out int directTasks))
         {
             // Read and write the operands in place at their storage offsets: an arena or sliced buffer would otherwise
             // be copied out (offset 0 is only right for a caller-supplied flat array).
@@ -10229,7 +10230,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 Simd.DirectConvAvx2.Forward(inArr, inOff, kArr, kOff, outArr, outOff,
                     accumulate: false, batch, inChannels, height, width, outChannels, kernelHeight, kernelWidth,
-                    strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth);
+                    strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth, directTasks);
                 return;
             }
         }
@@ -15335,8 +15336,8 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float))
         {
 #if NET5_0_OR_GREATER
-            if (Simd.DirectConvAvx2.ShouldUseBackwardInput(batch, inChannels, outChannels, height, width, kernelHeight, kernelWidth,
-                    strideH, strideW, padH, padW, dilationH, dilationW))
+            if (Simd.DirectConvAvx2.TryChoose(new Simd.DirectConvShape(Simd.DirectConvPass.BackwardInput, batch, inChannels, outChannels,
+                    height, width, kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW), out int directTasks))
             {
                 // Both operands were made contiguous above; read them in place at their storage offsets (an arena
                 // buffer is usually longer than the tensor, and GetFlattenedData would copy it every step).
@@ -15347,7 +15348,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 {
                     Simd.DirectConvAvx2.BackwardInput(gArr, gOff, kArr, kOff, dArr, dOff, accumulate,
                         batch, inChannels, height, width, outChannels, kernelHeight, kernelWidth,
-                        strideH, strideW, padH, padW, outputHeight, outputWidth);
+                        strideH, strideW, padH, padW, outputHeight, outputWidth, directTasks);
                     return;
                 }
             }
@@ -16500,8 +16501,8 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float))
         {
 #if NET5_0_OR_GREATER
-            if (Simd.DirectConvAvx2.ShouldUseBackwardKernel(inChannels, outChannels, kernelHeight, kernelWidth,
-                    strideH, strideW, outputHeight, outputWidth))
+            if (Simd.DirectConvAvx2.TryChoose(new Simd.DirectConvShape(Simd.DirectConvPass.BackwardKernel, batch, inChannels, outChannels,
+                    height, width, kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW), out _))
             {
                 // Both operands were made contiguous above; read them in place (see the input-gradient route).
                 var xArr = (float[]?)(object?)input.GetCpuBackingForStridedRead(out int xOff);

@@ -64,52 +64,73 @@ internal static class DirectConvAvx2
     // many grid positions per image the tiles are too short (256->512 stride 2 on 8x8, a 4x4 grid: 1.2 ms -> 1.4).
     private const int MinStridedPhasePositions = 64;
 
-    private static bool ShapeSuitsDirect(int kernelHeight, int kernelWidth, int strideH, int strideW, int planePositions)
-        => kernelHeight * kernelWidth > 1
-           && (strideH > 1 || strideW > 1 || planePositions <= MaxStride1PlanePositions);
-
-    /// <summary>Whether the forward conv takes the direct kernel (see the measurements above).</summary>
-    public static bool ShouldUseForward(int batch, int inChannels, int outChannels, int kernelHeight, int kernelWidth,
-        int strideH, int strideW, int outputHeight, int outputWidth)
-        => IsSupported
-           && (EnabledPasses & DirectConvPasses.Forward) != 0
-           && batch > 1
-           && inChannels % Block == 0
-           && outChannels % (Block * OutputBlocksPerTile) == 0
-           && outputHeight * outputWidth > 0
-           && ShapeSuitsDirect(kernelHeight, kernelWidth, strideH, strideW, outputHeight * outputWidth);
-
     /// <summary>
-    /// Whether an input gradient takes the direct kernel: a forward conv of the output gradient with the flipped,
-    /// transposed kernel, run per stride phase when strided.
+    /// Whether <paramref name="shape"/>'s pass runs on the direct kernel, and with what forward task target (0 = the
+    /// default). A configuration activated for the exact shape (<see cref="DirectConvTuning"/>, normally a tuned
+    /// winner) decides; otherwise the measured rules below do. Shapes the kernels cannot run are never routed.
     /// </summary>
-    public static bool ShouldUseBackwardInput(int batch, int inChannels, int outChannels, int height, int width,
-        int kernelHeight, int kernelWidth, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
-        => IsSupported
-           && (EnabledPasses & (strideH == 1 && strideW == 1 ? DirectConvPasses.BackwardInput : DirectConvPasses.BackwardInputStrided)) != 0
-           && batch > 1
-           && dilationH == 1 && dilationW == 1
-           && padH <= kernelHeight - 1 && padW <= kernelWidth - 1
-           && outChannels % Block == 0
-           && inChannels % (Block * OutputBlocksPerTile) == 0
-           && ShapeSuitsDirect(kernelHeight, kernelWidth, strideH, strideW, height * width)
-           && (strideH == 1 && strideW == 1 || (height / strideH) * (width / strideW) >= MinStridedPhasePositions);
+    public static bool TryChoose(in DirectConvShape shape, out int targetTasks)
+    {
+        targetTasks = 0;
+        if (!IsEligible(shape)) return false;
+        if (DirectConvTuning.TryGet(shape, out DirectConvConfiguration configuration))
+        {
+            targetTasks = configuration.TargetTasks;
+            return configuration.Route == DirectConvRoute.Direct;
+        }
+        return DefaultChoosesDirect(shape);
+    }
 
-    /// <summary>Whether the kernel gradient takes the direct kernel (see the measurements above).</summary>
-    public static bool ShouldUseBackwardKernel(int inChannels, int outChannels, int kernelHeight, int kernelWidth,
-        int strideH, int strideW, int outputHeight, int outputWidth)
-        => IsSupported
-           && (EnabledPasses & DirectConvPasses.BackwardKernel) != 0
-           && inChannels % Block == 0
-           && outChannels % Block == 0
-           && (inChannels / Block) * (outChannels / Block) >= MinBackwardKernelTasks
-           && ShapeSuitsDirect(kernelHeight, kernelWidth, strideH, strideW, outputHeight * outputWidth);
+    /// <summary>Whether the direct kernels can run <paramref name="shape"/> at all (layout and alignment, not speed).</summary>
+    public static bool IsEligible(in DirectConvShape shape)
+    {
+        if (!IsSupported || shape.Batch < 1 || shape.OutputHeight <= 0 || shape.OutputWidth <= 0) return false;
+        switch (shape.Pass)
+        {
+            case DirectConvPass.Forward:
+                return (EnabledPasses & DirectConvPasses.Forward) != 0
+                    && shape.InChannels % Block == 0
+                    && shape.OutChannels % (Block * OutputBlocksPerTile) == 0;
+            case DirectConvPass.BackwardInput:
+                return (EnabledPasses & (shape.StrideH == 1 && shape.StrideW == 1
+                        ? DirectConvPasses.BackwardInput : DirectConvPasses.BackwardInputStrided)) != 0
+                    && shape.DilationH == 1 && shape.DilationW == 1
+                    && shape.PadH <= shape.KernelHeight - 1 && shape.PadW <= shape.KernelWidth - 1
+                    && shape.OutChannels % Block == 0
+                    && shape.InChannels % (Block * OutputBlocksPerTile) == 0;
+            case DirectConvPass.BackwardKernel:
+                return (EnabledPasses & DirectConvPasses.BackwardKernel) != 0
+                    && shape.InChannels % Block == 0
+                    && shape.OutChannels % Block == 0;
+            default:
+                return false;
+        }
+    }
+
+    /// <summary>The measured routing rules (see the constants above) for a shape with no activated configuration.</summary>
+    public static bool DefaultChoosesDirect(in DirectConvShape shape)
+    {
+        if (shape.Batch < 2 || shape.KernelHeight * shape.KernelWidth == 1) return false;
+        bool strided = shape.StrideH > 1 || shape.StrideW > 1;
+        int plane = shape.Pass == DirectConvPass.BackwardInput
+            ? shape.Height * shape.Width
+            : shape.OutputHeight * shape.OutputWidth;
+        if (!strided && plane > MaxStride1PlanePositions) return false;
+        return shape.Pass switch
+        {
+            DirectConvPass.BackwardInput => !strided
+                || (shape.Height / shape.StrideH) * (shape.Width / shape.StrideW) >= MinStridedPhasePositions,
+            DirectConvPass.BackwardKernel => (shape.InChannels / Block) * (shape.OutChannels / Block) >= MinBackwardKernelTasks,
+            _ => true,
+        };
+    }
 #if NET5_0_OR_GREATER
     /// <summary>output[n, oc, oh, ow] (=, or += when <paramref name="accumulate"/>) conv(input, kernel), NCHW / OIHW.</summary>
     public static void Forward(
         float[] input, int inputOffset, float[] kernel, int kernelOffset, float[] output, int outputOffset, bool accumulate,
         int batch, int inChannels, int height, int width, int outChannels, int kernelHeight, int kernelWidth,
-        int strideH, int strideW, int padH, int padW, int dilationH, int dilationW, int outputHeight, int outputWidth)
+        int strideH, int strideW, int padH, int padW, int dilationH, int dilationW, int outputHeight, int outputWidth,
+        int targetTasks = 0)
     {
         int paddedH = height + 2 * padH, paddedW = width + 2 * padW;
         int inBlocks = inChannels / Block;
@@ -122,7 +143,7 @@ internal static class DirectConvAvx2
             PackKernel(kernel, kernelOffset, packedKernel, outChannels, inChannels, kernelHeight, kernelWidth, transposeAndFlip: false);
             ForwardPacked(packedInput, packedKernel, output, outputOffset, accumulate,
                 ForwardGeometry.Plain(batch, inBlocks, paddedH, paddedW, outChannels, kernelHeight, kernelWidth,
-                    strideH, strideW, dilationH, dilationW, outputHeight, outputWidth));
+                    strideH, strideW, dilationH, dilationW, outputHeight, outputWidth), targetTasks);
         }
         finally
         {
@@ -138,13 +159,13 @@ internal static class DirectConvAvx2
     public static void BackwardInput(
         float[] gradOutput, int gradOutputOffset, float[] kernel, int kernelOffset, float[] dest, int destOffset, bool accumulate,
         int batch, int inChannels, int height, int width, int outChannels, int kernelHeight, int kernelWidth,
-        int strideH, int strideW, int padH, int padW, int outputHeight, int outputWidth)
+        int strideH, int strideW, int padH, int padW, int outputHeight, int outputWidth, int targetTasks = 0)
     {
         if (strideH > 1 || strideW > 1)
         {
             BackwardInputStrided(gradOutput, gradOutputOffset, kernel, kernelOffset, dest, destOffset, accumulate,
                 batch, inChannels, height, width, outChannels, kernelHeight, kernelWidth,
-                strideH, strideW, padH, padW, outputHeight, outputWidth);
+                strideH, strideW, padH, padW, outputHeight, outputWidth, targetTasks);
             return;
         }
         int padHt = kernelHeight - 1 - padH, padWt = kernelWidth - 1 - padW;
@@ -159,7 +180,7 @@ internal static class DirectConvAvx2
             PackKernel(kernel, kernelOffset, packedKernel, outChannels, inChannels, kernelHeight, kernelWidth, transposeAndFlip: true);
             ForwardPacked(packedGrad, packedKernel, dest, destOffset, accumulate,
                 ForwardGeometry.Plain(batch, gradBlocks, paddedH, paddedW, inChannels, kernelHeight, kernelWidth,
-                    1, 1, 1, 1, height, width));
+                    1, 1, 1, 1, height, width), targetTasks);
         }
         finally
         {
@@ -177,8 +198,9 @@ internal static class DirectConvAvx2
     private static void BackwardInputStrided(
         float[] gradOutput, int gradOutputOffset, float[] kernel, int kernelOffset, float[] dest, int destOffset, bool accumulate,
         int batch, int inChannels, int height, int width, int outChannels, int kernelHeight, int kernelWidth,
-        int strideH, int strideW, int padH, int padW, int outputHeight, int outputWidth)
+        int strideH, int strideW, int padH, int padW, int outputHeight, int outputWidth, int targetTasks)
     {
+        int taskTarget = targetTasks > 0 ? targetTasks : TargetForwardTasks;
         // Every phase origin lies within a kernel extent of the gradient plane, so a kernel-sized border covers all reads.
         int borderH = kernelHeight, borderW = kernelWidth;
         int paddedH = outputHeight + 2 * borderH, paddedW = outputWidth + 2 * borderW;
@@ -210,7 +232,7 @@ internal static class DirectConvAvx2
                     tapsH, tapsW, 1, 1, 1, 1, gridH, gridW, (originRow * paddedW + originCol) * Block,
                     height, width, strideH, strideW, ry, rx);
                 int chunks = (geometry.TotalPositions + PositionUnroll - 1) / PositionUnroll;
-                int chunksPerTask = Math.Max(1, (int)(((long)chunks * tiles * strideH * strideW + TargetForwardTasks - 1) / TargetForwardTasks));
+                int chunksPerTask = Math.Max(1, (int)(((long)chunks * tiles * strideH * strideW + taskTarget - 1) / taskTarget));
                 int tasks = tiles * ((chunks + chunksPerTask - 1) / chunksPerTask);
                 phases.Add((geometry, packedOffset, firstH, tapsH, firstW, tapsW, chunks, chunksPerTask, tasks));
                 packedOffset += outChannels * inChannels * tapsH * tapsW;
@@ -428,12 +450,13 @@ internal static class DirectConvAvx2
     }
 
     private static void ForwardPacked(float[] packedInput, float[] packedKernel, float[] output, int outputOffset, bool accumulate,
-        ForwardGeometry geometry)
+        ForwardGeometry geometry, int targetTasks)
     {
+        int taskTarget = targetTasks > 0 ? targetTasks : TargetForwardTasks;
         int tiles = geometry.OutChannels / (Block * OutputBlocksPerTile);
         int totalPositions = geometry.TotalPositions;
         int chunks = (totalPositions + PositionUnroll - 1) / PositionUnroll;
-        int chunksPerTask = Math.Max(1, (int)(((long)chunks * tiles + TargetForwardTasks - 1) / TargetForwardTasks));
+        int chunksPerTask = Math.Max(1, (int)(((long)chunks * tiles + taskTarget - 1) / taskTarget));
         int tasksPerTile = (chunks + chunksPerTask - 1) / chunksPerTask;
         CpuParallelSettings.ParallelForOrSerial(0, tiles * tasksPerTile,
             (long)totalPositions * geometry.OutChannels * geometry.InBlocks * Block * geometry.KernelHeight * geometry.KernelWidth,
