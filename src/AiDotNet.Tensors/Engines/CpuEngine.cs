@@ -11419,7 +11419,7 @@ public partial class CpuEngine : ITensorLevelEngine
     /// (65K-524K elements) ran on one thread: a ResNet step spent 4 ms in ReLU against PyTorch's 0.9, whose own
     /// grain is 32K. Env override: AIDOTNET_ELEMENTWISE_GRAIN.
     /// </summary>
-    internal static int ElementwiseGrain =
+    internal static readonly int ElementwiseGrain =
         int.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_ELEMENTWISE_GRAIN"), out var grain) && grain > 0 ? grain : 64 * 1024;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -45836,13 +45836,11 @@ public partial class CpuEngine : ITensorLevelEngine
 
     /// <summary>
     /// Dispatches a JIT-compiled binary operation with multi-threaded parallelism for large arrays.
-    /// For arrays >= 2M elements, splits work across threads with per-chunk JIT kernels.
-    /// For smaller arrays, runs single-threaded JIT kernel.
+    /// Splits work across threads at the shared <see cref="ElementwiseGrain"/> (one chunk per grain, at most the
+    /// pool width) with per-chunk JIT kernels; an array under two grains runs one single-threaded JIT kernel.
     /// </summary>
     private static unsafe void JitBinaryDispatch(float* pA, float* pB, float* pR, int length, JitBinaryOp op)
     {
-        // For large arrays, parallelize across threads
-        // Use 500K threshold for bandwidth-bound binary ops
         int numChunks = ElementwiseChunks(length);
         if (numChunks >= 2)
         {
