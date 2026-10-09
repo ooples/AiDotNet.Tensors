@@ -60,6 +60,25 @@ public abstract class OptimizerBase : IOptimizer
     private float[] _sparseScratch = Array.Empty<float>();
 
     /// <summary>
+    /// Which parameters a step updates, as (group index, parameter index) → true; null updates every parameter.
+    /// Set by <see cref="ZeroShardedOptimizer"/> to restrict a step to its rank's shard.
+    /// </summary>
+    internal Func<int, int, bool>? StepFilter { get; set; }
+
+    /// <summary>
+    /// Combines a group-wide statistic across ranks in place (a sum). Set by <see cref="ZeroShardedOptimizer"/> so an
+    /// optimizer whose update depends on statistics over every parameter of a group (<see cref="HasGroupStatistics"/>)
+    /// sees the whole group while each rank steps only its shard.
+    /// </summary>
+    internal Action<double[]>? GroupStatisticsReducer { get; set; }
+
+    /// <summary>True when an update reads statistics summed over all of a group's parameters (D-Adaptation, Prodigy).</summary>
+    internal virtual bool HasGroupStatistics => false;
+
+    /// <summary>Sums <paramref name="statistics"/> across ranks when the step is sharded; a no-op otherwise.</summary>
+    private protected void ReduceGroupStatistics(double[] statistics) => GroupStatisticsReducer?.Invoke(statistics);
+
+    /// <summary>
     /// One optimization step that reads each tensor parameter's gradient straight from <paramref name="gradients"/>
     /// (typically the dictionary <c>GradientTape.ComputeGradients</c> returns), with no copy into
     /// <see cref="ParamGroup.Gradients"/>. A tensor parameter missing from the dictionary is skipped, as PyTorch skips a
@@ -194,11 +213,13 @@ public abstract class OptimizerBase : IOptimizer
     }
 
     /// <summary>
-    /// Whether this step updates <c>group[gi].param[pi]</c>: false only for a tensor parameter that
-    /// <see cref="Step(IReadOnlyDictionary{Tensor{float}, Tensor{float}})"/> was given no gradient for.
+    /// Whether this step updates <c>group[gi].param[pi]</c>: false outside the <see cref="StepFilter"/> shard, and for
+    /// a tensor parameter that <see cref="Step(IReadOnlyDictionary{Tensor{float}, Tensor{float}})"/> was given no
+    /// gradient for.
     /// </summary>
     private protected bool ShouldStep(int gi, int pi)
     {
+        if (StepFilter is not null && !StepFilter(gi, pi)) return false;
         var tensor = _groups[gi].ParameterTensor(pi);
         return tensor is null || _boundGradients is null || _boundGradients.ContainsKey(tensor);
     }

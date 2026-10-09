@@ -21,6 +21,9 @@ namespace AiDotNet.Tensors.Engines.Optimization.Optimizers;
 /// </summary>
 public sealed class DAdaptAdamOptimizer : OptimizerBase
 {
+    /// <inheritdoc />
+    internal override bool HasGroupStatistics => true;
+
     private static readonly Dictionary<string, double> _defaults = new Dictionary<string, double>
     {
         ["lr"] = 1.0, ["beta1"] = 0.9, ["beta2"] = 0.999, ["eps"] = 1e-8,
@@ -157,6 +160,11 @@ public sealed class DAdaptAdamOptimizer : OptimizerBase
             }
 
             // d update — only ever grows. growth_rate caps how fast d can rise per step.
+            // Sharded (ZeRO): the d-update reads sums over the whole group, so combine every rank's share.
+            var groupSums = new[] { sk_l1, numerator };
+            ReduceGroupStatistics(groupSums);
+            sk_l1 = groupSums[0];
+            numerator = groupSums[1];
             if (sk_l1 > 0)
             {
                 double dHat = numerator / ((1.0 - b2) * sk_l1);
@@ -180,6 +188,9 @@ public sealed class DAdaptAdamOptimizer : OptimizerBase
 /// </summary>
 public sealed class ProdigyOptimizer : OptimizerBase
 {
+    /// <inheritdoc />
+    internal override bool HasGroupStatistics => true;
+
     private static readonly Dictionary<string, double> _defaults = new Dictionary<string, double>
     {
         ["lr"] = 1.0, ["beta1"] = 0.9, ["beta2"] = 0.999, ["eps"] = 1e-8,
@@ -335,6 +346,11 @@ public sealed class ProdigyOptimizer : OptimizerBase
                 }
             }
 
+            // Sharded (ZeRO): the d-update reads sums over the whole group, so combine every rank's share.
+            var groupSums = new[] { dDelta, sk_l1 };
+            ReduceGroupStatistics(groupSums);
+            dDelta = groupSums[0];
+            sk_l1 = groupSums[1];
             DNumerator[gi] = b3 * DNumerator[gi] + dDelta;
             if (sk_l1 > 0)
             {
