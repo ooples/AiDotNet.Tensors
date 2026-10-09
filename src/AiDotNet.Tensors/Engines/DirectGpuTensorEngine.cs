@@ -2628,9 +2628,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var vector = tensor.DataVector;
         if (vector._deviceState is not { Buffer: { } buffer } state) return;
         if (_actionScratchBuffers.Contains(buffer)) return;   // the per-action scratch pool owns it
+        if (!tensor.IsContiguous || tensor._storageOffset != 0 || tensor.Length != vector.Length) return;
         if (s_staleDropTrace)
             StaleDropDiag($"RELEASE-DEAD len={tensor.Length} caller=" + new System.Diagnostics.StackTrace(1, false).ToString().Replace(System.Environment.NewLine, " <- "));
-        if (!tensor.IsContiguous || tensor._storageOffset != 0 || tensor.Length != vector.Length) return;
         Helpers.HostSync.Release(vector, ReleasedIntermediateMessage);
         if (tensor.GetBackingArrayForCacheLookupUnsafe() is { } array) Helpers.HostSync.Release(array, ReleasedIntermediateMessage);
         state.Buffer = null;
