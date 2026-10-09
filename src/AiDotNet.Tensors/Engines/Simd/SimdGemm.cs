@@ -1868,7 +1868,7 @@ internal static partial class SimdGemm
 #if NET5_0_OR_GREATER
         // Not gated on allowParallel: the same shape must sum in the same order on one thread or many. .NET 5+ only,
         // like the direct kernels each slice runs.
-        if (!transA && !transB && UseSplitK
+        if (!transA && !transB && UseSplitK && !t_inSplitK
             && m >= Mr && m <= DirectParallel2DMaxM && n >= Nr && k > DirectParallel2DMaxK
             && (long)m * n <= SplitKDirectMaxOutput
             && (long)m * k * n >= ParallelWorkThreshold)
@@ -2072,13 +2072,15 @@ internal static partial class SimdGemm
     // dst += src, vectorized.
     private static void AddInto(Span<float> dst, ReadOnlySpan<float> src)
     {
-        int i = 0, vw = System.Numerics.Vector<float>.Count;
+        int vw = System.Numerics.Vector<float>.Count;
         var dv = System.Runtime.InteropServices.MemoryMarshal.Cast<float, System.Numerics.Vector<float>>(dst);
         var sv = System.Runtime.InteropServices.MemoryMarshal.Cast<float, System.Numerics.Vector<float>>(src);
         for (int v = 0; v < dv.Length && v < sv.Length; v++) dv[v] += sv[v];
-        i = Math.Min(dv.Length, sv.Length) * vw;
-        for (; i < dst.Length; i++) dst[i] += src[i];
+        for (int i = Math.Min(dv.Length, sv.Length) * vw; i < dst.Length; i++) dst[i] += src[i];
     }
+
+    // Set while a split-K slice (or its single-slice fallback) runs, so the dispatch it calls cannot split again.
+    [ThreadStatic] private static bool t_inSplitK;
 
     /// <summary>A/B and test toggle for <see cref="SgemmSplitK"/>.</summary>
     internal static bool UseSplitK = true;
@@ -2108,8 +2110,12 @@ internal static partial class SimdGemm
         int slices = Math.Max(1, Math.Min(byWork, k / SplitKMinSlice));
         if (slices <= 1)
         {
-            if (clearedOutput) c.Clear();
-            SgemmAddInternal(a, lda, false, b, ldb, false, c, m, k, n, allowParallel: false, clearedOutput: true);
+            // Not reachable with today's bounds (k > 1024 and the work floor give at least 4 slices), but a single
+            // slice must neither re-enter split-K nor overwrite an accumulating call: dispatch once, unsplit.
+            bool prev = t_inSplitK;
+            t_inSplitK = true;
+            try { SgemmAddInternal(a, lda, false, b, ldb, false, c, m, k, n, allowParallel, clearedOutput); }
+            finally { t_inSplitK = prev; }
             return;
         }
         int outSize = m * n;
@@ -2127,8 +2133,15 @@ internal static partial class SimdGemm
                     var bSlice = new ReadOnlySpan<float>((float*)ipB + (long)k0 * ldb, bLen - k0 * ldb);
                     var part = new Span<float>(partials, sIdx * outSize, outSize);
                     part.Clear();
-                    SgemmAddInternal(aSlice, lda, false, bSlice, ldb, false, part, m, k1 - k0, n,
-                        allowParallel: false, clearedOutput: true);
+                    // A slice longer than the 2-D bound would otherwise split again on this (worker) thread.
+                    bool prev = t_inSplitK;
+                    t_inSplitK = true;
+                    try
+                    {
+                        SgemmAddInternal(aSlice, lda, false, bSlice, ldb, false, part, m, k1 - k0, n,
+                            allowParallel: false, clearedOutput: true);
+                    }
+                    finally { t_inSplitK = prev; }
                 }
                 if (allowParallel && cores > 1) Helpers.CpuParallelSettings.LightweightParallel(slices, Slice);
                 else for (int sIdx = 0; sIdx < slices; sIdx++) Slice(sIdx);

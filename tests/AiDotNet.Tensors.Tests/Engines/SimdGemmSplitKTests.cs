@@ -46,6 +46,8 @@ public sealed class SimdGemmSplitKTests
     [InlineData(64, 3136, 128)]
     [InlineData(32, 2048, 64)]
     [InlineData(12, 1531, 40)]
+    // Slices of 1250 exceed the 2-D bound, so each slice's own dispatch must not split again (re-entry guard).
+    [InlineData(32, 20000, 64)]
     public void SplitK_MatchesDoubleReference_ForOverwriteAndAccumulate(int m, int k, int n)
     {
         var a = Fill(m * k, 3);
