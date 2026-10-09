@@ -15,7 +15,8 @@ namespace AiDotNet.Tensors.Engines;
 /// convolution, bilinear, local response norm, the dropout variants and the rest) are built from engine
 /// primitives that this engine already runs on the device; their overrides below pass straight to the composition,
 /// whose virtual calls land on this engine's device kernels (they exist so the backend-completeness ratchet sees an
-/// explicit decision for every op). Degree/radian
+/// explicit decision for every op). Seven ops have device paths in
+/// DirectGpuTensorEngine.TorchParityDevice.cs. Degree/radian
 /// conversion is routed to the device's scalar multiply below. The reparameterized normal and the dropout variants
 /// compose on the device but draw their noise or keep-mask on the host and upload it, so they record a fallback too.
 /// </para>
@@ -37,34 +38,14 @@ public partial class DirectGpuTensorEngine
 
 
 
+
     // ---- CpuEngine.TorchComplex.cs ----
-
-    /// <inheritdoc/>
-    public override Tensor<T> TensorReal<T>(Tensor<Complex<T>> input)
-    {
-        GpuLaunchProbe.OnFallback("TensorReal: no device kernel", null);
-        return base.TensorReal<T>(input);
-    }
-
-    /// <inheritdoc/>
-    public override Tensor<T> TensorImag<T>(Tensor<Complex<T>> input)
-    {
-        GpuLaunchProbe.OnFallback("TensorImag: no device kernel", null);
-        return base.TensorImag<T>(input);
-    }
 
     /// <inheritdoc/>
     public override Tensor<Complex<T>> TensorComplex<T>(Tensor<T> real, Tensor<T> imag)
     {
         GpuLaunchProbe.OnFallback("TensorComplex: no device kernel", null);
         return base.TensorComplex<T>(real, imag);
-    }
-
-    /// <inheritdoc/>
-    public override Tensor<T> TensorViewAsReal<T>(Tensor<Complex<T>> input)
-    {
-        GpuLaunchProbe.OnFallback("TensorViewAsReal: no device kernel", null);
-        return base.TensorViewAsReal<T>(input);
     }
 
     /// <inheritdoc/>
@@ -447,38 +428,10 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <inheritdoc/>
-    public override (Tensor<T> Output, Tensor<int> Indices) TensorAdaptiveMaxPoolWithIndices<T>(Tensor<T> input, int[] outputSize)
-    {
-        GpuLaunchProbe.OnFallback("TensorAdaptiveMaxPoolWithIndices: no device kernel", null);
-        return base.TensorAdaptiveMaxPoolWithIndices<T>(input, outputSize);
-    }
-
-    /// <inheritdoc/>
-    public override (Tensor<T> Output, Tensor<int> Indices) TensorMaxPool1DWithIndices<T>(Tensor<T> input, int kernelSize, int stride = 0, int padding = 0, int dilation = 1, bool ceilMode = false)
-    {
-        GpuLaunchProbe.OnFallback("TensorMaxPool1DWithIndices: no device kernel", null);
-        return base.TensorMaxPool1DWithIndices<T>(input, kernelSize, stride, padding, dilation, ceilMode);
-    }
-
-    /// <inheritdoc/>
     public override Tensor<T> TensorLpPool<T>(Tensor<T> input, double power, int[] kernelSize, int[]? stride = null)
     {
         GpuLaunchProbe.OnFallback("TensorLpPool: no device kernel", null);
         return base.TensorLpPool<T>(input, power, kernelSize, stride);
-    }
-
-    /// <inheritdoc/>
-    public override (Tensor<T> Output, Tensor<int> Indices) TensorFractionalMaxPool<T>(Tensor<T> input, int[] kernelSize, int[] outputSize, int? seed = null)
-    {
-        GpuLaunchProbe.OnFallback("TensorFractionalMaxPool: no device kernel", null);
-        return base.TensorFractionalMaxPool<T>(input, kernelSize, outputSize, seed);
-    }
-
-    /// <inheritdoc/>
-    public override Tensor<T> TensorMaxUnpool<T>(Tensor<T> input, Tensor<int> indices, int[] outputSize)
-    {
-        GpuLaunchProbe.OnFallback("TensorMaxUnpool: no device kernel", null);
-        return base.TensorMaxUnpool<T>(input, indices, outputSize);
     }
 
     // ---- CpuEngine.TorchRandom.cs ----
