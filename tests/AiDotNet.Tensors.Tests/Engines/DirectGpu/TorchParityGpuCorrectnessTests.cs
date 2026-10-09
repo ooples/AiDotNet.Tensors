@@ -1,3 +1,5 @@
+#if !NETFRAMEWORK
+// GpuCpuCorrectnessFixture (GpuCpuCorrectnessTests.cs) is compiled only off .NET Framework.
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -85,3 +87,4 @@ public sealed class TorchParityGpuCorrectnessTests : IClassFixture<GpuCpuCorrect
                 $"{op}[{i}]: cpu {cpu[i]:R}, gpu {gpu[i]:R}");
     }
 }
+#endif

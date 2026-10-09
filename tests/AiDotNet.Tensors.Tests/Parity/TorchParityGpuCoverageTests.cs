@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Reflection;
@@ -35,9 +36,10 @@ public class TorchParityGpuCoverageTests
             .SelectMany(f => Regex.Matches(File.ReadAllText(f), @"public virtual [^(]+? (\w+)<T>\(", RegexOptions.None, RegexTimeout)
                 .Cast<Match>().Select(m => m.Groups[1].Value))
             .Distinct().ToList();
-        var overridden = typeof(DirectGpuTensorEngine)
+        // new HashSet, not ToHashSet: .NET Framework 4.7.1 has no Enumerable.ToHashSet.
+        var overridden = new HashSet<string>(typeof(DirectGpuTensorEngine)
             .GetMethods(BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly)
-            .Select(m => m.Name).ToHashSet();
+            .Select(m => m.Name), StringComparer.Ordinal);
         var missing = declared
             .Where(n => !OpRegistry.DelegatorOps.Contains(n) && !Metadata.Contains(n) && !overridden.Contains(n))
             .OrderBy(n => n, StringComparer.Ordinal).ToList();
