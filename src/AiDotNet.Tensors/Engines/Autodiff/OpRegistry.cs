@@ -247,6 +247,11 @@ internal static class OpRegistry
     /// </summary>
     internal static readonly HashSet<string> NonDifferentiableOps = new(StringComparer.Ordinal)
     {
+        // Random draws, nonzero_static and unique(dim): constants (CpuEngine.TorchRandom)
+        "TensorBernoulli", "TensorBinomial", "TensorPoisson", "TensorUniform",
+        "TensorCauchy", "TensorExponential", "TensorGeometric", "TensorLogNormal",
+        "TensorMultinomial", "TensorNonzeroStatic", "TensorUniqueDim",
+
         // Creation, random, window, index and truth-value ops: constants
         "TensorAll", "TensorAny", "TensorArange", "TensorRange",
         "TensorLogspace", "TensorZerosLike", "TensorOnesLike", "TensorFullLike",
@@ -480,6 +485,12 @@ internal static class OpRegistry
     /// </summary>
     internal static readonly HashSet<string> DelegatorOps = new(StringComparer.Ordinal)
     {
+        // Composed from recorded ops (reparameterized normal, constant masks, reshape/permute, matmul, conv, scatter_reduce)
+        "TensorNormal", "TensorAlphaDropout", "TensorFeatureAlphaDropout", "TensorChannelDropout",
+        "TensorBilinear", "TensorChannelShuffle", "TensorPixelUnshuffle", "TensorLocalResponseNorm",
+        "TensorSoftMarginLoss", "TensorRenorm", "TensorNormExceptDim", "TensorGradient",
+        "TensorPadSequence", "TensorIndexReduce", "TensorConvTranspose1D", "TensorConvTbc",
+
         // Composed from recorded ops (softmax, add/multiply/divide, matmul, batch matmul, reductions)
         "TensorSoftmin", "TensorRsub", "TensorAddcmul", "TensorAddcdiv",
         "TensorAddmv", "TensorAddr", "TensorBaddbmm", "TensorAddbmm",
