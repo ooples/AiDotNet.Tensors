@@ -529,14 +529,6 @@ extern ""C"" __global__ __launch_bounds__(1024) void lstm_backward_sequence(
             float dRow2 = dCCandidate;   // cell candidate g -> weight row 2
             float dRow3 = dO;            // output gate -> weight row 3
 
-            // Get previous hidden state for weight gradients
-            float h_prev_val;
-            if (t == 0) {
-                h_prev_val = h_init[b * hiddenSize + h_idx];
-            } else {
-                h_prev_val = h_states[(t - 1) * batch * hiddenSize + gid];
-            }
-
             // Accumulate weight gradients (atomic for multi-thread safety)
             int inputOffset = (b * timeSteps + t) * inputSize;
             for (int i = 0; i < inputSize; i++) {

@@ -9,7 +9,8 @@ namespace AiDotNet.Tensors.Engines.DirectGpu;
 /// <remarks>
 /// Declared only by backends verified against a CPU forward + BPTT reference (LstmSequenceBackendParityTests):
 /// CUDA, HIP, OpenCL and Vulkan. Metal and WebGPU are left out until their kernels are checked on hardware; there the
-/// engine keeps the per-timestep ops, which give the same gradients with more launches.
+/// engine keeps the per-timestep ops, which give the same gradients with more launches. Tracked per backend: Metal in
+/// #1107, WebGPU in #1108.
 /// </remarks>
 internal interface IFusedLstmSequenceTraining
 {
