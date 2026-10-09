@@ -51,11 +51,12 @@ public sealed class TunedKernelRegistryTests : IDisposable
 
     private sealed class Fake : ITunedKernelCandidate<Args>
     {
-        private readonly float _value;
         public Fake(string id, float value, double ms, bool deterministic = true, int maxColumns = int.MaxValue)
         {
-            Id = id; _value = value; Milliseconds = ms; IsDeterministic = deterministic; MaxColumns = maxColumns;
+            Id = id; Value = value; Milliseconds = ms; IsDeterministic = deterministic; MaxColumns = maxColumns;
         }
+        public float Value { get; set; }
+        public bool ThrowOnExecute { get; set; }
         public string Id { get; }
         public TunedKernelOrigin Origin => TunedKernelOrigin.Generated;
         public bool IsDeterministic { get; }
@@ -66,7 +67,8 @@ public sealed class TunedKernelRegistryTests : IDisposable
         public void Execute(in Args args)
         {
             Executions++;
-            for (int i = 0; i < args.Output.Length; i++) args.Output[i] = _value + i;
+            if (ThrowOnExecute) throw new InvalidOperationException(Id + " failed at dispatch");
+            for (int i = 0; i < args.Output.Length; i++) args.Output[i] = Value + i;
         }
     }
 
@@ -112,6 +114,51 @@ public sealed class TunedKernelRegistryTests : IDisposable
         Assert.True(decision.MedianSpeedup > 1.9 && decision.MedianSpeedup < 2.1, decision.ToString());
         Assert.True(decision.LowerSpeedupBound > 1.0);
         Assert.Equal(0.0, decision.MaxRelativeError);
+    }
+
+    [Fact]
+    public void ACachedTunedCandidateThatFailsAtDispatch_IsRetired_AndTheCallerFallsBack()
+    {
+        var reference = new Fake("ref", 1f, 1.0);
+        var fast = new Fake("fast", 1f, 0.5);
+        var slot = Slot(new Harness(), false, reference, fast);
+        Assert.Same(fast, slot.Resolve(Shape(), NewArgs()));
+
+        fast.ThrowOnExecute = true;   // e.g. its module was evicted and the call is under capture
+        Assert.False(slot.TryExecute(Shape(), NewArgs()));   // the engine op then runs its own reference path
+        Assert.Empty(slot.CachedDecisions);
+
+        Assert.Same(reference, slot.Resolve(Shape(), NewArgs()));
+        var decision = Assert.Single(slot.CachedDecisions);
+        Assert.Equal("ref", decision.CandidateId);
+        Assert.Contains(decision.Rejected, r => r.StartsWith("fast:", StringComparison.Ordinal));
+        Assert.True(slot.TryExecute(Shape(), NewArgs()));
+    }
+
+    [Fact]
+    public void AReferenceThatFailsAtDispatch_StillThrows()
+    {
+        var reference = new Fake("ref", 1f, 1.0);
+        var slot = Slot(new Harness(), false, reference);
+        Assert.Same(reference, slot.Resolve(Shape(), NewArgs()));
+        reference.ThrowOnExecute = true;
+        Assert.Throws<InvalidOperationException>(() => slot.TryExecute(Shape(), NewArgs()));
+    }
+
+    [Fact]
+    public void ANonFiniteReferenceOutput_IsNotCached_SoALaterCallTunesTheShape()
+    {
+        var reference = new Fake("ref", float.NaN, 1.0);
+        var fast = new Fake("fast", float.NaN, 0.5);
+        var slot = Slot(new Harness(), false, reference, fast);
+
+        Assert.Same(reference, slot.Resolve(Shape(), NewArgs()));
+        Assert.Empty(slot.CachedDecisions);   // nothing cached, so nothing persisted either
+
+        reference.Value = 1f;
+        fast.Value = 1f;
+        Assert.Same(fast, slot.Resolve(Shape(), NewArgs()));
+        Assert.Equal(TunedKernelDecisionReason.Tuned, Assert.Single(slot.CachedDecisions).Reason);
     }
 
     [Fact]

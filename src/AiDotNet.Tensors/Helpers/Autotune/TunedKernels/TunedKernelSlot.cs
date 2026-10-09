@@ -36,6 +36,9 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
     private readonly ConcurrentDictionary<TunedShape, Entry> _deterministicDecisions = new();
     private volatile ITunedKernelCandidate<TArgs>[] _candidates;
     private volatile string _poolKey;
+    // Candidates that threw at dispatch after being chosen (an evicted module under capture, a failed pin): never chosen
+    // again in this process, so a cached tuned choice cannot keep failing the engine op.
+    private readonly HashSet<string> _failedCandidates = new(StringComparer.Ordinal);
 
     /// <summary>Creates a slot. The first candidate is the reference: the established, always-correct path.</summary>
     public TunedKernelSlot(TunedKernelOp op, string device, ITunedKernelHarness<TArgs> harness,
@@ -126,8 +129,33 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
     {
         var c = Resolve(shape, args);
         if (c is null) return false;
-        c.Execute(args);
-        return true;
+        try
+        {
+            c.Execute(args);
+            return true;
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException && !IsReference(c))
+        {
+            // A tuned candidate failed where the reference would not: retire it, drop the decisions that chose it,
+            // and let the caller run its own reference path for this call.
+            RetireFailedCandidate(c, ex);
+            return false;
+        }
+    }
+
+    private bool IsReference(ITunedKernelCandidate<TArgs> candidate) =>
+        string.Equals(candidate.Id, _candidates[0].Id, StringComparison.Ordinal);
+
+    private void RetireFailedCandidate(ITunedKernelCandidate<TArgs> candidate, Exception ex)
+    {
+        lock (_sync)
+        {
+            _failedCandidates.Add(candidate.Id);
+            foreach (var map in new[] { _decisions, _deterministicDecisions })
+                foreach (var kv in map.ToArray())
+                    if (ReferenceEquals(kv.Value.Candidate, candidate)) map.TryRemove(kv.Key, out _);
+        }
+        Trace.TraceWarning($"Tuned kernel {candidate.Id} for {Op} on {Device} failed at dispatch and is retired: {ex.GetType().Name}: {ex.Message}");
     }
 
     private ITunedKernelCandidate<TArgs>? ResolveSlow(in TunedShape shape, in TArgs args, bool deterministic,
@@ -145,6 +173,11 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
                 try { ok = c.IsApplicable(shape); }
                 catch (Exception ex) { ok = false; rejected.Add($"{c.Id}: applicability check threw {ex.GetType().Name}"); }
                 if (!ok) continue;
+                if (_failedCandidates.Contains(c.Id))
+                {
+                    rejected.Add($"{c.Id}: failed at dispatch earlier in this process");
+                    continue;
+                }
                 if (deterministic && !c.IsDeterministic)
                 {
                     rejected.Add($"{c.Id}: non-deterministic under deterministic mode");
@@ -189,11 +222,14 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
             long start = Stopwatch.GetTimestamp();
             try
             {
-                var decision = Gate(shape, args, reference, applicable, rejected);
-                map[shape] = new Entry(decision.Item1, decision.Item2);
-                TunedKernelRegistry.Record(decision.Item2);
-                TunedKernelProfiles.Persist(decision.Item2, deterministic, _poolKey);
-                return decision.Item1;
+                var (chosen, decision) = Gate(shape, args, reference, applicable, rejected);
+                // No decision: the reference output was not finite, so nothing could be compared. Serve the reference
+                // uncached and unpersisted, and tune this shape on a later call with usable data.
+                if (decision is null) return chosen;
+                map[shape] = new Entry(chosen, decision);
+                TunedKernelRegistry.Record(decision);
+                TunedKernelProfiles.Persist(decision, deterministic, _poolKey);
+                return chosen;
             }
             finally
             {
@@ -213,7 +249,7 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
         return chosen;
     }
 
-    private (ITunedKernelCandidate<TArgs>, TunedKernelDecision) Gate(in TunedShape shape, in TArgs args,
+    private (ITunedKernelCandidate<TArgs> Chosen, TunedKernelDecision? Decision) Gate(in TunedShape shape, in TArgs args,
         ITunedKernelCandidate<TArgs> reference, List<ITunedKernelCandidate<TArgs>> applicable, List<string> rejected)
     {
         reference.Execute(args);
@@ -224,9 +260,9 @@ public sealed class TunedKernelSlot<TArgs> : ITunedKernelSlotInfo where TArgs : 
             double a = Math.Abs(expected[i]);
             if (double.IsNaN(a) || double.IsInfinity(a))
             {
-                rejected.Add("reference produced a non-finite output; the shape is not tuned");
-                return (reference, new TunedKernelDecision(Op, Device, shape, reference.Id, reference.Origin,
-                    TunedKernelDecisionReason.ReferenceWon, reference.Id, rejected: rejected.ToArray()));
+                // Not a decision: caching or persisting ReferenceWon here would pin the reference for this shape in
+                // every later process because of one batch of non-finite data.
+                return (reference, null);
             }
             if (a > scale) scale = a;
         }

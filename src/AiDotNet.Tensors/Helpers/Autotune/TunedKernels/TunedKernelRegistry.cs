@@ -418,10 +418,10 @@ public static class TunedKernelRegistry
     private static readonly List<WeakReference<ITunedKernelSlotInfo>> s_slots = new();
     private static readonly object s_slotsLock = new();
 
-    /// <summary>Environment variable that writes every decision to stderr when set to 1.</summary>
+    /// <summary>Environment variable that writes every decision to the trace listeners when set to 1.</summary>
     public const string LogEnvironmentVariable = "AIDOTNET_KERNEL_REGISTRY_LOG";
 
-    private static readonly bool s_logToConsole = Environment.GetEnvironmentVariable(LogEnvironmentVariable) == "1";
+    private static readonly bool s_logDecisions = Environment.GetEnvironmentVariable(LogEnvironmentVariable) == "1";
 
     /// <summary>Every decision made in this process, oldest first (bounded to the most recent 4096).</summary>
     public static IReadOnlyList<TunedKernelDecision> Decisions => s_log.ToArray();
@@ -445,7 +445,8 @@ public static class TunedKernelRegistry
     {
         s_log.Enqueue(decision);
         while (s_log.Count > 4096 && s_log.TryDequeue(out _)) { }
-        if (s_logToConsole) Console.Error.WriteLine("[kernel-registry] " + decision);
+        // Trace, not the console: the host routes it (a console or file listener, its logging framework).
+        if (s_logDecisions) System.Diagnostics.Trace.WriteLine("[kernel-registry] " + decision);
     }
 
     internal static void Track(ITunedKernelSlotInfo slot)
