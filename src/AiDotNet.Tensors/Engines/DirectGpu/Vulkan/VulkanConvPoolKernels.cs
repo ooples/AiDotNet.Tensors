@@ -254,9 +254,9 @@ void main() {
     int oh = t % outHeight; t = t / outHeight;
     int c = t % channels; int b = t / channels;
     int hStart = (oh * inHeight) / outHeight;
-    int hEnd = ((oh + 1) * inHeight) / outHeight;
+    int hEnd = ((oh + 1) * inHeight + outHeight - 1) / outHeight;
     int wStart = (ow * inWidth) / outWidth;
-    int wEnd = ((ow + 1) * inWidth) / outWidth;
+    int wEnd = ((ow + 1) * inWidth + outWidth - 1) / outWidth;
     float sum = 0.0; int count = 0;
     for (int ih = hStart; ih < hEnd; ih++)
         for (int iw = wStart; iw < wEnd; iw++) {

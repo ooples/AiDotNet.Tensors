@@ -502,6 +502,13 @@ public static class CuBlasNative
 #endif
 
     /// <summary>
+    /// Gives a cuBLAS handle a caller-owned workspace. Without one, cuBLAS allocates internally, which a CUDA stream
+    /// capture forbids (strided-batched GEMM then fails with an internal error inside capture).
+    /// </summary>
+    [DllImport(CublasLibrary, EntryPoint = "cublasSetWorkspace_v2")]
+    public static extern CublasStatus cublasSetWorkspace(IntPtr handle, IntPtr workspace, UIntPtr workspaceSizeInBytes);
+
+    /// <summary>
     /// Sets the cuBLAS stream.
     /// </summary>
 #if NET471

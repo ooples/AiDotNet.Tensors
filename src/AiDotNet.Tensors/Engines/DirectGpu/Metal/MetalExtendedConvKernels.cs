@@ -298,9 +298,9 @@ kernel void adaptive_max_pool2d(
     int c = (idx / (outWidth * outHeight)) % channels;
     int b = idx / (outWidth * outHeight * channels);
     int hStart = (oh * inHeight) / outHeight;
-    int hEnd = ((oh + 1) * inHeight) / outHeight;
+    int hEnd = ((oh + 1) * inHeight + outHeight - 1) / outHeight;
     int wStart = (ow * inWidth) / outWidth;
-    int wEnd = ((ow + 1) * inWidth) / outWidth;
+    int wEnd = ((ow + 1) * inWidth + outWidth - 1) / outWidth;
     float maxV = -INFINITY;
     for (int ih = hStart; ih < hEnd; ih++) {
         for (int iw = wStart; iw < wEnd; iw++) {

@@ -5045,9 +5045,16 @@ public partial class DirectGpuTensorEngine
             int rowCount = rowSize == 0 ? 0 : source.Length / rowSize;
             var sourceShape = (int[])source._shape.Clone();
             using var sourceBuffer = GetOrAllocateBuffer(backend, source);
+            var rect = rank <= RectSliceLimits.MaxRank ? backend as IRectSliceKernels : null;
             return DispatchDeferredGpuOp<T>(backend, total, (int[])inputShape.Clone(), output =>
             {
                 backend.Fill(output, 0f, total);
+                // One scatter launch instead of one device copy per contiguous row (see TryDeviceRectSlice).
+                if (rect is not null)
+                {
+                    rect.RectSlice(output, sourceBuffer.Buffer, inputShape, start, sourceShape, scatter: true);
+                    return;
+                }
                 for (int row = 0; row < rowCount; row++)
                 {
                     int remaining = row;

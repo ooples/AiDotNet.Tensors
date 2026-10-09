@@ -180,7 +180,7 @@ internal sealed class ConvBnFusionPass : ICpuOptimizationPass
                 // Conv2D / FusedConv2D, then CopyTo'd into the plan's
                 // pre-allocated output — ~100 µs of redundant memory
                 // traffic per ResNet Conv.
-                if (!isDepthwise && eng is CpuEngine cpuEngNonDw)
+                if (!isDepthwise && eng is CpuEngine cpuEngNonDw && !eng.SupportsGpu)
                 {
                     // Conv2DInto writes directly to output; then fused
                     // bias + activation in a single SIMD NCHW pass.
@@ -216,7 +216,7 @@ internal sealed class ConvBnFusionPass : ICpuOptimizationPass
 
                 // Depthwise path (MobileNet / EfficientNet): Path C write-
                 // through via DepthwiseConv2DInto + NCHW bias+activation.
-                if (isDepthwise && eng is CpuEngine cpuEngDw && output.Rank == 4)
+                if (isDepthwise && eng is CpuEngine cpuEngDw && !eng.SupportsGpu && output.Rank == 4)
                 {
                     cpuEngDw.DepthwiseConv2DInto(output, capturedInput, capturedFusedWeights,
                         capturedStrides, capturedPaddings);

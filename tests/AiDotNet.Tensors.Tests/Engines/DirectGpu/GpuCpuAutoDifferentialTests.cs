@@ -617,11 +617,15 @@ public sealed class GpuCpuAutoDifferentialTests : IClassFixture<GpuCpuAutoDiffer
     {
         // Class-index gather (CE/NLL core): GPU-vs-CPU forward + gradient parity and residency in ClassGatherTests.
         "TensorGatherClassValues(Tensor<T>,Tensor<T>)",
+        // Head-interleaved attention core (composed on the GPU): MultiHeadAttentionCoreGpuTests, forward + gradients.
+        "MultiHeadAttentionCore(Tensor<T>,Tensor<T>,Tensor<T>,Int32,Nullable<Double>,Boolean)",
         // Deformable / depthwise / locally-connected conv, 3D / transposed fused conv, FlashAttention
         // backward — GPU-vs-CPU parity in GpuConvKernelCoverageTests (and MaxPool2DBackward in
         // MaxPool2DBackwardGpuCorrectnessTests). These were hidden from this gate by a `public new`
         // hide on DirectGpuTensorEngine until it was converted to `override`.
         "DeformableConv2D(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Int32[],Int32[],Int32[])",
+        // Per-axis Conv2D (GPU training convolution): GpuConvKernelCoverageTests.Conv2DPerAxis_Gpu_MatchesCpu.
+        "Conv2D(Tensor<T>,Tensor<T>,Int32[],Int32[],Int32[])",
         // DCNv3 grouped/depthwise single-launch GPU kernels (forward + 4 backward) — GPU-vs-CPU parity in
         // GpuConvKernelCoverageTests.DeformableConv2DGrouped*_Gpu_MatchesCpu (#1691).
         "DeformableConv2DGrouped(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>,Int32[],Int32[],Int32[],Int32,Int32)",

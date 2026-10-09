@@ -602,9 +602,8 @@ extern ""C"" __global__ __launch_bounds__(1024) void gru_backward_sequence_preco
             dGates_t[scratchBase + 2 * hiddenSize + h_idx] = dHCand;
 
             // dH at previous timestep: direct (1 - z) plus contributions through
-            // U{z,r,h}. atomicAdd on dH_init[b, j] mirrors the LSTM kernel and
-            // is the remaining nondeterministic op in this kernel — see the
-            // PR #390 review note at lstm_backward_sequence_precompute_gates.
+            // U{z,r,h}. atomicAdd on dH_init[b, j] is the remaining nondeterministic op in
+            // this kernel (PR #390 review).
             float dH_self_next = dH * (1.0f - z);
             atomicAdd(&dH_init[b * hiddenSize + h_idx], dH_self_next);
             for (int j = 0; j < hiddenSize; j++) {

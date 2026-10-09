@@ -146,6 +146,12 @@ internal static unsafe class JitGemmAvx2
     internal static void RunJit(ReadOnlySpan<float> a, ReadOnlySpan<float> b, Span<float> c, int M, int N, int K)
         => RunJit(a, b, c, M, N, K, forceParallel: null);
 
+    /// <summary>Multiply-adds per parallel chunk of <see cref="RunJit(ReadOnlySpan{float}, ReadOnlySpan{float}, Span{float}, int, int, int, bool?)"/>
+    /// (env AIDOTNET_JIT_GEMM_GRAIN). About 15-20 µs of panel-kernel work, so each woken worker amortizes its dispatch.</summary>
+    internal static readonly long ParallelGrainFma =
+        long.TryParse(Environment.GetEnvironmentVariable("AIDOTNET_JIT_GEMM_GRAIN"), out var grain) && grain > 0
+            ? grain : 512 * 1024;
+
     /// <summary>
     /// <paramref name="forceParallel"/>: null = the built-in work heuristic;
     /// true/false force the PPE-parallel or calling-thread-serial path (benching,
@@ -174,8 +180,12 @@ internal static unsafe class JitGemmAvx2
                 if (parallel && numRB < 2) parallel = false;
                 if (parallel)
                 {
+                    // One chunk per ~ParallelGrainFma multiply-adds, capped by the row-blocks and the thread budget.
+                    // Splitting into maxT chunks regardless of size woke every worker for a few µs of work each:
+                    // [2048,64]x[64,64] (8.4M FMA) took 83 µs at 128 chunks vs 47 µs at 16 (3990X, 128 threads).
                     int maxT = Helpers.CpuParallelSettings.MaxDegreeOfParallelism;
-                    int chunks = Math.Max(1, Math.Min(numRB, maxT));
+                    long byWork = Math.Max(2, (long)M * N * K / ParallelGrainFma);
+                    int chunks = (int)Math.Max(1, Math.Min(Math.Min(numRB, maxT), byWork));
                     int perChunk = (numRB + chunks - 1) / chunks;
                     int totalRB = numRB;
                     Helpers.PersistentParallelExecutor.Instance.Execute(chunks, [MethodImpl(Hot)] (chunk) =>

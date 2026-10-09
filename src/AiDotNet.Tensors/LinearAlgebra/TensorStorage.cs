@@ -24,24 +24,17 @@ internal sealed class TensorStorage<T>
     private bool _trackGpuCacheVersion;
     private ExternalArrayGpuCacheEpoch? _externalArrayGpuCacheEpoch;
 
-    // The array this storage wraps when it was built to share an external-array epoch. The epoch is
-    // looked up or created from it lazily (see ResolveExternalEpoch), not at construction.
+    // The shared array this storage wraps, kept until its epoch is resolved. Resolution is LAZY: the weak table is
+    // only touched once GPU-cache tracking starts for some wrapper of the array. Eager registration put every
+    // zero-copy wrapper -- including each small tensor the allocator hands out -- through a locked
+    // ConditionalWeakTable insert plus a GC dependent handle at construction; profiling a small-model CPU fit
+    // (AiDotNet DeepAR, Ooples) attributed ~8% of the critical path to that lock and more to the handle/GC work,
+    // on a process that never used the GPU cache at all.
     private T[]? _externalArray;
-
-    // Set once any external-array epoch of this element type becomes tracked (a wrapper's GPU cache
-    // version was read because a device copy was cached). Until then no wrapper needs to look for an
-    // epoch on write, so CPU-only processes never touch the weak table.
-    private static int s_anyExternalEpochTracked;
 
     // Independently constructed zero-copy wrappers can share one array without sharing a
     // TensorStorage. Their GPU cache key is still that array, so they must share its epoch.
     // Keep the weak table off ordinary shape-owned allocation and mutation paths.
-    //
-    // The epoch is registered lazily: on the first GpuCacheVersion read (a device copy is being
-    // cached), on a write once some epoch of this type is tracked, or at construction when a deferred
-    // GPU download is pending. Registering every wrapper eagerly put a ConditionalWeakTable entry, a
-    // dependent GC handle keyed by the data array, behind nearly every op result: Gen0 pauses went
-    // from 0.04 ms to about 1 ms and a 10K-element tensor cost ~10 us to allocate instead of ~1 us.
     private sealed class ExternalArrayGpuCacheEpoch
     {
         internal int Version;
@@ -51,6 +44,32 @@ internal sealed class TensorStorage<T>
     private static class ExternalArrayGpuCacheEpochs
     {
         internal static readonly ConditionalWeakTable<T[], ExternalArrayGpuCacheEpoch> Table = new();
+
+        // Set once any epoch has been created. Until then no wrapper can have a peer epoch to find, so storages
+        // skip the table entirely (a CPU-only process never sets it).
+        internal static volatile bool Any;
+    }
+
+    /// <summary>
+    /// The external-array epoch, resolved on demand. <paramref name="create"/> = true when this call starts GPU-cache
+    /// tracking (the epoch must exist so peers share it); false on mutation paths, which only need an epoch a
+    /// peer already created.
+    /// </summary>
+    private ExternalArrayGpuCacheEpoch? ExternalEpoch(bool create)
+    {
+        var epoch = _externalArrayGpuCacheEpoch;
+        if (epoch is not null || _externalArray is not { } array) return epoch;
+        if (create)
+        {
+            epoch = ExternalArrayGpuCacheEpochs.Table.GetValue(array, static _ => new ExternalArrayGpuCacheEpoch());
+            ExternalArrayGpuCacheEpochs.Any = true;
+        }
+        else if (!ExternalArrayGpuCacheEpochs.Any || !ExternalArrayGpuCacheEpochs.Table.TryGetValue(array, out epoch))
+        {
+            return null;
+        }
+        _externalArrayGpuCacheEpoch = epoch;
+        return epoch;
     }
 
     // Shared by ordinary tensor views, separate from the per-tensor autodiff version.
@@ -59,9 +78,9 @@ internal sealed class TensorStorage<T>
     {
         get
         {
-            if ((_externalArrayGpuCacheEpoch ?? ResolveExternalEpoch(create: true)) is { } external)
+            if (ExternalEpoch(create: true) is { } external)
             {
-                MarkTracked(external);
+                if (!Volatile.Read(ref external.IsTracked)) Volatile.Write(ref external.IsTracked, true);
                 return Volatile.Read(ref external.Version);
             }
             if (!Volatile.Read(ref _trackGpuCacheVersion)) Volatile.Write(ref _trackGpuCacheVersion, true);
@@ -72,12 +91,7 @@ internal sealed class TensorStorage<T>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal void IncrementGpuCacheVersionIfTracked()
     {
-        var external = _externalArrayGpuCacheEpoch;
-        // A wrapper that has not registered yet must still invalidate a device copy cached through a
-        // peer over the same array, so join that peer's epoch if one exists.
-        if (external is null && _externalArray is not null && Volatile.Read(ref s_anyExternalEpochTracked) != 0)
-            external = ResolveExternalEpoch(create: false);
-        if (external is not null)
+        if (ExternalEpoch(create: false) is { } external)
         {
             if (Volatile.Read(ref external.IsTracked)) Interlocked.Increment(ref external.Version);
             return;
@@ -89,10 +103,7 @@ internal sealed class TensorStorage<T>
     {
         // COW replacement owns a different array. Copy the snapshot, never the external
         // epoch object, or writes to the detached clone would invalidate its former peers.
-        var sourceEpoch = source._externalArrayGpuCacheEpoch;
-        if (sourceEpoch is null && source._externalArray is not null && Volatile.Read(ref s_anyExternalEpochTracked) != 0)
-            sourceEpoch = source.ResolveExternalEpoch(create: false);
-        if (sourceEpoch is { } external)
+        if (source.ExternalEpoch(create: false) is { } external)
         {
             _gpuCacheVersion = Volatile.Read(ref external.Version);
             _trackGpuCacheVersion = Volatile.Read(ref external.IsTracked);
@@ -104,30 +115,6 @@ internal sealed class TensorStorage<T>
         }
         _externalArrayGpuCacheEpoch = null;
         _externalArray = null;
-    }
-
-    /// <summary>
-    /// Returns the shared epoch for <see cref="_externalArray"/> and caches it on this storage:
-    /// the existing one, or with <paramref name="create"/> a new one. Null when this storage does
-    /// not share an external-array epoch, or when none exists and <paramref name="create"/> is false.
-    /// </summary>
-    private ExternalArrayGpuCacheEpoch? ResolveExternalEpoch(bool create)
-    {
-        var array = _externalArray;
-        if (array is null) return null;
-        ExternalArrayGpuCacheEpoch? epoch;
-        if (create)
-            epoch = ExternalArrayGpuCacheEpochs.Table.GetValue(array, static _ => new ExternalArrayGpuCacheEpoch());
-        else if (!ExternalArrayGpuCacheEpochs.Table.TryGetValue(array, out epoch))
-            return null;
-        _externalArrayGpuCacheEpoch = epoch;
-        return epoch;
-    }
-
-    private static void MarkTracked(ExternalArrayGpuCacheEpoch external)
-    {
-        if (!Volatile.Read(ref external.IsTracked)) Volatile.Write(ref external.IsTracked, true);
-        if (Volatile.Read(ref s_anyExternalEpochTracked) == 0) Volatile.Write(ref s_anyExternalEpochTracked, 1);
     }
 
     // Streaming-pool zero-copy mmap alias (PR #604, CodeRabbit-Major): when
@@ -214,10 +201,6 @@ internal sealed class TensorStorage<T>
             && externalArray is not null)
         {
             _externalArray = externalArray;
-            // Join an epoch a peer wrapper already registered for this array (a lookup, and only once
-            // some epoch is tracked); otherwise registration waits until it is needed.
-            if (Volatile.Read(ref s_anyExternalEpochTracked) != 0)
-                ResolveExternalEpoch(create: false);
         }
         // GPU result arrays can be cached before their wrapping Tensor exists.
         // Tag that storage while its deferred download is still registered.
@@ -226,8 +209,8 @@ internal sealed class TensorStorage<T>
             _trackGpuCacheVersion = Helpers.HostSync.IsPending(data)
                 || (data.GetBackingArrayForReadOnlyAccess() is { } array
                     && Helpers.HostSync.IsPending(array));
-            if (_trackGpuCacheVersion && ResolveExternalEpoch(create: true) is { } external)
-                MarkTracked(external);
+            if (_trackGpuCacheVersion && ExternalEpoch(create: true) is { } external)
+                Volatile.Write(ref external.IsTracked, true);
         }
     }
 

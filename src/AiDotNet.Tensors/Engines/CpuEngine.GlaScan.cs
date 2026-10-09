@@ -89,6 +89,15 @@ public partial class CpuEngine
                 (double[])(object)vProj.GetDataArray()!, (double[])(object)gate.GetDataArray()!,
                 (double[])(object)output.GetDataArray()!, batch, seqLen, modelDim, numHeads, headDim);
         }
+#if NET5_0_OR_GREATER
+        else if (typeof(T) == typeof(float))
+        {
+            GlaForwardFloat(
+                (float[])(object)qProj.GetDataArray()!, (float[])(object)kProj.GetDataArray()!,
+                (float[])(object)vProj.GetDataArray()!, (float[])(object)gate.GetDataArray()!,
+                (float[])(object)output.GetDataArray()!, batch, seqLen, modelDim, numHeads, headDim);
+        }
+#endif
         else
         {
             GlaForwardGeneric<T>(
@@ -238,6 +247,166 @@ public partial class CpuEngine
             }
         });
     }
+
+#if NET5_0_OR_GREATER
+    // ── Float SIMD path ─────────────────────────────────────────────────────────────────
+    // The generic path ran float through INumericOperations<T> per multiply-add and allocated the seqLen x hd^2
+    // trajectory per chunk. Here each state row is processed with Vector<float>, and the trajectory lives in
+    // thread-static scratch that the forward recompute writes in place (S_t = g * S_{t-1} + v k^T straight into
+    // slot t), so there is no state copy per step.
+
+    [ThreadStatic] private static float[]? t_glaState;
+
+    private static float[] GlaScratch(ref float[]? slot, int length)
+    {
+        var a = slot;
+        if (a is null || a.Length < length) slot = a = new float[length];
+        return a;
+    }
+
+    /// <summary>r[i] = g * prev[i] + s * x[i]; a null <paramref name="prev"/> is a zero state.</summary>
+    private static unsafe void GlaDecayAxpy(float* r, float* prev, float g, float s, float* x, int n)
+    {
+        int w = System.Numerics.Vector<float>.Count, i = 0;
+        var vs = new System.Numerics.Vector<float>(s);
+        if (prev is null)
+        {
+            for (; i + w <= n; i += w)
+                System.Runtime.CompilerServices.Unsafe.WriteUnaligned(r + i,
+                    vs * System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Numerics.Vector<float>>(x + i));
+            for (; i < n; i++) r[i] = s * x[i];
+            return;
+        }
+        var vg = new System.Numerics.Vector<float>(g);
+        for (; i + w <= n; i += w)
+            System.Runtime.CompilerServices.Unsafe.WriteUnaligned(r + i,
+                vg * System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Numerics.Vector<float>>(prev + i)
+                + vs * System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Numerics.Vector<float>>(x + i));
+        for (; i < n; i++) r[i] = g * prev[i] + s * x[i];
+    }
+
+    private static unsafe float GlaDot(float* a, float* b, int n)
+    {
+        int w = System.Numerics.Vector<float>.Count, i = 0;
+        var acc = System.Numerics.Vector<float>.Zero;
+        for (; i + w <= n; i += w)
+            acc += System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Numerics.Vector<float>>(a + i)
+                 * System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Numerics.Vector<float>>(b + i);
+        float s = System.Numerics.Vector.Dot(acc, System.Numerics.Vector<float>.One);
+        for (; i < n; i++) s += a[i] * b[i];
+        return s;
+    }
+
+    /// <summary>y[i] += s * x[i].</summary>
+    private static unsafe void GlaAxpy(float* y, float s, float* x, int n)
+    {
+        int w = System.Numerics.Vector<float>.Count, i = 0;
+        var vs = new System.Numerics.Vector<float>(s);
+        for (; i + w <= n; i += w)
+            System.Runtime.CompilerServices.Unsafe.WriteUnaligned(y + i,
+                System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Numerics.Vector<float>>(y + i)
+                + vs * System.Runtime.CompilerServices.Unsafe.ReadUnaligned<System.Numerics.Vector<float>>(x + i));
+        for (; i < n; i++) y[i] += s * x[i];
+    }
+
+    private static unsafe void GlaForwardFloat(
+        float[] Q, float[] K, float[] V, float[] G, float[] outp,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    {
+        int hh = headDim * headDim;
+        CpuParallelSettings.ParallelForChunks(batch * numHeads, GlaBhGrain, (bhStart, bhCount) =>
+        {
+            var sArr = GlaScratch(ref t_glaState, hh);
+            fixed (float* S = sArr, q = Q, k = K, v = V, o = outp)
+            {
+                for (int bh = bhStart; bh < bhStart + bhCount; bh++)
+                {
+                    int b = bh / numHeads, h = bh % numHeads, hOff = h * headDim;
+                    for (int t = 0; t < seqLen; t++)
+                    {
+                        int baseOff = (b * seqLen + t) * modelDim + hOff;
+                        float g = G[(b * seqLen + t) * numHeads + h];
+                        for (int di = 0; di < headDim; di++)
+                        {
+                            float* row = S + di * headDim;
+                            GlaDecayAxpy(row, t == 0 ? null : row, g, v[baseOff + di], k + baseOff, headDim);
+                            o[baseOff + di] = GlaDot(row, q + baseOff, headDim);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    private static unsafe void GlaBackwardFloat(
+        float[] dOut, float[] Q, float[] K, float[] V, float[] G,
+        float[] dQ, float[] dK, float[] dV, float[] dG,
+        int batch, int seqLen, int modelDim, int numHeads, int headDim)
+    {
+        int hh = headDim * headDim;
+        CpuParallelSettings.ParallelForChunks(batch * numHeads, GlaBhGrain, (bhStart, bhCount) =>
+        {
+            // The trajectory is seqLen * headDim^2 floats (256 MB at seqLen 4096, headDim 128). Rented per chunk, not
+            // cached per thread: a thread-static copy on every pool worker kept the peak pinned for the process.
+            // Every element is written by the forward sweep below before the backward sweep reads it.
+            var trajArr = System.Buffers.ArrayPool<float>.Shared.Rent(seqLen * hh);
+            var dSArr = GlaScratch(ref t_glaState, hh);
+            try
+            {
+                fixed (float* traj = trajArr, dS = dSArr, q = Q, k = K, v = V, dO = dOut, dq = dQ, dk = dK, dv = dV)
+                {
+                    for (int bh = bhStart; bh < bhStart + bhCount; bh++)
+                    {
+                        int b = bh / numHeads, h = bh % numHeads, hOff = h * headDim;
+
+                        // Forward recompute: S_t written straight into its trajectory slot.
+                        for (int t = 0; t < seqLen; t++)
+                        {
+                            int baseOff = (b * seqLen + t) * modelDim + hOff;
+                            float g = G[(b * seqLen + t) * numHeads + h];
+                            float* st = traj + (long)t * hh;
+                            float* sp = t == 0 ? null : st - hh;
+                            for (int di = 0; di < headDim; di++)
+                                GlaDecayAxpy(st + di * headDim, sp is null ? null : sp + di * headDim, g, v[baseOff + di], k + baseOff, headDim);
+                        }
+
+                        // Reverse sweep, one fused pass per state row (rows are independent within a step):
+                        //   dS_row += dOut[di] * Q            output backward
+                        //   dQ     += dOut[di] * S_t row
+                        //   dK     += V[di] * dS_row;  dV[di] += <dS_row, K>;  dg += <dS_row, S_{t-1} row>
+                        //   dS_row *= g                        adjoint carried to step t-1
+                        new Span<float>(dS, hh).Clear();
+                        for (int t = seqLen - 1; t >= 0; t--)
+                        {
+                            int baseOff = (b * seqLen + t) * modelDim + hOff;
+                            int gOff = (b * seqLen + t) * numHeads + h;
+                            float g = G[gOff];
+                            float* st = traj + (long)t * hh;
+                            float* sp = t == 0 ? null : st - hh;
+                            float dg = 0f;
+                            for (int di = 0; di < headDim; di++)
+                            {
+                                float* dRow = dS + di * headDim;
+                                float dov = dO[baseOff + di];
+                                GlaAxpy(dRow, dov, q + baseOff, headDim);
+                                GlaAxpy(dq + baseOff, dov, st + di * headDim, headDim);
+                                GlaAxpy(dk + baseOff, v[baseOff + di], dRow, headDim);
+                                dv[baseOff + di] += GlaDot(dRow, k + baseOff, headDim);
+                                if (sp is not null) dg += GlaDot(dRow, sp + di * headDim, headDim);
+                                GlaDecayAxpy(dRow, null, 0f, g, dRow, headDim);
+                            }
+                            dG[gOff] += dg;
+                        }
+                    }
+                }
+            }
+            finally
+            {
+                System.Buffers.ArrayPool<float>.Shared.Return(trajArr);
+            }
+        });
+    }
+#endif
 
     // ── Generic-T path ───────────────────────────────────────────────────────────────────
     private static void GlaForwardGeneric<T>(
@@ -399,6 +568,18 @@ public partial class CpuEngine
                 (double[])(object)dV.GetDataArray()!, (double[])(object)dG.GetDataArray()!,
                 batch, seqLen, modelDim, numHeads, headDim);
         }
+#if NET5_0_OR_GREATER
+        else if (typeof(T) == typeof(float))
+        {
+            GlaBackwardFloat(
+                (float[])(object)gradOutput.GetDataArray()!,
+                (float[])(object)qProj.GetDataArray()!, (float[])(object)kProj.GetDataArray()!,
+                (float[])(object)vProj.GetDataArray()!, (float[])(object)gate.GetDataArray()!,
+                (float[])(object)dQ.GetDataArray()!, (float[])(object)dK.GetDataArray()!,
+                (float[])(object)dV.GetDataArray()!, (float[])(object)dG.GetDataArray()!,
+                batch, seqLen, modelDim, numHeads, headDim);
+        }
+#endif
         else
         {
             GlaBackwardGeneric<T>(

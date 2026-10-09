@@ -976,6 +976,13 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     internal int _gradIndex = -1;
 
     /// <summary>
+    /// The compiled-step write generation (<see cref="Engines.Autodiff.DifferentiableOps.GradWriteGeneration"/>) in
+    /// which this tensor, used as a pre-allocated gradient buffer, last received a contribution. A contribution in a
+    /// newer generation is the step's first write and is copied in; later ones in the same generation add.
+    /// </summary>
+    internal int _gradWriteGeneration;
+
+    /// <summary>
     /// Optional GPU buffer reference for GPU-resident tensors.
     /// When non-null, this tensor's authoritative data is on the GPU — the CPU-side
     /// _data array may be empty/stale until explicitly synchronized.
@@ -2675,8 +2682,79 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
             return;
         }
 
-        for (int i = 0; i < Length; i++)
-            destination[i] = source[FlatIndexToStorageIndex(i)];
+        CopyStridedToRowMajor(source, _storageOffset, _shape, _strides, destination);
+    }
+
+    /// <summary>
+    /// Writes the strided view (<paramref name="offset"/>, <paramref name="shape"/>, <paramref name="strides"/>) of
+    /// <paramref name="source"/> into <paramref name="destination"/> in row-major order. Size-1 axes are dropped and
+    /// adjacent axes that are contiguous relative to each other are merged, then the innermost axis is copied as one
+    /// run (a block copy when its stride is 1, a tight strided loop otherwise) under an odometer over the outer
+    /// axes. The per-element index arithmetic this replaces (a div/mod per axis, or an odometer step, per element)
+    /// was ~13% of a CPU Transformer training step, mostly transposed and permuted gradient views. Pure copies,
+    /// so the result is identical to any element-order walk.
+    /// </summary>
+    internal static void CopyStridedToRowMajor(ReadOnlySpan<T> source, int offset, int[] shape, int[] strides, Span<T> destination)
+    {
+        int rank = shape.Length;
+        int total = 1;
+        for (int d = 0; d < rank; d++) total *= shape[d];
+        if (total == 0) return;
+
+        // Coalesce: drop extent-1 axes; merge axis d into the following kept axis when stride[d] equals that axis's
+        // stride times its extent (they then walk one evenly strided run).
+        Span<int> dims = stackalloc int[rank == 0 ? 1 : rank];
+        Span<int> steps = stackalloc int[rank == 0 ? 1 : rank];
+        int n = 0;
+        for (int d = rank - 1; d >= 0; d--)
+        {
+            int extent = shape[d];
+            if (extent == 1) continue;
+            if (n > 0 && strides[d] == steps[n - 1] * dims[n - 1])
+            {
+                dims[n - 1] *= extent;
+                continue;
+            }
+            dims[n] = extent;
+            steps[n] = strides[d];
+            n++;
+        }
+        // dims/steps now run innermost-first.
+        if (n == 0) { destination[0] = source[offset]; return; }
+
+        int innerLength = dims[0];
+        int innerStride = steps[0];
+        int outerCount = total / innerLength;
+        Span<int> counter = stackalloc int[n];
+        // Explicit: the odometer must start at zero, and stackalloc is only zeroed while the assembly keeps locals
+        // init (a [SkipLocalsInit] would leave it holding stack garbage).
+        counter.Clear();
+        int src = offset;
+        int dst = 0;
+        for (int row = 0; row < outerCount; row++)
+        {
+            if (innerStride == 1)
+            {
+                source.Slice(src, innerLength).CopyTo(destination.Slice(dst, innerLength));
+            }
+            else
+            {
+                var dstRow = destination.Slice(dst, innerLength);
+                int s = src;
+                for (int i = 0; i < dstRow.Length; i++, s += innerStride)
+                    dstRow[i] = source[s];
+            }
+            dst += innerLength;
+
+            // Advance the odometer over the outer (coalesced) axes 1..n-1.
+            for (int d = 1; d < n; d++)
+            {
+                src += steps[d];
+                if (++counter[d] < dims[d]) break;
+                counter[d] = 0;
+                src -= steps[d] * dims[d];
+            }
+        }
     }
 
     /// <summary>

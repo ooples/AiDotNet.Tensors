@@ -242,6 +242,165 @@ internal static partial class SimdGemm
         int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_JIT_SMALLK_MAXM"), out var jmm) && jmm > 0
             ? jmm : 2048;
 
+    /// <summary>
+    /// C[m,n] = op(A)·op(B) (overwrite) through the small-K asm panel kernel, for the layouts of a linear layer's
+    /// forward and its two gradients. Returns false (nothing written) when the shape is outside the band where this wins:
+    /// <list type="bullet">
+    /// <item>no transpose: <see cref="TryJitSmallK"/>;</item>
+    /// <item>B transposed (dX = dY·Wᵀ): Wᵀ is materialized into pooled scratch (it is the small operand) and the
+    /// product runs as no-transpose. [2048,128]x[128,64]: 79-83 µs vs 222-241 µs through BlasProvider (3990X).</item>
+    /// <item>A transposed (dW = Xᵀ·dY, deep k): split-k over fixed row chunks, each into its own partial, summed in
+    /// chunk order. [64,2048]x[2048,128]: 96-168 µs vs 255-260 µs through BlasProvider (PyTorch 87).</item>
+    /// </list>
+    /// <paramref name="lda"/>/<paramref name="ldb"/> are the row strides of A and B as stored.
+    /// </summary>
+    internal static bool TryGemmSmallJit(
+        float[] a, int lda, bool transA, float[] b, int ldb, bool transB, float[] c, int m, int k, int n)
+    {
+#if !NET471
+        if (!_jitSmallK || !JitGemmAvx2.Available || m <= 0 || n <= 0 || k <= 0) return false;
+        // Same operand contract as every other entry here: the paths below slice, index and hand raw spans to the
+        // native kernel, so a short buffer must be rejected before any of that.
+        if (a is null) throw new ArgumentNullException(nameof(a));
+        if (b is null) throw new ArgumentNullException(nameof(b));
+        if (c is null) throw new ArgumentNullException(nameof(c));
+        ValidateGemmOperands(a.Length, lda, transA, b.Length, ldb, transB, c.Length, m, k, n);
+        if (!transA && !transB)
+            return lda == k && ldb == n && TryJitSmallK(a.AsSpan(0, m * k), b.AsSpan(0, k * n), c.AsSpan(0, m * n), m, n, k);
+
+        if (!transA && transB)
+        {
+            // B is stored [n, k]; Bᵀ [k, n] is the small operand.
+            if (lda != k || ldb != k || (long)k * n > SmallJitMaxTransposeElements || !InJitSmallKBand(m, n, k))
+                return false;
+            var bt = System.Buffers.ArrayPool<float>.Shared.Rent(k * n);
+            try
+            {
+                for (int j = 0; j < n; j++)
+                {
+                    int src = j * k;
+                    for (int i = 0; i < k; i++) bt[i * n + j] = b[src + i];
+                }
+                JitGemmAvx2.RunJit(a.AsSpan(0, m * k), bt.AsSpan(0, k * n), c.AsSpan(0, m * n), m, n, k);
+            }
+            finally { System.Buffers.ArrayPool<float>.Shared.Return(bt); }
+            return true;
+        }
+
+        if (transA && !transB && s_splitKTransA)
+        {
+            // dW = Xᵀ·dY: A stored [k, m] with k the deep reduction (batch rows), C [m, n] small. Split k into fixed
+            // chunks; each transposes its slice of A into a [mPad, rows] scratch (m padded to the panel's 6 rows with
+            // zero rows, so no row falls to the managed edge code) and runs the panel kernel serially into its own
+            // partial; partials are summed in chunk order (deterministic for any thread count).
+            if (lda != m || ldb != n || m < 6 || n < 16 || m > SplitKMaxOutput || n > SplitKMaxOutput
+                || (long)m * n * k < JitSmallKMinWork) return false;
+            int mPad = (m + 5) / 6 * 6;
+            int chunkRows = Math.Min(JitSmallKMaxK, k);
+            int chunks = (k + chunkRows - 1) / chunkRows;
+            if (chunks < 2) return false;
+            var pool = System.Buffers.ArrayPool<float>.Shared;
+            var partial = pool.Rent(chunks * mPad * n);
+            try
+            {
+                Helpers.CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)m * n * k, chunk =>
+                {
+                    int r0 = chunk * chunkRows, rows = Math.Min(chunkRows, k - r0);
+                    // Thread-local, not ArrayPool.Shared: per-chunk rent/return from every worker contends on the
+                    // shared pool's locked partitions.
+                    var at = t_splitKScratch is { } cached && cached.Length >= mPad * rows
+                        ? cached : (t_splitKScratch = new float[mPad * rows]);
+                    {
+                        for (int r = 0; r < rows; r++)
+                        {
+                            int src = (r0 + r) * lda;
+                            for (int f = 0; f < m; f++) at[f * rows + r] = a[src + f];
+                        }
+                        if (mPad > m) Array.Clear(at, m * rows, (mPad - m) * rows);
+                        JitGemmAvx2.RunJit(at.AsSpan(0, mPad * rows), b.AsSpan(r0 * n, rows * n),
+                            partial.AsSpan(chunk * mPad * n, mPad * n), mPad, n, rows, forceParallel: false);
+                    }
+                }, deterministicSafe: true);
+                // c[i, :] = sum over chunks of partial[chunk][i, :], rows split across the pool.
+                Helpers.CpuParallelSettings.ParallelForOrSerial(0, m, (long)m * n * chunks, i =>
+                {
+                    var dst = c.AsSpan(i * n, n);
+                    partial.AsSpan(i * n, n).CopyTo(dst);
+                    for (int ch = 1; ch < chunks; ch++)
+                    {
+                        var src = partial.AsSpan((ch * mPad + i) * n, n);
+                        int w = System.Numerics.Vector<float>.Count, j = 0;
+                        for (; j <= n - w; j += w)
+                            (new System.Numerics.Vector<float>(dst.Slice(j)) + new System.Numerics.Vector<float>(src.Slice(j))).CopyTo(dst.Slice(j));
+                        for (; j < n; j++) dst[j] += src[j];
+                    }
+                }, deterministicSafe: true);
+            }
+            finally { pool.Return(partial); }
+            return true;
+        }
+#endif
+        return false;
+    }
+
+
+
+    /// <summary>Shapes the small-K panel kernel wins at: shallow k, enough rows to parallelize, and either total work
+    /// under <see cref="JitSmallKMaxWork"/> or B re-read traffic under <see cref="JitSmallKMaxBTrafficBytes"/>.</summary>
+    private static bool InJitSmallKBand(int m, int n, int k)
+    {
+        long work = (long)m * n * k;
+        long bTraffic = (long)(m / 6) * k * n * sizeof(float);
+        return k <= JitSmallKMaxK && m >= 6 && m <= JitSmallKMaxM && n >= 16 && work >= JitSmallKMinWork
+            && (work <= JitSmallKMaxWork || bTraffic <= JitSmallKMaxBTrafficBytes);
+    }
+
+    // B re-read traffic ceiling for the panel route (bytes): the giant-M regressions were at 22-33 MB.
+    internal static readonly long JitSmallKMaxBTrafficBytes =
+        long.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_JIT_SMALLK_MAXBTRAFFIC"), out var jbt) && jbt > 0
+            ? jbt : 16L * 1024 * 1024;
+
+    // Split-k weight-gradient route of TryGemmSmallJit (AIDOTNET_JIT_SPLITK=0 disables) and its output-size ceiling
+    // per dimension (each chunk's partial is mPad x n).
+#if !NET471
+    [ThreadStatic] private static float[]? t_splitKScratch;
+#endif
+    private static readonly bool s_splitKTransA =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_JIT_SPLITK") != "0";
+
+    /// <summary>Whether the small-K routes of <see cref="TryGemmSmallJit"/> are switched on (AIDOTNET_JIT_SMALLK).</summary>
+    internal static bool JitSmallKEnabled => _jitSmallK;
+
+    /// <summary>Whether its split-k transposed-A route is switched on (AIDOTNET_JIT_SPLITK).</summary>
+    internal static bool SplitKTransAEnabled => s_splitKTransA;
+    private const int SplitKMaxOutput = 512;
+
+    // Transposed-B operand ceiling for TryGemmSmallJit (elements): the transpose is a per-call copy of the small side.
+    private const long SmallJitMaxTransposeElements = 64 * 1024;
+
+    /// <summary>
+    /// C = A·B (overwrite; A [m,k], B [k,n], C [m,n], all row-major contiguous) through the small-K asm panel
+    /// kernel, when the shape is in the band where it wins. B is read as passed (no identity cache), so callers whose
+    /// B changes between calls -- a compiled training plan's weights, updated in place by the optimizer -- may use it.
+    /// Returns false (nothing written) outside the band or when the kernel is unavailable.
+    /// </summary>
+    internal static bool TryJitSmallK(System.ReadOnlySpan<float> a, System.ReadOnlySpan<float> b, System.Span<float> c,
+        int m, int n, int k)
+    {
+#if !NET471
+        long work = (long)m * n * k;
+        // The work ceiling stands in for B re-read traffic, (m/6)*k*n*4 bytes, which is what regressed at giant M
+        // (22-33 MB). A shape just over the ceiling with modest traffic -- the [2048,64]x[64,128] FFN GEMM, 16.8M MACs
+        // and 11 MB -- is admitted on the traffic test.
+        if (_jitSmallK && JitGemmAvx2.Available && InJitSmallKBand(m, n, k))
+        {
+            JitGemmAvx2.RunJit(a, b.Slice(0, k * n), c, m, n, k);
+            return true;
+        }
+#endif
+        return false;
+    }
+
     // ─── Stale-weight invalidation epoch ────────────────────────────────────
     // The identity-keyed weight caches (pre-packed B below on net5+, the
     // Conv2D kernel-transpose cache in CpuEngine) never re-read the weight
@@ -520,13 +679,8 @@ internal static partial class SimdGemm
         // bake-off shows the panel-parallel at 227-234 GF/s vs ~100 for managed
         // (serial OR parallel) and 135-165 for OpenBLAS at these shapes, while
         // below the work gate (e.g. bs=8's 2.1M) the cached-B/managed path wins.
-        if (_jitSmallK && JitGemmAvx2.Available
-            && k <= JitSmallKMaxK && m >= 6 && m <= JitSmallKMaxM && n >= 16
-            && (long)m * n * k >= JitSmallKMinWork && (long)m * n * k <= JitSmallKMaxWork)
-        {
-            JitGemmAvx2.RunJit(a, b.AsSpan(0, k * n), c, m, n, k);
+        if (TryJitSmallK(a, b.AsSpan(0, k * n), c, m, n, k))
             return;
-        }
 #endif
 
         // Cache-eligibility gate: if n > Nc, the outer loop iterates jc multiple
@@ -1525,15 +1679,11 @@ internal static partial class SimdGemm
             return;
         }
 #endif
-        // Native OpenBLAS kernel on OUR pool for large no-transpose contiguous GEMMs.
-        // The bake-off showed OpenBLAS's microkernel at 2-3x the managed RyuJIT kernel,
-        // but routing whole calls to OpenBLAS regressed end-to-end: OpenBLAS spins its
-        // own ~N-thread pool PER CALL, and a many-GEMM model (transformer) pays that
-        // thread-sync floor on every op. The fix: pin OpenBLAS to ONE thread and supply
-        // the parallelism ourselves over the PersistentParallelExecutor (hot, spin-based,
-        // ~zero wakeup) by splitting the M rows into chunks — each chunk a single-thread
-        // OpenBLAS call. We get OpenBLAS's kernel quality with our cheap dispatch.
-        // Top-level only (SgemmSequential, used inside PPE regions, never reaches here).
+        // Native OpenBLAS kernel for large no-transpose contiguous GEMMs: its microkernel measured 2-3x the managed
+        // RyuJIT kernel. The call is ONE native SGEMM parallelised by OpenBLAS's own threads (see
+        // RunOpenBlasParallel for why the earlier pin-to-one-thread, split-M-over-our-pool design was removed);
+        // deterministic mode runs the managed kernel instead. Top-level only (SgemmSequential, used inside PPE
+        // regions, never reaches here).
         if (_openBlasGemm && !transA && !transB && lda == k && ldb == n
             && k >= OpenBlasMinK && (long)m * k * n >= OpenBlasMinWork && Helpers.BlasProvider.HasRawSgemm)
         {
@@ -1751,20 +1901,30 @@ internal static partial class SimdGemm
             return;
         }
 #if NET5_0_OR_GREATER
-        // Column-panel split where it wins (see PrefersParallelN). Here for SgemmAdd (accumulate) and
-        // the strided entry points; Sgemm checks it before its own fast paths.
-        // Every path below slices M (SgemmDirectParallelM needs m >= 64) and SgemmNParallelSmallM
-        // takes only m <= 8, so 9 <= m < 64 ran on one thread however large n was — the core GEMM of
-        // every conv layer with 9-63 output channels. A [32x144]·[144x4096] GEMM (1x16x64x64 conv,
-        // 32 filters) took 611 µs at 1, 16 and 128 threads alike.
-        if (allowParallel && !transA && !transB && PrefersParallelN(m, k, n))
-        {
-            SgemmDirectParallelN(a, lda, b, ldb, c, m, k, n, clearedOutput);
-            return;
-        }
-
         if (Avx2.IsSupported && Fma.IsSupported && m >= Mr && n > 0)
         {
+            // Small-M (training-batch) GEMMs: the direct kernel fanned over both output axes. Ahead of the
+            // paths below, which split only rows (too few at m <= 192) or pack A in one task per K panel.
+            // Partition-independent results; see SimdGemm.DirectParallel2D.cs.
+            // Gated on shape only (allowParallel just picks the chunk count), so a gated GEMM computes the same
+            // bits whether or not it may fan out.
+            if (UseDirectParallel2D && clearedOutput && !transA && !transB
+                && m <= DirectParallel2DMaxM && k <= DirectParallel2DMaxK && n >= Nr
+                && (long)m * k * n >= ParallelWorkThreshold
+                && TrySgemmDirectParallel2D(a, lda, b, ldb, c, m, k, n, allowParallel))
+                return;
+
+            // Column-panel split where it wins (see PrefersParallelN), for what the 2D path above does not take:
+            // accumulating calls (SgemmAdd) and K beyond its gate. Every path below slices M (SgemmDirectParallelM
+            // needs m >= 64) and SgemmNParallelSmallM takes only m <= 8, so 9 <= m < 64 ran on one thread however
+            // large n was — the core GEMM of every conv layer with 9-63 output channels. A [32x144]·[144x4096] GEMM
+            // (1x16x64x64 conv, 32 filters) took 611 µs at 1, 16 and 128 threads alike.
+            if (allowParallel && !transA && !transB && PrefersParallelN(m, k, n))
+            {
+                SgemmDirectParallelN(a, lda, b, ldb, c, m, k, n, clearedOutput);
+                return;
+            }
+
             // Iter 34: small-matmul fast path — no packing, direct 6×16 FMA
             // with fully vectorized masked edge kernels (proper fix for iter
             // 29's scalar-edge disaster). Targets per-head-attention shapes
@@ -1876,6 +2036,21 @@ internal static partial class SimdGemm
                 return;
             }
 
+            // Transposed operands at training-batch scale. The packed path below ran these 3-4x slower than the
+            // direct no-transpose kernels run the same product (a dense layer's backward on a [128, 784] -> 512
+            // layer: dX = dY.W^T in 2.3 ms and dW = X^T.dY in 2.0 ms, against 0.6 ms untransposed). Copy each
+            // transposed operand once into row-major order - O(m.k + k.n) moves against O(m.k.n) multiply-adds -
+            // and dispatch the untransposed product, which then takes the 2-D direct or tall-thin path.
+            long transposedWork = (long)m * k * n;
+            if ((transA || transB) && UseTransposeMaterialization
+                && transposedWork >= ParallelWorkThreshold && transposedWork <= TransposeMaterializeMaxWork
+                && (!transA || (long)m * k <= TransposeMaterializeMaxElements)
+                && (!transB || (long)k * n <= TransposeMaterializeMaxElements))
+            {
+                SgemmWithMaterializedTransposes(a, lda, transA, b, ldb, transB, c, m, k, n, allowParallel, clearedOutput);
+                return;
+            }
+
             SgemmTiled(a, lda, transA, b, ldb, transB, c, m, k, n, allowParallel);
             return;
         }
@@ -1927,6 +2102,93 @@ internal static partial class SimdGemm
     // Above 32M (e.g. 512³ = 134M, 1024² = 1B), the packed SgemmTiled path's
     // better cache reuse wins.
     private const long SmallMatmulWorkThreshold = 32L * 1024 * 1024;
+
+    /// <summary>A/B and test toggle: false sends transposed GEMMs back to the packed path. Not a production setting.</summary>
+    internal static bool UseTransposeMaterialization = true;
+
+    // The transposed-operand route's bounds: past 4G multiply-adds the packed path's cache blocking wins, and an operand
+    // over 16M floats (64 MB) is not worth a scratch copy.
+    private const long TransposeMaterializeMaxWork = 4L * 1024 * 1024 * 1024;
+    private const long TransposeMaterializeMaxElements = 16L * 1024 * 1024;
+
+    // Square tile of the blocked transpose: a 32x32 float tile is 4 KB read and 4 KB written, so both sides stay in L1.
+    private const int TransposeTile = 32;
+
+    /// <summary>
+    /// <c>C = op(A) . op(B)</c> with each transposed operand copied into row-major scratch first, then the untransposed
+    /// product dispatched through <see cref="SgemmAddInternal"/>.
+    /// </summary>
+    private static void SgemmWithMaterializedTransposes(
+        ReadOnlySpan<float> a, int lda, bool transA,
+        ReadOnlySpan<float> b, int ldb, bool transB,
+        Span<float> c, int m, int k, int n, bool allowParallel, bool clearedOutput)
+    {
+        float[]? aRows = null, bRows = null;
+        try
+        {
+            ReadOnlySpan<float> a2 = a, b2 = b;
+            int lda2 = lda, ldb2 = ldb;
+            if (transA)
+            {
+                // A is stored [k, m] (stride lda); op(A) = A^T is [m, k].
+                aRows = ArrayPool<float>.Shared.Rent(m * k);
+                TransposeInto(a, lda, k, m, aRows, allowParallel);
+                a2 = new ReadOnlySpan<float>(aRows, 0, m * k);
+                lda2 = k;
+            }
+            if (transB)
+            {
+                // B is stored [n, k] (stride ldb); op(B) = B^T is [k, n].
+                bRows = ArrayPool<float>.Shared.Rent(k * n);
+                TransposeInto(b, ldb, n, k, bRows, allowParallel);
+                b2 = new ReadOnlySpan<float>(bRows, 0, k * n);
+                ldb2 = n;
+            }
+            SgemmAddInternal(a2, lda2, false, b2, ldb2, false, c, m, k, n, allowParallel, clearedOutput);
+        }
+        finally
+        {
+            if (aRows is not null) ArrayPool<float>.Shared.Return(aRows);
+            if (bRows is not null) ArrayPool<float>.Shared.Return(bRows);
+        }
+    }
+
+    /// <summary>
+    /// <c>dst[c * rows + r] = src[r * ld + c]</c>: the [rows, cols] matrix at <paramref name="src"/> (row stride
+    /// <paramref name="ld"/>) written transposed, as [cols, rows] row-major, in L1-sized tiles; tile rows in parallel
+    /// when allowed and large enough.
+    /// </summary>
+    private static unsafe void TransposeInto(ReadOnlySpan<float> src, int ld, int rows, int cols, float[] dst, bool allowParallel)
+    {
+        int rowTiles = (rows + TransposeTile - 1) / TransposeTile;
+        fixed (float* ps = src)
+        fixed (float* pd = dst)
+        {
+            float* s = ps, d = pd;
+            void Tile(int rt)
+            {
+                int r0 = rt * TransposeTile, r1 = Math.Min(rows, r0 + TransposeTile);
+                for (int c0 = 0; c0 < cols; c0 += TransposeTile)
+                {
+                    int c1 = Math.Min(cols, c0 + TransposeTile);
+                    for (int r = r0; r < r1; r++)
+                    {
+                        float* row = s + (long)r * ld;
+                        for (int col = c0; col < c1; col++)
+                            d[(long)col * rows + r] = row[col];
+                    }
+                }
+            }
+
+            if (allowParallel && rowTiles > 1 && (long)rows * cols >= TransposeParallelElements)
+                Helpers.CpuParallelSettings.LightweightParallel(rowTiles, Tile);
+            else
+                for (int rt = 0; rt < rowTiles; rt++) Tile(rt);
+        }
+    }
+
+    // Below 64K elements (256 KB) the transpose costs less than a parallel dispatch.
+    private const long TransposeParallelElements = 64L * 1024;
 
     // Tall-thin transformer GEMMs (M=2048, K=128, N=384-8192) at
     // 100M-2.1G FMAs were going through SgemmTiled, where at K=128 the inner
@@ -2882,25 +3144,29 @@ internal static partial class SimdGemm
                 c.Length, m, k, n);
         }
 
-        const int MRf = 4;
-        int mFull = (m / MRf) * MRf;
-        int numFullBlocks = mFull / MRf;
+        // Rows [0, mFull) -- mFull a multiple of 4, the boundary of the original 4x8 kernel -- are each one FMA
+        // chain over p = 0..k-1, now computed six rows x sixteen columns at a time (12 accumulators: the 4x8
+        // kernel's 4 left FMA latency exposed, ~150 GFLOP/s on 16 threads at the [784x64]x[64x512] dW of a dense
+        // layer). Same chain per element, so the result is bit-identical to the 4x8 kernel. Rows [mFull, m) keep
+        // the scalar loop below, as before.
+        int mFull = (m / 4) * 4;
+        int numFullBlocks = (mFull + TransAMr - 1) / TransAMr;   // the last block may hold 2 or 4 rows
         int cores = Math.Max(1, Helpers.CpuParallelSettings.MaxDegreeOfParallelism);
         int numChunks = Math.Min(cores, Math.Max(1, (numFullBlocks + 1) / 2));
         numChunks = CapDirectChunksByWork(numChunks, (long)m * k * n);
         fixed (float* pA = a, pB = b, pC = c)
         {
             IntPtr ipA = (IntPtr)pA, ipB = (IntPtr)pB, ipC = (IntPtr)pC;
-            int kCap = k, nCap = n, mCap = m;
+            int kCap = k, nCap = n, mCap = m, mFullCap = mFull;
             if (numChunks <= 1 || numFullBlocks == 0)
-                SgemmTransABlock(pA, pB, pC, 0, numFullBlocks, kCap, nCap, mCap);
+                SgemmTransABlock(pA, pB, pC, 0, numFullBlocks, kCap, nCap, mCap, mFullCap);
             else
             {
                 int blocksPerChunk = (numFullBlocks + numChunks - 1) / numChunks;
                 Helpers.PersistentParallelExecutor.Instance.Execute(numChunks, chunk =>
                 {
                     int bs = chunk * blocksPerChunk, be = Math.Min(bs + blocksPerChunk, numFullBlocks);
-                    if (bs < be) SgemmTransABlock((float*)ipA, (float*)ipB, (float*)ipC, bs, be, kCap, nCap, mCap);
+                    if (bs < be) SgemmTransABlock((float*)ipA, (float*)ipB, (float*)ipC, bs, be, kCap, nCap, mCap, mFullCap);
                 });
             }
             for (int i = mFull; i < m; i++)
@@ -2916,85 +3182,149 @@ internal static partial class SimdGemm
         }
     }
 
-    [MethodImpl(Hot)]
-    private static unsafe void SgemmTransABlock(float* A, float* B, float* C, int blockStart, int blockEnd, int k, int n, int m)
-    {
-        const int MRf = 4;
+    /// <summary>Rows per register block of the transposed-A kernel below.</summary>
+    private const int TransAMr = 6;
 
-        // THE COLUMN LOOP IS 8 WIDE AND n NEED NOT BE. It used to run `j < n; j += 8` and finish
-        // every step with a full-width Avx.Store, so when n was not a multiple of 8 the final step
-        // wrote 8 - n % 8 floats past the end of each of the four C rows it touched. That is two
-        // separate defects, and the quieter one is the worse.
-        //
-        // WRONG RESULTS. The j loop is OUTSIDE the four row stores, so the spill from row i at the
-        // last j overwrites the start of row i+1 -- which an EARLIER j step had already written
-        // correctly, and which no later step rewrites. Every row but the last of each block came
-        // back wrong. Measured on the pre-fix code at m=4 k=3 n=13: C[1,0] is 0.33678542 where the
-        // product is 0.694251873.
-        //
-        // HEAP CORRUPTION. The spill from the last row of the last block has no next row to land
-        // in; it goes past the end of C. Writing past a managed array corrupts the GC heap and
-        // nothing fails at the call: the process dies at some later, unrelated allocation as
-        // "Internal CLR error (0x80131506)" / ExecutionEngineException, reported against whatever
-        // code happened to trigger that collection. This is how it was found -- as a test-host death
-        // two classes away from any GEMM, via
-        // SgemmDirectParallelMIntoTransA_SizesAgainstTheTransposedA, whose M=4 K=3 N=5 case stores
-        // 8 floats at offset 15 of a 20-element C.
-        //
-        // The load has the same shape of bug: it reads a full 8 floats from B, whose rows are also
-        // only n wide.
-        //
-        // The header used to declare "n % 8 == 0". The internal dispatch does gate on that, but this
-        // kernel's public entry point does not: it validates operand LENGTHS and lets any n through.
-        //
-        // The full-width blocks below are untouched -- the tail is peeled into its own masked block
-        // so the hot path keeps its unmasked load and store.
-        int nFull = (n / 8) * 8;
+    /// <summary>
+    /// C[i, :] = sum over p of At[i, p] * B[p, :] for the 6-row blocks [blockStart, blockEnd) of rows [0, mFull), with
+    /// A stored [k, m] (lda = m), B [k, n] and C [m, n]. Each block is swept in 16-column strips (12 accumulators; the
+    /// six A values for row block i0 at step p are contiguous at A + p*m + i0); the last block may hold fewer than six
+    /// rows and the last strip fewer than sixteen columns.
+    /// <para>
+    /// n NEED NOT BE A MULTIPLE OF 8, and the column tail is MASKED on both the B load and the C store. The 4x8
+    /// kernel this replaces once stored a full 8 floats on its last column step: the spill from row i overwrote the
+    /// start of row i+1 (written earlier, never rewritten) and the spill from the last row ran past the end of C,
+    /// corrupting the GC heap ("Internal CLR error" at some later allocation). Its B load over-read the same way.
+    /// The public entry validates operand LENGTHS only and lets any n through, so the tail must stay masked.
+    /// </para>
+    /// </summary>
+    [MethodImpl(Hot)]
+    private static unsafe void SgemmTransABlock(float* A, float* B, float* C, int blockStart, int blockEnd, int k, int n, int m, int mFull)
+    {
+        int nFull = (n / 16) * 16;
         int nTail = n - nFull;
-        var tailMask = _partialNrMasks[nTail].AsSingle();
+        int lane0N = nTail >= 8 ? 8 : nTail;
+        int lane1N = nTail >= 8 ? nTail - 8 : 0;
+        var mask0 = _partialNrMasks[lane0N].AsSingle();
+        var mask1 = _partialNrMasks[lane1N].AsSingle();
 
         for (int blk = blockStart; blk < blockEnd; blk++)
         {
-            int i0 = blk * MRf;
-            for (int j = 0; j < nFull; j += 8)
+            int i0 = blk * TransAMr;
+            int mc = Math.Min(TransAMr, mFull - i0);
+            float* cRow = C + (long)i0 * n;
+            if (mc == TransAMr)
             {
-                var c0 = Vector256<float>.Zero; var c1 = Vector256<float>.Zero;
-                var c2 = Vector256<float>.Zero; var c3 = Vector256<float>.Zero;
-                float* bj = B + j;
-                for (int p = 0; p < k; p++)
-                {
-                    var b0 = Avx.LoadVector256(bj + (long)p * n);
-                    float* ap = A + (long)p * m + i0;
-                    c0 = Fma.MultiplyAdd(Vector256.Create(ap[0]), b0, c0);
-                    c1 = Fma.MultiplyAdd(Vector256.Create(ap[1]), b0, c1);
-                    c2 = Fma.MultiplyAdd(Vector256.Create(ap[2]), b0, c2);
-                    c3 = Fma.MultiplyAdd(Vector256.Create(ap[3]), b0, c3);
-                }
-                Avx.Store(C + (long)(i0 + 0) * n + j, c0);
-                Avx.Store(C + (long)(i0 + 1) * n + j, c1);
-                Avx.Store(C + (long)(i0 + 2) * n + j, c2);
-                Avx.Store(C + (long)(i0 + 3) * n + j, c3);
+                for (int j = 0; j < nFull; j += 16)
+                    TransAKernel6x16(A + i0, m, B + j, n, cRow + j, k);
             }
-
+            else
+            {
+                for (int j = 0; j < nFull; j += 16)
+                    TransAKernelRows(A + i0, m, B + j, n, cRow + j, k, mc,
+                        Vector256<float>.AllBitsSet, Vector256<float>.AllBitsSet, lane1Any: true, masked: false);
+            }
             if (nTail > 0)
+                TransAKernelRows(A + i0, m, B + nFull, n, cRow + nFull, k, mc, mask0, mask1, lane1Any: lane1N > 0, masked: true);
+        }
+    }
+
+    /// <summary>Six rows x sixteen columns of C = At*B, overwriting C; pA points at row i0 of At (A + i0), lda = m,
+    /// and C's row stride equals B's (n).</summary>
+    [MethodImpl(HotInline)]
+    private static unsafe void TransAKernel6x16(float* pA, int lda, float* pB, int ldb, float* pC, int k)
+    {
+        var c00 = Vector256<float>.Zero; var c01 = Vector256<float>.Zero;
+        var c10 = Vector256<float>.Zero; var c11 = Vector256<float>.Zero;
+        var c20 = Vector256<float>.Zero; var c21 = Vector256<float>.Zero;
+        var c30 = Vector256<float>.Zero; var c31 = Vector256<float>.Zero;
+        var c40 = Vector256<float>.Zero; var c41 = Vector256<float>.Zero;
+        var c50 = Vector256<float>.Zero; var c51 = Vector256<float>.Zero;
+        for (int p = 0; p < k; p++)
+        {
+            var b0 = Avx.LoadVector256(pB);
+            var b1 = Avx.LoadVector256(pB + 8);
+            var a0 = Vector256.Create(pA[0]);
+            c00 = Fma.MultiplyAdd(a0, b0, c00); c01 = Fma.MultiplyAdd(a0, b1, c01);
+            var a1 = Vector256.Create(pA[1]);
+            c10 = Fma.MultiplyAdd(a1, b0, c10); c11 = Fma.MultiplyAdd(a1, b1, c11);
+            var a2 = Vector256.Create(pA[2]);
+            c20 = Fma.MultiplyAdd(a2, b0, c20); c21 = Fma.MultiplyAdd(a2, b1, c21);
+            var a3 = Vector256.Create(pA[3]);
+            c30 = Fma.MultiplyAdd(a3, b0, c30); c31 = Fma.MultiplyAdd(a3, b1, c31);
+            var a4 = Vector256.Create(pA[4]);
+            c40 = Fma.MultiplyAdd(a4, b0, c40); c41 = Fma.MultiplyAdd(a4, b1, c41);
+            var a5 = Vector256.Create(pA[5]);
+            c50 = Fma.MultiplyAdd(a5, b0, c50); c51 = Fma.MultiplyAdd(a5, b1, c51);
+            pA += lda;
+            pB += ldb;
+        }
+        Avx.Store(pC + 0, c00); Avx.Store(pC + 8, c01); pC += ldb;
+        Avx.Store(pC + 0, c10); Avx.Store(pC + 8, c11); pC += ldb;
+        Avx.Store(pC + 0, c20); Avx.Store(pC + 8, c21); pC += ldb;
+        Avx.Store(pC + 0, c30); Avx.Store(pC + 8, c31); pC += ldb;
+        Avx.Store(pC + 0, c40); Avx.Store(pC + 8, c41); pC += ldb;
+        Avx.Store(pC + 0, c50); Avx.Store(pC + 8, c51);
+    }
+
+    /// <summary>
+    /// The general case of <see cref="TransAKernel6x16"/>: <paramref name="mc"/> (1..6) rows and, when
+    /// <paramref name="masked"/>, a column tail selected by <paramref name="mask0"/> / <paramref name="mask1"/>
+    /// (loads and stores both masked, so lanes outside the mask are never read or written).
+    /// </summary>
+    private static unsafe void TransAKernelRows(float* pA, int lda, float* pB, int ldb, float* pC, int k, int mc,
+        Vector256<float> mask0, Vector256<float> mask1, bool lane1Any, bool masked)
+    {
+        var c00 = Vector256<float>.Zero; var c01 = Vector256<float>.Zero;
+        var c10 = Vector256<float>.Zero; var c11 = Vector256<float>.Zero;
+        var c20 = Vector256<float>.Zero; var c21 = Vector256<float>.Zero;
+        var c30 = Vector256<float>.Zero; var c31 = Vector256<float>.Zero;
+        var c40 = Vector256<float>.Zero; var c41 = Vector256<float>.Zero;
+        var c50 = Vector256<float>.Zero; var c51 = Vector256<float>.Zero;
+        for (int p = 0; p < k; p++)
+        {
+            Vector256<float> b0, b1;
+            if (masked)
             {
-                var c0 = Vector256<float>.Zero; var c1 = Vector256<float>.Zero;
-                var c2 = Vector256<float>.Zero; var c3 = Vector256<float>.Zero;
-                float* bj = B + nFull;
-                for (int p = 0; p < k; p++)
-                {
-                    var b0 = Avx.MaskLoad(bj + (long)p * n, tailMask);
-                    float* ap = A + (long)p * m + i0;
-                    c0 = Fma.MultiplyAdd(Vector256.Create(ap[0]), b0, c0);
-                    c1 = Fma.MultiplyAdd(Vector256.Create(ap[1]), b0, c1);
-                    c2 = Fma.MultiplyAdd(Vector256.Create(ap[2]), b0, c2);
-                    c3 = Fma.MultiplyAdd(Vector256.Create(ap[3]), b0, c3);
-                }
-                Avx.MaskStore(C + (long)(i0 + 0) * n + nFull, tailMask, c0);
-                Avx.MaskStore(C + (long)(i0 + 1) * n + nFull, tailMask, c1);
-                Avx.MaskStore(C + (long)(i0 + 2) * n + nFull, tailMask, c2);
-                Avx.MaskStore(C + (long)(i0 + 3) * n + nFull, tailMask, c3);
+                b0 = Avx.MaskLoad(pB, mask0);
+                b1 = lane1Any ? Avx.MaskLoad(pB + 8, mask1) : Vector256<float>.Zero;
             }
+            else
+            {
+                b0 = Avx.LoadVector256(pB);
+                b1 = Avx.LoadVector256(pB + 8);
+            }
+            var a0 = Vector256.Create(pA[0]);
+            c00 = Fma.MultiplyAdd(a0, b0, c00); c01 = Fma.MultiplyAdd(a0, b1, c01);
+            if (mc > 1) { var a1 = Vector256.Create(pA[1]); c10 = Fma.MultiplyAdd(a1, b0, c10); c11 = Fma.MultiplyAdd(a1, b1, c11); }
+            if (mc > 2) { var a2 = Vector256.Create(pA[2]); c20 = Fma.MultiplyAdd(a2, b0, c20); c21 = Fma.MultiplyAdd(a2, b1, c21); }
+            if (mc > 3) { var a3 = Vector256.Create(pA[3]); c30 = Fma.MultiplyAdd(a3, b0, c30); c31 = Fma.MultiplyAdd(a3, b1, c31); }
+            if (mc > 4) { var a4 = Vector256.Create(pA[4]); c40 = Fma.MultiplyAdd(a4, b0, c40); c41 = Fma.MultiplyAdd(a4, b1, c41); }
+            if (mc > 5) { var a5 = Vector256.Create(pA[5]); c50 = Fma.MultiplyAdd(a5, b0, c50); c51 = Fma.MultiplyAdd(a5, b1, c51); }
+            pA += lda;
+            pB += ldb;
+        }
+        TransAStoreRow(pC, mask0, mask1, c00, c01, masked);
+        if (mc > 1) TransAStoreRow(pC + ldb, mask0, mask1, c10, c11, masked);
+        if (mc > 2) TransAStoreRow(pC + 2L * ldb, mask0, mask1, c20, c21, masked);
+        if (mc > 3) TransAStoreRow(pC + 3L * ldb, mask0, mask1, c30, c31, masked);
+        if (mc > 4) TransAStoreRow(pC + 4L * ldb, mask0, mask1, c40, c41, masked);
+        if (mc > 5) TransAStoreRow(pC + 5L * ldb, mask0, mask1, c50, c51, masked);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static unsafe void TransAStoreRow(float* row, Vector256<float> m0, Vector256<float> m1,
+        Vector256<float> v0, Vector256<float> v1, bool masked)
+    {
+        if (masked)
+        {
+            Avx.MaskStore(row, m0, v0);
+            Avx.MaskStore(row + 8, m1, v1);
+        }
+        else
+        {
+            Avx.Store(row, v0);
+            Avx.Store(row + 8, v1);
         }
     }
 
@@ -3145,70 +3475,74 @@ internal static partial class SimdGemm
             return;
         }
         int blocksPerChunk = (numFullBlocks + numChunks - 1) / numChunks;
+        numChunks = (numFullBlocks + blocksPerChunk - 1) / blocksPerChunk;
 
-        // Pin the root pointers ONCE before the parallel dispatch — each worker
-        // computes its tile range using offsets, no per-worker Pin().
+        // 2D split: a short M (a linear layer's batch of 128 is 21 six-row blocks, so at most ~11 row chunks) left
+        // most cores idle while every chunk streamed all of B. Column groups of whole 16-wide tiles fill the rest;
+        // each task keeps one narrow B strip hot. The m % Mr tail rows run inside the last row chunk's tasks, not
+        // serially afterwards. Every C element is still computed by exactly one task in the same K order.
+        int nTiles = n / Nr;
+        // Total tasks obey the same work cap as the row chunks: a small GEMM fanned over every core costs more in
+        // dispatch than it gains (a transformer backward 64x256x192 went from 5 tasks to 30).
+        int taskCap = CapDirectChunksByWork(cores, (long)m * k * n);
+        int colGroups = Math.Max(1, Math.Min(nTiles, taskCap / numChunks));
+        int tilesPerGroup = nTiles > 0 ? (nTiles + colGroups - 1) / colGroups : 0;
+        if (nTiles > 0) colGroups = (nTiles + tilesPerGroup - 1) / tilesPerGroup;
+        int mcTail = m - mFull;
+
         fixed (float* pAroot = a, pBroot = b, pCroot = c)
         {
             IntPtr ipA = (IntPtr)pAroot;
             IntPtr ipB = (IntPtr)pBroot;
             IntPtr ipC = (IntPtr)pCroot;
-            int kCap = k, nCap = n, ldaCap = lda, ldbCap = ldb;
+            int kCap = k, nCap = n, ldaCap = lda, ldbCap = ldb, rowChunks = numChunks;
 
-            Helpers.PersistentParallelExecutor.Instance.Execute(numChunks, [MethodImpl(Hot)] (chunk) =>
+            Helpers.PersistentParallelExecutor.Instance.Execute(rowChunks * colGroups, [MethodImpl(Hot)] (task) =>
             {
+                int chunk = task / colGroups, group = task % colGroups;
                 int blockStart = chunk * blocksPerChunk;
                 int blockEnd = Math.Min(blockStart + blocksPerChunk, numFullBlocks);
-                if (blockStart >= blockEnd) return;
-
-                int iStart = blockStart * Mr;
-                int iEnd = blockEnd * Mr;
+                bool lastGroup = group == colGroups - 1;
+                int jStart = group * tilesPerGroup * Nr;
+                int jEnd = lastGroup ? nTiles * Nr : Math.Min(jStart + tilesPerGroup * Nr, nTiles * Nr);
+                int ncTail = lastGroup ? nCap - nTiles * Nr : 0;
 
                 float* pA = (float*)ipA;
                 float* pB = (float*)ipB;
                 float* pC = (float*)ipC;
 
-                for (int i = iStart; i < iEnd; i += Mr)
+                for (int i = blockStart * Mr; i < blockEnd * Mr; i += Mr)
                 {
                     float* pARow = pA + i * ldaCap;
                     float* pCRow = pC + i * nCap;
-
-                    int j = 0;
-                    for (; j + Nr <= nCap; j += Nr)
-                    {
+                    for (int j = jStart; j < jEnd; j += Nr)
                         DirectKernel6x16Store(pARow, ldaCap, pB + j, ldbCap, pCRow + j, nCap, kCap);
-                    }
-                    int ncTail = nCap - j;
                     if (ncTail > 0)
                     {
                         DirectKernelMxNMaskedStore(
-                            pARow, ldaCap, pB + j, ldbCap, pCRow + j, nCap,
+                            pARow, ldaCap, pB + jEnd, ldbCap, pCRow + jEnd, nCap,
                             kCap, mcActual: Mr, ncActual: ncTail);
                     }
                 }
-            });
 
-            // Handle the M-edge (≤ Mr-1 leftover rows) on the calling thread.
-            int mcTail = m - mFull;
-            if (mcTail > 0)
-            {
-                float* pARow = pAroot + mFull * lda;
-                float* pCRow = pCroot + mFull * n;
-                int j = 0;
-                for (; j + Nr <= n; j += Nr)
+                if (mcTail > 0 && chunk == rowChunks - 1)
                 {
-                    DirectKernelMxNMaskedStore(
-                        pARow, lda, pBroot + j, ldb, pCRow + j, n,
-                        k, mcActual: mcTail, ncActual: Nr);
+                    float* pARow = pA + mFull * ldaCap;
+                    float* pCRow = pC + mFull * nCap;
+                    for (int j = jStart; j < jEnd; j += Nr)
+                    {
+                        DirectKernelMxNMaskedStore(
+                            pARow, ldaCap, pB + j, ldbCap, pCRow + j, nCap,
+                            kCap, mcActual: mcTail, ncActual: Nr);
+                    }
+                    if (ncTail > 0)
+                    {
+                        DirectKernelMxNMaskedStore(
+                            pARow, ldaCap, pB + jEnd, ldbCap, pCRow + jEnd, nCap,
+                            kCap, mcActual: mcTail, ncActual: ncTail);
+                    }
                 }
-                int ncTail = n - j;
-                if (ncTail > 0)
-                {
-                    DirectKernelMxNMaskedStore(
-                        pARow, lda, pBroot + j, ldb, pCRow + j, n,
-                        k, mcActual: mcTail, ncActual: ncTail);
-                }
-            }
+            });
         }
     }
 

@@ -187,9 +187,9 @@ struct PA{batch:i32,channels:i32,inHeight:i32,inWidth:i32,outHeight:i32,outWidth
     let c=(idx/(pm.outWidth*pm.outHeight))%pm.channels;
     let b=idx/(pm.outWidth*pm.outHeight*pm.channels);
     let hStart=(oh*pm.inHeight)/pm.outHeight;
-    let hEnd=((oh+1)*pm.inHeight)/pm.outHeight;
+    let hEnd=((oh+1)*pm.inHeight+pm.outHeight-1)/pm.outHeight;
     let wStart=(ow*pm.inWidth)/pm.outWidth;
-    let wEnd=((ow+1)*pm.inWidth)/pm.outWidth;
+    let wEnd=((ow+1)*pm.inWidth+pm.outWidth-1)/pm.outWidth;
     var maxV=-3.402823466e38;
     for(var ih=hStart;ih<hEnd;ih=ih+1){
         for(var iw=wStart;iw<wEnd;iw=iw+1){

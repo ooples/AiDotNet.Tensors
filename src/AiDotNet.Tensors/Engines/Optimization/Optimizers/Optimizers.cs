@@ -84,12 +84,7 @@ public sealed class SgdOptimizer : OptimizerBase
                 }
                 else
                 {
-                    unsafe
-                    {
-                        fixed (float* pp = p)
-                        fixed (float* pg = grad)
-                            FusedOptimizer.SgdUpdateSimd(pp, pg, p.Length, lr);
-                    }
+                    FusedOptimizer.SgdStepHost(p, grad, p.Length, lr);
                 }
             }
         }
