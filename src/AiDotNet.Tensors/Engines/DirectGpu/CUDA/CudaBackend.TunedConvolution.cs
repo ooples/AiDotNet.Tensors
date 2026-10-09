@@ -78,7 +78,10 @@ public sealed partial class CudaBackend
                                 a.Batch, a.InChannels, a.InHeight, a.InWidth, a.OutChannels, a.OutHeight, a.OutWidth,
                                 a.KernelH, a.KernelW, a.StrideH, a.StrideW, a.PadH, a.PadW, a.DilationH, a.DilationW)),
                         new CudaTunedKernelCandidate<CudaConv2DArgs>("cublas.conv2d.im2col_gemm", TunedKernelOrigin.Vendor,
-                            true, shape => ConvGemmForwardFits(shape), (in CudaConv2DArgs a) => ExecuteConv2DForwardGemm(a)),
+                            // Not applicable when the GEMM route is switched off for the process: it would be timed and
+                            // logged as cuBLAS while the generic kernel ran.
+                            true, shape => s_convGemmBackward && ConvGemmForwardFits(shape),
+                            (in CudaConv2DArgs a) => ExecuteConv2DForwardGemm(a)),
                         new CudaTunedKernelCandidate<CudaConv2DArgs>("nvrtc.conv2d.tiled", TunedKernelOrigin.Builtin,
                             true, _ => HasTunedKernel("conv2d_tiled"), (in CudaConv2DArgs a) => LaunchConv2DTiled(a)),
                         new CudaTunedKernelCandidate<CudaConv2DArgs>("nvrtc.conv2d.direct", TunedKernelOrigin.Builtin,
@@ -106,8 +109,8 @@ public sealed partial class CudaBackend
 
     private void ExecuteConv2DForwardGemm(in CudaConv2DArgs a)
     {
-        // During capture without a cuBLAS workspace, or before the scratch is sized, the GEMM route is unusable;
-        // the generic kernel computes the same convolution.
+        // Only transient states land here (applicability already excludes the process-wide opt-out): during capture
+        // without a cuBLAS workspace, or with the scratch not yet sized, the generic kernel computes the same convolution.
         if (!TryConv2DForwardGemm(a))
             LaunchConv2DGeneric(a.Input, a.Kernel, a.Output, a.Batch, a.InChannels, a.InHeight, a.InWidth,
                 a.OutChannels, a.OutHeight, a.OutWidth, a.KernelH, a.KernelW, a.StrideH, a.StrideW,

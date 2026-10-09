@@ -41,6 +41,14 @@ public sealed partial class CudaBackend
             rejection = $"{artifact.CandidateId}: backend unavailable or capturing";
             return false;
         }
+        // Validate caps the request at the portable 48 KiB; this device may allow less, and a launch past its limit
+        // fails inside cuLaunchKernel, which the gate would see as an exception rather than a clean rejection.
+        if (LocalMemoryBytes > 0 && artifact.Launch.SharedMemoryBytes > LocalMemoryBytes)
+        {
+            rejection = $"{artifact.CandidateId}: needs {artifact.Launch.SharedMemoryBytes} bytes of shared memory per block, " +
+                $"device allows {LocalMemoryBytes}";
+            return false;
+        }
 
         IntPtr function;
         try
