@@ -2625,6 +2625,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     internal void ReleaseDeadDeviceStorage<T>(Tensor<T> tensor)
     {
+        if (s_staleDropTrace)
+            StaleDropDiag($"RELEASE-DEAD len={tensor.Length} caller=" + new System.Diagnostics.StackTrace(1, false).ToString().Replace(System.Environment.NewLine, " <- "));
         var vector = tensor.DataVector;
         if (vector._deviceState is not { Buffer: { } buffer } state) return;
         if (_actionScratchBuffers.Contains(buffer)) return;   // the per-action scratch pool owns it
@@ -3820,20 +3822,41 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         var arr = output.GetBackingArrayForCacheLookupUnsafe();
         if (arr is not null) if (s_producerDiagEnabled && s_producerOf.Count < ProducerDiagCap) s_producerOf[arr] = op;
     }
+    // Read once: AliasDiag runs on every compiled-step CopyResultInto (each replayed forward op on the CPU engine too),
+    // where a per-call environment lookup was ~2.6% of a CPU LSTM training step. Debug-only, process-stable flag.
+    private static readonly bool s_aliasDiagEnabled =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1";
+
     // AIDOTNET_STALE_DROP_TRACE=1 writes through its own sink: AliasDiag also requires the capture-debug variable, so
     // the trace used to pay for its stack walks and then print nothing.
     private static void StaleDropDiag(string reason)
     {
-        int n = s_aliasDiag.AddOrUpdate(reason, 1, (_, c) => c + 1);
-        if (n <= 3) try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(),
-            "aidotnet_graphcapture_diag.txt"), "[STALE] " + reason + System.Environment.NewLine); } catch { }
+        if (!s_staleDropTrace) return;
+        WriteGraphCaptureDiag("[STALE] ", reason);
     }
+
     private static void AliasDiag(string reason)
     {
-        if (System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") != "1") return;
+        if (!s_aliasDiagEnabled) return;
+        WriteGraphCaptureDiag("[ALIAS] ", reason);
+    }
+
+    // The one sink both debug traces share: the first three occurrences of each distinct reason, appended to
+    // aidotnet_graphcapture_diag.txt in the temp directory. Callers gate on their own switch first.
+    private static void WriteGraphCaptureDiag(string tag, string reason)
+    {
         int n = s_aliasDiag.AddOrUpdate(reason, 1, (_, c) => c + 1);
-        if (n <= 3) try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(),
-            "aidotnet_graphcapture_diag.txt"), "[ALIAS] " + reason + System.Environment.NewLine); } catch { }
+        if (n > 3) return;
+        try
+        {
+            System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(),
+                "aidotnet_graphcapture_diag.txt"), tag + reason + System.Environment.NewLine);
+        }
+        catch (Exception ex) when (ex is System.IO.IOException || ex is UnauthorizedAccessException)
+        {
+            // A debug trace must never fail the op it is tracing; report the lost line instead of throwing.
+            System.Diagnostics.Trace.TraceWarning($"Graph-capture diagnostic not written ({ex.GetType().Name}): {tag}{reason}");
+        }
     }
 
     private static readonly bool s_residentSyncDebug =
@@ -8732,18 +8755,39 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // the same Conv2D node the base records is added; its backward already dispatches to the device through
         // IEngine.Conv2DBackwardInput/Kernel. Bias and activation are the GPU ops, which record themselves. Graph
         // capture and anomaly mode keep the base path, which they instrument.
-        if (IsTapeActive<T>())
+        // Only float, the type the device kernels compute in: a taped double (a gradient check, say) keeps the exact host
+        // path it always had, rather than the default policy's float down-cast.
+        if (typeof(T) != typeof(float) && IsTapeActive<T>())
+            return base.FusedConv2D(input, kernel, bias, strideH, strideW, padH, padW, dilationH, dilationW, activation);
+        if (Autodiff.GradientTape<T>.Current is { } fusedTape && !Autodiff.NoGradScope<T>.IsSuppressed)
         {
-            // Only float, the type the device kernels compute in: a taped double (a gradient check, say) keeps the
-            // exact host path it always had, rather than the default policy's float down-cast.
-            if (typeof(T) != typeof(float) || Compilation.GraphMode.IsActive || Autodiff.AnomalyModeScope.IsActive
-                || Autodiff.GradientTape<T>.Current is null)
+            // Graph capture and anomaly mode keep the base path, which they instrument.
+            if (Compilation.GraphMode.IsActive || Autodiff.AnomalyModeScope.IsActive)
                 return base.FusedConv2D(input, kernel, bias, strideH, strideW, padH, padW, dilationH, dilationW, activation);
+            fusedTape.BindEngineIfUnset(this);
 
+            // The form CpuEngine records as one FusedConv2D entry (a rank-1 channel bias, no activation or ReLU): the
+            // fused kernel runs untaped and the same node is added, with FusedConv2DBiasActivationBackward and its saved
+            // state, whose engine path (ReluBackward, ReduceSum, Conv2DBackwardInput/Kernel) stays on the device.
+            if (bias is { Rank: 1 } fusedBias
+                && (activation == FusedActivationType.None || activation == FusedActivationType.ReLU))
+            {
+                Tensor<T> fused;
+                using (Autodiff.GradientTape<T>.NoGrad())
+                    fused = FusedConv2D(input, kernel, fusedBias, strideH, strideW, padH, padW, dilationH, dilationW, activation);
+                Autodiff.DifferentiableOps.RecordIfActive("FusedConv2D", fused, new[] { input, kernel, fusedBias },
+                    Autodiff.BackwardFunctions<T>.FusedConv2DBiasActivationBackward,
+                    new object[] { new[] { strideH, strideW }, new[] { padH, padW }, new[] { dilationH, dilationW },
+                        activation == FusedActivationType.ReLU });
+                return fused;
+            }
+
+            // Any other bias or activation: the convolution runs on the device with recording suppressed and the
+            // Conv2D node the base records is added; its backward dispatches to the device through
+            // IEngine.Conv2DBackwardInput/Kernel. Bias and activation are the GPU ops, which record themselves.
             Tensor<T> conv;
             using (Autodiff.GradientTape<T>.NoGrad())
                 conv = FusedConv2D(input, kernel, null, strideH, strideW, padH, padW, dilationH, dilationW, FusedActivationType.None);
-            Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
             Autodiff.DifferentiableOps.RecordBinary("Conv2D", conv, input, kernel, Autodiff.BackwardFunctions<T>.Conv2DBackward,
                 new object[] { new[] { strideH, strideW }, new[] { padH, padW }, new[] { dilationH, dilationW } });
 

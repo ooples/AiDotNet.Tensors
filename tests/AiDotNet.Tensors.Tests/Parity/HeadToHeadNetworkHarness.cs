@@ -337,7 +337,7 @@ internal static class HeadToHeadNetworkHarness
         var spec = ReadJson(Path.Combine(root, "parity", "networks", network + ".json"));
         string work = Path.Combine(Path.GetTempPath(), "aidotnet-residency", network);
         Directory.CreateDirectory(work);
-        var rng = new Random(spec.GetProperty("seed").GetInt32());
+        var rng = AiDotNet.Tensors.Helpers.RandomHelper.CreateSeededRandom(spec.GetProperty("seed").GetInt32());
         void WriteRandom(string file, int count, float scale)
         {
             using var writer = new BinaryWriter(File.Create(Path.Combine(work, file)));
@@ -452,15 +452,19 @@ internal static class HeadToHeadNetworkHarness
                         var gamma2 = Parameter(new[] { outChannels });
                         var beta2 = Parameter(new[] { outChannels });
                         bool project = s != 1 || inChannels != outChannels;
-                        var shortcut = project ? Parameter(new[] { outChannels, inChannels, 1, 1 }) : null;
-                        var shortcutGamma = project ? Parameter(new[] { outChannels }) : null;
-                        var shortcutBeta = project ? Parameter(new[] { outChannels }) : null;
+                        // Null when the block has no projection; the three are created together.
+                        var projection = project
+                            ? (Weight: Parameter(new[] { outChannels, inChannels, 1, 1 }),
+                               Gamma: Parameter(new[] { outChannels }),
+                               Beta: Parameter(new[] { outChannels }))
+                            : ((Tensor<float> Weight, Tensor<float> Gamma, Tensor<float> Beta)?)null;
                         layers.Add(h =>
                         {
                             var o = engine.ReLU(BatchNorm(engine.FusedConv2D(h, conv1, null, s, s, 1, 1, 1, 1, FusedActivationType.None), gamma1, beta1));
                             o = BatchNorm(engine.FusedConv2D(o, conv2, null, 1, 1, 1, 1, 1, 1, FusedActivationType.None), gamma2, beta2);
-                            var identity = shortcut is null ? h
-                                : BatchNorm(engine.FusedConv2D(h, shortcut, null, s, s, 0, 0, 1, 1, FusedActivationType.None), shortcutGamma!, shortcutBeta!);
+                            var identity = projection is { } p
+                                ? BatchNorm(engine.FusedConv2D(h, p.Weight, null, s, s, 0, 0, 1, 1, FusedActivationType.None), p.Gamma, p.Beta)
+                                : h;
                             return engine.ReLU(engine.TensorAdd(o, identity));
                         });
                         shape = new[] { outChannels, (shape[1] + 2 - 3) / s + 1, (shape[2] + 2 - 3) / s + 1 };
@@ -475,30 +479,15 @@ internal static class HeadToHeadNetworkHarness
                     }
                     case "lstm":
                     {
-                        int steps = shape[0], features = shape[1], hidden = layer.GetProperty("hidden").GetInt32();
+                        int features = shape[1], hidden = layer.GetProperty("hidden").GetInt32();
                         // PyTorch's layout and gate order (i, f, g, o): weight_ih, weight_hh, bias_ih, bias_hh.
                         var weightIh = Parameter(new[] { 4 * hidden, features });
                         var weightHh = Parameter(new[] { 4 * hidden, hidden });
                         var biasIh = Parameter(new[] { 4 * hidden });
                         var biasHh = Parameter(new[] { 4 * hidden });
-                        layers.Add(input =>
-                        {
-                            var h = Place(new Tensor<float>(new[] { batch, hidden }));
-                            var c = Place(new Tensor<float>(new[] { batch, hidden }));
-                            for (int t = 0; t < steps; t++)
-                            {
-                                var xt = engine.Reshape(engine.TensorSlice(input, new[] { 0, t, 0 }, new[] { batch, 1, features }), new[] { batch, features });
-                                var gates = engine.TensorAdd(engine.TensorMatMulTransposed(xt, weightIh), engine.TensorMatMulTransposed(h, weightHh));
-                                gates = AddBias(AddBias(gates, biasIh), biasHh);
-                                var i = engine.Sigmoid(engine.TensorNarrow(gates, 1, 0, hidden));
-                                var f = engine.Sigmoid(engine.TensorNarrow(gates, 1, hidden, hidden));
-                                var g = engine.Tanh(engine.TensorNarrow(gates, 1, 2 * hidden, hidden));
-                                var o = engine.Sigmoid(engine.TensorNarrow(gates, 1, 3 * hidden, hidden));
-                                c = engine.TensorAdd(engine.TensorMultiply(f, c), engine.TensorMultiply(i, g));
-                                h = engine.TensorMultiply(o, engine.Tanh(c));
-                            }
-                            return h;
-                        });
+                        // PyTorch's side runs the fused nn.LSTM, so ours runs the engine's fused sequence op: same
+                        // weights and gate order, one tape node with the exact BPTT backward.
+                        layers.Add(input => engine.LstmSequenceForward(input, null, null, weightIh, weightHh, biasIh, biasHh));
                         shape = new[] { hidden };
                         break;
                     }
@@ -591,6 +580,12 @@ internal static class HeadToHeadNetworkHarness
         };
         var losses = new List<double>();
         var sw = new Stopwatch();
+
+        // AiDotNet's training call sites (model bases, Optimize()) open a TensorArena around the loop and every
+        // top-level tape resets it on dispose, so a step reuses the previous step's buffers. Without it every
+        // step's activations and gradients are fresh large-object-heap arrays and the loop measures gen-2 GCs
+        // (one every ~1.5 MLP steps) rather than the framework. CPU only: device buffers don't come from it.
+        using var stepArena = gpu is null ? AiDotNet.Tensors.Helpers.TensorArena.Create() : null;
 
         for (int step = 0; step < warmup + measured; step++)
         {

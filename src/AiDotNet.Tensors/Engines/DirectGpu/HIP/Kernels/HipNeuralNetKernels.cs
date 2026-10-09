@@ -1566,7 +1566,8 @@ extern ""C"" __global__ void clip_scale_from_sum_squares(const double* sumSquare
 {
     if (blockIdx.x != 0 || threadIdx.x != 0) return;
     double norm = sqrt(*sumSquares);
-    double c = isfinite(norm) ? (double)maxNorm / (norm + 1e-6) : 1.0;
+    // Exponent bits, not isfinite(): under -ffast-math (finite-math-only) isfinite may fold to true.
+    double c = (__double_as_longlong(norm) & 0x7ff0000000000000LL) != 0x7ff0000000000000LL ? (double)maxNorm / (norm + 1e-6) : 1.0;
     *scale = (float)(c < 1.0 ? c : 1.0);
 }
 

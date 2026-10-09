@@ -116,6 +116,7 @@ public static partial class BlasManaged
     private const int ThinMDirectMinM = 64;     // enough Mr=6 blocks to parallelize
     private const int ThinMDirectMaxM = 1024;   // above this the packed path wins
     private const int ThinMDirectMaxN = 512;    // above this B re-stream dominates
+    private const int ThinMDirectTransBMaxN = 1024; // NT kernel: Bᵀ rows read once per row chunk
     private const int ThinMDirectMaxK = 1024;   // tested winning range
     // Tiny GEMMs (e.g. 72×72×48 ≈ 0.25M) gain nothing from the parallel direct kernel
     // and should stay on the strategy/autotune path (which learns + caches a winner for
@@ -150,7 +151,11 @@ public static partial class BlasManaged
         // contiguous vector dimension) — left on the strategy.
         if (transA && transB) return false;
         if (ldc != n || (n & 7) != 0) return false;
-        if (m < ThinMDirectMinM || m > ThinMDirectMaxM || n > ThinMDirectMaxN || k > ThinMDirectMaxK) return false;
+        // B transposed runs the NT dot-product kernel, which reads Bᵀ rows contiguously and does not re-stream a
+        // [k, n] B per row chunk, so its N ceiling is wider: a linear layer's input gradient dY·W at 784 outputs
+        // fell to the streaming strategy at 2.2x the time (128x512x784: 0.38 ms vs 0.17 here).
+        int maxN = transB && !transA ? ThinMDirectTransBMaxN : ThinMDirectMaxN;
+        if (m < ThinMDirectMinM || m > ThinMDirectMaxM || n > maxN || k > ThinMDirectMaxK) return false;
         if ((long)m * n * k < ThinMDirectMinWork) return false; // tiny GEMMs stay on the strategy/autotune path
         // Each operand must be contiguous in its stored (possibly transposed) layout:
         // !transA → A is [m,k] (lda=k); transA → Aᵀ is [k,m] (lda=m). Likewise B.
@@ -643,7 +648,7 @@ public static partial class BlasManaged
         // on PackBoth). With the fix, measured 1.3-2.5x over PackBoth through the engine. A clean GotoBLAS
         // macro-kernel over per-thread L2-resident A/B tiles. Deterministic by construction (each C element
         // computed by one thread in fixed K order ⇒ thread-count-independent, Deterministic/DisableAutotune-
-        // contract safe). C is pre-zeroed above ⇒ zero-then-accumulate yields C := A·B; handles its own M/N
+        // contract safe). Write-first: the first K-panel overwrites C, so no pre-clear is needed; handles its own M/N
         // tails. Gated to float, no trans, no pre-pack, no epilogue, large-shape regime. (The CCX-aware
         // pinned-pool variant beats this ~2x at the kernel level but its win is masked by per-call engine
         // overhead — deferred until that overhead is cut; prototype in tests/CcxGemmBench.)
@@ -658,9 +663,11 @@ public static partial class BlasManaged
             && (long)m * n * k >= GotoGemmFp32.ParallelMinWork && GotoGemmFp32.BeatsPackBoth(m, n, k)
             && GotoGemmFp32.IsAvailable)
         {
-            // RunParallel and the CCX pool write C first: each tile's first K-panel uses the overwrite
-            // kernel and zeroes its own tail strips, so no global clear (a serial memset of all of C, up
-            // paired A/B 1.11x on a 256x768x3072 GEMM at 16 threads, #653). Only the bf16 path still needs one.
+            // The fp32 GotoGemm routes (per-tile RunTile, CCX RunTilePackedB / RunMacroPanelStep) are write-first:
+            // the first K-panel stores C through the overwrite kernel and zeroes its scalar tail strips, so a
+            // beta=0 pre-clear of C was a redundant full pass over the output (a [1024, 49152] logits product
+            // spent ~2% of a CPU LM step in it). The gate above needs m*n*k >= ParallelMinWork, so k > 0 and a
+            // panel always runs; only the opt-in bf16 route, which accumulates, still clears first.
             var gepi = options.Epilogue;
             {
                 var gfa = MemoryMarshal.Cast<T, float>(a);

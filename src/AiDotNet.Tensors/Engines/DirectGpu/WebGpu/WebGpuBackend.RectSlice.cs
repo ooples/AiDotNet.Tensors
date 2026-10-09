@@ -29,11 +29,12 @@ struct RectSliceParams {
 fn rect_slice_nd(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx >= params.total) { return; }
-    let out_dims = array<u32, 8>(params.out_dim0, params.out_dim1, params.out_dim2, params.out_dim3,
+    // var, not let: older Naga rejects dynamic indexing of a let-bound array.
+    var out_dims = array<u32, 8>(params.out_dim0, params.out_dim1, params.out_dim2, params.out_dim3,
         params.out_dim4, params.out_dim5, params.out_dim6, params.out_dim7);
-    let full_strides = array<u32, 8>(params.full_stride0, params.full_stride1, params.full_stride2, params.full_stride3,
+    var full_strides = array<u32, 8>(params.full_stride0, params.full_stride1, params.full_stride2, params.full_stride3,
         params.full_stride4, params.full_stride5, params.full_stride6, params.full_stride7);
-    let starts = array<u32, 8>(params.start0, params.start1, params.start2, params.start3,
+    var starts = array<u32, 8>(params.start0, params.start1, params.start2, params.start3,
         params.start4, params.start5, params.start6, params.start7);
     var remaining = idx;
     var offset: u32 = 0u;

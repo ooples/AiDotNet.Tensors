@@ -4321,6 +4321,34 @@ public interface IEngine
         Tensor<bool>? mask = null);
 
     /// <summary>
+    /// Multi-head scaled dot-product attention on projected, head-interleaved activations:
+    /// <c>out[b, i, h] = softmax(scale * q[b, i, h] . k[b, :, h]^T) v[b, :, h]</c>, where head <c>h</c> owns columns
+    /// <c>h*dim .. (h+1)*dim</c> of the last axis. Equivalent to reshaping each input to
+    /// <c>[batch, seq, heads, dim]</c>, permuting to <c>[batch, heads, seq, dim]</c>, calling
+    /// <see cref="ScaledDotProductAttention{T}(Tensor{T}, Tensor{T}, Tensor{T}, Tensor{bool}?, double?, out Tensor{T}, double)"/>
+    /// and permuting and reshaping the result back, but without the permute copies or the
+    /// <c>[batch, heads, seqQ, seqK]</c> score tensor. Differentiable on the tape and in compiled training plans.
+    /// </summary>
+    /// <typeparam name="T">The numeric type of tensor elements.</typeparam>
+    /// <param name="query">[batch, seqQ, heads * headDim] projected queries.</param>
+    /// <param name="key">[batch, seqK, heads * headDim] projected keys.</param>
+    /// <param name="value">[batch, seqK, heads * valueDim] projected values.</param>
+    /// <param name="numHeads">Number of heads; must divide the query and value widths.</param>
+    /// <param name="scale">Score scale; defaults to <c>1 / sqrt(headDim)</c>.</param>
+    /// <param name="causal">When true, query position <c>i</c> attends only to key positions
+    /// <c>j &lt;= i + (seqK - seqQ)</c>: bottom-right aligned as in FlashAttention-2, so the last query sees every key
+    /// (a decode step over a key cache). Identical to PyTorch's <c>is_causal</c> when seqQ == seqK. A query row that
+    /// sees no key outputs zeros.</param>
+    /// <returns>[batch, seqQ, heads * valueDim] attention output, heads interleaved like the inputs.</returns>
+    Tensor<T> MultiHeadAttentionCore<T>(
+        Tensor<T> query,
+        Tensor<T> key,
+        Tensor<T> value,
+        int numHeads,
+        double? scale = null,
+        bool causal = false);
+
+    /// <summary>
     /// Fused LSTM sequence forward (inference only): processes a full
     /// <c>[batch, seq, in]</c> sequence through one LSTM cell in a single call.
     /// </summary>

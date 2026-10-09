@@ -142,7 +142,8 @@ internal static class RectSliceGeometry
         total = 1;
         for (int d = rank - 1; d >= 0; d--)
         {
-            if (start[d] < 0 || length[d] < 1 || start[d] + length[d] > fullShape[d])
+            // Compared as start > shape - length: start + length can wrap past int.MaxValue and pass.
+            if (fullShape[d] < 1 || start[d] < 0 || length[d] < 1 || start[d] > fullShape[d] - length[d])
                 throw new ArgumentOutOfRangeException(nameof(start), $"Axis {d}: [{start[d]}, +{length[d]}) is outside {fullShape[d]}.");
             outDims[d] = length[d];
             fullStrides[d] = stride;
