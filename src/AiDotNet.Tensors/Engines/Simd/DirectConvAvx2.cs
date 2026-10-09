@@ -88,8 +88,8 @@ internal static class DirectConvAvx2
         switch (shape.Pass)
         {
             case DirectConvPass.Forward:
+                // Input channels need not fill a block: the packing zero-pads them (a 3-channel image stem).
                 return (EnabledPasses & DirectConvPasses.Forward) != 0
-                    && shape.InChannels % Block == 0
                     && shape.OutChannels % (Block * OutputBlocksPerTile) == 0;
             case DirectConvPass.BackwardInput:
                 return (EnabledPasses & (shape.StrideH == 1 && shape.StrideW == 1
@@ -133,10 +133,10 @@ internal static class DirectConvAvx2
         int targetTasks = 0)
     {
         int paddedH = height + 2 * padH, paddedW = width + 2 * padW;
-        int inBlocks = inChannels / Block;
+        int inBlocks = (inChannels + Block - 1) / Block;
         var pool = ArrayPool<float>.Shared;
         var packedInput = pool.Rent(batch * inBlocks * paddedH * paddedW * Block);
-        var packedKernel = pool.Rent(outChannels * inChannels * kernelHeight * kernelWidth);
+        var packedKernel = pool.Rent(outChannels * inBlocks * Block * kernelHeight * kernelWidth);
         try
         {
             PackInput(input, inputOffset, packedInput, batch, inChannels, height, width, padH, padW, paddedH, paddedW);
@@ -362,11 +362,11 @@ internal static class DirectConvAvx2
         }
     }
 
-    /// <summary>NCHW -> zero-padded [N][C/8][H+2pH][W+2pW][8].</summary>
+    /// <summary>NCHW -> zero-padded [N][ceil(C/8)][H+2pH][W+2pW][8]; channels past C are zero.</summary>
     private static unsafe void PackInput(float[] source, int sourceOffset, float[] packed,
         int batch, int channels, int height, int width, int padH, int padW, int paddedH, int paddedW)
     {
-        int blocks = channels / Block;
+        int blocks = (channels + Block - 1) / Block;
         int plane = paddedH * paddedW * Block;
         CpuParallelSettings.ParallelForOrSerial(0, batch * blocks, (long)batch * blocks * plane, task =>
         {
@@ -376,7 +376,8 @@ internal static class DirectConvAvx2
             {
                 float* d = pd + (long)task * plane;
                 new Span<float>(d, plane).Clear();
-                for (int c = 0; c < Block; c++)
+                int blockChannels = Math.Min(Block, channels - blk * Block);
+                for (int c = 0; c < blockChannels; c++)
                 {
                     float* s = ps + sourceOffset + ((long)b * channels + blk * Block + c) * height * width;
                     for (int y = 0; y < height; y++)
@@ -420,13 +421,15 @@ internal static class DirectConvAvx2
         int taps = kernelHeight * kernelWidth;
         int packedOut = transposeAndFlip ? inChannels : outChannels;
         int packedIn = transposeAndFlip ? outChannels : inChannels;
-        int packedInBlocks = packedIn / Block;
+        int packedInBlocks = (packedIn + Block - 1) / Block;
         CpuParallelSettings.ParallelForOrSerial(0, packedOut / Block, (long)outChannels * inChannels * taps, ob =>
         {
             fixed (float* ps = source)
             fixed (float* pd = packed)
             {
                 float* d0 = pd + (long)ob * packedInBlocks * taps * Block * Block;
+                // A partial last input block keeps zero weights for its missing channels.
+                if (packedIn % Block != 0) new Span<float>(d0, packedInBlocks * taps * Block * Block).Clear();
                 for (int lane = 0; lane < Block; lane++)
                 {
                     int po = ob * Block + lane;
@@ -537,8 +540,11 @@ internal static class DirectConvAvx2
     private static unsafe void ForwardTile(float[] packedInput, float[] packedKernel, int kernelOffset, float[] output, int outputOffset,
         bool accumulate, in ForwardGeometry g, int tile, int first, int last)
     {
-        int taps = g.KernelHeight * g.KernelWidth;
-        long blockStride = (long)g.InBlocks * taps * Block * Block;
+        // Geometry in locals: read through the `in` reference, every field is a memory load inside the tap loops.
+        int kernelHeight = g.KernelHeight, kernelWidth = g.KernelWidth, inBlocks = g.InBlocks, planeIn = g.PlaneIn;
+        int rowStep = g.DilationH * g.PaddedW * Block, colStep = g.DilationW * Block;
+        int taps = kernelHeight * kernelWidth;
+        long blockStride = (long)inBlocks * taps * Block * Block;
         fixed (float* px = packedInput)
         fixed (float* pw = packedKernel)
         fixed (float* po = output)
@@ -548,36 +554,47 @@ internal static class DirectConvAvx2
             {
                 int count = Math.Min(PositionUnroll, last - q);
                 // A short final chunk repeats its last position; only the real positions are stored.
-                int o0 = g.InputOrigin(q);
-                int o1 = g.InputOrigin(count > 1 ? q + 1 : q);
-                int o2 = g.InputOrigin(count > 2 ? q + 2 : q);
+                float* x0 = px + g.InputOrigin(q);
+                float* x1 = px + g.InputOrigin(count > 1 ? q + 1 : q);
+                float* x2 = px + g.InputOrigin(count > 2 ? q + 2 : q);
                 var a00 = Vector256<float>.Zero; var a01 = a00; var a02 = a00; var a03 = a00;
                 var a10 = a00; var a11 = a00; var a12 = a00; var a13 = a00;
                 var a20 = a00; var a21 = a00; var a22 = a00; var a23 = a00;
-                for (int cb = 0; cb < g.InBlocks; cb++)
+                float* w = tileKernel;
+                for (int cb = 0; cb < inBlocks; cb++)
                 {
-                    float* xc = px + (long)cb * g.PlaneIn;
-                    float* wc = tileKernel + (long)cb * taps * Block * Block;
-                    for (int y = 0; y < g.KernelHeight; y++)
+                    int blockOffset = cb * planeIn;
+                    for (int y = 0; y < kernelHeight; y++)
                     {
-                        for (int x = 0; x < g.KernelWidth; x++)
+                        int rowOffset = blockOffset + y * rowStep;
+                        for (int x = 0; x < kernelWidth; x++)
                         {
-                            float* xs = xc + (y * g.DilationH * g.PaddedW + x * g.DilationW) * Block;
-                            float* ws = wc + (y * g.KernelWidth + x) * Block * Block;
-                            for (int c = 0; c < Block; c++)
+                            int tapOffset = rowOffset + x * colStep;
+                            float* s0 = x0 + tapOffset, s1 = x1 + tapOffset, s2 = x2 + tapOffset;
+                            // The tap's 8 input channels, two per iteration, addressed by pointer bumps.
+                            for (int c = 0; c < Block; c += 2)
                             {
-                                var b0 = Vector256.Create(xs[o0 + c]);
-                                var b1 = Vector256.Create(xs[o1 + c]);
-                                var b2 = Vector256.Create(xs[o2 + c]);
-                                float* wl = ws + c * Block;
-                                var wv = Avx.LoadVector256(wl);
+                                var b0 = Vector256.Create(s0[0]); var b1 = Vector256.Create(s1[0]); var b2 = Vector256.Create(s2[0]);
+                                var wv = Avx.LoadVector256(w);
                                 a00 = Fma.MultiplyAdd(b0, wv, a00); a10 = Fma.MultiplyAdd(b1, wv, a10); a20 = Fma.MultiplyAdd(b2, wv, a20);
-                                wv = Avx.LoadVector256(wl + blockStride);
+                                wv = Avx.LoadVector256(w + blockStride);
                                 a01 = Fma.MultiplyAdd(b0, wv, a01); a11 = Fma.MultiplyAdd(b1, wv, a11); a21 = Fma.MultiplyAdd(b2, wv, a21);
-                                wv = Avx.LoadVector256(wl + 2 * blockStride);
+                                wv = Avx.LoadVector256(w + 2 * blockStride);
                                 a02 = Fma.MultiplyAdd(b0, wv, a02); a12 = Fma.MultiplyAdd(b1, wv, a12); a22 = Fma.MultiplyAdd(b2, wv, a22);
-                                wv = Avx.LoadVector256(wl + 3 * blockStride);
+                                wv = Avx.LoadVector256(w + 3 * blockStride);
                                 a03 = Fma.MultiplyAdd(b0, wv, a03); a13 = Fma.MultiplyAdd(b1, wv, a13); a23 = Fma.MultiplyAdd(b2, wv, a23);
+
+                                b0 = Vector256.Create(s0[1]); b1 = Vector256.Create(s1[1]); b2 = Vector256.Create(s2[1]);
+                                wv = Avx.LoadVector256(w + Block);
+                                a00 = Fma.MultiplyAdd(b0, wv, a00); a10 = Fma.MultiplyAdd(b1, wv, a10); a20 = Fma.MultiplyAdd(b2, wv, a20);
+                                wv = Avx.LoadVector256(w + Block + blockStride);
+                                a01 = Fma.MultiplyAdd(b0, wv, a01); a11 = Fma.MultiplyAdd(b1, wv, a11); a21 = Fma.MultiplyAdd(b2, wv, a21);
+                                wv = Avx.LoadVector256(w + Block + 2 * blockStride);
+                                a02 = Fma.MultiplyAdd(b0, wv, a02); a12 = Fma.MultiplyAdd(b1, wv, a12); a22 = Fma.MultiplyAdd(b2, wv, a22);
+                                wv = Avx.LoadVector256(w + Block + 3 * blockStride);
+                                a03 = Fma.MultiplyAdd(b0, wv, a03); a13 = Fma.MultiplyAdd(b1, wv, a13); a23 = Fma.MultiplyAdd(b2, wv, a23);
+
+                                s0 += 2; s1 += 2; s2 += 2; w += 2 * Block;
                             }
                         }
                     }
@@ -589,7 +606,6 @@ internal static class DirectConvAvx2
             }
         }
     }
-
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static unsafe void StorePosition(float* output, bool accumulate, in ForwardGeometry g, int channelBase, int q,
         Vector256<float> v0, Vector256<float> v1, Vector256<float> v2, Vector256<float> v3)
@@ -610,73 +626,131 @@ internal static class DirectConvAvx2
             for (int lane = 0; lane < Block; lane++) d[(long)lane * stride] = v.GetElement(lane);
     }
 
+    // Positions per chunk of the kernel-gradient sweep: the chunk's gradient (8 KB) and the input rows it reads stay in
+    // L1 across all of a block pair's (kernel row, column group, channel half) passes.
+    private const int KernelGradPositionChunk = 256;
+
     /// <summary>
     /// One (output block, input block) pair of dW. For each kernel row the tile is 3 kernel columns x 4 input
     /// channels = 12 accumulators, each a vector over the block's 8 output channels; per position that is one
-    /// gradient load, 12 broadcasts and 12 FMAs (oneDNN's avx2 backward-weights blocking).
+    /// gradient load, 12 broadcasts and 12 FMAs (oneDNN's avx2 backward-weights blocking). Positions are swept in
+    /// L1-sized chunks, every tile pass running over a chunk before the next, with the tiles' accumulators parked in
+    /// a small stack buffer between chunks: a whole-plane sweep per pass re-streamed the gradient and input from L2
+    /// once per tile pass (six times for a 3x3 kernel).
     /// </summary>
     private static unsafe void BackwardKernelTile(float[] packedInput, float[] packedGrad, int[] offsets, float[] dest, int destOffset,
         bool accumulate, int ob, int ib, int batch, int inChannels, int outBlocks, int paddedW, int planeIn,
         int kernelHeight, int kernelWidth, int dilationH, int dilationW, int positions)
     {
-        int total = batch * positions;
+        int columnGroups = (kernelWidth + 2) / 3;
+        int passes = kernelHeight * columnGroups * 2;
+        const int AccumulatorsPerPass = 12;
+        float* parked = stackalloc float[passes * AccumulatorsPerPass * Block];
+        new Span<float>(parked, passes * AccumulatorsPerPass * Block).Clear();
+        int step = dilationW * Block;
         fixed (float* px = packedInput)
         fixed (float* pg = packedGrad)
         fixed (int* pOff = offsets)
         fixed (float* pd = dest)
         {
             float* xb = px + (long)ib * planeIn;
+            for (int b = 0; b < batch; b++)
+            {
+                float* gImage = pg + (long)(b * outBlocks + ob) * positions * Block;
+                int* oImage = pOff + b * positions;
+                for (int q0 = 0; q0 < positions; q0 += KernelGradPositionChunk)
+                {
+                    int q1 = Math.Min(positions, q0 + KernelGradPositionChunk);
+                    int pass = 0;
+                    for (int y = 0; y < kernelHeight; y++)
+                    {
+                        for (int x0 = 0; x0 < kernelWidth; x0 += 3)
+                        {
+                            int columns = Math.Min(3, kernelWidth - x0);
+                            for (int c0 = 0; c0 < Block; c0 += 4, pass++)
+                            {
+                                float* park = parked + pass * AccumulatorsPerPass * Block;
+                                var a00 = Avx.LoadVector256(park); var a01 = Avx.LoadVector256(park + 8);
+                                var a02 = Avx.LoadVector256(park + 16); var a03 = Avx.LoadVector256(park + 24);
+                                var a10 = Avx.LoadVector256(park + 32); var a11 = Avx.LoadVector256(park + 40);
+                                var a12 = Avx.LoadVector256(park + 48); var a13 = Avx.LoadVector256(park + 56);
+                                var a20 = Avx.LoadVector256(park + 64); var a21 = Avx.LoadVector256(park + 72);
+                                var a22 = Avx.LoadVector256(park + 80); var a23 = Avx.LoadVector256(park + 88);
+                                float* xTap = xb + (y * dilationH * paddedW + x0 * dilationW) * Block + c0;
+                                float* gq = gImage + q0 * Block;
+                                if (columns == 3)
+                                {
+                                    for (int q = q0; q < q1; q++, gq += Block)
+                                    {
+                                        var gv = Avx.LoadVector256(gq);
+                                        float* xs = xTap + oImage[q];
+                                        a00 = Fma.MultiplyAdd(Vector256.Create(xs[0]), gv, a00);
+                                        a01 = Fma.MultiplyAdd(Vector256.Create(xs[1]), gv, a01);
+                                        a02 = Fma.MultiplyAdd(Vector256.Create(xs[2]), gv, a02);
+                                        a03 = Fma.MultiplyAdd(Vector256.Create(xs[3]), gv, a03);
+                                        float* xs1 = xs + step;
+                                        a10 = Fma.MultiplyAdd(Vector256.Create(xs1[0]), gv, a10);
+                                        a11 = Fma.MultiplyAdd(Vector256.Create(xs1[1]), gv, a11);
+                                        a12 = Fma.MultiplyAdd(Vector256.Create(xs1[2]), gv, a12);
+                                        a13 = Fma.MultiplyAdd(Vector256.Create(xs1[3]), gv, a13);
+                                        float* xs2 = xs1 + step;
+                                        a20 = Fma.MultiplyAdd(Vector256.Create(xs2[0]), gv, a20);
+                                        a21 = Fma.MultiplyAdd(Vector256.Create(xs2[1]), gv, a21);
+                                        a22 = Fma.MultiplyAdd(Vector256.Create(xs2[2]), gv, a22);
+                                        a23 = Fma.MultiplyAdd(Vector256.Create(xs2[3]), gv, a23);
+                                    }
+                                }
+                                else
+                                {
+                                    for (int q = q0; q < q1; q++, gq += Block)
+                                    {
+                                        var gv = Avx.LoadVector256(gq);
+                                        float* xs = xTap + oImage[q];
+                                        a00 = Fma.MultiplyAdd(Vector256.Create(xs[0]), gv, a00);
+                                        a01 = Fma.MultiplyAdd(Vector256.Create(xs[1]), gv, a01);
+                                        a02 = Fma.MultiplyAdd(Vector256.Create(xs[2]), gv, a02);
+                                        a03 = Fma.MultiplyAdd(Vector256.Create(xs[3]), gv, a03);
+                                        if (columns > 1)
+                                        {
+                                            float* xs1 = xs + step;
+                                            a10 = Fma.MultiplyAdd(Vector256.Create(xs1[0]), gv, a10);
+                                            a11 = Fma.MultiplyAdd(Vector256.Create(xs1[1]), gv, a11);
+                                            a12 = Fma.MultiplyAdd(Vector256.Create(xs1[2]), gv, a12);
+                                            a13 = Fma.MultiplyAdd(Vector256.Create(xs1[3]), gv, a13);
+                                        }
+                                    }
+                                }
+                                Avx.Store(park, a00); Avx.Store(park + 8, a01); Avx.Store(park + 16, a02); Avx.Store(park + 24, a03);
+                                Avx.Store(park + 32, a10); Avx.Store(park + 40, a11); Avx.Store(park + 48, a12); Avx.Store(park + 56, a13);
+                                Avx.Store(park + 64, a20); Avx.Store(park + 72, a21); Avx.Store(park + 80, a22); Avx.Store(park + 88, a23);
+                            }
+                        }
+                    }
+                }
+            }
+
+            float* d = pd + destOffset;
+            int passIndex = 0;
             for (int y = 0; y < kernelHeight; y++)
             {
                 for (int x0 = 0; x0 < kernelWidth; x0 += 3)
                 {
                     int columns = Math.Min(3, kernelWidth - x0);
-                    int step = dilationW * Block;
-                    for (int c0 = 0; c0 < Block; c0 += 4)
+                    for (int c0 = 0; c0 < Block; c0 += 4, passIndex++)
                     {
-                        var a00 = Vector256<float>.Zero; var a01 = a00; var a02 = a00; var a03 = a00;
-                        var a10 = a00; var a11 = a00; var a12 = a00; var a13 = a00;
-                        var a20 = a00; var a21 = a00; var a22 = a00; var a23 = a00;
-                        int tapOffset = (y * dilationH * paddedW + x0 * dilationW) * Block + c0;
-                        for (int b = 0; b < batch; b++)
-                        {
-                            float* gq = pg + (long)(b * outBlocks + ob) * positions * Block;
-                            int* oq = pOff + b * positions;
-                            for (int q = 0; q < positions; q++)
-                            {
-                                var gv = Avx.LoadVector256(gq + q * Block);
-                                float* xs = xb + oq[q] + tapOffset;
-                                a00 = Fma.MultiplyAdd(Vector256.Create(xs[0]), gv, a00);
-                                a01 = Fma.MultiplyAdd(Vector256.Create(xs[1]), gv, a01);
-                                a02 = Fma.MultiplyAdd(Vector256.Create(xs[2]), gv, a02);
-                                a03 = Fma.MultiplyAdd(Vector256.Create(xs[3]), gv, a03);
-                                if (columns > 1)
-                                {
-                                    a10 = Fma.MultiplyAdd(Vector256.Create(xs[step]), gv, a10);
-                                    a11 = Fma.MultiplyAdd(Vector256.Create(xs[step + 1]), gv, a11);
-                                    a12 = Fma.MultiplyAdd(Vector256.Create(xs[step + 2]), gv, a12);
-                                    a13 = Fma.MultiplyAdd(Vector256.Create(xs[step + 3]), gv, a13);
-                                    if (columns > 2)
-                                    {
-                                        a20 = Fma.MultiplyAdd(Vector256.Create(xs[2 * step]), gv, a20);
-                                        a21 = Fma.MultiplyAdd(Vector256.Create(xs[2 * step + 1]), gv, a21);
-                                        a22 = Fma.MultiplyAdd(Vector256.Create(xs[2 * step + 2]), gv, a22);
-                                        a23 = Fma.MultiplyAdd(Vector256.Create(xs[2 * step + 3]), gv, a23);
-                                    }
-                                }
-                            }
-                        }
-                        float* d = pd + destOffset;
+                        float* park = parked + passIndex * AccumulatorsPerPass * Block;
                         int i0 = ib * Block + c0;
-                        StoreKernelColumn(d, accumulate, ob, i0, x0, y, inChannels, kernelHeight, kernelWidth, a00, a01, a02, a03);
-                        if (columns > 1) StoreKernelColumn(d, accumulate, ob, i0, x0 + 1, y, inChannels, kernelHeight, kernelWidth, a10, a11, a12, a13);
-                        if (columns > 2) StoreKernelColumn(d, accumulate, ob, i0, x0 + 2, y, inChannels, kernelHeight, kernelWidth, a20, a21, a22, a23);
+                        for (int column = 0; column < columns; column++)
+                        {
+                            float* col = park + column * 4 * Block;
+                            StoreKernelColumn(d, accumulate, ob, i0, x0 + column, y, inChannels, kernelHeight, kernelWidth,
+                                Avx.LoadVector256(col), Avx.LoadVector256(col + 8), Avx.LoadVector256(col + 16), Avx.LoadVector256(col + 24));
+                        }
                     }
                 }
             }
         }
     }
-
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static unsafe void StoreKernelColumn(float* d, bool accumulate, int ob, int i0, int x, int y,
         int inChannels, int kernelHeight, int kernelWidth,
