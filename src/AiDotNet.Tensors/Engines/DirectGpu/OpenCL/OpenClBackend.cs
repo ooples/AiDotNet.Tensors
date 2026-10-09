@@ -13676,8 +13676,16 @@ KERNEL VARIANTS (A/B testing):
             if (!_kernelCache.TryGetValue("lstm_forward_sequence", out var kernel))
                 throw new InvalidOperationException("OpenCL kernel not found: lstm_forward_sequence");
 
+            // One work-group per batch row: each work-item reads only its own row's previous hidden state, and the
+            // kernel's barrier orders those reads only within a work-group. A generic work-group size let a row
+            // straddle two groups and read a timestep its neighbour had not written yet.
+            int maxHidden = MaxLstmSequenceHidden();
+            if (hiddenSize > maxHidden)
+                throw new InvalidOperationException(
+                    $"LSTM forward sequence hiddenSize ({hiddenSize}) exceeds this device's work-group limit ({maxHidden}). " +
+                    "Each batch row must fit in one work-group. Use cell-level LSTM operations instead.");
             int totalThreads = batch * hiddenSize;
-            int localSize = CalculateOptimalWorkGroupSize1D(totalThreads);
+            int localSize = hiddenSize;
 
             kernel.SetArg(0u, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
             kernel.SetArg(1u, ((DirectOpenClGpuBuffer)hInit).Buffer.Handle);
@@ -13697,8 +13705,7 @@ KERNEL VARIANTS (A/B testing):
             kernel.SetArg(15u, inputSize);
             kernel.SetArg(16u, hiddenSize);
 
-            int globalSize = ((totalThreads + localSize - 1) / localSize) * localSize;
-            kernel.Execute1D(globalSize, localSize);
+            kernel.Execute1D(totalThreads, localSize);
         }
 
         public void LstmBackwardSequence(

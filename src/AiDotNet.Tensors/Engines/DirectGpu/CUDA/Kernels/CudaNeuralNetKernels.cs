@@ -1778,6 +1778,27 @@ extern ""C"" __global__ __launch_bounds__(256) void batched_transpose(
     B[outIdx] = A[inIdx];
 }
 
+// Rectangular N-d slice (rank <= 8) in ONE launch: each thread maps its index in the slice [outDims] to the
+// element at (starts + coords) of the full tensor. scatter == 0 gathers full -> slice (TensorSlice forward);
+// scatter != 0 writes slice -> full (slice backward into a zero-filled gradient). Dims, strides and starts ride
+// in a by-value parameter struct, so the launch is graph-capturable and needs no device metadata buffer.
+struct RectSliceMeta { int rank; int total; int outDims[8]; int fullStrides[8]; int starts[8]; };
+extern ""C"" __global__ __launch_bounds__(256) void rect_slice_nd(
+    float* full, float* slice, RectSliceMeta m, int scatter)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= m.total) return;
+    int remaining = idx;
+    int offset = 0;
+    for (int d = m.rank - 1; d >= 0; d--)
+    {
+        int c = remaining % m.outDims[d];
+        remaining /= m.outDims[d];
+        offset += (m.starts[d] + c) * m.fullStrides[d];
+    }
+    if (scatter) full[offset] = slice[idx];
+    else slice[idx] = full[offset];
+}
 // General permute for arbitrary axis permutations
 // Supports up to 8 dimensions
 extern ""C"" __global__ __launch_bounds__(256) void permute_general(
@@ -2936,6 +2957,7 @@ extern ""C"" __global__ __launch_bounds__(256) void adaptive_avgpool_backward(
                 "transpose_2d",
                 "batched_transpose",
                 "permute_general",
+                "rect_slice_nd",
                 // LSTM kernels
                 "lstm_cell_forward",
                 "lstm_cell_backward",

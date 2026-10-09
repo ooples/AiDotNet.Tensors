@@ -602,8 +602,13 @@ public static class CpuParallelSettings
         const long workPerChunk = 8 * 1024;
         int byWork = (int)Math.Min(count, Math.Max(1, totalWork / workPerChunk));
         int chunks = Math.Min(maxDegree, byWork);
+        // The pool hands chunks out round-robin with no stealing, so chunks beyond its participants (workers + the
+        // caller) only add per-chunk overhead and an uneven tail: on 128 logical CPUs (32 workers) a 256-head
+        // attention forward split 128 ways took 84-90 us vs 50 us split 33 ways. AIDOTNET_PFOS_CHUNK_CAP=0 disables.
+        if (s_capChunksAtParticipants)
+            chunks = Math.Min(chunks, PersistentParallelExecutor.Instance.WorkerCount + 1);
         int from = fromInclusive;
-        PersistentParallelExecutor.Instance.Execute(chunks, maxDegree, [MethodImpl(Hot)] (chunk) =>
+        PersistentParallelExecutor.Instance.Execute(chunks, maxDegree, [System.Runtime.CompilerServices.MethodImpl(Compatibility.MethodImplHelper.Hot)] (int chunk) =>
         {
             using var _region = EnterParallelRegion();
             int cs = from + (int)((long)chunk * count / chunks);
@@ -631,6 +636,9 @@ public static class CpuParallelSettings
     /// (e.g. to avoid the pool's dedicated worker threads in a thread-count-sensitive host,
     /// or to A/B benchmark the pool against the .NET ThreadPool).</para>
     /// </summary>
+    private static readonly bool s_capChunksAtParticipants =
+        System.Environment.GetEnvironmentVariable("AIDOTNET_PFOS_CHUNK_CAP") != "0";
+
     public static bool UseCooperativePool { get; set; } =
         System.Environment.GetEnvironmentVariable("AIDOTNET_COOP_POOL") != "0"; // =0 forces raw Parallel.For for A/B
 
@@ -722,6 +730,11 @@ public static class CpuParallelSettings
         const long workPerChunk = 8 * 1024;
         int byWork = (int)Math.Min(count, Math.Max(1, totalWork / workPerChunk));
         int chunks = Math.Min(maxDegree, byWork);
+        // The pool hands chunks out round-robin with no stealing, so chunks beyond its participants (workers + the
+        // caller) only add per-chunk overhead and an uneven tail: on 128 logical CPUs (32 workers) a 256-head
+        // attention forward split 128 ways took 84-90 us vs 50 us split 33 ways. AIDOTNET_PFOS_CHUNK_CAP=0 disables.
+        if (s_capChunksAtParticipants)
+            chunks = Math.Min(chunks, PersistentParallelExecutor.Instance.WorkerCount + 1);
         int from = fromInclusive;
         PersistentParallelExecutor.Instance.Execute<TLocal>(
             chunks,

@@ -48,6 +48,9 @@ internal sealed class PersistentParallelExecutor
             && sc >= 0 && sc <= 2047 ? sc : 32;
 
     private readonly int _numWorkers;
+
+    /// <summary>Parked worker threads in the pool (a dispatch's participants are at most this plus the caller).</summary>
+    internal int WorkerCount => _numWorkers;
     private readonly Thread[] _workers;
 
     // Per-worker signaling: workers wait on these to receive work
@@ -94,6 +97,54 @@ internal sealed class PersistentParallelExecutor
 
     // Completion signal for the dispatcher
     private readonly ManualResetEventSlim _allDone = new(false);
+
+    // How long the dispatching thread spins on _remaining before blocking on _allDone (Stopwatch ticks).
+    // Blocking made every dispatch pay a kernel wait plus a wake-up handshake (ManualResetEventSlim.Wait's
+    // Monitor slow path on the dispatcher, Set's lock + PulseAll on the last worker): on a CPU training step
+    // that issues dozens of 10-100 us dispatches, ~20% of the dispatching thread went to that machinery. The
+    // participants' chunks are equal-sized, so the woken workers usually finish within microseconds of the
+    // dispatcher. The spin is bounded, so a slow straggler still gets a blocking wait. Env override
+    // AIDOTNET_PPE_COMPLETION_SPIN_US (0 = block immediately, the old behaviour). Default 100 us.
+    private static readonly long _completionSpinTicks = ComputeCompletionSpinTicks();
+
+    private static long ComputeCompletionSpinTicks()
+    {
+        long micros = 100;
+        if (int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_PPE_COMPLETION_SPIN_US"), out var us) && us >= 0)
+            micros = us;
+        return (long)(micros * (System.Diagnostics.Stopwatch.Frequency / 1_000_000.0));
+    }
+
+    /// <summary>
+    /// Waits until every woken worker has decremented <see cref="_remaining"/>: a bounded spin, then the event.
+    /// </summary>
+    /// <remarks>
+    /// The event can carry a STALE set: when the spin sees the count reach zero it returns before the last
+    /// worker's <c>_allDone.Set()</c>, which may then land after the next dispatch's <c>Reset()</c>. So the
+    /// count, never the event, decides completion: after each wake the event is reset and the count re-read.
+    /// The last worker sets the event only AFTER its decrement, so a non-zero count read after the reset
+    /// guarantees that set is still to come -- no wake-up can be lost.
+    /// </remarks>
+    private void WaitForWorkers()
+    {
+        long budget = _completionSpinTicks;
+        if (budget > 0 && Volatile.Read(ref _remaining) != 0)
+        {
+            long start = System.Diagnostics.Stopwatch.GetTimestamp();
+            int spins = 0;
+            while (Volatile.Read(ref _remaining) != 0)
+            {
+                System.Threading.Thread.SpinWait(16);
+                if ((++spins & 0x3F) == 0 && System.Diagnostics.Stopwatch.GetTimestamp() - start >= budget)
+                    break;
+            }
+        }
+        while (Volatile.Read(ref _remaining) != 0)
+        {
+            _allDone.Wait();
+            _allDone.Reset();
+        }
+    }
 
     // Serialize concurrent Execute calls
     private readonly object _executeLock = new();
@@ -316,7 +367,7 @@ internal sealed class PersistentParallelExecutor
     /// re-throw first" semantics. Shared by the main thread and every worker (each passed the SAME
     /// immutable <paramref name="job"/>) so both paths behave identically.
     /// </summary>
-    [MethodImpl(Hot)]
+    [MethodImpl(Compatibility.MethodImplHelper.Hot)]
     private static Exception? RunParticipantChunks(Job job, int firstChunk)
     {
         Exception? first = null;
@@ -441,34 +492,6 @@ internal sealed class PersistentParallelExecutor
         }
     }
 #endif
-    // How long the dispatching thread spins for its workers before blocking (Stopwatch ticks).
-    private static readonly long s_joinSpinTicks = ToStopwatchTicks(TimeSpan.FromMilliseconds(2).Ticks);
-
-    /// <summary>
-    /// Waits for the woken workers of the current dispatch. Spins (bounded) on the completion count
-    /// before blocking: ManualResetEventSlim.Wait gives up after a few microseconds and parks the
-    /// dispatching thread in the kernel, and after a GC or an idle gap the workers routinely finish a few
-    /// microseconds later than that, so every such call paid a kernel wake-up of its own thread on top
-    /// of the work. The final Wait still runs, so the last worker's Set always completes before the next
-    /// dispatch resets the event.
-    /// </summary>
-    [MethodImpl(Hot)]
-    private void WaitForWorkers()
-    {
-        if (System.Threading.Volatile.Read(ref _remaining) != 0)
-        {
-            long start = System.Diagnostics.Stopwatch.GetTimestamp();
-            int spins = 0;
-            while (System.Threading.Volatile.Read(ref _remaining) != 0)
-            {
-                System.Threading.Thread.SpinWait(16);
-                if ((++spins & 0x3F) == 0
-                    && System.Diagnostics.Stopwatch.GetTimestamp() - start >= s_joinSpinTicks)
-                    break;
-            }
-        }
-        _allDone.Wait();
-    }
 
     [MethodImpl(Hot)]
     private void WorkerLoop(int slot)

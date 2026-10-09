@@ -1068,7 +1068,42 @@ __kernel void sparse_proximal_l1_update(
     else if (p < -threshold) param[i] = p + threshold;
     else                     param[i] = 0.0f;
 }
-";
+
+// Global-norm clip, the OpenCL port of CUDA's multi-tensor kernels: one work-group of 256 per tensor (the host
+// launches global = local = 256). Each work-item strides the tensor; work-item 0 then adds the group's partials, in
+// order, to acc[0]. Launches on one queue run in order, so the accumulation needs no atomics and is deterministic.
+__kernel void tensor_sum_squares_accumulate(__global const float* x, const int n, __global float* acc)
+{
+    __local float partial[256];
+    const int lid = get_local_id(0);
+    float v = 0.0f;
+    for (int i = lid; i < n; i += 256) { const float e = x[i]; v += e * e; }
+    partial[lid] = v;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (lid == 0)
+    {
+        float s = 0.0f;
+        for (int j = 0; j < 256; j++) s += partial[j];
+        acc[0] += s;
+    }
+}
+
+// PyTorch clip_grad_norm_ coefficient: min(1, maxNorm / (norm + 1e-6)); a non-finite norm leaves the gradients
+// unscaled (1). Finiteness is tested on the exponent bits: fast-relaxed-math may fold isfinite() to true.
+__kernel void clip_scale_from_sum_squares(__global const float* acc, const float maxNorm, __global float* scale)
+{
+    if (get_global_id(0) != 0) return;
+    const float norm = sqrt(acc[0]);
+    const float c = (as_uint(norm) & 0x7f800000u) != 0x7f800000u ? maxNorm / (norm + 1e-6f) : 1.0f;
+    scale[0] = c < 1.0f ? c : 1.0f;
+}
+
+// x[i] *= scale[0], in place.
+__kernel void scale_by_device_scalar_inplace(__global float* x, const int n, __global const float* scale)
+{
+    const int i = get_global_id(0);
+    if (i < n) x[i] *= scale[0];
+}";
     }
 
     /// <summary>
@@ -1078,7 +1113,10 @@ __kernel void sparse_proximal_l1_update(
     {
         return new[]
         {
-            "sgd_momentum_update",
+            "sgd_momentum_update",            "tensor_sum_squares_accumulate",
+            "clip_scale_from_sum_squares",
+            "scale_by_device_scalar_inplace",
+
             "sgd_update",
             "adam_update",
             "adamw_update",

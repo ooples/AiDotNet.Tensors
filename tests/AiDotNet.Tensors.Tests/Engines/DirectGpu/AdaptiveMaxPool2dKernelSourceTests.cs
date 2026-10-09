@@ -24,12 +24,12 @@ public sealed class AdaptiveMaxPool2dKernelSourceTests
     // buffer names or float literals). WGSL prefixes params with pm. and drops spaces, so the WebGPU row
     // carries the WGSL-form markers.
     [Theory]
-    [InlineData(CudaPool, "GetSource", "int hStart = (oh * inHeight) / outHeight;", "int wEnd = ((ow + 1) * inWidth) / outWidth;")]
-    [InlineData(HipPool, "GetSource", "int hStart = (oh * inHeight) / outHeight;", "int wEnd = ((ow + 1) * inWidth) / outWidth;")]
-    [InlineData(OpenClPool, "GetSource", "int hStart = (oh * inHeight) / outHeight;", "int wEnd = ((ow + 1) * inWidth) / outWidth;")]
-    [InlineData(MetalExt, "Source", "int hStart = (oh * inHeight) / outHeight;", "int wEnd = ((ow + 1) * inWidth) / outWidth;")]
-    [InlineData(VulkanExt, "AdaptiveMaxPool2D", "int hStart = (oh * inHeight) / outHeight;", "int wEnd = ((ow + 1) * inWidth) / outWidth;")]
-    [InlineData(WebGpuExt, "AdaptiveMaxPool2D", "let hStart=(oh*pm.inHeight)/pm.outHeight;", "let wEnd=((ow+1)*pm.inWidth)/pm.outWidth;")]
+    [InlineData(CudaPool, "GetSource", "int hStart = (oh * inHeight) / outHeight;", "int wEnd = ((ow + 1) * inWidth + outWidth - 1) / outWidth;")]
+    [InlineData(HipPool, "GetSource", "int hStart = (oh * inHeight) / outHeight;", "int wEnd = ((ow + 1) * inWidth + outWidth - 1) / outWidth;")]
+    [InlineData(OpenClPool, "GetSource", "int hStart = (oh * inHeight) / outHeight;", "int wEnd = ((ow + 1) * inWidth + outWidth - 1) / outWidth;")]
+    [InlineData(MetalExt, "Source", "int hStart = (oh * inHeight) / outHeight;", "int wEnd = ((ow + 1) * inWidth + outWidth - 1) / outWidth;")]
+    [InlineData(VulkanExt, "AdaptiveMaxPool2D", "int hStart = (oh * inHeight) / outHeight;", "int wEnd = ((ow + 1) * inWidth + outWidth - 1) / outWidth;")]
+    [InlineData(WebGpuExt, "AdaptiveMaxPool2D", "let hStart=(oh*pm.inHeight)/pm.outHeight;", "let wEnd=((ow+1)*pm.inWidth+pm.outWidth-1)/pm.outWidth;")]
     public void WindowBoundsAndMaxReduction_MatchAcrossBackends(string typeName, string memberName, string m1, string m2)
     {
         string source = GetStaticString(typeName, memberName);

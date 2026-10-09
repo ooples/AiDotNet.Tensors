@@ -132,6 +132,9 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     internal static readonly object GpuDispatchLock = new();
 
     private const int DefaultBlockSize = 256;
+
+    /// <summary>Shortest row SumAxis reduces with one block per row; see <see cref="SumAxis"/>.</summary>
+    internal const int SumAxisRowsMinReduce = 32;
     private const int MaxRnnBlockSize = 1024;
     // FP16 (Half) element width in bytes — used to validate half-buffer sizes before launching FP16-native kernels.
     private const int Fp16ByteWidth = 2;
@@ -167,7 +170,28 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     // a pool thread would still hold that engine's now-dangling handle and the NEXT engine would reuse it →
     // use-after-free → fatal host crash. ThreadLocal(trackAllValues:true) is scoped to THIS engine and lets
     // Dispose() enumerate every thread's handle for cublasDestroy.
-    private sealed class ThreadCublas { public IntPtr Handle; public bool IsDeterministic; public IntPtr Stream; }
+    private sealed class ThreadCublas
+    {
+        public IntPtr Handle;
+        public bool IsDeterministic;
+        public IntPtr Stream;
+        // Held for the handle's lifetime: cuBLAS keeps the raw pointer.
+        public IGpuBuffer? Workspace;
+    }
+
+    // Per-handle cuBLAS workspace (PyTorch sets one the same way). 8 MiB covers the fp32 GEMM algorithms used here.
+    private const int CublasWorkspaceFloats = 2 * 1024 * 1024;
+
+    /// <summary>True when the calling thread's cuBLAS handle has its own workspace, so cuBLAS needs no allocation
+    /// inside a stream capture and the strided-batched GEMM can be captured.</summary>
+    private bool CurrentCublasHasWorkspace
+    {
+        get
+        {
+            _ = _cublasHandle;   // materialize this thread's handle
+            return _threadCublas?.Value?.Workspace is not null;
+        }
+    }
     private ThreadLocal<ThreadCublas>? _threadCublas;
     // The default fp32 GEMM math mode chosen at init (TF32 tensor-op on Ampere+, else PEDANTIC), captured
     // so every per-thread handle applies the same mode on creation.
@@ -2319,6 +2343,44 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             "cublasSgemm(MatMulTransposed)");
     }
 
+    /// <summary>
+    /// Row-major <c>C[M,N] = alpha · A[K,M]ᵀ · B[K,N] + beta · C</c> in one cuBLAS GEMM, without materializing Aᵀ.
+    /// The matmul backward's weight gradient (<c>dW = Xᵀ · dY</c>) is this shape; forming it as a transpose kernel
+    /// plus a GEMM cost a transpose_2d launch and a temporary per matmul per step (AiDotNet #1804).
+    /// </summary>
+    public void MatMulTransposedA(IGpuBuffer A, IGpuBuffer B, IGpuBuffer C, int M, int N, int K, float alpha = 1.0f, float beta = 0.0f)
+    {
+        if (!IsAvailable)
+            throw new InvalidOperationException("CUDA backend is not available.");
+        ValidateGemmArgs(A, B, C, M, N, K);
+
+        using var _ = PushContext();
+        ApplyDeterministicGemmMathMode();
+        float alphaVal = alpha;
+        float betaVal = beta;
+
+        // Column-major views of the row-major bytes:
+        //   A_row[K,M] === A_col[M,K]   (ld = M)
+        //   B_row[K,N] === B_col[N,K]   (ld = N)
+        //   C_row[M,N] === C_col[N,M]   (ld = N)
+        // (Aᵀ · B)_row === (Bᵀ · A)_col... in column-major: C_col[N,M] = B_col[N,K] · A_col[M,K]ᵀ, so
+        //   op(first)  = None      on B_col (N×K)
+        //   op(second) = Transpose on A_col (M×K → K×M)
+        //   m=N, n=M, k=K.
+        CuBlasNative.CheckCublasStatus(
+            CuBlasNative.cublasSgemm(
+                _cublasHandle,
+                CublasOperation.None,
+                CublasOperation.Transpose,
+                N, M, K,
+                ref alphaVal,
+                B.Handle, N,
+                A.Handle, M,
+                ref betaVal,
+                C.Handle, N),
+            "cublasSgemm(MatMulTransposedA)");
+    }
+
     public IGpuBuffer MatMul(IGpuBuffer A, IGpuBuffer B, int M, int N, int K)
     {
         ValidateGemmArgs(A, B, null, M, N, K);
@@ -2363,7 +2425,10 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         // Softmax/attention frontier). Under capture, issue `batchCount` SEQUENTIAL cublasSgemm calls on _stream
         // (each is capturable); the strided-batched fast path stays for the non-captured (eager) steps where it
         // saturates the SMs. Same arg order as the strided call and BatchedGemmFanout's per-slice cublasSgemm.
-        if (IsStreamCapturing())
+        // With a handle-owned workspace (CreateThreadCublas) cuBLAS allocates nothing during capture, so the strided
+        // call captures as ONE node; the per-slice loop remains only for a handle without one. The loop cost the
+        // parity Transformer 2,570 small GEMMs per training step (10.7 of its 14.7 ms of GPU time).
+        if (IsStreamCapturing() && !CurrentCublasHasWorkspace)
         {
             for (int b = 0; b < batchCount; b++)
             {
@@ -5012,11 +5077,20 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         if (TryDirectPtxRowSum(A, B, outerSize, reduceSize))
             return;
 
-        if (!_kernelCache.TryGetValue("sum_axis", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: sum_axis");
+        // Rows of at least SumAxisRowsMinReduce elements take one block per row (sum_axis_rows): coalesced
+        // reads and a parallel in-row reduction. sum_axis gives each row to a single thread, which is
+        // uncoalesced, and serial when there are few rows. It was 97.8% of GPU time in N-BEATS training, whose
+        // bias and basis gradients are ≤256 rows (#1804). Short rows keep sum_axis: a block per 2-element row
+        // would idle most of its threads.
+        bool blockPerRow = reduceSize >= SumAxisRowsMinReduce;
+        string kernelName = blockPerRow ? "sum_axis_rows" : "sum_axis";
+        if (!_kernelCache.TryGetValue(kernelName, out var kernel))
+            throw new InvalidOperationException($"CUDA kernel not found: {kernelName}");
 
         using var _ = PushContext();
-        uint grid = (uint)((outerSize + DefaultBlockSize - 1) / DefaultBlockSize);
+        uint grid = blockPerRow
+            ? (uint)outerSize
+            : (uint)((outerSize + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr inputPtr = A.Handle;
         IntPtr outputPtr = B.Handle;
         int outer = outerSize;
@@ -5403,6 +5477,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         // Set cuBLAS to use the specified stream. Read the handle once: the property re-binds it to _stream.
         IntPtr cublas = _cublasHandle;
         CuBlasNative.CheckCublasStatus(CuBlasNative.cublasSetStream(cublas, stream.Handle), "cublasSetStream");
+        ReattachCurrentThreadCublasWorkspace(cublas);
 
         try
         {
@@ -5424,6 +5499,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         {
             // Restore the default stream
             CuBlasNative.cublasSetStream(cublas, _stream);
+            ReattachCurrentThreadCublasWorkspace(cublas);
         }
     }
 
@@ -5902,10 +5978,35 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             if (tc.Stream != stream)
             {
                 CuBlasNative.CheckCublasStatus(CuBlasNative.cublasSetStream(tc.Handle, stream), "cublasSetStream(follow current stream)");
+                ReattachCublasWorkspace(tc);
                 tc.Stream = stream;
             }
             return tc.Handle;
         }
+    }
+
+    // cublasSetStream unconditionally resets a handle's workspace to cuBLAS's default pool (cuBLAS documentation),
+    // so every stream switch re-attaches the handle-owned workspace. Without it the first switch silently dropped
+    // the workspace, and a GEMM captured afterwards allocated inside the capture, which CurrentCublasHasWorkspace
+    // had promised it would not. If cuBLAS refuses, the workspace is released and the handle reports none, so the
+    // capture paths take their per-slice fallback.
+    private static void ReattachCublasWorkspace(ThreadCublas tc)
+    {
+        if (tc.Workspace is not { } workspace) return;
+        var status = CuBlasNative.cublasSetWorkspace(tc.Handle, workspace.Handle,
+            (UIntPtr)((ulong)CublasWorkspaceFloats * sizeof(float)));
+        if ((int)status != 0)
+        {
+            workspace.Dispose();
+            tc.Workspace = null;
+        }
+    }
+
+    // As ReattachCublasWorkspace, for a call site that switched the calling thread's handle by hand.
+    private void ReattachCurrentThreadCublasWorkspace(IntPtr handle)
+    {
+        if (_threadCublas is { IsValueCreated: true } local && local.Value is { } tc && tc.Handle == handle)
+            ReattachCublasWorkspace(tc);
     }
 
     // ThreadLocal factory: build this thread's cuBLAS handle for this engine. Runs on the accessing thread,
@@ -5923,7 +6024,31 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         bool det = GpuDeterminism.IsActive;
         int initMode = det ? CuBlasNative.CUBLAS_PEDANTIC_MATH : _initGemmMathMode;
         CuBlasNative.CheckCublasStatus(CuBlasNative.cublasSetMathMode(h, initMode), "cublasSetMathMode(per-thread)");
-        return new ThreadCublas { Handle = h, IsDeterministic = det, Stream = _stream };
+        IGpuBuffer? workspace = null;
+        try
+        {
+            // AIDOTNET_CUBLAS_WORKSPACE=0: kill switch back to cuBLAS's internal allocator (and per-slice capture GEMMs).
+            if (System.Environment.GetEnvironmentVariable("AIDOTNET_CUBLAS_WORKSPACE") == "0") throw new InvalidOperationException("cuBLAS workspace disabled");
+            // A handle first created inside a stream capture gets no workspace: allocating there would pin the
+            // buffer to the capture. It keeps cuBLAS's internal allocator, and its capture GEMMs take the
+            // per-slice path, as with an older cuBLAS.
+            if (IsStreamCapturing()) throw new InvalidOperationException("cuBLAS workspace not allocated during capture");
+            workspace = AllocateBuffer(CublasWorkspaceFloats);
+            var status = CuBlasNative.cublasSetWorkspace(h, workspace.Handle, (UIntPtr)((ulong)CublasWorkspaceFloats * sizeof(float)));
+            if ((int)status != 0)   // CUBLAS_STATUS_SUCCESS
+            {
+                workspace.Dispose();
+                workspace = null;
+            }
+        }
+        catch (Exception ex) when (ex is EntryPointNotFoundException or DllNotFoundException or InvalidOperationException)
+        {
+            // An older cuBLAS without cublasSetWorkspace: keep the internal allocator (and the per-slice
+            // capture fallback in BatchedGemm).
+            workspace?.Dispose();
+            workspace = null;
+        }
+        return new ThreadCublas { Handle = h, IsDeterministic = det, Stream = _stream, Workspace = workspace };
     }
 
     // Device frees DEFERRED from buffer FINALIZERS. Calling the CUDA driver (cuCtxPushCurrent /
@@ -6703,6 +6828,9 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int strideH, int strideW, int padH, int padW,
         int dilationH, int dilationW)
     {
+        if (TryConv2DBackwardInputGemm(gradOutput, kernel, gradInput, batch, inChannels, inHeight, inWidth,
+                outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW))
+            return;
         if (!_kernelCache.TryGetValue("conv2d_backward_input", out var cudaKernel))
             throw new InvalidOperationException("CUDA kernel not found: conv2d_backward_input");
 
@@ -6744,6 +6872,9 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int strideH, int strideW, int padH, int padW,
         int dilationH, int dilationW)
     {
+        if (TryConv2DBackwardKernelGemm(input, gradOutput, gradKernel, batch, inChannels, inHeight, inWidth,
+                outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW))
+            return;
         if (!_kernelCache.TryGetValue("conv2d_backward_kernel", out var cudaKernel))
             throw new InvalidOperationException("CUDA kernel not found: conv2d_backward_kernel");
 
@@ -13453,6 +13584,167 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         dst[o + 7] = (byte)((a >> 56) & 0xFF);
     }
 
+    /// <summary>
+    /// Pointer, size and chunk tables for the multi-tensor gradient kernels, kept across calls. A compiled training
+    /// plan's gradient buffers are stable from step to step, so the tables are built and uploaded once and reused;
+    /// rebuilding them per call would cost seven allocations and uploads, more than the kernels themselves.
+    /// </summary>
+    private sealed class MultiTensorTable : IDisposable
+    {
+        public IntPtr[] Handles = Array.Empty<IntPtr>();
+        public int[] Sizes = Array.Empty<int>();
+        public IGpuBuffer? Pointers, SizesBuffer, ChunkTensor, ChunkStart;
+        public int TotalChunks;
+
+        public bool Matches(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes)
+        {
+            if (Handles.Length != tensors.Count) return false;
+            for (int i = 0; i < Handles.Length; i++)
+                if (Handles[i] != tensors[i].Handle || Sizes[i] != sizes[i]) return false;
+            return true;
+        }
+
+        public void Dispose()
+        {
+            Pointers?.Dispose(); SizesBuffer?.Dispose(); ChunkTensor?.Dispose(); ChunkStart?.Dispose();
+            Pointers = SizesBuffer = ChunkTensor = ChunkStart = null;
+        }
+    }
+
+    private MultiTensorTable? _gradientTable;
+
+    // Guards _gradientTable from lookup through launch: a caller rebuilding it disposes the previous table, which
+    // another caller may hold between GetGradientTable and its kernel launch.
+    private readonly object _gradientTableSync = new object();
+
+    // Upper bound on the multi-tensor reduction's grid: enough blocks to fill the device, few enough that the one
+    // atomic per block does not serialize.
+    private const int MultiTensorReductionMaxBlocks = 1024;
+
+    private MultiTensorTable GetGradientTable(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes)
+    {
+        if (tensors is null) throw new ArgumentNullException(nameof(tensors));
+        if (sizes is null) throw new ArgumentNullException(nameof(sizes));
+        if (sizes.Count != tensors.Count)
+            throw new ArgumentException("Every tensor needs a size.", nameof(sizes));
+        if (_gradientTable is { } cached && cached.Matches(tensors, sizes))
+            return cached;
+        // A rebuild uploads the address table and disposes the cached one, neither of which a stream capture can
+        // record; fail before touching either. The table is built by the eager steps that precede capture.
+        if (IsStreamCapturing())
+            throw new InvalidOperationException(
+                "The multi-tensor gradient table must be built before stream capture; run an eager step first.");
+
+        int n = tensors.Count;
+        var addresses = new byte[n * sizeof(ulong)];
+        var handles = new IntPtr[n];
+        var sizeArray = new int[n];
+        int totalChunks = 0;
+        for (int t = 0; t < n; t++)
+        {
+            int size = sizes[t];
+            if (size <= 0) throw new ArgumentOutOfRangeException(nameof(sizes), "Every tensor size must be positive.");
+            if (tensors[t].Size < size) throw new ArgumentException("A tensor buffer is smaller than its size.", nameof(tensors));
+            handles[t] = tensors[t].Handle;
+            WriteAddress(addresses, t, handles[t]);
+            sizeArray[t] = size;
+            totalChunks += (size + MultiTensorChunk - 1) / MultiTensorChunk;
+        }
+        var chunkTensor = new int[totalChunks];
+        var chunkStart = new int[totalChunks];
+        int c = 0;
+        for (int t = 0; t < n; t++)
+        {
+            int chunks = (sizeArray[t] + MultiTensorChunk - 1) / MultiTensorChunk;
+            for (int k = 0; k < chunks; k++) { chunkTensor[c] = t; chunkStart[c] = k * MultiTensorChunk; c++; }
+        }
+
+        // Build the replacement completely before retiring the cached table: a failed allocation or upload disposes
+        // the partial replacement and leaves the previous table intact.
+        var table = new MultiTensorTable { Handles = handles, Sizes = sizeArray, TotalChunks = totalChunks };
+        try
+        {
+            using (PushContext())
+            {
+                table.Pointers = AllocateByteBuffer(addresses.Length);
+                UploadByteBuffer(table.Pointers, addresses);
+                table.SizesBuffer = AllocateIntBuffer(sizeArray);
+                table.ChunkTensor = AllocateIntBuffer(chunkTensor);
+                table.ChunkStart = AllocateIntBuffer(chunkStart);
+            }
+        }
+        catch
+        {
+            table.Dispose();
+            throw;
+        }
+        _gradientTable?.Dispose();
+        _gradientTable = table;
+        return table;
+    }
+
+    /// <summary>
+    /// Sum of squares of every element of every tensor, in one launch, written as a double to
+    /// <paramref name="sumOfSquares"/> (at least two float slots). Accumulated in double, so it is finite exactly when
+    /// every element is: one reduction serves the global-norm clip and the non-finite-gradient check.
+    /// </summary>
+    public unsafe void MultiTensorSumOfSquares(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes, IGpuBuffer sumOfSquares)
+    {
+        if (sumOfSquares is null) throw new ArgumentNullException(nameof(sumOfSquares));
+        if (sumOfSquares.Size < 2) throw new ArgumentException("The double result needs two float slots.", nameof(sumOfSquares));
+        Fill(sumOfSquares, 0f, 2);
+        if (tensors is null || tensors.Count == 0) return;
+        if (!_kernelCache.TryGetValue("multi_tensor_sum_squares", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: multi_tensor_sum_squares");
+        void** args = stackalloc void*[6];
+        lock (_gradientTableSync)
+        {
+            var table = GetGradientTable(tensors, sizes);
+            using var _ = PushContext();
+            IntPtr pH = table.Pointers!.Handle, sH = table.SizesBuffer!.Handle, ctH = table.ChunkTensor!.Handle, csH = table.ChunkStart!.Handle;
+            IntPtr outH = sumOfSquares.Handle;
+            int totalChunks = table.TotalChunks;
+            args[0] = &pH; args[1] = &sH; args[2] = &ctH; args[3] = &csH; args[4] = &totalChunks; args[5] = &outH;
+            LaunchKernel(kernel, (uint)Math.Min(totalChunks, MultiTensorReductionMaxBlocks), MultiTensorChunk, args);
+        }
+    }
+
+    /// <summary>
+    /// The clip_grad_norm_ coefficient min(1, maxNorm / (norm + 1e-6)) from <see cref="MultiTensorSumOfSquares"/>'s
+    /// result, computed on the device into <paramref name="scale"/> (one float). A non-finite norm yields 1.
+    /// </summary>
+    public unsafe void ClipScaleFromSumOfSquares(IGpuBuffer sumOfSquares, float maxNorm, IGpuBuffer scale)
+    {
+        if (sumOfSquares is null) throw new ArgumentNullException(nameof(sumOfSquares));
+        if (scale is null) throw new ArgumentNullException(nameof(scale));
+        if (!_kernelCache.TryGetValue("clip_scale_from_sum_squares", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: clip_scale_from_sum_squares");
+        using var _ = PushContext();
+        IntPtr sH = sumOfSquares.Handle, cH = scale.Handle;
+        void** args = stackalloc void*[3];
+        args[0] = &sH; args[1] = &maxNorm; args[2] = &cH;
+        LaunchKernel(kernel, 1, 1, args);
+    }
+
+    /// <summary>Multiplies every element of every tensor by the device scalar <paramref name="scale"/>, in one launch.</summary>
+    public unsafe void MultiTensorScaleByDeviceScalar(IReadOnlyList<IGpuBuffer> tensors, IReadOnlyList<int> sizes, IGpuBuffer scale)
+    {
+        if (scale is null) throw new ArgumentNullException(nameof(scale));
+        if (tensors is null || tensors.Count == 0) return;
+        if (!_kernelCache.TryGetValue("multi_tensor_scale_by_device_scalar", out var kernel))
+            throw new InvalidOperationException("CUDA kernel not found: multi_tensor_scale_by_device_scalar");
+        void** args = stackalloc void*[5];
+        lock (_gradientTableSync)
+        {
+            var table = GetGradientTable(tensors, sizes);
+            using var _ = PushContext();
+            IntPtr pH = table.Pointers!.Handle, sH = table.SizesBuffer!.Handle, ctH = table.ChunkTensor!.Handle, csH = table.ChunkStart!.Handle;
+            IntPtr scH = scale.Handle;
+            args[0] = &pH; args[1] = &sH; args[2] = &ctH; args[3] = &csH; args[4] = &scH;
+            LaunchKernel(kernel, (uint)table.TotalChunks, MultiTensorChunk, args);
+        }
+    }
+
     public unsafe void AdamUpdateBf16(IGpuBuffer param, IGpuBuffer gradient, IGpuBuffer m, IGpuBuffer v,
         float learningRate, float beta1, float beta2, float epsilon, float weightDecay, int step, int size)
     {
@@ -17476,6 +17768,17 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
 
         _disposed = true;
 
+        // The multi-tensor table holds device buffers: free them only on an explicit dispose, never from the
+        // finalizer (the context may already be gone).
+        if (disposing)
+        {
+            lock (_gradientTableSync)
+            {
+                _gradientTable?.Dispose();
+                _gradientTable = null;
+            }
+        }
+
         // Drop the diagnostics registrations for these handles. The registry is process-lifetime but
         // kernel handles are not, and a driver may reuse a freed handle address -- a stale entry
         // would then name a later kernel wrongly, which in crash forensics is worse than no name.
@@ -17563,8 +17866,12 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         {
             foreach (var tc in _threadCublas.Values)
             {
-                if (tc is not null && tc.Handle != IntPtr.Zero)
+                if (tc is null) continue;
+                if (tc.Handle != IntPtr.Zero)
                     CuBlasNative.cublasDestroy(tc.Handle);
+                // The handle's 8 MiB workspace is the backend's allocation, not cuBLAS's: free it with the handle.
+                tc.Workspace?.Dispose();
+                tc.Workspace = null;
             }
 
             _threadCublas.Dispose();

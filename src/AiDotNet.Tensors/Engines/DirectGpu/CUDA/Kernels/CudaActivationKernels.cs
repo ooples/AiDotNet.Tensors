@@ -1034,6 +1034,44 @@ extern ""C"" __global__ __launch_bounds__(256) void sum_axis(const float* __rest
     output[idx] = sum;
 }
 
+// Row sum with one BLOCK per row, for rows long enough that sum_axis's one-thread-per-row loop is the
+// bottleneck: there each thread walks its own row, so a warp's loads hit 32 different rows (uncoalesced) and a
+// call with few rows leaves almost the whole GPU idle while one thread sums serially. Here the block's threads
+// stride across the row (coalesced), then reduce through warp shuffles and one shared-memory step. Launched with
+// gridDim.x = outerSize and 256 threads.
+extern ""C"" __global__ __launch_bounds__(256) void sum_axis_rows(const float* __restrict__ input, float* __restrict__ output, int outerSize, int reduceSize)
+{
+    __shared__ float warpSums[8];
+    unsigned int row = blockIdx.x;
+    if (row >= (unsigned int)outerSize) return;
+
+    const float* rowPtr = input + (size_t)row * (unsigned int)reduceSize;
+    float sum = 0.0f;
+    for (unsigned int i = threadIdx.x; i < (unsigned int)reduceSize; i += blockDim.x)
+        sum += __ldg(&rowPtr[i]);
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+
+    unsigned int lane = threadIdx.x & 31;
+    unsigned int warpId = threadIdx.x >> 5;
+    if (lane == 0)
+        warpSums[warpId] = sum;
+    __syncthreads();
+
+    if (warpId == 0)
+    {
+        unsigned int numWarps = (blockDim.x + 31) >> 5;
+        sum = lane < numWarps ? warpSums[lane] : 0.0f;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+        if (lane == 0)
+            output[row] = sum;
+    }
+}
+
 extern ""C"" __global__ __launch_bounds__(256) void bias_add(float* __restrict__ data, const float* __restrict__ bias, int rows, int cols)
 {
     int col = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1455,6 +1493,7 @@ extern ""C"" __global__ __launch_bounds__(256) void max_vectors_vec4(const float
                 "reduce_min",
                 "squared_deviation_from_mean",
                 "sum_axis",
+                "sum_axis_rows",
                 "bias_add",
                 "bias_add_out",
                 "conv2d_bias_add",

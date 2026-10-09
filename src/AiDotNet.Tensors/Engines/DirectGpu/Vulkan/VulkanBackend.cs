@@ -780,13 +780,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
         {
             var batchCmd = _batchThreadRes.CommandBuffer;
             if (_batchDispatchCount > 0)
-            {
-                VulkanNativeBindings.vkCmdPipelineBarrier(
-                    batchCmd,
-                    (uint)VkPipelineStageFlags.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                    (uint)VkPipelineStageFlags.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                    0, 0, IntPtr.Zero, 0, null, 0, IntPtr.Zero);
-            }
+                RecordComputeMemoryBarrier(batchCmd);
             VulkanNativeBindings.vkCmdBindPipeline(batchCmd, VulkanNativeBindings.VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.Handle);
             var batchDs = pipeline.DescriptorSet;
             VulkanNativeBindings.vkCmdBindDescriptorSets(batchCmd, VulkanNativeBindings.VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.Layout, 0, 1, &batchDs, 0, null);
@@ -848,21 +842,7 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
 
             // Insert barrier between dispatches to ensure data dependencies
             if (_batchDispatchCount > 0)
-            {
-                // Full execution + memory dependency barrier between compute dispatches.
-                // Uses execution dependency (no VkMemoryBarrier struct needed since
-                // Vulkan guarantees that a pipeline barrier with matching stage masks
-                // also creates a memory dependency for storage buffer accesses when
-                // the stages are COMPUTE_SHADER_BIT on both sides).
-                // NOTE: For strict correctness with independent buffer sets, per-buffer
-                // VkBufferMemoryBarriers would be more precise but require tracking
-                // which buffers each dispatch accesses.
-                VulkanNativeBindings.vkCmdPipelineBarrier(
-                    batchCmd,
-                    (uint)VkPipelineStageFlags.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                    (uint)VkPipelineStageFlags.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                    0, 0, IntPtr.Zero, 0, null, 0, IntPtr.Zero);
-            }
+                RecordComputeMemoryBarrier(batchCmd);
 
             // Bind pipeline
             VulkanNativeBindings.vkCmdBindPipeline(
@@ -1087,23 +1067,29 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     {
         if (!_batchMode) return;
 
-        var cmdBuffer = _batchThreadRes.CommandBuffer;
+        RecordComputeMemoryBarrier(_batchThreadRes.CommandBuffer);
+    }
 
-        // Full memory barrier: ensures all shader writes are visible to subsequent reads.
-        // VK_STRUCTURE_TYPE_MEMORY_BARRIER = 46, SHADER_WRITE = 0x40, SHADER_READ = 0x20
-        unsafe
-        {
-            var memBarrier = stackalloc ulong[4]; // sType, pNext, srcAccessMask, dstAccessMask
-            memBarrier[0] = 46; // VK_STRUCTURE_TYPE_MEMORY_BARRIER
-            memBarrier[1] = 0;  // pNext = null
-            memBarrier[2] = 0x40; // VK_ACCESS_SHADER_WRITE_BIT
-            memBarrier[3] = 0x20; // VK_ACCESS_SHADER_READ_BIT
-            VulkanNativeBindings.vkCmdPipelineBarrier(
-                cmdBuffer,
-                (uint)VkPipelineStageFlags.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                (uint)VkPipelineStageFlags.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                0, 1, (IntPtr)memBarrier, 0, null, 0, IntPtr.Zero);
-        }
+    /// <summary>
+    /// Compute-to-compute barrier that makes earlier shader writes visible to later shader reads AND writes.
+    /// Matching stage masks alone are only an execution dependency; without a memory barrier a following
+    /// read-modify-write dispatch (an accumulating reduction) may not see the previous dispatch's writes.
+    /// </summary>
+    private static unsafe void RecordComputeMemoryBarrier(IntPtr commandBuffer)
+    {
+        // VkMemoryBarrier: uint32 sType @0, (pad), void* pNext @8, uint32 srcAccessMask @16, uint32 dstAccessMask @20.
+        // The previous ulong[4] layout put dstAccessMask in the high half of slot 2, leaving it 0.
+        const uint StructureTypeMemoryBarrier = 46, AccessShaderRead = 0x20, AccessShaderWrite = 0x40;
+        byte* barrier = stackalloc byte[24];
+        new Span<byte>(barrier, 24).Clear();
+        *(uint*)barrier = StructureTypeMemoryBarrier;
+        *(uint*)(barrier + 16) = AccessShaderWrite;
+        *(uint*)(barrier + 20) = AccessShaderRead | AccessShaderWrite;
+        VulkanNativeBindings.vkCmdPipelineBarrier(
+            commandBuffer,
+            (uint)VkPipelineStageFlags.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            (uint)VkPipelineStageFlags.VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, (IntPtr)barrier, 0, null, 0, IntPtr.Zero);
     }
 
     #endregion

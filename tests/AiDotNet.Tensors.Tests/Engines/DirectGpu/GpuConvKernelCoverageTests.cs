@@ -164,6 +164,26 @@ public sealed class GpuConvKernelCoverageTests : IDisposable, IClassFixture<Dire
             "DeformableConv2DGroupedWithMask");
     }
 
+    // Per-axis stride/padding/dilation Conv2D: the GPU override that keeps GPU training's convolution on the
+    // device (it previously fell through to the CPU). Square, asymmetric and dilated geometries, batch > 1.
+    [SkippableTheory]
+    [InlineData(2, 3, 8, 9, 9, 3, 3, 1, 1, 1, 1, 1, 1)]   // plain 3x3, pad 1
+    [InlineData(2, 4, 6, 10, 7, 3, 3, 2, 1, 1, 0, 1, 1)]  // asymmetric stride and padding
+    [InlineData(1, 5, 4, 11, 11, 3, 3, 1, 1, 2, 2, 2, 2)] // dilation 2
+    [InlineData(3, 2, 5, 8, 6, 1, 3, 1, 2, 0, 1, 1, 1)]   // rectangular 1x3 kernel
+    public void Conv2DPerAxis_Gpu_MatchesCpu(int batch, int inC, int outC, int h, int w, int kh, int kw,
+        int strideH, int strideW, int padH, int padW, int dilH, int dilW)
+    {
+        SkipIfUnavailable();
+        var input = R(40, batch, inC, h, w);
+        var kernel = R(41, outC, inC, kh, kw);
+        int[] stride = { strideH, strideW }, pad = { padH, padW }, dil = { dilH, dilW };
+        AssertClose(
+            _cpu.Conv2D(input, kernel, stride, pad, dil),
+            Gpu.Conv2D(input, kernel, stride, pad, dil),
+            $"Conv2D(k={kh}x{kw},s={strideH}x{strideW},p={padH}x{padW},d={dilH}x{dilW})");
+    }
+
     // ---- Grouped (DCNv3) BACKWARD: single-launch GPU kernels vs CPU composition oracle (#1691) ----
     private (Tensor<float> input, Tensor<float> kernel, Tensor<float> offset, int[] stride, int[] pad,
              int[] dil, int groups, int dg, Tensor<float> grad) GroupedBwdSetup(int groups, int dg)

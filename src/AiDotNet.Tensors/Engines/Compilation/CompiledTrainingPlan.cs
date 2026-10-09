@@ -164,6 +164,19 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
 
     // Indices of gradient buffers that need zeroing (used by generic/accumulating backward only)
     private readonly int[]? _genericGradIndices;
+
+    /// <summary>Gradient buffers no backward action wrote in the last uncaptured run of the captured step body (null
+    /// until one ran): the only ones that body zeroes per step. See RunGpuStepBodyForCapture.</summary>
+    private int[]? _unwrittenGradIndices;
+
+    /// <summary>Host-engine eager step: per gradient buffer, true when every writer is a generic backward step, so
+    /// the buffer is not zeroed and its first contribution of the step is copied in (GradWriteGeneration). Null when
+    /// the backward is all-specialized, pooled, or has no such buffer. Entries are cleared by
+    /// <see cref="RecordEagerFirstWriteCoverage"/> when a run shows the buffer is not written.</summary>
+    private bool[]? _eagerFirstWriteCandidates;
+
+    /// <summary>True once one eager step has run with every candidate zeroed and recorded which ones it wrote.</summary>
+    private bool _eagerFirstWriteVerified;
     // #1624 liveness pooling: re-zero schedule indexed by backward action index.
     // _gradPoolReZeroByStep[i] (when non-null) lists physical-buffer indices into
     // _preAllocatedGrads to clear BEFORE backward action i runs, because that
@@ -294,6 +307,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         _clipSumSq = null;
         _clipTmp = null;
         _clipSquares = null;
+        _finitenessSumSquares?.Dispose();
+        _finitenessSumSquares = null;
+        _finitenessBackend = null;
 
         // Free the captured training-step graph, if any.
         InvalidateCapturedStepGraph();
@@ -395,6 +411,20 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     }
 
     /// <summary>
+    /// Why whole-step CUDA-graph capture was abandoned for this plan, or null while it is still eligible or engaged.
+    /// A failed capture used to be swallowed: the plan trained eagerly for the rest of its life (paying a launch, copy
+    /// or sync per op) and nothing said so. Measured on the PyTorch parity MLP and CNN, every run took that path.
+    /// </summary>
+    public string? GraphCaptureFailureReason { get; private set; }
+
+    private void RecordGraphCaptureFailure(string reason)
+    {
+        GraphCaptureFailureReason = reason;
+        System.Diagnostics.Trace.TraceWarning(
+            "CUDA graph capture of the compiled training step failed; this plan trains without graph replay from now on. " + reason);
+    }
+
+    /// <summary>
     /// Keeps THIS plan on the eager step even where whole-step CUDA-graph capture is enabled process-wide. The
     /// environment switch is read once per process, so this is how a single test process compares a captured plan
     /// against an eager one (the parity oracle for capture).
@@ -490,6 +520,67 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     }
 
     /// <summary>
+    /// Makes an in-place device update of parameter <paramref name="p"/> authoritative everywhere it is looked up,
+    /// through the engine's single path for that (the eager GpuOptimizer already uses it). Binding the buffer alone
+    /// left the persistent weight cache stamped with the pre-update version, so the next forward judged the updated
+    /// device buffer stale, re-uploaded the old host weights over it and disposed it: every float32 parameter that was
+    /// GPU-resident at the first step (one Predict before Train is enough) silently lost its first two updates, then
+    /// fell to the host optimizer.
+    /// </summary>
+    private void CommitDeviceParameterUpdate(Engines.DirectGpuTensorEngine engine, int p,
+        Engines.DirectGpu.IGpuBuffer buffer, Engines.DirectGpu.IDirectGpuBackend backend)
+    {
+        if (typeof(T) == typeof(float))
+            engine.CommitParameterUpdatedOnDevice((Tensor<float>)(object)_parameters[p], buffer, backend, syncPoint: null);
+    }
+
+    /// <summary>
+    /// The plan's gradient buffers live as long as the plan, but they are created during the trace, where the tape's
+    /// activation eviction can mark them as released step intermediates. A later write then failed ("GPU intermediate
+    /// of a finished GradientTape step"), which inside a CUDA graph capture aborted the capture of every CNN training
+    /// step. Like the arena and array pools re-issuing an object to a new owner, the plan clears those marks.
+    /// </summary>
+    private void ClearPlanBufferReleaseMarks()
+    {
+        if (_liveGradientMap is { } live)
+            foreach (var buffer in live.Values)
+                buffer?.ClearReleaseMarks();
+        if (_preAllocatedGrads is { } pre)
+            foreach (var buffer in pre)
+                buffer?.ClearReleaseMarks();
+    }
+
+    /// <summary>
+    /// Host wins after a host write. A GPU plan binds every parameter to a persistent device buffer and updates it there,
+    /// so between steps the device copy is authoritative. A host write in between (SetParameters, a user edit through
+    /// AsWritableSpan + IncrementVersion) advances the host version past the bound buffer's; upload those values into
+    /// the SAME buffer before the step, so the step reads them and a captured graph's baked pointers stay valid.
+    /// </summary>
+    private void UploadHostWrittenParameters()
+    {
+        if (typeof(T) != typeof(float) || _engine is not Engines.DirectGpuTensorEngine gte) return;
+        for (int p = 0; p < _parameters.Length; p++)
+        {
+            var parameter = _parameters[p];
+            var buffer = parameter._gpuBuffer;
+            if (buffer is null || buffer.Handle == IntPtr.Zero || parameter._gpuBackend is not { } backend) continue;
+            if (parameter._gpuBufferVersion == parameter.GpuCacheVersion) continue;
+
+            if (backend is Engines.DirectGpu.CUDA.CudaBackend cuda && buffer.Size >= parameter.Length)
+            {
+                var host = (float[])(object)parameter.ToArray();
+                cuda.UploadBufferInPlace(host, buffer);
+                gte.CommitParameterUpdatedOnDevice((Tensor<float>)(object)parameter, buffer, backend, syncPoint: null);
+            }
+            else
+            {
+                // No in-place upload on this backend: drop the binding so the next forward re-uploads the host values.
+                gte.InvalidateResidentWeightBuffer(parameter);
+            }
+        }
+    }
+
+    /// <summary>
     /// GPU weight-cache coherence after a CPU-side in-place parameter mutation. The fused optimizer
     /// mutates a parameter's host backing IN PLACE via raw pointers (no Version bump), so in a GPU
     /// resident/capture scope the forward's version-gate is BYPASSED and it keeps reading the STALE
@@ -505,12 +596,57 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // graph references: retire the graph here, where the mutation actually happens. (It used to be retired at the
         // top of every optimizer update, even when every parameter was updated on the device and the graph stayed
         // valid -- so a graph was captured every warmup cycle and never replayed.)
-        if (_stepGraphExec != IntPtr.Zero) InvalidateCapturedStepGraph();
+        if (_stepGraphExec != IntPtr.Zero)
+        {
+            InvalidateCapturedStepGraph();
+            // This optimizer path writes weights on the host every step, so any graph is retired by the next update:
+            // capturing again would rebuild it every step, which measured 23% slower than not capturing (parity MLP,
+            // 8.64 vs 7.02 ms/step). Stop capturing and say why; a device-side optimizer keeps the graph alive.
+            _graphStepDisabled = true;
+            RecordGraphCaptureFailure("the optimizer updates parameters on the host every step, which retires the "
+                + "captured graph each time; train with a device-resident optimizer update to keep graph replay");
+        }
         _parameters[p].IncrementVersion();
         (_engine as Engines.DirectGpuTensorEngine)?.InvalidateResidentWeightBuffer(_parameters[p]);
     }
 
-    public Tensor<T>[] Gradients => _gradients;
+    /// <summary>
+    /// Each parameter's gradient from the most recent step, index-aligned with the parameters.
+    /// </summary>
+    /// <remarks>
+    /// Resolved from the live gradient map on every read. The backward can REPLACE a parameter's map entry (an
+    /// out-of-place accumulation, a first-write copy, a contiguity fix-up) instead of adding into the buffer this
+    /// array was built with at compile time; the snapshot then kept only the first contribution. Every
+    /// multi-consumer parameter was wrong (CNN conv layers ~0.4x, LSTM input/forget/candidate gates ~0.5x against
+    /// PyTorch) while the update itself, which reads the live map, was right.
+    /// </remarks>
+    /// <summary>
+    /// Each parameter's gradient from the last step, as the live gradient map holds it. The backward can replace a
+    /// parameter's map entry (out-of-place accumulation, a first-write copy) rather than add into the plan's buffer,
+    /// so the plan's own array can hold only the first contribution. The result is a separate array: the plan's
+    /// array is what the step's clip, regularization and optimizer were configured against, and a reader must not
+    /// rebind it, least of all outside the step lock.
+    /// </summary>
+    public Tensor<T>[] Gradients
+    {
+        get
+        {
+            if (_liveGradientMap is not { } live)
+                return _gradients;
+            Tensor<T>[]? resolved = null;
+            for (int i = 0; i < _parameters.Length && i < _gradients.Length; i++)
+            {
+                if (live.TryGetValue(_parameters[i], out var current) && !ReferenceEquals(current, _gradients[i]))
+                {
+                    resolved ??= (Tensor<T>[])_gradients.Clone();
+                    resolved[i] = current;
+                }
+            }
+            return resolved ?? _gradients;
+        }
+    }
+
+    private Dictionary<Tensor<T>, Tensor<T>>? _liveGradientMap;
     public int ForwardStepCount => _forwardActions.Length;
     public int BackwardStepCount => _backwardActions.Length;
 
@@ -656,6 +792,47 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     /// the re-zero schedule indexed by backward ACTION index, plus the fused-step
     /// and skippable-ReduceSum decision sets for the caller's drift guard.</para>
     /// </summary>
+    /// <summary>
+    /// A reshape that is a view (its output shares its input's storage) has the identity as its backward: the input
+    /// gradient is the output gradient read in the input's shape. When the reshape is the input's only consumer and the
+    /// input is not a parameter, the input's gradient buffer becomes a view of the output's, so the backward step -- a
+    /// copy into a fresh tensor plus a copy into the gradient buffer -- is skipped. Walking the steps in reverse makes a
+    /// chain of reshapes collapse onto the last one's buffer. Measured on the parity Transformer (CPU): 31 reshape
+    /// backwards were 2.3 ms of a 21 ms backward.
+    /// <para>Host engines only: a GPU engine binds device buffers per tensor, not per storage.</para>
+    /// </summary>
+    private static HashSet<CompiledStep<T>>? AliasReshapeViewGradients(
+        List<CompiledStep<T>> forwardSteps,
+        Tensor<T>[] parameters,
+        Dictionary<Tensor<T>, int> consumerCount,
+        IEngine engine,
+        Dictionary<Tensor<T>, Tensor<T>> gradMap,
+        List<Tensor<T>> allGrads)
+    {
+        if (engine.SupportsGpu || engine is Engines.DirectGpuTensorEngine) return null;
+        HashSet<CompiledStep<T>>? aliased = null;
+        var parameterSet = new HashSet<Tensor<T>>(parameters, ReferenceEqualityComparer<Tensor<T>>.Instance);
+        var dropped = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+        for (int i = forwardSteps.Count - 1; i >= 0; i--)
+        {
+            var step = forwardSteps[i];
+            if (step.OpName != "Reshape" || step.Inputs.Length != 1) continue;
+            var input = step.Inputs[0];
+            var output = step.OutputBuffer;
+            if (input is null || parameterSet.Contains(input)) continue;
+            if (!consumerCount.TryGetValue(input, out int consumers) || consumers != 1) continue;
+            if (!input.SharesStorageWith(output) || input.Length != output.Length) continue;
+            if (!gradMap.TryGetValue(output, out var outputGrad) || !outputGrad.IsContiguous) continue;
+            if (!gradMap.TryGetValue(input, out var ownGrad)) continue;
+            gradMap[input] = outputGrad.ReshapeViewUnrecorded(input._shape);
+            dropped.Add(ownGrad);
+            (aliased ??= new HashSet<CompiledStep<T>>(ReferenceEqualityComparer<CompiledStep<T>>.Instance)).Add(step);
+        }
+        if (dropped.Count > 0)
+            allGrads.RemoveAll(g => dropped.Contains(g));
+        return aliased;
+    }
+
     private static int[][] BuildPooledGradMap(
         System.Collections.Generic.HashSet<Tensor<T>> allTensors,
         System.Collections.Generic.List<CompiledStep<T>> forwardSteps,
@@ -1137,11 +1314,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
 
             fixed (float* pGrad = &gradients[gradOffsets[p]])
             {
-                gradientsFinite = FusedOptimizer.AllFiniteSimd(pGrad, lengths[p]);
+                gradientsFinite = FusedOptimizer.AllFiniteParallel(pGrad, lengths[p]);
             }
         }
 
-        if (gradientsFinite)
+        if (gradientsFinite && TryMultiTensorFiniteness(gpuGradients, gpuBackends, lengths, out bool deviceGradientsFinite))
+        {
+            gradientsFinite = deviceGradientsFinite;
+        }
+        else if (gradientsFinite)
         {
             // Aggregate every gradient mask on-device and synchronize only once per backend. The
             // accumulator begins as all ones; multiplying a 0/1 mask into its prefix preserves a
@@ -1225,6 +1406,61 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         }
 
         MarkOptimizerStepDiscarded();
+        return true;
+    }
+
+    private Engines.DirectGpu.IGpuBuffer? _finitenessSumSquares;
+    private Engines.DirectGpu.IDirectGpuBackend? _finitenessBackend;
+    private readonly List<Engines.DirectGpu.IGpuBuffer> _finitenessBuffers = new List<Engines.DirectGpu.IGpuBuffer>();
+    private readonly List<int> _finitenessSizes = new List<int>();
+
+    // The multi-tensor clip's per-step argument lists, owned by the plan and cleared per call like its scratch.
+    private readonly List<Engines.DirectGpu.IGpuBuffer> _clipBuffers = new List<Engines.DirectGpu.IGpuBuffer>();
+    private readonly List<int> _clipSizes = new List<int>();
+    private readonly List<Tensor<T>> _clipOwners = new List<Tensor<T>>();
+
+    /// <summary>
+    /// CUDA: every device gradient is finite exactly when their double-accumulated sum of squares is (a float squared
+    /// cannot overflow a double), so one multi-tensor reduction and an 8-byte read replace a classify and a multiply
+    /// per gradient (AiDotNet #1804). False when the gradients are not all on one CUDA backend; the per-tensor mask
+    /// path then runs.
+    /// </summary>
+    private bool TryMultiTensorFiniteness(
+        Engines.DirectGpu.IGpuBuffer?[] gpuGradients,
+        Engines.DirectGpu.IDirectGpuBackend?[] gpuBackends,
+        int[] lengths,
+        out bool allFinite)
+    {
+        allFinite = true;
+        Engines.DirectGpu.CUDA.CudaBackend? cuda = null;
+        // Plan-owned lists, cleared per step: this runs on every optimizer step.
+        var buffers = _finitenessBuffers;
+        var sizes = _finitenessSizes;
+        buffers.Clear();
+        sizes.Clear();
+        for (int p = 0; p < gpuGradients.Length; p++)
+        {
+            if (gpuGradients[p] is not { } gradient || lengths[p] <= 0)
+                continue;
+            if (gpuBackends[p] is not Engines.DirectGpu.CUDA.CudaBackend owner)
+                return false;
+            if (cuda is null) cuda = owner;
+            else if (!ReferenceEquals(cuda, owner)) return false;
+            buffers.Add(gradient);
+            sizes.Add(lengths[p]);
+        }
+        if (cuda is null)
+            return false;
+
+        if (_finitenessSumSquares is null || !ReferenceEquals(_finitenessBackend, cuda))
+        {
+            _finitenessSumSquares?.Dispose();
+            _finitenessSumSquares = cuda.AllocateBuffer(2);
+            _finitenessBackend = cuda;
+        }
+        cuda.MultiTensorSumOfSquares(buffers, sizes, _finitenessSumSquares);
+        double sumSquares = BitConverter.ToDouble(cuda.DownloadByteBuffer(_finitenessSumSquares, sizeof(double)), 0);
+        allFinite = !double.IsNaN(sumSquares) && !double.IsInfinity(sumSquares);
         return true;
     }
 
@@ -1810,6 +2046,61 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     private static int _profStepCount;
     private static long[]? _profPerStepUs;
     private static string[]? _profBackwardStepNames;
+    private static long[]? _profFwdUs;
+    private static string[]? _profFwdNames;
+    private static long s_profLastAlloc;
+    private static int s_profLastGc0, s_profLastGc1, s_profLastGc2;
+#if NET7_0_OR_GREATER
+    private static long s_profLastPause;
+#endif
+    private bool _profZeroReported;
+
+    private bool[]? _accumulatingGradMask;
+
+    // Kill switch for clearing only accumulated-into buffers on the first-write path (A/B and rollback):
+    // AIDOTNET_COMPILED_ZERO_ACCUMULATING_ONLY=0 restores clearing every non-candidate buffer.
+    private static readonly bool s_zeroAccumulatingOnly =
+        Environment.GetEnvironmentVariable("AIDOTNET_COMPILED_ZERO_ACCUMULATING_ONLY") != "0";
+
+    /// <summary><see cref="_genericGradIndices"/> as a per-buffer mask (built once).</summary>
+    private bool[] AccumulatingGradMask(int count)
+    {
+        var mask = _accumulatingGradMask;
+        if (mask is null || mask.Length != count)
+        {
+            mask = new bool[count];
+            foreach (int idx in _genericGradIndices!) if (idx >= 0 && idx < count) mask[idx] = true;
+            _accumulatingGradMask = mask;
+        }
+        return mask;
+    }
+
+    // Writes "<AIDOTNET_STEP_PROF_PATH>.ops.txt": forward actions and backward delegates ranked by average µs/step,
+    // so a slow step can be attributed to individual ops without an external profiler.
+    private static void DumpPerOpProfile(int steps)
+    {
+        var sb = new System.Text.StringBuilder();
+        void Section(string title, long[]? us, string[]? names)
+        {
+            if (us is null) return;
+            long total = 0;
+            for (int i = 0; i < us.Length; i++) total += us[i];
+            sb.AppendLine($"== {title}: {us.Length} entries, {total / (double)steps:F1} µs/step");
+            var byName = new Dictionary<string, (long Us, int Count)>();
+            for (int i = 0; i < us.Length; i++)
+            {
+                string n = names is not null && i < names.Length ? names[i] : $"#{i}";
+                byName.TryGetValue(n, out var acc);
+                byName[n] = (acc.Us + us[i], acc.Count + 1);
+            }
+            foreach (var kv in byName.OrderByDescending(kv => kv.Value.Us))
+                sb.AppendLine($"  {kv.Value.Us / (double)steps,9:F1} µs  x{kv.Value.Count,-3} {kv.Key}");
+        }
+        Section("forward", _profFwdUs, _profFwdNames);
+        Section("backward", _profPerStepUs, _profBackwardStepNames);
+        System.IO.File.WriteAllText(StepProfDumpPath + ".ops.txt", sb.ToString());
+    }
+
     public static long[] ProfPerStepUs => _profPerStepUs ?? Array.Empty<long>();
     public static string[] ProfBackwardStepNames => _profBackwardStepNames ?? Array.Empty<string>();
     public static long ProfForwardUs => System.Threading.Interlocked.Read(ref _profForwardUs);
@@ -2011,8 +2302,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public Tensor<T> Step()
     {
+        // The pre-step parameter upload and mark reset are part of the step: under the lock, so a concurrent caller
+        // cannot upload parameters into buffers another thread's StepCore is reading.
         lock (_stepSync)
+        {
+            ClearPlanBufferReleaseMarks();
+            UploadHostWrittenParameters();
             return StepCore();
+        }
     }
 
     private Tensor<T> StepCore()
@@ -2096,8 +2393,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                         using (AiDotNet.Tensors.Engines.DirectGpu.GpuMemoryTracker.BeginCapture("StepGraphCapture"))
                             exec = cb.CaptureGraph(() => RunGpuStepBodyForCapture(cb));
                     }
-                    catch
+                    catch (Exception captureFailure)
                     {
+                        RecordGraphCaptureFailure(captureFailure.GetType().Name + ": " + captureFailure.Message);
                         // A throw during pre-residency/capture (not just exec==Zero) must also roll back the
                         // graph-lifetime state — otherwise eviction stays suspended (pins every offload buffer,
                         // risking OOM) and the embedding stays in externally-managed mode (the eager fallback
@@ -2119,6 +2417,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                     }
                     if (exec == IntPtr.Zero)
                     {
+                        RecordGraphCaptureFailure("the captured stream produced no graph (an op in the step body is not "
+                            + "capturable: a host read, a synchronous copy or an allocation; AIDOTNET_GRAPH_CAPTURE_DEBUG=1 names it)");
                         // Capture failed → the graph is permanently abandoned for this plan. Resume the
                         // eviction suspension we took above right now: StepEager doesn't need stable device
                         // pointers, and leaving it suspended for the plan's whole lifetime pins every offload
@@ -2212,6 +2512,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 if (TryRunResidentBody(gte, cb))
                 {
                     ran = true;
+                    _residentBodyRanLast = true;
                     RefreshLossFromCapturedGraph(gte);
                     ApplyL2Regularization();   // before clipping, as the eager and graph steps order it
                     if (_maxGradNorm > 0.0 && !TryClipGradientsGlobalL2Gpu(_gradients, _maxGradNorm))
@@ -2239,8 +2540,21 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 }
             }
         }
+        // A resident step leaves the gradient accumulators, loss seed, forward outputs and external inputs bound to
+        // device buffers. The eager step is host-centric: it zeroes the HOST gradient arrays, so its resident in-place
+        // accumulations landed on the previous step's device gradients (on OpenCL, where a host write to a parameter
+        // drops its device binding and sends the next step here, every compiled gradient after that came back as a
+        // multiple of the true one). Roll the residency back first, as a failed capture does.
+        if (_residentBodyRanLast && _engine is Engines.DirectGpuTensorEngine rollEngine)
+        {
+            RollBackCaptureResidency(rollEngine, deviceHoldsResults: true);
+            _residentBodyRanLast = false;
+        }
         return StepEager();
     }
+
+    // True while the last step ran the resident body, so its device bindings are still in place.
+    private bool _residentBodyRanLast;
 
     // Every tensor the graph reads that it does not produce and does not own as a parameter: the batch input, the
     // TARGET, masks, any caller-fed tensor. Each is bound to a stable device buffer in the capture pre-pass and
@@ -2507,32 +2821,30 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // pending download). Without that, a host read -- or a host-path op that reads the accumulator, like an
         // in-place add whose contribution is not resident -- saw the PREVIOUS step's values: measured as gradients
         // exactly doubling on the second uncaptured step. Host bookkeeping only, so it is capture-safe.
-        if (_genericGradIndices != null)
+        // Gradient buffers are NOT zeroed every step. The backward here is all-generic (_graphStepEligible), so every
+        // contribution goes through AccumulateGrad in a fixed order: under GradWriteGeneration the first contribution
+        // a buffer receives copies in and later ones add (AiDotNet #1804: a memset per gradient buffer plus an add per
+        // contribution, 836 + 393 per N-BEATS step). Only buffers the backward never writes must hold zeros: all of
+        // them before the first run, then exactly the ones an uncaptured run found unwritten.
+        int gradWriteGeneration = Autodiff.DifferentiableOps.NextGradWriteGeneration();
+        var zeroIndices = _unwrittenGradIndices;
+        int zeroCount = zeroIndices?.Length ?? _preAllocatedGrads.Length;
+        for (int z = 0; z < zeroCount; z++)
         {
-            for (int i = 0; i < _genericGradIndices.Length; i++)
+            int i = zeroIndices is null ? z : zeroIndices[z];
+            if (_preAllocatedGrads[i].TryGetGpuBuffer() is { } gb)
             {
-                int idx = _genericGradIndices[i];
-                if (_preAllocatedGrads[idx].TryGetGpuBuffer() is { } gb)
-                {
-                    ZeroDeviceBuffer(backend, gb, _preAllocatedGrads[idx].Length, esz);
-                    residentEngine?.BindResidentBuffer(_preAllocatedGrads[idx], gb, backend);
-                }
+                ZeroDeviceBuffer(backend, gb, _preAllocatedGrads[i].Length, esz);
+                residentEngine?.BindResidentBuffer(_preAllocatedGrads[i], gb, backend);
             }
-        }
-        else
-        {
-            for (int i = 0; i < _preAllocatedGrads.Length; i++)
-                if (_preAllocatedGrads[i].TryGetGpuBuffer() is { } gb)
-                {
-                    ZeroDeviceBuffer(backend, gb, _preAllocatedGrads[i].Length, esz);
-                    residentEngine?.BindResidentBuffer(_preAllocatedGrads[i], gb, backend);
-                }
         }
         if (_lossGradSeed.TryGetGpuBuffer() is { } seedBuf && _lossGradDest?.TryGetGpuBuffer() is { } destBuf)
         {
             if (cb is not null) cb.CopyBufferDtoD(seedBuf, destBuf, (long)_lossGradSeed.Length * esz);
             else backend.Copy(seedBuf, destBuf, _lossGradSeed.Length);
             residentEngine?.BindResidentBuffer(_lossGradDest, destBuf, backend);
+            if (_lossGradDest is { } seededDestination)
+                seededDestination._gradWriteGeneration = gradWriteGeneration;   // the seed is its first write
         }
 
         var bwd = _backwardActions;
@@ -2542,17 +2854,35 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // Logging its index + name + producing op turns "the THREW op moved" into a concrete backward work-item.
         bool bwdDiag = System.Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1" && IsCapturing();
         var bwdNames = ProfBackwardStepNames;
-        for (int i = 0; i < bwd.Length; i++)
+        Autodiff.DifferentiableOps.GradWriteGeneration = gradWriteGeneration;
+        try
         {
-            de?.SetCurrentScratchAction(fwd.Length + i);   // backward actions keyed in a namespace above forward
-            bwd[i](engine);
-            if (bwdDiag && cb!.StreamCaptureStatusRaw() == 2)
+            for (int i = 0; i < bwd.Length; i++)
             {
-                string nm = i < bwdNames.Length ? bwdNames[i] : "?";
-                try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphcapture_diag.txt"),
-                    $"[CAPTURE-INVALIDATED-BY] backwardAction#{i} name={nm} op={Engines.DirectGpuTensorEngine.s_currentBackwardOp}" + System.Environment.NewLine); } catch { }
-                bwdDiag = false;   // log only the FIRST invalidation
+                de?.SetCurrentScratchAction(fwd.Length + i);   // backward actions keyed in a namespace above forward
+                bwd[i](engine);
+                if (bwdDiag && cb!.StreamCaptureStatusRaw() == 2)
+                {
+                    string nm = i < bwdNames.Length ? bwdNames[i] : "?";
+                    try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_graphcapture_diag.txt"),
+                        $"[CAPTURE-INVALIDATED-BY] backwardAction#{i} name={nm} op={Engines.DirectGpuTensorEngine.s_currentBackwardOp}" + System.Environment.NewLine); } catch { }
+                    bwdDiag = false;   // log only the FIRST invalidation
+                }
             }
+        }
+        finally
+        {
+            Autodiff.DifferentiableOps.GradWriteGeneration = 0;
+        }
+        // An uncaptured run executed the backward for real, so it knows which buffers nothing wrote; later steps
+        // (and the capture) zero only those. A captured run only recorded, so its marks are not evidence.
+        if (!capturingNow)
+        {
+            var unwritten = new List<int>();
+            for (int i = 0; i < _preAllocatedGrads.Length; i++)
+                if (_preAllocatedGrads[i]._gradWriteGeneration != gradWriteGeneration)
+                    unwritten.Add(i);
+            _unwrittenGradIndices = unwritten.ToArray();
         }
         de?.SetCurrentScratchAction(-1);   // grad clip + optimizer (run after) must NOT pool
         if (FailInsideNextCaptureForTesting && IsCapturing())
@@ -2566,6 +2896,36 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // NOTE: _optimizerUpdate is intentionally NOT invoked here — it runs eagerly
         // in Step() after LaunchCapturedGraph so the LR schedule / Adam bias-correction
         // scalars are fresh per step rather than frozen at capture time.
+    }
+
+    /// <summary>
+    /// After an eager first-write step: a candidate buffer the backward did not write this step received no first
+    /// contribution, so skipping its zeroing would leave a previous step's values in it. Drop it from the candidate
+    /// set for good (it is zeroed from the next step on), then mark the set verified.
+    /// </summary>
+    private void RecordEagerFirstWriteCoverage(int generation)
+    {
+        var candidates = _eagerFirstWriteCandidates;
+        if (candidates is null) return;
+        for (int i = 0; i < candidates.Length; i++)
+        {
+            if (candidates[i] && _preAllocatedGrads[i]._gradWriteGeneration != generation)
+                candidates[i] = false;
+        }
+        _eagerFirstWriteVerified = true;
+    }
+
+    /// <summary>Gradient buffers the eager step currently leaves un-zeroed (first write copies in). Test hook.</summary>
+    internal int EagerFirstWriteCandidateCount
+    {
+        get
+        {
+            var candidates = _eagerFirstWriteCandidates;
+            if (candidates is null) return 0;
+            int n = 0;
+            for (int i = 0; i < candidates.Length; i++) if (candidates[i]) n++;
+            return n;
+        }
     }
 
     private Tensor<T> StepEager()
@@ -2700,6 +3060,32 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                     if (observer is not null && step is not null) observer(i, name, step.OutputBuffer);
                 }
             }
+            else if (s_stepProf)
+            {
+                // Per-action forward timing (AIDOTNET_STEP_PROF=1), dumped beside the phase totals.
+                var perFwd = _profFwdUs;
+                if (perFwd == null || perFwd.Length != fwd.Length)
+                {
+                    perFwd = new long[fwd.Length];
+                    _profFwdUs = perFwd;
+                    var names = new string[fwd.Length];
+                    var actionToStep = ActionToStepIndex;
+                    for (int i = 0; i < fwd.Length; i++)
+                    {
+                        int idx = actionToStep is not null && i < actionToStep.Length ? actionToStep[i] : i;
+                        names[i] = _forwardSteps is not null && idx >= 0 && idx < _forwardSteps.Length
+                            ? _forwardSteps[idx].OpName : $"#{i}";
+                    }
+                    _profFwdNames = names;
+                }
+                double tickToUsF = 1_000_000.0 / System.Diagnostics.Stopwatch.Frequency;
+                for (int i = 0; i < fwd.Length; i++)
+                {
+                    long si = System.Diagnostics.Stopwatch.GetTimestamp();
+                    fwd[i](engine);
+                    perFwd[i] += (long)((System.Diagnostics.Stopwatch.GetTimestamp() - si) * tickToUsF);
+                }
+            }
             else
             {
                 for (int i = 0; i < fwd.Length; i++)
@@ -2711,6 +3097,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
 
         // Cache raw arrays on first call — avoids AsWritableSpan()/GetDataArray() per step
         var gradArrays = _cachedGradArrays;
+        // The first step zeroes every gradient buffer; later steps zero only the accumulating ones (below).
+        bool firstGradBind = gradArrays == null;
         if (gradArrays == null)
         {
             gradArrays = new T[_preAllocatedGrads.Length][];
@@ -2737,10 +3125,40 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 : BindInternalStepBuffer(_lossGradDest, "loss gradient destination");
         }
 
+        // Generic (AccumulateGrad) backward on a host engine: buffers whose every writer is a generic backward are
+        // NOT zeroed. Under a GradWriteGeneration their first contribution of the step is copied in and later ones
+        // are added, which is bit-identical to zero-then-add and saves a memset plus an add pass per buffer. The
+        // first run zeroes everything and records which of those buffers the backward actually wrote; any it did
+        // not write keep being zeroed (see RecordEagerFirstWriteCoverage).
+        int eagerGradWriteGeneration = 0;
+        var eagerCandidates = _eagerFirstWriteCandidates;
+        if (eagerCandidates is not null && engine is not Engines.DirectGpuTensorEngine && _fp16HeteroOrder is null)
+        {
+            eagerGradWriteGeneration = Autodiff.DifferentiableOps.NextGradWriteGeneration();
+            bool verified = _eagerFirstWriteVerified;
+            // Buffers nothing accumulates into are overwritten whole by their (specialized, beta = 0) writers, exactly
+            // as in the accumulating-only branch below, so they need no clear either. Clearing every non-candidate
+            // instead was 59 of 77 buffers, 3.5M floats and ~2 ms of a 15 ms CPU Transformer step.
+            var accumulating = _genericGradIndices is null || firstGradBind || !s_zeroAccumulatingOnly
+                ? null : AccumulatingGradMask(gradArrays.Length);
+            for (int i = 0; i < gradArrays.Length; i++)
+            {
+                if (verified && eagerCandidates[i]) continue;   // its first contribution this step copies in
+                if (accumulating is not null && !accumulating[i]) continue;   // overwritten whole by its writer
+                Array.Clear(gradArrays[i], 0, _preAllocatedGrads[i].Length);
+                InvalidateStaleDeviceCopy(_preAllocatedGrads[i]);   // see the note on the full clear below
+                // The zeros ARE this buffer's first write, so every contribution adds onto them (a specialized
+                // delegate that accumulates in place does not claim a first write). A candidate on the verification
+                // run stays unmarked so its first contribution claims it, which is how coverage is recorded.
+                if (!eagerCandidates[i]) _preAllocatedGrads[i]._gradWriteGeneration = eagerGradWriteGeneration;
+            }
+        }
         // Only zero gradient buffers used by generic (accumulating) backward delegates.
         // Specialized backward delegates overwrite completely (TryGemmEx beta=0, SIMD ReLU).
         // At large sizes, this saves significant time by skipping unnecessary clears.
-        if (_genericGradIndices != null)
+        // The first step still clears everything: the buffers are rented uninitialized, and one that no delegate
+        // writes (a gradient nothing produces) must read as zero from then on.
+        else if (_genericGradIndices != null && !firstGradBind)
         {
             for (int i = 0; i < _genericGradIndices.Length; i++)
             {
@@ -2751,7 +3169,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         }
         else
         {
-            // First call: clear everything (safe fallback)
+            // First call (or no accumulating set): clear everything (safe fallback)
             for (int i = 0; i < gradArrays.Length; i++)
             {
                 Array.Clear(gradArrays[i], 0, _preAllocatedGrads[i].Length);
@@ -2765,6 +3183,39 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             }
         }
 
+        if (s_stepProf && !_profZeroReported && !firstGradBind)
+        {
+            // One line per plan: which zeroing branch runs and how much it clears each step.
+            _profZeroReported = true;
+            long zeroed = 0; int buffers = 0;
+            string mode;
+            if (eagerGradWriteGeneration != 0)
+            {
+                mode = "first-write";
+                var acc = _genericGradIndices is null ? null : AccumulatingGradMask(gradArrays.Length);
+                for (int i = 0; i < gradArrays.Length; i++)
+                    if (!(_eagerFirstWriteVerified && eagerCandidates![i]) && (acc is null || acc[i]))
+                    { zeroed += _preAllocatedGrads[i].Length; buffers++; }
+            }
+            else if (_genericGradIndices != null)
+            {
+                mode = "accumulating-only";
+                foreach (int idx in _genericGradIndices) { zeroed += _preAllocatedGrads[idx].Length; buffers++; }
+            }
+            else
+            {
+                mode = "all";
+                foreach (var g in _preAllocatedGrads) { zeroed += g.Length; buffers++; }
+            }
+            try
+            {
+                System.IO.File.AppendAllText(StepProfDumpPath,
+                    $"[STEPPROF-ZERO] mode={mode} buffers={buffers}/{gradArrays.Length} elements/step={zeroed}"
+                    + System.Environment.NewLine);
+            }
+            catch { }
+        }
+
         // Re-seed loss gradient — direct Array.Copy
         var seedArr = _cachedLossGradSeedArray;
         var destArr = _cachedLossGradDestArray;
@@ -2772,6 +3223,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         {
             Array.Copy(seedArr, destArr, seedArr.Length);
             if (_lossGradDest is not null) InvalidateStaleDeviceCopy(_lossGradDest);   // same reason as the gradient clear
+            // The seed is the destination's first write: a contribution arriving there must add, not replace it.
+            if (eagerGradWriteGeneration != 0 && _lossGradDest is not null)
+                _lossGradDest._gradWriteGeneration = eagerGradWriteGeneration;
         }
 
         long t2 = _profileStepEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
@@ -2785,6 +3239,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         var bwd = _backwardActions;
         var bwdProbe = StepProbe;
         if (bwdProbe != null) bwdProbe("BEGIN-BWD");
+        if (eagerGradWriteGeneration != 0) Autodiff.DifferentiableOps.GradWriteGeneration = eagerGradWriteGeneration;
         try
         {
         if (_fp16HeteroOrder is not null)
@@ -2834,7 +3289,9 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             // otherwise the trace lifecycle is unbalanced and the failing-backward diagnostic is lost.
             _dlTrace.Dispose();
             AiDotNet.Tensors.Engines.DirectGpu.GpuMemoryTracker.DumpDownloadTrace("backward");
+            if (eagerGradWriteGeneration != 0) Autodiff.DifferentiableOps.GradWriteGeneration = 0;
         }
+        if (eagerGradWriteGeneration != 0) RecordEagerFirstWriteCoverage(eagerGradWriteGeneration);
         long t3 = _profileStepEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         if (stepTiming) StepTiming.RecordBackward(Stopwatch.GetTimestamp() - bwdStart);
 
@@ -2900,9 +3357,29 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 try
                 {
                     long f = _profForwardUs, gz = _profGradZeroUs, b = _profBackwardUs, o = _profOptimUs;
+                    // Allocation and GC rates over the last dump interval: a step that allocates stalls every thread
+                    // in GC (PollGC), which shows up in profiles as time inside whatever op was running.
+#if NETCOREAPP3_0_OR_GREATER
+                    long allocNow = GC.GetTotalAllocatedBytes(false);
+#else
+                    long allocNow = GC.GetTotalMemory(false);
+#endif
+                    int g0 = GC.CollectionCount(0), g1 = GC.CollectionCount(1), g2 = GC.CollectionCount(2);
+                    string gcPart = s_profLastAlloc == 0 ? "" :
+                        $" allocKB/step={(allocNow - s_profLastAlloc) / 1024 / StepProfDumpInterval}"
+                        + $" gc0={g0 - s_profLastGc0} gc1={g1 - s_profLastGc1} gc2={g2 - s_profLastGc2} (per {StepProfDumpInterval} steps)"
+#if NET7_0_OR_GREATER
+                        + $" gcPauseUs/step={(GC.GetTotalPauseDuration().Ticks - s_profLastPause) / 10 / StepProfDumpInterval}"
+#endif
+                        ;
+#if NET7_0_OR_GREATER
+                    s_profLastPause = GC.GetTotalPauseDuration().Ticks;
+#endif
+                    s_profLastAlloc = allocNow; s_profLastGc0 = g0; s_profLastGc1 = g1; s_profLastGc2 = g2;
                     System.IO.File.AppendAllText(StepProfDumpPath,
                         $"[STEPPROF] steps={sc} avgUs/step fwd={f / sc} gradZero={gz / sc} bwd={b / sc} opt={o / sc} total={(f + gz + b + o) / sc}"
-                        + System.Environment.NewLine);
+                        + gcPart + System.Environment.NewLine);
+                    if (sc % (StepProfDumpInterval * 10) == 0) DumpPerOpProfile(sc);
                 }
                 catch { }
             }
@@ -2956,6 +3433,13 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         var protect = new HashSet<object>(ReferenceEqualityComparer<object>.Instance);
         for (int i = 0; i < _gradients.Length; i++)
             AddActivationCacheKeys(protect, _gradients[i]);
+        // Every live gradient-map entry, not only the parameters' compile-time buffers: the backward can REPLACE an
+        // entry with a donated contribution (an activation's gradient, a first-write copy), and an unprotected one was
+        // released here as a dead intermediate. The next step's first write into it then failed, which inside a CUDA
+        // graph capture aborted the capture of every CNN training step.
+        if (_liveGradientMap is { } live)
+            foreach (var entry in live.Values)
+                AddActivationCacheKeys(protect, entry);
         AddActivationCacheKeys(protect, _lossGradDest);
         AddActivationCacheKeys(protect, _lossGradSeed);
         return protect;
@@ -3495,8 +3979,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             // so the fused on-device optimizer mutates the SAME buffer the resident forward down-cast reads. If we
             // read TryGetGpuBuffer() first and pinned after, the optimizer would update a transient buffer the
             // forward never sees → the weights never change → flat loss. Only meaningful on the FP16 hetero path.
-            if (ResidentFp16TrainingEnabled && _fp16HeteroOrder is not null
-                && _engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine rde)
+            // Bind every parameter to the persistent weight buffer the GPU forward reads (this used to happen only for
+            // resident FP16 training), so the optimizer below updates it ON THE DEVICE. Unbound, a float32 parameter took
+            // the host update path: weights round-tripped every step and each host write retired the captured step
+            // graph. Bound, the parity MLP trains in 3.42 ms/step instead of 6.81, with the graph replaying.
+            if (_engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine rde)
                 rde.RegisterResidentParamBuffer(_parameters[p]);
             var paramGpuBuf = _parameters[p].TryGetGpuBuffer();
             var paramBackend = _parameters[p]._gpuBackend;
@@ -4174,7 +4661,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                     {
                         _parameters[p]._gpuBufferVersion = _parameters[p].GpuCacheVersion;
                         if (_engine is Engines.DirectGpuTensorEngine rebindEngine && gpuParam[p] is { } gpBind && gpuBackends[p] is { } beBind)
+                        {
                             rebindEngine.BindResidentBuffer(_parameters[p], gpBind, beBind);
+                            CommitDeviceParameterUpdate(rebindEngine, p, gpBind, beBind);
+                        }
                     }
                     return;
                 }
@@ -4370,7 +4860,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                     // Re-registering re-arms the download against the CURRENT device buffer (HostSync
                     // .Register TryAdds, so it's a no-op if a read is still pending, and re-arms after one fired).
                     if (_engine is Engines.DirectGpuTensorEngine _rebindEngine)
+                    {
                         _rebindEngine.BindResidentBuffer(_parameters[p], gpuP, gpuBe);
+                        CommitDeviceParameterUpdate(_rebindEngine, p, gpuP, gpuBe);
+                    }
                     continue;
                 }
 
@@ -4677,8 +5170,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             // GPU fast path — same logic as ConfigureOptimizerFloat. See
             // there for the full rationale on per-param GPU/CPU dispatch.
             // Pin BEFORE reading the buffer so the optimizer and the resident forward share the SAME param buffer.
-            if (ResidentFp16TrainingEnabled && _fp16HeteroOrder is not null
-                && _engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine rde)
+            // Bind every parameter to the persistent weight buffer the GPU forward reads (this used to happen only for
+            // resident FP16 training), so the optimizer below updates it ON THE DEVICE. Unbound, a float32 parameter took
+            // the host update path: weights round-tripped every step and each host write retired the captured step
+            // graph. Bound, the parity MLP trains in 3.42 ms/step instead of 6.81, with the graph replaying.
+            if (_engine is AiDotNet.Tensors.Engines.DirectGpuTensorEngine rde)
                 rde.RegisterResidentParamBuffer(_parameters[p]);
             var paramGpuBuf = _parameters[p].TryGetGpuBuffer();
             var paramBackend = _parameters[p]._gpuBackend;
@@ -5046,6 +5542,14 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                     // (per-layer-LR) GPU path — the path the Transformer's Noam/warmup schedule
                     // takes — trains against frozen weights: loss flat, weights drift, accuracy = chance.
                     _parameters[p]._gpuBufferVersion = _parameters[p].GpuCacheVersion;
+                    // And make the update authoritative in the persistent weight cache, as the non-grouped branch does:
+                    // a cache entry stamped with the pre-update version judged the updated buffer stale and re-uploaded
+                    // the old host weights over it. Every float32 parameter reaches this branch now, not just FP16 plans.
+                    if (_engine is Engines.DirectGpuTensorEngine groupedEngine)
+                    {
+                        groupedEngine.BindResidentBuffer(_parameters[p], gpuP, gpuBe);
+                        CommitDeviceParameterUpdate(groupedEngine, p, gpuP, gpuBe);
+                    }
                     continue;
                 }
 
@@ -6448,6 +6952,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 || Environment.GetEnvironmentVariable("AIDOTNET_COMPILED_GRAD_POOL") == "1")
             && !engine.SupportsGpu;
         int[][]? gradPoolReZeroByPosition = null;
+        // Reshape steps whose input gradient is a view of their output gradient; their backward is the identity.
+        HashSet<CompiledStep<T>>? aliasedReshapeSteps = null;
         // Decision sets the pooler used to plan the re-zero schedule; populated by
         // BuildPooledGradMap when pooling, left empty otherwise. Non-null so the
         // drift guard never needs a null-forgiving access.
@@ -6467,6 +6973,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 gradMap[tensor] = grad;
                 allGrads.Add(grad);
             }
+            aliasedReshapeSteps = AliasReshapeViewGradients(forwardSteps, parameters, consumerCount, engine, gradMap, allGrads);
         }
 
         // #1624 prototype: quantify how much the per-traced-tensor gradient buffer
@@ -6588,6 +7095,33 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 slicePrefixForwardSpecs, slicePrefixBackwardSpecs, consumedBySlicePrefix);
         }
 
+        // Conv2D -> channel-bias add [-> ReLU]: one forward and one backward action per chain on a CPU float plan
+        // (see DetectConvBiasActivationFusion). Off under grad pooling, whose re-zero schedule is planned per
+        // backward action of the unfused stream, and on GPU engines, which keep the capturable generic path.
+        // The tensors whose gradient can matter: the parameters and everything computed from one. A tensor outside
+        // this set (the network input, a constant) feeds no parameter's gradient, and the plan exposes only the
+        // parameters' gradients, so a backward may skip computing the gradient INTO it. Used by the Conv2D
+        // backwards below, where the input gradient of the first layer is a whole extra convolution.
+        var requiresGradTensors = new HashSet<Tensor<T>>(parameters);
+        foreach (var fwdStep in forwardSteps)
+            foreach (var fwdInput in fwdStep.Inputs)
+                if (fwdInput is not null && requiresGradTensors.Contains(fwdInput))
+                {
+                    requiresGradTensors.Add(fwdStep.OutputBuffer);
+                    break;
+                }
+
+        var convEpilogueForwardSpecs = new Dictionary<int, Action<IEngine>>();
+        var convEpilogueBackwardSpecs = new Dictionary<int, Action<IEngine>>();
+        var consumedByConvEpilogue = new HashSet<int>();
+        if (typeof(T) == typeof(float) && !useGradPool && !preferGenericForGpu
+            && engine is CpuEngine && !engine.SupportsGpu
+            && Environment.GetEnvironmentVariable("AIDOTNET_CONV_EPILOGUE_FUSION") != "0")
+        {
+            DetectConvBiasActivationFusion(forwardSteps, consumerCount, gradMap, requiresGradTensors,
+                convEpilogueForwardSpecs, convEpilogueBackwardSpecs, consumedByConvEpilogue);
+        }
+
         // Phase G.12: layer-level dW batching. Detect MatMul backward
         // steps with identical (M, N, K) shapes, peel out their dW
         // computation, and dispatch all same-shape dW GEMMs in a
@@ -6665,6 +7199,18 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 forwardEmitKinds[i] = ForwardEmit.Skip;
                 continue;  // Slice step — already handled by the fused MatMul above
             }
+            if (convEpilogueForwardSpecs.TryGetValue(i, out var convEpilogueFwd))
+            {
+                allForwardActions.Add(convEpilogueFwd);
+                forwardEmitKinds[i] = ForwardEmit.Fixed;
+                forwardFixedActions[i] = convEpilogueFwd;
+                continue;
+            }
+            if (consumedByConvEpilogue.Contains(i))
+            {
+                forwardEmitKinds[i] = ForwardEmit.Skip;
+                continue;  // bias add / ReLU of a fused conv chain: written by the conv's action
+            }
             if (fusedStepIndices.Contains(i))
             {
                 // A fused step starts a new group when its predecessor is NOT fused.
@@ -6723,11 +7269,30 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         var backwardActions = new List<Action<IEngine>>();
         var backwardStepNames = new List<string>();
         int genericBackwardCount = 0;
+        // Steps whose backward is the generic accumulator: AccumulateGrad ADDS into their inputs' gradient buffers.
+        var genericBackwardSteps = new List<CompiledStep<T>>();
+
+        // Gradient relevance: a tensor's gradient can reach a parameter only when the tensor was COMPUTED FROM one
+        // (requiresGradTensors, above). The traced input batch, the labels, and everything derived from them alone
+        // have gradients nothing reads: the optimizer reads parameter gradients only, and the only reader of a
+        // tensor's gradient is its producer's backward, which is itself irrelevant. The plan used to run every
+        // step's backward regardless -- for a dense first layer that is the full dX = dY.W^T GEMM over the input
+        // features (784x512 on the parity MLP, about a third of the whole backward), computed and discarded.
+        // PyTorch skips it because the input does not require grad; this is the same rule, derived from the graph.
+        // Whole steps are not pruned under gradient pooling (its re-zero schedule is indexed by the unpruned action
+        // stream) or for an FP16 heterogeneous graph (its Half nodes are not in forwardSteps, so a path through them
+        // would be missed).
+        HashSet<Tensor<T>>? gradRequired =
+            parameters.Length > 0 && !useGradPool && fp16HeteroOrder is null ? requiresGradTensors : null;
         for (int i = forwardSteps.Count - 1; i >= 0; i--)
         {
             if (fusedStepIndices.Contains(i)) continue;
             var step = forwardSteps[i];
             if (step.BackwardFn == null) continue;
+            // No parameter upstream of this step's output: its backward only produces gradients nothing reads.
+            if (gradRequired is not null && !gradRequired.Contains(step.OutputBuffer)) continue;
+            // A view reshape whose input gradient aliases its output gradient: the gradient is already in place.
+            if (aliasedReshapeSteps is not null && aliasedReshapeSteps.Contains(step)) continue;
 
             // Phase G.7: analytic loss-MatMul backward (replaces standard
             // spec for MatMuls whose gradOut is `α * ones` due to a
@@ -6757,6 +7322,18 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             {
                 continue;
             }
+            // Fused Conv2D -> bias add [-> ReLU]: the chain's whole backward runs at its last step.
+            if (convEpilogueBackwardSpecs.TryGetValue(i, out var convEpilogueBwd))
+            {
+                backwardActions.Add(convEpilogueBwd);
+                backwardStepNames.Add("fused:Conv2D+ChannelBias" + (step.OpType == OpType.ReLU ? "+ReLU"
+                    : step.OpName == "TensorChannelBiasAdd" ? "" : "+ReLU+" + step.OpName));
+                continue;
+            }
+            if (consumedByConvEpilogue.Contains(i))
+            {
+                continue;
+            }
 
             // Phase G.12: tell the spec'd MatMul backward to skip its dW
             // GEMM when this step's dW has been peeled out for batched
@@ -6767,7 +7344,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             // On a GPU engine, skip the host BLAS specialization (preferGenericForGpu) so the backward
             // runs on the GPU stream and the fixed sequence stays CUDA-graph-capturable.
             var action = preferGenericForGpu ? null : BuildSpecializedBackward(step, gradMap, consumerCount, engine, pinnedHandles,
-                dWPeeled: dWPeeledIndices.Contains(i));
+                dWPeeled: dWPeeledIndices.Contains(i), requiresGrad: requiresGradTensors);
             if (action != null)
             {
                 backwardActions.Add(action);
@@ -6776,9 +7353,15 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             else
             {
                 genericBackwardCount++;
+                genericBackwardSteps.Add(step);
                 backwardStepNames.Add($"generic:{step.OpName}");
                 var stepCopy = step;
                 var gradAcc = gradMap;
+                // The same relevance rule, one level down: a generic backward that asks
+                // DifferentiableOps.IsGradientRequired (MatMul, Conv2D, Linear, the fused LSTM, ...) skips the
+                // gradient INTO an input no parameter feeds -- the data batch's gradient, typically a whole extra
+                // GEMM per step that nothing reads. The eager tape installs the same filter for its requested sources.
+                var relevance = gradRequired;
                 backwardActions.Add(eng =>
                 {
                     // PR #638 A0: tag the producing op so the capture-path invalidation log can name it.
@@ -6788,8 +7371,17 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                     // ARBITRARY gradient buffer (gradAcc.Values.First()) and would have pushed it through the step.
                     if (!gradAcc.TryGetValue(stepCopy.OutputBuffer, out var gradOut))
                         return;
-                    stepCopy.BackwardFn(gradOut, stepCopy.Inputs, stepCopy.OutputBuffer,
-                        stepCopy.SavedState ?? Array.Empty<object>(), eng, gradAcc);
+                    if (relevance is null)
+                    {
+                        stepCopy.BackwardFn(gradOut, stepCopy.Inputs, stepCopy.OutputBuffer,
+                            stepCopy.SavedState ?? Array.Empty<object>(), eng, gradAcc);
+                        return;
+                    }
+                    using (DifferentiableOps.PushGradientRelevance(relevance))
+                    {
+                        stepCopy.BackwardFn(gradOut, stepCopy.Inputs, stepCopy.OutputBuffer,
+                            stepCopy.SavedState ?? Array.Empty<object>(), eng, gradAcc);
+                    }
                 });
             }
         }
@@ -6925,8 +7517,17 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // other buffer is fully overwritten by its beta=0 delegate and stays skipped.
         // When there are no multi-consumer tensors this yields an empty array — the
         // exact skip-all fast path as before, so feed-forward graphs are unchanged.
+        //
+        // A plan that mixes specialized and generic backward actions (a loss whose ops have no specialization --
+        // LogSoftmax, a per-axis ReduceSum -- in front of specialized layers) zeroes the same way plus the gradient
+        // buffers of every generic step's inputs, because AccumulateGrad ADDS into those. It used to clear EVERY
+        // buffer instead (one generic step anywhere was enough), the parameter gradients included, although the
+        // specialized beta=0 delegates overwrite those: on the parity CNN that was 1.5 ms of a 15 ms step. Buffers
+        // that nothing writes keep the zeros of the full clear on the first step. A GPU engine keeps the full clear
+        // for mixed plans: there the clear also invalidates every buffer's stale device copy, which this host-side
+        // accounting does not model. The FP16 heterogeneous backward does not run these actions either.
         int[]? genericGradIndices;
-        if (!useGradPool && genericBackwardCount == 0)
+        if (!useGradPool && (genericBackwardCount == 0 || (!engine.SupportsGpu && fp16HeteroOrder is null)))
         {
             // allGrads holds the distinct physical grad buffers (id == index), so a
             // reverse map gives each multi-consumer tensor's grad-buffer index.
@@ -6935,19 +7536,58 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
 
             var accumulatingGradIndices = new List<int>();
             var seenGradIndices = new HashSet<int>();
-            foreach (var kv in consumerCount)
+            void MarkAccumulating(Tensor<T> tensor)
             {
-                if (kv.Value <= 1) continue; // single-consumer buffers are overwritten, no zeroing needed
-                if (gradMap.TryGetValue(kv.Key, out var gradBuf)
+                if (gradMap.TryGetValue(tensor, out var gradBuf)
                     && gradBufferIndex.TryGetValue(gradBuf, out int bufIdx)
                     && seenGradIndices.Add(bufIdx))
                     accumulatingGradIndices.Add(bufIdx);
             }
+            foreach (var kv in consumerCount)
+            {
+                if (kv.Value <= 1) continue; // single-consumer buffers are overwritten, no zeroing needed
+                MarkAccumulating(kv.Key);
+            }
+            foreach (var genericStep in genericBackwardSteps)
+                foreach (var genericInput in genericStep.Inputs)
+                    if (genericInput is not null) MarkAccumulating(genericInput);
             genericGradIndices = accumulatingGradIndices.ToArray();
         }
         else
         {
-            genericGradIndices = null; // clear-all (unchanged: generic backward or grad pooling)
+            genericGradIndices = null; // clear-all (grad pooling, or a mixed plan on a GPU engine)
+        }
+
+        // Host-engine first-write set for a backward that is NOT all-specialized: a gradient buffer whose every
+        // writer is a generic backward step (AccumulateGrad) can skip its per-step zeroing, because under a
+        // GradWriteGeneration the first contribution is copied in. A buffer that ANY non-generic action can write
+        // (a specialized/fused/analytic delegate, which neither claims nor respects first-write marks) is excluded
+        // and stays zeroed. consumerCount counts every consuming step, so equality with the generic-only count
+        // means no other consumer exists. Pooled buffers keep their own re-zero schedule.
+        bool[]? eagerFirstWriteCandidates = null;
+        if (!useGradPool && genericBackwardCount > 0 && genericBackwardSteps.Count > 0)
+        {
+            var genericConsumers = new Dictionary<Tensor<T>, int>();
+            foreach (var genericStep in genericBackwardSteps)
+            {
+                foreach (var inp in genericStep.Inputs)
+                    genericConsumers[inp] = genericConsumers.TryGetValue(inp, out int seen) ? seen + 1 : 1;
+            }
+            var gradBufferIndex = new Dictionary<Tensor<T>, int>(allGrads.Count);
+            for (int gi = 0; gi < allGrads.Count; gi++) gradBufferIndex[allGrads[gi]] = gi;
+            var candidates = new bool[allGrads.Count];
+            int candidateCount = 0;
+            foreach (var kv in genericConsumers)
+            {
+                if (!consumerCount.TryGetValue(kv.Key, out int allConsumers) || allConsumers != kv.Value) continue;
+                if (gradMap.TryGetValue(kv.Key, out var gradBuf) && gradBufferIndex.TryGetValue(gradBuf, out int bufIdx)
+                    && !candidates[bufIdx])
+                {
+                    candidates[bufIdx] = true;
+                    candidateCount++;
+                }
+            }
+            if (candidateCount > 0) eagerFirstWriteCandidates = candidates;
         }
 
         // #1624 drift guard: the re-zero schedule (indexed by backward ACTION index)
@@ -7067,6 +7707,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 forwardFixedActions,
                 storageLeases);
             storageLeases = null;
+            plan._liveGradientMap = gradMap;
+            plan._eagerFirstWriteCandidates = eagerFirstWriteCandidates;
             scope.ReleaseStorageLeases();
             return plan;
         }
@@ -7436,6 +8078,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             //   * large M: native BLAS raw throughput wins, keep TryGemm.
             return eng =>
             {
+                // The small-K panel kernel reads B as passed, so it is correct with in-place weight updates; where it
+                // applies (K <= 128, enough rows) it beats both paths below (QKV [2048,64]x[64,64]: 47 vs 152+ µs).
+                if (SimdGemm.TryJitSmallK(cA.AsSpan(0, M * K), cB.AsSpan(0, K * N), cOut.AsSpan(0, M * N), M, N, K))
+                    return;
                 // Pick the kernel by shape — neither is universally best (measured,
                 // CompiledTrainingPlanGemmPerfBench, Ryzen, AIDOTNET_DISABLE_GPU=1):
                 //   * In BlasManaged's M-axis-parallel ThinMDirect range
@@ -7483,7 +8129,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 var oMem = ((Tensor<float>)(object)output).Data;
                 using var pinI = iMem.Pin();
                 using var pinO = oMem.Pin();
-                SimdKernels.ReLUUnsafe((float*)pinI.Pointer, (float*)pinO.Pointer, input.Length);
+                ParallelRelu((float*)pinI.Pointer, (float*)pinO.Pointer, input.Length);
             };
         }
         // ReLU forward non-float fallback (T=double etc.): route through the
@@ -7921,7 +8567,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         if (step.OpType == OpType.Swish && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            return eng => { if (eng is CpuEngine cpu) cpu.SwishInto(o, inp); else { var r = eng.Swish(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
+            return eng => { if (eng is CpuEngine cpu && !eng.SupportsGpu) cpu.SwishInto(o, inp); else { var r = eng.Swish(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
         // ELU forward: pinned SIMD ELUUnsafe
@@ -7945,7 +8591,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
             double alpha = step.SavedState != null && step.SavedState.Length > 0 ? (double)step.SavedState[0] : 1.0;
-            return eng => { if (eng is CpuEngine cpu) cpu.ELUInto(o, inp, alpha); else { var r = eng.ELU(inp, alpha); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
+            return eng => { if (eng is CpuEngine cpu && !eng.SupportsGpu) cpu.ELUInto(o, inp, alpha); else { var r = eng.ELU(inp, alpha); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
         // Log forward: pinned LogUnsafe — bypass EnsureMaterialized
@@ -7967,7 +8613,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         if (step.OpType == OpType.TensorLog && step.Inputs.Length == 1)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            return eng => { if (eng is CpuEngine cpu) cpu.TensorLogInto(o, inp); else { var r = eng.TensorLog(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
+            return eng => { if (eng is CpuEngine cpu && !eng.SupportsGpu) cpu.TensorLogInto(o, inp); else { var r = eng.TensorLog(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
         // Exp forward: VML → SIMD fallback, pinned GCHandle
@@ -7995,7 +8641,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         if (step.OpType == OpType.TensorExp && step.Inputs.Length == 1)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            return eng => { if (eng is CpuEngine cpu) cpu.TensorExpInto(o, inp); else { var r = eng.TensorExp(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
+            return eng => { if (eng is CpuEngine cpu && !eng.SupportsGpu) cpu.TensorExpInto(o, inp); else { var r = eng.TensorExp(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
         // Mish forward: pinned MishUnsafe — bypass EnsureMaterialized
@@ -8017,7 +8663,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         if (step.OpType == OpType.Mish && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            return eng => { if (eng is CpuEngine cpu) cpu.MishInto(o, inp); else { var r = eng.Mish(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
+            return eng => { if (eng is CpuEngine cpu && !eng.SupportsGpu) cpu.MishInto(o, inp); else { var r = eng.Mish(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
         // BatchNorm inference: direct SIMD kernel (bypasses all allocation)
@@ -8157,7 +8803,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 var capDilation = dilation;
                 return eng =>
                 {
-                    if (eng is CpuEngine cpuEng)
+                    if (eng is CpuEngine cpuEng && !eng.SupportsGpu)
                         cpuEng.Conv2DInto(o, inp, kernel, capStride, capPadding, capDilation);
                     else
                     {
@@ -8174,7 +8820,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             var defDilation = new[] { 1, 1 };
             return eng =>
             {
-                if (eng is CpuEngine cpuEng)
+                if (eng is CpuEngine cpuEng && !eng.SupportsGpu)
                     cpuEng.Conv2DInto(o, inp, kernel, defStride, defPadding, defDilation);
                 else
                 {
@@ -8218,7 +8864,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             var capOutPad = new[] { 0, 0 };
             return eng =>
             {
-                if (eng is CpuEngine cpuEng)
+                if (eng is CpuEngine cpuEng && !eng.SupportsGpu)
                     cpuEng.ConvTranspose2DInto(o, inp, kernel, capStride, capPadding, capOutPad);
                 else
                 {
@@ -8269,7 +8915,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             return eng =>
             {
                 Tensor<T> freshMean, freshVar;
-                if (eng is CpuEngine cpuEng)
+                if (eng is CpuEngine cpuEng && !eng.SupportsGpu)
                     cpuEng.GroupNormInto(o, inp, numGroupsGN, gamma, beta, epsilonGN, out freshMean, out freshVar);
                 else
                 {
@@ -8368,21 +9014,21 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         if (step.OpType == OpType.TensorSqrt && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            return eng => { if (eng is CpuEngine cpu) cpu.TensorSqrtInto(o, inp); else { var r = eng.TensorSqrt(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
+            return eng => { if (eng is CpuEngine cpu && !eng.SupportsGpu) cpu.TensorSqrtInto(o, inp); else { var r = eng.TensorSqrt(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
         // Sin forward: VML/SIMD via CpuEngine.TensorSinInto
         if (step.OpType == OpType.Sin && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            return eng => { if (eng is CpuEngine cpu) cpu.TensorSinInto(o, inp); else { var r = eng.TensorSin(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
+            return eng => { if (eng is CpuEngine cpu && !eng.SupportsGpu) cpu.TensorSinInto(o, inp); else { var r = eng.TensorSin(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
         // Cos forward: VML/SIMD via CpuEngine.TensorCosInto
         if (step.OpType == OpType.Cos && step.Inputs.Length == 1 && step.Inputs[0].IsContiguous)
         {
             var inp = step.Inputs[0]; var o = step.OutputBuffer;
-            return eng => { if (eng is CpuEngine cpu) cpu.TensorCosInto(o, inp); else { var r = eng.TensorCos(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
+            return eng => { if (eng is CpuEngine cpu && !eng.SupportsGpu) cpu.TensorCosInto(o, inp); else { var r = eng.TensorCos(inp); r.AsSpan().CopyTo(o.AsWritableSpan()); } };
         }
 
         // Softplus forward: SIMD SoftplusUnsafe with pinned arrays
@@ -8654,7 +9300,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             if (tensor.IsContiguous && offset == 0 && arr is double[] dNorm)
                 totalNormSq += SumSquaresVectorized(dNorm, len);
             else if (tensor.IsContiguous && offset == 0 && arr is float[] fNorm)
-                totalNormSq += SumSquaresVectorized(fNorm, len);
+                totalNormSq += SumSquaresChunked(fNorm, len);
             else if (tensor.IsContiguous && arr is not null)
                 for (int i = 0; i < len; i++)
                 {
@@ -8687,11 +9333,118 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             }
             else if (offset == 0 && arr is float[] fScale)
             {
-                ScaleInPlaceVectorized(fScale, len, (float)(maxNorm / (totalNorm + 1e-6)));
+                ScaleInPlaceChunked(fScale, len, (float)(maxNorm / (totalNorm + 1e-6)));
                 tensor.IncrementVersion();
             }
             else
                 tensor.ScaleLogicalInPlace(scale);
+        }
+    }
+
+    // Below this many FMAs a linear-backward GEMM stays on the direct managed kernel: BlasManaged's thin-M kernels
+    // start at 1M FMAs and its general strategy path loses to SimdGemm on small shapes (measured on the parity MLP's
+    // last layer, [64x128]x[128x10]: dW 15 µs managed-direct vs 65 µs through BlasManaged).
+    private const long LinearBackwardBlasMinWork = 1L << 20;
+
+    /// <summary>
+    /// C[m,n] := op(A)[m,k] · op(B)[k,n] (row-major, overwriting C) for the specialized linear backward. Routes like the
+    /// MatMul specialization -- BlasProvider.TryGemmEx, which honours deterministic mode (managed, reproducible across
+    /// thread counts) and native/autotune routing otherwise -- except for small GEMMs, which take the direct managed
+    /// kernel (see <see cref="LinearBackwardBlasMinWork"/>).
+    /// </summary>
+    // Elements per chunk of the parallel ReLU passes: a memory-bound pass of this size is ~10-20 µs, enough to amortize
+    // a dispatch. A single-threaded pass over [2048,128] took ~250 µs in the Transformer step (3990X).
+    private const int ReluChunkElements = 64 * 1024;
+
+    /// <summary>output = max(input, 0), chunked across the pool.</summary>
+    private static unsafe void ParallelRelu(float* input, float* output, int length)
+    {
+        if (length <= ReluChunkElements) { SimdKernels.ReLUUnsafe(input, output, length); return; }
+        int chunks = (length + ReluChunkElements - 1) / ReluChunkElements;
+        nint pi = (nint)input, po = (nint)output;
+        CpuParallelSettings.ParallelForOrSerial(0, chunks, length, c =>
+        {
+            int start = c * ReluChunkElements, count = Math.Min(ReluChunkElements, length - start);
+            SimdKernels.ReLUUnsafe((float*)pi + start, (float*)po + start, count);
+        }, deterministicSafe: true);
+    }
+
+    /// <summary>result = forward > 0 ? grad : 0, chunked across the pool.</summary>
+    private static unsafe void ParallelReluBackward(float* grad, float* forward, float* result, int length)
+    {
+        if (length <= ReluChunkElements) { SimdKernels.ReluBackwardUnsafe(grad, forward, result, length); return; }
+        int chunks = (length + ReluChunkElements - 1) / ReluChunkElements;
+        nint pg = (nint)grad, pf = (nint)forward, pr = (nint)result;
+        CpuParallelSettings.ParallelForOrSerial(0, chunks, length, c =>
+        {
+            int start = c * ReluChunkElements, count = Math.Min(ReluChunkElements, length - start);
+            SimdKernels.ReluBackwardUnsafe((float*)pg + start, (float*)pf + start, (float*)pr + start, count);
+        }, deterministicSafe: true);
+    }
+
+    /// <summary>dst[start..+count] += src (accumulate) or = src.</summary>
+    private static void AddOrCopy(float[] src, float[] dst, int start, int count, bool accumulate)
+    {
+        if (!accumulate) { Array.Copy(src, start, dst, start, count); return; }
+        int w = System.Numerics.Vector<float>.Count, i = start, end = start + count;
+        for (; i + w <= end; i += w)
+            (new System.Numerics.Vector<float>(dst, i) + new System.Numerics.Vector<float>(src, i)).CopyTo(dst, i);
+        for (; i < end; i++) dst[i] += src[i];
+    }
+
+    private static void LinearBackwardGemm(
+        float[] a, int lda, bool transA, float[] b, int ldb, bool transB, float[] c, int m, int k, int n)
+    {
+        if (SimdGemm.TryGemmSmallJit(a, lda, transA, b, ldb, transB, c, m, k, n))
+            return;
+        if ((long)m * k * n >= LinearBackwardBlasMinWork
+            && BlasProvider.TryGemmEx(m, n, k, a, 0, lda, transA, b, 0, ldb, transB, c, 0, n))
+            return;
+        SimdGemm.Sgemm(a, lda, transA, b, ldb, transB, c.AsSpan(0, m * n), m, k, n);
+    }
+
+    /// <summary>
+    /// dst[j] = Σ_r src[r·cols + j] for r = 0..rows-1. Small inputs sum in row order from zero; large ones sum fixed row
+    /// chunks in parallel and then the chunk partials in order (reproducible for any thread count, not bit-identical
+    /// to the serial order).
+    /// </summary>
+    private static void SumRowsInto(float[] src, int rows, int cols, float[] dst)
+    {
+        // Large sums: fixed row chunks (a function of the shape only) summed in parallel into partials, then the
+        // partials in chunk order -- reproducible for any thread count. A serial pass over [2048,128] was ~50 us per
+        // dense layer's bias gradient.
+        int chunks = Math.Min(16, rows / 256);
+        if (chunks >= 2 && (long)rows * cols >= 64 * 1024)
+        {
+            var partial = new float[chunks * cols];
+            CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)rows * cols, c =>
+            {
+                int r0 = (int)((long)c * rows / chunks), r1 = (int)((long)(c + 1) * rows / chunks);
+                SumRowRange(src, r0, r1, cols, partial, c * cols);
+            }, deterministicSafe: true);
+            SumRowRange(partial, 0, chunks, cols, dst, 0);
+            return;
+        }
+        SumRowRange(src, 0, rows, cols, dst, 0);
+    }
+
+    /// <summary>dst[dOff + j] = sum over r in [r0, r1) of src[r * cols + j], in row order from zero.</summary>
+    private static void SumRowRange(float[] src, int r0, int r1, int cols, float[] dst, int dOff)
+    {
+        int w = System.Numerics.Vector<float>.Count;
+        int j = 0;
+        for (; j + w <= cols; j += w)
+        {
+            var acc = System.Numerics.Vector<float>.Zero;
+            for (int r = r0; r < r1; r++)
+                acc += new System.Numerics.Vector<float>(src, r * cols + j);
+            acc.CopyTo(dst, dOff + j);
+        }
+        for (; j < cols; j++)
+        {
+            float s = 0f;
+            for (int r = r0; r < r1; r++) s += src[r * cols + j];
+            dst[dOff + j] = s;
         }
     }
 
@@ -8713,7 +9466,11 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         return s;
     }
 
-    internal static double SumSquaresVectorized(float[] a, int len)
+    internal static double SumSquaresVectorized(float[] a, int len) => SumSquaresRange(a, 0, len);
+
+    /// <summary>Sum of squares of a[start..end), accumulated in double -- <see cref="SumSquaresVectorized(float[], int)"/>
+    /// over a sub-range, with the same arithmetic.</summary>
+    internal static double SumSquaresRange(float[] a, int start, int end)
     {
         // Widen each float lane to double BEFORE squaring so the accumulation matches
         // the prior scalar path (double v = (double)arr[i]; sum += v*v) — squaring in
@@ -8722,8 +9479,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         int w = System.Numerics.Vector<float>.Count;
         var accLo = System.Numerics.Vector<double>.Zero;
         var accHi = System.Numerics.Vector<double>.Zero;
-        int i = 0;
-        for (; i <= len - w; i += w)
+        int i = start;
+        for (; i <= end - w; i += w)
         {
             var v = new System.Numerics.Vector<float>(a, i);
             System.Numerics.Vector.Widen(v, out var lo, out var hi);
@@ -8732,8 +9489,61 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         }
         double s = System.Numerics.Vector.Dot(accLo, System.Numerics.Vector<double>.One)
                  + System.Numerics.Vector.Dot(accHi, System.Numerics.Vector<double>.One);
-        for (; i < len; i++) { double v = a[i]; s += v * v; }
+        for (; i < end; i++) { double v = a[i]; s += v * v; }
         return s;
+    }
+
+    /// <summary>
+    /// Elements per partial sum of the chunked gradient-norm reduction. FIXED, never derived from the thread count:
+    /// the chunk partials are added in chunk order, so the norm depends on this constant and on nothing else -- the
+    /// same bits on any machine and at any MaxDegreeOfParallelism. A gradient of at most this many elements is one
+    /// chunk, summed exactly as before chunking existed.
+    /// </summary>
+    internal const int ClipChunkElements = 1 << 16;
+
+    /// <summary>
+    /// <see cref="SumSquaresVectorized(float[], int)"/> over fixed <see cref="ClipChunkElements"/>-element chunks summed
+    /// in parallel on the persistent pool, partials added in chunk order. The clip's two passes over a large dense
+    /// weight were serial (a 401K-element gradient: ~55 us to sum, ~70 us to scale, every step).
+    /// </summary>
+    internal static double SumSquaresChunked(float[] a, int len)
+    {
+        int chunks = (len + ClipChunkElements - 1) / ClipChunkElements;
+        if (chunks <= 1) return SumSquaresRange(a, 0, len);
+        var partials = System.Buffers.ArrayPool<double>.Shared.Rent(chunks);
+        try
+        {
+            Helpers.PersistentParallelExecutor.Instance.Execute(chunks, c =>
+                partials[c] = SumSquaresRange(a, c * ClipChunkElements, Math.Min(len, (c + 1) * ClipChunkElements)));
+            double s = 0.0;
+            for (int c = 0; c < chunks; c++) s += partials[c];
+            return s;
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<double>.Shared.Return(partials);
+        }
+    }
+
+    /// <summary><see cref="ScaleInPlaceVectorized(float[], int, float)"/> over the same chunks, in parallel. Each element
+    /// is one multiply whichever chunk or lane computes it, so the result is identical to the serial pass.</summary>
+    internal static void ScaleInPlaceChunked(float[] a, int len, float scale)
+    {
+        int chunks = (len + ClipChunkElements - 1) / ClipChunkElements;
+        if (chunks <= 1) { ScaleInPlaceVectorized(a, len, scale); return; }
+        Helpers.PersistentParallelExecutor.Instance.Execute(chunks, c =>
+        {
+            int start = c * ClipChunkElements, end = Math.Min(len, start + ClipChunkElements);
+            int w = System.Numerics.Vector<float>.Count;
+            var vs = new System.Numerics.Vector<float>(scale);
+            int i = start;
+            for (; i <= end - w; i += w)
+            {
+                var v = new System.Numerics.Vector<float>(a, i);
+                (v * vs).CopyTo(a, i);
+            }
+            for (; i < end; i++) a[i] *= scale;
+        });
     }
 
     internal static void ScaleInPlaceVectorized(double[] a, int len, double scale)
@@ -8932,7 +9742,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             if (g == null) continue;
             if (g.TryGetGpuBuffer() is null || g._gpuBackend is not Engines.DirectGpu.IDirectGpuBackend gcb)
             {
-                Engines.DirectGpu.GpuLaunchProbe.OnFallback("TryClipGradientsGlobalL2Gpu-gradient-not-device-resident", null);
+                // A fallback only on a GPU engine. On the CPU engine host gradients are the normal case, and recording
+                // it (a formatted key + a ConcurrentDictionary update) cost every CPU training step ~1% of its time.
+                if (_engine is Engines.DirectGpuTensorEngine)
+                    Engines.DirectGpu.GpuLaunchProbe.OnFallback("TryClipGradientsGlobalL2Gpu-gradient-not-device-resident", null);
                 return false;
             }
             cb ??= gcb;
@@ -8955,6 +9768,45 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             _clipSquares = null;
         }
         _clipScratchBackend = cb;
+
+        // Every GPU backend implements IMultiTensorKernels: one multi-tensor sum of squares, the coefficient computed
+        // on the device, one multi-tensor scale (CUDA and HIP launch once each; the others once per tensor). The
+        // per-tensor loop below issued a fill + square + reduce + add and a scale per gradient, ~630 launches per
+        // N-BEATS step (AiDotNet #1804).
+        if (cb is Engines.DirectGpu.IMultiTensorKernels multi)
+        {
+            var buffers = _clipBuffers;
+            var sizes = _clipSizes;
+            var owners = _clipOwners;
+            buffers.Clear();
+            sizes.Clear();
+            owners.Clear();
+            for (int p = 0; p < gradients.Length; p++)
+            {
+                var g = gradients[p];
+                if (g == null || g.Length == 0) continue;
+                var buf = g.TryGetGpuBuffer();
+                if (buf is null) continue;
+                buffers.Add(buf);
+                sizes.Add(g.Length);
+                owners.Add(g);
+            }
+            if (buffers.Count == 0) return true;
+            var sumSquares = _clipSumSq is { Size: >= 2 } existing ? existing : null;
+            if (sumSquares is null)
+            {
+                _clipSumSq?.Dispose();
+                sumSquares = _clipSumSq = cb.AllocateBuffer(2);
+            }
+            var scale = _clipTmp ??= cb.AllocateBuffer(1);
+            multi.MultiTensorSumOfSquares(buffers, sizes, sumSquares);
+            multi.ClipScaleFromSumOfSquares(sumSquares, (float)maxNorm, scale);
+            multi.MultiTensorScaleByDeviceScalar(buffers, sizes, scale);
+            for (int p = 0; p < owners.Count; p++)
+                (_engine as Engines.DirectGpuTensorEngine)?.BindResidentBuffer(owners[p], buffers[p], cb);
+            return true;
+        }
+
         var sumSq = _clipSumSq ??= cb.AllocateBuffer(1);
         var tmp = _clipTmp ??= cb.AllocateBuffer(1);
         {
@@ -9056,7 +9908,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         Dictionary<Tensor<T>, int> consumerCount,
         IEngine engine,
         List<GCHandle>? handleTracker = null,
-        bool dWPeeled = false)
+        bool dWPeeled = false,
+        HashSet<Tensor<T>>? requiresGrad = null)
     {
         // Per-branch type checks below — same pattern as TryBuildSpecializedForward.
         // PR #319: extend the MatMul backward to cover double via
@@ -9065,6 +9918,16 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // dominant backward op (matmul backward = ~30% of typical
         // transformer train wall-clock).
         if (typeof(T) != typeof(float) && typeof(T) != typeof(double)) return null;
+
+        // Every unary specialization below WRITES its input's gradient (CopyTo, or Array.Clear then fill) rather
+        // than accumulating into it. That is only correct when this step is the input's sole consumer. With more
+        // consumers it erases the gradient the others contributed: AdaptiveAveragePoolingLayer's non-dividing path
+        // takes several TensorSlices of one tensor, and the fused step kept only the last slice's gradient (conv
+        // update cosine 0.25-0.5 against the eager tape and PyTorch). The generic backward accumulates, so a
+        // multi-consumer unary step takes it.
+        if (step.Inputs.Length == 1
+            && consumerCount.TryGetValue(step.Inputs[0], out int unaryConsumers) && unaryConsumers > 1)
+            return null;
 
         // Specialized backward delegates capture raw zero-based arrays. Apply
         // the same centralized eligibility contract as specialized forward:
@@ -9309,11 +10172,24 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                     // Either call failed — fall through to FP32 path.
                 }
 
+                // Small-K panel routes first (SimdGemm.TryGemmSmallJit): dA = dC·Bᵀ as a no-transpose product over a
+                // transposed copy of the small B, dB = Aᵀ·dC as a split-k reduction. Each falls back on its own.
+                bool dAJit = dcOff == 0 && bOff == 0 && destAOff == 0
+                    && SimdGemm.TryGemmSmallJit(cachedDC, N, false, cachedB!, N, true, cachedDestA!, M, N, K);
+                bool dBJit = !dWPeeled && aOff == 0 && dcOff == 0 && destBOff == 0
+                    && SimdGemm.TryGemmSmallJit(cachedA!, K, true, cachedDC, N, false, cachedDestB!, K, M, N);
+                if (dAJit && (dBJit || dWPeeled))
+                {
+                    inputA.Grad = gradA;
+                    if (!dWPeeled) inputB.Grad = gradB;
+                    return;
+                }
+
                 // Phase G.10: batch the two backward GEMMs (dA + dW) into a
                 // single MKL cblas_sgemm_batch call. Skipped when dW
                 // peeling is active for this step (Phase G.12) — the
                 // dW computation is deferred to a layer-batched call.
-                if (!dWPeeled
+                if (!dWPeeled && !dAJit && !dBJit
                     && BlasProvider.IsMklBatchedAvailable
                     && BlasProvider.TryGemmExBatch2(
                         // dA = dC @ B^T  → [M, K]
@@ -9333,7 +10209,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 }
 
                 // dA = dC @ B^T — direct BLAS with engine fallback
-                if (!BlasProvider.TryGemmEx(M, K, N, cachedDC, dcOff, N, false, cachedB!, bOff, N, true, cachedDestA!, destAOff, K))
+                if (!dAJit && !BlasProvider.TryGemmEx(M, K, N, cachedDC, dcOff, N, false, cachedB!, bOff, N, true, cachedDestA!, destAOff, K))
                 {
                     var dA = eng.TensorMatMul(gradOut, inputB.Transpose());
                     dA.AsSpan().CopyTo(gradA.AsWritableSpan());
@@ -9342,7 +10218,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 // step (Phase G.12), skip this GEMM entirely; the dW
                 // computation is deferred to the batched-dW phase
                 // appended after the main backward loop.
-                if (!dWPeeled)
+                if (!dWPeeled && !dBJit)
                 {
                     if (!BlasProvider.TryGemmEx(K, N, M, cachedA!, aOff, K, true, cachedDC, dcOff, N, false, cachedDestB!, destBOff, N))
                     {
@@ -9353,6 +10229,127 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
 
                 inputA.Grad = gradA;
                 if (!dWPeeled) inputB.Grad = gradB;
+            };
+        }
+
+        // FusedLinear backward (float, no fused activation): Y = X·W (+ b). Writes dW, db and -- only when X can reach
+        // a parameter -- dX straight into the plan's gradient buffers. The generic BackwardFunctions path served every
+        // dense layer: it rented a zero-filled tensor per gradient from AutoTensorCache, ran the GEMM into it, then
+        // AccumulateGrad added it into the plan buffer the step had just cleared -- three passes over each gradient
+        // where one write suffices -- and it always computed dX, including the dX of the first layer whose input is
+        // the data batch. One generic action also forces the step to clear EVERY gradient buffer up front.
+        // Overwrite (beta = 0) semantics require each written operand to have exactly one consumer, the same rule as
+        // the MatMul specialization above; a shared operand takes the accumulating generic backward instead.
+        if (typeof(T) == typeof(float) && step.OpType == OpType.FusedLinear
+            && (step.Inputs.Length == 2 || step.Inputs.Length == 3)
+            && step.Inputs[0].Rank >= 2 && step.Inputs[1].Rank == 2
+            && (step.SavedState is null || step.SavedState.Length == 0
+                || (step.SavedState[0] is FusedActivationType linAct
+                    && (linAct == FusedActivationType.None || linAct == FusedActivationType.ReLU))))
+        {
+            // ReLU epilogue: dZ = dY where the output is positive, else 0 (relu(z) > 0 exactly when z > 0), written to
+            // a plan-owned scratch that the GEMMs and the bias sum then read in place of dY. Without this the layer
+            // took the generic backward: zero-filled rented gradients, an accumulating GEMM, a separate ReLU backward
+            // and a broadcast bias reduction, then AccumulateGrad copies (2.85 ms vs PyTorch's 1.0 ms for a
+            // [2048,64]->[2048,128] FFN layer, 3990X).
+            bool linRelu = step.SavedState is { Length: > 0 } && step.SavedState[0] is FusedActivationType.ReLU;
+            var linIn = step.Inputs[0];
+            var linW = step.Inputs[1];
+            var linB = step.Inputs.Length == 3 ? step.Inputs[2] : null;
+            var linOut = step.OutputBuffer;
+            int linK = linW._shape[0], linN = linW._shape[1];
+            int linRows = linIn.Length / Math.Max(1, linK);
+            if (linIn._shape[linIn.Rank - 1] != linK || linOut.Length != linRows * linN
+                || (linB is not null && linB.Length != linN))
+                return null;
+
+            bool linNeedX = requiresGrad is null || requiresGrad.Contains(linIn);
+            bool linNeedW = requiresGrad is null || requiresGrad.Contains(linW);
+            bool SoleConsumer(Tensor<T> t) => !consumerCount.TryGetValue(t, out int uses) || uses <= 1;
+            if ((linNeedX && !SoleConsumer(linIn)) || (linNeedW && !SoleConsumer(linW)))
+                return null;
+            if (!gradMap.TryGetValue(linOut, out var linGradOut)
+                || (linNeedX && !gradMap.ContainsKey(linIn))
+                || (linNeedW && !gradMap.ContainsKey(linW)))
+                return null;
+            Tensor<T>? linGradB = null;
+            if (linB is not null && (requiresGrad is null || requiresGrad.Contains(linB)))
+            {
+                if (!SoleConsumer(linB) || !gradMap.TryGetValue(linB, out linGradB))
+                    return null;
+            }
+            var linGradIn = linNeedX ? gradMap[linIn] : null;
+            var linGradW = linNeedW ? gradMap[linW] : null;
+            float[]? reluScratch = linRelu ? new float[linRows * linN] : null;
+
+            return eng =>
+            {
+                var dY = TryGetLiveFloatBacking(linGradOut) ?? throw new InvalidOperationException("FusedLinear backward: the output gradient has no live host buffer.");
+                if (reluScratch is not null)
+                {
+                    var y = TryGetLiveFloatBacking(linOut) ?? throw new InvalidOperationException("FusedLinear backward: the output has no live host buffer.");
+                    fixed (float* pdy = dY, py = y, pdz = reluScratch)
+                        ParallelReluBackward(pdy, py, pdz, reluScratch.Length);
+                    dY = reluScratch;
+                }
+                if (linGradW is not null)
+                {
+                    // dW[K,N] = Xᵀ[K,rows] · dY[rows,N]
+                    var x = TryGetLiveFloatBacking(linIn) ?? throw new InvalidOperationException("FusedLinear backward: the input has no live host buffer.");
+                    var dW = TryGetLiveFloatBacking(linGradW) ?? throw new InvalidOperationException("FusedLinear backward: the weight gradient has no live host buffer.");
+                    LinearBackwardGemm(x, linK, true, dY, linN, false, dW, linK, linRows, linN);
+                    linW.Grad = linGradW;
+                }
+                if (linGradIn is not null)
+                {
+                    // dX[rows,K] = dY[rows,N] · Wᵀ[N,K]
+                    var w = TryGetLiveFloatBacking(linW) ?? throw new InvalidOperationException("FusedLinear backward: the weight has no live host buffer.");
+                    var dX = TryGetLiveFloatBacking(linGradIn) ?? throw new InvalidOperationException("FusedLinear backward: the input gradient has no live host buffer.");
+                    LinearBackwardGemm(dY, linN, false, w, linN, true, dX, linRows, linN, linK);
+                    linIn.Grad = linGradIn;
+                }
+                if (linGradB is not null && linB is not null)
+                {
+                    var dB = TryGetLiveFloatBacking(linGradB) ?? throw new InvalidOperationException("FusedLinear backward: the bias gradient has no live host buffer.");
+                    SumRowsInto(dY, linRows, linN, dB);
+                    linB.Grad = linGradB;
+                }
+            };
+        }
+
+        // LogSoftmax backward (float, rank 2, softmax over the last axis): dX = dY - exp(Y) * rowsum(dY). The generic
+        // BackwardFunctions path ran it as five engine ops (exp, axis reduce, broadcast, multiply, subtract), each
+        // renting its result and dispatching through the broadcast machinery, then an AccumulateGrad: ~120 us per step
+        // for a 64x10 classifier head whose arithmetic is ~1 us. This computes the same values with the same
+        // arithmetic -- exp through the engine's own TensorExpInto kernel, each row sum in order from zero, then a
+        // float multiply and a float subtract per element -- straight into the input's gradient buffer.
+        if (typeof(T) == typeof(float) && step.OpType == OpType.LogSoftmax && step.Inputs.Length == 1
+            && step.Inputs[0].Rank == 2 && step.Inputs[0].IsContiguous && step.OutputBuffer.IsContiguous
+            && (step.SavedState is not { Length: > 0 } || (step.SavedState[0] is int lsmAxis && (lsmAxis == 1 || lsmAxis == -1)))
+            && engine is CpuEngine lsmCpu && !engine.SupportsGpu)
+        {
+            var lsmIn = step.Inputs[0];
+            var lsmOut = step.OutputBuffer;
+            if ((consumerCount.TryGetValue(lsmIn, out int lsmUses) && lsmUses > 1)
+                || !gradMap.TryGetValue(lsmOut, out var lsmGradOut) || !gradMap.TryGetValue(lsmIn, out var lsmGradIn)
+                || lsmOut.Length != lsmIn.Length)
+                return null;
+            int lsmRows = lsmIn._shape[0], lsmCols = lsmIn._shape[1];
+            var softmaxScratch = new Tensor<T>(lsmIn._shape);
+            return eng =>
+            {
+                lsmCpu.TensorExpInto(softmaxScratch, lsmOut);
+                var s = TryGetLiveFloatBacking(softmaxScratch) ?? throw new InvalidOperationException("LogSoftmax backward: the softmax scratch has no live host buffer.");
+                var dY = TryGetLiveFloatBacking(lsmGradOut) ?? throw new InvalidOperationException("LogSoftmax backward: the output gradient has no live host buffer.");
+                var dX = TryGetLiveFloatBacking(lsmGradIn) ?? throw new InvalidOperationException("LogSoftmax backward: the input gradient has no live host buffer.");
+                for (int r = 0; r < lsmRows; r++)
+                {
+                    int o = r * lsmCols;
+                    float rowSum = 0f;
+                    for (int c = 0; c < lsmCols; c++) rowSum += dY[o + c];
+                    for (int c = 0; c < lsmCols; c++) dX[o + c] = dY[o + c] - s[o + c] * rowSum;
+                }
+                lsmIn.Grad = lsmGradIn;
             };
         }
 
@@ -9617,6 +10614,31 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             bool accumA = consumerCount.ContainsKey(inputA) && consumerCount[inputA] > 1;
             bool accumB = consumerCount.ContainsKey(inputB) && consumerCount[inputB] > 1;
 
+            // Float host buffers of one shape: both gradients in one chunked pass across the pool. The engine add and
+            // the single-threaded span copy took ~170 us per residual add of [64,32,64] (3990X).
+            if (typeof(T) == typeof(float) && !engine.SupportsGpu
+                && gradA.Length == gradOut.Length && gradB.Length == gradOut.Length
+                && TryGetLiveFloatBacking(gradOut) is not null && TryGetLiveFloatBacking(gradA) is not null
+                && TryGetLiveFloatBacking(gradB) is not null)
+            {
+                int addLen = gradOut.Length;
+                return eng =>
+                {
+                    var g = TryGetLiveFloatBacking(gradOut)!;
+                    var ga = TryGetLiveFloatBacking(gradA)!;
+                    var gb = TryGetLiveFloatBacking(gradB)!;
+                    int chunks = Math.Max(1, (addLen + ReluChunkElements - 1) / ReluChunkElements);
+                    CpuParallelSettings.ParallelForOrSerial(0, chunks, 2L * addLen, c =>
+                    {
+                        int start = c * ReluChunkElements, count = Math.Min(ReluChunkElements, addLen - start);
+                        AddOrCopy(g, ga, start, count, accumA);
+                        AddOrCopy(g, gb, start, count, accumB);
+                    }, deterministicSafe: true);
+                    inputA.Grad = gradA;
+                    inputB.Grad = gradB;
+                };
+            }
+
             return eng =>
             {
                 if (accumA)
@@ -9744,6 +10766,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             var gradKernel = gradMap[kernel];
             bool accumInput = consumerCount.ContainsKey(input) && consumerCount[input] > 1;
             bool accumKernel = consumerCount.ContainsKey(kernel) && consumerCount[kernel] > 1;
+            // An input no parameter feeds (the network input) needs no gradient: skip that whole convolution.
+            bool needInputGrad = requiresGrad is null || requiresGrad.Contains(input);
             // Capture shapes so the closure doesn't walk Tensor.Shape every
             // Step (microoptimization but matters at 19+ Conv calls per iter).
             var inShape = (int[])input._shape.Clone();
@@ -9753,24 +10777,28 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             var capDilation = dilation;
             return eng =>
             {
-                if (eng is CpuEngine cpu)
+                if (eng is CpuEngine cpu && !eng.SupportsGpu)
                 {
-                    cpu.Conv2DBackwardInputInto(gradInput, gradOut, kernel, inShape,
-                        capStride, capPadding, capDilation, accumInput);
+                    if (needInputGrad)
+                        cpu.Conv2DBackwardInputInto(gradInput, gradOut, kernel, inShape,
+                            capStride, capPadding, capDilation, accumInput);
                     cpu.Conv2DBackwardKernelInto(gradKernel, gradOut, input, kShape,
                         capStride, capPadding, capDilation, accumKernel);
                 }
                 else
                 {
                     // Non-CpuEngine fallback — match the eager path semantics.
-                    var gi = eng.Conv2DBackwardInput(gradOut, kernel, inShape, capStride, capPadding, capDilation);
-                    if (accumInput) eng.TensorAddInto(gradInput, gradInput, gi);
-                    else gi.AsSpan().CopyTo(gradInput.AsWritableSpan());
+                    if (needInputGrad)
+                    {
+                        var gi = eng.Conv2DBackwardInput(gradOut, kernel, inShape, capStride, capPadding, capDilation);
+                        if (accumInput) eng.TensorAddInto(gradInput, gradInput, gi);
+                        else gi.AsSpan().CopyTo(gradInput.AsWritableSpan());
+                    }
                     var gk = eng.Conv2DBackwardKernel(gradOut, input, kShape, capStride, capPadding, capDilation);
                     if (accumKernel) eng.TensorAddInto(gradKernel, gradKernel, gk);
                     else gk.AsSpan().CopyTo(gradKernel.AsWritableSpan());
                 }
-                input.Grad = gradInput;
+                if (needInputGrad) input.Grad = gradInput;
                 kernel.Grad = gradKernel;
             };
         }
@@ -9810,7 +10838,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             bool accumBeta = consumerCount.ContainsKey(betaT) && consumerCount[betaT] > 1;
             return eng =>
             {
-                if (eng is CpuEngine cpu)
+                if (eng is CpuEngine cpu && !eng.SupportsGpu)
                 {
                     cpu.BatchNormBackwardInto(gradInput, gradGamma, gradBeta,
                         gradOut, input, gammaT, meanT, varianceT, epsilonD,
@@ -10040,6 +11068,84 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                     else reduced.AsSpan().CopyTo(gradInputB.AsWritableSpan());
                 }
                 inputB.Grad = gradInputB;
+            };
+        }
+
+        // MaxPool2D backward for a graph-mode pool node, which saves only its geometry ([poolSize, stride], no
+        // indices): the CPU engine re-scans the forward input for each window's winner and writes the gradient
+        // straight into the plan's buffer. The node's own backward replays the whole forward under a tape and
+        // accumulates a fresh tensor -- measured 4.6 ms of a 20 ms parity-CNN step, against a pass over the input.
+        if (step.OpType == OpType.MaxPool2D && step.Inputs.Length == 1
+            && step.SavedState is { Length: 2 } geometry
+            && geometry[0] is int[] { Length: 2 } recomputePool
+            && geometry[1] is int[] { Length: 2 } recomputeStride
+            && step.Inputs[0].Rank == 4 && step.Inputs[0].IsContiguous
+            && engine is CpuEngine && !engine.SupportsGpu)
+        {
+            var input = step.Inputs[0];
+            var output = step.OutputBuffer;
+            if (!gradMap.TryGetValue(output, out var gradOut) || !gradMap.TryGetValue(input, out var gradIn))
+                return null;
+            bool accum = consumerCount.TryGetValue(input, out int poolInputConsumers) && poolInputConsumers > 1;
+            int pH = recomputePool[0], pW = recomputePool[1], sH = recomputeStride[0], sW = recomputeStride[1];
+            return eng =>
+            {
+                if (eng is CpuEngine cpu && !eng.SupportsGpu)
+                {
+                    cpu.MaxPool2DBackwardRecomputeInto(gradIn, gradOut, input, pH, pW, sH, sW, accum);
+                }
+                else
+                {
+                    // Another engine at replay: recover the winners with its own indexed pool, outside any tape.
+                    Tensor<int> winners;
+                    using (new NoGradScope<T>())
+                        eng.MaxPool2DWithTensorIndices(input, recomputePool, recomputeStride, out winners);
+                    var grad = eng.MaxPool2DBackwardWithTensorIndices(gradOut, winners, input._shape,
+                        recomputePool, recomputeStride);
+                    if (accum) eng.TensorAddInto(gradIn, gradIn, grad);
+                    else grad.AsSpan().CopyTo(gradIn.AsWritableSpan());
+                }
+                input.Grad = gradIn;
+            };
+        }
+
+        // AdaptiveAvgPool2D backward (float, CPU): spread each output gradient over its window straight into the
+        // plan's input-gradient buffer. The node's generic backward rented a fresh input-sized tensor every step (a
+        // large-object-heap array for a conv feature map) and then added it into this buffer, which therefore also
+        // had to be zeroed first: 0.47 ms of a 6.5 ms parity-CNN step for a [64, 32, 14, 14] map. Same kernel and
+        // arithmetic as the generic float path, so the gradient is bit-identical.
+        if (typeof(T) == typeof(float) && step.OpName == "AdaptiveAvgPool2D" && step.Inputs.Length == 1
+            && step.SavedState is { Length: 2 } aapState
+            && aapState[0] is int aapOutH && aapState[1] is int aapOutW
+            && step.Inputs[0].Rank == 4 && step.OutputBuffer.Rank == 4
+            && step.OutputBuffer._shape[2] == aapOutH && step.OutputBuffer._shape[3] == aapOutW
+            && step.BackwardFn is { } genericBackward
+            && engine is CpuEngine && !engine.SupportsGpu)
+        {
+            var input = step.Inputs[0];
+            var output = step.OutputBuffer;
+            if (!gradMap.TryGetValue(output, out var gradOut) || !gradMap.TryGetValue(input, out var gradIn))
+                return null;
+            var gradOutArr = TryGetLiveFloatBacking(gradOut);
+            var gradInArr = TryGetLiveFloatBacking(gradIn);
+            if (gradOutArr is null || gradInArr is null) return null;
+            bool accum = consumerCount.TryGetValue(input, out int aapInputConsumers) && aapInputConsumers > 1;
+            int planes = input._shape[0] * input._shape[1], inH = input._shape[2], inW = input._shape[3];
+            var savedState = step.SavedState;
+            return eng =>
+            {
+                if (eng is CpuEngine && !eng.SupportsGpu)
+                {
+                    CpuEngine.AdaptiveAvgPool2DBackwardFloat(gradOutArr, 0, gradInArr, 0, planes,
+                        inH, inW, aapOutH, aapOutW, accum);
+                }
+                else
+                {
+                    // Another engine at replay: its own backward, accumulated into a cleared buffer unless shared.
+                    if (!accum) gradIn.AsWritableSpan().Clear();
+                    genericBackward(gradOut, step.Inputs, output, savedState, eng, gradMap);
+                }
+                input.Grad = gradIn;
             };
         }
 
@@ -10998,6 +12104,202 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     /// backward work.
     /// </para>
     /// </summary>
+    /// <summary>
+    /// Finds <c>Conv2D -> TensorChannelBiasAdd [-> ReLU]</c> chains on a CPU float plan and replaces the chain's
+    /// forward and backward with one action each. Forward: the convolution into its own output buffer (the same
+    /// call its specialized forward makes), then one pass act(conv + bias) straight into the chain's last output
+    /// (<see cref="CpuEngine.ChannelBiasActivationInto"/>); the bias-add and ReLU steps emit nothing. Backward: one
+    /// pass forming the pre-activation gradient into the convolution output's gradient buffer and the bias gradient
+    /// (<see cref="CpuEngine.ChannelBiasActivationBackwardInto"/>), then the convolution's input and kernel
+    /// gradients exactly as the specialized Conv2D backward computes them. Bit-identical to the unfused chain.
+    /// Steps are matched by dataflow, not adjacency: the plan's order may interleave unrelated steps.
+    /// </summary>
+    /// <remarks>
+    /// The bias-add (and ReLU) input buffers are never written, so the chain is only fused when each intermediate
+    /// has exactly one consumer (the next op of the chain) and every gradient buffer involved is distinct. The
+    /// forward action sits at the convolution's index (its output is written there, so step observers and the
+    /// forward-buffer sanitizer see a real write); the backward action sits at the chain's LAST index, which in
+    /// reverse order is where the output gradient is complete.
+    /// </remarks>
+    private static void DetectConvBiasActivationFusion(
+        List<CompiledStep<T>> steps,
+        Dictionary<Tensor<T>, int> consumerCount,
+        Dictionary<Tensor<T>, Tensor<T>> gradMap,
+        HashSet<Tensor<T>> requiresGrad,
+        Dictionary<int, Action<IEngine>> forwardSpecs,
+        Dictionary<int, Action<IEngine>> backwardSpecs,
+        HashSet<int> consumed)
+    {
+        if (typeof(T) != typeof(float)) return;
+        // AIDOTNET_CONV_POOL_BACKWARD_FUSION=0 keeps a following max pool's backward separate (A/B and tests).
+        bool poolBackwardFusion = Environment.GetEnvironmentVariable("AIDOTNET_CONV_POOL_BACKWARD_FUSION") != "0";
+
+        // The unique consumer step of each tensor read by exactly one step.
+        var soleConsumer = new Dictionary<Tensor<T>, int>();
+        for (int s = 0; s < steps.Count; s++)
+            foreach (var inp in steps[s].Inputs)
+                if (inp is not null && consumerCount.TryGetValue(inp, out int n) && n == 1)
+                    soleConsumer[inp] = s;
+
+        for (int convIdx = 0; convIdx < steps.Count; convIdx++)
+        {
+            var conv = steps[convIdx];
+            if (conv.OpType != OpType.Conv2D || conv.Inputs.Length != 2 || conv.BackwardFn == null) continue;
+            if (conv.SavedState is not { Length: >= 3 } convState
+                || convState[0] is not int[] stride || convState[1] is not int[] padding
+                || convState[2] is not int[] dilation) continue;
+            var x = conv.Inputs[0];
+            var kernel = conv.Inputs[1];
+            var convOut = conv.OutputBuffer;
+            if (x.Rank != 4 || kernel.Rank != 4 || convOut.Rank != 4
+                || !x.IsContiguous || !kernel.IsContiguous || !convOut.IsContiguous) continue;
+            if (!soleConsumer.TryGetValue(convOut, out int biasIdx) || biasIdx <= convIdx || consumed.Contains(biasIdx)) continue;
+
+            var biasStep = steps[biasIdx];
+            if (biasStep.OpName != "TensorChannelBiasAdd" || biasStep.Inputs.Length != 2
+                || !ReferenceEquals(biasStep.Inputs[0], convOut) || biasStep.BackwardFn == null) continue;
+            var bias = biasStep.Inputs[1];
+            var biasOut = biasStep.OutputBuffer;
+            if (bias.Rank != 1 || bias._shape[0] != convOut._shape[1] || !bias.IsContiguous
+                || !biasOut.IsContiguous || biasOut.Length != convOut.Length) continue;
+
+            // Extend through a ReLU when the bias-add output feeds only that ReLU.
+            int last = biasIdx;
+            bool relu = false;
+            if (soleConsumer.TryGetValue(biasOut, out int reluIdx) && reluIdx > biasIdx && !consumed.Contains(reluIdx))
+            {
+                var reluStep = steps[reluIdx];
+                if (reluStep.OpType == OpType.ReLU && reluStep.Inputs.Length == 1
+                    && ReferenceEquals(reluStep.Inputs[0], biasOut) && reluStep.BackwardFn != null
+                    && reluStep.OutputBuffer.IsContiguous && reluStep.OutputBuffer.Length == biasOut.Length)
+                {
+                    relu = true;
+                    last = reluIdx;
+                }
+            }
+            var y = steps[last].OutputBuffer;
+
+            if (!gradMap.TryGetValue(y, out var gradY) || !gradMap.TryGetValue(convOut, out var gradConvOut)
+                || !gradMap.TryGetValue(bias, out var gradBias) || !gradMap.TryGetValue(x, out var gradX)
+                || !gradMap.TryGetValue(kernel, out var gradKernel)) continue;
+            // Every buffer this writes or reads must be its own: an alias would let one write clobber another read.
+            var distinct = new HashSet<Tensor<T>> { gradY, gradConvOut, gradBias, gradX, gradKernel };
+            if (distinct.Count != 5 || !gradY.IsContiguous || !gradConvOut.IsContiguous) continue;
+
+            // A ReLU activation read only by a tiling max pool (stride = pool, the graph-mode node that saves just
+            // its geometry): the pool's backward joins the chain's, so each plane's pool gradient is scattered,
+            // ReLU-masked and bias-reduced in one pass and the activation gradient (gradY) is never written. The
+            // pool's forward stays its own action; the chain's backward then runs at the pool's position.
+            // An adaptive average pool joins the same way (e.g. a final ReLU feeding global average pooling).
+            int poolIdx = -1, poolH = 0, poolW = 0;
+            bool poolIsAdaptiveAvg = false;
+            Tensor<float>? gradPoolOutF = null;
+            if (relu && poolBackwardFusion && y.Rank == 4 && y.IsContiguous
+                && soleConsumer.TryGetValue(y, out int candidatePool) && candidatePool > last
+                && !consumed.Contains(candidatePool))
+            {
+                var pool = steps[candidatePool];
+                if (pool.OpName == "AdaptiveAvgPool2D" && pool.Inputs.Length == 1 && ReferenceEquals(pool.Inputs[0], y)
+                    && pool.SavedState is { Length: 2 } aapGeometry
+                    && aapGeometry[0] is int aapH && aapGeometry[1] is int aapW && aapH > 0 && aapW > 0
+                    && pool.OutputBuffer.Rank == 4
+                    && pool.OutputBuffer._shape[2] == aapH && pool.OutputBuffer._shape[3] == aapW
+                    && gradMap.TryGetValue(pool.OutputBuffer, out var gradAapOut) && gradAapOut.IsContiguous
+                    && !distinct.Contains(gradAapOut))
+                {
+                    poolIdx = candidatePool;
+                    poolIsAdaptiveAvg = true;
+                    gradPoolOutF = (Tensor<float>)(object)gradAapOut;
+                }
+                else if (pool.OpType == OpType.MaxPool2D && pool.Inputs.Length == 1 && ReferenceEquals(pool.Inputs[0], y)
+                    && pool.SavedState is { Length: 2 } poolGeometry
+                    && poolGeometry[0] is int[] { Length: 2 } poolSize && poolGeometry[1] is int[] { Length: 2 } poolStride
+                    && poolSize[0] > 0 && poolSize[1] > 0 && poolSize[0] == poolStride[0] && poolSize[1] == poolStride[1]
+                    && pool.OutputBuffer.Rank == 4
+                    && pool.OutputBuffer._shape[2] == (y._shape[2] - poolSize[0]) / poolSize[0] + 1
+                    && pool.OutputBuffer._shape[3] == (y._shape[3] - poolSize[1]) / poolSize[1] + 1
+                    && gradMap.TryGetValue(pool.OutputBuffer, out var gradPoolOut) && gradPoolOut.IsContiguous
+                    && !distinct.Contains(gradPoolOut))
+                {
+                    poolIdx = candidatePool;
+                    poolH = poolSize[0];
+                    poolW = poolSize[1];
+                    gradPoolOutF = (Tensor<float>)(object)gradPoolOut;
+                }
+            }
+
+            bool accumX = consumerCount.TryGetValue(x, out int xConsumers) && xConsumers > 1;
+            bool accumKernel = consumerCount.TryGetValue(kernel, out int kConsumers) && kConsumers > 1;
+            bool accumBias = consumerCount.TryGetValue(bias, out int bConsumers) && bConsumers > 1;
+            // An input no parameter feeds (the network input) needs no gradient: skip that whole convolution.
+            bool needInputGrad = requiresGrad.Contains(x);
+            var xShape = (int[])x._shape.Clone();
+            var kShape = (int[])kernel._shape.Clone();
+            var convOutF = (Tensor<float>)(object)convOut;
+            var xF = (Tensor<float>)(object)x;
+            var kernelF = (Tensor<float>)(object)kernel;
+            var biasF = (Tensor<float>)(object)bias;
+            var yF = (Tensor<float>)(object)y;
+            var gradYF = (Tensor<float>)(object)gradY;
+            var gradConvOutF = (Tensor<float>)(object)gradConvOut;
+            var gradBiasF = (Tensor<float>)(object)gradBias;
+            var capStride = stride; var capPadding = padding; var capDilation = dilation;
+
+            forwardSpecs[convIdx] = eng =>
+            {
+                if (eng is CpuEngine cpu && !eng.SupportsGpu)
+                {
+                    // Nothing reads the raw convolution once the chain is fused (the backward uses the activation),
+                    // so the conv writes the activation directly. The forward diagnostics inspect each step's own
+                    // output buffer, so under them the convolution is still materialised (same values either way).
+                    if (SanitizeForwardBuffers || ForwardStepObserver is not null)
+                    {
+                        cpu.Conv2DInto(convOut, x, kernel, capStride, capPadding, capDilation);
+                        cpu.ChannelBiasActivationInto(yF, convOutF, biasF, relu);
+                    }
+                    else
+                    {
+                        cpu.Conv2DBiasActivationInto(yF, xF, kernelF, biasF, relu, capStride, capPadding, capDilation);
+                    }
+                }
+                else
+                {
+                    var z = eng.TensorChannelBiasAdd(eng.Conv2D(x, kernel, capStride, capPadding, capDilation), bias);
+                    (relu ? eng.ReLU(z) : z).AsSpan().CopyTo(y.AsWritableSpan());
+                }
+            };
+            backwardSpecs[poolIdx >= 0 ? poolIdx : last] = eng =>
+            {
+                if (eng is CpuEngine cpu && !eng.SupportsGpu)
+                {
+                    if (gradPoolOutF is not null && poolIsAdaptiveAvg)
+                        cpu.AdaptiveAvgPoolReluBiasBackwardInto(gradConvOutF, gradBiasF, gradPoolOutF, yF, accumBias);
+                    else if (gradPoolOutF is not null)
+                        cpu.MaxPoolReluBiasBackwardInto(gradConvOutF, gradBiasF, gradPoolOutF, yF, poolH, poolW, accumBias);
+                    else
+                        cpu.ChannelBiasActivationBackwardInto(gradConvOutF, gradBiasF, gradYF, yF, relu, accumBias);
+                    if (needInputGrad)
+                        cpu.Conv2DBackwardInputInto(gradX, gradConvOut, kernel, xShape,
+                            capStride, capPadding, capDilation, accumX);
+                    cpu.Conv2DBackwardKernelInto(gradKernel, gradConvOut, x, kShape,
+                        capStride, capPadding, capDilation, accumKernel);
+                }
+                else
+                {
+                    throw new InvalidOperationException(
+                        "The fused Conv2D/bias/activation backward was compiled for a CPU engine and cannot replay on "
+                        + eng.GetType().Name + ".");
+                }
+                if (needInputGrad) x.Grad = gradX;
+                kernel.Grad = gradKernel;
+                bias.Grad = gradBias;
+            };
+            consumed.Add(convIdx);
+            consumed.Add(biasIdx);
+            if (relu) consumed.Add(reluIdx);
+        }
+    }
+
     private static void DetectMatMulSlicePrefixFusion(
         List<CompiledStep<T>> forwardSteps,
         Dictionary<Tensor<T>, int> consumerCount,

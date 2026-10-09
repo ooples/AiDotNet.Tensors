@@ -370,17 +370,39 @@ public sealed class TapeStepContext<T>
                 $"ParameterBuffer has {buffer.Count} slots but {parameters.Count} parameters were provided. " +
                 "The buffer must have been created with the same parameter shapes in the same order.");
 
+        // A sparse leaf's buffer slot holds only its pattern's non-zeros (ParameterLayout), so it counts as
+        // NonZeroCount, not its dense rows x columns.
         int expectedTotal = 0;
-        foreach (var p in parameters) expectedTotal += p.Length;
+        for (int i = 0; i < parameters.Count; i++)
+            expectedTotal += buffer.IsSparse(i) && parameters[i] is SparseTensor<T> sparse
+                ? sparse.NonZeroCount
+                : parameters[i].Length;
         if (buffer.TotalSize != expectedTotal)
             throw new ArgumentException(
                 $"ParameterBuffer total size ({buffer.TotalSize}) does not match parameter total ({expectedTotal}).");
 
-        // Verify parameters are actual views into the buffer's storage (shared reference identity)
+        // Verify parameters are actual views into the buffer's storage. A dense view shares the buffer's storage
+        // object; a sparse view wraps a slice of the buffer's memory in its own storage, so it must instead point
+        // at its own slot's values.
         var bufferStorage = buffer.Storage;
         for (int i = 0; i < parameters.Count; i++)
         {
-            if (!ReferenceEquals(parameters[i]._storage, bufferStorage))
+            bool isView;
+            if (buffer.IsSparse(i))
+            {
+                var slot = buffer.GetSparseValuesReadOnlySpan(i);
+                isView = parameters[i] is SparseTensor<T> sparseView
+                    && sparseView.NonZeroCount == slot.Length
+                    && (slot.Length == 0 || System.Runtime.CompilerServices.Unsafe.AreSame(
+                        ref System.Runtime.InteropServices.MemoryMarshal.GetReference(slot),
+                        ref System.Runtime.InteropServices.MemoryMarshal.GetReference(
+                            (ReadOnlySpan<T>)sparseView.DataVector.AsSpan().Slice(sparseView._storageOffset, slot.Length))));
+            }
+            else
+            {
+                isView = ReferenceEquals(parameters[i]._storage, bufferStorage);
+            }
+            if (!isView)
                 throw new ArgumentException(
                     $"Parameter {i} is not a view into the provided ParameterBuffer. " +
                     "Use ParameterBuffer.CreateAllViews() to create parameter tensors backed by the buffer.");

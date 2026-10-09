@@ -80,6 +80,9 @@ public sealed class CrossBackendKernelCoverageTests
         "embedding_lookup",                                    // -> CUDA/HIP backend.Embedding launches embedding_forward
         "sddmm_collab",                                        // -> CUDA CsrSddmm resident via 'sddmm'; _collab is an
                                                                // OpenCL-specific collaborative-tiling perf variant
+        "tensor_sum_squares_accumulate",                       // -> multi_tensor_sum_squares (CudaOptimizerKernels.cs,
+                                                               // HipBackend.MultiTensor.cs); OpenCL launches per tensor
+        "scale_by_device_scalar_inplace",                      // -> multi_tensor_scale_by_device_scalar (same homes)
     };
 
     // (Five dead OpenCL kernels that used to be reconciled here — create_hann_window, create_hamming_window,
