@@ -30,6 +30,6 @@ void main() {
             unchecked((uint)SingleToInt32BitsCompat(alpha)),
             unchecked((uint)SingleToInt32BitsCompat(beta)),
         };
-        GlslBinaryOp(GemmFp32TransposedAGlsl, A, B, C, M * N, push, (uint)(push.Length * sizeof(uint)));
+        GlslBinaryOp(GemmFp32TransposedAGlsl, A, B, C, checked(M * N), push, (uint)(push.Length * sizeof(uint)));
     }
 }

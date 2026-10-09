@@ -49,4 +49,25 @@ public class TapeStepContextSparseBufferTests
         Assert.Throws<ArgumentException>(
             () => new TapeStepContext<float>(impostor, new Dictionary<Tensor<float>, Tensor<float>>(), 0f, buffer));
     }
+
+    [Fact]
+    public void AForeignSparseTensorOfTheSlotsSize_IsRejected()
+    {
+        // Same type, pattern and non-zero count as the slot's view, but its values live in their own array: only the
+        // storage-identity check can reject it, so a validator that compared NonZeroCount alone would pass it.
+        var pattern = new SparsityLayout(3, 3, new[] { 0, 1, 2 }, new[] { 0, 1, 2 });
+        var buffer = new ParameterBuffer<float>(new[]
+        {
+            new ParameterLayout(new[] { 2, 5 }),
+            new ParameterLayout(new[] { 3, 3 }, pattern),
+        });
+        var views = buffer.CreateAllViews();
+        var foreign = new SparseTensor<float>(3, 3, new[] { 0, 1, 2 }, new[] { 0, 1, 2 }, new[] { 1f, 2f, 3f });
+        Assert.Equal(((SparseTensor<float>)views[1]).NonZeroCount, foreign.NonZeroCount);
+        var impostor = new Tensor<float>[] { views[0], foreign };
+
+        var ex = Assert.Throws<ArgumentException>(
+            () => new TapeStepContext<float>(impostor, new Dictionary<Tensor<float>, Tensor<float>>(), 0f, buffer));
+        Assert.Contains("not a view", ex.Message);
+    }
 }
