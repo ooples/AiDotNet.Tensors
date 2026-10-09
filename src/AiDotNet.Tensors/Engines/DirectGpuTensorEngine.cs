@@ -2629,6 +2629,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             StaleDropDiag($"RELEASE-DEAD len={tensor.Length} caller=" + new System.Diagnostics.StackTrace(1, false).ToString().Replace(System.Environment.NewLine, " <- "));
         var vector = tensor.DataVector;
         if (vector._deviceState is not { Buffer: { } buffer } state) return;
+        if (_actionScratchBuffers.Contains(buffer)) return;   // the per-action scratch pool owns it
         if (!tensor.IsContiguous || tensor._storageOffset != 0 || tensor.Length != vector.Length) return;
         Helpers.HostSync.Release(vector, ReleasedIntermediateMessage);
         if (tensor.GetBackingArrayForCacheLookupUnsafe() is { } array) Helpers.HostSync.Release(array, ReleasedIntermediateMessage);
@@ -5036,6 +5037,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // compiled action (_currentScratchAction >= 0); the pre-pass (EnsureResidentBuffer) and the eager optimizer
     // run with action = -1 → normal alloc, so the cached-once persistent buffers are never pooled.
     private readonly System.Collections.Generic.Dictionary<long, IGpuBuffer> _actionScratchPool = new();
+    // The pool's buffers by identity: a tensor wrapping one (a pooled zero gradient, a pooled reduction) does not own it,
+    // so freeing that tensor's storage early must leave the buffer to the pool, whose captured graphs bake its address.
+    private readonly System.Collections.Generic.HashSet<IGpuBuffer> _actionScratchBuffers = new();
     private int _currentScratchAction = -1;
     private int _currentScratchLocal;
 
@@ -5066,9 +5070,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             else backend.Fill(b, 0f, length);
             return b;
         }
-        if (b is not null) { try { b.Dispose(); } catch { } }
+        if (b is not null) { _actionScratchBuffers.Remove(b); try { b.Dispose(); } catch { } }
         var nb = backend.AllocateBuffer(length);   // first pass at this (action,local): record the stable buffer
         _actionScratchPool[key] = nb;
+        _actionScratchBuffers.Add(nb);
         return nb;
     }
 
@@ -5083,6 +5088,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         foreach (var kv in _actionScratchPool)
             { try { kv.Value?.Dispose(); } catch { } }
         _actionScratchPool.Clear();
+        _actionScratchBuffers.Clear();
         _currentScratchAction = -1;
         _currentScratchLocal = 0;
     }
