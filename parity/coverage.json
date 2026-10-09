@@ -1,6 +1,6 @@
 {
   "torchVersion": "2.11.0",
-  "gapBaseline": 1514,
+  "gapBaseline": 926,
   "entries": {
     "Tensor:abs": {
       "status": "mapped",
@@ -12,8 +12,9 @@
       "source": "name-match"
     },
     "Tensor:absolute": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Abs",
+      "source": "reviewed-alias"
     },
     "Tensor:absolute_": {
       "status": "gap",
@@ -43,8 +44,9 @@
       "source": "name-match"
     },
     "Tensor:add_": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601::AddInPlace",
+      "source": "reviewed-alias"
     },
     "Tensor:addbmm": {
       "status": "gap",
@@ -100,12 +102,14 @@
       "source": "name-match"
     },
     "Tensor:align_as": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-object, storage-pointer, named-tensor or quantized-qtensor accessor without a counterpart in Tensors' managed, unnamed tensor model.",
+      "source": "reviewed"
     },
     "Tensor:align_to": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-object, storage-pointer, named-tensor or quantized-qtensor accessor without a counterpart in Tensors' managed, unnamed tensor model.",
+      "source": "reviewed"
     },
     "Tensor:all": {
       "status": "gap",
@@ -117,8 +121,9 @@
       "source": "name-match"
     },
     "Tensor:amax": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::ReduceMax",
+      "source": "reviewed-alias"
     },
     "Tensor:amin": {
       "status": "gap",
@@ -142,44 +147,50 @@
       "source": "name-match"
     },
     "Tensor:arccos": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Acos",
+      "source": "reviewed-alias"
     },
     "Tensor:arccos_": {
       "status": "gap",
       "source": "name-match"
     },
     "Tensor:arccosh": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Acosh",
+      "source": "reviewed-alias"
     },
     "Tensor:arccosh_": {
       "status": "gap",
       "source": "name-match"
     },
     "Tensor:arcsin": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Asin",
+      "source": "reviewed-alias"
     },
     "Tensor:arcsin_": {
       "status": "gap",
       "source": "name-match"
     },
     "Tensor:arcsinh": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Asinh",
+      "source": "reviewed-alias"
     },
     "Tensor:arcsinh_": {
       "status": "gap",
       "source": "name-match"
     },
     "Tensor:arctan": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Atan",
+      "source": "reviewed-alias"
     },
     "Tensor:arctan2": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorAtan2",
+      "source": "reviewed-alias"
     },
     "Tensor:arctan2_": {
       "status": "gap",
@@ -190,8 +201,9 @@
       "source": "name-match"
     },
     "Tensor:arctanh": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Atanh",
+      "source": "reviewed-alias"
     },
     "Tensor:arctanh_": {
       "status": "gap",
@@ -229,8 +241,9 @@
       "source": "name-match"
     },
     "Tensor:as_subclass": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-object, storage-pointer, named-tensor or quantized-qtensor accessor without a counterpart in Tensors' managed, unnamed tensor model.",
+      "source": "reviewed"
     },
     "Tensor:asin": {
       "status": "mapped",
@@ -355,8 +368,9 @@
       "source": "name-match"
     },
     "Tensor:bmm": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::BatchMatMul",
+      "source": "reviewed-alias"
     },
     "Tensor:bool": {
       "status": "gap",
@@ -384,8 +398,9 @@
       "source": "name-match"
     },
     "Tensor:ceil": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Ceiling",
+      "source": "reviewed-alias"
     },
     "Tensor:ceil_": {
       "status": "gap",
@@ -404,8 +419,9 @@
       "source": "name-match"
     },
     "Tensor:cholesky": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::Cholesky",
+      "source": "reviewed-alias"
     },
     "Tensor:cholesky_inverse": {
       "status": "gap",
@@ -544,8 +560,9 @@
       "source": "name-match"
     },
     "Tensor:cuda": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A vendor-library kernel entry point (cuDNN, MIOpen, oneDNN, FBGEMM) or a device-type cast; Tensors dispatches the same operations through its engines (IEngine / DirectGpu backends), not per-vendor entry points.",
+      "source": "reviewed"
     },
     "Tensor:cummax": {
       "status": "mapped",
@@ -576,8 +593,9 @@
       "source": "name-match"
     },
     "Tensor:data_ptr": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-object, storage-pointer, named-tensor or quantized-qtensor accessor without a counterpart in Tensors' managed, unnamed tensor model.",
+      "source": "reviewed"
     },
     "Tensor:deg2rad": {
       "status": "gap",
@@ -588,16 +606,18 @@
       "source": "name-match"
     },
     "Tensor:dense_dim": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen-internal or dispatcher-level operator (functionalization, layout probing, unchecked variants) that PyTorch does not document for user code.",
+      "source": "reviewed"
     },
     "Tensor:dequantize": {
       "status": "gap",
       "source": "name-match"
     },
     "Tensor:det": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::Det",
+      "source": "reviewed-alias"
     },
     "Tensor:detach": {
       "status": "gap",
@@ -644,24 +664,29 @@
       "source": "name-match"
     },
     "Tensor:dim": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601::Rank",
+      "source": "reviewed-alias"
     },
     "Tensor:dim_order": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-object, storage-pointer, named-tensor or quantized-qtensor accessor without a counterpart in Tensors' managed, unnamed tensor model.",
+      "source": "reviewed"
     },
     "Tensor:dist": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Distance",
+      "source": "reviewed-alias"
     },
     "Tensor:div": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601::Divide",
+      "source": "reviewed-alias"
     },
     "Tensor:div_": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601::DivideInPlace",
+      "source": "reviewed-alias"
     },
     "Tensor:divide": {
       "status": "mapped",
@@ -669,8 +694,9 @@
       "source": "name-match"
     },
     "Tensor:divide_": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601::DivideInPlace",
+      "source": "reviewed-alias"
     },
     "Tensor:dot": {
       "status": "mapped",
@@ -687,12 +713,14 @@
       "source": "name-match"
     },
     "Tensor:eig": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::Eig",
+      "source": "reviewed-alias"
     },
     "Tensor:element_size": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-object, storage-pointer, named-tensor or quantized-qtensor accessor without a counterpart in Tensors' managed, unnamed tensor model.",
+      "source": "reviewed"
     },
     "Tensor:eq": {
       "status": "mapped",
@@ -753,8 +781,9 @@
       "source": "name-match"
     },
     "Tensor:expand": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601::ExpandTo",
+      "source": "reviewed-alias"
     },
     "Tensor:expand_as": {
       "status": "mapped",
@@ -783,8 +812,9 @@
       "source": "name-match"
     },
     "Tensor:fix": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Truncate",
+      "source": "reviewed-alias"
     },
     "Tensor:fix_": {
       "status": "gap",
@@ -901,8 +931,9 @@
       "source": "name-match"
     },
     "Tensor:ger": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorOuter",
+      "source": "reviewed-alias"
     },
     "Tensor:get_device": {
       "status": "mapped",
@@ -910,8 +941,9 @@
       "source": "name-match"
     },
     "Tensor:greater": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorGreaterThan",
+      "source": "reviewed-alias"
     },
     "Tensor:greater_": {
       "status": "gap",
@@ -926,8 +958,9 @@
       "source": "name-match"
     },
     "Tensor:gt": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorGreaterThan",
+      "source": "reviewed-alias"
     },
     "Tensor:gt_": {
       "status": "gap",
@@ -942,12 +975,14 @@
       "source": "name-match"
     },
     "Tensor:has_names": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-object, storage-pointer, named-tensor or quantized-qtensor accessor without a counterpart in Tensors' managed, unnamed tensor model.",
+      "source": "reviewed"
     },
     "Tensor:hash_tensor": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-runtime or interop helper (numpy/buffer/file conversion, Python isinstance checks, global Python state) with no counterpart in a typed .NET API.",
+      "source": "reviewed"
     },
     "Tensor:heaviside": {
       "status": "gap",
@@ -1073,20 +1108,24 @@
       "source": "name-match"
     },
     "Tensor:int_repr": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-object, storage-pointer, named-tensor or quantized-qtensor accessor without a counterpart in Tensors' managed, unnamed tensor model.",
+      "source": "reviewed"
     },
     "Tensor:inverse": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::Inv",
+      "source": "reviewed-alias"
     },
     "Tensor:ipu": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A vendor-library kernel entry point (cuDNN, MIOpen, oneDNN, FBGEMM) or a device-type cast; Tensors dispatches the same operations through its engines (IEngine / DirectGpu backends), not per-vendor entry points.",
+      "source": "reviewed"
     },
     "Tensor:is_coalesced": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen-internal or dispatcher-level operator (functionalization, layout probing, unchecked variants) that PyTorch does not document for user code.",
+      "source": "reviewed"
     },
     "Tensor:is_complex": {
       "status": "gap",
@@ -1102,16 +1141,18 @@
       "source": "name-match"
     },
     "Tensor:is_distributed": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-runtime or interop helper (numpy/buffer/file conversion, Python isinstance checks, global Python state) with no counterpart in a typed .NET API.",
+      "source": "reviewed"
     },
     "Tensor:is_floating_point": {
       "status": "gap",
       "source": "name-match"
     },
     "Tensor:is_inference": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-runtime or interop helper (numpy/buffer/file conversion, Python isinstance checks, global Python state) with no counterpart in a typed .NET API.",
+      "source": "reviewed"
     },
     "Tensor:is_neg": {
       "status": "gap",
@@ -1122,20 +1163,23 @@
       "source": "name-match"
     },
     "Tensor:is_pinned": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-object, storage-pointer, named-tensor or quantized-qtensor accessor without a counterpart in Tensors' managed, unnamed tensor model.",
+      "source": "reviewed"
     },
     "Tensor:is_same_size": {
       "status": "gap",
       "source": "name-match"
     },
     "Tensor:is_set_to": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-object, storage-pointer, named-tensor or quantized-qtensor accessor without a counterpart in Tensors' managed, unnamed tensor model.",
+      "source": "reviewed"
     },
     "Tensor:is_shared": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-object, storage-pointer, named-tensor or quantized-qtensor accessor without a counterpart in Tensors' managed, unnamed tensor model.",
+      "source": "reviewed"
     },
     "Tensor:is_signed": {
       "status": "gap",
@@ -1228,8 +1272,9 @@
       "source": "name-match"
     },
     "Tensor:less": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorLessThan",
+      "source": "reviewed-alias"
     },
     "Tensor:less_": {
       "status": "gap",
@@ -1370,24 +1415,28 @@
       "source": "name-match"
     },
     "Tensor:lstsq": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::Lstsq",
+      "source": "reviewed-alias"
     },
     "Tensor:lt": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorLessThan",
+      "source": "reviewed-alias"
     },
     "Tensor:lt_": {
       "status": "gap",
       "source": "name-match"
     },
     "Tensor:lu": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::LU",
+      "source": "reviewed-alias"
     },
     "Tensor:lu_solve": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::LuSolve",
+      "source": "reviewed-alias"
     },
     "Tensor:map2_": {
       "status": "gap",
@@ -1426,12 +1475,14 @@
       "source": "name-match"
     },
     "Tensor:matrix_exp": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::MatrixExp",
+      "source": "reviewed-alias"
     },
     "Tensor:matrix_power": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::MatrixPower",
+      "source": "reviewed-alias"
     },
     "Tensor:max": {
       "status": "mapped",
@@ -1462,8 +1513,9 @@
       "source": "name-match"
     },
     "Tensor:mm": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601::MatrixMultiply",
+      "source": "reviewed-alias"
     },
     "Tensor:mode": {
       "status": "mapped",
@@ -1471,12 +1523,14 @@
       "source": "name-match"
     },
     "Tensor:module_load": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-object, storage-pointer, named-tensor or quantized-qtensor accessor without a counterpart in Tensors' managed, unnamed tensor model.",
+      "source": "reviewed"
     },
     "Tensor:moveaxis": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorMoveDim",
+      "source": "reviewed-alias"
     },
     "Tensor:movedim": {
       "status": "mapped",
@@ -1488,16 +1542,19 @@
       "source": "name-match"
     },
     "Tensor:mtia": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A vendor-library kernel entry point (cuDNN, MIOpen, oneDNN, FBGEMM) or a device-type cast; Tensors dispatches the same operations through its engines (IEngine / DirectGpu backends), not per-vendor entry points.",
+      "source": "reviewed"
     },
     "Tensor:mul": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601::Multiply",
+      "source": "reviewed-alias"
     },
     "Tensor:mul_": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601::MultiplyInPlace",
+      "source": "reviewed-alias"
     },
     "Tensor:multinomial": {
       "status": "gap",
@@ -1509,12 +1566,14 @@
       "source": "name-match"
     },
     "Tensor:multiply_": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601::MultiplyInPlace",
+      "source": "reviewed-alias"
     },
     "Tensor:mv": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::MatrixVectorMultiply",
+      "source": "reviewed-alias"
     },
     "Tensor:mvlgamma": {
       "status": "gap",
@@ -1556,44 +1615,51 @@
       "source": "name-match"
     },
     "Tensor:narrow_copy": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A functionalization view-copy variant used by torch.compile; in Tensors the view op followed by Contiguous() gives the same result.",
+      "source": "reviewed"
     },
     "Tensor:ndimension": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601::Rank",
+      "source": "reviewed-alias"
     },
     "Tensor:ne": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorNotEquals",
+      "source": "reviewed-alias"
     },
     "Tensor:ne_": {
       "status": "gap",
       "source": "name-match"
     },
     "Tensor:neg": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Negate",
+      "source": "reviewed-alias"
     },
     "Tensor:neg_": {
       "status": "gap",
       "source": "name-match"
     },
     "Tensor:negative": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Negate",
+      "source": "reviewed-alias"
     },
     "Tensor:negative_": {
       "status": "gap",
       "source": "name-match"
     },
     "Tensor:nelement": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601::Length",
+      "source": "reviewed-alias"
     },
     "Tensor:new": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-object, storage-pointer, named-tensor or quantized-qtensor accessor without a counterpart in Tensors' managed, unnamed tensor model.",
+      "source": "reviewed"
     },
     "Tensor:new_empty": {
       "status": "gap",
@@ -1612,8 +1678,9 @@
       "source": "name-match"
     },
     "Tensor:new_tensor": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601",
+      "source": "reviewed-alias"
     },
     "Tensor:new_zeros": {
       "status": "gap",
@@ -1655,12 +1722,14 @@
       "source": "name-match"
     },
     "Tensor:numel": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601::Length",
+      "source": "reviewed-alias"
     },
     "Tensor:numpy": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-runtime or interop helper (numpy/buffer/file conversion, Python isinstance checks, global Python state) with no counterpart in a typed .NET API.",
+      "source": "reviewed"
     },
     "Tensor:orgqr": {
       "status": "gap",
@@ -1681,12 +1750,14 @@
       "source": "name-match"
     },
     "Tensor:pin_memory": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-object, storage-pointer, named-tensor or quantized-qtensor accessor without a counterpart in Tensors' managed, unnamed tensor model.",
+      "source": "reviewed"
     },
     "Tensor:pinverse": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::Pinv",
+      "source": "reviewed-alias"
     },
     "Tensor:polygamma": {
       "status": "mapped",
@@ -1716,8 +1787,9 @@
       "source": "name-match"
     },
     "Tensor:prod": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Product",
+      "source": "reviewed-alias"
     },
     "Tensor:put": {
       "status": "mapped",
@@ -1729,32 +1801,39 @@
       "source": "name-match"
     },
     "Tensor:q_per_channel_axis": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-object, storage-pointer, named-tensor or quantized-qtensor accessor without a counterpart in Tensors' managed, unnamed tensor model.",
+      "source": "reviewed"
     },
     "Tensor:q_per_channel_scales": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-object, storage-pointer, named-tensor or quantized-qtensor accessor without a counterpart in Tensors' managed, unnamed tensor model.",
+      "source": "reviewed"
     },
     "Tensor:q_per_channel_zero_points": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-object, storage-pointer, named-tensor or quantized-qtensor accessor without a counterpart in Tensors' managed, unnamed tensor model.",
+      "source": "reviewed"
     },
     "Tensor:q_scale": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-object, storage-pointer, named-tensor or quantized-qtensor accessor without a counterpart in Tensors' managed, unnamed tensor model.",
+      "source": "reviewed"
     },
     "Tensor:q_zero_point": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-object, storage-pointer, named-tensor or quantized-qtensor accessor without a counterpart in Tensors' managed, unnamed tensor model.",
+      "source": "reviewed"
     },
     "Tensor:qr": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::QR",
+      "source": "reviewed-alias"
     },
     "Tensor:qscheme": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-object, storage-pointer, named-tensor or quantized-qtensor accessor without a counterpart in Tensors' managed, unnamed tensor model.",
+      "source": "reviewed"
     },
     "Tensor:quantile": {
       "status": "gap",
@@ -1773,8 +1852,9 @@
       "source": "name-match"
     },
     "Tensor:ravel": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorFlatten",
+      "source": "reviewed-alias"
     },
     "Tensor:reciprocal": {
       "status": "mapped",
@@ -1786,12 +1866,14 @@
       "source": "name-match"
     },
     "Tensor:record_stream": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A vendor-library kernel entry point (cuDNN, MIOpen, oneDNN, FBGEMM) or a device-type cast; Tensors dispatches the same operations through its engines (IEngine / DirectGpu backends), not per-vendor entry points.",
+      "source": "reviewed"
     },
     "Tensor:refine_names": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-object, storage-pointer, named-tensor or quantized-qtensor accessor without a counterpart in Tensors' managed, unnamed tensor model.",
+      "source": "reviewed"
     },
     "Tensor:register_hook": {
       "status": "gap",
@@ -1802,8 +1884,9 @@
       "source": "name-match"
     },
     "Tensor:reinforce": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-object, storage-pointer, named-tensor or quantized-qtensor accessor without a counterpart in Tensors' managed, unnamed tensor model.",
+      "source": "reviewed"
     },
     "Tensor:relu": {
       "status": "mapped",
@@ -1811,8 +1894,9 @@
       "source": "name-match"
     },
     "Tensor:relu_": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::ReLUInPlace",
+      "source": "reviewed-alias"
     },
     "Tensor:remainder": {
       "status": "mapped",
@@ -1824,8 +1908,9 @@
       "source": "name-match"
     },
     "Tensor:rename": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-object, storage-pointer, named-tensor or quantized-qtensor accessor without a counterpart in Tensors' managed, unnamed tensor model.",
+      "source": "reviewed"
     },
     "Tensor:rename_": {
       "status": "gap",
@@ -1840,8 +1925,9 @@
       "source": "name-match"
     },
     "Tensor:repeat": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorTile",
+      "source": "reviewed-alias"
     },
     "Tensor:repeat_interleave": {
       "status": "mapped",
@@ -1862,16 +1948,18 @@
       "source": "name-match"
     },
     "Tensor:resize": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen-internal or dispatcher-level operator (functionalization, layout probing, unchecked variants) that PyTorch does not document for user code.",
+      "source": "reviewed"
     },
     "Tensor:resize_": {
       "status": "gap",
       "source": "name-match"
     },
     "Tensor:resize_as": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen-internal or dispatcher-level operator (functionalization, layout probing, unchecked variants) that PyTorch does not document for user code.",
+      "source": "reviewed"
     },
     "Tensor:resize_as_": {
       "status": "gap",
@@ -1917,8 +2005,9 @@
       "source": "name-match"
     },
     "Tensor:rsqrt": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::ReciprocalSqrt",
+      "source": "reviewed-alias"
     },
     "Tensor:rsqrt_": {
       "status": "gap",
@@ -1965,8 +2054,9 @@
       "source": "name-match"
     },
     "Tensor:sgn": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Sign",
+      "source": "reviewed-alias"
     },
     "Tensor:sgn_": {
       "status": "gap",
@@ -1986,8 +2076,9 @@
       "source": "name-match"
     },
     "Tensor:sigmoid_": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::SigmoidInPlace",
+      "source": "reviewed-alias"
     },
     "Tensor:sign": {
       "status": "mapped",
@@ -2029,8 +2120,9 @@
       "source": "name-match"
     },
     "Tensor:size": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601::Shape",
+      "source": "reviewed-alias"
     },
     "Tensor:slice_inverse": {
       "status": "gap",
@@ -2042,8 +2134,9 @@
       "source": "name-match"
     },
     "Tensor:slogdet": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::SlogDet",
+      "source": "reviewed-alias"
     },
     "Tensor:smm": {
       "status": "gap",
@@ -2055,8 +2148,9 @@
       "source": "name-match"
     },
     "Tensor:solve": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::Solve",
+      "source": "reviewed-alias"
     },
     "Tensor:sort": {
       "status": "mapped",
@@ -2064,8 +2158,9 @@
       "source": "name-match"
     },
     "Tensor:sparse_dim": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen-internal or dispatcher-level operator (functionalization, layout probing, unchecked variants) that PyTorch does not document for user code.",
+      "source": "reviewed"
     },
     "Tensor:sparse_mask": {
       "status": "gap",
@@ -2130,28 +2225,33 @@
       "source": "name-match"
     },
     "Tensor:storage": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-object, storage-pointer, named-tensor or quantized-qtensor accessor without a counterpart in Tensors' managed, unnamed tensor model.",
+      "source": "reviewed"
     },
     "Tensor:storage_offset": {
       "status": "gap",
       "source": "name-match"
     },
     "Tensor:storage_type": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-object, storage-pointer, named-tensor or quantized-qtensor accessor without a counterpart in Tensors' managed, unnamed tensor model.",
+      "source": "reviewed"
     },
     "Tensor:stride": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601::Strides",
+      "source": "reviewed-alias"
     },
     "Tensor:sub": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601::Subtract",
+      "source": "reviewed-alias"
     },
     "Tensor:sub_": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601::SubtractInPlace",
+      "source": "reviewed-alias"
     },
     "Tensor:subtract": {
       "status": "mapped",
@@ -2159,8 +2259,9 @@
       "source": "name-match"
     },
     "Tensor:subtract_": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601::SubtractInPlace",
+      "source": "reviewed-alias"
     },
     "Tensor:sum": {
       "status": "mapped",
@@ -2172,8 +2273,9 @@
       "source": "name-match"
     },
     "Tensor:svd": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::Svd",
+      "source": "reviewed-alias"
     },
     "Tensor:swapaxes": {
       "status": "mapped",
@@ -2185,8 +2287,9 @@
       "source": "name-match"
     },
     "Tensor:swapdims": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorSwapAxes",
+      "source": "reviewed-alias"
     },
     "Tensor:swapdims_": {
       "status": "gap",
@@ -2197,8 +2300,9 @@
       "source": "name-match"
     },
     "Tensor:t": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601::TransposeLast2D",
+      "source": "reviewed-alias"
     },
     "Tensor:t_": {
       "status": "gap",
@@ -2229,8 +2333,9 @@
       "source": "name-match"
     },
     "Tensor:tanh_": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TanhInPlace",
+      "source": "reviewed-alias"
     },
     "Tensor:tensor_split": {
       "status": "mapped",
@@ -2252,8 +2357,9 @@
       "source": "name-match"
     },
     "Tensor:to_mkldnn": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A vendor-library kernel entry point (cuDNN, MIOpen, oneDNN, FBGEMM) or a device-type cast; Tensors dispatches the same operations through its engines (IEngine / DirectGpu backends), not per-vendor entry points.",
+      "source": "reviewed"
     },
     "Tensor:to_padded_tensor": {
       "status": "gap",
@@ -2284,8 +2390,9 @@
       "source": "name-match"
     },
     "Tensor:tolist": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-runtime or interop helper (numpy/buffer/file conversion, Python isinstance checks, global Python state) with no counterpart in a typed .NET API.",
+      "source": "reviewed"
     },
     "Tensor:topk": {
       "status": "mapped",
@@ -2329,32 +2436,37 @@
       "source": "name-match"
     },
     "Tensor:true_divide": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601::Divide",
+      "source": "reviewed-alias"
     },
     "Tensor:true_divide_": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601::DivideInPlace",
+      "source": "reviewed-alias"
     },
     "Tensor:trunc": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Truncate",
+      "source": "reviewed-alias"
     },
     "Tensor:trunc_": {
       "status": "gap",
       "source": "name-match"
     },
     "Tensor:type": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-runtime or interop helper (numpy/buffer/file conversion, Python isinstance checks, global Python state) with no counterpart in a typed .NET API.",
+      "source": "reviewed"
     },
     "Tensor:type_as": {
       "status": "gap",
       "source": "name-match"
     },
     "Tensor:unbind": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorUnstack",
+      "source": "reviewed-alias"
     },
     "Tensor:unflatten": {
       "status": "gap",
@@ -2380,16 +2492,19 @@
       "source": "name-match"
     },
     "Tensor:unsafe_chunk": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen-internal or dispatcher-level operator (functionalization, layout probing, unchecked variants) that PyTorch does not document for user code.",
+      "source": "reviewed"
     },
     "Tensor:unsafe_split": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen-internal or dispatcher-level operator (functionalization, layout probing, unchecked variants) that PyTorch does not document for user code.",
+      "source": "reviewed"
     },
     "Tensor:unsafe_split_with_sizes": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen-internal or dispatcher-level operator (functionalization, layout probing, unchecked variants) that PyTorch does not document for user code.",
+      "source": "reviewed"
     },
     "Tensor:unsqueeze": {
       "status": "mapped",
@@ -2401,8 +2516,9 @@
       "source": "name-match"
     },
     "Tensor:untyped_storage": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-object, storage-pointer, named-tensor or quantized-qtensor accessor without a counterpart in Tensors' managed, unnamed tensor model.",
+      "source": "reviewed"
     },
     "Tensor:values": {
       "status": "gap",
@@ -2418,8 +2534,9 @@
       "source": "name-match"
     },
     "Tensor:view": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601::Reshape",
+      "source": "reviewed-alias"
     },
     "Tensor:view_as": {
       "status": "gap",
@@ -2445,8 +2562,9 @@
       "source": "name-match"
     },
     "Tensor:xpu": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A vendor-library kernel entry point (cuDNN, MIOpen, oneDNN, FBGEMM) or a device-type cast; Tensors dispatches the same operations through its engines (IEngine / DirectGpu backends), not per-vendor entry points.",
+      "source": "reviewed"
     },
     "Tensor:zero_": {
       "status": "gap",
@@ -2462,8 +2580,9 @@
       "source": "name-match"
     },
     "aten:absolute": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Abs",
+      "source": "reviewed-alias"
     },
     "aten:absolute_": {
       "status": "gap",
@@ -2493,16 +2612,18 @@
       "source": "name-match"
     },
     "aten:adaptive_max_pool2d_backward": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen backward/forward kernel split; Tensors computes these through the GradientTape of the forward op rather than exposing the kernels.",
+      "source": "reviewed"
     },
     "aten:adaptive_max_pool3d": {
       "status": "gap",
       "source": "name-match"
     },
     "aten:adaptive_max_pool3d_backward": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen backward/forward kernel split; Tensors computes these through the GradientTape of the forward op rather than exposing the kernels.",
+      "source": "reviewed"
     },
     "aten:add": {
       "status": "mapped",
@@ -2510,8 +2631,9 @@
       "source": "name-match"
     },
     "aten:add_": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorAddInPlace",
+      "source": "reviewed-alias"
     },
     "aten:addbmm": {
       "status": "gap",
@@ -2563,12 +2685,14 @@
       "source": "name-match"
     },
     "aten:alias": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen-internal or dispatcher-level operator (functionalization, layout probing, unchecked variants) that PyTorch does not document for user code.",
+      "source": "reviewed"
     },
     "aten:alias_copy": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen-internal or dispatcher-level operator (functionalization, layout probing, unchecked variants) that PyTorch does not document for user code.",
+      "source": "reviewed"
     },
     "aten:all": {
       "status": "gap",
@@ -2579,8 +2703,9 @@
       "source": "name-match"
     },
     "aten:amax": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::ReduceMax",
+      "source": "reviewed-alias"
     },
     "aten:amin": {
       "status": "gap",
@@ -2604,44 +2729,50 @@
       "source": "name-match"
     },
     "aten:arccos": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Acos",
+      "source": "reviewed-alias"
     },
     "aten:arccos_": {
       "status": "gap",
       "source": "name-match"
     },
     "aten:arccosh": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Acosh",
+      "source": "reviewed-alias"
     },
     "aten:arccosh_": {
       "status": "gap",
       "source": "name-match"
     },
     "aten:arcsin": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Asin",
+      "source": "reviewed-alias"
     },
     "aten:arcsin_": {
       "status": "gap",
       "source": "name-match"
     },
     "aten:arcsinh": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Asinh",
+      "source": "reviewed-alias"
     },
     "aten:arcsinh_": {
       "status": "gap",
       "source": "name-match"
     },
     "aten:arctan": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Atan",
+      "source": "reviewed-alias"
     },
     "aten:arctan2": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorAtan2",
+      "source": "reviewed-alias"
     },
     "aten:arctan2_": {
       "status": "gap",
@@ -2652,8 +2783,9 @@
       "source": "name-match"
     },
     "aten:arctanh": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Atanh",
+      "source": "reviewed-alias"
     },
     "aten:arctanh_": {
       "status": "gap",
@@ -2678,8 +2810,9 @@
       "source": "name-match"
     },
     "aten:as_strided_copy": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A functionalization view-copy variant used by torch.compile; in Tensors the view op followed by Contiguous() gives the same result.",
+      "source": "reviewed"
     },
     "aten:as_strided_scatter": {
       "status": "gap",
@@ -2844,8 +2977,9 @@
       "source": "name-match"
     },
     "aten:bmm": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::BatchMatMul",
+      "source": "reviewed-alias"
     },
     "aten:broadcast_tensors": {
       "status": "mapped",
@@ -2858,8 +2992,9 @@
       "source": "name-match"
     },
     "aten:cat": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Concat",
+      "source": "reviewed-alias"
     },
     "aten:cauchy": {
       "status": "gap",
@@ -2870,8 +3005,9 @@
       "source": "name-match"
     },
     "aten:ceil": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Ceiling",
+      "source": "reviewed-alias"
     },
     "aten:ceil_": {
       "status": "gap",
@@ -2890,8 +3026,9 @@
       "source": "name-match"
     },
     "aten:cholesky": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::Cholesky",
+      "source": "reviewed-alias"
     },
     "aten:cholesky_inverse": {
       "status": "gap",
@@ -2976,8 +3113,9 @@
       "source": "name-match"
     },
     "aten:convolution_backward": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen backward/forward kernel split; Tensors computes these through the GradientTape of the forward op rather than exposing the kernels.",
+      "source": "reviewed"
     },
     "aten:copy": {
       "status": "mapped",
@@ -3021,12 +3159,14 @@
       "source": "name-match"
     },
     "aten:cudnn_batch_norm": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A vendor-library kernel entry point (cuDNN, MIOpen, oneDNN, FBGEMM) or a device-type cast; Tensors dispatches the same operations through its engines (IEngine / DirectGpu backends), not per-vendor entry points.",
+      "source": "reviewed"
     },
     "aten:cudnn_batch_norm_backward": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A vendor-library kernel entry point (cuDNN, MIOpen, oneDNN, FBGEMM) or a device-type cast; Tensors dispatches the same operations through its engines (IEngine / DirectGpu backends), not per-vendor entry points.",
+      "source": "reviewed"
     },
     "aten:cummax": {
       "status": "mapped",
@@ -3065,8 +3205,9 @@
       "source": "name-match"
     },
     "aten:dense_dim": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen-internal or dispatcher-level operator (functionalization, layout probing, unchecked variants) that PyTorch does not document for user code.",
+      "source": "reviewed"
     },
     "aten:detach": {
       "status": "gap",
@@ -3088,12 +3229,14 @@
       "source": "name-match"
     },
     "aten:diagonal_backward": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen backward/forward kernel split; Tensors computes these through the GradientTape of the forward op rather than exposing the kernels.",
+      "source": "reviewed"
     },
     "aten:diagonal_copy": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A functionalization view-copy variant used by torch.compile; in Tensors the view op followed by Contiguous() gives the same result.",
+      "source": "reviewed"
     },
     "aten:diagonal_scatter": {
       "status": "gap",
@@ -3109,20 +3252,24 @@
       "source": "name-match"
     },
     "aten:dim": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601::Rank",
+      "source": "reviewed-alias"
     },
     "aten:dist": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Distance",
+      "source": "reviewed-alias"
     },
     "aten:div": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Divide",
+      "source": "reviewed-alias"
     },
     "aten:div_": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601::DivideInPlace",
+      "source": "reviewed-alias"
     },
     "aten:divide": {
       "status": "mapped",
@@ -3130,8 +3277,9 @@
       "source": "name-match"
     },
     "aten:divide_": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601::DivideInPlace",
+      "source": "reviewed-alias"
     },
     "aten:dot": {
       "status": "mapped",
@@ -3163,8 +3311,9 @@
       "source": "name-match"
     },
     "aten:embedding_dense_backward": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen backward/forward kernel split; Tensors computes these through the GradientTape of the forward op rather than exposing the kernels.",
+      "source": "reviewed"
     },
     "aten:empty": {
       "status": "mapped",
@@ -3176,8 +3325,9 @@
       "source": "name-match"
     },
     "aten:empty_permuted": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen-internal or dispatcher-level operator (functionalization, layout probing, unchecked variants) that PyTorch does not document for user code.",
+      "source": "reviewed"
     },
     "aten:empty_strided": {
       "status": "gap",
@@ -3237,12 +3387,14 @@
       "source": "name-match"
     },
     "aten:expand": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601::ExpandTo",
+      "source": "reviewed-alias"
     },
     "aten:expand_copy": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A functionalization view-copy variant used by torch.compile; in Tensors the view op followed by Contiguous() gives the same result.",
+      "source": "reviewed"
     },
     "aten:expm1": {
       "status": "mapped",
@@ -3267,84 +3419,104 @@
       "source": "name-match"
     },
     "aten:fft_fft": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::FFT",
+      "source": "reviewed-alias"
     },
     "aten:fft_fft2": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Fft.Fft::Fft2",
+      "source": "reviewed-alias"
     },
     "aten:fft_fftn": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Fft.Fft::FftN",
+      "source": "reviewed-alias"
     },
     "aten:fft_fftshift": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Fft.Fft::FftShift",
+      "source": "reviewed-alias"
     },
     "aten:fft_hfft": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Fft.Fft::HFft",
+      "source": "reviewed-alias"
     },
     "aten:fft_hfft2": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Fft.Fft::HFft2",
+      "source": "reviewed-alias"
     },
     "aten:fft_hfftn": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Fft.Fft::HFftN",
+      "source": "reviewed-alias"
     },
     "aten:fft_ifft": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::IFFT",
+      "source": "reviewed-alias"
     },
     "aten:fft_ifft2": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Fft.Fft::IFft2",
+      "source": "reviewed-alias"
     },
     "aten:fft_ifftn": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Fft.Fft::IFftN",
+      "source": "reviewed-alias"
     },
     "aten:fft_ifftshift": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Fft.Fft::IFftShift",
+      "source": "reviewed-alias"
     },
     "aten:fft_ihfft": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Fft.Fft::IHFft",
+      "source": "reviewed-alias"
     },
     "aten:fft_ihfft2": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Fft.Fft::IHFft2",
+      "source": "reviewed-alias"
     },
     "aten:fft_ihfftn": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Fft.Fft::IHFftN",
+      "source": "reviewed-alias"
     },
     "aten:fft_irfft": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::IRFFT",
+      "source": "reviewed-alias"
     },
     "aten:fft_irfft2": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Fft.Fft::IRFft2",
+      "source": "reviewed-alias"
     },
     "aten:fft_irfftn": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Fft.Fft::IRFftN",
+      "source": "reviewed-alias"
     },
     "aten:fft_rfft": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::RFFT",
+      "source": "reviewed-alias"
     },
     "aten:fft_rfft2": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Fft.Fft::RFft2",
+      "source": "reviewed-alias"
     },
     "aten:fft_rfftn": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Fft.Fft::RFftN",
+      "source": "reviewed-alias"
     },
     "aten:fill": {
       "status": "mapped",
@@ -3356,8 +3528,9 @@
       "source": "name-match"
     },
     "aten:fix": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Truncate",
+      "source": "reviewed-alias"
     },
     "aten:fix_": {
       "status": "gap",
@@ -3425,8 +3598,9 @@
       "source": "name-match"
     },
     "aten:full": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601::CreateDefault",
+      "source": "reviewed-alias"
     },
     "aten:full_like": {
       "status": "gap",
@@ -3459,8 +3633,9 @@
       "source": "name-match"
     },
     "aten:gelu_": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::GELUInPlace",
+      "source": "reviewed-alias"
     },
     "aten:gelu_backward": {
       "status": "mapped",
@@ -3486,8 +3661,9 @@
       "source": "name-match"
     },
     "aten:greater": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorGreaterThan",
+      "source": "reviewed-alias"
     },
     "aten:greater_": {
       "status": "gap",
@@ -3506,24 +3682,27 @@
       "source": "name-match"
     },
     "aten:grid_sampler_2d_backward": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen backward/forward kernel split; Tensors computes these through the GradientTape of the forward op rather than exposing the kernels.",
+      "source": "reviewed"
     },
     "aten:grid_sampler_3d": {
       "status": "gap",
       "source": "name-match"
     },
     "aten:grid_sampler_3d_backward": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen backward/forward kernel split; Tensors computes these through the GradientTape of the forward op rather than exposing the kernels.",
+      "source": "reviewed"
     },
     "aten:gru": {
       "status": "gap",
       "source": "name-match"
     },
     "aten:gt": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorGreaterThan",
+      "source": "reviewed-alias"
     },
     "aten:gt_": {
       "status": "gap",
@@ -3571,8 +3750,9 @@
       "source": "name-match"
     },
     "aten:hardtanh_backward": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen backward/forward kernel split; Tensors computes these through the GradientTape of the forward op rather than exposing the kernels.",
+      "source": "reviewed"
     },
     "aten:heaviside": {
       "status": "gap",
@@ -3598,8 +3778,9 @@
       "source": "name-match"
     },
     "aten:huber_loss_backward": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen backward/forward kernel split; Tensors computes these through the GradientTape of the forward op rather than exposing the kernels.",
+      "source": "reviewed"
     },
     "aten:hypot": {
       "status": "mapped",
@@ -3697,8 +3878,9 @@
       "source": "name-match"
     },
     "aten:is_coalesced": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen-internal or dispatcher-level operator (functionalization, layout probing, unchecked variants) that PyTorch does not document for user code.",
+      "source": "reviewed"
     },
     "aten:is_complex": {
       "status": "gap",
@@ -3710,20 +3892,23 @@
       "source": "name-match"
     },
     "aten:is_non_overlapping_and_dense": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen-internal or dispatcher-level operator (functionalization, layout probing, unchecked variants) that PyTorch does not document for user code.",
+      "source": "reviewed"
     },
     "aten:is_pinned": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-object, storage-pointer, named-tensor or quantized-qtensor accessor without a counterpart in Tensors' managed, unnamed tensor model.",
+      "source": "reviewed"
     },
     "aten:is_same_size": {
       "status": "gap",
       "source": "name-match"
     },
     "aten:is_strides_like_format": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen-internal or dispatcher-level operator (functionalization, layout probing, unchecked variants) that PyTorch does not document for user code.",
+      "source": "reviewed"
     },
     "aten:isfinite": {
       "status": "mapped",
@@ -3799,8 +3984,9 @@
       "source": "name-match"
     },
     "aten:leaky_relu_": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::LeakyReLUInPlace",
+      "source": "reviewed-alias"
     },
     "aten:leaky_relu_backward": {
       "status": "mapped",
@@ -3817,8 +4003,9 @@
       "source": "name-match"
     },
     "aten:less": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorLessThan",
+      "source": "reviewed-alias"
     },
     "aten:less_": {
       "status": "gap",
@@ -3842,84 +4029,102 @@
       "source": "name-match"
     },
     "aten:lift": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen-internal or dispatcher-level operator (functionalization, layout probing, unchecked variants) that PyTorch does not document for user code.",
+      "source": "reviewed"
     },
     "aten:lift_fresh": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen-internal or dispatcher-level operator (functionalization, layout probing, unchecked variants) that PyTorch does not document for user code.",
+      "source": "reviewed"
     },
     "aten:lift_fresh_copy": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen-internal or dispatcher-level operator (functionalization, layout probing, unchecked variants) that PyTorch does not document for user code.",
+      "source": "reviewed"
     },
     "aten:linalg_cholesky_ex": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::CholeskyEx",
+      "source": "reviewed-alias"
     },
     "aten:linalg_cross": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorCross",
+      "source": "reviewed-alias"
     },
     "aten:linalg_eig": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::Eig",
+      "source": "reviewed-alias"
     },
     "aten:linalg_eigvals": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::Eigvals",
+      "source": "reviewed-alias"
     },
     "aten:linalg_householder_product": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::HouseholderProduct",
+      "source": "reviewed-alias"
     },
     "aten:linalg_inv_ex": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::InvEx",
+      "source": "reviewed-alias"
     },
     "aten:linalg_ldl_factor_ex": {
       "status": "gap",
       "source": "name-match"
     },
     "aten:linalg_ldl_solve": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::LdlSolve",
+      "source": "reviewed-alias"
     },
     "aten:linalg_lu": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::LU",
+      "source": "reviewed-alias"
     },
     "aten:linalg_lu_factor_ex": {
       "status": "gap",
       "source": "name-match"
     },
     "aten:linalg_lu_solve": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::LuSolve",
+      "source": "reviewed-alias"
     },
     "aten:linalg_matrix_exp": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::MatrixExp",
+      "source": "reviewed-alias"
     },
     "aten:linalg_qr": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::QR",
+      "source": "reviewed-alias"
     },
     "aten:linalg_solve_triangular": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::SolveTriangular",
+      "source": "reviewed-alias"
     },
     "aten:linalg_vector_norm": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::VectorNorm",
+      "source": "reviewed-alias"
     },
     "aten:linear": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::FusedLinear",
+      "source": "reviewed-alias"
     },
     "aten:linear_backward": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::FusedLinearBackward",
+      "source": "reviewed-alias"
     },
     "aten:linspace": {
       "status": "mapped",
@@ -3971,12 +4176,14 @@
       "source": "name-match"
     },
     "aten:log_sigmoid_backward": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen backward/forward kernel split; Tensors computes these through the GradientTape of the forward op rather than exposing the kernels.",
+      "source": "reviewed"
     },
     "aten:log_sigmoid_forward": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen backward/forward kernel split; Tensors computes these through the GradientTape of the forward op rather than exposing the kernels.",
+      "source": "reviewed"
     },
     "aten:logaddexp": {
       "status": "mapped",
@@ -4038,8 +4245,9 @@
       "source": "name-match"
     },
     "aten:logit_backward": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen backward/forward kernel split; Tensors computes these through the GradientTape of the forward op rather than exposing the kernels.",
+      "source": "reviewed"
     },
     "aten:logspace": {
       "status": "gap",
@@ -4051,12 +4259,14 @@
       "source": "name-match"
     },
     "aten:lstm": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::LstmSequenceForward",
+      "source": "reviewed-alias"
     },
     "aten:lt": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorLessThan",
+      "source": "reviewed-alias"
     },
     "aten:lt_": {
       "status": "gap",
@@ -4090,8 +4300,9 @@
       "source": "name-match"
     },
     "aten:masked_scatter_backward": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen backward/forward kernel split; Tensors computes these through the GradientTape of the forward op rather than exposing the kernels.",
+      "source": "reviewed"
     },
     "aten:masked_select": {
       "status": "mapped",
@@ -4114,8 +4325,9 @@
       "source": "name-match"
     },
     "aten:max_pool2d_with_indices_backward": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen backward/forward kernel split; Tensors computes these through the GradientTape of the forward op rather than exposing the kernels.",
+      "source": "reviewed"
     },
     "aten:max_pool3d_with_indices": {
       "status": "mapped",
@@ -4123,8 +4335,9 @@
       "source": "name-match"
     },
     "aten:max_pool3d_with_indices_backward": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen backward/forward kernel split; Tensors computes these through the GradientTape of the forward op rather than exposing the kernels.",
+      "source": "reviewed"
     },
     "aten:max_unpool2d": {
       "status": "gap",
@@ -4163,16 +4376,19 @@
       "source": "name-match"
     },
     "aten:miopen_batch_norm": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A vendor-library kernel entry point (cuDNN, MIOpen, oneDNN, FBGEMM) or a device-type cast; Tensors dispatches the same operations through its engines (IEngine / DirectGpu backends), not per-vendor entry points.",
+      "source": "reviewed"
     },
     "aten:miopen_batch_norm_backward": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A vendor-library kernel entry point (cuDNN, MIOpen, oneDNN, FBGEMM) or a device-type cast; Tensors dispatches the same operations through its engines (IEngine / DirectGpu backends), not per-vendor entry points.",
+      "source": "reviewed"
     },
     "aten:miopen_rnn": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A vendor-library kernel entry point (cuDNN, MIOpen, oneDNN, FBGEMM) or a device-type cast; Tensors dispatches the same operations through its engines (IEngine / DirectGpu backends), not per-vendor entry points.",
+      "source": "reviewed"
     },
     "aten:mish": {
       "status": "mapped",
@@ -4180,8 +4396,9 @@
       "source": "name-match"
     },
     "aten:mish_": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::MishInPlace",
+      "source": "reviewed-alias"
     },
     "aten:mish_backward": {
       "status": "mapped",
@@ -4189,16 +4406,19 @@
       "source": "name-match"
     },
     "aten:mkldnn_rnn_layer": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A vendor-library kernel entry point (cuDNN, MIOpen, oneDNN, FBGEMM) or a device-type cast; Tensors dispatches the same operations through its engines (IEngine / DirectGpu backends), not per-vendor entry points.",
+      "source": "reviewed"
     },
     "aten:mkldnn_rnn_layer_backward": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A vendor-library kernel entry point (cuDNN, MIOpen, oneDNN, FBGEMM) or a device-type cast; Tensors dispatches the same operations through its engines (IEngine / DirectGpu backends), not per-vendor entry points.",
+      "source": "reviewed"
     },
     "aten:mm": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorMatMul",
+      "source": "reviewed-alias"
     },
     "aten:mode": {
       "status": "mapped",
@@ -4211,16 +4431,19 @@
       "source": "name-match"
     },
     "aten:mse_loss_backward": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen backward/forward kernel split; Tensors computes these through the GradientTape of the forward op rather than exposing the kernels.",
+      "source": "reviewed"
     },
     "aten:mul": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Multiply",
+      "source": "reviewed-alias"
     },
     "aten:mul_": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorMultiplyInPlace",
+      "source": "reviewed-alias"
     },
     "aten:multi_margin_loss": {
       "status": "mapped",
@@ -4228,8 +4451,9 @@
       "source": "name-match"
     },
     "aten:multilabel_margin_loss_forward": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen backward/forward kernel split; Tensors computes these through the GradientTape of the forward op rather than exposing the kernels.",
+      "source": "reviewed"
     },
     "aten:multinomial": {
       "status": "gap",
@@ -4241,12 +4465,14 @@
       "source": "name-match"
     },
     "aten:multiply_": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorMultiplyInPlace",
+      "source": "reviewed-alias"
     },
     "aten:mv": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::MatrixVectorMultiply",
+      "source": "reviewed-alias"
     },
     "aten:mvlgamma": {
       "status": "gap",
@@ -4280,60 +4506,72 @@
       "source": "name-match"
     },
     "aten:narrow_copy": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A functionalization view-copy variant used by torch.compile; in Tensors the view op followed by Contiguous() gives the same result.",
+      "source": "reviewed"
     },
     "aten:native_batch_norm": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen-internal or dispatcher-level operator (functionalization, layout probing, unchecked variants) that PyTorch does not document for user code.",
+      "source": "reviewed"
     },
     "aten:native_batch_norm_backward": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen backward/forward kernel split; Tensors computes these through the GradientTape of the forward op rather than exposing the kernels.",
+      "source": "reviewed"
     },
     "aten:native_dropout": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen-internal or dispatcher-level operator (functionalization, layout probing, unchecked variants) that PyTorch does not document for user code.",
+      "source": "reviewed"
     },
     "aten:native_dropout_backward": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen backward/forward kernel split; Tensors computes these through the GradientTape of the forward op rather than exposing the kernels.",
+      "source": "reviewed"
     },
     "aten:native_group_norm": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen-internal or dispatcher-level operator (functionalization, layout probing, unchecked variants) that PyTorch does not document for user code.",
+      "source": "reviewed"
     },
     "aten:native_group_norm_backward": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen backward/forward kernel split; Tensors computes these through the GradientTape of the forward op rather than exposing the kernels.",
+      "source": "reviewed"
     },
     "aten:native_layer_norm": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen-internal or dispatcher-level operator (functionalization, layout probing, unchecked variants) that PyTorch does not document for user code.",
+      "source": "reviewed"
     },
     "aten:native_layer_norm_backward": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen backward/forward kernel split; Tensors computes these through the GradientTape of the forward op rather than exposing the kernels.",
+      "source": "reviewed"
     },
     "aten:ne": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorNotEquals",
+      "source": "reviewed-alias"
     },
     "aten:ne_": {
       "status": "gap",
       "source": "name-match"
     },
     "aten:neg": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Negate",
+      "source": "reviewed-alias"
     },
     "aten:neg_": {
       "status": "gap",
       "source": "name-match"
     },
     "aten:negative": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Negate",
+      "source": "reviewed-alias"
     },
     "aten:negative_": {
       "status": "gap",
@@ -4374,20 +4612,24 @@
       "source": "name-match"
     },
     "aten:nll_loss2d_backward": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen backward/forward kernel split; Tensors computes these through the GradientTape of the forward op rather than exposing the kernels.",
+      "source": "reviewed"
     },
     "aten:nll_loss2d_forward": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen backward/forward kernel split; Tensors computes these through the GradientTape of the forward op rather than exposing the kernels.",
+      "source": "reviewed"
     },
     "aten:nll_loss_backward": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen backward/forward kernel split; Tensors computes these through the GradientTape of the forward op rather than exposing the kernels.",
+      "source": "reviewed"
     },
     "aten:nll_loss_forward": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen backward/forward kernel split; Tensors computes these through the GradientTape of the forward op rather than exposing the kernels.",
+      "source": "reviewed"
     },
     "aten:nonzero": {
       "status": "mapped",
@@ -4424,12 +4666,14 @@
       "source": "name-match"
     },
     "aten:numel": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601::Length",
+      "source": "reviewed-alias"
     },
     "aten:ones": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601::CreateOnes",
+      "source": "reviewed-alias"
     },
     "aten:ones_like": {
       "status": "gap",
@@ -4459,12 +4703,14 @@
       "source": "name-match"
     },
     "aten:permute_copy": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A functionalization view-copy variant used by torch.compile; in Tensors the view op followed by Contiguous() gives the same result.",
+      "source": "reviewed"
     },
     "aten:pin_memory": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-object, storage-pointer, named-tensor or quantized-qtensor accessor without a counterpart in Tensors' managed, unnamed tensor model.",
+      "source": "reviewed"
     },
     "aten:pixel_shuffle": {
       "status": "mapped",
@@ -4507,16 +4753,19 @@
       "source": "name-match"
     },
     "aten:prod": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Product",
+      "source": "reviewed-alias"
     },
     "aten:quantized_gru": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A PyTorch eager-quantization (qtensor) entry point; Tensors' quantization is the int8/fp8 kernels (Int8RowScaled, QuantizedGemm), not qtensors.",
+      "source": "reviewed"
     },
     "aten:quantized_lstm": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A PyTorch eager-quantization (qtensor) entry point; Tensors' quantization is the int8/fp8 kernels (Int8RowScaled, QuantizedGemm), not qtensors.",
+      "source": "reviewed"
     },
     "aten:rad2deg": {
       "status": "gap",
@@ -4527,8 +4776,9 @@
       "source": "name-match"
     },
     "aten:rand": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601::CreateRandom",
+      "source": "reviewed-alias"
     },
     "aten:rand_like": {
       "status": "gap",
@@ -4543,8 +4793,9 @@
       "source": "name-match"
     },
     "aten:randn": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorRandomNormal",
+      "source": "reviewed-alias"
     },
     "aten:randn_like": {
       "status": "gap",
@@ -4572,24 +4823,27 @@
       "source": "name-match"
     },
     "aten:reflection_pad1d_backward": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen backward/forward kernel split; Tensors computes these through the GradientTape of the forward op rather than exposing the kernels.",
+      "source": "reviewed"
     },
     "aten:reflection_pad2d": {
       "status": "gap",
       "source": "name-match"
     },
     "aten:reflection_pad2d_backward": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen backward/forward kernel split; Tensors computes these through the GradientTape of the forward op rather than exposing the kernels.",
+      "source": "reviewed"
     },
     "aten:reflection_pad3d": {
       "status": "gap",
       "source": "name-match"
     },
     "aten:reflection_pad3d_backward": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen backward/forward kernel split; Tensors computes these through the GradientTape of the forward op rather than exposing the kernels.",
+      "source": "reviewed"
     },
     "aten:relu": {
       "status": "mapped",
@@ -4602,8 +4856,9 @@
       "source": "name-match"
     },
     "aten:relu_": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::ReLUInPlace",
+      "source": "reviewed-alias"
     },
     "aten:remainder": {
       "status": "mapped",
@@ -4623,8 +4878,9 @@
       "source": "name-match"
     },
     "aten:repeat": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorTile",
+      "source": "reviewed-alias"
     },
     "aten:repeat_interleave": {
       "status": "mapped",
@@ -4636,24 +4892,27 @@
       "source": "name-match"
     },
     "aten:replication_pad1d_backward": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen backward/forward kernel split; Tensors computes these through the GradientTape of the forward op rather than exposing the kernels.",
+      "source": "reviewed"
     },
     "aten:replication_pad2d": {
       "status": "gap",
       "source": "name-match"
     },
     "aten:replication_pad2d_backward": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen backward/forward kernel split; Tensors computes these through the GradientTape of the forward op rather than exposing the kernels.",
+      "source": "reviewed"
     },
     "aten:replication_pad3d": {
       "status": "gap",
       "source": "name-match"
     },
     "aten:replication_pad3d_backward": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen backward/forward kernel split; Tensors computes these through the GradientTape of the forward op rather than exposing the kernels.",
+      "source": "reviewed"
     },
     "aten:reshape": {
       "status": "mapped",
@@ -4661,12 +4920,14 @@
       "source": "name-match"
     },
     "aten:resize": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen-internal or dispatcher-level operator (functionalization, layout probing, unchecked variants) that PyTorch does not document for user code.",
+      "source": "reviewed"
     },
     "aten:resize_as": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen-internal or dispatcher-level operator (functionalization, layout probing, unchecked variants) that PyTorch does not document for user code.",
+      "source": "reviewed"
     },
     "aten:resize_as_": {
       "status": "gap",
@@ -4708,16 +4969,18 @@
       "source": "name-match"
     },
     "aten:rrelu_with_noise_backward": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen backward/forward kernel split; Tensors computes these through the GradientTape of the forward op rather than exposing the kernels.",
+      "source": "reviewed"
     },
     "aten:rrelu_with_noise_functional": {
       "status": "gap",
       "source": "name-match"
     },
     "aten:rsqrt": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::ReciprocalSqrt",
+      "source": "reviewed-alias"
     },
     "aten:rsqrt_": {
       "status": "gap",
@@ -4728,8 +4991,9 @@
       "source": "name-match"
     },
     "aten:scalar_tensor": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601::FromScalar",
+      "source": "reviewed-alias"
     },
     "aten:scatter": {
       "status": "mapped",
@@ -4764,16 +5028,18 @@
       "source": "name-match"
     },
     "aten:segment_reduce": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen-internal or dispatcher-level operator (functionalization, layout probing, unchecked variants) that PyTorch does not document for user code.",
+      "source": "reviewed"
     },
     "aten:select": {
       "status": "gap",
       "source": "name-match"
     },
     "aten:select_backward": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen backward/forward kernel split; Tensors computes these through the GradientTape of the forward op rather than exposing the kernels.",
+      "source": "reviewed"
     },
     "aten:select_scatter": {
       "status": "mapped",
@@ -4794,8 +5060,9 @@
       "source": "name-match"
     },
     "aten:sgn": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Sign",
+      "source": "reviewed-alias"
     },
     "aten:sgn_": {
       "status": "gap",
@@ -4807,8 +5074,9 @@
       "source": "name-match"
     },
     "aten:sigmoid_": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::SigmoidInPlace",
+      "source": "reviewed-alias"
     },
     "aten:sigmoid_backward": {
       "status": "mapped",
@@ -4834,12 +5102,14 @@
       "source": "name-match"
     },
     "aten:silu_": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::SwishInPlace",
+      "source": "reviewed-alias"
     },
     "aten:silu_backward": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::SwishBackward",
+      "source": "reviewed-alias"
     },
     "aten:sin": {
       "status": "mapped",
@@ -4868,8 +5138,9 @@
       "source": "name-match"
     },
     "aten:size": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601::Shape",
+      "source": "reviewed-alias"
     },
     "aten:slice": {
       "status": "mapped",
@@ -4877,8 +5148,9 @@
       "source": "name-match"
     },
     "aten:slice_backward": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen backward/forward kernel split; Tensors computes these through the GradientTape of the forward op rather than exposing the kernels.",
+      "source": "reviewed"
     },
     "aten:slice_scatter": {
       "status": "mapped",
@@ -4891,16 +5163,18 @@
       "source": "name-match"
     },
     "aten:smooth_l1_loss_backward": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen backward/forward kernel split; Tensors computes these through the GradientTape of the forward op rather than exposing the kernels.",
+      "source": "reviewed"
     },
     "aten:soft_margin_loss": {
       "status": "gap",
       "source": "name-match"
     },
     "aten:soft_margin_loss_backward": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen backward/forward kernel split; Tensors computes these through the GradientTape of the forward op rather than exposing the kernels.",
+      "source": "reviewed"
     },
     "aten:softplus": {
       "status": "mapped",
@@ -4923,8 +5197,9 @@
       "source": "name-match"
     },
     "aten:sparse_dim": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen-internal or dispatcher-level operator (functionalization, layout probing, unchecked variants) that PyTorch does not document for user code.",
+      "source": "reviewed"
     },
     "aten:special_airy_ai": {
       "status": "gap",
@@ -4979,16 +5254,19 @@
       "source": "name-match"
     },
     "aten:special_i0e": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorI0e",
+      "source": "reviewed-alias"
     },
     "aten:special_i1": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorI1",
+      "source": "reviewed-alias"
     },
     "aten:special_i1e": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorI1e",
+      "source": "reviewed-alias"
     },
     "aten:special_laguerre_polynomial_l": {
       "status": "gap",
@@ -5055,12 +5333,14 @@
       "source": "name-match"
     },
     "aten:special_xlog1py": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorXlog1py",
+      "source": "reviewed-alias"
     },
     "aten:special_zeta": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorZeta",
+      "source": "reviewed-alias"
     },
     "aten:split": {
       "status": "mapped",
@@ -5072,8 +5352,9 @@
       "source": "name-match"
     },
     "aten:split_with_sizes_copy": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A functionalization view-copy variant used by torch.compile; in Tensors the view op followed by Contiguous() gives the same result.",
+      "source": "reviewed"
     },
     "aten:sqrt": {
       "status": "mapped",
@@ -5099,8 +5380,9 @@
       "source": "name-match"
     },
     "aten:squeeze_copy": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A functionalization view-copy variant used by torch.compile; in Tensors the view op followed by Contiguous() gives the same result.",
+      "source": "reviewed"
     },
     "aten:stack": {
       "status": "mapped",
@@ -5126,16 +5408,19 @@
       "source": "name-match"
     },
     "aten:stride": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601::Strides",
+      "source": "reviewed-alias"
     },
     "aten:sub": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Subtract",
+      "source": "reviewed-alias"
     },
     "aten:sub_": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorSubtractInPlace",
+      "source": "reviewed-alias"
     },
     "aten:subtract": {
       "status": "mapped",
@@ -5143,8 +5428,9 @@
       "source": "name-match"
     },
     "aten:subtract_": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorSubtractInPlace",
+      "source": "reviewed-alias"
     },
     "aten:sum": {
       "status": "mapped",
@@ -5152,44 +5438,53 @@
       "source": "name-match"
     },
     "aten:svd": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::Svd",
+      "source": "reviewed-alias"
     },
     "aten:sym_constrain_range": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A symbolic-shape helper for torch.compile tracing; Tensors has no symbolic shape tracer, shapes are concrete ints.",
+      "source": "reviewed"
     },
     "aten:sym_constrain_range_for_size": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A symbolic-shape helper for torch.compile tracing; Tensors has no symbolic shape tracer, shapes are concrete ints.",
+      "source": "reviewed"
     },
     "aten:sym_numel": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A symbolic-shape helper for torch.compile tracing; Tensors has no symbolic shape tracer, shapes are concrete ints.",
+      "source": "reviewed"
     },
     "aten:sym_size": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A symbolic-shape helper for torch.compile tracing; Tensors has no symbolic shape tracer, shapes are concrete ints.",
+      "source": "reviewed"
     },
     "aten:sym_storage_offset": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A symbolic-shape helper for torch.compile tracing; Tensors has no symbolic shape tracer, shapes are concrete ints.",
+      "source": "reviewed"
     },
     "aten:sym_stride": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A symbolic-shape helper for torch.compile tracing; Tensors has no symbolic shape tracer, shapes are concrete ints.",
+      "source": "reviewed"
     },
     "aten:t": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601::TransposeLast2D",
+      "source": "reviewed-alias"
     },
     "aten:t_": {
       "status": "gap",
       "source": "name-match"
     },
     "aten:t_copy": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A functionalization view-copy variant used by torch.compile; in Tensors the view op followed by Contiguous() gives the same result.",
+      "source": "reviewed"
     },
     "aten:take": {
       "status": "mapped",
@@ -5211,8 +5506,9 @@
       "source": "name-match"
     },
     "aten:tanh_": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TanhInPlace",
+      "source": "reviewed-alias"
     },
     "aten:tanh_backward": {
       "status": "mapped",
@@ -5263,8 +5559,9 @@
       "source": "name-match"
     },
     "aten:transpose_copy": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A functionalization view-copy variant used by torch.compile; in Tensors the view op followed by Contiguous() gives the same result.",
+      "source": "reviewed"
     },
     "aten:triangular_solve": {
       "status": "gap",
@@ -5297,28 +5594,33 @@
       "source": "name-match"
     },
     "aten:true_divide": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Divide",
+      "source": "reviewed-alias"
     },
     "aten:true_divide_": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601::DivideInPlace",
+      "source": "reviewed-alias"
     },
     "aten:trunc": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Truncate",
+      "source": "reviewed-alias"
     },
     "aten:trunc_": {
       "status": "gap",
       "source": "name-match"
     },
     "aten:unbind": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorUnstack",
+      "source": "reviewed-alias"
     },
     "aten:unbind_copy": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A functionalization view-copy variant used by torch.compile; in Tensors the view op followed by Contiguous() gives the same result.",
+      "source": "reviewed"
     },
     "aten:unfold": {
       "status": "mapped",
@@ -5326,12 +5628,14 @@
       "source": "name-match"
     },
     "aten:unfold_backward": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen backward/forward kernel split; Tensors computes these through the GradientTape of the forward op rather than exposing the kernels.",
+      "source": "reviewed"
     },
     "aten:unfold_copy": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A functionalization view-copy variant used by torch.compile; in Tensors the view op followed by Contiguous() gives the same result.",
+      "source": "reviewed"
     },
     "aten:uniform": {
       "status": "gap",
@@ -5351,16 +5655,19 @@
       "source": "name-match"
     },
     "aten:unsafe_chunk": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen-internal or dispatcher-level operator (functionalization, layout probing, unchecked variants) that PyTorch does not document for user code.",
+      "source": "reviewed"
     },
     "aten:unsafe_split": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen-internal or dispatcher-level operator (functionalization, layout probing, unchecked variants) that PyTorch does not document for user code.",
+      "source": "reviewed"
     },
     "aten:unsafe_split_with_sizes": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen-internal or dispatcher-level operator (functionalization, layout probing, unchecked variants) that PyTorch does not document for user code.",
+      "source": "reviewed"
     },
     "aten:unsqueeze": {
       "status": "mapped",
@@ -5372,8 +5679,9 @@
       "source": "name-match"
     },
     "aten:unsqueeze_copy": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A functionalization view-copy variant used by torch.compile; in Tensors the view op followed by Contiguous() gives the same result.",
+      "source": "reviewed"
     },
     "aten:upsample_bicubic2d": {
       "status": "gap",
@@ -5396,8 +5704,9 @@
       "source": "name-match"
     },
     "aten:upsample_nearest2d_backward": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen backward/forward kernel split; Tensors computes these through the GradientTape of the forward op rather than exposing the kernels.",
+      "source": "reviewed"
     },
     "aten:upsample_nearest3d": {
       "status": "gap",
@@ -5421,8 +5730,9 @@
       "source": "name-match"
     },
     "aten:view": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Reshape",
+      "source": "reviewed-alias"
     },
     "aten:view_as_complex": {
       "status": "gap",
@@ -5433,8 +5743,9 @@
       "source": "name-match"
     },
     "aten:view_copy": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A functionalization view-copy variant used by torch.compile; in Tensors the view op followed by Contiguous() gives the same result.",
+      "source": "reviewed"
     },
     "aten:where": {
       "status": "mapped",
@@ -5459,8 +5770,9 @@
       "source": "name-match"
     },
     "aten:zeros": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601::CreateZeros",
+      "source": "reviewed-alias"
     },
     "aten:zeros_like": {
       "status": "gap",
@@ -6427,8 +6739,9 @@
       "source": "name-match"
     },
     "nn.functional:cross_entropy": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::CrossEntropyLoss",
+      "source": "reviewed-alias"
     },
     "nn.functional:ctc_loss": {
       "status": "mapped",
@@ -6610,12 +6923,14 @@
       "source": "name-match"
     },
     "nn.functional:leaky_relu_": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::LeakyReLUInPlace",
+      "source": "reviewed-alias"
     },
     "nn.functional:linear": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::FusedLinear",
+      "source": "reviewed-alias"
     },
     "nn.functional:local_response_norm": {
       "status": "gap",
@@ -6719,8 +7034,9 @@
       "source": "name-match"
     },
     "nn.functional:native_channel_shuffle": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen-internal or dispatcher-level operator (functionalization, layout probing, unchecked variants) that PyTorch does not document for user code.",
+      "source": "reviewed"
     },
     "nn.functional:nll_loss": {
       "status": "mapped",
@@ -6782,8 +7098,9 @@
       "source": "name-match"
     },
     "nn.functional:relu_": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::ReLUInPlace",
+      "source": "reviewed-alias"
     },
     "nn.functional:rms_norm": {
       "status": "mapped",
@@ -7069,8 +7386,9 @@
       "source": "name-match"
     },
     "torch:absolute": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Abs",
+      "source": "reviewed-alias"
     },
     "torch:acos": {
       "status": "mapped",
@@ -7141,12 +7459,14 @@
       "source": "name-match"
     },
     "torch:alias_copy": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen-internal or dispatcher-level operator (functionalization, layout probing, unchecked variants) that PyTorch does not document for user code.",
+      "source": "reviewed"
     },
     "torch:align_tensors": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-object, storage-pointer, named-tensor or quantized-qtensor accessor without a counterpart in Tensors' managed, unnamed tensor model.",
+      "source": "reviewed"
     },
     "torch:all": {
       "status": "gap",
@@ -7166,8 +7486,9 @@
       "source": "name-match"
     },
     "torch:amax": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::ReduceMax",
+      "source": "reviewed-alias"
     },
     "torch:amin": {
       "status": "gap",
@@ -7191,52 +7512,59 @@
       "source": "name-match"
     },
     "torch:arccos": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Acos",
+      "source": "reviewed-alias"
     },
     "torch:arccos_": {
       "status": "gap",
       "source": "name-match"
     },
     "torch:arccosh": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Acosh",
+      "source": "reviewed-alias"
     },
     "torch:arccosh_": {
       "status": "gap",
       "source": "name-match"
     },
     "torch:arcsin": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Asin",
+      "source": "reviewed-alias"
     },
     "torch:arcsin_": {
       "status": "gap",
       "source": "name-match"
     },
     "torch:arcsinh": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Asinh",
+      "source": "reviewed-alias"
     },
     "torch:arcsinh_": {
       "status": "gap",
       "source": "name-match"
     },
     "torch:arctan": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Atan",
+      "source": "reviewed-alias"
     },
     "torch:arctan2": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorAtan2",
+      "source": "reviewed-alias"
     },
     "torch:arctan_": {
       "status": "gap",
       "source": "name-match"
     },
     "torch:arctanh": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Atanh",
+      "source": "reviewed-alias"
     },
     "torch:arctanh_": {
       "status": "gap",
@@ -7274,20 +7602,23 @@
       "source": "name-match"
     },
     "torch:as_strided_copy": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A functionalization view-copy variant used by torch.compile; in Tensors the view op followed by Contiguous() gives the same result.",
+      "source": "reviewed"
     },
     "torch:as_strided_scatter": {
       "status": "gap",
       "source": "name-match"
     },
     "torch:as_tensor": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601",
+      "source": "reviewed-alias"
     },
     "torch:asarray": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601",
+      "source": "reviewed-alias"
     },
     "torch:asin": {
       "status": "mapped",
@@ -7346,12 +7677,14 @@
       "source": "name-match"
     },
     "torch:autocast_decrement_nesting": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "torch.autocast's internal cache and nesting hooks; Tensors' mixed precision is configured explicitly (MixedPrecision scopes), not through autocast state.",
+      "source": "reviewed"
     },
     "torch:autocast_increment_nesting": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "torch.autocast's internal cache and nesting hooks; Tensors' mixed precision is configured explicitly (MixedPrecision scopes), not through autocast state.",
+      "source": "reviewed"
     },
     "torch:avg_pool1d": {
       "status": "mapped",
@@ -7372,12 +7705,14 @@
       "source": "name-match"
     },
     "torch:batch_norm_backward_elemt": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen backward/forward kernel split; Tensors computes these through the GradientTape of the forward op rather than exposing the kernels.",
+      "source": "reviewed"
     },
     "torch:batch_norm_backward_reduce": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen backward/forward kernel split; Tensors computes these through the GradientTape of the forward op rather than exposing the kernels.",
+      "source": "reviewed"
     },
     "torch:batch_norm_elemt": {
       "status": "gap",
@@ -7454,8 +7789,9 @@
       "source": "name-match"
     },
     "torch:bmm": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::BatchMatMul",
+      "source": "reviewed-alias"
     },
     "torch:broadcast_shapes": {
       "status": "gap",
@@ -7486,12 +7822,14 @@
       "source": "name-match"
     },
     "torch:cat": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Concat",
+      "source": "reviewed-alias"
     },
     "torch:ccol_indices_copy": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A functionalization view-copy variant used by torch.compile; in Tensors the view op followed by Contiguous() gives the same result.",
+      "source": "reviewed"
     },
     "torch:cdist": {
       "status": "mapped",
@@ -7499,8 +7837,9 @@
       "source": "name-match"
     },
     "torch:ceil": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Ceiling",
+      "source": "reviewed-alias"
     },
     "torch:ceil_": {
       "status": "gap",
@@ -7515,16 +7854,18 @@
       "source": "name-match"
     },
     "torch:chain_matmul": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorMultiDot",
+      "source": "reviewed-alias"
     },
     "torch:channel_shuffle": {
       "status": "gap",
       "source": "name-match"
     },
     "torch:cholesky": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::Cholesky",
+      "source": "reviewed-alias"
     },
     "torch:cholesky_inverse": {
       "status": "gap",
@@ -7535,8 +7876,9 @@
       "source": "name-match"
     },
     "torch:choose_qparams_optimized": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A PyTorch eager-quantization (qtensor) entry point; Tensors' quantization is the int8/fp8 kernels (Int8RowScaled, QuantizedGemm), not qtensors.",
+      "source": "reviewed"
     },
     "torch:chunk": {
       "status": "gap",
@@ -7570,8 +7912,9 @@
       "source": "name-match"
     },
     "torch:clear_autocast_cache": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "torch.autocast's internal cache and nesting hooks; Tensors' mixed precision is configured explicitly (MixedPrecision scopes), not through autocast state.",
+      "source": "reviewed"
     },
     "torch:clip": {
       "status": "mapped",
@@ -7588,8 +7931,9 @@
       "source": "name-match"
     },
     "torch:col_indices_copy": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A functionalization view-copy variant used by torch.compile; in Tensors the view op followed by Contiguous() gives the same result.",
+      "source": "reviewed"
     },
     "torch:column_stack": {
       "status": "mapped",
@@ -7601,12 +7945,14 @@
       "source": "name-match"
     },
     "torch:compile": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A TorchScript / torch.compile / C++ runtime hook with no meaning for a .NET library (compilation here is TensorCodec / compiled plans).",
+      "source": "reviewed"
     },
     "torch:compiled_with_cxx11_abi": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A TorchScript / torch.compile / C++ runtime hook with no meaning for a .NET library (compilation here is TensorCodec / compiled plans).",
+      "source": "reviewed"
     },
     "torch:complex": {
       "status": "gap",
@@ -7623,8 +7969,9 @@
       "source": "name-match"
     },
     "torch:cond": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::Cond",
+      "source": "reviewed-alias"
     },
     "torch:conj": {
       "status": "gap",
@@ -7731,8 +8078,9 @@
       "source": "name-match"
     },
     "torch:crow_indices_copy": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A functionalization view-copy variant used by torch.compile; in Tensors the view op followed by Contiguous() gives the same result.",
+      "source": "reviewed"
     },
     "torch:ctc_loss": {
       "status": "mapped",
@@ -7740,36 +8088,44 @@
       "source": "name-match"
     },
     "torch:cudnn_affine_grid_generator": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A vendor-library kernel entry point (cuDNN, MIOpen, oneDNN, FBGEMM) or a device-type cast; Tensors dispatches the same operations through its engines (IEngine / DirectGpu backends), not per-vendor entry points.",
+      "source": "reviewed"
     },
     "torch:cudnn_batch_norm": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A vendor-library kernel entry point (cuDNN, MIOpen, oneDNN, FBGEMM) or a device-type cast; Tensors dispatches the same operations through its engines (IEngine / DirectGpu backends), not per-vendor entry points.",
+      "source": "reviewed"
     },
     "torch:cudnn_convolution": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A vendor-library kernel entry point (cuDNN, MIOpen, oneDNN, FBGEMM) or a device-type cast; Tensors dispatches the same operations through its engines (IEngine / DirectGpu backends), not per-vendor entry points.",
+      "source": "reviewed"
     },
     "torch:cudnn_convolution_add_relu": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A vendor-library kernel entry point (cuDNN, MIOpen, oneDNN, FBGEMM) or a device-type cast; Tensors dispatches the same operations through its engines (IEngine / DirectGpu backends), not per-vendor entry points.",
+      "source": "reviewed"
     },
     "torch:cudnn_convolution_relu": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A vendor-library kernel entry point (cuDNN, MIOpen, oneDNN, FBGEMM) or a device-type cast; Tensors dispatches the same operations through its engines (IEngine / DirectGpu backends), not per-vendor entry points.",
+      "source": "reviewed"
     },
     "torch:cudnn_convolution_transpose": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A vendor-library kernel entry point (cuDNN, MIOpen, oneDNN, FBGEMM) or a device-type cast; Tensors dispatches the same operations through its engines (IEngine / DirectGpu backends), not per-vendor entry points.",
+      "source": "reviewed"
     },
     "torch:cudnn_grid_sampler": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A vendor-library kernel entry point (cuDNN, MIOpen, oneDNN, FBGEMM) or a device-type cast; Tensors dispatches the same operations through its engines (IEngine / DirectGpu backends), not per-vendor entry points.",
+      "source": "reviewed"
     },
     "torch:cudnn_is_acceptable": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A vendor-library kernel entry point (cuDNN, MIOpen, oneDNN, FBGEMM) or a device-type cast; Tensors dispatches the same operations through its engines (IEngine / DirectGpu backends), not per-vendor entry points.",
+      "source": "reviewed"
     },
     "torch:cummax": {
       "status": "mapped",
@@ -7808,8 +8164,9 @@
       "source": "name-match"
     },
     "torch:det": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::Det",
+      "source": "reviewed-alias"
     },
     "torch:detach": {
       "status": "gap",
@@ -7820,8 +8177,9 @@
       "source": "name-match"
     },
     "torch:detach_copy": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A functionalization view-copy variant used by torch.compile; in Tensors the view op followed by Contiguous() gives the same result.",
+      "source": "reviewed"
     },
     "torch:diag": {
       "status": "mapped",
@@ -7843,8 +8201,9 @@
       "source": "name-match"
     },
     "torch:diagonal_copy": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A functionalization view-copy variant used by torch.compile; in Tensors the view op followed by Contiguous() gives the same result.",
+      "source": "reviewed"
     },
     "torch:diagonal_scatter": {
       "status": "gap",
@@ -7860,12 +8219,14 @@
       "source": "name-match"
     },
     "torch:dist": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Distance",
+      "source": "reviewed-alias"
     },
     "torch:div": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Divide",
+      "source": "reviewed-alias"
     },
     "torch:divide": {
       "status": "mapped",
@@ -7929,8 +8290,9 @@
       "source": "name-match"
     },
     "torch:empty_permuted": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen-internal or dispatcher-level operator (functionalization, layout probing, unchecked variants) that PyTorch does not document for user code.",
+      "source": "reviewed"
     },
     "torch:empty_quantized": {
       "status": "gap",
@@ -7991,8 +8353,9 @@
       "source": "name-match"
     },
     "torch:expand_copy": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A functionalization view-copy variant used by torch.compile; in Tensors the view op followed by Contiguous() gives the same result.",
+      "source": "reviewed"
     },
     "torch:expm1": {
       "status": "mapped",
@@ -8009,40 +8372,49 @@
       "source": "name-match"
     },
     "torch:fake_quantize_per_channel_affine": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A PyTorch eager-quantization (qtensor) entry point; Tensors' quantization is the int8/fp8 kernels (Int8RowScaled, QuantizedGemm), not qtensors.",
+      "source": "reviewed"
     },
     "torch:fake_quantize_per_tensor_affine": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A PyTorch eager-quantization (qtensor) entry point; Tensors' quantization is the int8/fp8 kernels (Int8RowScaled, QuantizedGemm), not qtensors.",
+      "source": "reviewed"
     },
     "torch:fbgemm_linear_fp16_weight": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A vendor-library kernel entry point (cuDNN, MIOpen, oneDNN, FBGEMM) or a device-type cast; Tensors dispatches the same operations through its engines (IEngine / DirectGpu backends), not per-vendor entry points.",
+      "source": "reviewed"
     },
     "torch:fbgemm_linear_fp16_weight_fp32_activation": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A vendor-library kernel entry point (cuDNN, MIOpen, oneDNN, FBGEMM) or a device-type cast; Tensors dispatches the same operations through its engines (IEngine / DirectGpu backends), not per-vendor entry points.",
+      "source": "reviewed"
     },
     "torch:fbgemm_linear_int8_weight": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A vendor-library kernel entry point (cuDNN, MIOpen, oneDNN, FBGEMM) or a device-type cast; Tensors dispatches the same operations through its engines (IEngine / DirectGpu backends), not per-vendor entry points.",
+      "source": "reviewed"
     },
     "torch:fbgemm_linear_int8_weight_fp32_activation": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A vendor-library kernel entry point (cuDNN, MIOpen, oneDNN, FBGEMM) or a device-type cast; Tensors dispatches the same operations through its engines (IEngine / DirectGpu backends), not per-vendor entry points.",
+      "source": "reviewed"
     },
     "torch:fbgemm_linear_quantize_weight": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A vendor-library kernel entry point (cuDNN, MIOpen, oneDNN, FBGEMM) or a device-type cast; Tensors dispatches the same operations through its engines (IEngine / DirectGpu backends), not per-vendor entry points.",
+      "source": "reviewed"
     },
     "torch:fbgemm_pack_gemm_matrix_fp16": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A vendor-library kernel entry point (cuDNN, MIOpen, oneDNN, FBGEMM) or a device-type cast; Tensors dispatches the same operations through its engines (IEngine / DirectGpu backends), not per-vendor entry points.",
+      "source": "reviewed"
     },
     "torch:fbgemm_pack_quantized_matrix": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A vendor-library kernel entry point (cuDNN, MIOpen, oneDNN, FBGEMM) or a device-type cast; Tensors dispatches the same operations through its engines (IEngine / DirectGpu backends), not per-vendor entry points.",
+      "source": "reviewed"
     },
     "torch:feature_alpha_dropout": {
       "status": "gap",
@@ -8070,8 +8442,9 @@
       "source": "name-match"
     },
     "torch:fix": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Truncate",
+      "source": "reviewed-alias"
     },
     "torch:fix_": {
       "status": "gap",
@@ -8129,8 +8502,9 @@
       "source": "name-match"
     },
     "torch:fork": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A TorchScript / torch.compile / C++ runtime hook with no meaning for a .NET library (compilation here is TensorCodec / compiled plans).",
+      "source": "reviewed"
     },
     "torch:frac": {
       "status": "mapped",
@@ -8151,28 +8525,33 @@
       "source": "name-match"
     },
     "torch:from_file": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-runtime or interop helper (numpy/buffer/file conversion, Python isinstance checks, global Python state) with no counterpart in a typed .NET API.",
+      "source": "reviewed"
     },
     "torch:from_numpy": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-runtime or interop helper (numpy/buffer/file conversion, Python isinstance checks, global Python state) with no counterpart in a typed .NET API.",
+      "source": "reviewed"
     },
     "torch:frombuffer": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-runtime or interop helper (numpy/buffer/file conversion, Python isinstance checks, global Python state) with no counterpart in a typed .NET API.",
+      "source": "reviewed"
     },
     "torch:full": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601::CreateDefault",
+      "source": "reviewed-alias"
     },
     "torch:full_like": {
       "status": "gap",
       "source": "name-match"
     },
     "torch:fused_moving_avg_obs_fake_quant": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A PyTorch eager-quantization (qtensor) entry point; Tensors' quantization is the int8/fp8 kernels (Int8RowScaled, QuantizedGemm), not qtensors.",
+      "source": "reviewed"
     },
     "torch:gather": {
       "status": "mapped",
@@ -8196,28 +8575,34 @@
       "source": "name-match"
     },
     "torch:ger": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorOuter",
+      "source": "reviewed-alias"
     },
     "torch:get_autocast_cpu_dtype": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "torch.autocast's internal cache and nesting hooks; Tensors' mixed precision is configured explicitly (MixedPrecision scopes), not through autocast state.",
+      "source": "reviewed"
     },
     "torch:get_autocast_dtype": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.Gpu.AutocastScope::Precision",
+      "source": "reviewed-alias"
     },
     "torch:get_autocast_gpu_dtype": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "torch.autocast's internal cache and nesting hooks; Tensors' mixed precision is configured explicitly (MixedPrecision scopes), not through autocast state.",
+      "source": "reviewed"
     },
     "torch:get_autocast_ipu_dtype": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "torch.autocast's internal cache and nesting hooks; Tensors' mixed precision is configured explicitly (MixedPrecision scopes), not through autocast state.",
+      "source": "reviewed"
     },
     "torch:get_autocast_xla_dtype": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "torch.autocast's internal cache and nesting hooks; Tensors' mixed precision is configured explicitly (MixedPrecision scopes), not through autocast state.",
+      "source": "reviewed"
     },
     "torch:get_default_device": {
       "status": "gap",
@@ -8237,8 +8622,9 @@
       "source": "name-match"
     },
     "torch:get_device_module": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-runtime or interop helper (numpy/buffer/file conversion, Python isinstance checks, global Python state) with no counterpart in a typed .NET API.",
+      "source": "reviewed"
     },
     "torch:get_float32_matmul_precision": {
       "status": "gap",
@@ -8257,8 +8643,9 @@
       "source": "name-match"
     },
     "torch:greater": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorGreaterThan",
+      "source": "reviewed-alias"
     },
     "torch:greater_equal": {
       "status": "gap",
@@ -8290,8 +8677,9 @@
       "source": "name-match"
     },
     "torch:gt": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorGreaterThan",
+      "source": "reviewed-alias"
     },
     "torch:hamming_window": {
       "status": "gap",
@@ -8307,8 +8695,9 @@
       "source": "name-match"
     },
     "torch:hash_tensor": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-runtime or interop helper (numpy/buffer/file conversion, Python isinstance checks, global Python state) with no counterpart in a typed .NET API.",
+      "source": "reviewed"
     },
     "torch:heaviside": {
       "status": "gap",
@@ -8379,12 +8768,14 @@
       "source": "name-match"
     },
     "torch:import_ir_module": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A TorchScript / torch.compile / C++ runtime hook with no meaning for a .NET library (compilation here is TensorCodec / compiled plans).",
+      "source": "reviewed"
     },
     "torch:import_ir_module_from_buffer": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A TorchScript / torch.compile / C++ runtime hook with no meaning for a .NET library (compilation here is TensorCodec / compiled plans).",
+      "source": "reviewed"
     },
     "torch:index_add": {
       "status": "mapped",
@@ -8420,12 +8811,14 @@
       "source": "name-match"
     },
     "torch:indices_copy": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A functionalization view-copy variant used by torch.compile; in Tensors the view op followed by Contiguous() gives the same result.",
+      "source": "reviewed"
     },
     "torch:init_num_threads": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-runtime or interop helper (numpy/buffer/file conversion, Python isinstance checks, global Python state) with no counterpart in a typed .NET API.",
+      "source": "reviewed"
     },
     "torch:inner": {
       "status": "mapped",
@@ -8438,40 +8831,49 @@
       "source": "name-match"
     },
     "torch:int_repr": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-object, storage-pointer, named-tensor or quantized-qtensor accessor without a counterpart in Tensors' managed, unnamed tensor model.",
+      "source": "reviewed"
     },
     "torch:inverse": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::Inv",
+      "source": "reviewed-alias"
     },
     "torch:is_anomaly_check_nan_enabled": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-runtime or interop helper (numpy/buffer/file conversion, Python isinstance checks, global Python state) with no counterpart in a typed .NET API.",
+      "source": "reviewed"
     },
     "torch:is_anomaly_enabled": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.Autodiff.AnomalyModeScope::IsActive",
+      "source": "reviewed-alias"
     },
     "torch:is_autocast_cache_enabled": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "torch.autocast's internal cache and nesting hooks; Tensors' mixed precision is configured explicitly (MixedPrecision scopes), not through autocast state.",
+      "source": "reviewed"
     },
     "torch:is_autocast_cpu_enabled": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "torch.autocast's internal cache and nesting hooks; Tensors' mixed precision is configured explicitly (MixedPrecision scopes), not through autocast state.",
+      "source": "reviewed"
     },
     "torch:is_autocast_enabled": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.Gpu.AutocastScope::IsEnabled",
+      "source": "reviewed-alias"
     },
     "torch:is_autocast_ipu_enabled": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "torch.autocast's internal cache and nesting hooks; Tensors' mixed precision is configured explicitly (MixedPrecision scopes), not through autocast state.",
+      "source": "reviewed"
     },
     "torch:is_autocast_xla_enabled": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "torch.autocast's internal cache and nesting hooks; Tensors' mixed precision is configured explicitly (MixedPrecision scopes), not through autocast state.",
+      "source": "reviewed"
     },
     "torch:is_complex": {
       "status": "gap",
@@ -8486,24 +8888,28 @@
       "source": "name-match"
     },
     "torch:is_distributed": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-runtime or interop helper (numpy/buffer/file conversion, Python isinstance checks, global Python state) with no counterpart in a typed .NET API.",
+      "source": "reviewed"
     },
     "torch:is_floating_point": {
       "status": "gap",
       "source": "name-match"
     },
     "torch:is_grad_enabled": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.Autodiff.NoGradScope\u00601::IsSuppressed",
+      "source": "reviewed-alias"
     },
     "torch:is_inference": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-runtime or interop helper (numpy/buffer/file conversion, Python isinstance checks, global Python state) with no counterpart in a typed .NET API.",
+      "source": "reviewed"
     },
     "torch:is_inference_mode_enabled": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.Autodiff.InferenceModeFlag::IsActive",
+      "source": "reviewed-alias"
     },
     "torch:is_neg": {
       "status": "gap",
@@ -8522,20 +8928,24 @@
       "source": "name-match"
     },
     "torch:is_storage": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-runtime or interop helper (numpy/buffer/file conversion, Python isinstance checks, global Python state) with no counterpart in a typed .NET API.",
+      "source": "reviewed"
     },
     "torch:is_tensor": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-runtime or interop helper (numpy/buffer/file conversion, Python isinstance checks, global Python state) with no counterpart in a typed .NET API.",
+      "source": "reviewed"
     },
     "torch:is_vulkan_available": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A vendor-library kernel entry point (cuDNN, MIOpen, oneDNN, FBGEMM) or a device-type cast; Tensors dispatches the same operations through its engines (IEngine / DirectGpu backends), not per-vendor entry points.",
+      "source": "reviewed"
     },
     "torch:is_warn_always_enabled": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-runtime or interop helper (numpy/buffer/file conversion, Python isinstance checks, global Python state) with no counterpart in a typed .NET API.",
+      "source": "reviewed"
     },
     "torch:isclose": {
       "status": "mapped",
@@ -8630,8 +9040,9 @@
       "source": "name-match"
     },
     "torch:less": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorLessThan",
+      "source": "reviewed-alias"
     },
     "torch:less_equal": {
       "status": "gap",
@@ -8745,24 +9156,28 @@
       "source": "name-match"
     },
     "torch:lstm": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::LstmSequenceForward",
+      "source": "reviewed-alias"
     },
     "torch:lstm_cell": {
       "status": "gap",
       "source": "name-match"
     },
     "torch:lt": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorLessThan",
+      "source": "reviewed-alias"
     },
     "torch:lu": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::LU",
+      "source": "reviewed-alias"
     },
     "torch:lu_solve": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::LuSolve",
+      "source": "reviewed-alias"
     },
     "torch:lu_unpack": {
       "status": "gap",
@@ -8794,12 +9209,14 @@
       "source": "name-match"
     },
     "torch:matrix_exp": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::MatrixExp",
+      "source": "reviewed-alias"
     },
     "torch:matrix_power": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::MatrixPower",
+      "source": "reviewed-alias"
     },
     "torch:max": {
       "status": "mapped",
@@ -8840,8 +9257,9 @@
       "source": "name-match"
     },
     "torch:merge_type_from_type_comment": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A TorchScript / torch.compile / C++ runtime hook with no meaning for a .NET library (compilation here is TensorCodec / compiled plans).",
+      "source": "reviewed"
     },
     "torch:meshgrid": {
       "status": "mapped",
@@ -8858,64 +9276,79 @@
       "source": "name-match"
     },
     "torch:miopen_batch_norm": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A vendor-library kernel entry point (cuDNN, MIOpen, oneDNN, FBGEMM) or a device-type cast; Tensors dispatches the same operations through its engines (IEngine / DirectGpu backends), not per-vendor entry points.",
+      "source": "reviewed"
     },
     "torch:miopen_convolution": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A vendor-library kernel entry point (cuDNN, MIOpen, oneDNN, FBGEMM) or a device-type cast; Tensors dispatches the same operations through its engines (IEngine / DirectGpu backends), not per-vendor entry points.",
+      "source": "reviewed"
     },
     "torch:miopen_convolution_add_relu": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A vendor-library kernel entry point (cuDNN, MIOpen, oneDNN, FBGEMM) or a device-type cast; Tensors dispatches the same operations through its engines (IEngine / DirectGpu backends), not per-vendor entry points.",
+      "source": "reviewed"
     },
     "torch:miopen_convolution_relu": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A vendor-library kernel entry point (cuDNN, MIOpen, oneDNN, FBGEMM) or a device-type cast; Tensors dispatches the same operations through its engines (IEngine / DirectGpu backends), not per-vendor entry points.",
+      "source": "reviewed"
     },
     "torch:miopen_convolution_transpose": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A vendor-library kernel entry point (cuDNN, MIOpen, oneDNN, FBGEMM) or a device-type cast; Tensors dispatches the same operations through its engines (IEngine / DirectGpu backends), not per-vendor entry points.",
+      "source": "reviewed"
     },
     "torch:miopen_ctc_loss": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A vendor-library kernel entry point (cuDNN, MIOpen, oneDNN, FBGEMM) or a device-type cast; Tensors dispatches the same operations through its engines (IEngine / DirectGpu backends), not per-vendor entry points.",
+      "source": "reviewed"
     },
     "torch:miopen_depthwise_convolution": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A vendor-library kernel entry point (cuDNN, MIOpen, oneDNN, FBGEMM) or a device-type cast; Tensors dispatches the same operations through its engines (IEngine / DirectGpu backends), not per-vendor entry points.",
+      "source": "reviewed"
     },
     "torch:miopen_rnn": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A vendor-library kernel entry point (cuDNN, MIOpen, oneDNN, FBGEMM) or a device-type cast; Tensors dispatches the same operations through its engines (IEngine / DirectGpu backends), not per-vendor entry points.",
+      "source": "reviewed"
     },
     "torch:mkldnn_adaptive_avg_pool2d": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A vendor-library kernel entry point (cuDNN, MIOpen, oneDNN, FBGEMM) or a device-type cast; Tensors dispatches the same operations through its engines (IEngine / DirectGpu backends), not per-vendor entry points.",
+      "source": "reviewed"
     },
     "torch:mkldnn_convolution": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A vendor-library kernel entry point (cuDNN, MIOpen, oneDNN, FBGEMM) or a device-type cast; Tensors dispatches the same operations through its engines (IEngine / DirectGpu backends), not per-vendor entry points.",
+      "source": "reviewed"
     },
     "torch:mkldnn_linear_backward_weights": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A vendor-library kernel entry point (cuDNN, MIOpen, oneDNN, FBGEMM) or a device-type cast; Tensors dispatches the same operations through its engines (IEngine / DirectGpu backends), not per-vendor entry points.",
+      "source": "reviewed"
     },
     "torch:mkldnn_max_pool2d": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A vendor-library kernel entry point (cuDNN, MIOpen, oneDNN, FBGEMM) or a device-type cast; Tensors dispatches the same operations through its engines (IEngine / DirectGpu backends), not per-vendor entry points.",
+      "source": "reviewed"
     },
     "torch:mkldnn_max_pool3d": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A vendor-library kernel entry point (cuDNN, MIOpen, oneDNN, FBGEMM) or a device-type cast; Tensors dispatches the same operations through its engines (IEngine / DirectGpu backends), not per-vendor entry points.",
+      "source": "reviewed"
     },
     "torch:mkldnn_rnn_layer": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A vendor-library kernel entry point (cuDNN, MIOpen, oneDNN, FBGEMM) or a device-type cast; Tensors dispatches the same operations through its engines (IEngine / DirectGpu backends), not per-vendor entry points.",
+      "source": "reviewed"
     },
     "torch:mm": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorMatMul",
+      "source": "reviewed-alias"
     },
     "torch:mode": {
       "status": "mapped",
@@ -8923,8 +9356,9 @@
       "source": "name-match"
     },
     "torch:moveaxis": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorMoveDim",
+      "source": "reviewed-alias"
     },
     "torch:movedim": {
       "status": "mapped",
@@ -8936,8 +9370,9 @@
       "source": "name-match"
     },
     "torch:mul": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Multiply",
+      "source": "reviewed-alias"
     },
     "torch:multinomial": {
       "status": "gap",
@@ -8949,8 +9384,9 @@
       "source": "name-match"
     },
     "torch:mv": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::MatrixVectorMultiply",
+      "source": "reviewed-alias"
     },
     "torch:mvlgamma": {
       "status": "gap",
@@ -8988,48 +9424,58 @@
       "source": "name-match"
     },
     "torch:narrow_copy": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A functionalization view-copy variant used by torch.compile; in Tensors the view op followed by Contiguous() gives the same result.",
+      "source": "reviewed"
     },
     "torch:native_batch_norm": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen-internal or dispatcher-level operator (functionalization, layout probing, unchecked variants) that PyTorch does not document for user code.",
+      "source": "reviewed"
     },
     "torch:native_channel_shuffle": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen-internal or dispatcher-level operator (functionalization, layout probing, unchecked variants) that PyTorch does not document for user code.",
+      "source": "reviewed"
     },
     "torch:native_dropout": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen-internal or dispatcher-level operator (functionalization, layout probing, unchecked variants) that PyTorch does not document for user code.",
+      "source": "reviewed"
     },
     "torch:native_group_norm": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen-internal or dispatcher-level operator (functionalization, layout probing, unchecked variants) that PyTorch does not document for user code.",
+      "source": "reviewed"
     },
     "torch:native_layer_norm": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen-internal or dispatcher-level operator (functionalization, layout probing, unchecked variants) that PyTorch does not document for user code.",
+      "source": "reviewed"
     },
     "torch:native_norm": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen-internal or dispatcher-level operator (functionalization, layout probing, unchecked variants) that PyTorch does not document for user code.",
+      "source": "reviewed"
     },
     "torch:ne": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorNotEquals",
+      "source": "reviewed-alias"
     },
     "torch:neg": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Negate",
+      "source": "reviewed-alias"
     },
     "torch:neg_": {
       "status": "gap",
       "source": "name-match"
     },
     "torch:negative": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Negate",
+      "source": "reviewed-alias"
     },
     "torch:negative_": {
       "status": "gap",
@@ -9071,12 +9517,14 @@
       "source": "name-match"
     },
     "torch:numel": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601::Length",
+      "source": "reviewed-alias"
     },
     "torch:ones": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601::CreateOnes",
+      "source": "reviewed-alias"
     },
     "torch:ones_like": {
       "status": "gap",
@@ -9101,16 +9549,19 @@
       "source": "name-match"
     },
     "torch:parse_ir": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A TorchScript / torch.compile / C++ runtime hook with no meaning for a .NET library (compilation here is TensorCodec / compiled plans).",
+      "source": "reviewed"
     },
     "torch:parse_schema": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A TorchScript / torch.compile / C++ runtime hook with no meaning for a .NET library (compilation here is TensorCodec / compiled plans).",
+      "source": "reviewed"
     },
     "torch:parse_type_comment": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A TorchScript / torch.compile / C++ runtime hook with no meaning for a .NET library (compilation here is TensorCodec / compiled plans).",
+      "source": "reviewed"
     },
     "torch:pdist": {
       "status": "mapped",
@@ -9123,12 +9574,14 @@
       "source": "name-match"
     },
     "torch:permute_copy": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A functionalization view-copy variant used by torch.compile; in Tensors the view op followed by Contiguous() gives the same result.",
+      "source": "reviewed"
     },
     "torch:pinverse": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::Pinv",
+      "source": "reviewed-alias"
     },
     "torch:pixel_shuffle": {
       "status": "mapped",
@@ -9172,8 +9625,9 @@
       "source": "name-match"
     },
     "torch:prod": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Product",
+      "source": "reviewed-alias"
     },
     "torch:promote_types": {
       "status": "gap",
@@ -9185,28 +9639,34 @@
       "source": "name-match"
     },
     "torch:q_per_channel_axis": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-object, storage-pointer, named-tensor or quantized-qtensor accessor without a counterpart in Tensors' managed, unnamed tensor model.",
+      "source": "reviewed"
     },
     "torch:q_per_channel_scales": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-object, storage-pointer, named-tensor or quantized-qtensor accessor without a counterpart in Tensors' managed, unnamed tensor model.",
+      "source": "reviewed"
     },
     "torch:q_per_channel_zero_points": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-object, storage-pointer, named-tensor or quantized-qtensor accessor without a counterpart in Tensors' managed, unnamed tensor model.",
+      "source": "reviewed"
     },
     "torch:q_scale": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-object, storage-pointer, named-tensor or quantized-qtensor accessor without a counterpart in Tensors' managed, unnamed tensor model.",
+      "source": "reviewed"
     },
     "torch:q_zero_point": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-object, storage-pointer, named-tensor or quantized-qtensor accessor without a counterpart in Tensors' managed, unnamed tensor model.",
+      "source": "reviewed"
     },
     "torch:qr": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::QR",
+      "source": "reviewed-alias"
     },
     "torch:quantile": {
       "status": "gap",
@@ -9225,36 +9685,44 @@
       "source": "name-match"
     },
     "torch:quantized_batch_norm": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A PyTorch eager-quantization (qtensor) entry point; Tensors' quantization is the int8/fp8 kernels (Int8RowScaled, QuantizedGemm), not qtensors.",
+      "source": "reviewed"
     },
     "torch:quantized_gru_cell": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A PyTorch eager-quantization (qtensor) entry point; Tensors' quantization is the int8/fp8 kernels (Int8RowScaled, QuantizedGemm), not qtensors.",
+      "source": "reviewed"
     },
     "torch:quantized_lstm_cell": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A PyTorch eager-quantization (qtensor) entry point; Tensors' quantization is the int8/fp8 kernels (Int8RowScaled, QuantizedGemm), not qtensors.",
+      "source": "reviewed"
     },
     "torch:quantized_max_pool1d": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A PyTorch eager-quantization (qtensor) entry point; Tensors' quantization is the int8/fp8 kernels (Int8RowScaled, QuantizedGemm), not qtensors.",
+      "source": "reviewed"
     },
     "torch:quantized_max_pool2d": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A PyTorch eager-quantization (qtensor) entry point; Tensors' quantization is the int8/fp8 kernels (Int8RowScaled, QuantizedGemm), not qtensors.",
+      "source": "reviewed"
     },
     "torch:quantized_max_pool3d": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A PyTorch eager-quantization (qtensor) entry point; Tensors' quantization is the int8/fp8 kernels (Int8RowScaled, QuantizedGemm), not qtensors.",
+      "source": "reviewed"
     },
     "torch:quantized_rnn_relu_cell": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A PyTorch eager-quantization (qtensor) entry point; Tensors' quantization is the int8/fp8 kernels (Int8RowScaled, QuantizedGemm), not qtensors.",
+      "source": "reviewed"
     },
     "torch:quantized_rnn_tanh_cell": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A PyTorch eager-quantization (qtensor) entry point; Tensors' quantization is the int8/fp8 kernels (Int8RowScaled, QuantizedGemm), not qtensors.",
+      "source": "reviewed"
     },
     "torch:rad2deg": {
       "status": "gap",
@@ -9265,8 +9733,9 @@
       "source": "name-match"
     },
     "torch:rand": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601::CreateRandom",
+      "source": "reviewed-alias"
     },
     "torch:rand_like": {
       "status": "gap",
@@ -9281,8 +9750,9 @@
       "source": "name-match"
     },
     "torch:randn": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorRandomNormal",
+      "source": "reviewed-alias"
     },
     "torch:randn_like": {
       "status": "gap",
@@ -9297,12 +9767,14 @@
       "source": "name-match"
     },
     "torch:ravel": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorFlatten",
+      "source": "reviewed-alias"
     },
     "torch:read_vitals": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A TorchScript / torch.compile / C++ runtime hook with no meaning for a .NET library (compilation here is TensorCodec / compiled plans).",
+      "source": "reviewed"
     },
     "torch:real": {
       "status": "gap",
@@ -9323,8 +9795,9 @@
       "source": "name-match"
     },
     "torch:relu_": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::ReLUInPlace",
+      "source": "reviewed-alias"
     },
     "torch:remainder": {
       "status": "mapped",
@@ -9406,8 +9879,9 @@
       "source": "name-match"
     },
     "torch:row_indices_copy": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A functionalization view-copy variant used by torch.compile; in Tensors the view op followed by Contiguous() gives the same result.",
+      "source": "reviewed"
     },
     "torch:row_stack": {
       "status": "mapped",
@@ -9424,8 +9898,9 @@
       "source": "name-match"
     },
     "torch:rsqrt": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::ReciprocalSqrt",
+      "source": "reviewed-alias"
     },
     "torch:rsqrt_": {
       "status": "gap",
@@ -9440,8 +9915,9 @@
       "source": "name-match"
     },
     "torch:scalar_tensor": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601::FromScalar",
+      "source": "reviewed-alias"
     },
     "torch:scatter": {
       "status": "mapped",
@@ -9464,16 +9940,18 @@
       "source": "name-match"
     },
     "torch:segment_reduce": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen-internal or dispatcher-level operator (functionalization, layout probing, unchecked variants) that PyTorch does not document for user code.",
+      "source": "reviewed"
     },
     "torch:select": {
       "status": "gap",
       "source": "name-match"
     },
     "torch:select_copy": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A functionalization view-copy variant used by torch.compile; in Tensors the view op followed by Contiguous() gives the same result.",
+      "source": "reviewed"
     },
     "torch:select_scatter": {
       "status": "mapped",
@@ -9490,48 +9968,59 @@
       "source": "name-match"
     },
     "torch:set_anomaly_enabled": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.Autodiff.AnomalyModeScope",
+      "source": "reviewed-alias"
     },
     "torch:set_autocast_cache_enabled": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "torch.autocast's internal cache and nesting hooks; Tensors' mixed precision is configured explicitly (MixedPrecision scopes), not through autocast state.",
+      "source": "reviewed"
     },
     "torch:set_autocast_cpu_dtype": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "torch.autocast's internal cache and nesting hooks; Tensors' mixed precision is configured explicitly (MixedPrecision scopes), not through autocast state.",
+      "source": "reviewed"
     },
     "torch:set_autocast_cpu_enabled": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "torch.autocast's internal cache and nesting hooks; Tensors' mixed precision is configured explicitly (MixedPrecision scopes), not through autocast state.",
+      "source": "reviewed"
     },
     "torch:set_autocast_dtype": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "torch.autocast's internal cache and nesting hooks; Tensors' mixed precision is configured explicitly (MixedPrecision scopes), not through autocast state.",
+      "source": "reviewed"
     },
     "torch:set_autocast_enabled": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.Gpu.AutocastScope",
+      "source": "reviewed-alias"
     },
     "torch:set_autocast_gpu_dtype": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "torch.autocast's internal cache and nesting hooks; Tensors' mixed precision is configured explicitly (MixedPrecision scopes), not through autocast state.",
+      "source": "reviewed"
     },
     "torch:set_autocast_ipu_dtype": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "torch.autocast's internal cache and nesting hooks; Tensors' mixed precision is configured explicitly (MixedPrecision scopes), not through autocast state.",
+      "source": "reviewed"
     },
     "torch:set_autocast_ipu_enabled": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "torch.autocast's internal cache and nesting hooks; Tensors' mixed precision is configured explicitly (MixedPrecision scopes), not through autocast state.",
+      "source": "reviewed"
     },
     "torch:set_autocast_xla_dtype": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "torch.autocast's internal cache and nesting hooks; Tensors' mixed precision is configured explicitly (MixedPrecision scopes), not through autocast state.",
+      "source": "reviewed"
     },
     "torch:set_autocast_xla_enabled": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "torch.autocast's internal cache and nesting hooks; Tensors' mixed precision is configured explicitly (MixedPrecision scopes), not through autocast state.",
+      "source": "reviewed"
     },
     "torch:set_default_device": {
       "status": "gap",
@@ -9554,8 +10043,9 @@
       "source": "name-match"
     },
     "torch:set_flush_denormal": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-runtime or interop helper (numpy/buffer/file conversion, Python isinstance checks, global Python state) with no counterpart in a typed .NET API.",
+      "source": "reviewed"
     },
     "torch:set_num_interop_threads": {
       "status": "gap",
@@ -9566,16 +10056,19 @@
       "source": "name-match"
     },
     "torch:set_vital": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A TorchScript / torch.compile / C++ runtime hook with no meaning for a .NET library (compilation here is TensorCodec / compiled plans).",
+      "source": "reviewed"
     },
     "torch:set_warn_always": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A Python-runtime or interop helper (numpy/buffer/file conversion, Python isinstance checks, global Python state) with no counterpart in a typed .NET API.",
+      "source": "reviewed"
     },
     "torch:sgn": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Sign",
+      "source": "reviewed-alias"
     },
     "torch:sigmoid": {
       "status": "mapped",
@@ -9583,8 +10076,9 @@
       "source": "name-match"
     },
     "torch:sigmoid_": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::SigmoidInPlace",
+      "source": "reviewed-alias"
     },
     "torch:sign": {
       "status": "mapped",
@@ -9622,8 +10116,9 @@
       "source": "name-match"
     },
     "torch:slice_copy": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A functionalization view-copy variant used by torch.compile; in Tensors the view op followed by Contiguous() gives the same result.",
+      "source": "reviewed"
     },
     "torch:slice_inverse": {
       "status": "gap",
@@ -9635,8 +10130,9 @@
       "source": "name-match"
     },
     "torch:slogdet": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::SlogDet",
+      "source": "reviewed-alias"
     },
     "torch:smm": {
       "status": "gap",
@@ -9682,16 +10178,18 @@
       "source": "name-match"
     },
     "torch:split_copy": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A functionalization view-copy variant used by torch.compile; in Tensors the view op followed by Contiguous() gives the same result.",
+      "source": "reviewed"
     },
     "torch:split_with_sizes": {
       "status": "gap",
       "source": "name-match"
     },
     "torch:split_with_sizes_copy": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A functionalization view-copy variant used by torch.compile; in Tensors the view op followed by Contiguous() gives the same result.",
+      "source": "reviewed"
     },
     "torch:spmm": {
       "status": "gap",
@@ -9721,8 +10219,9 @@
       "source": "name-match"
     },
     "torch:squeeze_copy": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A functionalization view-copy variant used by torch.compile; in Tensors the view op followed by Contiguous() gives the same result.",
+      "source": "reviewed"
     },
     "torch:sspaddmm": {
       "status": "gap",
@@ -9748,8 +10247,9 @@
       "source": "name-match"
     },
     "torch:sub": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Subtract",
+      "source": "reviewed-alias"
     },
     "torch:subtract": {
       "status": "mapped",
@@ -9762,8 +10262,9 @@
       "source": "name-match"
     },
     "torch:svd": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::Svd",
+      "source": "reviewed-alias"
     },
     "torch:swapaxes": {
       "status": "mapped",
@@ -9771,60 +10272,74 @@
       "source": "name-match"
     },
     "torch:swapdims": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorSwapAxes",
+      "source": "reviewed-alias"
     },
     "torch:sym_constrain_range": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A symbolic-shape helper for torch.compile tracing; Tensors has no symbolic shape tracer, shapes are concrete ints.",
+      "source": "reviewed"
     },
     "torch:sym_constrain_range_for_size": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A symbolic-shape helper for torch.compile tracing; Tensors has no symbolic shape tracer, shapes are concrete ints.",
+      "source": "reviewed"
     },
     "torch:sym_float": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A symbolic-shape helper for torch.compile tracing; Tensors has no symbolic shape tracer, shapes are concrete ints.",
+      "source": "reviewed"
     },
     "torch:sym_fresh_size": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A symbolic-shape helper for torch.compile tracing; Tensors has no symbolic shape tracer, shapes are concrete ints.",
+      "source": "reviewed"
     },
     "torch:sym_int": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A symbolic-shape helper for torch.compile tracing; Tensors has no symbolic shape tracer, shapes are concrete ints.",
+      "source": "reviewed"
     },
     "torch:sym_ite": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A symbolic-shape helper for torch.compile tracing; Tensors has no symbolic shape tracer, shapes are concrete ints.",
+      "source": "reviewed"
     },
     "torch:sym_max": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A symbolic-shape helper for torch.compile tracing; Tensors has no symbolic shape tracer, shapes are concrete ints.",
+      "source": "reviewed"
     },
     "torch:sym_min": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A symbolic-shape helper for torch.compile tracing; Tensors has no symbolic shape tracer, shapes are concrete ints.",
+      "source": "reviewed"
     },
     "torch:sym_not": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A symbolic-shape helper for torch.compile tracing; Tensors has no symbolic shape tracer, shapes are concrete ints.",
+      "source": "reviewed"
     },
     "torch:sym_sqrt": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A symbolic-shape helper for torch.compile tracing; Tensors has no symbolic shape tracer, shapes are concrete ints.",
+      "source": "reviewed"
     },
     "torch:sym_sum": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A symbolic-shape helper for torch.compile tracing; Tensors has no symbolic shape tracer, shapes are concrete ints.",
+      "source": "reviewed"
     },
     "torch:t": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601::TransposeLast2D",
+      "source": "reviewed-alias"
     },
     "torch:t_copy": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A functionalization view-copy variant used by torch.compile; in Tensors the view op followed by Contiguous() gives the same result.",
+      "source": "reviewed"
     },
     "torch:take": {
       "status": "mapped",
@@ -9851,12 +10366,14 @@
       "source": "name-match"
     },
     "torch:tanh_": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TanhInPlace",
+      "source": "reviewed-alias"
     },
     "torch:tensor": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601",
+      "source": "reviewed-alias"
     },
     "torch:tensor_split": {
       "status": "mapped",
@@ -9898,8 +10415,9 @@
       "source": "name-match"
     },
     "torch:transpose_copy": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A functionalization view-copy variant used by torch.compile; in Tensors the view op followed by Contiguous() gives the same result.",
+      "source": "reviewed"
     },
     "torch:trapezoid": {
       "status": "gap",
@@ -9937,40 +10455,47 @@
       "source": "name-match"
     },
     "torch:true_divide": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Divide",
+      "source": "reviewed-alias"
     },
     "torch:trunc": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::Truncate",
+      "source": "reviewed-alias"
     },
     "torch:trunc_": {
       "status": "gap",
       "source": "name-match"
     },
     "torch:typename": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A TorchScript / torch.compile / C++ runtime hook with no meaning for a .NET library (compilation here is TensorCodec / compiled plans).",
+      "source": "reviewed"
     },
     "torch:unbind": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorUnstack",
+      "source": "reviewed-alias"
     },
     "torch:unbind_copy": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A functionalization view-copy variant used by torch.compile; in Tensors the view op followed by Contiguous() gives the same result.",
+      "source": "reviewed"
     },
     "torch:unflatten": {
       "status": "gap",
       "source": "name-match"
     },
     "torch:unfold_copy": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A functionalization view-copy variant used by torch.compile; in Tensors the view op followed by Contiguous() gives the same result.",
+      "source": "reviewed"
     },
     "torch:unify_type_list": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A TorchScript / torch.compile / C++ runtime hook with no meaning for a .NET library (compilation here is TensorCodec / compiled plans).",
+      "source": "reviewed"
     },
     "torch:unique": {
       "status": "mapped",
@@ -9987,16 +10512,19 @@
       "source": "name-match"
     },
     "torch:unsafe_chunk": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen-internal or dispatcher-level operator (functionalization, layout probing, unchecked variants) that PyTorch does not document for user code.",
+      "source": "reviewed"
     },
     "torch:unsafe_split": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen-internal or dispatcher-level operator (functionalization, layout probing, unchecked variants) that PyTorch does not document for user code.",
+      "source": "reviewed"
     },
     "torch:unsafe_split_with_sizes": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "An ATen-internal or dispatcher-level operator (functionalization, layout probing, unchecked variants) that PyTorch does not document for user code.",
+      "source": "reviewed"
     },
     "torch:unsqueeze": {
       "status": "mapped",
@@ -10004,20 +10532,23 @@
       "source": "name-match"
     },
     "torch:unsqueeze_copy": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A functionalization view-copy variant used by torch.compile; in Tensors the view op followed by Contiguous() gives the same result.",
+      "source": "reviewed"
     },
     "torch:use_deterministic_algorithms": {
       "status": "gap",
       "source": "name-match"
     },
     "torch:values_copy": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A functionalization view-copy variant used by torch.compile; in Tensors the view op followed by Contiguous() gives the same result.",
+      "source": "reviewed"
     },
     "torch:vander": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::Vander",
+      "source": "reviewed-alias"
     },
     "torch:var": {
       "status": "mapped",
@@ -10037,24 +10568,28 @@
       "source": "name-match"
     },
     "torch:view_as_complex_copy": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A functionalization view-copy variant used by torch.compile; in Tensors the view op followed by Contiguous() gives the same result.",
+      "source": "reviewed"
     },
     "torch:view_as_real": {
       "status": "gap",
       "source": "name-match"
     },
     "torch:view_as_real_copy": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A functionalization view-copy variant used by torch.compile; in Tensors the view op followed by Contiguous() gives the same result.",
+      "source": "reviewed"
     },
     "torch:view_copy": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A functionalization view-copy variant used by torch.compile; in Tensors the view op followed by Contiguous() gives the same result.",
+      "source": "reviewed"
     },
     "torch:vitals_enabled": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A TorchScript / torch.compile / C++ runtime hook with no meaning for a .NET library (compilation here is TensorCodec / compiled plans).",
+      "source": "reviewed"
     },
     "torch:vsplit": {
       "status": "mapped",
@@ -10067,8 +10602,9 @@
       "source": "name-match"
     },
     "torch:wait": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A TorchScript / torch.compile / C++ runtime hook with no meaning for a .NET library (compilation here is TensorCodec / compiled plans).",
+      "source": "reviewed"
     },
     "torch:where": {
       "status": "mapped",
@@ -10089,8 +10625,9 @@
       "source": "name-match"
     },
     "torch:zeros": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601::CreateZeros",
+      "source": "reviewed-alias"
     },
     "torch:zeros_like": {
       "status": "gap",
@@ -10102,32 +10639,39 @@
       "source": "name-match"
     },
     "torch.fft:fft2": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Fft.Fft::Fft2",
+      "source": "reviewed-alias"
     },
     "torch.fft:fftfreq": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Fft.Fft::FftFreq",
+      "source": "reviewed-alias"
     },
     "torch.fft:fftn": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Fft.Fft::FftN",
+      "source": "reviewed-alias"
     },
     "torch.fft:fftshift": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Fft.Fft::FftShift",
+      "source": "reviewed-alias"
     },
     "torch.fft:hfft": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Fft.Fft::HFft",
+      "source": "reviewed-alias"
     },
     "torch.fft:hfft2": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Fft.Fft::HFft2",
+      "source": "reviewed-alias"
     },
     "torch.fft:hfftn": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Fft.Fft::HFftN",
+      "source": "reviewed-alias"
     },
     "torch.fft:ifft": {
       "status": "mapped",
@@ -10135,28 +10679,34 @@
       "source": "name-match"
     },
     "torch.fft:ifft2": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Fft.Fft::IFft2",
+      "source": "reviewed-alias"
     },
     "torch.fft:ifftn": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Fft.Fft::IFftN",
+      "source": "reviewed-alias"
     },
     "torch.fft:ifftshift": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Fft.Fft::IFftShift",
+      "source": "reviewed-alias"
     },
     "torch.fft:ihfft": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Fft.Fft::IHFft",
+      "source": "reviewed-alias"
     },
     "torch.fft:ihfft2": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Fft.Fft::IHFft2",
+      "source": "reviewed-alias"
     },
     "torch.fft:ihfftn": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Fft.Fft::IHFftN",
+      "source": "reviewed-alias"
     },
     "torch.fft:irfft": {
       "status": "mapped",
@@ -10164,12 +10714,14 @@
       "source": "name-match"
     },
     "torch.fft:irfft2": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Fft.Fft::IRFft2",
+      "source": "reviewed-alias"
     },
     "torch.fft:irfftn": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Fft.Fft::IRFftN",
+      "source": "reviewed-alias"
     },
     "torch.fft:rfft": {
       "status": "mapped",
@@ -10177,28 +10729,34 @@
       "source": "name-match"
     },
     "torch.fft:rfft2": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Fft.Fft::RFft2",
+      "source": "reviewed-alias"
     },
     "torch.fft:rfftfreq": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Fft.Fft::RFftFreq",
+      "source": "reviewed-alias"
     },
     "torch.fft:rfftn": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Fft.Fft::RFftN",
+      "source": "reviewed-alias"
     },
     "torch.linalg:cholesky": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::Cholesky",
+      "source": "reviewed-alias"
     },
     "torch.linalg:cholesky_ex": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::CholeskyEx",
+      "source": "reviewed-alias"
     },
     "torch.linalg:cond": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::Cond",
+      "source": "reviewed-alias"
     },
     "torch.linalg:cross": {
       "status": "mapped",
@@ -10206,8 +10764,9 @@
       "source": "name-match"
     },
     "torch.linalg:det": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::Det",
+      "source": "reviewed-alias"
     },
     "torch.linalg:diagonal": {
       "status": "mapped",
@@ -10215,64 +10774,77 @@
       "source": "name-match"
     },
     "torch.linalg:eig": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::Eig",
+      "source": "reviewed-alias"
     },
     "torch.linalg:eigh": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::Eigh",
+      "source": "reviewed-alias"
     },
     "torch.linalg:eigvals": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::Eigvals",
+      "source": "reviewed-alias"
     },
     "torch.linalg:eigvalsh": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::Eigvalsh",
+      "source": "reviewed-alias"
     },
     "torch.linalg:householder_product": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::HouseholderProduct",
+      "source": "reviewed-alias"
     },
     "torch.linalg:inv": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::Inv",
+      "source": "reviewed-alias"
     },
     "torch.linalg:inv_ex": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::InvEx",
+      "source": "reviewed-alias"
     },
     "torch.linalg:ldl_factor": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::LdlFactor",
+      "source": "reviewed-alias"
     },
     "torch.linalg:ldl_factor_ex": {
       "status": "gap",
       "source": "name-match"
     },
     "torch.linalg:ldl_solve": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::LdlSolve",
+      "source": "reviewed-alias"
     },
     "torch.linalg:lstsq": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::Lstsq",
+      "source": "reviewed-alias"
     },
     "torch.linalg:lu": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::LU",
+      "source": "reviewed-alias"
     },
     "torch.linalg:lu_factor": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::LuFactor",
+      "source": "reviewed-alias"
     },
     "torch.linalg:lu_factor_ex": {
       "status": "gap",
       "source": "name-match"
     },
     "torch.linalg:lu_solve": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::LuSolve",
+      "source": "reviewed-alias"
     },
     "torch.linalg:matmul": {
       "status": "mapped",
@@ -10280,20 +10852,24 @@
       "source": "name-match"
     },
     "torch.linalg:matrix_exp": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::MatrixExp",
+      "source": "reviewed-alias"
     },
     "torch.linalg:matrix_norm": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::MatrixNorm",
+      "source": "reviewed-alias"
     },
     "torch.linalg:matrix_power": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::MatrixPower",
+      "source": "reviewed-alias"
     },
     "torch.linalg:matrix_rank": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::MatrixRank",
+      "source": "reviewed-alias"
     },
     "torch.linalg:multi_dot": {
       "status": "mapped",
@@ -10306,48 +10882,59 @@
       "source": "name-match"
     },
     "torch.linalg:pinv": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::Pinv",
+      "source": "reviewed-alias"
     },
     "torch.linalg:qr": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::QR",
+      "source": "reviewed-alias"
     },
     "torch.linalg:slogdet": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::SlogDet",
+      "source": "reviewed-alias"
     },
     "torch.linalg:solve": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::Solve",
+      "source": "reviewed-alias"
     },
     "torch.linalg:solve_ex": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::SolveEx",
+      "source": "reviewed-alias"
     },
     "torch.linalg:solve_triangular": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::SolveTriangular",
+      "source": "reviewed-alias"
     },
     "torch.linalg:svd": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::Svd",
+      "source": "reviewed-alias"
     },
     "torch.linalg:svdvals": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::SvdVals",
+      "source": "reviewed-alias"
     },
     "torch.linalg:tensorinv": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::TensorInv",
+      "source": "reviewed-alias"
     },
     "torch.linalg:tensorsolve": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::TensorSolve",
+      "source": "reviewed-alias"
     },
     "torch.linalg:vander": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::Vander",
+      "source": "reviewed-alias"
     },
     "torch.linalg:vecdot": {
       "status": "mapped",
@@ -10355,8 +10942,9 @@
       "source": "name-match"
     },
     "torch.linalg:vector_norm": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Linalg::VectorNorm",
+      "source": "reviewed-alias"
     }
   }
 }
