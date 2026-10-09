@@ -10219,11 +10219,19 @@ public partial class CpuEngine : ITensorLevelEngine
         if (input.Layout == LinearAlgebra.TensorLayout.Nchw
             && Simd.DirectConvAvx2.ShouldUseForward(batch, inChannels, outChannels, kernelHeight, kernelWidth, strideH, strideW, outputHeight, outputWidth))
         {
-            Simd.DirectConvAvx2.Forward(
-                inputData ?? input.GetReadOnlyDataArray(), 0, kernelData ?? kernel.GetReadOnlyDataArray(), 0, outputData ?? output.GetDataArray(), 0,
-                accumulate: false, batch, inChannels, height, width, outChannels, kernelHeight, kernelWidth,
-                strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth);
-            return;
+            // Read and write the operands in place at their storage offsets: an arena or sliced buffer would otherwise
+            // be copied out (offset 0 is only right for a caller-supplied flat array).
+            int inOff = 0, kOff = 0, outOff = 0;
+            float[]? inArr = inputData ?? (input.IsContiguous ? input.GetCpuBackingForStridedRead(out inOff) : null);
+            float[]? kArr = kernelData ?? (kernel.IsContiguous ? kernel.GetCpuBackingForStridedRead(out kOff) : null);
+            float[]? outArr = outputData ?? output.GetCpuBackingForContiguousWrite(out outOff);
+            if (inArr is not null && kArr is not null && outArr is not null)
+            {
+                Simd.DirectConvAvx2.Forward(inArr, inOff, kArr, kOff, outArr, outOff,
+                    accumulate: false, batch, inChannels, height, width, outChannels, kernelHeight, kernelWidth,
+                    strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth);
+                return;
+            }
         }
 #endif
         if (input.Layout == LinearAlgebra.TensorLayout.Nchw
@@ -15330,12 +15338,18 @@ public partial class CpuEngine : ITensorLevelEngine
             if (Simd.DirectConvAvx2.ShouldUseBackwardInput(batch, inChannels, outChannels, height, width, kernelHeight, kernelWidth,
                     strideH, strideW, padH, padW, dilationH, dilationW))
             {
-                Simd.DirectConvAvx2.BackwardInput(
-                    (float[])(object)gradOutput.GetFlattenedData(), 0, (float[])(object)kernel.GetFlattenedData(), 0,
-                    (float[])(object)dest._storage.GetDataArray(), dest._storageOffset, accumulate,
-                    batch, inChannels, height, width, outChannels, kernelHeight, kernelWidth,
-                    strideH, strideW, padH, padW, outputHeight, outputWidth);
-                return;
+                // Both operands were made contiguous above; read them in place at their storage offsets (an arena
+                // buffer is usually longer than the tensor, and GetFlattenedData would copy it every step).
+                var gArr = (float[]?)(object?)gradOutput.GetCpuBackingForStridedRead(out int gOff);
+                var kArr = (float[]?)(object?)kernel.GetCpuBackingForStridedRead(out int kOff);
+                var dArr = (float[]?)(object?)dest.GetCpuBackingForContiguousWrite(out int dOff);
+                if (gArr is not null && kArr is not null && dArr is not null)
+                {
+                    Simd.DirectConvAvx2.BackwardInput(gArr, gOff, kArr, kOff, dArr, dOff, accumulate,
+                        batch, inChannels, height, width, outChannels, kernelHeight, kernelWidth,
+                        strideH, strideW, padH, padW, outputHeight, outputWidth);
+                    return;
+                }
             }
 #endif
             // FUSED FAST PATH (transposed-convolution identity). For stride=1,
@@ -16489,12 +16503,17 @@ public partial class CpuEngine : ITensorLevelEngine
             if (Simd.DirectConvAvx2.ShouldUseBackwardKernel(inChannels, outChannels, kernelHeight, kernelWidth,
                     strideH, strideW, outputHeight, outputWidth))
             {
-                Simd.DirectConvAvx2.BackwardKernel(
-                    (float[])(object)input.GetFlattenedData(), 0, (float[])(object)gradOutput.GetFlattenedData(), 0,
-                    (float[])(object)dest._storage.GetDataArray(), dest._storageOffset, accumulate,
-                    batch, inChannels, height, width, outChannels, kernelHeight, kernelWidth,
-                    strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth);
-                return;
+                // Both operands were made contiguous above; read them in place (see the input-gradient route).
+                var xArr = (float[]?)(object?)input.GetCpuBackingForStridedRead(out int xOff);
+                var gArr = (float[]?)(object?)gradOutput.GetCpuBackingForStridedRead(out int gOff);
+                var dArr = (float[]?)(object?)dest.GetCpuBackingForContiguousWrite(out int dOff);
+                if (xArr is not null && gArr is not null && dArr is not null)
+                {
+                    Simd.DirectConvAvx2.BackwardKernel(xArr, xOff, gArr, gOff, dArr, dOff, accumulate,
+                        batch, inChannels, height, width, outChannels, kernelHeight, kernelWidth,
+                        strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth);
+                    return;
+                }
             }
 #endif
 #if !NET471

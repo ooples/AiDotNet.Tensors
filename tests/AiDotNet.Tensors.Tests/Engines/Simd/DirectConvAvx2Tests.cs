@@ -161,5 +161,43 @@ public class DirectConvAvx2Tests
         }
         AssertClose(expected, dw, "kernel gradient");
     }
+
+    [SkippableFact]
+    public void EngineRoutes_ReadAndWriteOffsetViewsInPlace()
+    {
+        // Operands that are contiguous views at a nonzero storage offset (an arena slab, a batch slice): every pass the
+        // engine sends to the direct kernels must address them at their offset, against a copy at offset 0.
+        Skip.IfNot(DirectConvAvx2.IsSupported, "needs AVX2 and FMA");
+        var engine = new AiDotNet.Tensors.Engines.CpuEngine();
+        int[] stride = { 2, 2 }, pad = { 1, 1 }, dil = { 1, 1 };
+        Assert.True(DirectConvAvx2.ShouldUseForward(4, 32, 32, 3, 3, 2, 2, 8, 8));
+        Assert.True(DirectConvAvx2.ShouldUseBackwardInput(4, 32, 32, 16, 16, 3, 3, 2, 2, 1, 1, 1, 1));
+        Assert.True(DirectConvAvx2.ShouldUseBackwardKernel(32, 32, 3, 3, 2, 2, 8, 8));
+
+        var xBig = Random(11, 6, 32, 16, 16); var x = xBig.Slice(0, 1, 5);
+        var w = Random(12, 32, 32, 3, 3);
+        var gBig = Random(13, 6, 32, 8, 8); var g = gBig.Slice(0, 2, 6);
+        var xFlat = x.Contiguous().Clone(); var gFlat = g.Contiguous().Clone();
+        Assert.True(x.IsContiguous && g.IsContiguous);
+
+        var y = engine.Conv2D(x, w, stride, pad, dil);
+        var yRef = engine.Conv2D(xFlat, w, stride, pad, dil);
+        Assert.Equal(yRef.AsSpan().ToArray(), y.AsSpan().ToArray());
+
+        var w32 = Random(14, 32, 32, 3, 3);
+        var dxBig = new AiDotNet.Tensors.LinearAlgebra.Tensor<float>(new[] { 6, 32, 16, 16 });
+        var dx = dxBig.Slice(0, 1, 5);
+        var dxRef = new AiDotNet.Tensors.LinearAlgebra.Tensor<float>(new[] { 4, 32, 16, 16 });
+        engine.Conv2DBackwardInputInto(dx, g, w32, new[] { 4, 32, 16, 16 }, stride, pad, dil, accumulate: false);
+        engine.Conv2DBackwardInputInto(dxRef, gFlat, w32, new[] { 4, 32, 16, 16 }, stride, pad, dil, accumulate: false);
+        Assert.Equal(dxRef.AsSpan().ToArray(), dx.Contiguous().AsSpan().ToArray());
+        Assert.All(dxBig.Slice(0, 0, 1).AsSpan().ToArray(), v => Assert.Equal(0f, v));   // nothing written outside the view
+
+        var dw = new AiDotNet.Tensors.LinearAlgebra.Tensor<float>(new[] { 32, 32, 3, 3 });
+        var dwRef = new AiDotNet.Tensors.LinearAlgebra.Tensor<float>(new[] { 32, 32, 3, 3 });
+        engine.Conv2DBackwardKernelInto(dw, g, x, new[] { 32, 32, 3, 3 }, stride, pad, dil, accumulate: false);
+        engine.Conv2DBackwardKernelInto(dwRef, gFlat, xFlat, new[] { 32, 32, 3, 3 }, stride, pad, dil, accumulate: false);
+        Assert.Equal(dwRef.AsSpan().ToArray(), dw.AsSpan().ToArray());
+    }
 }
 #endif
