@@ -10408,7 +10408,7 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             if (!t_forceFullIm2Col && TryConv2DRowBlockParallelFloat(input, kernel, result, batch, inChannels, height, width,
                     outChannels, kernelHeight, kernelWidth, stride, padding, dilation, outputHeight, outputWidth))
-                return false;
+                return false;   // the epilogue is left to the caller, as on every non-fusing path
             Conv2DWithIm2ColGemm(input, kernel, result, batch, inChannels, height, width,
                 outChannels, kernelHeight, kernelWidth, stride, padding, dilation, outputHeight, outputWidth);
             return false;
@@ -37234,11 +37234,9 @@ public partial class CpuEngine : ITensorLevelEngine
                 var capturedSrc = tensor;
                 var capturedAxes = (int[])axes.Clone();
                 scope.RecordInPlace(LazyNodeType.Custom, "TensorPermuteInto", output, new[] { tensor },
-                    (eng, dst) =>
-                    {
-                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu) cpuEng.TensorPermuteInto(dst, capturedSrc, capturedAxes);
-                        else { var r = eng.TensorPermute(capturedSrc, capturedAxes).Contiguous(); r.AsSpan().CopyTo(dst.AsWritableSpan()); }
-                    },
+                    // Every engine's own write-into: a device engine permutes on the device, where the former
+                    // permute-then-copy through host spans downloaded the result, a host read that aborts a CUDA graph capture.
+                    (eng, dst) => eng.TensorPermuteInto(dst, capturedSrc, capturedAxes),
                     BackwardFunctions<T>.PermuteBackward, new object[] { capturedAxes });
                 return;
             }

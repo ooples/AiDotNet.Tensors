@@ -231,6 +231,8 @@ kernel void tensor_sum_squares_accumulate(
     uint group [[threadgroup_position_in_grid]],
     uint groupSize [[threads_per_threadgroup]])
 {
+    // 1024 is Metal's per-threadgroup thread ceiling (maxTotalThreadsPerThreadgroup), so lid < 1024 always; the host
+    // dispatches MultiTensorArgs.ReductionGroupSize (256).
     threadgroup float partial[1024];
     if (group != 0) return;
     float v = 0.0f;

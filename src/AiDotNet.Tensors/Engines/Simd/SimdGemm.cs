@@ -1614,6 +1614,18 @@ internal static partial class SimdGemm
         }
 
 #if !NET471
+        // Direct-2D first where it applies, as in SgemmAddInternal (measured faster than the column panel on every
+        // shape both take). It needs a zeroed C; any route below overwrites C if it declines.
+        if (UseParallelGemm && UseDirectParallel2D && !transA && !transB && lda == k && ldb == n
+            && Avx2.IsSupported && Fma.IsSupported && m >= Mr
+            && m <= DirectParallel2DMaxM && k <= DirectParallel2DMaxK && n >= Nr
+            && (long)m * k * n >= ParallelWorkThreshold)
+        {
+            c.Slice(0, m * n).Clear();
+            if (TrySgemmDirectParallel2D(a, lda, b, ldb, c, m, k, n, allowParallel: true))
+                return;
+        }
+
         // Column-panel direct GEMM where it wins (see PrefersParallelN): ahead of the JIT small-K,
         // OpenBLAS and M-sliced routes below, which it beats at every shape it accepts. The store
         // kernels overwrite C, so no Clear is needed.
@@ -1901,30 +1913,35 @@ internal static partial class SimdGemm
             return;
         }
 #if NET5_0_OR_GREATER
+        // Ahead of the column panel below: on the shapes both take, direct-2D measured 75 vs 150 us (16x576x1024),
+        // 114 vs 183 (64x784x512), 174 vs 186 (32x144x4096) and tied at 128x512x512. The column panel still serves
+        // what direct-2D does not (accumulating output, shapes past its bounds).
+        // Small-M (training-batch) GEMMs: the direct kernel fanned over both output axes. Ahead of the
+        // paths below, which split only rows (too few at m <= 192) or pack A in one task per K panel.
+        // Partition-independent results; see SimdGemm.DirectParallel2D.cs.
+        // Gated on shape only (allowParallel just picks the chunk count), so a gated GEMM computes the same
+        // bits whether or not it may fan out.
+        if (UseDirectParallel2D && clearedOutput && !transA && !transB
+            && Avx2.IsSupported && Fma.IsSupported && m >= Mr
+            && m <= DirectParallel2DMaxM && k <= DirectParallel2DMaxK && n >= Nr
+            && (long)m * k * n >= ParallelWorkThreshold
+            && TrySgemmDirectParallel2D(a, lda, b, ldb, c, m, k, n, allowParallel))
+            return;
+
+        // Column-panel split where it wins (see PrefersParallelN). Here for SgemmAdd (accumulate) and
+        // the strided entry points; Sgemm checks it before its own fast paths.
+        // Every path below slices M (SgemmDirectParallelM needs m >= 64) and SgemmNParallelSmallM
+        // takes only m <= 8, so 9 <= m < 64 ran on one thread however large n was — the core GEMM of
+        // every conv layer with 9-63 output channels. A [32x144]·[144x4096] GEMM (1x16x64x64 conv,
+        // 32 filters) took 611 µs at 1, 16 and 128 threads alike.
+        if (allowParallel && !transA && !transB && PrefersParallelN(m, k, n))
+        {
+            SgemmDirectParallelN(a, lda, b, ldb, c, m, k, n, clearedOutput);
+            return;
+        }
+
         if (Avx2.IsSupported && Fma.IsSupported && m >= Mr && n > 0)
         {
-            // Small-M (training-batch) GEMMs: the direct kernel fanned over both output axes. Ahead of the
-            // paths below, which split only rows (too few at m <= 192) or pack A in one task per K panel.
-            // Partition-independent results; see SimdGemm.DirectParallel2D.cs.
-            // Gated on shape only (allowParallel just picks the chunk count), so a gated GEMM computes the same
-            // bits whether or not it may fan out.
-            if (UseDirectParallel2D && clearedOutput && !transA && !transB
-                && m <= DirectParallel2DMaxM && k <= DirectParallel2DMaxK && n >= Nr
-                && (long)m * k * n >= ParallelWorkThreshold
-                && TrySgemmDirectParallel2D(a, lda, b, ldb, c, m, k, n, allowParallel))
-                return;
-
-            // Column-panel split where it wins (see PrefersParallelN), for what the 2D path above does not take:
-            // accumulating calls (SgemmAdd) and K beyond its gate. Every path below slices M (SgemmDirectParallelM
-            // needs m >= 64) and SgemmNParallelSmallM takes only m <= 8, so 9 <= m < 64 ran on one thread however
-            // large n was — the core GEMM of every conv layer with 9-63 output channels. A [32x144]·[144x4096] GEMM
-            // (1x16x64x64 conv, 32 filters) took 611 µs at 1, 16 and 128 threads alike.
-            if (allowParallel && !transA && !transB && PrefersParallelN(m, k, n))
-            {
-                SgemmDirectParallelN(a, lda, b, ldb, c, m, k, n, clearedOutput);
-                return;
-            }
-
             // Iter 34: small-matmul fast path — no packing, direct 6×16 FMA
             // with fully vectorized masked edge kernels (proper fix for iter
             // 29's scalar-edge disaster). Targets per-head-attention shapes
