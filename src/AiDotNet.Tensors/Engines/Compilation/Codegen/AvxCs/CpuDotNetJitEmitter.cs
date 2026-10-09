@@ -86,43 +86,18 @@ public sealed class CpuDotNetJitEmitter : IKernelEmitter
                     $"Phase B CPU emitter does not yet handle {cat} ops (found {node.Op}).");
         }
 
-        // Every output must ultimately be the same shape as every
-        // input (pointwise). Shape mismatches indicate broadcast /
-        // reshape which isn't pointwise-fusable without a layout
-        // rewrite pass.
-        var firstShape = graph.Nodes[0].Shape;
-        long elementCount = 1;
-        for (int i = 0; i < firstShape.Length; i++) elementCount *= firstShape[i];
-        foreach (var node in graph.Nodes)
-        {
-            long nc = 1;
-            for (int i = 0; i < node.Shape.Length; i++) nc *= node.Shape[i];
-            if (nc != elementCount)
-                return CodegenEmitResult.Decline(
-                    $"Phase B CPU emitter requires all graph nodes to share element count; "
-                  + $"first={elementCount}, mismatch at op {node.Op}={nc}.");
-        }
-
-        // The compiled kernel currently passes elementCount as int (the
-        // Expression-tree loop counter is int — moving to long would
-        // make every array index a long-to-int conversion). Reject
-        // graphs that exceed int.MaxValue elements so the (int) cast
-        // below at the CompiledCpuKernel ctor cannot silently truncate
-        // and produce wrong results.
-        if (elementCount > int.MaxValue)
-            return CodegenEmitResult.Decline(
-                $"CpuDotNetJitEmitter cannot emit kernels for graphs with element count "
-              + $"{elementCount} (exceeds int.MaxValue = {int.MaxValue}); the loop counter is int.");
+        if (!CpuKernelContract.TryValidateGraph(graph, dtype, out int elementCount, out string reason))
+            return CodegenEmitResult.Decline(reason);
 
         return dtype switch
         {
-            CodegenElementType.Float32 => EmitTyped<float>(graph, dtype),
-            CodegenElementType.Float64 => EmitTyped<double>(graph, dtype),
+            CodegenElementType.Float32 => EmitTyped<float>(graph, dtype, elementCount),
+            CodegenElementType.Float64 => EmitTyped<double>(graph, dtype, elementCount),
             _ => CodegenEmitResult.Decline($"Unreachable — dtype check above excluded {dtype}."),
         };
     }
 
-    private static CodegenEmitResult EmitTyped<T>(CodegenGraph graph, CodegenElementType dtype)
+    private static CodegenEmitResult EmitTyped<T>(CodegenGraph graph, CodegenElementType dtype, int elementCount)
         where T : unmanaged
     {
         // ─── 1. Build the expression tree ────────────────────────────
@@ -253,7 +228,7 @@ public sealed class CpuDotNetJitEmitter : IKernelEmitter
         var source = DumpSource(graph, dtype);
 
         return CodegenEmitResult.Succeeded(
-            new CompiledCpuKernel<T>(graph, dtype, compiled, (int)graph.Nodes[0].ElementCount),
+            new CompiledCpuKernel<T>(graph, dtype, compiled, elementCount),
             source);
     }
 
@@ -318,9 +293,10 @@ public sealed class CpuDotNetJitEmitter : IKernelEmitter
 
             // Activations — expressed in terms of the primitives above.
             case CodegenOpKind.ReLU:
-                // max(x, 0)
-                return CallMath<T>(nameof(Math.Max), nameof(MathF.Max),
-                    nodeValue[node.Inputs[0]], Expression.Constant(default(T)));
+                // Match the SIMD body and tail: preserve NaN and signed zero.
+                return Expression.Condition(
+                    Expression.LessThan(nodeValue[node.Inputs[0]], Expression.Constant(default(T))),
+                    Expression.Constant(default(T)), nodeValue[node.Inputs[0]]);
             case CodegenOpKind.Sigmoid:
             {
                 // 1 / (1 + exp(-x))
@@ -440,7 +416,7 @@ public sealed class CpuDotNetJitEmitter : IKernelEmitter
         CodegenOpKind.Floor => $"{MathHost(scalar)}.Floor(v{node.Inputs[0]})",
         CodegenOpKind.Ceil => $"{MathHost(scalar)}.Ceiling(v{node.Inputs[0]})",
         CodegenOpKind.Round => $"{MathHost(scalar)}.Round(v{node.Inputs[0]})",
-        CodegenOpKind.ReLU => $"{MathHost(scalar)}.Max(v{node.Inputs[0]}, 0)",
+        CodegenOpKind.ReLU => $"v{node.Inputs[0]} < 0 ? 0 : v{node.Inputs[0]}",
         CodegenOpKind.Sigmoid => $"1 / (1 + {MathHost(scalar)}.Exp(-v{node.Inputs[0]}))",
         CodegenOpKind.Max => $"{MathHost(scalar)}.Max(v{node.Inputs[0]}, v{node.Inputs[1]})",
         CodegenOpKind.Min => $"{MathHost(scalar)}.Min(v{node.Inputs[0]}, v{node.Inputs[1]})",
@@ -488,16 +464,8 @@ internal sealed class CompiledCpuKernel<TElement> : CodegenKernel
             throw new ArgumentException(
                 $"Kernel specialised for {typeof(TElement).Name} — caller passed {typeof(T).Name}.",
                 nameof(inputs));
-        if (inputs is null) throw new ArgumentNullException(nameof(inputs));
-        if (outputs is null) throw new ArgumentNullException(nameof(outputs));
-        if (inputs.Length != InputCount)
-            throw new ArgumentException(
-                $"Expected {InputCount} input buffers, got {inputs.Length}.", nameof(inputs));
-        if (outputs.Length != OutputCount)
-            throw new ArgumentException(
-                $"Expected {OutputCount} output buffers, got {outputs.Length}.", nameof(outputs));
+        CpuKernelContract.ValidateBuffers(inputs, outputs, InputCount, OutputCount, _elementCount);
 
-        // Reinterpret — safe because the type check above guarantees T == TElement.
         var typedInputs = (TElement[][])(object)inputs;
         var typedOutputs = (TElement[][])(object)outputs;
         _delegate(typedInputs, typedOutputs, _elementCount);
