@@ -199,10 +199,20 @@ public sealed class GpuCpuAutoDifferentialTests : IClassFixture<GpuCpuAutoDiffer
     };
 
     // Stochastic / non-deterministic kernels — substring match on the method name.
-    private static readonly string[] NonDeterministicNameFragments = { "Dropout", "Random", "Rand", "Bernoulli", "Gumbel", "Noise" };
+    private static readonly string[] NonDeterministicNameFragments =
+    {
+        "Dropout", "Random", "Rand", "Bernoulli", "Gumbel", "Noise",
+        // PyTorch-parity samplers: each draws from its own generator on each engine.
+        "Binomial", "Poisson", "Multinomial", "Cauchy", "LogNormal", "TensorExponential", "TensorGeometric", "TensorUniform",
+    };
+
+    // Stochastic ops whose names are a prefix of deterministic ones ("TensorNormal" vs "TensorNormalize"), so they
+    // are matched exactly rather than by fragment.
+    private static readonly HashSet<string> NonDeterministicNames = new(StringComparer.Ordinal) { "TensorNormal" };
 
     private static bool IsNonDeterministic(string name) =>
-        NonDeterministicNameFragments.Any(f => name.IndexOf(f, StringComparison.OrdinalIgnoreCase) >= 0);
+        NonDeterministicNames.Contains(name)
+        || NonDeterministicNameFragments.Any(f => name.IndexOf(f, StringComparison.OrdinalIgnoreCase) >= 0);
 
     private static bool IsGpuKernelOverride(MethodInfo m) =>
         m.IsGenericMethodDefinition
@@ -615,6 +625,38 @@ public sealed class GpuCpuAutoDifferentialTests : IClassFixture<GpuCpuAutoDiffer
     // TODO(gpu-correctness): add dedicated GPU-vs-CPU tests for these and remove them from the list.
     private static readonly HashSet<string> DedicatedlyCovered = new(StringComparer.Ordinal)
     {
+        // PyTorch-parity ops the generic harness cannot drive (constant constructors, integer-valued operands,
+        // shape-coupled convolution/pooling/sampling): TorchParityGpuCorrectnessTests, GPU vs CPU per op.
+        "TensorAdaptiveAvgPool3D(Tensor<T>,Int32[])",
+        "TensorAdaptiveMaxPool3D(Tensor<T>,Int32[])",
+        "TensorAddmv(Tensor<T>,Tensor<T>,Tensor<T>,Double,Double)",
+        "TensorArange(Double,Double,Double)",
+        "TensorBartlettWindow(Int32,Boolean)",
+        "TensorBilinear(Tensor<T>,Tensor<T>,Tensor<T>,Tensor<T>)",
+        "TensorBitwiseAnd(Tensor<T>,Tensor<T>)",
+        "TensorBitwiseLeftShift(Tensor<T>,Tensor<T>)",
+        "TensorBitwiseNot(Tensor<T>)",
+        "TensorBitwiseOr(Tensor<T>,Tensor<T>)",
+        "TensorBitwiseRightShift(Tensor<T>,Tensor<T>)",
+        "TensorBitwiseXor(Tensor<T>,Tensor<T>)",
+        "TensorBlackmanWindow(Int32,Boolean)",
+        "TensorConvolution(Tensor<T>,Tensor<T>,Tensor<T>,Int32[],Int32[],Int32[],Boolean,Int32[],Int32)",
+        "TensorConvTbc(Tensor<T>,Tensor<T>,Tensor<T>,Int32)",
+        "TensorConvTranspose1D(Tensor<T>,Tensor<T>,Int32,Int32,Int32)",
+        "TensorDiagonalScatter(Tensor<T>,Tensor<T>,Int32,Int32,Int32)",
+        "TensorGcd(Tensor<T>,Tensor<T>)",
+        "TensorGridSample3D(Tensor<T>,Tensor<T>,GridSampleMode,GridSamplePadding,Boolean)",
+        "TensorHammingWindow(Int32,Boolean,Double,Double)",
+        "TensorHannWindow(Int32,Boolean)",
+        "TensorKaiserWindow(Int32,Boolean,Double)",
+        "TensorLcm(Tensor<T>,Tensor<T>)",
+        "TensorLogspace(Double,Double,Int32,Double)",
+        "TensorMaxUnpool(Tensor<T>,Tensor<Int32>,Int32[])",
+        "TensorNonzeroStatic(Tensor<T>,Int32,Int32)",
+        "TensorRange(Double,Double,Double)",
+        "TensorTrilIndices(Int32,Int32,Int32)",
+        "TensorTriuIndices(Int32,Int32,Int32)",
+        "TensorViewAsComplex(Tensor<T>)",
         // Class-index gather (CE/NLL core): GPU-vs-CPU forward + gradient parity and residency in ClassGatherTests.
         "TensorGatherClassValues(Tensor<T>,Tensor<T>)",
         // Head-interleaved attention core (composed on the GPU): MultiHeadAttentionCoreGpuTests, forward + gradients.

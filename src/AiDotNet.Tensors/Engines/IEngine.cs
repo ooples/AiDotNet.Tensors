@@ -34,7 +34,7 @@ internal sealed class CpuMixedResidencyElementwiseAttribute : System.Attribute
 /// Your code stays the same - just swap the engine to change where it runs!
 /// </para>
 /// </remarks>
-public interface IEngine
+public partial interface IEngine
 {
     /// <summary>
     /// Gets the name of this engine.

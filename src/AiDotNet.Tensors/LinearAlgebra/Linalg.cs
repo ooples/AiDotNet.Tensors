@@ -32,7 +32,7 @@ namespace AiDotNet.Tensors.LinearAlgebra;
 /// </list>
 /// </para>
 /// </summary>
-public static class Linalg
+public static partial class Linalg
 {
     // ═══════════════════════════════════════════════════════════════════════
     // DECOMPOSITIONS
