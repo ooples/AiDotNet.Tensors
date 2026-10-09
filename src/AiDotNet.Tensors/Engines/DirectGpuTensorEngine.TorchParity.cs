@@ -13,7 +13,9 @@ namespace AiDotNet.Tensors.Engines;
 /// <para>
 /// The composed parity ops (listed in <c>OpRegistry.DelegatorOps</c>: the RNN cells and sequences, the general
 /// convolution, bilinear, local response norm, the dropout variants and the rest) are built from engine
-/// primitives that this engine already runs on the device, so they need no override here. Degree/radian
+/// primitives that this engine already runs on the device; their overrides below pass straight to the composition,
+/// whose virtual calls land on this engine's device kernels (they exist so the backend-completeness ratchet sees an
+/// explicit decision for every op). Degree/radian
 /// conversion is routed to the device's scalar multiply below. The reparameterized normal and the dropout variants
 /// compose on the device but draw their noise or keep-mask on the host and upload it, so they record a fallback too.
 /// </para>
@@ -31,6 +33,7 @@ namespace AiDotNet.Tensors.Engines;
 /// </remarks>
 public partial class DirectGpuTensorEngine
 {
+
 
 
 
@@ -78,7 +81,17 @@ public partial class DirectGpuTensorEngine
         return base.TensorAngle<T>(input);
     }
 
+    // ---- CpuEngine.TorchConvolution.cs ----
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorConvolution<T>(Tensor<T> input, Tensor<T> weight, Tensor<T>? bias, int[] stride, int[] padding, int[] dilation, bool transposed = false, int[]? outputPadding = null, int groups = 1)
+        => base.TensorConvolution<T>(input, weight, bias, stride, padding, dilation, transposed, outputPadding, groups);
+
     // ---- CpuEngine.TorchCreation.cs ----
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorAmin<T>(Tensor<T> tensor, int[] axes, bool keepDims = false)
+        => base.TensorAmin<T>(tensor, axes, keepDims);
 
     /// <inheritdoc/>
     public override Tensor<T> TensorAll<T>(Tensor<T> tensor, int[]? axes = null, bool keepDims = false)
@@ -235,6 +248,34 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <inheritdoc/>
+    public override Tensor<T> TensorCombinations<T>(Tensor<T> tensor, int r = 2, bool withReplacement = false)
+        => base.TensorCombinations<T>(tensor, r, withReplacement);
+
+    /// <inheritdoc/>
+    public override Tensor<T>[] TensorChunk<T>(Tensor<T> tensor, int chunks, int dim = 0)
+        => base.TensorChunk<T>(tensor, chunks, dim);
+
+    /// <inheritdoc/>
+    public override Tensor<T>[] TensorSplitWithSizes<T>(Tensor<T> tensor, int[] sizes, int dim = 0)
+        => base.TensorSplitWithSizes<T>(tensor, sizes, dim);
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorUnflatten<T>(Tensor<T> tensor, int dim, int[] sizes)
+        => base.TensorUnflatten<T>(tensor, dim, sizes);
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorSelect<T>(Tensor<T> tensor, int dim, int index)
+        => base.TensorSelect<T>(tensor, dim, index);
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorViewAs<T>(Tensor<T> tensor, Tensor<T> other)
+        => base.TensorViewAs<T>(tensor, other);
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorSumToSize<T>(Tensor<T> tensor, int[] size)
+        => base.TensorSumToSize<T>(tensor, size);
+
+    /// <inheritdoc/>
     public override Tensor<T> TensorQuantile<T>(Tensor<T> tensor, double q, int? dim = null, bool keepDim = false, QuantileInterpolation interpolation = QuantileInterpolation.Linear)
     {
         GpuLaunchProbe.OnFallback("TensorQuantile: no device kernel", null);
@@ -247,6 +288,34 @@ public partial class DirectGpuTensorEngine
         GpuLaunchProbe.OnFallback("TensorNanQuantile: no device kernel", null);
         return base.TensorNanQuantile<T>(tensor, q, dim, keepDim, interpolation);
     }
+
+    /// <inheritdoc/>
+    public override (Tensor<T> Std, Tensor<T> Mean) TensorStdMean<T>(Tensor<T> tensor, int[]? axes = null, int correction = 1, bool keepDims = false)
+        => base.TensorStdMean<T>(tensor, axes, correction, keepDims);
+
+    /// <inheritdoc/>
+    public override (Tensor<T> Var, Tensor<T> Mean) TensorVarMean<T>(Tensor<T> tensor, int[]? axes = null, int correction = 1, bool keepDims = false)
+        => base.TensorVarMean<T>(tensor, axes, correction, keepDims);
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorCov<T>(Tensor<T> tensor, int correction = 1)
+        => base.TensorCov<T>(tensor, correction);
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorCorrcoef<T>(Tensor<T> tensor)
+        => base.TensorCorrcoef<T>(tensor);
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorDiff<T>(Tensor<T> tensor, int n = 1, int dim = -1)
+        => base.TensorDiff<T>(tensor, n, dim);
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorTrapezoid<T>(Tensor<T> y, double dx = 1, int dim = -1)
+        => base.TensorTrapezoid<T>(y, dx, dim);
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorCumulativeTrapezoid<T>(Tensor<T> y, double dx = 1, int dim = -1)
+        => base.TensorCumulativeTrapezoid<T>(y, dx, dim);
 
     // ---- CpuEngine.TorchGridSample.cs ----
 
@@ -288,11 +357,43 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <inheritdoc/>
+    public override Tensor<T> TensorSoftmin<T>(Tensor<T> tensor, int axis = -1)
+        => base.TensorSoftmin<T>(tensor, axis);
+
+    /// <inheritdoc/>
     public override Tensor<T> TensorRrelu<T>(Tensor<T> tensor, double lower = 1.0 / 8, double upper = 1.0 / 3, bool training = false, int? seed = null)
     {
         GpuLaunchProbe.OnFallback("TensorRrelu: no device kernel", null);
         return base.TensorRrelu<T>(tensor, lower, upper, training, seed);
     }
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorRsub<T>(Tensor<T> input, Tensor<T> other, double alpha = 1)
+        => base.TensorRsub<T>(input, other, alpha);
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorAddcmul<T>(Tensor<T> input, Tensor<T> tensor1, Tensor<T> tensor2, double value = 1)
+        => base.TensorAddcmul<T>(input, tensor1, tensor2, value);
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorAddcdiv<T>(Tensor<T> input, Tensor<T> tensor1, Tensor<T> tensor2, double value = 1)
+        => base.TensorAddcdiv<T>(input, tensor1, tensor2, value);
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorAddmv<T>(Tensor<T> input, Tensor<T> mat, Tensor<T> vec, double beta = 1, double alpha = 1)
+        => base.TensorAddmv<T>(input, mat, vec, beta, alpha);
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorAddr<T>(Tensor<T> input, Tensor<T> vec1, Tensor<T> vec2, double beta = 1, double alpha = 1)
+        => base.TensorAddr<T>(input, vec1, vec2, beta, alpha);
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorBaddbmm<T>(Tensor<T> input, Tensor<T> batch1, Tensor<T> batch2, double beta = 1, double alpha = 1)
+        => base.TensorBaddbmm<T>(input, batch1, batch2, beta, alpha);
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorAddbmm<T>(Tensor<T> input, Tensor<T> batch1, Tensor<T> batch2, double beta = 1, double alpha = 1)
+        => base.TensorAddbmm<T>(input, batch1, batch2, beta, alpha);
 
     /// <inheritdoc/>
     public override Tensor<T> TensorMsort<T>(Tensor<T> tensor)
@@ -474,6 +575,42 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <inheritdoc/>
+    public override Tensor<T> TensorBilinear<T>(Tensor<T> input1, Tensor<T> input2, Tensor<T> weight, Tensor<T>? bias = null)
+        => base.TensorBilinear<T>(input1, input2, weight, bias);
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorChannelShuffle<T>(Tensor<T> tensor, int groups)
+        => base.TensorChannelShuffle<T>(tensor, groups);
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorPixelUnshuffle<T>(Tensor<T> tensor, int downscaleFactor)
+        => base.TensorPixelUnshuffle<T>(tensor, downscaleFactor);
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorLocalResponseNorm<T>(Tensor<T> tensor, int size, double alpha = 1e-4, double beta = 0.75, double k = 1)
+        => base.TensorLocalResponseNorm<T>(tensor, size, alpha, beta, k);
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorSoftMarginLoss<T>(Tensor<T> input, Tensor<T> target, LossReduction reduction = LossReduction.Mean)
+        => base.TensorSoftMarginLoss<T>(input, target, reduction);
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorRenorm<T>(Tensor<T> tensor, double p, int dim, double maxNorm)
+        => base.TensorRenorm<T>(tensor, p, dim, maxNorm);
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorNormExceptDim<T>(Tensor<T> tensor, double pow = 2, int dim = 0)
+        => base.TensorNormExceptDim<T>(tensor, pow, dim);
+
+    /// <inheritdoc/>
+    public override Tensor<T>[] TensorGradient<T>(Tensor<T> tensor, double spacing = 1, int[]? dims = null)
+        => base.TensorGradient<T>(tensor, spacing, dims);
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorPadSequence<T>(Tensor<T>[] sequences, bool batchFirst = false, double paddingValue = 0)
+        => base.TensorPadSequence<T>(sequences, batchFirst, paddingValue);
+
+    /// <inheritdoc/>
     public override Tensor<int> TensorNonzeroStatic<T>(Tensor<T> tensor, int size, int fillValue = -1)
     {
         GpuLaunchProbe.OnFallback("TensorNonzeroStatic: no device kernel", null);
@@ -486,6 +623,36 @@ public partial class DirectGpuTensorEngine
         GpuLaunchProbe.OnFallback("TensorUniqueDim: no device kernel", null);
         return base.TensorUniqueDim<T>(tensor, dim);
     }
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorIndexReduce<T>(Tensor<T> tensor, int dim, Tensor<int> index, Tensor<T> source, ScatterReduceMode reduce, bool includeSelf = true)
+        => base.TensorIndexReduce<T>(tensor, dim, index, source, reduce, includeSelf);
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorConvTranspose1D<T>(Tensor<T> input, Tensor<T> kernel, int stride = 1, int padding = 0, int outputPadding = 0)
+        => base.TensorConvTranspose1D<T>(input, kernel, stride, padding, outputPadding);
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorConvTbc<T>(Tensor<T> input, Tensor<T> weight, Tensor<T> bias, int pad = 0)
+        => base.TensorConvTbc<T>(input, weight, bias, pad);
+
+    // ---- CpuEngine.TorchRnn.cs ----
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorRnnCell<T>(Tensor<T> input, Tensor<T> hidden, Tensor<T> wIh, Tensor<T> wHh, Tensor<T>? bIh = null, Tensor<T>? bHh = null, RnnCellType cell = RnnCellType.RnnTanh)
+        => base.TensorRnnCell<T>(input, hidden, wIh, wHh, bIh, bHh, cell);
+
+    /// <inheritdoc/>
+    public override (Tensor<T> Hidden, Tensor<T> Cell) TensorLstmCell<T>(Tensor<T> input, Tensor<T> hidden, Tensor<T> cell, Tensor<T> wIh, Tensor<T> wHh, Tensor<T>? bIh = null, Tensor<T>? bHh = null)
+        => base.TensorLstmCell<T>(input, hidden, cell, wIh, wHh, bIh, bHh);
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorGruCell<T>(Tensor<T> input, Tensor<T> hidden, Tensor<T> wIh, Tensor<T> wHh, Tensor<T>? bIh = null, Tensor<T>? bHh = null)
+        => base.TensorGruCell<T>(input, hidden, wIh, wHh, bIh, bHh);
+
+    /// <inheritdoc/>
+    public override (Tensor<T> Output, Tensor<T> Hidden) TensorRecurrent<T>(RnnCellType cell, Tensor<T> input, Tensor<T>? h0, IReadOnlyList<Tensor<T>> weights, bool hasBiases, int numLayers, double dropout = 0, bool training = false, bool bidirectional = false, bool batchFirst = false)
+        => base.TensorRecurrent<T>(cell, input, h0, weights, hasBiases, numLayers, dropout, training, bidirectional, batchFirst);
 
     // ---- CpuEngine.TorchSpecial.cs ----
 
@@ -517,6 +684,10 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorRad2Deg<T>(Tensor<T> tensor)
         => TensorMultiplyScalar(tensor, MathHelper.GetNumericOperations<T>().FromDouble(180 / Math.PI));
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorPositive<T>(Tensor<T> tensor)
+        => base.TensorPositive<T>(tensor);
 
     /// <inheritdoc/>
     public override Tensor<T> TensorSignbit<T>(Tensor<T> tensor)
@@ -643,6 +814,14 @@ public partial class DirectGpuTensorEngine
         GpuLaunchProbe.OnFallback("TensorBitwiseRightShift: no device kernel", null);
         return base.TensorBitwiseRightShift<T>(a, b);
     }
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorNanSum<T>(Tensor<T> tensor, int[]? axes = null, bool keepDims = false)
+        => base.TensorNanSum<T>(tensor, axes, keepDims);
+
+    /// <inheritdoc/>
+    public override Tensor<T> TensorNanMean<T>(Tensor<T> tensor, int[]? axes = null, bool keepDims = false)
+        => base.TensorNanMean<T>(tensor, axes, keepDims);
 
     /// <inheritdoc/>
     public override Tensor<T> TensorIgamma<T>(Tensor<T> a, Tensor<T> x)
