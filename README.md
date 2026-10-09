@@ -234,9 +234,11 @@ call at 1.32×.
 | Vector Subtract | 1000 | 391 ns | 1.4 µs | 592 ns | **3.63×** | **1.51×** |
 
 The three NumSharp losses (`Matrix Scalar Multiply` and `Matrix Subtract` at N=500, `Transpose` at N=1000) are benchmarks
-that allocate a 2–8 MB result and discard it on every call. AiDotNet returns a managed array, so that churn triggers
-gen-2 garbage collections (about one every seven calls for the 8 MB transpose); NumSharp allocates unmanaged memory and
-does not. Writing into an existing matrix avoids the allocation: `TransposeInPlace` at N=1000 takes 125 µs.
+that allocate a 2–8 MB result and discard it on every call. Each fresh result lands in memory the OS has to fault in
+and zero again (about 210 page faults per 2 MB result; the first write costs about twice a rewrite), and the large-object
+churn triggers gen-2 collections; NumSharp's results are unmanaged and stay out of the GC heap. The computation itself is not the gap: writing
+into an existing matrix takes 22 µs for the N=500 scalar multiply, and `TransposeInPlace` at N=1000 takes 125 µs. Recycling
+discarded result buffers is the follow-up change that addresses this.
 
 **Element-wise (vs NumSharp, double):**
 
