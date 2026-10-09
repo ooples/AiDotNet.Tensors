@@ -5013,6 +5013,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return destinationArray is not null;
     }
 
+    // A view that does not cover its whole storage (a slice or strided view). Pooled tensors whose backing array is
+    // longer than their length are not views and keep the resident fast paths.
+    private static bool IsPartialView<T>(Tensor<T> tensor)
+        => tensor.IsView && (!tensor.IsContiguous || tensor._storageOffset != 0 || tensor._storage.Length != tensor.Length);
+
     private static bool IsCanonicalDenseAllocation<T>(Tensor<T> tensor)
         => tensor.IsContiguous && !tensor.IsSparse
             && tensor._storageOffset == 0 && tensor._storage.Length == tensor.Length;
@@ -5874,6 +5879,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // whole graph). Falls back to the transient path if it has no backing array.
     private OwnedBuffer GetResidentOrPersistentInputBuffer<T>(IDirectGpuBackend backend, Tensor<T> t)
     {
+        // A view onto part of another tensor's storage shares that storage's backing array, and every lookup below
+        // (the _gpuBuffer field, the resident registry, the caches keyed on that array) returns the WHOLE storage's
+        // buffer from element 0. The stacked-gradient slices of a backward pass are such views: a negate backward on
+        // slice 1 read slice 0 (a GRU sequence's input gradient was off by ~1). GetOrAllocateBuffer materializes the
+        // view's own elements.
+        if (IsPartialView(t))
+            return GetOrAllocateBuffer(backend, t);
         // #3 FP16-act CONVERT-AT-GAP: if t holds FP16 activation data, transparently up-convert to a STABLE FP32
         // buffer so any non-FP16-aware resident op (attention matmul/softmax, resample, concat) reads correct FP32.
         // FP16-aware ops (conv/groupnorm/add) BYPASS this by reading the raw FP16 via TryFp16ResidentInput.
@@ -7368,8 +7380,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // under the running kernel. Requiring both operands resident (ResolveResidentBufferNoUpload, which
         // never uploads) means there is no owned buffer to free, which is exactly the invariant the original
         // comment identifies as making this safe.
+        // Not on a partial view: it resolves its whole storage's buffer, so the add would land at element 0 and
+        // BindResidentBuffer would then make that buffer authoritative for a storage the view's siblings share (an
+        // accumulation into one slice of a stacked gradient hid the other slices' values).
         if (!Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
-            && a.IsContiguous && b.IsContiguous && a.Length == b.Length
+            && a.IsContiguous && b.IsContiguous && !IsPartialView(a) && !IsPartialView(b) && a.Length == b.Length
             // The target must be resident in its OWN right (bound buffer / activation), never via a persistent
             // weight-cache copy: after a GPU inference pass cached a weight, `weight -= update` used to write that
             // copy, bind the weight to it and leave the host stale behind a deferred download -- which the
