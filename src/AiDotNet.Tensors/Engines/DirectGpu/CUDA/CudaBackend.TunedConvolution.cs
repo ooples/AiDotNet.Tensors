@@ -120,9 +120,11 @@ public sealed partial class CudaBackend
         if (!ConvGemmUsable() || a.Batch <= 0) return false;
         int L = a.OutHeight * a.OutWidth, P = a.InChannels * a.KernelH * a.KernelW;
         long needed = (long)a.Batch * P * L;
-        if (IsStreamCapturing() && (_convColScratch is null || _convColScratch.Size < needed)) return false;
         using var _ = PushContext();
-        var col = ConvScratch(ref _convColScratch, needed);
+        // Null when the scratch cannot be sized (too large, or undersized during a capture): the slot's next
+        // candidate runs instead.
+        var col = TryConvScratch(ref _convColScratch, needed);
+        if (col is null) return false;
         LaunchIm2Col(a.Input, col, a.Batch, a.InChannels, a.InHeight, a.InWidth, a.KernelH, a.KernelW,
             a.StrideH, a.StrideW, a.PadH, a.PadW, a.DilationH, a.DilationW, a.OutHeight, a.OutWidth);
         ApplyDeterministicGemmMathMode();
