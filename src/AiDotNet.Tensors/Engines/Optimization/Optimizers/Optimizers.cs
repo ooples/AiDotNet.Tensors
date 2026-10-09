@@ -883,9 +883,9 @@ public sealed class LionOptimizer : OptimizerBase
                     continue;
                 }
 
+                var grad = DenseGradient(gi, pi, p);
                 ForEachChunk(p.Length, (start, count) =>
                 {
-                    var grad = DenseGradient(gi, pi, p);
                     unsafe
                     {
                         fixed (float* pp = p, pg = grad.Array, pm = m)
@@ -964,9 +964,9 @@ public sealed class AsgdOptimizer : OptimizerBase
                     continue;
                 }
 
+                var grad = DenseGradient(gi, pi, p);
                 ForEachChunk(p.Length, (start, count) =>
                 {
-                    var grad = DenseGradient(gi, pi, p);
                     unsafe
                     {
                         fixed (float* pp = p, pg = grad.Array, pax = ax)
@@ -1040,9 +1040,9 @@ public sealed class RpropOptimizer : OptimizerBase
                     continue;
                 }
 
+                var grad = DenseGradient(gi, pi, p);
                 ForEachChunk(p.Length, (start, count) =>
                 {
-                    var grad = DenseGradient(gi, pi, p);
                     unsafe
                     {
                         fixed (float* pp = p, pg = grad.Array, ppr = prev, pss = ss)
@@ -1243,9 +1243,9 @@ public sealed class FtrlOptimizer : OptimizerBase
                     continue;
                 }
 
+                var grad = DenseGradient(gi, pi, p);
                 ForEachChunk(p.Length, (start, count) =>
                 {
-                    var grad = DenseGradient(gi, pi, p);
                     unsafe
                     {
                         fixed (float* pp = p, pg = grad.Array, pz = z, pn = n)

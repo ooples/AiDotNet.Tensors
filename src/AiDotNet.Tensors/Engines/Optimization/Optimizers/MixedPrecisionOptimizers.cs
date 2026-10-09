@@ -230,7 +230,16 @@ public sealed class FP8LionOptimizer : OptimizerBase
                     float sparseScale = scale;
                     if (newMaxAbs > fp8Max * scale * 0.95f || newMaxAbs < fp8Max * scale * 0.1f)
                     {
-                        sparseScale = newMaxAbs > 0 ? newMaxAbs / (fp8Max * 0.5f) : 1f;
+                        // The new scale must hold every stored moment, not only the touched ones: an untouched row
+                        // (rarely-seen embeddings) can be far larger than this batch's, and re-encoding it against
+                        // a scale sized for the batch alone would clamp it for good.
+                        float allMaxAbs = newMaxAbs;
+                        for (int i = 0; i < p.Length; i++)
+                        {
+                            float stored = MathF.Abs(E4M3ToFloat(ReadFp8(packed, i)) * scale);
+                            if (stored > allMaxAbs) allMaxAbs = stored;
+                        }
+                        sparseScale = allMaxAbs > 0 ? allMaxAbs / (fp8Max * 0.5f) : 1f;
                         for (int i = 0; i < p.Length; i++)
                         {
                             float mFp32 = E4M3ToFloat(ReadFp8(packed, i)) * scale;

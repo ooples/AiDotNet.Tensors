@@ -258,4 +258,52 @@ public class OptimizerTensorGradientTests
 
         for (int i = 0; i < 4; i++) Assert.Equal(-3f * lr, p[i], 6);
     }
+
+    [Theory]
+    [InlineData(Kind.Lion)]
+    [InlineData(Kind.Asgd)]
+    [InlineData(Kind.Rprop)]
+    [InlineData(Kind.Ftrl)]
+    [InlineData(Kind.Adam)]
+    public void GradientScratch_IsRentedOncePerParameter_NotPerChunk(Kind kind)
+    {
+        // maximize sends the gradient through pooled scratch. Resolving it inside the parallel chunk body rented and
+        // returned the shared buffer once per chunk, racing (a double Return corrupts ArrayPool.Shared); it must be
+        // resolved once per parameter, before the chunks run. 196 x 1004 is four chunks.
+        var shape = ShapeFor(kind);
+        int n = shape[0] * shape[1];
+        var optimizer = Create(kind);
+        var options = OptionsFor(kind);
+        options["maximize"] = 1.0;
+        optimizer.AddParamGroup(options).AddParameter(RandomArray(n, 1), RandomArray(n, 2));
+        optimizer.AddParamGroup(options).AddParameter(RandomArray(n, 3), RandomArray(n, 4));
+
+        int before = optimizer.GradientScratchRentals;
+        optimizer.Step();
+        Assert.Equal(2, optimizer.GradientScratchRentals - before);
+    }
+
+    [Fact]
+    public void FP8Lion_ASparseScaleRefresh_KeepsAnUntouchedLargeMoment()
+    {
+        // Element 7's moment grows to ~10 in a dense step. A sparse step then touches only element 0 with a tiny
+        // gradient, so the touched moments fall below the scale's band and the scale is refreshed. Sizing it from the
+        // touched moments alone clamped element 7's moment to ~1e-5; a final gradient of -50 then gives
+        // c = 0.9*m - 5 < 0 and steps element 7 the wrong way. Intact, c > 0 and it descends again.
+        const float lr = 0.01f;
+        var p = new float[8];
+        var grad = new float[8];
+        var optimizer = new FP8LionOptimizer();
+        optimizer.AddParamGroup(new Dictionary<string, double> { ["lr"] = lr }).AddParameter(p, grad);
+
+        grad[7] = 1000f;
+        optimizer.Step();
+        Array.Clear(grad, 0, grad.Length);
+        optimizer.SetSparseGradient(0, 0, new[] { 0 }, new[] { 1e-3f });
+        optimizer.Step();
+        grad[7] = -50f;
+        optimizer.Step();
+
+        Assert.Equal(-2f * lr, p[7], 6);
+    }
 }

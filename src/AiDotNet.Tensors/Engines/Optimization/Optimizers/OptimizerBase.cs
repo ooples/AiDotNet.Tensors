@@ -313,8 +313,12 @@ public abstract class OptimizerBase : IOptimizer
             destination[destinationOffset + i] = sign * gradient[gradientOffset + i] + decay * parameter[parameterOffset + i];
     }
 
+    /// <summary>How many times a step has rented gradient scratch (one per parameter that needs it), for tests.</summary>
+    internal int GradientScratchRentals { get; private set; }
+
     private float[] RentGradientScratch(int length)
     {
+        GradientScratchRentals++;
         ReturnGradientScratch();
         _gradientScratch = ArrayPool<float>.Shared.Rent(length);
         return _gradientScratch;

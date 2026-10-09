@@ -7278,6 +7278,8 @@ public partial class DirectGpuTensorEngine
         using var ownWih = gpu.GetOrAllocateBuffer(backend, Dense(inp[1]));
         using var ownWhh = gpu.GetOrAllocateBuffer(backend, Dense(inp[2]));
         using var ownGradOutput = gpu.GetOrAllocateBuffer(backend, Dense(gradOutput));
+        // Buffers this backward owns: scratch, and gradient buffers not (yet) handed to a tensor. All are released
+        // in the finally, after a Synchronize, whether the step succeeds or throws partway.
         var transient = new System.Collections.Generic.List<IGpuBuffer>();
         try
         {
@@ -7302,31 +7304,33 @@ public partial class DirectGpuTensorEngine
             {
                 var bufH0 = idxH0 >= 0 ? h0.Buffer : Transient(Zeros(B * Hd));
                 var bufC0 = idxC0 >= 0 ? c0.Buffer : Transient(Zeros(B * Hd));
-                var bufGradInput = Zeros(B * S * In);
-                var bufDWih = Zeros(G * In);
-                var bufDWhh = Zeros(G * Hd);
-                var bufDBih = Zeros(G);
-                var bufDBhh = Zeros(G);
-                var bufDH0 = Zeros(B * Hd);
-                var bufDC0 = Zeros(B * Hd);
+                var bufGradInput = Transient(Zeros(B * S * In));
+                var bufDWih = Transient(Zeros(G * In));
+                var bufDWhh = Transient(Zeros(G * Hd));
+                var bufDBih = Transient(Zeros(G));
+                var bufDBhh = Transient(Zeros(G));
+                var bufDH0 = Transient(Zeros(B * Hd));
+                var bufDC0 = Transient(Zeros(B * Hd));
 
                 backend.LstmBackwardSequence(
                     gradOut, ownAllH.Buffer, ownAllC.Buffer, ownGates.Buffer, bufH0, bufC0,
                     ownWih.Buffer, ownWhh.Buffer, ownInput.Buffer,
                     bufGradInput, bufDH0, bufDC0, bufDWih, bufDWhh, bufDBih, bufDBhh,
                     S, B, In, Hd);
+                // The kernel must finish before any buffer it touches is handed off or returns to the pool (h0/c0
+                // uploaded from the host, gradients nobody receives).
+                backend.Synchronize();
 
-                // Each gradient buffer becomes the device tensor handed to the tape; one nobody receives is freed.
+                // Each received gradient buffer becomes the device tensor handed to the tape and leaves the cleanup
+                // list; one nobody receives stays on it and is freed in the finally.
                 void Accum(Tensor<float>? key, IGpuBuffer gradBuf, int[] shape)
                 {
-                    if (key is null)
-                    {
-                        gradBuf.Dispose();
-                        return;
-                    }
+                    if (key is null) return;
                     int n = 1;
                     for (int d = 0; d < shape.Length; d++) n *= shape[d];
-                    Autodiff.DifferentiableOps.AccumulateGrad(grads, key, gpu.DeferTensorResult<float>(backend, gradBuf, n, shape), engine);
+                    var gradient = gpu.DeferTensorResult<float>(backend, gradBuf, n, shape);
+                    transient.Remove(gradBuf);
+                    Autodiff.DifferentiableOps.AccumulateGrad(grads, key, gradient, engine);
                 }
 
                 Accum(inp[0], bufGradInput, new[] { B, S, In });
@@ -7345,7 +7349,7 @@ public partial class DirectGpuTensorEngine
         }
         finally
         {
-            // The kernel must finish before its scratch inputs return to the pool.
+            // A throw between the launch and its Synchronize lands here: wait before freeing what the kernel uses.
             backend.Synchronize();
             foreach (var buffer in transient) buffer.Dispose();
         }
