@@ -16526,7 +16526,7 @@ public partial class CpuEngine : ITensorLevelEngine
         {
 #if NET5_0_OR_GREATER
             if (Simd.DirectConvAvx2.TryChoose(new Simd.DirectConvShape(Simd.DirectConvPass.BackwardKernel, batch, inChannels, outChannels,
-                    height, width, kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW), out _))
+                    height, width, kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW), out int directTasks))
             {
                 // Both operands were made contiguous above; read them in place (see the input-gradient route).
                 var xArr = (float[]?)(object?)input.GetCpuBackingForStridedRead(out int xOff);
@@ -16536,7 +16536,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 {
                     Simd.DirectConvAvx2.BackwardKernel(xArr, xOff, gArr, gOff, dArr, dOff, accumulate,
                         batch, inChannels, height, width, outChannels, kernelHeight, kernelWidth,
-                        strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth);
+                        strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth, directTasks);
                     return;
                 }
             }

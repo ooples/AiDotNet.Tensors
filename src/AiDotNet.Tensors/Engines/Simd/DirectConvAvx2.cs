@@ -44,6 +44,9 @@ internal static class DirectConvAvx2
     // Backward weights needs one (output block, input block) pair per task; fewer pairs than this starve the pool.
     private const int MinBackwardKernelTasks = 16;
 
+    // Weight-gradient tasks to aim for when splitting the batch across partial gradients.
+    private const int TargetBackwardKernelTasks = 128;
+
     /// <summary>Passes allowed onto the direct kernels (process-wide; for A/B measurement and kernel tuning).</summary>
     internal static DirectConvPasses EnabledPasses { get; set; } = DirectConvPasses.All;
 
@@ -330,16 +333,25 @@ internal static class DirectConvAvx2
     public static void BackwardKernel(
         float[] input, int inputOffset, float[] gradOutput, int gradOutputOffset, float[] dest, int destOffset, bool accumulate,
         int batch, int inChannels, int height, int width, int outChannels, int kernelHeight, int kernelWidth,
-        int strideH, int strideW, int padH, int padW, int dilationH, int dilationW, int outputHeight, int outputWidth)
+        int strideH, int strideW, int padH, int padW, int dilationH, int dilationW, int outputHeight, int outputWidth,
+        int targetTasks = 0)
     {
         int paddedH = height + 2 * padH, paddedW = width + 2 * padW;
         int inBlocks = inChannels / Block, outBlocks = outChannels / Block;
         int positions = outputHeight * outputWidth;
         int planeIn = paddedH * paddedW * Block;
+        int pairs = outBlocks * inBlocks;
+        int kernelSize = outChannels * inChannels * kernelHeight * kernelWidth;
+        // Few block pairs leave cores idle (32 pairs for 32->64 channels), so the batch is split too: each slice
+        // sums into its own partial gradient and the partials are reduced in a fixed order afterwards.
+        int splits = Math.Max(1, Math.Min(batch, ((targetTasks > 0 ? targetTasks : TargetBackwardKernelTasks) + pairs - 1) / pairs));
+        int imagesPerSplit = (batch + splits - 1) / splits;
+        splits = (batch + imagesPerSplit - 1) / imagesPerSplit;
         var pool = ArrayPool<float>.Shared;
         var packedInput = pool.Rent(batch * inBlocks * planeIn);
         var packedGrad = pool.Rent(batch * outChannels * positions);
         var offsets = ArrayPool<int>.Shared.Rent(batch * positions);
+        var partials = splits > 1 ? pool.Rent(splits * kernelSize) : null;
         try
         {
             PackInput(input, inputOffset, packedInput, batch, inChannels, height, width, padH, padW, paddedH, paddedW);
@@ -349,19 +361,62 @@ internal static class DirectConvAvx2
                     offsets[b * positions + q] = b * inBlocks * planeIn
                         + ((q / outputWidth) * strideH * paddedW + (q % outputWidth) * strideW) * Block;
 
-            CpuParallelSettings.ParallelForOrSerial(0, outBlocks * inBlocks,
-                (long)outChannels * inChannels * kernelHeight * kernelWidth * batch * positions,
-                task => BackwardKernelTile(packedInput, packedGrad, offsets, dest, destOffset, accumulate,
-                    task / inBlocks, task % inBlocks, batch, inChannels, outBlocks, paddedW, planeIn,
-                    kernelHeight, kernelWidth, dilationH, dilationW, positions),
-                deterministicSafe: true);
+            if (partials is null)
+            {
+                CpuParallelSettings.ParallelForOrSerial(0, pairs, (long)kernelSize * batch * positions,
+                    task => BackwardKernelTile(packedInput, packedGrad, offsets, dest, destOffset, accumulate,
+                        task / inBlocks, task % inBlocks, 0, batch, inChannels, outBlocks, paddedW, planeIn,
+                        kernelHeight, kernelWidth, dilationH, dilationW, positions),
+                    deterministicSafe: true);
+            }
+            else
+            {
+                CpuParallelSettings.ParallelForOrSerial(0, pairs * splits, (long)kernelSize * batch * positions, task =>
+                {
+                    int split = task / pairs, pair = task % pairs;
+                    int b0 = split * imagesPerSplit;
+                    BackwardKernelTile(packedInput, packedGrad, offsets, partials, split * kernelSize, false,
+                        pair / inBlocks, pair % inBlocks, b0, Math.Min(batch, b0 + imagesPerSplit), inChannels, outBlocks,
+                        paddedW, planeIn, kernelHeight, kernelWidth, dilationH, dilationW, positions);
+                }, deterministicSafe: true);
+                ReducePartials(partials, splits, kernelSize, dest, destOffset, accumulate);
+            }
         }
         finally
         {
             pool.Return(packedInput);
             pool.Return(packedGrad);
             ArrayPool<int>.Shared.Return(offsets);
+            if (partials is not null) pool.Return(partials);
         }
+    }
+
+    private static unsafe void ReducePartials(float[] partials, int splits, int length, float[] dest, int destOffset, bool accumulate)
+    {
+        const int Chunk = 2048;
+        int chunks = (length + Chunk - 1) / Chunk;
+        CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)splits * length, chunk =>
+        {
+            int begin = chunk * Chunk, end = Math.Min(length, begin + Chunk);
+            fixed (float* pp = partials)
+            fixed (float* pd = dest)
+            {
+                float* d = pd + destOffset;
+                int i = begin;
+                for (; i + Block <= end; i += Block)
+                {
+                    var sum = accumulate ? Avx.LoadVector256(d + i) : Vector256<float>.Zero;
+                    for (int s = 0; s < splits; s++) sum = Avx.Add(sum, Avx.LoadVector256(pp + (long)s * length + i));
+                    Avx.Store(d + i, sum);
+                }
+                for (; i < end; i++)
+                {
+                    float sum = accumulate ? d[i] : 0f;
+                    for (int s = 0; s < splits; s++) sum += pp[(long)s * length + i];
+                    d[i] = sum;
+                }
+            }
+        }, deterministicSafe: true);
     }
 
     /// <summary>NCHW -> zero-padded [N][ceil(C/8)][H+2pH][W+2pW][8]; channels past C are zero.</summary>
@@ -642,7 +697,7 @@ internal static class DirectConvAvx2
     /// in a small stack buffer between chunks: a whole-plane sweep per pass re-streamed the operands from L2.
     /// </summary>
     private static unsafe void BackwardKernelTile(float[] packedInput, float[] packedGrad, int[] offsets, float[] dest, int destOffset,
-        bool accumulate, int ob, int ib, int batch, int inChannels, int outBlocks, int paddedW, int planeIn,
+        bool accumulate, int ob, int ib, int batchBegin, int batchEnd, int inChannels, int outBlocks, int paddedW, int planeIn,
         int kernelHeight, int kernelWidth, int dilationH, int dilationW, int positions)
     {
         int columnGroups = (kernelWidth + 2) / 3;
@@ -657,7 +712,7 @@ internal static class DirectConvAvx2
         fixed (float* pd = dest)
         {
             float* xb = px + (long)ib * planeIn;
-            for (int b = 0; b < batch; b++)
+            for (int b = batchBegin; b < batchEnd; b++)
             {
                 float* gImage = pg + (long)(b * outBlocks + ob) * positions * Block;
                 int* oImage = pOff + b * positions;
