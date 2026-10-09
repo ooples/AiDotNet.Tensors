@@ -426,6 +426,35 @@ public static partial class BlasManaged
         }
     }
 
+    /// <summary>
+    /// Two float shape classes where <see cref="Simd.SimdGemm"/> beats this dispatcher by 4-5x, measured head to head
+    /// (min of 150): a small output with a long K, which SimdGemm splits over K (a [64,3136]x[3136,128] dense layer:
+    /// 0.08 ms against 0.30), and a tall A^T with a small K, which SimdGemm transposes once and runs untransposed (its
+    /// weight gradient, 3136x64x128 with A^T: 0.25 ms against 1.25). Every other measured shape is faster here, so
+    /// only these route out, and only for plain products: no pre-packed operand, no epilogue, a dense output.
+    /// Both SimdGemm routes sum in a fixed order that does not follow the thread budget.
+    /// </summary>
+    private static bool TryRouteToSimdGemm<T>(
+        ReadOnlySpan<T> a, int lda, bool transA, ReadOnlySpan<T> b, int ldb, bool transB,
+        Span<T> c, int ldc, int m, int n, int k, in BlasOptions<T> options) where T : unmanaged
+    {
+        if (ldc != n || options.PackedA is not null || options.PackedB is not null
+            || !options.Epilogue.BiasN.IsEmpty || options.Epilogue.Activation != FusedActivationType.None
+            || !options.Epilogue.SkipMxN.IsEmpty || options.Epilogue.DropoutMask != 0)
+            return false;
+        bool splitK = !transA && !transB && m >= 6 && m <= 192 && n >= 16 && k > 1024 && (long)m * n <= 64L * 1024
+            && (long)m * k * n >= Simd.SimdGemm.ParallelWorkThreshold;
+        bool tallTransA = transA && !transB && m >= 1024 && k <= 128 && n >= 16;
+        if (!splitK && !tallTransA) return false;
+        var af = MemoryMarshal.Cast<T, float>(a);
+        var bf = MemoryMarshal.Cast<T, float>(b);
+        var cf = MemoryMarshal.Cast<T, float>(c).Slice(0, m * n);
+        // BlasManaged overwrites C whatever BetaZero says (it only promises a write-first kernel may skip the clear);
+        // the overwriting entry also unlocks SimdGemm's write-first paths.
+        Simd.SimdGemm.Sgemm(af, lda, transA, bf, ldb, transB, cf, m, k, n);
+        return true;
+    }
+
     private static void GemmCore<T>(
         ReadOnlySpan<T> a, int lda, bool transA,
         ReadOnlySpan<T> b, int ldb, bool transB,
@@ -475,6 +504,8 @@ public static partial class BlasManaged
         // bit-identical (packing is only a memory-layout optimization). The per-row-work guard keeps
         // the handle for small-N·K thin-M GEMMs (e.g. M=32 K=128 N=64) where the tuned strategy is
         // already fast and dropping it would skip the pre-pack consumption other callers rely on.
+        if (typeof(T) == typeof(float) && TryRouteToSimdGemm(a, lda, transA, b, ldb, transB, c, ldc, m, n, k, in options))
+            return;
         const long ThinMPrePackDropMinRowWork = 1L << 16; // 64K = N·K above which thin-M pre-pack stalls
         if (options.PackedB is not null && options.PackedA is null && m < ThinMDirectMinM
             && (long)n * k >= ThinMPrePackDropMinRowWork
