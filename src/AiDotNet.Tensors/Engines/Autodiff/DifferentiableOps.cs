@@ -1081,7 +1081,9 @@ internal static class DifferentiableOps
         }
         else
         {
-            owned = new Tensor<T>(contribution._shape);
+            // The copy overwrites every element, so rent uninitialized: a zeroed fresh array per fan-out
+            // (every residual add hands one gradient to two slots) paid page faults on top of the copy.
+            owned = AiDotNet.Tensors.Helpers.TensorAllocator.RentUninitialized<T>(contribution._shape);
             contribution.CopyTo(owned.AsWritableSpan());
         }
         owners[owned] = destination;
@@ -1120,7 +1122,7 @@ internal static class DifferentiableOps
         // Use the explicit destination API instead of TensorAdd. Besides making
         // ownership unambiguous, this cannot be collapsed by an algebraic/CSE
         // identity when both operands are the same tensor object.
-        var accumulated = new Tensor<T>(existing._shape);
+        var accumulated = AiDotNet.Tensors.Helpers.TensorAllocator.RentUninitialized<T>(existing._shape);
         engine.TensorAddInto(accumulated, existing, contribution);
         return accumulated;
     }
