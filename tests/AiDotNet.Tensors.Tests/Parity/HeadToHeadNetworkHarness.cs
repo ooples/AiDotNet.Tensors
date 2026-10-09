@@ -385,9 +385,6 @@ internal static class HeadToHeadNetworkHarness
         const double NormEpsilon = 1e-5;
         Tensor<float> BatchNorm(Tensor<float> h, Tensor<float> gamma, Tensor<float> beta)
             => engine.BatchNorm(h, gamma, beta, NormEpsilon, out _, out _);
-        // A [rows, n] + [n] broadcast add. It is a CpuEngine operation (both engines derive from it), not an IEngine one.
-        var broadcastEngine = (CpuEngine)engine;
-        Tensor<float> AddBias(Tensor<float> a, Tensor<float> bias) => broadcastEngine.TensorBroadcastAdd(a, bias);
         Tensor<float> Activate(Tensor<float> h, FusedActivationType activation)
             => activation == FusedActivationType.ReLU ? engine.ReLU(h) : h;
         var layers = new List<Func<Tensor<float>, Tensor<float>>>();
@@ -398,6 +395,19 @@ internal static class HeadToHeadNetworkHarness
             {
                 var data = ReadFloats(reader, parameterShape.Aggregate(1, (a, d) => a * d));
                 var tensor = Place(Tensor<float>.FromMemory(data, parameterShape));
+                parameters.Add(tensor);
+                return tensor;
+            }
+
+            // A torch [out, in] linear weight, stored transposed as the [in, out] FusedLinear takes.
+            Tensor<float> LinearWeight(int outFeatures, int inFeatures)
+            {
+                var torchLayout = ReadFloats(reader, outFeatures * inFeatures);
+                var data = new float[torchLayout.Length];
+                for (int o = 0; o < outFeatures; o++)
+                    for (int i = 0; i < inFeatures; i++)
+                        data[i * outFeatures + o] = torchLayout[o * inFeatures + i];
+                var tensor = Place(new Tensor<float>(data, new[] { inFeatures, outFeatures }));
                 parameters.Add(tensor);
                 return tensor;
             }
@@ -495,40 +505,34 @@ internal static class HeadToHeadNetworkHarness
                     {
                         int seq = shape[0], model = shape[1];
                         int heads = layer.GetProperty("heads").GetInt32(), ffn = layer.GetProperty("ffn").GetInt32();
-                        int headDim = model / heads;
                         // nn.TransformerEncoderLayer's order: in_proj, out_proj, linear1, linear2, norm1, norm2.
-                        var inProj = Parameter(new[] { 3 * model, model });
+                        var inProj = LinearWeight(3 * model, model);
                         var inBias = Parameter(new[] { 3 * model });
-                        var outProj = Parameter(new[] { model, model });
+                        var outProj = LinearWeight(model, model);
                         var outBias = Parameter(new[] { model });
-                        var linear1 = Parameter(new[] { ffn, model });
+                        var linear1 = LinearWeight(ffn, model);
                         var bias1 = Parameter(new[] { ffn });
-                        var linear2 = Parameter(new[] { model, ffn });
+                        var linear2 = LinearWeight(model, ffn);
                         var bias2 = Parameter(new[] { model });
                         var norm1Gamma = Parameter(new[] { model });
                         var norm1Beta = Parameter(new[] { model });
                         var norm2Gamma = Parameter(new[] { model });
                         var norm2Beta = Parameter(new[] { model });
-                        float scale = 1f / MathF.Sqrt(headDim);
+                        // torch's encoder layer runs the in-projection as one addmm, attention as fused scaled-dot-product
+                        // attention over head-interleaved columns, and each linear with its bias folded in; the fused
+                        // engine calls here are the same operations.
                         layers.Add(input =>
                         {
                             var x2 = engine.Reshape(input, new[] { batch * seq, model });
-                            var qkv = AddBias(engine.TensorMatMulTransposed(x2, inProj), inBias);
-                            Tensor<float> Heads(int part) => engine.Reshape(
-                                engine.TensorPermute(engine.Reshape(engine.TensorNarrow(qkv, 1, part * model, model), new[] { batch, seq, heads, headDim }), new[] { 0, 2, 1, 3 }),
-                                new[] { batch * heads, seq, headDim });
-                            var q = Heads(0);
-                            var k = Heads(1);
-                            var v = Heads(2);
-                            var scores = engine.TensorMultiplyScalar(engine.BatchMatMul(q, engine.TensorPermute(k, new[] { 0, 2, 1 })), scale);
-                            var context = engine.BatchMatMul(engine.Softmax(scores, -1), v);
-                            context = engine.Reshape(
-                                engine.TensorPermute(engine.Reshape(context, new[] { batch, heads, seq, headDim }), new[] { 0, 2, 1, 3 }),
-                                new[] { batch * seq, model });
-                            var attention = AddBias(engine.TensorMatMulTransposed(context, outProj), outBias);
+                            var qkv = engine.FusedLinear(x2, inProj, inBias, FusedActivationType.None);
+                            Tensor<float> Part(int part)
+                                => engine.Reshape(engine.TensorNarrow(qkv, 1, part * model, model), new[] { batch, seq, model });
+                            var context = engine.MultiHeadAttentionCore(Part(0), Part(1), Part(2), heads);
+                            var attention = engine.FusedLinear(
+                                engine.Reshape(context, new[] { batch * seq, model }), outProj, outBias, FusedActivationType.None);
                             var y1 = engine.LayerNorm(engine.TensorAdd(x2, attention), norm1Gamma, norm1Beta, NormEpsilon, out _, out _);
-                            var hidden = engine.ReLU(AddBias(engine.TensorMatMulTransposed(y1, linear1), bias1));
-                            var feedForward = AddBias(engine.TensorMatMulTransposed(hidden, linear2), bias2);
+                            var hidden = engine.FusedLinear(y1, linear1, bias1, FusedActivationType.ReLU);
+                            var feedForward = engine.FusedLinear(hidden, linear2, bias2, FusedActivationType.None);
                             var y2 = engine.LayerNorm(engine.TensorAdd(y1, feedForward), norm2Gamma, norm2Beta, NormEpsilon, out _, out _);
                             return engine.Reshape(y2, new[] { batch, seq, model });
                         });

@@ -122,8 +122,24 @@ public partial class CpuEngine
         var q4 = TensorPermute(Reshape(query, new[] { s.Batch, s.SeqQ, s.Heads, s.HeadDim }), new[] { 0, 2, 1, 3 });
         var k4 = TensorPermute(Reshape(key, new[] { s.Batch, s.SeqK, s.Heads, s.HeadDim }), new[] { 0, 2, 1, 3 });
         var v4 = TensorPermute(Reshape(value, new[] { s.Batch, s.SeqK, s.Heads, s.ValueDim }), new[] { 0, 2, 1, 3 });
+        if (!s.Causal)
+        {
+            // softmax(scale * q k^T) v through batched matmuls and a row softmax: primitives every engine keeps on its
+            // own device under the tape. ScaledDotProductAttention with its weights output runs on the host on a GPU
+            // engine, so a GPU training step through it crossed the device boundary on every call.
+            int bh = s.Batch * s.Heads;
+            var q3 = Reshape(q4, new[] { bh, s.SeqQ, s.HeadDim });
+            var k3 = Reshape(k4, new[] { bh, s.SeqK, s.HeadDim });
+            var v3 = Reshape(v4, new[] { bh, s.SeqK, s.ValueDim });
+            var scores = TensorMultiplyScalar(BatchMatMul(q3, TensorPermute(k3, new[] { 0, 2, 1 })),
+                MathHelper.GetNumericOperations<T>().FromDouble(s.Scale));
+            var weighted = BatchMatMul(Softmax(scores, -1), v3);
+            return Reshape(
+                TensorPermute(Reshape(weighted, new[] { s.Batch, s.Heads, s.SeqQ, s.ValueDim }), new[] { 0, 2, 1, 3 }),
+                new[] { s.Batch, s.SeqQ, s.ValueWidth });
+        }
+
         Tensor<bool>? mask = null;
-        if (s.Causal)
         {
             var allowed = new bool[s.Batch * s.Heads * s.SeqQ * s.SeqK];
             for (int bh = 0; bh < s.Batch * s.Heads; bh++)
