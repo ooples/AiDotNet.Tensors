@@ -622,22 +622,43 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     {
         get
         {
+            // Always a copy: handing out _gradients itself let a caller rebind an entry the step then read.
+            var resolved = (Tensor<T>[])_gradients.Clone();
             if (_liveGradientMap is not { } live)
-                return _gradients;
-            Tensor<T>[]? resolved = null;
-            for (int i = 0; i < _parameters.Length && i < _gradients.Length; i++)
-            {
-                if (live.TryGetValue(_parameters[i], out var current) && !ReferenceEquals(current, _gradients[i]))
-                {
-                    resolved ??= (Tensor<T>[])_gradients.Clone();
+                return resolved;
+            for (int i = 0; i < _parameters.Length && i < resolved.Length; i++)
+                if (live.TryGetValue(_parameters[i], out var current))
                     resolved[i] = current;
-                }
-            }
-            return resolved ?? _gradients;
+            return resolved;
         }
     }
 
     private Dictionary<Tensor<T>, Tensor<T>>? _liveGradientMap;
+
+    /// <summary>
+    /// Copies a parameter gradient the backward REPLACED in the live map (an out-of-place accumulation, a first-write
+    /// copy, a contiguity fix-up) into the plan's own buffer. L2 regularization, clipping, the finiteness check, the
+    /// GPU gradient resolution and the optimizer closures all read <c>_gradients[p]</c>, the buffer they were configured
+    /// against at compile time, so without this they read only the first contribution. Copying keeps that buffer, and
+    /// a captured graph's baked pointer to it, stable; it costs nothing when no entry was replaced.
+    /// </summary>
+    private void CommitReplacedParameterGradients(IEngine engine)
+    {
+        if (_liveGradientMap is not { } live) return;
+        for (int p = 0; p < _parameters.Length && p < _gradients.Length; p++)
+        {
+            var own = _gradients[p];
+            if (own is null || !live.TryGetValue(_parameters[p], out var current) || ReferenceEquals(current, own))
+                continue;
+            if (current.Length != own.Length)
+                throw new InvalidOperationException(
+                    $"Parameter {p}'s replaced gradient has {current.Length} elements; its buffer has {own.Length}.");
+            using (new Autodiff.NoGradScope<T>())
+                engine.TensorCopy(current, own);
+            live[_parameters[p]] = own;
+            _parameters[p].Grad = own;
+        }
+    }
     public int ForwardStepCount => _forwardActions.Length;
     public int BackwardStepCount => _backwardActions.Length;
 
@@ -2769,6 +2790,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         {
             Autodiff.DifferentiableOps.GradWriteGeneration = 0;
         }
+        CommitReplacedParameterGradients(engine);
         // An uncaptured run executed the backward for real, so it knows which buffers nothing wrote; later steps
         // (and the capture) zero only those. A captured run only recorded, so its marks are not evidence.
         if (!capturingNow)
@@ -3062,6 +3084,7 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         }
         long t3 = _profileStepEnabled ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
         if (stepTiming) StepTiming.RecordBackward(Stopwatch.GetTimestamp() - bwdStart);
+        CommitReplacedParameterGradients(engine);
 
         // Some generic CPU backward primitives produce a deferred tensor and
         // attach it to the plan's pre-allocated parameter-gradient slot. The
