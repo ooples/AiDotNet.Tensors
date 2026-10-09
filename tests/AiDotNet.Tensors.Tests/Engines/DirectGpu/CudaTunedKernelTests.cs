@@ -62,6 +62,16 @@ public sealed class CudaTunedKernelTests
     private static IEnumerable<ITunedKernelCandidate<TArgs>> All<TArgs>(TunedKernelSlot<TArgs> slot) where TArgs : struct =>
         slot.CandidateIds.Select(id => slot.Candidate(id)).OfType<ITunedKernelCandidate<TArgs>>();
 
+    // The candidates a loop checks for this shape. Never empty, and always including the reference (the slot's first
+    // candidate): a regression that made nothing applicable would otherwise leave the loop body unrun and the test green.
+    private static List<ITunedKernelCandidate<TArgs>> Applicable<TArgs>(TunedKernelSlot<TArgs> slot, TunedShape shape) where TArgs : struct
+    {
+        var list = All(slot).Where(c => c.IsApplicable(shape)).ToList();
+        Assert.True(list.Count > 0, $"no {slot.Op} candidate is applicable to {shape}");
+        Assert.Contains(list, c => string.Equals(c.Id, slot.CandidateIds[0], StringComparison.Ordinal));
+        return list;
+    }
+
     [SkippableFact]
     public void Softmax_EveryCandidate_MatchesCpu()
     {
@@ -81,7 +91,7 @@ public sealed class CudaTunedKernelTests
             using var output = backend.AllocateBuffer(x.Length);
             var shape = TunedShape.Of2(TunedKernelDType.Float32, rows, n);
             var args = new CudaSoftmaxArgs(input, output, rows, n);
-            foreach (var c in All(backend.SoftmaxSlot).Where(c => c.IsApplicable(shape)))
+            foreach (var c in Applicable(backend.SoftmaxSlot, shape))
             {
                 c.Execute(args);
                 backend.Synchronize();
@@ -110,7 +120,7 @@ public sealed class CudaTunedKernelTests
             using var dx = backend.AllocateBuffer(y.Length);
             var shape = TunedShape.Of2(TunedKernelDType.Float32, rows, n);
             var args = new CudaSoftmaxBackwardArgs(dyb, yb, dx, rows, n);
-            foreach (var c in All(backend.SoftmaxBackwardSlot).Where(c => c.IsApplicable(shape)))
+            foreach (var c in Applicable(backend.SoftmaxBackwardSlot, shape))
             {
                 c.Execute(args);
                 backend.Synchronize();
@@ -180,7 +190,7 @@ public sealed class CudaTunedKernelTests
             var shape = TunedShape.Of2(TunedKernelDType.Float32, rows, n);
 
             var fwd = new CudaLayerNormArgs(xb, yb, gb, bb, mb, ib, rows, n, eps);
-            foreach (var c in All(backend.LayerNormSlot).Where(c => c.IsApplicable(shape)))
+            foreach (var c in Applicable(backend.LayerNormSlot, shape))
             {
                 c.Execute(fwd);
                 backend.Synchronize();
@@ -193,14 +203,14 @@ public sealed class CudaTunedKernelTests
             using var mcpu = backend.AllocateBuffer(mean);
             using var icpu = backend.AllocateBuffer(inv);
             var bwd = new CudaNormBackwardArgs(dyb, xb, gb, mcpu, icpu, dxb, null, rows, n);
-            foreach (var c in All(backend.LayerNormBackwardSlot).Where(c => c.IsApplicable(shape)))
+            foreach (var c in Applicable(backend.LayerNormBackwardSlot, shape))
             {
                 c.Execute(bwd);
                 backend.Synchronize();
                 AssertClose(dx, backend.DownloadBuffer(dxb), dx.Length, $"{c.Id} dx {rows}x{n}");
             }
             var par = new CudaNormBackwardArgs(dyb, xb, null, mcpu, icpu, dgb, dbb, rows, n);
-            foreach (var c in All(backend.LayerNormGradParametersSlot).Where(c => c.IsApplicable(shape)))
+            foreach (var c in Applicable(backend.LayerNormGradParametersSlot, shape))
             {
                 c.Execute(par);
                 backend.Synchronize();
@@ -232,7 +242,7 @@ public sealed class CudaTunedKernelTests
             using var dgb = backend.AllocateBuffer(n);
             var shape = TunedShape.Of2(TunedKernelDType.Float32, rows, n);
             var args = new CudaNormBackwardArgs(dyb, xb, null, rb, null, dgb, null, rows, n);
-            foreach (var c in All(backend.RmsNormGradGammaSlot).Where(c => c.IsApplicable(shape)))
+            foreach (var c in Applicable(backend.RmsNormGradGammaSlot, shape))
             {
                 c.Execute(args);
                 backend.Synchronize();
@@ -256,7 +266,7 @@ public sealed class CudaTunedKernelTests
         using var a = backend.AllocateBuffer(x.Length);
         using var b = backend.AllocateBuffer(x.Length);
         var shape = TunedShape.Of2(TunedKernelDType.Float32, rows, n);
-        foreach (var c in All(backend.SoftmaxSlot).Where(c => c.IsApplicable(shape)))
+        foreach (var c in Applicable(backend.SoftmaxSlot, shape))
         {
             Assert.True(c.IsDeterministic);
             c.Execute(new CudaSoftmaxArgs(input, a, rows, n));
