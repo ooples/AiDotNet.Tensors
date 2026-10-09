@@ -111,13 +111,13 @@ public sealed class ZeroShardedOptimizer : IShardedOptimizer
 
     /// <inheritdoc />
     /// <remarks>
-    /// ZeRO-1 contract: each rank steps only its local parameters; non-local parameters
-    /// (and their state) must not change on this rank — they are owned and updated by
-    /// other ranks, then communicated back via all-gather.
-    ///
-    /// We achieve that without touching every concrete optimizer by snapshotting the
-    /// non-local parameters and their state before delegating to <c>_inner.Step()</c>,
-    /// then restoring them afterwards. Local params + state are updated normally.
+    /// ZeRO-1 contract: each rank computes the update of its own shard only. The inner step
+    /// runs under <see cref="OptimizerBase.StepFilter"/>, so other ranks' parameters, gradients
+    /// and optimizer state are never touched (and their state is never allocated here).
+    /// Group-wide statistics (D-Adapt, Prodigy) are all-reduced through the process group.
+    /// With a process group, each rank then broadcasts its updated shard (one packed
+    /// broadcast per owning rank), so every rank ends the step with every parameter current.
+    /// Without one, an optimizer with group-wide statistics is refused on more than one rank.
     /// </remarks>
     public void Step() => RunLocalStep(_inner.Step);
 
