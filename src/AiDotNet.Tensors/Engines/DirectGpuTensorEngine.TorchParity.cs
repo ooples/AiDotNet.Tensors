@@ -75,6 +75,9 @@ public partial class DirectGpuTensorEngine
         => base.TensorAmin<T>(tensor, axes, keepDims);
 
     /// <inheritdoc/>
+    /// <remarks>Intentional host fallback (a boolean reduction off the training paths): every call records a <see cref="GpuLaunchProbe"/>
+    /// fallback, so a GPU workload that reaches it shows in the residency diagnostics. The native kernel is tracked in
+    /// https://github.com/ooples/AiDotNet.Tensors/issues/1112.</remarks>
     public override Tensor<T> TensorAll<T>(Tensor<T> tensor, int[]? axes = null, bool keepDims = false)
     {
         GpuLaunchProbe.OnFallback("TensorAll: no device kernel", null);
@@ -82,6 +85,9 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <inheritdoc/>
+    /// <remarks>Intentional host fallback (a boolean reduction off the training paths): every call records a <see cref="GpuLaunchProbe"/>
+    /// fallback, so a GPU workload that reaches it shows in the residency diagnostics. The native kernel is tracked in
+    /// https://github.com/ooples/AiDotNet.Tensors/issues/1112.</remarks>
     public override Tensor<T> TensorAny<T>(Tensor<T> tensor, int[]? axes = null, bool keepDims = false)
     {
         GpuLaunchProbe.OnFallback("TensorAny: no device kernel", null);
@@ -257,6 +263,9 @@ public partial class DirectGpuTensorEngine
         => base.TensorSumToSize<T>(tensor, size);
 
     /// <inheritdoc/>
+    /// <remarks>Intentional host fallback (a sort-based statistic off the training paths): every call records a <see cref="GpuLaunchProbe"/>
+    /// fallback, so a GPU workload that reaches it shows in the residency diagnostics. The native kernel is tracked in
+    /// https://github.com/ooples/AiDotNet.Tensors/issues/1112.</remarks>
     public override Tensor<T> TensorQuantile<T>(Tensor<T> tensor, double q, int? dim = null, bool keepDim = false, QuantileInterpolation interpolation = QuantileInterpolation.Linear)
     {
         GpuLaunchProbe.OnFallback("TensorQuantile: no device kernel", null);
@@ -264,6 +273,9 @@ public partial class DirectGpuTensorEngine
     }
 
     /// <inheritdoc/>
+    /// <remarks>Intentional host fallback (a sort-based statistic off the training paths): every call records a <see cref="GpuLaunchProbe"/>
+    /// fallback, so a GPU workload that reaches it shows in the residency diagnostics. The native kernel is tracked in
+    /// https://github.com/ooples/AiDotNet.Tensors/issues/1112.</remarks>
     public override Tensor<T> TensorNanQuantile<T>(Tensor<T> tensor, double q, int? dim = null, bool keepDim = false, QuantileInterpolation interpolation = QuantileInterpolation.Linear)
     {
         GpuLaunchProbe.OnFallback("TensorNanQuantile: no device kernel", null);

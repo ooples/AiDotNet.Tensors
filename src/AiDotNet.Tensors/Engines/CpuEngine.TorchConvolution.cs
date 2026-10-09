@@ -107,7 +107,14 @@ public partial class CpuEngine
                     new[] { 1, s[0] }, new[] { 0, p[0] }, new[] { 1, d[0] });
                 return Reshape(y, new[] { y._shape[0], y._shape[1], y._shape[3] });
             case 2: return Conv2D(x, w, s, p, d);
-            default: return Conv3D(x, w, s, p, d);
+            default:
+                // The array overload is not virtual, so it always ran on the host. A uniform geometry takes the virtual
+                // scalar overload, which a device engine runs on its Conv3D kernel; a per-axis one stays on the host and
+                // is recorded as a fallback (native kernel tracked in https://github.com/ooples/AiDotNet.Tensors/issues/1112).
+                if (s[0] == s[1] && s[1] == s[2] && p[0] == p[1] && p[1] == p[2] && d[0] == d[1] && d[1] == d[2])
+                    return Conv3D(x, w, s[0], p[0], d[0]);
+                if (SupportsGpu) AiDotNet.Tensors.Engines.DirectGpu.GpuLaunchProbe.OnFallback("TensorConvolution: per-axis 3-D geometry has no device kernel", null);
+                return Conv3D(x, w, s, p, d);
         }
     }
 }
