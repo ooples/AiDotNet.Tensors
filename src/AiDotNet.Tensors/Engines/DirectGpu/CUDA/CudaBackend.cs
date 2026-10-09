@@ -1226,6 +1226,9 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         // Compile reduction kernels (mean, variance, std, norm, logsumexp, product, cumsum)
         CompileKernelModule(device, CudaReductionKernels.GetSource(), "reduction_kernels", CudaReductionKernels.GetKernelNames());
 
+        // Generated row/column variants served through the tuned-kernel registry (optional capability).
+        CompileTunedRowKernels(device);
+
         // Compile the established contiguous, strided, and batched dot-product
         // baselines. These kernels previously existed in source but were never
         // registered, which made both the public APIs and the #836 comparison
@@ -5833,7 +5836,19 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         LaunchKernel(kernel, grid, DefaultBlockSize, args);
     }
 
-    private unsafe void LaunchSoftmaxKernel(IGpuBuffer input, IGpuBuffer output, int batchSize, int features)
+    private void LaunchSoftmaxKernel(IGpuBuffer input, IGpuBuffer output, int batchSize, int features)
+    {
+        // Tuned-kernel registry seam (#1096 E-1): the established block-per-row kernel is the reference; the
+        // generated lanes-per-row variants are chosen per shape class only after the correctness and paired
+        // timing gate (TunedKernelSlot).
+        if (batchSize > 0 && features > 0 &&
+            SoftmaxSlot.TryExecute(RowShape(batchSize, features),
+                new CudaSoftmaxArgs(input, output, batchSize, features)))
+            return;
+        LaunchSoftmaxReference(input, output, batchSize, features);
+    }
+
+    private unsafe void LaunchSoftmaxReference(IGpuBuffer input, IGpuBuffer output, int batchSize, int features)
     {
         if (!_kernelCache.TryGetValue("softmax", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: softmax");
@@ -6534,6 +6549,27 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         using var _profile = CudaDispatchPolicy.Scope(
             "Conv2D",
             useVendor: false);
+        // Tuned-kernel registry seam (#1096 E-1): the generic Winograd/tiled/direct dispatch below is the
+        // reference; im2col + cuBLAS GEMM and the explicit tiled/direct kernels compete per shape class.
+        if (batch > 0 && outHeight > 0 && outWidth > 0)
+        {
+            var convArgs = new CudaConv2DArgs(input, kernel, output, batch, inChannels, inHeight, inWidth,
+                outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+            if (Conv2DForwardSlot.TryExecute(convArgs.Shape(), convArgs)) return;
+        }
+        LaunchConv2DGeneric(input, kernel, output, batch, inChannels, inHeight, inWidth,
+            outChannels, outHeight, outWidth, kernelH, kernelW, strideH, strideW, padH, padW, dilationH, dilationW);
+    }
+
+    /// <summary>The established generic convolution dispatch: Winograd F(2x2,3x3) for 3x3 stride-1, else the
+    /// shared-memory tiled kernel, else the direct kernel.</summary>
+    private unsafe void LaunchConv2DGeneric(IGpuBuffer input, IGpuBuffer kernel, IGpuBuffer output,
+        int batch, int inChannels, int inHeight, int inWidth,
+        int outChannels, int outHeight, int outWidth,
+        int kernelH, int kernelW,
+        int strideH, int strideW, int padH, int padW,
+        int dilationH, int dilationW)
+    {
         using var _ = PushContext();
         IntPtr inputPtr = input.Handle;
         IntPtr kernelPtr = kernel.Handle;
@@ -7716,6 +7752,14 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         int kernelH, int kernelW,
         int strideH, int strideW, int padH, int padW)
     {
+        // The deterministic kernel bounds each input cell's scan by its covering windows, dividing by the strides; a
+        // zero stride there is undefined on the device, and no pool geometry has one.
+        if (strideH < 1 || strideW < 1)
+            throw new ArgumentOutOfRangeException(strideH < 1 ? nameof(strideH) : nameof(strideW), "Pool strides must be at least 1.");
+        if (kernelH < 1 || kernelW < 1)
+            throw new ArgumentOutOfRangeException(kernelH < 1 ? nameof(kernelH) : nameof(kernelW), "Pool kernel sizes must be at least 1.");
+        if (padH < 0 || padW < 0)
+            throw new ArgumentOutOfRangeException(padH < 0 ? nameof(padH) : nameof(padW), "Pool padding must not be negative.");
         using var _ = PushContext();
         const int blockSize = 16;
         IntPtr gradOutPtr = gradOutput.Handle;
@@ -7734,7 +7778,9 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             // Issue #382: route to atomic-free variant.
             if (!_kernelCache.TryGetValue("maxpool2d_backward_deterministic", out var kernelD))
                 throw new InvalidOperationException("CUDA kernel not found: maxpool2d_backward_deterministic");
-            void** argsD = stackalloc void*[9];
+            // The window geometry lets each input cell visit only the output cells whose pooling window covers
+            // it (instead of every output cell of its plane); see the kernel for the bit-identity argument.
+            void** argsD = stackalloc void*[15];
             argsD[0] = &gradOutPtr;
             argsD[1] = &indicesPtr;
             argsD[2] = &gradInPtr;
@@ -7744,6 +7790,12 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             argsD[6] = &inWidth;
             argsD[7] = &outH;
             argsD[8] = &outW;
+            argsD[9] = &kernelH;
+            argsD[10] = &kernelW;
+            argsD[11] = &strideH;
+            argsD[12] = &strideW;
+            argsD[13] = &padH;
+            argsD[14] = &padW;
             // Deterministic variant grid: per (b, c, ih, iw) input cell.
             uint gridDX = (uint)((inWidth + blockSize - 1) / blockSize);
             uint gridDY = (uint)((inHeight + blockSize - 1) / blockSize);
@@ -8564,29 +8616,12 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
                 input, output, gamma, beta, saveMean, saveInvVar, batchSize, epsilon))
             return;
 
-        if (!_kernelCache.TryGetValue("layernorm_forward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: layernorm_forward");
-
-        using var _ = PushContext();
-        uint gridX = (uint)batchSize;
-        IntPtr inputPtr = input.Handle;
-        IntPtr outputPtr = output.Handle;
-        IntPtr gammaPtr = gamma.Handle;
-        IntPtr betaPtr = beta.Handle;
-        IntPtr saveMeanPtr = saveMean.Handle;
-        IntPtr saveInvVarPtr = saveInvVar.Handle;
-        void** args = stackalloc void*[9];
-        args[0] = &inputPtr;
-        args[1] = &outputPtr;
-        args[2] = &gammaPtr;
-        args[3] = &betaPtr;
-        args[4] = &saveMeanPtr;
-        args[5] = &saveInvVarPtr;
-        args[6] = &batchSize;
-        args[7] = &normalizedSize;
-        args[8] = &epsilon;
-        // 1 block per batch element, 1 shared array
-        LaunchKernelWithSharedMem(kernel, gridX, DefaultBlockSize, (uint)(DefaultBlockSize * sizeof(float)), args);
+        var lnArgs = new CudaLayerNormArgs(input, output, gamma, beta, saveMean, saveInvVar,
+            batchSize, normalizedSize, epsilon);
+        if (batchSize > 0 && normalizedSize > 0 &&
+            LayerNormSlot.TryExecute(RowShape(batchSize, normalizedSize), lnArgs))
+            return;
+        LaunchLayerNormReference(lnArgs);
     }
 
     public unsafe void LayerNormBackward(IGpuBuffer gradOutput, IGpuBuffer input, IGpuBuffer gamma,
@@ -8599,52 +8634,20 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
                 gradInput, gradGamma, gradBeta, batchSize, epsilon))
             return;
 
-        if (!_kernelCache.TryGetValue("layernorm_backward", out var kernel))
-            throw new InvalidOperationException("CUDA kernel not found: layernorm_backward");
+        var inputGradArgs = new CudaNormBackwardArgs(gradOutput, input, gamma, saveMean, saveInvVar,
+            gradInput, null, batchSize, normalizedSize);
+        bool rowsValid = batchSize > 0 && normalizedSize > 0;
+        if (!(rowsValid && LayerNormBackwardSlot.TryExecute(RowShape(batchSize, normalizedSize), inputGradArgs)))
+            LaunchLayerNormBackwardReference(inputGradArgs);
 
-        using var _ = PushContext();
-        uint gridX = (uint)batchSize;
-        IntPtr gradOutputPtr = gradOutput.Handle;
-        IntPtr inputPtr = input.Handle;
-        IntPtr gammaPtr = gamma.Handle;
-        IntPtr saveMeanPtr = saveMean.Handle;
-        IntPtr saveInvVarPtr = saveInvVar.Handle;
-        IntPtr gradInputPtr = gradInput.Handle;
-        IntPtr gradGammaPtr = gradGamma.Handle;
-        IntPtr gradBetaPtr = gradBeta.Handle;
-        void** args = stackalloc void*[11];
-        args[0] = &gradOutputPtr;
-        args[1] = &inputPtr;
-        args[2] = &gammaPtr;
-        args[3] = &saveMeanPtr;
-        args[4] = &saveInvVarPtr;
-        args[5] = &gradInputPtr;
-        args[6] = &gradGammaPtr;
-        args[7] = &gradBetaPtr;
-        args[8] = &batchSize;
-        args[9] = &normalizedSize;
-        args[10] = &epsilon;
-        // 2 shared arrays for sumDy and sumDyXmu
-        LaunchKernelWithSharedMem(kernel, gridX, DefaultBlockSize, (uint)(2 * DefaultBlockSize * sizeof(float)), args);
-
-        // The layernorm_backward kernel above computes ONLY gradInput — it leaves
-        // gradGamma/gradBeta untouched (they require a reduction ACROSS the batch, not a
-        // per-row block result). Launch the dedicated param-gradient kernel; without it,
-        // LayerNorm's affine gamma/beta receive ZERO gradient on GPU and never train
-        // (every transformer layer has a LayerNorm — caught by LayerNormGradientCheckTests).
-        if (!_kernelCache.TryGetValue("layernorm_grad_params", out var paramKernel))
-            throw new InvalidOperationException("CUDA kernel not found: layernorm_grad_params");
-        uint paramGrid = (uint)((normalizedSize + DefaultBlockSize - 1) / DefaultBlockSize);
-        void** pargs = stackalloc void*[8];
-        pargs[0] = &gradOutputPtr;
-        pargs[1] = &inputPtr;
-        pargs[2] = &saveMeanPtr;
-        pargs[3] = &saveInvVarPtr;
-        pargs[4] = &gradGammaPtr;
-        pargs[5] = &gradBetaPtr;
-        pargs[6] = &batchSize;
-        pargs[7] = &normalizedSize;
-        LaunchKernel(paramKernel, paramGrid, DefaultBlockSize, pargs);
+        // The input-gradient kernels compute ONLY gradInput; gradGamma/gradBeta need a reduction ACROSS the
+        // rows (without it LayerNorm's affine parameters receive zero gradient on GPU -- caught by
+        // LayerNormGradientCheckTests). The established kernel gives each column one thread looping over every
+        // row; the registry may select a generated column-tile reduction instead.
+        var paramArgs = new CudaNormBackwardArgs(gradOutput, input, null, saveMean, saveInvVar,
+            gradGamma, gradBeta, batchSize, normalizedSize);
+        if (!(rowsValid && LayerNormGradParametersSlot.TryExecute(RowShape(batchSize, normalizedSize), paramArgs)))
+            LaunchColumnGradReference("layernorm_grad_params", rms: false, paramArgs);
     }
 
     public unsafe void GroupNorm(IGpuBuffer input, IGpuBuffer output, IGpuBuffer gamma, IGpuBuffer beta,
@@ -8959,19 +8962,12 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
         // 1 block per batch element, 1 shared array
         LaunchKernelWithSharedMem(kernel, gridX, DefaultBlockSize, (uint)(DefaultBlockSize * sizeof(float)), args);
 
-        // Compute gradGamma using rmsnorm_grad_gamma kernel
-        if (!_kernelCache.TryGetValue("rmsnorm_grad_gamma", out var kernel2))
-            throw new InvalidOperationException("CUDA kernel not found: rmsnorm_grad_gamma");
-
-        uint gridGamma = (uint)((normalizedSize + DefaultBlockSize - 1) / DefaultBlockSize);
-        void** args2 = stackalloc void*[6];
-        args2[0] = &gradOutputPtr;
-        args2[1] = &inputPtr;
-        args2[2] = &saveRmsPtr;
-        args2[3] = &gradGammaPtr;
-        args2[4] = &batchSize;
-        args2[5] = &normalizedSize;
-        LaunchKernel(kernel2, gridGamma, DefaultBlockSize, args2);
+        // Compute gradGamma (a column reduction over rows) through the tuned-kernel registry.
+        var gammaArgs = new CudaNormBackwardArgs(gradOutput, input, null, saveRms, null, gradGamma, null,
+            batchSize, normalizedSize);
+        if (!(batchSize > 0 && normalizedSize > 0 &&
+              RmsNormGradGammaSlot.TryExecute(RowShape(batchSize, normalizedSize), gammaArgs)))
+            LaunchColumnGradReference("rmsnorm_grad_gamma", rms: true, gammaArgs);
     }
 
     #endregion
@@ -10195,11 +10191,23 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
     {
         // Fail-closed direct-PTX fast path (issue #840): dX = S*(dY - sum(dY*S)); S=output, dY=gradOutput.
         if (TryDirectPtxSoftmaxBackward(output, gradOutput, gradInput, batchSize, features)) return;
+        if (batchSize > 0 && features > 0 &&
+            SoftmaxBackwardSlot.TryExecute(RowShape(batchSize, features),
+                new CudaSoftmaxBackwardArgs(gradOutput, output, gradInput, batchSize, features)))
+            return;
+        LaunchSoftmaxBackwardReference(gradOutput, output, gradInput, batchSize, features);
+    }
+
+    private unsafe void LaunchSoftmaxBackwardReference(IGpuBuffer gradOutput, IGpuBuffer output, IGpuBuffer gradInput,
+        int batchSize, int features)
+    {
         if (!_kernelCache.TryGetValue("softmax_backward", out var kernel))
             throw new InvalidOperationException("CUDA kernel not found: softmax_backward");
 
         using var _ = PushContext();
-        uint grid = (uint)batchSize;
+        // One thread per row: ceil(rows / block) blocks. This launched `batchSize` blocks (256x the threads
+        // needed, all but the first rows/256 blocks exiting at the bounds check); results are unchanged.
+        uint grid = (uint)((batchSize + DefaultBlockSize - 1) / DefaultBlockSize);
         IntPtr gradOutPtr = gradOutput.Handle;
         IntPtr outPtr = output.Handle;
         IntPtr gradInPtr = gradInput.Handle;
@@ -17830,6 +17838,7 @@ public sealed partial class CudaBackend : IUninitializedGpuAllocation, IAsyncGpu
             try { CudaNativeBindings.cuEventDestroy(_streamOrderEvent); } catch { }
             _streamOrderEvent = IntPtr.Zero;
         }
+        DisposeTunedKernelResources();
         _pinnedPool.Dispose();
         _bufferPool.Dispose();
 

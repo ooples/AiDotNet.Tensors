@@ -60,51 +60,38 @@ public class Fp16HeteroScratchFreeTests
         return (plan.Fp16HeteroOrderForTest, plan.LossOutput);
     }
 
-    // A measurement window a GC landed in is retaken, up to this many times.
-    private const int MaxMeasureAttempts = 5;
-
-    private static double GradNorm(System.Collections.Generic.IEnumerable<System.Collections.Generic.KeyValuePair<Tensor<float>, Tensor<float>>> grads)
-    {
-        double sum = 0;
-        foreach (var kv in grads)
-        {
-            var a = kv.Value.ToArray();
-            for (int i = 0; i < a.Length; i++) sum += (double)a[i] * a[i];
-        }
-        return Math.Sqrt(sum);
-    }
-
     // Run one ISOLATED forward+backward with scratch-free on/off, returning the param-grad L2 norm (correctness
     // fingerprint) and the resident activation-cache bytes right after the backward. Each run captures its OWN
     // fresh graph (distinct tensors) and clears the activation cache first, so the two runs don't share cache
     // state (a shared snapshot would treat the other run's entries as pre-existing and confound the A/B).
-    private static (double gradNorm, long cacheBytesAfter) RunOnce(DirectGpuTensorEngine gpu, bool scratchFree)
+    private static (double gradNorm, long cacheBytesAfter, long scratchReleased, bool collected) RunOnce(DirectGpuTensorEngine gpu, bool scratchFree)
     {
         var prevEnv = Environment.GetEnvironmentVariable("AIDOTNET_FP16_NO_SCRATCH_FREE");
         Environment.SetEnvironmentVariable("AIDOTNET_FP16_NO_SCRATCH_FREE", scratchFree ? null : "1");
         try
         {
-            for (int attempt = 1; ; attempt++)
+            var (order, loss) = CaptureHetero(gpu);
+            gpu.ClearActivationCache(); // isolate this run's cache accounting from the capture + the other run
+            using var plan = MixedPrecisionCompiledPlan.FromCapturedOrder(gpu, order, loss, paging: false);
+            // Replicate the real Step condition: eviction suspended for the whole forward+backward (#226), so
+            // without the scratch-free the per-op backward scratch genuinely accumulates in the cache.
+            gpu.SuspendActivationEviction();
+            try
             {
-                var (order, loss) = CaptureHetero(gpu);
-                gpu.ClearActivationCache(); // isolate this run's cache accounting from the capture + the other run
-                using var plan = MixedPrecisionCompiledPlan.FromCapturedOrder(gpu, order, loss, paging: false);
-                // Replicate the real Step condition: eviction suspended for the whole forward+backward (#226), so
-                // without the scratch-free the per-op backward scratch genuinely accumulates in the cache.
-                gpu.SuspendActivationEviction();
-                try
+                int gen0 = GC.CollectionCount(0);
+                plan.Forward();
+                var grads = plan.Backward();
+                long bytes = gpu.CurrentActivationCacheBytes;
+                bool collected = GC.CollectionCount(0) != gen0;
+                double sum = 0;
+                foreach (var kv in grads.Fp32)
                 {
-                    int collections = GC.CollectionCount(0);
-                    plan.Forward();
-                    var grads = plan.Backward();
-                    long bytes = gpu.CurrentActivationCacheBytes;
-                    // Entries die with their storage, so a GC inside this window frees unreferenced scratch on its own
-                    // and the A/B then measures GC timing instead of the release (net471 showed on=2x off).
-                    if (GC.CollectionCount(0) != collections && attempt < MaxMeasureAttempts) continue;
-                    return (GradNorm(grads.Fp32), bytes);
+                    var a = kv.Value.ToArray();
+                    for (int i = 0; i < a.Length; i++) sum += (double)a[i] * a[i];
                 }
-                finally { gpu.ResumeActivationEviction(); }
+                return (Math.Sqrt(sum), bytes, plan.ScratchBytesReleasedForTest, collected);
             }
+            finally { gpu.ResumeActivationEviction(); }
         }
         finally { Environment.SetEnvironmentVariable("AIDOTNET_FP16_NO_SCRATCH_FREE", prevEnv); }
     }
@@ -112,36 +99,37 @@ public class Fp16HeteroScratchFreeTests
     // Run one ISOLATED forward (+ backward for the grad fingerprint) with the forward Half-resident store on/off,
     // returning the param-grad L2 norm and the resident activation-cache bytes right AFTER the forward (before
     // the backward adds grads/scratch) — so the measurement isolates the activation STORAGE dtype.
-    private static (double gradNorm, long cacheBytesAfterForward) RunForwardStoreOnce(DirectGpuTensorEngine gpu, bool store)
+    private static (double gradNorm, long cacheBytesAfterForward, bool collected) RunForwardStoreOnce(DirectGpuTensorEngine gpu, bool store)
     {
         var prevEnv = Environment.GetEnvironmentVariable("AIDOTNET_FP16_NO_FWD_STORE");
         // store on = default (env unset); store off = opt out via env (engages the FP32 up-cast store).
         Environment.SetEnvironmentVariable("AIDOTNET_FP16_NO_FWD_STORE", store ? null : "1");
         try
         {
-            for (int attempt = 1; ; attempt++)
+            var (order, loss) = CaptureHetero(gpu);
+            gpu.ClearActivationCache();
+            using var plan = MixedPrecisionCompiledPlan.FromCapturedOrder(gpu, order, loss, paging: false);
+            gpu.SuspendActivationEviction();
+            DirectGpuTensorEngine.TrackOwnedResultBytes = true;
+            gpu.ResetOwnedResultTracking();
+            try
             {
-                var (order, loss) = CaptureHetero(gpu);
-                gpu.ClearActivationCache();
-                using var plan = MixedPrecisionCompiledPlan.FromCapturedOrder(gpu, order, loss, paging: false);
-                gpu.SuspendActivationEviction();
-                DirectGpuTensorEngine.TrackOwnedResultBytes = true;
-                gpu.ResetOwnedResultTracking();
-                try
+                int gen0 = GC.CollectionCount(0);
+                plan.Forward();
+                // Resident activation storage right after the forward: the activation cache PLUS the results that own
+                // their device buffers (FP32 results are no longer cache entries, so the cache alone undercounts).
+                long bytes = gpu.CurrentActivationCacheBytes + gpu.LiveOwnedResultBytes;
+                bool collected = GC.CollectionCount(0) != gen0;
+                var grads = plan.Backward();
+                double sum = 0;
+                foreach (var kv in grads.Fp32)
                 {
-                    int collections = GC.CollectionCount(0);
-                    plan.Forward();
-                    // Resident activation storage right after the forward: the activation cache PLUS the results that own
-                    // their device buffers (FP32 results are no longer cache entries, so the cache alone undercounts).
-                    long bytes = gpu.CurrentActivationCacheBytes + gpu.LiveOwnedResultBytes;
-                    // As in RunOnce: a GC inside the window frees entries by itself and skews the A/B.
-                    bool collected = GC.CollectionCount(0) != collections;
-                    var grads = plan.Backward();
-                    if (collected && attempt < MaxMeasureAttempts) continue;
-                    return (GradNorm(grads.Fp32), bytes);
+                    var a = kv.Value.ToArray();
+                    for (int i = 0; i < a.Length; i++) sum += (double)a[i] * a[i];
                 }
-                finally { gpu.ResumeActivationEviction(); DirectGpuTensorEngine.TrackOwnedResultBytes = false; }
+                return (Math.Sqrt(sum), bytes, collected);
             }
+            finally { gpu.ResumeActivationEviction(); DirectGpuTensorEngine.TrackOwnedResultBytes = false; }
         }
         finally { Environment.SetEnvironmentVariable("AIDOTNET_FP16_NO_FWD_STORE", prevEnv); }
     }
@@ -166,8 +154,26 @@ public class Fp16HeteroScratchFreeTests
 
         // (2) The win: the Half-resident matmul activations occupy 2 bytes/elem vs 4 (FP32 up-cast), so the
         // resident activation-cache bytes after the forward are strictly lower with the store on.
-        Assert.True(on.cacheBytesAfterForward < off.cacheBytesAfterForward,
-            $"forward Half-store should lower resident activation bytes: on={on.cacheBytesAfterForward} off={off.cacheBytesAfterForward}.");
+        // As in the scratch-free test below: entries die with their storage, so a collection during either forward frees
+        // entries by itself (net471: on=65540 off=32768 in about one run in six). Compared on the first attempt neither arm
+        // collected in; the test fails if no attempt is clean, so it never passes without making the comparison.
+        const int Attempts = 8;
+        for (int attempt = 0; ; attempt++)
+        {
+            if (!on.collected && !off.collected)
+            {
+                Assert.True(on.cacheBytesAfterForward < off.cacheBytesAfterForward,
+                    $"forward Half-store should lower resident activation bytes: on={on.cacheBytesAfterForward} off={off.cacheBytesAfterForward}.");
+                return;
+            }
+            Assert.True(attempt + 1 < Attempts,
+                $"a garbage collection ran during every one of {Attempts} attempts, so the resident-bytes comparison was never made.");
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+            off = RunForwardStoreOnce(gpu, store: false);
+            on = RunForwardStoreOnce(gpu, store: true);
+        }
     }
 
     [SkippableFact]
@@ -184,9 +190,32 @@ public class Fp16HeteroScratchFreeTests
         Assert.True(Math.Abs(on.gradNorm - off.gradNorm) <= 1e-3 * (1 + Math.Abs(off.gradNorm)),
             $"scratch-free changed the gradient norm: on={on.gradNorm} off={off.gradNorm}.");
 
-        // (2) Peak win: with the release on, the per-op backward scratch is gone after each node, so the
-        // resident activation-cache bytes after the backward are strictly lower (the held grads remain).
-        Assert.True(on.cacheBytesAfter < off.cacheBytesAfter,
-            $"scratch-free should lower resident cache bytes: on={on.cacheBytesAfter} off={off.cacheBytesAfter}.");
+        // (2) The release itself: the scratch-free backward frees per-op scratch after each node, the opt-out frees none.
+        // Counted exactly by the eviction, so a garbage collection cannot hide it.
+        Assert.True(on.scratchReleased > 0, $"scratch-free released no backward scratch (off released {off.scratchReleased}).");
+        Assert.Equal(0L, off.scratchReleased);
+
+        // (3) Peak win: with the release on, the resident activation-cache bytes after the backward are strictly lower.
+        // The opt-out's scratch is garbage the GC releases on its own, so a collection during either arm makes both read
+        // the same bytes (on=off=557056 in a full run; forcing one gave 229376 each). Each attempt starts from a fresh
+        // collection; the comparison is asserted on the first attempt neither arm collected in, and the test fails if no
+        // attempt is clean -- it never passes without making the comparison.
+        const int Attempts = 8;
+        for (int attempt = 0; ; attempt++)
+        {
+            if (!on.collected && !off.collected)
+            {
+                Assert.True(on.cacheBytesAfter < off.cacheBytesAfter,
+                    $"scratch-free should lower resident cache bytes: on={on.cacheBytesAfter} off={off.cacheBytesAfter}.");
+                return;
+            }
+            Assert.True(attempt + 1 < Attempts,
+                $"a garbage collection ran during every one of {Attempts} attempts, so the resident-bytes comparison was never made.");
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+            off = RunOnce(gpu, scratchFree: false);
+            on = RunOnce(gpu, scratchFree: true);
+        }
     }
 }

@@ -1261,11 +1261,16 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     private const int ElementwiseParallelMinLength = 1 << 16;
 
     /// <summary>
-    /// Minimum chunk size for the parallel elementwise path: two chunks for mid-size matrices and
-    /// 128K-element chunks for large ones. More, smaller chunks measured slower at every size
-    /// (e.g. 250K elements: 16K chunks 493 µs vs two chunks 217 µs).
+    /// Chunk size for the parallel elementwise path: about eight chunks, never below 32K elements or above 128K.
     /// </summary>
-    private static int ElementwiseParallelGrain(int length) => Math.Min(1 << 17, Math.Max(1 << 15, length / 2));
+    /// <remarks>
+    /// A fresh large result is written once, and the first write to each page faults it in: the OS zeroes the page on
+    /// the faulting core, so the store that follows hits cache. Spreading those first touches over more cores is what
+    /// the split buys. On a Threadripper 3990X (double, allocate + scale, 250K elements, one process per variant):
+    /// 2 chunks 162 µs, 8 chunks 74.5 µs, 16 chunks 104 µs. The 32K floor keeps the 16-core Ryzen result that
+    /// motivated the old two-chunk rule out of reach (16K-element chunks there: 493 µs vs 217 µs for two chunks).
+    /// </remarks>
+    private static int ElementwiseParallelGrain(int length) => Math.Min(1 << 17, Math.Max(1 << 15, length / 8));
 
     /// <summary>
     /// Multiplies this matrix by a scalar value in-place.

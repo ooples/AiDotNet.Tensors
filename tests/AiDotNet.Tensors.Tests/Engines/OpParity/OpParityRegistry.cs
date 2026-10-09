@@ -128,7 +128,7 @@ public static class OpParityRegistry
             .Concat(OutputContractBackwardCases())
             .Concat(OutputContractSignalCases())
             .Concat(OutputContractGeometryCases())
-            .Concat(OutputContractIndexCases());
+            .Concat(OutputContractIndexCases()).Concat(TorchParityContractCases());
 
     private static IEnumerable<OpCase> OutputContractShapeCases()
     {
@@ -797,6 +797,111 @@ public static class OpParityRegistry
                     out var rgbGradient, out var densityGradient);
                 return new[] { rgbGradient, densityGradient };
             }, ParityTol.Accum(2e-3), GraphCaptureExpectation.BackwardKernel);
+    }
+
+    // Multi-output, complex and integer-typed PyTorch-parity ops (CpuEngine.Torch*), one case per generated
+    // output or graph-capture contract.
+    // Seeds 7300-7317: an unused range, one seed per input (7100-7117 were already the PReLU and RBF cases' seeds).
+    private static IEnumerable<OpCase> TorchParityContractCases()
+    {
+        var x = OpInput.Rand(7300, new[] { 4, 6 });
+        yield return HomogeneousOutputCase("TensorChunk[all-outputs]", "shape", "TensorChunk",
+            e => e.TensorChunk(x.F(), 3, 1), e => e.TensorChunk(x.D(), 3, 1), ParityTol.Exact);
+        yield return HomogeneousOutputCase("TensorSplitWithSizes[all-outputs]", "shape", "TensorSplitWithSizes",
+            e => e.TensorSplitWithSizes(x.F(), new[] { 1, 2, 3 }, 1), e => e.TensorSplitWithSizes(x.D(), new[] { 1, 2, 3 }, 1), ParityTol.Exact);
+        yield return HomogeneousOutputCase("TensorGradient[all-outputs]", "shape", "TensorGradient",
+            e => e.TensorGradient(x.F()), e => e.TensorGradient(x.D()), ParityTol.Accum(1e-4));
+        yield return HomogeneousOutputCase("TensorUnravelIndex[all-outputs]", "index", "TensorUnravelIndex",
+            e => e.TensorUnravelIndex(new Tensor<float>(new float[] { 0, 5, 11, 7 }, new[] { 4 }), new[] { 3, 4 }),
+            e => e.TensorUnravelIndex(new Tensor<double>(new double[] { 0, 5, 11, 7 }, new[] { 4 }), new[] { 3, 4 }), ParityTol.Exact,
+            graphCaptureExpectation: GraphCaptureExpectation.HostBoundary);
+        yield return HomogeneousOutputCase("TensorStdMean[all-outputs]", "reduction", "TensorStdMean",
+            e => { var (std, mean) = e.TensorStdMean(x.F(), new[] { 1 }); return new[] { std, mean }; },
+            e => { var (std, mean) = e.TensorStdMean(x.D(), new[] { 1 }); return new[] { std, mean }; }, ParityTol.Accum(1e-5));
+        yield return HomogeneousOutputCase("TensorVarMean[all-outputs]", "reduction", "TensorVarMean",
+            e => { var (variance, mean) = e.TensorVarMean(x.F(), new[] { 1 }); return new[] { variance, mean }; },
+            e => { var (variance, mean) = e.TensorVarMean(x.D(), new[] { 1 }); return new[] { variance, mean }; }, ParityTol.Accum(1e-5));
+
+        // A stacked gradient hands each input a slice view of one storage. Backwards that negate a later slice, or
+        // accumulate into an earlier one, once read or bound the shared storage from element 0 on the GPU.
+        var sa = OpInput.Rand(7316, new[] { 2, 4 });
+        var sb = OpInput.Rand(7317, new[] { 2, 4 });
+        yield return new OpCase("TensorStack[x,-x]", "shape",
+            e => { var x = sa.F(); return e.TensorStack(new[] { x, e.TensorNegate(x) }, 0); },
+            e => { var x = sa.D(); return e.TensorStack(new[] { x, e.TensorNegate(x) }, 0); },
+            ParityTol.Exact, opMethod: "TensorStack");
+        yield return new OpCase("TensorStack[x,t-x]", "shape",
+            e => { var x = sa.F(); return e.TensorStack(new[] { x, e.TensorSubtract(sb.F(), x) }, 0); },
+            e => { var x = sa.D(); return e.TensorStack(new[] { x, e.TensorSubtract(sb.D(), x) }, 0); },
+            ParityTol.Exact, opMethod: "TensorStack");
+        var cellX = OpInput.Rand(7301, new[] { 2, 3 });
+        var cellH = OpInput.Rand(7302, new[] { 2, 4 });
+        var cellC = OpInput.Rand(7303, new[] { 2, 4 });
+        var wIh = OpInput.Rand(7304, new[] { 16, 3 });
+        var wHh = OpInput.Rand(7305, new[] { 16, 4 });
+        yield return HomogeneousOutputCase("TensorLstmCell[all-outputs]", "recurrent", "TensorLstmCell",
+            e => { var (h, c) = e.TensorLstmCell(cellX.F(), cellH.F(), cellC.F(), wIh.F(), wHh.F()); return new[] { h, c }; },
+            e => { var (h, c) = e.TensorLstmCell(cellX.D(), cellH.D(), cellC.D(), wIh.D(), wHh.D()); return new[] { h, c }; }, ParityTol.Accum(1e-4));
+        var seq = OpInput.Rand(7306, new[] { 3, 2, 3 });
+        var gIh = OpInput.Rand(7307, new[] { 12, 3 });
+        var gHh = OpInput.Rand(7308, new[] { 12, 4 });
+        yield return HomogeneousOutputCase("TensorRecurrent[gru;all-outputs]", "recurrent", "TensorRecurrent",
+            e => { var (o, h) = e.TensorRecurrent(AiDotNet.Tensors.Engines.DevicePrimitives.RnnCellType.Gru, seq.F(), null, new[] { gIh.F(), gHh.F() }, false, 1); return new[] { o, h }; },
+            e => { var (o, h) = e.TensorRecurrent(AiDotNet.Tensors.Engines.DevicePrimitives.RnnCellType.Gru, seq.D(), null, new[] { gIh.D(), gHh.D() }, false, 1); return new[] { o, h }; }, ParityTol.Accum(1e-4));
+
+        // The indexed pools max-reduce on the device; their int index output is assembled on the host from the
+        // reduction's argmax (one transfer). A resident index path is tracked in #1112.
+        var pool = OpInput.Rand(7309, new[] { 1, 2, 5, 7 });
+        yield return HeterogeneousOutputCase("TensorAdaptiveMaxPoolWithIndices[all-outputs]", "pool", "TensorAdaptiveMaxPoolWithIndices",
+            e => { var (o, i) = e.TensorAdaptiveMaxPoolWithIndices(pool.F(), new[] { 2, 3 }); return new(new[] { o }, new[] { i }); },
+            e => { var (o, i) = e.TensorAdaptiveMaxPoolWithIndices(pool.D(), new[] { 2, 3 }); return new(new[] { o }, new[] { i }); }, ParityTol.Exact,
+            gpuReadbackContract: GpuReadbackContract.LegacyHostOutput);
+        yield return HeterogeneousOutputCase("TensorFractionalMaxPool[seed3;all-outputs]", "pool", "TensorFractionalMaxPool",
+            e => { var (o, i) = e.TensorFractionalMaxPool(pool.F(), new[] { 2, 2 }, new[] { 3, 4 }, 3); return new(new[] { o }, new[] { i }); },
+            e => { var (o, i) = e.TensorFractionalMaxPool(pool.D(), new[] { 2, 2 }, new[] { 3, 4 }, 3); return new(new[] { o }, new[] { i }); }, ParityTol.Exact,
+            gpuReadbackContract: GpuReadbackContract.LegacyHostOutput);
+        var line = OpInput.Rand(7310, new[] { 2, 3, 9 });
+        yield return HeterogeneousOutputCase("TensorMaxPool1DWithIndices[all-outputs]", "pool", "TensorMaxPool1DWithIndices",
+            e => { var (o, i) = e.TensorMaxPool1DWithIndices(line.F(), 3, 2, 1); return new(new[] { o }, new[] { i }); },
+            e => { var (o, i) = e.TensorMaxPool1DWithIndices(line.D(), 3, 2, 1); return new(new[] { o }, new[] { i }); }, ParityTol.Exact,
+            gpuReadbackContract: GpuReadbackContract.LegacyHostOutput);
+        // Fill 0 rather than -1 so every entry is a valid id for the index projection; x has no zeros, so the 20 slots hold its first 20 positions.
+        yield return new OpCase("TensorNonzeroStatic[4,6;size20]", "index",
+            e => ProjectIndices(e, e.TensorNonzeroStatic(x.F(), 20, fillValue: 0), 16),
+            e => ProjectIndicesDouble(e, e.TensorNonzeroStatic(x.D(), 20, fillValue: 0), 16),
+            ParityTol.Exact, opMethod: "TensorNonzeroStatic",
+            graphCaptureSignatureConstraint: GraphCaptureSignatureConstraint.HeterogeneousOutput)
+        {
+            // Computed on the host under the GPU engine (one input transfer); native kernels are tracked in #1112.
+            GpuReadbackContract = GpuReadbackContract.LegacyHostOutput
+        };
+
+        var re = OpInput.Rand(7311, new[] { 4, 6 });
+        var im = OpInput.Rand(7312, new[] { 4, 6 });
+        yield return new OpCase("TensorReal[4,6]", "complex", e => e.TensorReal(re.CF(im)), e => e.TensorReal(re.CD(im)),
+            ParityTol.Exact, opMethod: "TensorReal", graphCaptureSignatureConstraint: GraphCaptureSignatureConstraint.HeterogeneousInput);
+        yield return new OpCase("TensorImag[4,6]", "complex", e => e.TensorImag(re.CF(im)), e => e.TensorImag(re.CD(im)),
+            ParityTol.Exact, opMethod: "TensorImag", graphCaptureSignatureConstraint: GraphCaptureSignatureConstraint.HeterogeneousInput);
+        yield return new OpCase("TensorViewAsReal[4,6]", "complex", e => e.TensorViewAsReal(re.CF(im)), e => e.TensorViewAsReal(re.CD(im)),
+            ParityTol.Exact, opMethod: "TensorViewAsReal", graphCaptureSignatureConstraint: GraphCaptureSignatureConstraint.HeterogeneousInput);
+        yield return new OpCase("TensorComplex[4,6]", "complex",
+            e => ProjectComplex(e, e.TensorComplex(re.F(), im.F())), e => ProjectComplex(e, e.TensorComplex(re.D(), im.D())),
+            ParityTol.Accum(1e-5), opMethod: "TensorComplex", graphCaptureSignatureConstraint: GraphCaptureSignatureConstraint.HeterogeneousOutput);
+        var pairs = OpInput.Rand(7313, new[] { 4, 3, 2 });
+        yield return new OpCase("TensorViewAsComplex[4,3,2]", "complex",
+            e => ProjectComplex(e, e.TensorViewAsComplex(pairs.F())), e => ProjectComplex(e, e.TensorViewAsComplex(pairs.D())),
+            ParityTol.Accum(1e-5), opMethod: "TensorViewAsComplex", graphCaptureSignatureConstraint: GraphCaptureSignatureConstraint.HeterogeneousOutput);
+
+        var pooled = OpInput.Rand(7314, new[] { 2, 3 });
+        yield return new OpCase("TensorMaxUnpool[2,3->5]", "pool",
+            e => e.TensorMaxUnpool(pooled.F(), new Tensor<int>(new[] { 0, 2, 4, 1, 3, 0 }, new[] { 2, 3 }), new[] { 5 }),
+            e => e.TensorMaxUnpool(pooled.D(), new Tensor<int>(new[] { 0, 2, 4, 1, 3, 0 }, new[] { 2, 3 }), new[] { 5 }),
+            ParityTol.Exact, opMethod: "TensorMaxUnpool", graphCaptureSignatureConstraint: GraphCaptureSignatureConstraint.HeterogeneousInput);
+        var source = OpInput.Rand(7315, new[] { 3, 6 });
+        yield return new OpCase("TensorIndexReduce[4,6;idx3;sum]", "index",
+            e => e.TensorIndexReduce(x.F(), 0, new Tensor<int>(new[] { 0, 2, 0 }, new[] { 3 }), source.F(), ScatterReduceMode.Sum),
+            e => e.TensorIndexReduce(x.D(), 0, new Tensor<int>(new[] { 0, 2, 0 }, new[] { 3 }), source.D(), ScatterReduceMode.Sum),
+            ParityTol.Ulp(4), opMethod: "TensorIndexReduce", graphCaptureSignatureConstraint: GraphCaptureSignatureConstraint.HeterogeneousInput);
     }
 
     private static IEnumerable<OpCase> OutputContractIndexCases()

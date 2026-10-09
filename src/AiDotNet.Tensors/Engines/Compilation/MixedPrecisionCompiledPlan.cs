@@ -68,6 +68,12 @@ public sealed class MixedPrecisionCompiledPlan : IDisposable
     // giving the hetero path the FP32 path's progressive release. Default-on for the GPU hetero path; opt-out.
     private readonly bool _scratchFree;
 
+    private long _scratchBytesReleased;
+
+    /// <summary>Device bytes the scratch-free backward has released so far (zero with AIDOTNET_FP16_NO_SCRATCH_FREE=1).
+    /// Exact, unlike a before/after read of the activation cache, which a garbage collection can shrink on its own.</summary>
+    internal long ScratchBytesReleasedForTest => _scratchBytesReleased;
+
     // ── Forward Half-resident activation STORAGE (the last structural piece, #633) ─────────────────────
     // The hetero forward otherwise emits each Half matmul output as an FP32 device buffer (the engine up-casts
     // Tensor<Half> → FP32 in GetOrAllocateBuffer/FinishGpuOp), so the activations are stored FLOAT on the GPU and
@@ -331,7 +337,7 @@ public sealed class MixedPrecisionCompiledPlan : IDisposable
                         }
                         // materializePending:false — the scratch is dead (not protected, not a forward activation
                         // kept past the snapshot), so dropping its pending download keeps the step fully resident.
-                        _freeEng.EvictActivationsCreatedAfter(bwdSnap, protect, materializePending: false);
+                        _scratchBytesReleased += _freeEng.EvictActivationsCreatedAfter(bwdSnap, protect, materializePending: false);
                     }
                     : null);
         }

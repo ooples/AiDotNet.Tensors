@@ -2622,7 +2622,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// never read again), so materializing it would be a wasted GPU→CPU transfer that breaks full residency. The
     /// FP16 parity tests gate correctness: a wrongful discard of a still-needed tensor would corrupt the grads.
     /// </summary>
-    internal void EvictActivationsCreatedAfter(long snapshot, HashSet<object>? protect, bool materializePending)
+    /// <returns>The device bytes released.</returns>
+    internal long EvictActivationsCreatedAfter(long snapshot, HashSet<object>? protect, bool materializePending)
         => EvictActivationsCreatedAfter(snapshot, protect,
             materializePending ? ActivationReleaseMode.MaterializeThenFree : ActivationReleaseMode.DropScratch);
 
@@ -2648,8 +2649,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     internal void ReleaseDeadDeviceStorage<T>(Tensor<T> tensor)
     {
-        if (s_staleDropTrace)
-            StaleDropDiag($"RELEASE-DEAD len={tensor.Length} caller=" + new System.Diagnostics.StackTrace(1, false).ToString().Replace(System.Environment.NewLine, " <- "));
         var vector = tensor.DataVector;
         if (vector._deviceState is not { Buffer: { } buffer } state) return;
         if (_actionScratchBuffers.Contains(buffer)) return;   // the per-action scratch pool owns it
@@ -2713,7 +2712,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// Evicts this thread's activation-cache entries created after <paramref name="snapshot"/> (except
     /// <paramref name="protect"/>), handling entries whose only valid copy is on the device per <paramref name="mode"/>.
     /// </summary>
-    internal void EvictActivationsCreatedAfter(long snapshot, HashSet<object>? protect, ActivationReleaseMode mode)
+    internal long EvictActivationsCreatedAfter(long snapshot, HashSet<object>? protect, ActivationReleaseMode mode)
     {
         // The activation timestamp counter is process-wide, so "created after my snapshot"
         // also matches a CONCURRENT tape's activations on another thread. Free only THIS
@@ -2723,7 +2722,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         List<ActivationCacheEntry> toDispose;
         lock (_activationCacheLock)
         {
-            if (_activationCache.IsEmpty) return;
+            if (_activationCache.IsEmpty) return 0;
             var entries = _activationCache.ToArray();
             toDispose = new List<ActivationCacheEntry>();
             for (int i = 0; i < entries.Length; i++)
@@ -2759,7 +2758,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 }
             }
         }
-        foreach (var entry in toDispose) entry.Dispose();
+        long released = 0;
+        foreach (var entry in toDispose) { released += entry.Buffer.SizeInBytes; entry.Dispose(); }
+        return released;
     }
 
     /// <summary>
@@ -5039,6 +5040,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         return destinationArray is not null;
     }
 
+    // A view that does not cover its whole storage (a slice or strided view). Pooled tensors whose backing array is
+    // longer than their length are not views and keep the resident fast paths.
+    private static bool IsPartialView<T>(Tensor<T> tensor)
+        => tensor.IsView && (!tensor.IsContiguous || tensor._storageOffset != 0 || tensor._storage.Length != tensor.Length);
+
     private static bool IsCanonicalDenseAllocation<T>(Tensor<T> tensor)
         => tensor.IsContiguous && !tensor.IsSparse
             && tensor._storageOffset == 0 && tensor._storage.Length == tensor.Length;
@@ -5905,6 +5911,13 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     // whole graph). Falls back to the transient path if it has no backing array.
     private OwnedBuffer GetResidentOrPersistentInputBuffer<T>(IDirectGpuBackend backend, Tensor<T> t)
     {
+        // A view onto part of another tensor's storage shares that storage's backing array, and every lookup below
+        // (the _gpuBuffer field, the resident registry, the caches keyed on that array) returns the WHOLE storage's
+        // buffer from element 0. The stacked-gradient slices of a backward pass are such views: a negate backward on
+        // slice 1 read slice 0 (a GRU sequence's input gradient was off by ~1). GetOrAllocateBuffer materializes the
+        // view's own elements.
+        if (IsPartialView(t))
+            return GetOrAllocateBuffer(backend, t);
         // #3 FP16-act CONVERT-AT-GAP: if t holds FP16 activation data, transparently up-convert to a STABLE FP32
         // buffer so any non-FP16-aware resident op (attention matmul/softmax, resample, concat) reads correct FP32.
         // FP16-aware ops (conv/groupnorm/add) BYPASS this by reading the raw FP16 via TryFp16ResidentInput.
@@ -7399,8 +7412,11 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // under the running kernel. Requiring both operands resident (ResolveResidentBufferNoUpload, which
         // never uploads) means there is no owned buffer to free, which is exactly the invariant the original
         // comment identifies as making this safe.
+        // Not on a partial view: it resolves its whole storage's buffer, so the add would land at element 0 and
+        // BindResidentBuffer would then make that buffer authoritative for a storage the view's siblings share (an
+        // accumulation into one slice of a stacked gradient hid the other slices' values).
         if (!Gpu.AutocastScope.IsEnabled && typeof(T) == typeof(float)
-            && a.IsContiguous && b.IsContiguous && a.Length == b.Length
+            && a.IsContiguous && b.IsContiguous && !IsPartialView(a) && !IsPartialView(b) && a.Length == b.Length
             // The target must be resident in its OWN right (bound buffer / activation), never via a persistent
             // weight-cache copy: after a GPU inference pass cached a weight, `weight -= update` used to write that
             // copy, bind the weight to it and leave the host stale behind a deferred download -- which the
