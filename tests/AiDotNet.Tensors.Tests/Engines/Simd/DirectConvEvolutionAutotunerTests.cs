@@ -81,8 +81,8 @@ public class DirectConvEvolutionAutotunerTests : IDisposable
             Assert.Null(DirectConvEvolutionAutotuner.ValidateConfiguration(kernelShape, new DirectConvConfiguration(DirectConvRoute.Direct, 0)));
             Assert.NotNull(DirectConvEvolutionAutotuner.ValidateConfiguration(kernelShape, new DirectConvConfiguration(DirectConvRoute.Direct, 128)));
         }
-        // A shape the kernels cannot run (3 input channels) only offers the existing route.
-        var unaligned = Shape with { InChannels = 3 };
+        // A shape the kernels cannot run (20 output channels: not a whole 32-channel tile) only offers the existing route.
+        var unaligned = Shape with { OutChannels = 20 };
         Assert.Equal(new[] { new DirectConvConfiguration(DirectConvRoute.Im2Col, 0) }, DirectConvEvolutionAutotuner.GetSearchSpace(unaligned));
     }
 

@@ -44,6 +44,8 @@ public class DirectConvAvx2Tests
     [InlineData(2, 16, 32, 8, 3, 1, 2, 1)]
     [InlineData(2, 8, 32, 9, 3, 1, 2, 2)]
     [InlineData(4, 24, 32, 5, 3, 1, 0, 1)]
+    [InlineData(2, 3, 32, 7, 3, 1, 1, 1)]     // a 3-channel image stem: input channels zero-padded to one block
+    [InlineData(2, 13, 32, 6, 3, 2, 1, 1)]    // a full block plus a partial one
     public void Forward_MatchesANaiveReference(int batch, int inC, int outC, int size, int k, int stride, int pad, int dilation)
     {
         int outSize = OutSize(size, k, stride, pad, dilation);

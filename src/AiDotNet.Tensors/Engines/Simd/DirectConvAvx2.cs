@@ -88,8 +88,8 @@ internal static class DirectConvAvx2
         switch (shape.Pass)
         {
             case DirectConvPass.Forward:
+                // Input channels need not fill a block: the packing zero-pads them (a 3-channel image stem).
                 return (EnabledPasses & DirectConvPasses.Forward) != 0
-                    && shape.InChannels % Block == 0
                     && shape.OutChannels % (Block * OutputBlocksPerTile) == 0;
             case DirectConvPass.BackwardInput:
                 return (EnabledPasses & (shape.StrideH == 1 && shape.StrideW == 1
@@ -133,10 +133,10 @@ internal static class DirectConvAvx2
         int targetTasks = 0)
     {
         int paddedH = height + 2 * padH, paddedW = width + 2 * padW;
-        int inBlocks = inChannels / Block;
+        int inBlocks = (inChannels + Block - 1) / Block;
         var pool = ArrayPool<float>.Shared;
         var packedInput = pool.Rent(batch * inBlocks * paddedH * paddedW * Block);
-        var packedKernel = pool.Rent(outChannels * inChannels * kernelHeight * kernelWidth);
+        var packedKernel = pool.Rent(outChannels * inBlocks * Block * kernelHeight * kernelWidth);
         try
         {
             PackInput(input, inputOffset, packedInput, batch, inChannels, height, width, padH, padW, paddedH, paddedW);
@@ -362,11 +362,11 @@ internal static class DirectConvAvx2
         }
     }
 
-    /// <summary>NCHW -> zero-padded [N][C/8][H+2pH][W+2pW][8].</summary>
+    /// <summary>NCHW -> zero-padded [N][ceil(C/8)][H+2pH][W+2pW][8]; channels past C are zero.</summary>
     private static unsafe void PackInput(float[] source, int sourceOffset, float[] packed,
         int batch, int channels, int height, int width, int padH, int padW, int paddedH, int paddedW)
     {
-        int blocks = channels / Block;
+        int blocks = (channels + Block - 1) / Block;
         int plane = paddedH * paddedW * Block;
         CpuParallelSettings.ParallelForOrSerial(0, batch * blocks, (long)batch * blocks * plane, task =>
         {
@@ -376,7 +376,8 @@ internal static class DirectConvAvx2
             {
                 float* d = pd + (long)task * plane;
                 new Span<float>(d, plane).Clear();
-                for (int c = 0; c < Block; c++)
+                int blockChannels = Math.Min(Block, channels - blk * Block);
+                for (int c = 0; c < blockChannels; c++)
                 {
                     float* s = ps + sourceOffset + ((long)b * channels + blk * Block + c) * height * width;
                     for (int y = 0; y < height; y++)
@@ -420,13 +421,15 @@ internal static class DirectConvAvx2
         int taps = kernelHeight * kernelWidth;
         int packedOut = transposeAndFlip ? inChannels : outChannels;
         int packedIn = transposeAndFlip ? outChannels : inChannels;
-        int packedInBlocks = packedIn / Block;
+        int packedInBlocks = (packedIn + Block - 1) / Block;
         CpuParallelSettings.ParallelForOrSerial(0, packedOut / Block, (long)outChannels * inChannels * taps, ob =>
         {
             fixed (float* ps = source)
             fixed (float* pd = packed)
             {
                 float* d0 = pd + (long)ob * packedInBlocks * taps * Block * Block;
+                // A partial last input block keeps zero weights for its missing channels.
+                if (packedIn % Block != 0) new Span<float>(d0, packedInBlocks * taps * Block * Block).Clear();
                 for (int lane = 0; lane < Block; lane++)
                 {
                     int po = ob * Block + lane;
