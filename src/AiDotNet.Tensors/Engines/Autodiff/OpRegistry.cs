@@ -501,6 +501,9 @@ internal static class OpRegistry
         "TensorSoftMarginLoss", "TensorRenorm", "TensorNormExceptDim", "TensorGradient",
         "TensorPadSequence", "TensorIndexReduce", "TensorConvTranspose1D", "TensorConvTbc",
 
+        // Recurrent cells and sequences composed from linear, gate and stack ops (CpuEngine.TorchRnn)
+        "TensorRnnCell", "TensorLstmCell", "TensorGruCell", "TensorRecurrent",
+
         // Composed from recorded ops (softmax, add/multiply/divide, matmul, batch matmul, reductions)
         "TensorSoftmin", "TensorRsub", "TensorAddcmul", "TensorAddcdiv",
         "TensorAddmv", "TensorAddr", "TensorBaddbmm", "TensorAddbmm",

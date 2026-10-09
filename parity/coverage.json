@@ -1,6 +1,6 @@
 {
   "torchVersion": "2.11.0",
-  "gapBaseline": 401,
+  "gapBaseline": 391,
   "entries": {
     "Tensor:abs": {
       "status": "mapped",
@@ -3876,8 +3876,9 @@
       "source": "reviewed"
     },
     "aten:gru": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorRecurrent",
+      "source": "reviewed"
     },
     "aten:gt": {
       "status": "mapped",
@@ -5171,12 +5172,14 @@
       "source": "name-match"
     },
     "aten:rnn_relu": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorRecurrent",
+      "source": "reviewed"
     },
     "aten:rnn_tanh": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorRecurrent",
+      "source": "reviewed"
     },
     "aten:roll": {
       "status": "mapped",
@@ -9094,12 +9097,14 @@
       "source": "name-match"
     },
     "torch:gru": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorRecurrent",
+      "source": "reviewed"
     },
     "torch:gru_cell": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorGruCell",
+      "source": "reviewed"
     },
     "torch:gt": {
       "status": "mapped",
@@ -9611,8 +9616,9 @@
       "source": "reviewed-alias"
     },
     "torch:lstm_cell": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorLstmCell",
+      "source": "reviewed"
     },
     "torch:lt": {
       "status": "mapped",
@@ -10333,20 +10339,24 @@
       "source": "name-match"
     },
     "torch:rnn_relu": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorRecurrent",
+      "source": "reviewed"
     },
     "torch:rnn_relu_cell": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorRnnCell",
+      "source": "reviewed"
     },
     "torch:rnn_tanh": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorRecurrent",
+      "source": "reviewed"
     },
     "torch:rnn_tanh_cell": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorRnnCell",
+      "source": "reviewed"
     },
     "torch:roll": {
       "status": "mapped",
