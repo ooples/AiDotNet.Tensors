@@ -351,6 +351,10 @@ public static class GpuOptimizer
     /// <summary>Overwrites a device-resident tensor's elements with <paramref name="data"/> and marks it current.</summary>
     internal static bool TryUpload(Tensor<float> tensor, float[] data)
     {
+        if (tensor is null) throw new ArgumentNullException(nameof(tensor));
+        if (data is null) throw new ArgumentNullException(nameof(data));
+        if (data.Length < tensor.Length)
+            throw new ArgumentException($"data has {data.Length} elements but the tensor has {tensor.Length}.", nameof(data));
         if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false; var b = e.GetBackend(); if (b is null) return false;
         var buffer = tensor.TryGetGpuBuffer();
         if (buffer is null) return false;
