@@ -1,5 +1,6 @@
 using System;
 using System.Buffers;
+using System.Collections.Generic;
 using AiDotNet.Tensors.Helpers;
 #if NET5_0_OR_GREATER
 using System.Runtime.CompilerServices;
@@ -8,6 +9,18 @@ using System.Runtime.Intrinsics.X86;
 #endif
 
 namespace AiDotNet.Tensors.Engines.Simd;
+
+/// <summary>The conv passes <see cref="DirectConvAvx2"/> may take; the rest keep the im2col routes.</summary>
+[Flags]
+internal enum DirectConvPasses
+{
+    None = 0,
+    Forward = 1,
+    BackwardInput = 2,
+    BackwardInputStrided = 4,
+    BackwardKernel = 8,
+    All = Forward | BackwardInput | BackwardInputStrided | BackwardKernel,
+}
 
 /// <summary>
 /// Direct float32 convolution on an 8-channel-blocked layout, after oneDNN's jit:avx2 forward and backward-weights
@@ -31,51 +44,66 @@ internal static class DirectConvAvx2
     // Backward weights needs one (output block, input block) pair per task; fewer pairs than this starve the pool.
     private const int MinBackwardKernelTasks = 16;
 
+    /// <summary>Passes allowed onto the direct kernels (process-wide; for A/B measurement and kernel tuning).</summary>
+    internal static DirectConvPasses EnabledPasses { get; set; } = DirectConvPasses.All;
+
 #if NET5_0_OR_GREATER
     public static bool IsSupported => Avx2.IsSupported && Fma.IsSupported;
 #else
     public static bool IsSupported => false;
 #endif
 
-    /// <summary>
-    /// Whether the forward conv takes the direct kernel. Measured on a 3950X against the im2col routes (batch 8):
-    /// it wins on stride-1 planes from 4x4 to 32x32 (256 channels on 8x8: 1.4 ms against 2.9) and on strided convs
-    /// with a short reduction (64->128 3x3 stride 2 on 32x32: 0.8 ms against 3.2). A strided conv with a long
-    /// reduction (256->512 3x3 stride 2, K = 2304) stays on the batched GEMM, which ran it in 0.76 ms against 1.2.
-    /// </summary>
+    // Interleaved A/B on a 3950X (batch 8, ResNet-18 shapes): the direct kernels lose to the existing routes on 1x1
+    // kernels (64->128 stride 2: 0.46 ms forward against 0.58) and on stride-1 planes past 16x16 (64 channels on
+    // 32x32, where Winograd, the transposed-conv input gradient and the 3x3 kernel-gradient kernel run 1.2 ms against
+    // 1.4-1.6). They win on strided 3x3 convs (64->128 stride 2: forward 2.3 -> 0.8, dX 2.8 -> 1.0, dW 2.8 -> 1.1 ms)
+    // and on small planes (512 channels on 4x4: dX 2.5 -> 1.6, dW 4.2 -> 1.4 ms).
+    private const int MaxStride1PlanePositions = 256;
+
+    // A strided input gradient runs one stride-1 conv per phase over a grid of (H/stride) x (W/stride); below this
+    // many grid positions per image the tiles are too short (256->512 stride 2 on 8x8, a 4x4 grid: 1.2 ms -> 1.4).
+    private const int MinStridedPhasePositions = 64;
+
+    private static bool ShapeSuitsDirect(int kernelHeight, int kernelWidth, int strideH, int strideW, int planePositions)
+        => kernelHeight * kernelWidth > 1
+           && (strideH > 1 || strideW > 1 || planePositions <= MaxStride1PlanePositions);
+
+    /// <summary>Whether the forward conv takes the direct kernel (see the measurements above).</summary>
     public static bool ShouldUseForward(int batch, int inChannels, int outChannels, int kernelHeight, int kernelWidth,
         int strideH, int strideW, int outputHeight, int outputWidth)
         => IsSupported
+           && (EnabledPasses & DirectConvPasses.Forward) != 0
            && batch > 1
            && inChannels % Block == 0
            && outChannels % (Block * OutputBlocksPerTile) == 0
            && outputHeight * outputWidth > 0
-           && !((strideH > 1 || strideW > 1) && inChannels * kernelHeight * kernelWidth > 1152);
+           && ShapeSuitsDirect(kernelHeight, kernelWidth, strideH, strideW, outputHeight * outputWidth);
 
     /// <summary>
-    /// Whether a stride-1 input gradient takes the direct kernel (as a forward conv of the output gradient with the
-    /// flipped, transposed kernel). Measured winning or tied on every stride-1 ResNet stage; 256 channels on 8x8
-    /// ran 1.4 ms against 3.7.
+    /// Whether an input gradient takes the direct kernel: a forward conv of the output gradient with the flipped,
+    /// transposed kernel, run per stride phase when strided.
     /// </summary>
-    public static bool ShouldUseBackwardInput(int batch, int inChannels, int outChannels, int kernelHeight, int kernelWidth,
-        int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
+    public static bool ShouldUseBackwardInput(int batch, int inChannels, int outChannels, int height, int width,
+        int kernelHeight, int kernelWidth, int strideH, int strideW, int padH, int padW, int dilationH, int dilationW)
         => IsSupported
+           && (EnabledPasses & (strideH == 1 && strideW == 1 ? DirectConvPasses.BackwardInput : DirectConvPasses.BackwardInputStrided)) != 0
            && batch > 1
-           && strideH == 1 && strideW == 1 && dilationH == 1 && dilationW == 1
+           && dilationH == 1 && dilationW == 1
            && padH <= kernelHeight - 1 && padW <= kernelWidth - 1
            && outChannels % Block == 0
-           && inChannels % (Block * OutputBlocksPerTile) == 0;
+           && inChannels % (Block * OutputBlocksPerTile) == 0
+           && ShapeSuitsDirect(kernelHeight, kernelWidth, strideH, strideW, height * width)
+           && (strideH == 1 && strideW == 1 || (height / strideH) * (width / strideW) >= MinStridedPhasePositions);
 
-    /// <summary>
-    /// Whether the kernel gradient takes the direct kernel. Measured winning or tied on every ResNet conv,
-    /// strided and 1x1 included (512 channels on 4x4: 1.3 ms against 3.2).
-    /// </summary>
-    public static bool ShouldUseBackwardKernel(int inChannels, int outChannels)
+    /// <summary>Whether the kernel gradient takes the direct kernel (see the measurements above).</summary>
+    public static bool ShouldUseBackwardKernel(int inChannels, int outChannels, int kernelHeight, int kernelWidth,
+        int strideH, int strideW, int outputHeight, int outputWidth)
         => IsSupported
+           && (EnabledPasses & DirectConvPasses.BackwardKernel) != 0
            && inChannels % Block == 0
            && outChannels % Block == 0
-           && (inChannels / Block) * (outChannels / Block) >= MinBackwardKernelTasks;
-
+           && (inChannels / Block) * (outChannels / Block) >= MinBackwardKernelTasks
+           && ShapeSuitsDirect(kernelHeight, kernelWidth, strideH, strideW, outputHeight * outputWidth);
 #if NET5_0_OR_GREATER
     /// <summary>output[n, oc, oh, ow] (=, or += when <paramref name="accumulate"/>) conv(input, kernel), NCHW / OIHW.</summary>
     public static void Forward(
@@ -93,8 +121,8 @@ internal static class DirectConvAvx2
             PackInput(input, inputOffset, packedInput, batch, inChannels, height, width, padH, padW, paddedH, paddedW);
             PackKernel(kernel, kernelOffset, packedKernel, outChannels, inChannels, kernelHeight, kernelWidth, transposeAndFlip: false);
             ForwardPacked(packedInput, packedKernel, output, outputOffset, accumulate,
-                batch, inBlocks, paddedH, paddedW, outChannels, kernelHeight, kernelWidth,
-                strideH, strideW, dilationH, dilationW, outputHeight, outputWidth);
+                ForwardGeometry.Plain(batch, inBlocks, paddedH, paddedW, outChannels, kernelHeight, kernelWidth,
+                    strideH, strideW, dilationH, dilationW, outputHeight, outputWidth));
         }
         finally
         {
@@ -110,8 +138,15 @@ internal static class DirectConvAvx2
     public static void BackwardInput(
         float[] gradOutput, int gradOutputOffset, float[] kernel, int kernelOffset, float[] dest, int destOffset, bool accumulate,
         int batch, int inChannels, int height, int width, int outChannels, int kernelHeight, int kernelWidth,
-        int padH, int padW, int outputHeight, int outputWidth)
+        int strideH, int strideW, int padH, int padW, int outputHeight, int outputWidth)
     {
+        if (strideH > 1 || strideW > 1)
+        {
+            BackwardInputStrided(gradOutput, gradOutputOffset, kernel, kernelOffset, dest, destOffset, accumulate,
+                batch, inChannels, height, width, outChannels, kernelHeight, kernelWidth,
+                strideH, strideW, padH, padW, outputHeight, outputWidth);
+            return;
+        }
         int padHt = kernelHeight - 1 - padH, padWt = kernelWidth - 1 - padW;
         int paddedH = outputHeight + 2 * padHt, paddedW = outputWidth + 2 * padWt;
         int gradBlocks = outChannels / Block;
@@ -123,8 +158,8 @@ internal static class DirectConvAvx2
             PackInput(gradOutput, gradOutputOffset, packedGrad, batch, outChannels, outputHeight, outputWidth, padHt, padWt, paddedH, paddedW);
             PackKernel(kernel, kernelOffset, packedKernel, outChannels, inChannels, kernelHeight, kernelWidth, transposeAndFlip: true);
             ForwardPacked(packedGrad, packedKernel, dest, destOffset, accumulate,
-                batch, gradBlocks, paddedH, paddedW, inChannels, kernelHeight, kernelWidth,
-                1, 1, 1, 1, height, width);
+                ForwardGeometry.Plain(batch, gradBlocks, paddedH, paddedW, inChannels, kernelHeight, kernelWidth,
+                    1, 1, 1, 1, height, width));
         }
         finally
         {
@@ -133,6 +168,140 @@ internal static class DirectConvAvx2
         }
     }
 
+    /// <summary>
+    /// dX for a strided conv, as oneDNN computes it: split dX into strideH x strideW phases (ih mod strideH, iw mod
+    /// strideW). Phase (ry, rx) receives only the kernel taps kh = (ry + padH) mod strideH + strideH*t (likewise kw),
+    /// and over its own grid of rows ry + strideH*j it is a stride-1 correlation of the output gradient with that
+    /// flipped sub-kernel, so the forward tile runs it unchanged. No column matrix, no scatter.
+    /// </summary>
+    private static void BackwardInputStrided(
+        float[] gradOutput, int gradOutputOffset, float[] kernel, int kernelOffset, float[] dest, int destOffset, bool accumulate,
+        int batch, int inChannels, int height, int width, int outChannels, int kernelHeight, int kernelWidth,
+        int strideH, int strideW, int padH, int padW, int outputHeight, int outputWidth)
+    {
+        // Every phase origin lies within a kernel extent of the gradient plane, so a kernel-sized border covers all reads.
+        int borderH = kernelHeight, borderW = kernelWidth;
+        int paddedH = outputHeight + 2 * borderH, paddedW = outputWidth + 2 * borderW;
+        int gradBlocks = outChannels / Block;
+        int tiles = inChannels / (Block * OutputBlocksPerTile);
+
+        // The phases that receive a tap. Their sub-kernels partition the kernel, so they pack into one kernel-sized buffer.
+        var phases = new List<(ForwardGeometry Geometry, int KernelOffset, int FirstH, int TapsH, int FirstW, int TapsW, int Chunks, int ChunksPerTask, int Tasks)>();
+        int packedOffset = 0, totalTasks = 0;
+        for (int ry = 0; ry < strideH; ry++)
+        {
+            for (int rx = 0; rx < strideW; rx++)
+            {
+                int firstH = (ry + padH) % strideH, firstW = (rx + padW) % strideW;
+                int tapsH = firstH < kernelHeight ? (kernelHeight - 1 - firstH) / strideH + 1 : 0;
+                int tapsW = firstW < kernelWidth ? (kernelWidth - 1 - firstW) / strideW + 1 : 0;
+                int gridH = ry < height ? (height - ry + strideH - 1) / strideH : 0;
+                int gridW = rx < width ? (width - rx + strideW - 1) / strideW : 0;
+                if (gridH == 0 || gridW == 0) continue;
+                if (tapsH == 0 || tapsW == 0)
+                {
+                    if (!accumulate) ClearPhase(dest, destOffset, batch * inChannels, height, width, ry, rx, strideH, strideW);
+                    continue;
+                }
+                // Grid row j, sub-kernel row y (= tap tapsH-1-y) reads gradient row j + (ry+padH)/strideH - tapsH + 1 + y.
+                int originRow = (ry + padH) / strideH - tapsH + 1 + borderH;
+                int originCol = (rx + padW) / strideW - tapsW + 1 + borderW;
+                var geometry = new ForwardGeometry(batch, gradBlocks, paddedH * paddedW * Block, paddedW, inChannels,
+                    tapsH, tapsW, 1, 1, 1, 1, gridH, gridW, (originRow * paddedW + originCol) * Block,
+                    height, width, strideH, strideW, ry, rx);
+                int chunks = (geometry.TotalPositions + PositionUnroll - 1) / PositionUnroll;
+                int chunksPerTask = Math.Max(1, (int)(((long)chunks * tiles * strideH * strideW + TargetForwardTasks - 1) / TargetForwardTasks));
+                int tasks = tiles * ((chunks + chunksPerTask - 1) / chunksPerTask);
+                phases.Add((geometry, packedOffset, firstH, tapsH, firstW, tapsW, chunks, chunksPerTask, tasks));
+                packedOffset += outChannels * inChannels * tapsH * tapsW;
+                totalTasks += tasks;
+            }
+        }
+        if (phases.Count == 0) return;
+
+        var pool = ArrayPool<float>.Shared;
+        var packedGrad = pool.Rent(batch * gradBlocks * paddedH * paddedW * Block);
+        var packedKernel = pool.Rent(Math.Max(1, packedOffset));
+        try
+        {
+            PackInput(gradOutput, gradOutputOffset, packedGrad, batch, outChannels, outputHeight, outputWidth, borderH, borderW, paddedH, paddedW);
+            int inBlocks = inChannels / Block;
+            CpuParallelSettings.ParallelForOrSerial(0, phases.Count * inBlocks, (long)outChannels * inChannels * kernelHeight * kernelWidth, task =>
+            {
+                var phase = phases[task / inBlocks];
+                PackKernelPhase(kernel, kernelOffset, packedKernel, phase.KernelOffset, task % inBlocks, outChannels, inChannels,
+                    kernelHeight, kernelWidth, phase.FirstH, strideH, phase.TapsH, phase.FirstW, strideW, phase.TapsW);
+            }, deterministicSafe: true);
+
+            // One dispatch over every phase's tiles: the phases write disjoint dX positions.
+            var taskStart = new int[phases.Count + 1];
+            for (int p = 0; p < phases.Count; p++) taskStart[p + 1] = taskStart[p] + phases[p].Tasks;
+            CpuParallelSettings.ParallelForOrSerial(0, totalTasks,
+                (long)batch * height * width * inChannels * outChannels * kernelHeight * kernelWidth / (strideH * strideW),
+                task =>
+                {
+                    int p = 0;
+                    while (taskStart[p + 1] <= task) p++;
+                    var phase = phases[p];
+                    int local = task - taskStart[p];
+                    int tasksPerTile = phase.Tasks / tiles;
+                    int tile = local / tasksPerTile, part = local % tasksPerTile;
+                    int first = part * phase.ChunksPerTask * PositionUnroll;
+                    int last = Math.Min(phase.Geometry.TotalPositions, first + phase.ChunksPerTask * PositionUnroll);
+                    ForwardTile(packedGrad, packedKernel, phase.KernelOffset, dest, destOffset, accumulate, phase.Geometry, tile, first, last);
+                },
+                deterministicSafe: true);
+        }
+        finally
+        {
+            pool.Return(packedGrad);
+            pool.Return(packedKernel);
+        }
+    }
+    /// <summary>Zeroes phase (ry, rx) of every plane: the input positions no kernel tap reaches (a 1x1 stride-2 conv's odd rows).</summary>
+    private static void ClearPhase(float[] dest, int destOffset, int planes, int height, int width, int ry, int rx, int strideH, int strideW)
+    {
+        CpuParallelSettings.ParallelForOrSerial(0, planes, (long)planes * height * width / (strideH * strideW), plane =>
+        {
+            int baseIndex = destOffset + plane * height * width;
+            for (int y = ry; y < height; y += strideH)
+                for (int x = rx; x < width; x += strideW)
+                    dest[baseIndex + y * width + x] = 0f;
+        }, deterministicSafe: true);
+    }
+
+    /// <summary>
+    /// One input block of one strided-dX phase's packed kernel, at <paramref name="packedOffset"/>:
+    /// [I/8][O/8][tapsH][tapsW][8 out][8 in] with sub-kernel tap (y, x)
+    /// = W[o, i, firstH + strideH*(tapsH-1-y), firstW + strideW*(tapsW-1-x)].
+    /// </summary>
+    private static unsafe void PackKernelPhase(float[] source, int sourceOffset, float[] packed, int packedOffset, int ib,
+        int outChannels, int inChannels, int kernelHeight, int kernelWidth,
+        int firstH, int strideH, int tapsH, int firstW, int strideW, int tapsW)
+    {
+        int taps = tapsH * tapsW;
+        int outBlocks = outChannels / Block;
+        fixed (float* ps = source)
+        fixed (float* pd = packed)
+        {
+            float* d0 = pd + packedOffset + (long)ib * outBlocks * taps * Block * Block;
+            for (int lane = 0; lane < Block; lane++)
+            {
+                int i = ib * Block + lane;
+                for (int o = 0; o < outChannels; o++)
+                {
+                    float* s = ps + sourceOffset + ((long)o * inChannels + i) * kernelHeight * kernelWidth;
+                    float* d = d0 + (long)(o / Block) * taps * Block * Block + (o % Block) * Block + lane;
+                    for (int y = 0; y < tapsH; y++)
+                    {
+                        int kh = firstH + strideH * (tapsH - 1 - y);
+                        for (int x = 0; x < tapsW; x++)
+                            d[(y * tapsW + x) * Block * Block] = s[kh * kernelWidth + firstW + strideW * (tapsW - 1 - x)];
+                    }
+                }
+            }
+        }
+    }
     /// <summary>dW[oc, ic, kh, kw] (=, or += when <paramref name="accumulate"/>) for the conv of input with kernel.</summary>
     public static void BackwardKernel(
         float[] input, int inputOffset, float[] gradOutput, int gradOutputOffset, float[] dest, int destOffset, bool accumulate,
@@ -259,38 +428,50 @@ internal static class DirectConvAvx2
     }
 
     private static void ForwardPacked(float[] packedInput, float[] packedKernel, float[] output, int outputOffset, bool accumulate,
-        int batch, int inBlocks, int paddedH, int paddedW, int outChannels, int kernelHeight, int kernelWidth,
-        int strideH, int strideW, int dilationH, int dilationW, int outputHeight, int outputWidth)
+        ForwardGeometry geometry)
     {
-        int positions = outputHeight * outputWidth;
-        int totalPositions = batch * positions;
-        int tiles = outChannels / (Block * OutputBlocksPerTile);
+        int tiles = geometry.OutChannels / (Block * OutputBlocksPerTile);
+        int totalPositions = geometry.TotalPositions;
         int chunks = (totalPositions + PositionUnroll - 1) / PositionUnroll;
         int chunksPerTask = Math.Max(1, (int)(((long)chunks * tiles + TargetForwardTasks - 1) / TargetForwardTasks));
         int tasksPerTile = (chunks + chunksPerTask - 1) / chunksPerTask;
-        var geometry = new ForwardGeometry(inBlocks, paddedH * paddedW * Block, paddedW, outChannels, kernelHeight, kernelWidth,
-            strideH, strideW, dilationH, dilationW, outputWidth, positions, totalPositions);
         CpuParallelSettings.ParallelForOrSerial(0, tiles * tasksPerTile,
-            (long)totalPositions * outChannels * inBlocks * Block * kernelHeight * kernelWidth,
+            (long)totalPositions * geometry.OutChannels * geometry.InBlocks * Block * geometry.KernelHeight * geometry.KernelWidth,
             task =>
             {
                 int tile = task / tasksPerTile, part = task % tasksPerTile;
                 int first = part * chunksPerTask * PositionUnroll;
                 int last = Math.Min(totalPositions, first + chunksPerTask * PositionUnroll);
-                ForwardTile(packedInput, packedKernel, output, outputOffset, accumulate, geometry, tile, first, last);
+                ForwardTile(packedInput, packedKernel, 0, output, outputOffset, accumulate, geometry, tile, first, last);
             },
             deterministicSafe: true);
     }
 
+    /// <summary>
+    /// Where a forward tile reads and writes. Positions run over a grid of <see cref="GridPositions"/> per image;
+    /// position (row, col) reads the packed input at <see cref="OriginBase"/> + (row*strideH, col*strideW) and writes
+    /// output plane element (<see cref="OffsetH"/> + row*<see cref="StepH"/>, <see cref="OffsetW"/> +
+    /// col*<see cref="StepW"/>). A plain conv uses the whole output plane as its grid; one phase of a strided input
+    /// gradient uses every StepH-th row and StepW-th column of the input-gradient plane.
+    /// </summary>
     private readonly struct ForwardGeometry
     {
-        public ForwardGeometry(int inBlocks, int planeIn, int paddedW, int outChannels, int kernelHeight, int kernelWidth,
-            int strideH, int strideW, int dilationH, int dilationW, int outputWidth, int positions, int totalPositions)
+        public ForwardGeometry(int batch, int inBlocks, int planeIn, int paddedW, int outChannels, int kernelHeight, int kernelWidth,
+            int strideH, int strideW, int dilationH, int dilationW, int gridHeight, int gridWidth, int originBase,
+            int outHeight, int outWidth, int stepH, int stepW, int offsetH, int offsetW)
         {
             InBlocks = inBlocks; PlaneIn = planeIn; PaddedW = paddedW; OutChannels = outChannels;
             KernelHeight = kernelHeight; KernelWidth = kernelWidth; StrideH = strideH; StrideW = strideW;
-            DilationH = dilationH; DilationW = dilationW; OutputWidth = outputWidth; Positions = positions; TotalPositions = totalPositions;
+            DilationH = dilationH; DilationW = dilationW; GridWidth = gridWidth; GridPositions = gridHeight * gridWidth;
+            TotalPositions = batch * GridPositions; OriginBase = originBase;
+            OutPlane = outHeight * outWidth; OutWidth = outWidth; StepH = stepH; StepW = stepW; OffsetH = offsetH; OffsetW = offsetW;
         }
+
+        /// <summary>A plain conv: the grid is the output plane, read from the packed input's origin.</summary>
+        public static ForwardGeometry Plain(int batch, int inBlocks, int paddedH, int paddedW, int outChannels,
+            int kernelHeight, int kernelWidth, int strideH, int strideW, int dilationH, int dilationW, int outputHeight, int outputWidth)
+            => new ForwardGeometry(batch, inBlocks, paddedH * paddedW * Block, paddedW, outChannels, kernelHeight, kernelWidth,
+                strideH, strideW, dilationH, dilationW, outputHeight, outputWidth, 0, outputHeight, outputWidth, 1, 1, 0, 0);
 
         public int InBlocks { get; }
         public int PlaneIn { get; }
@@ -302,20 +483,36 @@ internal static class DirectConvAvx2
         public int StrideW { get; }
         public int DilationH { get; }
         public int DilationW { get; }
-        public int OutputWidth { get; }
-        public int Positions { get; }
+        public int GridWidth { get; }
+        public int GridPositions { get; }
         public int TotalPositions { get; }
+        public int OriginBase { get; }
+        public int OutPlane { get; }
+        public int OutWidth { get; }
+        public int StepH { get; }
+        public int StepW { get; }
+        public int OffsetH { get; }
+        public int OffsetW { get; }
 
-        /// <summary>Offset of flattened output position q's receptive-field origin in the packed input.</summary>
+        /// <summary>Offset of flattened grid position q's receptive-field origin in the packed input.</summary>
         public int InputOrigin(int q)
         {
-            int b = q / Positions, r = q % Positions;
-            return b * InBlocks * PlaneIn + ((r / OutputWidth) * StrideH * PaddedW + (r % OutputWidth) * StrideW) * Block;
+            int b = q / GridPositions, r = q % GridPositions;
+            return b * InBlocks * PlaneIn + OriginBase
+                + ((r / GridWidth) * StrideH * PaddedW + (r % GridWidth) * StrideW) * Block;
+        }
+
+        /// <summary>Offset, in one output channel's plane, of flattened grid position q, and q's image.</summary>
+        public int OutputIndex(int q, out int image)
+        {
+            image = q / GridPositions;
+            int r = q % GridPositions;
+            return (OffsetH + (r / GridWidth) * StepH) * OutWidth + OffsetW + (r % GridWidth) * StepW;
         }
     }
 
-    private static unsafe void ForwardTile(float[] packedInput, float[] packedKernel, float[] output, int outputOffset, bool accumulate,
-        in ForwardGeometry g, int tile, int first, int last)
+    private static unsafe void ForwardTile(float[] packedInput, float[] packedKernel, int kernelOffset, float[] output, int outputOffset,
+        bool accumulate, in ForwardGeometry g, int tile, int first, int last)
     {
         int taps = g.KernelHeight * g.KernelWidth;
         long blockStride = (long)g.InBlocks * taps * Block * Block;
@@ -323,7 +520,7 @@ internal static class DirectConvAvx2
         fixed (float* pw = packedKernel)
         fixed (float* po = output)
         {
-            float* tileKernel = pw + tile * OutputBlocksPerTile * blockStride;
+            float* tileKernel = pw + kernelOffset + tile * OutputBlocksPerTile * blockStride;
             for (int q = first; q < last; q += PositionUnroll)
             {
                 int count = Math.Min(PositionUnroll, last - q);
@@ -374,14 +571,13 @@ internal static class DirectConvAvx2
     private static unsafe void StorePosition(float* output, bool accumulate, in ForwardGeometry g, int channelBase, int q,
         Vector256<float> v0, Vector256<float> v1, Vector256<float> v2, Vector256<float> v3)
     {
-        int b = q / g.Positions, r = q % g.Positions;
-        float* d = output + ((long)b * g.OutChannels + channelBase) * g.Positions + r;
-        StoreLanes(d, g.Positions, accumulate, v0);
-        StoreLanes(d + (long)Block * g.Positions, g.Positions, accumulate, v1);
-        StoreLanes(d + (long)2 * Block * g.Positions, g.Positions, accumulate, v2);
-        StoreLanes(d + (long)3 * Block * g.Positions, g.Positions, accumulate, v3);
+        int index = g.OutputIndex(q, out int b);
+        float* d = output + ((long)b * g.OutChannels + channelBase) * g.OutPlane + index;
+        StoreLanes(d, g.OutPlane, accumulate, v0);
+        StoreLanes(d + (long)Block * g.OutPlane, g.OutPlane, accumulate, v1);
+        StoreLanes(d + (long)2 * Block * g.OutPlane, g.OutPlane, accumulate, v2);
+        StoreLanes(d + (long)3 * Block * g.OutPlane, g.OutPlane, accumulate, v3);
     }
-
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static unsafe void StoreLanes(float* d, int stride, bool accumulate, Vector256<float> v)
     {

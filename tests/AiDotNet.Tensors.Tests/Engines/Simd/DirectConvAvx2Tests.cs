@@ -1,4 +1,3 @@
-using AiDotNet.Tensors.Engines;
 using AiDotNet.Tensors.Engines.Simd;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -7,15 +6,14 @@ using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.Simd;
 
+#if NET5_0_OR_GREATER
 /// <summary>
-/// The direct blocked conv kernels against a naive double-precision reference, through the engine entry points that
-/// route to them. Each case asserts the route is taken, so a predicate change cannot quietly turn these into tests of
-/// the im2col path.
+/// The direct blocked conv kernels against a naive double-precision reference, called directly so every geometry is
+/// covered whatever the routing predicates currently send to them (the engine-level conv suites cover the routed
+/// shapes).
 /// </summary>
 public class DirectConvAvx2Tests
 {
-    private readonly CpuEngine _engine = new CpuEngine();
-
     private static Tensor<float> Random(int seed, params int[] shape)
     {
         var rng = RandomHelper.CreateSeededRandom(seed);
@@ -38,7 +36,7 @@ public class DirectConvAvx2Tests
 
     // Shapes: batch, inC, outC, size, kernel, stride, pad, dilation. 3x3 and 1x1, strides 1 and 2, padding 0-2,
     // dilation 2, and output-position counts that leave a 1- and 2-position tail of the 3-position tile.
-    [Theory]
+    [SkippableTheory]
     [InlineData(2, 8, 32, 7, 3, 1, 1, 1)]
     [InlineData(3, 16, 64, 6, 3, 2, 1, 1)]
     [InlineData(2, 8, 32, 9, 1, 2, 0, 1)]
@@ -48,11 +46,14 @@ public class DirectConvAvx2Tests
     public void Forward_MatchesANaiveReference(int batch, int inC, int outC, int size, int k, int stride, int pad, int dilation)
     {
         int outSize = OutSize(size, k, stride, pad, dilation);
-        Assert.True(DirectConvAvx2.ShouldUseForward(batch, inC, outC, k, k, stride, stride, outSize, outSize) || !DirectConvAvx2.IsSupported);
+        Skip.IfNot(DirectConvAvx2.IsSupported, "needs AVX2 and FMA");
         var x = Random(1, batch, inC, size, size);
         var w = Random(2, outC, inC, k, k);
+        var y = new Tensor<float>(new[] { batch, outC, outSize, outSize });
+        for (int i = 0; i < y.Length; i++) y.SetFlat(i, float.NaN);
 
-        var y = _engine.Conv2D(x, w, new[] { stride, stride }, new[] { pad, pad }, new[] { dilation, dilation });
+        DirectConvAvx2.Forward(x.GetDataArray(), 0, w.GetDataArray(), 0, y.GetDataArray(), 0, accumulate: false,
+            batch, inC, size, size, outC, k, k, stride, stride, pad, pad, dilation, dilation, outSize, outSize);
 
         var expected = new double[batch * outC * outSize * outSize];
         for (int b = 0; b < batch; b++)
@@ -74,22 +75,31 @@ public class DirectConvAvx2Tests
         AssertClose(expected, y, "output");
     }
 
-    [Theory]
-    [InlineData(2, 32, 8, 7, 3, 1, false)]
-    [InlineData(3, 64, 16, 4, 3, 1, true)]
-    [InlineData(2, 32, 16, 6, 3, 0, false)]
-    [InlineData(2, 32, 8, 5, 1, 0, true)]
-    public void BackwardInput_MatchesANaiveReference(int batch, int inC, int outC, int size, int k, int pad, bool accumulate)
+    [SkippableTheory]
+    [InlineData(2, 32, 8, 7, 3, 1, 1, false)]
+    [InlineData(3, 64, 16, 4, 3, 1, 1, true)]
+    [InlineData(2, 32, 16, 6, 3, 1, 0, false)]
+    [InlineData(2, 32, 8, 5, 1, 1, 0, true)]
+    // Strided: each dX phase is a stride-1 correlation with a sub-kernel. Even and odd sizes, a 1x1 kernel whose odd
+    // phases receive no tap (zeroed, or left alone when accumulating), stride 3, and padding 0.
+    [InlineData(2, 32, 16, 8, 3, 2, 1, false)]
+    [InlineData(3, 32, 8, 9, 3, 2, 1, true)]
+    [InlineData(2, 32, 16, 8, 1, 2, 0, false)]
+    [InlineData(2, 32, 16, 9, 1, 2, 0, true)]
+    [InlineData(2, 32, 8, 10, 3, 3, 1, false)]
+    [InlineData(2, 64, 16, 7, 3, 2, 0, false)]
+    public void BackwardInput_MatchesANaiveReference(int batch, int inC, int outC, int size, int k, int stride, int pad, bool accumulate)
     {
-        int outSize = OutSize(size, k, 1, pad, 1);
-        Assert.True(DirectConvAvx2.ShouldUseBackwardInput(batch, inC, outC, k, k, 1, 1, pad, pad, 1, 1) || !DirectConvAvx2.IsSupported);
+        int outSize = OutSize(size, k, stride, pad, 1);
+        Skip.IfNot(DirectConvAvx2.IsSupported, "needs AVX2 and FMA");
         var w = Random(3, outC, inC, k, k);
         var g = Random(4, batch, outC, outSize, outSize);
         var prior = Random(5, batch, inC, size, size);
         var dx = new Tensor<float>(prior.Shape.ToArray());
         for (int i = 0; i < dx.Length; i++) dx.SetFlat(i, accumulate ? prior.GetFlat(i) : float.NaN);
 
-        _engine.Conv2DBackwardInputInto(dx, g, w, new[] { batch, inC, size, size }, new[] { 1, 1 }, new[] { pad, pad }, new[] { 1, 1 }, accumulate);
+        DirectConvAvx2.BackwardInput(g.GetDataArray(), 0, w.GetDataArray(), 0, dx.GetDataArray(), 0, accumulate,
+            batch, inC, size, size, outC, k, k, stride, stride, pad, pad, outSize, outSize);
 
         var expected = new double[dx.Length];
         for (int b = 0; b < batch; b++)
@@ -102,8 +112,10 @@ public class DirectConvAvx2Tests
             for (int i = 0; i < k; i++)
             for (int j = 0; j < k; j++)
             {
-                int oh = ih + pad - i, ow = iw + pad - j;
-                if (oh < 0 || oh >= outSize || ow < 0 || ow >= outSize) continue;
+                int nh = ih + pad - i, nw = iw + pad - j;
+                if (nh < 0 || nw < 0 || nh % stride != 0 || nw % stride != 0) continue;
+                int oh = nh / stride, ow = nw / stride;
+                if (oh >= outSize || ow >= outSize) continue;
                 acc += (double)w[o, c, i, j] * g[b, o, oh, ow];
             }
             expected[((b * inC + c) * size + ih) * size + iw] = acc;
@@ -111,7 +123,7 @@ public class DirectConvAvx2Tests
         AssertClose(expected, dx, "input gradient");
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(2, 32, 32, 7, 3, 1, 1, 1, false)]
     [InlineData(3, 16, 64, 8, 3, 2, 1, 1, true)]
     [InlineData(2, 32, 32, 9, 1, 2, 0, 1, false)]
@@ -120,14 +132,15 @@ public class DirectConvAvx2Tests
     public void BackwardKernel_MatchesANaiveReference(int batch, int inC, int outC, int size, int k, int stride, int pad, int dilation, bool accumulate)
     {
         int outSize = OutSize(size, k, stride, pad, dilation);
-        Assert.True(DirectConvAvx2.ShouldUseBackwardKernel(inC, outC) || !DirectConvAvx2.IsSupported);
+        Skip.IfNot(DirectConvAvx2.IsSupported, "needs AVX2 and FMA");
         var x = Random(6, batch, inC, size, size);
         var g = Random(7, batch, outC, outSize, outSize);
         var prior = Random(8, outC, inC, k, k);
         var dw = new Tensor<float>(prior.Shape.ToArray());
         for (int i = 0; i < dw.Length; i++) dw.SetFlat(i, accumulate ? prior.GetFlat(i) : float.NaN);
 
-        _engine.Conv2DBackwardKernelInto(dw, g, x, new[] { outC, inC, k, k }, new[] { stride, stride }, new[] { pad, pad }, new[] { dilation, dilation }, accumulate);
+        DirectConvAvx2.BackwardKernel(x.GetDataArray(), 0, g.GetDataArray(), 0, dw.GetDataArray(), 0, accumulate,
+            batch, inC, size, size, outC, k, k, stride, stride, pad, pad, dilation, dilation, outSize, outSize);
 
         var expected = new double[dw.Length];
         for (int o = 0; o < outC; o++)
@@ -149,3 +162,4 @@ public class DirectConvAvx2Tests
         AssertClose(expected, dw, "kernel gradient");
     }
 }
+#endif

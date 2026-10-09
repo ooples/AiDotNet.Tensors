@@ -15327,14 +15327,14 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float))
         {
 #if NET5_0_OR_GREATER
-            if (Simd.DirectConvAvx2.ShouldUseBackwardInput(batch, inChannels, outChannels, kernelHeight, kernelWidth,
+            if (Simd.DirectConvAvx2.ShouldUseBackwardInput(batch, inChannels, outChannels, height, width, kernelHeight, kernelWidth,
                     strideH, strideW, padH, padW, dilationH, dilationW))
             {
                 Simd.DirectConvAvx2.BackwardInput(
                     (float[])(object)gradOutput.GetFlattenedData(), 0, (float[])(object)kernel.GetFlattenedData(), 0,
                     (float[])(object)dest._storage.GetDataArray(), dest._storageOffset, accumulate,
                     batch, inChannels, height, width, outChannels, kernelHeight, kernelWidth,
-                    padH, padW, outputHeight, outputWidth);
+                    strideH, strideW, padH, padW, outputHeight, outputWidth);
                 return;
             }
 #endif
@@ -16486,7 +16486,8 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float))
         {
 #if NET5_0_OR_GREATER
-            if (Simd.DirectConvAvx2.ShouldUseBackwardKernel(inChannels, outChannels))
+            if (Simd.DirectConvAvx2.ShouldUseBackwardKernel(inChannels, outChannels, kernelHeight, kernelWidth,
+                    strideH, strideW, outputHeight, outputWidth))
             {
                 Simd.DirectConvAvx2.BackwardKernel(
                     (float[])(object)input.GetFlattenedData(), 0, (float[])(object)gradOutput.GetFlattenedData(), 0,
