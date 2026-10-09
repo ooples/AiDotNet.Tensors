@@ -1960,28 +1960,13 @@ internal static partial class SimdGemm
                 var bT = ArrayPool<float>.Shared.Rent(k * n);
                 try
                 {
-                    // B is [n, k] row-major (since transB=true). Lay it
-                    // out as [k, n] row-major in bT so SgemmDirect reads
-                    // contiguous K-rows of length N.
-                    for (int j = 0; j < n; j++)
-                    {
-                        int bRowStart = j * ldb;
-                        for (int p = 0; p < k; p++)
-                        {
-                            bT[p * n + j] = b[bRowStart + p];
-                        }
-                    }
-                    // Same parallel-M dispatch as the !transB branch above.
-                    if (allowParallel
-                        && directWork >= ParallelDirectWorkThreshold
-                        && m >= ParallelDirectMinM)
-                    {
-                        SgemmDirectParallelM(a, lda, new ReadOnlySpan<float>(bT, 0, k * n), n, c, m, k, n, clearedOutput);
-                    }
-                    else
-                    {
-                        SgemmDirect(a, lda, new ReadOnlySpan<float>(bT, 0, k * n), n, c, m, k, n, clearedOutput);
-                    }
+                    // B is [n, k] row-major (since transB=true): tile-transpose it to [k, n], then dispatch the
+                    // untransposed product. A serial strided copy followed by the M-only split cost 5x the
+                    // untransposed GEMM on a [64x128]x[128x3136] input gradient (64 rows give the M split
+                    // ~10 chunks); the untransposed dispatch reaches the 2-D direct path, which splits N too.
+                    TransposeInto(b, ldb, n, k, bT, allowParallel);
+                    SgemmAddInternal(a, lda, false, new ReadOnlySpan<float>(bT, 0, k * n), n, false, c, m, k, n,
+                        allowParallel, clearedOutput);
                 }
                 finally
                 {
@@ -2115,33 +2100,48 @@ internal static partial class SimdGemm
     private static unsafe void TransposeInto(ReadOnlySpan<float> src, int ld, int rows, int cols, float[] dst, bool allowParallel)
     {
         int rowTiles = (rows + TransposeTile - 1) / TransposeTile;
+        int colTiles = (cols + TransposeTile - 1) / TransposeTile;
         fixed (float* ps = src)
         fixed (float* pd = dst)
         {
             float* s = ps, d = pd;
-            void Tile(int rt)
+            // One work item per tile of the 2-D grid, not per row strip: a backward operand is often short and
+            // wide ([64, 3136] as A^T of a weight gradient), which made only two row strips, so the transpose ran
+            // on two threads and cost more than the GEMM it fed.
+            void Tile(int t)
             {
+                int rt = t / colTiles, ct = t % colTiles;
                 int r0 = rt * TransposeTile, r1 = Math.Min(rows, r0 + TransposeTile);
-                for (int c0 = 0; c0 < cols; c0 += TransposeTile)
+                int c0 = ct * TransposeTile, c1 = Math.Min(cols, c0 + TransposeTile);
+                for (int r = r0; r < r1; r++)
                 {
-                    int c1 = Math.Min(cols, c0 + TransposeTile);
-                    for (int r = r0; r < r1; r++)
-                    {
-                        float* row = s + (long)r * ld;
-                        for (int col = c0; col < c1; col++)
-                            d[(long)col * rows + r] = row[col];
-                    }
+                    float* row = s + (long)r * ld;
+                    for (int col = c0; col < c1; col++)
+                        d[(long)col * rows + r] = row[col];
                 }
             }
-
-            if (allowParallel && rowTiles > 1 && (long)rows * cols >= TransposeParallelElements)
-                Helpers.CpuParallelSettings.LightweightParallel(rowTiles, Tile);
+            int tiles = rowTiles * colTiles;
+            if (!allowParallel || tiles <= 1 || (long)rows * cols < TransposeParallelElements)
+            {
+                for (int t = 0; t < tiles; t++) Tile(t);
+                return;
+            }
+            // Strips along whichever axis has more tiles. A short, wide operand ([64, 3136] as A^T of a weight
+            // gradient) has two row strips, which left the transpose on two threads; its column strips each write
+            // whole destination rows contiguously. (One pool item per 32x32 tile was slower than both.)
+            if (rowTiles >= colTiles)
+                Helpers.CpuParallelSettings.LightweightParallel(rowTiles, rt =>
+                {
+                    for (int ct = 0; ct < colTiles; ct++) Tile(rt * colTiles + ct);
+                });
             else
-                for (int rt = 0; rt < rowTiles; rt++) Tile(rt);
+                Helpers.CpuParallelSettings.LightweightParallel(colTiles, ct =>
+                {
+                    for (int rt = 0; rt < rowTiles; rt++) Tile(rt * colTiles + ct);
+                });
         }
     }
 
-    // Below 64K elements (256 KB) the transpose costs less than a parallel dispatch.
     private const long TransposeParallelElements = 64L * 1024;
 
     // Tall-thin transformer GEMMs (M=2048, K=128, N=384-8192) at
