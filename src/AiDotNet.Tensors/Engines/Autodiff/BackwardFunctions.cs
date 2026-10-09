@@ -4031,8 +4031,10 @@ internal static class BackwardFunctions<T>
         Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
         object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
     {
-        // Sign has zero gradient everywhere. Adding zero to an existing gradient is a no-op.
-        if (grads.ContainsKey(inputs[0])) return;
+        // Sign has zero gradient everywhere, so adding zero to a gradient already written this step is a no-op. A
+        // compiled step's map also holds the previous step's buffers, cleared only by their first write; one whose
+        // only contribution is this Sign must still take the zero, or it keeps last step's values.
+        if (grads.TryGetValue(inputs[0], out var existing) && DifferentiableOps.IsWrittenThisStep(existing)) return;
 
         // The input still needs an (all-zero) entry, as PyTorch's sign backward returns zeros_like. On a GPU engine
         // it is filled on the device: a host zero tensor had to be uploaded, and inside a captured training step that
