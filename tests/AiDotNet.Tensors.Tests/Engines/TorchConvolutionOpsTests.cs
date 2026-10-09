@@ -90,4 +90,27 @@ public class TorchConvolutionOpsTests
         Close(new[] { 0.0, -0.010000000000000009, 0.05000000000000002, 0.24, 0.0, -0.06999999999999999, -0.04999999999999996, 0.23000000000000004, 0.0, -0.13000000000000003, -0.15000000000000002, 0.22000000000000003, 0.0, 0.09000000000000014, 0.15000000000000002, 0.21000000000000002, 0.0, 0.18000000000000005, 0.2, 0.22000000000000003, 0.0, 0.27000000000000013, 0.25, 0.23000000000000004 }, grads[x], "transposed 1-D, padding past the kernel dx");
         Close(new[] { 5.551115123125783e-17, -0.36000000000000004, 0.79, 0.1700000000000002, -0.07999999999999999, -0.04000000000000005, -1.1500000000000004, -0.07000000000000006, 0.07, 0.5100000000000002, 0.13, -0.08000000000000002 }, grads[w], "transposed 1-D, padding past the kernel dw");
     }
+
+    [Fact]
+    public void Convolution_RejectsInvalidGeometryAndBias()
+    {
+        var x = W(new[] { 1, 2, 5 }, 7, 3, 1);
+        var w = W(new[] { 3, 2, 2 }, 5, 2, 1);
+        var bias = W(new[] { 3 }, 3, 1, 0);
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            _engine.TensorConvolution(x, w, bias, new[] { 0 }, new[] { 0 }, new[] { 1 }));
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            _engine.TensorConvolution(x, w, bias, new[] { 1 }, new[] { 0 }, new[] { 0 }));
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            _engine.TensorConvolution(x, w, bias, new[] { 1 }, new[] { -1 }, new[] { 1 }));
+        // Output padding is only for a transposed convolution, and there it must be below the stride or dilation.
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            _engine.TensorConvolution(x, w, bias, new[] { 1 }, new[] { 0 }, new[] { 1 }, false, new[] { 1 }));
+        var wt = W(new[] { 2, 3, 2 }, 5, 2, 1);
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            _engine.TensorConvolution(x, wt, bias, new[] { 2 }, new[] { 0 }, new[] { 1 }, true, new[] { 2 }));
+        Assert.Throws<ArgumentException>(() =>
+            _engine.TensorConvolution(x, w, W(new[] { 4 }, 3, 1, 0), new[] { 1 }, new[] { 0 }, new[] { 1 }));
+        Assert.Equal(new[] { 1, 3, 4 }, _engine.TensorConvolution(x, w, bias, new[] { 1 }, new[] { 0 }, new[] { 1 })._shape);
+    }
 }

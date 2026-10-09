@@ -22,6 +22,18 @@ public partial class CpuEngine
         }
         var s = Axis(stride, nameof(stride), 1); var p = Axis(padding, nameof(padding), 0);
         var d = Axis(dilation, nameof(dilation), 1); var op = Axis(outputPadding, nameof(outputPadding), 0);
+        for (int a = 0; a < dims; a++)
+        {
+            if (s[a] < 1) throw new ArgumentOutOfRangeException(nameof(stride), "stride must be at least 1.");
+            if (d[a] < 1) throw new ArgumentOutOfRangeException(nameof(dilation), "dilation must be at least 1.");
+            if (p[a] < 0) throw new ArgumentOutOfRangeException(nameof(padding), "padding must not be negative.");
+            // As PyTorch: output padding only resolves the transposed output size, so it is below the stride or the
+            // dilation, and a plain convolution takes none.
+            if (op[a] < 0 || (transposed ? op[a] >= Math.Max(s[a], d[a]) : op[a] != 0))
+                throw new ArgumentOutOfRangeException(nameof(outputPadding), transposed
+                    ? "outputPadding must be non-negative and smaller than the stride or the dilation."
+                    : "outputPadding applies only to a transposed convolution.");
+        }
         if (groups < 1 || input._shape[1] % groups != 0 || weight._shape[0] % groups != 0)
             throw new ArgumentException("groups must divide the input channels and weight's first axis.", nameof(groups));
         var k = weight._shape.Skip(2).ToArray();
@@ -78,6 +90,8 @@ public partial class CpuEngine
         }
         var y = groups == 1 ? outputs[0] : TensorConcatenate(outputs, 1);
         if (bias == null) return y;
+        if (bias.Length != y._shape[1])
+            throw new ArgumentException($"bias has {bias.Length} entries; the convolution has {y._shape[1]} output channels.", nameof(bias));
         var biasShape = new[] { 1, bias.Length }.Concat(Enumerable.Repeat(1, dims)).ToArray();
         return TensorAdd(y, TensorBroadcastTo(Reshape(bias, biasShape), (int[])y._shape.Clone()));
     }
