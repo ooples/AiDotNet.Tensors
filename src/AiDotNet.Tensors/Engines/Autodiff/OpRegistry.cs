@@ -20,6 +20,15 @@ internal static class OpRegistry
     /// </summary>
     internal static readonly HashSet<string> DifferentiableOps = new(StringComparer.Ordinal)
     {
+        // torch.special / element-wise parity ops (backward from the derivative, CpuEngine.TorchSpecial)
+        "TensorErf", "TensorLogit", "TensorSinc", "TensorDeg2Rad",
+        "TensorRad2Deg", "TensorFmax", "TensorFmin", "TensorIgamma",
+        "TensorIgammac", "TensorMvlgamma", "TensorEntr", "TensorErfcx",
+        "TensorNdtr", "TensorLogNdtr", "TensorNdtri", "TensorBesselJ0",
+        "TensorBesselJ1", "TensorBesselY0", "TensorBesselY1", "TensorModifiedBesselI0",
+        "TensorModifiedBesselI1", "TensorModifiedBesselK0", "TensorModifiedBesselK1", "TensorScaledModifiedBesselK0",
+        "TensorScaledModifiedBesselK1", "TensorSphericalBesselJ0", "TensorAiryAi",
+
         // Arithmetic
         "TensorAdd", "TensorSubtract", "TensorMultiply", "TensorDivide",
         "TensorNegate", "TensorAbs", "TensorSign",
@@ -231,6 +240,15 @@ internal static class OpRegistry
     /// </summary>
     internal static readonly HashSet<string> NonDifferentiableOps = new(StringComparer.Ordinal)
     {
+        // Comparisons, indicators, bitwise/integer ops and orthogonal polynomials (PyTorch defines no gradient)
+        "TensorSignbit", "TensorIsPosInf", "TensorIsNegInf", "TensorIsReal",
+        "TensorGreaterEqual", "TensorLessEqual", "TensorHeaviside", "TensorFloorDivide",
+        "TensorGcd", "TensorLcm", "TensorBitwiseAnd", "TensorBitwiseOr",
+        "TensorBitwiseXor", "TensorBitwiseNot", "TensorBitwiseLeftShift", "TensorBitwiseRightShift",
+        "TensorChebyshevPolynomialT", "TensorChebyshevPolynomialU", "TensorChebyshevPolynomialV", "TensorChebyshevPolynomialW",
+        "TensorShiftedChebyshevPolynomialT", "TensorShiftedChebyshevPolynomialU", "TensorShiftedChebyshevPolynomialV", "TensorShiftedChebyshevPolynomialW",
+        "TensorHermitePolynomialH", "TensorHermitePolynomialHe", "TensorLaguerrePolynomialL", "TensorLegendrePolynomialP",
+
         // Comparison (return bool-like tensors, not differentiable)
         "TensorEquals", "TensorNotEquals", "TensorGreaterThan", "TensorLessThan",
         "TensorGreaterOrEqual", "TensorLessOrEqual",
@@ -447,6 +465,9 @@ internal static class OpRegistry
     /// </summary>
     internal static readonly HashSet<string> DelegatorOps = new(StringComparer.Ordinal)
     {
+        // Composed from recorded ops (where + ReduceSum / TensorDivide) or the identity
+        "TensorPositive", "TensorNanSum", "TensorNanMean",
+
         // Expressed entirely through tape-connected Unfold/reshape/multiply/reduce primitives.
         "PartialCorrelationVolume",
         // IEngine wrappers that delegate to internal methods

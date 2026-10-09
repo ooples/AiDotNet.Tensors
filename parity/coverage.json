@@ -1,6 +1,6 @@
 {
   "torchVersion": "2.11.0",
-  "gapBaseline": 926,
+  "gapBaseline": 803,
   "entries": {
     "Tensor:abs": {
       "status": "mapped",
@@ -320,48 +320,54 @@
       "source": "name-match"
     },
     "Tensor:bitwise_and": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorBitwiseAnd",
+      "source": "reviewed-alias"
     },
     "Tensor:bitwise_and_": {
       "status": "gap",
       "source": "name-match"
     },
     "Tensor:bitwise_left_shift": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorBitwiseLeftShift",
+      "source": "reviewed-alias"
     },
     "Tensor:bitwise_left_shift_": {
       "status": "gap",
       "source": "name-match"
     },
     "Tensor:bitwise_not": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorBitwiseNot",
+      "source": "reviewed-alias"
     },
     "Tensor:bitwise_not_": {
       "status": "gap",
       "source": "name-match"
     },
     "Tensor:bitwise_or": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorBitwiseOr",
+      "source": "reviewed-alias"
     },
     "Tensor:bitwise_or_": {
       "status": "gap",
       "source": "name-match"
     },
     "Tensor:bitwise_right_shift": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorBitwiseRightShift",
+      "source": "reviewed-alias"
     },
     "Tensor:bitwise_right_shift_": {
       "status": "gap",
       "source": "name-match"
     },
     "Tensor:bitwise_xor": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorBitwiseXor",
+      "source": "reviewed-alias"
     },
     "Tensor:bitwise_xor_": {
       "status": "gap",
@@ -598,8 +604,9 @@
       "source": "reviewed"
     },
     "Tensor:deg2rad": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorDeg2Rad",
+      "source": "reviewed-alias"
     },
     "Tensor:deg2rad_": {
       "status": "gap",
@@ -737,8 +744,9 @@
       "source": "name-match"
     },
     "Tensor:erf": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorErf",
+      "source": "reviewed-alias"
     },
     "Tensor:erf_": {
       "status": "gap",
@@ -863,20 +871,23 @@
       "source": "name-match"
     },
     "Tensor:floor_divide": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorFloorDivide",
+      "source": "reviewed-alias"
     },
     "Tensor:floor_divide_": {
       "status": "gap",
       "source": "name-match"
     },
     "Tensor:fmax": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorFmax",
+      "source": "reviewed-alias"
     },
     "Tensor:fmin": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorFmin",
+      "source": "reviewed-alias"
     },
     "Tensor:fmod": {
       "status": "mapped",
@@ -907,16 +918,18 @@
       "source": "name-match"
     },
     "Tensor:gcd": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorGcd",
+      "source": "reviewed-alias"
     },
     "Tensor:gcd_": {
       "status": "gap",
       "source": "name-match"
     },
     "Tensor:ge": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorGreaterEqual",
+      "source": "reviewed-alias"
     },
     "Tensor:ge_": {
       "status": "gap",
@@ -950,8 +963,9 @@
       "source": "name-match"
     },
     "Tensor:greater_equal": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorGreaterEqual",
+      "source": "reviewed-alias"
     },
     "Tensor:greater_equal_": {
       "status": "gap",
@@ -985,8 +999,9 @@
       "source": "reviewed"
     },
     "Tensor:heaviside": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorHeaviside",
+      "source": "reviewed-alias"
     },
     "Tensor:heaviside_": {
       "status": "gap",
@@ -1026,16 +1041,18 @@
       "source": "name-match"
     },
     "Tensor:igamma": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorIgamma",
+      "source": "reviewed-alias"
     },
     "Tensor:igamma_": {
       "status": "gap",
       "source": "name-match"
     },
     "Tensor:igammac": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorIgammac",
+      "source": "reviewed-alias"
     },
     "Tensor:igammac_": {
       "status": "gap",
@@ -1206,16 +1223,19 @@
       "source": "name-match"
     },
     "Tensor:isneginf": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorIsNegInf",
+      "source": "reviewed-alias"
     },
     "Tensor:isposinf": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorIsPosInf",
+      "source": "reviewed-alias"
     },
     "Tensor:isreal": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorIsReal",
+      "source": "reviewed-alias"
     },
     "Tensor:istft": {
       "status": "mapped",
@@ -1238,8 +1258,9 @@
       "source": "name-match"
     },
     "Tensor:lcm": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorLcm",
+      "source": "reviewed-alias"
     },
     "Tensor:lcm_": {
       "status": "gap",
@@ -1255,8 +1276,9 @@
       "source": "name-match"
     },
     "Tensor:le": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorLessEqual",
+      "source": "reviewed-alias"
     },
     "Tensor:le_": {
       "status": "gap",
@@ -1281,8 +1303,9 @@
       "source": "name-match"
     },
     "Tensor:less_equal": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorLessEqual",
+      "source": "reviewed-alias"
     },
     "Tensor:less_equal_": {
       "status": "gap",
@@ -1398,8 +1421,9 @@
       "source": "name-match"
     },
     "Tensor:logit": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorLogit",
+      "source": "reviewed-alias"
     },
     "Tensor:logit_": {
       "status": "gap",
@@ -1576,8 +1600,9 @@
       "source": "reviewed-alias"
     },
     "Tensor:mvlgamma": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorMvlgamma",
+      "source": "reviewed-alias"
     },
     "Tensor:mvlgamma_": {
       "status": "gap",
@@ -1593,8 +1618,9 @@
       "source": "name-match"
     },
     "Tensor:nanmean": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorNanMean",
+      "source": "reviewed-alias"
     },
     "Tensor:nanmedian": {
       "status": "mapped",
@@ -1606,8 +1632,9 @@
       "source": "name-match"
     },
     "Tensor:nansum": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorNanSum",
+      "source": "reviewed-alias"
     },
     "Tensor:narrow": {
       "status": "mapped",
@@ -1714,8 +1741,9 @@
       "source": "name-match"
     },
     "Tensor:not_equal": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorNotEquals",
+      "source": "reviewed-alias"
     },
     "Tensor:not_equal_": {
       "status": "gap",
@@ -1769,8 +1797,9 @@
       "source": "name-match"
     },
     "Tensor:positive": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorPositive",
+      "source": "reviewed-alias"
     },
     "Tensor:pow": {
       "status": "mapped",
@@ -1840,8 +1869,9 @@
       "source": "name-match"
     },
     "Tensor:rad2deg": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorRad2Deg",
+      "source": "reviewed-alias"
     },
     "Tensor:rad2deg_": {
       "status": "gap",
@@ -2090,8 +2120,9 @@
       "source": "name-match"
     },
     "Tensor:signbit": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorSignbit",
+      "source": "reviewed-alias"
     },
     "Tensor:sin": {
       "status": "mapped",
@@ -2103,8 +2134,9 @@
       "source": "name-match"
     },
     "Tensor:sinc": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorSinc",
+      "source": "reviewed-alias"
     },
     "Tensor:sinc_": {
       "status": "gap",
@@ -2924,48 +2956,54 @@
       "source": "name-match"
     },
     "aten:bitwise_and": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorBitwiseAnd",
+      "source": "reviewed-alias"
     },
     "aten:bitwise_and_": {
       "status": "gap",
       "source": "name-match"
     },
     "aten:bitwise_left_shift": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorBitwiseLeftShift",
+      "source": "reviewed-alias"
     },
     "aten:bitwise_left_shift_": {
       "status": "gap",
       "source": "name-match"
     },
     "aten:bitwise_not": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorBitwiseNot",
+      "source": "reviewed-alias"
     },
     "aten:bitwise_not_": {
       "status": "gap",
       "source": "name-match"
     },
     "aten:bitwise_or": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorBitwiseOr",
+      "source": "reviewed-alias"
     },
     "aten:bitwise_or_": {
       "status": "gap",
       "source": "name-match"
     },
     "aten:bitwise_right_shift": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorBitwiseRightShift",
+      "source": "reviewed-alias"
     },
     "aten:bitwise_right_shift_": {
       "status": "gap",
       "source": "name-match"
     },
     "aten:bitwise_xor": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorBitwiseXor",
+      "source": "reviewed-alias"
     },
     "aten:bitwise_xor_": {
       "status": "gap",
@@ -3197,8 +3235,9 @@
       "source": "name-match"
     },
     "aten:deg2rad": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorDeg2Rad",
+      "source": "reviewed-alias"
     },
     "aten:deg2rad_": {
       "status": "gap",
@@ -3343,8 +3382,9 @@
       "source": "name-match"
     },
     "aten:erf": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorErf",
+      "source": "reviewed-alias"
     },
     "aten:erf_": {
       "status": "gap",
@@ -3555,20 +3595,23 @@
       "source": "name-match"
     },
     "aten:floor_divide": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorFloorDivide",
+      "source": "reviewed-alias"
     },
     "aten:floor_divide_": {
       "status": "gap",
       "source": "name-match"
     },
     "aten:fmax": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorFmax",
+      "source": "reviewed-alias"
     },
     "aten:fmin": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorFmin",
+      "source": "reviewed-alias"
     },
     "aten:fmod": {
       "status": "mapped",
@@ -3612,16 +3655,18 @@
       "source": "name-match"
     },
     "aten:gcd": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorGcd",
+      "source": "reviewed-alias"
     },
     "aten:gcd_": {
       "status": "gap",
       "source": "name-match"
     },
     "aten:ge": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorGreaterEqual",
+      "source": "reviewed-alias"
     },
     "aten:ge_": {
       "status": "gap",
@@ -3670,8 +3715,9 @@
       "source": "name-match"
     },
     "aten:greater_equal": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorGreaterEqual",
+      "source": "reviewed-alias"
     },
     "aten:greater_equal_": {
       "status": "gap",
@@ -3755,8 +3801,9 @@
       "source": "reviewed"
     },
     "aten:heaviside": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorHeaviside",
+      "source": "reviewed-alias"
     },
     "aten:heaviside_": {
       "status": "gap",
@@ -3801,16 +3848,18 @@
       "source": "name-match"
     },
     "aten:igamma": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorIgamma",
+      "source": "reviewed-alias"
     },
     "aten:igamma_": {
       "status": "gap",
       "source": "name-match"
     },
     "aten:igammac": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorIgammac",
+      "source": "reviewed-alias"
     },
     "aten:igammac_": {
       "status": "gap",
@@ -3931,12 +3980,14 @@
       "source": "name-match"
     },
     "aten:isneginf": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorIsNegInf",
+      "source": "reviewed-alias"
     },
     "aten:isposinf": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorIsPosInf",
+      "source": "reviewed-alias"
     },
     "aten:istft": {
       "status": "mapped",
@@ -3954,8 +4005,9 @@
       "source": "name-match"
     },
     "aten:lcm": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorLcm",
+      "source": "reviewed-alias"
     },
     "aten:lcm_": {
       "status": "gap",
@@ -3971,8 +4023,9 @@
       "source": "name-match"
     },
     "aten:le": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorLessEqual",
+      "source": "reviewed-alias"
     },
     "aten:le_": {
       "status": "gap",
@@ -4012,8 +4065,9 @@
       "source": "name-match"
     },
     "aten:less_equal": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorLessEqual",
+      "source": "reviewed-alias"
     },
     "aten:less_equal_": {
       "status": "gap",
@@ -4237,8 +4291,9 @@
       "source": "name-match"
     },
     "aten:logit": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorLogit",
+      "source": "reviewed-alias"
     },
     "aten:logit_": {
       "status": "gap",
@@ -4475,8 +4530,9 @@
       "source": "reviewed-alias"
     },
     "aten:mvlgamma": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorMvlgamma",
+      "source": "reviewed-alias"
     },
     "aten:mvlgamma_": {
       "status": "gap",
@@ -4497,8 +4553,9 @@
       "source": "name-match"
     },
     "aten:nansum": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorNanSum",
+      "source": "reviewed-alias"
     },
     "aten:narrow": {
       "status": "mapped",
@@ -4658,8 +4715,9 @@
       "source": "name-match"
     },
     "aten:not_equal": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorNotEquals",
+      "source": "reviewed-alias"
     },
     "aten:not_equal_": {
       "status": "gap",
@@ -4735,8 +4793,9 @@
       "source": "name-match"
     },
     "aten:positive": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorPositive",
+      "source": "reviewed-alias"
     },
     "aten:pow": {
       "status": "mapped",
@@ -4768,8 +4827,9 @@
       "source": "reviewed"
     },
     "aten:rad2deg": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorRad2Deg",
+      "source": "reviewed-alias"
     },
     "aten:rad2deg_": {
       "status": "gap",
@@ -5093,8 +5153,9 @@
       "source": "name-match"
     },
     "aten:signbit": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorSignbit",
+      "source": "reviewed-alias"
     },
     "aten:silu": {
       "status": "mapped",
@@ -5121,8 +5182,9 @@
       "source": "name-match"
     },
     "aten:sinc": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorSinc",
+      "source": "reviewed-alias"
     },
     "aten:sinc_": {
       "status": "gap",
@@ -5202,56 +5264,69 @@
       "source": "reviewed"
     },
     "aten:special_airy_ai": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorAiryAi",
+      "source": "reviewed-alias"
     },
     "aten:special_bessel_j0": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorBesselJ0",
+      "source": "reviewed-alias"
     },
     "aten:special_bessel_j1": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorBesselJ1",
+      "source": "reviewed-alias"
     },
     "aten:special_bessel_y0": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorBesselY0",
+      "source": "reviewed-alias"
     },
     "aten:special_bessel_y1": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorBesselY1",
+      "source": "reviewed-alias"
     },
     "aten:special_chebyshev_polynomial_t": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorChebyshevPolynomialT",
+      "source": "reviewed-alias"
     },
     "aten:special_chebyshev_polynomial_u": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorChebyshevPolynomialU",
+      "source": "reviewed-alias"
     },
     "aten:special_chebyshev_polynomial_v": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorChebyshevPolynomialV",
+      "source": "reviewed-alias"
     },
     "aten:special_chebyshev_polynomial_w": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorChebyshevPolynomialW",
+      "source": "reviewed-alias"
     },
     "aten:special_entr": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorEntr",
+      "source": "reviewed-alias"
     },
     "aten:special_erfcx": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorErfcx",
+      "source": "reviewed-alias"
     },
     "aten:special_hermite_polynomial_h": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorHermitePolynomialH",
+      "source": "reviewed-alias"
     },
     "aten:special_hermite_polynomial_he": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorHermitePolynomialHe",
+      "source": "reviewed-alias"
     },
     "aten:special_i0e": {
       "status": "mapped",
@@ -5269,68 +5344,84 @@
       "source": "reviewed-alias"
     },
     "aten:special_laguerre_polynomial_l": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorLaguerrePolynomialL",
+      "source": "reviewed-alias"
     },
     "aten:special_legendre_polynomial_p": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorLegendrePolynomialP",
+      "source": "reviewed-alias"
     },
     "aten:special_log_ndtr": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorLogNdtr",
+      "source": "reviewed-alias"
     },
     "aten:special_modified_bessel_i0": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorModifiedBesselI0",
+      "source": "reviewed-alias"
     },
     "aten:special_modified_bessel_i1": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorModifiedBesselI1",
+      "source": "reviewed-alias"
     },
     "aten:special_modified_bessel_k0": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorModifiedBesselK0",
+      "source": "reviewed-alias"
     },
     "aten:special_modified_bessel_k1": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorModifiedBesselK1",
+      "source": "reviewed-alias"
     },
     "aten:special_ndtr": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorNdtr",
+      "source": "reviewed-alias"
     },
     "aten:special_ndtri": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorNdtri",
+      "source": "reviewed-alias"
     },
     "aten:special_scaled_modified_bessel_k0": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorScaledModifiedBesselK0",
+      "source": "reviewed-alias"
     },
     "aten:special_scaled_modified_bessel_k1": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorScaledModifiedBesselK1",
+      "source": "reviewed-alias"
     },
     "aten:special_shifted_chebyshev_polynomial_t": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorShiftedChebyshevPolynomialT",
+      "source": "reviewed-alias"
     },
     "aten:special_shifted_chebyshev_polynomial_u": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorShiftedChebyshevPolynomialU",
+      "source": "reviewed-alias"
     },
     "aten:special_shifted_chebyshev_polynomial_v": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorShiftedChebyshevPolynomialV",
+      "source": "reviewed-alias"
     },
     "aten:special_shifted_chebyshev_polynomial_w": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorShiftedChebyshevPolynomialW",
+      "source": "reviewed-alias"
     },
     "aten:special_spherical_bessel_j0": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorSphericalBesselJ0",
+      "source": "reviewed-alias"
     },
     "aten:special_xlog1py": {
       "status": "mapped",
@@ -7756,28 +7847,34 @@
       "source": "name-match"
     },
     "torch:bitwise_and": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorBitwiseAnd",
+      "source": "reviewed-alias"
     },
     "torch:bitwise_left_shift": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorBitwiseLeftShift",
+      "source": "reviewed-alias"
     },
     "torch:bitwise_not": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorBitwiseNot",
+      "source": "reviewed-alias"
     },
     "torch:bitwise_or": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorBitwiseOr",
+      "source": "reviewed-alias"
     },
     "torch:bitwise_right_shift": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorBitwiseRightShift",
+      "source": "reviewed-alias"
     },
     "torch:bitwise_xor": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorBitwiseXor",
+      "source": "reviewed-alias"
     },
     "torch:blackman_window": {
       "status": "gap",
@@ -8152,8 +8249,9 @@
       "source": "name-match"
     },
     "torch:deg2rad": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorDeg2Rad",
+      "source": "reviewed-alias"
     },
     "torch:deg2rad_": {
       "status": "gap",
@@ -8313,8 +8411,9 @@
       "source": "name-match"
     },
     "torch:erf": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorErf",
+      "source": "reviewed-alias"
     },
     "torch:erf_": {
       "status": "gap",
@@ -8485,16 +8584,19 @@
       "source": "name-match"
     },
     "torch:floor_divide": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorFloorDivide",
+      "source": "reviewed-alias"
     },
     "torch:fmax": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorFmax",
+      "source": "reviewed-alias"
     },
     "torch:fmin": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorFmin",
+      "source": "reviewed-alias"
     },
     "torch:fmod": {
       "status": "mapped",
@@ -8559,16 +8661,18 @@
       "source": "name-match"
     },
     "torch:gcd": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorGcd",
+      "source": "reviewed-alias"
     },
     "torch:gcd_": {
       "status": "gap",
       "source": "name-match"
     },
     "torch:ge": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorGreaterEqual",
+      "source": "reviewed-alias"
     },
     "torch:geqrf": {
       "status": "gap",
@@ -8648,8 +8752,9 @@
       "source": "reviewed-alias"
     },
     "torch:greater_equal": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorGreaterEqual",
+      "source": "reviewed-alias"
     },
     "torch:grid_sampler": {
       "status": "gap",
@@ -8700,8 +8805,9 @@
       "source": "reviewed"
     },
     "torch:heaviside": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorHeaviside",
+      "source": "reviewed-alias"
     },
     "torch:hinge_embedding_loss": {
       "status": "mapped",
@@ -8756,12 +8862,14 @@
       "source": "name-match"
     },
     "torch:igamma": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorIgamma",
+      "source": "reviewed-alias"
     },
     "torch:igammac": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorIgammac",
+      "source": "reviewed-alias"
     },
     "torch:imag": {
       "status": "gap",
@@ -8973,16 +9081,19 @@
       "source": "name-match"
     },
     "torch:isneginf": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorIsNegInf",
+      "source": "reviewed-alias"
     },
     "torch:isposinf": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorIsPosInf",
+      "source": "reviewed-alias"
     },
     "torch:isreal": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorIsReal",
+      "source": "reviewed-alias"
     },
     "torch:istft": {
       "status": "mapped",
@@ -9014,8 +9125,9 @@
       "source": "name-match"
     },
     "torch:lcm": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorLcm",
+      "source": "reviewed-alias"
     },
     "torch:lcm_": {
       "status": "gap",
@@ -9031,8 +9143,9 @@
       "source": "name-match"
     },
     "torch:le": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorLessEqual",
+      "source": "reviewed-alias"
     },
     "torch:lerp": {
       "status": "mapped",
@@ -9045,8 +9158,9 @@
       "source": "reviewed-alias"
     },
     "torch:less_equal": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorLessEqual",
+      "source": "reviewed-alias"
     },
     "torch:lgamma": {
       "status": "mapped",
@@ -9139,8 +9253,9 @@
       "source": "name-match"
     },
     "torch:logit": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorLogit",
+      "source": "reviewed-alias"
     },
     "torch:logit_": {
       "status": "gap",
@@ -9389,8 +9504,9 @@
       "source": "reviewed-alias"
     },
     "torch:mvlgamma": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorMvlgamma",
+      "source": "reviewed-alias"
     },
     "torch:nan_to_num": {
       "status": "mapped",
@@ -9402,8 +9518,9 @@
       "source": "name-match"
     },
     "torch:nanmean": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorNanMean",
+      "source": "reviewed-alias"
     },
     "torch:nanmedian": {
       "status": "mapped",
@@ -9415,8 +9532,9 @@
       "source": "name-match"
     },
     "torch:nansum": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorNanSum",
+      "source": "reviewed-alias"
     },
     "torch:narrow": {
       "status": "mapped",
@@ -9509,8 +9627,9 @@
       "source": "name-match"
     },
     "torch:not_equal": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorNotEquals",
+      "source": "reviewed-alias"
     },
     "torch:nuclear_norm": {
       "status": "gap",
@@ -9611,8 +9730,9 @@
       "source": "name-match"
     },
     "torch:positive": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorPositive",
+      "source": "reviewed-alias"
     },
     "torch:pow": {
       "status": "mapped",
@@ -9725,8 +9845,9 @@
       "source": "reviewed"
     },
     "torch:rad2deg": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorRad2Deg",
+      "source": "reviewed-alias"
     },
     "torch:rad2deg_": {
       "status": "gap",
@@ -10086,8 +10207,9 @@
       "source": "name-match"
     },
     "torch:signbit": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorSignbit",
+      "source": "reviewed-alias"
     },
     "torch:sin": {
       "status": "mapped",
@@ -10099,8 +10221,9 @@
       "source": "name-match"
     },
     "torch:sinc": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorSinc",
+      "source": "reviewed-alias"
     },
     "torch:sinc_": {
       "status": "gap",
