@@ -152,7 +152,7 @@ public class TapeBailAuditTests
     };
 
     /// <summary>
-    /// Norms whose kernels compute in FP32. Under a tape, only a NON-FLOAT step stays on CpuEngine, so double
+    /// Ops whose kernels compute in FP32 (the norms and the fused convolution). Under a tape, only a NON-FLOAT step stays on CpuEngine, so double
     /// training keeps its precision (a double finite-difference gradcheck cannot resolve an FP32 forward); float runs
     /// the kernel and records. The tape check is therefore not a residency bail, and
     /// <c>Non_float_precision_guards_gate_only_non_float</c> holds every entry to exactly that form.
@@ -163,6 +163,7 @@ public class TapeBailAuditTests
         "GroupNorm",
         "InstanceNorm",
         "RMSNorm",
+        "FusedConv2D",
     };
 
     /// <summary>Ops already fixed — they must never regress to bailing.</summary>

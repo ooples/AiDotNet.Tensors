@@ -8747,18 +8747,39 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // the same Conv2D node the base records is added; its backward already dispatches to the device through
         // IEngine.Conv2DBackwardInput/Kernel. Bias and activation are the GPU ops, which record themselves. Graph
         // capture and anomaly mode keep the base path, which they instrument.
-        if (IsTapeActive<T>())
+        // Only float, the type the device kernels compute in: a taped double (a gradient check, say) keeps the exact host
+        // path it always had, rather than the default policy's float down-cast.
+        if (typeof(T) != typeof(float) && IsTapeActive<T>())
+            return base.FusedConv2D(input, kernel, bias, strideH, strideW, padH, padW, dilationH, dilationW, activation);
+        if (Autodiff.GradientTape<T>.Current is { } fusedTape && !Autodiff.NoGradScope<T>.IsSuppressed)
         {
-            // Only float, the type the device kernels compute in: a taped double (a gradient check, say) keeps the
-            // exact host path it always had, rather than the default policy's float down-cast.
-            if (typeof(T) != typeof(float) || Compilation.GraphMode.IsActive || Autodiff.AnomalyModeScope.IsActive
-                || Autodiff.GradientTape<T>.Current is null)
+            // Graph capture and anomaly mode keep the base path, which they instrument.
+            if (Compilation.GraphMode.IsActive || Autodiff.AnomalyModeScope.IsActive)
                 return base.FusedConv2D(input, kernel, bias, strideH, strideW, padH, padW, dilationH, dilationW, activation);
+            fusedTape.BindEngineIfUnset(this);
 
+            // The form CpuEngine records as one FusedConv2D entry (a rank-1 channel bias, no activation or ReLU): the
+            // fused kernel runs untaped and the same node is added, with FusedConv2DBiasActivationBackward and its saved
+            // state, whose engine path (ReluBackward, ReduceSum, Conv2DBackwardInput/Kernel) stays on the device.
+            if (bias is { Rank: 1 } fusedBias
+                && (activation == FusedActivationType.None || activation == FusedActivationType.ReLU))
+            {
+                Tensor<T> fused;
+                using (Autodiff.GradientTape<T>.NoGrad())
+                    fused = FusedConv2D(input, kernel, fusedBias, strideH, strideW, padH, padW, dilationH, dilationW, activation);
+                Autodiff.DifferentiableOps.RecordIfActive("FusedConv2D", fused, new[] { input, kernel, fusedBias },
+                    Autodiff.BackwardFunctions<T>.FusedConv2DBiasActivationBackward,
+                    new object[] { new[] { strideH, strideW }, new[] { padH, padW }, new[] { dilationH, dilationW },
+                        activation == FusedActivationType.ReLU });
+                return fused;
+            }
+
+            // Any other bias or activation: the convolution runs on the device with recording suppressed and the
+            // Conv2D node the base records is added; its backward dispatches to the device through
+            // IEngine.Conv2DBackwardInput/Kernel. Bias and activation are the GPU ops, which record themselves.
             Tensor<T> conv;
             using (Autodiff.GradientTape<T>.NoGrad())
                 conv = FusedConv2D(input, kernel, null, strideH, strideW, padH, padW, dilationH, dilationW, FusedActivationType.None);
-            Autodiff.GradientTape<T>.Current?.BindEngineIfUnset(this);
             Autodiff.DifferentiableOps.RecordBinary("Conv2D", conv, input, kernel, Autodiff.BackwardFunctions<T>.Conv2DBackward,
                 new object[] { new[] { strideH, strideW }, new[] { padH, padW }, new[] { dilationH, dilationW } });
 
