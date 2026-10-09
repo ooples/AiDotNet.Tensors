@@ -41247,6 +41247,31 @@ public partial class CpuEngine : ITensorLevelEngine
         // backward can trace the dependency chain from loss -> output -> parameters.
         // The BLAS fast path below bypasses the tape (operates on raw arrays), so we
         // must use the recorded path during training.
+        if (Autodiff.GradientTape<T>.Current is not null && !Autodiff.NoGradScope<T>.IsSuppressed
+            && typeof(T) == typeof(float) && input.Rank == 2 && weights.Rank == 2
+            && (activation == FusedActivationType.None || activation == FusedActivationType.ReLU))
+        {
+            // Under a tape the general path below ran the GEMM, then a separate broadcast bias add, then a separate
+            // activation, each a full pass and allocation (an MLP's 128x784->512 layer: 0.23 ms against 0.18 for the
+            // fused single pass). Identity and ReLU take the fused untaped kernel and record one entry. ReLU's
+            // backward masks on pre-activation > 0, which is exactly output > 0, so the output stands in for it.
+            Tensor<T> fused;
+            using (new NoGradScope<T>())
+                fused = FusedLinear(input, weights, bias, activation, activationParams);
+            var fusedLinearInputs = bias != null ? new[] { input, weights, bias } : new[] { input, weights };
+            object[]? fusedState = null;
+            if (activation == FusedActivationType.ReLU)
+            {
+                fusedState = new object[activationParams is null ? 2 : 3];
+                fusedState[0] = activation;
+                fusedState[1] = fused;
+                if (activationParams is not null) fusedState[2] = activationParams;
+            }
+            Autodiff.DifferentiableOps.RecordIfActive("FusedLinear", fused, fusedLinearInputs,
+                Autodiff.BackwardFunctions<T>.FusedLinearWithActivationBackward, fusedState);
+            { var ci = input; var cw = weights; var cb = bias; var cact = activation; AutoTracer.RecordOp("FusedLinear", fused, eng => eng.FusedLinear(ci, cw, cb, cact)); }
+            return fused;
+        }
         if (Autodiff.GradientTape<T>.Current is not null && !Autodiff.NoGradScope<T>.IsSuppressed)
         {
             // Fused tape path: use the exact same TensorMatMul code path as unfused
