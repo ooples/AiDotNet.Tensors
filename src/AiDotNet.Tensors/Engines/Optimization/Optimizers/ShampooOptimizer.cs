@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines.Optimization.Optimizers;
 
@@ -51,6 +52,22 @@ public sealed class ShampooOptimizer : OptimizerBase
         var group = AddParamGroup(overrides);
         group.AddParameter(parameter, gradient);
         _shapes[(ParamGroups.Count - 1, group.Parameters.Count - 1)] = (d1, d2);
+        return group;
+    }
+
+    /// <summary>
+    /// Add a rank-2 parameter tensor ([d1, d2]) for full-matrix preconditioning, updated in place; its gradient comes
+    /// from <see cref="OptimizerBase.Step(IReadOnlyDictionary{Tensor{float}, Tensor{float}})"/> (see
+    /// <see cref="ParamGroup.AddParameter(Tensor{float})"/>).
+    /// </summary>
+    public ParamGroup Add2DParameter(Tensor<float> parameter, IDictionary<string, double>? overrides = null)
+    {
+        if (parameter == null) throw new ArgumentNullException(nameof(parameter));
+        if (parameter.Rank != 2)
+            throw new ArgumentException($"Expected a rank-2 parameter; got rank {parameter.Rank}.", nameof(parameter));
+        var group = AddParamGroup(overrides);
+        group.AddParameter(parameter);
+        _shapes[(ParamGroups.Count - 1, group.Parameters.Count - 1)] = (parameter.Shape[0], parameter.Shape[1]);
         return group;
     }
 

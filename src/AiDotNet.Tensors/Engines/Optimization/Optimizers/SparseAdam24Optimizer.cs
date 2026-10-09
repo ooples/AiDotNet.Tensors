@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines.Optimization.Optimizers;
 
@@ -53,11 +54,39 @@ public sealed class SparseAdam24Optimizer : OptimizerBase
         if (parameter == null) throw new ArgumentNullException(nameof(parameter));
         if (gradient == null) throw new ArgumentNullException(nameof(gradient));
         if (patternNibbles == null) throw new ArgumentNullException(nameof(patternNibbles));
-        if (parameter.Length == 0)
-            throw new ArgumentException("parameter must not be empty.", nameof(parameter));
-        if (parameter.Length % 4 != 0)
+        var patternCopy = ValidatedPattern(parameter.Length, patternNibbles);
+
+        var grp = AddParamGroup(overrides);
+        grp.AddParameter(parameter, gradient);
+        _patterns[(ParamGroups.Count - 1, grp.Parameters.Count - 1)] = patternCopy;
+        return grp;
+    }
+
+    /// <summary>
+    /// Add a 2:4-sparse parameter tensor, updated in place; its gradient comes from
+    /// <see cref="OptimizerBase.Step(IReadOnlyDictionary{Tensor{float}, Tensor{float}})"/> (see
+    /// <see cref="ParamGroup.AddParameter(Tensor{float})"/>). Same layout rules as the array overload.
+    /// </summary>
+    public ParamGroup AddSparse24Parameter(
+        Tensor<float> parameter, byte[] patternNibbles, IDictionary<string, double>? overrides = null)
+    {
+        if (parameter == null) throw new ArgumentNullException(nameof(parameter));
+        if (patternNibbles == null) throw new ArgumentNullException(nameof(patternNibbles));
+        var patternCopy = ValidatedPattern(parameter.Length, patternNibbles);
+
+        var grp = AddParamGroup(overrides);
+        grp.AddParameter(parameter);
+        _patterns[(ParamGroups.Count - 1, grp.Parameters.Count - 1)] = patternCopy;
+        return grp;
+    }
+
+    private static byte[] ValidatedPattern(int length, byte[] patternNibbles)
+    {
+        if (length == 0)
+            throw new ArgumentException("parameter must not be empty.", "parameter");
+        if (length % 4 != 0)
             throw new ArgumentException("2:4 sparsity requires parameter length to be a multiple of 4.");
-        int blocks = parameter.Length / 4;
+        int blocks = length / 4;
         int expectedPatternBytes = (blocks + 1) / 2;
         if (patternNibbles.Length != expectedPatternBytes)
             throw new ArgumentException(
@@ -84,10 +113,7 @@ public sealed class SparseAdam24Optimizer : OptimizerBase
         var patternCopy = new byte[patternNibbles.Length];
         Array.Copy(patternNibbles, patternCopy, patternNibbles.Length);
 
-        var grp = AddParamGroup(overrides);
-        grp.AddParameter(parameter, gradient);
-        _patterns[(ParamGroups.Count - 1, grp.Parameters.Count - 1)] = patternCopy;
-        return grp;
+        return patternCopy;
     }
 
     /// <inheritdoc />
