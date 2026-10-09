@@ -78,6 +78,14 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
     /// </summary>
     public bool IsAvailable => _initialized && !_disposed;
 
+    /// <summary>Why the last <see cref="Initialize"/> failed (stage and VkResult), or empty; see <see cref="VulkanDevice.InitializationFailure"/>.</summary>
+    public string InitializationFailure =>
+        _disposed ? "The Vulkan backend was disposed."
+        : _platformFailure.Length > 0 ? _platformFailure
+        : _device.InitializationFailure;
+
+    private string _platformFailure = string.Empty;
+
     /// <summary>
     /// Gets whether runtime GLSL→SPIR-V compilation is available on this
     /// host. Returns <c>false</c> when libshaderc cannot be loaded — which
@@ -175,8 +183,10 @@ public sealed unsafe partial class VulkanBackend : IDirectGpuBackend, IGpuBatchE
 
         if (!VulkanNativeBindings.IsPlatformSupported)
         {
+            _platformFailure = "The Vulkan loader (vulkan-1) could not be loaded.";
             return false;
         }
+        _platformFailure = string.Empty;
 
         if (!_device.Initialize())
         {

@@ -354,6 +354,26 @@ jobs:
           echo "::warning::Intel SDE download/extract failed for all mirrors (Intel rotated the URL). Skipping the SDE-emulated AVX-512 verification — the native --verify-microkernels above still ran. Update SDE_URLS in .github/workflows/build.yml with a current mirror link to re-enable it."
         fi
 
+    # #685: without AVX-512 hardware the machine-kernel GEMM tests above SKIP their AVX-512 cases, so
+    # the hand-emitted 6x32 kernel and the AVX-512 GEMM paths went unverified on almost every run
+    # (AVX512_RUNNER is unset; 57 of 60 recent jobs landed on non-AVX-512 runners). Run those same
+    # tests under the SDE fetched above, which emulates Sapphire Rapids, so they execute instead of
+    # skipping. Measured locally: ~17 min per pass, 25/25 run with 0 skipped.
+    - name: Run AVX-512 GEMM tests under Intel SDE (non-AVX-512 runners)
+      run: |
+        set -uo pipefail
+        if lscpu | grep -qiw avx512f; then
+          echo "Runner has AVX-512; the native run above already executed these tests."
+          exit 0
+        fi
+        if [ ! -x "$RUNNER_TEMP/sde/sde64" ]; then
+          echo "::warning::Intel SDE unavailable; the AVX-512 GEMM tests did NOT run on this job (#685)."
+          exit 0
+        fi
+        export DOTNET_EnableWriteXorExecute=0
+        "$RUNNER_TEMP/sde/sde64" -spr -- dotnet test tests/AiDotNet.Tensors.Tests/AiDotNet.Tensors.Tests.csproj \
+          --configuration Release --no-build --framework net10.0 \
+          --filter "FullyQualifiedName~MachineKernelGemmTests"
     # Sub-S (#409) S.4: report the per-microkernel GFLOPS (% of a measured register-FMA
     # ceiling) on this runner. On a real AVX-512 runner this prints the Avx512Fp32_16x16 /
     # 8x32 / Avx512Fp64_8x16 numbers we cannot measure on AVX2-only dev boxes (SDE GFLOPS

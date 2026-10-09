@@ -344,6 +344,18 @@ internal static class BackwardFunctions<T>
         DifferentiableOps.AccumulateGrad(grads, x, grad, engine);
     }
 
+    /// <summary>d(atanh(x))/dx = grad / (1 - x^2)</summary>
+    internal static void AtanhBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var x = inputs[0];
+        var denominator = engine.ScalarMinusTensor(numOps.One, engine.TensorMultiply(x, x));
+        var grad = engine.TensorDivide(gradOutput, denominator);
+        DifferentiableOps.AccumulateGrad(grads, x, grad, engine);
+    }
+
     /// <summary>
     /// d(atan2(y, x))/dy = grad * x / (x^2 + y^2), d/dx = -grad * y / (x^2 + y^2).
     /// </summary>

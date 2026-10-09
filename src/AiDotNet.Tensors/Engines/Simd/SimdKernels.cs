@@ -1517,13 +1517,114 @@ namespace AiDotNet.Tensors.Engines.Simd
 #endif
 
             // The former 2*FastSigmoid256(2*x)-1 path cancelled near zero and exceeded the
-            // public parity contract by hundreds of ULP. Keep VML above when available; the
-            // portable path must use libm until an equivalently accurate vector approximation exists.
-            for (int i = 0; i < length; i++)
+            // public parity contract by hundreds of ULP. AccurateTanh256 avoids that cancellation
+            // (Cephes tanhf: an odd polynomial below |x| = 0.625, 1 - 2/(e^2|x| + 1) above it, with
+            // a minimax exp), so the portable path no longer falls back to a scalar MathF.Tanh loop,
+            // which ran 10-16x slower than the other activations when MKL VML is absent.
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx2.IsSupported && Fma.IsSupported)
+            {
+                int simdLength = length & ~7;
+                for (; i < simdLength; i += 8)
+                    Avx.Store(output + i, AccurateTanh256(Avx.LoadVector256(input + i)));
+                // The last 1-7 elements go through the same kernel via a padded block, so an element's
+                // result never depends on its position in the buffer.
+                if (i < length)
+                {
+                    float* block = stackalloc float[8];
+                    int rem = length - i;
+                    for (int j = 0; j < 8; j++) block[j] = j < rem ? input[i + j] : 0f;
+                    Avx.Store(block, AccurateTanh256(Avx.LoadVector256(block)));
+                    for (int j = 0; j < rem; j++) output[i + j] = block[j];
+                    i = length;
+                }
+            }
+#endif
+            for (; i < length; i++)
             {
                 output[i] = MathF.Tanh(input[i]);
             }
         }
+
+#if NET5_0_OR_GREATER
+        /// <summary>
+        /// tanh for 8 floats within a few ULP of <see cref="Math.Tanh(double)"/> (the op-parity budget is 16).
+        /// Cephes tanhf: below |x| = 0.625 the odd polynomial x + x^3 P(x^2) has no cancellation; above it
+        /// 1 - 2/(e^(2|x|) + 1) loses nothing because the result is at least 0.55, and |x| >= 10 rounds to +/-1.
+        /// </summary>
+        [MethodImpl(HotInline)]
+        internal static Vector256<float> AccurateTanh256(Vector256<float> x)
+        {
+            var signMask = Vector256.Create(-0.0f);
+            var sign = Avx.And(x, signMask);
+            var ax = Avx.AndNot(signMask, x);
+
+            // |x| < 0.625: |x| + |x| * z * P(z), z = x^2 (Cephes tanhf coefficients), then the sign of x.
+            // Evaluating on |x| keeps tanh(-0) = -0; the FMA on x itself rounded -0 to +0.
+            var z = Avx.Multiply(x, x);
+            var p = Fma.MultiplyAdd(Vector256.Create(-5.70498872745E-3f), z, Vector256.Create(2.06390887954E-2f));
+            p = Fma.MultiplyAdd(p, z, Vector256.Create(-5.37397155531E-2f));
+            p = Fma.MultiplyAdd(p, z, Vector256.Create(1.33314422036E-1f));
+            p = Fma.MultiplyAdd(p, z, Vector256.Create(-3.33332819422E-1f));
+            var small = Avx.Or(Fma.MultiplyAdd(Avx.Multiply(ax, z), p, ax), sign);
+
+            // |x| >= 0.625: 1 - 2 / (exp(2|x|) + 1). Clamping at 10, where float tanh is exactly 1, keeps
+            // tanh(9) = 0.99999994 exact and sends +/-infinity to +/-1.
+            var t = Avx.Min(ax, Vector256.Create(10.0f));
+            var e = AccurateExp256(Avx.Add(t, t));
+            var large = Avx.Subtract(Vector256.Create(1.0f),
+                Avx.Divide(Vector256.Create(2.0f), Avx.Add(e, Vector256.Create(1.0f))));
+            large = Avx.Or(large, sign);
+
+            var result = Avx.BlendVariable(large, small, Avx.CompareLessThan(ax, Vector256.Create(0.625f)));
+            // NaN in, NaN out (Min above would have turned it into a finite value).
+            return Avx.BlendVariable(result, x, Avx.CompareUnordered(x, x));
+        }
+
+        /// <summary>
+        /// Mish for 8 floats: x * tanh(softplus(x)) = x * n / (n + 2), n = e^x (e^x + 2). The identity
+        /// has no cancellation, so the error is the exp's plus a few roundings. x > 20 returns x (tanh of
+        /// the softplus rounds to 1); x below -80 returns -0, where |mish| has underflowed (mish(-inf) = -0).
+        /// </summary>
+        [MethodImpl(HotInline)]
+        internal static Vector256<float> AccurateMish256(Vector256<float> x)
+        {
+            var xc = Avx.Max(Avx.Min(x, Vector256.Create(AccurateExpMax)), Vector256.Create(AccurateExpMin));
+            var e = AccurateExp256(xc);
+            var n = Avx.Multiply(e, Avx.Add(e, Vector256.Create(2.0f)));
+            var mish = Avx.Multiply(x, Avx.Divide(n, Avx.Add(n, Vector256.Create(2.0f))));
+            var result = Avx.BlendVariable(mish, x, Avx.CompareGreaterThan(x, Vector256.Create(AccurateExpMax)));
+            // Below -80, |mish| underflows to zero; x * n/(n+2) would give -infinity at x = -infinity.
+            result = Avx.BlendVariable(result, Vector256.Create(-0.0f), Avx.CompareLessThan(x, Vector256.Create(AccurateExpMin)));
+            return Avx.BlendVariable(result, x, Avx.CompareUnordered(x, x));
+        }
+        /// <summary>
+        /// exp for 8 floats in [-80, 20] to about 1 ULP: Cephes expf (Cody-Waite ln2 split, minimax degree-5
+        /// polynomial). Inputs outside [<see cref="AccurateExpMin"/>, <see cref="AccurateExpMax"/>] are clamped
+        /// to that range, which keeps the 2^n reconstruction a normal float.
+        /// </summary>
+        private const float AccurateExpMin = -80.0f;
+        private const float AccurateExpMax = 20.0f;
+
+        [MethodImpl(HotInline)]
+        private static Vector256<float> AccurateExp256(Vector256<float> x)
+        {
+            x = Avx.Max(Avx.Min(x, Vector256.Create(AccurateExpMax)), Vector256.Create(AccurateExpMin));
+            var n = Avx.RoundToNearestInteger(Avx.Multiply(x, Vector256.Create(1.44269504088896341f)));
+            var r = Fma.MultiplyAddNegated(n, Vector256.Create(0.693359375f), x);
+            r = Fma.MultiplyAddNegated(n, Vector256.Create(-2.12194440e-4f), r);
+            var p = Fma.MultiplyAdd(Vector256.Create(1.9875691500E-4f), r, Vector256.Create(1.3981999507E-3f));
+            p = Fma.MultiplyAdd(p, r, Vector256.Create(8.3334519073E-3f));
+            p = Fma.MultiplyAdd(p, r, Vector256.Create(4.1665795894E-2f));
+            p = Fma.MultiplyAdd(p, r, Vector256.Create(1.6666665459E-1f));
+            p = Fma.MultiplyAdd(p, r, Vector256.Create(5.0000001201E-1f));
+            var r2 = Avx.Multiply(r, r);
+            var poly = Avx.Add(Fma.MultiplyAdd(p, r2, r), Vector256.Create(1.0f));
+            var pow2n = Avx2.ShiftLeftLogical(Avx2.Add(Avx.ConvertToVector256Int32(n), Vector256.Create(127)), 23).AsSingle();
+            return Avx.Multiply(poly, pow2n);
+        }
+#endif
 
         /// <summary>
         /// Pointer-based LeakyReLU — max(alpha*x, x) with zero bounds-checking.
@@ -1672,9 +1773,28 @@ namespace AiDotNet.Tensors.Engines.Simd
         public static unsafe void MishUnsafe(float* input, float* output, int length)
         {
             // FastExp/FastLog plus the sigmoid tanh identity accumulated errors far beyond
-            // Mish's 64-ULP contract. Preserve the stable large-positive branch and use libm
-            // for the portable implementation until an accuracy-bounded SIMD kernel exists.
-            for (int i = 0; i < length; i++)
+            // Mish's 64-ULP contract. The vector path uses tanh(softplus(x)) = n / (n + 2) with
+            // n = e^x (e^x + 2), which has no cancellation, and the accurate exp from AccurateTanh256.
+            int i = 0;
+#if NET5_0_OR_GREATER
+            if (Avx2.IsSupported && Fma.IsSupported)
+            {
+                int simdLength = length & ~7;
+                for (; i < simdLength; i += 8)
+                    Avx.Store(output + i, AccurateMish256(Avx.LoadVector256(input + i)));
+                // Same padded-block tail as TanhUnsafe: one kernel for every element.
+                if (i < length)
+                {
+                    float* block = stackalloc float[8];
+                    int rem = length - i;
+                    for (int j = 0; j < 8; j++) block[j] = j < rem ? input[i + j] : 0f;
+                    Avx.Store(block, AccurateMish256(Avx.LoadVector256(block)));
+                    for (int j = 0; j < rem; j++) output[i + j] = block[j];
+                    i = length;
+                }
+            }
+#endif
+            for (; i < length; i++)
             {
                 float x = input[i];
                 float sp = x > 20f ? x : MathF.Log(1f + MathF.Exp(x));

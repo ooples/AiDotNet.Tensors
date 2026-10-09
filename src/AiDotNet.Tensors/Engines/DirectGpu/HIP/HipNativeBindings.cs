@@ -184,12 +184,6 @@ internal static class HipNativeBindings
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern IntPtr AddDllDirectory(string lpPathName);
 
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool SetDefaultDllDirectories(uint directoryFlags);
-
-    private const uint LOAD_LIBRARY_SEARCH_DEFAULT_DIRS = 0x00001000;
-    private const uint LOAD_LIBRARY_SEARCH_USER_DIRS = 0x00000400;
-
 #if NET5_0_OR_GREATER
     static HipNativeBindings()
     {
@@ -223,8 +217,12 @@ internal static class HipNativeBindings
                 if (System.IO.Directory.Exists(binPath))
                 {
                     RocmBinPath = binPath;
-                    // Enable user-defined DLL directories
-                    SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | LOAD_LIBRARY_SEARCH_USER_DIRS);
+                    // No SetDefaultDllDirectories here. It is process-wide and sticky: once called, a
+                    // plain-name load such as NativeLibrary.TryLoad("vulkan-1") failed for the rest of the
+                    // process, so on a machine with ROCm installed, touching HIP first made Vulkan report
+                    // "unavailable" (#1027: 13 Vulkan tests skipped whenever a HIP test ran first). The ROCm
+                    // resolver loads HIP libraries by full path, which resolves their dependencies from the
+                    // same directory, so the process-wide search order is never needed.
 
                     // Add ROCm bin directory to search path
                     var result = AddDllDirectory(binPath);

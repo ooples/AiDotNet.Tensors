@@ -2103,10 +2103,10 @@ public interface IDirectGpuBackend : IDisposable
     /// <summary>Logical NOT on a float-0/1 mask.</summary>
     void LogicalNot(IGpuBuffer a, IGpuBuffer output, int n);
 
-    /// <summary>GridSample bilinear backward-to-input (NHWC, zeros pad). gradIn pre-zeroed.</summary>
+    /// <summary>GridSample bilinear backward-to-input, zeros pad. gradOut and gradIn are NCHW despite the historical Nhwc suffix. gradIn pre-zeroed.</summary>
     void GridSampleBackwardInputNhwc(IGpuBuffer gradOut, IGpuBuffer grid, IGpuBuffer gradIn, int batch, int h, int w, int c, int outH, int outW);
 
-    /// <summary>GridSample bilinear backward-to-grid (NHWC). gradGrid is [batch,outH,outW,2].</summary>
+    /// <summary>GridSample bilinear backward-to-grid. gradOut and input are NCHW despite the historical Nhwc suffix; gradGrid is [batch,outH,outW,2].</summary>
     void GridSampleBackwardGridNhwc(IGpuBuffer gradOut, IGpuBuffer input, IGpuBuffer grid, IGpuBuffer gradGrid, int batch, int h, int w, int c, int outH, int outW);
 
     /// <summary>
