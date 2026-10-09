@@ -28557,12 +28557,10 @@ public partial class CpuEngine : ITensorLevelEngine
             return resultFCast;
         }
 
-        // Double-precision fast path mirrors the float version. Uses
-        // MatrixMultiplyHelper.MultiplyBlocked as the GEMM kernel — the helper's
-        // numOps.MultiplyAdd inner kernel dispatches to SimdKernels'
-        // AVX2/FMA Vector256<double> path, so each per-head GEMM runs at SIMD
-        // throughput instead of the scalar virtual-dispatch triple-loop the
-        // generic-T fallback below would otherwise hit. For Pika21 / DiT-XL at
+        // Double-precision fast path mirrors the float version: a fused per-row
+        // SIMD kernel for short sequences / small heads, sequential SIMD DGEMMs
+        // per head otherwise -- instead of the scalar virtual-dispatch triple-loop
+        // the generic-T fallback below would otherwise hit. For Pika21 / DiT-XL at
         // double precision this collapses ~75M scalar virtual FMAs per SDPA
         // call (× 24-28 blocks × 50 inference steps) into batched SIMD GEMMs.
         if (typeof(T) == typeof(double))
@@ -29100,6 +29098,19 @@ public partial class CpuEngine : ITensorLevelEngine
         });
     }
 
+    private static void SdpaAxpy(Span<double> y, double alpha, double[] x, int xOff)
+    {
+        int n = y.Length, i = 0;
+        if (System.Numerics.Vector.IsHardwareAccelerated && n >= System.Numerics.Vector<double>.Count)
+        {
+            var va = new System.Numerics.Vector<double>(alpha);
+            int w = System.Numerics.Vector<double>.Count;
+            var yv = System.Runtime.InteropServices.MemoryMarshal.Cast<double, System.Numerics.Vector<double>>(y);
+            for (int k = 0; k < yv.Length; k++, i += w) yv[k] += va * new System.Numerics.Vector<double>(x, xOff + i);
+        }
+        for (; i < n; i++) y[i] += alpha * x[xOff + i];
+    }
+
     /// <summary>
     /// SIMD-backed double-precision fast path for <see cref="ScaledDotProductAttention{T}"/>.
     /// Replaces the scalar virtual-dispatch triple-loop with two SIMD-blocked DGEMMs per head
@@ -29109,8 +29120,9 @@ public partial class CpuEngine : ITensorLevelEngine
     /// numOps.MultiplyAdd dispatches to SimdKernels' AVX2/FMA Vector256&lt;double&gt; kernel.
     /// <para>
     /// Mirrors the structure of <see cref="ScaledDotProductAttentionFloat"/> exactly so the
-    /// two paths stay easy to keep in sync. The K^T transpose is materialized into a per-head
-    /// scratch buffer because MultiplyBlocked has no transposed-B variant.
+    /// two paths stay easy to keep in sync. Short sequences with small heads (d_k, d_v &lt;= 64,
+    /// seq_k &lt;= 256) run a fused per-row SIMD kernel; larger ones materialize K^T per head and
+    /// run two sequential SIMD DGEMMs.
     /// </para>
     /// </summary>
     private Tensor<double> ScaledDotProductAttentionDouble(
@@ -29132,7 +29144,6 @@ public partial class CpuEngine : ITensorLevelEngine
         var qd = query.GetFlattenedData();
         var kd = key.GetFlattenedData();
         var vd = value.GetFlattenedData();
-        var doubleOps = MathHelper.GetNumericOperations<double>();
 
         // scoresData is internal scratch — rent from ArrayPool to amortize the
         // per-call allocation across the SDPA hot path (24-28 calls per DiT
@@ -29141,11 +29152,21 @@ public partial class CpuEngine : ITensorLevelEngine
         var scoresData = System.Buffers.ArrayPool<double>.Shared.Rent(scoresLen);
         try
         {
-            var weightsData = new double[scoresLen];
-            var outputData = new double[bhCount * seqQ * d_v];
+            // Both outputs are rented UNINITIALIZED: softmax writes every weight (a fully masked row writes zeros) and
+            // the sequential DGEMM overwrites every output element. A fresh `new double[]` per call zero-filled the
+            // [batch, heads, seqQ, seqK] weights plane (4.7 MB at [256, 4, 24, 24]) on the large-object heap.
+            var weightsTensor = TensorAllocator.RentUninitialized<double>(new[] { batch, heads, seqQ, seqK });
+            var outputTensor = TensorAllocator.RentUninitialized<double>(new[] { batch, heads, seqQ, d_v });
+            double[]? liveWeights = weightsTensor.GetLiveBackingArrayAllowingPaddingOrNull();
+            double[]? liveOutput = outputTensor.GetLiveBackingArrayAllowingPaddingOrNull();
+            bool weightsLive = liveWeights is not null, outputLive = liveOutput is not null;
+            double[] weightsData = liveWeights ?? new double[scoresLen];
+            double[] outputData = liveOutput ?? new double[bhCount * seqQ * d_v];
             double negInfD = double.NegativeInfinity;
 
-            CpuParallelSettings.ParallelForOrSerial(0, bhCount, (long)bhCount * seqQ * d_k, bh =>
+            // Work = both GEMMs per head (scores and output), not just the Q read: the old estimate left small-batch
+            // attention ([32, 4, 24, 8]) serial.
+            CpuParallelSettings.ParallelForOrSerial(0, bhCount, (long)bhCount * seqQ * seqK * (d_k + d_v), bh =>
             {
                 int b = bh / heads;
                 int h = bh % heads;
@@ -29166,6 +29187,59 @@ public partial class CpuEngine : ITensorLevelEngine
                 int kOff = bh * seqK * d_k;
                 int sOff = bh * seqQ * seqK;
 
+                // Short-sequence / small-head fast path: per head, K is transposed once and each query row's scores are
+                // built as d_k SIMD axpys over the seq_k axis (no per-score horizontal reductions), then scaled, maxed,
+                // exponentiated (SimdKernels.Exp, ~1e-16 rel.), normalized, and turned into the output row as SIMD axpys
+                // of the V rows. The GEMM path below runs two tiny GEMMs per head, whose packing and dispatch dominate at
+                // these sizes. Same math as below: fully masked rows give zero weights and a zero output row.
+                if (d_k <= 64 && d_v <= 64 && seqK <= 256)
+                {
+                    int vBase = bh * seqK * d_v, oBase = bh * seqQ * d_v;
+                    var ktRow = System.Buffers.ArrayPool<double>.Shared.Rent(d_k * seqK);
+                    try
+                    {
+                        for (int j2 = 0; j2 < seqK; j2++)
+                            for (int d = 0; d < d_k; d++)
+                                ktRow[d * seqK + j2] = kd[kOff + j2 * d_k + d];
+                        bool plain = mask is null && softcap <= 0.0;
+                        for (int i = 0; i < seqQ; i++)
+                        {
+                            int qRow = qOff + i * d_k, wRow = sOff + i * seqK, oRow = oBase + i * d_v;
+                            var srow = new Span<double>(weightsData, wRow, seqK);
+                            srow.Clear();
+                            for (int d = 0; d < d_k; d++) SdpaAxpy(srow, qd[qRow + d], ktRow, d * seqK);
+                            double maxVal;
+                            if (plain)
+                            {
+                                Simd.SimdKernels.MultiplyScalar(srow, scaleValue, srow);
+                                maxVal = Simd.SimdKernels.Max(srow);
+                            }
+                            else
+                            {
+                                maxVal = negInfD;
+                                for (int j2 = 0; j2 < seqK; j2++)
+                                {
+                                    double v = srow[j2] * scaleValue;
+                                    if (softcap > 0.0) v = softcap * Math.Tanh(v / softcap);
+                                    if (mask != null && !mask[mskb, mskh, BroadcastMaskIndex(i, mskQ), BroadcastMaskIndex(j2, mskK)]) v = negInfD;
+                                    if (v > maxVal) maxVal = v;
+                                    srow[j2] = v;
+                                }
+                            }
+                            var oSpan = new Span<double>(outputData, oRow, d_v);
+                            oSpan.Clear();
+                            if (double.IsNegativeInfinity(maxVal)) { srow.Clear(); continue; }
+                            Simd.SimdKernels.AddScalar(srow, -maxVal, srow);
+                            Simd.SimdKernels.Exp(srow, srow);
+                            double sumExp = Simd.SimdKernels.Sum(srow);
+                            Simd.SimdKernels.MultiplyScalar(srow, sumExp != 0d ? 1d / sumExp : 0d, srow);
+                            for (int j2 = 0; j2 < seqK; j2++) SdpaAxpy(oSpan, srow[j2], vd, vBase + j2 * d_v);
+                        }
+                    }
+                    finally { System.Buffers.ArrayPool<double>.Shared.Return(ktRow, clearArray: false); }
+                    return;
+                }
+
                 // ──── Step 1: scores = Q @ K^T.
                 // MultiplyBlocked has no transposed-B variant, so materialize K^T
                 // into a per-head scratch buffer rented from ArrayPool. allowParallel:
@@ -29177,16 +29251,13 @@ public partial class CpuEngine : ITensorLevelEngine
                         for (int j = 0; j < d_k; j++)
                             kt[j * seqK + i] = kd[kOff + i * d_k + j];
 
-                    var scoresSlice = new Memory<double>(scoresData, sOff, seqQ * seqK);
-                    scoresSlice.Span.Clear();
-                    MatrixMultiplyHelper.MultiplyBlocked(
-                        doubleOps,
-                        new ReadOnlyMemory<double>(qd, qOff, seqQ * d_k),
-                        new ReadOnlyMemory<double>(kt, 0, d_k * seqK),
-                        scoresSlice,
-                        seqQ, d_k, seqK,
-                        d_k, seqK, seqK,
-                        allowParallel: false);
+                    // SIMD sequential DGEMM (clears its output); the generic MultiplyBlocked here ran every
+                    // multiply-add through INumericOperations and was most of a double SDPA forward.
+                    Simd.SimdGemm.DgemmSequential(
+                        new ReadOnlySpan<double>(qd, qOff, seqQ * d_k),
+                        new ReadOnlySpan<double>(kt, 0, d_k * seqK),
+                        new Span<double>(scoresData, sOff, seqQ * seqK),
+                        seqQ, d_k, seqK);
                 }
                 finally { System.Buffers.ArrayPool<double>.Shared.Return(kt, clearArray: false); }
 
@@ -29226,24 +29297,19 @@ public partial class CpuEngine : ITensorLevelEngine
                 int wOff = bh * seqQ * seqK;
                 int vOff = bh * seqK * d_v;
                 int oOff = bh * seqQ * d_v;
-                var outSlice = new Memory<double>(outputData, oOff, seqQ * d_v);
-                outSlice.Span.Clear();
-                MatrixMultiplyHelper.MultiplyBlocked(
-                    doubleOps,
-                    new ReadOnlyMemory<double>(weightsData, wOff, seqQ * seqK),
-                    new ReadOnlyMemory<double>(vd, vOff, seqK * d_v),
-                    outSlice,
-                    seqQ, seqK, d_v,
-                    seqK, d_v, d_v,
-                    allowParallel: false);
+                Simd.SimdGemm.DgemmSequential(
+                    new ReadOnlySpan<double>(weightsData, wOff, seqQ * seqK),
+                    new ReadOnlySpan<double>(vd, vOff, seqK * d_v),
+                    new Span<double>(outputData, oOff, seqQ * d_v),
+                    seqQ, seqK, d_v);
             });
 
-            attentionWeights = TensorAllocator.Rent<double>(
-                new[] { batch, heads, seqQ, seqK },
-                new Vector<double>(weightsData));
-            return TensorAllocator.Rent<double>(
-                new[] { batch, heads, seqQ, d_v },
-                new Vector<double>(outputData));
+            attentionWeights = weightsLive
+                ? weightsTensor
+                : TensorAllocator.Rent<double>(new[] { batch, heads, seqQ, seqK }, new Vector<double>(weightsData));
+            if (weightsLive) weightsTensor.IncrementVersion();
+            if (outputLive) { outputTensor.IncrementVersion(); return outputTensor; }
+            return TensorAllocator.Rent<double>(new[] { batch, heads, seqQ, d_v }, new Vector<double>(outputData));
         }
         finally
         {

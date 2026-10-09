@@ -96,6 +96,57 @@ public class SdpaDoubleFastPathTests
         return output;
     }
 
+    /// <summary>
+    /// Masked double SDPA (a causal [1, 1, seqQ, seqK] mask with query row 1 fully masked) must match a scalar reference
+    /// for both the output and the returned attention weights, on the fused short-sequence path (24 x 8) and the GEMM
+    /// path (seqK 300, d 96). A fully masked row has zero weights and a zero output row.
+    /// </summary>
+    [Theory]
+    [InlineData(3, 4, 24, 24, 8, 8)]
+    [InlineData(1, 2, 10, 300, 96, 96)]
+    public void SdpaDouble_Masked_MatchesReference(int batch, int heads, int seqQ, int seqK, int d_k, int d_v)
+    {
+        var rng = new Random(7);
+        double[] Rand(int n) { var a = new double[n]; for (int i = 0; i < n; i++) a[i] = rng.NextDouble() * 2 - 1; return a; }
+        var qData = Rand(batch * heads * seqQ * d_k); var kData = Rand(batch * heads * seqK * d_k); var vData = Rand(batch * heads * seqK * d_v);
+        var mask = new Tensor<bool>(new[] { 1, 1, seqQ, seqK });
+        for (int i = 0; i < seqQ; i++)
+            for (int j = 0; j < seqK; j++)
+                mask[0, 0, i, j] = i != 1 && j <= i + (seqK - seqQ);   // causal, row 1 fully masked
+        double scale = 1.0 / Math.Sqrt(d_k);
+
+        var actual = _engine.ScaledDotProductAttention(
+            new Tensor<double>(qData, new[] { batch, heads, seqQ, d_k }),
+            new Tensor<double>(kData, new[] { batch, heads, seqK, d_k }),
+            new Tensor<double>(vData, new[] { batch, heads, seqK, d_v }),
+            mask, scale, out var weights);
+        var outData = actual.GetDataArray(); var wData = weights.GetDataArray();
+
+        for (int bh = 0; bh < batch * heads; bh++)
+            for (int i = 0; i < seqQ; i++)
+            {
+                var w = new double[seqK]; double max = double.NegativeInfinity;
+                for (int j = 0; j < seqK; j++)
+                {
+                    double s = 0; for (int d = 0; d < d_k; d++) s += qData[(bh * seqQ + i) * d_k + d] * kData[(bh * seqK + j) * d_k + d];
+                    w[j] = mask[0, 0, i, j] ? s * scale : double.NegativeInfinity;
+                    if (w[j] > max) max = w[j];
+                }
+                double sum = 0;
+                for (int j = 0; j < seqK; j++) { w[j] = double.IsNegativeInfinity(max) ? 0 : Math.Exp(w[j] - max); sum += w[j]; }
+                for (int j = 0; j < seqK; j++)
+                {
+                    if (sum != 0) w[j] /= sum;
+                    Assert.True(Math.Abs(w[j] - wData[(bh * seqQ + i) * seqK + j]) <= 1e-12, $"weight bh={bh} i={i} j={j}");
+                }
+                for (int d = 0; d < d_v; d++)
+                {
+                    double o = 0; for (int j = 0; j < seqK; j++) o += w[j] * vData[(bh * seqK + j) * d_v + d];
+                    Assert.True(Math.Abs(o - outData[(bh * seqQ + i) * d_v + d]) <= 1e-12, $"output bh={bh} i={i} d={d}");
+                }
+            }
+    }
+
     [Theory]
     [InlineData(1, 1, 4, 4, 8, 8)]      // tiny
     [InlineData(1, 2, 8, 8, 16, 16)]    // multi-head, small
