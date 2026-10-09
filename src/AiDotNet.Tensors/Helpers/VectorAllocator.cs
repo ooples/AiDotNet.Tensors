@@ -25,6 +25,12 @@ public static class VectorAllocator
     /// </summary>
     public const int ArrayPoolThresholdValue = ArrayPoolThreshold;
 
+    // Pooled from the element-count threshold, or from the size whose results the tracker recycles (the large-object
+    // threshold by default), so a 2 MB double result (250K elements) is pooled and recycled like a larger one.
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static bool UsesPool<T>(int elements)
+        => elements >= ArrayPoolThreshold || ResultBufferTracker.Qualifies<T>(elements);
+
     /// <summary>
     /// Creates a zero-initialized vector with the given length.
     /// Large vectors use ArrayPool to reduce GC pressure; small-medium vectors
@@ -62,7 +68,7 @@ public static class VectorAllocator
         }
 
         // Tier 2: ArrayPool for large allocations.
-        if (length >= ArrayPoolThreshold)
+        if (UsesPool<T>(length))
         {
             T[] pooled = ThreadLocalTensorCache<T>.RentOrAllocateExact(length);
             Array.Clear(pooled, 0,
@@ -120,7 +126,7 @@ public static class VectorAllocator
         }
 
 #if NET5_0_OR_GREATER
-        if (length >= ArrayPoolThreshold)
+        if (UsesPool<T>(length))
         {
             T[] pooled = ThreadLocalTensorCache<T>.RentOrAllocateExact(length);
             if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
@@ -155,7 +161,7 @@ public static class VectorAllocator
             return Vector<T>.FromMemory(clone);
         }
 
-        if (length >= ArrayPoolThreshold)
+        if (UsesPool<T>(length))
         {
             T[] pooled = ThreadLocalTensorCache<T>.RentOrAllocateExact(length);
             data.AsSpan().CopyTo(pooled.AsSpan(0, length));

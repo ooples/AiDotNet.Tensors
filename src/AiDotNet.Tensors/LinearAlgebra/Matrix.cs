@@ -91,6 +91,9 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     {
         var matrix = new Matrix<T>(memory, rows, cols);
         matrix.SetPooledArray(pooledArray);
+        // This result owns the pooled array: if it is never returned explicitly, the tracker hands the array back to the
+        // cache once this result (and every zero-copy view of it) has been collected.
+        matrix.ResultOwner = Helpers.ResultBufferTracker.Track(pooledArray);
         return matrix;
     }
 

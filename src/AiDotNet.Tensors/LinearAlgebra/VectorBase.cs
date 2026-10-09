@@ -125,6 +125,12 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     private T[]? _pooledArray;
 
     /// <summary>
+    /// The owner of this vector's array when it is a tracked result buffer (see <see cref="Helpers.ResultBufferTracker"/>).
+    /// Holding it keeps the array from being recycled while this vector exists; null otherwise.
+    /// </summary>
+    internal Helpers.ResultBufferOwner? ResultOwner;
+
+    /// <summary>
     /// Gets the pooled array backing this vector, or null if not pooled.
     /// </summary>
     internal T[]? PooledArray => _pooledArray;
@@ -218,6 +224,8 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     {
         _memory = memory;
         _logicalLength = memory.Length;
+        // A zero-copy wrap of a tracked result's array (of any type, at any offset) shares that result's owner.
+        ResultOwner = Helpers.ResultBufferTracker.Find((ReadOnlyMemory<T>)memory);
         if (MemoryMarshal.TryGetArray((ReadOnlyMemory<T>)memory, out var segment)
             && segment.Array is not null && segment.Offset == 0)
         {

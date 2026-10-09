@@ -265,6 +265,9 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     {
         var vector = new Vector<T>(memory, false);
         vector.SetPooledArray(pooledArray);
+        // This result owns the pooled array: if it is never returned explicitly, the tracker hands the array back to the
+        // cache once this result (and every zero-copy view of it) has been collected.
+        vector.ResultOwner = Helpers.ResultBufferTracker.Track(pooledArray);
         return vector;
     }
 

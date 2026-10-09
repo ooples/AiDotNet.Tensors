@@ -76,6 +76,12 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     private T[]? _pooledArray;
 
     /// <summary>
+    /// The owner of this matrix's array when it is a tracked result buffer (see <see cref="Helpers.ResultBufferTracker"/>).
+    /// Holding it keeps the array from being recycled while this matrix exists; null otherwise.
+    /// </summary>
+    internal Helpers.ResultBufferOwner? ResultOwner;
+
+    /// <summary>
     /// Gets the pooled array backing this matrix, or null if not pooled.
     /// </summary>
     internal T[]? PooledArray => _pooledArray;
@@ -270,6 +276,8 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
         this._rows = rows;
         this._cols = cols;
         this._memory = memory;
+        // A zero-copy wrap of a tracked result's array (of any type, at any offset) shares that result's owner.
+        this.ResultOwner = Helpers.ResultBufferTracker.Find((ReadOnlyMemory<T>)memory);
         if (MemoryMarshal.TryGetArray((ReadOnlyMemory<T>)memory, out var segment)
             && segment.Array is not null && segment.Offset == 0)
         {

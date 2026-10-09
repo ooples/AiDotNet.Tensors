@@ -854,6 +854,9 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     internal static Tensor<T> FromPooledMemory(Memory<T> memory, int[] dimensions, T[] pooledArray)
     {
         var vector = Vector<T>.FromMemory(memory);
+        // This result owns the pooled array: if it is never returned explicitly, the tracker hands the array back to the
+        // cache once this tensor, its views (which share this vector through the storage) and any zero-copy wraps has been collected.
+        vector.ResultOwner = Helpers.ResultBufferTracker.Track(pooledArray);
         var tensor = new Tensor<T>(vector, dimensions);
         tensor._pooledArray = pooledArray;
         return tensor;
