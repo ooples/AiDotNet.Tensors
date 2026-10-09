@@ -103,9 +103,12 @@ public partial class CpuEngine
         // Conv2DWithIm2ColFloat), with the epilogue handed to it; any other layout or geometry keeps the two-pass form.
         // A conv DispatchFloatConv2D sends to the batch-wide GEMM goes through Conv2DInto too, so the fused plan
         // computes the same convolution, bit for bit, as the unfused one.
+        // The direct blocked kernel is DispatchFloatConv2D's first choice, so a conv it takes goes through Conv2DInto too.
         bool batchedRoute = input.Layout == LinearAlgebra.TensorLayout.Nchw
-            && UseBatchedConvForward(input._shape[0], input._shape[1], kernelHeight, kernelWidth,
-                strideH, strideW, outputHeight, outputWidth, kernel._shape[0]);
+            && (Engines.Simd.DirectConvAvx2.ShouldUseForward(input._shape[0], input._shape[1], kernel._shape[0],
+                    kernelHeight, kernelWidth, strideH, strideW, outputHeight, outputWidth)
+                || UseBatchedConvForward(input._shape[0], input._shape[1], kernelHeight, kernelWidth,
+                    strideH, strideW, outputHeight, outputWidth, kernel._shape[0]));
         bool adaptiveRoute = !batchedRoute
             && input.IsContiguous && kernel.IsContiguous && output.IsContiguous && bias.IsContiguous
             && input.Layout == LinearAlgebra.TensorLayout.Nchw

@@ -10215,6 +10215,17 @@ public partial class CpuEngine : ITensorLevelEngine
         int outputHeight,
         int outputWidth)
     {
+#if NET5_0_OR_GREATER
+        if (input.Layout == LinearAlgebra.TensorLayout.Nchw
+            && Simd.DirectConvAvx2.ShouldUseForward(batch, inChannels, outChannels, kernelHeight, kernelWidth, strideH, strideW, outputHeight, outputWidth))
+        {
+            Simd.DirectConvAvx2.Forward(
+                inputData ?? input.GetReadOnlyDataArray(), 0, kernelData ?? kernel.GetReadOnlyDataArray(), 0, outputData ?? output.GetDataArray(), 0,
+                accumulate: false, batch, inChannels, height, width, outChannels, kernelHeight, kernelWidth,
+                strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth);
+            return;
+        }
+#endif
         if (input.Layout == LinearAlgebra.TensorLayout.Nchw
             && UseBatchedConvForward(batch, inChannels, kernelHeight, kernelWidth, strideH, strideW, outputHeight, outputWidth, outChannels))
         {
@@ -15315,6 +15326,18 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(float))
         {
+#if NET5_0_OR_GREATER
+            if (Simd.DirectConvAvx2.ShouldUseBackwardInput(batch, inChannels, outChannels, kernelHeight, kernelWidth,
+                    strideH, strideW, padH, padW, dilationH, dilationW))
+            {
+                Simd.DirectConvAvx2.BackwardInput(
+                    (float[])(object)gradOutput.GetFlattenedData(), 0, (float[])(object)kernel.GetFlattenedData(), 0,
+                    (float[])(object)dest._storage.GetDataArray(), dest._storageOffset, accumulate,
+                    batch, inChannels, height, width, outChannels, kernelHeight, kernelWidth,
+                    padH, padW, outputHeight, outputWidth);
+                return;
+            }
+#endif
             // FUSED FAST PATH (transposed-convolution identity). For stride=1,
             // dilation=1 and a non-negative symmetric transposed padding, the
             // input-gradient equals a FORWARD convolution of gradOutput with the
@@ -16462,6 +16485,17 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(float))
         {
+#if NET5_0_OR_GREATER
+            if (Simd.DirectConvAvx2.ShouldUseBackwardKernel(inChannels, outChannels))
+            {
+                Simd.DirectConvAvx2.BackwardKernel(
+                    (float[])(object)input.GetFlattenedData(), 0, (float[])(object)gradOutput.GetFlattenedData(), 0,
+                    (float[])(object)dest._storage.GetDataArray(), dest._storageOffset, accumulate,
+                    batch, inChannels, height, width, outChannels, kernelHeight, kernelWidth,
+                    strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth);
+                return;
+            }
+#endif
 #if !NET471
             // 3x3 stride-1 dilation-1 kernels whose per-image GEMM is small: the direct FMA kernel (one task per
             // (oc, ic) pair summing over every image). The im2col + per-image GEMM route below fans one native
