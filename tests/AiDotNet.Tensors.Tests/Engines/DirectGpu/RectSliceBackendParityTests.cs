@@ -2,8 +2,10 @@
 using System;
 using AiDotNet.Tensors.Engines.DirectGpu;
 using AiDotNet.Tensors.Engines.DirectGpu.HIP;
+using AiDotNet.Tensors.Engines.DirectGpu.Metal;
 using AiDotNet.Tensors.Engines.DirectGpu.OpenCL;
 using AiDotNet.Tensors.Engines.DirectGpu.Vulkan;
+using AiDotNet.Tensors.Engines.DirectGpu.WebGpu;
 using Xunit;
 
 namespace AiDotNet.Tensors.Tests.Engines.DirectGpu;
@@ -92,6 +94,25 @@ public sealed class RectSliceBackendParityTests
     {
         using var backend = new HipBackend();
         Skip.IfNot(backend.IsAvailable, "HIP is not available.");
+        Check(backend);
+    }
+    [SkippableFact]
+    public void Metal_RectSlice_MatchesCpu()
+    {
+        // The constructor throws PlatformNotSupportedException off Apple platforms.
+        Skip.IfNot(OperatingSystem.IsMacOS() || OperatingSystem.IsIOS(), "Metal needs macOS or iOS.");
+        using var backend = new MetalBackend();
+        Skip.IfNot(backend.IsAvailable, "Metal is not available.");
+        Check(backend);
+    }
+
+    [SkippableFact]
+    public void WebGpu_RectSlice_MatchesCpu()
+    {
+        // WebGPU runs through the browser's JavaScript interop; elsewhere the backend throws PlatformNotSupportedException.
+        Skip.IfNot(OperatingSystem.IsBrowser(), "WebGPU needs a browser host.");
+        using var backend = new WebGpuBackend();
+        Skip.IfNot(backend.InitializeAsync().GetAwaiter().GetResult(), "WebGPU is not available.");
         Check(backend);
     }
 }
