@@ -380,7 +380,7 @@ internal static class HeadToHeadNetworkHarness
 
         // Mirrors tools/parity/run_torch_network.py layer for layer: the same shape arithmetic and the
         // same weights.bin order (each parameterised layer's weight, then its bias).
-        var parameters = new List<(float[] Data, float[] Grad, Tensor<float> Tensor)>();
+        var parameters = new List<Tensor<float>>();
         // PyTorch's BatchNorm2d and LayerNorm default; the runner builds both with it.
         const double NormEpsilon = 1e-5;
         Tensor<float> BatchNorm(Tensor<float> h, Tensor<float> gamma, Tensor<float> beta)
@@ -398,7 +398,7 @@ internal static class HeadToHeadNetworkHarness
             {
                 var data = ReadFloats(reader, parameterShape.Aggregate(1, (a, d) => a * d));
                 var tensor = Place(Tensor<float>.FromMemory(data, parameterShape));
-                parameters.Add((data, new float[data.Length], tensor));
+                parameters.Add(tensor);
                 return tensor;
             }
 
@@ -566,9 +566,12 @@ internal static class HeadToHeadNetworkHarness
         double lr = spec.GetProperty("optimizer").GetProperty("lr").GetDouble();
         var optimizer = new SgdOptimizer();
         var group = optimizer.AddParamGroup(new Dictionary<string, double> { ["lr"] = lr });
-        foreach (var p in parameters) group.AddParameter(p.Data, p.Grad);
+        // The optimizer updates the parameter tensors in place and reads the tape's gradients directly, as
+        // torch.optim reads .grad: no gradient is copied into optimizer-owned buffers.
+        if (gpu is null)
+            foreach (var p in parameters) group.AddParameter(p);
         void Sync() => gpu?.SynchronizeStream();
-        var sources = parameters.Select(p => p.Tensor).ToArray();
+        var sources = parameters.ToArray();
         var allAxes = new[] { 0, 1 };
 
         int warmup = capture?.MeasuredStep ?? spec.GetProperty("warmupSteps").GetInt32();
@@ -608,24 +611,17 @@ internal static class HeadToHeadNetworkHarness
 
             for (int i = 0; i < parameters.Count; i++)
             {
-                if (!grads.TryGetValue(parameters[i].Tensor, out var g))
+                if (!grads.TryGetValue(parameters[i], out var g))
                     throw new InvalidOperationException($"Tape produced no gradient for parameter {i}.");
-                if (gpu is null)
-                    g.AsSpan().CopyTo(parameters[i].Grad);
-                else if (!GpuOptimizer.TrySgdStep(parameters[i].Tensor, g, (float)lr))
+                if (gpu is not null && !GpuOptimizer.TrySgdStep(parameters[i], g, (float)lr))
                     throw new InvalidOperationException(
-                        $"Parameter {i} [{string.Join(", ", parameters[i].Tensor.Shape.ToArray())}]: the device-side SGD step " +
-                        $"was refused (parameter on device: {parameters[i].Tensor.TryGetGpuBuffer() is not null}, gradient on " +
+                        $"Parameter {i} [{string.Join(", ", parameters[i].Shape.ToArray())}]: the device-side SGD step " +
+                        $"was refused (parameter on device: {parameters[i].TryGetGpuBuffer() is not null}, gradient on " +
                         $"device: {g.TryGetGpuBuffer() is not null}). That is a residency gap: the step would have to leave the device.");
             }
 
-            if (gpu is null)
-            {
-                // The optimizer updates the raw parameter arrays the tensors were built on; tell the tensors, or the
-                // engine keeps using data derived from the previous weights.
-                optimizer.Step();
-                foreach (var parameter in parameters) parameter.Tensor.MarkModified();
-            }
+            // Marks each parameter modified itself, so data derived from the old weights is refreshed.
+            if (gpu is null) optimizer.Step(grads);
             Sync();
             double t3 = sw.Elapsed.TotalMilliseconds;
             if (crossingScope is not null && capture is not null)
