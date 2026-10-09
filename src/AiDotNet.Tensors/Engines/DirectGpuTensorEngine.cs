@@ -2599,7 +2599,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// never read again), so materializing it would be a wasted GPU→CPU transfer that breaks full residency. The
     /// FP16 parity tests gate correctness: a wrongful discard of a still-needed tensor would corrupt the grads.
     /// </summary>
-    internal void EvictActivationsCreatedAfter(long snapshot, HashSet<object>? protect, bool materializePending)
+    /// <returns>The device bytes released.</returns>
+    internal long EvictActivationsCreatedAfter(long snapshot, HashSet<object>? protect, bool materializePending)
         => EvictActivationsCreatedAfter(snapshot, protect,
             materializePending ? ActivationReleaseMode.MaterializeThenFree : ActivationReleaseMode.DropScratch);
 
@@ -2625,8 +2626,6 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// </summary>
     internal void ReleaseDeadDeviceStorage<T>(Tensor<T> tensor)
     {
-        if (s_staleDropTrace)
-            StaleDropDiag($"RELEASE-DEAD len={tensor.Length} caller=" + new System.Diagnostics.StackTrace(1, false).ToString().Replace(System.Environment.NewLine, " <- "));
         var vector = tensor.DataVector;
         if (vector._deviceState is not { Buffer: { } buffer } state) return;
         if (_actionScratchBuffers.Contains(buffer)) return;   // the per-action scratch pool owns it
@@ -2690,7 +2689,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     /// Evicts this thread's activation-cache entries created after <paramref name="snapshot"/> (except
     /// <paramref name="protect"/>), handling entries whose only valid copy is on the device per <paramref name="mode"/>.
     /// </summary>
-    internal void EvictActivationsCreatedAfter(long snapshot, HashSet<object>? protect, ActivationReleaseMode mode)
+    internal long EvictActivationsCreatedAfter(long snapshot, HashSet<object>? protect, ActivationReleaseMode mode)
     {
         // The activation timestamp counter is process-wide, so "created after my snapshot"
         // also matches a CONCURRENT tape's activations on another thread. Free only THIS
@@ -2700,7 +2699,7 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         List<ActivationCacheEntry> toDispose;
         lock (_activationCacheLock)
         {
-            if (_activationCache.IsEmpty) return;
+            if (_activationCache.IsEmpty) return 0;
             var entries = _activationCache.ToArray();
             toDispose = new List<ActivationCacheEntry>();
             for (int i = 0; i < entries.Length; i++)
@@ -2736,7 +2735,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 }
             }
         }
-        foreach (var entry in toDispose) entry.Dispose();
+        long released = 0;
+        foreach (var entry in toDispose) { released += entry.Buffer.SizeInBytes; entry.Dispose(); }
+        return released;
     }
 
     /// <summary>
