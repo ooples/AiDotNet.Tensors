@@ -947,6 +947,12 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     internal int _storageOffset;
 
     /// <summary>
+    /// The element offset of this tensor's first element in its underlying storage (<c>Tensor.storage_offset</c>):
+    /// 0 for a tensor that owns its storage, the view's start for a slice or narrow.
+    /// </summary>
+    public int StorageOffset => _storageOffset;
+
+    /// <summary>
     /// Tracks the device where this tensor's data currently resides.
     /// Set to GPU by DirectGpuTensorEngine when a GPU op defers its download.
     /// Reset to CPU when the data is materialized to the CPU-side array.

@@ -20,6 +20,10 @@ internal static class OpRegistry
     /// </summary>
     internal static readonly HashSet<string> DifferentiableOps = new(StringComparer.Ordinal)
     {
+        // Activations and index-map ops with their own backward (CpuEngine.TorchMisc)
+        "TensorCelu", "TensorHardtanh", "TensorLogSigmoid", "TensorSoftsign",
+        "TensorRrelu", "TensorMsort", "TensorDiagflat", "TensorDiagonalScatter",
+
         // Quantiles: backward to the two order statistics read (CpuEngine.TorchCreation)
         "TensorQuantile", "TensorNanQuantile",
 
@@ -476,6 +480,10 @@ internal static class OpRegistry
     /// </summary>
     internal static readonly HashSet<string> DelegatorOps = new(StringComparer.Ordinal)
     {
+        // Composed from recorded ops (softmax, add/multiply/divide, matmul, batch matmul, reductions)
+        "TensorSoftmin", "TensorRsub", "TensorAddcmul", "TensorAddcdiv",
+        "TensorAddmv", "TensorAddr", "TensorBaddbmm", "TensorAddbmm",
+
         // Shape and statistics ops composed from recorded ops (narrow, reshape, reductions, matmul, index select)
         "TensorAmin", "TensorChunk", "TensorSplitWithSizes", "TensorUnflatten",
         "TensorSelect", "TensorViewAs", "TensorSumToSize", "TensorStdMean",

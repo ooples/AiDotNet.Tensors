@@ -106,6 +106,9 @@ public class DifferentiableOpsGradCheckSweep
         ["TensorTrace"] = r => [SafeTensor([3, 3], r)],
         ["TensorCosineSimilarity"] = r => [SafeTensor([2, 4], r), SafeTensor([2, 4], r), 1, 1e-8],
 
+        // --- diagonal_scatter: src is sized to the chosen diagonal (offset 1 of a 3 x 4 input has 3 elements) ---
+        ["TensorDiagonalScatter"] = r => [SafeTensor([3, 4], r), SafeTensor([3], r), 1, 0, 1],
+
         // --- elementwise binaries needing matched shapes ---
         ["TensorAddMany"] = r => [new[] { SafeTensor([4], r), SafeTensor([4], r), SafeTensor([4], r) }],
         ["TensorMultiplyMany"] = r => [new[] { SafeTensor([4], r), SafeTensor([4], r) }],
