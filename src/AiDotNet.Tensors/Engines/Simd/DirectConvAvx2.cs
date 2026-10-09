@@ -47,6 +47,10 @@ internal static class DirectConvAvx2
     // Weight-gradient tasks to aim for when splitting the batch across partial gradients.
     private const int TargetBackwardKernelTasks = 128;
 
+    // Most floats the backward-kernel batch split may hold in per-split partials (16 MB). Shape-only, so the split
+    // (and the summation order) never depends on the thread budget.
+    private const long MaxBackwardKernelPartialFloats = 4L * 1024 * 1024;
+
     /// <summary>Passes allowed onto the direct kernels (process-wide; for A/B measurement and kernel tuning).</summary>
     internal static DirectConvPasses EnabledPasses { get; set; } = DirectConvPasses.All;
 
@@ -345,6 +349,8 @@ internal static class DirectConvAvx2
         // Few block pairs leave cores idle (32 pairs for 32->64 channels), so the batch is split too: each slice
         // sums into its own partial gradient and the partials are reduced in a fixed order afterwards.
         int splits = Math.Max(1, Math.Min(batch, ((targetTasks > 0 ? targetTasks : TargetBackwardKernelTasks) + pairs - 1) / pairs));
+        // Each split adds a kernel-sized partial that ReducePartials reads back, so bound the partials' total size.
+        splits = Math.Max(1, Math.Min(splits, (int)Math.Min(int.MaxValue, MaxBackwardKernelPartialFloats / Math.Max(1, kernelSize))));
         int imagesPerSplit = (batch + splits - 1) / splits;
         splits = (batch + imagesPerSplit - 1) / imagesPerSplit;
         var pool = ArrayPool<float>.Shared;
