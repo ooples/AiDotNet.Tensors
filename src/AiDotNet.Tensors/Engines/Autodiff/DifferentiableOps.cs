@@ -593,6 +593,23 @@ internal static class DifferentiableOps
         return true;
     }
 
+    /// <summary>Marks a buffer stored fresh in the current <see cref="GradWriteGeneration"/> as written, so a later
+    /// contribution adds to it rather than claiming the first write and overwriting it.</summary>
+    private static void MarkWrittenThisStep<T>(Tensor<T> buffer)
+    {
+        int generation = GradWriteGeneration;
+        if (generation != 0) buffer._gradWriteGeneration = generation;
+    }
+
+    /// <summary>True when <paramref name="buffer"/> already holds this step's gradient: outside a
+    /// <see cref="GradWriteGeneration"/> every stored buffer is live, inside one only a buffer written in it is. A
+    /// buffer kept from an earlier compiled step is stale until its first write clears it.</summary>
+    internal static bool IsWrittenThisStep<T>(Tensor<T> buffer)
+    {
+        int generation = GradWriteGeneration;
+        return generation == 0 || buffer._gradWriteGeneration == generation;
+    }
+
     /// <summary>The step's first contribution to a gradient buffer that was not zeroed: copied in, not added.</summary>
     private static Tensor<T> CopyFirstWrite<T>(Tensor<T> tensor, Tensor<T> buffer, Tensor<T> contribution, IEngine engine)
     {
@@ -876,6 +893,7 @@ internal static class DifferentiableOps
                 var stored = needsOutOfPlace
                     ? grad
                     : TakeAccumulatorBuffer(tensor, GradForInPlace(), engine);
+                MarkWrittenThisStep(stored);
                 _indexedGrads[idx] = stored;
                 tensor.Grad = stored;
             }
@@ -927,6 +945,7 @@ internal static class DifferentiableOps
             var stored = needsOutOfPlace
                 ? grad
                 : TakeAccumulatorBuffer(tensor, GradForInPlace(), engine);
+            MarkWrittenThisStep(stored);
             grads[tensor] = stored;
             tensor.Grad = stored;
         }
