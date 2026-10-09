@@ -479,29 +479,34 @@ internal static class DirectConvAvx2
         int packedOut = transposeAndFlip ? inChannels : outChannels;
         int packedIn = transposeAndFlip ? outChannels : inChannels;
         int packedInBlocks = (packedIn + Block - 1) / Block;
-        CpuParallelSettings.ParallelForOrSerial(0, packedOut / Block, (long)outChannels * inChannels * taps, ob =>
+        // One task per (output block, input block) pair, and the destination is written strictly in
+        // order: [tap][input lane][output lane]. The source reads stay within Block rows of
+        // Block*taps contiguous floats, so both sides stream instead of striding a cache line per
+        // store (the old lane-outer order touched every destination line Block times).
+        CpuParallelSettings.ParallelForOrSerial(0, (packedOut / Block) * packedInBlocks, (long)outChannels * inChannels * taps, task =>
         {
+            int ob = task / packedInBlocks, ib = task % packedInBlocks;
             fixed (float* ps = source)
             fixed (float* pd = packed)
             {
-                float* d0 = pd + (long)ob * packedInBlocks * taps * Block * Block;
-                // A partial last input block keeps zero weights for its missing channels.
-                if (packedIn % Block != 0) new Span<float>(d0, packedInBlocks * taps * Block * Block).Clear();
-                for (int lane = 0; lane < Block; lane++)
+                float* d = pd + ((long)ob * packedInBlocks + ib) * taps * Block * Block;
+                float* src = ps + sourceOffset;
+                for (int t = 0; t < taps; t++)
                 {
-                    int po = ob * Block + lane;
-                    for (int pi = 0; pi < packedIn; pi++)
+                    int tap = transposeAndFlip ? taps - 1 - t : t;
+                    for (int il = 0; il < Block; il++, d += Block)
                     {
-                        float* d = d0 + (long)(pi / Block) * taps * Block * Block + (pi % Block) * Block + lane;
-                        if (transposeAndFlip)
+                        int pi = ib * Block + il;
+                        if (pi >= packedIn)
                         {
-                            float* s = ps + sourceOffset + ((long)pi * inChannels + po) * taps;
-                            for (int t = 0; t < taps; t++) d[t * Block * Block] = s[taps - 1 - t];
+                            new Span<float>(d, Block).Clear();
+                            continue;
                         }
-                        else
+                        for (int lane = 0; lane < Block; lane++)
                         {
-                            float* s = ps + sourceOffset + ((long)po * inChannels + pi) * taps;
-                            for (int t = 0; t < taps; t++) d[t * Block * Block] = s[t];
+                            int po = ob * Block + lane;
+                            long row = transposeAndFlip ? (long)pi * inChannels + po : (long)po * inChannels + pi;
+                            d[lane] = src[row * taps + tap];
                         }
                     }
                 }
