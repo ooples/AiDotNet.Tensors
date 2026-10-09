@@ -86,26 +86,13 @@ public sealed class CpuAvx512Emitter : IKernelEmitter
                     $"CpuAvx512Emitter cannot emit {node.Op} (no direct AVX-512F intrinsic).");
         }
 
-        // Shape uniformity gate (mirrors the JIT emitter's check).
-        var firstShape = graph.Nodes[0].Shape;
-        long elementCount = 1;
-        for (int i = 0; i < firstShape.Length; i++) elementCount *= firstShape[i];
-        foreach (var node in graph.Nodes)
-        {
-            long nc = 1;
-            for (int i = 0; i < node.Shape.Length; i++) nc *= node.Shape[i];
-            if (nc != elementCount)
-                return CodegenEmitResult.Decline(
-                    $"CpuAvx512Emitter requires shape uniformity; mismatch at {node.Op}.");
-        }
-        if (elementCount > int.MaxValue)
-            return CodegenEmitResult.Decline(
-                $"CpuAvx512Emitter cannot emit graphs with element count {elementCount} > int.MaxValue.");
+        if (!CpuKernelContract.TryValidateGraph(graph, dtype, out int elementCount, out string reason))
+            return CodegenEmitResult.Decline(reason);
 
         return dtype switch
         {
-            CodegenElementType.Float32 => EmitFloat32(graph, (int)elementCount),
-            CodegenElementType.Float64 => EmitFloat64(graph, (int)elementCount),
+            CodegenElementType.Float32 => EmitFloat32(graph, elementCount),
+            CodegenElementType.Float64 => EmitFloat64(graph, elementCount),
             _ => CodegenEmitResult.Decline("Unreachable.")
         };
 #endif
@@ -164,20 +151,10 @@ public sealed class CpuAvx512Emitter : IKernelEmitter
 
         unsafe void Kernel(float[][] inputs, float[][] outputs, int len)
         {
+            // Counts are captured at emission, even if the caller later edits Graph.
             if (inputs.Length != inputCount || outputs.Length != outputCount)
                 throw new ArgumentException("input/output buffer count mismatch.");
 
-            // Bounds-check: the kernel was specialised for 'count'
-            // elements; supplied buffers must accommodate it.
-            for (int b = 0; b < inputs.Length; b++)
-                if (inputs[b].Length < count)
-                    throw new ArgumentException($"Input buffer {b} too small for kernel ({inputs[b].Length} < {count}).");
-            for (int b = 0; b < outputs.Length; b++)
-                if (outputs[b].Length < count)
-                    throw new ArgumentException($"Output buffer {b} too small for kernel ({outputs[b].Length} < {count}).");
-
-            // Per-node value slot; v[i] is the current Vector512<float>
-            // for node i. SIMD loop fills these top-down each iteration.
             var v = new Vector512<float>[n];
 
             int simdEnd = count & ~15;
@@ -205,7 +182,7 @@ public sealed class CpuAvx512Emitter : IKernelEmitter
                             v[k] = Avx512F.Multiply(v[nodeIn0[k]], v[nodeIn1[k]]);
                             break;
                         case CodegenOpKind.Negate:
-                            v[k] = Avx512F.Subtract(Vector512<float>.Zero, v[nodeIn0[k]]);
+                            v[k] = Avx512F.Xor(v[nodeIn0[k]].AsUInt32(), Vector512.Create(0x80000000u)).AsSingle();
                             break;
                         case CodegenOpKind.Sqrt:
                             v[k] = Avx512F.Sqrt(v[nodeIn0[k]]);
@@ -241,7 +218,7 @@ public sealed class CpuAvx512Emitter : IKernelEmitter
             }
         }
 
-        var source = DumpSource(graph, CodegenElementType.Float32, "float");
+        var source = DumpSource(graph, CodegenElementType.Float32, "float", elementCount);
         var kernel = new CompiledAvx512Kernel<float>(graph, CodegenElementType.Float32, Kernel, count);
         return CodegenEmitResult.Succeeded(kernel, source);
     }
@@ -275,14 +252,9 @@ public sealed class CpuAvx512Emitter : IKernelEmitter
 
         unsafe void Kernel(double[][] inputs, double[][] outputs, int len)
         {
+            // Counts are captured at emission, even if the caller later edits Graph.
             if (inputs.Length != inputCount || outputs.Length != outputCount)
                 throw new ArgumentException("input/output buffer count mismatch.");
-            for (int b = 0; b < inputs.Length; b++)
-                if (inputs[b].Length < count)
-                    throw new ArgumentException($"Input buffer {b} too small for kernel ({inputs[b].Length} < {count}).");
-            for (int b = 0; b < outputs.Length; b++)
-                if (outputs[b].Length < count)
-                    throw new ArgumentException($"Output buffer {b} too small for kernel ({outputs[b].Length} < {count}).");
 
             var v = new Vector512<double>[n];
             int simdEnd = count & ~7;
@@ -303,7 +275,7 @@ public sealed class CpuAvx512Emitter : IKernelEmitter
                         case CodegenOpKind.Add: v[k] = Avx512F.Add(v[nodeIn0[k]], v[nodeIn1[k]]); break;
                         case CodegenOpKind.Sub: v[k] = Avx512F.Subtract(v[nodeIn0[k]], v[nodeIn1[k]]); break;
                         case CodegenOpKind.Mul: v[k] = Avx512F.Multiply(v[nodeIn0[k]], v[nodeIn1[k]]); break;
-                        case CodegenOpKind.Negate: v[k] = Avx512F.Subtract(Vector512<double>.Zero, v[nodeIn0[k]]); break;
+                        case CodegenOpKind.Negate: v[k] = Avx512F.Xor(v[nodeIn0[k]].AsUInt64(), Vector512.Create(0x8000000000000000UL)).AsDouble(); break;
                         case CodegenOpKind.Sqrt: v[k] = Avx512F.Sqrt(v[nodeIn0[k]]); break;
                         case CodegenOpKind.ReLU:
                             var lt = Avx512F.CompareLessThan(v[nodeIn0[k]], Vector512<double>.Zero);
@@ -332,18 +304,18 @@ public sealed class CpuAvx512Emitter : IKernelEmitter
             }
         }
 
-        var source = DumpSource(graph, CodegenElementType.Float64, "double");
+        var source = DumpSource(graph, CodegenElementType.Float64, "double", elementCount);
         var kernel = new CompiledAvx512Kernel<double>(graph, CodegenElementType.Float64, Kernel, count);
         return CodegenEmitResult.Succeeded(kernel, source);
     }
 
-    private static string DumpSource(CodegenGraph graph, CodegenElementType dtype, string scalar)
+    private static string DumpSource(CodegenGraph graph, CodegenElementType dtype, string scalar, int elementCount)
     {
         var lanes = scalar == "float" ? 16 : 8;
         var sb = new System.Text.StringBuilder();
         sb.AppendLine($"// AVX-512F kernel — emitted by CpuAvx512Emitter ({dtype}).");
         sb.AppendLine($"// {lanes}-wide SIMD body + scalar tail. Pointwise pure.");
-        sb.AppendLine($"// Element count: {graph.Nodes[0].Shape.Aggregate(1, (a, b) => a * b)}.");
+        sb.AppendLine($"// Element count: {elementCount}.");
         sb.AppendLine();
         for (int i = 0; i < graph.Count; i++)
         {
@@ -381,12 +353,7 @@ internal sealed class CompiledAvx512Kernel<TElement> : CodegenKernel
             throw new ArgumentException(
                 $"Kernel specialised for {typeof(TElement).Name} — caller passed {typeof(T).Name}.",
                 nameof(inputs));
-        if (inputs is null) throw new ArgumentNullException(nameof(inputs));
-        if (outputs is null) throw new ArgumentNullException(nameof(outputs));
-        if (inputs.Length != InputCount)
-            throw new ArgumentException($"Expected {InputCount} input buffers, got {inputs.Length}.");
-        if (outputs.Length != OutputCount)
-            throw new ArgumentException($"Expected {OutputCount} output buffers, got {outputs.Length}.");
+        CpuKernelContract.ValidateBuffers(inputs, outputs, InputCount, OutputCount, _count);
 
         var typedInputs = (TElement[][])(object)inputs;
         var typedOutputs = (TElement[][])(object)outputs;
