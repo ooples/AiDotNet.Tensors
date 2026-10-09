@@ -4,7 +4,7 @@
 [![Build](https://github.com/ooples/AiDotNet.Tensors/actions/workflows/build.yml/badge.svg)](https://github.com/ooples/AiDotNet.Tensors/actions/workflows/build.yml)
 [![License](https://img.shields.io/badge/license-BSL%201.1-blue.svg)](LICENSE)
 
-A high-performance .NET tensor library with hand-written AVX2/AVX-512 SIMD kernels in `SimdKernels.cs` / `SimdGemm.cs` / `SimdConvHelper.cs`. Every hot path runs through our own managed-C# kernels — we do NOT call into `System.Numerics.Tensors`, MKL.NET, or oneDNN through the standard wrappers. Beats ML.NET, TensorFlow.NET, MathNet, and NumSharp outright on every measured op. Against libtorch (TorchSharp's hand-tuned C++ kernels), wins on Mish 2.3×, Mish (double) 2.2×, **GELU (double) 1.6× ahead**, **Tanh (double) within noise**, Tanh (float) 1.4×, TensorMean/Min/Max, MaxPool2D, TensorAdd 100K, and TensorAdd 1M (vs single-thread torch) — all using pure managed C# with hand-tuned AVX2/FMA SIMD kernels and JIT-compiled machine code.
+A high-performance .NET tensor library with hand-written AVX2/AVX-512 SIMD kernels in `SimdKernels.cs` / `SimdGemm.cs` / `SimdConvHelper.cs`. Every hot path runs through our own managed-C# kernels — we do NOT call into `System.Numerics.Tensors`, MKL.NET, or oneDNN through the standard wrappers. In the latest benchmark run on a Threadripper 3990X (see [CPU Benchmarks](#cpu-benchmarks) for every number, the versions compared and the losses), AiDotNet.Tensors was faster than TorchSharp 0.107 (libtorch) in 73 of 82 measurements, than ML.NET 5.0 and TensorFlow.NET 0.150 in all of them, than NumSharp 0.70 in 45 of 48 and than MathNet.Numerics 5.0 in all 33.
 
 > **Note on dependencies.** The .nupkg ships with the following PackageReferences:
 > `Microsoft.Extensions.Logging.Abstractions`, `System.Text.Json`,
@@ -75,200 +75,193 @@ var transpose = m1.Transpose();
 
 ## CPU Benchmarks
 
-All numbers from the latest BenchmarkDotNet run on AMD Ryzen 9 3950X (16 cores, AVX2/FMA, no AVX-512), .NET 10.0. Reproduce with:
+Every number below comes from two BenchmarkDotNet runs on one machine on 2026-10-08: `--vs-all` at commit `dcb0926f` and `--linalg`
+at commit `587358ed`, using the suites in this repository. AiDotNet.Tensors runs its own managed C#
+SIMD kernels; the comparison libraries run their native backends (libtorch for TorchSharp, the TensorFlow runtime for
+TensorFlow.NET).
+
+**Machine:** AMD Ryzen Threadripper 3990X (64 cores / 128 threads, AVX2 + FMA, no AVX-512), Windows 11, .NET 10.0.401,
+BenchmarkDotNet 0.15.8. BenchmarkDotNet confines each benchmark process to one 64-thread processor group.
+
+**Versions compared:** TorchSharp 0.107.0 (its bundled libtorch CPU build), ML.NET 5.0.0, TensorFlow.NET 0.150.0
+(TensorFlow runtime 2.16.0), NumSharp 0.70.0, MathNet.Numerics 5.0.0.
+
+**Summary of this run** (a cell is a win when AiDotNet's mean time is lower):
+
+| Compared with | Wins | Losses |
+|---|--:|--:|
+| TorchSharp (41 ops, steady state and cold call) | 73 | 9 |
+| ML.NET | 6 | 0 |
+| TensorFlow.NET | 11 | 0 |
+| NumSharp | 45 | 3 |
+| MathNet.Numerics | 33 | 0 |
+
+Reproduce:
 
 ```bash
-dotnet run -c Release --project tests/AiDotNet.Tensors.Benchmarks --framework net10.0 -- --vs-all
+dotnet run -c Release --project tests/AiDotNet.Tensors.Benchmarks --framework net10.0 -- --vs-all   # TorchSharp, ML.NET, TensorFlow.NET
+dotnet run -c Release --project tests/AiDotNet.Tensors.Benchmarks --framework net10.0 -- --linalg   # NumSharp, MathNet
 ```
 
-The full per-op result set with error bars lives in [`tests/AiDotNet.Tensors.Benchmarks/BENCHMARK_RESULTS.md`](tests/AiDotNet.Tensors.Benchmarks/BENCHMARK_RESULTS.md). The summary below is a hand-curated subset.
+`--vs-all-filter <glob>` and `--linalg-filter <glob>` run a subset.
 
-### vs TorchSharp CPU (libtorch C++ backend)
+The BenchmarkDotNet reports behind every table are in [`tests/AiDotNet.Tensors.Benchmarks/Results/2026-10-08-threadripper-3990x/`](tests/AiDotNet.Tensors.Benchmarks/Results/2026-10-08-threadripper-3990x/); `python tests/AiDotNet.Tensors.Benchmarks/make_readme_tables.py <reports> <reports>` regenerates the tables from them.
 
-Latest BDN run, post-#209 perf fixes — captured **after** removing
-`System.Numerics.Tensors` entirely and routing every hot path through
-our in-house `SimdKernels`. **All comparisons are eager-vs-eager** —
-neither side uses `torch.compile` or AiDotNet compiled plans, so this
-is libtorch's hand-rolled C++ kernels against AiDotNet's pure managed
-C# + AVX2 SIMD. See
-[`tests/AiDotNet.Tensors.Benchmarks/BENCHMARK_RESULTS.md`](tests/AiDotNet.Tensors.Benchmarks/BENCHMARK_RESULTS.md)
-for the full per-op table with error bars.
+### How to read these numbers
 
-**Big wins** — AiDotNet beats TorchSharp by 2× or more:
+- **Steady state** is BenchmarkDotNet's normal mode: many calls per iteration, averaged.
+- **Cold call** times one call per iteration with a forced garbage collection before it, which is what an op costs when
+  it runs occasionally. Both libraries' first call (JIT and library start-up) is excluded.
+- **Each arm matches the competitor's allocation behaviour.** Where the other library reuses or frees its output (ML.NET
+  writes into a preallocated destination; TorchSharp disposes its result), the AiDotNet arm returns its result to the
+  tensor pool. Where the other library allocates a fresh result every call (TensorFlow.NET, NumSharp, MathNet), so does
+  the AiDotNet arm. The same op can therefore show very different absolute times in different tables.
+- **Speedup** is the other library's time divided by AiDotNet's; above 1× means AiDotNet is faster.
 
-| Operation | Size | AiDotNet | TorchSharp | Speedup |
-|-----------|------|---------:|-----------:|--------:|
-| Mish | 1M | **377 µs** | 884 µs | **2.3× faster** |
-| Mish (double) | 1M | **1,038 µs** | 2,313 µs | **2.2× faster** |
+### vs TorchSharp (libtorch CPU)
 
-**Wins** — AiDotNet beats TorchSharp:
+| Operation | Shape | AiDotNet steady | TorchSharp steady | Speedup | AiDotNet cold call | TorchSharp cold call | Speedup |
+|---|---|--:|--:|--:|--:|--:|--:|
+| Abs | 1M | 8.2 µs | 18 µs | **2.26×** | 25 µs | 41 µs | **1.63×** |
+| Add | 100K | 31 µs | 39 µs | **1.25×** | 34 µs | 39 µs | **1.15×** |
+| Add | 1M | 162 µs | 221 µs | **1.37×** | 187 µs | 216 µs | **1.15×** |
+| Attention Q·Kᵀ | 512×64 · 64×512 | 77 µs | 115 µs | **1.49×** | 92 µs | 147 µs | **1.59×** |
+| BatchNorm | 32×64×32×32 | 62 µs | 187 µs | **3.04×** | 94 µs | 380 µs | **4.03×** |
+| Conv2D | 1×16×64×64 → 32, 3×3 | 174 µs | 277 µs | **1.59×** | 280 µs | 327 µs | **1.17×** |
+| Conv2D (double) | 1×3×32×32 → 16, 3×3 | 49 µs | 115 µs | **2.36×** | 68 µs | 111 µs | **1.63×** |
+| Divide | 1M | 12 µs | 21 µs | **1.86×** | 24 µs | 58 µs | **2.36×** |
+| Exp | 1M | 27 µs | 44 µs | **1.65×** | 57 µs | 72 µs | **1.26×** |
+| Exp (double) | 1M | 55 µs | 79 µs | **1.43×** | 106 µs | 136 µs | **1.28×** |
+| GELU | 1M | 36 µs | 56 µs | **1.54×** | 75 µs | 117 µs | **1.55×** |
+| GELU (double) | 1M | 134 µs | 207 µs | **1.54×** | 147 µs | 364 µs | **2.49×** |
+| GroupNorm | 32×64×32×32, 32 groups | 54 µs | 67 µs | **1.24×** | 81 µs | 101 µs | **1.24×** |
+| LayerNorm | 32768×64 | 72 µs | 81 µs | **1.13×** | 187 µs | 142 µs | 0.76× (slower) |
+| LeakyReLU | 1M | 8.5 µs | 21 µs | **2.42×** | 21 µs | 45 µs | **2.13×** |
+| Log | 1M | 47 µs | 46 µs | 0.98× (slower) | 96 µs | 77 µs | 0.80× (slower) |
+| Log (double) | 1M | 114 µs | 94 µs | 0.83× (slower) | 172 µs | 214 µs | **1.25×** |
+| LogSoftmax | 512×1024 | 19 µs | 32 µs | **1.64×** | 59 µs | 81 µs | **1.37×** |
+| MatMul | 256×256 | 26 µs | 67 µs | **2.54×** | 86 µs | 106 µs | **1.24×** |
+| MatMul | 512×512 | 146 µs | 213 µs | **1.46×** | 566 µs | 508 µs | 0.90× (slower) |
+| MatMul (double) | 256×256 | 54 µs | 119 µs | **2.22×** | 143 µs | 199 µs | **1.39×** |
+| Max | 1M | 6.4 µs | 12 µs | **1.93×** | 11 µs | 29 µs | **2.70×** |
+| MaxPool2D | 1×32×64×64, 3×3 / 2 | 14 µs | 54 µs | **3.82×** | 26 µs | 100 µs | **3.86×** |
+| Mean | 1M | 5.9 µs | 32 µs | **5.49×** | 18 µs | 65 µs | **3.56×** |
+| Min | 1M | 6.2 µs | 13 µs | **2.02×** | 11 µs | 31 µs | **2.84×** |
+| Mish | 1M | 997 µs | 1.02 ms | **1.02×** | 980 µs | 905 µs | 0.92× (slower) |
+| Mish (double) | 1M | 347 µs | 2.16 ms | **6.22×** | 357 µs | 1.86 ms | **5.22×** |
+| Multiply | 100K | 28 µs | 40 µs | **1.44×** | 32 µs | 37 µs | **1.17×** |
+| Multiply | 1M | 179 µs | 228 µs | **1.27×** | 171 µs | 199 µs | **1.16×** |
+| ReLU | 1M | 221 µs | 206 µs | 0.93× (slower) | 218 µs | 219 µs | **1.00×** |
+| Sigmoid | 1M | 183 µs | 189 µs | **1.03×** | 181 µs | 199 µs | **1.10×** |
+| Sigmoid (double) | 1M | 72 µs | 150 µs | **2.08×** | 103 µs | 282 µs | **2.73×** |
+| Sigmoid backward | 1M | 12 µs | 64 µs | **5.41×** | 40 µs | 111 µs | **2.76×** |
+| Softmax | 512×1024 | 16 µs | 29 µs | **1.80×** | 50 µs | 59 µs | **1.19×** |
+| Softmax (double) | 512×1024 | 60 µs | 56 µs | 0.93× (slower) | 76 µs | 138 µs | **1.81×** |
+| Sqrt | 1M | 14 µs | 29 µs | **2.04×** | 21 µs | 47 µs | **2.31×** |
+| Subtract | 1M | 12 µs | 21 µs | **1.86×** | 33 µs | 51 µs | **1.56×** |
+| Sum | 1M | 6.1 µs | 24 µs | **3.96×** | 20 µs | 49 µs | **2.44×** |
+| Tanh | 1M | 61 µs | 90 µs | **1.47×** | 134 µs | 124 µs | 0.93× (slower) |
+| Tanh (double) | 1M | 86 µs | 163 µs | **1.91×** | 119 µs | 275 µs | **2.31×** |
+| Tanh backward | 1M | 12 µs | 64 µs | **5.13×** | 37 µs | 113 µs | **3.08×** |
 
-| Operation | Size | AiDotNet | TorchSharp | Speedup |
-|-----------|------|---------:|-----------:|--------:|
-| **GELU (double)** | 1M | **481 µs** | 753 µs | **1.6× faster** (was 3.6× behind!) |
-| **Tanh (double)** | 1M | **586 µs** | 627 µs | **1.07× faster** (was 3.3× behind!) |
-| Tanh (float) | 1M | **282 µs** | 406 µs | **1.4× faster** |
-| TensorAdd | 100K | **33 µs** | 42 µs | **1.3× faster** |
-| TensorMean | 1M | **189 µs** | 243 µs | **1.3× faster** |
-| TensorAdd | 1M (vs 1-thread torch) | **350 µs** | 468 µs | **1.3× vs 1-thread torch** |
-| MaxPool2D | — | **250 µs** | 285 µs | 1.1× faster |
-| TensorMin | 1M | **205 µs** | 215 µs | within noise (slight win) |
-| TensorMultiply | 100K | **37 µs** | 39 µs | within noise (slight win) |
+**Where AiDotNet is behind:** float and double `Log`, the double `Softmax` steady state, `ReLU` steady state, and the cold call
+of `LayerNorm`, `Log`, `Tanh`, `Mish` and the 512×512 `MatMul`. Most are within 10%; the largest gap is the `LayerNorm` cold
+call at 1.32×.
 
-**Closer-to-parity** — AiDotNet within ~1.5× of libtorch:
+### vs ML.NET
 
-| Operation | Size | AiDotNet | TorchSharp | Ratio |
-|-----------|------|---------:|-----------:|------:|
-| ReLU | 1M | 261 µs | 191 µs | 1.4× |
-| Sigmoid | 1M | 326 µs | 223 µs | 1.5× |
-| TensorMaxValue | 1M | 195 µs | 189 µs | 1.03× |
-| TensorExp | 1M | 296 µs | 306 µs | within noise |
-| GELU (float) | 1M | 354 µs | 332 µs | 1.07× |
-| TensorSum | 1M | 229 µs | 212 µs | 1.08× |
-| TensorAbs | 1M | 362 µs | 221 µs | 1.6× |
-| LeakyReLU | 1M | 409 µs | 273 µs | 1.5× |
-| Exp (double) | 1M | 753 µs | 284 µs | 2.6× (was 4.3×) |
-| Log (double) | 1M | 612 µs | 355 µs | 1.7× (was 16×!) |
+| Operation | Shape | AiDotNet | ML.NET 5.0.0 | Speedup |
+|---|---|--:|--:|--:|
+| Add | 100K | 5.9 µs | 50 µs | **8.46×** |
+| Add | 1M | 12 µs | 521 µs | **42.20×** |
+| Mean | 1M | 5.3 µs | 89 µs | **16.79×** |
+| Multiply | 100K | 5.7 µs | 51 µs | **8.89×** |
+| Multiply | 1M | 12 µs | 546 µs | **45.61×** |
+| Sum | 1M | 8.0 µs | 168 µs | **20.91×** |
 
-**This PR's #209 close-parity wins** — validated against the pre-fix
-baseline by fresh BDN re-runs and same-process micro-benchmarks:
+### vs TensorFlow.NET
 
-| Operation | Pre-fix | Post-fix | Improvement |
-|-----------|------:|--------:|------------:|
-| **Softmax_Double 512×1024** | 3,766 µs | **185 µs** (**slightly AHEAD** of torch's 206!) | **20× faster** |
-| GELU_Double 1M | 2,782 µs | **481 µs** (now **1.6× ahead** of torch!) | **5.8× faster** |
-| Tanh_Double 1M | 2,067 µs | **586 µs** (within noise of torch) | **3.5× faster** |
-| Log_Double 1M  | 5,785 µs | **612 µs** | **9.4× faster** |
-| Exp_Double 1M  | 1,634 µs | 753 µs | 2.2× faster |
-| LayerNorm 32k×64 | 1,347 µs | 890 µs | 1.5× faster |
-| TensorAdd 1M | 480 µs | 350 µs | 1.4× faster |
-| AttentionQKT 512×64 | 599 µs | **419 µs** (parallel-M pre-transpose) | **1.4× faster** |
-| AttentionQKT 512×128 | (not measured) | **451 µs** | (149 GFLOPS, parallel-M kernel) |
-| MatMul 256³ | 510 µs | **196 µs** (parallel-M SgemmDirect) | **2.6× faster** |
-| MatMul 512³ | 1,074 µs | **930 µs** | 1.15× faster |
-| Conv2D 1×16×64×64→32 | 458 µs (regressed to 764 with naive 4-oc) | **397 µs** (Auto policy picks PerChannel) | back to baseline + 13% |
+| Operation | Shape | AiDotNet | TensorFlow.NET 0.150.0 | Speedup |
+|---|---|--:|--:|--:|
+| Add | 100K | 86 µs | 117 µs | **1.36×** |
+| Add | 1M | 583 µs | 1.41 ms | **2.42×** |
+| Conv2D | 1×16×64×64 → 32, 3×3 | 398 µs | 490 µs | **1.23×** |
+| MatMul | 256×256 | 309 µs | 480 µs | **1.55×** |
+| MatMul | 512×512 | 444 µs | 1.25 ms | **2.82×** |
+| Mean | 1M | 6.0 µs | 106 µs | **17.50×** |
+| Multiply | 100K | 86 µs | 118 µs | **1.37×** |
+| Multiply | 1M | 577 µs | 1.34 ms | **2.31×** |
+| ReLU | 1M | 585 µs | 1.48 ms | **2.54×** |
+| Sigmoid | 1M | 642 µs | 1.62 ms | **2.51×** |
+| Sum | 1M | 6.8 µs | 136 µs | **19.98×** |
 
-**Residual tracked gaps** — areas where libtorch's Intel MKL-DNN
-(with AVX-512 inner kernels on Intel hardware) still wins. These need
-multi-day kernel rewrites (single-pass register-resident LayerNorm,
-fused QKᵀ attention kernel, BLIS-style 6×16 micro-kernel prefetch
-tuning) and are left as follow-up work:
+### vs NumSharp and MathNet.Numerics (double precision)
 
-| Operation | Size | AiDotNet | TorchSharp | Ratio |
-|-----------|------|---------:|-----------:|------:|
-| TensorMatMul (float) | 256 | **196 µs** (parallel-M SgemmDirect) | 109 µs | 1.8× — was 4.7× |
-| TensorMatMul (float) | 512 | 930 µs | 534 µs | 1.7× — was 2.0× |
-| LayerNorm | 32k×64 | 890 µs | 303 µs | 2.9× |
-| BatchNorm | 32×64×32×32 | 2,201 µs | 745 µs | 3.0× |
-| Conv2D (float) | 1×16×64×64→32 | ~397 µs (Auto picks PerChannel) | 310 µs | 1.3× — was 2.3× before A/B fix |
-| Conv2D (double) | 4×3×32×32 | 438 µs | 115 µs | 3.8× — unchanged this PR |
-| AttentionQKT | 512×64 | **419 µs** (parallel-M pre-transpose) | 135 µs | 3.1× — was 4.3× |
-| AttentionQKT | 512×128 | **451 µs** (parallel-M) | — | 149 GFLOPS, was 1,102 µs |
-| Softmax_Double 512×1024 | — | **185 µs** | 206 µs | **slight win** ✓ closed |
+| Operation | N | AiDotNet | NumSharp 0.70.0 | MathNet 5.0.0 | Speedup vs NumSharp | Speedup vs MathNet |
+|---|--:|--:|--:|--:|--:|--:|
+| Dot Product | 100 | 21 ns | 949 ns | 80 ns | **45.29×** | **3.81×** |
+| Dot Product | 500 | 57 ns | 720 ns | 355 ns | **12.64×** | **6.23×** |
+| Dot Product | 1000 | 102 ns | 766 ns | 696 ns | **7.47×** | **6.79×** |
+| L2 Norm | 100 | 14 ns | 1.2 µs | 962 ns | **86.44×** | **69.04×** |
+| L2 Norm | 500 | 44 ns | 1.3 µs | 4.9 µs | **28.30×** | **110.09×** |
+| L2 Norm | 1000 | 81 ns | 1.3 µs | 9.8 µs | **15.67×** | **120.48×** |
+| Matrix Add | 100 | 3.1 µs | 6.7 µs | 5.5 µs | **2.13×** | **1.74×** |
+| Matrix Add | 500 | 248 µs | 298 µs | 504 µs | **1.20×** | **2.03×** |
+| Matrix Add | 1000 | 1.80 ms | 2.13 ms | 3.48 ms | **1.19×** | **1.93×** |
+| Matrix Multiply | 100 | 52 µs | 126 µs | 199 µs | **2.44×** | **3.85×** |
+| Matrix Multiply | 500 | 3.54 ms | 9.74 ms | 6.87 ms | **2.75×** | **1.94×** |
+| Matrix Multiply | 1000 | 18.67 ms | 74.84 ms | 35.88 ms | **4.01×** | **1.92×** |
+| Matrix Scalar Multiply | 100 | 2.6 µs | 7.9 µs | 5.1 µs | **3.10×** | **2.00×** |
+| Matrix Scalar Multiply | 500 | 253 µs | 213 µs | 338 µs | 0.84× (slower) | **1.34×** |
+| Matrix Scalar Multiply | 1000 | 1.09 ms | 1.17 ms | 2.02 ms | **1.07×** | **1.85×** |
+| Matrix Subtract | 100 | 3.7 µs | 8.7 µs | 7.0 µs | **2.32×** | **1.87×** |
+| Matrix Subtract | 500 | 252 µs | 242 µs | 427 µs | 0.96× (slower) | **1.69×** |
+| Matrix Subtract | 1000 | 1.52 ms | 1.65 ms | 2.46 ms | **1.08×** | **1.62×** |
+| Transpose | 100 | 5.2 µs | 10 µs | 13 µs | **2.00×** | **2.56×** |
+| Transpose | 500 | 283 µs | 568 µs | 540 µs | **2.01×** | **1.91×** |
+| Transpose | 1000 | 1.68 ms | 1.57 ms | 4.53 ms | 0.94× (slower) | **2.69×** |
+| Transpose (view) | 100 | 84 ns | 479 ns | — | **5.70×** | — |
+| Transpose (view) | 500 | 104 ns | 599 ns | — | **5.76×** | — |
+| Transpose (view) | 1000 | 114 ns | 445 ns | — | **3.90×** | — |
+| Vector Add | 100 | 85 ns | 914 ns | 121 ns | **10.81×** | **1.43×** |
+| Vector Add | 500 | 322 ns | 1.4 µs | 338 ns | **4.37×** | **1.05×** |
+| Vector Add | 1000 | 599 ns | 1.6 µs | 652 ns | **2.68×** | **1.09×** |
+| Vector Scalar Multiply | 100 | 52 ns | 1.6 µs | 81 ns | **30.38×** | **1.57×** |
+| Vector Scalar Multiply | 500 | 227 ns | 1.9 µs | 274 ns | **8.25×** | **1.20×** |
+| Vector Scalar Multiply | 1000 | 322 ns | 2.1 µs | 518 ns | **6.46×** | **1.61×** |
+| Vector Subtract | 100 | 65 ns | 837 ns | 104 ns | **12.81×** | **1.59×** |
+| Vector Subtract | 500 | 262 ns | 1.1 µs | 292 ns | **4.28×** | **1.11×** |
+| Vector Subtract | 1000 | 391 ns | 1.4 µs | 592 ns | **3.63×** | **1.51×** |
 
-**Zero-external-dependency policy.** Every hot path runs through our
-hand-tuned `SimdKernels` AVX2/AVX-512 implementations. We deliberately
-do NOT reference `System.Numerics.Tensors`, MKL, MKL.NET, or oneDNN —
-both for supply-chain hygiene and because we measured several
-TensorPrimitives entry points to regress 4–20× vs our in-house kernels
-on Ryzen 9 3950X (notably `Tanh(float)` 20× slower, `Sigmoid(double)`
-12× slower, `Log(double)` 4× slower). All double-precision and
-single-precision paths now go through the same hand-tuned SIMD
-kernels — no fallback to any external library.
+The three NumSharp losses (`Matrix Scalar Multiply` and `Matrix Subtract` at N=500, `Transpose` at N=1000) are benchmarks
+that allocate a 2–8 MB result and discard it on every call. AiDotNet returns a managed array, so that churn triggers
+gen-2 garbage collections (about one every seven calls for the 8 MB transpose); NumSharp allocates unmanaged memory and
+does not. Writing into an existing matrix avoids the allocation: `TransposeInPlace` at N=1000 takes 125 µs.
 
-### vs ML.NET (Microsoft.ML, eager-vs-eager)
+**Element-wise (vs NumSharp, double):**
 
-Latest BDN run, validated post-#209-perf. Microsoft's general-purpose
-ML framework — same Ryzen 9 3950X, same .NET 10.0.7.
+| Operation | N | AiDotNet | NumSharp 0.70.0 | Speedup vs NumSharp |
+|---|--:|--:|--:|--:|
+| Exp | 1000 | 2.1 µs | 5.4 µs | **2.64×** |
+| Exp | 10000 | 16 µs | 58 µs | **3.60×** |
+| Exp | 100000 | 114 µs | 610 µs | **5.35×** |
+| Max | 1000 | 123 ns | 1.3 µs | **10.37×** |
+| Max | 10000 | 906 ns | 2.3 µs | **2.53×** |
+| Max | 100000 | 5.0 µs | 12 µs | **2.45×** |
+| Multiply | 1000 | 858 ns | 1.5 µs | **1.76×** |
+| Multiply | 10000 | 4.9 µs | 9.5 µs | **1.93×** |
+| Multiply | 100000 | 59 µs | 91 µs | **1.53×** |
+| Sum | 1000 | 91 ns | 1.2 µs | **13.19×** |
+| Sum | 10000 | 684 ns | 1.7 µs | **2.44×** |
+| Sum | 100000 | 4.1 µs | 9.8 µs | **2.40×** |
 
-| Operation | Size | AiDotNet | ML.NET | Speedup |
-|-----------|------|---------:|-------:|--------:|
-| TensorMean | 1M | **80 µs** | 180 µs | **2.2× faster** |
-| TensorSum | 1M | **92 µs** | 104 µs | 1.1× faster |
-| TensorAdd | 100K | 106 µs | 55 µs | 0.5× (memory-bound — ML.NET stayed allocator-warm) |
-| TensorMultiply | 100K | 106 µs | 60 µs | 0.6× (memory-bound) |
-| TensorAdd | 1M | 800 µs | 601 µs | 0.75× (memory-bound) |
-| TensorMultiply | 1M | 782 µs | 595 µs | 0.76× (memory-bound) |
+**Small matrix multiply (double):**
 
-The 1M-element bulk ops are memory-bandwidth-bound: at ~50 GB/s
-sustained DRAM bandwidth on Zen 2, a 4 MB read + 4 MB read + 4 MB
-write = 12 MB of traffic per call → 240 µs theoretical floor before
-any allocator overhead. Both libraries are within 2× of that floor.
-
-### vs TensorFlow.NET CPU (eager-vs-eager)
-
-Latest BDN run, validated post-#209-perf. SciSharp's TensorFlow .NET
-binding (eager mode, no graph compile). Same hardware. AiDotNet wins
-outright on every measured op except small-Conv2D and 256×256 MatMul.
-
-| Operation | Size | AiDotNet | TensorFlow.NET | Speedup |
-|-----------|------|---------:|---------------:|--------:|
-| TensorSum | 1M | **77 µs** | 259 µs | **3.4× faster** |
-| TensorMean | 1M | **76 µs** | 189 µs | **2.5× faster** |
-| TensorMultiply | 100K | **119 µs** | 202 µs | **1.7× faster** |
-| Sigmoid | 1M | **1,264 µs** | 1,941 µs | **1.5× faster** |
-| TensorAdd | 100K | **141 µs** | 211 µs | **1.5× faster** |
-| TensorMatMul | 512 | **1,286 µs** | 1,554 µs | **1.2× faster** |
-| TensorAdd | 1M | **1,340 µs** | 1,478 µs | 1.1× faster |
-| ReLU | 1M | 1,680 µs | 1,606 µs | within noise (high stddev 713 µs) |
-| TensorMultiply | 1M | 1,655 µs | 1,347 µs | 0.81× (memory-bound) |
-| TensorMatMul | 256 | 432 µs | 398 µs | 0.92× |
-| Conv2D | 4×3×32×32 | 719 µs | 428 µs | 0.6× |
-
-The fresh validation run captured full data on bulk Add/Multiply +
-256/512 MatMul (the original `fcb7fea` baseline showed `NA` because
-SciSharp's TensorFlow.NET was crashing at those shapes; later runtime
-versions stabilized).
-
-### vs MathNet.Numerics (Linear Algebra, double, N=1000)
-
-| Operation | AiDotNet | MathNet | Speedup |
-|-----------|----------|---------|---------|
-| Matrix Multiply 1000×1000 | 8.3 ms | 49.2 ms | **6× faster** |
-| Matrix Add | 1.87 ms | 2.50 ms | **1.3× faster** |
-| Matrix Subtract | 2.08 ms | 2.47 ms | **1.2× faster** |
-| Matrix Scalar Multiply | 1.66 ms | 2.14 ms | **1.3× faster** |
-| Transpose | 2.85 ms | 3.68 ms | **1.3× faster** |
-| Dot Product | 97 ns | 817 ns | **8.4× faster** |
-| L2 Norm | 92 ns | 11,552 ns | **125× faster** |
-
-### vs NumSharp (N=1000)
-
-| Operation | AiDotNet | NumSharp | Speedup |
-|-----------|----------|----------|---------|
-| Matrix Multiply 1000×1000 | 8.3 ms | 26.5 s | **3,200× faster** |
-| Matrix Add | 1.87 ms | 1.98 ms | 1.1× faster |
-| Transpose | 2.85 ms | 13.7 ms | **4.8× faster** |
-| Vector Add | 1.47 us | 54.5 us | **37× faster** |
-
-### vs System.Numerics.Tensors.TensorPrimitives (historical — REMOVED)
-
-We previously referenced `System.Numerics.Tensors` and benchmarked our
-kernels against `TensorPrimitives.*` directly. As of #209 the dependency
-is **removed entirely** — every elementwise op now runs through our
-in-house `SimdKernels`, both for supply-chain hygiene and because we
-measured several TensorPrimitives entry points to regress 4–20× vs our
-in-house kernels on Ryzen 9 3950X (notably `Tanh(float)` ~20× slower,
-`Sigmoid(double)` ~12× slower, `Log(double)` ~4× slower).
-
-| Operation | AiDotNet | TensorPrimitives (raw) | Speedup |
-|-----------|----------|------------------------|---------|
-| Sigmoid (1M, float) | **284 µs** | 7,295 µs | **25× faster** |
-| TensorAdd (100K, float) | **24 µs** | 138 µs | **5.7× faster** |
-| TensorAdd (1M, float) | **379 µs** | 614 µs | **1.6× faster** |
-| TensorSum (1M, float) | **196 µs** | 298 µs | **1.5× faster** |
-| Dot Product (1K, double, in-place) | 97 ns | 185 ns | **1.9× faster** |
-| L2 Norm (1K, double, in-place) | 92 ns | 187 ns | **2.0× faster** |
-
-### Small Matrix Multiply (double)
-
-| Size | AiDotNet | MathNet | NumSharp |
-|------|----------|---------|----------|
-| 4×4 | 172 ns | 165 ns | 2,198 ns |
-| 16×16 | 2.1 us | 2.9 us | 107.5 us |
-| 32×32 | 10.5 us | 36.2 us | 774.8 us |
-
-AiDotNet is **1.4× faster** at 16×16 and **3.4× faster** at 32×32 than MathNet.
+| Operation | N | AiDotNet | NumSharp 0.70.0 | MathNet 5.0.0 | Speedup vs NumSharp | Speedup vs MathNet |
+|---|--:|--:|--:|--:|--:|--:|
+| 16x16 Multiply |  | 654 ns | 1.9 µs | 3.0 µs | **2.90×** | **4.57×** |
+| 32x32 Multiply |  | 2.7 µs | 5.8 µs | 25 µs | **2.14×** | **9.39×** |
+| 4x4 Multiply |  | 112 ns | 1.0 µs | 138 ns | **9.00×** | **1.23×** |
 
 ### SIMD Instruction Support
 

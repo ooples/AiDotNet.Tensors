@@ -1,5 +1,7 @@
 # BENCHMARK RESULTS
 
+> **Historical.** These runs are from a Ryzen 9 3950X before October 2026 and are kept for the per-issue notes below. The current comparison tables (TorchSharp 0.107, ML.NET 5.0, TensorFlow.NET 0.150, NumSharp 0.70, MathNet 5.0, steady state and cold call) are in the README's CPU Benchmarks section, with the raw reports in `Results/2026-10-08-threadripper-3990x/`.
+
 > **Hardware**: AMD Ryzen 9 3950X (16C / 32T, AVX2/FMA, no AVX-512)
 > **Runtime**: .NET 10.0.7, BenchmarkDotNet v0.15.8
 > **Last regenerated**: 2026-04-30 — full three-suite validation run after
