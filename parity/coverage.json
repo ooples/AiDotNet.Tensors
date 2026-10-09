@@ -1,6 +1,6 @@
 {
   "torchVersion": "2.11.0",
-  "gapBaseline": 509,
+  "gapBaseline": 494,
   "entries": {
     "Tensor:abs": {
       "status": "mapped",
@@ -1750,8 +1750,9 @@
       "source": "reviewed"
     },
     "Tensor:new_empty_strided": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601",
+      "source": "reviewed"
     },
     "Tensor:new_full": {
       "status": "mapped",
@@ -2471,8 +2472,9 @@
       "source": "reviewed"
     },
     "Tensor:to_padded_tensor": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "A nested (jagged) tensor conversion; Tensors has no nested-tensor type, ragged batches are padded explicitly (PadNd) or packed by the caller.",
+      "source": "reviewed"
     },
     "Tensor:to_sparse": {
       "status": "mapped",
@@ -3482,8 +3484,9 @@
       "source": "reviewed"
     },
     "aten:empty_strided": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601",
+      "source": "reviewed"
     },
     "aten:eq": {
       "status": "mapped",
@@ -4765,8 +4768,9 @@
       "source": "reviewed"
     },
     "aten:new_empty_strided": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601",
+      "source": "reviewed"
     },
     "aten:new_full": {
       "status": "mapped",
@@ -5016,8 +5020,9 @@
       "source": "name-match"
     },
     "aten:reflection_pad1d": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::PadNd",
+      "source": "reviewed"
     },
     "aten:reflection_pad1d_backward": {
       "status": "not-applicable",
@@ -5025,8 +5030,9 @@
       "source": "reviewed"
     },
     "aten:reflection_pad2d": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::PadNd",
+      "source": "reviewed"
     },
     "aten:reflection_pad2d_backward": {
       "status": "not-applicable",
@@ -5034,8 +5040,9 @@
       "source": "reviewed"
     },
     "aten:reflection_pad3d": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::PadNd",
+      "source": "reviewed"
     },
     "aten:reflection_pad3d_backward": {
       "status": "not-applicable",
@@ -5085,8 +5092,9 @@
       "source": "name-match"
     },
     "aten:replication_pad1d": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::PadNd",
+      "source": "reviewed"
     },
     "aten:replication_pad1d_backward": {
       "status": "not-applicable",
@@ -5094,8 +5102,9 @@
       "source": "reviewed"
     },
     "aten:replication_pad2d": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::PadNd",
+      "source": "reviewed"
     },
     "aten:replication_pad2d_backward": {
       "status": "not-applicable",
@@ -5103,8 +5112,9 @@
       "source": "reviewed"
     },
     "aten:replication_pad3d": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::PadNd",
+      "source": "reviewed"
     },
     "aten:replication_pad3d_backward": {
       "status": "not-applicable",
@@ -6009,8 +6019,9 @@
       "source": "name-match"
     },
     "aten:zero": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorZerosLike",
+      "source": "reviewed"
     },
     "aten:zero_": {
       "status": "gap",
@@ -8108,8 +8119,9 @@
       "source": "name-match"
     },
     "torch:can_cast": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "PyTorch's runtime dtype promotion; in Tensors the element type is Tensor<T>'s compile-time type parameter, and conversion between types is explicit (Tensor<T>.Cast<TOut>).",
+      "source": "reviewed"
     },
     "torch:cartesian_prod": {
       "status": "mapped",
@@ -8614,8 +8626,9 @@
       "source": "reviewed"
     },
     "torch:empty_strided": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor\u00601",
+      "source": "reviewed"
     },
     "torch:eq": {
       "status": "mapped",
@@ -10000,8 +10013,9 @@
       "source": "reviewed-alias"
     },
     "torch:promote_types": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "PyTorch's runtime dtype promotion; in Tensors the element type is Tensor<T>'s compile-time type parameter, and conversion between types is explicit (Tensor<T>.Cast<TOut>).",
+      "source": "reviewed"
     },
     "torch:put": {
       "status": "mapped",
@@ -10218,8 +10232,9 @@
       "source": "reviewed"
     },
     "torch:result_type": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "not-applicable",
+      "reason": "PyTorch's runtime dtype promotion; in Tensors the element type is Tensor<T>'s compile-time type parameter, and conversion between types is explicit (Tensor<T>.Cast<TOut>).",
+      "source": "reviewed"
     },
     "torch:rms_norm": {
       "status": "mapped",
