@@ -20,6 +20,9 @@ internal static class OpRegistry
     /// </summary>
     internal static readonly HashSet<string> DifferentiableOps = new(StringComparer.Ordinal)
     {
+        // Quantiles: backward to the two order statistics read (CpuEngine.TorchCreation)
+        "TensorQuantile", "TensorNanQuantile",
+
         // torch.special / element-wise parity ops (backward from the derivative, CpuEngine.TorchSpecial)
         "TensorErf", "TensorLogit", "TensorSinc", "TensorDeg2Rad",
         "TensorRad2Deg", "TensorFmax", "TensorFmin", "TensorIgamma",
@@ -240,6 +243,14 @@ internal static class OpRegistry
     /// </summary>
     internal static readonly HashSet<string> NonDifferentiableOps = new(StringComparer.Ordinal)
     {
+        // Creation, random, window, index and truth-value ops: constants
+        "TensorAll", "TensorAny", "TensorArange", "TensorRange",
+        "TensorLogspace", "TensorZerosLike", "TensorOnesLike", "TensorFullLike",
+        "TensorEmptyLike", "TensorRandLike", "TensorRandnLike", "TensorRandint",
+        "TensorRandintLike", "TensorRandperm", "TensorHannWindow", "TensorHammingWindow",
+        "TensorBlackmanWindow", "TensorBartlettWindow", "TensorKaiserWindow", "TensorTrilIndices",
+        "TensorTriuIndices", "TensorUnravelIndex",
+
         // Comparisons, indicators, bitwise/integer ops and orthogonal polynomials (PyTorch defines no gradient)
         "TensorSignbit", "TensorIsPosInf", "TensorIsNegInf", "TensorIsReal",
         "TensorGreaterEqual", "TensorLessEqual", "TensorHeaviside", "TensorFloorDivide",
@@ -465,6 +476,12 @@ internal static class OpRegistry
     /// </summary>
     internal static readonly HashSet<string> DelegatorOps = new(StringComparer.Ordinal)
     {
+        // Shape and statistics ops composed from recorded ops (narrow, reshape, reductions, matmul, index select)
+        "TensorAmin", "TensorChunk", "TensorSplitWithSizes", "TensorUnflatten",
+        "TensorSelect", "TensorViewAs", "TensorSumToSize", "TensorStdMean",
+        "TensorVarMean", "TensorCov", "TensorCorrcoef", "TensorDiff",
+        "TensorTrapezoid", "TensorCumulativeTrapezoid", "TensorCombinations",
+
         // Composed from recorded ops (where + ReduceSum / TensorDivide) or the identity
         "TensorPositive", "TensorNanSum", "TensorNanMean",
 
