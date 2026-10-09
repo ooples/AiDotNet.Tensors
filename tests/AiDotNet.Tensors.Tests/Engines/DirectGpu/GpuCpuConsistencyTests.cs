@@ -143,6 +143,338 @@ public class GpuCpuConsistencyTests : IClassFixture<DirectGpuTensorEngineTestFix
         Assert.Equal(4f, refreshed[1], 5);
     }
 
+    [SkippableTheory]
+    [InlineData(12, 64, 256)]   // AiDotNet #1804: N-BEATS forecast [H, B] -> permuted [B, H]
+    [InlineData(12, 12, 256)]   // square: the permuted view has the same shape as its source
+    public void EagerResidentBinary_PermutedResidentOperands_MatchCpu(int rows, int cols, int inner)
+    {
+        SkipIfNoDirectGpu();
+        var gpu = Gpu;
+        var cpu = new CpuEngine();
+        Tensor<float> Make(int r, int c, int seed) =>
+            new Tensor<float>(Enumerable.Range(0, r * c).Select(i => DeterministicValue(seed + i)).ToArray(), [r, c]);
+        var weights = Make(rows, inner, 1);
+        var thetaA = Make(inner, cols, 50_000);
+        var thetaB = Make(inner, cols, 90_000);
+
+        // Each operand is a permuted VIEW of a matmul result. On the GPU engine the matmul result is
+        // device-resident and its permute shares that buffer, so the eager resident shortcut sees two
+        // live device buffers that hold the SOURCE [rows, cols] layout, not the view's [cols, rows].
+        foreach (bool subtract in new[] { false, true })
+        {
+            Tensor<float> Run(IEngine e, bool contiguousLeft)
+            {
+                var left = contiguousLeft
+                    ? e.TensorMatMul(Make(cols, inner, 7), Make(inner, rows, 9))
+                    : e.TensorPermute(e.TensorMatMul(weights, thetaA), new[] { 1, 0 });
+                var right = e.TensorPermute(e.TensorMatMul(weights, thetaB), new[] { 1, 0 });
+                return subtract ? e.TensorSubtract(left, right) : e.TensorAdd(left, right);
+            }
+
+            foreach (bool contiguousLeft in new[] { false, true })
+            {
+                var expected = Run(cpu, contiguousLeft).ToArray();
+                var actual = Run(gpu, contiguousLeft).ToArray();
+                Assert.Equal(expected.Length, actual.Length);
+                for (int i = 0; i < expected.Length; i++)
+                {
+                    // The operands are GEMM results (O(1) magnitude) whose float32 summation order differs
+                    // between the GPU and CPU, so an element that nearly cancels carries ~1e-6 absolute
+                    // round-off that a relative bound cannot absorb. A layout error is O(1) (1 to 36 on
+                    // these shapes before the fix), five orders above this bound.
+                    Assert.True(Math.Abs(expected[i] - actual[i]) <= 1e-4f * (1f + Math.Abs(expected[i])),
+                        $"{(subtract ? "Subtract" : "Add")} contiguousLeft={contiguousLeft} [{rows},{cols}] index {i}: " +
+                        $"cpu={expected[i]} gpu={actual[i]}");
+                }
+            }
+        }
+    }
+    [SkippableFact]
+    public void IEngineReduceSum_InnermostAxisOfPermutedResidentView_MatchesCpu_AndLeavesSourceIntact()
+    {
+        SkipIfNoDirectGpu();
+        IEngine gpu = Gpu;   // AiDotNet calls the engine through IEngine: the explicit implementation is the path under test
+        IEngine cpu = new CpuEngine();
+        Tensor<float> Make(int r, int c, int seed) =>
+            new Tensor<float>(Enumerable.Range(0, r * c).Select(i => DeterministicValue(seed + i)).ToArray(), [r, c]);
+        var weights = Make(12, 256, 1);
+        var theta = Make(256, 64, 50_000);
+
+        // [12,64] device-resident matmul result, then a permuted [64,12] view of it. Reducing the view's
+        // innermost axis takes the raw-upload SumAxis kernel, which read the view's shared source buffer
+        // as if it were the view (#1090: off by 3.7).
+        var expected = cpu.ReduceSum(cpu.TensorPermute(cpu.TensorMatMul(weights, theta), new[] { 1, 0 }), new[] { 1 }, false).ToArray();
+        var source = gpu.TensorMatMul(weights, theta);
+        var actual = gpu.ReduceSum(gpu.TensorPermute(source, new[] { 1, 0 }), new[] { 1 }, false).ToArray();
+        Assert.Equal(expected.Length, actual.Length);
+        for (int i = 0; i < expected.Length; i++)
+            Assert.True(Math.Abs(expected[i] - actual[i]) <= 1e-4f * (1f + Math.Abs(expected[i])),
+                $"ReduceSum(view) row {i}: cpu={expected[i]} gpu={actual[i]}");
+
+        // The view shares its source's backing array, which keys the upload caches. Uploading the view must
+        // not overwrite the source's cached buffer: reducing the SOURCE afterwards must still be right.
+        var expectedSource = cpu.ReduceSum(cpu.TensorMatMul(weights, theta), new[] { 1 }, false).ToArray();
+        var actualSource = gpu.ReduceSum(source, new[] { 1 }, false).ToArray();
+        for (int i = 0; i < expectedSource.Length; i++)
+            Assert.True(Math.Abs(expectedSource[i] - actualSource[i]) <= 1e-4f * (1f + Math.Abs(expectedSource[i])),
+                $"ReduceSum(source) row {i} after the view upload: cpu={expectedSource[i]} gpu={actualSource[i]}");
+    }
+    [SkippableTheory]
+    [InlineData(1, 65536)]     // one long row: the old one-thread-per-row kernel ran it serially
+    [InlineData(8, 1_000_000)] // few, very long rows
+    [InlineData(256, 64)]      // N-BEATS bias-gradient shape (AiDotNet #1804)
+    [InlineData(1000, 32)]     // shortest row the block-per-row kernel takes
+    [InlineData(1000, 31)]     // longest row that stays on the one-thread-per-row kernel
+    [InlineData(100000, 2)]    // many tiny rows
+    public void IEngineReduceSum_InnermostAxis_MatchesExactRowSums(int rows, int columns)
+    {
+        SkipIfNoDirectGpu();
+        IEngine gpu = Gpu;
+        var data = new float[rows * columns];
+        for (int i = 0; i < data.Length; i++) data[i] = DeterministicValue(i);
+        var actual = gpu.ReduceSum(new Tensor<float>(data, [rows, columns]), new[] { 1 }, false).ToArray();
+
+        Assert.Equal(rows, actual.Length);
+        for (int r = 0; r < rows; r++)
+        {
+            double exact = 0;
+            for (int c = 0; c < columns; c++) exact += data[r * columns + c];
+            // float32 accumulation over up to 1e6 terms in either order: bound relative to the row's
+            // magnitude. A wrong row or a dropped element is O(1) off.
+            Assert.True(Math.Abs(actual[r] - exact) <= 1e-4 * (1 + Math.Abs(exact)) + 1e-6 * columns,
+                $"[{rows},{columns}] row {r}: exact={exact} gpu={actual[r]}");
+        }
+    }
+    [SkippableFact]
+    public void MultiTensorSumOfSquaresAndClip_MatchExactValues_AndDetectNonFinite()
+    {
+        SkipIfNoDirectGpu();
+        var cuda = Gpu.TestBackend as AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaBackend;
+        Skip.If(cuda is null, "Multi-tensor gradient kernels are CUDA-only.");
+
+        // Ragged sizes across chunk boundaries (chunk = 256), more chunks than the reduction's block cap.
+        int[] sizes = { 1, 255, 256, 257, 4096, 300_000 };
+        var host = sizes.Select((n, t) => Enumerable.Range(0, n).Select(i => DeterministicValue(t * 1_000_003 + i)).ToArray()).ToArray();
+        double exact = host.Sum(a => a.Sum(v => (double)v * v));
+        var buffers = host.Select(a => cuda!.AllocateBuffer(a)).ToList();
+        var sumSq = cuda!.AllocateBuffer(2);
+        var scale = cuda.AllocateBuffer(1);
+        try
+        {
+            double Read() => BitConverter.ToDouble(cuda.DownloadByteBuffer(sumSq, sizeof(double)), 0);
+
+            cuda.MultiTensorSumOfSquares(buffers, sizes, sumSq);
+            Assert.True(Math.Abs(Read() - exact) <= 1e-9 * exact, $"sum of squares {Read()} vs exact {exact}");
+
+            // clip_grad_norm_: every element scaled by min(1, max / (norm + 1e-6)).
+            double norm = Math.Sqrt(exact);
+            float maxNorm = (float)(norm / 4);
+            cuda.ClipScaleFromSumOfSquares(sumSq, maxNorm, scale);
+            cuda.MultiTensorScaleByDeviceScalar(buffers, sizes, scale);
+            double coefficient = Math.Min(1.0, maxNorm / (norm + 1e-6));
+            for (int t = 0; t < sizes.Length; t++)
+            {
+                var scaled = cuda.DownloadBuffer(buffers[t]);
+                for (int i = 0; i < sizes[t]; i += Math.Max(1, sizes[t] / 64))
+                    Assert.True(Math.Abs(scaled[i] - host[t][i] * coefficient) <= 1e-6 * (1 + Math.Abs(host[t][i])),
+                        $"tensor {t}[{i}]: {scaled[i]} vs {host[t][i] * coefficient}");
+            }
+
+            // 3e30 squared overflows float but not double: still finite, so the step must not be discarded. (A new
+            // buffer for tensor 0, which has one element; the cached pointer table must notice the new handle.)
+            buffers[0].Dispose();
+            buffers[0] = cuda.AllocateBuffer(new[] { 3e30f });
+            cuda.MultiTensorSumOfSquares(buffers, sizes, sumSq);
+            Assert.False(double.IsInfinity(Read()) || double.IsNaN(Read()), "a finite gradient read as non-finite");
+
+            // One NaN anywhere makes the whole sum non-finite.
+            buffers[0].Dispose();
+            buffers[0] = cuda.AllocateBuffer(new[] { float.NaN });
+            cuda.MultiTensorSumOfSquares(buffers, sizes, sumSq);
+            Assert.True(double.IsNaN(Read()) || double.IsInfinity(Read()), "a NaN gradient read as finite");
+        }
+        finally
+        {
+            foreach (var b in buffers) b.Dispose();
+            sumSq.Dispose();
+            scale.Dispose();
+        }
+    }
+    [SkippableTheory]
+    [InlineData(64, 96, 256)]   // N-BEATS first FC layer, batch 64 (AiDotNet #1804)
+    [InlineData(7, 13, 5)]      // ragged, below any tile size
+    [InlineData(300, 1, 129)]   // degenerate K
+    public void MatMulBackward2D_TransposeFlagGemms_MatchCpuGradients(int m, int k, int n)
+    {
+        SkipIfNoDirectGpu();
+        var gpu = Gpu;
+        Tensor<float> Make(int r, int c, int seed) =>
+            new Tensor<float>(Enumerable.Range(0, r * c).Select(i => DeterministicValue(seed + i)).ToArray(), [r, c]);
+        var a = Make(m, k, 11);
+        var b = Make(k, n, 22_222);
+        var g = Make(m, n, 333_333);
+
+        Skip.IfNot(gpu.TryMatMulBackward2D(g, a, b, out var gradA, out var gradB), "A float backend implementing ITransposedAGemm is required.");
+        Assert.NotNull(gradA);
+        Assert.NotNull(gradB);
+
+        // Reference in double: dA = G·Bᵀ, dB = Aᵀ·G.
+        var ga = gradA.ToArray();
+        var gb = gradB.ToArray();
+        var ah = a.ToArray(); var bh = b.ToArray(); var gh = g.ToArray();
+        for (int i = 0; i < m; i++)
+            for (int j = 0; j < k; j++)
+            {
+                double s = 0; for (int q = 0; q < n; q++) s += (double)gh[i * n + q] * bh[j * n + q];
+                Assert.True(Math.Abs(ga[i * k + j] - s) <= 1e-4 * (1 + Math.Abs(s)), $"dA[{i},{j}] gpu={ga[i * k + j]} exact={s}");
+            }
+        for (int i = 0; i < k; i++)
+            for (int j = 0; j < n; j++)
+            {
+                double s = 0; for (int q = 0; q < m; q++) s += (double)ah[q * k + i] * gh[q * n + j];
+                Assert.True(Math.Abs(gb[i * n + j] - s) <= 1e-4 * (1 + Math.Abs(s)), $"dB[{i},{j}] gpu={gb[i * n + j]} exact={s}");
+            }
+    }
+
+    [SkippableFact]
+    public void MatMulTapeGradients_OnGpu_MatchCpu()
+    {
+        SkipIfNoDirectGpu();
+        Tensor<float> Make(int r, int c, int seed) =>
+            new Tensor<float>(Enumerable.Range(0, r * c).Select(i => DeterministicValue(seed + i)).ToArray(), [r, c]);
+        (float[] dA, float[] dB) Run(IEngine e)
+        {
+            var a = Make(48, 33, 5);
+            var b = Make(33, 17, 70_000);
+            using var tape = new GradientTape<float>();
+            var y = e.TensorMatMul(a, b);
+            var loss = e.ReduceSum(e.TensorMultiply(y, y), null);
+            var grads = tape.ComputeGradients(loss, new[] { a, b });
+            return (grads[a].ToArray(), grads[b].ToArray());
+        }
+        var (cpuA, cpuB) = Run(new CpuEngine());
+        var (gpuA, gpuB) = Run(Gpu);
+        for (int i = 0; i < cpuA.Length; i++)
+            Assert.True(Math.Abs(cpuA[i] - gpuA[i]) <= 1e-3f * (1 + Math.Abs(cpuA[i])), $"dA[{i}] cpu={cpuA[i]} gpu={gpuA[i]}");
+        for (int i = 0; i < cpuB.Length; i++)
+            Assert.True(Math.Abs(cpuB[i] - gpuB[i]) <= 1e-3f * (1 + Math.Abs(cpuB[i])), $"dB[{i}] cpu={cpuB[i]} gpu={gpuB[i]}");
+    }
+
+    [SkippableFact]
+    public void FusedLstmSequenceTrain_ForwardAndGradients_MatchDecomposedCpu()
+    {
+        // TryLstmSequenceTrain (persistent-RNN forward + BPTT kernels, one tape node) against the same LSTM written
+        // as per-step CPU ops: output and the gradients of input, both packed weights and the bias.
+        SkipIfNoDirectGpu();
+        int b = 3, t = 5, inSize = 4, h = 6;
+        Tensor<float> Make(int[] shape, int seed, float scale) =>
+            new Tensor<float>(Enumerable.Range(0, shape.Aggregate(1, (x, y) => x * y))
+                .Select(i => DeterministicValue(seed + i) * scale).ToArray(), shape);
+        var x = Make([b, t, inSize], 3, 1f);
+        var wIh = Make([4 * h, inSize], 900, 0.4f);
+        var wHh = Make([4 * h, h], 1900, 0.4f);
+        var bias = Make([4 * h], 2900, 0.2f);
+
+        (float[] y, float[] dx, float[] dwi, float[] dwh, float[] db) Reference()
+        {
+            var cpu = new CpuEngine();
+            using var tape = new GradientTape<float>();
+            var hPrev = new Tensor<float>([b, h]);
+            var cPrev = new Tensor<float>([b, h]);
+            var wiT = cpu.TensorTranspose(wIh); var whT = cpu.TensorTranspose(wHh);
+            var bias2 = cpu.Reshape(bias, [1, 4 * h]);
+            var steps = new List<Tensor<float>>();
+            for (int s = 0; s < t; s++)
+            {
+                var gates = cpu.TensorAdd(cpu.TensorAdd(cpu.TensorMatMul(cpu.TensorSliceAxis(x, 1, s), wiT),
+                    cpu.TensorMatMul(hPrev, whT)), bias2);
+                var ig = cpu.Sigmoid(cpu.TensorSlice(gates, [0, 0], [b, h]));
+                var fg = cpu.Sigmoid(cpu.TensorSlice(gates, [0, h], [b, h]));
+                var gg = cpu.Tanh(cpu.TensorSlice(gates, [0, 2 * h], [b, h]));
+                var og = cpu.Sigmoid(cpu.TensorSlice(gates, [0, 3 * h], [b, h]));
+                cPrev = cpu.TensorAdd(cpu.TensorMultiply(fg, cPrev), cpu.TensorMultiply(ig, gg));
+                hPrev = cpu.TensorMultiply(og, cpu.Tanh(cPrev));
+                steps.Add(cpu.Reshape(hPrev, [b, 1, h]));
+            }
+            var y = cpu.TensorConcatenate(steps.ToArray(), axis: 1);
+            var loss = cpu.ReduceSum(cpu.TensorMultiply(y, y), null);
+            var g = tape.ComputeGradients(loss, new[] { x, wIh, wHh, bias });
+            return (y.ToArray(), g[x].ToArray(), g[wIh].ToArray(), g[wHh].ToArray(), g[bias].ToArray());
+        }
+
+        (float[] y, float[] dx, float[] dwi, float[] dwh, float[] db) Fused()
+        {
+            using var tape = new GradientTape<float>();
+            var fused = Gpu.TryLstmSequenceTrain(x, wIh, wHh, bias);
+            Skip.If(fused is null, "fused LSTM training op not available on this backend");
+            if (fused is not { } y) throw new InvalidOperationException("unreachable: skipped above");
+            var loss = Gpu.ReduceSum(Gpu.TensorMultiply(y, y), null);
+            var g = tape.ComputeGradients(loss, new[] { x, wIh, wHh, bias });
+            return (y.ToArray(), g[x].ToArray(), g[wIh].ToArray(), g[wHh].ToArray(), g[bias].ToArray());
+        }
+
+        var expected = Reference();
+        var actual = Fused();
+        foreach (var (name, e, a) in new[] { ("y", expected.y, actual.y), ("dx", expected.dx, actual.dx),
+                     ("dWih", expected.dwi, actual.dwi), ("dWhh", expected.dwh, actual.dwh), ("dBias", expected.db, actual.db) })
+        {
+            Assert.Equal(e.Length, a.Length);
+            for (int i = 0; i < e.Length; i++)
+                Assert.True(Math.Abs(e[i] - a[i]) <= 1e-4f * (1 + Math.Abs(e[i])), $"{name}[{i}] cpu={e[i]} gpu={a[i]}");
+        }
+    }
+
+    [SkippableFact]
+    public void AdaptiveAvgPool_NonDividingBins_MatchCpu()
+    {
+        // 7 -> 4 does not divide: each bin is [floor(o*in/out), ceil((o+1)*in/out)) and neighbours overlap. The GPU
+        // kernels ended bins at floor((o+1)*in/out) and dropped rows (parity CNN logits off by 1e-2 vs PyTorch).
+        SkipIfNoDirectGpu();
+        var input = new Tensor<float>(Enumerable.Range(0, 2 * 3 * 7 * 7).Select(i => DeterministicValue(31 + i)).ToArray(), [2, 3, 7, 7]);
+        var cpu = new CpuEngine().AdaptiveAvgPool2D(input, 4, 4).ToArray();
+        var gpu = Gpu.AdaptiveAvgPool2D(input, 4, 4).ToArray();
+        Assert.Equal(cpu.Length, gpu.Length);
+        for (int i = 0; i < cpu.Length; i++)
+            Assert.True(Math.Abs(cpu[i] - gpu[i]) <= 1e-5f * (1 + Math.Abs(cpu[i])), $"[{i}] cpu={cpu[i]} gpu={gpu[i]}");
+    }
+
+    [SkippableFact]
+    public void RectSlices_OnNonLastAxes_ForwardAndAccumulatedGradients_MatchCpu()
+    {
+        // Two OVERLAPPING rectangles over non-last axes of one tensor (the AdaptiveAveragePoolingLayer
+        // pattern): the forward exercises the one-launch rect_slice_nd gather, the backward its scatter and the
+        // accumulation of both slices' gradients into the shared input.
+        SkipIfNoDirectGpu();
+        (float[] s1, float[] s2, float[] dx) Run(IEngine e)
+        {
+            var x = new Tensor<float>(Enumerable.Range(0, 4 * 3 * 7 * 7).Select(i => DeterministicValue(17 + i)).ToArray(), [4, 3, 7, 7]);
+            using var tape = new GradientTape<float>();
+            var a = e.TensorSlice(x, [0, 1, 1, 0], [4, 2, 3, 7]);
+            var b = e.TensorSlice(x, [1, 0, 2, 2], [3, 3, 4, 4]);
+            var loss = e.TensorAdd(e.ReduceSum(e.TensorMultiply(a, a), null), e.ReduceSum(e.TensorMultiply(b, b), null));
+            var grads = tape.ComputeGradients(loss, new[] { x });
+            return (a.ToArray(), b.ToArray(), grads[x].ToArray());
+        }
+        var cpu = Run(new CpuEngine());
+        // The GPU run must stay on the device: a silent CPU fallback would match the CPU reference trivially.
+        bool savedThrowOnFallback = DirectGpuTensorEngine.ThrowOnGpuKernelFallback;
+        (float[] s1, float[] s2, float[] dx) gpu;
+        try
+        {
+            DirectGpuTensorEngine.ThrowOnGpuKernelFallback = true;
+            gpu = Run(Gpu);
+        }
+        finally
+        {
+            DirectGpuTensorEngine.ThrowOnGpuKernelFallback = savedThrowOnFallback;
+        }
+        foreach (var (name, c, g) in new[] { ("slice1", cpu.s1, gpu.s1), ("slice2", cpu.s2, gpu.s2), ("dx", cpu.dx, gpu.dx) })
+        {
+            Assert.Equal(c.Length, g.Length);
+            for (int i = 0; i < c.Length; i++)
+                Assert.True(Math.Abs(c[i] - g[i]) <= 1e-5f * (1 + Math.Abs(c[i])), $"{name}[{i}] cpu={c[i]} gpu={g[i]}");
+        }
+    }
     [SkippableFact]
     public void HardsigmoidBackward_IsBitIdenticalAtBoundariesAndStaysResident()
     {

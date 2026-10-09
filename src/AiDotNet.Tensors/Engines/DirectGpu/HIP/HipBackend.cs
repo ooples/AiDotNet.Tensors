@@ -1,4 +1,4 @@
-﻿// Copyright (c) AiDotNet. All rights reserved.
+// Copyright (c) AiDotNet. All rights reserved.
 // HIP backend for AMD GPU with real MFMA (Matrix Fused Multiply-Add) support.
 // Target: 25,000+ GFLOPS on MI200, 15,000+ GFLOPS on RX 7900.
 
@@ -11063,7 +11063,9 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
             // Copy the last timestep from allH and allC into hFinal and cFinal
             // allH layout: [(seqLen + 1) * batch * hiddenSize] where index 0 is hInit
             // So final hidden state is at index seqLen (last timestep output)
-            int finalStateOffset = seqLen * batch * hiddenSize;
+            // The kernel stores step t at h_states[t] (t = 0..seqLen-1), as CUDA's does: the final state is step
+            // seqLen - 1.
+            int finalStateOffset = (seqLen - 1) * batch * hiddenSize;
             int stateSize = batch * hiddenSize;
             var byteSize = (UIntPtr)(stateSize * sizeof(float));
 
@@ -11364,6 +11366,7 @@ public sealed partial class HipBackend : IAsyncGpuBackend, IFusedAdvancedKernels
         _disposed = true;
 
         DisposeCompiledCodegenKernels();
+        DisposeMultiTensorTable();
 
         // Dispose the default stream wrapper (does not destroy underlying stream)
         _defaultStream?.Dispose();

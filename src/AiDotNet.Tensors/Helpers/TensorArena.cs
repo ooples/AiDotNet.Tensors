@@ -176,7 +176,7 @@ public sealed class TensorArena : IDisposable
     /// <summary>Bytes per MiB, used to render byte counters in the diagnostic messages.</summary>
     private const double BytesPerMiB = 1024.0 * 1024.0;
 
-    private static Array? RentPersistent(Type type, int elementCount)
+    private static Array? RentPersistent(Type type, int elementCount, bool zero = true)
     {
         if (elementCount < PersistThresholdElems) return null;
         var pool = _persistent;
@@ -196,11 +196,31 @@ public sealed class TensorArena : IDisposable
             // anyway — we just skip the allocation + GC. Without this, the
             // cross-arena reuse corrupts those consumers (caught by GroupNorm
             // correctness tests).
-            Array.Clear(arr, 0, arr.Length);
+            if (zero) ClearLarge(arr);
             HostSync.ClearReleased(arr);   // new owner: no inherited release mark
             return arr;
         }
         return null;
+    }
+
+    // Elements per parallel chunk when clearing a recycled buffer (1 MiB of float).
+    private const int ParallelClearChunk = 256 * 1024;
+
+    /// <summary>
+    /// Zeroes a recycled buffer. Step-sized buffers (a [tokens, vocab] logits tensor is ~200 MB) were cleared with
+    /// one serial memset per rent -- ~10% of a CPU LM training step -- so buffers spanning several chunks are cleared
+    /// in parallel fixed chunks. Same result, every element zero.
+    /// </summary>
+    private static void ClearLarge(Array arr)
+    {
+        int length = arr.Length;
+        int chunks = (length + ParallelClearChunk - 1) / ParallelClearChunk;
+        if (chunks < 4) { Array.Clear(arr, 0, length); return; }
+        CpuParallelSettings.ParallelForOrSerial(0, chunks, length, c =>
+        {
+            int start = c * ParallelClearChunk;
+            Array.Clear(arr, start, Math.Min(ParallelClearChunk, length - start));
+        }, deterministicSafe: true);
     }
 
     private static void ReturnPersistent(Type type, int elementCount, Array arr)
@@ -709,6 +729,36 @@ public sealed class TensorArena : IDisposable
         return arr;
     }
 
+    /// <summary>
+    /// Gives up every wrapper and buffer this arena has issued so far, leaving them to the garbage collector: the
+    /// tensor ring's wrappers, their backing arrays, and the scratch pool's arrays. A streaming backward that releases
+    /// activations as it goes needs exactly that - while the arena held them, nothing it released could be freed
+    /// before the tape was disposed. Later rents allocate afresh, so the arena loses only this step's reuse.
+    /// </summary>
+    internal void DisownIssued()
+    {
+        if (_disposed) return;
+        if (_tensorRing is not null)
+        {
+            for (int i = 0; i < _tensorRingCount; i++)
+            {
+                if (_tensorRing[i] is List<object> bucket) bucket.Clear();
+                _tensorRingCursors![i] = 0;
+            }
+        }
+        _ringBackingArrays.Clear();
+        foreach (var arrays in _pool.Values) arrays.Clear();
+        // Keys stay (TryAllocate indexes the cursor table by the pool's keys); the cursors restart on empty lists.
+        var keys = new List<(Type, int)>(_cursor.Keys);
+        foreach (var key in keys) _cursor[key] = 0;
+    }
+
+    /// <summary>
+    /// True for the arena a top-level <see cref="Engines.Autodiff.GradientTape{T}"/> created for itself, as opposed
+    /// to one a model base or Optimize() call site opened for a training step and resets per step.
+    /// </summary>
+    internal bool OwnedByTape { get; set; }
+
     // Flat tensor ring buffer — sequential scan is faster than dictionary hash for <10 sizes.
     // A slot is keyed by element TYPE as well as element count: one arena can serve float and double
     // operations (a float model whose preprocessing runs in double, a mixed-precision step), and a
@@ -767,7 +817,7 @@ public sealed class TensorArena : IDisposable
                     // the normal zero-allocation reuse path below remains unchanged.
                     if (cached.IsDisposed)
                     {
-                        var replacementArray = RentPersistent(typeof(T), totalSize) as T[] ?? new T[totalSize];
+                        var replacementArray = RentPersistent(typeof(T), totalSize, zero: false) as T[] ?? new T[totalSize];
                         _ringBackingArrays.Add((typeof(T), totalSize, replacementArray));
                         TrackBackingBytes<T>(totalSize);
                         cached = LinearAlgebra.Tensor<T>.FromMemory(
@@ -793,7 +843,7 @@ public sealed class TensorArena : IDisposable
                 // Need one more tensor of this size — reuse a persistent-pool
                 // backing array if available (ring tensors are uninitialized:
                 // the caller overwrites every element, so no clear needed).
-                var newArr = RentPersistent(typeof(T), totalSize) as T[] ?? new T[totalSize];
+                var newArr = RentPersistent(typeof(T), totalSize, zero: false) as T[] ?? new T[totalSize];
                 _ringBackingArrays.Add((typeof(T), totalSize, newArr));
                 TrackBackingBytes<T>(totalSize);
                 var newTensor = LinearAlgebra.Tensor<T>.FromMemory(new Memory<T>(newArr, 0, totalSize), shape);
@@ -806,7 +856,7 @@ public sealed class TensorArena : IDisposable
         // New size — add slot
         if (_tensorRingCount < MaxTensorRingSlots)
         {
-            var arr = RentPersistent(typeof(T), totalSize) as T[] ?? new T[totalSize];
+            var arr = RentPersistent(typeof(T), totalSize, zero: false) as T[] ?? new T[totalSize];
             _ringBackingArrays.Add((typeof(T), totalSize, arr));
             TrackBackingBytes<T>(totalSize);
             var tensor = LinearAlgebra.Tensor<T>.FromMemory(new Memory<T>(arr, 0, totalSize), shape);

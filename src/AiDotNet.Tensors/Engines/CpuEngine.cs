@@ -2025,6 +2025,14 @@ public partial class CpuEngine : ITensorLevelEngine
         if (GraphMode.IsActive)
         {
             var scope = GraphMode.Current; scope?.BindEngineIfUnset(this);
+            // A contiguous host tensor reshapes as a view: Tensor.Reshape records a no-op view node whose output shares
+            // the producer's storage, so the compiled plan neither copies the forward nor allocates a buffer for it.
+            // Measured on the parity Transformer (CPU): 32 reshape copies were 2.4 ms of an 11 ms forward. GPU engines
+            // keep the copying node; their device bindings are per tensor, not per storage. Training traces only: an
+            // inference plan's MemoryPlanningPass recycles a tensor's storage once the TENSOR is dead, which a view of
+            // it outlives (measured: GraphCaptureParityTests multi-output ops read a recycled buffer).
+            if (scope != null && tensor.IsContiguous && this is not DirectGpuTensorEngine && !GraphMode.IsInferenceTrace)
+                return tensor.Reshape(newShape);
             if (scope != null)
             {
                 var captured = tensor;
@@ -2475,7 +2483,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     new[] { xOrig, gamma, beta }, x._shape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng)
+                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu)
                             cpuEng.BatchNormInferenceInto(output, capX, capG, capB, capM, capV, capE);
                         else
                         {
@@ -2521,7 +2529,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     new[] { x, gamma, beta, mean, variance }, x._shape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng)
+                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu)
                         {
                             cpuEng.BatchNormInferenceInto(output, capX, capG, capB, capM, capV, capE);
                         }
@@ -2675,7 +2683,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     // ~50 µs per call = ~1.2 ms aggregate per BERT inference.
                     (eng, output) =>
                     {
-                        if (typeof(T) == typeof(float) && eng is CpuEngine cpuEng)
+                        if (typeof(T) == typeof(float) && eng is CpuEngine cpuEng && !eng.SupportsGpu)
                         {
                             cpuEng.BatchMatMulFloatInto(
                                 (Tensor<float>)(object)capturedA,
@@ -3247,7 +3255,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // Save input before mutation when tape is active (for backward pass)
         Tensor<T>? savedA = null;
         var tape = GradientTape<T>.Current;
-        if (tape is not null && tape.Options.RecordInPlace)
+        if (tape is not null && tape.Options.RecordInPlace && !NoGradScope<T>.IsSuppressed)
             savedA = a.Clone();
 
         // Increment version BEFORE mutation so prior tape entries detect the change
@@ -6034,7 +6042,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         Tensor<T>? savedA = null;
         var mulTape = GradientTape<T>.Current;
-        if (mulTape is not null && mulTape.Options.RecordInPlace)
+        if (mulTape is not null && mulTape.Options.RecordInPlace && !NoGradScope<T>.IsSuppressed)
             savedA = a.Clone();
 
         a.IncrementVersion();
@@ -6217,7 +6225,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         Tensor<T>? savedASub = null;
         var subTape = GradientTape<T>.Current;
-        if (subTape is not null && subTape.Options.RecordInPlace)
+        if (subTape is not null && subTape.Options.RecordInPlace && !NoGradScope<T>.IsSuppressed)
             savedASub = a.Clone();
 
         a.IncrementVersion();
@@ -6551,7 +6559,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         // CUDA-graph capture — the attention QK^T·1/√d scaling); else the host path.
                         if (eng is DirectGpuTensorEngine sclGpu && sclGpu.TryMultiplyScalarResidentInto(output, captured, capturedScalar))
                             return;
-                        if (eng is CpuEngine cpuEng) cpuEng.TensorMultiplyScalarInto(output, captured, capturedScalar);
+                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu) cpuEng.TensorMultiplyScalarInto(output, captured, capturedScalar);
                         else { var r = eng.TensorMultiplyScalar(captured, capturedScalar); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.MultiplyScalarBackward, scalar != null ? new object[] { scalar } : Array.Empty<object>());
@@ -6949,7 +6957,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorLog", tensor, tensor._shape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng) cpuEng.TensorLogInto(output, captured);
+                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu) cpuEng.TensorLogInto(output, captured);
                         else { var r = eng.TensorLog(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.LogBackward);
@@ -7013,7 +7021,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorExp", tensor, tensor._shape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng) cpuEng.TensorExpInto(output, captured);
+                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu) cpuEng.TensorExpInto(output, captured);
                         else { var r = eng.TensorExp(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.ExpBackward);
@@ -7082,7 +7090,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorSqrt", tensor, tensor._shape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng) cpuEng.TensorSqrtInto(output, captured);
+                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu) cpuEng.TensorSqrtInto(output, captured);
                         else { var r = eng.TensorSqrt(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.SqrtBackward);
@@ -7132,7 +7140,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.Custom, "TensorAbs", tensor, tensor._shape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng) cpuEng.TensorAbsInto(output, captured);
+                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu) cpuEng.TensorAbsInto(output, captured);
                         else { var r = eng.TensorAbs(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.AbsBackward);
@@ -7568,7 +7576,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.Custom, "Sin", tensor, tensor._shape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng) cpuEng.TensorSinInto(output, captured);
+                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu) cpuEng.TensorSinInto(output, captured);
                         else { var r = eng.TensorSin(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.SinBackward);
@@ -7623,7 +7631,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.Custom, "Cos", tensor, tensor._shape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng) cpuEng.TensorCosInto(output, captured);
+                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu) cpuEng.TensorCosInto(output, captured);
                         else { var r = eng.TensorCos(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.CosBackward);
@@ -8846,10 +8854,16 @@ public partial class CpuEngine : ITensorLevelEngine
             if (bc >= CpuParallelSettings.MaxDegreeOfParallelism
                 && (long)bc * hw >= PersistentParallelExecutor.DefaultSerialGrainSize)
             {
-                CpuParallelSettings.ParallelForOrSerial(0, bc, (long)bc * hw, idx =>
+                CpuParallelSettings.ParallelForOrSerial(0, bc, (long)bc * hw, [MethodImpl(Compatibility.MethodImplHelper.Hot)] (int idx) =>
                 {
                     float* inBase = (float*)ipIn + idx * hw;
                     float* outBase = (float*)ipOut + idx * ohow;
+                    if (st == 2)
+                    {
+                        for (int oh = 0; oh < oH; oh++)
+                            MaxPool2x2Stride2Row(inBase + oh * 2 * w, inBase + oh * 2 * w + w, outBase + oh * oW, oW);
+                        return;
+                    }
                     for (int oh = 0; oh < oH; oh++)
                     {
                         float* r0 = inBase + oh * st * w;
@@ -8873,6 +8887,12 @@ public partial class CpuEngine : ITensorLevelEngine
                 {
                     float* inBase = pIn + idx * hw;
                     float* outBase = pOut + idx * ohow;
+                    if (st == 2)
+                    {
+                        for (int oh = 0; oh < oH; oh++)
+                            MaxPool2x2Stride2Row(inBase + oh * 2 * w, inBase + oh * 2 * w + w, outBase + oh * oW, oW);
+                        continue;
+                    }
                     for (int oh = 0; oh < oH; oh++)
                     {
                         float* r0 = inBase + oh * st * w;
@@ -9073,10 +9093,15 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.MaxPool2D, "MaxPool2D", input, outputShape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng) cpuEng.MaxPool2DInto(output, captured, ps, st, pd);
+                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu) cpuEng.MaxPool2DInto(output, captured, ps, st, pd);
                         else { var eager = eng.MaxPool2D(captured, ps, st, pd); DirectGpuTensorEngine.CopyResultInto(eng, eager, output); }
                     },
-                    BackwardFunctions<T>.MaxPool2DBackward, new object[] { new[] { poolSize, poolSize }, new[] { stride, stride } });
+                    // The node saves no argmax, so its backward recovers the winners from the input: MaxPool2DBackward
+                    // casts savedState[0] to the indices array, and a compiled plan's first backward threw on it.
+                    pd == 0 ? BackwardFunctions<T>.MaxPool2DRecomputeBackward : BackwardFunctions<T>.MaxPool2DPaddedRecomputeBackward,
+                    pd == 0
+                        ? new object[] { new[] { poolSize, poolSize }, new[] { stride, stride } }
+                        : new object[] { new[] { poolSize, poolSize }, new[] { stride, stride }, pd });
             }
         }
 
@@ -9112,7 +9137,12 @@ public partial class CpuEngine : ITensorLevelEngine
                 new object[] { paddedIndices, new[] { poolSize, poolSize }, new[] { stride, stride } });
             return padded;
         }
-        if (tape is not null)
+        // A contiguous unpadded float pool on this CPU engine saves no indices: the fast pool below computes the
+        // output and the backward re-scans the input for each window's winner, against a [b, c, oh, ow, 2] index
+        // array filled per window here and read back per window there.
+        bool recomputeBackward = tape is not null && typeof(T) == typeof(float) && padding == 0 && !SupportsGpu
+            && ReferenceEquals(input, inputOrig) && input.Layout == LinearAlgebra.TensorLayout.Nchw;
+        if (tape is not null && !recomputeBackward)
         {
             var resultWithIdx = MaxPool2DWithIndices(input, new[] { poolSize, poolSize }, new[] { stride, stride }, out var maxIndices);
             DifferentiableOps.RecordUnary("MaxPool2D", resultWithIdx, inputOrig, BackwardFunctions<T>.MaxPool2DBackward,
@@ -9144,6 +9174,9 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 MaxPool2DFloatGeneric(inArr, outArr, bc, h, w, oH, oW, ps, st, pd);
             }
+            if (recomputeBackward)
+                DifferentiableOps.RecordUnary("MaxPool2D", result, inputOrig, BackwardFunctions<T>.MaxPool2DRecomputeBackward,
+                    new object[] { new[] { poolSize, poolSize }, new[] { stride, stride } });
             return result;
         }
 
@@ -9524,7 +9557,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.Custom, "AvgPool2D", input, outShape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng) cpuEng.AvgPool2DInto(output, captured, ps, s, p, cip);
+                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu) cpuEng.AvgPool2DInto(output, captured, ps, s, p, cip);
                         else { var r = eng.AvgPool2D(captured, ps, s, p, cip); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.AvgPool2DBackward, AvgPool2DSavedState(poolSize, st, padding, countIncludePad));
@@ -9776,7 +9809,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordBinary(LazyNodeType.Conv2D, "Conv2D", input, kernel, outShape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng) cpuEng.Conv2DInto(output, capturedInput, capturedKernel, s, p, d);
+                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu) cpuEng.Conv2DInto(output, capturedInput, capturedKernel, s, p, d);
                         else { var eager = eng.Conv2D(capturedInput, capturedKernel, s, p, d); DirectGpuTensorEngine.CopyResultInto(eng, eager, output); }
                     },
                     BackwardFunctions<T>.Conv2DBackward, new object[] { new[] { stride, stride }, new[] { padding, padding }, new[] { dilation, dilation } });
@@ -10187,6 +10220,35 @@ public partial class CpuEngine : ITensorLevelEngine
         int outputHeight,
         int outputWidth)
     {
+#if NET5_0_OR_GREATER
+        if (input.Layout == LinearAlgebra.TensorLayout.Nchw
+            && Simd.DirectConvAvx2.TryChoose(new Simd.DirectConvShape(Simd.DirectConvPass.Forward, batch, inChannels, outChannels,
+                height, width, kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW), out int directTasks))
+        {
+            // Read and write the operands in place at their storage offsets: an arena or sliced buffer would otherwise
+            // be copied out (offset 0 is only right for a caller-supplied flat array).
+            int inOff = 0, kOff = 0, outOff = 0;
+            float[]? inArr = inputData ?? (input.IsContiguous ? input.GetCpuBackingForStridedRead(out inOff) : null);
+            float[]? kArr = kernelData ?? (kernel.IsContiguous ? kernel.GetCpuBackingForStridedRead(out kOff) : null);
+            float[]? outArr = outputData ?? output.GetCpuBackingForContiguousWrite(out outOff);
+            if (inArr is not null && kArr is not null && outArr is not null)
+            {
+                Simd.DirectConvAvx2.Forward(inArr, inOff, kArr, kOff, outArr, outOff,
+                    accumulate: false, batch, inChannels, height, width, outChannels, kernelHeight, kernelWidth,
+                    strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth, directTasks);
+                return;
+            }
+        }
+#endif
+        if (input.Layout == LinearAlgebra.TensorLayout.Nchw
+            && UseBatchedConvForward(batch, inChannels, kernelHeight, kernelWidth, strideH, strideW, outputHeight, outputWidth, outChannels))
+        {
+            Conv2DForwardBatchedFloat(
+                inputData ?? input.GetReadOnlyDataArray(), kernelData ?? kernel.GetReadOnlyDataArray(), outputData ?? output.GetDataArray(),
+                batch, inChannels, height, width, outChannels, kernelHeight, kernelWidth,
+                strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth);
+            return;
+        }
         if (ShouldUseAdaptiveFloatConv2D(
             input.Layout, strideH, strideW, padH, padW, dilationH, dilationW))
         {
@@ -10215,7 +10277,12 @@ public partial class CpuEngine : ITensorLevelEngine
     /// Tries in order: oneDNN, fused im2col-GEMM, Winograd, SIMD direct conv, im2col+GEMM fallback.
     /// BLAS-based approaches are preferred over SIMD direct conv for most sizes.
     /// </summary>
-    private void Conv2DWithIm2ColFloat(
+    /// <param name="epilogueBias">When set, the strategy that supports it (the SIMD 3x3 route) writes
+    /// <c>act(conv + bias[oc])</c> instead of the plain convolution, and the method returns true. Every other
+    /// strategy ignores it and writes the plain convolution (returning false); the caller then applies the bias and
+    /// activation itself.</param>
+    /// <param name="epilogueRelu">With <paramref name="epilogueBias"/>: apply ReLU after the bias.</param>
+    private bool Conv2DWithIm2ColFloat(
         Tensor<float> input,
         Tensor<float> kernel,
         Tensor<float> result,
@@ -10230,14 +10297,16 @@ public partial class CpuEngine : ITensorLevelEngine
         int padding,
         int dilation,
         int outputHeight,
-        int outputWidth)
+        int outputWidth,
+        Tensor<float>? epilogueBias = null,
+        bool epilogueRelu = false)
     {
 #if !NET471
         // Strategy 1: Try oneDNN for best performance (uses optimized CPU kernels)
         if (TryConv2DOneDnn(input, kernel, result, batch, inChannels, height, width,
             outChannels, kernelHeight, kernelWidth, stride, padding, dilation, outputHeight, outputWidth))
         {
-            return;
+            return false;
         }
 
         // Strategy 1.5: route to explicit im2col + BLAS GEMM (implicit-GEMM panels).
@@ -10288,7 +10357,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 Conv2DWithImplicitGemmFloat(input, kernel, result, batch, inChannels, height, width,
                     outChannels, kernelHeight, kernelWidth, stride, padding, dilation, outputHeight, outputWidth);
             }
-            return;
+            return false;
         }
 
         // Strategy 2: Try fused im2col-GEMM with cache tiling (BLAS-based, faster for most sizes)
@@ -10305,7 +10374,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 outChannels, kernelHeight, kernelWidth,
                 stride, stride, padding, padding,
                 dilation, dilation, outputHeight, outputWidth);
-            return;
+            return false;
         }
 #endif
 
@@ -10320,21 +10389,23 @@ public partial class CpuEngine : ITensorLevelEngine
                 inputSpan, kernelSpan, outputSpan,
                 batch, inChannels, height, width,
                 outChannels, padding, padding);
-            return;
+            return false;
         }
 
 #if !NET471
         // Strategy 4: Try SIMD direct convolution for small 3x3 kernels with stride=1
         if (TryConv2DSimd(input, kernel, result, batch, inChannels, height, width,
-            outChannels, kernelHeight, kernelWidth, stride, padding, dilation, outputHeight, outputWidth))
+            outChannels, kernelHeight, kernelWidth, stride, padding, dilation, outputHeight, outputWidth,
+            epilogueBias, epilogueRelu, out bool epilogueFused))
         {
-            return;
+            return epilogueFused;
         }
 #endif
 
         // Strategy 5: Fallback to im2col + GEMM (works for all cases)
         Conv2DWithIm2ColGemm(input, kernel, result, batch, inChannels, height, width,
             outChannels, kernelHeight, kernelWidth, stride, padding, dilation, outputHeight, outputWidth);
+        return false;
     }
 
 #if !NET471
@@ -10375,8 +10446,10 @@ public partial class CpuEngine : ITensorLevelEngine
         Tensor<float> input, Tensor<float> kernel, Tensor<float> result,
         int batch, int inChannels, int height, int width,
         int outChannels, int kernelHeight, int kernelWidth,
-        int stride, int padding, int dilation, int outputHeight, int outputWidth)
+        int stride, int padding, int dilation, int outputHeight, int outputWidth,
+        Tensor<float>? epilogueBias, bool epilogueRelu, out bool epilogueFused)
     {
+        epilogueFused = false;
         if (!SimdConvHelper.CanUseSimdConv(kernelHeight, kernelWidth, stride, stride))
         {
             return false;
@@ -10385,11 +10458,22 @@ public partial class CpuEngine : ITensorLevelEngine
         var inputSpan = input.AsSpan();
         var kernelSpan = kernel.AsSpan();
         var outputSpan = result.Data.Span;
+        var biasSpan = epilogueBias is null ? default : epilogueBias.AsSpan();
 
         fixed (float* inputPtr = inputSpan)
         fixed (float* kernelPtr = kernelSpan)
         fixed (float* outputPtr = outputSpan)
+        fixed (float* biasPtr = biasSpan)
         {
+            if (kernelHeight == 3 && kernelWidth == 3 && epilogueBias is not null
+                && SimdConvHelper.TryConv3x3Stride1BiasActivation(
+                    inputPtr, kernelPtr, biasPtr, outputPtr,
+                    batch, inChannels, height, width,
+                    outChannels, padding, padding, dilation, dilation, epilogueRelu))
+            {
+                epilogueFused = true;
+                return true;
+            }
             if (kernelHeight == 3 && kernelWidth == 3)
             {
                 SimdConvHelper.Conv3x3Stride1(
@@ -11176,7 +11260,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         Tensor<T>? savedInput = null;
         var sigTape = GradientTape<T>.Current;
-        if (sigTape is not null && sigTape.Options.RecordInPlace)
+        if (sigTape is not null && sigTape.Options.RecordInPlace && !NoGradScope<T>.IsSuppressed)
             savedInput = tensor.Clone();
 
         tensor.IncrementVersion();
@@ -11229,7 +11313,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         Tensor<T>? savedInput = null;
         var sigTape = GradientTape<T>.Current;
-        if (sigTape is not null && sigTape.Options.RecordInPlace)
+        if (sigTape is not null && sigTape.Options.RecordInPlace && !NoGradScope<T>.IsSuppressed)
             savedInput = tensor.Clone();
 
         tensor.IncrementVersion();
@@ -11475,7 +11559,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         Tensor<T>? savedInput = null;
         var reluTape = GradientTape<T>.Current;
-        if (reluTape is not null && reluTape.Options.RecordInPlace)
+        if (reluTape is not null && reluTape.Options.RecordInPlace && !NoGradScope<T>.IsSuppressed)
             savedInput = tensor.Clone();
 
         tensor.IncrementVersion();
@@ -11528,7 +11612,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         Tensor<T>? savedInput = null;
         var reluTape = GradientTape<T>.Current;
-        if (reluTape is not null && reluTape.Options.RecordInPlace)
+        if (reluTape is not null && reluTape.Options.RecordInPlace && !NoGradScope<T>.IsSuppressed)
             savedInput = tensor.Clone();
 
         tensor.IncrementVersion();
@@ -11766,7 +11850,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.Custom, "Mish", tensor, tensor._shape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng) cpuEng.MishInto(output, captured);
+                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu) cpuEng.MishInto(output, captured);
                         else { var r = eng.Mish(captured); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.MishBackward);
@@ -11896,7 +11980,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.ELU, "ELU", tensor, tensor._shape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng) cpuEng.ELUInto(output, captured, capturedAlpha);
+                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu) cpuEng.ELUInto(output, captured, capturedAlpha);
                         else { var r = eng.ELU(captured, capturedAlpha); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.ELUBackward, new object[] { alpha });
@@ -12635,6 +12719,9 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    // Work (M*N*K) at which TensorMatMulTransposed's float path hands the product to the packed BLAS.
+    private const long MatMulTransposedBlasMinWork = 1L << 24;
+
     public virtual Tensor<T> TensorMatMulTransposed<T>(Tensor<T> a, Tensor<T> b)
     {
         if (a is null) throw new ArgumentNullException(nameof(a));
@@ -12703,6 +12790,11 @@ public partial class CpuEngine : ITensorLevelEngine
             // a is [M,K] row-major (lda=K, transA=false). b is stored
             // [N,K] row-major (lda for b = K, transB=true so the kernel
             // treats it as Kᵀ-major and contracts over K).
+            // Large products take the parallel packed BLAS first: a tied LM head's logits [1024,512]·[49152,512]ᵀ ran
+            // 592 ms through SimdGemm vs PyTorch's 207 ms (3990X).
+            bool viaBlas = (long)M * N * K >= MatMulTransposedBlasMinWork
+                && BlasProvider.TryGemmEx(M, N, K, aRaw, aOff, K, false, bRaw, bOff, K, true, rRaw, rOff, N);
+            if (!viaBlas)
             AiDotNet.Tensors.Engines.Simd.SimdGemm.Sgemm(
                 new ReadOnlySpan<float>(aRaw, aOff, M * K),
                 lda: K, transA: false,
@@ -12802,14 +12894,14 @@ public partial class CpuEngine : ITensorLevelEngine
                             if (mmGpu.TryMatMulResidentInto(output, capturedA, capturedB)) return;
                             if (mmGpu.TryBatchedMatMulResidentInto(output, capturedA, capturedB)) return;
                         }
-                        if (typeof(T) == typeof(float) && eng is CpuEngine cpuEngF)
+                        if (typeof(T) == typeof(float) && eng is CpuEngine cpuEngF && !eng.SupportsGpu)
                         {
                             cpuEngF.TensorMatMulFloatInto(
                                 (Tensor<float>)(object)capturedA,
                                 (Tensor<float>)(object)capturedB,
                                 (Tensor<float>)(object)output);
                         }
-                        else if (typeof(T) == typeof(double) && eng is CpuEngine cpuEngD)
+                        else if (typeof(T) == typeof(double) && eng is CpuEngine cpuEngD && !eng.SupportsGpu)
                         {
                             cpuEngD.TensorMatMulDoubleInto(
                                 (Tensor<double>)(object)capturedA,
@@ -13944,7 +14036,7 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
-    public Tensor<T> Conv2D<T>(Tensor<T> input, Tensor<T> kernel, int[] stride, int[] padding, int[] dilation)
+    public virtual Tensor<T> Conv2D<T>(Tensor<T> input, Tensor<T> kernel, int[] stride, int[] padding, int[] dilation)
     {
         using var _opScope = AiDotNet.Tensors.Engines.Profiling.Profiler.OpScope("Conv2D");
         return Conv2DIntoImpl<T>(input, kernel, stride, padding, dilation, preAllocatedOutput: null);
@@ -14016,7 +14108,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         // Routes through Conv2DInto(int[]) so the dispatch stays
                         // on the fast int[] NCHWc / im2col+Sgemm path without
                         // allocating an intermediate tensor.
-                        if (eng is CpuEngine cpuEng)
+                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu)
                             cpuEng.Conv2DInto(output, capturedInput, capturedKernel, capturedStride, capturedPad, capturedDil);
                         else { var eager = eng.Conv2D(capturedInput, capturedKernel, capturedStride, capturedPad, capturedDil); DirectGpuTensorEngine.CopyResultInto(eng, eager, output); }
                     },
@@ -15267,6 +15359,24 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(float))
         {
+#if NET5_0_OR_GREATER
+            if (Simd.DirectConvAvx2.TryChoose(new Simd.DirectConvShape(Simd.DirectConvPass.BackwardInput, batch, inChannels, outChannels,
+                    height, width, kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW), out int directTasks))
+            {
+                // Both operands were made contiguous above; read them in place at their storage offsets (an arena
+                // buffer is usually longer than the tensor, and GetFlattenedData would copy it every step).
+                var gArr = (float[]?)(object?)gradOutput.GetCpuBackingForStridedRead(out int gOff);
+                var kArr = (float[]?)(object?)kernel.GetCpuBackingForStridedRead(out int kOff);
+                var dArr = (float[]?)(object?)dest.GetCpuBackingForContiguousWrite(out int dOff);
+                if (gArr is not null && kArr is not null && dArr is not null)
+                {
+                    Simd.DirectConvAvx2.BackwardInput(gArr, gOff, kArr, kOff, dArr, dOff, accumulate,
+                        batch, inChannels, height, width, outChannels, kernelHeight, kernelWidth,
+                        strideH, strideW, padH, padW, outputHeight, outputWidth, directTasks);
+                    return;
+                }
+            }
+#endif
             // FUSED FAST PATH (transposed-convolution identity). For stride=1,
             // dilation=1 and a non-negative symmetric transposed padding, the
             // input-gradient equals a FORWARD convolution of gradOutput with the
@@ -15282,24 +15392,33 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 int padHt = (kernelHeight - 1) - padH;
                 int padWt = (kernelWidth - 1) - padW;
-                if (strideH == 1 && strideW == 1 && dilationH == 1 && dilationW == 1
+                // Small output planes (deep layers) take the batched im2col path below instead: the transposed conv
+                // there is a [B*colW]-wide GEMM, measured 2.2 ms against 5.3 ms at 256 channels on 8x8.
+                bool smallPlane = outputHeight * outputWidth <= ConvBackwardInputBatchedMaxPlane
+                    && UseBatchedConv(batch, inChannels * kernelHeight * kernelWidth, outputHeight * outputWidth, outChannels);
+                if (!smallPlane && strideH == 1 && strideW == 1 && dilationH == 1 && dilationW == 1
                     && padHt >= 0 && padWt >= 0 && padHt == padWt)
                 {
                     int kHWf = kernelHeight * kernelWidth;
                     var gradOutFloat = (Tensor<float>)(object)gradOutput;
-                    var flippedKernel = new Tensor<float>(new[] { inChannels, outChannels, kernelHeight, kernelWidth });
+                    // Rented, not allocated: at 512 channels the flipped 3x3 kernel is 9.4 MB, a large-object-heap
+                    // allocation per backward call that cost more than the transposed conv itself.
+                    var flippedKernel = Helpers.AutoTensorCache.RentOrAllocate<float>(new[] { inChannels, outChannels, kernelHeight, kernelWidth });
                     var flippedF = (float[])(object)flippedKernel._storage.GetDataArray();
+                    int flippedOff = flippedKernel._storageOffset;
                     var kernelFlip = (float[])(object)kernel.GetFlattenedData();
-                    for (int oc = 0; oc < outChannels; oc++)
-                        for (int ic = 0; ic < inChannels; ic++)
+                    CpuParallelSettings.ParallelForOrSerial(0, inChannels, (long)inChannels * outChannels * kHWf, ic =>
+                    {
+                        for (int oc = 0; oc < outChannels; oc++)
                         {
                             int kBase = oc * inChannels * kHWf + ic * kHWf;
-                            int fBase = ic * outChannels * kHWf + oc * kHWf;
+                            int fBase = flippedOff + ic * outChannels * kHWf + oc * kHWf;
                             for (int kh = 0; kh < kernelHeight; kh++)
                                 for (int kw = 0; kw < kernelWidth; kw++)
                                     flippedF[fBase + kh * kernelWidth + kw] =
                                         kernelFlip[kBase + (kernelHeight - 1 - kh) * kernelWidth + (kernelWidth - 1 - kw)];
                         }
+                    }, deterministicSafe: true);
                     var destFused = (float[])(object)dest._storage.GetDataArray();
                     int destOffFused = dest._storageOffset;
                     int totalFused = batch * inChannels * height * width;
@@ -15329,6 +15448,7 @@ public partial class CpuEngine : ITensorLevelEngine
                         var fusedF = (float[])(object)fusedResult.GetFlattenedData();
                         for (int i = 0; i < totalFused; i++) destFused[destOffFused + i] += fusedF[i];
                     }
+                    Helpers.AutoTensorCache.Return(flippedKernel);
                     return;
                 }
             }
@@ -15348,6 +15468,14 @@ public partial class CpuEngine : ITensorLevelEngine
                 Array.Clear(destF, destOff, batch * inChannels * height * width);
             var gradOutputF = (float[])(object)gradOutput.GetFlattenedData();
             var kernelF = (float[])(object)kernel.GetFlattenedData();
+            if (UseBatchedConv(batch, colH, colW, outChannels))
+            {
+                Conv2DBackwardInputBatchedFloat(
+                    destF, destOff, gradOutputF, kernelF,
+                    batch, inChannels, height, width, outChannels, kernelHeight, kernelWidth,
+                    strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth);
+                return;
+            }
             var pool = System.Buffers.ArrayPool<float>.Shared;
             // #639: rent the transposed-kernel scratch instead of `new float[]` per call.
             // Its size is fixed per layer (only the contents change each step), and the
@@ -16396,6 +16524,60 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(float))
         {
+#if NET5_0_OR_GREATER
+            if (Simd.DirectConvAvx2.TryChoose(new Simd.DirectConvShape(Simd.DirectConvPass.BackwardKernel, batch, inChannels, outChannels,
+                    height, width, kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW), out _))
+            {
+                // Both operands were made contiguous above; read them in place (see the input-gradient route).
+                var xArr = (float[]?)(object?)input.GetCpuBackingForStridedRead(out int xOff);
+                var gArr = (float[]?)(object?)gradOutput.GetCpuBackingForStridedRead(out int gOff);
+                var dArr = (float[]?)(object?)dest.GetCpuBackingForContiguousWrite(out int dOff);
+                if (xArr is not null && gArr is not null && dArr is not null)
+                {
+                    Simd.DirectConvAvx2.BackwardKernel(xArr, xOff, gArr, gOff, dArr, dOff, accumulate,
+                        batch, inChannels, height, width, outChannels, kernelHeight, kernelWidth,
+                        strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth);
+                    return;
+                }
+            }
+#endif
+#if !NET471
+            // 3x3 stride-1 dilation-1 kernels whose per-image GEMM is small: the direct FMA kernel (one task per
+            // (oc, ic) pair summing over every image). The im2col + per-image GEMM route below fans one native
+            // call per image across the pool, and those calls serialise on the native compute gate.
+            if (kernelHeight == 3 && kernelWidth == 3 && strideH == 1 && strideW == 1
+                && dilationH == 1 && dilationW == 1 && padH >= 0 && padW >= 0
+                && outputHeight == height + 2 * padH - 2 && outputWidth == width + 2 * padW - 2
+                && outputHeight > 0 && outputWidth > 0
+                && (long)outChannels * inChannels * 9 * outputHeight * outputWidth < ConvBackwardParallelBatchMaxPerImage
+                && SimdConvHelper.CanUseDirectKernelGrad)
+            {
+                var gradOutputData = (float[])(object)gradOutput.GetFlattenedData();
+                var inputData = (float[])(object)input.GetFlattenedData();
+                var destData = (float[])(object)dest._storage.GetDataArray();
+                unsafe
+                {
+                    fixed (float* pIn = inputData)
+                    fixed (float* pGrad = gradOutputData)
+                    fixed (float* pDest = &destData[dest._storageOffset])
+                    {
+                        SimdConvHelper.Conv3x3KernelGradStride1(pIn, pGrad, pDest,
+                            batch, inChannels, height, width, outChannels, padH, padW,
+                            outputHeight, outputWidth, accumulate);
+                    }
+                }
+                return;
+            }
+#endif
+            if (UseBatchedConv(batch, inChannels * kernelHeight * kernelWidth, outputHeight * outputWidth, outChannels))
+            {
+                Conv2DBackwardKernelBatchedFloat(
+                    (float[])(object)dest._storage.GetDataArray(), dest._storageOffset, accumulate,
+                    (float[])(object)gradOutput.GetFlattenedData(), (float[])(object)input.GetFlattenedData(),
+                    batch, inChannels, height, width, outChannels, kernelHeight, kernelWidth,
+                    strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth);
+                return;
+            }
             int colH = inChannels * kernelHeight * kernelWidth;
             int colW = outputHeight * outputWidth;
             int totalLen = outChannels * colH;
@@ -16811,29 +16993,34 @@ public partial class CpuEngine : ITensorLevelEngine
                 maxIndices = new int[batch, channels, outputHeight, outputWidth, 2];
                 var captured = input;
                 int ph = poolH, pw = poolW, sh = strideH, sw = strideW;
-                // No backwardFn / savedState: this branch is gated to
-                // GradientTape<T>.Current is null (inference-only trace), so
-                // replay never runs a backward. Recording
-                // MaxPool2DWithIndicesBackward + the zero-filled maxIndices
-                // here would (a) pin a potentially large
-                // int[batch, channels, outH, outW, 2] for the lifetime of
-                // the lazy graph / compiled plan, and (b) hand any future
-                // backward consumer corrupt all-zero routing indices.
+                // No saved indices: recording MaxPool2DWithIndicesBackward + the
+                // zero-filled maxIndices here would (a) pin a potentially large
+                // int[batch, channels, outH, outW, 2] for the lifetime of the
+                // lazy graph / compiled plan, and (b) hand any backward consumer
+                // corrupt all-zero routing indices. A compiled training plan
+                // recovers the winners from the input instead (see the backward
+                // and saved geometry below).
                 return scope.RecordUnary(LazyNodeType.MaxPool2D, "MaxPool2DWithIndices", input,
                     new[] { batch, channels, outputHeight, outputWidth },
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng && ph == pw && sh == sw)
+                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu && ph == pw && sh == sw)
                         {
                             cpuEng.MaxPool2DInto(output, captured, ph, sh, 0);
                         }
                         else
                         {
-                            var eager = eng.MaxPool2DWithIndices(captured, new[] { ph, pw }, new[] { sh, sw }, out _);
+                            // The tensor-index form keeps the argmax on the device on a GPU engine; the int[,,,,] form
+                            // downloaded it on every replay, a host read that aborted CUDA graph capture of every CNN step.
+                            var eager = eng.MaxPool2DWithTensorIndices(captured, new[] { ph, pw }, new[] { sh, sw }, out _);
                             DirectGpuTensorEngine.CopyResultInto(eng, eager, output);
                         }
                     },
-                    BackwardFunctions<T>.ReplayUnderTape(eng => eng.MaxPool2DWithIndices(captured, new[] { ph, pw }, new[] { sh, sw }, out _)));
+                    BackwardFunctions<T>.ReplayUnderTape(eng => eng.MaxPool2DWithTensorIndices(captured, new[] { ph, pw }, new[] { sh, sw }, out _)),
+                    // The pool geometry (no indices): lets a compiled CPU training plan run the backward as one
+                    // re-scan of the input written straight into the gradient buffer (MaxPool2DBackwardRecomputeInto)
+                    // instead of replaying the forward under a tape, and lets the serializer rebuild the real pool.
+                    new object[] { new[] { ph, pw }, new[] { sh, sw } });
             }
         }
 
@@ -16941,6 +17128,11 @@ public partial class CpuEngine : ITensorLevelEngine
         Tensor<T> input, int[] poolSize, int[] stride, out Tensor<int> maxIndices)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
+        if (input.Rank != 4) throw new ArgumentException("MaxPool2D expects NCHW rank-4 input.", nameof(input));
+        if (poolSize is not { Length: 2 } || poolSize[0] <= 0 || poolSize[1] <= 0)
+            throw new ArgumentException("poolSize must contain two positive values.", nameof(poolSize));
+        if (stride is not { Length: 2 } || stride[0] <= 0 || stride[1] <= 0)
+            throw new ArgumentException("stride must contain two positive values.", nameof(stride));
         int batch = input._shape[0], channels = input._shape[1];
         int height = input._shape[2], width = input._shape[3];
         int poolH = poolSize[0], poolW = poolSize[1];
@@ -16953,7 +17145,10 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"Invalid output dimensions ({outputHeight}x{outputWidth}). Check pool size and stride.");
 
         var result = TensorAllocator.Rent<T>([batch, channels, outputHeight, outputWidth]);
-        var outputData = result.GetDataArray();
+        // Write the pooled tensor's own storage at its offset: GetDataArray hands back a copy for a pool-padded or
+        // offset tensor, so results written there were lost.
+        var outputData = result.GetCpuBackingForContiguousWrite(out int outOff)
+            ?? throw new InvalidOperationException("A freshly rented CPU tensor has no contiguous host storage.");
         var inputData = input.GetFlattenedData();
         // Sized from the logical output: a pooled backing array can be longer than result.Length.
         var flatIndices = new int[result.Length];
@@ -16963,14 +17158,16 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var src = (float[])(object)inputData;
             var dst = (float[])(object)outputData;
-            CpuParallelSettings.ParallelForOrSerial(0, batch * channels, outputData.Length, plane =>
+            CpuParallelSettings.ParallelForOrSerial(0, batch * channels, result.Length, plane =>
             {
                 int inBase = plane * inPlane, outBase = plane * outPlane;
                 for (int oh = 0; oh < outputHeight; oh++)
                 for (int ow = 0; ow < outputWidth; ow++)
                 {
                     float maxVal = float.MinValue;
-                    int maxIdx = 0;
+                    // Seeded inside the window: if nothing beats MinValue (all NaN or -inf), the backward must still
+                    // route this window's gradient to one of its own elements, not to plane position 0.
+                    int maxIdx = oh * strideH * width + ow * strideW;
                     for (int kh = 0; kh < poolH; kh++)
                     {
                         int ih = oh * strideH + kh;
@@ -16982,7 +17179,7 @@ public partial class CpuEngine : ITensorLevelEngine
                             if (val > maxVal) { maxVal = val; maxIdx = ih * width + iw; }
                         }
                     }
-                    dst[outBase + oh * outputWidth + ow] = maxVal;
+                    dst[outOff + outBase + oh * outputWidth + ow] = maxVal;
                     flatIndices[outBase + oh * outputWidth + ow] = maxIdx;
                 }
             });
@@ -16990,14 +17187,14 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            CpuParallelSettings.ParallelForOrSerial(0, batch * channels, outputData.Length, plane =>
+            CpuParallelSettings.ParallelForOrSerial(0, batch * channels, result.Length, plane =>
             {
                 int inBase = plane * inPlane, outBase = plane * outPlane;
                 for (int oh = 0; oh < outputHeight; oh++)
                 for (int ow = 0; ow < outputWidth; ow++)
                 {
                     T maxVal = numOps.MinValue;
-                    int maxIdx = 0;
+                    int maxIdx = oh * strideH * width + ow * strideW;
                     for (int kh = 0; kh < poolH; kh++)
                     {
                         int ih = oh * strideH + kh;
@@ -17009,7 +17206,7 @@ public partial class CpuEngine : ITensorLevelEngine
                             if (numOps.GreaterThan(val, maxVal)) { maxVal = val; maxIdx = ih * width + iw; }
                         }
                     }
-                    outputData[outBase + oh * outputWidth + ow] = maxVal;
+                    outputData[outOff + outBase + oh * outputWidth + ow] = maxVal;
                     flatIndices[outBase + oh * outputWidth + ow] = maxIdx;
                 }
             });
@@ -17169,6 +17366,160 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }, deterministicSafe: true);
         return result;
+    }
+
+    /// <summary>
+    /// One plane of the float max-pool backward that re-scans the forward input for each window's winner (first
+    /// maximum, starting from float.MinValue with a strict greater-than, so NaN never wins and a window with no winner
+    /// sends its gradient to plane cell 0) and writes <c>0 + g</c> there. With <paramref name="tiles"/> (stride equal
+    /// to the pool, not accumulating) each window owns its cells and writes them in one pass, and only the uncovered
+    /// remainder rows/columns are cleared; otherwise the whole plane is cleared first and the gradients are added.
+    /// </summary>
+    [MethodImpl(Compatibility.MethodImplHelper.Hot)]
+    private static void MaxPoolBackwardRecomputePlane(
+        float[] x, int xBase, float[] g, int gBase, float[] dst, int dBase,
+        int height, int width, int outH, int outW, int poolH, int poolW, int strideH, int strideW, bool tiles)
+    {
+        if (!tiles)
+            Array.Clear(dst, dBase, height * width);
+        if (tiles)
+        {
+            int coveredH = outH * poolH, coveredW = outW * poolW;
+            for (int r = 0; r < coveredH; r++)
+                if (coveredW < width) Array.Clear(dst, dBase + r * width + coveredW, width - coveredW);
+            if (coveredH < height) Array.Clear(dst, dBase + coveredH * width, (height - coveredH) * width);
+        }
+        int ohStart = 0;
+        if (tiles && poolH == 2 && poolW == 2 && strideH == 2 && strideW == 2)
+        {
+            MaxPool2x2Stride2TilesBackwardPlane(x, xBase, g, gBase, dst, dBase, width, outH, outW);
+            ohStart = outH;
+        }
+        for (int oh = ohStart; oh < outH; oh++)
+        {
+            int ih0 = oh * strideH;
+            for (int ow = 0; ow < outW; ow++)
+            {
+                int iw0 = ow * strideW;
+                float maxVal = float.MinValue;
+                int maxIdx = ih0 * width + iw0;   // a winnerless window routes to its own first cell
+                for (int kh = 0; kh < poolH; kh++)
+                {
+                    int row = (ih0 + kh) * width;
+                    for (int kw = 0; kw < poolW; kw++)
+                    {
+                        float v = x[xBase + row + iw0 + kw];
+                        if (v > maxVal) { maxVal = v; maxIdx = row + iw0 + kw; }
+                    }
+                }
+                if (tiles)
+                {
+                    for (int kh = 0; kh < poolH; kh++)
+                    {
+                        int row = dBase + (ih0 + kh) * width + iw0;
+                        for (int kw = 0; kw < poolW; kw++) dst[row + kw] = 0f;
+                    }
+                }
+                dst[dBase + maxIdx] += g[gBase + oh * outW + ow];
+            }
+        }
+    }
+
+    /// <summary>
+    /// Unpadded MaxPool2D backward that finds each window's winner by re-scanning the forward INPUT, then writes the
+    /// input gradient straight into <paramref name="gradInput"/>. The winner rule is exactly the one
+    /// <c>MaxPool2DWithTensorIndices</c> records (start below every finite value, strict greater-than in row-major
+    /// window order, so the first maximum wins and NaN never does; a window with no winner routes to its first cell),
+    /// so the gradient is the one the tape would produce from saved indices -- without saving them, without a
+    /// replayed forward, and without a temporary gradient tensor.
+    /// </summary>
+    /// <remarks>
+    /// Per input plane the contributions land in output (row-major) order onto zero, exactly as the saved-index
+    /// scatter does; with <paramref name="accumulate"/> that plane-sized sum is formed in scratch first and then added
+    /// to the caller's value once per cell (<c>existing + sum</c>, as a separate scatter plus TensorAddInto would),
+    /// so either way the result is bit-identical to the indexed path. Planes are independent, so the result does not
+    /// depend on the thread count.
+    /// </remarks>
+    internal void MaxPool2DBackwardRecomputeInto<T>(
+        Tensor<T> gradInput, Tensor<T> gradOutput, Tensor<T> input,
+        int poolH, int poolW, int strideH, int strideW, bool accumulate)
+    {
+        if (gradInput == null) throw new ArgumentNullException(nameof(gradInput));
+        if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        if (input.Rank != 4 || gradOutput.Rank != 4)
+            throw new ArgumentException("MaxPool2D backward needs rank-4 [batch, channels, height, width] tensors.");
+        if (poolH <= 0 || poolW <= 0 || strideH <= 0 || strideW <= 0)
+            throw new ArgumentException("Pool size and stride must be positive.");
+        int batch = input._shape[0], channels = input._shape[1];
+        int height = input._shape[2], width = input._shape[3];
+        int outH = gradOutput._shape[2], outW = gradOutput._shape[3];
+        if (gradOutput._shape[0] != batch || gradOutput._shape[1] != channels
+            || outH != (height - poolH) / strideH + 1 || outW != (width - poolW) / strideW + 1)
+            throw new ArgumentException("Output gradient shape does not match an unpadded pool of the input.", nameof(gradOutput));
+        if (gradInput.Length != input.Length)
+            throw new ArgumentException("Input gradient must have the input's shape.", nameof(gradInput));
+
+        int planes = checked(batch * channels);
+        int inPlane = height * width, outPlane = outH * outW;
+        var src = input.GetCpuBackingForStridedRead(out int srcOff);
+        var go = gradOutput.GetCpuBackingForStridedRead(out int goOff);
+        var gi = gradInput.GetCpuBackingForContiguousWrite(out int giOff);
+        // gi is null for a strided gradInput (GetCpuBackingForContiguousWrite refuses one); the check is explicit too.
+        if (typeof(T) == typeof(float) && src is not null && go is not null && gi is not null
+            && input.IsContiguous && gradOutput.IsContiguous && gradInput.IsContiguous)
+        {
+            var x = (float[])(object)src;
+            var g = (float[])(object)go;
+            var d = (float[])(object)gi;
+            // A window that tiles its input without overlap owns its cells, so the plane is written in one pass
+            // (each owned cell gets 0 + g or 0); only uncovered remainder rows/columns need a separate zero.
+            bool tiles = !accumulate && strideH == poolH && strideW == poolW;
+            CpuParallelSettings.ParallelForOrSerial(0, planes, (long)planes * inPlane, [MethodImpl(Compatibility.MethodImplHelper.Hot)] (int plane) =>
+            {
+                int xBase = srcOff + plane * inPlane, gBase = goOff + plane * outPlane;
+                // Accumulating: scatter this plane into zeroed scratch, then add it to the destination once.
+                float[]? scratch = accumulate ? System.Buffers.ArrayPool<float>.Shared.Rent(inPlane) : null;
+                float[] dst = scratch ?? d;
+                int dBase = scratch is null ? giOff + plane * inPlane : 0;
+                MaxPoolBackwardRecomputePlane(x, xBase, g, gBase, dst, dBase, height, width, outH, outW,
+                    poolH, poolW, strideH, strideW, tiles);
+                if (scratch is not null)
+                {
+                    int target = giOff + plane * inPlane;
+                    for (int i = 0; i < inPlane; i++) d[target + i] += scratch[i];
+                    System.Buffers.ArrayPool<float>.Shared.Return(scratch);
+                }
+            });
+            return;
+        }
+
+        // Any other element type or layout: the saved-index scatter on a materialised index tensor.
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var xs = input.IsContiguous ? input : input.Contiguous();
+        var xData = xs.GetFlattenedData();
+        var flat = new int[gradOutput.Length];
+        for (int plane = 0; plane < planes; plane++)
+        {
+            int xBase = plane * inPlane;
+            for (int oh = 0; oh < outH; oh++)
+            for (int ow = 0; ow < outW; ow++)
+            {
+                T maxVal = numOps.MinValue;
+                int maxIdx = oh * strideH * width + ow * strideW;   // a winnerless window routes to its first cell
+                for (int kh = 0; kh < poolH; kh++)
+                for (int kw = 0; kw < poolW; kw++)
+                {
+                    int idx = (oh * strideH + kh) * width + ow * strideW + kw;
+                    if (numOps.GreaterThan(xData[xBase + idx], maxVal)) { maxVal = xData[xBase + idx]; maxIdx = idx; }
+                }
+                flat[plane * outPlane + oh * outW + ow] = maxIdx;
+            }
+        }
+        var grad = MaxPool2DBackwardWithTensorIndices(gradOutput, new Tensor<int>(flat, (int[])gradOutput._shape.Clone()),
+            input._shape, new[] { poolH, poolW }, new[] { strideH, strideW });
+        if (accumulate) TensorAddInto(gradInput, gradInput, grad);
+        else grad.AsSpan().CopyTo(gradInput.AsWritableSpan());
     }
 
     /// <summary>
@@ -17498,7 +17849,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordBinary(LazyNodeType.DepthwiseConv2D, "DepthwiseConv2D", input, kernel, outShape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng) cpuEng.DepthwiseConv2DInto(output, capturedInput, capturedKernel, capturedStride, capturedPadding);
+                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu) cpuEng.DepthwiseConv2DInto(output, capturedInput, capturedKernel, capturedStride, capturedPadding);
                         else { var r = eng.DepthwiseConv2D(capturedInput, capturedKernel, capturedStride, capturedPadding); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.DepthwiseConv2DBackward, new object[] { stride, padding });
@@ -25241,51 +25592,77 @@ public partial class CpuEngine : ITensorLevelEngine
             float epsF = (float)numOps.ToDouble(eps);
             var ggF = new float[channels];
             var gbF = new float[channels];
-            var giF = new float[input.Length];
+            // Every element is written below, so the arena buffer needs no clearing.
+            var gradInputT = TensorAllocator.RentUninitialized<T>(input._shape);
+            var giF = (float[]?)(object?)gradInputT.GetCpuBackingForContiguousWrite(out int giOff)
+                ?? throw new InvalidOperationException("A rented CPU tensor has no managed backing array.");
             float elemF = elementsPerChannel;
 
+            // As torch's batch_norm_cpu_backward and the double path below: two reductions per channel,
+            // sum(dy) and dot(dy, x - mean), then one pass dx = k1*dy + k2*(x - mean) + k3. The scalar form kept a
+            // third, redundant accumulator and ran every loop one element at a time.
             CpuParallelSettings.ParallelForOrSerial(0, channels, (long)channels * elementsPerChannel, c =>
             {
                 float invStd = 1f / MathF.Sqrt(vaF[c] + epsF);
-                float mean_c = meF[c];
-                float gGamma = 0, gBeta = 0, sumGrad = 0, sumGradX = 0;
-
+                float meanC = meF[c];
+                int width = System.Numerics.Vector<float>.Count;
+                var vMean = new System.Numerics.Vector<float>(meanC);
+                var accGrad = System.Numerics.Vector<float>.Zero;
+                var accGradX = System.Numerics.Vector<float>.Zero;
+                float sumGrad = 0f, sumGradX = 0f;
                 for (int n = 0; n < batch; n++)
                 {
                     int baseIdx = (n * channels + c) * spatialSize;
-                    for (int s = 0; s < spatialSize; s++)
+                    int s = 0;
+                    if (System.Numerics.Vector.IsHardwareAccelerated)
                     {
-                        int idx = baseIdx + s;
-                        float diff = inF[idx] - mean_c;
-                        gGamma += goF[idx] * diff * invStd;
-                        gBeta += goF[idx];
-                        sumGrad += goF[idx];
-                        sumGradX += goF[idx] * diff;
+                        for (; s + width <= spatialSize; s += width)
+                        {
+                            var go = new System.Numerics.Vector<float>(goF, baseIdx + s);
+                            accGrad += go;
+                            accGradX += go * (new System.Numerics.Vector<float>(inF, baseIdx + s) - vMean);
+                        }
+                    }
+                    for (; s < spatialSize; s++)
+                    {
+                        float go = goF[baseIdx + s];
+                        sumGrad += go;
+                        sumGradX += go * (inF[baseIdx + s] - meanC);
                     }
                 }
+                sumGrad += System.Numerics.Vector.Dot(accGrad, System.Numerics.Vector<float>.One);
+                sumGradX += System.Numerics.Vector.Dot(accGradX, System.Numerics.Vector<float>.One);
 
-                ggF[c] = gGamma;
-                gbF[c] = gBeta;
-                float gamma_c = gaF[c];
-                float gammaSumGrad = gamma_c * sumGrad;
-                float gammaSumGradX = gamma_c * sumGradX;
-
+                ggF[c] = sumGradX * invStd;
+                gbF[c] = sumGrad;
+                float gammaC = gaF[c];
+                float k1 = gammaC * invStd;
+                float k2 = -gammaC * invStd * invStd * invStd * sumGradX / elemF;
+                float k3 = -gammaC * invStd * sumGrad / elemF;
+                var vK1 = new System.Numerics.Vector<float>(k1);
+                var vK2 = new System.Numerics.Vector<float>(k2);
+                var vK3 = new System.Numerics.Vector<float>(k3);
                 for (int n = 0; n < batch; n++)
                 {
-                    int baseIdx2 = (n * channels + c) * spatialSize;
-                    for (int s = 0; s < spatialSize; s++)
+                    int baseIdx = (n * channels + c) * spatialSize;
+                    int s = 0;
+                    if (System.Numerics.Vector.IsHardwareAccelerated)
                     {
-                        int idx = baseIdx2 + s;
-                        float normalized = (inF[idx] - mean_c) * invStd;
-                        float gradNorm = gamma_c * goF[idx];
-                        giF[idx] = invStd / elemF * (elemF * gradNorm - gammaSumGrad - normalized * invStd * gammaSumGradX);
+                        for (; s + width <= spatialSize; s += width)
+                        {
+                            var dx = vK1 * new System.Numerics.Vector<float>(goF, baseIdx + s)
+                                + vK2 * (new System.Numerics.Vector<float>(inF, baseIdx + s) - vMean) + vK3;
+                            dx.CopyTo(giF, giOff + baseIdx + s);
+                        }
                     }
+                    for (; s < spatialSize; s++)
+                        giF[giOff + baseIdx + s] = k1 * goF[baseIdx + s] + k2 * (inF[baseIdx + s] - meanC) + k3;
                 }
             });
 
             gradGamma = TensorAllocator.Rent<T>([channels], (Vector<T>)(object)Vector<float>.FromMemory(ggF));
             gradBeta = TensorAllocator.Rent<T>([channels], (Vector<T>)(object)Vector<float>.FromMemory(gbF));
-            return TensorAllocator.Rent<T>(input._shape, (Vector<T>)(object)Vector<float>.FromMemory(giF));
+            return gradInputT;
         }
 
         // Double fast path — replaces the per-channel scalar inner loops with
@@ -25690,6 +26067,18 @@ public partial class CpuEngine : ITensorLevelEngine
                         scope, (Tensor<float>)(object)input, (Tensor<float>)(object)gamma,
                         (Tensor<float>)(object)beta, epsilon, eagerMp._shape, "LayerNorm");
                     return (Tensor<T>)(object)yF;
+                }
+                if (typeof(T) == typeof(float) && this is not DirectGpuTensorEngine)
+                {
+                    var compiledLn = TryRecordLayerNormFloat(scope, (Tensor<float>)(object)input,
+                        (Tensor<float>)(object)gamma, (Tensor<float>)(object)beta, epsilon,
+                        out var compiledMean, out var compiledVariance);
+                    if (compiledLn is not null)
+                    {
+                        mean = (Tensor<T>)(object)compiledMean!;
+                        variance = (Tensor<T>)(object)compiledVariance!;
+                        return (Tensor<T>)(object)compiledLn;
+                    }
                 }
                 var ci = input; var cg = gamma; var cb = beta; double ce = epsilon;
                 var savedScope = GraphMode.Current;
@@ -31879,9 +32268,14 @@ public partial class CpuEngine : ITensorLevelEngine
         var sourceData = source.GetFlattenedData();
         var outputData = new T[outputShape.Aggregate(1, (a, b) => a * b)];
 
-        // Initialize to zero
-        for (int i = 0; i < outputData.Length; i++)
-            outputData[i] = numOps.Zero;
+        // A fresh array is already zero when the type's zero is default(T) (every numeric T). The explicit loop is
+        // only for types where it is not; for an embedding-table gradient ([vocab, dim], 25M elements for a 49K x 512
+        // tied table) it was a serial interface-call pass over the whole output.
+        if (!EqualityComparer<T>.Default.Equals(numOps.Zero, default!))
+        {
+            for (int i = 0; i < outputData.Length; i++)
+                outputData[i] = numOps.Zero;
+        }
 
         // Calculate strides
         int innerSize = 1;
@@ -31901,6 +32295,14 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 int targetIdx = indicesData[d % indicesData.Length];
                 if (targetIdx < 0 || targetIdx >= outDimSize) continue;
+
+                if (innerSize >= 8)
+                {
+                    // Whole contiguous row: one SIMD span add (rows sharing a target accumulate in index order, as before).
+                    var dst = new Span<T>(outputData, outer * outDimSize * innerSize + targetIdx * innerSize, innerSize);
+                    numOps.Add(dst, new ReadOnlySpan<T>(sourceData, outer * srcDimSize * innerSize + d * innerSize, innerSize), dst);
+                    continue;
+                }
 
                 for (int inner = 0; inner < innerSize; inner++)
                 {
@@ -32939,6 +33341,11 @@ public partial class CpuEngine : ITensorLevelEngine
                     else shapeList.Add(input._shape[i]);
                 }
                 var outShape = shapeList.Count > 0 ? shapeList.ToArray() : new[] { 1 };
+                if (typeof(T) == typeof(float) && this is not DirectGpuTensorEngine && !GraphMode.IsInferenceTrace)
+                {
+                    var compiledMean = TryRecordReduceMeanFloat(scope, (Tensor<float>)(object)input, axes, keepDims, outShape);
+                    if (compiledMean is not null) return (Tensor<T>)(object)compiledMean;
+                }
                 return scope.RecordUnary(LazyNodeType.ReduceMean, "ReduceMean", input, outShape,
                     (eng, output) => { var r = eng.ReduceMean(captured, capturedAxes, capturedKeepDims); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
                     BackwardFunctions<T>.ReduceMeanBackward, new object[] { axes, keepDims });
@@ -33838,7 +34245,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.Custom, "Upsample", input, outShape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng) cpuEng.UpsampleInto(output, captured, capScaleH, capScaleW);
+                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu) cpuEng.UpsampleInto(output, captured, capScaleH, capScaleW);
                         else { var r = eng.Upsample(captured, capScaleH, capScaleW); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.UpsampleBackward, new object[] { capScaleH, capScaleW });
@@ -34111,7 +34518,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.Custom, "PixelShuffle", input, outShape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng) cpuEng.PixelShuffleInto(output, c_input, c_upscaleFactor);
+                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu) cpuEng.PixelShuffleInto(output, c_input, c_upscaleFactor);
                         else { var r = eng.PixelShuffle(c_input, c_upscaleFactor); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.PixelShuffleBackward, new object[] { c_upscaleFactor });
@@ -34823,7 +35230,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.Custom, "Crop", input, outShape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng) cpuEng.CropInto(output, c_input, c_top, c_left, c_height, c_width);
+                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu) cpuEng.CropInto(output, c_input, c_top, c_left, c_height, c_width);
                         else { var r = eng.Crop(c_input, c_top, c_left, c_height, c_width); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.CropBackward, new object[] { c_top, c_left });
@@ -35015,7 +35422,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.Custom, "Pad", input, outShape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng) cpuEng.PadInto(output, captured, capTop, capBottom, capLeft, capRight, capValue);
+                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu) cpuEng.PadInto(output, captured, capTop, capBottom, capLeft, capRight, capValue);
                         else { var r = eng.Pad(captured, capTop, capBottom, capLeft, capRight, capValue); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.PadBackward, new object[] { capTop, capLeft });
@@ -35096,7 +35503,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordVariadic(LazyNodeType.Custom, "Concat", captured, outShape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng) cpuEng.ConcatInto(output, captured, capturedAxis);
+                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu) cpuEng.ConcatInto(output, captured, capturedAxis);
                         else { var r = eng.Concat(captured, capturedAxis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.ConcatenateBackward, new object[] { capturedAxis });
@@ -35597,15 +36004,23 @@ public partial class CpuEngine : ITensorLevelEngine
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         int numClasses = valuesShape[valuesShape.Length - 1];
-        var grad = new Tensor<T>((int[])valuesShape.Clone());
-        var gradData = grad.GetDataArray();
+        // The gradient is [rows, numClasses] -- for a language-model loss that is the full [tokens, vocab] logits
+        // shape (200 MB at 1024 x 49152), and `new Tensor` put one fresh large-object-heap array per step on the GC
+        // (PerfView allocation stacks: the largest single allocation site of a CPU LM step). It is a backward
+        // intermediate, so it comes from the step allocator, and each row is written in full -- zeroed, then its
+        // class entry set -- so the result does not depend on what the rented buffer held.
+        var grad = Helpers.AutoTensorCache.RentOrAllocate<T>((int[])valuesShape.Clone());
+        var gradData = grad.GetCpuBackingForContiguousWrite(out int gOff)!;
         var upstream = (gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous()).GetReadOnlyDataArray();
         var classData = (classIndices.IsContiguous ? classIndices : classIndices.Contiguous()).GetReadOnlyDataArray();
-        for (int r = 0; r < classData.Length; r++)
+        Helpers.CpuParallelSettings.ParallelForOrSerial(0, classData.Length, (long)classData.Length * numClasses, r =>
         {
+            var row = new Span<T>(gradData, gOff + r * numClasses, numClasses);
+            row.Clear();
             int c = ClassIndexOf(numOps.ToDouble(classData[r]), numClasses);
-            if (c >= 0) gradData[(long)r * numClasses + c] = upstream[r];
-        }
+            if (c >= 0) row[c] = upstream[r];
+        }, deterministicSafe: true);
+        grad.IncrementVersion();
         return grad;
     }
 
@@ -36113,24 +36528,7 @@ public partial class CpuEngine : ITensorLevelEngine
         int totalElements = length.Aggregate(1, (a, b) => a * b);
         var tensorData = tensor.GetFlattenedData();
         var resultData = result.GetDataArray();
-
-        // For each output element, find the corresponding input element
-        CpuParallelSettings.ParallelForOrSerial(0, totalElements, totalElements, flatIdx =>
-        {
-            // Convert flat index to output indices and map to input flat index
-            int remaining = flatIdx;
-            int inputFlat = 0;
-            int stride = 1;
-            for (int d = tensor._shape.Length - 1; d >= 0; d--)
-            {
-                int outputIdx = remaining % length[d];
-                remaining /= length[d];
-                inputFlat += (start[d] + outputIdx) * stride;
-                stride *= tensor._shape[d];
-            }
-
-            resultData[flatIdx] = tensorData[inputFlat];
-        });
+        CopySliceRuns(tensorData, tensor._shape, start, length, resultData, totalElements);
 
         // A tape is an immutable record of the FORWARD call. `start` and `length` are mutable
         // caller-owned arrays, and high-throughput callers commonly reuse one buffer across a
@@ -36154,6 +36552,64 @@ public partial class CpuEngine : ITensorLevelEngine
                 eng => eng.TensorSlice(tensor, tracedStart, tracedLength));
         }
         return result;
+    }
+
+    /// <summary>
+    /// Copies the box <paramref name="start"/> + <paramref name="length"/> of a row-major <paramref name="shape"/>
+    /// array into <paramref name="destination"/> (row-major, <paramref name="totalElements"/> long). The trailing axes
+    /// the box covers in full, plus the first axis it does not, are one contiguous run in the source, so the copy is
+    /// one block copy per run instead of a div/mod index walk per element (that walk was most of an LSTM's
+    /// concatenate-backward on the CPU). Pure copies, so the result is bit-identical to the per-element walk.
+    /// </summary>
+    internal static void CopySliceRuns<T>(T[] source, int[] shape, int[] start, int[] length, T[] destination, int totalElements)
+    {
+        if (totalElements <= 0) return;
+        int rank = shape.Length;
+        if (rank == 0) { destination[0] = source[0]; return; }
+
+        // Axes k..rank-1 form one contiguous source run: every axis after k is taken in full.
+        int k = rank - 1;
+        int run = length[k];
+        while (k > 0 && length[k] == shape[k])
+        {
+            k--;
+            run *= length[k];
+        }
+
+        // Source strides, and the run's base offset from the start of the axes inside the run (only axis k can
+        // have a non-zero start there; the later axes are full, so their start is 0).
+        var strides = new int[rank];
+        int stride = 1;
+        for (int d = rank - 1; d >= 0; d--)
+        {
+            strides[d] = stride;
+            stride *= shape[d];
+        }
+        int runBase = start[k] * strides[k];
+        int rows = totalElements / run;
+
+        if (rows == 1)
+        {
+            Array.Copy(source, runBase + OuterOffset(0), destination, 0, run);
+            return;
+        }
+
+        CpuParallelSettings.ParallelForOrSerial(0, rows, totalElements, row =>
+            Array.Copy(source, runBase + OuterOffset(row), destination, row * run, run));
+
+        // Source offset of outer row `row` over axes 0..k-1 (row-major over the box's extents there).
+        int OuterOffset(int row)
+        {
+            int offset = 0;
+            int remaining = row;
+            for (int d = k - 1; d >= 0; d--)
+            {
+                int index = remaining % length[d];
+                remaining /= length[d];
+                offset += (start[d] + index) * strides[d];
+            }
+            return offset;
+        }
     }
 
     /// <inheritdoc/>
@@ -36437,7 +36893,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 scope.RecordInPlace(LazyNodeType.Custom, "TensorPermuteInto", output, new[] { tensor },
                     (eng, dst) =>
                     {
-                        if (eng is CpuEngine cpuEng) cpuEng.TensorPermuteInto(dst, capturedSrc, capturedAxes);
+                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu) cpuEng.TensorPermuteInto(dst, capturedSrc, capturedAxes);
                         else { var r = eng.TensorPermute(capturedSrc, capturedAxes).Contiguous(); r.AsSpan().CopyTo(dst.AsWritableSpan()); }
                     },
                     BackwardFunctions<T>.PermuteBackward, new object[] { capturedAxes });
@@ -36862,7 +37318,12 @@ public partial class CpuEngine : ITensorLevelEngine
 
         { var ac = AutoTracer.TryGetCompiledPlan<T>("TensorGather", source._shape); if (ac is not null) return ac.Execute(); }
 
-        var sourceData = source.GetFlattenedData();
+        // Read a contiguous source in place. GetFlattenedData() copies the WHOLE source, so an embedding lookup of
+        // 1024 rows from a 49K x 512 table copied all 100 MB every forward pass (PerfView main-thread stacks:
+        // TensorGather -> GetFlattenedData -> ToArray, the largest serial copy of the HRE Track B CPU step).
+        T[]? srcBacking = null;
+        int srcOff = 0;
+        if (source.IsContiguous) srcBacking = source.GetCpuBackingForStridedRead(out srcOff);
         var indicesData = indices.GetFlattenedData();
 
         // Fast path: axis=0, 2D source — embedding lookup
@@ -36870,6 +37331,8 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             int embeddingDim = source._shape[1];
             int numIndices = indices.Length;
+            var rowSource = srcBacking ?? source.GetFlattenedData();
+            int rowOff = srcBacking is null ? 0 : srcOff;
             var result = TensorAllocator.Rent<T>([numIndices, embeddingDim]);
             var resultData = result.GetDataArray();
             CpuParallelSettings.ParallelForOrSerial(0, numIndices, (long)numIndices * embeddingDim, i =>
@@ -36877,7 +37340,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 int idx = indicesData[i];
                 if (idx >= 0 && idx < source._shape[0])
                 {
-                    Array.Copy(sourceData, idx * embeddingDim, resultData, i * embeddingDim, embeddingDim);
+                    Array.Copy(rowSource, rowOff + idx * embeddingDim, resultData, i * embeddingDim, embeddingDim);
                 }
             });
 
@@ -36888,6 +37351,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // General path: gather along any axis for any-rank tensor
         {
+            var sourceData = srcBacking is not null && srcOff == 0 ? srcBacking : source.GetFlattenedData();
             // Output shape: for each dimension d, if d == axis then use indices shape, else source shape
             var outShape = ComputeGatherOutputShape(source._shape, indices._shape, normalizedAxis);
             int totalOutput = 1;
@@ -38229,54 +38693,29 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
                 outShape[normAxis] = totalAxis;
                 return scope.RecordVariadic(LazyNodeType.Custom, "Concatenate", captured, outShape,
-                    (eng, output) => { var r = eng.TensorConcatenate(captured, capturedAxis); DirectGpuTensorEngine.CopyResultInto(eng, r, output); },
+                    (eng, output) =>
+                    {
+                        // Host engines write the concatenation straight into the plan's buffer.
+                        if (eng is not DirectGpuTensorEngine && TryConcatenateInto(captured, capturedAxis, output)) return;
+                        var r = eng.TensorConcatenate(captured, capturedAxis);
+                        DirectGpuTensorEngine.CopyResultInto(eng, r, output);
+                    },
                     BackwardFunctions<T>.ConcatenateBackward, new object[] { capturedAxis });
             }
         }
 
-        // Fast path for contiguous tensors concatenated on the last axis.
-        // Each leading-index row is a contiguous block, so copy one block per
-        // input instead of Tensor<T>.Concatenate's element-wise recursive walk.
+        // Fast path for contiguous tensors concatenated on any axis but the first: each leading-index row of every
+        // input is one contiguous block of shape[axis] * (product of the trailing dims), so copy one block per input
+        // per row instead of Tensor<T>.Concatenate's element-wise recursive walk (an LSTM's per-timestep output
+        // concat along the time axis spent ~13% of its CPU training step in that walk).
         Tensor<T> result;
         int concatRank = tensors[0].Rank;
         int normalizedAxis = axis < 0 ? concatRank + axis : axis;
-        if (normalizedAxis == concatRank - 1 && tensors.All(t => t.IsContiguous))
+        if (normalizedAxis > 0 && normalizedAxis < concatRank && tensors.All(t => t.IsContiguous))
         {
-            var outShape = (int[])tensors[0]._shape.Clone();
-            int outerRows = 1;
-            for (int d = 0; d < concatRank - 1; d++)
-                outerRows *= outShape[d];
-
-            int outputWidth = 0;
-            for (int i = 0; i < tensors.Length; i++)
-            {
-                var shape = tensors[i]._shape;
-                if (shape.Length != concatRank)
-                    throw new ArgumentException("All tensors must have the same rank.", nameof(tensors));
-                for (int d = 0; d < concatRank - 1; d++)
-                {
-                    if (shape[d] != outShape[d])
-                        throw new ArgumentException(
-                            "All tensors must have the same shape except along the concatenation axis.",
-                            nameof(tensors));
-                }
-                outputWidth += shape[concatRank - 1];
-            }
-            outShape[concatRank - 1] = outputWidth;
-
+            var outShape = ConcatenateOutputShape(tensors, normalizedAxis);
             result = AutoTensorCache.RentOrAllocate<T>(outShape);
-            var destination = result.AsWritableSpan();
-            for (int row = 0; row < outerRows; row++)
-            {
-                int destinationOffset = row * outputWidth;
-                for (int i = 0; i < tensors.Length; i++)
-                {
-                    int width = tensors[i]._shape[concatRank - 1];
-                    tensors[i].AsSpan().Slice(row * width, width)
-                        .CopyTo(destination.Slice(destinationOffset, width));
-                    destinationOffset += width;
-                }
-            }
+            ConcatenateContiguousInto(tensors, normalizedAxis, result.AsWritableSpan());
         }
         // Fast path for axis=0 contiguous tensors: direct Array.Copy (any rank)
         else if (axis == 0 && tensors.All(t => t.IsContiguous))
@@ -38315,6 +38754,85 @@ public partial class CpuEngine : ITensorLevelEngine
             savedState: new object[] { axis });
         { var ct = tensors; var ca = axis; AutoTracer.RecordOp("Concatenate", result, eng => eng.TensorConcatenate(ct, ca)); }
         return result;
+    }
+
+    /// <summary>
+    /// The concatenation's output shape along <paramref name="axis"/> (already normalized and in range). Throws when
+    /// the inputs differ in rank or in any extent other than <paramref name="axis"/>.
+    /// </summary>
+    private static int[] ConcatenateOutputShape<T>(Tensor<T>[] tensors, int axis)
+    {
+        var outShape = (int[])tensors[0]._shape.Clone();
+        int rank = outShape.Length;
+        int total = 0;
+        for (int i = 0; i < tensors.Length; i++)
+        {
+            var shape = tensors[i]._shape;
+            if (shape.Length != rank)
+                throw new ArgumentException("All tensors must have the same rank.", nameof(tensors));
+            for (int d = 0; d < rank; d++)
+            {
+                if (d != axis && shape[d] != outShape[d])
+                    throw new ArgumentException(
+                        "All tensors must have the same shape except along the concatenation axis.",
+                        nameof(tensors));
+            }
+            total += shape[axis];
+        }
+        outShape[axis] = total;
+        return outShape;
+    }
+
+    /// <summary>
+    /// Writes the concatenation of contiguous, shape-validated <paramref name="tensors"/> along
+    /// <paramref name="axis"/> into <paramref name="destination"/> (row-major): for each index over the leading axes,
+    /// one block copy per input. Pure copies, bit-identical to the element-wise walk.
+    /// </summary>
+    private static void ConcatenateContiguousInto<T>(Tensor<T>[] tensors, int axis, Span<T> destination)
+    {
+        var firstShape = tensors[0]._shape;
+        int rank = firstShape.Length;
+        int outer = 1;
+        for (int d = 0; d < axis; d++) outer *= firstShape[d];
+        int inner = 1;
+        for (int d = axis + 1; d < rank; d++) inner *= firstShape[d];
+
+        int destinationOffset = 0;
+        for (int row = 0; row < outer; row++)
+        {
+            for (int i = 0; i < tensors.Length; i++)
+            {
+                int block = tensors[i]._shape[axis] * inner;
+                tensors[i].AsSpan().Slice(row * block, block)
+                    .CopyTo(destination.Slice(destinationOffset, block));
+                destinationOffset += block;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Compiled-replay concatenation straight into the plan's output buffer, skipping the temporary result and the
+    /// copy out of it. Only for host data: false (caller takes its general path) when any input or the output is
+    /// not contiguous, the output has a device copy to invalidate, or the shapes do not line up.
+    /// </summary>
+    internal static bool TryConcatenateInto<T>(Tensor<T>[] tensors, int axis, Tensor<T> output)
+    {
+        if (tensors.Length == 0 || !output.IsContiguous || output._gpuBuffer is not null || output.HasPendingGpuData)
+            return false;
+        int rank = tensors[0].Rank;
+        int normalizedAxis = axis < 0 ? rank + axis : axis;
+        if (normalizedAxis < 0 || normalizedAxis >= rank || output.Rank != rank) return false;
+        for (int i = 0; i < tensors.Length; i++)
+            if (!tensors[i].IsContiguous || tensors[i].HasPendingGpuData) return false;
+        int[] outShape;
+        try { outShape = ConcatenateOutputShape(tensors, normalizedAxis); }
+        catch (ArgumentException) { return false; }
+        for (int d = 0; d < rank; d++)
+            if (outShape[d] != output._shape[d]) return false;
+
+        ConcatenateContiguousInto(tensors, normalizedAxis, output.AsWritableSpan());
+        output.IncrementVersion();
+        return true;
     }
 
     /// <inheritdoc/>
@@ -40721,6 +41239,10 @@ public partial class CpuEngine : ITensorLevelEngine
             // Fused tape path: use the exact same TensorMatMul code path as unfused
             // to avoid BLAS accumulation divergence, then consolidate tape entries
             // into a single fused entry for backward.
+            // Count the entries the decomposed ops below record rather than assume one each: under an arena or a
+            // strided input they can record more (a contiguous copy, say), and removing a fixed count then left some.
+            var fusedTape = Autodiff.GradientTape<T>.Current;
+            int entriesBeforeFused = fusedTape?.EntryCount ?? 0;
             Tensor<T> fusedResult = TensorMatMul(input, weights);
             if (bias != null) fusedResult = TensorBroadcastAdd(fusedResult, bias);
 
@@ -40728,13 +41250,24 @@ public partial class CpuEngine : ITensorLevelEngine
             // have to re-run a full matmul to recover it (was 98% of backward time
             // on paper-scale transformers). The saved tensor is a detached clone
             // so the in-place activation below does not corrupt it.
+            // The decomposed ops' entries go first: the single fused entry below replaces them. The activation then
+            // runs unrecorded, because that entry's backward applies its derivative. Applied while recording, it added
+            // an entry of its own, so the removal took the activation and the bias add and left the matmul's entry
+            // behind on the tape.
+            RemoveLastNTapeEntries<T>(fusedTape is null ? 0 : fusedTape.EntryCount - entriesBeforeFused);
             Tensor<T>? savedPreActivation = null;
             if (activation != FusedActivationType.None)
             {
-                savedPreActivation = fusedResult.Clone();
-                ApplyFusedActivationInPlace(fusedResult, activation, activationParams);
+                // The pre-activation is kept as is and the activation is written to a new tensor: cloning it and then
+                // activating in place made the copy-on-write clone copy the whole output first (an extra full pass).
+                // Untaped: the fused entry below owns the activation's backward. A recorded activation would add its
+                // own entry, so removing the last 1-2 entries would drop it and the bias add, and orphan the matmul.
+                savedPreActivation = fusedResult;
+                var handler = ActivationRegistry.Get(activation);
+                if (handler is not null)
+                    using (new NoGradScope<T>())
+                        fusedResult = handler.Apply(this, fusedResult, activationParams);
             }
-            RemoveLastNTapeEntries<T>(bias != null ? 2 : 1);
 
             // Record single fused entry with activation info AND the captured
             // pre-activation for backward. #506 review: also carry FusedActivationParams
@@ -41554,6 +42087,13 @@ public partial class CpuEngine : ITensorLevelEngine
         // backward graph has no entry for this op (cf. AiDotNet#1328).
         if (DifferentiableOps.IsTapeActiveForThread<T>() || GraphMode.IsActive)
         {
+            // Float, eager tape, channel bias, ReLU or no activation: one tape entry and one epilogue pass instead of
+            // three entries and three full passes each way. Lazy graph mode keeps the three-op chain its compiled
+            // training plan pattern-matches.
+            if (typeof(T) == typeof(float) && !GraphMode.IsActive && bias is not null
+                && TryConv2DBiasActivationRecorded((Tensor<float>)(object)input, (Tensor<float>)(object)kernel,
+                    (Tensor<float>)(object)bias, strideH, strideW, padH, padW, dilationH, dilationW, activation) is { } fused)
+                return (Tensor<T>)(object)fused;
             var convResult = Conv2D(input, kernel, new[] { strideH, strideW }, new[] { padH, padW }, new[] { dilationH, dilationW });
             if (bias != null)
             {
@@ -43501,6 +44041,26 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    // Elements per task of an elementwise kernel split across the pool: 64K floats (256 KB of each operand), the grain
+    // torch's parallel_for uses for its elementwise CPU kernels within a factor of two. Fixed, so the split - and the
+    // result, since each element is computed alone - does not depend on the thread count.
+    private const int ElementwiseParallelChunk = 64 * 1024;
+
+    /// <summary>Runs <paramref name="body"/>(start, count) over [0, length) in fixed chunks across the pool.</summary>
+    private static void ParallelElementwiseChunks(int length, Action<int, int> body)
+    {
+        int chunks = (length + ElementwiseParallelChunk - 1) / ElementwiseParallelChunk;
+        if (chunks <= 1)
+        {
+            if (length > 0) body(0, length);
+            return;
+        }
+        CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)length * 3, chunk =>
+        {
+            int start = chunk * ElementwiseParallelChunk;
+            body(start, Math.Min(ElementwiseParallelChunk, length - start));
+        }, deterministicSafe: true);
+    }
     public virtual unsafe Tensor<T> ReluBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
@@ -43522,8 +44082,11 @@ public partial class CpuEngine : ITensorLevelEngine
             var resultTensor = AutoTensorCache.RentOrAllocate<T>(input._shape);
             var iArr = (float[])(object)input.GetDataArray();
             var rArr = (float[])(object)resultTensor.GetDataArray();
-            fixed (float* pI = iArr, pR = rArr)
-                SimdKernels.ReluBackwardScalarUnsafe(scale, pI, pR, length);
+            ParallelElementwiseChunks(length, (start, count) =>
+            {
+                fixed (float* pI = iArr, pR = rArr)
+                    SimdKernels.ReluBackwardScalarUnsafe(scale, pI + start, pR + start, count);
+            });
             return resultTensor;
         }
 
@@ -43538,8 +44101,11 @@ public partial class CpuEngine : ITensorLevelEngine
             var gArr = (float[])(object)gradOutput.GetDataArray();
             var iArr = (float[])(object)input.GetDataArray();
             var rArr = (float[])(object)resultTensor2.GetDataArray();
-            fixed (float* pG = gArr, pI = iArr, pR = rArr)
-                SimdKernels.ReluBackwardUnsafe(pG, pI, pR, length);
+            ParallelElementwiseChunks(length, (start, count) =>
+            {
+                fixed (float* pG = gArr, pI = iArr, pR = rArr)
+                    SimdKernels.ReluBackwardUnsafe(pG + start, pI + start, pR + start, count);
+            });
         }
         else if (typeof(T) == typeof(double))
         {
@@ -45134,45 +45700,14 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
 
-        // Float fast path — generic adaptive bin pool, no NumOps boxing.
-        if (typeof(T) == typeof(float)
-            && input.GetDataArray() is float[] inArr
-            && output.GetDataArray() is float[] outArr)
+        // Float fast path — generic adaptive bin pool, no NumOps boxing. Reads and writes the LIVE backings:
+        // GetDataArray() hands back a copy for a pool-padded or offset tensor, and writing a copy drops the result.
+        if (typeof(T) == typeof(float) && output.IsContiguous
+            && input.GetCpuBackingForStridedRead(out int aapInOff) is float[] inArr
+            && output.GetCpuBackingForContiguousWrite(out int aapOutOff) is float[] outArr)
         {
-            int oH = outputHeight, oW = outputWidth, iH = inHeight, iW = inWidth;
-            int totalChannels = batch * channels;
-            Action<int> kernel = bc =>
-            {
-                int inputBaseOffset = bc * iH * iW;
-                int outputBaseOffset = bc * oH * oW;
-                for (int oh = 0; oh < oH; oh++)
-                {
-                    int startH = (int)Math.Floor((double)oh * iH / oH);
-                    int endH = (int)Math.Ceiling((double)(oh + 1) * iH / oH);
-                    for (int ow = 0; ow < oW; ow++)
-                    {
-                        int startW = (int)Math.Floor((double)ow * iW / oW);
-                        int endW = (int)Math.Ceiling((double)(ow + 1) * iW / oW);
-                        float sum = 0f;
-                        int count = 0;
-                        for (int ih = startH; ih < endH; ih++)
-                        {
-                            int rowOff = inputBaseOffset + ih * iW;
-                            for (int iw = startW; iw < endW; iw++)
-                            {
-                                sum += inArr[rowOff + iw];
-                                count++;
-                            }
-                        }
-                        outArr[outputBaseOffset + oh * oW + ow] = sum / count;
-                    }
-                }
-            };
-            // Issue #319: grain-size dispatch. Adaptive pool reads `iH*iW`
-            // input per channel and writes `oH*oW` per channel. Total work
-            // approximates input element traversal.
-            long adapPoolWork = (long)totalChannels * iH * iW;
-            CpuParallelSettings.LightweightParallel(totalChannels, adapPoolWork, kernel);
+            AdaptiveAvgPool2DFloat(inArr, aapInOff, outArr, aapOutOff, batch * channels,
+                inHeight, inWidth, outputHeight, outputWidth);
             return;
         }
 
@@ -45226,7 +45761,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.Custom, "AdaptiveAvgPool2D", input, outShape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng) cpuEng.AdaptiveAvgPool2DInto(output, captured, capOutH, capOutW);
+                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu) cpuEng.AdaptiveAvgPool2DInto(output, captured, capOutH, capOutW);
                         else { var r = eng.AdaptiveAvgPool2D(captured, capOutH, capOutW); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.AdaptiveAvgPool2DBackward, new object[] { capOutH, capOutW });
@@ -47091,7 +47626,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return scope.RecordUnary(LazyNodeType.Custom, "UpsampleBilinear", input, outShape,
                     (eng, output) =>
                     {
-                        if (eng is CpuEngine cpuEng) cpuEng.TensorUpsampleBilinearInto(output, captured, capOutputSize);
+                        if (eng is CpuEngine cpuEng && !eng.SupportsGpu) cpuEng.TensorUpsampleBilinearInto(output, captured, capOutputSize);
                         else { var r = eng.TensorUpsampleBilinear(captured, capOutputSize); DirectGpuTensorEngine.CopyResultInto(eng, r, output); }
                     },
                     BackwardFunctions<T>.UpsampleBilinearBackward, new object[] { new[] { capH, capW } });
@@ -47411,15 +47946,20 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = TensorAllocator.Rent<T>([n, c, outH, outW]);
         var argmax = new int[n * c * outH * outW];
         var inData = input.GetFlattenedData();
-        var outData = result.GetDataArray();
+        // The rented tensor's own storage at its offset; GetDataArray copies a pool-padded one, losing the writes.
+        var outData = result.GetCpuBackingForContiguousWrite(out int outOff)
+            ?? throw new InvalidOperationException("A freshly rented CPU tensor has no contiguous host storage.");
 
         for (int batch = 0; batch < n; batch++)
             for (int ch = 0; ch < c; ch++)
                 for (int oh = 0; oh < outH; oh++)
                     for (int ow = 0; ow < outW; ow++)
                     {
-                        int hStart = oh * h / outH, hEnd = (oh + 1) * h / outH;
-                        int wStart = ow * w / outW, wEnd = (ow + 1) * w / outW;
+                        // PyTorch adaptive bins: start = floor(i*In/Out), end = ceil((i+1)*In/Out), the rule every GPU
+                        // kernel uses. A truncated end dropped the last row/column of a bin when In % Out != 0.
+                        // long intermediates: (outH-1)*h overflows int for large inputs, wrapping hEnd negative.
+                        int hStart = (int)((long)oh * h / outH), hEnd = (int)(((long)(oh + 1) * h + outH - 1) / outH);
+                        int wStart = (int)((long)ow * w / outW), wEnd = (int)(((long)(ow + 1) * w + outW - 1) / outW);
                         int baseIdx = (batch * c + ch) * h * w;
                         double maxV = double.NegativeInfinity;
                         int maxI = baseIdx + hStart * w + wStart;
@@ -47431,7 +47971,7 @@ public partial class CpuEngine : ITensorLevelEngine
                                 if (v > maxV) { maxV = v; maxI = idx; }
                             }
                         int outIdx = (batch * c + ch) * outH * outW + oh * outW + ow;
-                        outData[outIdx] = numOps.FromDouble(maxV);
+                        outData[outOff + outIdx] = numOps.FromDouble(maxV);
                         argmax[outIdx] = maxI;
                     }
         DifferentiableOps.RecordUnary("AdaptiveMaxPool2D", result, input,
@@ -51704,6 +52244,10 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     [ThreadStatic] private static Dictionary<(int n, bool inverse), Complex<float>[]>? _twiddleCacheFloat;
+
+    /// <summary>The native in-place float FFT (unnormalized; inverse flips the twiddle sign) for host kernels
+    /// outside this class, e.g. the RFFT/IRFFT adjoint backwards.</summary>
+    internal static void NativeFftFloatInPlace(Span<Complex<float>> data, bool inverse) => NativeFFTInPlaceFloatSpan(data, inverse);
 
     private static void NativeFFTInPlaceFloatSpan(Span<Complex<float>> data, bool inverse)
     {

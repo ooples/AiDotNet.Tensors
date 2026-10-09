@@ -45,7 +45,10 @@ internal static class FusedOptimizer
     /// the tensor runs inline on the caller thread with no closure allocation. Overridable via
     /// AIDOTNET_FUSED_OPT_PARALLEL_MIN.
     /// </summary>
-    private const int DefaultParallelThreshold = 1 << 18; // 262144 elements
+    /// <remarks>2^15: AdamW is bound by its per-element divide and square root, not memory -- a 401K-element
+    /// dense weight measured 352 us serial and 40 us over 12 pool chunks of >= 32K elements (~25 us of work each,
+    /// several times the pool dispatch). The previous 2^18 floor left any tensor under 512K elements serial.</remarks>
+    private const int DefaultParallelThreshold = 1 << 15; // 32768 elements
 
     internal static int ParallelThreshold =
         int.TryParse(System.Environment.GetEnvironmentVariable("AIDOTNET_FUSED_OPT_PARALLEL_MIN"), out var _mn) && _mn > 0
@@ -122,6 +125,28 @@ internal static class FusedOptimizer
         }
 
         return true;
+    }
+
+    /// <summary>
+    /// <see cref="AllFiniteSimd(float*, int)"/> split over the persistent pool for a large gradient, with the same
+    /// element-parallel chunking (<see cref="ChunkPlan"/>) as the update kernels. A boolean, so the answer cannot
+    /// depend on the split; a chunk that finds a non-finite value lets the others skip their scan.
+    /// </summary>
+    internal static unsafe bool AllFiniteParallel(float* values, int length)
+    {
+        int nChunks = ChunkPlan(length, FloatSimdWidth, out int chunk);
+        if (nChunks <= 1) return AllFiniteSimd(values, length);
+        nint pv = (nint)values;
+        var nonFinite = new int[1];
+        AiDotNet.Tensors.Helpers.PersistentParallelExecutor.Instance.Execute(nChunks, c =>
+        {
+            if (System.Threading.Volatile.Read(ref nonFinite[0]) != 0) return;
+            int s = c * chunk;
+            int e = s + chunk; if (e > length) e = length;
+            if (s < e && !AllFiniteSimd((float*)pv + s, e - s))
+                System.Threading.Volatile.Write(ref nonFinite[0], 1);
+        });
+        return nonFinite[0] == 0;
     }
 
     /// <summary>
@@ -548,6 +573,225 @@ internal static class FusedOptimizer
         AdamWUpdateSimd(param, grad, m, v, length, lr, beta1, beta2, eps, weightDecay, bc1, bc2);
     }
 
+    // The AdamW host steps hand raw pointers to the SIMD kernel, so a bad offset or short buffer would read and
+    // write past the array (heap corruption, not an exception). Reject it before any pointer arithmetic.
+    private static void ValidateHostRange<TElement>(TElement[] array, int offset, int length, string name)
+    {
+        if (array is null) throw new System.ArgumentNullException(name);
+        if (offset < 0 || length < 0 || offset > array.Length - length)
+            throw new System.ArgumentOutOfRangeException(name,
+                $"[{offset}, {offset}+{length}) is outside the {array.Length}-element array.");
+    }
+    // Elements per parallel chunk of SgdStepHost (256 KB of each array). SGD is bandwidth-bound, so a large layer's
+    // update needs several cores to reach memory bandwidth; small parameters fall to the serial path.
+    private const int SgdHostChunk = 64 * 1024;
+
+    /// <summary>
+    /// One plain-SGD step (param -= lr * grad) over host arrays, the SIMD kernel split into fixed chunks across the
+    /// pool. Element-wise, so the result does not depend on the thread count.
+    /// </summary>
+    internal static unsafe void SgdStepHost(float[] param, float[] grad, int length, float lr)
+    {
+        ValidateHostRange(param, 0, length, nameof(param));
+        ValidateHostRange(grad, 0, length, nameof(grad));
+        int chunks = System.Math.Max(1, (length + SgdHostChunk - 1) / SgdHostChunk);
+        Helpers.CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)length * 3, c =>
+        {
+            int start = c * SgdHostChunk, count = System.Math.Min(SgdHostChunk, length - start);
+            fixed (float* pp = param, pg = grad)
+                SgdUpdateSimd(pp + start, pg + start, count, lr);
+        }, deterministicSafe: true);
+    }
+    // Elements per parallel chunk of AdamWStepHost: a ~1 MB slice of each of the four arrays.
+    private const int AdamWHostChunk = 256 * 1024;
+
+    /// <summary>
+    /// One AdamW step over host arrays (array + offset form, no unsafe code at the caller): the single-pass
+    /// <see cref="AdamWUpdateSimd(float*, float*, float*, float*, int, float, float, float, float, float, float, float)"/>
+    /// kernel split into fixed chunks across the pool. For eager optimizers that update a parameter tensor in place.
+    /// </summary>
+    internal static unsafe void AdamWStepHost(
+        float[] param, int paramOffset, float[] grad, int gradOffset, float[] m, int mOffset, float[] v, int vOffset,
+        int length, float lr, float beta1, float beta2, float eps, float weightDecay, float bc1, float bc2)
+    {
+        ValidateHostRange(param, paramOffset, length, nameof(param));
+        ValidateHostRange(grad, gradOffset, length, nameof(grad));
+        ValidateHostRange(m, mOffset, length, nameof(m));
+        ValidateHostRange(v, vOffset, length, nameof(v));
+        int chunks = System.Math.Max(1, (length + AdamWHostChunk - 1) / AdamWHostChunk);
+        Helpers.CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)length * 4, c =>
+        {
+            int start = c * AdamWHostChunk, count = System.Math.Min(AdamWHostChunk, length - start);
+            fixed (float* pp = param, pg = grad, pm = m, pv = v)
+                AdamWUpdateSimd(pp + paramOffset + start, pg + gradOffset + start, pm + mOffset + start,
+                    pv + vOffset + start, count, lr, beta1, beta2, eps, weightDecay, bc1, bc2);
+        }, deterministicSafe: true);
+    }
+
+    // Elements per parallel chunk of the gradient-norm helpers. Fixed (not derived from the core count), so the
+    // chunk partials -- and therefore the summation order -- are the same on every machine.
+    private const int GradNormHostChunk = 64 * 1024;
+
+    /// <summary>
+    /// Sum of squares of a host float/double tensor, accumulated in double: SIMD within fixed chunks, chunks in
+    /// parallel, partials added in chunk order (deterministic). The result is non-finite exactly when some element
+    /// is NaN or infinite (a finite float squared cannot overflow a double), so one pass serves both a global-norm
+    /// clip and a NaN/Inf probe. False (nothing computed) for another element type or a tensor without a contiguous
+    /// host backing; the caller keeps its own loop for those.
+    /// </summary>
+    internal static bool TrySumOfSquaresHost<T>(LinearAlgebra.Tensor<T> tensor, out double sumOfSquares)
+    {
+        sumOfSquares = 0;
+        if (tensor.Length == 0) return true;
+        if (!tensor.IsContiguous) return false;
+        int length = tensor.Length;
+        if (typeof(T) == typeof(float))
+        {
+            var a = ((LinearAlgebra.Tensor<float>)(object)tensor).GetCpuBackingForStridedRead(out int off);
+            if (a is null) return false;
+            sumOfSquares = ChunkedSum(length, (s, n) => SumSquaresFloat(a, off + s, n));
+            return true;
+        }
+        if (typeof(T) == typeof(double))
+        {
+            var a = ((LinearAlgebra.Tensor<double>)(object)tensor).GetCpuBackingForStridedRead(out int off);
+            if (a is null) return false;
+            sumOfSquares = ChunkedSum(length, (s, n) => SumSquaresDouble(a, off + s, n));
+            return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Multiplies a host float/double tensor by <paramref name="scale"/> in place (chunked, parallel, SIMD) and bumps
+    /// its version. False (nothing done) under the same conditions as <see cref="TrySumOfSquaresHost{T}"/>.
+    /// </summary>
+    internal static bool TryScaleHost<T>(LinearAlgebra.Tensor<T> tensor, double scale)
+    {
+        if (tensor.Length == 0) return true;
+        if (!tensor.IsContiguous) return false;
+        int length = tensor.Length;
+        int chunks = System.Math.Max(1, (length + GradNormHostChunk - 1) / GradNormHostChunk);
+        if (typeof(T) == typeof(float))
+        {
+            var a = ((LinearAlgebra.Tensor<float>)(object)tensor).GetCpuBackingForContiguousWrite(out int off);
+            if (a is null) return false;
+            float s = (float)scale;
+            Helpers.CpuParallelSettings.ParallelForOrSerial(0, chunks, length, c =>
+            {
+                int start = c * GradNormHostChunk;
+                unsafe
+                {
+                    fixed (float* p = a)
+                        SimdKernels.MultiplyScalarUnsafe(p + off + start, s, p + off + start, System.Math.Min(GradNormHostChunk, length - start));
+                }
+            }, deterministicSafe: true);
+        }
+        else if (typeof(T) == typeof(double))
+        {
+            var a = ((LinearAlgebra.Tensor<double>)(object)tensor).GetCpuBackingForContiguousWrite(out int off);
+            if (a is null) return false;
+            Helpers.CpuParallelSettings.ParallelForOrSerial(0, chunks, length, c =>
+            {
+                int start = c * GradNormHostChunk, n = System.Math.Min(GradNormHostChunk, length - start);
+                var span = a.AsSpan(off + start, n);
+                for (int i = 0; i < span.Length; i++) span[i] *= scale;
+            }, deterministicSafe: true);
+        }
+        else return false;
+        tensor.IncrementVersion();
+        return true;
+    }
+
+    private static double ChunkedSum(int length, System.Func<int, int, double> chunkSum)
+    {
+        int chunks = System.Math.Max(1, (length + GradNormHostChunk - 1) / GradNormHostChunk);
+        var partials = new double[chunks];
+        Helpers.CpuParallelSettings.ParallelForOrSerial(0, chunks, length, c =>
+        {
+            int start = c * GradNormHostChunk;
+            partials[c] = chunkSum(start, System.Math.Min(GradNormHostChunk, length - start));
+        }, deterministicSafe: true);
+        double total = 0;
+        for (int c = 0; c < partials.Length; c++) total += partials[c];
+        return total;
+    }
+
+    private static unsafe double SumSquaresFloat(float[] a, int start, int n)
+    {
+        double s = 0;
+        int i = 0;
+        fixed (float* p0 = a)
+        {
+            float* p = p0 + start;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && n >= 8)
+            {
+                var acc0 = Vector256<double>.Zero;
+                var acc1 = Vector256<double>.Zero;
+                for (; i + 8 <= n; i += 8)
+                {
+                    var lo = Avx.ConvertToVector256Double(Sse.LoadVector128(p + i));
+                    var hi = Avx.ConvertToVector256Double(Sse.LoadVector128(p + i + 4));
+                    acc0 = Avx.Add(acc0, Avx.Multiply(lo, lo));
+                    acc1 = Avx.Add(acc1, Avx.Multiply(hi, hi));
+                }
+                var acc = Avx.Add(acc0, acc1);
+                s = acc.GetElement(0) + acc.GetElement(1) + acc.GetElement(2) + acc.GetElement(3);
+            }
+#endif
+            for (; i < n; i++) { double v = p[i]; s += v * v; }
+        }
+        return s;
+    }
+
+    private static unsafe double SumSquaresDouble(double[] a, int start, int n)
+    {
+        double s = 0;
+        int i = 0;
+        fixed (double* p0 = a)
+        {
+            double* p = p0 + start;
+#if NET5_0_OR_GREATER
+            if (Avx.IsSupported && n >= 8)
+            {
+                var acc0 = Vector256<double>.Zero;
+                var acc1 = Vector256<double>.Zero;
+                for (; i + 8 <= n; i += 8)
+                {
+                    var x0 = Avx.LoadVector256(p + i);
+                    var x1 = Avx.LoadVector256(p + i + 4);
+                    acc0 = Avx.Add(acc0, Avx.Multiply(x0, x0));
+                    acc1 = Avx.Add(acc1, Avx.Multiply(x1, x1));
+                }
+                var acc = Avx.Add(acc0, acc1);
+                s = acc.GetElement(0) + acc.GetElement(1) + acc.GetElement(2) + acc.GetElement(3);
+            }
+#endif
+            for (; i < n; i++) s += p[i] * p[i];
+        }
+        return s;
+    }
+
+    /// <inheritdoc cref="AdamWStepHost(float[], int, float[], int, float[], int, float[], int, int, float, float, float, float, float, float, float)"/>
+    internal static unsafe void AdamWStepHost(
+        double[] param, int paramOffset, double[] grad, int gradOffset, double[] m, int mOffset, double[] v, int vOffset,
+        int length, double lr, double beta1, double beta2, double eps, double weightDecay, double bc1, double bc2)
+    {
+        ValidateHostRange(param, paramOffset, length, nameof(param));
+        ValidateHostRange(grad, gradOffset, length, nameof(grad));
+        ValidateHostRange(m, mOffset, length, nameof(m));
+        ValidateHostRange(v, vOffset, length, nameof(v));
+        int chunks = System.Math.Max(1, (length + AdamWHostChunk - 1) / AdamWHostChunk);
+        Helpers.CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)length * 4, c =>
+        {
+            int start = c * AdamWHostChunk, count = System.Math.Min(AdamWHostChunk, length - start);
+            fixed (double* pp = param, pg = grad, pm = m, pv = v)
+                AdamWUpdateSimd(pp + paramOffset + start, pg + gradOffset + start, pm + mOffset + start,
+                    pv + vOffset + start, count, lr, beta1, beta2, eps, weightDecay, bc1, bc2);
+        }, deterministicSafe: true);
+    }
+
     /// <summary>Single-pass fused AdamW with precomputed step-global bias corrections
     /// (bc1 = 1-β1^step, bc2 = 1-β2^step). Bit-identical to the step overload.</summary>
     internal static unsafe void AdamWUpdateSimd(
@@ -896,7 +1140,9 @@ internal static class FusedOptimizer
             return;
         }
         nint pP = (nint)param, pG = (nint)grad, pM = (nint)m, pV = (nint)v;
-        System.Threading.Tasks.Parallel.For(0, nChunks, c =>
+        // The persistent pool, not the TPL: Parallel.For paid its scheduling and worker wake-up on every call,
+        // which ate most of the gain (401K-element AdamW: 384 us serial, 208 us over a 16-way Parallel.For).
+        AiDotNet.Tensors.Helpers.PersistentParallelExecutor.Instance.Execute(nChunks, c =>
         {
             int s = c * chunk;
             int e = s + chunk; if (e > length) e = length;

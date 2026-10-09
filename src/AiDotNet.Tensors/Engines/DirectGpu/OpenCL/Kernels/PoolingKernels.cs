@@ -390,9 +390,9 @@ __kernel void adaptive_avgpool2d(
 
     // Calculate the input region for this output element
     int hStart = (oh * inHeight) / outHeight;
-    int hEnd = ((oh + 1) * inHeight) / outHeight;
+    int hEnd = ((oh + 1) * inHeight + outHeight - 1) / outHeight;
     int wStart = (ow * inWidth) / outWidth;
-    int wEnd = ((ow + 1) * inWidth) / outWidth;
+    int wEnd = ((ow + 1) * inWidth + outWidth - 1) / outWidth;
 
     float sum = 0.0f;
     int count = 0;
@@ -835,9 +835,9 @@ __kernel void adaptive_max_pool2d(
     if (ow >= outWidth || oh >= outHeight || b >= batch) return;
 
     int hStart = (oh * inHeight) / outHeight;
-    int hEnd = ((oh + 1) * inHeight) / outHeight;
+    int hEnd = ((oh + 1) * inHeight + outHeight - 1) / outHeight;
     int wStart = (ow * inWidth) / outWidth;
-    int wEnd = ((ow + 1) * inWidth) / outWidth;
+    int wEnd = ((ow + 1) * inWidth + outWidth - 1) / outWidth;
 
     float maxV = -INFINITY;
     for (int ih = hStart; ih < hEnd; ih++) {

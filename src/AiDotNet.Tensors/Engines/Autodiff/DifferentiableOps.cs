@@ -84,6 +84,27 @@ internal static class DifferentiableOps
     [ThreadStatic]
     internal static object?[]? _indexedGrads;
 
+    /// <summary>
+    /// Non-zero while a compiled step runs a backward whose gradient buffers are NOT zeroed beforehand: the first
+    /// contribution a buffer receives in this generation is copied in, later ones are added. A compiled plan sets it
+    /// only when every backward action accumulates through <see cref="AccumulateGrad{T}"/> (all-generic), where the
+    /// write order is fixed, so each buffer's first writer is the same every step. Replaces a memset of every
+    /// gradient buffer plus an add for every contribution with one copy per buffer (AiDotNet #1804: 836 memsets and
+    /// 393 adds per N-BEATS step on GPU).
+    /// </summary>
+    [ThreadStatic]
+    internal static int GradWriteGeneration;
+
+    private static int s_gradWriteGenerationCounter;
+
+    /// <summary>A process-wide unique, non-zero generation, so a buffer's mark from an earlier step or plan can never
+    /// be mistaken for the current one.</summary>
+    internal static int NextGradWriteGeneration()
+    {
+        int generation = System.Threading.Interlocked.Increment(ref s_gradWriteGenerationCounter);
+        return generation != 0 ? generation : System.Threading.Interlocked.Increment(ref s_gradWriteGenerationCounter);
+    }
+
     /// <summary>Sets the indexed gradient array for the current backward pass.</summary>
     internal static void SetIndexedGrads(object?[] grads) => _indexedGrads = grads;
 
@@ -562,6 +583,31 @@ internal static class DifferentiableOps
     /// when they end up as the first-write slot.
     /// </para>
     /// </summary>
+    /// <summary>True, and marks the buffer written, when this is its first contribution in the current
+    /// <see cref="GradWriteGeneration"/>; false outside a generation or for later contributions.</summary>
+    private static bool ClaimFirstWrite<T>(Tensor<T> buffer)
+    {
+        int generation = GradWriteGeneration;
+        if (generation == 0 || buffer._gradWriteGeneration == generation) return false;
+        buffer._gradWriteGeneration = generation;
+        return true;
+    }
+
+    /// <summary>The step's first contribution to a gradient buffer that was not zeroed: copied in, not added.</summary>
+    private static Tensor<T> CopyFirstWrite<T>(Tensor<T> tensor, Tensor<T> buffer, Tensor<T> contribution, IEngine engine)
+    {
+        if (!buffer.IsContiguous)
+        {
+            var previous = buffer;
+            buffer = buffer.Contiguous();
+            buffer._gradWriteGeneration = GradWriteGeneration;
+            ReplaceAccumulatorBufferOwner(tensor, previous, buffer);
+        }
+        if (!ReferenceEquals(contribution, buffer))
+            engine.TensorCopy(contribution, buffer);
+        return buffer;
+    }
+
     internal static bool AccumulateGradPoolable<T>(
         Dictionary<Tensor<T>, Tensor<T>> grads,
         Tensor<T> tensor,
@@ -606,6 +652,91 @@ internal static class DifferentiableOps
     // (#728/#1804). Debug-only flag; env vars are process-stable.
     private static readonly bool _graphCaptureDebug =
         Environment.GetEnvironmentVariable("AIDOTNET_GRAPH_CAPTURE_DEBUG") == "1";
+
+    /// <summary>
+    /// Adds a slice's gradient into ONLY its region of <paramref name="tensor"/>'s existing accumulator, instead of
+    /// materializing a full-size zero tensor and adding all of it. A recurrence that slices one tensor per step (an
+    /// LSTM's per-timestep input) otherwise does O(T * size) work per sequence in backward; on the CPU that made a
+    /// hoisted-projection LSTM 2.4x slower than the per-step form it was meant to beat.
+    /// </summary>
+    /// <param name="regionStart">Start of the region per axis of the full tensor (rank = tensor rank).</param>
+    /// <param name="regionShape">The region's shape per axis of the full tensor; <paramref name="contribution"/> holds
+    /// exactly its elements in row-major order (an axis slice's dropped axis has extent 1 here).</param>
+    /// <returns>False (nothing done) unless the in-place path applies: CPU engine, no create-graph, an existing
+    /// contiguous host accumulator that does not overlap the contribution. The caller then takes its full-size path.</returns>
+    internal static bool TryAccumulateRegion<T>(
+        Dictionary<Tensor<T>, Tensor<T>> grads, Tensor<T> tensor, Tensor<T> contribution,
+        int[] regionStart, int[] regionShape, IEngine engine)
+    {
+        if (_isBackwardCreateGraph || engine.SupportsGpu || engine is not CpuEngine) return false;
+        int idx = tensor._gradIndex;
+        bool indexed = idx >= 0 && _indexedGrads != null && idx < _indexedGrads.Length;
+        Tensor<T>? existing = indexed
+            ? (Tensor<T>?)_indexedGrads![idx]
+            : (grads.TryGetValue(tensor, out var found) ? found : null);
+        if (existing is null || !existing.IsContiguous || existing.HasPendingGpuData
+            || existing.Length != tensor.Length || existing.Rank != regionStart.Length) return false;
+        var source = contribution.IsContiguous ? contribution : contribution.Contiguous();
+        if (HasOverlappingStorage(existing, source)) return false;
+
+        var numOps = global::AiDotNet.Tensors.Helpers.MathHelper.GetNumericOperations<T>();
+        var dest = existing.AsWritableSpan();
+        if (ClaimFirstWrite(existing)) dest.Clear();   // stale buffer from an earlier step: this is its first write
+        var src = source.AsSpan();
+        var fullShape = existing._shape;
+        int rank = fullShape.Length;
+        int rowLength = regionShape[rank - 1];
+        int rows = rowLength == 0 ? 0 : src.Length / rowLength;
+        for (int row = 0; row < rows; row++)
+        {
+            int remaining = row;
+            int offset = regionStart[rank - 1];
+            int stride = fullShape[rank - 1];
+            for (int d = rank - 2; d >= 0; d--)
+            {
+                int coordinate = remaining % regionShape[d];
+                remaining /= regionShape[d];
+                offset += (regionStart[d] + coordinate) * stride;
+                stride *= fullShape[d];
+            }
+            // One vectorized add per row (it was a virtual numOps.Add per element); element-wise, so bit-identical.
+            var destRow = dest.Slice(offset, rowLength);
+            numOps.Add(destRow, src.Slice(row * rowLength, rowLength), destRow);
+        }
+
+        if (indexed) _indexedGrads![idx] = existing;
+        grads[tensor] = existing;
+        tensor.Grad = existing;
+        return true;
+    }
+
+    /// <summary>
+    /// For a fused backward that produces an input's whole gradient: the existing host accumulator it may write straight
+    /// into, so the gradient is never staged in a temporary and copied. <paramref name="overwrite"/> is true when this is
+    /// the buffer's first contribution of the step under a <see cref="GradWriteGeneration"/> (the buffer was not zeroed,
+    /// so the caller must store, not add); otherwise the caller adds. Returns null when the direct route does not apply
+    /// -- no existing contiguous host accumulator yet (the eager tape's first contribution), a GPU engine, or a
+    /// create-graph backward -- and the caller passes a contribution tensor to <see cref="AccumulateGrad{T}"/> instead.
+    /// A caller that writes the returned buffer must call <see cref="TensorBase{T}.IncrementVersion"/> afterwards.
+    /// </summary>
+    internal static Tensor<T>? TryGetDirectGradTarget<T>(
+        Dictionary<Tensor<T>, Tensor<T>> grads, Tensor<T> tensor, IEngine engine, out bool overwrite)
+    {
+        overwrite = false;
+        if (_isBackwardCreateGraph || engine.SupportsGpu || engine is not CpuEngine) return null;
+        int idx = tensor._gradIndex;
+        bool indexed = idx >= 0 && _indexedGrads != null && idx < _indexedGrads.Length;
+        Tensor<T>? existing = indexed
+            ? (Tensor<T>?)_indexedGrads![idx]
+            : (grads.TryGetValue(tensor, out var found) ? found : null);
+        if (existing is null || !existing.IsContiguous || existing.HasPendingGpuData
+            || existing.Length != tensor.Length) return null;
+        overwrite = ClaimFirstWrite(existing);
+        if (indexed) _indexedGrads![idx] = existing;
+        grads[tensor] = existing;
+        tensor.Grad = existing;
+        return existing;
+    }
 
     /// <summary>
     /// Accumulates a gradient for a tensor in the gradient dictionary.
@@ -699,6 +830,10 @@ internal static class DifferentiableOps
                     // back through the original GradFn lineage.
                     accumulated = engine.TensorAdd(existing, grad);
                 }
+                else if (ClaimFirstWrite(existing))
+                {
+                    accumulated = CopyFirstWrite(tensor, existing, GradForInPlace(), engine);
+                }
                 else
                 {
                     // Defensive: if the existing slot is somehow
@@ -724,7 +859,8 @@ internal static class DifferentiableOps
                     }
                     else
                     {
-                        engine.TensorAddInPlace(existing, GradForInPlace());
+                        using (new NoGradScope<T>()) // accumulation is not a recorded op; skips the in-place op's pre-mutation clone
+                            engine.TensorAddInPlace(existing, GradForInPlace());
                         accumulated = existing;
                     }
                 }
@@ -756,6 +892,12 @@ internal static class DifferentiableOps
                 grads[tensor] = accumulated;
                 tensor.Grad = accumulated;
             }
+            else if (ClaimFirstWrite(existingDict))
+            {
+                var written = CopyFirstWrite(tensor, existingDict, GradForInPlace(), engine);
+                grads[tensor] = written;
+                tensor.Grad = written;
+            }
             else
             {
                 if (!existingDict.IsContiguous)
@@ -774,7 +916,8 @@ internal static class DifferentiableOps
                 }
                 else
                 {
-                    engine.TensorAddInPlace(existingDict, GradForInPlace());
+                    using (new NoGradScope<T>()) // accumulation is not a recorded op; skips the in-place op's pre-mutation clone
+                        engine.TensorAddInPlace(existingDict, GradForInPlace());
                     tensor.Grad = existingDict;
                 }
             }

@@ -1639,7 +1639,7 @@ internal static class BlasProvider
                 new ReadOnlySpan<float>(a, aOffset, a.Length - aOffset), lda, transA,
                 new ReadOnlySpan<float>(b, bOffset, b.Length - bOffset), ldb, transB,
                 new Span<float>(c, cOffset, c.Length - cOffset), ldc,
-                m, n, k);
+                m, n, k, new Engines.BlasManaged.BlasOptions<float> { BetaZero = true });
             LogShape(m, n, k, transA, transB);
             return true;
         }
@@ -1664,7 +1664,7 @@ internal static class BlasProvider
                 new ReadOnlySpan<float>(a, aOffset, a.Length - aOffset), lda, transA,
                 new ReadOnlySpan<float>(b, bOffset, b.Length - bOffset), ldb, transB,
                 new Span<float>(c, cOffset, c.Length - cOffset), ldc,
-                m, n, k);
+                m, n, k, new Engines.BlasManaged.BlasOptions<float> { BetaZero = true });
             LogShape(m, n, k, transA, transB);
             return true;
         }
@@ -1675,7 +1675,7 @@ internal static class BlasProvider
                 new ReadOnlySpan<float>(a, aOffset, a.Length - aOffset), lda, transA,
                 new ReadOnlySpan<float>(b, bOffset, b.Length - bOffset), ldb, transB,
                 new Span<float>(c, cOffset, c.Length - cOffset), ldc,
-                m, n, k);
+                m, n, k, new Engines.BlasManaged.BlasOptions<float> { BetaZero = true });
             LogShape(m, n, k, transA, transB);
             return true;
         }
@@ -1721,7 +1721,7 @@ internal static class BlasProvider
                 new ReadOnlySpan<double>(a, aOffset, a.Length - aOffset), lda, transA,
                 new ReadOnlySpan<double>(b, bOffset, b.Length - bOffset), ldb, transB,
                 new Span<double>(c, cOffset, c.Length - cOffset), ldc,
-                m, n, k);
+                m, n, k, new Engines.BlasManaged.BlasOptions<double> { BetaZero = true });
             LogShape(m, n, k, transA, transB);
             return true;
         }
@@ -1733,7 +1733,7 @@ internal static class BlasProvider
                 new ReadOnlySpan<double>(a, aOffset, a.Length - aOffset), lda, transA,
                 new ReadOnlySpan<double>(b, bOffset, b.Length - bOffset), ldb, transB,
                 new Span<double>(c, cOffset, c.Length - cOffset), ldc,
-                m, n, k);
+                m, n, k, new Engines.BlasManaged.BlasOptions<double> { BetaZero = true });
             LogShape(m, n, k, transA, transB);
             return true;
         }
@@ -1744,7 +1744,7 @@ internal static class BlasProvider
                 new ReadOnlySpan<double>(a, aOffset, a.Length - aOffset), lda, transA,
                 new ReadOnlySpan<double>(b, bOffset, b.Length - bOffset), ldb, transB,
                 new Span<double>(c, cOffset, c.Length - cOffset), ldc,
-                m, n, k);
+                m, n, k, new Engines.BlasManaged.BlasOptions<double> { BetaZero = true });
             LogShape(m, n, k, transA, transB);
             return true;
         }

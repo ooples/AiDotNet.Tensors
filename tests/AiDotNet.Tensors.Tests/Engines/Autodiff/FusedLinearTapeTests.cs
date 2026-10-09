@@ -70,6 +70,26 @@ public class FusedLinearTapeTests : IDisposable
         _output.WriteLine($"{activation}: wGrad[0]={wGrad.GetFlat(0):F6}, bGrad[0]={bGrad.GetFlat(0):F6}");
     }
 
+    [Theory]
+    [InlineData(FusedActivationType.None, true)]
+    [InlineData(FusedActivationType.ReLU, true)]
+    [InlineData(FusedActivationType.ReLU, false)]
+    [InlineData(FusedActivationType.Sigmoid, true)]
+    [InlineData(FusedActivationType.GELU, true)]
+    public void FusedLinear_Float_RecordsExactlyOneTapeEntry(FusedActivationType activation, bool withBias)
+    {
+        // The fused entry owns the activation's backward; the decomposed matmul / bias / activation
+        // entries must all be gone. An in-place activation that records its own entry used to make
+        // the cleanup drop the wrong ones and leave the matmul entry orphaned on the tape.
+        var input = new Tensor<float>(new float[] { 1, 2, 3, 4 }, [2, 2]);
+        var weights = new Tensor<float>(new float[] { 0.5f, -0.3f, 0.1f, 0.8f }, [2, 2]);
+        var bias = withBias ? new Tensor<float>(new float[] { 0.1f, -0.1f }, [2]) : null;
+
+        using var tape = new GradientTape<float>();
+        _engine.FusedLinear(input, weights, bias, activation);
+
+        Assert.Equal(1, tape.EntryCount);
+    }
     [Fact]
     public void FusedLinear_Double_ProducesGradients()
     {
