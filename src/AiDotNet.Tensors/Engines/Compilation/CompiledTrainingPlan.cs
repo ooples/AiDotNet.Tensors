@@ -9570,26 +9570,19 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         // computes it correctly.
         if (!leftSpansOutput && !rightSpansOutput) return null;
 
-        // Dense float [N,M] op [M] (row-vector / bias shape): a tight indexed loop, kept as a fast
-        // sub-case of the one path rather than as a branch that re-decides orientation.
-        if (typeof(T) == typeof(float) && leftSpansOutput && !rightSpansOutput
-            && left.Rank == 2
-            && (right.Rank == 1 || (right.Rank == 2 && right._shape[0] == 1))
-            && left._shape[1] == (right.Rank == 1 ? right._shape[0] : right._shape[1]))
+        // Dense rank-2 [R,C] op bias, where the bias is a row vector ([C] or [1,C]) or a column vector ([R,1]), in
+        // float or double: ONE fused SIMD pass per row writing the output directly. The generic path below copies the
+        // spanning operand into the output and then applies the bias in place -- two full passes over [R,C], the
+        // second a broadcast kernel -- which profiled as most of the memmove in a column-major MLP training step
+        // (N-BEATS: [hidden, B] + [hidden, 1] in every layer). Add and multiply also take the bias on the LEFT.
+        var fusedBias = TryBuildFusedRank2BiasForward(left, right, output, isAdd, isSubtract, leftSpansOutput, rightSpansOutput);
+        if (fusedBias is not null)
         {
-            var leftArray = TryGetLiveFloatBacking(left);
-            var rightArray = TryGetLiveFloatBacking(right);
-            var outputArray = TryGetLiveFloatBacking(output);
-            if (leftArray is not null && rightArray is not null && outputArray is not null)
+            return engine =>
             {
-                int rows = left._shape[0];
-                int cols = left._shape[1];
-                if (isAdd)
-                    return _ => { for (int r = 0; r < rows; r++) { int off = r * cols; for (int c = 0; c < cols; c++) outputArray[off + c] = leftArray[off + c] + rightArray[c]; } };
-                if (isSubtract)
-                    return _ => { for (int r = 0; r < rows; r++) { int off = r * cols; for (int c = 0; c < cols; c++) outputArray[off + c] = leftArray[off + c] - rightArray[c]; } };
-                return _ => { for (int r = 0; r < rows; r++) { int off = r * cols; for (int c = 0; c < cols; c++) outputArray[off + c] = leftArray[off + c] * rightArray[c]; } };
-            }
+                if (engine is CpuEngine) fusedBias(engine);
+                else ReplayBroadcastBinaryEagerly(engine, step.OpType, left, right, output);
+            };
         }
 
         // Subtract and multiply have no in-place broadcasting kernel for a smaller RIGHT operand,
@@ -9629,6 +9622,83 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 cpu.TensorBroadcastAddInPlace(output, right);
             }
         };
+    }
+
+
+    /// <summary>
+    /// The fused rank-2 bias forward for <see cref="TryBuildBroadcastBinaryForward"/>: <c>out[r,c] = x[r,c] op bias</c>
+    /// with a row (<c>[C]</c>, <c>[1,C]</c>) or column (<c>[R,1]</c>) bias, one SIMD pass per row, rows in parallel when
+    /// the tensor is large. <see langword="null"/> when the shapes, element type or backings do not fit.
+    /// </summary>
+    private static Action<IEngine>? TryBuildFusedRank2BiasForward(
+        Tensor<T> left, Tensor<T> right, Tensor<T> output, bool isAdd, bool isSubtract,
+        bool leftSpansOutput, bool rightSpansOutput)
+    {
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double)) return null;
+        if (output.Rank != 2) return null;
+
+        // x spans the output; bias is the other operand. Subtract is not commutative, so its bias must be on the right.
+        Tensor<T> x, bias;
+        if (leftSpansOutput && !rightSpansOutput) { x = left; bias = right; }
+        else if (rightSpansOutput && !leftSpansOutput && !isSubtract) { x = right; bias = left; }
+        else return null;
+
+        int rows = output._shape[0], cols = output._shape[1];
+        bool rowBias = (bias.Rank == 1 && bias._shape[0] == cols)
+                    || (bias.Rank == 2 && bias._shape[0] == 1 && bias._shape[1] == cols);
+        bool colBias = bias.Rank == 2 && bias._shape[0] == rows && bias._shape[1] == 1;
+        if (!rowBias && !colBias) return null;
+        if (rowBias && colBias && cols != 1) return null;   // [1,1] on a [1,C] output: only the row reading is valid
+
+        long work = (long)rows * cols;
+        if (typeof(T) == typeof(double))
+        {
+            var xa = TryGetLiveDoubleBacking(x); var ba = TryGetLiveDoubleBacking(bias); var oa = TryGetLiveDoubleBacking(output);
+            if (xa is null || ba is null || oa is null) return null;
+            return _ => Helpers.CpuParallelSettings.ParallelForOrSerial(0, rows, work, r =>
+            {
+                var xr = new ReadOnlySpan<double>(xa, r * cols, cols);
+                var orow = new Span<double>(oa, r * cols, cols);
+                if (rowBias)
+                {
+                    var bv = new ReadOnlySpan<double>(ba, 0, cols);
+                    if (isAdd) Simd.SimdKernels.VectorAdd(xr, bv, orow);
+                    else if (isSubtract) Simd.SimdKernels.VectorSubtract(xr, bv, orow);
+                    else Simd.SimdKernels.VectorMultiply(xr, bv, orow);
+                }
+                else
+                {
+                    double s = ba[r];
+                    if (isAdd) Simd.SimdKernels.AddScalar(xr, s, orow);
+                    else if (isSubtract) Simd.SimdKernels.SubtractScalar(xr, s, orow);
+                    else Simd.SimdKernels.MultiplyScalar(xr, s, orow);
+                }
+            }, deterministicSafe: true);
+        }
+        else
+        {
+            var xa = TryGetLiveFloatBacking(x); var ba = TryGetLiveFloatBacking(bias); var oa = TryGetLiveFloatBacking(output);
+            if (xa is null || ba is null || oa is null) return null;
+            return _ => Helpers.CpuParallelSettings.ParallelForOrSerial(0, rows, work, r =>
+            {
+                var xr = new ReadOnlySpan<float>(xa, r * cols, cols);
+                var orow = new Span<float>(oa, r * cols, cols);
+                if (rowBias)
+                {
+                    var bv = new ReadOnlySpan<float>(ba, 0, cols);
+                    if (isAdd) Simd.SimdKernels.VectorAdd(xr, bv, orow);
+                    else if (isSubtract) Simd.SimdKernels.VectorSubtract(xr, bv, orow);
+                    else Simd.SimdKernels.VectorMultiply(xr, bv, orow);
+                }
+                else
+                {
+                    float s = ba[r];
+                    if (isAdd) Simd.SimdKernels.AddScalar(xr, s, orow);
+                    else if (isSubtract) Simd.SimdKernels.SubtractScalar(xr, s, orow);
+                    else Simd.SimdKernels.MultiplyScalar(xr, s, orow);
+                }
+            }, deterministicSafe: true);
+        }
     }
 
     /// <summary>
