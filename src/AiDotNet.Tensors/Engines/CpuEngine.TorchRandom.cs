@@ -42,6 +42,10 @@ public partial class CpuEngine
     // Exact binomial draw by geometric waiting times between successes: O(n·min(p, 1-p)) expected steps.
     private static double SampleBinomial(double count, double p, Random rng)
     {
+        // torch.binomial does not validate this and returns fractional draws for a fractional count; a count of
+        // trials must be a whole number, so it is rejected rather than truncated.
+        if (double.IsNaN(count) || count != Math.Floor(count))
+            throw new ArgumentOutOfRangeException(nameof(count), $"count must be a whole number of trials, got {count}.");
         long n = (long)count;
         if (n < 0 || p < 0 || p > 1 || double.IsNaN(p)) throw new ArgumentOutOfRangeException(nameof(p), "need count ≥ 0 and 0 ≤ p ≤ 1.");
         if (n == 0 || p == 0) return 0;
@@ -280,7 +284,7 @@ public partial class CpuEngine
         var cs = TensorCumSum(padded, 1);
         var window = TensorSubtract(TensorNarrow(cs, 1, size, c), TensorNarrow(cs, 1, 0, c));
         var denominator = TensorAddScalar(TensorMultiplyScalar(window, ops.FromDouble(alpha / size)), ops.FromDouble(k));
-        var scaled = TensorExp(TensorMultiplyScalar(TensorLog(denominator), ops.FromDouble(beta)));
+        var scaled = TensorPow(denominator, ops.FromDouble(beta));
         return Reshape(TensorDivide(x, scaled), (int[])tensor._shape.Clone());
     }
 
@@ -297,14 +301,20 @@ public partial class CpuEngine
         };
     }
 
-    // (Σ |x|^p over axes)^(1/p), recorded; p = 1 and p = 2 avoid the exp/log form.
+    // (Σ |x|^p over axes)^(1/p), recorded. |x|^p is a power, not exp(p·log|x|), so a zero element has a zero
+    // derivative (p > 1) instead of 0·∞. The root of a zero sum has an infinite derivative, so zero sums are
+    // shifted to 1 inside the root and back out after it (a constant mask): the norm stays 0 and, as in PyTorch's
+    // norm backward, its gradient is 0 rather than NaN.
     private Tensor<T> PNorm<T>(Tensor<T> x, double p, int[] axes, bool keepDims)
     {
         var ops = MathHelper.GetNumericOperations<T>();
-        if (p == 2) return TensorSqrt(ReduceSum(TensorSquare(x), axes, keepDims));
         if (p == 1) return ReduceSum(TensorAbs(x), axes, keepDims);
-        var powered = TensorExp(TensorMultiplyScalar(TensorLog(TensorAbs(x)), ops.FromDouble(p)));
-        return TensorExp(TensorMultiplyScalar(TensorLog(ReduceSum(powered, axes, keepDims)), ops.FromDouble(1 / p)));
+        var sum = ReduceSum(p == 2 ? TensorSquare(x) : TensorPow(TensorAbs(x), ops.FromDouble(p)), axes, keepDims);
+        var sums = (sum.IsContiguous ? sum : sum.Contiguous()).AsSpan().ToArray();
+        var zeroMask = FromDoubles<T>((int[])sum._shape.Clone(), i => ops.ToDouble(sums[i]) == 0 ? 1.0 : 0.0);
+        var shifted = TensorAdd(sum, zeroMask);
+        var root = p == 2 ? TensorSqrt(shifted) : TensorPow(shifted, ops.FromDouble(1 / p));
+        return TensorSubtract(root, zeroMask);
     }
 
     /// <inheritdoc/>

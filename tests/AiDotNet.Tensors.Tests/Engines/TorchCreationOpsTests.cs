@@ -124,4 +124,26 @@ public class TorchCreationOpsTests
         var ints = _engine.TensorRandint<double>(-3, 4, new[] { 1000 }, seed: 1).ToArray();
         Assert.True(ints.All(v => v >= -3 && v < 4 && v == Math.Floor(v)) && ints.Distinct().Count() == 7);
     }
+
+    [Fact]
+    public void Range_TruncatesLikeTorch_AndValidatesItsBounds()
+    {
+        // 0.3 / 0.1 is 2.9999999999999996 in double, so torch.range(0, 0.3, 0.1) has 3 elements.
+        Assert.Equal(3, _engine.TensorRange<double>(0, 0.3, 0.1).Length);
+        Assert.Equal(11, _engine.TensorRange<double>(0, 1, 0.1).Length);
+        Assert.Throws<ArgumentOutOfRangeException>(() => _engine.TensorArange<double>(0, double.NaN, 1));
+        Assert.Throws<ArgumentOutOfRangeException>(() => _engine.TensorRange<double>(double.NegativeInfinity, 1, 1));
+        Assert.Throws<ArgumentOutOfRangeException>(() => _engine.TensorArange<double>(0, 1e300, 1));
+    }
+
+    [Fact]
+    public void LikeConstructors_RejectNull()
+    {
+        // The null contract is what is under test, so nullable analysis is off for the one declaration.
+#nullable disable
+        Tensor<double> missing = null;
+#nullable restore
+        Assert.Throws<ArgumentNullException>(() => _engine.TensorZerosLike(missing));
+        Assert.Throws<ArgumentNullException>(() => _engine.TensorRandintLike(missing, 0, 3));
+    }
 }

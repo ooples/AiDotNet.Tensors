@@ -46,17 +46,24 @@ public partial class CpuEngine
         double evalSlope = (lower + upper) / 2;
         var source = tensor.IsContiguous ? tensor : tensor.Contiguous();
         var values = source.AsSpan().ToArray();
-        var result = FromDoubles<T>((int[])source._shape.Clone(), i =>
-        {
-            double x = ops.ToDouble(values[i]);
-            if (x >= 0) return x;
-            double slope = rng is null ? evalSlope : lower + (upper - lower) * rng.NextDouble();
-            return slope * x;
-        });
-        // On the negative side y = slope·x, so the derivative y/x is the slope that was drawn.
-        Func<double, double, double> derivative = (x, y) => x >= 0 ? 1 : y / x;
-        DifferentiableOps.RecordUnary("TensorRrelu", result, tensor, SpecialBackward<T>.Unary, new object[] { derivative });
+        // PyTorch draws a slope for every x <= 0 (and leaky_relu's derivative at 0 is the slope), so the slope
+        // array is also the exact derivative; the backward reads it rather than recovering y / x after rounding.
+        var slopes = new double[values.Length];
+        for (int i = 0; i < slopes.Length; i++)
+            slopes[i] = ops.ToDouble(values[i]) > 0 ? 1 : rng is null ? evalSlope : lower + (upper - lower) * rng.NextDouble();
+        var result = FromDoubles<T>((int[])source._shape.Clone(), i => slopes[i] * ops.ToDouble(values[i]));
+        DifferentiableOps.RecordUnary("TensorRrelu", result, tensor, RreluBackward<T>, new object[] { slopes });
         return result;
+    }
+
+    private static void RreluBackward<T>(Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var ops = MathHelper.GetNumericOperations<T>();
+        var slopes = (double[])savedState[0];
+        var g = (gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous()).AsSpan().ToArray();
+        DifferentiableOps.AccumulateGrad(grads, inputs[0],
+            FromDoubles<T>((int[])inputs[0]._shape.Clone(), i => ops.ToDouble(g[i]) * slopes[i]), engine);
     }
 
     private static T Scalar<T>(double value) => MathHelper.GetNumericOperations<T>().FromDouble(value);

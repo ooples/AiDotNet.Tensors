@@ -63,18 +63,26 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorArange<T>(double start, double end, double step = 1)
     {
-        if (step == 0 || double.IsNaN(step)) throw new ArgumentOutOfRangeException(nameof(step), "step must be non-zero.");
-        if ((end - start) * step < 0) throw new ArgumentException("end must lie in the direction of step from start.");
-        int count = (int)Math.Ceiling((end - start) / step);
+        int count = RangeCount(start, end, step, Math.Ceiling((end - start) / step));
         return FromDoubles<T>(new[] { count }, i => start + i * step);
+    }
+
+    private static int RangeCount(double start, double end, double step, double size)
+    {
+        if (double.IsNaN(start) || double.IsInfinity(start)) throw new ArgumentOutOfRangeException(nameof(start), "start must be finite.");
+        if (double.IsNaN(end) || double.IsInfinity(end)) throw new ArgumentOutOfRangeException(nameof(end), "end must be finite.");
+        if (step == 0 || double.IsNaN(step) || double.IsInfinity(step)) throw new ArgumentOutOfRangeException(nameof(step), "step must be finite and non-zero.");
+        if ((end - start) * step < 0) throw new ArgumentException("end must lie in the direction of step from start.");
+        if (size > int.MaxValue) throw new ArgumentOutOfRangeException(nameof(step), $"the range would hold {size} elements, more than a tensor axis can.");
+        return (int)size;
     }
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorRange<T>(double start, double end, double step = 1)
     {
-        if (step == 0 || double.IsNaN(step)) throw new ArgumentOutOfRangeException(nameof(step), "step must be non-zero.");
-        if ((end - start) * step < 0) throw new ArgumentException("end must lie in the direction of step from start.");
-        int count = (int)Math.Floor((end - start) / step + 1e-12) + 1;
+        // PyTorch: size = (int64)((end - start) / step + 1), truncating with no slack, so range(0, 0.3, 0.1) has 3
+        // elements because 0.3 / 0.1 rounds to 2.9999999999999996.
+        int count = RangeCount(start, end, step, Math.Floor((end - start) / step + 1));
         return FromDoubles<T>(new[] { count }, i => start + i * step);
     }
 
@@ -85,8 +93,11 @@ public partial class CpuEngine
         return FromDoubles<T>(new[] { steps }, i => Math.Pow(logBase, steps == 1 ? start : start + i * (end - start) / (steps - 1)));
     }
 
+    private static int[] LikeShape<T>(Tensor<T> tensor)
+        => (int[])(tensor ?? throw new ArgumentNullException(nameof(tensor)))._shape.Clone();
+
     /// <inheritdoc/>
-    public virtual Tensor<T> TensorZerosLike<T>(Tensor<T> tensor) => new Tensor<T>((int[])tensor._shape.Clone());
+    public virtual Tensor<T> TensorZerosLike<T>(Tensor<T> tensor) => new Tensor<T>(LikeShape(tensor));
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorOnesLike<T>(Tensor<T> tensor) => TensorFullLike(tensor, MathHelper.GetNumericOperations<T>().One);
@@ -94,7 +105,7 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorFullLike<T>(Tensor<T> tensor, T value)
     {
-        var result = new Tensor<T>((int[])tensor._shape.Clone());
+        var result = new Tensor<T>(LikeShape(tensor));
         result.AsWritableSpan().Fill(value);
         return result;
     }
@@ -106,7 +117,7 @@ public partial class CpuEngine
     public virtual Tensor<T> TensorRandLike<T>(Tensor<T> tensor, int? seed = null)
     {
         var rng = RandomSource(seed);
-        return FromDoubles<T>((int[])tensor._shape.Clone(), _ => rng.NextDouble());
+        return FromDoubles<T>(LikeShape(tensor), _ => rng.NextDouble());
     }
 
     /// <inheritdoc/>
@@ -114,13 +125,14 @@ public partial class CpuEngine
     {
         var rng = RandomSource(seed);
         // Box–Muller; 1 - U keeps the logarithm's argument in (0, 1].
-        return FromDoubles<T>((int[])tensor._shape.Clone(),
+        return FromDoubles<T>(LikeShape(tensor),
             _ => Math.Sqrt(-2 * Math.Log(1 - rng.NextDouble())) * Math.Cos(2 * Math.PI * rng.NextDouble()));
     }
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorRandint<T>(long low, long high, int[] shape, int? seed = null)
     {
+        if (shape == null) throw new ArgumentNullException(nameof(shape));
         if (high <= low) throw new ArgumentException("high must be greater than low.", nameof(high));
         var rng = RandomSource(seed);
         double span = high - (double)low;
@@ -129,7 +141,7 @@ public partial class CpuEngine
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorRandintLike<T>(Tensor<T> tensor, long low, long high, int? seed = null)
-        => TensorRandint<T>(low, high, tensor._shape, seed);
+        => TensorRandint<T>(low, high, LikeShape(tensor), seed);
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorRandperm<T>(int n, int? seed = null)
@@ -441,7 +453,7 @@ public partial class CpuEngine
         var reduce = (axes ?? AllAxes(tensor.Rank)).Select(a => NormalizeDim(a, tensor.Rank)).ToArray();
         int count = reduce.Aggregate(1, (a, k) => a * tensor._shape[k]);
         var meanKept = ReduceMean(tensor, reduce, keepDims: true);
-        var centered = TensorSubtract(tensor, TensorBroadcastTo(meanKept, (int[])tensor._shape.Clone()));
+        var centered = TensorSubtract(tensor, TensorBroadcastTo(meanKept, LikeShape(tensor)));
         var variance = TensorMultiplyScalar(ReduceSum(TensorSquare(centered), reduce, keepDims), ops.FromDouble(1.0 / (count - correction)));
         var mean = keepDims ? meanKept : ReduceMean(tensor, reduce, keepDims: false);
         return (variance, mean);

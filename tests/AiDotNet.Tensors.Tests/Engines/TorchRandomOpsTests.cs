@@ -112,4 +112,34 @@ public class TorchRandomOpsTests
         Assert.InRange(m, -0.03, 0.03);
         Assert.InRange(v, 0.95, 1.05);
     }
+
+    [Fact]
+    public void RenormAndNormExceptDim_ZeroSlices_HaveTorchsFiniteGradients()
+    {
+        // A zero row has a zero norm and |x|^p has zero elements: PyTorch's gradients are finite there, not NaN.
+        var w = Values(new[] { 3, 3 }, 0, 0, 0, 1, -2, 0.5, 0, 3, -1);
+        var weights = Values(new[] { 3, 3 }, 1, 2, 3, 4, 5, 6, 7, 8, 9);
+        using (var tape = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<double>())
+        {
+            var y = _engine.TensorRenorm(w, 3.0, 0, 2.0);
+            Close(new[] { 0.0, 0.0, 0.0, 0.9570890565775739, -1.9141781131551479, 0.47854452828878696, 0.0, 1.9759012029552872, -0.6586337343184291 }, y, "renorm");
+            var loss = _engine.ReduceSum(_engine.TensorMultiply(y, weights), null, false);
+            Close(new[] { 1.0, 2.0, 3.0, 4.143015627113561, 3.526807679674805, 5.82119918966626, 4.6104361402290035, 2.0935144743742624, 6.280543097773992 },
+                tape.ComputeGradients(loss, new[] { w })[w], "renorm gradient", 1e-11);
+        }
+        var v = Values(new[] { 3, 3 }, 0, 0, 0, 1, -2, 0.5, 0, 3, -1);
+        using (var tape = new AiDotNet.Tensors.Engines.Autodiff.GradientTape<double>())
+        {
+            var n = _engine.TensorNormExceptDim(v, 3, 0);
+            Close(new[] { 0.0, 2.089669598190616, 3.0365889718756622 }, n, "norm_except_dim");
+            var loss = _engine.ReduceSum(_engine.TensorMultiply(n, Values(new[] { 3, 1 }, 1, 2, 3)), null, false);
+            Close(new[] { 0.0, 0.0, 0.0, 0.4580097749458884, -1.8320390997835536, 0.1145024437364721, 0.0, 2.9281393657372465, -0.3253488184152496 },
+                tape.ComputeGradients(loss, new[] { v })[v], "norm_except_dim gradient", 1e-11);
+        }
+    }
+
+    [Fact]
+    public void Binomial_RejectsAFractionalCount()
+        => Assert.Throws<ArgumentOutOfRangeException>(() =>
+            _engine.TensorBinomial(Values(new[] { 2 }, 3, 2.5), Values(new[] { 2 }, 0.5, 0.5), seed: 1));
 }

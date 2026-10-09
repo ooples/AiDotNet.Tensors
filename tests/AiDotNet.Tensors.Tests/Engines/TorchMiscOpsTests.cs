@@ -111,4 +111,30 @@ public class TorchMiscOpsTests
         Assert.Equal(0, M().StorageOffset);
         Assert.Equal(3, M().Slice(0, 1, 2).StorageOffset);
     }
+
+    [Fact]
+    public void Rrelu_GradientIsTheDrawnSlope_AndSeedsReproduce()
+    {
+        // Eval mode: leaky_relu with slope (l+u)/2, whose derivative at 0 is the slope (torch: 0.229166..., not 1).
+        var x = T(new[] { 3 }, 0, -2, 3);
+        using (var tape = new GradientTape<double>())
+        {
+            var loss = _engine.ReduceSum(_engine.TensorRrelu(x), null, false);
+            Close(new[] { 0.22916666666666666, 0.22916666666666666, 1.0 }, tape.ComputeGradients(loss, new[] { x })[x], "rrelu eval gradient");
+        }
+        // Training mode: the gradient is exactly the slope each negative element drew, and a seed reproduces it.
+        var xs = T(new[] { 6 }, -1, -0.5, 2, -3, 0.25, -7);
+        using (var tape = new GradientTape<double>())
+        {
+            var y = _engine.TensorRrelu(xs, 0.1, 0.3, training: true, seed: 11);
+            Assert.Equal(y.ToArray(), _engine.TensorRrelu(xs, 0.1, 0.3, training: true, seed: 11).ToArray());
+            var grad = tape.ComputeGradients(_engine.ReduceSum(y, null, false), new[] { xs })[xs];
+            for (int i = 0; i < xs.Length; i++)
+            {
+                double xi = xs.GetFlat(i), gi = grad.GetFlat(i);
+                if (xi > 0) Assert.Equal(1.0, gi);
+                else { Assert.InRange(gi, 0.1, 0.3); Assert.Equal(y.GetFlat(i), gi * xi, 15); }
+            }
+        }
+    }
 }
