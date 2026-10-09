@@ -408,6 +408,10 @@ internal static class OpRegistry
         "STFT", "FFT", "IFFT", "FFT2D", "IFFT2D", "FFTND",
         "GroupNormInto", "ProjectGaussians3DTo2D",
 
+        // Real/complex conversions (CpuEngine.TorchComplex); TensorAngle of a real input is piecewise constant,
+        // so its derivative is zero wherever it exists, as in PyTorch
+        "TensorReal", "TensorImag", "TensorComplex", "TensorViewAsReal", "TensorViewAsComplex", "TensorAngle",
+
         // Native Complex<T> operations (no backward functions implemented yet)
         "NativeComplexFFT", "NativeComplexIFFT", "NativeComplexIFFTReal",
         "NativeComplexMultiply", "NativeComplexConjugate",

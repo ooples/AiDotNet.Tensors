@@ -1,6 +1,6 @@
 {
   "torchVersion": "2.11.0",
-  "gapBaseline": 416,
+  "gapBaseline": 401,
   "entries": {
     "Tensor:abs": {
       "status": "mapped",
@@ -143,8 +143,9 @@
       "source": "name-match"
     },
     "Tensor:angle": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorAngle",
+      "source": "reviewed"
     },
     "Tensor:any": {
       "status": "mapped",
@@ -2855,8 +2856,9 @@
       "source": "name-match"
     },
     "aten:angle": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorAngle",
+      "source": "reviewed"
     },
     "aten:any": {
       "status": "mapped",
@@ -3241,8 +3243,9 @@
       "source": "reviewed"
     },
     "aten:complex": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorComplex",
+      "source": "reviewed"
     },
     "aten:conj": {
       "status": "mapped",
@@ -4003,8 +4006,9 @@
       "source": "reviewed"
     },
     "aten:imag": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorImag",
+      "source": "reviewed"
     },
     "aten:index": {
       "status": "gap",
@@ -4943,8 +4947,9 @@
       "source": "reviewed-alias"
     },
     "aten:polar": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::NativeComplexFromPolar",
+      "source": "reviewed"
     },
     "aten:polygamma": {
       "status": "mapped",
@@ -5030,8 +5035,9 @@
       "source": "reviewed-alias"
     },
     "aten:real": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorReal",
+      "source": "reviewed"
     },
     "aten:reciprocal": {
       "status": "mapped",
@@ -6019,12 +6025,14 @@
       "source": "reviewed-alias"
     },
     "aten:view_as_complex": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorViewAsComplex",
+      "source": "reviewed"
     },
     "aten:view_as_real": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorViewAsReal",
+      "source": "reviewed"
     },
     "aten:view_copy": {
       "status": "not-applicable",
@@ -7844,8 +7852,9 @@
       "source": "name-match"
     },
     "torch:angle": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorAngle",
+      "source": "reviewed"
     },
     "torch:any": {
       "status": "mapped",
@@ -8331,8 +8340,9 @@
       "source": "reviewed"
     },
     "torch:complex": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorComplex",
+      "source": "reviewed"
     },
     "torch:concat": {
       "status": "mapped",
@@ -9184,8 +9194,9 @@
       "source": "reviewed-alias"
     },
     "torch:imag": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorImag",
+      "source": "reviewed"
     },
     "torch:import_ir_module": {
       "status": "not-applicable",
@@ -10061,8 +10072,9 @@
       "source": "name-match"
     },
     "torch:polar": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::NativeComplexFromPolar",
+      "source": "reviewed"
     },
     "torch:polygamma": {
       "status": "mapped",
@@ -10249,8 +10261,9 @@
       "source": "reviewed"
     },
     "torch:real": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorReal",
+      "source": "reviewed"
     },
     "torch:reciprocal": {
       "status": "mapped",
@@ -11071,8 +11084,9 @@
       "source": "reviewed"
     },
     "torch:view_as_complex": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorViewAsComplex",
+      "source": "reviewed"
     },
     "torch:view_as_complex_copy": {
       "status": "not-applicable",
@@ -11080,8 +11094,9 @@
       "source": "reviewed"
     },
     "torch:view_as_real": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorViewAsReal",
+      "source": "reviewed"
     },
     "torch:view_as_real_copy": {
       "status": "not-applicable",
