@@ -30,6 +30,9 @@ internal static class OpRegistry
         "TensorAdaptiveMaxPoolWithIndices", "TensorMaxPool1DWithIndices", "TensorLpPool", "TensorFractionalMaxPool",
         "TensorMaxUnpool",
 
+        // Volumetric grid sampling with input and grid adjoints (CpuEngine.TorchGridSample)
+        "TensorGridSample3D",
+
         // Quantiles: backward to the two order statistics read (CpuEngine.TorchCreation)
         "TensorQuantile", "TensorNanQuantile",
 

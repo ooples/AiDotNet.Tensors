@@ -1,6 +1,6 @@
 {
   "torchVersion": "2.11.0",
-  "gapBaseline": 389,
+  "gapBaseline": 387,
   "entries": {
     "Tensor:abs": {
       "status": "mapped",
@@ -3868,8 +3868,9 @@
       "source": "reviewed"
     },
     "aten:grid_sampler_3d": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorGridSample3D",
+      "source": "reviewed"
     },
     "aten:grid_sampler_3d_backward": {
       "status": "not-applicable",
@@ -9090,8 +9091,9 @@
       "source": "reviewed"
     },
     "torch:grid_sampler_3d": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorGridSample3D",
+      "source": "reviewed"
     },
     "torch:group_norm": {
       "status": "mapped",

@@ -111,6 +111,7 @@ public class DifferentiableOpsGradCheckSweep
         // --- pooling over trailing axes; unpool indices must be distinct within each plane ---
         ["TensorAdaptiveAvgPool3D"] = r => [SafeTensor([1, 3, 4, 5], r), new[] { 2, 3, 2 }],
         ["TensorAdaptiveMaxPool3D"] = r => [SafeTensor([1, 3, 4, 5], r), new[] { 2, 3, 2 }],
+        ["TensorGridSample3D"] = r => [SafeTensor([1, 2, 3, 4, 3], r), SafeTensor([1, 2, 2, 2, 3], r), GridSampleMode.Bilinear, GridSamplePadding.Reflection, false],
         ["TensorMaxUnpool"] = r => [SafeTensor([2, 3], r), new Tensor<int>(new[] { 0, 2, 4, 1, 3, 0 }, new[] { 2, 3 }), new[] { 5 }],
 
         // --- elementwise binaries needing matched shapes ---
