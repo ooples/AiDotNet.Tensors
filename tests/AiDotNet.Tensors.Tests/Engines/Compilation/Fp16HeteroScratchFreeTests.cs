@@ -176,11 +176,26 @@ public class Fp16HeteroScratchFreeTests
         Assert.Equal(0L, off.scratchReleased);
 
         // (3) Peak win: with the release on, the resident activation-cache bytes after the backward are strictly lower.
-        // Only comparable when no collection ran during either arm: the opt-out's scratch is garbage the GC releases on
-        // its own, and a collection mid-run made both arms read the same bytes (on=off=557056 in a full run; forcing one
-        // gave 229376 each). The release is asserted above regardless.
-        if (!on.collected && !off.collected)
-            Assert.True(on.cacheBytesAfter < off.cacheBytesAfter,
-                $"scratch-free should lower resident cache bytes: on={on.cacheBytesAfter} off={off.cacheBytesAfter}.");
+        // The opt-out's scratch is garbage the GC releases on its own, so a collection during either arm makes both read
+        // the same bytes (on=off=557056 in a full run; forcing one gave 229376 each). Each attempt starts from a fresh
+        // collection; the comparison is asserted on the first attempt neither arm collected in, and the test fails if no
+        // attempt is clean -- it never passes without making the comparison.
+        const int Attempts = 8;
+        for (int attempt = 0; ; attempt++)
+        {
+            if (!on.collected && !off.collected)
+            {
+                Assert.True(on.cacheBytesAfter < off.cacheBytesAfter,
+                    $"scratch-free should lower resident cache bytes: on={on.cacheBytesAfter} off={off.cacheBytesAfter}.");
+                return;
+            }
+            Assert.True(attempt + 1 < Attempts,
+                $"a garbage collection ran during every one of {Attempts} attempts, so the resident-bytes comparison was never made.");
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+            off = RunOnce(gpu, scratchFree: false);
+            on = RunOnce(gpu, scratchFree: true);
+        }
     }
 }
