@@ -62,6 +62,7 @@ public sealed class DAdaptAdamOptimizer : OptimizerBase
     /// <inheritdoc />
     public override void Step()
     {
+        BeginStep();
         try {
         // Grow the per-group d-array incrementally — adding a new param group mid-training
         // must not wipe the adapted d_t values that already exist for prior groups.
@@ -90,7 +91,8 @@ public sealed class DAdaptAdamOptimizer : OptimizerBase
 
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
-                float[] p = g.Parameters[pi]; float[] grad = g.Gradients[pi];
+                if (!ShouldStep(gi, pi)) continue;
+                float[] p = g.Parameters[pi];
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 if (!slot.ContainsKey("exp_avg"))     slot["exp_avg"]     = OptimizerStateValue.FromTensor(new float[p.Length]);
                 if (!slot.ContainsKey("exp_avg_sq"))  slot["exp_avg_sq"]  = OptimizerStateValue.FromTensor(new float[p.Length]);
@@ -131,7 +133,7 @@ public sealed class DAdaptAdamOptimizer : OptimizerBase
                     continue;
                 }
 
-                if (wd != 0f) for (int i = 0; i < p.Length; i++) grad[i] += wd * p[i];
+                var grad = DenseGradient(gi, pi, p, wd).Span;
 
                 double dg, dgSq;
                 for (int i = 0; i < p.Length; i++)
@@ -166,7 +168,7 @@ public sealed class DAdaptAdamOptimizer : OptimizerBase
                 CurrentD[gi] = newD;
             }
         }
-        } finally { ClearAutoClearSparseGrads(); }
+        } finally { EndStep(); }
     }
 }
 
@@ -233,6 +235,7 @@ public sealed class ProdigyOptimizer : OptimizerBase
     /// <inheritdoc />
     public override void Step()
     {
+        BeginStep();
         try {
         // Grow CurrentD / DNumerator incrementally so groups added mid-training keep their
         // adapted state instead of being silently reset on the next Step().
@@ -267,7 +270,8 @@ public sealed class ProdigyOptimizer : OptimizerBase
 
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
-                float[] p = g.Parameters[pi]; float[] grad = g.Gradients[pi];
+                if (!ShouldStep(gi, pi)) continue;
+                float[] p = g.Parameters[pi];
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 if (!slot.ContainsKey("exp_avg"))     slot["exp_avg"]     = OptimizerStateValue.FromTensor(new float[p.Length]);
                 if (!slot.ContainsKey("exp_avg_sq"))  slot["exp_avg_sq"]  = OptimizerStateValue.FromTensor(new float[p.Length]);
@@ -312,7 +316,7 @@ public sealed class ProdigyOptimizer : OptimizerBase
                     continue;
                 }
 
-                if (wd != 0f) for (int i = 0; i < p.Length; i++) grad[i] += wd * p[i];
+                var grad = DenseGradient(gi, pi, p, wd).Span;
 
                 for (int i = 0; i < p.Length; i++)
                 {
@@ -343,6 +347,6 @@ public sealed class ProdigyOptimizer : OptimizerBase
                 CurrentD[gi] = newD;
             }
         }
-        } finally { ClearAutoClearSparseGrads(); }
+        } finally { EndStep(); }
     }
 }

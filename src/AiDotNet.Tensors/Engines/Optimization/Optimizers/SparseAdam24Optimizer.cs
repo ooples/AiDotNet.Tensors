@@ -93,6 +93,9 @@ public sealed class SparseAdam24Optimizer : OptimizerBase
     /// <inheritdoc />
     public override void Step()
     {
+        BeginStep();
+        try
+        {
         for (int gi = 0; gi < ParamGroups.Count; gi++)
         {
             var g = ParamGroups[gi];
@@ -107,7 +110,9 @@ public sealed class SparseAdam24Optimizer : OptimizerBase
                     throw new InvalidOperationException(
                         $"param[{gi},{pi}] was not added via AddSparse24Parameter.");
 
-                float[] p = g.Parameters[pi]; float[] grad = g.Gradients[pi];
+                if (!ShouldStep(gi, pi)) continue;
+                float[] p = g.Parameters[pi];
+                var grad = DenseGradient(gi, pi, p);
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 int step = (slot["step"].IntValue ?? 0) + 1;
                 slot["step"].IntValue = step;
@@ -120,27 +125,32 @@ public sealed class SparseAdam24Optimizer : OptimizerBase
                 float bc2Inv = 1f / bc2;
 
                 int blocks = p.Length / 4;
-                for (int blk = 0; blk < blocks; blk++)
+                ForEachChunk(blocks, (start, count) =>
                 {
-                    // Two 2-bit indices per nibble; two nibbles per byte.
-                    byte b = pattern[blk >> 1];
-                    byte nib = (blk & 1) == 0 ? (byte)(b & 0x0F) : (byte)((b >> 4) & 0x0F);
-                    int idx0 = nib & 0x3;
-                    int idx1 = (nib >> 2) & 0x3;
-                    int blockBase = blk * 4;
+                    for (int blk = start; blk < start + count; blk++)
+                    {
+                        // Two 2-bit indices per nibble; two nibbles per byte.
+                        byte b = pattern[blk >> 1];
+                        byte nib = (blk & 1) == 0 ? (byte)(b & 0x0F) : (byte)((b >> 4) & 0x0F);
+                        int idx0 = nib & 0x3;
+                        int idx1 = (nib >> 2) & 0x3;
+                        int blockBase = blk * 4;
 
-                    UpdateOne(blockBase + idx0, grad, m, v, p, b1, b2, eps, lrAdj, bc2Inv);
-                    if (idx1 != idx0)
-                        UpdateOne(blockBase + idx1, grad, m, v, p, b1, b2, eps, lrAdj, bc2Inv);
-                }
+                        UpdateOne(blockBase + idx0, grad.Array, grad.Offset, m, v, p, b1, b2, eps, lrAdj, bc2Inv);
+                        if (idx1 != idx0)
+                            UpdateOne(blockBase + idx1, grad.Array, grad.Offset, m, v, p, b1, b2, eps, lrAdj, bc2Inv);
+                    }
+                });
             }
         }
+        }
+        finally { EndStep(); }
     }
 
-    private static void UpdateOne(int i, float[] grad, float[] m, float[] v, float[] p,
+    private static void UpdateOne(int i, float[] grad, int gradOffset, float[] m, float[] v, float[] p,
                                   float b1, float b2, float eps, float lrAdj, float bc2Inv)
     {
-        float gi = grad[i];
+        float gi = grad[gradOffset + i];
         float mNew = b1 * m[i] + (1f - b1) * gi;
         float vNew = b2 * v[i] + (1f - b2) * gi * gi;
         m[i] = mNew;

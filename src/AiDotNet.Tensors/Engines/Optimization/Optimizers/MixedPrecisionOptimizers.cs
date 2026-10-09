@@ -37,7 +37,7 @@ public sealed class BF16AdamOptimizer : OptimizerBase
     /// <inheritdoc />
     public override void Step()
     {
-        bool maximized = ApplyMaximize();
+        BeginStep();
         try
         {
             for (int gi = 0; gi < ParamGroups.Count; gi++)
@@ -50,8 +50,8 @@ public sealed class BF16AdamOptimizer : OptimizerBase
                 float wd = (float)g.GetOption("weight_decay", 0.0);
                 for (int pi = 0; pi < g.Parameters.Count; pi++)
                 {
+                    if (!ShouldStep(gi, pi)) continue;
                     float[] p = g.Parameters[pi];
-                    float[] grad = g.Gradients[pi];
                     var slot = GetOrCreateState(gi, pi, p.Length);
 
                     // Lazy-allocate the BF16 moments + FP32 master copy on first step.
@@ -97,9 +97,15 @@ public sealed class BF16AdamOptimizer : OptimizerBase
                         continue;
                     }
 
-                    for (int i = 0; i < p.Length; i++)
+                    // Chunks start at even indices (ElementwiseChunk is even), so no packed cell spans two chunks.
+                    var grad = DenseGradient(gi, pi, p);
+                    ForEachChunk(p.Length, (start, count) =>
                     {
-                        float gi_ = grad[i] + wd * pMaster[i];
+                    float[] ga = grad.Array;
+                    int go = grad.Offset;
+                    for (int i = start; i < start + count; i++)
+                    {
+                        float gi_ = ga[go + i] + wd * pMaster[i];
                         float mFp32 = UnpackBF16(mPacked, i);
                         float vFp32 = UnpackBF16(vPacked, i);
                         mFp32 = b1 * mFp32 + (1f - b1) * gi_;
@@ -113,10 +119,11 @@ public sealed class BF16AdamOptimizer : OptimizerBase
                         // Working FP32 buffer mirrors the master copy.
                         p[i] = pMaster[i];
                     }
+                    });
                 }
             }
         }
-        finally { if (maximized) UnflipMaximize(); ClearAutoClearSparseGrads(); }
+        finally { EndStep(); }
     }
 
     // BF16 = upper 16 bits of FP32. Packed two-per-float[] cell: low 16 bits = even index, high 16 bits = odd index.
@@ -172,6 +179,7 @@ public sealed class FP8LionOptimizer : OptimizerBase
     /// <inheritdoc />
     public override void Step()
     {
+        BeginStep();
         try {
         for (int gi = 0; gi < ParamGroups.Count; gi++)
         {
@@ -183,7 +191,8 @@ public sealed class FP8LionOptimizer : OptimizerBase
 
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
-                float[] p = g.Parameters[pi]; float[] grad = g.Gradients[pi];
+                if (!ShouldStep(gi, pi)) continue;
+                float[] p = g.Parameters[pi];
                 var slot = GetOrCreateState(gi, pi, p.Length);
 
                 if (!slot.ContainsKey("exp_avg_fp8"))
@@ -207,77 +216,76 @@ public sealed class FP8LionOptimizer : OptimizerBase
                 if (TryGetSparseGradient(gi, pi, out var sIdx, out var sVal, out var sNnz))
                 {
                     if (sNnz == 0) continue;
+                    // As in the dense path, the scale is settled before the touched moments are written, so a moment
+                    // that outgrew the old scale is not clamped to it first. Hysteresis: refresh only when the touched
+                    // moments leave the safe band; the refresh re-encodes every moment (untouched ones would otherwise
+                    // be read against the wrong scale), which is O(N) but rare.
                     float newMaxAbs = 0f;
                     for (int k = 0; k < sNnz; k++)
                     {
+                        float mOld = E4M3ToFloat(ReadFp8(packed, sIdx[k])) * scale;
+                        float absM = MathF.Abs(b2 * mOld + (1f - b2) * sVal[k]);
+                        if (absM > newMaxAbs) newMaxAbs = absM;
+                    }
+                    float sparseScale = scale;
+                    if (newMaxAbs > fp8Max * scale * 0.95f || newMaxAbs < fp8Max * scale * 0.1f)
+                    {
+                        sparseScale = newMaxAbs > 0 ? newMaxAbs / (fp8Max * 0.5f) : 1f;
+                        for (int i = 0; i < p.Length; i++)
+                        {
+                            float mFp32 = E4M3ToFloat(ReadFp8(packed, i)) * scale;
+                            WriteFp8(packed, i, FloatToE4M3(mFp32 / sparseScale));
+                        }
+                        slot["m_scale"].FloatValue = sparseScale;
+                    }
+                    for (int k = 0; k < sNnz; k++)
+                    {
                         int i = sIdx[k];
-                        byte fp8 = ReadFp8(packed, i);
-                        float mFp32 = E4M3ToFloat(fp8) * scale;
+                        float mFp32 = E4M3ToFloat(ReadFp8(packed, i)) * sparseScale;
                         float gV = sVal[k];
                         float c = b1 * mFp32 + (1f - b1) * gV;
                         float signC = c > 0f ? 1f : (c < 0f ? -1f : 0f);
                         p[i] -= lr * (signC + wd * p[i]);
                         float mNew = b2 * mFp32 + (1f - b2) * gV;
-                        float absM = MathF.Abs(mNew);
-                        if (absM > newMaxAbs) newMaxAbs = absM;
-                        WriteFp8(packed, i, FloatToE4M3(mNew / scale));
-                    }
-                    // Hysteresis check: only refresh scale if touched moments exceeded the
-                    // safe band. Re-encode IS still O(N) when triggered (we have to
-                    // re-quantize the untouched moments against the new scale or they'd
-                    // be misinterpreted), but it's the same cost as the dense path's
-                    // re-encode and triggered rarely.
-                    if (newMaxAbs > fp8Max * scale * 0.95f || newMaxAbs < fp8Max * scale * 0.1f)
-                    {
-                        float newScale = newMaxAbs > 0 ? newMaxAbs / (fp8Max * 0.5f) : 1f;
-                        for (int i = 0; i < p.Length; i++)
-                        {
-                            byte fp8 = ReadFp8(packed, i);
-                            float mFp32 = E4M3ToFloat(fp8) * scale;
-                            WriteFp8(packed, i, FloatToE4M3(mFp32 / newScale));
-                        }
-                        slot["m_scale"].FloatValue = newScale;
+                        WriteFp8(packed, i, FloatToE4M3(mNew / sparseScale));
                     }
                     continue;
                 }
 
-                // Dense path: dequantize → update → requantize. Track new max-abs to refresh scale next step.
+                // Dense path. The new moments' max-abs picks the scale (E4M3 tops out near 448, with hysteresis so
+                // the scale only moves when needed) BEFORE any moment is written, so each one is quantized once,
+                // against the scale it is stored with: encoding against the old scale first would clamp a moment
+                // that outgrew it, and re-encoding the clamped byte would keep the clamp.
+                var gb = DenseGradient(gi, pi, p);
+                var grad = gb.Span;
                 float newMaxAbsD = 0f;
                 for (int i = 0; i < p.Length; i++)
                 {
-                    byte fp8 = ReadFp8(packed, i);
-                    float mFp32 = E4M3ToFloat(fp8) * scale;
+                    float mFp32 = E4M3ToFloat(ReadFp8(packed, i)) * scale;
+                    float absM = MathF.Abs(b2 * mFp32 + (1f - b2) * grad[i]);
+                    if (absM > newMaxAbsD) newMaxAbsD = absM;
+                }
+                float storeScale = scale;
+                if (newMaxAbsD > fp8Max * scale * 0.95f || newMaxAbsD < fp8Max * scale * 0.1f)
+                {
+                    storeScale = newMaxAbsD > 0 ? newMaxAbsD / (fp8Max * 0.5f) : 1f;
+                    slot["m_scale"].FloatValue = storeScale;
+                }
+
+                for (int i = 0; i < p.Length; i++)
+                {
+                    float mFp32 = E4M3ToFloat(ReadFp8(packed, i)) * scale;
 
                     float c = b1 * mFp32 + (1f - b1) * grad[i];
                     float signC = c > 0f ? 1f : (c < 0f ? -1f : 0f);
                     p[i] -= lr * (signC + wd * p[i]);
 
                     float mNew = b2 * mFp32 + (1f - b2) * grad[i];
-                    float absM = MathF.Abs(mNew);
-                    if (absM > newMaxAbsD) newMaxAbsD = absM;
-
-                    // Provisionally requantize against current scale; we'll redo with
-                    // refreshed scale at the end if maxAbs grew.
-                    WriteFp8(packed, i, FloatToE4M3(mNew / scale));
-                }
-
-                // Update scale to keep all moments inside E4M3's representable range
-                // (max ≈ 448). Apply hysteresis so we only re-encode when needed.
-                if (newMaxAbsD > fp8Max * scale * 0.95f || newMaxAbsD < fp8Max * scale * 0.1f)
-                {
-                    float newScale = newMaxAbsD > 0 ? newMaxAbsD / (fp8Max * 0.5f) : 1f;
-                    // Re-encode every entry against the new scale so values aren't quantised twice.
-                    for (int i = 0; i < p.Length; i++)
-                    {
-                        byte fp8 = ReadFp8(packed, i);
-                        float mFp32 = E4M3ToFloat(fp8) * scale;
-                        WriteFp8(packed, i, FloatToE4M3(mFp32 / newScale));
-                    }
-                    slot["m_scale"].FloatValue = newScale;
+                    WriteFp8(packed, i, FloatToE4M3(mNew / storeScale));
                 }
             }
         }
-        } finally { ClearAutoClearSparseGrads(); }
+        } finally { EndStep(); }
     }
 
     private static byte ReadFp8(float[] packed, int i)

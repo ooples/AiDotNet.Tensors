@@ -59,6 +59,7 @@ public sealed class ShampooOptimizer : OptimizerBase
     /// <inheritdoc />
     public override void Step()
     {
+        BeginStep();
         try {
         for (int gi = 0; gi < ParamGroups.Count; gi++)
         {
@@ -80,8 +81,8 @@ public sealed class ShampooOptimizer : OptimizerBase
 
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
+                if (!ShouldStep(gi, pi)) continue;
                 float[] p = g.Parameters[pi];
-                float[] grad = g.Gradients[pi];
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 int step = (slot["step"].IntValue ?? 0) + 1;
                 slot["step"].IntValue = step;
@@ -102,11 +103,13 @@ public sealed class ShampooOptimizer : OptimizerBase
                 {
                     if (useFull)
                     {
-                        // Full-matrix path: materialize sparse → dense and use the existing kernel.
-                        MaterializeSparseIntoDense(gi, pi, grad);
-                        if (wd != 0f) for (int i = 0; i < p.Length; i++) grad[i] += wd * p[i];
+                        // Full-matrix path: scatter the (maximize-signed) sparse values into a dense scratch gradient
+                        // and use the existing kernel. The caller's buffers are not written.
+                        var dense = new float[p.Length];
+                        for (int k = 0; k < sNnz; k++) dense[sIdx[k]] += sVal[k];
+                        if (wd != 0f) for (int i = 0; i < p.Length; i++) dense[i] += wd * p[i];
                         EnsureFullState(slot, shape.d1, shape.d2);
-                        UpdateFull(slot, grad, p, shape.d1, shape.d2, step, lr, momentum, preFreq, eps);
+                        UpdateFull(slot, dense, p, shape.d1, shape.d2, step, lr, momentum, preFreq, eps);
                         continue;
                     }
 
@@ -129,8 +132,7 @@ public sealed class ShampooOptimizer : OptimizerBase
                     continue;
                 }
 
-                if (wd != 0f)
-                    for (int i = 0; i < p.Length; i++) grad[i] += wd * p[i];
+                var grad = DenseGradient(gi, pi, p, wd).Span;
 
                 if (useFull)
                 {
@@ -144,7 +146,7 @@ public sealed class ShampooOptimizer : OptimizerBase
                 }
             }
         }
-        } finally { ClearAutoClearSparseGrads(); }
+        } finally { EndStep(); }
     }
 
     private static void EnsureFullState(Dictionary<string, OptimizerStateValue> slot, int d1, int d2)
@@ -166,7 +168,7 @@ public sealed class ShampooOptimizer : OptimizerBase
     }
 
     private static void UpdateDiagonal(
-        Dictionary<string, OptimizerStateValue> slot, float[] grad, float[] p,
+        Dictionary<string, OptimizerStateValue> slot, ReadOnlySpan<float> grad, float[] p,
         float lr, float momentum, float eps)
     {
         var acc = slot["diag_acc"].Tensor!;
@@ -185,7 +187,7 @@ public sealed class ShampooOptimizer : OptimizerBase
     }
 
     private static void UpdateFull(
-        Dictionary<string, OptimizerStateValue> slot, float[] grad, float[] p,
+        Dictionary<string, OptimizerStateValue> slot, ReadOnlySpan<float> grad, float[] p,
         int d1, int d2, int step, float lr, float momentum, int preFreq, float eps)
     {
         var L = slot["L"].Tensor!;

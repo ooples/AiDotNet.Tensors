@@ -1,3 +1,4 @@
+using AiDotNet.Tensors.LinearAlgebra;
 using System.Collections.Generic;
 
 namespace AiDotNet.Tensors.Engines.Optimization.Optimizers;
@@ -101,7 +102,19 @@ public sealed class ZeroShardedOptimizer : IShardedOptimizer
     /// non-local parameters and their state before delegating to <c>_inner.Step()</c>,
     /// then restoring them afterwards. Local params + state are updated normally.
     /// </remarks>
-    public void Step()
+    public void Step() => RunLocalStep(_inner.Step);
+
+    /// <summary>
+    /// <see cref="OptimizerBase.Step(IReadOnlyDictionary{Tensor{float}, Tensor{float}})"/> for this rank's shard:
+    /// tensor parameters read their gradients from <paramref name="gradients"/> with no copy.
+    /// </summary>
+    public void Step(IReadOnlyDictionary<Tensor<float>, Tensor<float>> gradients)
+    {
+        if (gradients == null) throw new System.ArgumentNullException(nameof(gradients));
+        RunLocalStep(() => _inner.Step(gradients));
+    }
+
+    private void RunLocalStep(System.Action innerStep)
     {
         var localSet = new HashSet<int>(LocalParamIds);
 
@@ -123,9 +136,11 @@ public sealed class ZeroShardedOptimizer : IShardedOptimizer
             {
                 if (localSet.Contains(globalId)) continue;
                 var p = grp.Parameters[pi];
-                var g = grp.Gradients[pi];
+                // A tensor parameter's gradient buffer may not exist (its gradients arrive through Step(gradients));
+                // reading Gradients would create one just to copy it.
+                var g = grp.PeekGradient(pi);
                 paramSnapshots.Add((p, (float[])p.Clone()));
-                gradSnapshots.Add((g, (float[])g.Clone()));
+                if (g is not null) gradSnapshots.Add((g, (float[])g.Clone()));
                 if (_inner.StateInternal.TryGetValue((gi, pi), out var slots))
                     stateSnapshots.Add((gi, pi, CloneSlots(slots)));
                 else
@@ -137,7 +152,7 @@ public sealed class ZeroShardedOptimizer : IShardedOptimizer
         // non-local mutation and removes any lazy state created during the failed call.
         try
         {
-            _inner.Step();
+            innerStep();
         }
         finally
         {
