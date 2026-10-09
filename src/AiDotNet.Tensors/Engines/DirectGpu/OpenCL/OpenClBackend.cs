@@ -13804,8 +13804,7 @@ KERNEL VARIANTS (A/B testing):
             if (!_kernelCache.TryGetValue("gru_forward_sequence", out var kernel))
                 throw new InvalidOperationException("OpenCL kernel not found: gru_forward_sequence");
 
-            int totalThreads = batch * hiddenSize;
-            int localSize = CalculateOptimalWorkGroupSize1D(totalThreads);
+            int localSize = GruSequenceWorkGroupSize(hiddenSize);
 
             kernel.SetArg(0u, ((DirectOpenClGpuBuffer)input).Buffer.Handle);
             kernel.SetArg(1u, ((DirectOpenClGpuBuffer)hInit).Buffer.Handle);
@@ -13822,8 +13821,8 @@ KERNEL VARIANTS (A/B testing):
             kernel.SetArg(12u, inputSize);
             kernel.SetArg(13u, hiddenSize);
 
-            int globalSize = ((totalThreads + localSize - 1) / localSize) * localSize;
-            kernel.Execute1D(globalSize, localSize);
+            // One work-group per batch row (the kernel synchronizes a row's hidden units with barriers).
+            kernel.Execute1D(batch * localSize, localSize);
         }
 
         public void GruBackwardSequence(
@@ -13848,8 +13847,17 @@ KERNEL VARIANTS (A/B testing):
             if (!_kernelCache.TryGetValue("gru_backward_sequence", out var kernel))
                 throw new InvalidOperationException("OpenCL kernel not found: gru_backward_sequence");
 
-            int totalThreads = batch * hiddenSize;
-            int localSize = CalculateOptimalWorkGroupSize1D(totalThreads);
+            int localSize = GruSequenceWorkGroupSize(hiddenSize);
+            long localBytes = 4L * hiddenSize * sizeof(float);   // one step's r, z, n and r*n gate gradients
+            if (LocalMemoryBytes > 0 && localBytes > LocalMemoryBytes)
+                throw new InvalidOperationException(
+                    $"GRU backward sequence needs {localBytes} bytes of local memory for hiddenSize {hiddenSize}; the device has {LocalMemoryBytes}.");
+
+            // The kernel accumulates weight and bias gradients over batch rows and steps: start them at zero.
+            Fill(gradWeightsIh, 0f, 3 * hiddenSize * inputSize);
+            Fill(gradWeightsHh, 0f, 3 * hiddenSize * hiddenSize);
+            Fill(gradBiasIh, 0f, 3 * hiddenSize);
+            Fill(gradBiasHh, 0f, 3 * hiddenSize);
 
             kernel.SetArg(0u, ((DirectOpenClGpuBuffer)gradOutput).Buffer.Handle);
             kernel.SetArg(1u, ((DirectOpenClGpuBuffer)allH).Buffer.Handle);
@@ -13869,8 +13877,17 @@ KERNEL VARIANTS (A/B testing):
             kernel.SetArg(15u, inputSize);
             kernel.SetArg(16u, hiddenSize);
 
-            int globalSize = ((totalThreads + localSize - 1) / localSize) * localSize;
-            kernel.Execute1D(globalSize, localSize);
+            kernel.SetLocalArg(17u, (int)localBytes);
+            kernel.Execute1D(batch * localSize, localSize);
+        }
+
+        /// <summary>Work-group size for the GRU sequence kernels: one group per batch row whose work-items stride over
+        /// the hidden units, so a group of up to the device limit (a multiple of 64) covers any hidden size.</summary>
+        private int GruSequenceWorkGroupSize(int hiddenSize)
+        {
+            int max = _maxWorkGroupSize > 0 ? (int)Math.Min(_maxWorkGroupSize, 1024UL) : 256;
+            int size = ((hiddenSize + 63) / 64) * 64;
+            return Math.Max(1, Math.Min(size, max));
         }
 
         public void GruCellBackward(
