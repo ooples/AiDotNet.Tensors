@@ -1,3 +1,4 @@
+using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Engines.Autodiff;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -10,6 +11,7 @@ public partial class CpuEngine
     public virtual Tensor<T> TensorGridSample3D<T>(Tensor<T> input, Tensor<T> grid, GridSampleMode mode = GridSampleMode.Bilinear,
         GridSamplePadding padding = GridSamplePadding.Zeros, bool alignCorners = false)
     {
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (grid == null) throw new ArgumentNullException(nameof(grid));
         if (mode == GridSampleMode.Bicubic) throw new ArgumentException("bicubic sampling is 2-D only, as in PyTorch.", nameof(mode));

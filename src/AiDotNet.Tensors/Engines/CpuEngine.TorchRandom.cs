@@ -1,3 +1,4 @@
+using AiDotNet.Tensors.Engines.Compilation;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -79,15 +80,19 @@ public partial class CpuEngine
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorBernoulli<T>(Tensor<T> probabilities, int? seed = null)
-        => SampleElementwise(probabilities, seed, (p, rng) =>
+    {
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
+        return SampleElementwise(probabilities, seed, (p, rng) =>
         {
             if (p < 0 || p > 1 || double.IsNaN(p)) throw new ArgumentOutOfRangeException(nameof(probabilities), "probabilities must lie in [0, 1].");
             return rng.NextDouble() < p ? 1 : 0;
         });
+    }
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorBinomial<T>(Tensor<T> count, Tensor<T> probability, int? seed = null)
     {
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
         if (count == null) throw new ArgumentNullException(nameof(count));
         if (probability == null) throw new ArgumentNullException(nameof(probability));
         if (!count._shape.SequenceEqual(probability._shape)) throw new ArgumentException("count and probability must have the same shape.");
@@ -99,11 +104,16 @@ public partial class CpuEngine
     }
 
     /// <inheritdoc/>
-    public virtual Tensor<T> TensorPoisson<T>(Tensor<T> rates, int? seed = null) => SampleElementwise(rates, seed, SamplePoisson);
+    public virtual Tensor<T> TensorPoisson<T>(Tensor<T> rates, int? seed = null)
+    {
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
+        return SampleElementwise(rates, seed, SamplePoisson);
+    }
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorNormal<T>(Tensor<T> mean, Tensor<T> std, int? seed = null)
     {
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
         if (mean == null) throw new ArgumentNullException(nameof(mean));
         if (std == null) throw new ArgumentNullException(nameof(std));
         // mean + std·ε with ε a constant draw: the reparameterized form, so gradients reach mean and std as in PyTorch.
@@ -140,6 +150,7 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorMultinomial<T>(Tensor<T> probabilities, int numSamples, bool replacement = false, int? seed = null)
     {
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
         if (probabilities == null) throw new ArgumentNullException(nameof(probabilities));
         if (probabilities.Rank < 1 || probabilities.Rank > 2) throw new ArgumentException("multinomial expects 1-D or 2-D weights.");
         int categories = probabilities._shape[probabilities.Rank - 1], rows = probabilities.Length / Math.Max(1, categories);
@@ -180,11 +191,17 @@ public partial class CpuEngine
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorAlphaDropout<T>(Tensor<T> tensor, double p, bool training, int? seed = null)
-        => AlphaDropout(tensor, p, training, seed, channelWise: false);
+    {
+        if (training) GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
+        return AlphaDropout(tensor, p, training, seed, channelWise: false);
+    }
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorFeatureAlphaDropout<T>(Tensor<T> tensor, double p, bool training, int? seed = null)
-        => AlphaDropout(tensor, p, training, seed, channelWise: true);
+    {
+        if (training) GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
+        return AlphaDropout(tensor, p, training, seed, channelWise: true);
+    }
 
     // out = a·(x·m + α'(1 - m)) + b with a, b keeping mean 0 and variance 1 under SELU; recorded as x·(a·m) + const.
     private Tensor<T> AlphaDropout<T>(Tensor<T> tensor, double p, bool training, int? seed, bool channelWise)
@@ -202,6 +219,7 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorChannelDropout<T>(Tensor<T> tensor, double p, bool training, int spatialDims, int? seed = null)
     {
+        if (training) GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (p < 0 || p > 1) throw new ArgumentOutOfRangeException(nameof(p));
         if (spatialDims < 0 || spatialDims >= tensor.Rank) throw new ArgumentOutOfRangeException(nameof(spatialDims));
@@ -392,6 +410,7 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<int> TensorNonzeroStatic<T>(Tensor<T> tensor, int size, int fillValue = -1)
     {
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HeterogeneousOutput);
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (size < 0) throw new ArgumentOutOfRangeException(nameof(size));
         var ops = MathHelper.GetNumericOperations<T>();
@@ -412,6 +431,7 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorUniqueDim<T>(Tensor<T> tensor, int dim)
     {
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.DataDependentOutputShape);
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         int d = NormalizeDim(dim, tensor.Rank);
         var ops = MathHelper.GetNumericOperations<T>();

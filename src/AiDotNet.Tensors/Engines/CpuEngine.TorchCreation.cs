@@ -1,3 +1,4 @@
+using AiDotNet.Tensors.Engines.Compilation;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -41,11 +42,17 @@ public partial class CpuEngine
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorAll<T>(Tensor<T> tensor, int[]? axes = null, bool keepDims = false)
-        => Truthiness(tensor, axes, keepDims, all: true);
+    {
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
+        return Truthiness(tensor, axes, keepDims, all: true);
+    }
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorAny<T>(Tensor<T> tensor, int[]? axes = null, bool keepDims = false)
-        => Truthiness(tensor, axes, keepDims, all: false);
+    {
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
+        return Truthiness(tensor, axes, keepDims, all: false);
+    }
 
     // all = min over the 0/1 indicator, any = max over it; constants, so no gradient is recorded.
     private Tensor<T> Truthiness<T>(Tensor<T> tensor, int[]? axes, bool keepDims, bool all)
@@ -116,6 +123,7 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorRandLike<T>(Tensor<T> tensor, int? seed = null)
     {
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
         var rng = RandomSource(seed);
         return FromDoubles<T>(LikeShape(tensor), _ => rng.NextDouble());
     }
@@ -123,6 +131,7 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorRandnLike<T>(Tensor<T> tensor, int? seed = null)
     {
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
         var rng = RandomSource(seed);
         // Box–Muller; 1 - U keeps the logarithm's argument in (0, 1].
         return FromDoubles<T>(LikeShape(tensor),
@@ -141,7 +150,10 @@ public partial class CpuEngine
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorRandintLike<T>(Tensor<T> tensor, long low, long high, int? seed = null)
-        => TensorRandint<T>(low, high, LikeShape(tensor), seed);
+    {
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
+        return TensorRandint<T>(low, high, LikeShape(tensor), seed);
+    }
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorRandperm<T>(int n, int? seed = null)
@@ -217,6 +229,7 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T>[] TensorUnravelIndex<T>(Tensor<T> indices, int[] shape)
     {
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
         if (indices == null) throw new ArgumentNullException(nameof(indices));
         if (shape == null) throw new ArgumentNullException(nameof(shape));
         var ops = MathHelper.GetNumericOperations<T>();
@@ -342,12 +355,18 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorQuantile<T>(Tensor<T> tensor, double q, int? dim = null, bool keepDim = false,
         QuantileInterpolation interpolation = QuantileInterpolation.Linear)
-        => QuantileCore("TensorQuantile", tensor, q, dim, keepDim, interpolation, ignoreNan: false);
+    {
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
+        return QuantileCore("TensorQuantile", tensor, q, dim, keepDim, interpolation, ignoreNan: false);
+    }
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorNanQuantile<T>(Tensor<T> tensor, double q, int? dim = null, bool keepDim = false,
         QuantileInterpolation interpolation = QuantileInterpolation.Linear)
-        => QuantileCore("TensorNanQuantile", tensor, q, dim, keepDim, interpolation, ignoreNan: true);
+    {
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
+        return QuantileCore("TensorNanQuantile", tensor, q, dim, keepDim, interpolation, ignoreNan: true);
+    }
 
     // Per output: sort the slice, read the two order statistics around q·(n-1) and blend them. The backward sends
     // (1 - w)·dy to the lower one and w·dy to the upper one, as PyTorch's does.
