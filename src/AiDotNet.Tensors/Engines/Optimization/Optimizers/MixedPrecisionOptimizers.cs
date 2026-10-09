@@ -50,8 +50,8 @@ public sealed class BF16AdamOptimizer : OptimizerBase
                 float wd = (float)g.GetOption("weight_decay", 0.0);
                 for (int pi = 0; pi < g.Parameters.Count; pi++)
                 {
-                    if (!ShouldStep(gi, pi)) continue;
-                    float[] p = g.Parameters[pi];
+                    if (!ShouldStep(gi, pi) || StepOnDevice(gi, pi)) continue;
+                    float[] p = HostParameter(gi, pi);
                     var slot = GetOrCreateState(gi, pi, p.Length);
 
                     // Lazy-allocate the BF16 moments + FP32 master copy on first step.
@@ -191,8 +191,8 @@ public sealed class FP8LionOptimizer : OptimizerBase
 
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
-                if (!ShouldStep(gi, pi)) continue;
-                float[] p = g.Parameters[pi];
+                if (!ShouldStep(gi, pi) || StepOnDevice(gi, pi)) continue;
+                float[] p = HostParameter(gi, pi);
                 var slot = GetOrCreateState(gi, pi, p.Length);
 
                 if (!slot.ContainsKey("exp_avg_fp8"))

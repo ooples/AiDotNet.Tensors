@@ -51,6 +51,12 @@ public sealed class OptimizerStateValue
     /// <summary>Tensor data (flattened) — used for <c>exp_avg</c>, <c>exp_avg_sq</c>, <c>vMax</c>, …</summary>
     public float[]? Tensor { get; set; }
 
+    /// <summary>
+    /// The slot's buffer while it lives on the GPU (a parameter stepped by a device kernel); <see cref="Tensor"/> is
+    /// null meanwhile. A state dict reads it back; a host step moves it back to <see cref="Tensor"/> first.
+    /// </summary>
+    internal LinearAlgebra.Tensor<float>? DeviceTensor { get; set; }
+
     /// <summary>Build a state value holding an int.</summary>
     public static OptimizerStateValue FromInt(int v) => new OptimizerStateValue { IntValue = v };
 

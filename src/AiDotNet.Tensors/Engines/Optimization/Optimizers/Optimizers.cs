@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using AiDotNet.Tensors.Engines.Gpu;
+using AiDotNet.Tensors.LinearAlgebra;
 using AiDotNet.Tensors.Engines.Compilation;
 
 namespace AiDotNet.Tensors.Engines.Optimization.Optimizers;
@@ -24,6 +26,20 @@ public sealed class SgdOptimizer : OptimizerBase
     protected override IReadOnlyList<string> StateNames => _stateNames;
 
     /// <inheritdoc />
+    private protected override bool TryStepOnDevice(int gi, int pi, Tensor<float> parameter, Tensor<float> gradient)
+    {
+        var g = ParamGroups[gi];
+        float lr = (float)g.LearningRate;
+        float momentum = (float)g.GetOption("momentum", 0.0);
+        float wd = (float)g.GetOption("weight_decay", 0.0);
+        // The device kernels have neither PyTorch's Nesterov form nor dampening; those run on the host.
+        if (g.GetOption("nesterov", 0.0) != 0.0 || g.GetOption("dampening", 0.0) != 0.0) return false;
+        if (momentum == 0f) return GpuOptimizer.TrySgdStep(parameter, gradient, lr, wd);
+        var slot = DeviceState(gi, pi, parameter.Length);
+        return GpuOptimizer.TrySgdMomentumStep(parameter, gradient, DeviceSlot(slot, "momentum_buffer"), lr, momentum, wd);
+    }
+
+    /// <inheritdoc />
     public override void Step()
     {
         BeginStep();
@@ -39,8 +55,8 @@ public sealed class SgdOptimizer : OptimizerBase
 
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
-                if (!ShouldStep(gi, pi)) continue;
-                float[] p = g.Parameters[pi];
+                if (!ShouldStep(gi, pi) || StepOnDevice(gi, pi)) continue;
+                float[] p = HostParameter(gi, pi);
 
                 if (TryGetSparseGradient(gi, pi, out var sIdx, out var sVal, out var sNnz))
                 {
@@ -124,6 +140,23 @@ public sealed class AdamOptimizer : OptimizerBase
     protected override IReadOnlyList<string> StateNames => _stateNames;
 
     /// <inheritdoc />
+    private protected override bool TryStepOnDevice(int gi, int pi, Tensor<float> parameter, Tensor<float> gradient)
+    {
+        var g = ParamGroups[gi];
+        var slot = DeviceState(gi, pi, parameter.Length);
+        int step = (slot["step"].IntValue ?? 0) + 1;
+        float lr = (float)g.LearningRate, b1 = (float)g.GetOption("beta1", 0.9), b2 = (float)g.GetOption("beta2", 0.999);
+        float eps = (float)g.GetOption("eps", 1e-8), wd = (float)g.GetOption("weight_decay", 0.0);
+        var m = DeviceSlot(slot, "exp_avg");
+        var v = DeviceSlot(slot, "exp_avg_sq");
+        bool ran = g.GetOption("amsgrad", 0.0) != 0.0
+            ? GpuOptimizer.TryAmsgradStep(parameter, gradient, m, v, DeviceSlot(slot, "max_exp_avg_sq"), lr, b1, b2, eps, wd, step)
+            : GpuOptimizer.TryAdamStep(parameter, gradient, m, v, lr, b1, b2, eps, wd, step);
+        if (ran) slot["step"].IntValue = step;
+        return ran;
+    }
+
+    /// <inheritdoc />
     public override void Step()
     {
         BeginStep();
@@ -139,8 +172,8 @@ public sealed class AdamOptimizer : OptimizerBase
             bool amsgrad = g.GetOption("amsgrad", 0.0) != 0.0;
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
-                if (!ShouldStep(gi, pi)) continue;
-                float[] p = g.Parameters[pi];
+                if (!ShouldStep(gi, pi) || StepOnDevice(gi, pi)) continue;
+                float[] p = HostParameter(gi, pi);
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 int step = (slot["step"].IntValue ?? 0) + 1;
                 slot["step"].IntValue = step;
@@ -220,6 +253,19 @@ public sealed class AdamWOptimizer : OptimizerBase
     protected override IReadOnlyList<string> StateNames => _stateNames;
 
     /// <inheritdoc />
+    private protected override bool TryStepOnDevice(int gi, int pi, Tensor<float> parameter, Tensor<float> gradient)
+    {
+        var g = ParamGroups[gi];
+        var slot = DeviceState(gi, pi, parameter.Length);
+        int step = (slot["step"].IntValue ?? 0) + 1;
+        bool ran = GpuOptimizer.TryAdamWStep(parameter, gradient, DeviceSlot(slot, "exp_avg"), DeviceSlot(slot, "exp_avg_sq"),
+            (float)g.LearningRate, (float)g.GetOption("beta1", 0.9), (float)g.GetOption("beta2", 0.999),
+            (float)g.GetOption("eps", 1e-8), (float)g.GetOption("weight_decay", 1e-2), step);
+        if (ran) slot["step"].IntValue = step;
+        return ran;
+    }
+
+    /// <inheritdoc />
     public override void Step()
     {
         BeginStep();
@@ -234,8 +280,8 @@ public sealed class AdamWOptimizer : OptimizerBase
             float wd = (float)g.GetOption("weight_decay", 1e-2);
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
-                if (!ShouldStep(gi, pi)) continue;
-                float[] p = g.Parameters[pi];
+                if (!ShouldStep(gi, pi) || StepOnDevice(gi, pi)) continue;
+                float[] p = HostParameter(gi, pi);
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 int step = (slot["step"].IntValue ?? 0) + 1;
                 slot["step"].IntValue = step;
@@ -299,8 +345,8 @@ public sealed class RAdamOptimizer : OptimizerBase
             float wd = (float)g.GetOption("weight_decay", 0.0);
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
-                if (!ShouldStep(gi, pi)) continue;
-                float[] p = g.Parameters[pi];
+                if (!ShouldStep(gi, pi) || StepOnDevice(gi, pi)) continue;
+                float[] p = HostParameter(gi, pi);
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 int step = (slot["step"].IntValue ?? 0) + 1;
                 slot["step"].IntValue = step;
@@ -351,6 +397,19 @@ public sealed class NAdamOptimizer : OptimizerBase
     protected override IReadOnlyList<string> StateNames => _stateNames;
 
     /// <inheritdoc />
+    private protected override bool TryStepOnDevice(int gi, int pi, Tensor<float> parameter, Tensor<float> gradient)
+    {
+        var g = ParamGroups[gi];
+        var slot = DeviceState(gi, pi, parameter.Length);
+        int step = (slot["step"].IntValue ?? 0) + 1;
+        bool ran = GpuOptimizer.TryNadamStep(parameter, gradient, DeviceSlot(slot, "exp_avg"), DeviceSlot(slot, "exp_avg_sq"),
+            (float)g.LearningRate, (float)g.GetOption("beta1", 0.9), (float)g.GetOption("beta2", 0.999),
+            (float)g.GetOption("eps", 1e-8), (float)g.GetOption("weight_decay", 0.0), step);
+        if (ran) slot["step"].IntValue = step;
+        return ran;
+    }
+
+    /// <inheritdoc />
     public override void Step()
     {
         BeginStep();
@@ -365,8 +424,8 @@ public sealed class NAdamOptimizer : OptimizerBase
             float wd = (float)g.GetOption("weight_decay", 0.0);
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
-                if (!ShouldStep(gi, pi)) continue;
-                float[] p = g.Parameters[pi];
+                if (!ShouldStep(gi, pi) || StepOnDevice(gi, pi)) continue;
+                float[] p = HostParameter(gi, pi);
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 int step = (slot["step"].IntValue ?? 0) + 1;
                 slot["step"].IntValue = step;
@@ -417,6 +476,19 @@ public sealed class AdamaxOptimizer : OptimizerBase
     protected override IReadOnlyList<string> StateNames => _stateNames;
 
     /// <inheritdoc />
+    private protected override bool TryStepOnDevice(int gi, int pi, Tensor<float> parameter, Tensor<float> gradient)
+    {
+        var g = ParamGroups[gi];
+        var slot = DeviceState(gi, pi, parameter.Length);
+        int step = (slot["step"].IntValue ?? 0) + 1;
+        bool ran = GpuOptimizer.TryAdamaxStep(parameter, gradient, DeviceSlot(slot, "exp_avg"), DeviceSlot(slot, "exp_inf"),
+            (float)g.LearningRate, (float)g.GetOption("beta1", 0.9), (float)g.GetOption("beta2", 0.999),
+            (float)g.GetOption("eps", 1e-8), (float)g.GetOption("weight_decay", 0.0), step);
+        if (ran) slot["step"].IntValue = step;
+        return ran;
+    }
+
+    /// <inheritdoc />
     public override void Step()
     {
         BeginStep();
@@ -431,8 +503,8 @@ public sealed class AdamaxOptimizer : OptimizerBase
             float wd = (float)g.GetOption("weight_decay", 0.0);
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
-                if (!ShouldStep(gi, pi)) continue;
-                float[] p = g.Parameters[pi];
+                if (!ShouldStep(gi, pi) || StepOnDevice(gi, pi)) continue;
+                float[] p = HostParameter(gi, pi);
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 int step = (slot["step"].IntValue ?? 0) + 1;
                 slot["step"].IntValue = step;
@@ -482,6 +554,23 @@ public sealed class AdagradOptimizer : OptimizerBase
     protected override IReadOnlyList<string> StateNames => _stateNames;
 
     /// <inheritdoc />
+    private protected override bool TryStepOnDevice(int gi, int pi, Tensor<float> parameter, Tensor<float> gradient)
+    {
+        var g = ParamGroups[gi];
+        var slot = DeviceState(gi, pi, parameter.Length);
+        int priorSteps = slot.TryGetValue("step", out var sv) ? sv.IntValue ?? 0 : 0;
+        float clr = (float)g.LearningRate / (1f + priorSteps * (float)g.GetOption("lr_decay", 0.0));
+        bool ran = GpuOptimizer.TryAdagradStep(parameter, gradient, DeviceSlot(slot, "sum"), clr,
+            (float)g.GetOption("eps", 1e-10), (float)g.GetOption("weight_decay", 0.0));
+        if (ran)
+        {
+            if (sv is null) slot["step"] = OptimizerStateValue.FromInt(priorSteps + 1);
+            else sv.IntValue = priorSteps + 1;
+        }
+        return ran;
+    }
+
+    /// <inheritdoc />
     public override void Step()
     {
         BeginStep();
@@ -495,8 +584,8 @@ public sealed class AdagradOptimizer : OptimizerBase
             float lrDecay = (float)g.GetOption("lr_decay", 0.0);
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
-                if (!ShouldStep(gi, pi)) continue;
-                float[] p = g.Parameters[pi];
+                if (!ShouldStep(gi, pi) || StepOnDevice(gi, pi)) continue;
+                float[] p = HostParameter(gi, pi);
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 var s = slot["sum"].Tensor!;
                 // PyTorch: clr = lr / (1 + (step - 1)·lr_decay), step counted from 1. A state loaded from before the
@@ -550,6 +639,17 @@ public sealed class RmsPropOptimizer : OptimizerBase
     protected override IReadOnlyList<string> StateNames => _stateNames;
 
     /// <inheritdoc />
+    private protected override bool TryStepOnDevice(int gi, int pi, Tensor<float> parameter, Tensor<float> gradient)
+    {
+        var g = ParamGroups[gi];
+        // The device kernel is the plain form; centered and momentum variants run on the host.
+        if (g.GetOption("centered", 0.0) != 0.0 || g.GetOption("momentum", 0.0) != 0.0) return false;
+        var slot = DeviceState(gi, pi, parameter.Length);
+        return GpuOptimizer.TryRmspropStep(parameter, gradient, DeviceSlot(slot, "square_avg"), (float)g.LearningRate,
+            (float)g.GetOption("alpha", 0.99), (float)g.GetOption("eps", 1e-8), (float)g.GetOption("weight_decay", 0.0));
+    }
+
+    /// <inheritdoc />
     public override void Step()
     {
         BeginStep();
@@ -565,8 +665,8 @@ public sealed class RmsPropOptimizer : OptimizerBase
             bool centered = g.GetOption("centered", 0.0) != 0.0;
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
-                if (!ShouldStep(gi, pi)) continue;
-                float[] p = g.Parameters[pi];
+                if (!ShouldStep(gi, pi) || StepOnDevice(gi, pi)) continue;
+                float[] p = HostParameter(gi, pi);
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 var v = slot["square_avg"].Tensor!;
 
@@ -673,6 +773,17 @@ public sealed class AdaDeltaOptimizer : OptimizerBase
     protected override IReadOnlyList<string> StateNames => _stateNames;
 
     /// <inheritdoc />
+    private protected override bool TryStepOnDevice(int gi, int pi, Tensor<float> parameter, Tensor<float> gradient)
+    {
+        var g = ParamGroups[gi];
+        // The device kernel applies the update unscaled, i.e. lr = 1 (the paper's and PyTorch's default).
+        if (g.LearningRate != 1.0) return false;
+        var slot = DeviceState(gi, pi, parameter.Length);
+        return GpuOptimizer.TryAdadeltaStep(parameter, gradient, DeviceSlot(slot, "square_avg"), DeviceSlot(slot, "acc_delta"),
+            (float)g.GetOption("rho", 0.9), (float)g.GetOption("eps", 1e-6), (float)g.GetOption("weight_decay", 0.0));
+    }
+
+    /// <inheritdoc />
     public override void Step()
     {
         BeginStep();
@@ -686,8 +797,8 @@ public sealed class AdaDeltaOptimizer : OptimizerBase
             float wd = (float)g.GetOption("weight_decay", 0.0);
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
-                if (!ShouldStep(gi, pi)) continue;
-                float[] p = g.Parameters[pi];
+                if (!ShouldStep(gi, pi) || StepOnDevice(gi, pi)) continue;
+                float[] p = HostParameter(gi, pi);
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 var sq = slot["square_avg"].Tensor!;
                 var ad = slot["acc_delta"].Tensor!;
@@ -734,6 +845,15 @@ public sealed class LionOptimizer : OptimizerBase
     protected override IReadOnlyList<string> StateNames => _stateNames;
 
     /// <inheritdoc />
+    private protected override bool TryStepOnDevice(int gi, int pi, Tensor<float> parameter, Tensor<float> gradient)
+    {
+        var g = ParamGroups[gi];
+        var slot = DeviceState(gi, pi, parameter.Length);
+        return GpuOptimizer.TryLionStep(parameter, gradient, DeviceSlot(slot, "exp_avg"), (float)g.LearningRate,
+            (float)g.GetOption("beta1", 0.9), (float)g.GetOption("beta2", 0.99), (float)g.GetOption("weight_decay", 0.0));
+    }
+
+    /// <inheritdoc />
     public override void Step()
     {
         BeginStep();
@@ -747,8 +867,8 @@ public sealed class LionOptimizer : OptimizerBase
             float wd = (float)g.GetOption("weight_decay", 0.0);
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
-                if (!ShouldStep(gi, pi)) continue;
-                float[] p = g.Parameters[pi];
+                if (!ShouldStep(gi, pi) || StepOnDevice(gi, pi)) continue;
+                float[] p = HostParameter(gi, pi);
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 var m = slot["exp_avg"].Tensor!;
 
@@ -810,8 +930,8 @@ public sealed class AsgdOptimizer : OptimizerBase
             float wd = (float)g.GetOption("weight_decay", 0.0);
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
-                if (!ShouldStep(gi, pi)) continue;
-                float[] p = g.Parameters[pi];
+                if (!ShouldStep(gi, pi) || StepOnDevice(gi, pi)) continue;
+                float[] p = HostParameter(gi, pi);
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 int step = (slot["step"].IntValue ?? 0) + 1;
                 slot["step"].IntValue = step;
@@ -887,8 +1007,8 @@ public sealed class RpropOptimizer : OptimizerBase
             float lr0 = (float)g.LearningRate;
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
-                if (!ShouldStep(gi, pi)) continue;
-                float[] p = g.Parameters[pi];
+                if (!ShouldStep(gi, pi) || StepOnDevice(gi, pi)) continue;
+                float[] p = HostParameter(gi, pi);
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 var prev = slot["prev_grad"].Tensor!;
                 var ss = slot["step_size"].Tensor!;
@@ -965,8 +1085,8 @@ public sealed class LambOptimizer : OptimizerBase
             float wd = (float)g.GetOption("weight_decay", 0.0);
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
-                if (!ShouldStep(gi, pi)) continue;
-                float[] p = g.Parameters[pi];
+                if (!ShouldStep(gi, pi) || StepOnDevice(gi, pi)) continue;
+                float[] p = HostParameter(gi, pi);
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 int step = (slot["step"].IntValue ?? 0) + 1;
                 slot["step"].IntValue = step;
@@ -1032,8 +1152,8 @@ public sealed class LarsOptimizer : OptimizerBase
             float eps = (float)g.GetOption("eps", 1e-8);
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
-                if (!ShouldStep(gi, pi)) continue;
-                float[] p = g.Parameters[pi];
+                if (!ShouldStep(gi, pi) || StepOnDevice(gi, pi)) continue;
+                float[] p = HostParameter(gi, pi);
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 var v = slot["momentum_buffer"].Tensor!;
 
@@ -1078,6 +1198,17 @@ public sealed class FtrlOptimizer : OptimizerBase
     protected override IReadOnlyList<string> StateNames => _stateNames;
 
     /// <inheritdoc />
+    private protected override bool TryStepOnDevice(int gi, int pi, Tensor<float> parameter, Tensor<float> gradient)
+    {
+        var g = ParamGroups[gi];
+        // The device kernel is the sqrt(n) schedule, lr_power = -0.5; other powers run on the host.
+        if (g.GetOption("lr_power", -0.5) != -0.5) return false;
+        var slot = DeviceState(gi, pi, parameter.Length);
+        return GpuOptimizer.TryFtrlStep(parameter, gradient, DeviceSlot(slot, "z"), DeviceSlot(slot, "n"), (float)g.LearningRate,
+            (float)g.GetOption("l1_reg", 0.0), (float)g.GetOption("l2_reg", 0.0), 0f);
+    }
+
+    /// <inheritdoc />
     public override void Step()
     {
         BeginStep();
@@ -1094,8 +1225,8 @@ public sealed class FtrlOptimizer : OptimizerBase
             float lrPow = (float)g.GetOption("lr_power", -0.5);
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
-                if (!ShouldStep(gi, pi)) continue;
-                float[] p = g.Parameters[pi];
+                if (!ShouldStep(gi, pi) || StepOnDevice(gi, pi)) continue;
+                float[] p = HostParameter(gi, pi);
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 var z = slot["z"].Tensor!;
                 var n = slot["n"].Tensor!;
@@ -1161,8 +1292,8 @@ public sealed class SparseAdamOptimizer : OptimizerBase
             float eps = (float)g.GetOption("eps", 1e-8);
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
-                if (!ShouldStep(gi, pi)) continue;
-                float[] p = g.Parameters[pi];
+                if (!ShouldStep(gi, pi) || StepOnDevice(gi, pi)) continue;
+                float[] p = HostParameter(gi, pi);
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 int step = (slot["step"].IntValue ?? 0) + 1;
                 slot["step"].IntValue = step;

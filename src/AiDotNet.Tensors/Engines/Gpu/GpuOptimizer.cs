@@ -321,6 +321,45 @@ public static class GpuOptimizer
     //      returns false if not on a GPU engine or any tensor isn't GPU-resident, so the caller falls back to CPU).
     //      All buffers must be GPU-resident; the kernel updates param + state IN PLACE with no host download. ----
 
+    /// <summary>Plain SGD with L2-coupled weight decay (<c>grad + weightDecay·param</c>), in place on the GPU.</summary>
+    internal static bool TrySgdStep(Tensor<float> p, Tensor<float> g, float lr, float weightDecay)
+    {
+        if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false; var b = e.GetBackend(); if (b is null) return false;
+        var pb = p.TryGetGpuBuffer(); var gb = g.TryGetGpuBuffer();
+        if (pb is null || gb is null) return false;
+        b.SgdUpdate(pb, gb, lr, weightDecay, p.Length);
+        MarkGpuUpdated(b, p);
+        return true;
+    }
+
+    /// <summary>
+    /// Downloads a device-resident tensor's elements, or returns null when it has no device buffer. The backend may
+    /// round a buffer up, so exactly <c>tensor.Length</c> elements are returned.
+    /// </summary>
+    internal static float[]? TryDownload(Tensor<float> tensor)
+    {
+        if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return null; var b = e.GetBackend(); if (b is null) return null;
+        var buffer = tensor.TryGetGpuBuffer();
+        if (buffer is null) return null;
+        var full = b.DownloadBuffer(buffer);
+        if (full.Length == tensor.Length) return full;
+        var exact = new float[tensor.Length];
+        Array.Copy(full, exact, exact.Length);
+        return exact;
+    }
+
+    /// <summary>Overwrites a device-resident tensor's elements with <paramref name="data"/> and marks it current.</summary>
+    internal static bool TryUpload(Tensor<float> tensor, float[] data)
+    {
+        if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false; var b = e.GetBackend(); if (b is null) return false;
+        var buffer = tensor.TryGetGpuBuffer();
+        if (buffer is null) return false;
+        using (var staged = b.AllocateBuffer(data))
+            b.Copy(staged, buffer, tensor.Length);
+        MarkGpuUpdated(b, tensor);
+        return true;
+    }
+
     public static bool TrySgdMomentumStep(Tensor<float> p, Tensor<float> g, Tensor<float> velocity, float lr, float momentum, float weightDecay)
     {
         if (!(AiDotNetEngine.Current is DirectGpuTensorEngine e)) return false; var b = e.GetBackend(); if (b is null) return false;

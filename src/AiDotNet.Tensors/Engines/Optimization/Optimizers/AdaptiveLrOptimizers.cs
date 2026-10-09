@@ -91,8 +91,8 @@ public sealed class DAdaptAdamOptimizer : OptimizerBase
 
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
-                if (!ShouldStep(gi, pi)) continue;
-                float[] p = g.Parameters[pi];
+                if (!ShouldStep(gi, pi) || StepOnDevice(gi, pi)) continue;
+                float[] p = HostParameter(gi, pi);
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 if (!slot.ContainsKey("exp_avg"))     slot["exp_avg"]     = OptimizerStateValue.FromTensor(new float[p.Length]);
                 if (!slot.ContainsKey("exp_avg_sq"))  slot["exp_avg_sq"]  = OptimizerStateValue.FromTensor(new float[p.Length]);
@@ -270,8 +270,8 @@ public sealed class ProdigyOptimizer : OptimizerBase
 
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
-                if (!ShouldStep(gi, pi)) continue;
-                float[] p = g.Parameters[pi];
+                if (!ShouldStep(gi, pi) || StepOnDevice(gi, pi)) continue;
+                float[] p = HostParameter(gi, pi);
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 if (!slot.ContainsKey("exp_avg"))     slot["exp_avg"]     = OptimizerStateValue.FromTensor(new float[p.Length]);
                 if (!slot.ContainsKey("exp_avg_sq"))  slot["exp_avg_sq"]  = OptimizerStateValue.FromTensor(new float[p.Length]);

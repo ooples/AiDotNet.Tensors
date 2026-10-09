@@ -22,6 +22,7 @@ public sealed class ParamGroup
     private readonly List<float[]> _params = new List<float[]>();
     private readonly List<float[]?> _grads = new List<float[]?>();
     private readonly List<Tensor<float>?> _tensors = new List<Tensor<float>?>();
+    private readonly List<bool> _onDevice = new List<bool>();
     private readonly GradientList _gradientView;
 
     /// <summary>Creates an empty group.</summary>
@@ -60,6 +61,7 @@ public sealed class ParamGroup
         _params.Add(parameter);
         _grads.Add(gradient);
         _tensors.Add(null);
+        _onDevice.Add(false);
     }
 
     /// <summary>
@@ -72,10 +74,19 @@ public sealed class ParamGroup
     public void AddParameter(Tensor<float> parameter)
     {
         if (parameter == null) throw new ArgumentNullException(nameof(parameter));
-        _params.Add(ResolveStorage(parameter));
+        // A GPU-resident tensor is updated on the device by the optimizers with a device kernel for their rule; the
+        // array here is then only the host staging buffer of a host-computed step.
+        bool onDevice = IsDeviceResident(parameter);
+        _params.Add(onDevice ? new float[parameter.Length] : ResolveStorage(parameter));
         _grads.Add(null);
         _tensors.Add(parameter);
+        _onDevice.Add(onDevice);
     }
+
+    /// <summary>True for a tensor parameter that lives on the GPU.</summary>
+    internal bool IsDeviceParameter(int index) => _onDevice[index];
+
+    private static bool IsDeviceResident(Tensor<float> tensor) => tensor.IsGpuResident;
 
     /// <summary>The tensor a parameter was added as, or null for one added as an array.</summary>
     internal Tensor<float>? ParameterTensor(int index) => _tensors[index];
@@ -92,7 +103,7 @@ public sealed class ParamGroup
         for (int i = 0; i < _tensors.Count; i++)
         {
             var tensor = _tensors[i];
-            if (tensor is not null) _params[i] = ResolveStorage(tensor);
+            if (tensor is not null && !_onDevice[i]) _params[i] = ResolveStorage(tensor);
         }
     }
 

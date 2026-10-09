@@ -136,8 +136,8 @@ public sealed class SparseAdam24Optimizer : OptimizerBase
                     throw new InvalidOperationException(
                         $"param[{gi},{pi}] was not added via AddSparse24Parameter.");
 
-                if (!ShouldStep(gi, pi)) continue;
-                float[] p = g.Parameters[pi];
+                if (!ShouldStep(gi, pi) || StepOnDevice(gi, pi)) continue;
+                float[] p = HostParameter(gi, pi);
                 var grad = DenseGradient(gi, pi, p);
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 int step = (slot["step"].IntValue ?? 0) + 1;

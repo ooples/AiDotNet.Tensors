@@ -75,6 +75,93 @@ public abstract class OptimizerBase : IOptimizer
         finally { _boundGradients = null; }
     }
 
+    // Device parameters a host-computed step downloaded into their staging arrays; written back when the step ends.
+    private readonly List<(Tensor<float> Tensor, float[] Staging)> _stagedDeviceParameters =
+        new List<(Tensor<float> Tensor, float[] Staging)>();
+
+    /// <summary>
+    /// The host array the update of <c>group[gi].param[pi]</c> writes. For a GPU-resident parameter the optimizer
+    /// had no device kernel for, that is a staging copy downloaded now and written back to the device when the step
+    /// ends (recorded as a fallback: correct, but it crosses the device boundary).
+    /// </summary>
+    private protected float[] HostParameter(int gi, int pi)
+    {
+        var group = _groups[gi];
+        var parameter = group.Parameters[pi];
+        var tensor = group.ParameterTensor(pi);
+        if (tensor is null || !group.IsDeviceParameter(pi)) return parameter;
+        var current = Gpu.GpuOptimizer.TryDownload(tensor)
+            ?? throw new InvalidOperationException("A GPU parameter has no device buffer to update.");
+        Array.Copy(current, parameter, parameter.Length);
+        _stagedDeviceParameters.Add((tensor, parameter));
+        DirectGpu.GpuLaunchProbe.OnFallback($"{GetType().Name}-host-step-of-a-device-parameter", null);
+        return parameter;
+    }
+
+    /// <summary>
+    /// Runs this step's update of <c>group[gi].param[pi]</c> on the GPU when the parameter and its gradient are both
+    /// there and the optimizer has a device kernel for its configuration; false sends it down the host path.
+    /// </summary>
+    private protected bool StepOnDevice(int gi, int pi)
+    {
+        var group = _groups[gi];
+        var tensor = group.ParameterTensor(pi);
+        if (tensor is null || !group.IsDeviceParameter(pi) || _boundGradients is null || HasSparseGradient(gi, pi))
+            return false;
+        if (!_boundGradients.TryGetValue(tensor, out var gradient) || !gradient.IsGpuResident) return false;
+        if (gradient.Length != tensor.Length)
+            throw new ArgumentException(
+                $"A gradient has {gradient.Length} elements but its parameter has {tensor.Length}.", "gradients");
+        if (!(AiDotNetEngine.Current is DirectGpuTensorEngine engine)) return false;
+        // The kernels descend; ascent descends the negated gradient (a new device tensor, the caller's is untouched).
+        if (group.GetOption("maximize", 0.0) != 0.0) gradient = engine.TensorNegate(gradient);
+        return TryStepOnDevice(gi, pi, tensor, gradient);
+    }
+
+    /// <summary>
+    /// The optimizer's device update of one GPU parameter with a GPU gradient (maximize already applied), using
+    /// <see cref="DeviceState"/> for its state. False when it has no kernel for the group's configuration.
+    /// </summary>
+    private protected virtual bool TryStepOnDevice(int gi, int pi, Tensor<float> parameter, Tensor<float> gradient)
+        => false;
+
+    /// <summary>
+    /// The state record of a device-stepped parameter: scalars on the host as usual, every buffer slot a GPU tensor
+    /// (<see cref="OptimizerStateValue.DeviceTensor"/>), created zeroed or uploaded from a host value it already had.
+    /// </summary>
+    private protected Dictionary<string, OptimizerStateValue> DeviceState(int gi, int pi, int length)
+    {
+        var slot = GetOrCreateStateRecord(gi, pi, length, onDevice: true);
+        foreach (var value in slot.Values)
+        {
+            if (value.DeviceTensor is not null) continue;
+            if (value.Tensor is not null)
+            {
+                var device = Gpu.GpuOptimizer.CreateStateTensor(new[] { value.Tensor.Length });
+                if (!Gpu.GpuOptimizer.TryUpload(device, value.Tensor))
+                    throw new InvalidOperationException("Optimizer state could not be placed on the GPU.");
+                value.DeviceTensor = device;
+                value.Tensor = null;
+            }
+        }
+        return slot;
+    }
+
+    /// <summary>A device state record's GPU buffer for <paramref name="name"/>.</summary>
+    private protected static Tensor<float> DeviceSlot(Dictionary<string, OptimizerStateValue> slot, string name)
+        => slot[name].DeviceTensor ?? throw new InvalidOperationException($"State '{name}' is not on the GPU.");
+
+    // Moves every device-resident buffer of a state record back to the host (a host step is about to read it).
+    private static void MoveStateToHost(Dictionary<string, OptimizerStateValue> slot)
+    {
+        foreach (var value in slot.Values)
+        {
+            if (value.DeviceTensor is null) continue;
+            value.Tensor = Gpu.GpuOptimizer.TryDownload(value.DeviceTensor) ?? value.DeviceTensor.ToArray();
+            value.DeviceTensor = null;
+        }
+    }
+
     /// <summary>Starts a step: re-reads tensor parameters' storage. Every <see cref="Step()"/> calls it first.</summary>
     private protected void BeginStep()
     {
@@ -92,10 +179,16 @@ public abstract class OptimizerBase : IOptimizer
             var group = _groups[gi];
             for (int pi = 0; pi < group.Parameters.Count; pi++)
             {
+                // A device-stepped parameter was marked current on the device by its kernel; marking it modified
+                // here would make the stale host copy look newer.
                 var tensor = group.ParameterTensor(pi);
-                if (tensor is not null && ShouldStep(gi, pi)) tensor.MarkModified();
+                if (tensor is not null && !group.IsDeviceParameter(pi) && ShouldStep(gi, pi)) tensor.MarkModified();
             }
         }
+        foreach (var (tensor, staging) in _stagedDeviceParameters)
+            if (!Gpu.GpuOptimizer.TryUpload(tensor, staging))
+                throw new InvalidOperationException("A GPU parameter's host-computed update could not be written back.");
+        _stagedDeviceParameters.Clear();
         ReturnGradientScratch();
         ClearAutoClearSparseGrads();
     }
@@ -251,6 +344,14 @@ public abstract class OptimizerBase : IOptimizer
     /// <summary>Get or lazily create the state record for <c>group[gi].param[pi]</c>.</summary>
     protected Dictionary<string, OptimizerStateValue> GetOrCreateState(int gi, int pi, int paramLen)
     {
+        var slot = GetOrCreateStateRecord(gi, pi, paramLen);
+        MoveStateToHost(slot);
+        return slot;
+    }
+
+    // The state record without moving its buffers anywhere; new buffer slots are zeroed on the host.
+    private Dictionary<string, OptimizerStateValue> GetOrCreateStateRecord(int gi, int pi, int paramLen, bool onDevice = false)
+    {
         var key = (gi, pi);
         if (_state.TryGetValue(key, out var dict)) return dict;
         dict = new Dictionary<string, OptimizerStateValue>();
@@ -261,6 +362,8 @@ public abstract class OptimizerBase : IOptimizer
                 dict[name] = OptimizerStateValue.FromInt(0);
             else if (scalarSet.Contains(name))
                 dict[name] = OptimizerStateValue.FromFloat(0f);
+            else if (onDevice)
+                dict[name] = new OptimizerStateValue { DeviceTensor = Gpu.GpuOptimizer.CreateStateTensor(new[] { paramLen }) };
             else
                 dict[name] = OptimizerStateValue.FromTensor(new float[paramLen]);
         }
@@ -472,7 +575,10 @@ public abstract class OptimizerBase : IOptimizer
                         {
                             IntValue = v.IntValue,
                             FloatValue = v.FloatValue,
-                            Tensor = v.Tensor == null ? null : (float[])v.Tensor.Clone()
+                            // A device-resident buffer is read back; the saved dict is always host data.
+                            Tensor = v.DeviceTensor is not null
+                                ? Gpu.GpuOptimizer.TryDownload(v.DeviceTensor) ?? v.DeviceTensor.ToArray()
+                                : v.Tensor == null ? null : (float[])v.Tensor.Clone()
                         };
                     }
                     sd.State[id] = copy;
@@ -525,6 +631,7 @@ public abstract class OptimizerBase : IOptimizer
                 // sharded / partial state-dict loads.
                 int id = gs.ParamIds[pi];
                 if (!state.State.TryGetValue(id, out var slots)) continue;
+                // Host-side: a device parameter's next device step uploads what is loaded here.
                 var dst = GetOrCreateState(gi, pi, group.Parameters[pi].Length);
                 foreach (var kv in slots)
                 {
