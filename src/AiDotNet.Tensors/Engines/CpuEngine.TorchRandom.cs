@@ -233,7 +233,16 @@ public partial class CpuEngine
         if (input1 == null) throw new ArgumentNullException(nameof(input1));
         if (input2 == null) throw new ArgumentNullException(nameof(input2));
         if (weight == null) throw new ArgumentNullException(nameof(weight));
+        if (weight.Rank != 3) throw new ArgumentException($"weight must be [out, in1, in2], got rank {weight.Rank}.", nameof(weight));
         int outFeatures = weight._shape[0], in1 = weight._shape[1], in2 = weight._shape[2];
+        if (input1.Rank == 0 || input1._shape[input1.Rank - 1] != in1)
+            throw new ArgumentException($"input1's last axis must be in1 = {in1}.", nameof(input1));
+        if (input2.Rank == 0 || input2._shape[input2.Rank - 1] != in2)
+            throw new ArgumentException($"input2's last axis must be in2 = {in2}.", nameof(input2));
+        if (!input1._shape.Take(input1.Rank - 1).SequenceEqual(input2._shape.Take(input2.Rank - 1)))
+            throw new ArgumentException("input1 and input2 must share their leading dimensions.", nameof(input2));
+        if (bias != null && bias.Length != outFeatures)
+            throw new ArgumentException($"bias must hold out = {outFeatures} values, got {bias.Length}.", nameof(bias));
         int rows = input1.Length / in1;
         var lead = input1._shape.Take(input1.Rank - 1).ToArray();
         // x1·W as [rows, out·in2], then multiplied by x2 and summed over in2.
@@ -276,6 +285,7 @@ public partial class CpuEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (size <= 0) throw new ArgumentOutOfRangeException(nameof(size));
+        if (tensor.Rank < 3) throw new ArgumentException($"local response norm needs [batch, channels, ...] with rank ≥ 3, got {tensor.Rank}.", nameof(tensor));
         int n = tensor._shape[0], c = tensor._shape[1], m = tensor.Length / (n * c);
         var x = Reshape(tensor, new[] { n, c, m });
         // Window sums of x² over channels by a cumulative sum with a leading zero: S[c] = cs[c + size] - cs[c].

@@ -88,6 +88,11 @@ public class TorchMiscOpsTests
         Close(new[] { -0.08034929195143281, -0.22095731023731693, -2.3734847402271133, -0.433869091021474, -0.5940885257860046, -3.161635394789695, 0.0846935813468008, 0.8757837114961079 }, Linalg.Ormqr(packed, tau, c), "ormqr", 1e-10);
         Close(new[] { -2.041241452319315, -0.816496580927726, -1.2871918058696765, -1.8812803316556812, 0.4004267173619032, -2.5565705800798435, -0.12700012700019042, 0.5080005080007619 }, Linalg.Ormqr(packed, tau, c, transpose: true), "ormqr transposed", 1e-10);
         Close(new[] { -1.224744871391589, -0.29704426289300234, -2.0021335868095163, 0.6350006350009524, -1.632993161855452, -2.871427874632355, -0.1540102759084243, -0.25400025400038106 }, Linalg.Ormqr(packed, tau, T(new[] { 2, 4 }, 1, 0, 2, 1, 0, 3, 1, 1), left: false), "ormqr right", 1e-10);
+        // Shape contract: Q is 4x4, so other needs 4 rows (left) or 4 columns (right), and a batched other needs a
+        // batched a and tau.
+        Assert.Throws<ArgumentException>(() => Linalg.Ormqr(packed, tau, T(new[] { 3, 2 }, 1, 0, 2, 1, 0, 3)));
+        Assert.Throws<ArgumentException>(() => Linalg.Ormqr(packed, tau, c, left: false));
+        Assert.Throws<ArgumentException>(() => Linalg.Ormqr(packed, tau, T(new[] { 2, 4, 2 }, 1, 0, 2, 1, 0, 3, 1, 1, 1, 0, 2, 1, 0, 3, 1, 1)));
 
         var square = T(new[] { 3, 3 }, 0, 2, 1, 4, 1, 3, 2, 5, 7);
         var (lu, pivots) = Linalg.LuFactor(square);

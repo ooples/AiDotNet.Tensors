@@ -166,11 +166,18 @@ public partial class CpuEngine
         int stride = 0, int padding = 0, int dilation = 1, bool ceilMode = false)
     {
         if (input == null) throw new ArgumentNullException(nameof(input));
+        if (kernelSize <= 0) throw new ArgumentOutOfRangeException(nameof(kernelSize), "kernelSize must be positive.");
+        if (stride < 0) throw new ArgumentOutOfRangeException(nameof(stride), "stride must be positive (0 means the kernel size).");
+        if (dilation <= 0) throw new ArgumentOutOfRangeException(nameof(dilation), "dilation must be positive.");
+        // PyTorch: padding at most half the effective kernel, so no window holds only padding.
+        if (padding < 0 || padding > ((kernelSize - 1) * dilation + 1) / 2)
+            throw new ArgumentOutOfRangeException(nameof(padding), "padding must be between 0 and half the effective kernel size.");
         int s = stride <= 0 ? kernelSize : stride, length = input._shape[input.Rank - 1];
         double span = length + 2.0 * padding - dilation * (kernelSize - 1) - 1;
         int outLength = (int)(ceilMode ? Math.Ceiling(span / s) : Math.Floor(span / s)) + 1;
         // With ceil mode, the last window must start inside the (left-padded) input.
         if (ceilMode && (outLength - 1) * s >= length + padding) outLength--;
+        if (outLength < 1) throw new ArgumentException($"input length {length} is too short for kernel {kernelSize} with dilation {dilation} and padding {padding}.", nameof(input));
         return WindowPool("TensorMaxPool1DWithIndices", input, new[] { outLength },
             (_, _, o) => new PoolWindow(o * s - padding, kernelSize, dilation), WindowReduce.Max);
     }
@@ -182,7 +189,13 @@ public partial class CpuEngine
         if (kernelSize == null || kernelSize.Length == 0) throw new ArgumentException("kernelSize is required.", nameof(kernelSize));
         var steps = stride ?? kernelSize;
         int dims = kernelSize.Length;
+        if (steps.Length != dims) throw new ArgumentException($"stride needs {dims} entries, one per kernel axis.", nameof(stride));
+        if (kernelSize.Any(k => k <= 0) || steps.Any(v => v <= 0)) throw new ArgumentOutOfRangeException(nameof(kernelSize), "kernel sizes and strides must be positive.");
+        if (power == 0 || double.IsNaN(power)) throw new ArgumentOutOfRangeException(nameof(power), "power must be a non-zero number.");
+        if (input.Rank < dims + 1) throw new ArgumentException($"lp pooling over {dims} axes needs at least {dims + 1} dimensions.", nameof(input));
         var spatial = input._shape.Skip(input.Rank - dims).ToArray();
+        for (int d = 0; d < dims; d++)
+            if (kernelSize[d] > spatial[d]) throw new ArgumentException($"kernel {kernelSize[d]} is larger than input axis {spatial[d]}.", nameof(kernelSize));
         var outputSize = spatial.Select((n, d) => (n - kernelSize[d]) / steps[d] + 1).ToArray();
         return WindowPool("TensorLpPool", input, outputSize, (_, d, o) => new PoolWindow(o * steps[d], kernelSize[d]), WindowReduce.Power, power).Output;
     }
@@ -224,6 +237,8 @@ public partial class CpuEngine
         if (indices == null) throw new ArgumentNullException(nameof(indices));
         if (outputSize == null || outputSize.Length == 0) throw new ArgumentException("outputSize is required.", nameof(outputSize));
         if (!indices._shape.SequenceEqual(input._shape)) throw new ArgumentException("indices must match the input's shape.", nameof(indices));
+        if (input.Rank < outputSize.Length) throw new ArgumentException($"unpooling {outputSize.Length} axes needs an input of rank ≥ {outputSize.Length}, got {input.Rank}.", nameof(input));
+        // As in PyTorch, an index repeated within a plane keeps the last value written (and its gradient).
         int dims = outputSize.Length, inPlane = input._shape.Skip(input.Rank - dims).Aggregate(1, (a, b) => a * b);
         int outPlane = outputSize.Aggregate(1, (a, b) => a * b), planes = input.Length / inPlane;
         var idx = (indices.IsContiguous ? indices : indices.Contiguous()).AsSpan().ToArray();

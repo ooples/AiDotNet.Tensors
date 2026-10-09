@@ -159,9 +159,19 @@ public static partial class Linalg
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (tau == null) throw new ArgumentNullException(nameof(tau));
         if (other == null) throw new ArgumentNullException(nameof(other));
+        // torch.ormqr's shape contract: matching batch dimensions, Q's order m matching other's multiplied side,
+        // and k ≤ min(m, n) reflectors.
+        if (a.Rank < 2 || other.Rank != a.Rank || tau.Rank != a.Rank - 1)
+            throw new ArgumentException($"ormqr needs a and other of the same rank ≥ 2 and tau one rank lower; got {a.Rank}, {other.Rank} and {tau.Rank}.");
+        for (int axis = 0; axis < a.Rank - 2; axis++)
+            if (other.Shape[axis] != a.Shape[axis] || tau.Shape[axis] != a.Shape[axis])
+                throw new ArgumentException("a, tau and other must have the same batch dimensions.");
         int m = a.Shape[a.Rank - 2], n = a.Shape[a.Rank - 1], k = tau.Shape[tau.Rank - 1];
         int rows = other.Shape[other.Rank - 2], cols = other.Shape[other.Rank - 1];
-        int batch = other.Length / (rows * cols);
+        if ((left ? rows : cols) != m)
+            throw new ArgumentException($"Q is {m}x{m}, but other's {(left ? "rows" : "columns")} number {(left ? rows : cols)}.", nameof(other));
+        if (k > Math.Min(m, n)) throw new ArgumentException($"tau holds {k} reflectors, more than min(m, n) = {Math.Min(m, n)}.", nameof(tau));
+        int batch = rows * cols == 0 ? 0 : other.Length / (rows * cols);
         var av = ToDoubles(a);
         var tv = ToDoubles(tau);
         var c = ToDoubles(other);

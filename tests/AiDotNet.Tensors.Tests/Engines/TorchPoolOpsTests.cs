@@ -104,4 +104,20 @@ public class TorchPoolOpsTests
         Assert.Equal(output.ToArray(), again.ToArray());
         Assert.Equal(indices.ToArray(), againIndices.ToArray());
     }
+
+    [Fact]
+    public void PoolingArguments_AreValidated()
+    {
+        var x = Perm(new[] { 1, 2, 5 }, 11, 3, 0);
+        Assert.Throws<ArgumentOutOfRangeException>(() => _engine.TensorMaxPool1DWithIndices(x, 0));
+        Assert.Throws<ArgumentOutOfRangeException>(() => _engine.TensorMaxPool1DWithIndices(x, 2, dilation: 0));
+        // torch: padding at most half the effective kernel (kernel 2 allows 1, not 2).
+        Assert.Throws<ArgumentOutOfRangeException>(() => _engine.TensorMaxPool1DWithIndices(x, 2, padding: 2));
+        Assert.Throws<ArgumentException>(() => _engine.TensorMaxPool1DWithIndices(x, 3, dilation: 3));
+        Assert.Throws<ArgumentException>(() => _engine.TensorLpPool(x, 2.0, new[] { 2 }, new[] { 1, 1 }));
+        Assert.Throws<ArgumentException>(() => _engine.TensorLpPool(x, 2.0, new[] { 6 }));
+        Assert.Throws<ArgumentOutOfRangeException>(() => _engine.TensorLpPool(x, 0.0, new[] { 2 }));
+        Assert.Throws<ArgumentException>(() => _engine.TensorMaxUnpool(
+            new Tensor<double>(new[] { 1.0, 2.0 }, new[] { 2 }), new Tensor<int>(new[] { 0, 1 }, new[] { 2 }), new[] { 2, 2 }));
+    }
 }

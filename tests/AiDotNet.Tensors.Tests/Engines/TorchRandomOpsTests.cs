@@ -142,4 +142,15 @@ public class TorchRandomOpsTests
     public void Binomial_RejectsAFractionalCount()
         => Assert.Throws<ArgumentOutOfRangeException>(() =>
             _engine.TensorBinomial(Values(new[] { 2 }, 3, 2.5), Values(new[] { 2 }, 0.5, 0.5), seed: 1));
+
+    [Fact]
+    public void BilinearAndLocalResponseNorm_ValidateShapes()
+    {
+        var w = Range(new[] { 2, 3, 4 }, 0.1, -1);
+        Assert.Throws<ArgumentException>(() => _engine.TensorBilinear(Range(new[] { 2, 2 }, 1, 0), Range(new[] { 2, 4 }, 1, 0), w));
+        Assert.Throws<ArgumentException>(() => _engine.TensorBilinear(Range(new[] { 2, 3 }, 1, 0), Range(new[] { 2, 5 }, 1, 0), w));
+        Assert.Throws<ArgumentException>(() => _engine.TensorBilinear(Range(new[] { 2, 3 }, 1, 0), Range(new[] { 3, 4 }, 1, 0), w));
+        Assert.Throws<ArgumentException>(() => _engine.TensorBilinear(Range(new[] { 2, 3 }, 1, 0), Range(new[] { 2, 4 }, 1, 0), w, Values(new[] { 3 }, 1, 2, 3)));
+        Assert.Throws<ArgumentException>(() => _engine.TensorLocalResponseNorm(Range(new[] { 4 }, 1, 0), 2));
+    }
 }
