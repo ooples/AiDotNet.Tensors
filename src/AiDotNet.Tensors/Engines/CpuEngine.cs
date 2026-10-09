@@ -25568,51 +25568,77 @@ public partial class CpuEngine : ITensorLevelEngine
             float epsF = (float)numOps.ToDouble(eps);
             var ggF = new float[channels];
             var gbF = new float[channels];
-            var giF = new float[input.Length];
+            // Every element is written below, so the arena buffer needs no clearing.
+            var gradInputT = TensorAllocator.RentUninitialized<T>(input._shape);
+            var giF = (float[]?)(object?)gradInputT.GetCpuBackingForContiguousWrite(out int giOff)
+                ?? throw new InvalidOperationException("A rented CPU tensor has no managed backing array.");
             float elemF = elementsPerChannel;
 
+            // As torch's batch_norm_cpu_backward and the double path below: two reductions per channel,
+            // sum(dy) and dot(dy, x - mean), then one pass dx = k1*dy + k2*(x - mean) + k3. The scalar form kept a
+            // third, redundant accumulator and ran every loop one element at a time.
             CpuParallelSettings.ParallelForOrSerial(0, channels, (long)channels * elementsPerChannel, c =>
             {
                 float invStd = 1f / MathF.Sqrt(vaF[c] + epsF);
-                float mean_c = meF[c];
-                float gGamma = 0, gBeta = 0, sumGrad = 0, sumGradX = 0;
-
+                float meanC = meF[c];
+                int width = System.Numerics.Vector<float>.Count;
+                var vMean = new System.Numerics.Vector<float>(meanC);
+                var accGrad = System.Numerics.Vector<float>.Zero;
+                var accGradX = System.Numerics.Vector<float>.Zero;
+                float sumGrad = 0f, sumGradX = 0f;
                 for (int n = 0; n < batch; n++)
                 {
                     int baseIdx = (n * channels + c) * spatialSize;
-                    for (int s = 0; s < spatialSize; s++)
+                    int s = 0;
+                    if (System.Numerics.Vector.IsHardwareAccelerated)
                     {
-                        int idx = baseIdx + s;
-                        float diff = inF[idx] - mean_c;
-                        gGamma += goF[idx] * diff * invStd;
-                        gBeta += goF[idx];
-                        sumGrad += goF[idx];
-                        sumGradX += goF[idx] * diff;
+                        for (; s + width <= spatialSize; s += width)
+                        {
+                            var go = new System.Numerics.Vector<float>(goF, baseIdx + s);
+                            accGrad += go;
+                            accGradX += go * (new System.Numerics.Vector<float>(inF, baseIdx + s) - vMean);
+                        }
+                    }
+                    for (; s < spatialSize; s++)
+                    {
+                        float go = goF[baseIdx + s];
+                        sumGrad += go;
+                        sumGradX += go * (inF[baseIdx + s] - meanC);
                     }
                 }
+                sumGrad += System.Numerics.Vector.Dot(accGrad, System.Numerics.Vector<float>.One);
+                sumGradX += System.Numerics.Vector.Dot(accGradX, System.Numerics.Vector<float>.One);
 
-                ggF[c] = gGamma;
-                gbF[c] = gBeta;
-                float gamma_c = gaF[c];
-                float gammaSumGrad = gamma_c * sumGrad;
-                float gammaSumGradX = gamma_c * sumGradX;
-
+                ggF[c] = sumGradX * invStd;
+                gbF[c] = sumGrad;
+                float gammaC = gaF[c];
+                float k1 = gammaC * invStd;
+                float k2 = -gammaC * invStd * invStd * invStd * sumGradX / elemF;
+                float k3 = -gammaC * invStd * sumGrad / elemF;
+                var vK1 = new System.Numerics.Vector<float>(k1);
+                var vK2 = new System.Numerics.Vector<float>(k2);
+                var vK3 = new System.Numerics.Vector<float>(k3);
                 for (int n = 0; n < batch; n++)
                 {
-                    int baseIdx2 = (n * channels + c) * spatialSize;
-                    for (int s = 0; s < spatialSize; s++)
+                    int baseIdx = (n * channels + c) * spatialSize;
+                    int s = 0;
+                    if (System.Numerics.Vector.IsHardwareAccelerated)
                     {
-                        int idx = baseIdx2 + s;
-                        float normalized = (inF[idx] - mean_c) * invStd;
-                        float gradNorm = gamma_c * goF[idx];
-                        giF[idx] = invStd / elemF * (elemF * gradNorm - gammaSumGrad - normalized * invStd * gammaSumGradX);
+                        for (; s + width <= spatialSize; s += width)
+                        {
+                            var dx = vK1 * new System.Numerics.Vector<float>(goF, baseIdx + s)
+                                + vK2 * (new System.Numerics.Vector<float>(inF, baseIdx + s) - vMean) + vK3;
+                            dx.CopyTo(giF, giOff + baseIdx + s);
+                        }
                     }
+                    for (; s < spatialSize; s++)
+                        giF[giOff + baseIdx + s] = k1 * goF[baseIdx + s] + k2 * (inF[baseIdx + s] - meanC) + k3;
                 }
             });
 
             gradGamma = TensorAllocator.Rent<T>([channels], (Vector<T>)(object)Vector<float>.FromMemory(ggF));
             gradBeta = TensorAllocator.Rent<T>([channels], (Vector<T>)(object)Vector<float>.FromMemory(gbF));
-            return TensorAllocator.Rent<T>(input._shape, (Vector<T>)(object)Vector<float>.FromMemory(giF));
+            return gradInputT;
         }
 
         // Double fast path — replaces the per-channel scalar inner loops with
@@ -43991,6 +44017,26 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    // Elements per task of an elementwise kernel split across the pool: 64K floats (256 KB of each operand), the grain
+    // torch's parallel_for uses for its elementwise CPU kernels within a factor of two. Fixed, so the split - and the
+    // result, since each element is computed alone - does not depend on the thread count.
+    private const int ElementwiseParallelChunk = 64 * 1024;
+
+    /// <summary>Runs <paramref name="body"/>(start, count) over [0, length) in fixed chunks across the pool.</summary>
+    private static void ParallelElementwiseChunks(int length, Action<int, int> body)
+    {
+        int chunks = (length + ElementwiseParallelChunk - 1) / ElementwiseParallelChunk;
+        if (chunks <= 1)
+        {
+            if (length > 0) body(0, length);
+            return;
+        }
+        CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)length * 3, chunk =>
+        {
+            int start = chunk * ElementwiseParallelChunk;
+            body(start, Math.Min(ElementwiseParallelChunk, length - start));
+        }, deterministicSafe: true);
+    }
     public virtual unsafe Tensor<T> ReluBackward<T>(Tensor<T> gradOutput, Tensor<T> input)
     {
         if (gradOutput == null) throw new ArgumentNullException(nameof(gradOutput));
@@ -44012,8 +44058,11 @@ public partial class CpuEngine : ITensorLevelEngine
             var resultTensor = AutoTensorCache.RentOrAllocate<T>(input._shape);
             var iArr = (float[])(object)input.GetDataArray();
             var rArr = (float[])(object)resultTensor.GetDataArray();
-            fixed (float* pI = iArr, pR = rArr)
-                SimdKernels.ReluBackwardScalarUnsafe(scale, pI, pR, length);
+            ParallelElementwiseChunks(length, (start, count) =>
+            {
+                fixed (float* pI = iArr, pR = rArr)
+                    SimdKernels.ReluBackwardScalarUnsafe(scale, pI + start, pR + start, count);
+            });
             return resultTensor;
         }
 
@@ -44028,8 +44077,11 @@ public partial class CpuEngine : ITensorLevelEngine
             var gArr = (float[])(object)gradOutput.GetDataArray();
             var iArr = (float[])(object)input.GetDataArray();
             var rArr = (float[])(object)resultTensor2.GetDataArray();
-            fixed (float* pG = gArr, pI = iArr, pR = rArr)
-                SimdKernels.ReluBackwardUnsafe(pG, pI, pR, length);
+            ParallelElementwiseChunks(length, (start, count) =>
+            {
+                fixed (float* pG = gArr, pI = iArr, pR = rArr)
+                    SimdKernels.ReluBackwardUnsafe(pG + start, pI + start, pR + start, count);
+            });
         }
         else if (typeof(T) == typeof(double))
         {
