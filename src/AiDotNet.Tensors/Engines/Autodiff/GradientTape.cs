@@ -1,4 +1,4 @@
-﻿using AiDotNet.Tensors.Engines.Compilation;
+using AiDotNet.Tensors.Engines.Compilation;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
 
@@ -1116,8 +1116,12 @@ public sealed class GradientTape<T> : IDisposable
         // and discarded them at the end. This scope lets heavyweight backward functions skip
         // individual irrelevant inputs and makes AccumulateGrad stop upstream traversal at a
         // frozen boundary.
-        using var gradientRelevance = DifferentiableOps.PushGradientRelevance(
-            createGraph ? null : BuildGradientRelevance(loss, sources));
+        var relevance = createGraph ? null : BuildGradientRelevance(loss, sources);
+        using var gradientRelevance = DifferentiableOps.PushGradientRelevance(relevance);
+        // A small tape skips the reachability walk; the walk-free leaf filter still drops the input gradients of
+        // leaves nobody asked for (a CNN's first convolution computed a [batch, 1, 28, 28] gradient for the batch).
+        using var gradientLeaves = DifferentiableOps.PushGradientLeafSources(
+            relevance is null && !createGraph && sources is { Count: > 0 } ? BuildGradientLeafSources(sources) : null);
 
         // Auto-training compiler: highest priority — use compiled backward if available.
         // Must be checked BEFORE the graph path because DifferentiableOps always records
@@ -1620,6 +1624,21 @@ public sealed class GradientTape<T> : IDisposable
     private Tensor<T>[]? _cachedGradientRelevanceSources;
     private int _cachedGradientRelevanceEntryCount = -1;
     private HashSet<Tensor<T>>? _cachedGradientRelevance;
+
+    private HashSet<Tensor<T>> BuildGradientLeafSources(IReadOnlyList<Tensor<T>> sources)
+    {
+        var leaves = new HashSet<Tensor<T>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+        foreach (var source in sources) leaves.Add(source);
+        if (_retainGrad is not null)
+            foreach (var retained in _retainGrad) leaves.Add(retained);
+        if (_hooks is not null)
+            foreach (var hooked in _hooks.Keys) leaves.Add(hooked);
+        // This tape's recorded outputs too: a persistent tape's cleanup releases their GradFn, so on a replayed
+        // pass they would otherwise look like leaves. Outputs of other tapes keep their GradFn.
+        for (int e = 0; e < _entries.Count; e++)
+            if (_entries[e].Output is { } output) leaves.Add(output);
+        return leaves;
+    }
 
     private HashSet<Tensor<T>>? BuildGradientRelevance(
         Tensor<T> loss,
