@@ -37,7 +37,9 @@ public sealed class AvgPool3dKernelSourceTests
     [InlineData(OpenClPool, "GetSource")]
     [InlineData(MetalExt, "Source")]
     [InlineData(VulkanExt, "AvgPool3D")]
+#if NET7_0_OR_GREATER // the WebGPU backend is compiled only for net7.0+
     [InlineData("AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuExtendedConvKernels", "AvgPool3D")]
+#endif
     public void CountIncludePadDivisor_IsPresentAcrossBackends(string typeName, string memberName)
     {
         string source = GetStaticString(typeName, memberName);

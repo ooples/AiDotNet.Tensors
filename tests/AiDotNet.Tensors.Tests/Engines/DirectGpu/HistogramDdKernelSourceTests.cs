@@ -13,7 +13,9 @@ public sealed class HistogramDdKernelSourceTests
     [InlineData("AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels.ShapeKernels", "GetSource")]
     [InlineData("AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalParity210Kernels", "Source")]
     [InlineData("AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanAuditKernels", "Histogramdd")]
+#if NET7_0_OR_GREATER // the WebGPU backend is compiled only for net7.0+
     [InlineData("AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuAuditKernels", "Histogramdd")]
+#endif
     public void EveryBackendHandlesTheInclusiveMaximumWithoutDivision(
         string typeName, string memberName)
     {

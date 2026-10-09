@@ -26814,19 +26814,23 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 #endif
 
-        // Scalar fallback
+        // Scalar fallback (net471, and rows too short for a vector). Moments are accumulated in double: a float
+        // sum of 256 values near 1000 reaches ~256000, where a float step is ~0.03, and the mean it gave put the
+        // normalized output 0.0019 off where the input's own precision allows 0.0017. The SIMD paths above shift by
+        // the row's first element instead; here double accumulation costs nothing measurable.
         {
-            float sum = 0f;
+            double sum = 0d;
             for (int f = 0; f < fs; f++) sum += fInput[off + f];
-            m = sum / fs;
+            double meanD = sum / fs;
+            m = (float)meanD;
             fMean[b] = m;
-            float sumSq = 0f;
+            double sumSq = 0d;
             for (int f = 0; f < fs; f++)
             {
-                float d = fInput[off + f] - m;
+                double d = fInput[off + f] - meanD;
                 sumSq += d * d;
             }
-            v2 = sumSq / fs;
+            v2 = (float)(sumSq / fs);
             fVar[b] = v2;
             float invStd = 1f / MathF.Sqrt(v2 + fEps);
             for (int f = 0; f < fs; f++)

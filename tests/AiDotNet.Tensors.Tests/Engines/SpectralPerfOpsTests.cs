@@ -38,8 +38,10 @@ public class SpectralPerfOpsTests
 
         for (int i = 0; i < n; i++)
         {
-            Assert.Equal(tensorOutput[i].Real, spanOutput[i].Real, 10);
-            Assert.Equal(tensorOutput[i].Imaginary, spanOutput[i].Imaginary, 10);
+            // An absolute tolerance, not `precision: 10`: rounding both to 10 decimal places made values 9e-15
+            // apart fail whenever they straddled a rounding boundary (5.22765529814993 vs 5.22765529815002 on net471).
+            Assert.Equal(tensorOutput[i].Real, spanOutput[i].Real, 1e-9);
+            Assert.Equal(tensorOutput[i].Imaginary, spanOutput[i].Imaginary, 1e-9);
         }
     }
 

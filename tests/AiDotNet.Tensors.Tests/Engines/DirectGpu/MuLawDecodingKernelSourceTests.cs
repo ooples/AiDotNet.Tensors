@@ -13,7 +13,9 @@ public sealed class MuLawDecodingKernelSourceTests
     [InlineData("AiDotNet.Tensors.Engines.DirectGpu.OpenCL.OpenClAudioKernels", "GetSource", "__global const int* input")]
     [InlineData("AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalAudioKernels", "Source", "device const int* input")]
     [InlineData("AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanAudioKernels", "MuLawDecoding", "int input_[]")]
+#if NET7_0_OR_GREATER // the WebGPU backend is compiled only for net7.0+
     [InlineData("AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuAudioKernels", "MuLawDecoding", "array<i32>")]
+#endif
     public void EveryBackendConsumesResidentInt32Codes(
         string typeName, string memberName, string expectedDeclaration)
     {

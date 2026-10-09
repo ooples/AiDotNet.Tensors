@@ -23,9 +23,11 @@ public sealed class PowerKernelSourceTests
     [InlineData(
         "AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanGlslKernels", "UnaryElementwise", "case 0u:",
         "v0 == trunc(v0)", "pow(-x, v0)", "mod(abs(v0), 2.0) == 1.0")]
+#if NET7_0_OR_GREATER // WebGpuKernels is compiled only on net7.0+
     [InlineData(
         "AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuKernels", "ScalarOpsSource", "fn pow_scalar(",
         "exponent == trunc(exponent)", "pow(-x, exponent)", "select(magnitude, -magnitude, is_odd)")]
+#endif
     public void EveryAcceleratorPowerKernelHandlesNegativeBasesWithIntegralExponents(
         string typeName,
         string memberName,
@@ -51,9 +53,11 @@ public sealed class PowerKernelSourceTests
     [InlineData(
         "AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanGlslKernels", "UnaryElementwise", "case 0u:",
         "uintBitsToFloat(0x7fc00000u)")]
+#if NET7_0_OR_GREATER // WebGpuKernels is compiled only on net7.0+
     [InlineData(
         "AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuKernels", "ScalarOpsSource", "fn pow_scalar(",
         "bitcast<f32>(0x7fc00000u)")]
+#endif
     public void ShaderBackendsExplicitlyReturnNaNForNegativeBasesWithFractionalExponents(
         string typeName,
         string memberName,

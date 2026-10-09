@@ -1,0 +1,43 @@
+<Project>
+
+  <!--
+    shaderc_shared on .NET Framework.
+
+    The Vulkan backend compiles GLSL to SPIR-V through shaderc_shared, which reaches us through
+    Silk.NET.Shaderc.Native. On .NET (Core) the SDK deploys it from runtimes/<rid>/native and the
+    host probes that folder. .NET Framework has no RID probing: DllImport searches the application
+    folder, so the DLL has to be copied there. Silk's buildTransitive props do that copy only when
+    Prefer32Bit or PlatformTarget names an architecture. An SDK-style AnyCPU project leaves both
+    unset, so it got no shaderc at all, and every Vulkan GLSL dispatch failed with "Vulkan GLSL
+    pipeline unavailable".
+
+    This adds the copy for exactly that case: a .NET Framework build on Windows for which Silk chose
+    no runtime. AnyCPU without Prefer32Bit runs as a 64-bit process on a 64-bit OS, so it gets
+    win-x64. The package version is wildcarded, the same way the MKL redist copies in
+    AiDotNet.Tensors.csproj are, because NuGet resolves a single version per restore.
+
+    Imported by AiDotNet.Tensors.csproj (the item flows to referencing projects like any
+    CopyToOutputDirectory item) and by build/AiDotNet.Tensors.targets for package consumers. The
+    framework is derived from TargetFramework rather than read from TargetFrameworkIdentifier: the
+    csproj imports this file in its body, before the SDK targets that infer TargetFrameworkIdentifier.
+  -->
+  <PropertyGroup Condition="'$(TargetFramework)' != ''">
+    <_AiDotNetShadercTfi>$([MSBuild]::GetTargetFrameworkIdentifier('$(TargetFramework)'))</_AiDotNetShadercTfi>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(_AiDotNetShadercTfi)' == '.NETFramework' And '$(OS)' == 'Windows_NT' And '$(_Silk_NativePackages_Shaderc_NativeRuntime)' == ''">
+    <_AiDotNetShadercRid Condition="'$(PlatformTarget)' == 'x86' Or '$(Prefer32Bit)' == 'true'">win-x86</_AiDotNetShadercRid>
+    <_AiDotNetShadercRid Condition="'$(_AiDotNetShadercRid)' == '' And '$(PlatformTarget)' == 'arm64'">win-arm64</_AiDotNetShadercRid>
+    <_AiDotNetShadercRid Condition="'$(_AiDotNetShadercRid)' == ''">win-x64</_AiDotNetShadercRid>
+  </PropertyGroup>
+
+  <ItemGroup Condition="'$(_AiDotNetShadercRid)' != ''">
+    <None Include="$([MSBuild]::EnsureTrailingSlash($(NuGetPackageRoot)))silk.net.shaderc.native\*\runtimes\$(_AiDotNetShadercRid)\native\shaderc_shared.dll">
+      <Link>%(Filename)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Visible>false</Visible>
+      <Pack>false</Pack>
+    </None>
+  </ItemGroup>
+
+</Project>

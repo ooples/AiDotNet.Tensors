@@ -49,7 +49,9 @@ public class FastLogDoubleAccuracyTests
         var got = _engine.TensorLog(x);
 
         double worstRel = 0;
-        int worstIdx = -1;
+        // Index 0 rather than -1: an exact result everywhere (net471 has no SIMD log and computes Math.Log) leaves
+        // nothing above zero, and the diagnostics below index x[worstIdx].
+        int worstIdx = 0;
         for (int i = 0; i < length; i++)
         {
             double expected = Math.Log(x[i]);

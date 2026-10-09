@@ -113,6 +113,10 @@
       <Pack>true</Pack>
       <PackagePath>build\</PackagePath>
     </None>
+    <None Include="..\..\build\AiDotNet.Tensors.NativeAssets.targets">
+      <Pack>true</Pack>
+      <PackagePath>build\</PackagePath>
+    </None>
   </ItemGroup>
 
   <ItemGroup>
@@ -283,7 +287,9 @@
   <!-- intelmkl.redist's MSBuild targets gate Content-item generation on
        legacy `packages.config` detection, so SDK-style projects don't get
        the native DLLs auto-copied to bin. Replicate the deployment
-       manually using NuGetPackageRoot.
+       manually using NuGetPackageRoot. EnsureTrailingSlash because a
+       NUGET_PACKAGES set without one (F:\nuget-packages) yields a root with
+       no separator, and the glob then matched nothing, silently.
 
        Version wildcard (`*`) on the package-version folder: NU1603 (above)
        allows restore to pick newer patch versions of Intel transitive
@@ -299,19 +305,19 @@
        redist packages share the same DLL names with binary-compatible
        contents. -->
   <ItemGroup Condition="$([MSBuild]::IsOSPlatform('Windows'))">
-    <None Include="$(NuGetPackageRoot)intelmkl.redist.win-x64\*\runtimes\win-x64\native\*.dll">
+    <None Include="$([MSBuild]::EnsureTrailingSlash($(NuGetPackageRoot)))intelmkl.redist.win-x64\*\runtimes\win-x64\native\*.dll">
       <Link>%(Filename)%(Extension)</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <Visible>false</Visible>
       <Pack>false</Pack>
     </None>
-    <None Include="$(NuGetPackageRoot)intelopenmp.redist.win\*\runtimes\win-x64\native\*.dll">
+    <None Include="$([MSBuild]::EnsureTrailingSlash($(NuGetPackageRoot)))intelopenmp.redist.win\*\runtimes\win-x64\native\*.dll">
       <Link>%(Filename)%(Extension)</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <Visible>false</Visible>
       <Pack>false</Pack>
     </None>
-    <None Include="$(NuGetPackageRoot)inteltbb.redist.win\*\runtimes\win-x64\native\*.dll">
+    <None Include="$([MSBuild]::EnsureTrailingSlash($(NuGetPackageRoot)))inteltbb.redist.win\*\runtimes\win-x64\native\*.dll">
       <Link>%(Filename)%(Extension)</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <Visible>false</Visible>
@@ -380,6 +386,9 @@
     operator-side keypair-generation procedure.
   -->
   <Import Project="$(MSBuildThisFileDirectory)..\..\build\AiDotNet.Tensors.Enterprise.targets" />
+
+  <!-- shaderc_shared for .NET Framework builds; see the file for why Silk's own copy misses them. -->
+  <Import Project="$(MSBuildThisFileDirectory)..\..\build\AiDotNet.Tensors.NativeAssets.targets" />
 
   <!-- #375 Phase 4: shipped per-fingerprint pre-warm autotune caches. Empty until CI
        produces them, so the glob matching nothing is a build no-op. The README is not

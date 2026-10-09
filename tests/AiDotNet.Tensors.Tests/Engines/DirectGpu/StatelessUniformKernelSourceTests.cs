@@ -13,7 +13,9 @@ public sealed class StatelessUniformKernelSourceTests
     [InlineData("AiDotNet.Tensors.Engines.DirectGpu.OpenCL.Kernels.RandomKernels", "GetKernels")]
     [InlineData("AiDotNet.Tensors.Engines.DirectGpu.Metal.MetalResidentKernels", "Source")]
     [InlineData("AiDotNet.Tensors.Engines.DirectGpu.Vulkan.VulkanResidentKernels", "RandomGenerate")]
+#if NET7_0_OR_GREATER // the WebGPU backend is compiled only for net7.0+
     [InlineData("AiDotNet.Tensors.Engines.DirectGpu.WebGpu.WebGpuKernels", "PhiloxRngSource")]
+#endif
     public void EveryBackendUsesTheSharedIntegerPcgUniformContract(
         string typeName, string memberName)
     {

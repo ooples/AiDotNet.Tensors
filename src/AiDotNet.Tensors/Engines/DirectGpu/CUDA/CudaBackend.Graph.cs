@@ -137,21 +137,31 @@ public sealed partial class CudaBackend
             // Everything this thread already enqueued on the compute stream happens before the captured work.
             CuBlasNative.CheckCudaResult(CudaNativeBindings.cuEventRecord(_captureOrderEvent, _mainStream), "cuEventRecord(capture order)");
             CuBlasNative.CheckCudaResult(CudaNativeBindings.cuStreamWaitEvent(_captureStream, _captureOrderEvent, 0), "cuStreamWaitEvent(capture order)");
+            t_captureMainStream = _mainStream;
+            t_captureStream = _captureStream;
+            // Copies and memsets issued through the CuBlasNative/CudaNativeBindings stream wrappers read the ambient
+            // stream, not _stream, so point it at the capture stream too; otherwise they would run outside the capture.
+            t_ambientBeforeCapture = CudaCurrentStream.Enter(_captureStream, _cudaContext);
+            // Inside the try: on net471 this call used to throw DllNotFoundException (no cuBLAS resolver), and from
+            // after the try it left the gate held and the depth raised, so the next capture on any other thread
+            // waited on the gate forever - the full net471 test run hung in DirectPtxGatherTests for hours.
+            CuBlasNative.cublasSetStream(_cublasHandle, _captureStream);
         }
         catch
         {
             // The scope never opened: leaving the depth raised would make this thread treat every later capture as
             // nested (and defer its frees forever), and a held gate blocks every other capture and context sync.
+            if (t_captureMainStream != IntPtr.Zero)
+            {
+                CudaCurrentStream.Restore(t_ambientBeforeCapture);
+                t_ambientBeforeCapture = default;
+                t_captureMainStream = IntPtr.Zero;
+                t_captureStream = IntPtr.Zero;
+            }
             t_captureDepth--;
             System.Threading.Monitor.Exit(gate);
             throw;
         }
-        t_captureMainStream = _mainStream;
-        t_captureStream = _captureStream;
-        // Copies and memsets issued through the CuBlasNative/CudaNativeBindings stream wrappers read the ambient stream,
-        // not _stream, so point it at the capture stream too; otherwise they would run outside the capture.
-        t_ambientBeforeCapture = CudaCurrentStream.Enter(_captureStream, _cudaContext);
-        CuBlasNative.cublasSetStream(_cublasHandle, _captureStream);
     }
 
     // All or nothing: a stream without its order event would pass the `_captureStream == 0` check next time and record on
@@ -206,12 +216,19 @@ public sealed partial class CudaBackend
     private void ExitCapture()
     {
         if (t_captureDepth == 0 || --t_captureDepth > 0) return;
-        CudaCurrentStream.Restore(t_ambientBeforeCapture);
-        t_ambientBeforeCapture = default;
-        t_captureMainStream = IntPtr.Zero;
-        t_captureStream = IntPtr.Zero;
-        CuBlasNative.cublasSetStream(_cublasHandle, _mainStream);
-        System.Threading.Monitor.Exit(CaptureGateFor(_cudaContext));
+        try
+        {
+            CudaCurrentStream.Restore(t_ambientBeforeCapture);
+            t_ambientBeforeCapture = default;
+            t_captureMainStream = IntPtr.Zero;
+            t_captureStream = IntPtr.Zero;
+            CuBlasNative.cublasSetStream(_cublasHandle, _mainStream);
+        }
+        finally
+        {
+            // Released whatever happened above: a gate left held blocks every later capture and context sync.
+            System.Threading.Monitor.Exit(CaptureGateFor(_cudaContext));
+        }
         var releases = t_postCaptureReleases;
         if (releases is null || releases.Count == 0) return;
         t_postCaptureReleases = null;
