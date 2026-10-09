@@ -204,4 +204,12 @@ public class TorchSpecialOpsTests
             Assert.Equal(fd, gx.GetFlat(i), 6);
         }
     }
+
+    [Fact]
+    public void PolynomialDegree_TruncatesTowardZero_LikeTorch()
+    {
+        // torch casts n with static_cast<int64_t>: 2.7 -> 2, -0.7 -> 0, 3.9 -> 3, -2.5 -> -2 (negative degree: 0).
+        Close(new[] { -0.5, 1.0 }, _engine.TensorChebyshevPolynomialT(T(new[] { 0.5, 0.3 }), T(new[] { 2.7, -0.7 })), "chebyshev_t", 1e-15);
+        Close(new[] { -0.4375, 0.0 }, _engine.TensorLegendrePolynomialP(T(new[] { 0.5, 0.3 }), T(new[] { 3.9, -2.5 })), "legendre_p", 1e-15);
+    }
 }

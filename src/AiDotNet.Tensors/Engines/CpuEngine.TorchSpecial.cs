@@ -86,8 +86,9 @@ public partial class CpuEngine
     /// <inheritdoc/>
     public virtual Tensor<T> TensorSinc<T>(Tensor<T> tensor)
         => SpecialUnary("TensorSinc", tensor,
-            x => x == 0 ? 1 : Math.Sin(Math.PI * x) / (Math.PI * x),
-            (x, _) => x == 0 ? 0 : (Math.Cos(Math.PI * x) * Math.PI * x - Math.Sin(Math.PI * x)) / (Math.PI * x * x),
+            x => x == 0 ? 1 : double.IsInfinity(x) ? 0 : SpecialFunctions.SinPi(x) / (Math.PI * x),
+            (x, _) => x == 0 || double.IsInfinity(x) ? 0
+                : (SpecialFunctions.CosPi(x) * Math.PI * x - SpecialFunctions.SinPi(x)) / (Math.PI * x * x),
             e => e.TensorSinc(tensor));
 
     /// <inheritdoc/>
@@ -370,7 +371,11 @@ public partial class CpuEngine
     // Pₙ(x) per element, with the degree taken from n (rounded, as PyTorch truncates an integral n tensor).
     private static Tensor<T> PolynomialOp<T>(string opName, PolynomialKind kind, bool shifted, Tensor<T> x, Tensor<T> n,
         Func<IEngine, Tensor<T>> replay)
-        => SpecialBinary(opName, x, n, (v, d) => Polynomial(kind, shifted ? 2 * v - 1 : v, (int)Math.Round(d)), null, null, replay);
+        => SpecialBinary(opName, x, n, (v, d) => double.IsNaN(d) ? double.NaN : Polynomial(kind, shifted ? 2 * v - 1 : v, PolynomialDegree(d)), null, null, replay);
+
+    // PyTorch casts the degree with static_cast<int64_t>, truncating toward zero (2.7 -> 2, -0.7 -> 0).
+    private static int PolynomialDegree(double d)
+        => d >= int.MaxValue ? int.MaxValue : d <= int.MinValue ? int.MinValue : (int)Math.Truncate(d);
 
     /// <inheritdoc/>
     public virtual Tensor<T> TensorChebyshevPolynomialT<T>(Tensor<T> x, Tensor<T> n)

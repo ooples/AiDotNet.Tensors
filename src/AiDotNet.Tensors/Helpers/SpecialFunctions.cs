@@ -20,25 +20,38 @@ internal static class SpecialFunctions
     public static double Erf(double x)
     {
         if (double.IsNaN(x)) return double.NaN;
-        if (Math.Abs(x) < 2.5) return ErfSeries(x);
-        return x > 0 ? 1.0 - ErfcLarge(x) : ErfcLarge(-x) - 1.0;
+        if (double.IsInfinity(x)) return x > 0 ? 1.0 : -1.0;
+        if (Math.Abs(x) < 0.5) return ErfSeries(x);
+        // erf = 1 - erfc with erfc ≤ 0.48 here, so the subtraction cannot cancel.
+        double tail = Erfc(Math.Abs(x));
+        return x > 0 ? 1.0 - tail : tail - 1.0;
     }
 
     /// <summary>erfc(x) = 1 - erf(x), without cancellation for large x.</summary>
     public static double Erfc(double x)
     {
         if (double.IsNaN(x)) return double.NaN;
+        if (double.IsInfinity(x)) return x > 0 ? 0.0 : 2.0;
         if (x >= 2.5) return ErfcLarge(x);
-        if (x <= -2.5) return 2.0 - ErfcLarge(-x);
+        if (x >= 0.5) return ErfcMid(x);
+        if (x <= -0.5) return 2.0 - Erfc(-x);
         return 1.0 - ErfSeries(x);
     }
+
+    // erfc on [0.5, 2.5): erfc(2.5) plus (2/√π)∫ₓ^{2.5} e^{-t²} dt. Both terms are positive, so unlike 1 - erf(x)
+    // nothing cancels as erfc(x) gets small (1 - erf lost ~3 digits by x ≈ 2.5); 32-node Gauss–Legendre on an
+    // interval of length ≤ 2 integrates the Gaussian to double precision.
+    private static double ErfcMid(double x)
+        => ErfcLarge(2.5) + 2.0 / SqrtPi * GaussLegendre(x, 2.5, 32, t => Math.Exp(-t * t));
 
     /// <summary>The scaled complementary error function erfcx(x) = exp(x²)·erfc(x).</summary>
     public static double Erfcx(double x)
     {
         if (double.IsNaN(x)) return double.NaN;
+        if (double.IsPositiveInfinity(x)) return 0.0;
         if (x >= 2.5) return ErfcContinuedFraction(x) / SqrtPi;
-        if (x >= -2.5) return Math.Exp(x * x) * (1.0 - ErfSeries(x));
+        if (x >= 0.5) return Math.Exp(x * x) * ErfcMid(x);
+        if (x > -0.5) return Math.Exp(x * x) * (1.0 - ErfSeries(x));
         if (x < -26.7) return double.PositiveInfinity;
         return 2.0 * Math.Exp(x * x) - Erfcx(-x);
     }
@@ -85,9 +98,40 @@ internal static class SpecialFunctions
     /// <summary>log Φ(x), accurate in the far left tail.</summary>
     public static double LogNdtr(double x)
     {
+        if (double.IsNaN(x)) return double.NaN;
+        if (double.IsNegativeInfinity(x)) return double.NegativeInfinity;
+        // log(1 - Φ(-x)) without forming 1 - Φ(-x), which keeps only ~|log10 Φ(-x)| digits of the small deviation.
+        if (x > 0) return Log1p(-Ndtr(-x));
         if (x > -1.0) return Math.Log(Ndtr(x));
         // Φ(x) = ½·erfcx(-x/√2)·exp(-x²/2)
         return Math.Log(0.5 * Erfcx(-x / Sqrt2)) - 0.5 * x * x;
+    }
+
+    /// <summary>log(1 + y), accurate for small y (Goldberg's correction; .NET Framework has no Math.Log1P).</summary>
+    public static double Log1p(double y)
+    {
+        double u = 1.0 + y;
+        return u == 1.0 ? y : Math.Log(u) * y / (u - 1.0);
+    }
+
+    /// <summary>sin(πx) with exact argument reduction: exactly 0 at every integer, including huge ones.</summary>
+    public static double SinPi(double x)
+    {
+        if (double.IsNaN(x) || double.IsInfinity(x)) return double.NaN;
+        double r = x - 2.0 * Math.Round(x / 2.0);   // exact: r ∈ [-1, 1], sin(πx) = sin(πr)
+        double a = Math.Abs(r);
+        if (a == 0.0 || a == 1.0) return 0.0;
+        if (a > 0.5) a = 1.0 - a;                    // sin(π(1 - a)) = sin(πa)
+        return Math.Sign(r) * Math.Sin(Math.PI * a);
+    }
+
+    /// <summary>cos(πx) with exact argument reduction: exactly 0 at every half-integer.</summary>
+    public static double CosPi(double x)
+    {
+        if (double.IsNaN(x) || double.IsInfinity(x)) return double.NaN;
+        double a = Math.Abs(x - 2.0 * Math.Round(x / 2.0));   // cos(πx) = cos(πa), a ∈ [0, 1]
+        if (a == 0.5) return 0.0;
+        return a > 0.5 ? -Math.Sin(Math.PI * (a - 0.5)) : Math.Sin(Math.PI * (0.5 - a));
     }
 
     /// <summary>The standard normal quantile Φ⁻¹(p): Acklam's rational approximation refined by Halley steps.</summary>
@@ -138,6 +182,7 @@ internal static class SpecialFunctions
     public static double LogGamma(double x)
     {
         if (double.IsNaN(x)) return double.NaN;
+        if (double.IsInfinity(x)) return double.PositiveInfinity;
         if (x <= 0 && Math.Floor(x) == x) return double.PositiveInfinity;
         if (x < 0.5) return Math.Log(Math.PI / Math.Abs(Math.Sin(Math.PI * x))) - LogGamma(1 - x);
         x -= 1;
@@ -233,6 +278,45 @@ internal static class SpecialFunctions
 
     // ---- Bessel functions --------------------------------------------------------------------------------------
 
+    // e^{-t} underflows to zero for t > 745, so integrands past it contribute nothing.
+    private const double ExpUnderflow = 745;
+
+    // Above this argument the scaled I and K use their large-x asymptotic series: the smallest term there is about
+    // e^{-2x} (below 1e-43), and the quadratures below it would otherwise need O(√x) nodes (I) or alias (K).
+    private const double LargeArgument = 50;
+
+    // Σ (±1)ᵏ (x/2)^{2k+n} / (k!(k+n)!), the power series of J_n (alternating) or I_n; used for |x| < 2, where it
+    // converges in a few terms with no cancellation and is exact at 0 (the quadratures leave ~1e-17 there).
+    private static double BesselSeries(int n, double x, bool alternating)
+    {
+        double half = x / 2, term = 1;
+        for (int k = 1; k <= n; k++) term *= half / k;
+        double sum = term, q = half * half * (alternating ? -1 : 1);
+        for (int k = 1; k < 60; k++)
+        {
+            term *= q / (k * (double)(k + n));
+            sum += term;
+            if (Math.Abs(term) <= 1e-17 * Math.Abs(sum)) break;
+        }
+        return sum;
+    }
+
+    // Σ_k c_k(μ)/xᵏ with c_k = c_{k-1}·(μ - (2k-1)²)/(8k), the large-x series shared by e^{-x}I (alternating) and
+    // e^{x}K; summed to its smallest term.
+    private static double ModifiedBesselAsymptotic(double mu, double x, bool alternating)
+    {
+        double term = 1, sum = 1, last = double.MaxValue;
+        for (int k = 1; k < 200; k++)
+        {
+            term *= (mu - (2.0 * k - 1) * (2.0 * k - 1)) / (8.0 * k * x) * (alternating ? -1 : 1);
+            if (Math.Abs(term) > last) break;
+            last = Math.Abs(term);
+            sum += term;
+            if (Math.Abs(term) < 1e-17 * Math.Abs(sum)) break;
+        }
+        return sum;
+    }
+
     // Hankel's asymptotic expansion for integer order n ≥ 0, x large: returns (J_n, Y_n).
     private static (double J, double Y) HankelAsymptotic(int n, double x)
     {
@@ -247,8 +331,12 @@ internal static class SpecialFunctions
             else p += ((k / 2) % 2 == 0 ? 1 : -1) * term;
             if (Math.Abs(term) < 1e-17) break;
         }
-        double chi = x - (n / 2.0 + 0.25) * Math.PI, s = Math.Sqrt(2 / (Math.PI * x));
-        return (s * (p * Math.Cos(chi) - q * Math.Sin(chi)), s * (p * Math.Sin(chi) + q * Math.Cos(chi)));
+        // cos/sin(x - φ) through cos x and sin x, which reduce x exactly; forming x - φ first rounds it to x's ulp
+        // (1.2e-10 at x = 1e6), an error the cosine then carries in full near its zeros.
+        double phi = (n / 2.0 + 0.25) * Math.PI, s = Math.Sqrt(2 / (Math.PI * x));
+        double cx = Math.Cos(x), sx = Math.Sin(x), cp = Math.Cos(phi), sp = Math.Sin(phi);
+        double cosChi = cx * cp + sx * sp, sinChi = sx * cp - cx * sp;
+        return (s * (p * cosChi - q * sinChi), s * (p * sinChi + q * cosChi));
     }
 
     /// <summary>The Bessel function of the first kind J_n(x), integer n.</summary>
@@ -256,6 +344,8 @@ internal static class SpecialFunctions
     {
         if (double.IsNaN(x)) return double.NaN;
         double ax = Math.Abs(x);
+        if (double.IsInfinity(ax)) return 0;
+        if (ax < 2) return BesselSeries(n, x, alternating: true);
         if (ax > 25) return (n % 2 == 1 && x < 0 ? -1 : 1) * HankelAsymptotic(n, ax).J;
         // J_n(x) = (1/2π)∫₀^{2π} cos(nτ - x sin τ) dτ: a periodic analytic integrand, so the equally spaced mean
         // converges exponentially (aliasing error ~ J_N(x)).
@@ -274,13 +364,14 @@ internal static class SpecialFunctions
     {
         if (double.IsNaN(x) || x < 0) return double.NaN;
         if (x == 0) return double.NegativeInfinity;
+        if (double.IsPositiveInfinity(x)) return 0;
         if (x > 25) return HankelAsymptotic(n, x).Y;
         // Y_n(x) = (1/π)∫₀^π sin(x sin τ - nτ) dτ - (1/π)∫₀^∞ (e^{nt} + (-1)ⁿe^{-nt}) e^{-x sinh t} dt.
         double first = GaussLegendre(0, Math.PI, 96, tau => Math.Sin(x * Math.Sin(tau) - n * tau));
         double sign = n % 2 == 0 ? 1 : -1;
         // Not even in t, so the trapezoid rule would only be O(h²) here: composite Gauss–Legendre instead.
         double second = DecayingGaussLegendre(t => (Math.Exp(n * t) + sign * Math.Exp(-n * t)) * Math.Exp(-x * Math.Sinh(t)),
-            t => x * Math.Sinh(t) - n * t > 745);
+            t => x * Math.Sinh(t) - n * t > ExpUnderflow);
         return (first - second) / Math.PI;
     }
 
@@ -291,6 +382,10 @@ internal static class SpecialFunctions
     {
         if (double.IsNaN(x)) return double.NaN;
         double ax = Math.Abs(x);
+        double sign = n % 2 == 1 && x < 0 ? -1 : 1;
+        if (ax < 2) return sign * Math.Exp(-ax) * BesselSeries(n, ax, alternating: false);
+        // e^{-x}I_n(x) ~ (2πx)^{-1/2} Σ (-1)ᵏ c_k(4n²)/xᵏ; 0 at infinity.
+        if (ax > LargeArgument) return sign * ModifiedBesselAsymptotic(4.0 * n * n, ax, alternating: true) / Math.Sqrt(2 * Math.PI * ax);
         // I_n(x) = (1/2π)∫₀^{2π} e^{x cos τ} cos(nτ) dτ; scaled by e^{-|x|} so large x cannot overflow. Fourier
         // coefficients beyond k decay like e^{-k²/2|x|}, so √(80|x|) + 40 points reach double precision.
         int points = 40 + (int)Math.Ceiling(Math.Sqrt(80 * ax));
@@ -300,12 +395,13 @@ internal static class SpecialFunctions
             double tau = 2 * Math.PI * i / points;
             sum += Math.Exp(ax * (Math.Cos(tau) - 1)) * Math.Cos(n * tau);
         }
-        double value = sum / points;
-        return n % 2 == 1 && x < 0 ? -value : value;
+        return sign * sum / points;
     }
 
     /// <summary>The modified Bessel function of the first kind I_n(x), integer n.</summary>
-    public static double BesselI(int n, double x) => BesselIScaled(n, x) * Math.Exp(Math.Abs(x));
+    public static double BesselI(int n, double x)
+        => double.IsInfinity(x) ? (n % 2 == 1 && x < 0 ? double.NegativeInfinity : double.PositiveInfinity)
+            : BesselIScaled(n, x) * Math.Exp(Math.Abs(x));
 
     /// <summary>
     /// The modified Bessel function of the second kind, exponentially scaled: e^{x}·K_ν(x), x &gt; 0, any real ν.
@@ -314,19 +410,23 @@ internal static class SpecialFunctions
     {
         if (double.IsNaN(x) || x < 0) return double.NaN;
         if (x == 0) return double.PositiveInfinity;
+        // e^{x}K_ν(x) ~ √(π/2x) Σ c_k(4ν²)/xᵏ; 0 at infinity. Below the cutoff the trapezoid's aliasing error,
+        // about exp(-2π²/(h²x)), is negligible; above it the Gaussian peak at t = 0 gets too narrow for h = 0.02.
+        if (x > LargeArgument) return Math.Sqrt(Math.PI / (2 * x)) * ModifiedBesselAsymptotic(4 * nu * nu, x, alternating: false);
         // e^{x}K_ν(x) = ∫₀^∞ e^{-x(cosh t - 1)} cosh(νt) dt; the integrand decays double-exponentially, so the
         // trapezoid rule converges exponentially in 1/h.
         return DecayingTrapezoid(t => Math.Exp(-x * (Math.Cosh(t) - 1)) * Math.Cosh(nu * t),
-            t => x * (Math.Cosh(t) - 1) - Math.Abs(nu) * t > 745);
+            t => x * (Math.Cosh(t) - 1) - Math.Abs(nu) * t > ExpUnderflow);
     }
 
     /// <summary>The modified Bessel function of the second kind K_ν(x), x &gt; 0.</summary>
-    public static double BesselK(double nu, double x) => BesselKScaled(nu, x) * Math.Exp(-x);
+    public static double BesselK(double nu, double x) => double.IsPositiveInfinity(x) ? 0 : BesselKScaled(nu, x) * Math.Exp(-x);
 
     /// <summary>The spherical Bessel function j₀(x) = sin(x)/x.</summary>
     public static double SphericalBesselJ0(double x)
     {
         if (double.IsNaN(x)) return double.NaN;
+        if (double.IsInfinity(x)) return 0;
         if (Math.Abs(x) < 1e-4) return 1 - x * x / 6;
         return Math.Sin(x) / x;
     }
@@ -401,7 +501,7 @@ internal static class SpecialFunctions
     private static double BesselJFractional(double nu, double x)
     {
         double first = GaussLegendre(0, Math.PI, 96, tau => Math.Cos(nu * tau - x * Math.Sin(tau)));
-        double second = DecayingGaussLegendre(t => Math.Exp(-x * Math.Sinh(t) - nu * t), t => x * Math.Sinh(t) + nu * t > 745);
+        double second = DecayingGaussLegendre(t => Math.Exp(-x * Math.Sinh(t) - nu * t), t => x * Math.Sinh(t) + nu * t > ExpUnderflow);
         return (first - Math.Sin(nu * Math.PI) * second) / Math.PI;
     }
 
@@ -447,8 +547,45 @@ internal static class SpecialFunctions
             if (k % 2 == 0) even += signed; else odd += signed;
             if (term < 1e-17) break;
         }
-        double phase = zeta + Math.PI / 4;
-        return (Math.Sin(phase) * even - Math.Cos(phase) * odd) / (Math.Sqrt(Math.PI) * Math.Pow(z, 0.25));
+        // The phase ζ + π/4 for large z: ζ = (2/3)z^{3/2} reaches 6.7e20 at z = 1e14, where one ulp is 131072, so ζ
+        // is carried as a double-double hi + lo and sin/cos(ζ + π/4) expanded so Math.Sin/Cos reduce hi exactly.
+        ZetaDoubleDouble(z, out double hi, out double lo);
+        double sh = Math.Sin(hi), ch = Math.Cos(hi), sl = Math.Sin(lo + Math.PI / 4), cl = Math.Cos(lo + Math.PI / 4);
+        double sinPhase = sh * cl + ch * sl, cosPhase = ch * cl - sh * sl;
+        return (sinPhase * even - cosPhase * odd) / (Math.Sqrt(Math.PI) * Math.Pow(z, 0.25));
+    }
+
+    // a·b = p + e exactly (Dekker's product with Veltkamp splitting; no FMA, so it also runs on .NET Framework).
+    private static void TwoProduct(double a, double b, out double p, out double e)
+    {
+        p = a * b;
+        Split(a, out double ah, out double al);
+        Split(b, out double bh, out double bl);
+        e = ((ah * bh - p) + ah * bl + al * bh) + al * bl;
+    }
+
+    private static void Split(double a, out double hi, out double lo)
+    {
+        double t = 134217729.0 * a;   // 2^27 + 1
+        hi = t - (t - a);
+        lo = a - hi;
+    }
+
+    // ζ = (2/3)·z·√z as an unevaluated sum hi + lo good to ~1e-32 relative.
+    private static void ZetaDoubleDouble(double z, out double hi, out double lo)
+    {
+        double root = Math.Sqrt(z);
+        TwoProduct(root, root, out double sq, out double sqErr);
+        double rootLo = ((z - sq) - sqErr) / (2 * root);                // √z ≈ root + rootLo
+        TwoProduct(z, root, out double m, out double mErr);
+        double mLo = mErr + z * rootLo;                                  // z√z ≈ m + mLo
+        const double TwoThirds = 2.0 / 3.0;
+        TwoProduct(3.0, TwoThirds, out double three, out double threeErr);
+        double twoThirdsLo = ((2.0 - three) - threeErr) / 3.0;           // 2/3 ≈ TwoThirds + twoThirdsLo
+        TwoProduct(m, TwoThirds, out double p, out double pErr);
+        double pLo = pErr + m * twoThirdsLo + mLo * TwoThirds;
+        hi = p + pLo;
+        lo = pLo - (hi - p);
     }
 
     /// <summary>Ai'(x), by Richardson-extrapolated central differences of <see cref="AiryAi"/>.</summary>
