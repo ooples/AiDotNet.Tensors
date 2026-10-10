@@ -197,7 +197,7 @@ public static class TensorAllocator
     {
         T[] array = ThreadLocalTensorCache<T>.RentOrAllocateExact(totalSize);
         if (zeroed || RuntimeHelpers.IsReferenceOrContainsReferences<T>())
-            Array.Clear(array, 0, array.Length);
+            PooledArrayClear.Clear(array, 0, array.Length);
         return array;
     }
 #endif
@@ -482,7 +482,7 @@ public static class TensorAllocator
         {
             // Exactly totalSize elements (see RentExactArray), so there is no padding to carry a
             // previous renter's bytes; clearing it gives Rent's zero-init contract.
-            Array.Clear(cached, 0, cached.Length);
+            PooledArrayClear.Clear(cached, 0, cached.Length);
             return Tensor<T>.FromPooledMemory(new Memory<T>(cached), shape, cached);
         }
 

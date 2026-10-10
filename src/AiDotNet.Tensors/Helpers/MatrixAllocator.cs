@@ -57,7 +57,7 @@ public static class MatrixAllocator
         T[]? cached = ThreadLocalTensorCache<T>.TryRent(totalSize);
         if (cached is not null)
         {
-            Array.Clear(cached, 0,
+            PooledArrayClear.Clear(cached, 0,
                 RuntimeHelpers.IsReferenceOrContainsReferences<T>() ? cached.Length : totalSize);
             var memory = new Memory<T>(cached, 0, totalSize);
             return Matrix<T>.FromPooledMemory(memory, rows, cols, cached);
@@ -67,7 +67,7 @@ public static class MatrixAllocator
         if (totalSize >= ArrayPoolThreshold)
         {
             T[] pooled = ThreadLocalTensorCache<T>.RentOrAllocateExact(totalSize);
-            Array.Clear(pooled, 0,
+            PooledArrayClear.Clear(pooled, 0,
                 RuntimeHelpers.IsReferenceOrContainsReferences<T>() ? pooled.Length : totalSize);
             var memory = new Memory<T>(pooled, 0, totalSize);
             return Matrix<T>.FromPooledMemory(memory, rows, cols, pooled);

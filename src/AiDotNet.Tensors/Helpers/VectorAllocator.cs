@@ -55,7 +55,7 @@ public static class VectorAllocator
         T[]? cached = ThreadLocalTensorCache<T>.TryRent(length);
         if (cached is not null)
         {
-            Array.Clear(cached, 0,
+            PooledArrayClear.Clear(cached, 0,
                 RuntimeHelpers.IsReferenceOrContainsReferences<T>() ? cached.Length : length);
             var memory = new Memory<T>(cached, 0, length);
             return Vector<T>.FromPooledMemory(memory, cached);
@@ -65,7 +65,7 @@ public static class VectorAllocator
         if (length >= ArrayPoolThreshold)
         {
             T[] pooled = ThreadLocalTensorCache<T>.RentOrAllocateExact(length);
-            Array.Clear(pooled, 0,
+            PooledArrayClear.Clear(pooled, 0,
                 RuntimeHelpers.IsReferenceOrContainsReferences<T>() ? pooled.Length : length);
             var memory = new Memory<T>(pooled, 0, length);
             return Vector<T>.FromPooledMemory(memory, pooled);
