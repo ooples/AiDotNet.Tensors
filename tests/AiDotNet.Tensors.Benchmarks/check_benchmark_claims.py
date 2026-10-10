@@ -36,6 +36,8 @@ README_NAMES = {'TorchSharp': ['TorchSharp'], 'ML.NET': ['ML.NET'], 'TensorFlow.
                 'NumSharp': ['NumSharp'], 'MathNet.Numerics': ['MathNet.Numerics', 'MathNet']}
 MULTIPLIER = re.compile(r'(?<![\w.×])(\d+(?:[.,]\d+)?)\s?[x×](?![\w\d])')
 SUPERLATIVE = re.compile(r'\b(fastest|beats?|outperform\w*|faster than|slower than|matches torchsharp)\b', re.I)
+# "50% faster", "30 percent quicker": a relative speed claim without an "x".
+PERCENT = re.compile(r'\b\d+(?:[.,]\d+)?\s?(?:%|percent)\s+(?:faster|slower|quicker|less (?:time|latency)|more throughput|speed\w*)', re.I)
 HISTORICAL = ['BENCHMARK_BASELINE.md', 'tests/AiDotNet.Tensors.Benchmarks/BENCHMARK_RESULTS.md']
 
 errors = []
@@ -126,14 +128,19 @@ def check_readme_prose(readme, speedups, valid_pairs, valid_all):
             if float(v) == 1: continue   # "above 1x means faster" is a definition, not a claim
             if f'{float(v):.2f}' not in speedups:
                 fail(f'README:{i} says "{m.group(0)}", which is no speedup in the published reports: {raw.strip()[:160]}')
-        if SUPERLATIVE.search(line):
-            backed = any((int(a), int(b)) in valid_pairs for a, b in re.findall(r'\b(\d+) of (\d+)\b', line)) \
-                or any(int(n) in valid_all for n in re.findall(r'\ball (\d+)\b', line))
+        if PERCENT.search(line):
+            fail(f'README:{i} makes a percentage speed claim the reports do not state: {raw.strip()[:160]}')
+        # A comparative word is backed only by a verified count in the same sentence, so one counted result
+        # cannot carry an unrelated claim elsewhere on the line.
+        for sentence in re.split(r'(?<=[.;!?])\s+', line):
+            if not SUPERLATIVE.search(sentence): continue
+            backed = any((int(a), int(b)) in valid_pairs for a, b in re.findall(r'\b(\d+) of (\d+)\b', sentence)) \
+                or any(int(n) in valid_all for n in re.findall(r'\ball (\d+)\b', sentence))
             if not backed:
-                fail(f'README:{i} makes a comparative claim with no counted result beside it: {raw.strip()[:160]}')
+                fail(f'README:{i} makes a comparative claim with no counted result beside it: {sentence.strip()[:160]}')
 
 def check_unbacked_text(label, text):
-    if MULTIPLIER.search(text) or SUPERLATIVE.search(text):
+    if MULTIPLIER.search(text) or SUPERLATIVE.search(text) or PERCENT.search(text):
         fail(f'{label} makes a speed claim no report backs ({text.strip()[:200]!r}). '
              'Point readers to the README benchmarks instead of quoting numbers.')
 
