@@ -33,7 +33,7 @@ public partial class CpuEngine
         for (int d = 0; d < indices.Length; d++) if (indices[d] is not null) advanced.Add(d);
         if (advanced.Count == 0) return tensor;   // all full slices: the tensor itself, as torch returns a view
         int[] b = Array.Empty<int>();
-        foreach (int d in advanced) b = BroadcastShapes(b, indices[d]!._shape);
+        foreach (int d in advanced) b = BroadcastIndexShapes(b, indices[d]!._shape);
         bool adjacent = advanced[advanced.Count - 1] - advanced[0] == advanced.Count - 1;
 
         // Output layout: (dims before the block) B (dims after), or B (all sliced dims) when separated.
@@ -144,7 +144,7 @@ public partial class CpuEngine
         return TensorIndex(tensor, idx);
     }
 
-    private static int[] BroadcastShapes(int[] a, int[] b)
+    private static int[] BroadcastIndexShapes(int[] a, int[] b)
     {
         int n = Math.Max(a.Length, b.Length);
         var r = new int[n];
