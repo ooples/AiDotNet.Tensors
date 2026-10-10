@@ -3535,16 +3535,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (TryBroadcastTrailingRepeat(a, b, out int bTileSize))
         {
             var res = AutoTensorCache.RentOrAllocate<T>(a._shape);
-            var numOps = MathHelper.GetNumericOperations<T>();
-            var aSpan = a.AsSpan();
-            var bSpan = b.AsSpan();
-            var rSpan = res.AsWritableSpan();
-            int numTiles = a.Length / bTileSize;
-            for (int t = 0; t < numTiles; t++)
-            {
-                int off = t * bTileSize;
-                numOps.Add(aSpan.Slice(off, bTileSize), bSpan, rSpan.Slice(off, bTileSize));
-            }
+            TrailingRepeatBinary(a, b, res, bTileSize, multiply: false);
             DifferentiableOps.RecordBinary("TensorBroadcastAdd", res, aOrig, bOrig, BackwardFunctions<T>.BroadcastAddBackward);
             // #319: gate closure allocation on AutoTracer.ShouldRecord.
             // The replay-delegate closure costs ~30 ns/op and was being
@@ -3568,6 +3559,50 @@ public partial class CpuEngine : ITensorLevelEngine
             AutoTracer.RecordOp("TensorBroadcastAdd", result, eng => eng.TensorAdd(ca, cb));
         }
         return result;
+    }
+
+    /// <summary>
+    /// <c>r = a op b</c> where <paramref name="b"/> repeats along the leading axes of <paramref name="a"/> in tiles of
+    /// <paramref name="tile"/> elements (the [N, M] op [M] bias pattern). Above the elementwise grain the tiles are
+    /// split across threads (#653: the former single loop ran every row-bias add and scale on one core at every size --
+    /// 4.9 ms for an 8M-element float tensor at DOP 1 through 64); below it, or when a backing is not directly
+    /// addressable, it is one serial pass. Each tile is the same vectorized INumericOperations span call either way.
+    /// </summary>
+    private static void TrailingRepeatBinary<T>(Tensor<T> a, Tensor<T> b, Tensor<T> r, int tile, bool multiply)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        int length = a.Length;
+        int numTiles = length / tile;
+        int chunks = Math.Min(CpuParallelSettings.ElementwiseChunkCount(length), numTiles);
+        if (chunks >= 2
+            && a.GetCpuBackingForStridedRead(out int aOff) is { } aArr
+            && b.GetCpuBackingForStridedRead(out int bOff) is { } bArr
+            && r.GetCpuBackingForContiguousWrite(out int rOff) is { } rArr)
+        {
+            int tilesPerChunk = (numTiles + chunks - 1) / chunks;
+            CpuParallelSettings.ParallelForOrSerial(0, chunks, length, c =>
+            {
+                int t0 = c * tilesPerChunk, t1 = Math.Min(numTiles, t0 + tilesPerChunk);
+                var bSpanC = new ReadOnlySpan<T>(bArr, bOff, tile);
+                for (int t = t0; t < t1; t++)
+                {
+                    var aT = new ReadOnlySpan<T>(aArr, aOff + t * tile, tile);
+                    var rT = new Span<T>(rArr, rOff + t * tile, tile);
+                    if (multiply) numOps.Multiply(aT, bSpanC, rT); else numOps.Add(aT, bSpanC, rT);
+                }
+            }, deterministicSafe: true);
+            return;
+        }
+
+        var aSpan = a.AsSpan();
+        var bSpan = b.AsSpan();
+        var rSpan = r.AsWritableSpan();
+        for (int t = 0; t < numTiles; t++)
+        {
+            int off = t * tile;
+            if (multiply) numOps.Multiply(aSpan.Slice(off, tile), bSpan, rSpan.Slice(off, tile));
+            else numOps.Add(aSpan.Slice(off, tile), bSpan, rSpan.Slice(off, tile));
+        }
     }
 
     /// <inheritdoc/>
@@ -3820,16 +3855,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (TryBroadcastTrailingRepeat(a, b, out int bTileSize))
         {
             var res = AutoTensorCache.RentOrAllocate<T>(a._shape);
-            var numOps = MathHelper.GetNumericOperations<T>();
-            var aSpan = a.AsSpan();
-            var bSpan = b.AsSpan();
-            var rSpan = res.AsWritableSpan();
-            int numTiles = a.Length / bTileSize;
-            for (int t = 0; t < numTiles; t++)
-            {
-                int off = t * bTileSize;
-                numOps.Multiply(aSpan.Slice(off, bTileSize), bSpan, rSpan.Slice(off, bTileSize));
-            }
+            TrailingRepeatBinary(a, b, res, bTileSize, multiply: true);
             DifferentiableOps.RecordBinary("TensorBroadcastMultiply", res, aOrig, bOrig, BackwardFunctions<T>.BroadcastMultiplyBackward);
             { var ca = a; var cb = b; AutoTracer.RecordOp("TensorBroadcastMultiply", res, eng => eng.TensorMultiply(ca, cb)); }
             return res;
@@ -5228,16 +5254,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (TryBroadcastTrailingRepeat(a, b, out int bTileSize))
         {
-            var numOps = MathHelper.GetNumericOperations<T>();
-            var aSpan = a.AsSpan();
-            var bSpan = b.AsSpan();
-            var rSpan = destination.AsWritableSpan();
-            int numTiles = a.Length / bTileSize;
-            for (int t = 0; t < numTiles; t++)
-            {
-                int off = t * bTileSize;
-                numOps.Multiply(aSpan.Slice(off, bTileSize), bSpan, rSpan.Slice(off, bTileSize));
-            }
+            TrailingRepeatBinary(a, b, destination, bTileSize, multiply: true);
             return;
         }
 
@@ -5269,16 +5286,7 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (TryBroadcastTrailingRepeat(a, b, out int bTileSize))
         {
-            var numOps = MathHelper.GetNumericOperations<T>();
-            var aSpan = a.AsSpan();
-            var bSpan = b.AsSpan();
-            var rSpan = destination.AsWritableSpan();
-            int numTiles = a.Length / bTileSize;
-            for (int t = 0; t < numTiles; t++)
-            {
-                int off = t * bTileSize;
-                numOps.Add(aSpan.Slice(off, bTileSize), bSpan, rSpan.Slice(off, bTileSize));
-            }
+            TrailingRepeatBinary(a, b, destination, bTileSize, multiply: false);
             return;
         }
 
@@ -8143,6 +8151,62 @@ public partial class CpuEngine : ITensorLevelEngine
         return numOps.Sum(tensor.AsSpan());
     }
 
+    // #653: the 2-D ReduceSum fast paths ran one serial scalar loop at every size (an [8192, 1024] float row-sum took
+    // 6.6 ms at DOP 1 through 64). Rows / column blocks are now split across threads WITHOUT changing any element's
+    // summation order -- every output is accumulated by one thread in the same sequence as before -- so the result is
+    // bit-identical to the serial loop at any thread count.
+    private const int ReduceColumnBlock = 64;
+
+    private static void ReduceSum2DRows(float[] src, float[] dst, int rows, int cols)
+    {
+        CpuParallelSettings.ParallelForOrSerial(0, rows, (long)rows * cols, r =>
+        {
+            float sum = 0; int offset = r * cols;
+            for (int c = 0; c < cols; c++) sum += src[offset + c];
+            dst[r] = sum;
+        }, deterministicSafe: true);
+    }
+
+    private static void ReduceSum2DRows(double[] src, double[] dst, int rows, int cols)
+    {
+        CpuParallelSettings.ParallelForOrSerial(0, rows, (long)rows * cols, r =>
+        {
+            double sum = 0; int offset = r * cols;
+            for (int c = 0; c < cols; c++) sum += src[offset + c];
+            dst[r] = sum;
+        }, deterministicSafe: true);
+    }
+
+    private static void ReduceSum2DColumns(float[] src, float[] dst, int rows, int cols)
+    {
+        int blocks = (cols + ReduceColumnBlock - 1) / ReduceColumnBlock;
+        CpuParallelSettings.ParallelForOrSerial(0, blocks, (long)rows * cols, blk =>
+        {
+            int c0 = blk * ReduceColumnBlock, c1 = Math.Min(cols, c0 + ReduceColumnBlock);
+            Array.Clear(dst, c0, c1 - c0);
+            for (int r = 0; r < rows; r++)
+            {
+                int offset = r * cols;
+                for (int c = c0; c < c1; c++) dst[c] += src[offset + c];
+            }
+        }, deterministicSafe: true);
+    }
+
+    private static void ReduceSum2DColumns(double[] src, double[] dst, int rows, int cols)
+    {
+        int blocks = (cols + ReduceColumnBlock - 1) / ReduceColumnBlock;
+        CpuParallelSettings.ParallelForOrSerial(0, blocks, (long)rows * cols, blk =>
+        {
+            int c0 = blk * ReduceColumnBlock, c1 = Math.Min(cols, c0 + ReduceColumnBlock);
+            Array.Clear(dst, c0, c1 - c0);
+            for (int r = 0; r < rows; r++)
+            {
+                int offset = r * cols;
+                for (int c = c0; c < c1; c++) dst[c] += src[offset + c];
+            }
+        }, deterministicSafe: true);
+    }
+
     /// <inheritdoc/>
     public virtual Tensor<T> ReduceSum<T>(Tensor<T> tensor, int[]? axes = null, bool keepDims = false)
     {
@@ -8273,13 +8337,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var outShape = keepDims ? new[] { 1, cols } : new[] { cols };
                 var fastResult = AutoTensorCache.RentOrAllocate<T>(outShape);
                 var rArr = (float[])(object)fastResult.GetDataArray();
-                Array.Clear(rArr, 0, cols);
-                for (int r = 0; r < rows; r++)
-                {
-                    int offset = r * cols;
-                    for (int c = 0; c < cols; c++)
-                        rArr[c] += srcArr[offset + c];
-                }
+                ReduceSum2DColumns(srcArr, rArr, rows, cols);
                 DifferentiableOps.RecordUnary("ReduceSum", fastResult, tensorOrig, BackwardFunctions<T>.ReduceSumBackward,
                     new object[] { normalizedAxes.ToArray(), keepDims });
                 return fastResult;
@@ -8290,14 +8348,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var outShape = keepDims ? new[] { rows, 1 } : new[] { rows };
                 var fastResult = AutoTensorCache.RentOrAllocate<T>(outShape);
                 var rArr = (float[])(object)fastResult.GetDataArray();
-                for (int r = 0; r < rows; r++)
-                {
-                    float sum = 0;
-                    int offset = r * cols;
-                    for (int c = 0; c < cols; c++)
-                        sum += srcArr[offset + c];
-                    rArr[r] = sum;
-                }
+                ReduceSum2DRows(srcArr, rArr, rows, cols);
                 DifferentiableOps.RecordUnary("ReduceSum", fastResult, tensorOrig, BackwardFunctions<T>.ReduceSumBackward,
                     new object[] { normalizedAxes.ToArray(), keepDims });
                 return fastResult;
@@ -8318,13 +8369,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var outShape = keepDims ? new[] { 1, cols } : new[] { cols };
                 var fastResult = AutoTensorCache.RentOrAllocate<T>(outShape);
                 var rArr = (double[])(object)fastResult.GetDataArray();
-                Array.Clear(rArr, 0, cols);
-                for (int r = 0; r < rows; r++)
-                {
-                    int offset = r * cols;
-                    for (int c = 0; c < cols; c++)
-                        rArr[c] += srcArr[offset + c];
-                }
+                ReduceSum2DColumns(srcArr, rArr, rows, cols);
                 DifferentiableOps.RecordUnary("ReduceSum", fastResult, tensorOrig, BackwardFunctions<T>.ReduceSumBackward,
                     new object[] { normalizedAxes.ToArray(), keepDims });
                 return fastResult;
@@ -8334,14 +8379,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 var outShape = keepDims ? new[] { rows, 1 } : new[] { rows };
                 var fastResult = AutoTensorCache.RentOrAllocate<T>(outShape);
                 var rArr = (double[])(object)fastResult.GetDataArray();
-                for (int r = 0; r < rows; r++)
-                {
-                    double sum = 0;
-                    int offset = r * cols;
-                    for (int c = 0; c < cols; c++)
-                        sum += srcArr[offset + c];
-                    rArr[r] = sum;
-                }
+                ReduceSum2DRows(srcArr, rArr, rows, cols);
                 DifferentiableOps.RecordUnary("ReduceSum", fastResult, tensorOrig, BackwardFunctions<T>.ReduceSumBackward,
                     new object[] { normalizedAxes.ToArray(), keepDims });
                 return fastResult;
@@ -33464,6 +33502,64 @@ public partial class CpuEngine : ITensorLevelEngine
         return TensorAllocator.Rent<T>(inputShape, gradInput);
     }
 
+    // Inner-axis block a ReduceMean work unit covers (see TryReduceMeanSingleAxisDense).
+    private const int ReduceMeanInnerBlock = 64;
+
+    /// <summary>
+    /// Mean over ONE axis of a dense row-major float/double array: work units are (outer index, 64-wide inner block),
+    /// split across threads, so it parallelizes whether the reduced axis is the last one (many outer rows) or the first
+    /// (one outer row, many inner columns). Each output accumulates over the reduced axis in increasing order and is
+    /// then scaled by 1/axisSize -- exactly the odometer's sequence -- so the result is bit-identical to it at any
+    /// thread count (#653: the odometer ran serially; an [8192, 1024] float mean over axis 0 took 17 ms at DOP 1 through
+    /// 64). Returns false for other element types.
+    /// </summary>
+    private static bool TryReduceMeanSingleAxisDense<T>(T[] data, T[] outData, int[] shape, int axis)
+    {
+        if (typeof(T) != typeof(float) && typeof(T) != typeof(double)) return false;
+        int outer = 1, inner = 1, axisSize = shape[axis];
+        for (int d = 0; d < axis; d++) outer *= shape[d];
+        for (int d = axis + 1; d < shape.Length; d++) inner *= shape[d];
+        int blocks = (inner + ReduceMeanInnerBlock - 1) / ReduceMeanInnerBlock;
+        long units = (long)outer * blocks;
+        if (units > int.MaxValue) return false;
+        long work = (long)outer * axisSize * inner;
+        if (typeof(T) == typeof(double))
+        {
+            var src = (double[])(object)data; var dst = (double[])(object)outData;
+            double inv = 1.0 / axisSize;
+            CpuParallelSettings.ParallelForOrSerial(0, (int)units, work, u =>
+            {
+                int o = u / blocks, j0 = (u % blocks) * ReduceMeanInnerBlock, j1 = Math.Min(inner, j0 + ReduceMeanInnerBlock);
+                int ob = o * inner, ib = o * axisSize * inner;
+                for (int j = j0; j < j1; j++) dst[ob + j] = 0;
+                for (int a = 0; a < axisSize; a++)
+                {
+                    int rb = ib + a * inner;
+                    for (int j = j0; j < j1; j++) dst[ob + j] += src[rb + j];
+                }
+                for (int j = j0; j < j1; j++) dst[ob + j] *= inv;
+            }, deterministicSafe: true);
+        }
+        else
+        {
+            var src = (float[])(object)data; var dst = (float[])(object)outData;
+            float inv = 1.0f / axisSize;
+            CpuParallelSettings.ParallelForOrSerial(0, (int)units, work, u =>
+            {
+                int o = u / blocks, j0 = (u % blocks) * ReduceMeanInnerBlock, j1 = Math.Min(inner, j0 + ReduceMeanInnerBlock);
+                int ob = o * inner, ib = o * axisSize * inner;
+                for (int j = j0; j < j1; j++) dst[ob + j] = 0;
+                for (int a = 0; a < axisSize; a++)
+                {
+                    int rb = ib + a * inner;
+                    for (int j = j0; j < j1; j++) dst[ob + j] += src[rb + j];
+                }
+                for (int j = j0; j < j1; j++) dst[ob + j] *= inv;
+            }, deterministicSafe: true);
+        }
+        return true;
+    }
+
     /// <inheritdoc/>
     public virtual Tensor<T> ReduceMean<T>(Tensor<T> input, int[] axes, bool keepDims)
     {
@@ -33606,6 +33702,10 @@ public partial class CpuEngine : ITensorLevelEngine
         int outputSize = outputShape.Aggregate(1, (a, b) => a * b);
         var outputData = new T[outputSize];
 
+        // #653: dense single-axis float/double mean, parallel and bit-identical to the odometer below.
+        if (normalizedAxes.Length == 1 && TryReduceMeanSingleAxisDense(inputData, outputData, inputShape, normalizedAxes[0]))
+            goto meanRecord;
+
         // Allocation-free odometer reduction (mirrors the Tensor<T>.Sum fast
         // path). The previous implementation allocated a FlatToMultiIndex int[]
         // + a List<int> + a MultiToFlatIndex int[] PER ELEMENT plus a
@@ -33683,6 +33783,7 @@ public partial class CpuEngine : ITensorLevelEngine
             for (int i = 0; i < outputSize; i++) outputData[i] = numOps.Divide(outputData[i], divisor);
         }
 
+    meanRecord:
         var result = TensorAllocator.Rent<T>(outputShape, outputData);
         DifferentiableOps.RecordUnary("ReduceMean", result, input,
             BackwardFunctions<T>.ReduceMeanBackward,
