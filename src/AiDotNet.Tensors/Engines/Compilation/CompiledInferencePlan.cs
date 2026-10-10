@@ -985,7 +985,8 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         var data = eng.DownloadResidentBuffer(_finalOutput);
         if (data is null) return false;
         var src = (T[])(object)data;
-        var dst = _finalOutput.AsWritableSpan();
+        using var dstLease = _finalOutput.LeaseWritable();
+        var dst = dstLease.Span;
         if (src.Length < dst.Length) return false;
         src.AsSpan(0, dst.Length).CopyTo(dst);
         return true;
@@ -1382,8 +1383,10 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                         step.OpName,
                         (eng, o) =>
                         {
-                            var src = capturedInput.AsSpan();
-                            var dst = capturedOutput.AsWritableSpan();
+                            using var srcLease = capturedInput.Lease();
+                            var src = srcLease.Span;
+                            using var dstLease = capturedOutput.LeaseWritable();
+                            var dst = dstLease.Span;
                             for (int r = 0; r < rows; r++)
                                 for (int c = 0; c < cols; c++)
                                     dst[c * rows + r] = src[r * cols + c];

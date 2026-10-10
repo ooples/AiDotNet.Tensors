@@ -331,7 +331,8 @@ public sealed class CpuRnn : IDeviceRnn
             ctx.CacheRawCellOutput = layout.Proj > 0 ? new T[LD][] : null;
         }
 
-        var hNSpan = ctx.HN.AsWritableSpan();
+        using var hNSpanLease = ctx.HN.LeaseWritable();
+        var hNSpan = hNSpanLease.Span;
         Span<T> cNSpan = ctx.CN is null ? default : ctx.CN.AsWritableSpan();
 
         for (int l = 0; l < layout.NumLayers; l++)
@@ -488,7 +489,8 @@ public sealed class CpuRnn : IDeviceRnn
             if (cell == RnnCellType.Lstm) cPrev!.AsSpan().CopyTo(allC.AsSpan(0, B * H));
         }
 
-        var inSpan = layerInput.AsSpan();
+        using var inSpanLease = layerInput.Lease();
+        var inSpan = inSpanLease.Span;
 
         for (int step = 0; step < T_; step++)
         {
@@ -721,7 +723,8 @@ public sealed class CpuRnn : IDeviceRnn
         Tensor<T>? gradC0 = cell == RnnCellType.Lstm
             ? new Tensor<T>(new[] { layout.NumLayers * layout.NumDirections, layout.Batch, layout.Hidden })
             : null;
-        var gradH0Span = gradH0.AsWritableSpan();
+        using var gradH0SpanLease = gradH0.LeaseWritable();
+        var gradH0Span = gradH0SpanLease.Span;
         Span<T> gradC0Span = gradC0 is null ? default : gradC0.AsWritableSpan();
 
         var dY = new T[layout.SeqLen * layout.Batch * layout.OutputFeature];

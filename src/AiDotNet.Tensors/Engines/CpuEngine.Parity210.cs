@@ -82,9 +82,11 @@ public partial class CpuEngine
         }
 
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
-        var src = tensor.AsSpan();
+        using var srcLease = tensor.Lease();
+        var src = srcLease.Span;
         var result = AutoTensorCache.RentOrAllocate<T>(shape);
-        var dst = result.AsWritableSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
 
         // Iterate every index; destination position = (i_k + shift_k) mod d_k.
         var idx = new int[rank];
@@ -144,9 +146,11 @@ public partial class CpuEngine
 
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var shape = tensor._shape;
-        var src = tensor.AsSpan();
+        using var srcLease = tensor.Lease();
+        var src = srcLease.Span;
         var result = AutoTensorCache.RentOrAllocate<T>(shape);
-        var dst = result.AsWritableSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
 
         var idx = new int[rank];
         int total = tensor.Length;
@@ -205,9 +209,11 @@ public partial class CpuEngine
         var outShape = (int[])inShape.Clone();
         outShape[dim] = checked(inShape[dim] * repeats);
 
-        var src = tensor.AsSpan();
+        using var srcLease = tensor.Lease();
+        var src = srcLease.Span;
         var result = AutoTensorCache.RentOrAllocate<T>(outShape);
-        var dst = result.AsWritableSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
 
         // Iterate over the output's index space, map each to the source.
         var idx = new int[rank];
@@ -466,10 +472,13 @@ public partial class CpuEngine
             }
         }
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
-        var src = tensor.AsSpan();
-        var idx = indices.AsSpan();
+        using var srcLease = tensor.Lease();
+        var src = srcLease.Span;
+        using var idxLease = indices.Lease();
+        var idx = idxLease.Span;
         var result = new Tensor<T>(indices._shape);
-        var dst = result.AsWritableSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
         int total = src.Length;
         for (int i = 0; i < idx.Length; i++)
         {
@@ -519,10 +528,13 @@ public partial class CpuEngine
         }
 
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
-        var src = tensor.AsSpan();
-        var idx = indices.AsSpan();
+        using var srcLease = tensor.Lease();
+        var src = srcLease.Span;
+        using var idxLease = indices.Lease();
+        var idx = idxLease.Span;
         var result = new Tensor<T>(indices._shape);
-        var dst = result.AsWritableSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
 
         int outerSize = 1; for (int k = 0; k < dim; k++) outerSize *= tensor._shape[k];
         int innerSize = 1; for (int k = dim + 1; k < rank; k++) innerSize *= tensor._shape[k];
@@ -589,9 +601,11 @@ public partial class CpuEngine
         var ops = MathHelper.GetNumericOperations<T>();
         var matmul = TensorMatMul(a, b);
         var result = AutoTensorCache.RentOrAllocate<T>(new[] { m, n });
-        var mmSrc = matmul.AsSpan();
+        using var mmSrcLease = matmul.Lease();
+        var mmSrc = mmSrcLease.Span;
         var inSrc = (input.IsContiguous ? input : input.Contiguous()).AsSpan();
-        var dst = result.AsWritableSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
         for (int i = 0; i < dst.Length; i++)
             dst[i] = ops.Add(ops.Multiply(alpha, mmSrc[i]), ops.Multiply(beta, inSrc[i]));
         // Stash alpha/beta as double so we're robust to T being a reference
@@ -711,8 +725,10 @@ public partial class CpuEngine
         var x2Orig = x2;
         if (!x1.IsContiguous) x1 = x1.Contiguous();
         if (!x2.IsContiguous) x2 = x2.Contiguous();
-        var a = x1.AsSpan();
-        var b = x2.AsSpan();
+        using var aLease = x1.Lease();
+        var a = aLease.Span;
+        using var bLease = x2.Lease();
+        var b = bLease.Span;
 
         // Output shape drops dim.
         var outShape = new int[rank - 1];
@@ -720,7 +736,8 @@ public partial class CpuEngine
         for (int i = 0; i < rank; i++) if (i != dim) outShape[w++] = x1._shape[i];
         var result = new Tensor<T>(outShape.Length == 0 ? new[] { 1 } : outShape);
         // 0-rank result for e.g. 1-D input: treat specially — single scalar.
-        var dst = result.AsWritableSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
 
         int outerSize = 1; for (int k = 0; k < dim; k++) outerSize *= x1._shape[k];
         int innerSize = 1; for (int k = dim + 1; k < rank; k++) innerSize *= x1._shape[k];
@@ -786,10 +803,12 @@ public partial class CpuEngine
         // #257: preserve the user-facing ref before .Contiguous() discards GradFn.
         var inputOrig = input;
         if (!input.IsContiguous) input = input.Contiguous();
-        var src = input.AsSpan();
+        using var srcLease = input.Lease();
+        var src = srcLease.Span;
         int pairs = n * (n - 1) / 2;
         var result = new Tensor<T>(new[] { pairs });
-        var dst = result.AsWritableSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
         int cursor = 0;
         for (int i = 0; i < n; i++)
             for (int j = i + 1; j < n; j++)
@@ -826,12 +845,15 @@ public partial class CpuEngine
         var x2Orig = x2;
         if (!x1.IsContiguous) x1 = x1.Contiguous();
         if (!x2.IsContiguous) x2 = x2.Contiguous();
-        var a = x1.AsSpan();
-        var b = x2.AsSpan();
+        using var aLease = x1.Lease();
+        var a = aLease.Span;
+        using var bLease = x2.Lease();
+        var b = bLease.Span;
         int m = x1._shape[0], n = x2._shape[0], d = x1._shape[1];
 
         var result = new Tensor<T>(new[] { m, n });
-        var dst = result.AsWritableSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
         for (int i = 0; i < m; i++)
             for (int j = 0; j < n; j++)
                 dst[i * n + j] = PNormCross(ops, a, i * d, b, j * d, d, p);
@@ -964,9 +986,12 @@ public partial class CpuEngine
         if (!b.IsContiguous) b = b.Contiguous();
 
         var result = AutoTensorCache.RentOrAllocate<T>(outShape);
-        var dst = result.AsWritableSpan();
-        var aSrc = a.AsSpan();
-        var bSrc = b.AsSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
+        using var aSrcLease = a.Lease();
+        var aSrc = aSrcLease.Span;
+        using var bSrcLease = b.Lease();
+        var bSrc = bSrcLease.Span;
 
         // Row-major strides for a (reshaped), b (reshaped), and output.
         var aStrides = new int[rank];
@@ -1077,7 +1102,8 @@ public partial class CpuEngine
         int total = (int)totalLong;
 
         var result = AutoTensorCache.RentOrAllocate<T>(new[] { total, d });
-        var dst = result.AsWritableSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
 
         var sizes = new int[d];
         for (int k = 0; k < d; k++) sizes[k] = tensors[k]._shape[0];
@@ -1206,7 +1232,8 @@ public partial class CpuEngine
         if (tensor.Rank != 2) throw new ArgumentException("Trace requires a 2-D tensor");
         var ops = MathHelper.GetNumericOperations<T>();
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
-        var src = tensor.AsSpan();
+        using var srcLease = tensor.Lease();
+        var src = srcLease.Span;
         int rows = tensor._shape[0];
         int cols = tensor._shape[1];
         int n = System.Math.Min(rows, cols);
@@ -1254,12 +1281,14 @@ public partial class CpuEngine
         outShape[rank] = matSize;
 
         var result = AutoTensorCache.RentOrAllocate<T>(outShape);
-        var dst = result.AsWritableSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
         var ops = MathHelper.GetNumericOperations<T>();
         var zero = ops.Zero;
         for (int i = 0; i < dst.Length; i++) dst[i] = zero;
 
-        var src = tensor.AsSpan();
+        using var srcLease = tensor.Lease();
+        var src = srcLease.Span;
         int batchSize = 1; for (int k = 0; k < rank - 1; k++) batchSize *= tensor._shape[k];
         for (int b = 0; b < batchSize; b++)
             for (int i = 0; i < diagLen; i++)
@@ -1306,9 +1335,12 @@ public partial class CpuEngine
         if (!b.IsContiguous) b = b.Contiguous();
 
         var result = AutoTensorCache.RentOrAllocate<T>(a._shape);
-        var av = a.AsSpan();
-        var bv = b.AsSpan();
-        var dst = result.AsWritableSpan();
+        using var avLease = a.Lease();
+        var av = avLease.Span;
+        using var bvLease = b.Lease();
+        var bv = bvLease.Span;
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
 
         int outerSize = 1; for (int k = 0; k < dim; k++) outerSize *= a._shape[k];
         int innerSize = 1; for (int k = dim + 1; k < rank; k++) innerSize *= a._shape[k];
@@ -1342,8 +1374,10 @@ public partial class CpuEngine
         var ops = MathHelper.GetNumericOperations<T>();
         if (!a.IsContiguous) a = a.Contiguous();
         if (!b.IsContiguous) b = b.Contiguous();
-        var av = a.AsSpan();
-        var bv = b.AsSpan();
+        using var avLease = a.Lease();
+        var av = avLease.Span;
+        using var bvLease = b.Lease();
+        var bv = bvLease.Span;
         T acc = ops.Zero;
         for (int i = 0; i < av.Length; i++)
             acc = ops.Add(acc, ops.Multiply(av[i], bv[i]));
@@ -1480,10 +1514,12 @@ public partial class CpuEngine
 
         var ops = MathHelper.GetNumericOperations<T>();
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
-        var src = tensor.AsSpan();
+        using var srcLease = tensor.Lease();
+        var src = srcLease.Span;
         var shape = tensor._shape;
         var result = AutoTensorCache.RentOrAllocate<T>(shape);
-        var dst = result.AsWritableSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
 
         var strides = ComputeRowMajorStrides(shape);
         int axisLen = shape[axis];
@@ -1547,8 +1583,10 @@ public partial class CpuEngine
         var ops = MathHelper.GetNumericOperations<T>();
         if (!a.IsContiguous) a = a.Contiguous();
         if (!b.IsContiguous) b = b.Contiguous();
-        var av = a.AsSpan();
-        var bv = b.AsSpan();
+        using var avLease = a.Lease();
+        var av = avLease.Span;
+        using var bvLease = b.Lease();
+        var bv = bvLease.Span;
         var result = new Bit[a.Length];
         for (int i = 0; i < a.Length; i++)
         {
@@ -1571,7 +1609,8 @@ public partial class CpuEngine
     public virtual bool TensorAllClose<T>(Tensor<T> a, Tensor<T> b, T rtol, T atol, bool equalNan = false)
     {
         var mask = TensorIsClose(a, b, rtol, atol, equalNan);
-        var span = mask.AsSpan();
+        using var spanLease = mask.Lease();
+        var span = spanLease.Span;
         for (int i = 0; i < span.Length; i++)
             if (!(bool)span[i]) return false;
         return true;
@@ -1595,9 +1634,11 @@ public partial class CpuEngine
         }
         var ops = MathHelper.GetNumericOperations<T>();
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
-        var src = tensor.AsSpan();
+        using var srcLease = tensor.Lease();
+        var src = srcLease.Span;
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
-        var dst = result.AsWritableSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
 
         double defaultNan = nan ?? 0.0;
         // PyTorch defaults posinf / neginf to the max/min finite of the dtype
@@ -1626,7 +1667,8 @@ public partial class CpuEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         var ops = MathHelper.GetNumericOperations<T>();
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
-        var src = tensor.AsSpan();
+        using var srcLease = tensor.Lease();
+        var src = srcLease.Span;
         var result = new Bit[src.Length];
         for (int i = 0; i < src.Length; i++)
         {
@@ -1648,7 +1690,8 @@ public partial class CpuEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         var ops = MathHelper.GetNumericOperations<T>();
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
-        var src = tensor.AsSpan();
+        using var srcLease = tensor.Lease();
+        var src = srcLease.Span;
         var result = new Bit[src.Length];
         for (int i = 0; i < src.Length; i++)
             result[i] = ops.IsNaN(src[i]) ? Bit.True : Bit.False;
@@ -1661,7 +1704,8 @@ public partial class CpuEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
-        var src = tensor.AsSpan();
+        using var srcLease = tensor.Lease();
+        var src = srcLease.Span;
         var result = new Bit[src.Length];
         for (int i = 0; i < src.Length; i++)
         {
@@ -1727,7 +1771,8 @@ public partial class CpuEngine
         int batchSize = 1; for (int k = 0; k < rank - 2; k++) batchSize *= tensor._shape[k];
 
         var result = (Tensor<T>)tensor.Clone();
-        var dst = result.AsWritableSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
         var zero = ops.Zero;
 
         for (int b = 0; b < batchSize; b++)
@@ -1755,7 +1800,8 @@ public partial class CpuEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         var ops = MathHelper.GetNumericOperations<T>();
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
-        var src = tensor.AsSpan();
+        using var srcLease = tensor.Lease();
+        var src = srcLease.Span;
         int rank = tensor.Rank;
         var strides = ComputeRowMajorStrides(tensor._shape);
 
@@ -1765,7 +1811,8 @@ public partial class CpuEngine
 
         // Second pass: coordinates.
         var result = new Tensor<int>(new[] { n, rank });
-        var dst = result.AsWritableSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
         int row = 0;
         for (int i = 0; i < src.Length; i++)
         {
@@ -1789,7 +1836,8 @@ public partial class CpuEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         var ops = MathHelper.GetNumericOperations<T>();
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
-        var src = tensor.AsSpan();
+        using var srcLease = tensor.Lease();
+        var src = srcLease.Span;
         int n = 0;
         for (int i = 0; i < src.Length; i++) if (!ops.Equals(src[i], ops.Zero)) n++;
         return n;
@@ -1813,7 +1861,8 @@ public partial class CpuEngine
     {
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (!a.IsContiguous) a = a.Contiguous();
-        var src = a.AsSpan();
+        using var srcLease = a.Lease();
+        var src = srcLease.Span;
         var dst = new Bit[src.Length];
         for (int i = 0; i < src.Length; i++) dst[i] = (bool)src[i] ? Bit.False : Bit.True;
         return new Tensor<Bit>(dst, a._shape);
@@ -1829,8 +1878,10 @@ public partial class CpuEngine
             throw new ArgumentException("logical op: shape mismatch");
         if (!a.IsContiguous) a = a.Contiguous();
         if (!b.IsContiguous) b = b.Contiguous();
-        var av = a.AsSpan();
-        var bv = b.AsSpan();
+        using var avLease = a.Lease();
+        var av = avLease.Span;
+        using var bvLease = b.Lease();
+        var bv = bvLease.Span;
         var dst = new Bit[av.Length];
         for (int i = 0; i < av.Length; i++) dst[i] = f(av[i], bv[i]) ? Bit.True : Bit.False;
         return new Tensor<Bit>(dst, a._shape);
@@ -1845,7 +1896,8 @@ public partial class CpuEngine
 
         var set = new System.Collections.Generic.HashSet<T>(testElements.AsSpan().ToArray());
         if (!elements.IsContiguous) elements = elements.Contiguous();
-        var src = elements.AsSpan();
+        using var srcLease = elements.Lease();
+        var src = srcLease.Span;
         var result = new Bit[elements.Length];
         for (int i = 0; i < src.Length; i++)
         {
@@ -1879,9 +1931,11 @@ public partial class CpuEngine
         }
         var ops = MathHelper.GetNumericOperations<T>();
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
-        var src = tensor.AsSpan();
+        using var srcLease = tensor.Lease();
+        var src = srcLease.Span;
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
-        var dst = result.AsWritableSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
         for (int i = 0; i < src.Length; i++)
             dst[i] = ops.LessThan(src[i], min) ? min : src[i];
 
@@ -1916,9 +1970,11 @@ public partial class CpuEngine
         }
         var ops = MathHelper.GetNumericOperations<T>();
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
-        var src = tensor.AsSpan();
+        using var srcLease = tensor.Lease();
+        var src = srcLease.Span;
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
-        var dst = result.AsWritableSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
         for (int i = 0; i < src.Length; i++)
             dst[i] = ops.GreaterThan(src[i], max) ? max : src[i];
 
@@ -1961,9 +2017,11 @@ public partial class CpuEngine
         int[]? minStrides = ValidateAndComputeClampBroadcastStrides(tensor._shape, min?._shape);
         int[]? maxStrides = ValidateAndComputeClampBroadcastStrides(tensor._shape, max?._shape);
 
-        var src = tensor.AsSpan();
+        using var srcLease = tensor.Lease();
+        var src = srcLease.Span;
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
-        var dst = result.AsWritableSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
         var minSpan = min is null ? default : (min.IsContiguous ? min : min.Contiguous()).AsSpan();
         var maxSpan = max is null ? default : (max.IsContiguous ? max : max.Contiguous()).AsSpan();
 
@@ -2056,8 +2114,10 @@ public partial class CpuEngine
         if (!source.IsContiguous) source = source.Contiguous();
 
         var result = (Tensor<T>)tensor.Clone();
-        var dst = result.AsWritableSpan();
-        var src = source.AsSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
+        using var srcLease = source.Lease();
+        var src = srcLease.Span;
 
         int outerSize = 1; for (int k = 0; k < dim; k++) outerSize *= tensor._shape[k];
         int innerSize = 1; for (int k = dim + 1; k < rank; k++) innerSize *= tensor._shape[k];
@@ -2086,7 +2146,8 @@ public partial class CpuEngine
         if (tensor.Length == 0) throw new ArgumentException("Aminmax requires a non-empty tensor");
         var ops = MathHelper.GetNumericOperations<T>();
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
-        var src = tensor.AsSpan();
+        using var srcLease = tensor.Lease();
+        var src = srcLease.Span;
         T min = src[0], max = src[0];
         for (int i = 1; i < src.Length; i++)
         {
@@ -2139,9 +2200,12 @@ public partial class CpuEngine
         if (!source.IsContiguous) source = source.Contiguous();
 
         var result = (Tensor<T>)tensor.Clone();
-        var dst = result.AsWritableSpan();
-        var srcData = source.AsSpan();
-        var idxData = indices.AsSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
+        using var srcDataLease = source.Lease();
+        var srcData = srcDataLease.Span;
+        using var idxDataLease = indices.Lease();
+        var idxData = idxDataLease.Span;
 
         int outerSize = 1; for (int k = 0; k < axis; k++) outerSize *= tensor._shape[k];
         int innerSize = 1; for (int k = axis + 1; k < rank; k++) innerSize *= tensor._shape[k];
@@ -2211,8 +2275,10 @@ public partial class CpuEngine
         if (!source.IsContiguous) source = source.Contiguous();
 
         var result = (Tensor<T>)tensor.Clone();
-        var dst = result.AsWritableSpan();
-        var srcData = source.AsSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
+        using var srcDataLease = source.Lease();
+        var srcData = srcDataLease.Span;
 
         // Contiguous row-major strides over tensor.Shape.
         var strides = ComputeRowMajorStrides(tensor._shape);
@@ -2282,9 +2348,12 @@ public partial class CpuEngine
         if (!source.IsContiguous) source = source.Contiguous();
 
         var result = (Tensor<T>)tensor.Clone();
-        var dst = result.AsWritableSpan();
-        var srcData = source.AsSpan();
-        var idxData = indices.AsSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
+        using var srcDataLease = source.Lease();
+        var srcData = srcDataLease.Span;
+        using var idxDataLease = indices.Lease();
+        var idxData = idxDataLease.Span;
 
         int outerSize = 1; for (int k = 0; k < axis; k++) outerSize *= tensor._shape[k];
         int innerSize = 1; for (int k = axis + 1; k < rank; k++) innerSize *= tensor._shape[k];
@@ -2371,7 +2440,8 @@ public partial class CpuEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.DataDependentOutputShape);
         if (!input.IsContiguous) input = input.Contiguous();
-        var src = input.AsSpan();
+        using var srcLease = input.Lease();
+        var src = srcLease.Span;
         if (src.Length == 0) return new Tensor<T>(new T[0], new[] { 0 });
 
         var ops = MathHelper.GetNumericOperations<T>();
@@ -2407,7 +2477,8 @@ public partial class CpuEngine
         }
 
         var result = AutoTensorCache.RentOrAllocate<T>(new[] { totalRows, totalCols });
-        var dst = result.AsWritableSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
         var zero = ops.Zero;
         for (int i = 0; i < dst.Length; i++) dst[i] = zero;
 
@@ -2415,7 +2486,8 @@ public partial class CpuEngine
         foreach (var m in matrices)
         {
             var contig = m.IsContiguous ? m : m.Contiguous();
-            var src = contig.AsSpan();
+            using var srcLease = contig.Lease();
+            var src = srcLease.Span;
             int r = m._shape[0], c = m._shape[1];
             for (int i = 0; i < r; i++)
                 for (int j = 0; j < c; j++)
@@ -2466,8 +2538,10 @@ public partial class CpuEngine
         if (!source.IsContiguous) source = source.Contiguous();
 
         var result = (Tensor<T>)tensor.Clone();
-        var dst = result.AsWritableSpan();
-        var src = source.AsSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
+        using var srcLease = source.Lease();
+        var src = srcLease.Span;
 
         int outerSize = 1; for (int k = 0; k < dim; k++) outerSize *= tensor._shape[k];
         int innerSize = 1; for (int k = dim + 1; k < rank; k++) innerSize *= tensor._shape[k];
@@ -2506,8 +2580,10 @@ public partial class CpuEngine
 
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var result = (Tensor<T>)tensor.Clone();
-        var dst = result.AsWritableSpan();
-        var idxData = indices.AsSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
+        using var idxDataLease = indices.Lease();
+        var idxData = idxDataLease.Span;
 
         int outerSize = 1; for (int k = 0; k < axis; k++) outerSize *= tensor._shape[k];
         int innerSize = 1; for (int k = axis + 1; k < rank; k++) innerSize *= tensor._shape[k];
@@ -2567,9 +2643,12 @@ public partial class CpuEngine
         if (!source.IsContiguous) source = source.Contiguous();
 
         var result = (Tensor<T>)tensor.Clone();
-        var dst = result.AsWritableSpan();
-        var srcData = source.AsSpan();
-        var idxData = indices.AsSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
+        using var srcDataLease = source.Lease();
+        var srcData = srcDataLease.Span;
+        using var idxDataLease = indices.Lease();
+        var idxData = idxDataLease.Span;
 
         // For mean mode, track per-target counts including (optionally) self.
         int[]? counts = mode == ScatterReduceMode.Mean ? new int[result.Length] : null;
@@ -2701,9 +2780,12 @@ public partial class CpuEngine
         if (!source.IsContiguous) source = source.Contiguous();
 
         var result = (Tensor<T>)tensor.Clone();
-        var dst = result.AsWritableSpan();
-        var maskData = mask.AsSpan();
-        var srcData = source.AsSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
+        using var maskDataLease = mask.Lease();
+        var maskData = maskDataLease.Span;
+        using var srcDataLease = source.Lease();
+        var srcData = srcDataLease.Span;
 
         int sourceCursor = 0;
         for (int i = 0; i < maskData.Length; i++)
@@ -2741,9 +2823,12 @@ public partial class CpuEngine
         var indicesOut = new Tensor<int>(input._shape);
 
         if (!input.IsContiguous) input = input.Contiguous();
-        var src = input.AsSpan();
-        var valDst = valuesOut.AsWritableSpan();
-        var idxDst = indicesOut.AsWritableSpan();
+        using var srcLease = input.Lease();
+        var src = srcLease.Span;
+        using var valDstLease = valuesOut.LeaseWritable();
+        var valDst = valDstLease.Span;
+        using var idxDstLease = indicesOut.LeaseWritable();
+        var idxDst = idxDstLease.Span;
 
         int axisSize = input._shape[axis];
         int outerSize = 1; for (int k = 0; k < axis; k++) outerSize *= input._shape[k];
@@ -2754,9 +2839,12 @@ public partial class CpuEngine
         // boxing into a (T,int) struct array.
         if (typeof(T) == typeof(float) && innerSize == 1 && !descending)
         {
-            float[] srcFloatArr = (float[])(object)input.GetDataArray();
-            float[] valFloatArr = (float[])(object)valuesOut.GetDataArray();
-            int[] idxArr = indicesOut.GetDataArray();
+            using var srcFloatArrLease = input.LeaseArray();
+            float[] srcFloatArr = (float[])(object)srcFloatArrLease.Array;
+            using var valFloatArrLease = valuesOut.LeaseArray();
+            float[] valFloatArr = (float[])(object)valFloatArrLease.Array;
+            using var idxArrLease = indicesOut.LeaseArray();
+            int[] idxArr = idxArrLease.Array;
             for (int outer = 0; outer < outerSize; outer++)
             {
                 int baseIdx = outer * axisSize;
@@ -2809,7 +2897,8 @@ public partial class CpuEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.DataDependentOutputShape);
         if (!input.IsContiguous) input = input.Contiguous();
-        var src = input.AsSpan();
+        using var srcLease = input.Lease();
+        var src = srcLease.Span;
         var ops = MathHelper.GetNumericOperations<T>();
 
         // Collect distinct values preserving first-seen order, track bucket index per element.
@@ -2888,7 +2977,8 @@ public partial class CpuEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.DataDependentOutputShape);
         if (!input.IsContiguous) input = input.Contiguous();
-        var src = input.AsSpan();
+        using var srcLease = input.Lease();
+        var src = srcLease.Span;
         var ops = MathHelper.GetNumericOperations<T>();
 
         var values = new System.Collections.Generic.List<T>();
@@ -2934,7 +3024,8 @@ public partial class CpuEngine
 
         var ops = MathHelper.GetNumericOperations<T>();
         if (!input.IsContiguous) input = input.Contiguous();
-        var src = input.AsSpan();
+        using var srcLease = input.Lease();
+        var src = srcLease.Span;
 
         // If min == max, auto-detect from input (matches torch.histc).
         T loBound = min, hiBound = max;
@@ -2960,7 +3051,8 @@ public partial class CpuEngine
             if (ops.Equals(loBound, hiBound))
             {
                 var r = new Tensor<T>(new[] { bins });
-                var d = r.AsWritableSpan();
+                using var dLease = r.LeaseWritable();
+                var d = dLease.Span;
                 d[0] = ops.FromDouble(src.Length);
                 for (int b = 1; b < bins; b++) d[b] = ops.Zero;
                 return r;
@@ -2972,7 +3064,8 @@ public partial class CpuEngine
         }
 
         var result = new Tensor<T>(new[] { bins });
-        var dst = result.AsWritableSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
         var width = ops.Divide(ops.Subtract(hiBound, loBound), ops.FromDouble(bins));
         for (int i = 0; i < src.Length; i++)
         {
@@ -3002,8 +3095,10 @@ public partial class CpuEngine
         if (!a.IsContiguous) a = a.Contiguous();
         if (!b.IsContiguous) b = b.Contiguous();
         var ops = MathHelper.GetNumericOperations<T>();
-        var av = a.AsSpan();
-        var bv = b.AsSpan();
+        using var avLease = a.Lease();
+        var av = avLease.Span;
+        using var bvLease = b.Lease();
+        var bv = bvLease.Span;
         for (int i = 0; i < av.Length; i++)
         {
             // NaN != NaN per PyTorch semantics; Equals returns false for NaN.
@@ -3022,10 +3117,13 @@ public partial class CpuEngine
         if (!a.IsContiguous) a = a.Contiguous();
         if (!b.IsContiguous) b = b.Contiguous();
         var ops = MathHelper.GetNumericOperations<T>();
-        var av = a.AsSpan();
-        var bv = b.AsSpan();
+        using var avLease = a.Lease();
+        var av = avLease.Span;
+        using var bvLease = b.Lease();
+        var bv = bvLease.Span;
         var result = new Tensor<Bit>(a._shape);
-        var dst = result.AsWritableSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
         for (int i = 0; i < av.Length; i++)
             dst[i] = ops.Equals(av[i], bv[i]) ? Bit.True : Bit.False;
         return result;
@@ -3037,9 +3135,11 @@ public partial class CpuEngine
         if (a == null) throw new ArgumentNullException(nameof(a));
         if (!a.IsContiguous) a = a.Contiguous();
         var ops = MathHelper.GetNumericOperations<T>();
-        var av = a.AsSpan();
+        using var avLease = a.Lease();
+        var av = avLease.Span;
         var result = new Tensor<Bit>(a._shape);
-        var dst = result.AsWritableSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
         for (int i = 0; i < av.Length; i++)
             dst[i] = ops.Equals(av[i], scalar) ? Bit.True : Bit.False;
         return result;
@@ -3120,9 +3220,11 @@ public partial class CpuEngine
         if (len == 0) return new Tensor<T>(outShape);
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
 
-        var src = tensor.AsSpan();
+        using var srcLease = tensor.Lease();
+        var src = srcLease.Span;
         var result = new Tensor<T>(outShape);
-        var dst = result.AsWritableSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
         int outer = 1; for (int k = 0; k < dim; k++) outer *= tensor._shape[k];
         int inner = 1; for (int k = dim + 1; k < rank; k++) inner *= tensor._shape[k];
         int srcStride = tensor._shape[dim] * inner;
@@ -3163,9 +3265,11 @@ public partial class CpuEngine
         outShape[rank] = size;
 
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
-        var src = tensor.AsSpan();
+        using var srcLease = tensor.Lease();
+        var src = srcLease.Span;
         var result = AutoTensorCache.RentOrAllocate<T>(outShape);
-        var dst = result.AsWritableSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
 
         int outerSize = 1;
         for (int k = 0; k < dim; k++) outerSize *= tensor._shape[k];
@@ -3306,7 +3410,8 @@ public partial class CpuEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         if (!input.IsContiguous) input = input.Contiguous();
-        var src = input.AsSpan();
+        using var srcLease = input.Lease();
+        var src = srcLease.Span;
         var pairs = new (T value, int index)[src.Length];
         for (int i = 0; i < src.Length; i++) pairs[i] = (src[i], i);
         Array.Sort(pairs, (x, y) => numOps.Compare(x.value, y.value));
@@ -3330,7 +3435,8 @@ public partial class CpuEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.DataDependentOutputShape);
         if (!input.IsContiguous) input = input.Contiguous();
-        var src = input.AsSpan();
+        using var srcLease = input.Lease();
+        var src = srcLease.Span;
 
         // HashSet<T> preserves first-insertion order in .NET; we sort afterwards if requested.
         var seen = new System.Collections.Generic.HashSet<T>();
@@ -3364,14 +3470,16 @@ public partial class CpuEngine
         if (!sortedSequence.IsContiguous) sortedSequence = sortedSequence.Contiguous();
         if (!values.IsContiguous) values = values.Contiguous();
         var result = new Tensor<int>(values._shape);
-        var dst = result.AsWritableSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
 
         // Float32 fast path: route through SortKernels which uses AVX2
         // popcount-masked comparison for short sequences and a branchless
         // binary search for longer ones.
         if (typeof(T) == typeof(float))
         {
-            float[] seqArr = (float[])(object)sortedSequence.GetDataArray();
+            using var seqArrLease = sortedSequence.LeaseArray();
+            float[] seqArr = (float[])(object)seqArrLease.Array;
             float[] vsArr = (float[])(object)values.GetDataArray();
             ReadOnlySpan<float> seqSpan = seqArr;
             if (right)
@@ -3382,7 +3490,8 @@ public partial class CpuEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var seqT = sortedSequence.AsSpan();
+        using var seqTLease = sortedSequence.Lease();
+        var seqT = seqTLease.Span;
         var vsT = values.AsSpan();
         for (int i = 0; i < vsT.Length; i++)
         {
@@ -3410,7 +3519,8 @@ public partial class CpuEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
         var ops = MathHelper.GetNumericOperations<T>();
         if (!input.IsContiguous) input = input.Contiguous();
-        var src = input.AsSpan();
+        using var srcLease = input.Lease();
+        var src = srcLease.Span;
         // Filter NaNs; take lower-median of the remaining values.
         var kept = new System.Collections.Generic.List<T>(src.Length);
         for (int i = 0; i < src.Length; i++)
@@ -3427,7 +3537,8 @@ public partial class CpuEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (input.Length == 0) throw new ArgumentException("Mode requires a non-empty tensor");
         if (!input.IsContiguous) input = input.Contiguous();
-        var src = input.AsSpan();
+        using var srcLease = input.Lease();
+        var src = srcLease.Span;
         // Count occurrences; return the most frequent. Ties broken by smallest
         // value. Using a list of (value, count) pairs with linear search
         // avoids the Dictionary<T, …> notnull constraint on generic T — Mode
@@ -3477,7 +3588,8 @@ public partial class CpuEngine
         if (input == null) throw new ArgumentNullException(nameof(input));
         if (input.Rank != 1) throw new ArgumentException("BinCount requires a 1-D int tensor");
         if (!input.IsContiguous) input = input.Contiguous();
-        var src = input.AsSpan();
+        using var srcLease = input.Lease();
+        var src = srcLease.Span;
 
         // Find max; reject negatives (torch.bincount rejects them too).
         int maxV = minLength ?? 0;
@@ -3490,7 +3602,8 @@ public partial class CpuEngine
         if (maxV == 0) return new Tensor<int>(new[] { 0 });
 
         var result = new Tensor<int>(new[] { maxV });
-        var dst = result.AsWritableSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
         for (int i = 0; i < src.Length; i++) dst[src[i]]++;
         return result;
     }
@@ -3555,11 +3668,13 @@ public partial class CpuEngine
         }
 
         if (!samples.IsContiguous) samples = samples.Contiguous();
-        var src = samples.AsSpan();
+        using var srcLease = samples.Lease();
+        var src = srcLease.Span;
 
         // Output shape is bins[0] × bins[1] × ... × bins[d-1].
         var result = new Tensor<int>(bins);
-        var dst = result.AsWritableSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
 
         // Precompute widths and row-major strides of the output.
         var widths = new T[d];
@@ -3610,8 +3725,10 @@ public partial class CpuEngine
         if (!input.IsContiguous) input = input.Contiguous();
 
         var result = new Tensor<int>(new[] { bins });
-        var dst = result.AsWritableSpan();
-        var src = input.AsSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
+        using var srcLease = input.Lease();
+        var src = srcLease.Span;
 
         var width = numOps.Divide(numOps.Subtract(max, min), numOps.FromDouble(bins));
         for (int i = 0; i < src.Length; i++)
@@ -3763,10 +3880,13 @@ public partial class CpuEngine
         var ops = MathHelper.GetNumericOperations<T>();
         if (!x.IsContiguous) x = x.Contiguous();
         if (!exp.IsContiguous) exp = exp.Contiguous();
-        var src = x.AsSpan();
-        var e = exp.AsSpan();
+        using var srcLease = x.Lease();
+        var src = srcLease.Span;
+        using var eLease = exp.Lease();
+        var e = eLease.Span;
         var result = AutoTensorCache.RentOrAllocate<T>(x._shape);
-        var dst = result.AsWritableSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
         for (int i = 0; i < src.Length; i++)
         {
             // ldexp(x, n) = x · 2ⁿ. Computing as `Math.Pow(2, n) * x` (the
@@ -3890,9 +4010,12 @@ public partial class CpuEngine
         var putTensorOrig = tensor;
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var result = (Tensor<T>)tensor.Clone();
-        var dst = result.AsWritableSpan();
-        var idx = indices.AsSpan();
-        var src = source.AsSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
+        using var idxLease = indices.Lease();
+        var idx = idxLease.Span;
+        using var srcLease = source.Lease();
+        var src = srcLease.Span;
         int total = dst.Length;
         for (int i = 0; i < idx.Length; i++)
         {
@@ -4210,11 +4333,14 @@ public partial class CpuEngine
         GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HeterogeneousOutput);
         var ops = MathHelper.GetNumericOperations<T>();
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
-        var src = tensor.AsSpan();
+        using var srcLease = tensor.Lease();
+        var src = srcLease.Span;
         var mant = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
         var exp = new Tensor<int>(tensor._shape);
-        var mdst = mant.AsWritableSpan();
-        var edst = exp.AsWritableSpan();
+        using var mdstLease = mant.LeaseWritable();
+        var mdst = mdstLease.Span;
+        using var edstLease = exp.LeaseWritable();
+        var edst = edstLease.Span;
         for (int i = 0; i < src.Length; i++)
         {
             double xd = System.Convert.ToDouble(src[i], System.Globalization.CultureInfo.InvariantCulture);
@@ -4310,10 +4436,12 @@ public partial class CpuEngine
         if (axis < 0 || axis >= rank) throw new ArgumentOutOfRangeException(nameof(axis));
 
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
-        var src = tensor.AsSpan();
+        using var srcLease = tensor.Lease();
+        var src = srcLease.Span;
         var shape = tensor._shape;
         var result = AutoTensorCache.RentOrAllocate<T>(shape);
-        var dst = result.AsWritableSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
 
         var strides = ComputeRowMajorStrides(shape);
         int axisLen = shape[axis];
@@ -4403,9 +4531,11 @@ public partial class CpuEngine
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
-        var src = tensor.AsSpan();
+        using var srcLease = tensor.Lease();
+        var src = srcLease.Span;
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
-        var dst = result.AsWritableSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
         for (int i = 0; i < src.Length; i++) dst[i] = f(src[i]);
         return result;
     }
@@ -4455,10 +4585,13 @@ public partial class CpuEngine
                 $"{opName}: shape mismatch [{string.Join(", ", a._shape)}] vs [{string.Join(", ", b._shape)}]");
         if (!a.IsContiguous) a = a.Contiguous();
         if (!b.IsContiguous) b = b.Contiguous();
-        var av = a.AsSpan();
-        var bv = b.AsSpan();
+        using var avLease = a.Lease();
+        var av = avLease.Span;
+        using var bvLease = b.Lease();
+        var bv = bvLease.Span;
         var result = AutoTensorCache.RentOrAllocate<T>(a._shape);
-        var dst = result.AsWritableSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
         for (int i = 0; i < av.Length; i++) dst[i] = f(av[i], bv[i]);
         return result;
     }

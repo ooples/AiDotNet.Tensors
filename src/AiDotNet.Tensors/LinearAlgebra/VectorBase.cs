@@ -125,9 +125,31 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     private T[]? _pooledArray;
 
     /// <summary>
+    /// The owner of this vector's array when it is a tracked result buffer (see <see cref="Helpers.ResultBufferTracker"/>).
+    /// Holding it keeps the array from being recycled while this vector exists; null otherwise.
+    /// </summary>
+    internal Helpers.ResultBufferOwner? ResultOwner;
+
+    /// <summary>
     /// Gets the pooled array backing this vector, or null if not pooled.
     /// </summary>
     internal T[]? PooledArray => _pooledArray;
+
+    /// <summary>Test hook: this vector's storage without the escape mark (identity checks in recycling tests).</summary>
+    internal ReadOnlyMemory<T> AsMemoryUnmarkedForTests() => _memory;
+
+    /// <summary>
+    /// The backing array for code outside this type that reads it directly; marks the array escaped (never recycled),
+    /// like every raw accessor. See <see cref="AsSpan"/>.
+    /// </summary>
+    internal T[]? CachedArrayEscaping
+    {
+        get
+        {
+            ResultOwner?.MarkEscaped();
+            return _cachedArray;
+        }
+    }
 
     /// <summary>
     /// Detaches the pooled array reference so it can be safely returned to the pool.
@@ -218,6 +240,8 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     {
         _memory = memory;
         _logicalLength = memory.Length;
+        // A zero-copy wrap of a tracked result's array (of any type, at any offset) shares that result's owner.
+        ResultOwner = Helpers.ResultBufferTracker.Find((ReadOnlyMemory<T>)memory);
         if (MemoryMarshal.TryGetArray((ReadOnlyMemory<T>)memory, out var segment)
             && segment.Array is not null && segment.Offset == 0)
         {
@@ -382,10 +406,54 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     /// without making a copy. Think of it like looking at the original data through
     /// a glass window instead of making a photocopy.</para>
     /// </remarks>
-    public ReadOnlySpan<T> AsSpan()
+    internal ReadOnlySpan<T> AsSpan()
+    {
+        // Raw access: from here nothing guarantees this vector outlives the caller's use of the data, so its array
+        // (if it is a tracked result buffer) is never recycled. Leases (Lease/LeaseWritable) keep the vector alive instead.
+        ResultOwner?.MarkEscaped();
+        return AsSpanUnmarked();
+    }
+
+    /// <summary>
+    /// <see cref="AsSpan"/> without the escape mark, for callers that keep this vector alive for as long as they use
+    /// the span (leases, and members of this type).
+    /// </summary>
+    internal ReadOnlySpan<T> AsSpanUnmarked()
     {
         EnsureMaterialized();
         return _memory.Span;
+    }
+
+    /// <summary>
+    /// A read-only view of this object's data that keeps the object alive until the lease is disposed. Use it instead
+    /// of <see cref="AsSpan"/> whenever the object could otherwise become unreachable while the span is in use (a
+    /// temporary result, or a local whose last use is the span); see <see cref="ReadLease{T}"/>.
+    /// </summary>
+    internal ReadLease<T> Lease() => new(this, AsSpanUnmarked());
+
+    /// <summary>The writable form of <see cref="Lease"/>.</summary>
+    internal WriteLease<T> LeaseWritable() => new(this, AsWritableSpanUnmarked());
+
+    /// <summary>
+    /// The backing array with this object kept alive until the lease is disposed; the lease form of GetDataArray, which
+    /// marks the array escaped. See <see cref="ArrayLease{T}"/>.
+    /// </summary>
+    internal ArrayLease<T> LeaseArray() => new(this, GetDataArrayUnmarked());
+
+    /// <summary>
+    /// Copies this vector's elements into <paramref name="destination"/>, which must hold at least as many elements.
+    /// </summary>
+    /// <remarks>
+    /// The public way to read the data out. Direct views of the backing storage are internal: large results' storage
+    /// is reused once the vector is collected, so a view that outlived it would read another result's data.
+    /// </remarks>
+    /// <exception cref="ArgumentException">Thrown when <paramref name="destination"/> is too short.</exception>
+    public void CopyTo(Span<T> destination)
+    {
+        var source = AsSpanUnmarked();
+        if (destination.Length < source.Length)
+            throw new ArgumentException($"Destination holds {destination.Length} elements; {source.Length} are needed.", nameof(destination));
+        source.CopyTo(destination);
     }
 
     /// <summary>
@@ -401,6 +469,15 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     /// <para><b>Warning:</b> Use with caution - modifications affect the vector directly.</para>
     /// </remarks>
     internal Span<T> AsWritableSpan()
+    {
+        // Raw access: from here nothing guarantees this vector outlives the caller's use of the data, so its array
+        // (if it is a tracked result buffer) is never recycled. Leases (Lease/LeaseWritable) keep the vector alive instead.
+        ResultOwner?.MarkEscaped();
+        return AsWritableSpanUnmarked();
+    }
+
+    /// <summary><see cref="AsWritableSpan"/> without the escape mark; see <see cref="AsSpanUnmarked"/>.</summary>
+    internal Span<T> AsWritableSpanUnmarked()
     {
         _beforeWrite?.Invoke();
         EnsureMaterialized();
@@ -439,6 +516,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     /// </summary>
     internal T[]? GetBackingArrayUnsafe()
     {
+        ResultOwner?.MarkEscaped(); // raw access: see AsSpan
         _beforeWrite?.Invoke();
         return TryGetBackingArraySegmentForReadOnlyAccess(out var array, out int offset) && offset == 0
             ? array
@@ -451,10 +529,16 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     /// </summary>
     internal T[]? GetBackingArrayForReadOnlyAccess()
     {
-        return TryGetBackingArraySegmentForReadOnlyAccess(out var array, out int offset) && offset == 0
-            ? array
-            : null;
+        ResultOwner?.MarkEscaped(); // raw access: see AsSpan
+        return GetBackingArrayIdentity();
     }
+
+    /// <summary>
+    /// The backing array as an IDENTITY only (cache and epoch keys, release bookkeeping): does not mark the array
+    /// escaped. Never read or write data through it; use a lease or a marking accessor for that.
+    /// </summary>
+    internal T[]? GetBackingArrayIdentity()
+        => TryGetBackingArrayIdentity(out var array, out int offset) && offset == 0 ? array : null;
 
     /// <summary>
     /// Gets the actual managed backing array and the offset at which this
@@ -468,6 +552,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     /// </remarks>
     internal bool TryGetBackingArraySegment(out T[]? array, out int offset)
     {
+        ResultOwner?.MarkEscaped(); // raw access: see AsSpan
         _beforeWrite?.Invoke();
         return TryGetBackingArraySegmentForReadOnlyAccess(out array, out offset);
     }
@@ -477,6 +562,15 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     /// returned managed array must never be mutated by the caller.
     /// </summary>
     internal bool TryGetBackingArraySegmentForReadOnlyAccess(out T[]? array, out int offset)
+    {
+        ResultOwner?.MarkEscaped(); // raw access: see AsSpan
+        return TryGetBackingArrayIdentity(out array, out offset);
+    }
+
+    /// <summary>
+    /// <see cref="TryGetBackingArraySegmentForReadOnlyAccess"/> as an IDENTITY only (see <see cref="GetBackingArrayIdentity"/>).
+    /// </summary>
+    internal bool TryGetBackingArrayIdentity(out T[]? array, out int offset)
     {
         // Memory<T>.Empty is backed by the process-wide Array.Empty<T>() singleton. A
         // zero-allocation GPU vector therefore has an implementation array, but it does
@@ -518,6 +612,19 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     /// </summary>
     internal T[] GetDataArray()
     {
+        // Raw access: from here nothing guarantees this vector outlives the caller's use of the data, so its array
+        // (if it is a tracked result buffer) is never recycled. Leases (Lease/LeaseWritable) keep the vector alive instead.
+        ResultOwner?.MarkEscaped();
+        return GetDataArrayUnmarked();
+    }
+
+    /// <summary>
+    /// <see cref="GetDataArray"/> without the escape mark, for a caller that keeps this vector alive for as long as it
+    /// uses the array: an op writing the result it returns, or reading an input it holds with a
+    /// <see cref="KeepAliveScope"/>.
+    /// </summary>
+    internal T[] GetDataArrayUnmarked()
+    {
         _beforeWrite?.Invoke();
         EnsureMaterialized();
 
@@ -548,8 +655,11 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     /// <para><b>For Beginners:</b> This gives you access to the vector's data in a format
     /// that can be stored and passed around, unlike Span which must be used immediately.</para>
     /// </remarks>
-    public ReadOnlyMemory<T> AsMemory()
+    internal ReadOnlyMemory<T> AsMemory()
     {
+        // Raw access: from here nothing guarantees this vector outlives the caller's use of the data, so its array
+        // (if it is a tracked result buffer) is never recycled. Leases (Lease/LeaseWritable) keep the vector alive instead.
+        ResultOwner?.MarkEscaped();
         EnsureMaterialized();
         return _memory;
     }
@@ -567,6 +677,9 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     /// </remarks>
     internal Memory<T> AsWritableMemory()
     {
+        // Raw access: from here nothing guarantees this vector outlives the caller's use of the data, so its array
+        // (if it is a tracked result buffer) is never recycled. Leases (Lease/LeaseWritable) keep the vector alive instead.
+        ResultOwner?.MarkEscaped();
         _beforeWrite?.Invoke();
         EnsureMaterialized();
         return _memory;
@@ -612,7 +725,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     {
         var result = CreateInstance(size);
         // Use vectorized Fill for SIMD acceleration
-        _numOps.Fill(result.AsWritableSpan(), _numOps.Zero);
+        _numOps.Fill(result.AsWritableSpanUnmarked(), _numOps.Zero);
 
         return result;
     }
@@ -831,7 +944,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     {
         var result = CreateInstance(size);
         // Use vectorized Fill for SIMD acceleration
-        _numOps.Fill(result.AsWritableSpan(), _numOps.One);
+        _numOps.Fill(result.AsWritableSpanUnmarked(), _numOps.One);
 
         return result;
     }
@@ -852,7 +965,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     {
         var result = CreateInstance(size);
         // Use vectorized Fill for SIMD acceleration
-        _numOps.Fill(result.AsWritableSpan(), defaultValue);
+        _numOps.Fill(result.AsWritableSpanUnmarked(), defaultValue);
 
         return result;
     }
@@ -907,12 +1020,13 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     /// </remarks>
     public virtual VectorBase<T> Add(VectorBase<T> other)
     {
+        using var keepOtherAlive = new KeepAliveScope(other); // reads other's storage directly below
         if (Length != other.Length)
             throw new ArgumentException("Vectors must have the same length");
 
         var result = CreateInstance(Length);
         EnsureMaterialized(); other.EnsureMaterialized();
-        _numOps.Add(_memory.Span, other._memory.Span, result.AsWritableSpan());
+        _numOps.Add(_memory.Span, other._memory.Span, result.AsWritableSpanUnmarked());
         return result;
     }
 
@@ -930,6 +1044,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     /// </remarks>
     public virtual void AddInPlace(VectorBase<T> other)
     {
+        using var keepOtherAlive = new KeepAliveScope(other); // reads other's storage directly below
         _beforeWrite?.Invoke();
         if (Length != other.Length)
             throw new ArgumentException("Vectors must have the same length");
@@ -972,6 +1087,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     /// </remarks>
     public virtual void Add(VectorBase<T> other, Span<T> destination)
     {
+        using var keepOtherAlive = new KeepAliveScope(other); // reads other's storage directly below
         if (Length != other.Length)
             throw new ArgumentException("Vectors must have the same length");
         if (destination.Length < Length)
@@ -1021,12 +1137,13 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     /// </remarks>
     public virtual VectorBase<T> Subtract(VectorBase<T> other)
     {
+        using var keepOtherAlive = new KeepAliveScope(other); // reads other's storage directly below
         if (Length != other.Length)
             throw new ArgumentException("Vectors must have the same length");
 
         var result = CreateInstance(Length);
         EnsureMaterialized(); other.EnsureMaterialized();
-        _numOps.Subtract(_memory.Span, other._memory.Span, result.AsWritableSpan());
+        _numOps.Subtract(_memory.Span, other._memory.Span, result.AsWritableSpanUnmarked());
         return result;
     }
 
@@ -1043,6 +1160,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     /// </remarks>
     public virtual void SubtractInPlace(VectorBase<T> other)
     {
+        using var keepOtherAlive = new KeepAliveScope(other); // reads other's storage directly below
         _beforeWrite?.Invoke();
         if (Length != other.Length)
             throw new ArgumentException("Vectors must have the same length");
@@ -1083,6 +1201,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     /// </remarks>
     public virtual void Subtract(VectorBase<T> other, Span<T> destination)
     {
+        using var keepOtherAlive = new KeepAliveScope(other); // reads other's storage directly below
         if (Length != other.Length)
             throw new ArgumentException("Vectors must have the same length");
         if (destination.Length < Length)
@@ -1133,7 +1252,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     {
         var result = CreateInstance(Length);
         EnsureMaterialized();
-        _numOps.MultiplyScalar(_memory.Span, scalar, result.AsWritableSpan());
+        _numOps.MultiplyScalar(_memory.Span, scalar, result.AsWritableSpanUnmarked());
         return result;
     }
 
@@ -1231,7 +1350,7 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     {
         var result = CreateInstance(Length);
         EnsureMaterialized();
-        _numOps.DivideScalar(_memory.Span, scalar, result.AsWritableSpan());
+        _numOps.DivideScalar(_memory.Span, scalar, result.AsWritableSpanUnmarked());
         return result;
     }
 

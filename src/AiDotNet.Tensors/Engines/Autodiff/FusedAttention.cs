@@ -394,18 +394,22 @@ public static class FusedAttention<T>
     // in float (8 AVX2 lanes) instead of double (4).
     private static Tensor<float> DoubleToFloat(Tensor<double> t)
     {
-        var src = t.AsSpan();
+        using var srcLease = t.Lease();
+        var src = srcLease.Span;
         var result = Tensor<float>.CreateZeros((int[])t._shape.Clone());
-        var dst = result.AsWritableSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
         for (int i = 0; i < src.Length; i++) dst[i] = (float)src[i];
         return result;
     }
 
     private static Tensor<double> FloatToDouble(Tensor<float> t)
     {
-        var src = t.AsSpan();
+        using var srcLease = t.Lease();
+        var src = srcLease.Span;
         var result = Tensor<double>.CreateZeros((int[])t._shape.Clone());
-        var dst = result.AsWritableSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
         for (int i = 0; i < src.Length; i++) dst[i] = src[i];
         return result;
     }
@@ -453,7 +457,8 @@ public static class FusedAttention<T>
         if (!scores.IsContiguous) scores = scores.Contiguous();
         // Scores are normally a reshape view. Array access returns a snapshot for views;
         // the causal mask must write through the tensor's COW-aware storage instead.
-        var data = scores.AsWritableSpan();
+        using var dataLease = scores.LeaseWritable();
+        var data = dataLease.Span;
         T negInf = numOps.FromDouble(double.NegativeInfinity);
         for (int i = 0; i < b; i++)
         {
@@ -660,7 +665,8 @@ public static class FusedAttention<T>
             int bk = Math.Min(tileBk, Sk - j0);
             var kt = SliceAxis1(numOps, kf, BH, Sk, headDim, j0, bk);                       // [BH, bk, Dh]
             var sTile = ScoresTileWithBias(engine, qf, kt, scaleT, attentionBias, B, H, Sq, bk, j0); // [BH, Sq, bk]
-            var s = sTile.AsSpan();
+            using var sLease = sTile.Lease();
+            var s = sLease.Span;
             for (int row = 0; row < BH * Sq; row++)
             {
                 int b0 = row * bk;
@@ -691,8 +697,10 @@ public static class FusedAttention<T>
             var vt = SliceAxis1(numOps, vf, BH, Sk, Dv, j0, bk);                            // [BH, bk, Dv]
             var sTile = ScoresTileWithBias(engine, qf, kt, scaleT, attentionBias, B, H, Sq, bk, j0); // [BH, Sq, bk]
             var dpTile = engine.TensorBatchMatMul(dof, vt.TransposeLast2D());               // [BH, Sq, bk]
-            var s = sTile.AsSpan();
-            var dp = dpTile.AsSpan();
+            using var sLease = sTile.Lease();
+            var s = sLease.Span;
+            using var dpLease = dpTile.Lease();
+            var dp = dpLease.Span;
             for (int row = 0; row < BH * Sq; row++)
             {
                 int b0 = row * bk;
@@ -718,8 +726,10 @@ public static class FusedAttention<T>
             var vt = SliceAxis1(numOps, vf, BH, Sk, Dv, j0, bk);                            // [BH, bk, Dv]
             var sTile = ScoresTileWithBias(engine, qf, kt, scaleT, attentionBias, B, H, Sq, bk, j0); // [BH, Sq, bk]
             var dpTile = engine.TensorBatchMatMul(dof, vt.TransposeLast2D());               // [BH, Sq, bk]
-            var s = sTile.AsSpan();
-            var dp = dpTile.AsSpan();
+            using var sLease = sTile.Lease();
+            var s = sLease.Span;
+            using var dpLease = dpTile.Lease();
+            var dp = dpLease.Span;
 
             // Masked (j >= jMax) entries stay zero-init, so they contribute nothing to the
             // dV / dK / dQ GEMMs below — exactly the causal mask.
@@ -750,7 +760,8 @@ public static class FusedAttention<T>
             // dQ_i += scale · Σ_j dS_ij · k_j -> [BH, Sq, Dh] (accumulate across tiles)
             var dQtile = engine.TensorMultiplyScalar(
                 engine.TensorBatchMatMul(dsTile, kt), scaleT);                              // [BH, Sq, Dh]
-            var dq = dQtile.AsSpan();
+            using var dqLease = dQtile.Lease();
+            var dq = dqLease.Span;
             for (int idx = 0; idx < dQacc.Length; idx++)
                 dQacc[idx] = numOps.Add(dQacc[idx], dq[idx]);
         }
@@ -789,7 +800,8 @@ public static class FusedAttention<T>
     private static Tensor<T> SliceAxis1(INumericOperations<T> numOps, Tensor<T> src, int BH, int S, int D, int j0, int bk)
     {
         if (!src.IsContiguous) src = src.Contiguous();
-        var srcData = src.AsSpan();
+        using var srcDataLease = src.Lease();
+        var srcData = srcDataLease.Span;
         var dst = new T[BH * bk * D];
         for (int b = 0; b < BH; b++)
             srcData.Slice((b * S + j0) * D, bk * D).CopyTo(dst.AsSpan(b * bk * D, bk * D));
@@ -815,8 +827,10 @@ public static class FusedAttention<T>
         if (!P.IsContiguous) P = P.Contiguous();
         var shape = P._shape;
         int b = shape[0], h = shape[1], sq = shape[2], sk = shape[3];
-        var pData = P.AsSpan();
-        var dpData = dP.AsSpan();
+        using var pDataLease = P.Lease();
+        var pData = pDataLease.Span;
+        using var dpDataLease = dP.Lease();
+        var dpData = dpDataLease.Span;
         var dsData = new T[pData.Length];
         for (int i = 0; i < b; i++)
         {

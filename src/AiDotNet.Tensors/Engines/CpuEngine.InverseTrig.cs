@@ -120,24 +120,33 @@ public partial class CpuEngine
 
         if (typeof(T) == typeof(double))
         {
-            var dy = (double[])(object)y.GetDataArray();
-            var dx = (double[])(object)x.GetDataArray();
-            var dst = (double[])(object)result.GetDataArray();
+            using var dyLease = y.LeaseArray();
+            var dy = (double[])(object)dyLease.Array;
+            using var dxLease = x.LeaseArray();
+            var dx = (double[])(object)dxLease.Array;
+            using var dstLease = result.LeaseArray();
+            var dst = (double[])(object)dstLease.Array;
             for (int i = 0; i < length; i++) dst[i] = Math.Atan2(dy[i], dx[i]);
         }
         else if (typeof(T) == typeof(float))
         {
-            var fy = (float[])(object)y.GetDataArray();
-            var fx = (float[])(object)x.GetDataArray();
-            var dst = (float[])(object)result.GetDataArray();
+            using var fyLease = y.LeaseArray();
+            var fy = (float[])(object)fyLease.Array;
+            using var fxLease = x.LeaseArray();
+            var fx = (float[])(object)fxLease.Array;
+            using var dstLease = result.LeaseArray();
+            var dst = (float[])(object)dstLease.Array;
             for (int i = 0; i < length; i++) dst[i] = MathF.Atan2(fy[i], fx[i]);
         }
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            var ySpan = y.AsSpan();
-            var xSpan = x.AsSpan();
-            var dst = result.AsWritableSpan();
+            using var ySpanLease = y.Lease();
+            var ySpan = ySpanLease.Span;
+            using var xSpanLease = x.Lease();
+            var xSpan = xSpanLease.Span;
+            using var dstLease = result.LeaseWritable();
+            var dst = dstLease.Span;
             for (int i = 0; i < length; i++)
             {
                 dst[i] = numOps.FromDouble(Math.Atan2(numOps.ToDouble(ySpan[i]), numOps.ToDouble(xSpan[i])));
@@ -196,21 +205,27 @@ public partial class CpuEngine
 
         if (typeof(T) == typeof(double))
         {
-            var src = (double[])(object)tensor.GetDataArray();
-            var dst = (double[])(object)result.GetDataArray();
+            using var srcLease = tensor.LeaseArray();
+            var src = (double[])(object)srcLease.Array;
+            using var dstLease = result.LeaseArray();
+            var dst = (double[])(object)dstLease.Array;
             for (int i = 0; i < length; i++) dst[i] = scalar(src[i]);
         }
         else if (typeof(T) == typeof(float))
         {
-            var src = (float[])(object)tensor.GetDataArray();
-            var dst = (float[])(object)result.GetDataArray();
+            using var srcLease = tensor.LeaseArray();
+            var src = (float[])(object)srcLease.Array;
+            using var dstLease = result.LeaseArray();
+            var dst = (float[])(object)dstLease.Array;
             for (int i = 0; i < length; i++) dst[i] = (float)scalar(src[i]);
         }
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            var src = tensor.AsSpan();
-            var dst = result.AsWritableSpan();
+            using var srcLease = tensor.Lease();
+            var src = srcLease.Span;
+            using var dstLease = result.LeaseWritable();
+            var dst = dstLease.Span;
             for (int i = 0; i < length; i++)
             {
                 dst[i] = numOps.FromDouble(scalar(numOps.ToDouble(src[i])));

@@ -563,7 +563,8 @@ public partial class CpuEngine
                 for (int hh2 = 0; hh2 < hidden; hh2++)
                     wHhT[hh2 * gateRows + g] = wHhSpan[g * hidden + hh2];
 
-            var outArr = (float[])(object)output.GetDataArray();
+            using var outArrLease = output.LeaseArray();
+            var outArr = (float[])(object)outArrLease.Array;
             float[]? fhArr = wantState ? (float[])(object)finalHidden.GetDataArray() : null;
             float[]? fcArr = wantState ? (float[])(object)finalCell.GetDataArray() : null;
 
@@ -916,8 +917,10 @@ public partial class CpuEngine
             var hhSpan = hhBuf.AsSpan();
             var hCurr = hbufs[nxt];
             var cCurr = cbufs[nxt];
-            var hCurrSpan = hCurr.AsWritableSpan();
-            var cCurrSpan = cCurr.AsWritableSpan();
+            using var hCurrSpanLease = hCurr.LeaseWritable();
+            var hCurrSpan = hCurrSpanLease.Span;
+            using var cCurrSpanLease = cCurr.LeaseWritable();
+            var cCurrSpan = cCurrSpanLease.Span;
             var cPrevSpan = cbufs[cur].AsSpan();
             bool hasBhh = bHhData is not null;
             ReadOnlySpan<T> bHhSpan = hasBhh ? bHhData.AsSpan() : default;
@@ -969,7 +972,8 @@ public partial class CpuEngine
 
             if (returnSequences)
             {
-                var outSpan = output.AsWritableSpan();
+                using var outSpanLease = output.LeaseWritable();
+                var outSpan = outSpanLease.Span;
                 for (int b = 0; b < batch; b++)
                 {
                     int srcOff = b * hidden;
@@ -989,7 +993,8 @@ public partial class CpuEngine
 
         if (!returnSequences)
         {
-            var outSpan = output.AsWritableSpan();
+            using var outSpanLease = output.LeaseWritable();
+            var outSpan = outSpanLease.Span;
             var hLastSpan = hbufs[cur].AsSpan();
             for (int i = 0; i < batch * hidden; i++)
                 outSpan[i] = hLastSpan[i];
@@ -1022,7 +1027,8 @@ public partial class CpuEngine
     /// </remarks>
     private static void SeedLstmState<T>(Tensor<T> buffer, Tensor<T>? source, int n)
     {
-        var dst = buffer.AsWritableSpan();
+        using var dstLease = buffer.LeaseWritable();
+        var dst = dstLease.Span;
         if (source is null)
             dst.Slice(0, n).Clear();
         else

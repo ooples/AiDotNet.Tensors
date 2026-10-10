@@ -62,15 +62,18 @@ public partial class CpuEngine
                 "(would cross the packing boundary). Pack on a different axis.");
 
         if (!packed.IsContiguous) packed = packed.Contiguous();
-        var src = packed.AsSpan();
-        var idx = indices.AsSpan();
+        using var srcLease = packed.Lease();
+        var src = srcLease.Span;
+        using var idxLease = indices.Lease();
+        var idx = idxLease.Span;
 
         var outShape = (int[])packed._shape.Clone();
         int idxLen = indices.Length;
         outShape[axis] = idxLen;
 
         var result = new Tensor<byte>(outShape);
-        var dst = result.AsWritableSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
 
         int outerSize = 1; for (int k = 0; k < axis; k++) outerSize *= packed._shape[k];
         int innerSize = 1; for (int k = axis + 1; k < rank; k++) innerSize *= packed._shape[k];
@@ -115,9 +118,12 @@ public partial class CpuEngine
         if (!source.IsContiguous) source = source.Contiguous();
 
         var result = (Tensor<byte>)packed.Clone();
-        var dst = result.AsWritableSpan();
-        var srcData = source.AsSpan();
-        var idx = indices.AsSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
+        using var srcDataLease = source.Lease();
+        var srcData = srcDataLease.Span;
+        using var idxLease = indices.Lease();
+        var idx = idxLease.Span;
 
         int outerSize = 1; for (int k = 0; k < axis; k++) outerSize *= packed._shape[k];
         int innerSize = 1; for (int k = axis + 1; k < rank; k++) innerSize *= packed._shape[k];

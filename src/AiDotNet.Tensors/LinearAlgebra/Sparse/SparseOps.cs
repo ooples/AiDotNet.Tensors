@@ -115,7 +115,8 @@ public static class SparseOps
 
             if (outArr is not null)
             {
-                var outSpanFloat = output.AsWritableSpan();
+                using var outSpanFloatLease = output.LeaseWritable();
+                var outSpanFloat = outSpanFloatLease.Span;
                 for (int i = 0; i < outSpanFloat.Length; i++) outSpanFloat[i] = (T)(object)outArr[i];
                 _ = k;
                 return output;
@@ -145,7 +146,8 @@ public static class SparseOps
 
             if (outArr is not null)
             {
-                var outSpanDouble = output.AsWritableSpan();
+                using var outSpanDoubleLease = output.LeaseWritable();
+                var outSpanDouble = outSpanDoubleLease.Span;
                 for (int i = 0; i < outSpanDouble.Length; i++) outSpanDouble[i] = (T)(object)outArr[i];
                 _ = k;
                 return output;
@@ -154,8 +156,10 @@ public static class SparseOps
         }
 
         var valsT = csr.DataVector;
-        var bSpan = b.AsSpan();
-        var outSpan = output.AsWritableSpan();
+        using var bSpanLease = b.Lease();
+        var bSpan = bSpanLease.Span;
+        using var outSpanLease = output.LeaseWritable();
+        var outSpan = outSpanLease.Span;
         for (int r = 0; r < rows; r++)
         {
             int rs = rowPtr[r], re = rowPtr[r + 1];
@@ -184,9 +188,11 @@ public static class SparseOps
         var rowPtr = csr.RowPointers;
         var colIdx = csr.ColumnIndices;
         var vals = csr.DataVector;
-        var xSpan = x.AsSpan();
+        using var xSpanLease = x.Lease();
+        var xSpan = xSpanLease.Span;
         var output = new Tensor<T>(new[] { a.Rows });
-        var outSpan = output.AsWritableSpan();
+        using var outSpanLease = output.LeaseWritable();
+        var outSpan = outSpanLease.Span;
 
         for (int r = 0; r < a.Rows; r++)
         {
@@ -218,9 +224,12 @@ public static class SparseOps
                 $"got rank {c.Rank} with shape [{string.Join(", ", c._shape)}].",
                 nameof(c));
         var output = new Tensor<T>((int[])product._shape.Clone());
-        var pSpan = product.AsSpan();
-        var cSpan = c.AsSpan();
-        var oSpan = output.AsWritableSpan();
+        using var pSpanLease = product.Lease();
+        var pSpan = pSpanLease.Span;
+        using var cSpanLease = c.Lease();
+        var cSpan = cSpanLease.Span;
+        using var oSpanLease = output.LeaseWritable();
+        var oSpan = oSpanLease.Span;
         for (int i = 0; i < oSpan.Length; i++)
             oSpan[i] = ops.Add(ops.Multiply(alpha, pSpan[i]), ops.Multiply(beta, cSpan[i]));
         return output;
@@ -262,7 +271,8 @@ public static class SparseOps
                     nameof(batchSparse));
         }
         var output = new Tensor<T>(new[] { batch, outRows, outCols });
-        var outSpan = output.AsWritableSpan();
+        using var outSpanLease = output.LeaseWritable();
+        var outSpan = outSpanLease.Span;
 
         for (int b = 0; b < batch; b++)
         {
@@ -284,7 +294,8 @@ public static class SparseOps
         if (axis is null)
         {
             T acc = ops.Zero;
-            var span = a.DataVector.AsSpan();
+            using var spanLease = a.DataVector.Lease();
+            var span = spanLease.Span;
             for (int i = 0; i < span.Length; i++) acc = ops.Add(acc, span[i]);
             var result = new Tensor<T>(new[] { 1 });
             result.AsWritableSpan()[0] = acc;
@@ -296,7 +307,8 @@ public static class SparseOps
         if (axis.Value == 0)
         {
             var sums = new Tensor<T>(new[] { a.Columns });
-            var s = sums.AsWritableSpan();
+            using var sLease = sums.LeaseWritable();
+            var s = sLease.Span;
             for (int i = 0; i < s.Length; i++) s[i] = ops.Zero;
             for (int k = 0; k < cooVals.Length; k++)
                 s[coo.ColumnIndices[k]] = ops.Add(s[coo.ColumnIndices[k]], cooVals[k]);
@@ -305,7 +317,8 @@ public static class SparseOps
         if (axis.Value == 1)
         {
             var sums = new Tensor<T>(new[] { a.Rows });
-            var s = sums.AsWritableSpan();
+            using var sLease = sums.LeaseWritable();
+            var s = sLease.Span;
             for (int i = 0; i < s.Length; i++) s[i] = ops.Zero;
             for (int k = 0; k < cooVals.Length; k++)
                 s[coo.RowIndices[k]] = ops.Add(s[coo.RowIndices[k]], cooVals[k]);
@@ -326,7 +339,8 @@ public static class SparseOps
             : axis.Value == 0 ? a.Rows
             : axis.Value == 1 ? a.Columns
             : throw new ArgumentOutOfRangeException(nameof(axis));
-        var span = sum.AsWritableSpan();
+        using var spanLease = sum.LeaseWritable();
+        var span = spanLease.Span;
         T denom = ops.FromDouble(divisor);
         for (int i = 0; i < span.Length; i++) span[i] = ops.Divide(span[i], denom);
         return sum;
@@ -397,7 +411,8 @@ public static class SparseOps
         var rows = (int[])coo.RowIndices.Clone();
         var cols = (int[])coo.ColumnIndices.Clone();
         var vals = new T[nnz];
-        var dSpan = dense.AsSpan();
+        using var dSpanLease = dense.Lease();
+        var dSpan = dSpanLease.Span;
         int n = dense._shape[1];
         for (int k = 0; k < nnz; k++)
             vals[k] = dSpan[rows[k] * n + cols[k]];
@@ -425,9 +440,12 @@ public static class SparseOps
         var rows = (int[])coo.RowIndices.Clone();
         var cols = (int[])coo.ColumnIndices.Clone();
         var outVals = new T[nnz];
-        var aSpan = a.AsSpan();
-        var bSpan = b.AsSpan();
-        var cSpan = c.AsSpan();
+        using var aSpanLease = a.Lease();
+        var aSpan = aSpanLease.Span;
+        using var bSpanLease = b.Lease();
+        var bSpan = bSpanLease.Span;
+        using var cSpanLease = c.Lease();
+        var cSpan = cSpanLease.Span;
 
         for (int p = 0; p < nnz; p++)
         {
@@ -495,8 +513,10 @@ public static class SparseOps
         var ops = MathHelper.GetNumericOperations<T>();
         if (x.IsContiguous && y.IsContiguous)
         {
-            var xSpan = x.AsSpan();
-            var ySpan = y.AsSpan();
+            using var xSpanLease = x.Lease();
+            var xSpan = xSpanLease.Span;
+            using var ySpanLease = y.Lease();
+            var ySpan = ySpanLease.Span;
             for (int p = 0; p < nnz; p++)
             {
                 int i = rowIndices[p], j = colIndices[p];
@@ -539,7 +559,8 @@ public static class SparseOps
         var rowList = new System.Collections.Generic.List<int>();
         var colList = new System.Collections.Generic.List<int>();
         var valList = new System.Collections.Generic.List<T>();
-        var dSpan = diagonals.AsSpan();
+        using var dSpanLease = diagonals.Lease();
+        var dSpan = dSpanLease.Span;
         int diagLen = diagonals._shape[1];
 
         for (int dRow = 0; dRow < offsets.Length; dRow++)
@@ -627,8 +648,10 @@ public static class SparseOps
         int n = b._shape[1];
         int blockRows = a.Rows / br;
         var src = a.DataVector;
-        var bSpan = b.AsSpan();
-        var outSpan = output.AsWritableSpan();
+        using var bSpanLease = b.Lease();
+        var bSpan = bSpanLease.Span;
+        using var outSpanLease = output.LeaseWritable();
+        var outSpan = outSpanLease.Span;
 
         for (int br_i = 0; br_i < blockRows; br_i++)
         {

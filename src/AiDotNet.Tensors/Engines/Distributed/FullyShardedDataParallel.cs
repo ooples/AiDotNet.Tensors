@@ -165,7 +165,8 @@ public sealed class FullyShardedDataParallel<T>
         _group.AllGather(param.LocalShard, perRank);
         // Concatenate into full.
         int offset = 0;
-        var dst = full.AsWritableSpan();
+        using var dstLease = full.LeaseWritable();
+        var dst = dstLease.Span;
         for (int r = 0; r < perRank.Count; r++)
         {
             var src = perRank[r].AsSpan();
@@ -253,11 +254,13 @@ public sealed class FullyShardedDataParallel<T>
         // only its chunk's reduction.
         var perRankInputs = new List<Tensor<T>>(_group.WorldSize);
         int chunkLen = param.LocalShard.Length;
-        var srcSpan = fullGrad.AsSpan();
+        using var srcSpanLease = fullGrad.Lease();
+        var srcSpan = srcSpanLease.Span;
         for (int r = 0; r < _group.WorldSize; r++)
         {
             var chunk = new Tensor<T>((int[])param.LocalShard._shape.Clone());
-            var dstSpan = chunk.AsWritableSpan();
+            using var dstSpanLease = chunk.LeaseWritable();
+            var dstSpan = dstSpanLease.Span;
             int from = r * chunkLen;
             int copyLen = Math.Min(chunkLen, srcSpan.Length - from);
             if (copyLen > 0) srcSpan.Slice(from, copyLen).CopyTo(dstSpan.Slice(0, copyLen));
@@ -327,7 +330,8 @@ public sealed class FullyShardedDataParallel<T>
             _group.AllGather(localParamSlice, perRank);
 
             int chunkLen = localParamSlice.Length;
-            var dst = fullParam.AsWritableSpan();
+            using var dstLease = fullParam.LeaseWritable();
+            var dst = dstLease.Span;
             for (int r = 0; r < _group.WorldSize; r++)
             {
                 int from = r * chunkLen;

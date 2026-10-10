@@ -330,7 +330,8 @@ public static class SavedTensorRecipes
         => SavedTensorHooks.Push<float>(
             pack: tensor =>
             {
-                var src = tensor.AsSpan();
+                using var srcLease = tensor.Lease();
+                var src = srcLease.Span;
                 var half = new Half[src.Length];
                 for (int i = 0; i < src.Length; i++) half[i] = (Half)src[i];
                 return new HalfSaved(half, tensor.Shape.ToArray());
@@ -359,7 +360,8 @@ public static class SavedTensorRecipes
         => SavedTensorHooks.Push<float>(
             pack: tensor =>
             {
-                var data = tensor.AsSpan();
+                using var dataLease = tensor.Lease();
+                var data = dataLease.Span;
                 float absMax = 0f;
                 for (int i = 0; i < data.Length; i++)
                 {
@@ -408,7 +410,8 @@ public static class SavedTensorRecipes
         => SavedTensorHooks.Push<float>(
             pack: tensor =>
             {
-                var src = tensor.AsSpan();
+                using var srcLease = tensor.Lease();
+                var src = srcLease.Span;
                 var bytes = new byte[src.Length * sizeof(float)];
                 System.Runtime.InteropServices.MemoryMarshal
                     .AsBytes(src).CopyTo(bytes);
@@ -479,7 +482,8 @@ public static class SavedTensorRecipes
         return SavedTensorHooks.Push<float>(
             pack: tensor =>
             {
-                var src = tensor.AsSpan();
+                using var srcLease = tensor.Lease();
+                var src = srcLease.Span;
                 var bytes = new byte[src.Length * sizeof(float)];
                 System.Runtime.InteropServices.MemoryMarshal
                     .AsBytes(src).CopyTo(bytes);

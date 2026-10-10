@@ -280,7 +280,8 @@ public sealed class TapeStepContext<T>
         int total = 0;
         foreach (var p in Parameters) total += p.Length;
         var flat = new Vector<T>(total);
-        var span = flat.AsWritableSpan();
+        using var spanLease = flat.LeaseWritable();
+        var span = spanLease.Span;
         int offset = 0;
         foreach (var p in Parameters)
         {
@@ -306,7 +307,8 @@ public sealed class TapeStepContext<T>
         int total = 0;
         foreach (var p in Parameters) total += p.Length;
         var flat = new Vector<T>(total);
-        var span = flat.AsWritableSpan();
+        using var spanLease = flat.LeaseWritable();
+        var span = spanLease.Span;
         int offset = 0;
         foreach (var p in Parameters)
         {
@@ -349,7 +351,8 @@ public sealed class TapeStepContext<T>
                 nameof(flatParams));
 
         // Distribute into individual tensors
-        var src = flatParams.AsSpan();
+        using var srcLease = flatParams.Lease();
+        var src = srcLease.Span;
         int offset = 0;
         foreach (var p in Parameters)
         {
@@ -357,7 +360,8 @@ public sealed class TapeStepContext<T>
                 throw new InvalidOperationException(
                     $"SetFlatParameters requires contiguous parameter tensors. " +
                     $"Call Contiguous() on non-contiguous parameters before using flat access.");
-            var dst = p.AsWritableSpan();
+            using var dstLease = p.LeaseWritable();
+            var dst = dstLease.Span;
             src.Slice(offset, p.Length).CopyTo(dst);
             offset += p.Length;
         }

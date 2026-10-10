@@ -41,7 +41,8 @@ public static class Pruning
         // `toPrune` indices in ascending magnitude as the prune set.
         // Exact-count regardless of ties; matches PyTorch's
         // prune.l1_unstructured semantics.
-        var src = raw.AsSpan();
+        using var srcLease = raw.Lease();
+        var src = srcLease.Span;
         var indexed = new (double Mag, int Idx)[total];
         for (int i = 0; i < total; i++) indexed[i] = (Math.Abs(ops.ToDouble(src[i])), i);
         Array.Sort(indexed, (a, b) => a.Mag.CompareTo(b.Mag));
@@ -90,7 +91,8 @@ public static class Pruning
         for (int i = dim + 1; i < raw.Rank; i++) inner *= raw._shape[i];
 
         var sliceNorms = new double[axisLen];
-        var src = raw.AsSpan();
+        using var srcLease = raw.Lease();
+        var src = srcLease.Span;
         for (int a = 0; a < axisLen; a++)
         {
             double normN = 0;
@@ -225,8 +227,10 @@ public static class Pruning
         if (pruned is null) throw new ArgumentNullException(nameof(pruned));
         var ops = MathHelper.GetNumericOperations<T>();
         var output = new Tensor<T>((int[])pruned.Raw._shape.Clone());
-        var src = pruned.Raw.AsSpan();
-        var dst = output.AsWritableSpan();
+        using var srcLease = pruned.Raw.Lease();
+        var src = srcLease.Span;
+        using var dstLease = output.LeaseWritable();
+        var dst = dstLease.Span;
         for (int i = 0; i < src.Length; i++)
             dst[i] = pruned.IsKept(i) ? src[i] : ops.Zero;
         return output;

@@ -265,6 +265,9 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     {
         var vector = new Vector<T>(memory, false);
         vector.SetPooledArray(pooledArray);
+        // This result owns the pooled array: if it is never returned explicitly, the tracker hands the array back to the
+        // cache once this result (and every zero-copy view of it) has been collected.
+        vector.ResultOwner = Helpers.ResultBufferTracker.Track(pooledArray);
         return vector;
     }
 
@@ -358,7 +361,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
 
 #if NET5_0_OR_GREATER
         var arr = _cachedArray;
-        var otherArr = other._cachedArray;
+        var otherArr = other.CachedArrayEscaping;
         if (arr is not null && otherArr is not null && typeof(T) == typeof(double) && Avx.IsSupported)
         {
             var dArr = Unsafe.As<T[], double[]>(ref arr);
@@ -411,7 +414,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
 
 #if NET5_0_OR_GREATER
         var arr = _cachedArray;
-        var otherArr = other._cachedArray;
+        var otherArr = other.CachedArrayEscaping;
         if (arr is not null && otherArr is not null && typeof(T) == typeof(double) && Avx.IsSupported)
         {
             var dArr = Unsafe.As<T[], double[]>(ref arr);
@@ -497,6 +500,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     /// </remarks>
     public Vector<T> ElementwiseDivide(Vector<T> other)
     {
+        using var keepOtherAlive = new KeepAliveScope(other); // reads other's storage directly below
         if (other == null)
             throw new ArgumentNullException(nameof(other));
 
@@ -506,7 +510,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
         }
 
         var result = VA.RentUninitialized<T>(this.Length);
-        _numOps.Divide(_memory.Span, other._memory.Span, result.AsWritableSpan());
+        _numOps.Divide(_memory.Span, other._memory.Span, result.AsWritableSpanUnmarked());
 
         return result;
     }
@@ -658,7 +662,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     public override VectorBase<T> Ones(int size)
     {
         var result = new Vector<T>(size);
-        _numOps.Fill(result.AsWritableSpan(), _numOps.One);
+        _numOps.Fill(result.AsWritableSpanUnmarked(), _numOps.One);
         return result;
     }
 
@@ -748,6 +752,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     /// </remarks>
     public T DotProduct(Vector<T> other)
     {
+        using var keepOtherAlive = new KeepAliveScope(other); // reads other's storage directly below
         if (other == null)
             throw new ArgumentNullException(nameof(other));
 
@@ -790,7 +795,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     public new Vector<T> Divide(T scalar)
     {
         var result = VA.RentUninitialized<T>(this.Length);
-        _numOps.DivideScalar(_memory.Span, scalar, result.AsWritableSpan());
+        _numOps.DivideScalar(_memory.Span, scalar, result.AsWritableSpanUnmarked());
         return result;
     }
 
@@ -883,6 +888,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     /// </remarks>
     public Vector<T> ElementwiseMultiply(Vector<T> other)
     {
+        using var keepOtherAlive = new KeepAliveScope(other); // reads other's storage directly below
         if (other == null)
             throw new ArgumentNullException(nameof(other));
 
@@ -890,7 +896,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
             throw new ArgumentException("Vectors must have the same length for element-wise multiplication.", nameof(other));
 
         var result = VA.RentUninitialized<T>(this.Length);
-        _numOps.Multiply(_memory.Span, other._memory.Span, result.AsWritableSpan());
+        _numOps.Multiply(_memory.Span, other._memory.Span, result.AsWritableSpanUnmarked());
 
         return result;
     }
@@ -1418,6 +1424,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     /// </remarks>
     public static Vector<T> Concatenate(params Vector<T>[] vectors)
     {
+        using var keepVectorsAlive = new KeepAliveScope(vectors); // the loop below reads each vector's storage directly
         int totalSize = vectors.Sum(v => v.Length);
         Vector<T> result = new(totalSize);
 
@@ -1472,7 +1479,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
             throw new ArgumentException("Vectors must have the same length");
 
         var result = VA.RentUninitialized<T>(Length);
-        _numOps.Add(_memory.Span, other.AsSpan(), result.AsWritableSpan());
+        _numOps.Add(_memory.Span, other.AsSpan(), result.AsWritableSpanUnmarked());
         return result;
     }
 
@@ -1492,7 +1499,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
             throw new ArgumentException("Vectors must have the same length");
 
         var result = VA.RentUninitialized<T>(Length);
-        _numOps.Subtract(_memory.Span, other.AsSpan(), result.AsWritableSpan());
+        _numOps.Subtract(_memory.Span, other.AsSpan(), result.AsWritableSpanUnmarked());
         return result;
     }
 
@@ -1509,7 +1516,7 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     public new Vector<T> Multiply(T scalar)
     {
         var result = VA.RentUninitialized<T>(Length);
-        _numOps.MultiplyScalar(_memory.Span, scalar, result.AsWritableSpan());
+        _numOps.MultiplyScalar(_memory.Span, scalar, result.AsWritableSpanUnmarked());
         return result;
     }
 
@@ -1543,11 +1550,12 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     /// </remarks>
     public static Vector<T> operator +(Vector<T> vector, T scalar)
     {
+        using var keepVectorAlive = new KeepAliveScope(vector); // reads vector's storage directly below
         if (vector == null)
             throw new ArgumentNullException(nameof(vector));
 
         var result = VA.RentUninitialized<T>(vector.Length);
-        _numOps.AddScalar(vector._memory.Span, scalar, result.AsWritableSpan());
+        _numOps.AddScalar(vector._memory.Span, scalar, result.AsWritableSpanUnmarked());
         return result;
     }
 
@@ -1566,11 +1574,12 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     /// </remarks>
     public static Vector<T> operator -(Vector<T> vector, T scalar)
     {
+        using var keepVectorAlive = new KeepAliveScope(vector); // reads vector's storage directly below
         if (vector == null)
             throw new ArgumentNullException(nameof(vector));
 
         var result = VA.RentUninitialized<T>(vector.Length);
-        _numOps.SubtractScalar(vector._memory.Span, scalar, result.AsWritableSpan());
+        _numOps.SubtractScalar(vector._memory.Span, scalar, result.AsWritableSpanUnmarked());
         return result;
     }
 

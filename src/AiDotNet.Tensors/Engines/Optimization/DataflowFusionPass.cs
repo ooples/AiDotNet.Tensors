@@ -135,10 +135,14 @@ internal sealed class DataflowFusionPass : ICpuOptimizationPass
             "FusedTwoLayer",
             (eng, output) =>
             {
-                var inArr = (float[])(object)capturedInput.GetDataArray();
-                var w1Arr = (float[])(object)capturedW1.GetDataArray();
-                var w2Arr = (float[])(object)capturedW2.GetDataArray();
-                var outArr = (float[])(object)output.GetDataArray();
+                using var inArrLease = capturedInput.LeaseArray();
+                var inArr = (float[])(object)inArrLease.Array;
+                using var w1ArrLease = capturedW1.LeaseArray();
+                var w1Arr = (float[])(object)w1ArrLease.Array;
+                using var w2ArrLease = capturedW2.LeaseArray();
+                var w2Arr = (float[])(object)w2ArrLease.Array;
+                using var outArrLease = output.LeaseArray();
+                var outArr = (float[])(object)outArrLease.Array;
                 // Read actual batch size at replay time (may differ from compile time)
                 int currentM = capturedInput._shape[0];
                 var activated = capturedActivated;

@@ -80,7 +80,8 @@ public sealed class SparseSemiStructured<T>
         int groups = cols / M;
         var packed = new T[rows * groups * N];
         var meta = new byte[rows * groups];
-        var src = dense.AsSpan();
+        using var srcLease = dense.Lease();
+        var src = srcLease.Span;
 
         for (int r = 0; r < rows; r++)
         {
@@ -118,7 +119,8 @@ public sealed class SparseSemiStructured<T>
         var ops = MathHelper.GetNumericOperations<T>();
         var dense = new Tensor<T>(new[] { Rows, Columns });
         int groups = Columns / M;
-        var dst = dense.AsWritableSpan();
+        using var dstLease = dense.LeaseWritable();
+        var dst = dstLease.Span;
         for (int r = 0; r < Rows; r++)
         {
             for (int g = 0; g < groups; g++)
@@ -166,7 +168,8 @@ public sealed class SparseSemiStructured<T>
                 var outF = SparseSemiStructuredGpuDispatch.MatMul(
                     packedF, Metadata, bF, Rows, Columns, dense._shape[1]);
                 var outputT = new Tensor<T>(new[] { Rows, dense._shape[1] });
-                var outSpanT = outputT.AsWritableSpan();
+                using var outSpanTLease = outputT.LeaseWritable();
+                var outSpanT = outSpanTLease.Span;
                 for (int i = 0; i < outSpanT.Length; i++) outSpanT[i] = (T)(object)outF[i];
                 return outputT;
             }
@@ -182,8 +185,10 @@ public sealed class SparseSemiStructured<T>
         int n = dense._shape[1];
         int groups = Columns / M;
         var output = new Tensor<T>(new[] { Rows, n });
-        var bSpan = dense.AsSpan();
-        var outSpan = output.AsWritableSpan();
+        using var bSpanLease = dense.Lease();
+        var bSpan = bSpanLease.Span;
+        using var outSpanLease = output.LeaseWritable();
+        var outSpan = outSpanLease.Span;
 
         for (int r = 0; r < Rows; r++)
         {

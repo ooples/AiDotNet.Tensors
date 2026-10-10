@@ -54,7 +54,8 @@ internal static class LinearSolvers
         if (a.Shape[1] != n) return MatrixStructure.General;
         if (n < 2) return MatrixStructure.General;
 
-        var d = a.GetDataArray();
+        using var dLease = a.LeaseArray();
+        var d = dLease.Array;
         const double tol = 1e-8;
 
         bool upperTri = true;
@@ -103,8 +104,10 @@ internal static class LinearSolvers
             ? CopyPrefix(a._shape, rank - 2)
             : new[] { 1 };
         var info = new Tensor<int>(infoShape);
-        var luData = lu.GetDataArray();
-        var iData = info.GetDataArray();
+        using var luDataLease = lu.LeaseArray();
+        var luData = luDataLease.Array;
+        using var iDataLease = info.LeaseArray();
+        var iData = iDataLease.Array;
         for (int bi = 0; bi < batch; bi++)
         {
             int status = 0;
@@ -240,8 +243,10 @@ internal static class LinearSolvers
         if (m > n)
         {
             var axMinusB = MatMulMinusB(a, sol, b, bIsVector);
-            var resD = residuals.GetDataArray();
-            var rbD = axMinusB.GetDataArray();
+            using var resDLease = residuals.LeaseArray();
+            var resD = resDLease.Array;
+            using var rbDLease = axMinusB.LeaseArray();
+            var rbD = rbDLease.Array;
             for (int c = 0; c < nrhs; c++)
             {
                 double s = 0.0;
@@ -260,8 +265,10 @@ internal static class LinearSolvers
         // Approximate SVs via R's diagonal magnitudes — not exact singular
         // values but adequate for callers that use SV magnitudes as a
         // conditioning sanity-check. A full SVD-backed driver lands separately.
-        var rData = R.GetDataArray();
-        var svData = sv.GetDataArray();
+        using var rDataLease = R.LeaseArray();
+        var rData = rDataLease.Array;
+        using var svDataLease = sv.LeaseArray();
+        var svData = svDataLease.Array;
         int rCols = R.Shape[R.Rank - 1];
         for (int i = 0; i < Math.Min(m, n); i++)
             svData[i] = FromDouble<T>(Math.Abs(ToDouble(rData[i * rCols + i])));
@@ -282,8 +289,10 @@ internal static class LinearSolvers
         int n = t._shape[rank - 1];
         int batch = 1;
         for (int i = 0; i < rank - 2; i++) batch *= t._shape[i];
-        var sD = t.GetDataArray();
-        var rD = res.GetDataArray();
+        using var sDLease = t.LeaseArray();
+        var sD = sDLease.Array;
+        using var rDLease = res.LeaseArray();
+        var rD = rDLease.Array;
         for (int b = 0; b < batch; b++)
             for (int i = 0; i < m; i++)
                 for (int j = 0; j < n; j++)
@@ -301,9 +310,12 @@ internal static class LinearSolvers
         int nrhs = bIsVector ? 1 : y.Shape[y.Rank - 1];
         var outShape = bIsVector ? new[] { n } : new[] { n, nrhs };
         var res = new Tensor<T>(outShape);
-        var qD = Q.GetDataArray();
-        var yD = y.GetDataArray();
-        var rD = res.GetDataArray();
+        using var qDLease = Q.LeaseArray();
+        var qD = qDLease.Array;
+        using var yDLease = y.LeaseArray();
+        var yD = yDLease.Array;
+        using var rDLease = res.LeaseArray();
+        var rD = rDLease.Array;
         for (int i = 0; i < n; i++)
         {
             for (int c = 0; c < nrhs; c++)
@@ -331,10 +343,14 @@ internal static class LinearSolvers
         int nrhs = bIsVector ? 1 : x.Shape[x.Rank - 1];
         var outShape = bIsVector ? new[] { m } : new[] { m, nrhs };
         var res = new Tensor<T>(outShape);
-        var aD = A.GetDataArray();
-        var xD = x.GetDataArray();
-        var bD = b.GetDataArray();
-        var rD = res.GetDataArray();
+        using var aDLease = A.LeaseArray();
+        var aD = aDLease.Array;
+        using var xDLease = x.LeaseArray();
+        var xD = xDLease.Array;
+        using var bDLease = b.LeaseArray();
+        var bD = bDLease.Array;
+        using var rDLease = res.LeaseArray();
+        var rD = rDLease.Array;
         for (int i = 0; i < m; i++)
         {
             for (int c = 0; c < nrhs; c++)
@@ -508,9 +524,12 @@ internal static class LinearSolvers
         int prefRank = bIsVector ? rank - 1 : rank - 2;
         for (int i = 0; i < prefRank; i++) batch *= b._shape[i];
 
-        var qData = q.GetDataArray();
-        var bData = b.GetDataArray();
-        var rData = result.GetDataArray();
+        using var qDataLease = q.LeaseArray();
+        var qData = qDataLease.Array;
+        using var bDataLease = b.LeaseArray();
+        var bData = bDataLease.Array;
+        using var rDataLease = result.LeaseArray();
+        var rData = rDataLease.Array;
         int qStride = m * k;
         int bStride = bIsVector ? m : m * nrhs;
         int rStride = bIsVector ? k : k * nrhs;

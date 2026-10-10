@@ -25,6 +25,12 @@ public static class MatrixAllocator
     /// </summary>
     public const int ArrayPoolThresholdValue = ArrayPoolThreshold;
 
+    // Pooled from the element-count threshold, or from the size whose results the tracker recycles (the large-object
+    // threshold by default), so a 2 MB double result (250K elements) is pooled and recycled like a larger one.
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static bool UsesPool<T>(int elements)
+        => elements >= ArrayPoolThreshold || ResultBufferTracker.Qualifies<T>(elements);
+
     /// <summary>
     /// Creates a zero-initialized matrix with the given dimensions.
     /// Large matrices use ArrayPool to reduce GC pressure; small-medium matrices
@@ -64,7 +70,7 @@ public static class MatrixAllocator
         }
 
         // Tier 2: ArrayPool for large allocations.
-        if (totalSize >= ArrayPoolThreshold)
+        if (UsesPool<T>(totalSize))
         {
             T[] pooled = ThreadLocalTensorCache<T>.RentOrAllocateExact(totalSize);
             Array.Clear(pooled, 0,
@@ -126,7 +132,7 @@ public static class MatrixAllocator
         }
 
 #if NET5_0_OR_GREATER
-        if (totalSize >= ArrayPoolThreshold)
+        if (UsesPool<T>(totalSize))
         {
             T[] pooled = ThreadLocalTensorCache<T>.RentOrAllocateExact(totalSize);
             if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
@@ -166,7 +172,7 @@ public static class MatrixAllocator
             return Matrix<T>.FromMemory(memory, rows, cols);
         }
 
-        if (totalSize >= ArrayPoolThreshold)
+        if (UsesPool<T>(totalSize))
         {
             T[] pooled = ThreadLocalTensorCache<T>.RentOrAllocateExact(totalSize);
             data.AsSpan().CopyTo(pooled.AsSpan(0, totalSize));

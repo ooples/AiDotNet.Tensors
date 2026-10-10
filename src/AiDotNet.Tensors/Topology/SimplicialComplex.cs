@@ -130,7 +130,8 @@ public sealed class SimplicialComplex
             a.AsSpan(), a.Columns, ops.Zero, term.AsWritableSpan(), n);
 
         // Mirror lower → upper to produce the full symmetric matrix.
-        var span = term.AsWritableSpan();
+        using var spanLease = term.LeaseWritable();
+        var span = spanLease.Span;
         for (int i = 0; i < n; i++)
             for (int j = 0; j < i; j++)
                 span[j * n + i] = span[i * n + j];

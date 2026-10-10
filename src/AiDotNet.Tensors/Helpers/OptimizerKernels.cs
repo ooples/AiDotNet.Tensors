@@ -148,8 +148,10 @@ public static class OptimizerKernels
         // everything else goes through the per-element numeric ops
         // dispatch. Still zero-allocation — no intermediate tensor.
         var numOps = MathHelper.GetNumericOperations<T>();
-        var paramSpanT = param.AsWritableSpan();
-        var gradSpanT = gradContig.AsSpan();
+        using var paramSpanTLease = param.LeaseWritable();
+        var paramSpanT = paramSpanTLease.Span;
+        using var gradSpanTLease = gradContig.Lease();
+        var gradSpanT = gradSpanTLease.Span;
         for (int i = 0; i < paramSpanT.Length; i++)
         {
             paramSpanT[i] = numOps.Subtract(
@@ -310,7 +312,8 @@ public static class OptimizerKernels
 
         // Scalar AdamW = (decoupled decay) ∘ Adam
         var numOps = MathHelper.GetNumericOperations<T>();
-        var paramSpan = param.AsWritableSpan();
+        using var paramSpanLease = param.LeaseWritable();
+        var paramSpan = paramSpanLease.Span;
         T decayFactor = numOps.Subtract(numOps.One, numOps.Multiply(weightDecay, lr));
         for (int i = 0; i < paramSpan.Length; i++)
             paramSpan[i] = numOps.Multiply(paramSpan[i], decayFactor);
@@ -353,10 +356,14 @@ public static class OptimizerKernels
         T lr, T beta1, T beta2, T eps, int step)
     {
         var numOps = MathHelper.GetNumericOperations<T>();
-        var pSpan = param.AsWritableSpan();
-        var gSpan = grad.AsSpan();
-        var mSpan = m.AsWritableSpan();
-        var vSpan = v.AsWritableSpan();
+        using var pSpanLease = param.LeaseWritable();
+        var pSpan = pSpanLease.Span;
+        using var gSpanLease = grad.Lease();
+        var gSpan = gSpanLease.Span;
+        using var mSpanLease = m.LeaseWritable();
+        var mSpan = mSpanLease.Span;
+        using var vSpanLease = v.LeaseWritable();
+        var vSpan = vSpanLease.Span;
 
         T oneMinusB1 = numOps.Subtract(numOps.One, beta1);
         T oneMinusB2 = numOps.Subtract(numOps.One, beta2);

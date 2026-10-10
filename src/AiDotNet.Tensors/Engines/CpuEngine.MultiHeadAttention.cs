@@ -257,9 +257,12 @@ public partial class CpuEngine
             }
             else
             {
-                var qWS = qWeight.AsSpan();
-                var kWS = kWeight.AsSpan();
-                var vWS = vWeight.AsSpan();
+                using var qWSLease = qWeight.Lease();
+                var qWS = qWSLease.Span;
+                using var kWSLease = kWeight.Lease();
+                var kWS = kWSLease.Span;
+                using var vWSLease = vWeight.Lease();
+                var vWS = vWSLease.Span;
                 var fW = fusedWBuf!.AsSpan();
                 for (int kk = 0; kk < dModel; kk++)
                 {

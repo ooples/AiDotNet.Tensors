@@ -91,6 +91,9 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     {
         var matrix = new Matrix<T>(memory, rows, cols);
         matrix.SetPooledArray(pooledArray);
+        // This result owns the pooled array: if it is never returned explicitly, the tracker hands the array back to the
+        // cache once this result (and every zero-copy view of it) has been collected.
+        matrix.ResultOwner = Helpers.ResultBufferTracker.Track(pooledArray);
         return matrix;
     }
 
@@ -747,7 +750,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     public Vector<T> GetColumnSegment(int columnIndex, int startRow, int length)
     {
         var result = VA.RentUninitialized<T>(length);
-        var destSpan = result.AsWritableSpan();
+        var destSpan = result.AsWritableSpanUnmarked();
         var srcSpan = _memory.Span;
         for (int i = 0; i < length; i++)
         {
@@ -773,7 +776,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     {
         var result = VA.RentUninitialized<T>(length);
         var sourceSpan = _memory.Span.Slice(rowIndex * _cols + startColumn, length);
-        _numOps.Copy(sourceSpan, result.AsWritableSpan());
+        _numOps.Copy(sourceSpan, result.AsWritableSpanUnmarked());
         return result;
     }
 
@@ -852,7 +855,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     public Vector<T> ToRowVector()
     {
         Vector<T> result = new(Rows * Columns);
-        _numOps.Copy(_memory.Span, result.AsWritableSpan());
+        _numOps.Copy(_memory.Span, result.AsWritableSpanUnmarked());
         return result;
     }
 
@@ -876,7 +879,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
         }
 
         var result = MA.RentUninitialized<T>(Rows, Columns);
-        _numOps.Add(_memory.Span, tensor.AsSpan(), result.AsWritableSpan());
+        _numOps.Add(_memory.Span, tensor.AsSpan(), result.AsWritableSpanUnmarked());
         return result;
     }
 
@@ -1099,7 +1102,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     public Matrix<T> Divide(T scalar)
     {
         Matrix<T> result = MA.RentUninitialized<T>(Rows, Columns);
-        _numOps.DivideScalar(_memory.Span, scalar, result.AsWritableSpan());
+        _numOps.DivideScalar(_memory.Span, scalar, result.AsWritableSpanUnmarked());
         return result;
     }
 
@@ -1129,6 +1132,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     /// </remarks>
     public Matrix<T> Divide(Matrix<T> other)
     {
+        using var keepOtherAlive = new KeepAliveScope(other); // reads other's storage directly below
         if (this.Rows != other.Rows || this.Columns != other.Columns)
         {
             throw new ArgumentException("Matrices must have the same dimensions for division.");
@@ -1136,7 +1140,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
 
         Matrix<T> result = MA.RentUninitialized<T>(Rows, Columns);
         // Use vectorized Divide operation for SIMD acceleration (5-15x faster with AVX2)
-        _numOps.Divide(_memory.Span, other._memory.Span, result.AsWritableSpan());
+        _numOps.Divide(_memory.Span, other._memory.Span, result.AsWritableSpanUnmarked());
 
         return result;
     }
@@ -1450,7 +1454,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     /// This is efficient because matrix data is stored in row-major order (rows are contiguous in memory).
     /// Use this for SIMD vectorization with TensorPrimitives.</para>
     /// </remarks>
-    public Span<T> GetRowSpan(int rowIndex)
+    internal Span<T> GetRowSpan(int rowIndex)
     {
         if (rowIndex < 0 || rowIndex >= Rows)
             throw new ArgumentOutOfRangeException(nameof(rowIndex));
@@ -1468,7 +1472,7 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     /// <para><b>For Beginners:</b> A ReadOnlySpan provides a high-performance, zero-allocation view over a matrix row
     /// that prevents modifications. This is efficient for reading row data without copying.</para>
     /// </remarks>
-    public ReadOnlySpan<T> GetRowReadOnlySpan(int rowIndex)
+    internal ReadOnlySpan<T> GetRowReadOnlySpan(int rowIndex)
     {
         if (rowIndex < 0 || rowIndex >= Rows)
             throw new ArgumentOutOfRangeException(nameof(rowIndex));

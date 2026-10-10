@@ -53,8 +53,10 @@ public partial class CpuEngine
         var ops = MathHelper.GetNumericOperations<T>();
         int n = boxes.Length / 4;
         var result = new Tensor<T>(boxes._shape);
-        var src = boxes.AsSpan();
-        var dst = result.AsWritableSpan();
+        using var srcLease = boxes.Lease();
+        var src = srcLease.Span;
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
         T half = ops.Divide(ops.One, ops.FromDouble(2.0));
 
         for (int i = 0; i < n; i++)
@@ -122,8 +124,10 @@ public partial class CpuEngine
         var outShape = boxes._shape.Take(boxes.Rank - 1).ToArray();
         if (outShape.Length == 0) outShape = new[] { 1 };
         var result = new Tensor<T>(outShape);
-        var src = boxes.AsSpan();
-        var dst = result.AsWritableSpan();
+        using var srcLease = boxes.Lease();
+        var src = srcLease.Span;
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
         T zero = ops.Zero;
         for (int i = 0; i < n; i++)
         {
@@ -167,11 +171,15 @@ public partial class CpuEngine
         var ops = MathHelper.GetNumericOperations<T>();
         var (iou, union, _, _) = ComputePairwiseIoU(boxesA, boxesB);
         // GIoU = IoU − (|enclosing| − |union|) / |enclosing|.
-        var a = boxesA.AsSpan();
-        var b = boxesB.AsSpan();
+        using var aLease = boxesA.Lease();
+        var a = aLease.Span;
+        using var bLease = boxesB.Lease();
+        var b = bLease.Span;
         int N = boxesA._shape[0], M = boxesB._shape[0];
-        var iouSpan = iou.AsWritableSpan();
-        var unionSpan = union.AsSpan();
+        using var iouSpanLease = iou.LeaseWritable();
+        var iouSpan = iouSpanLease.Span;
+        using var unionSpanLease = union.Lease();
+        var unionSpan = unionSpanLease.Span;
         for (int i = 0; i < N; i++)
         {
             T ax1 = a[i * 4], ay1 = a[i * 4 + 1], ax2 = a[i * 4 + 2], ay2 = a[i * 4 + 3];
@@ -241,8 +249,10 @@ public partial class CpuEngine
         if (n == 0) return new Tensor<int>(new[] { 0 });
 
         var ops = MathHelper.GetNumericOperations<T>();
-        var b = boxes.AsSpan();
-        var s = scores.AsSpan();
+        using var bLease = boxes.Lease();
+        var b = bLease.Span;
+        using var sLease = scores.Lease();
+        var s = sLease.Span;
 
         // Sort indices by score descending — Array.Sort with custom comparer
         // is allocation-free for int[] keys.
@@ -288,7 +298,8 @@ public partial class CpuEngine
         }
 
         var result = new Tensor<int>(new[] { keep.Count });
-        var rs = result.AsWritableSpan();
+        using var rsLease = result.LeaseWritable();
+        var rs = rsLease.Span;
         for (int i = 0; i < keep.Count; i++) rs[i] = keep[i];
         return result;
     }
@@ -312,7 +323,8 @@ public partial class CpuEngine
         // smaller than box extent). We use the full span (max − min + 1),
         // which dominates any pairwise distance regardless of sign.
         var ops = MathHelper.GetNumericOperations<T>();
-        var b = boxes.AsSpan();
+        using var bLease = boxes.Lease();
+        var b = bLease.Span;
         double maxCoord = double.NegativeInfinity;
         double minCoord = double.PositiveInfinity;
         for (int i = 0; i < n; i++)
@@ -324,9 +336,11 @@ public partial class CpuEngine
         }
         double offsetUnit = (maxCoord - minCoord) + 1.0;
 
-        var ids = classIds.AsSpan();
+        using var idsLease = classIds.Lease();
+        var ids = idsLease.Span;
         var offsetBoxes = new Tensor<T>(boxes._shape);
-        var ob = offsetBoxes.AsWritableSpan();
+        using var obLease = offsetBoxes.LeaseWritable();
+        var ob = obLease.Span;
         for (int i = 0; i < n; i++)
         {
             T off = ops.FromDouble(ids[i] * offsetUnit);
@@ -347,9 +361,11 @@ public partial class CpuEngine
             throw new ArgumentException("MasksToBoxes requires rank-3 masks [N, H, W].");
         var ops = MathHelper.GetNumericOperations<T>();
         int N = masks._shape[0], H = masks._shape[1], W = masks._shape[2];
-        var src = masks.AsSpan();
+        using var srcLease = masks.Lease();
+        var src = srcLease.Span;
         var result = new Tensor<int>(new[] { N, 4 });
-        var dst = result.AsWritableSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
         T zero = ops.Zero;
 
         for (int n = 0; n < N; n++)
@@ -399,14 +415,20 @@ public partial class CpuEngine
         int N = boxesA._shape[0], M = boxesB._shape[0];
         var areaA = (Tensor<T>)BoxArea(boxesA);
         var areaB = (Tensor<T>)BoxArea(boxesB);
-        var aSpan = boxesA.AsSpan();
-        var bSpan = boxesB.AsSpan();
-        var aaSpan = areaA.AsSpan();
-        var abSpan = areaB.AsSpan();
+        using var aSpanLease = boxesA.Lease();
+        var aSpan = aSpanLease.Span;
+        using var bSpanLease = boxesB.Lease();
+        var bSpan = bSpanLease.Span;
+        using var aaSpanLease = areaA.Lease();
+        var aaSpan = aaSpanLease.Span;
+        using var abSpanLease = areaB.Lease();
+        var abSpan = abSpanLease.Span;
         var iou = new Tensor<T>(new[] { N, M });
         var union = new Tensor<T>(new[] { N, M });
-        var iouSpan = iou.AsWritableSpan();
-        var uSpan = union.AsWritableSpan();
+        using var iouSpanLease = iou.LeaseWritable();
+        var iouSpan = iouSpanLease.Span;
+        using var uSpanLease = union.LeaseWritable();
+        var uSpan = uSpanLease.Span;
         T zero = ops.Zero;
         for (int i = 0; i < N; i++)
         {
@@ -447,9 +469,12 @@ public partial class CpuEngine
 
         var ops = MathHelper.GetNumericOperations<T>();
         var (iou, _, _, _) = ComputePairwiseIoU(boxesA, boxesB);
-        var iouSpan = iou.AsWritableSpan();
-        var a = boxesA.AsSpan();
-        var b = boxesB.AsSpan();
+        using var iouSpanLease = iou.LeaseWritable();
+        var iouSpan = iouSpanLease.Span;
+        using var aLease = boxesA.Lease();
+        var a = aLease.Span;
+        using var bLease = boxesB.Lease();
+        var b = bLease.Span;
         int N = boxesA._shape[0], M = boxesB._shape[0];
         T half = ops.Divide(ops.One, ops.FromDouble(2.0));
         T four = ops.FromDouble(4.0);
@@ -561,11 +586,16 @@ public partial class CpuEngine
         if (N == 0 || M == 0) return (gradA, gradB);
 
         var ops = MathHelper.GetNumericOperations<T>();
-        var a = boxesA.AsSpan();
-        var b = boxesB.AsSpan();
-        var go = gradOutput.AsSpan();
-        var gA = gradA.AsWritableSpan();
-        var gB = gradB.AsWritableSpan();
+        using var aLease = boxesA.Lease();
+        var a = aLease.Span;
+        using var bLease = boxesB.Lease();
+        var b = bLease.Span;
+        using var goLease = gradOutput.Lease();
+        var go = goLease.Span;
+        using var gALease = gradA.LeaseWritable();
+        var gA = gALease.Span;
+        using var gBLease = gradB.LeaseWritable();
+        var gB = gBLease.Span;
 
         // Work in double for numerical stability — the forward converts via
         // ops.ToDouble() for DIoU/CIoU anyway, so keeping backward in the

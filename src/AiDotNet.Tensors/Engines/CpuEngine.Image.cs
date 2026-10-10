@@ -230,7 +230,8 @@ internal static class PngCodec
         int H = image._shape[0], W = image._shape[1], C = image._shape[2];
         byte colorType = C switch { 1 => 0, 2 => 4, 3 => 2, 4 => 6, _ => throw new ArgumentException("PNG: unsupported channel count") };
 
-        var src = image.AsSpan();
+        using var srcLease = image.Lease();
+        var src = srcLease.Span;
         var raw = new byte[H * (1 + W * C)];
         int dst = 0;
         for (int y = 0; y < H; y++)

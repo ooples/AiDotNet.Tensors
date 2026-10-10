@@ -854,6 +854,9 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     internal static Tensor<T> FromPooledMemory(Memory<T> memory, int[] dimensions, T[] pooledArray)
     {
         var vector = Vector<T>.FromMemory(memory);
+        // This result owns the pooled array: if it is never returned explicitly, the tracker hands the array back to the
+        // cache once this tensor, its views (which share this vector through the storage) and any zero-copy wraps has been collected.
+        vector.ResultOwner = Helpers.ResultBufferTracker.Track(pooledArray);
         var tensor = new Tensor<T>(vector, dimensions);
         tensor._pooledArray = pooledArray;
         return tensor;
@@ -1968,7 +1971,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
                 if (typeof(T) == typeof(float))
                 {
                     var s = (float[])(object)GetDataArray();
-                    var r = (float[])(object)result.GetDataArray();
+                    using var rLease = result.LeaseArray();
+                    var r = (float[])(object)rLease.Array;
                     CpuParallelSettings.ParallelForOrSerial(0, kept, len, c =>
                     {
                         float acc = 0f;
@@ -1983,7 +1987,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
                 else
                 {
                     var s = (double[])(object)GetDataArray();
-                    var r = (double[])(object)result.GetDataArray();
+                    using var rLease = result.LeaseArray();
+                    var r = (double[])(object)rLease.Array;
                     CpuParallelSettings.ParallelForOrSerial(0, kept, len, c =>
                     {
                         double acc = 0d;
@@ -2004,7 +2009,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             if (typeof(T) == typeof(float))
             {
                 var s = (float[])(object)GetDataArray();
-                var r = (float[])(object)result.GetDataArray();
+                using var rLease = result.LeaseArray();
+                var r = (float[])(object)rLease.Array;
                 for (int i = 0; i < len; i++)
                 {
                     r[outFlat] += s[i];
@@ -2020,7 +2026,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             if (typeof(T) == typeof(double))
             {
                 var s = (double[])(object)GetDataArray();
-                var r = (double[])(object)result.GetDataArray();
+                using var rLease = result.LeaseArray();
+                var r = (double[])(object)rLease.Array;
                 for (int i = 0; i < len; i++)
                 {
                     r[outFlat] += s[i];
@@ -2036,7 +2043,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
 
             // Generic T: still allocation-free / indexer-free; only Add is virtual.
             var src = AsSpan();
-            var rArr = result.GetDataArray();
+            using var rArrLease = result.LeaseArray();
+            var rArr = rArrLease.Array;
             for (int i = 0; i < len; i++)
             {
                 rArr[outFlat] = _numOps.Add(rArr[outFlat], src[i]);
@@ -2082,7 +2090,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
 
         var result = new Vector<T>(length);
         var sourceSpan = _data.AsSpan().Slice(start, length);
-        var destSpan = result.AsWritableSpan();
+        using var destSpanLease = result.LeaseWritable();
+        var destSpan = destSpanLease.Span;
         _numOps.Copy(sourceSpan, destSpan);
         return result;
     }
@@ -3646,7 +3655,7 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     /// For GPU-resident tensors, this triggers synchronization and data download.
     /// For CPU-resident tensors, this returns the backing array directly.
     /// </summary>
-    public T[] GetCpuData()
+    internal T[] GetCpuData()
     {
         if (IsGpuResident)
         {

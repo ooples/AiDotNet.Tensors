@@ -112,12 +112,17 @@ public static class FlashAttention<T> where T : unmanaged
         var output = new Tensor<T>(outShape);
         var logsumexp = new Tensor<T>(lseShape);
 
-        var qArr = query.GetDataArray();
-        var kArr = key.GetDataArray();
-        var vArr = value.GetDataArray();
+        using var qArrLease = query.LeaseArray();
+        var qArr = qArrLease.Array;
+        using var kArrLease = key.LeaseArray();
+        var kArr = kArrLease.Array;
+        using var vArrLease = value.LeaseArray();
+        var vArr = vArrLease.Array;
         var biasArr = attentionBias?.GetDataArray();
-        var outArr = output.GetDataArray();
-        var lseArr = logsumexp.GetDataArray();
+        using var outArrLease = output.LeaseArray();
+        var outArr = outArrLease.Array;
+        using var lseArrLease = logsumexp.LeaseArray();
+        var lseArr = lseArrLease.Array;
 
         // Float / double primitive fast paths run the same kernel as
         // the rank-fixed FlashAttention2 — just looped over
@@ -201,16 +206,25 @@ public static class FlashAttention<T> where T : unmanaged
         var dK = new Tensor<T>((int[])key._shape.Clone());
         var dV = new Tensor<T>((int[])value._shape.Clone());
 
-        var qArr = query.GetDataArray();
-        var kArr = key.GetDataArray();
-        var vArr = value.GetDataArray();
-        var oArr = output.GetDataArray();
-        var dOArr = gradOutput.GetDataArray();
-        var lseArr = logsumexp.GetDataArray();
+        using var qArrLease = query.LeaseArray();
+        var qArr = qArrLease.Array;
+        using var kArrLease = key.LeaseArray();
+        var kArr = kArrLease.Array;
+        using var vArrLease = value.LeaseArray();
+        var vArr = vArrLease.Array;
+        using var oArrLease = output.LeaseArray();
+        var oArr = oArrLease.Array;
+        using var dOArrLease = gradOutput.LeaseArray();
+        var dOArr = dOArrLease.Array;
+        using var lseArrLease = logsumexp.LeaseArray();
+        var lseArr = lseArrLease.Array;
         var biasArr = attentionBias?.GetDataArray();
-        var dQArr = dQ.GetDataArray();
-        var dKArr = dK.GetDataArray();
-        var dVArr = dV.GetDataArray();
+        using var dQArrLease = dQ.LeaseArray();
+        var dQArr = dQArrLease.Array;
+        using var dKArrLease = dK.LeaseArray();
+        var dKArr = dKArrLease.Array;
+        using var dVArrLease = dV.LeaseArray();
+        var dVArr = dVArrLease.Array;
 
         if (typeof(T) == typeof(float))
         {

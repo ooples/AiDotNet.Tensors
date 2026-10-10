@@ -44,7 +44,8 @@ public static partial class Linalg
         var ops = MathHelper.GetNumericOperations<T>();
         int n = like.Shape[like.Rank - 1];
         var identity = new Tensor<T>(like.Shape.ToArray());
-        var span = identity.AsWritableSpan();
+        using var spanLease = identity.LeaseWritable();
+        var span = spanLease.Span;
         for (int start = 0; start < span.Length; start += n * n)
             for (int i = 0; i < n; i++) span[start + i * n + i] = ops.One;
         return identity;
@@ -77,9 +78,12 @@ public static partial class Linalg
         var p = new Tensor<T>([.. lead, m, m]);
         var l = new Tensor<T>([.. lead, m, k]);
         var u = new Tensor<T>([.. lead, k, n]);
-        var ps = p.AsWritableSpan();
-        var ls = l.AsWritableSpan();
-        var us = u.AsWritableSpan();
+        using var psLease = p.LeaseWritable();
+        var ps = psLease.Span;
+        using var lsLease = l.LeaseWritable();
+        var ls = lsLease.Span;
+        using var usLease = u.LeaseWritable();
+        var us = usLease.Span;
         for (int b = 0; b < batch; b++)
         {
             for (int i = 0; i < m; i++)
@@ -224,7 +228,8 @@ public static partial class Linalg
     {
         var ops = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(shape);
-        var span = result.AsWritableSpan();
+        using var spanLease = result.LeaseWritable();
+        var span = spanLease.Span;
         for (int i = 0; i < values.Length; i++) span[i] = ops.FromDouble(values[i]);
         return result;
     }
