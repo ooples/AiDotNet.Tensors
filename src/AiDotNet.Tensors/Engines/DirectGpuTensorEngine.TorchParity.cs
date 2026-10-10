@@ -162,34 +162,43 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorRandLike<T>(Tensor<T> tensor, int? seed = null)
     {
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
+        if (tensor is not null && TrySampleOnDevice<T>("TensorRandLike", tensor._shape, 0, 0, 1, seed) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorRandLike: no device kernel", null);
-        return base.TensorRandLike<T>(tensor, seed);
+        return base.TensorRandLike<T>(tensor!, seed);
     }
 
     /// <inheritdoc/>
     public override Tensor<T> TensorRandnLike<T>(Tensor<T> tensor, int? seed = null)
     {
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
+        if (tensor is not null && TrySampleOnDevice<T>("TensorRandnLike", tensor._shape, 5, 0, 0, seed) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorRandnLike: no device kernel", null);
-        return base.TensorRandnLike<T>(tensor, seed);
+        return base.TensorRandnLike<T>(tensor!, seed);
     }
 
     /// <inheritdoc/>
     public override Tensor<T> TensorRandint<T>(long low, long high, int[] shape, int? seed = null)
     {
+        if (shape is not null && high > low && TrySampleOnDevice<T>("TensorRandint", shape, 6, low, high - (double)low, seed) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorRandint: no device kernel", null);
-        return base.TensorRandint<T>(low, high, shape, seed);
+        return base.TensorRandint<T>(low, high, shape!, seed);
     }
 
     /// <inheritdoc/>
     public override Tensor<T> TensorRandintLike<T>(Tensor<T> tensor, long low, long high, int? seed = null)
     {
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
+        if (tensor is not null && high > low && TrySampleOnDevice<T>("TensorRandintLike", tensor._shape, 6, low, high - (double)low, seed) is { } onDevice)
+            return onDevice;
         GpuLaunchProbe.OnFallback("TensorRandintLike: no device kernel", null);
-        return base.TensorRandintLike<T>(tensor, low, high, seed);
+        return base.TensorRandintLike<T>(tensor!, low, high, seed);
     }
 
     /// <inheritdoc/>
     public override Tensor<T> TensorRandperm<T>(int n, int? seed = null)
     {
+        if (TryRandpermOnDevice<T>(n, seed) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorRandperm: no device kernel", null);
         return base.TensorRandperm<T>(n, seed);
     }
@@ -387,6 +396,8 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorRrelu<T>(Tensor<T> tensor, double lower = 1.0 / 8, double upper = 1.0 / 3, bool training = false, int? seed = null)
     {
+        if (training) GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
+        if (TryRreluOnDevice(tensor, lower, upper, training, seed) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorRrelu: no device kernel", null);
         return base.TensorRrelu<T>(tensor, lower, upper, training, seed);
     }
@@ -453,6 +464,8 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorBernoulli<T>(Tensor<T> probabilities, int? seed = null)
     {
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
+        if (TryValidatedSampleOnDevice(probabilities, null, seed, "TensorBernoulli") is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorBernoulli: no device kernel", null);
         return base.TensorBernoulli<T>(probabilities, seed);
     }
@@ -460,6 +473,8 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorBinomial<T>(Tensor<T> count, Tensor<T> probability, int? seed = null)
     {
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
+        if (TryValidatedSampleOnDevice(count, probability, seed, "TensorBinomial") is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorBinomial: no device kernel", null);
         return base.TensorBinomial<T>(count, probability, seed);
     }
@@ -467,6 +482,8 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorPoisson<T>(Tensor<T> rates, int? seed = null)
     {
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
+        if (TryValidatedSampleOnDevice(rates, null, seed, "TensorPoisson") is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorPoisson: no device kernel", null);
         return base.TensorPoisson<T>(rates, seed);
     }
@@ -474,48 +491,59 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorNormal<T>(Tensor<T> mean, Tensor<T> std, int? seed = null)
     {
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
+        // mean + std * epsilon with a device epsilon: the reparameterized form, so gradients reach mean and std.
+        if (mean is not null && std is not null && TrySampleOnDevice<T>("TensorNormal", mean._shape, 5, 0, 0, seed) is { } epsilon)
+            return TensorAdd(mean, TensorMultiply(std, epsilon));
         GpuLaunchProbe.OnFallback("TensorNormal: noise drawn on the host", null);
-        return base.TensorNormal<T>(mean, std, seed);
+        return base.TensorNormal<T>(mean!, std!, seed);
     }
 
     /// <inheritdoc/>
     public override Tensor<T> TensorUniform<T>(int[] shape, double low = 0, double high = 1, int? seed = null)
     {
+        if (shape is not null && TrySampleOnDevice<T>("TensorUniform", shape, 0, low, high, seed) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorUniform: no device kernel", null);
-        return base.TensorUniform<T>(shape, low, high, seed);
+        return base.TensorUniform<T>(shape!, low, high, seed);
     }
 
     /// <inheritdoc/>
     public override Tensor<T> TensorCauchy<T>(int[] shape, double median = 0, double sigma = 1, int? seed = null)
     {
+        if (shape is not null && TrySampleOnDevice<T>("TensorCauchy", shape, 1, median, sigma, seed) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorCauchy: no device kernel", null);
-        return base.TensorCauchy<T>(shape, median, sigma, seed);
+        return base.TensorCauchy<T>(shape!, median, sigma, seed);
     }
 
     /// <inheritdoc/>
     public override Tensor<T> TensorExponential<T>(int[] shape, double rate = 1, int? seed = null)
     {
+        if (shape is not null && rate > 0 && TrySampleOnDevice<T>("TensorExponential", shape, 2, rate, 0, seed) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorExponential: no device kernel", null);
-        return base.TensorExponential<T>(shape, rate, seed);
+        return base.TensorExponential<T>(shape!, rate, seed);
     }
 
     /// <inheritdoc/>
     public override Tensor<T> TensorGeometric<T>(int[] shape, double p, int? seed = null)
     {
+        if (shape is not null && p > 0 && p <= 1 && TrySampleOnDevice<T>("TensorGeometric", shape, 3, p, 0, seed) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorGeometric: no device kernel", null);
-        return base.TensorGeometric<T>(shape, p, seed);
+        return base.TensorGeometric<T>(shape!, p, seed);
     }
 
     /// <inheritdoc/>
     public override Tensor<T> TensorLogNormal<T>(int[] shape, double mean = 1, double std = 2, int? seed = null)
     {
+        if (shape is not null && TrySampleOnDevice<T>("TensorLogNormal", shape, 4, mean, std, seed) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorLogNormal: no device kernel", null);
-        return base.TensorLogNormal<T>(shape, mean, std, seed);
+        return base.TensorLogNormal<T>(shape!, mean, std, seed);
     }
 
     /// <inheritdoc/>
     public override Tensor<T> TensorMultinomial<T>(Tensor<T> probabilities, int numSamples, bool replacement = false, int? seed = null)
     {
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
+        if (TryMultinomialOnDevice(probabilities, numSamples, replacement, seed) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorMultinomial: no device kernel", null);
         return base.TensorMultinomial<T>(probabilities, numSamples, replacement, seed);
     }
@@ -523,6 +551,8 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorAlphaDropout<T>(Tensor<T> tensor, double p, bool training, int? seed = null)
     {
+        if (training) GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
+        if (TryDropoutOnDevice(tensor, p, training, seed, alpha: true, spatialDims: -1) is { } onDevice) return onDevice;
         GpuLaunchProbe.OnFallback("TensorAlphaDropout: noise drawn on the host", null);
         return base.TensorAlphaDropout<T>(tensor, p, training, seed);
     }
@@ -530,15 +560,22 @@ public partial class DirectGpuTensorEngine
     /// <inheritdoc/>
     public override Tensor<T> TensorFeatureAlphaDropout<T>(Tensor<T> tensor, double p, bool training, int? seed = null)
     {
+        if (training) GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
+        if (tensor is not null && TryDropoutOnDevice(tensor, p, training, seed, alpha: true, spatialDims: Math.Max(0, tensor.Rank - 2)) is { } onDevice)
+            return onDevice;
         GpuLaunchProbe.OnFallback("TensorFeatureAlphaDropout: noise drawn on the host", null);
-        return base.TensorFeatureAlphaDropout<T>(tensor, p, training, seed);
+        return base.TensorFeatureAlphaDropout<T>(tensor!, p, training, seed);
     }
 
     /// <inheritdoc/>
     public override Tensor<T> TensorChannelDropout<T>(Tensor<T> tensor, double p, bool training, int spatialDims, int? seed = null)
     {
+        if (training) GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HostBoundary);
+        if (tensor is not null && spatialDims >= 0 && spatialDims < tensor.Rank
+            && TryDropoutOnDevice(tensor, p, training, seed, alpha: false, spatialDims) is { } onDevice)
+            return onDevice;
         GpuLaunchProbe.OnFallback("TensorChannelDropout: noise drawn on the host", null);
-        return base.TensorChannelDropout<T>(tensor, p, training, spatialDims, seed);
+        return base.TensorChannelDropout<T>(tensor!, p, training, spatialDims, seed);
     }
 
     /// <inheritdoc/>

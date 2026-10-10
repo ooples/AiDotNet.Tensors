@@ -186,6 +186,113 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
         LaunchKernel(quantileKernel, ParityGrid(rows), DefaultBlockSize, args);
     }
 
+    unsafe void ITorchParityElementwiseBackend.TorchParityFlagReset(IGpuBuffer flag)
+    {
+        IntPtr resetKernel = ParityKernel("parity_flag_reset");
+        using var _ = PushContext();
+        IntPtr pf = flag.Handle;
+        void** args = stackalloc void*[1];
+        args[0] = &pf;
+        LaunchKernel(resetKernel, 1, 1, args);
+    }
+
+    unsafe void ITorchParityElementwiseBackend.TorchParitySample(IGpuBuffer output, int n, int kind, double a, double b, ulong seed)
+    {
+        if (n <= 0) return;
+        IntPtr sampleKernel = ParityKernel("parity_sample");
+        using var _ = PushContext();
+        IntPtr py = output.Handle;
+        void** args = stackalloc void*[6];
+        args[0] = &py; args[1] = &n; args[2] = &kind; args[3] = &a; args[4] = &b; args[5] = &seed;
+        LaunchKernel(sampleKernel, ParityGrid(n), DefaultBlockSize, args);
+    }
+
+    unsafe void ITorchParityElementwiseBackend.TorchParityBernoulli(IGpuBuffer probabilities, IGpuBuffer output, int n, ulong seed, IGpuBuffer flag)
+    {
+        if (n <= 0) return;
+        IntPtr bernoulliKernel = ParityKernel("parity_bernoulli");
+        using var _ = PushContext();
+        IntPtr pp = probabilities.Handle, py = output.Handle, pf = flag.Handle;
+        void** args = stackalloc void*[5];
+        args[0] = &pp; args[1] = &py; args[2] = &n; args[3] = &seed; args[4] = &pf;
+        LaunchKernel(bernoulliKernel, ParityGrid(n), DefaultBlockSize, args);
+    }
+
+    unsafe void ITorchParityElementwiseBackend.TorchParityPoisson(IGpuBuffer rates, IGpuBuffer output, int n, ulong seed, IGpuBuffer flag)
+    {
+        if (n <= 0) return;
+        IntPtr poissonKernel = ParityKernel("parity_poisson");
+        using var _ = PushContext();
+        IntPtr pr = rates.Handle, py = output.Handle, pf = flag.Handle;
+        void** args = stackalloc void*[5];
+        args[0] = &pr; args[1] = &py; args[2] = &n; args[3] = &seed; args[4] = &pf;
+        LaunchKernel(poissonKernel, ParityGrid(n), DefaultBlockSize, args);
+    }
+
+    unsafe void ITorchParityElementwiseBackend.TorchParityBinomial(IGpuBuffer counts, IGpuBuffer probabilities, IGpuBuffer output, int n,
+        ulong seed, IGpuBuffer flag)
+    {
+        if (n <= 0) return;
+        IntPtr binomialKernel = ParityKernel("parity_binomial");
+        using var _ = PushContext();
+        IntPtr pc = counts.Handle, pp = probabilities.Handle, py = output.Handle, pf = flag.Handle;
+        void** args = stackalloc void*[6];
+        args[0] = &pc; args[1] = &pp; args[2] = &py; args[3] = &n; args[4] = &seed; args[5] = &pf;
+        LaunchKernel(binomialKernel, ParityGrid(n), DefaultBlockSize, args);
+    }
+
+    unsafe void ITorchParityElementwiseBackend.TorchParityMultinomial(IGpuBuffer weights, IGpuBuffer scratch, IGpuBuffer output, int rows,
+        int categories, int numSamples, bool replacement, ulong seed, IGpuBuffer flag)
+    {
+        if (rows <= 0) return;
+        IntPtr multinomialKernel = ParityKernel("parity_multinomial");
+        using var _ = PushContext();
+        IntPtr pw = weights.Handle, ps = scratch.Handle, py = output.Handle, pf = flag.Handle;
+        int withReplacement = replacement ? 1 : 0;
+        void** args = stackalloc void*[9];
+        args[0] = &pw; args[1] = &ps; args[2] = &py; args[3] = &rows; args[4] = &categories; args[5] = &numSamples;
+        args[6] = &withReplacement; args[7] = &seed; args[8] = &pf;
+        LaunchKernel(multinomialKernel, ParityGrid(rows), DefaultBlockSize, args);
+    }
+
+    unsafe void ITorchParityElementwiseBackend.TorchParityDropoutAffine(IGpuBuffer scale, IGpuBuffer offset, int n, int block, double p,
+        double a, double sat, double b, bool alpha, ulong seed)
+    {
+        if (n <= 0) return;
+        IntPtr dropoutKernel = ParityKernel("parity_dropout_affine");
+        using var _ = PushContext();
+        IntPtr pscale = scale.Handle, poffset = offset.Handle;
+        int isAlpha = alpha ? 1 : 0;
+        void** args = stackalloc void*[10];
+        args[0] = &pscale; args[1] = &poffset; args[2] = &n; args[3] = &block; args[4] = &p; args[5] = &a; args[6] = &sat;
+        args[7] = &b; args[8] = &isAlpha; args[9] = &seed;
+        LaunchKernel(dropoutKernel, ParityGrid(n), DefaultBlockSize, args);
+    }
+
+    unsafe void ITorchParityElementwiseBackend.TorchParityRrelu(IGpuBuffer input, IGpuBuffer output, int n, double lower, double upper,
+        bool training, ulong seed)
+    {
+        if (n <= 0) return;
+        IntPtr rreluKernel = ParityKernel("parity_rrelu");
+        using var _ = PushContext();
+        IntPtr px = input.Handle, py = output.Handle;
+        int isTraining = training ? 1 : 0;
+        void** args = stackalloc void*[7];
+        args[0] = &px; args[1] = &py; args[2] = &n; args[3] = &lower; args[4] = &upper; args[5] = &isTraining; args[6] = &seed;
+        LaunchKernel(rreluKernel, ParityGrid(n), DefaultBlockSize, args);
+    }
+
+    unsafe void ITorchParityElementwiseBackend.TorchParityRandomKeys(IGpuBuffer output, int n, ulong seed)
+    {
+        if (n <= 0) return;
+        IntPtr keysKernel = ParityKernel("parity_random_keys");
+        using var _ = PushContext();
+        IntPtr py = output.Handle;
+        void** args = stackalloc void*[3];
+        args[0] = &py; args[1] = &n; args[2] = &seed;
+        LaunchKernel(keysKernel, ParityGrid(n), DefaultBlockSize, args);
+    }
+
     unsafe void ITorchParityElementwiseBackend.TorchParityBinary(
         TorchParityBinaryOp op, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int n)
     {

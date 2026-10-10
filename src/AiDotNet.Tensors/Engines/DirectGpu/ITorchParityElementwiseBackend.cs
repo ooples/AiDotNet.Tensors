@@ -67,4 +67,45 @@ internal interface ITorchParityElementwiseBackend
     /// 2 higher, 3 nearest, 4 midpoint.
     /// </summary>
     void TorchParityQuantileRows(IGpuBuffer sorted, IGpuBuffer output, int rows, int length, double q, int mode, bool ignoreNan);
+
+    // ---- random sampling (Philox; see the kernels). A flag is a 2-float (64-bit) buffer: reset it before a validating
+    // launch; afterwards it holds (index << 3 | code) of the first invalid element, or all ones. ----
+
+    /// <summary>Sets a 64-bit validation flag to "no error".</summary>
+    void TorchParityFlagReset(IGpuBuffer flag);
+
+    /// <summary>
+    /// n draws of distribution <paramref name="kind"/>: 0 uniform(a, b), 1 cauchy(median a, sigma b), 2 exponential(rate a),
+    /// 3 geometric(p a), 4 log-normal(mean a, std b), 5 standard normal, 6 randint(low a, span b).
+    /// </summary>
+    void TorchParitySample(IGpuBuffer output, int n, int kind, double a, double b, ulong seed);
+
+    /// <summary>Bernoulli draws; flag code 1 for p outside [0, 1].</summary>
+    void TorchParityBernoulli(IGpuBuffer probabilities, IGpuBuffer output, int n, ulong seed, IGpuBuffer flag);
+
+    /// <summary>Poisson draws; flag code 1 for a negative or NaN rate.</summary>
+    void TorchParityPoisson(IGpuBuffer rates, IGpuBuffer output, int n, ulong seed, IGpuBuffer flag);
+
+    /// <summary>Binomial draws; flag code 1 for a count that is not a whole number, 2 for count &lt; 0 or p outside [0, 1].</summary>
+    void TorchParityBinomial(IGpuBuffer counts, IGpuBuffer probabilities, IGpuBuffer output, int n, ulong seed, IGpuBuffer flag);
+
+    /// <summary>
+    /// numSamples category draws per row of weights (rows x categories; scratch is as large); flag code 1 for an invalid
+    /// weight, 2 for a row with no positive weight left.
+    /// </summary>
+    void TorchParityMultinomial(IGpuBuffer weights, IGpuBuffer scratch, IGpuBuffer output, int rows, int categories, int numSamples,
+        bool replacement, ulong seed, IGpuBuffer flag);
+
+    /// <summary>
+    /// Per-element scale and offset of a dropout keep mask drawn once per block: alpha dropout (a * keep,
+    /// a * sat * (1 - keep) + b) or channel dropout (keep * a, 0).
+    /// </summary>
+    void TorchParityDropoutAffine(IGpuBuffer scale, IGpuBuffer offset, int n, int block, double p, double a, double sat, double b,
+        bool alpha, ulong seed);
+
+    /// <summary>rrelu with the eval slope or (training) a uniform slope in [lower, upper] per element.</summary>
+    void TorchParityRrelu(IGpuBuffer input, IGpuBuffer output, int n, double lower, double upper, bool training, ulong seed);
+
+    /// <summary>n uniform sort keys for a random permutation.</summary>
+    void TorchParityRandomKeys(IGpuBuffer output, int n, ulong seed);
 }

@@ -614,6 +614,250 @@ extern ""C"" __global__ __launch_bounds__(256) void parity_quantile_rows(const f
     }
     y[r] = (float)((1.0 - w) * (double)s[below] + w * (double)s[above]);
 }
+
+// Random sampling (#1112 tier 7): a counter-based Philox4x32-10 generator, as torch.cuda uses. Element i draws its
+// k-th uniform from counter (i, k), so a seed gives the same tensor on every run and launch shape, and rejection
+// samplers can draw as many values as they need. The streams differ from the CPU's System.Random (as torch's CPU and
+// CUDA generators differ); the distributions are the CPU's, sampled by the same algorithms.
+//
+// Invalid per-element parameters do not produce values: the kernel lowers a 64-bit flag to (index << 3 | code) with
+// atomicMin, and the host reads it back to raise the CPU's exception for the first offending element.
+
+__device__ __forceinline__ void parity_philox_round(unsigned int* c, unsigned int k0, unsigned int k1)
+{
+    unsigned int lo0 = 0xD2511F53u * c[0], hi0 = __umulhi(0xD2511F53u, c[0]);
+    unsigned int lo1 = 0xCD9E8D57u * c[2], hi1 = __umulhi(0xCD9E8D57u, c[2]);
+    unsigned int n0 = hi1 ^ c[1] ^ k0, n2 = hi0 ^ c[3] ^ k1;
+    c[0] = n0; c[1] = lo1; c[2] = n2; c[3] = lo0;
+}
+
+struct ParityRng { unsigned int key0, key1; unsigned long long element; unsigned int draw; };
+
+__device__ __forceinline__ ParityRng parity_rng(unsigned long long seed, unsigned long long element)
+{
+    ParityRng r; r.key0 = (unsigned int)seed; r.key1 = (unsigned int)(seed >> 32); r.element = element; r.draw = 0; return r;
+}
+
+// A uniform double in [0, 1) with 53 random bits.
+__device__ double parity_uniform(ParityRng* r)
+{
+    unsigned int c[4] = { (unsigned int)r->element, (unsigned int)(r->element >> 32), r->draw++, 0x5EEDu };
+    unsigned int k0 = r->key0, k1 = r->key1;
+    for (int round = 0; round < 10; round++)
+    {
+        parity_philox_round(c, k0, k1);
+        k0 += 0x9E3779B9u; k1 += 0xBB67AE85u;
+    }
+    return ((c[0] >> 5) * 67108864.0 + (c[1] >> 6)) * (1.0 / 9007199254740992.0);
+}
+
+// Box-Muller, as the CPU's StandardNormal: sqrt(-2 log(1 - U1)) cos(2 pi U2).
+__device__ double parity_standard_normal(ParityRng* r)
+{
+    double u1 = parity_uniform(r), u2 = parity_uniform(r);
+    return sqrt(-2.0 * log(1.0 - u1)) * cos(2.0 * PARITY_PI * u2);
+}
+
+__device__ __forceinline__ void parity_flag(unsigned long long* flag, unsigned long long element, int code)
+{
+    atomicMin(flag, (element << 3) | (unsigned long long)code);
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void parity_flag_reset(unsigned long long* flag)
+{
+    if (blockIdx.x == 0 && threadIdx.x == 0) *flag = 0xFFFFFFFFFFFFFFFFull;
+}
+
+// Shape-only distributions: 0 uniform(a = low, b = high), 1 cauchy(a = median, b = sigma), 2 exponential(a = rate),
+// 3 geometric(a = p), 4 log-normal(a = mean, b = std), 5 standard normal, 6 randint(a = low, b = span).
+extern ""C"" __global__ __launch_bounds__(256) void parity_sample(float* __restrict__ y, int n, int kind, double a, double b,
+    unsigned long long seed)
+{
+    PARITY_INDEX
+    ParityRng r = parity_rng(seed, (unsigned long long)i);
+    double v;
+    switch (kind)
+    {
+        case 0: v = a + (b - a) * parity_uniform(&r); break;
+        case 1: v = a + b * tan(PARITY_PI * (parity_uniform(&r) - 0.5)); break;
+        case 2: v = -log(1.0 - parity_uniform(&r)) / a; break;
+        case 3: v = a == 1.0 ? 1.0 : fmax(1.0, ceil(log(1.0 - parity_uniform(&r)) / log(1.0 - a))); break;
+        case 4: v = exp(a + b * parity_standard_normal(&r)); break;
+        case 5: v = parity_standard_normal(&r); break;
+        default: v = a + fmin(floor(parity_uniform(&r) * b), b - 1.0); break;
+    }
+    y[i] = (float)v;
+}
+
+// Bernoulli: 1 with probability p; code 1 for p outside [0, 1] or NaN.
+extern ""C"" __global__ __launch_bounds__(256) void parity_bernoulli(const float* __restrict__ p, float* __restrict__ y, int n,
+    unsigned long long seed, unsigned long long* flag)
+{
+    PARITY_INDEX
+    double q = (double)p[i];
+    if (!(q >= 0.0 && q <= 1.0)) { parity_flag(flag, (unsigned long long)i, 1); return; }
+    ParityRng r = parity_rng(seed, (unsigned long long)i);
+    y[i] = parity_uniform(&r) < q ? 1.0f : 0.0f;
+}
+
+// Poisson: Knuth's product method below rate 10, Hormann's PTRS above; code 1 for a negative or NaN rate.
+extern ""C"" __global__ __launch_bounds__(256) void parity_poisson(const float* __restrict__ rates, float* __restrict__ y, int n,
+    unsigned long long seed, unsigned long long* flag)
+{
+    PARITY_INDEX
+    double rate = (double)rates[i];
+    if (!(rate >= 0.0)) { parity_flag(flag, (unsigned long long)i, 1); return; }
+    if (rate == 0.0) { y[i] = 0.0f; return; }
+    ParityRng r = parity_rng(seed, (unsigned long long)i);
+    if (rate < 10.0)
+    {
+        double limit = exp(-rate), product = parity_uniform(&r);
+        int k = 0;
+        while (product > limit) { k++; product *= parity_uniform(&r); }
+        y[i] = (float)k;
+        return;
+    }
+    double slam = sqrt(rate), logLam = log(rate);
+    double bb = 0.931 + 2.53 * slam, aa = -0.059 + 0.02483 * bb, invAlpha = 1.1239 + 1.1328 / (bb - 3.4), vr = 0.9277 - 3.6224 / (bb - 2.0);
+    while (true)
+    {
+        double u = parity_uniform(&r) - 0.5, v = parity_uniform(&r), us = 0.5 - fabs(u);
+        double k = floor((2.0 * aa / us + bb) * u + rate + 0.43);
+        if (us >= 0.07 && v <= vr) { y[i] = (float)k; return; }
+        if (k < 0.0 || (us < 0.013 && v > us)) continue;
+        if (log(v) + log(invAlpha) - log(aa / (us * us) + bb) <= -rate + k * logLam - lgamma(k + 1.0)) { y[i] = (float)k; return; }
+    }
+}
+
+__device__ double parity_stirling_tail(double k)
+{
+    const double table[10] = {
+        0.08106146679532726, 0.04134069595540929, 0.02767792568499834, 0.02079067210376509, 0.01664469118982119,
+        0.01387612882307075, 0.01189670994589177, 0.01041126526197209, 0.009255462182712733, 0.008330563433362871 };
+    if (k <= 9.0) return table[(int)k];
+    double kp1sq = (k + 1.0) * (k + 1.0);
+    return (1.0 / 12.0 - (1.0 / 360.0 - 1.0 / 1260.0 / kp1sq) / kp1sq) / (k + 1.0);
+}
+
+// Binomial: geometric waiting times while n min(p, 1-p) < 10, Hormann's BTRS above (as the CPU and PyTorch).
+// Code 1: count not a whole number of trials within the long range; code 2: count < 0, or p outside [0, 1] / NaN.
+extern ""C"" __global__ __launch_bounds__(256) void parity_binomial(const float* __restrict__ counts, const float* __restrict__ probs,
+    float* __restrict__ y, int total, unsigned long long seed, unsigned long long* flag)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    double count = (double)counts[i], p = (double)probs[i];
+    if (isnan(count) || isinf(count) || count != floor(count) || count >= 9.2233720368547758E18) { parity_flag(flag, (unsigned long long)i, 1); return; }
+    long long n = (long long)count;
+    if (n < 0 || !(p >= 0.0 && p <= 1.0)) { parity_flag(flag, (unsigned long long)i, 2); return; }
+    if (n == 0 || p == 0.0) { y[i] = 0.0f; return; }
+    if (p == 1.0) { y[i] = (float)n; return; }
+    ParityRng r = parity_rng(seed, (unsigned long long)i);
+    bool flip = p > 0.5;
+    double q = flip ? 1.0 - p : p, draw;
+    if (n * q >= 10.0)
+    {
+        double stddev = sqrt(n * q * (1.0 - q)), bb = 1.15 + 2.53 * stddev, aa = -0.0873 + 0.0248 * bb + 0.01 * q;
+        double c = n * q + 0.5, vR = 0.92 - 4.2 / bb, ratio = q / (1.0 - q), alpha = (2.83 + 5.1 / bb) * stddev;
+        double m = floor((n + 1) * q);
+        while (true)
+        {
+            double u = parity_uniform(&r) - 0.5, v = parity_uniform(&r), us = 0.5 - fabs(u);
+            double k = floor((2.0 * aa / us + bb) * u + c);
+            if (k < 0.0 || k > (double)n) continue;
+            if (us >= 0.07 && v <= vR) { draw = k; break; }
+            v = log(v * alpha / (aa / (us * us) + bb));
+            double upper = (m + 0.5) * log((m + 1.0) / (ratio * (n - m + 1.0)))
+                + (n + 1.0) * log((n - m + 1.0) / (n - k + 1.0))
+                + (k + 0.5) * log(ratio * (n - k + 1.0) / (k + 1.0))
+                + parity_stirling_tail(m) + parity_stirling_tail(n - m) - parity_stirling_tail(k) - parity_stirling_tail(n - k);
+            if (v <= upper) { draw = k; break; }
+        }
+    }
+    else
+    {
+        double logQ = log(1.0 - q);
+        long long successes = 0, position = 0;
+        while (true)
+        {
+            position += (long long)floor(log(1.0 - parity_uniform(&r)) / logQ) + 1;
+            if (position > n) break;
+            successes++;
+        }
+        draw = (double)successes;
+    }
+    y[i] = (float)(flip ? n - draw : draw);
+}
+
+// Multinomial: one thread per row walks numSamples draws over its categories (removing each pick without
+// replacement), as the CPU. The row's weights are copied into scratch (rows x categories). Code 1: a negative,
+// NaN or infinite weight (flagged at its element); code 2: a row with no positive weight left (flagged at the row).
+extern ""C"" __global__ __launch_bounds__(256) void parity_multinomial(const float* __restrict__ weights, float* __restrict__ scratch,
+    float* __restrict__ y, int rows, int categories, int numSamples, int replacement, unsigned long long seed, unsigned long long* flag)
+{
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows) return;
+    const float* w = weights + (long long)row * categories;
+    float* s = scratch + (long long)row * categories;
+    for (int c = 0; c < categories; c++)
+    {
+        double v = (double)w[c];
+        if (!(v >= 0.0) || isinf(v)) { parity_flag(flag, (unsigned long long)row * categories + c, 1); return; }
+        s[c] = w[c];
+    }
+    ParityRng r = parity_rng(seed, (unsigned long long)row);
+    for (int k = 0; k < numSamples; k++)
+    {
+        double total = 0.0;
+        for (int c = 0; c < categories; c++) total += (double)s[c];
+        // Ranked after every weight error (bit 58), as the CPU validates all weights before it samples.
+        if (!(total > 0.0)) { parity_flag(flag, (1ull << 58) | ((unsigned long long)row * categories), 2); return; }
+        double u = parity_uniform(&r) * total, running = 0.0;
+        int chosen = -1;
+        for (int c = categories - 1; c >= 0; c--) if (s[c] > 0.0f) { chosen = c; break; }
+        for (int c = 0; c < categories; c++)
+        {
+            running += (double)s[c];
+            if (u < running && s[c] > 0.0f) { chosen = c; break; }
+        }
+        y[(long long)row * numSamples + k] = (float)chosen;
+        if (!replacement) s[chosen] = 0.0f;
+    }
+}
+
+// Dropout keep mask, one draw per block of `block` elements (block = 1 elementwise): keep = (U >= p). Writes the
+// per-element scale and offset of out = x * scale + offset: alpha dropout uses (a * keep, a * sat * (1 - keep) + b),
+// channel dropout (keep * inverseKeep, 0).
+extern ""C"" __global__ __launch_bounds__(256) void parity_dropout_affine(float* __restrict__ scale, float* __restrict__ offset, int n,
+    int block, double p, double a, double sat, double b, int alpha, unsigned long long seed)
+{
+    PARITY_INDEX
+    ParityRng r = parity_rng(seed, (unsigned long long)(i / block));
+    double keep = parity_uniform(&r) >= p ? 1.0 : 0.0;
+    if (alpha) { scale[i] = (float)(a * keep); offset[i] = (float)(a * sat * (1.0 - keep) + b); }
+    else { scale[i] = (float)(keep * a); offset[i] = 0.0f; }
+}
+
+// rrelu: slope 1 above zero; below, the eval slope (training = 0) or a uniform draw in [lower, upper].
+extern ""C"" __global__ __launch_bounds__(256) void parity_rrelu(const float* __restrict__ x, float* __restrict__ y, int n,
+    double lower, double upper, int training, unsigned long long seed)
+{
+    PARITY_INDEX
+    double v = (double)x[i];
+    double slope;
+    if (v > 0.0) slope = 1.0;
+    else if (!training) slope = (lower + upper) / 2.0;
+    else { ParityRng r = parity_rng(seed, (unsigned long long)i); slope = lower + (upper - lower) * parity_uniform(&r); }
+    y[i] = (float)(slope * v);
+}
+
+// randperm keys: one uniform per position, sorted to give a uniformly random permutation (ties keep index order).
+extern ""C"" __global__ __launch_bounds__(256) void parity_random_keys(float* __restrict__ y, int n, unsigned long long seed)
+{
+    PARITY_INDEX
+    ParityRng r = parity_rng(seed, (unsigned long long)i);
+    y[i] = (float)parity_uniform(&r);
+}
 ";
         }
 
@@ -643,6 +887,8 @@ extern ""C"" __global__ __launch_bounds__(256) void parity_quantile_rows(const f
             "parity_spherical_bessel_j0", "parity_airy_ai", "parity_mvlgamma", "parity_igamma", "parity_igammac",
             "parity_range", "parity_logspace", "parity_window", "parity_tri_indices",
             "parity_angle", "parity_nonzero", "parity_floor_divide", "parity_diagflat", "parity_diagonal_scatter", "parity_quantile_rows",
+            "parity_flag_reset", "parity_sample", "parity_bernoulli", "parity_poisson", "parity_binomial", "parity_multinomial",
+            "parity_dropout_affine", "parity_rrelu", "parity_random_keys",
         };
     }
 }
