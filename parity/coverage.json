@@ -1,6 +1,6 @@
 {
   "torchVersion": "2.11.0",
-  "gapBaseline": 21,
+  "gapBaseline": 18,
   "entries": {
     "Tensor:abs": {
       "status": "mapped",
@@ -7451,8 +7451,9 @@
       "source": "name-match"
     },
     "nn.functional:grouped_mm": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorGroupedMatMul",
+      "source": "reviewed"
     },
     "nn.functional:gumbel_softmax": {
       "status": "mapped",
@@ -7755,12 +7756,14 @@
       "source": "name-match"
     },
     "nn.functional:scaled_grouped_mm": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorScaledGroupedMatMul",
+      "source": "reviewed"
     },
     "nn.functional:scaled_mm": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorScaledMatMul",
+      "source": "reviewed"
     },
     "nn.functional:selu": {
       "status": "mapped",
