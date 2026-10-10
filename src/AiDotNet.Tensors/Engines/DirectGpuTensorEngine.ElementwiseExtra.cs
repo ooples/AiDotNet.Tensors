@@ -127,7 +127,12 @@ public partial class DirectGpuTensorEngine
     {
         try
         {
-            var output = TryRunUnaryTensor(tensor, static (backend, input, output, size) => backend.RsqrtKernel(input, output, size));
+            var output = TryRunUnaryTensor(tensor, static (backend, input, output, size) =>
+            {
+                // The rsqrt kernel is part of the batch-execution backend surface; other backends take the CPU path.
+                if (backend is IGpuBatchExecution batch) batch.RsqrtKernel(input, output, size);
+                else throw new System.NotSupportedException("This backend has no rsqrt kernel.");
+            });
             if (output != null)
             {
                 Autodiff.DifferentiableOps.RecordUnary("TensorRsqrt", output, tensor, Autodiff.BackwardFunctions<T>.RsqrtBackward);
