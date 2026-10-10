@@ -46333,6 +46333,14 @@ public partial class CpuEngine : ITensorLevelEngine
     #region JIT Dispatch Helpers
 
     /// <summary>
+    /// Chunks the last float JIT elementwise dispatch on this thread fanned out to (0 = ran serially). A test hook:
+    /// these dispatchers once returned through the SERIAL path whenever the array was large enough to split,
+    /// leaving every large float add/subtract/multiply/divide/min/max/relu on one core -- correct values, so only
+    /// a dispatch assertion catches it (ElementwiseDispatchParallelismTests).
+    /// </summary>
+    [ThreadStatic] internal static int t_lastElementwiseDispatchChunks;
+
+    /// <summary>
     /// Runs a float binary elementwise op (Add / Subtract / Multiply / Divide) on SimdKernels, split across threads
     /// at the shared <see cref="ElementwiseGrain"/> (one chunk per grain, at most the pool width).
     /// </summary>
@@ -46344,11 +46352,14 @@ public partial class CpuEngine : ITensorLevelEngine
     private static unsafe void JitBinaryDispatch(float* pA, float* pB, float* pR, int length, JitBinaryOp op)
     {
         int numChunks = ElementwiseChunks(length);
-        if (numChunks >= 2)
+        if (numChunks < 2)
         {
+            // Below the elementwise grain: one serial pass.
+            t_lastElementwiseDispatchChunks = 0;
             RunBinary(pA, pB, pR, length, op);
             return;
         }
+        t_lastElementwiseDispatchChunks = numChunks;
 
         int chunkSize = AlignFloatChunk((length + numChunks - 1) / numChunks);
         CpuParallelSettings.ParallelForOrSerial(0, numChunks, length, chunk =>
@@ -46376,11 +46387,14 @@ public partial class CpuEngine : ITensorLevelEngine
     private static unsafe void JitUnaryDispatch(float* pSrc, float* pDst, int length)
     {
         int numChunks = ElementwiseChunks(length);
-        if (numChunks >= 2)
+        if (numChunks < 2)
         {
+            // Below the elementwise grain: one serial pass.
+            t_lastElementwiseDispatchChunks = 0;
             SimdKernels.ReLUUnsafe(pSrc, pDst, length);
             return;
         }
+        t_lastElementwiseDispatchChunks = numChunks;
 
         int chunkSize = AlignFloatChunk((length + numChunks - 1) / numChunks);
         CpuParallelSettings.ParallelForOrSerial(0, numChunks, length, chunk =>
