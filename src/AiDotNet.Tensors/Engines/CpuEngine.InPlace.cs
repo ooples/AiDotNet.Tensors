@@ -297,26 +297,33 @@ public partial class CpuEngine
         if (weight is null) throw new ArgumentNullException(nameof(weight));
         if (indices is null) throw new ArgumentNullException(nameof(indices));
         if (weight.Rank != 2) throw new ArgumentException("embedding_renorm_ needs a 2-D weight [num_embeddings, dim].", nameof(weight));
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HeterogeneousInput, "TensorEmbeddingRenormInPlace");
         if (normType <= 0) throw new ArgumentOutOfRangeException(nameof(normType), "The norm order must be positive.");
-        // torch runs this under no_grad: it rescales the rows a lookup touched, it is not part of the graph.
+        // torch runs this under no_grad: it rescales the rows a lookup touched, it is not part of the graph. Composed from
+        // engine ops (gather the rows, p-norm, scale, scatter back) so a GPU engine runs it as device kernels.
         var numOps = MathHelper.GetNumericOperations<T>();
         int rows = weight._shape[0], dim = weight._shape[1];
-        var w = weight.IsContiguous ? weight : weight.Contiguous();
-        var data = w.AsWritableSpan();
-        var seen = new System.Collections.Generic.HashSet<int>();
+        var unique = new System.Collections.Generic.SortedSet<int>();
         foreach (int row in indices.AsSpan().ToArray())
         {
             if (row < 0 || row >= rows) throw new ArgumentOutOfRangeException(nameof(indices), $"Index {row} is outside [0, {rows}).");
-            if (!seen.Add(row)) continue;
-            double norm = 0;
-            for (int j = 0; j < dim; j++) norm += Math.Pow(Math.Abs(numOps.ToDouble(data[row * dim + j])), normType);
-            norm = Math.Pow(norm, 1.0 / normType);
-            if (norm <= maxNorm) continue;
-            double scale = maxNorm / (norm + 1e-7);
-            for (int j = 0; j < dim; j++) data[row * dim + j] = numOps.FromDouble(numOps.ToDouble(data[row * dim + j]) * scale);
+            unique.Add(row);
         }
-        if (!ReferenceEquals(w, weight)) for (int i = 0; i < w.Length; i++) weight[i] = w[i];
-        weight.IncrementVersion();
+        if (unique.Count == 0) return;
+        IEngine e = this;
+        using (new NoGradScope<T>())
+        {
+            var idx = new Tensor<int>(new System.Collections.Generic.List<int>(unique).ToArray(), new[] { unique.Count });
+            var selected = e.TensorIndexSelect(weight, idx, 0);                                     // [k, dim]
+            var powered = e.TensorPow(e.TensorAbs(selected), numOps.FromDouble(normType));
+            var norms = e.TensorPow(e.ReduceSum(powered, new[] { 1 }, keepDims: true), numOps.FromDouble(1.0 / normType));   // [k, 1]
+            // scale = 1 where norm <= maxNorm, else maxNorm / (norm + 1e-7) (torch's exact rule)
+            var over = e.TensorGreaterThan(norms, numOps.FromDouble(maxNorm));                      // 1 / 0
+            var shrink = e.TensorMultiplyScalar(e.TensorReciprocal(e.TensorAddScalar(norms, numOps.FromDouble(1e-7))), numOps.FromDouble(maxNorm));
+            var scale = e.TensorAddScalar(e.TensorMultiply(over, e.TensorAddScalar(shrink, numOps.FromDouble(-1.0))), numOps.One);
+            var rescaled = e.TensorMultiply(selected, e.TensorBroadcastTo(scale, selected._shape));
+            e.TensorIndexCopyInPlace(weight, 0, idx, rescaled);
+        }
     }
 
     // ---- random fills -------------------------------------------------------------------------------------------

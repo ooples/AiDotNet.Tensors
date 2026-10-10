@@ -37,6 +37,7 @@ public static class OpParityRegistry
         .Concat(BceScatterMaskBwd()).Concat(MaxoutSpectral()).Concat(NerfSplatSh())
         .Concat(ShBwdCtcSpectralBatch()).Concat(MaxPoolBwdAudio()).Concat(FoldReorderUnique())
         .Concat(ConjReorderNdIfft()).Concat(MaskedSelectScatter()).Concat(IrfftBatch())
+        .Concat(InPlaceAndIndexParityGaps())
         .Concat(ResidentLayoutEmbeddingHashBackward()).Concat(DeterministicPendingAudio())
         .Concat(WithGraphExpectation(NativeComplexPending(), GraphCaptureExpectation.MixedElementTypes))
         .Concat(WithGraphExpectation(TensorPredicatePending(), GraphCaptureExpectation.MixedElementTypes))
@@ -4456,6 +4457,123 @@ public static class OpParityRegistry
                 e => e.SoftmaxBackward(go.D(), e.Softmax(logits.D(), -1), -1),
                 ParityTol.Accum(1e-3), graphCaptureExpectation: GraphCaptureExpectation.BackwardKernel);
         }
+    }
+
+    // Torch op_ forms, advanced indexing, grouped/scaled GEMM and embedding_renorm_ whose operands mix element types
+    // (int indices, masks): each must refuse graph capture (HeterogeneousInput) and run as device kernels on a GPU engine.
+    // An in-place case writes a clone of its input and returns it.
+    private static IEnumerable<OpCase> InPlaceAndIndexParityGaps()
+    {
+        static Tensor<int> I(int[] values, params int[] shape) => new Tensor<int>((int[])values.Clone(), shape);
+        static Tensor<TT> W<TT>(Tensor<TT> source, System.Action<Tensor<TT>> write)
+        {
+            var target = source.Clone();
+            write(target);
+            return target;
+        }
+
+        var m = OpInput.Rand(5101, new[] { 4, 8 });
+        const GraphCaptureSignatureConstraint Hetero = GraphCaptureSignatureConstraint.HeterogeneousInput;
+
+        var addSrc = OpInput.Rand(5102, new[] { 2, 8 });
+        yield return new OpCase("TensorIndexAddInPlace[4,8;ax0]", "index",
+            e => W(m.F(), t => e.TensorIndexAddInPlace(t, 0, I(new[] { 0, 2 }, 2), addSrc.F())),
+            e => W(m.D(), t => e.TensorIndexAddInPlace(t, 0, I(new[] { 0, 2 }, 2), addSrc.D())),
+            ParityTol.Ulp(4, 1e-6), opMethod: "TensorIndexAddInPlace", graphCaptureSignatureConstraint: Hetero);
+        yield return new OpCase("TensorIndexCopyInPlace[4,8;ax0]", "index",
+            e => W(m.F(), t => e.TensorIndexCopyInPlace(t, 0, I(new[] { 0, 2 }, 2), addSrc.F())),
+            e => W(m.D(), t => e.TensorIndexCopyInPlace(t, 0, I(new[] { 0, 2 }, 2), addSrc.D())),
+            ParityTol.Exact, opMethod: "TensorIndexCopyInPlace", graphCaptureSignatureConstraint: Hetero);
+        yield return new OpCase("TensorIndexFillInPlace[4,8;ax0]", "index",
+            e => W(m.F(), t => e.TensorIndexFillInPlace(t, 0, I(new[] { 1, 3 }, 2), 0.5f)),
+            e => W(m.D(), t => e.TensorIndexFillInPlace(t, 0, I(new[] { 1, 3 }, 2), 0.5)),
+            ParityTol.Exact, opMethod: "TensorIndexFillInPlace", graphCaptureSignatureConstraint: Hetero);
+        var putSrc = OpInput.Rand(5103, new[] { 3 });
+        yield return new OpCase("TensorIndexPutInPlace[4,8;rows+cols]", "index",
+            e => W(m.F(), t => e.TensorIndexPutInPlace(t, new[] { I(new[] { 0, 1, 2 }, 3), I(new[] { 0, 2, 4 }, 3) }, putSrc.F(), false)),
+            e => W(m.D(), t => e.TensorIndexPutInPlace(t, new[] { I(new[] { 0, 1, 2 }, 3), I(new[] { 0, 2, 4 }, 3) }, putSrc.D(), false)),
+            ParityTol.Exact, opMethod: "TensorIndexPutInPlace", graphCaptureSignatureConstraint: Hetero);
+        var reduceSrc = OpInput.Rand(5104, new[] { 3, 8 });
+        yield return new OpCase("TensorIndexReduceInPlace[4,8;sum]", "index",
+            e => W(m.F(), t => e.TensorIndexReduceInPlace(t, 0, I(new[] { 0, 2, 0 }, 3), reduceSrc.F(), ScatterReduceMode.Sum)),
+            e => W(m.D(), t => e.TensorIndexReduceInPlace(t, 0, I(new[] { 0, 2, 0 }, 3), reduceSrc.D(), ScatterReduceMode.Sum)),
+            ParityTol.Ulp(4, 1e-6), opMethod: "TensorIndexReduceInPlace", graphCaptureSignatureConstraint: Hetero);
+        var srIdx = new int[24]; for (int i = 0; i < 24; i++) srIdx[i] = (i * 5) % 4;
+        yield return new OpCase("TensorScatterReduceInPlace[4,8;sum]", "index",
+            e => W(m.F(), t => e.TensorScatterReduceInPlace(t, 0, I(srIdx, 3, 8), reduceSrc.F(), ScatterReduceMode.Sum, true)),
+            e => W(m.D(), t => e.TensorScatterReduceInPlace(t, 0, I(srIdx, 3, 8), reduceSrc.D(), ScatterReduceMode.Sum, true)),
+            ParityTol.Ulp(4, 1e-6), opMethod: "TensorScatterReduceInPlace", graphCaptureSignatureConstraint: Hetero);
+        var sd = OpInput.Rand(5105, new[] { 4, 6 });
+        var sv = OpInput.Rand(5106, new[] { 4, 6 });
+        yield return new OpCase("ScatterInPlace[4,6;idx6;axis1]", "index",
+            e => W(sd.F(), t => e.ScatterInPlace(t, I(new[] { 5, 3, 1, 4, 2, 0 }, 6), sv.F(), 1)),
+            e => W(sd.D(), t => e.ScatterInPlace(t, I(new[] { 5, 3, 1, 4, 2, 0 }, 6), sv.D(), 1)),
+            ParityTol.Exact, opMethod: "ScatterInPlace", graphCaptureSignatureConstraint: Hetero);
+        var scatterValues = OpInput.Rand(5107, new[] { 4, 8 });
+        yield return new OpCase("ScatterAddInPlace[4,8;values;d0]", "index",
+            e => W(m.F(), t => e.ScatterAddInPlace(t, I(new[] { 0, 1, 1, 3 }, 4), scatterValues.F(), 0)),
+            e => W(m.D(), t => e.ScatterAddInPlace(t, I(new[] { 0, 1, 1, 3 }, 4), scatterValues.D(), 0)),
+            ParityTol.Ulp(8, 1e-6), opMethod: "ScatterAddInPlace", graphCaptureSignatureConstraint: Hetero);
+        var bits = new Bit[24]; for (int i = 0; i < 24; i++) bits[i] = (i % 2) == 0;
+        var msSrc = OpInput.Rand(5108, new[] { 12 });
+        yield return new OpCase("TensorMaskedScatterInPlace[4,6;checker]", "index",
+            e => W(sd.F(), t => e.TensorMaskedScatterInPlace(t, new Tensor<Bit>((Bit[])bits.Clone(), new[] { 4, 6 }), msSrc.F())),
+            e => W(sd.D(), t => e.TensorMaskedScatterInPlace(t, new Tensor<Bit>((Bit[])bits.Clone(), new[] { 4, 6 }), msSrc.D())),
+            ParityTol.Exact, opMethod: "TensorMaskedScatterInPlace", graphCaptureSignatureConstraint: Hetero);
+        var bools = new bool[24]; for (int i = 0; i < 24; i++) bools[i] = (i % 3) == 0;
+        yield return new OpCase("TensorMaskedFillInPlace[4,6;bool]", "index",
+            e => W(sd.F(), t => e.TensorMaskedFillInPlace(t, new Tensor<bool>((bool[])bools.Clone(), new[] { 4, 6 }), 0f)),
+            e => W(sd.D(), t => e.TensorMaskedFillInPlace(t, new Tensor<bool>((bool[])bools.Clone(), new[] { 4, 6 }), 0.0)),
+            ParityTol.Exact, opMethod: "TensorMaskedFillInPlace", graphCaptureSignatureConstraint: Hetero,
+            graphCaptureSignatureOverload: GraphCaptureSignatureOverload.TensorMaskedFillInPlace_Tensor_T_Tensor_Boolean_T);
+        yield return new OpCase("TensorMaskedFillInPlace[4,6;bit]", "index",
+            e => W(sd.F(), t => e.TensorMaskedFillInPlace(t, new Tensor<Bit>((Bit[])bits.Clone(), new[] { 4, 6 }), 0f)),
+            e => W(sd.D(), t => e.TensorMaskedFillInPlace(t, new Tensor<Bit>((Bit[])bits.Clone(), new[] { 4, 6 }), 0.0)),
+            ParityTol.Exact, opMethod: "TensorMaskedFillInPlace", graphCaptureSignatureConstraint: Hetero,
+            graphCaptureSignatureOverload: GraphCaptureSignatureOverload.TensorMaskedFillInPlace_Tensor_T_Tensor_Bit_T);
+        var putVals = OpInput.Rand(5109, new[] { 3 });
+        yield return new OpCase("TensorPutInPlace[4,8;flat3]", "index",
+            e => W(m.F(), t => e.TensorPutInPlace(t, I(new[] { 0, 10, 25 }, 3), putVals.F())),
+            e => W(m.D(), t => e.TensorPutInPlace(t, I(new[] { 0, 10, 25 }, 3), putVals.D())),
+            ParityTol.Exact, opMethod: "TensorPutInPlace", graphCaptureSignatureConstraint: Hetero);
+        var lx = OpInput.Rand(5110, new[] { 3, 4 });
+        var le = new int[12]; for (int i = 0; i < 12; i++) le[i] = (i % 5) - 2;
+        yield return new OpCase("TensorLdexpInPlace[3,4]", "math",
+            e => W(lx.F(), t => e.TensorLdexpInPlace(t, I(le, 3, 4))),
+            e => W(lx.D(), t => e.TensorLdexpInPlace(t, I(le, 3, 4))),
+            ParityTol.Ulp(2, 1e-6), opMethod: "TensorLdexpInPlace", graphCaptureSignatureConstraint: Hetero);
+
+        var x = OpInput.Rand(5111, new[] { 2, 3, 4 });
+        yield return new OpCase("TensorIndex[2,3,4;adv0,2]", "index",
+            e => e.TensorIndex(x.F(), new Tensor<int>?[] { I(new[] { 1, 0 }, 2), null, I(new[] { 3, 1 }, 2) }),
+            e => e.TensorIndex(x.D(), new Tensor<int>?[] { I(new[] { 1, 0 }, 2), null, I(new[] { 3, 1 }, 2) }),
+            ParityTol.Exact, opMethod: "TensorIndex", graphCaptureSignatureConstraint: Hetero,
+            graphCaptureSignatureOverload: GraphCaptureSignatureOverload.TensorIndex_Tensor_T_Tensor_Int32Array);
+        var maskBools = new[] { true, false, true, false, true, true };
+        yield return new OpCase("TensorIndex[2,3,4;mask2x3]", "index",
+            e => e.TensorIndex(x.F(), new Tensor<bool>((bool[])maskBools.Clone(), new[] { 2, 3 })),
+            e => e.TensorIndex(x.D(), new Tensor<bool>((bool[])maskBools.Clone(), new[] { 2, 3 })),
+            ParityTol.Exact, opMethod: "TensorIndex", graphCaptureSignatureConstraint: Hetero,
+            graphCaptureSignatureOverload: GraphCaptureSignatureOverload.TensorIndex_Tensor_T_Tensor_Boolean);
+
+        var ga = OpInput.Rand(5112, new[] { 12, 8 });
+        var gb = OpInput.Rand(5113, new[] { 2, 8, 4 });
+        yield return new OpCase("TensorGroupedMatMul[12,8x2,8,4;offs]", "matmul",
+            e => e.TensorGroupedMatMul(ga.F(), gb.F(), I(new[] { 4, 12 }, 2)),
+            e => e.TensorGroupedMatMul(ga.D(), gb.D(), I(new[] { 4, 12 }, 2)),
+            ParityTol.Accum(1e-4), opMethod: "TensorGroupedMatMul", graphCaptureSignatureConstraint: Hetero);
+        var gsa = OpInput.Rand(5114, new[] { 12 });
+        var gsb = OpInput.Rand(5115, new[] { 2, 4 });
+        yield return new OpCase("TensorScaledGroupedMatMul[rowwise;offs]", "matmul",
+            e => e.TensorScaledGroupedMatMul(ga.F(), gb.F(), gsa.F(), ScalingRecipe.RowWise, gsb.F(), ScalingRecipe.RowWise, offsets: I(new[] { 4, 12 }, 2)),
+            e => e.TensorScaledGroupedMatMul(ga.D(), gb.D(), gsa.D(), ScalingRecipe.RowWise, gsb.D(), ScalingRecipe.RowWise, offsets: I(new[] { 4, 12 }, 2)),
+            ParityTol.Accum(1e-4), opMethod: "TensorScaledGroupedMatMul", graphCaptureSignatureConstraint: Hetero);
+
+        var emb = OpInput.Rand(5116, new[] { 6, 4 });
+        yield return new OpCase("TensorEmbeddingRenormInPlace[6,4;max0.5]", "index",
+            e => W(emb.F(), t => e.TensorEmbeddingRenormInPlace(t, I(new[] { 0, 2, 2, 5 }, 4), 0.5)),
+            e => W(emb.D(), t => e.TensorEmbeddingRenormInPlace(t, I(new[] { 0, 2, 2, 5 }, 4), 0.5)),
+            ParityTol.Ulp(8, 1e-6), opMethod: "TensorEmbeddingRenormInPlace", graphCaptureSignatureConstraint: Hetero);
     }
 }
 #endif

@@ -1,4 +1,5 @@
 using System;
+using AiDotNet.Tensors.Engines.Compilation;
 using System.Collections.Generic;
 using AiDotNet.Tensors.Helpers;
 using AiDotNet.Tensors.LinearAlgebra;
@@ -55,6 +56,7 @@ public partial class CpuEngine
         if (b is null) throw new ArgumentNullException(nameof(b));
         if (a.Rank is < 2 or > 3 || b.Rank is < 2 or > 3)
             throw new ArgumentException($"grouped_mm takes 2-D or 3-D operands; got ranks {a.Rank} and {b.Rank}.");
+        if (offsets is not null) GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HeterogeneousInput, "TensorGroupedMatMul");
         IEngine e = this;
         int[]? ends = offsets is null ? null : offsets.AsSpan().ToArray();
 
@@ -194,6 +196,7 @@ public partial class CpuEngine
     {
         if (a is null) throw new ArgumentNullException(nameof(a));
         if (b is null) throw new ArgumentNullException(nameof(b));
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HeterogeneousInput, "TensorScaledGroupedMatMul");
         IEngine e = this;
         using (new Autodiff.NoGradScope<T>())
         {

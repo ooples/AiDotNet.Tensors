@@ -1,4 +1,5 @@
 using System;
+using AiDotNet.Tensors.Engines.Compilation;
 using System.Collections.Generic;
 using AiDotNet.Tensors.LinearAlgebra;
 
@@ -23,6 +24,7 @@ public partial class CpuEngine
     {
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
         if (indices is null) throw new ArgumentNullException(nameof(indices));
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HeterogeneousInput, "TensorIndex");
         if (indices.Length > tensor.Rank)
             throw new ArgumentException($"{indices.Length} indices for a tensor of rank {tensor.Rank}.", nameof(indices));
         int rank = tensor.Rank;
@@ -124,6 +126,7 @@ public partial class CpuEngine
     {
         if (tensor is null) throw new ArgumentNullException(nameof(tensor));
         if (mask is null) throw new ArgumentNullException(nameof(mask));
+        GraphMode.ThrowIfActiveUnsupported(GraphCaptureLimitation.HeterogeneousInput, "TensorIndex");
         int k = mask.Rank;
         if (k > tensor.Rank) throw new ArgumentException("The mask has more dimensions than the tensor.", nameof(mask));
         for (int d = 0; d < k; d++)

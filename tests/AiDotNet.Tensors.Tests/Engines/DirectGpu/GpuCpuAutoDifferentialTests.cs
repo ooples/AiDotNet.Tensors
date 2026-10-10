@@ -51,6 +51,15 @@ public sealed class GpuCpuAutoDifferentialTests : IClassFixture<GpuCpuAutoDiffer
     // GPU fast-math approximation noise (~1e-3) on transcendental ops.
     private const float Tol = 1e-2f;
 
+    // Relative part of the tolerance, as in allclose: an element passes when |gpu - cpu| <= Tol + RelTol * |cpu|.
+    // A flat absolute bound cannot hold for large outputs: TensorNormExceptDim with p = 0.5 on [129,129] returns values
+    // near 7,400, where one float ULP is ~5e-4 and the two backends' reduction orders differ by ~30 ULP (1.56e-2,
+    // 2e-6 relative). RelTol = 1e-4 still fails anything that is wrong rather than rounded.
+    private const double RelTol = 1e-4;
+
+    // How far one element exceeds the relative part of the tolerance; compared against Tol.
+    private static double ExcessError(double gpu, double cpu) => Math.Abs(gpu - cpu) - RelTol * Math.Abs(cpu);
+
     // Differential correctness does not need a huge shape, but several ops EXPAND their input.
     // TensorKron on [129,129] returns [16641,16641] — 276,922,881 elements, 1.1 GB as float — and
     // CompareValue then calls ToArray() on BOTH sides for two more managed copies of the same size.
@@ -469,7 +478,7 @@ public sealed class GpuCpuAutoDifferentialTests : IClassFixture<GpuCpuAutoDiffer
                     // Both non-finite — treat as match for tolerance accounting.
                     continue;
                 }
-                double e = Math.Abs((double)ga[i] - ca[i]); if (e > m) m = e;
+                double e = ExcessError(ga[i], ca[i]); if (e > m) m = e;
             }
             return m;
         }
@@ -480,7 +489,7 @@ public sealed class GpuCpuAutoDifferentialTests : IClassFixture<GpuCpuAutoDiffer
             double m = 0;
             for (int i = 0; i < ca.Length; i++)
             {
-                double er = Math.Abs((double)ga[i].Real - ca[i].Real), ei = Math.Abs((double)ga[i].Imaginary - ca[i].Imaginary);
+                double er = ExcessError(ga[i].Real, ca[i].Real), ei = ExcessError(ga[i].Imaginary, ca[i].Imaginary);
                 if (er > m) m = er; if (ei > m) m = ei;
             }
             return m;
@@ -582,7 +591,7 @@ public sealed class GpuCpuAutoDifferentialTests : IClassFixture<GpuCpuAutoDiffer
                     double e = CompareValue(gpuArgs[i], cpuArgs[i]);
                     if (e > maxErr) maxErr = e; // -1 (non-comparable out) ignored
                 }
-                Assert.True(maxErr < Tol, $"{opKey} on shape [{string.Join(",", shape)}]: GPU vs CPU max_abs_err {maxErr:E3} exceeded tolerance {Tol:E3}");
+                Assert.True(maxErr < Tol, $"{opKey} on shape [{string.Join(",", shape)}]: GPU vs CPU error {maxErr:E3} beyond the relative allowance ({RelTol:E0} x |cpu|) exceeded tolerance {Tol:E3}");
                 return; // first CPU-accepted combo checked -> done
             }
         }
