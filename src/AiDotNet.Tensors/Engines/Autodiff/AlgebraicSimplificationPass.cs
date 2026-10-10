@@ -49,7 +49,8 @@ internal static class AlgebraicSimplificationPass
             int m = gradOutput._shape[0];
             int n = gradOutput._shape[1];
             var biasGradArr = new float[n];
-            var gArr = (float[])(object)gradOutput.GetDataArray();
+            using var gArrLease = gradOutput.LeaseArray();
+            var gArr = (float[])(object)gArrLease.Array;
             fixed (float* pG = gArr, pB = biasGradArr)
             {
                 for (int row = 0; row < m; row++)

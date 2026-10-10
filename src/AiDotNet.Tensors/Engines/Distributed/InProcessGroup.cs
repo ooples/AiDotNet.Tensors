@@ -306,7 +306,8 @@ public sealed class InProcessGroup : IProcessGroup
         for (int i = 1; i < tensors.Count; i++)
         {
             var src = tensors[i].AsSpan();
-            var dst = result.AsWritableSpan();
+            using var dstLease = result.LeaseWritable();
+            var dst = dstLease.Span;
             for (int k = 0; k < dst.Length; k++)
             {
                 dst[k] = op switch
@@ -323,7 +324,8 @@ public sealed class InProcessGroup : IProcessGroup
         if (op == ReduceOp.Avg)
         {
             var divisor = ops.FromDouble(tensors.Count);
-            var dst = result.AsWritableSpan();
+            using var dstLease = result.LeaseWritable();
+            var dst = dstLease.Span;
             for (int k = 0; k < dst.Length; k++) dst[k] = ops.Divide(dst[k], divisor);
         }
         return result;

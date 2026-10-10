@@ -194,7 +194,8 @@ public sealed class DistributedDataParallel<T>
         if (totalLen == 0) return;
 
         var flat = new Tensor<T>(new[] { totalLen });
-        var flatSpan = flat.AsWritableSpan();
+        using var flatSpanLease = flat.LeaseWritable();
+        var flatSpan = flatSpanLease.Span;
         int offset = 0;
         for (int i = start; i < end; i++)
         {

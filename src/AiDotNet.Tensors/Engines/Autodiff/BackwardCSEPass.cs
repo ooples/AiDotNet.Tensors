@@ -55,9 +55,12 @@ internal sealed class BackwardCSEPass<T>
         {
             int m = a._shape[0], n = b._shape[0], k = a._shape[1];
             var result = TensorAllocator.RentUninitialized<T>(new[] { m, n });
-            var aArr = (float[])(object)a.GetDataArray();
-            var bArr = (float[])(object)b.GetDataArray();
-            var rArr = (float[])(object)result.GetDataArray();
+            using var aArrLease = a.LeaseArray();
+            var aArr = (float[])(object)aArrLease.Array;
+            using var bArrLease = b.LeaseArray();
+            var bArr = (float[])(object)bArrLease.Array;
+            using var rArrLease = result.LeaseArray();
+            var rArr = (float[])(object)rArrLease.Array;
 
             if (BlasProvider.TryGemmEx(m, n, k, aArr, 0, k, false, bArr, 0, k, true, rArr, 0, n))
                 return result;
@@ -81,9 +84,12 @@ internal sealed class BackwardCSEPass<T>
         {
             int m = a._shape[1], n = b._shape[1], k = a._shape[0];
             var result = TensorAllocator.RentUninitialized<T>(new[] { m, n });
-            var aArr = (float[])(object)a.GetDataArray();
-            var bArr = (float[])(object)b.GetDataArray();
-            var rArr = (float[])(object)result.GetDataArray();
+            using var aArrLease = a.LeaseArray();
+            var aArr = (float[])(object)aArrLease.Array;
+            using var bArrLease = b.LeaseArray();
+            var bArr = (float[])(object)bArrLease.Array;
+            using var rArrLease = result.LeaseArray();
+            var rArr = (float[])(object)rArrLease.Array;
 
             if (BlasProvider.TryGemmEx(m, n, k, aArr, 0, m, true, bArr, 0, n, false, rArr, 0, n))
                 return result;

@@ -490,7 +490,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
         if (fresh is null) return;
         var key = _lossOutput.GetBackingArrayForCacheLookupUnsafe();
         if (key is not null) Helpers.HostSync.Remove(key);
-        var dst = _lossOutput.AsWritableSpan();
+        using var dstLease = _lossOutput.LeaseWritable();
+        var dst = dstLease.Span;
         int n = Math.Min(dst.Length, fresh.Length);
         for (int i = 0; i < n; i++) dst[i] = (T)(object)fresh[i];
     }
@@ -1994,8 +1995,10 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 backend.AddScaled(gradBuffer, paramBuffer, gradBuffer, 1f, _l2Regularization, grad.Length);
                 continue;
             }
-            var g = grad.AsWritableSpan();   // materializes a pending device result first
-            var w = param.AsSpan();
+            using var gLease = grad.LeaseWritable();
+            var g = gLease.Span;   // materializes a pending device result first
+            using var wLease = param.Lease();
+            var w = wLease.Span;
             for (int i = 0; i < g.Length; i++) g[i] = numOps.Add(g[i], numOps.Multiply(strength, w[i]));
             // AsWritableSpan does not bump the GPU-cache version. A device copy of this gradient would otherwise stay
             // "current" and the optimizer would read it - without the term just added on the host.
@@ -2243,7 +2246,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     {
         if (typeof(T) != typeof(float) && typeof(T) != typeof(double)) return;
         var sentinel = MathHelper.GetNumericOperations<T>().FromDouble(ForwardSanitizerSentinel);
-        var span = buffer.AsWritableSpan();
+        using var spanLease = buffer.LeaseWritable();
+        var span = spanLease.Span;
         for (int i = 0; i < span.Length; i++) span[i] = sentinel;
     }
 
@@ -2252,7 +2256,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
     {
         if (typeof(T) != typeof(float) && typeof(T) != typeof(double)) return 0;
         var sentinel = MathHelper.GetNumericOperations<T>().FromDouble(ForwardSanitizerSentinel);
-        var span = buffer.AsSpan();
+        using var spanLease = buffer.Lease();
+        var span = spanLease.Span;
         int leaked = 0;
         for (int i = 0; i < span.Length; i++)
         {
@@ -2661,7 +2666,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
                 if (ReferenceEquals(leaf, _compiledInputTensor)) continue;   // refreshed below, as before
                 if (!LeafStillBoundToCapturedBuffer(leaf, cb, out var leafBuffer)) { allLive = false; continue; }
                 if (leafBuffer is null) continue;
-                var leafData = leaf.GetDataArray();
+                using var leafDataLease = leaf.LeaseArray();
+                var leafData = leafDataLease.Array;
                 if (leafBuffer.Size < leaf.Length) continue;
                 cb.UploadBufferInPlace((float[])(object)leafData, leafBuffer);
                 leaf._gpuBufferVersion = leaf.GpuCacheVersion;
@@ -2686,7 +2692,8 @@ internal sealed class CompiledTrainingPlan<T> : ICompiledTrainingPlan<T>, ICompi
             if (bound.Handle == IntPtr.Zero) return false;
             buf = bound;
         }
-        var data = inT.GetDataArray();                 // host backing (T==float on the graph path)
+        using var dataLease = inT.LeaseArray();
+        var data = dataLease.Array;                 // host backing (T==float on the graph path)
         if (buf.Size < inT.Length) return allLive;
         cb.UploadBufferInPlace((float[])(object)data, buf);
         inT._gpuBufferVersion = inT.GpuCacheVersion;

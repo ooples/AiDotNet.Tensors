@@ -234,7 +234,8 @@ public partial class DirectGpuTensorEngine
     {
         int batch = flow.Shape[0], height = flow.Shape[2], width = flow.Shape[3];
         var baseGrid = new Tensor<T>([batch, height, width, 2]);
-        var values = baseGrid.AsWritableSpan();
+        using var valuesLease = baseGrid.LeaseWritable();
+        var values = valuesLease.Span;
         var ops = MathHelper.GetNumericOperations<T>();
         for (int b = 0; b < batch; b++)
         for (int y = 0; y < height; y++)

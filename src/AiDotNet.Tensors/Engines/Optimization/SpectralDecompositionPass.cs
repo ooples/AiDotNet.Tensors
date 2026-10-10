@@ -109,8 +109,10 @@ internal sealed class SpectralDecompositionPass : ICpuOptimizationPass
                 var fftWeight = (Tensor<float>)(object)capturedWeight;
                 var fftBias = capturedBias is null ? null : (Tensor<float>)(object)capturedBias;
                 var fftOut = FftConv.Conv2DSame(fftInput, fftWeight, fftBias);
-                var fftData = fftOut.GetDataArray();
-                var outArr = (float[])(object)output.GetDataArray();
+                using var fftDataLease = fftOut.LeaseArray();
+                var fftData = fftDataLease.Array;
+                using var outArrLease = output.LeaseArray();
+                var outArr = (float[])(object)outArrLease.Array;
                 System.Array.Copy(fftData, outArr, fftOut.Length);
             },
             step.OutputBuffer,
@@ -130,7 +132,8 @@ internal sealed class SpectralDecompositionPass : ICpuOptimizationPass
         // Only worthwhile for matrices large enough
         if (m < 32 || n < 32) return null;
 
-        var weightData = (float[])(object)weight.GetDataArray();
+        using var weightDataLease = weight.LeaseArray();
+        var weightData = (float[])(object)weightDataLease.Array;
         var factors = TensorCodecOptimizer.TrySpectralDecompose(weightData, m, n);
 
         if (!factors.HasValue) return null;
@@ -143,8 +146,10 @@ internal sealed class SpectralDecompositionPass : ICpuOptimizationPass
             "SpectralMatMul",
             (eng, output) =>
             {
-                var inArr = (float[])(object)capturedInput.GetDataArray();
-                var outArr = (float[])(object)output.GetDataArray();
+                using var inArrLease = capturedInput.LeaseArray();
+                var inArr = (float[])(object)inArrLease.Array;
+                using var outArrLease = output.LeaseArray();
+                var outArr = (float[])(object)outArrLease.Array;
                 int rows = capturedInput._shape.Length >= 2 ? capturedInput._shape[0] : 1;
                 int cols = capturedInput._shape.Length >= 2 ? capturedInput._shape[^1] : capturedInput._shape[0];
 

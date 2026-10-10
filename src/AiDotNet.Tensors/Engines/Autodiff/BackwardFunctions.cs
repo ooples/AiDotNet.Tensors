@@ -666,9 +666,12 @@ internal static class BackwardFunctions<T>
         if (typeof(T) == typeof(float))
         {
             var gradA = AutoTensorCache.RentOrAllocate<T>(new[] { M, K });
-            var dC = (float[])(object)gradOutput.GetDataArray();
-            var bT = (float[])(object)bTransposed.GetDataArray();
-            var gA = (float[])(object)gradA.GetDataArray();
+            using var dCLease = gradOutput.LeaseArray();
+            var dC = (float[])(object)dCLease.Array;
+            using var bTLease = bTransposed.LeaseArray();
+            var bT = (float[])(object)bTLease.Array;
+            using var gALease = gradA.LeaseArray();
+            var gA = (float[])(object)gALease.Array;
             // gradA[M,K] = dC[M,N] · Bᵀ[N,K]. Bᵀ pre-packed as the "B" of this GEMM,
             // bT is the live-pack fallback when handle is dirty.
             var opts = new Engines.BlasManaged.BlasOptions<float> { PackedB = prePackedBT };
@@ -679,9 +682,12 @@ internal static class BackwardFunctions<T>
         if (typeof(T) == typeof(double))
         {
             var gradA = AutoTensorCache.RentOrAllocate<T>(new[] { M, K });
-            var dC = (double[])(object)gradOutput.GetDataArray();
-            var bT = (double[])(object)bTransposed.GetDataArray();
-            var gA = (double[])(object)gradA.GetDataArray();
+            using var dCLease = gradOutput.LeaseArray();
+            var dC = (double[])(object)dCLease.Array;
+            using var bTLease = bTransposed.LeaseArray();
+            var bT = (double[])(object)bTLease.Array;
+            using var gALease = gradA.LeaseArray();
+            var gA = (double[])(object)gALease.Array;
             var opts = new Engines.BlasManaged.BlasOptions<double> { PackedB = prePackedBT };
             Engines.BlasManaged.BlasManaged.Gemm<double>(
                 dC, N, false, bT, K, false, gA, K, M, K, N, opts);
@@ -775,8 +781,10 @@ internal static class BackwardFunctions<T>
                         {
                             var gradATensor = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
                             var gradBTensor = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
-                            var gradAData = (float[])(object)gradATensor.GetDataArray();
-                            var gradBData = (float[])(object)gradBTensor.GetDataArray();
+                            using var gradADataLease = gradATensor.LeaseArray();
+                            var gradAData = (float[])(object)gradADataLease.Array;
+                            using var gradBDataLease = gradBTensor.LeaseArray();
+                            var gradBData = (float[])(object)gradBDataLease.Array;
 
                             if (UseSimdGemmBackward(backwardWork))
                             {
@@ -839,8 +847,10 @@ internal static class BackwardFunctions<T>
                     {
                         var gradATensor = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
                         var gradBTensor = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
-                        var gradAData = (double[])(object)gradATensor.GetDataArray();
-                        var gradBData = (double[])(object)gradBTensor.GetDataArray();
+                        using var gradADataLease = gradATensor.LeaseArray();
+                        var gradAData = (double[])(object)gradADataLease.Array;
+                        using var gradBDataLease = gradBTensor.LeaseArray();
+                        var gradBData = (double[])(object)gradBDataLease.Array;
 
                         bool okA = BlasProvider.TryGemmEx(Mflat, K, N,
                             dCArr, 0, N, false, bArr, 0, N, true, gradAData, 0, K);
@@ -1018,8 +1028,10 @@ internal static class BackwardFunctions<T>
                 {
                     var gradATensor = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
                     var gradBTensor = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
-                    var gradAData = (float[])(object)gradATensor.GetDataArray();
-                    var gradBData = (float[])(object)gradBTensor.GetDataArray();
+                    using var gradADataLease = gradATensor.LeaseArray();
+                    var gradAData = (float[])(object)gradADataLease.Array;
+                    using var gradBDataLease = gradBTensor.LeaseArray();
+                    var gradBData = (float[])(object)gradBDataLease.Array;
 
                     if (UseSimdGemmBackward(backwardWork))
                     {
@@ -1838,7 +1850,8 @@ internal static class BackwardFunctions<T>
         // whole reason this op exists — so the int[] we build here MUST
         // mirror exactly what the forward Custom op read on the same Step.
         int n = capturedFloatIdx.Length;
-        var floatData = capturedFloatIdx.GetDataArray();
+        using var floatDataLease = capturedFloatIdx.LeaseArray();
+        var floatData = floatDataLease.Array;
         var nops = MathHelper.GetNumericOperations<T>();
         var idxLong = new long[n];
         for (int i = 0; i < n; i++)
@@ -1878,10 +1891,13 @@ internal static class BackwardFunctions<T>
         var logP = inputs[0];                            // [B, V]
         int B = capturedTarget.Length;
         var nops = MathHelper.GetNumericOperations<T>();
-        var go = gradOutput.GetDataArray();              // [B]
-        var tg = capturedTarget.GetDataArray();          // [B] live
+        using var goLease = gradOutput.LeaseArray();
+        var go = goLease.Array;              // [B]
+        using var tgLease = capturedTarget.LeaseArray();
+        var tg = tgLease.Array;          // [B] live
         var gradLogP = new Tensor<T>(logP._shape);       // zeros [B,V]
-        var gl = gradLogP.GetDataArray();
+        using var glLease = gradLogP.LeaseArray();
+        var gl = glLease.Array;
         for (int i = 0; i < B; i++)
         {
             int c = (int)Math.Round(nops.ToDouble(tg[i]));
@@ -2966,8 +2982,10 @@ internal static class BackwardFunctions<T>
         // nodes; the scalar version dominated its backward pass despite moving contiguous data.
         int copyLength = checked(length * innerSize);
         var source = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
-        ReadOnlySpan<T> sourceSpan = source.AsSpan();
-        Span<T> destinationSpan = inputGrad.AsWritableSpan();
+        using var sourceSpanLease = source.Lease();
+        ReadOnlySpan<T> sourceSpan = sourceSpanLease.Span;
+        using var destinationSpanLease = inputGrad.LeaseWritable();
+        Span<T> destinationSpan = destinationSpanLease.Span;
         for (int outer = 0; outer < outerSize; outer++)
         {
             int destinationOffset = checked((outer * dimSize + start) * innerSize);
@@ -3480,8 +3498,10 @@ internal static class BackwardFunctions<T>
         int[] argmax = (int[])savedState[0];
         var inputGrad = TensorPool<T>.RentZeroed(inputs[0]._shape);
         if (!gradOutput.IsContiguous) gradOutput = gradOutput.Contiguous();
-        ReadOnlySpan<T> gradData = gradOutput.AsSpan();
-        Span<T> resultData = inputGrad.AsWritableSpan();
+        using var gradDataLease = gradOutput.Lease();
+        ReadOnlySpan<T> gradData = gradDataLease.Span;
+        using var resultDataLease = inputGrad.LeaseWritable();
+        Span<T> resultData = resultDataLease.Span;
         for (int i = 0; i < argmax.Length; i++)
         {
             int idx = argmax[i];
@@ -4360,8 +4380,10 @@ internal static class BackwardFunctions<T>
         var numOps = MathHelper.GetNumericOperations<T>();
         int[] argmax = (int[])savedState[0];
         var inputGrad = TensorPool<T>.RentZeroed(inputs[0]._shape);
-        var gradData = gradOutput.GetDataArray();
-        var resultData = inputGrad.GetDataArray();
+        using var gradDataLease = gradOutput.LeaseArray();
+        var gradData = gradDataLease.Array;
+        using var resultDataLease = inputGrad.LeaseArray();
+        var resultData = resultDataLease.Array;
         for (int i = 0; i < argmax.Length; i++)
         {
             int idx = argmax[i];
@@ -4533,7 +4555,8 @@ internal static class BackwardFunctions<T>
         }
         else if (savedState[0] is Tensor<bool> boolMask)
         {
-            var boolSpan = boolMask.AsSpan();
+            using var boolSpanLease = boolMask.Lease();
+            var boolSpan = boolSpanLease.Span;
             var maskData = new T[boolSpan.Length];
             for (int i = 0; i < boolSpan.Length; i++)
                 maskData[i] = boolSpan[i] ? numOps.Zero : numOps.One;
@@ -4649,8 +4672,10 @@ internal static class BackwardFunctions<T>
             int K = inputs[0]._shape[1]; // in_features
             int N = inputs[1]._shape[1]; // out_features
 
-            var gArr = (float[])(object)gradOutput.GetDataArray();
-            var paArr = (float[])(object)preActivation.GetDataArray();
+            using var gArrLease = gradOutput.LeaseArray();
+            var gArr = (float[])(object)gArrLease.Array;
+            using var paArrLease = preActivation.LeaseArray();
+            var paArr = (float[])(object)paArrLease.Array;
             var inArr = (float[])(object)inputs[0].GetDataArray();
             var wArr = (float[])(object)inputs[1].GetDataArray();
 
@@ -4766,9 +4791,11 @@ internal static class BackwardFunctions<T>
 
         // Defer rentals until we're committed to a fast path.
         var gradInput = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
-        var gradInputArr = (float[])(object)gradInput.GetDataArray();
+        using var gradInputArrLease = gradInput.LeaseArray();
+        var gradInputArr = (float[])(object)gradInputArrLease.Array;
         var gradWeight = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
-        var gradWeightArr = (float[])(object)gradWeight.GetDataArray();
+        using var gradWeightArrLease = gradWeight.LeaseArray();
+        var gradWeightArr = (float[])(object)gradWeightArrLease.Array;
 
         bool used = false;
 
@@ -4800,7 +4827,8 @@ internal static class BackwardFunctions<T>
 
         // gradBias = sum(maskedGrad, axis=0) — single pass, pooled buffer
         var gradBias = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[2]._shape);
-        var biasArr = (float[])(object)gradBias.GetDataArray();
+        using var biasArrLease = gradBias.LeaseArray();
+        var biasArr = (float[])(object)biasArrLease.Array;
         Array.Clear(biasArr, 0, N);
         fixed (float* pM = maskedArr, pB = biasArr)
         {
@@ -6018,11 +6046,14 @@ internal static class BackwardFunctions<T>
         // becomes zeros. Same defect fixed in MaskedScatter/IndexFill/IndexCopy.
         var gradInput = new Tensor<T>(gradOutput._shape);
         {
-            var scSrc = gradOutput.AsSpan();
-            var scDst = gradInput.AsWritableSpan();
+            using var scSrcLease = gradOutput.Lease();
+            var scSrc = scSrcLease.Span;
+            using var scDstLease = gradInput.LeaseWritable();
+            var scDst = scDstLease.Span;
             for (int i = 0; i < scSrc.Length; i++) scDst[i] = scSrc[i];
         }
-        var gradInputData = gradInput.GetDataArray();
+        using var gradInputDataLease = gradInput.LeaseArray();
+        var gradInputData = gradInputDataLease.Array;
         var inputShape = inputs[0]._shape;
         int axisSize = inputShape[axis];
         int innerSize = 1;
@@ -6216,8 +6247,10 @@ internal static class BackwardFunctions<T>
         for (int i = 0; i < inputs.Length; i++)
         {
             var grad = new Tensor<T>(gradOutput._shape);
-            var amSrc = gradOutput.AsSpan();
-            var amDst = grad.AsWritableSpan();
+            using var amSrcLease = gradOutput.Lease();
+            var amSrc = amSrcLease.Span;
+            using var amDstLease = grad.LeaseWritable();
+            var amDst = amDstLease.Span;
             for (int k = 0; k < amSrc.Length; k++) amDst[k] = amSrc[k];
             DifferentiableOps.AccumulateGrad(grads, inputs[i], grad, engine);
         }
@@ -6281,7 +6314,8 @@ internal static class BackwardFunctions<T>
         // Sum every `repeats` consecutive elements along axis
         var grad = new Tensor<T>(inputShape);
         var gradData = gradOutput.GetFlattenedData();
-        var resultData = grad.GetDataArray();
+        using var resultDataLease = grad.LeaseArray();
+        var resultData = resultDataLease.Array;
 
         int innerSize = 1;
         for (int d = axis + 1; d < inputShape.Length; d++) innerSize *= inputShape[d];
@@ -6476,7 +6510,8 @@ internal static class BackwardFunctions<T>
             int K = inputs[0]._shape[1]; // in_features
             int N = inputs[1]._shape[1]; // out_features
 
-            var gArr = (float[])(object)gradOutput.GetDataArray();
+            using var gArrLease = gradOutput.LeaseArray();
+            var gArr = (float[])(object)gArrLease.Array;
             var inArr = (float[])(object)inputs[0].GetDataArray();
             var wArr = (float[])(object)inputs[1].GetDataArray();
 
@@ -6576,7 +6611,8 @@ internal static class BackwardFunctions<T>
             int K = inputs[0]._shape[1]; // in_features
             int N = inputs[1]._shape[1]; // out_features
 
-            var gArr = (double[])(object)gradOutput.GetDataArray();
+            using var gArrLease = gradOutput.LeaseArray();
+            var gArr = (double[])(object)gArrLease.Array;
             var inArr = (double[])(object)inputs[0].GetDataArray();
             var wArr = (double[])(object)inputs[1].GetDataArray();
 
@@ -6744,7 +6780,8 @@ internal static class BackwardFunctions<T>
 
         if (typeof(T) == typeof(float))
         {
-            var grad = (float[])(object)gradOutput.GetDataArray();
+            using var gradLease = gradOutput.LeaseArray();
+            var grad = (float[])(object)gradLease.Array;
             var input = (float[])(object)inputs[0].GetDataArray();
             var weight = (float[])(object)inputs[1].GetDataArray();
             var options = new Engines.BlasManaged.BlasOptions<float>
@@ -6799,7 +6836,8 @@ internal static class BackwardFunctions<T>
 
         if (typeof(T) == typeof(double))
         {
-            var grad = (double[])(object)gradOutput.GetDataArray();
+            using var gradLease = gradOutput.LeaseArray();
+            var grad = (double[])(object)gradLease.Array;
             var input = (double[])(object)inputs[0].GetDataArray();
             var weight = (double[])(object)inputs[1].GetDataArray();
             var options = new Engines.BlasManaged.BlasOptions<double>
@@ -6959,8 +6997,10 @@ internal static class BackwardFunctions<T>
         int innerSize = 1; for (int k = dim + 1; k < rank; k++) innerSize *= input._shape[k];
 
         var ops = MathHelper.GetNumericOperations<T>();
-        var src = gradOutput.AsSpan();
-        var dst = grad.AsWritableSpan();
+        using var srcLease = gradOutput.Lease();
+        var src = srcLease.Span;
+        using var dstLease = grad.LeaseWritable();
+        var dst = dstLease.Span;
 
         int outerStrideSrc = axisLen * repeats * innerSize;
         int outerStrideDst = axisLen * innerSize;
@@ -6995,10 +7035,14 @@ internal static class BackwardFunctions<T>
         var ops = MathHelper.GetNumericOperations<T>();
         var input = inputs[0];
         var grad = new Tensor<T>(input._shape);
-        var src = input.AsSpan();
-        var y = output.AsSpan();
-        var dY = gradOutput.AsSpan();
-        var dX = grad.AsWritableSpan();
+        using var srcLease = input.Lease();
+        var src = srcLease.Span;
+        using var yLease = output.Lease();
+        var y = yLease.Span;
+        using var dYLease = gradOutput.Lease();
+        var dY = dYLease.Span;
+        using var dXLease = grad.LeaseWritable();
+        var dX = dXLease.Span;
 
         int rank = input.Rank;
         if (axis < 0) axis += rank;
@@ -7048,9 +7092,12 @@ internal static class BackwardFunctions<T>
         var ops = MathHelper.GetNumericOperations<T>();
         var input = inputs[0];
         var grad = new Tensor<T>(input._shape);
-        var src = input.AsSpan();
-        var dY = gradOutput.AsSpan();
-        var dX = grad.AsWritableSpan();
+        using var srcLease = input.Lease();
+        var src = srcLease.Span;
+        using var dYLease = gradOutput.Lease();
+        var dY = dYLease.Span;
+        using var dXLease = grad.LeaseWritable();
+        var dX = dXLease.Span;
         var zero = ops.Zero;
         for (int i = 0; i < dX.Length; i++) dX[i] = zero;
 
@@ -7097,10 +7144,14 @@ internal static class BackwardFunctions<T>
         var ops = MathHelper.GetNumericOperations<T>();
         var input = inputs[0];
         var grad = new Tensor<T>(input._shape);
-        var src = input.AsSpan();
-        var y = output.AsSpan();
-        var dY = gradOutput.AsSpan();
-        var dX = grad.AsWritableSpan();
+        using var srcLease = input.Lease();
+        var src = srcLease.Span;
+        using var yLease = output.Lease();
+        var y = yLease.Span;
+        using var dYLease = gradOutput.Lease();
+        var dY = dYLease.Span;
+        using var dXLease = grad.LeaseWritable();
+        var dX = dXLease.Span;
 
         int rank = input.Rank;
         if (axis < 0) axis += rank;
@@ -7174,9 +7225,11 @@ internal static class BackwardFunctions<T>
     {
         var ops = MathHelper.GetNumericOperations<T>();
         var a = inputs[0]; var b = inputs[1];
-        var y = output.AsSpan();
+        using var yLease = output.Lease();
+        var y = yLease.Span;
         var aSrc = a.AsSpan(); var bSrc = b.AsSpan();
-        var dY = gradOutput.AsSpan();
+        using var dYLease = gradOutput.Lease();
+        var dY = dYLease.Span;
         var gA = new Tensor<T>(a._shape); var gB = new Tensor<T>(b._shape);
         var dA = gA.AsWritableSpan(); var dB = gB.AsWritableSpan();
         var zero = ops.Zero;
@@ -7199,9 +7252,11 @@ internal static class BackwardFunctions<T>
         var a = inputs[0];
         var b = inputs[1];
         var aSrc = a.AsSpan(); var bSrc = b.AsSpan();
-        var dY = gradOutput.AsSpan();
+        using var dYLease = gradOutput.Lease();
+        var dY = dYLease.Span;
         var gA = new Tensor<T>(a._shape);
-        var dA = gA.AsWritableSpan();
+        using var dALease = gA.LeaseWritable();
+        var dA = dALease.Span;
         var zero = ops.Zero;
         for (int i = 0; i < dA.Length; i++)
         {
@@ -7222,7 +7277,8 @@ internal static class BackwardFunctions<T>
         var ops = MathHelper.GetNumericOperations<T>();
         var a = inputs[0]; var b = inputs[1];
         var aSrc = a.AsSpan(); var bSrc = b.AsSpan();
-        var dY = gradOutput.AsSpan();
+        using var dYLease = gradOutput.Lease();
+        var dY = dYLease.Span;
         var gA = new Tensor<T>(a._shape);
         var gB = new Tensor<T>(b._shape);
         var dA = gA.AsWritableSpan(); var dB = gB.AsWritableSpan();
@@ -7247,7 +7303,8 @@ internal static class BackwardFunctions<T>
         var ops = MathHelper.GetNumericOperations<T>();
         var a = inputs[0]; var b = inputs[1];
         var aSrc = a.AsSpan(); var bSrc = b.AsSpan();
-        var dY = gradOutput.AsSpan();
+        using var dYLease = gradOutput.Lease();
+        var dY = dYLease.Span;
         var gA = new Tensor<T>(a._shape);
         var gB = new Tensor<T>(b._shape);
         var dA = gA.AsWritableSpan(); var dB = gB.AsWritableSpan();
@@ -7271,8 +7328,10 @@ internal static class BackwardFunctions<T>
         var ops = MathHelper.GetNumericOperations<T>();
         var a = inputs[0]; var b = inputs[1];
         var aSrc = a.AsSpan(); var bSrc = b.AsSpan();
-        var ySrc = output.AsSpan();
-        var dY = gradOutput.AsSpan();
+        using var ySrcLease = output.Lease();
+        var ySrc = ySrcLease.Span;
+        using var dYLease = gradOutput.Lease();
+        var dY = dYLease.Span;
         var gA = new Tensor<T>(a._shape);
         var gB = new Tensor<T>(b._shape);
         var dA = gA.AsWritableSpan(); var dB = gB.AsWritableSpan();
@@ -7300,10 +7359,13 @@ internal static class BackwardFunctions<T>
         var x = inputs[0];
         // exp is stored in savedState as Tensor<int>; non-differentiable.
         var expT = (Tensor<int>)savedState[0];
-        var eSrc = expT.AsSpan();
-        var dY = gradOutput.AsSpan();
+        using var eSrcLease = expT.Lease();
+        var eSrc = eSrcLease.Span;
+        using var dYLease = gradOutput.Lease();
+        var dY = dYLease.Span;
         var gX = new Tensor<T>(x._shape);
-        var dX = gX.AsWritableSpan();
+        using var dXLease = gX.LeaseWritable();
+        var dX = dXLease.Span;
         for (int i = 0; i < dX.Length; i++)
         {
             var scale = ops.FromDouble(System.Math.Pow(2.0, eSrc[i]));
@@ -7320,8 +7382,10 @@ internal static class BackwardFunctions<T>
         var ops = MathHelper.GetNumericOperations<T>();
         var a = inputs[0]; var b = inputs[1];
         var aSrc = a.AsSpan(); var bSrc = b.AsSpan();
-        var ySrc = output.AsSpan();
-        var dY = gradOutput.AsSpan();
+        using var ySrcLease = output.Lease();
+        var ySrc = ySrcLease.Span;
+        using var dYLease = gradOutput.Lease();
+        var dY = dYLease.Span;
         var gA = new Tensor<T>(a._shape);
         var gB = new Tensor<T>(b._shape);
         var dA = gA.AsWritableSpan(); var dB = gB.AsWritableSpan();
@@ -7345,8 +7409,10 @@ internal static class BackwardFunctions<T>
         var ops = MathHelper.GetNumericOperations<T>();
         var a = inputs[0]; var b = inputs[1];
         var aSrc = a.AsSpan(); var bSrc = b.AsSpan();
-        var ySrc = output.AsSpan();
-        var dY = gradOutput.AsSpan();
+        using var ySrcLease = output.Lease();
+        var ySrc = ySrcLease.Span;
+        using var dYLease = gradOutput.Lease();
+        var dY = dYLease.Span;
         var gA = new Tensor<T>(a._shape);
         var gB = new Tensor<T>(b._shape);
         var dA = gA.AsWritableSpan(); var dB = gB.AsWritableSpan();
@@ -7375,10 +7441,13 @@ internal static class BackwardFunctions<T>
     {
         var ops = MathHelper.GetNumericOperations<T>();
         var x = inputs[0];
-        var xSrc = x.AsSpan();
-        var dY = gradOutput.AsSpan();
+        using var xSrcLease = x.Lease();
+        var xSrc = xSrcLease.Span;
+        using var dYLease = gradOutput.Lease();
+        var dY = dYLease.Span;
         var gX = new Tensor<T>(x._shape);
-        var dX = gX.AsWritableSpan();
+        using var dXLease = gX.LeaseWritable();
+        var dX = dXLease.Span;
         // -2/√π
         var c = ops.FromDouble(-2.0 / System.Math.Sqrt(System.Math.PI));
         for (int i = 0; i < dX.Length; i++)
@@ -7396,10 +7465,13 @@ internal static class BackwardFunctions<T>
     {
         var ops = MathHelper.GetNumericOperations<T>();
         var x = inputs[0];
-        var ySrc = output.AsSpan();
-        var dY = gradOutput.AsSpan();
+        using var ySrcLease = output.Lease();
+        var ySrc = ySrcLease.Span;
+        using var dYLease = gradOutput.Lease();
+        var dY = dYLease.Span;
         var gX = new Tensor<T>(x._shape);
-        var dX = gX.AsWritableSpan();
+        using var dXLease = gX.LeaseWritable();
+        var dX = dXLease.Span;
         var c = ops.FromDouble(System.Math.Sqrt(System.Math.PI) / 2.0);
         for (int i = 0; i < dX.Length; i++)
         {
@@ -7418,7 +7490,8 @@ internal static class BackwardFunctions<T>
         var ops = MathHelper.GetNumericOperations<T>();
         var x = inputs[0]; var y = inputs[1];
         var xSrc = x.AsSpan(); var ySrc = y.AsSpan();
-        var dY = gradOutput.AsSpan();
+        using var dYLease = gradOutput.Lease();
+        var dY = dYLease.Span;
         var gX = new Tensor<T>(x._shape);
         var gY = new Tensor<T>(y._shape);
         var dX = gX.AsWritableSpan(); var dYg = gY.AsWritableSpan();
@@ -7440,7 +7513,8 @@ internal static class BackwardFunctions<T>
         var ops = MathHelper.GetNumericOperations<T>();
         var x = inputs[0]; var y = inputs[1];
         var xSrc = x.AsSpan(); var ySrc = y.AsSpan();
-        var dY = gradOutput.AsSpan();
+        using var dYLease = gradOutput.Lease();
+        var dY = dYLease.Span;
         var gX = new Tensor<T>(x._shape);
         var gY = new Tensor<T>(y._shape);
         var dX = gX.AsWritableSpan(); var dYg = gY.AsWritableSpan();
@@ -7462,10 +7536,13 @@ internal static class BackwardFunctions<T>
     {
         var ops = MathHelper.GetNumericOperations<T>();
         var x = inputs[0];
-        var xSrc = x.AsSpan();
-        var dY = gradOutput.AsSpan();
+        using var xSrcLease = x.Lease();
+        var xSrc = xSrcLease.Span;
+        using var dYLease = gradOutput.Lease();
+        var dY = dYLease.Span;
         var gX = new Tensor<T>(x._shape);
-        var dX = gX.AsWritableSpan();
+        using var dXLease = gX.LeaseWritable();
+        var dX = dXLease.Span;
         for (int i = 0; i < dX.Length; i++)
         {
             double xd = System.Convert.ToDouble(xSrc[i], System.Globalization.CultureInfo.InvariantCulture);
@@ -7487,10 +7564,13 @@ internal static class BackwardFunctions<T>
     {
         var ops = MathHelper.GetNumericOperations<T>();
         var x = inputs[0];
-        var xSrc = x.AsSpan();
-        var dY = gradOutput.AsSpan();
+        using var xSrcLease = x.Lease();
+        var xSrc = xSrcLease.Span;
+        using var dYLease = gradOutput.Lease();
+        var dY = dYLease.Span;
         var gX = new Tensor<T>(x._shape);
-        var dX = gX.AsWritableSpan();
+        using var dXLease = gX.LeaseWritable();
+        var dX = dXLease.Span;
         for (int i = 0; i < dX.Length; i++)
         {
             double xd = System.Convert.ToDouble(xSrc[i], System.Globalization.CultureInfo.InvariantCulture);
@@ -7514,10 +7594,13 @@ internal static class BackwardFunctions<T>
     {
         var ops = MathHelper.GetNumericOperations<T>();
         var x = inputs[0];
-        var xSrc = x.AsSpan();
-        var dY = gradOutput.AsSpan();
+        using var xSrcLease = x.Lease();
+        var xSrc = xSrcLease.Span;
+        using var dYLease = gradOutput.Lease();
+        var dY = dYLease.Span;
         var gX = new Tensor<T>(x._shape);
-        var dX = gX.AsWritableSpan();
+        using var dXLease = gX.LeaseWritable();
+        var dX = dXLease.Span;
         for (int i = 0; i < dX.Length; i++)
         {
             double xd = System.Convert.ToDouble(xSrc[i], System.Globalization.CultureInfo.InvariantCulture);
@@ -7542,11 +7625,15 @@ internal static class BackwardFunctions<T>
     {
         var ops = MathHelper.GetNumericOperations<T>();
         var x = inputs[0];
-        var xSrc = x.AsSpan();
-        var ySrc = output.AsSpan();
-        var dY = gradOutput.AsSpan();
+        using var xSrcLease = x.Lease();
+        var xSrc = xSrcLease.Span;
+        using var ySrcLease = output.Lease();
+        var ySrc = ySrcLease.Span;
+        using var dYLease = gradOutput.Lease();
+        var dY = dYLease.Span;
         var gX = new Tensor<T>(x._shape);
-        var dX = gX.AsWritableSpan();
+        using var dXLease = gX.LeaseWritable();
+        var dX = dXLease.Span;
         for (int i = 0; i < dX.Length; i++)
         {
             double xd = System.Convert.ToDouble(xSrc[i], System.Globalization.CultureInfo.InvariantCulture);
@@ -7580,7 +7667,8 @@ internal static class BackwardFunctions<T>
         var input = inputs[0];
         var ops = MathHelper.GetNumericOperations<T>();
         var grad = new Tensor<T>(input._shape);
-        var dst = grad.AsWritableSpan();
+        using var dstLease = grad.LeaseWritable();
+        var dst = dstLease.Span;
         // gradOutput is a scalar tensor.
         T scalar = gradOutput.AsSpan()[0];
         int rows = input._shape[0];
@@ -7646,14 +7734,19 @@ internal static class BackwardFunctions<T>
             outStrides[k] = outStrides[k + 1] * outShape[k + 1];
         }
 
-        var aSrc = a.AsSpan();
-        var bSrc = b.AsSpan();
-        var dySrc = gradOutput.AsSpan();
+        using var aSrcLease = a.Lease();
+        var aSrc = aSrcLease.Span;
+        using var bSrcLease = b.Lease();
+        var bSrc = bSrcLease.Span;
+        using var dySrcLease = gradOutput.Lease();
+        var dySrc = dySrcLease.Span;
 
         var dA = new Tensor<T>(a._shape);
-        var dAd = dA.AsWritableSpan();
+        using var dAdLease = dA.LeaseWritable();
+        var dAd = dAdLease.Span;
         var dB = new Tensor<T>(b._shape);
-        var dBd = dB.AsWritableSpan();
+        using var dBdLease = dB.LeaseWritable();
+        var dBd = dBdLease.Span;
 
         // Accumulate by walking every output position once — O(outTotal).
         var idx = new int[rank];
@@ -7709,12 +7802,15 @@ internal static class BackwardFunctions<T>
         if (axis < 0) axis += rank;
         var ops = MathHelper.GetNumericOperations<T>();
         var srcGrad = new Tensor<T>(source._shape);
-        var sd = srcGrad.AsWritableSpan();
-        var go = gradOutput.AsSpan();
+        using var sdLease = srcGrad.LeaseWritable();
+        var sd = sdLease.Span;
+        using var goLease = gradOutput.Lease();
+        var go = goLease.Span;
         int outerSize = 1; for (int k = 0; k < axis; k++) outerSize *= gradOutput._shape[k];
         int innerSize = 1; for (int k = axis + 1; k < rank; k++) innerSize *= gradOutput._shape[k];
         int goAxis = gradOutput._shape[axis];
-        var idxSpan = indices.AsSpan();
+        using var idxSpanLease = indices.Lease();
+        var idxSpan = idxSpanLease.Span;
         for (int outer = 0; outer < outerSize; outer++)
             for (int i = 0; i < idxSpan.Length; i++)
             {
@@ -7775,18 +7871,22 @@ internal static class BackwardFunctions<T>
             // is exactly why that one always survived while this one did not.
         var grad = new Tensor<T>(gradOutput._shape);
         {
-            var srcSpan0 = gradOutput.AsSpan();
-            var dstSpan0 = grad.AsWritableSpan();
+            using var srcSpan0Lease = gradOutput.Lease();
+            var srcSpan0 = srcSpan0Lease.Span;
+            using var dstSpan0Lease = grad.LeaseWritable();
+            var dstSpan0 = dstSpan0Lease.Span;
             for (int i = 0; i < srcSpan0.Length; i++) dstSpan0[i] = srcSpan0[i];
         }
-        var dst = grad.AsWritableSpan();
+        using var dstLease = grad.LeaseWritable();
+        var dst = dstLease.Span;
         int rank = input.Rank;
         if (axis < 0) axis += rank;
         int axisSize = input._shape[axis];
         int outerSize = 1; for (int k = 0; k < axis; k++) outerSize *= input._shape[k];
         int innerSize = 1; for (int k = axis + 1; k < rank; k++) innerSize *= input._shape[k];
         var zero = ops.Zero;
-        var idx = indices.AsSpan();
+        using var idxLease = indices.Lease();
+        var idx = idxLease.Span;
         for (int outer = 0; outer < outerSize; outer++)
             for (int i = 0; i < idx.Length; i++)
             {
@@ -7801,8 +7901,10 @@ internal static class BackwardFunctions<T>
         if (inputs.Length < 2) return;
         var source = inputs[1];
         var srcGrad = new Tensor<T>(source._shape);
-        var sd = srcGrad.AsWritableSpan();
-        var go = gradOutput.AsSpan();
+        using var sdLease = srcGrad.LeaseWritable();
+        var sd = sdLease.Span;
+        using var goLease = gradOutput.Lease();
+        var go = goLease.Span;
         var overwritten = new HashSet<int>(OverwrittenIndexPositions(idx.ToArray()));
         for (int outer = 0; outer < outerSize; outer++)
             for (int i = 0; i < idx.Length; i++)
@@ -7850,18 +7952,22 @@ internal static class BackwardFunctions<T>
             // is exactly why that one always survived while this one did not.
         var grad = new Tensor<T>(gradOutput._shape);
         {
-            var srcSpan0 = gradOutput.AsSpan();
-            var dstSpan0 = grad.AsWritableSpan();
+            using var srcSpan0Lease = gradOutput.Lease();
+            var srcSpan0 = srcSpan0Lease.Span;
+            using var dstSpan0Lease = grad.LeaseWritable();
+            var dstSpan0 = dstSpan0Lease.Span;
             for (int i = 0; i < srcSpan0.Length; i++) dstSpan0[i] = srcSpan0[i];
         }
-        var dst = grad.AsWritableSpan();
+        using var dstLease = grad.LeaseWritable();
+        var dst = dstLease.Span;
         int rank = input.Rank;
         if (axis < 0) axis += rank;
         int axisSize = input._shape[axis];
         int outerSize = 1; for (int k = 0; k < axis; k++) outerSize *= input._shape[k];
         int innerSize = 1; for (int k = axis + 1; k < rank; k++) innerSize *= input._shape[k];
         var zero = ops.Zero;
-        var idx = indices.AsSpan();
+        using var idxLease = indices.Lease();
+        var idx = idxLease.Span;
         for (int outer = 0; outer < outerSize; outer++)
             for (int i = 0; i < idx.Length; i++)
             {
@@ -7885,9 +7991,12 @@ internal static class BackwardFunctions<T>
         var input = inputs[0];
         var ops = MathHelper.GetNumericOperations<T>();
         var grad = new Tensor<T>(input._shape);
-        var dst = grad.AsWritableSpan();
-        var src = gradOutput.AsSpan();
-        var idx = indices.AsSpan();
+        using var dstLease = grad.LeaseWritable();
+        var dst = dstLease.Span;
+        using var srcLease = gradOutput.Lease();
+        var src = srcLease.Span;
+        using var idxLease = indices.Lease();
+        var idx = idxLease.Span;
         var zero = ops.Zero;
         for (int i = 0; i < dst.Length; i++) dst[i] = zero;
 
@@ -7944,13 +8053,18 @@ internal static class BackwardFunctions<T>
             // is exactly why that one always survived while this one did not.
             var inputGrad = new Tensor<T>(gradOutput._shape);
         {
-            var srcSpan = gradOutput.AsSpan();
-            var dstSpan = inputGrad.AsWritableSpan();
+            using var srcSpanLease = gradOutput.Lease();
+            var srcSpan = srcSpanLease.Span;
+            using var dstSpanLease = inputGrad.LeaseWritable();
+            var dstSpan = dstSpanLease.Span;
             for (int i = 0; i < srcSpan.Length; i++) dstSpan[i] = srcSpan[i];
         }
-        var inputDst = inputGrad.AsWritableSpan();
-        var maskSpan = mask.AsSpan();
-        var go = gradOutput.AsSpan();
+        using var inputDstLease = inputGrad.LeaseWritable();
+        var inputDst = inputDstLease.Span;
+        using var maskSpanLease = mask.Lease();
+        var maskSpan = maskSpanLease.Span;
+        using var goLease = gradOutput.Lease();
+        var go = goLease.Span;
         var zero = ops.Zero;
         int maskedCount = 0;
         for (int i = 0; i < inputDst.Length; i++)
@@ -7966,7 +8080,8 @@ internal static class BackwardFunctions<T>
         // Source is 1-D with length = number of mask-trues; entries are
         // consumed in row-major order as the mask is scanned.
         var srcGrad = new Tensor<T>(source._shape);
-        var sd = srcGrad.AsWritableSpan();
+        using var sdLease = srcGrad.LeaseWritable();
+        var sd = sdLease.Span;
         int cursor = 0;
         for (int i = 0; i < maskSpan.Length && cursor < sd.Length; i++)
         {
@@ -7989,9 +8104,12 @@ internal static class BackwardFunctions<T>
 
         var grad = new Tensor<T>(inputShape);
         var numOps = MathHelper.GetNumericOperations<T>();
-        var dst = grad.AsWritableSpan();
-        var src = gradOutput.AsSpan();
-        var idx = indices.AsSpan();
+        using var dstLease = grad.LeaseWritable();
+        var dst = dstLease.Span;
+        using var srcLease = gradOutput.Lease();
+        var src = srcLease.Span;
+        using var idxLease = indices.Lease();
+        var idx = idxLease.Span;
         // dst starts at zero (tensor default); accumulate into indexed slots.
         var zero = numOps.Zero;
         for (int i = 0; i < dst.Length; i++) dst[i] = zero;
@@ -8016,9 +8134,12 @@ internal static class BackwardFunctions<T>
 
         var grad = new Tensor<T>(inputShape);
         var numOps = MathHelper.GetNumericOperations<T>();
-        var dest = grad.AsWritableSpan();
-        var src = gradOutput.AsSpan();
-        var maskSpan = mask.AsSpan();
+        using var destLease = grad.LeaseWritable();
+        var dest = destLease.Span;
+        using var srcLease = gradOutput.Lease();
+        var src = srcLease.Span;
+        using var maskSpanLease = mask.Lease();
+        var maskSpan = maskSpanLease.Span;
         var zero = numOps.Zero;
 
         int r = 0;
@@ -8113,9 +8234,12 @@ internal static class BackwardFunctions<T>
         var input = inputs[0];
         var ops = MathHelper.GetNumericOperations<T>();
         var grad = new Tensor<T>(input._shape);
-        var src = input.AsSpan();
-        var go = gradOutput.AsSpan();
-        var dst = grad.AsWritableSpan();
+        using var srcLease = input.Lease();
+        var src = srcLease.Span;
+        using var goLease = gradOutput.Lease();
+        var go = goLease.Span;
+        using var dstLease = grad.LeaseWritable();
+        var dst = dstLease.Span;
         var zero = ops.Zero;
         for (int i = 0; i < src.Length; i++)
         {
@@ -8144,8 +8268,10 @@ internal static class BackwardFunctions<T>
         int matSize = diagLen + System.Math.Abs(offset);
 
         var grad = new Tensor<T>(input._shape);
-        var go = gradOutput.AsSpan();
-        var dst = grad.AsWritableSpan();
+        using var goLease = gradOutput.Lease();
+        var go = goLease.Span;
+        using var dstLease = grad.LeaseWritable();
+        var dst = dstLease.Span;
 
         int batchSize = 1;
         for (int k = 0; k < rank - 1; k++) batchSize *= input._shape[k];
@@ -8245,8 +8371,10 @@ internal static class BackwardFunctions<T>
         var input = inputs[0];
         var ops = MathHelper.GetNumericOperations<T>();
         var grad = new Tensor<T>(inputShape);
-        var gSrc = gradOutput.AsSpan();
-        var gDst = grad.AsWritableSpan();
+        using var gSrcLease = gradOutput.Lease();
+        var gSrc = gSrcLease.Span;
+        using var gDstLease = grad.LeaseWritable();
+        var gDst = gDstLease.Span;
         var zero = ops.Zero;
         for (int i = 0; i < gDst.Length; i++) gDst[i] = zero;
 
@@ -8413,9 +8541,12 @@ internal static class BackwardFunctions<T>
         var x = inputs[0];
         var ops = MathHelper.GetNumericOperations<T>();
         var deriv = new Tensor<T>(x._shape);
-        var xs = x.AsSpan();
-        var i1es = output.AsSpan();
-        var dst = deriv.AsWritableSpan();
+        using var xsLease = x.Lease();
+        var xs = xsLease.Span;
+        using var i1esLease = output.Lease();
+        var i1es = i1esLease.Span;
+        using var dstLease = deriv.LeaseWritable();
+        var dst = dstLease.Span;
         // compute I0e on the side
         var i0e = engine.TensorI0e(x).AsSpan();
         for (int i = 0; i < xs.Length; i++)
@@ -8516,8 +8647,10 @@ internal static class BackwardFunctions<T>
         for (int i = spatial - 2; i >= 0; i--) srcStride[i] = srcStride[i + 1] * srcDims[i + 1];
         int srcSpatial = 1; for (int i = 0; i < spatial; i++) srcSpatial *= srcDims[i];
         int dstSpatial = 1; for (int i = 0; i < spatial; i++) dstSpatial *= dstDims[i];
-        var gout = gradOutput.AsSpan();
-        var gin = gradInput.AsWritableSpan();
+        using var goutLease = gradOutput.Lease();
+        var gout = goutLease.Span;
+        using var ginLease = gradInput.LeaseWritable();
+        var gin = ginLease.Span;
         var dstIdx = new int[spatial];
 
         for (int n = 0; n < N; n++)
@@ -8641,8 +8774,10 @@ internal static class BackwardFunctions<T>
         var numOps = MathHelper.GetNumericOperations<T>();
         var gradInput = new Tensor<T>(input._shape);
         var sourceMap = PadNdSourceMap(input._shape, gradOutputShape, pad, mode);
-        var gout = gradOutput.AsSpan();
-        var gin = gradInput.AsWritableSpan();
+        using var goutLease = gradOutput.Lease();
+        var gout = goutLease.Span;
+        using var ginLease = gradInput.LeaseWritable();
+        var gin = ginLease.Span;
         for (int k = 0; k < gout.Length; k++)
         {
             int inOff = sourceMap[k];
@@ -8732,8 +8867,10 @@ internal static class BackwardFunctions<T>
         var numOps = MathHelper.GetNumericOperations<T>();
         int N = theta._shape[0];
         var gradTheta = new Tensor<T>(theta._shape);
-        var gOut = gradOutput.AsSpan();
-        var gTheta = gradTheta.AsWritableSpan();
+        using var gOutLease = gradOutput.Lease();
+        var gOut = gOutLease.Span;
+        using var gThetaLease = gradTheta.LeaseWritable();
+        var gTheta = gThetaLease.Span;
 
         for (int n = 0; n < N; n++)
         {
@@ -8780,8 +8917,10 @@ internal static class BackwardFunctions<T>
         var numOps = MathHelper.GetNumericOperations<T>();
         int N = theta._shape[0];
         var gradTheta = new Tensor<T>(theta._shape);
-        var gOut = gradOutput.AsSpan();
-        var gTheta = gradTheta.AsWritableSpan();
+        using var gOutLease = gradOutput.Lease();
+        var gOut = gOutLease.Span;
+        using var gThetaLease = gradTheta.LeaseWritable();
+        var gTheta = gThetaLease.Span;
 
         for (int n = 0; n < N; n++)
         {
@@ -8839,9 +8978,12 @@ internal static class BackwardFunctions<T>
         var gradInput = new Tensor<T>(input._shape);
         int N = input._shape[0], C = input._shape[1], H = input._shape[2], W = input._shape[3];
         int K = boxes._shape[0];
-        var go = gradOutput.AsSpan();
-        var b = boxes.AsSpan();
-        var gi = gradInput.AsWritableSpan();
+        using var goLease = gradOutput.Lease();
+        var go = goLease.Span;
+        using var bLease = boxes.Lease();
+        var b = bLease.Span;
+        using var giLease = gradInput.LeaseWritable();
+        var gi = giLease.Span;
         double offset = aligned ? 0.5 : 0.0;
 
         for (int k = 0; k < K; k++)
@@ -8916,10 +9058,14 @@ internal static class BackwardFunctions<T>
         var gradInput = new Tensor<T>(input._shape);
         int N = input._shape[0], C = input._shape[1], H = input._shape[2], W = input._shape[3];
         int K = boxes._shape[0];
-        var src = input.AsSpan();
-        var go = gradOutput.AsSpan();
-        var b = boxes.AsSpan();
-        var gi = gradInput.AsWritableSpan();
+        using var srcLease = input.Lease();
+        var src = srcLease.Span;
+        using var goLease = gradOutput.Lease();
+        var go = goLease.Span;
+        using var bLease = boxes.Lease();
+        var b = bLease.Span;
+        using var giLease = gradInput.LeaseWritable();
+        var gi = giLease.Span;
 
         for (int k = 0; k < K; k++)
         {
@@ -8978,9 +9124,12 @@ internal static class BackwardFunctions<T>
         float minAmp = (float)savedState[0];
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(input._shape);
-        var src = input.AsSpan();
-        var gout = gradOutput.AsSpan();
-        var dst = result.AsWritableSpan();
+        using var srcLease = input.Lease();
+        var src = srcLease.Span;
+        using var goutLease = gradOutput.Lease();
+        var gout = goutLease.Span;
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
         double scale = 20.0 / Math.Log(10.0);
         for (int i = 0; i < src.Length; i++)
         {
@@ -9008,8 +9157,10 @@ internal static class BackwardFunctions<T>
         int tLen = input._shape[rank - 1];
         int leading = input.Length / Math.Max(1, tLen);
         var result = new Tensor<T>(input._shape);
-        var gout = gradOutput.AsSpan();
-        var dst = result.AsWritableSpan();
+        using var goutLease = gradOutput.Lease();
+        var gout = goutLease.Span;
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
         for (int row = 0; row < leading; row++)
         {
             int baseOff = row * tLen;
@@ -9069,8 +9220,10 @@ internal static class BackwardFunctions<T>
         int tOut = (int)((long)tIn * up / down);
         int leading = input.Length / Math.Max(1, tIn);
         double cutoff = 1.0 / Math.Max(up, down);
-        var gout = gradOutput.AsSpan();
-        var dst = result.AsWritableSpan();
+        using var goutLease = gradOutput.Lease();
+        var gout = goutLease.Span;
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
 
         for (int r = 0; r < leading; r++)
         {
@@ -9131,9 +9284,12 @@ internal static class BackwardFunctions<T>
         var gradInput = new Tensor<T>(input._shape);
         int N = input._shape[0], C = input._shape[1], H = input._shape[2], W = input._shape[3];
         int K = boxes._shape[0];
-        var go = gradOutput.AsSpan();
-        var b = boxes.AsSpan();
-        var gi = gradInput.AsWritableSpan();
+        using var goLease = gradOutput.Lease();
+        var go = goLease.Span;
+        using var bLease = boxes.Lease();
+        var b = bLease.Span;
+        using var giLease = gradInput.LeaseWritable();
+        var gi = giLease.Span;
 
         for (int k = 0; k < K; k++)
         {
@@ -9194,9 +9350,12 @@ internal static class BackwardFunctions<T>
         var gradInput = new Tensor<T>(input._shape);
         int N = input._shape[0], C = input._shape[1], H = input._shape[2], W = input._shape[3];
         int K = boxes._shape[0];
-        var go = gradOutput.AsSpan();
-        var b = boxes.AsSpan();
-        var gi = gradInput.AsWritableSpan();
+        using var goLease = gradOutput.Lease();
+        var go = goLease.Span;
+        using var bLease = boxes.Lease();
+        var b = bLease.Span;
+        using var giLease = gradInput.LeaseWritable();
+        var gi = giLease.Span;
 
         for (int k = 0; k < K; k++)
         {
@@ -9357,11 +9516,13 @@ internal static class BackwardFunctions<T>
             return;
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var gradData = gradOutput.GetDataArray();
+        using var gradDataLease = gradOutput.LeaseArray();
+        var gradData = gradDataLease.Array;
         int batchSize = gradOutput.Length / (numFreqs * 2);
 
         var result = new Tensor<T>(input._shape);
-        var resultData = result.GetDataArray();
+        using var resultDataLease = result.LeaseArray();
+        var resultData = resultDataLease.Array;
 
         for (int b = 0; b < batchSize; b++)
         {
@@ -9434,11 +9595,13 @@ internal static class BackwardFunctions<T>
             return;
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var gradData = gradOutput.GetDataArray();
+        using var gradDataLease = gradOutput.LeaseArray();
+        var gradData = gradDataLease.Array;
         int batchSize = gradOutput.Length / outputLength;
 
         var result = new Tensor<T>(input._shape);
-        var resultData = result.GetDataArray();
+        using var resultDataLease = result.LeaseArray();
+        var resultData = resultDataLease.Array;
         double invN = 1.0 / nFft;
 
         for (int b = 0; b < batchSize; b++)
@@ -9674,15 +9837,21 @@ internal static class BackwardFunctions<T>
         int numFrames = magnitude._shape[^1];
         int batchSize = magnitude.Length / (numFreqs * numFrames);
 
-        var gradData = gradOutput.GetDataArray();
-        var magData = magnitude.GetDataArray();
-        var phaseData = phase.GetDataArray();
-        var windowData = window.GetDataArray();
+        using var gradDataLease = gradOutput.LeaseArray();
+        var gradData = gradDataLease.Array;
+        using var magDataLease = magnitude.LeaseArray();
+        var magData = magDataLease.Array;
+        using var phaseDataLease = phase.LeaseArray();
+        var phaseData = phaseDataLease.Array;
+        using var windowDataLease = window.LeaseArray();
+        var windowData = windowDataLease.Array;
 
         var gradMagnitude = new Tensor<T>(magnitude._shape);
         var gradPhase = new Tensor<T>(magnitude._shape);
-        var gradMagnitudeData = gradMagnitude.GetDataArray();
-        var gradPhaseData = gradPhase.GetDataArray();
+        using var gradMagnitudeDataLease = gradMagnitude.LeaseArray();
+        var gradMagnitudeData = gradMagnitudeDataLease.Array;
+        using var gradPhaseDataLease = gradPhase.LeaseArray();
+        var gradPhaseData = gradPhaseDataLease.Array;
 
         var windowSum = new double[outputLength];
         var normalisedGrad = new double[outputLength];
@@ -9832,9 +10001,12 @@ internal static class BackwardFunctions<T>
         int paddedLength = origLength + 2 * padAmount;
         int batchSize = gradMagnitude.Length / (numFreqs * numFrames);
 
-        var gradData = gradMagnitude.GetDataArray();
-        var phaseData = phase.GetDataArray();
-        var windowData = window.GetDataArray();
+        using var gradDataLease = gradMagnitude.LeaseArray();
+        var gradData = gradDataLease.Array;
+        using var phaseDataLease = phase.LeaseArray();
+        var phaseData = phaseDataLease.Array;
+        using var windowDataLease = window.LeaseArray();
+        var windowData = windowDataLease.Array;
         // Bound once, non-nullable, so the inner loop needs no null handling and no suppression.
         // Empty for the magnitude target, which never indexes it.
         var magnitudeData = Array.Empty<T>();
@@ -9851,7 +10023,8 @@ internal static class BackwardFunctions<T>
         }
 
         var result = new Tensor<T>(waveformShape);
-        var resultData = result.GetDataArray();
+        using var resultDataLease = result.LeaseArray();
+        var resultData = resultDataLease.Array;
         var padded = new double[paddedLength];
 
         // Hoisted out of the frame loop: one pair per (batch, frame) would churn thousands of
@@ -9986,10 +10159,14 @@ internal static class BackwardFunctions<T>
         int numFrames = magnitude._shape[^1];
         int batchSize = magnitude.Length / (numFreqs * numFrames);
 
-        var gradData = gradOutput.GetDataArray();
-        var magData = magnitude.GetDataArray();
-        var filterData = melFilterbank.GetDataArray();
-        var linearMelData = linearMel.GetDataArray();
+        using var gradDataLease = gradOutput.LeaseArray();
+        var gradData = gradDataLease.Array;
+        using var magDataLease = magnitude.LeaseArray();
+        var magData = magDataLease.Array;
+        using var filterDataLease = melFilterbank.LeaseArray();
+        var filterData = filterDataLease.Array;
+        using var linearMelDataLease = linearMel.LeaseArray();
+        var linearMelData = linearMelDataLease.Array;
 
         // Stage 1: undo the dB conversion, in place on a copy of the incoming gradient.
         var gMel = new double[gradOutput.Length];
@@ -10024,7 +10201,8 @@ internal static class BackwardFunctions<T>
         // output rows, which is what keeps this deterministic. Expressing it as a TensorMatMul
         // would also work but would reassociate the sum over m and change the low bits.
         var gradMag = new Tensor<T>(magnitude._shape);
-        var gradMagData = gradMag.GetDataArray();
+        using var gradMagDataLease = gradMag.LeaseArray();
+        var gradMagData = gradMagDataLease.Array;
         int rows = batchSize * numFreqs;
         Helpers.CpuParallelSettings.ParallelForOrSerial(0, rows, (long)rows * numFrames * nMels, row =>
         {

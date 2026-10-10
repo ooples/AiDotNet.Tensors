@@ -733,9 +733,11 @@ internal static class DifferentiableOps
         if (HasOverlappingStorage(existing, source)) return false;
 
         var numOps = global::AiDotNet.Tensors.Helpers.MathHelper.GetNumericOperations<T>();
-        var dest = existing.AsWritableSpan();
+        using var destLease = existing.LeaseWritable();
+        var dest = destLease.Span;
         if (ClaimFirstWrite(existing)) dest.Clear();   // stale buffer from an earlier step: this is its first write
-        var src = source.AsSpan();
+        using var srcLease = source.Lease();
+        var src = srcLease.Span;
         var fullShape = existing._shape;
         int rank = fullShape.Length;
         int rowLength = regionShape[rank - 1];

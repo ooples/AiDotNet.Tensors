@@ -311,7 +311,8 @@ public sealed class GraphExecutor<T> : IDisposable
             return cached;
         var t = new Tensor<T>(new[] { size });
         var numOps = MathHelper.GetNumericOperations<T>();
-        var span = t.AsWritableSpan();
+        using var spanLease = t.LeaseWritable();
+        var span = spanLease.Span;
         for (int i = 0; i < size; i++)
             span[i] = numOps.One;
         _cachedOnes[size] = t;

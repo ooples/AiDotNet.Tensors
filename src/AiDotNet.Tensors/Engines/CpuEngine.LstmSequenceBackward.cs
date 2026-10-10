@@ -163,7 +163,8 @@ public partial class CpuEngine
         var output = returnSequences
             ? new Tensor<float>(new[] { batch, seqLen, hidden })
             : new Tensor<float>(new[] { batch, hidden });
-        var outSpan = output.AsWritableSpan();
+        using var outSpanLease = output.LeaseWritable();
+        var outSpan = outSpanLease.Span;
 
         // seqLen == 0 corner case: the timestep loop below is skipped, so the
         // last-hidden output stays at its default zero-init. Match the generic
@@ -184,8 +185,10 @@ public partial class CpuEngine
             {
                 finalHidden = new Tensor<float>(new[] { batch, hidden });
                 finalCell = new Tensor<float>(new[] { batch, hidden });
-                var fhSpan0 = finalHidden.AsWritableSpan();
-                var fcSpan0 = finalCell.AsWritableSpan();
+                using var fhSpan0Lease = finalHidden.LeaseWritable();
+                var fhSpan0 = fhSpan0Lease.Span;
+                using var fcSpan0Lease = finalCell.LeaseWritable();
+                var fcSpan0 = fcSpan0Lease.Span;
                 for (int b = 0; b < batch; b++)
                     for (int h = 0; h < hidden; h++)
                     {
@@ -215,8 +218,10 @@ public partial class CpuEngine
         {
             finalHidden = new Tensor<float>(new[] { batch, hidden });
             finalCell = new Tensor<float>(new[] { batch, hidden });
-            var fhSpan = finalHidden.AsWritableSpan();
-            var fcSpan = finalCell.AsWritableSpan();
+            using var fhSpanLease = finalHidden.LeaseWritable();
+            var fhSpan = fhSpanLease.Span;
+            using var fcSpanLease = finalCell.LeaseWritable();
+            var fcSpan = fcSpanLease.Span;
             for (int b = 0; b < batch; b++)
                 for (int h = 0; h < hidden; h++)
                 {
@@ -840,7 +845,8 @@ public partial class CpuEngine
         var sum = parts[0];
         for (int c = 1; c < chunks; c++) LstmAddInto(sum, parts[c], k * G);
         var grad = new Tensor<float>(new[] { G, k });
-        var dst = grad.AsWritableSpan();
+        using var dstLease = grad.LeaseWritable();
+        var dst = dstLease.Span;
         for (int g = 0; g < G; g++)
             for (int i = 0; i < k; i++)
                 dst[g * k + i] = sum[i * G + g];
@@ -1101,7 +1107,8 @@ public partial class CpuEngine
         var output = returnSequences
             ? new Tensor<double>(new[] { batch, seqLen, hidden })
             : new Tensor<double>(new[] { batch, hidden });
-        var outSpan = output.AsWritableSpan();
+        using var outSpanLease = output.LeaseWritable();
+        var outSpan = outSpanLease.Span;
 
         if (seqLen == 0)
         {

@@ -313,8 +313,10 @@ public sealed class DTensor<T>
         int dstAxis = dst._shape[axis];
         int copyLen = srcLen < 0 ? dstAxis : srcLen;
 
-        var s = src.AsSpan();
-        var d = dst.AsWritableSpan();
+        using var sLease = src.Lease();
+        var s = sLease.Span;
+        using var dLease = dst.LeaseWritable();
+        var d = dLease.Span;
         for (int o = 0; o < outer; o++)
         {
             int srcRowStart = (o * srcAxis + srcStart) * inner;

@@ -311,8 +311,10 @@ public sealed class NamedTensor<T>
         var newShape = new int[perm.Length];
         for (int i = 0; i < perm.Length; i++) newShape[i] = tensor._shape[perm[i]];
         var result = new Tensor<T>(newShape);
-        var dst = result.AsWritableSpan();
-        var src = tensor.AsSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
+        using var srcLease = tensor.Lease();
+        var src = srcLease.Span;
 
         // Use the tensor's own strides — recomputing dense row-major
         // strides from _shape is only correct for contiguous tensors.

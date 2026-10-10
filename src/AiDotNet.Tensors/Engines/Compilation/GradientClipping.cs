@@ -117,7 +117,8 @@ public static class GradientClipping
                 continue;
             }
 
-            var data = grad.AsWritableSpan();
+            using var dataLease = grad.LeaseWritable();
+            var data = dataLease.Span;
             int len = data.Length;
             int i = 0;
 

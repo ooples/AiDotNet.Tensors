@@ -1971,7 +1971,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
                 if (typeof(T) == typeof(float))
                 {
                     var s = (float[])(object)GetDataArray();
-                    var r = (float[])(object)result.GetDataArray();
+                    using var rLease = result.LeaseArray();
+                    var r = (float[])(object)rLease.Array;
                     CpuParallelSettings.ParallelForOrSerial(0, kept, len, c =>
                     {
                         float acc = 0f;
@@ -1986,7 +1987,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
                 else
                 {
                     var s = (double[])(object)GetDataArray();
-                    var r = (double[])(object)result.GetDataArray();
+                    using var rLease = result.LeaseArray();
+                    var r = (double[])(object)rLease.Array;
                     CpuParallelSettings.ParallelForOrSerial(0, kept, len, c =>
                     {
                         double acc = 0d;
@@ -2007,7 +2009,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             if (typeof(T) == typeof(float))
             {
                 var s = (float[])(object)GetDataArray();
-                var r = (float[])(object)result.GetDataArray();
+                using var rLease = result.LeaseArray();
+                var r = (float[])(object)rLease.Array;
                 for (int i = 0; i < len; i++)
                 {
                     r[outFlat] += s[i];
@@ -2023,7 +2026,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
             if (typeof(T) == typeof(double))
             {
                 var s = (double[])(object)GetDataArray();
-                var r = (double[])(object)result.GetDataArray();
+                using var rLease = result.LeaseArray();
+                var r = (double[])(object)rLease.Array;
                 for (int i = 0; i < len; i++)
                 {
                     r[outFlat] += s[i];
@@ -2039,7 +2043,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
 
             // Generic T: still allocation-free / indexer-free; only Add is virtual.
             var src = AsSpan();
-            var rArr = result.GetDataArray();
+            using var rArrLease = result.LeaseArray();
+            var rArr = rArrLease.Array;
             for (int i = 0; i < len; i++)
             {
                 rArr[outFlat] = _numOps.Add(rArr[outFlat], src[i]);
@@ -2085,7 +2090,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
 
         var result = new Vector<T>(length);
         var sourceSpan = _data.AsSpan().Slice(start, length);
-        var destSpan = result.AsWritableSpan();
+        using var destSpanLease = result.LeaseWritable();
+        var destSpan = destSpanLease.Span;
         _numOps.Copy(sourceSpan, destSpan);
         return result;
     }

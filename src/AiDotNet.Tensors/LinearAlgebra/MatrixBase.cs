@@ -141,6 +141,15 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
     internal T[] GetDataArray()
     {
         ResultOwner?.MarkEscaped(); // raw access: see AsSpan
+        return GetDataArrayUnmarked();
+    }
+
+    /// <summary>
+    /// <see cref="GetDataArray"/> without the escape mark, for a caller that keeps this matrix alive while it uses the
+    /// array (an op writing the result it returns, or reading an input it holds with a <see cref="KeepAliveScope"/>).
+    /// </summary>
+    internal T[] GetDataArrayUnmarked()
+    {
         // If a deferred GPU download is pending, materialize now: callers
         // of GetDataArray either read the data directly or pass it to code
         // that does (host-side serialization, base CPU ops, etc.). The
@@ -1065,7 +1074,8 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
         // Cache-oblivious recursion, parallelized across a flat grid of disjoint C-tiles through
         // the persistent worker pool — write directly into result's backing array.
         MatrixMultiplyHelper.TraceMatmul("RECURSIVE", M, N, K);
-        var resultData = result.GetDataArray();
+        using var resultDataLease = result.LeaseArray();
+        var resultData = resultDataLease.Array;
         // GetDataArray() hands back the live backing array when the memory is a full array (offset 0) —
         // no per-multiply full-matrix copy — and falls back to ToArray() only for sliced/non-array-backed
         // memory. MultiplyParallel only READS a and b (it writes into resultData), so sharing the backing
@@ -1221,7 +1231,8 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
             throw new ArgumentException("Number of columns in the matrix must equal the length of the vector.");
 
         var result = VA.RentUninitialized<T>(_rows);
-        var vecSpan = vector.AsSpan();
+        using var vecSpanLease = vector.Lease();
+        var vecSpan = vecSpanLease.Span;
 
         // Use vectorized dot product for each row (SIMD accelerated)
         for (int i = 0; i < _rows; i++)
@@ -1713,6 +1724,9 @@ public abstract class MatrixBase<T> : Helpers.IHostSyncOwner
 
     /// <summary>The writable form of <see cref="Lease"/>.</summary>
     internal WriteLease<T> LeaseWritable() => new(this, AsWritableSpanUnmarked());
+
+    /// <summary>The backing array with this matrix kept alive until the lease is disposed. See <see cref="ArrayLease{T}"/>.</summary>
+    internal ArrayLease<T> LeaseArray() => new(this, GetDataArrayUnmarked());
 
     /// <summary>
     /// Copies this matrix's elements into <paramref name="destination"/>, which must hold at least as many elements.

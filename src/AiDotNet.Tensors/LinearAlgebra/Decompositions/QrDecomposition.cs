@@ -38,8 +38,10 @@ internal static class QrDecomposition
         int batch = BatchSize(input._shape, rank);
 
         var inData = input.Contiguous().GetDataArray();
-        var qData = Q.GetDataArray();
-        var rData = R.GetDataArray();
+        using var qDataLease = Q.LeaseArray();
+        var qData = qDataLease.Array;
+        using var rDataLease = R.LeaseArray();
+        var rData = rDataLease.Array;
         int inStride = m * n;
         int qStride = m * qCols;
         int rStride = qCols * n;

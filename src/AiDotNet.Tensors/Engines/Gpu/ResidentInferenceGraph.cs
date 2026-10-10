@@ -207,7 +207,8 @@ public sealed class ResidentInferenceGraph : System.IDisposable
             _engine.PrepareStableCaptureOutput(preResOut);
             if (verify && verifyRef is not null)
             {
-                var got = preResOut.AsSpan();
+                using var gotLease = preResOut.Lease();
+                var got = gotLease.Span;
                 double maxd = 0; int n = System.Math.Min(got.Length, verifyRef.Length);
                 for (int i = 0; i < n; i++) maxd = System.Math.Max(maxd, System.Math.Abs(System.Convert.ToDouble(got[i]) - verifyRef[i]));
                 try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_resident_verify.txt"),
@@ -264,7 +265,8 @@ public sealed class ResidentInferenceGraph : System.IDisposable
                     _engine.RefreshResidentInputInPlace(s[0]);
                     _engine.LaunchGpuGraph(exec);
                     var out3 = DownloadOutput<T>();
-                    var c = out3.AsSpan();
+                    using var cLease = out3.Lease();
+                    var c = cLease.Span;
                     double mutd = 0, c0 = 0; int n3 = System.Math.Min(a.Length, c.Length);
                     for (int i = 0; i < n3; i++)
                     {

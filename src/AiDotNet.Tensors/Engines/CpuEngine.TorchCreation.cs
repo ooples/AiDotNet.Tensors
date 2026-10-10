@@ -31,7 +31,8 @@ public partial class CpuEngine
     {
         var ops = MathHelper.GetNumericOperations<T>();
         var result = new Tensor<T>(shape);
-        var dst = result.AsWritableSpan();
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
         for (int i = 0; i < dst.Length; i++) dst[i] = ops.FromDouble(value(i));
         return result;
     }
@@ -379,7 +380,8 @@ public partial class CpuEngine
         int d = dim is null ? 0 : NormalizeDim(dim.Value, tensor.Rank);
         var source = x.IsContiguous ? x : x.Contiguous();
         var ops = MathHelper.GetNumericOperations<T>();
-        var values = source.AsSpan();
+        using var valuesLease = source.Lease();
+        var values = valuesLease.Span;
         int extent = source._shape[d];
         int outer = source._shape.Take(d).Aggregate(1, (a, b) => a * b);
         int inner = source._shape.Skip(d + 1).Aggregate(1, (a, b) => a * b);
@@ -445,7 +447,8 @@ public partial class CpuEngine
         var weight = (double[])savedState[2];
         var ops = MathHelper.GetNumericOperations<T>();
         var dy = gradOutput.IsContiguous ? gradOutput : gradOutput.Contiguous();
-        var g = dy.AsSpan();
+        using var gLease = dy.Lease();
+        var g = gLease.Span;
         var dx = new double[inputs[0].Length];
         for (int k = 0; k < lo.Length; k++)
         {

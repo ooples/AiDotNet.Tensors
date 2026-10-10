@@ -174,7 +174,8 @@ internal static class TensorTableWriter
             ? tensor
             : tensor.Contiguous();
 
-        var data = contiguous.GetDataArray();
+        using var dataLease = contiguous.LeaseArray();
+        var data = dataLease.Array;
         int byteCount = contiguous.Length * Marshal.SizeOf<T>();
         var bytes = new byte[byteCount];
         Buffer.BlockCopy(data, 0, bytes, 0, byteCount);

@@ -94,8 +94,10 @@ public sealed class GradScaler
     public Tensor<float> ScaleLoss(Tensor<float> loss)
     {
         var result = new Tensor<float>(loss._shape);
-        var src = loss.AsSpan();
-        var dst = result.AsWritableSpan();
+        using var srcLease = loss.Lease();
+        var src = srcLease.Span;
+        using var dstLease = result.LeaseWritable();
+        var dst = dstLease.Span;
         for (int i = 0; i < src.Length; i++) dst[i] = src[i] * _scale;
         return result;
     }
@@ -117,7 +119,8 @@ public sealed class GradScaler
         bool foundInfNan = false;
         foreach (var kv in grads)
         {
-            var span = kv.Value.AsWritableSpan();
+            using var spanLease = kv.Value.LeaseWritable();
+            var span = spanLease.Span;
             for (int i = 0; i < span.Length; i++)
             {
                 T scaled = ops.Multiply(span[i], invScale);

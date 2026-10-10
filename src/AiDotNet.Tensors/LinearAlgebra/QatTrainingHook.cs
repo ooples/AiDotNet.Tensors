@@ -74,7 +74,8 @@ public sealed class QatTrainingHook
         var m = _masters[key];
         var fakeQ = new Tensor<float>(m.Shape);
         var src = m.Buffer.AsSpan();
-        var dst = fakeQ.AsWritableSpan();
+        using var dstLease = fakeQ.LeaseWritable();
+        var dst = dstLease.Span;
         if (_bits == QuantizationBits.Int8)
         {
             var raw = new sbyte[src.Length];

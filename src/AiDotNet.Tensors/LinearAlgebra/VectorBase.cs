@@ -435,6 +435,12 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     internal WriteLease<T> LeaseWritable() => new(this, AsWritableSpanUnmarked());
 
     /// <summary>
+    /// The backing array with this object kept alive until the lease is disposed; the lease form of GetDataArray, which
+    /// marks the array escaped. See <see cref="ArrayLease{T}"/>.
+    /// </summary>
+    internal ArrayLease<T> LeaseArray() => new(this, GetDataArrayUnmarked());
+
+    /// <summary>
     /// Copies this vector's elements into <paramref name="destination"/>, which must hold at least as many elements.
     /// </summary>
     /// <remarks>

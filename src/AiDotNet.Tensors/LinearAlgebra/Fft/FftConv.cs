@@ -45,8 +45,10 @@ public static class FftConv
         var xPadShape = (int[])input._shape.Clone();
         xPadShape[^1] = L;
         var xPad = new Tensor<T>(xPadShape);
-        var xInSrc = input.GetDataArray();
-        var xInDst = xPad.GetDataArray();
+        using var xInSrcLease = input.LeaseArray();
+        var xInSrc = xInSrcLease.Array;
+        using var xInDstLease = xPad.LeaseArray();
+        var xInDst = xInDstLease.Array;
         int leading = 1;
         for (int i = 0; i < input.Rank - 1; i++) leading *= input._shape[i];
         for (int b = 0; b < leading; b++)
@@ -56,8 +58,10 @@ public static class FftConv
         // corresponds to cross-correlation (ML convention), not pure math
         // convolution.
         var kPad = new Tensor<T>(new[] { L });
-        var kSrc = kernel.GetDataArray();
-        var kDst = kPad.GetDataArray();
+        using var kSrcLease = kernel.LeaseArray();
+        var kSrc = kSrcLease.Array;
+        using var kDstLease = kPad.LeaseArray();
+        var kDst = kDstLease.Array;
         for (int i = 0; i < K; i++) kDst[i] = kSrc[K - 1 - i];
 
         var X = Fft.RFft(xPad);
@@ -65,11 +69,14 @@ public static class FftConv
 
         // Broadcast multiply: X has shape [..., 2·(L/2+1)], KSpec has shape [2·(L/2+1)].
         var ops = MathHelper.GetNumericOperations<T>();
-        var XDat = X.GetDataArray();
-        var KDat = KSpec.GetDataArray();
+        using var XDatLease = X.LeaseArray();
+        var XDat = XDatLease.Array;
+        using var KDatLease = KSpec.LeaseArray();
+        var KDat = KDatLease.Array;
         int freq = L / 2 + 1;
         var prodT = new Tensor<T>((int[])X._shape.Clone());
-        var prodD = prodT.GetDataArray();
+        using var prodDLease = prodT.LeaseArray();
+        var prodD = prodDLease.Array;
         int rowLen = 2 * freq;
         for (int b = 0; b < leading; b++)
         {
@@ -89,8 +96,10 @@ public static class FftConv
         int startOffset = K / 2; // floor division: matches PyTorch conv1d with padding=(K-1)/2 floor
         var outShape = (int[])input._shape.Clone();
         var output = new Tensor<T>(outShape);
-        var fullD = full.GetDataArray();
-        var outD = output.GetDataArray();
+        using var fullDLease = full.LeaseArray();
+        var fullD = fullDLease.Array;
+        using var outDLease = output.LeaseArray();
+        var outD = outDLease.Array;
         for (int b = 0; b < leading; b++)
             Array.Copy(fullD, b * L + startOffset, outD, b * N, N);
         return output;
@@ -135,8 +144,10 @@ public static class FftConv
         // For each input [N, Cin] pad to [N, Cin, Lh, Lw], FFT, multiply+sum over Cin
         // per output channel, IFFT, crop to H×W.
         var output = new Tensor<T>(new[] { N, Cout, H, W });
-        var outD = output.GetDataArray();
-        var inD = input.GetDataArray();
+        using var outDLease = output.LeaseArray();
+        var outD = outDLease.Array;
+        using var inDLease = input.LeaseArray();
+        var inD = inDLease.Array;
 
         double[]? biasD = null;
         if (bias is not null)
@@ -144,7 +155,8 @@ public static class FftConv
             if (bias.Rank != 1 || bias.Shape[0] != Cout)
                 throw new ArgumentException($"bias must be 1D with length {Cout}.", nameof(bias));
             biasD = new double[Cout];
-            var b = bias.GetDataArray();
+            using var bLease = bias.LeaseArray();
+            var b = bLease.Array;
             for (int i = 0; i < Cout; i++) biasD[i] = ops.ToDouble(b[i]);
         }
 
@@ -214,7 +226,8 @@ public static class FftConv
         int Kh = weight.Shape[2];
         int Kw = weight.Shape[3];
         var ops = MathHelper.GetNumericOperations<T>();
-        var wD = weight.GetDataArray();
+        using var wDLease = weight.LeaseArray();
+        var wD = wDLease.Array;
         var result = new double[Cout * Cin * Lh * 2 * freqW];
         AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, Cout * Cin, result.Length, idx =>
         {

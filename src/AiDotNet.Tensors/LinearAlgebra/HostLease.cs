@@ -67,3 +67,24 @@ internal readonly ref struct KeepAliveScope
 
     public void Dispose() => GC.KeepAlive(_target);
 }
+
+/// <summary>
+/// The backing array of a tensor, matrix or vector, with the object kept alive until the lease is disposed: the
+/// array form of <see cref="ReadLease{T}"/>, for code that needs the T[] itself (pinning, interop, legacy kernels).
+/// </summary>
+internal readonly ref struct ArrayLease<T>
+{
+    private readonly object _owner;
+
+    internal ArrayLease(object owner, T[] array)
+    {
+        _owner = owner;
+        Array = array;
+    }
+
+    /// <summary>The leased array (the live backing array, or a copy for layouts that have none).</summary>
+    public T[] Array { get; }
+
+    /// <summary>Ends the lease; the owner may be collected (and its array recycled) after this.</summary>
+    public void Dispose() => GC.KeepAlive(_owner);
+}

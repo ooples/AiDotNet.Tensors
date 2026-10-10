@@ -570,7 +570,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (typeof(T) != typeof(float) || t is null) return;
         if (GetBackend() is not Engines.DirectGpu.CUDA.CudaBackend cb) return;
         if (t._gpuBuffer is not { } buf || !ReferenceEquals(t._gpuBackend, cb) || buf.Handle == System.IntPtr.Zero) return;
-        var data = t.GetDataArray();
+        using var dataLease = t.LeaseArray();
+        var data = dataLease.Array;
         if (buf.Size < t.Length) return;
         cb.UploadBufferInPlace((float[])(object)data, buf);
         t._gpuBufferVersion = t.GpuCacheVersion;
@@ -590,7 +591,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         // a view sharing its array (the backward's Reshape or Transpose of the batch) can have armed a download into
         // it; materializing that would read back data the host already holds.
         if (t.GetBackingArrayForCacheLookupUnsafe() is { } hostArray) Helpers.HostSync.Remove(hostArray);
-        var data = t.GetDataArray();
+        using var dataLease = t.LeaseArray();
+        var data = dataLease.Array;
         if (cb is Engines.DirectGpu.CUDA.CudaBackend cuda && t._gpuBuffer is { } existing && ReferenceEquals(t._gpuBackend, cb)
             && existing.Handle != System.IntPtr.Zero && existing.Size >= t.Length)
         {
@@ -2232,7 +2234,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
 
         // No cached buffer — must upload from CPU
-        var data = tensor.GetDataArray();
+        using var dataLease = tensor.LeaseArray();
+        var data = dataLease.Array;
         float[] floatData = DirectGpuEngine.ToFloatArray(data);
         return new OwnedBuffer(backend.AllocateBuffer(floatData), ownsBuffer: true);
     }
@@ -3942,7 +3945,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             dest._gpuBackend = null;
             dest._gpuBufferVersion = -1;
         }
-        var destination = dest.AsWritableSpan();
+        using var destinationLease = dest.LeaseWritable();
+        var destination = destinationLease.Span;
         if (src.IsContiguous)
             src.AsSpan().CopyTo(destination);
         else
@@ -4515,7 +4519,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return null;
         }
 
-        var inputArray = input.GetDataArray();
+        using var inputArrayLease = input.LeaseArray();
+        var inputArray = inputArrayLease.Array;
         if (inputArray is not float[] inputFloat) return null; // only float supported by this path
 
         var resultFloat = new float[totalElements];
@@ -6975,7 +6980,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 var floatInput = (Tensor<float>)(object)input;
                 var floatDest = (Tensor<float>)(object)destination;
-                var inputData = floatInput.GetDataArray();
+                using var inputDataLease = floatInput.LeaseArray();
+                var inputData = inputDataLease.Array;
 
                 var gpuIn = gpuBackend.AllocateBuffer(inputData);
                 var gpuOut = gpuBackend.AllocateBuffer(input.Length);
@@ -7051,7 +7057,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 var floatInput = (Tensor<float>)(object)input;
                 var floatDest = (Tensor<float>)(object)dest;
-                var inputData = floatInput.GetDataArray();
+                using var inputDataLease = floatInput.LeaseArray();
+                var inputData = inputDataLease.Array;
                 int size = input.Length;
 
                 var gpuIn = gpuBackend.AllocateBuffer(inputData);
@@ -7088,7 +7095,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 var floatInput = (Tensor<float>)(object)input;
                 var floatDest = (Tensor<float>)(object)dest;
-                var inputData = floatInput.GetDataArray();
+                using var inputDataLease = floatInput.LeaseArray();
+                var inputData = inputDataLease.Array;
                 int size = input.Length;
 
                 var gpuIn = gpuBackend.AllocateBuffer(inputData);
@@ -7122,7 +7130,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             {
                 var floatInput = (Tensor<float>)(object)input;
                 var floatDest = (Tensor<float>)(object)dest;
-                var inputData = floatInput.GetDataArray();
+                using var inputDataLease = floatInput.LeaseArray();
+                var inputData = inputDataLease.Array;
                 int size = input.Length;
 
                 var gpuIn = gpuBackend.AllocateBuffer(inputData);
@@ -7468,7 +7477,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (a.GetLiveBackingArrayOrNull() is null)
             return false;
 
-        var aData = a.GetDataArray();
+        using var aDataLease = a.LeaseArray();
+        var aData = aDataLease.Array;
         var bData = b.GetReadOnlyDataArray();
         // Compared against bData, not b.Length, on purpose: the device op reads bData from index 0, so bData must
         // be exactly b's elements. A padded backing array or a view's shared source is longer than b and would
@@ -7552,7 +7562,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         if (tensor.GetLiveBackingArrayOrNull() is null)
             return TryRunUnaryInPlaceResident(tensor, op);
 
-        var data = tensor.GetDataArray();
+        using var dataLease = tensor.LeaseArray();
+        var data = dataLease.Array;
         using var buffer = GetOrAllocateBuffer(backend, tensor);
 
         // See TryRunBinaryInPlace: a stale cached buffer can be smaller than the
@@ -12412,7 +12423,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         {
             if (!HasResidentIndexStorage(targetIds))
             {
-                var ids = targetIds.GetDataArray();
+                using var idsLease = targetIds.LeaseArray();
+                var ids = idsLease.Array;
                 for (int i = 0; i < n; i++)
                     if (ids[i] < 0 || ids[i] >= vocab)
                         throw new ArgumentOutOfRangeException(nameof(targetIds),
@@ -16818,8 +16830,10 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         var numOps = MathHelper.GetNumericOperations<T>();
         int lastDim = input.Shape._dims[^1];
-        var inputData = input.GetDataArray();
-        var biasData = bias.GetDataArray();
+        using var inputDataLease = input.LeaseArray();
+        var inputData = inputDataLease.Array;
+        using var biasDataLease = bias.LeaseArray();
+        var biasData = biasDataLease.Array;
         var result = new T[input.Length];
 
         // Add bias (broadcast along last dimension)
@@ -16857,7 +16871,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 : (Tensor<int>)indices.Contiguous();
             if (!HasResidentIndexStorage(contiguousIndices))
             {
-                var indexValues = contiguousIndices.GetDataArray();
+                using var indexValuesLease = contiguousIndices.LeaseArray();
+                var indexValues = indexValuesLease.Array;
                 for (int i = 0; i < contiguousIndices.Length; i++)
                     if (indexValues[i] < 0 || indexValues[i] >= vocabSize)
                         throw new ArgumentOutOfRangeException(nameof(indices),
@@ -16914,7 +16929,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 : (Tensor<int>)indices.Contiguous();
             if (!HasResidentIndexStorage(contiguousIndices))
             {
-                var indexValues = contiguousIndices.GetDataArray();
+                using var indexValuesLease = contiguousIndices.LeaseArray();
+                var indexValues = indexValuesLease.Array;
                 for (int i = 0; i < contiguousIndices.Length; i++)
                     if (indexValues[i] < 0 || indexValues[i] >= vocabSize)
                         throw new ArgumentOutOfRangeException(nameof(indices),
@@ -17065,7 +17081,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             _cachedEmbIndexCapacity = n;
         }
         if (_embIndexScratch is null || _embIndexScratch.Length < n) _embIndexScratch = new int[n];
-        var raw = indices.GetDataArray();
+        using var rawLease = indices.LeaseArray();
+        var raw = rawLease.Array;
         // Typed fast paths avoid boxing every token each step (Convert.ToInt32((object)x) on ~B*ctx elements
         // per step is heavy GC pressure). Token indices are int or long in practice.
         if (raw is int[] ir) System.Array.Copy(ir, _embIndexScratch, n);
@@ -18350,7 +18367,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             outputStrides[i] = outputStrides[i + 1] * outputShape[i + 1];
         }
 
-        var inputData = input.GetDataArray();
+        using var inputDataLease = input.LeaseArray();
+        var inputData = inputDataLease.Array;
         var outputData = new T[input.Length];
 
         // Permute data
@@ -22538,7 +22556,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 using var bufIn = GetOrAllocateBuffer(backend, tensor);
                 var bufOut = AllocateOutputBuffer(backend, tensor.Length);
                 backend.Permute(bufIn.Buffer, bufOut.Buffer, tensor.Shape._dims, axes);
-                var dst = output.GetDataArray();
+                using var dstLease = output.LeaseArray();
+                var dst = dstLease.Array;
                 DownloadGpuBufferInto(backend, bufOut, output, dst, output.Length);
             }
         }
@@ -23209,7 +23228,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 : (Tensor<int>)indices.Contiguous();
             if (!HasResidentIndexStorage(contiguousIndices))
             {
-                var indexValues = contiguousIndices.GetDataArray();
+                using var indexValuesLease = contiguousIndices.LeaseArray();
+                var indexValues = indexValuesLease.Array;
                 for (int i = 0; i < contiguousIndices.Length; i++)
                     if (indexValues[i] < 0 || indexValues[i] >= sourceRows)
                         throw new ArgumentOutOfRangeException(nameof(indices),
@@ -23262,7 +23282,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
                 : (Tensor<int>)indices.Contiguous();
             if (!HasResidentIndexStorage(contiguousIndices))
             {
-                var indexValues = contiguousIndices.GetDataArray();
+                using var indexValuesLease = contiguousIndices.LeaseArray();
+                var indexValues = indexValuesLease.Array;
                 for (int i = 0; i < contiguousIndices.Length; i++)
                     if (indexValues[i] < 0 || indexValues[i] >= vocabSize)
                         throw new ArgumentOutOfRangeException(nameof(indices),
@@ -25025,7 +25046,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             var contiguousIndices = indices.IsContiguous ? indices : (Tensor<int>)indices.Contiguous();
             if (!HasResidentIndexStorage(contiguousIndices))
             {
-                var indexData = contiguousIndices.GetDataArray();
+                using var indexDataLease = contiguousIndices.LeaseArray();
+                var indexData = indexDataLease.Array;
                 for (int i = 0; i < contiguousIndices.Length; i++)
                     if (indexData[i] < 0 || indexData[i] >= axisSize)
                         throw new IndexOutOfRangeException(

@@ -2416,6 +2416,12 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     internal WriteLease<T> LeaseWritable() => new(this, AsWritableSpanUnmarked());
 
     /// <summary>
+    /// The backing array with this object kept alive until the lease is disposed; the lease form of GetDataArray, which
+    /// marks the array escaped. See <see cref="ArrayLease{T}"/>.
+    /// </summary>
+    internal ArrayLease<T> LeaseArray() => new(this, GetDataArrayUnmarked());
+
+    /// <summary>
     /// Gets a writable span over the tensor data. Throws for non-contiguous views.
     /// </summary>
     /// <remarks>

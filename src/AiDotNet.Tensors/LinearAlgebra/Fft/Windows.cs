@@ -79,7 +79,8 @@ public static class Windows
             return result;
         }
         int M = periodic ? length : length - 1;
-        var data = result.GetDataArray();
+        using var dataLease = result.LeaseArray();
+        var data = dataLease.Array;
         for (int i = 0; i < length; i++)
         {
             double v = 0;
@@ -101,7 +102,8 @@ public static class Windows
         var result = new Tensor<T>(new[] { length });
         if (length == 1) { result[0] = FromDouble<T>(1.0); return result; }
         int M = periodic ? length : length - 1;
-        var data = result.GetDataArray();
+        using var dataLease = result.LeaseArray();
+        var data = dataLease.Array;
         for (int i = 0; i < length; i++)
         {
             double v = 1.0 - Math.Abs((2.0 * i - M) / M);
@@ -121,7 +123,8 @@ public static class Windows
         var result = new Tensor<T>(new[] { length });
         if (length == 1) { result[0] = FromDouble<T>(1.0); return result; }
         int M = periodic ? length : length - 1;
-        var data = result.GetDataArray();
+        using var dataLease = result.LeaseArray();
+        var data = dataLease.Array;
         for (int i = 0; i < length; i++)
         {
             double v = Math.Sin(Math.PI * (i + 0.5) / M);
@@ -143,7 +146,8 @@ public static class Windows
         var result = new Tensor<T>(new[] { length });
         if (length == 1) { result[0] = FromDouble<T>(1.0); return result; }
         double mid = (periodic ? length : length - 1) / 2.0;
-        var data = result.GetDataArray();
+        using var dataLease = result.LeaseArray();
+        var data = dataLease.Array;
         for (int i = 0; i < length; i++)
         {
             double d = (i - mid) / std;
@@ -171,7 +175,8 @@ public static class Windows
         // by a redundant ternary (both branches computed length-1); we
         // unify them here without changing behavior.
         double c = center ?? (length - 1) / 2.0;
-        var data = result.GetDataArray();
+        using var dataLease = result.LeaseArray();
+        var data = dataLease.Array;
         for (int i = 0; i < length; i++)
         {
             double v = Math.Exp(-Math.Abs(i - c) / tau);
@@ -194,7 +199,8 @@ public static class Windows
         if (length == 1) { result[0] = FromDouble<T>(1.0); return result; }
         int M = periodic ? length : length - 1;
         double i0Beta = BesselI0(beta);
-        var data = result.GetDataArray();
+        using var dataLease = result.LeaseArray();
+        var data = dataLease.Array;
         for (int i = 0; i < length; i++)
         {
             double r = (2.0 * i - M) / M; // −1 .. 1

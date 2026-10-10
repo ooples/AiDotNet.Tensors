@@ -29,7 +29,8 @@ public sealed class CpuLinalgOps : IDeviceLinalgOps
         // Mirror cuSOLVER / NumPy semantics by throwing on the first
         // non-zero info code.
         var (factor, info) = CholeskyDecomposition.Compute(a, upper);
-        var infoSpan = info.AsSpan();
+        using var infoSpanLease = info.Lease();
+        var infoSpan = infoSpanLease.Span;
         for (int i = 0; i < infoSpan.Length; i++)
         {
             if (infoSpan[i] != 0)
