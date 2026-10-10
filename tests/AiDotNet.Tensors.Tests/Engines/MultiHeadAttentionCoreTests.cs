@@ -98,6 +98,33 @@ public class MultiHeadAttentionCoreTests
         }
     }
 
+    /// <summary>
+    /// Non-float tensors take the decomposed path (permute, batched matmul, softmax), not the fused float kernel, so the
+    /// float tests above never reach it. Double inputs carry the same values as the float ones, so the double reference
+    /// applies with a double-precision tolerance.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(Shapes))]
+    public async Task Double_DecomposedPath_ForwardAndTapeGradients_MatchReference(
+        int batch, int seqQ, int seqK, int heads, int hd, int vd, bool causal)
+    {
+        await Task.Yield();
+        var (qf, kf, vf, upstreamF) = Inputs(batch, seqQ, seqK, heads, hd, vd, seed: 6);
+        Tensor<double> ToDouble(Tensor<float> t) => new(Array.ConvertAll(t.ToArray(), x => (double)x), t.Shape.ToArray());
+        Tensor<double> q = ToDouble(qf), k = ToDouble(kf), v = ToDouble(vf), upstream = ToDouble(upstreamF);
+        var engine = new CpuEngine();
+
+        using var tape = new GradientTape<double>();
+        var output = engine.MultiHeadAttentionCore(q, k, v, heads, causal: causal);
+        var loss = engine.ReduceSum(engine.TensorMultiply(output, upstream), null);
+        var grads = tape.ComputeGradients(loss, new[] { q, k, v });
+
+        var expected = Reference(qf, kf, vf, upstreamF, heads, causal, out var dq, out var dk, out var dv);
+        AssertCloseDouble(expected, output.ToArray(), "output");
+        AssertCloseDouble(dq, grads[q].ToArray(), "dQ");
+        AssertCloseDouble(dk, grads[k].ToArray(), "dK");
+        AssertCloseDouble(dv, grads[v].ToArray(), "dV");
+    }
     /// <summary>Self-attention on one tensor: its gradient is the sum of the query, key and value contributions.</summary>
     [Fact]
     public async Task SameTensorAsQueryKeyAndValue_SumsAllThreeGradients()
@@ -224,5 +251,21 @@ public class MultiHeadAttentionCoreTests
         Assert.True(maxErr <= 1e-5 + 1e-4 * maxRef,
             $"{what}: max |error| {maxErr:G4} at {worst} (expected {(worst >= 0 ? expected[worst] : 0):G6}, "
             + $"got {(worst >= 0 ? actual[worst] : 0):G6}); max |reference| {maxRef:G4}");
+    }
+
+    private static void AssertCloseDouble(double[] expected, double[] actual, string what)
+    {
+        Assert.Equal(expected.Length, actual.Length);
+        double maxErr = 0, maxRef = 0;
+        int worst = -1;
+        for (int i = 0; i < expected.Length; i++)
+        {
+            Assert.False(double.IsNaN(actual[i]) || double.IsInfinity(actual[i]), $"{what}[{i}] is {actual[i]}");
+            double err = Math.Abs(expected[i] - actual[i]);
+            if (err > maxErr) { maxErr = err; worst = i; }
+            maxRef = Math.Max(maxRef, Math.Abs(expected[i]));
+        }
+        Assert.True(maxErr <= 1e-10 + 1e-9 * maxRef,
+            $"{what}: max |error| {maxErr:G4} at {worst}; max |reference| {maxRef:G4}");
     }
 }

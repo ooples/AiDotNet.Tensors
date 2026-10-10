@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using AiDotNet.Tensors.Engines.Gpu;
+using AiDotNet.Tensors.LinearAlgebra;
 using AiDotNet.Tensors.Engines.Compilation;
 
 namespace AiDotNet.Tensors.Engines.Optimization.Optimizers;
@@ -24,9 +26,23 @@ public sealed class SgdOptimizer : OptimizerBase
     protected override IReadOnlyList<string> StateNames => _stateNames;
 
     /// <inheritdoc />
+    private protected override bool TryStepOnDevice(int gi, int pi, Tensor<float> parameter, Tensor<float> gradient)
+    {
+        var g = ParamGroups[gi];
+        float lr = (float)g.LearningRate;
+        float momentum = (float)g.GetOption("momentum", 0.0);
+        float wd = (float)g.GetOption("weight_decay", 0.0);
+        // The device kernels have neither PyTorch's Nesterov form nor dampening; those run on the host.
+        if (g.GetOption("nesterov", 0.0) != 0.0 || g.GetOption("dampening", 0.0) != 0.0) return false;
+        if (momentum == 0f) return GpuOptimizer.TrySgdStep(parameter, gradient, lr, wd);
+        var slot = DeviceState(gi, pi, parameter.Length);
+        return GpuOptimizer.TrySgdMomentumStep(parameter, gradient, DeviceSlot(slot, "momentum_buffer"), lr, momentum, wd);
+    }
+
+    /// <inheritdoc />
     public override void Step()
     {
-        bool maximized = ApplyMaximize();
+        BeginStep();
         try {
         for (int gi = 0; gi < ParamGroups.Count; gi++)
         {
@@ -39,8 +55,8 @@ public sealed class SgdOptimizer : OptimizerBase
 
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
-                float[] p = g.Parameters[pi];
-                float[] grad = g.Gradients[pi];
+                if (!ShouldStep(gi, pi) || StepOnDevice(gi, pi)) continue;
+                float[] p = HostParameter(gi, pi);
 
                 if (TryGetSparseGradient(gi, pi, out var sIdx, out var sVal, out var sNnz))
                 {
@@ -55,40 +71,56 @@ public sealed class SgdOptimizer : OptimizerBase
                     continue;
                 }
 
-                if (wd != 0f)
-                    for (int i = 0; i < p.Length; i++) grad[i] += wd * p[i];
-
+                var grad = DenseGradient(gi, pi, p, wd);
                 if (momentum != 0f)
                 {
+                    // PyTorch starts the buffer at the first gradient itself (buf = grad.clone()), undamped.
+                    bool firstStep = !_state.ContainsKey((gi, pi));
                     var slot = GetOrCreateState(gi, pi, p.Length);
                     var v = slot["momentum_buffer"].Tensor!;
-                    if (dampening == 0f)
+                    float damping = firstStep ? 0f : dampening;
+                    if (damping == 0f)
                     {
-                        unsafe
+                        // The kernel computes v = momentum·v + g, which with v still zero is the first-step clone.
+                        ForEachChunk(p.Length, (start, count) =>
                         {
-                            fixed (float* pp = p)
-                            fixed (float* pg = grad)
-                            fixed (float* pv = v)
-                                FusedOptimizer.SgdMomentumUpdateSimd(pp, pg, pv, p.Length, lr, momentum, nesterov);
-                        }
+                            unsafe
+                            {
+                                fixed (float* pp = p, pg = grad.Array, pv = v)
+                                    FusedOptimizer.SgdMomentumUpdateSimd(pp + start, pg + grad.Offset + start, pv + start,
+                                        count, lr, momentum, nesterov);
+                            }
+                        });
                     }
                     else
                     {
-                        for (int i = 0; i < p.Length; i++)
+                        ForEachChunk(p.Length, (start, count) =>
                         {
-                            v[i] = momentum * v[i] + (1f - dampening) * grad[i];
-                            float upd = nesterov ? grad[i] + momentum * v[i] : v[i];
-                            p[i] -= lr * upd;
-                        }
+                            float[] ga = grad.Array;
+                            int go = grad.Offset;
+                            for (int i = start; i < start + count; i++)
+                            {
+                                v[i] = momentum * v[i] + (1f - damping) * ga[go + i];
+                                float upd = nesterov ? ga[go + i] + momentum * v[i] : v[i];
+                                p[i] -= lr * upd;
+                            }
+                        });
                     }
                 }
                 else
                 {
-                    FusedOptimizer.SgdStepHost(p, grad, p.Length, lr);
+                    ForEachChunk(p.Length, (start, count) =>
+                    {
+                        unsafe
+                        {
+                            fixed (float* pp = p, pg = grad.Array)
+                                FusedOptimizer.SgdUpdateSimd(pp + start, pg + grad.Offset + start, count, lr);
+                        }
+                    });
                 }
             }
         }
-        } finally { if (maximized) UnflipMaximize(); ClearAutoClearSparseGrads(); }
+        } finally { EndStep(); }
     }
 }
 
@@ -108,9 +140,26 @@ public sealed class AdamOptimizer : OptimizerBase
     protected override IReadOnlyList<string> StateNames => _stateNames;
 
     /// <inheritdoc />
+    private protected override bool TryStepOnDevice(int gi, int pi, Tensor<float> parameter, Tensor<float> gradient)
+    {
+        var g = ParamGroups[gi];
+        var slot = DeviceState(gi, pi, parameter.Length);
+        int step = (slot["step"].IntValue ?? 0) + 1;
+        float lr = (float)g.LearningRate, b1 = (float)g.GetOption("beta1", 0.9), b2 = (float)g.GetOption("beta2", 0.999);
+        float eps = (float)g.GetOption("eps", 1e-8), wd = (float)g.GetOption("weight_decay", 0.0);
+        var m = DeviceSlot(slot, "exp_avg");
+        var v = DeviceSlot(slot, "exp_avg_sq");
+        bool ran = g.GetOption("amsgrad", 0.0) != 0.0
+            ? GpuOptimizer.TryAmsgradStep(parameter, gradient, m, v, DeviceSlot(slot, "max_exp_avg_sq"), lr, b1, b2, eps, wd, step)
+            : GpuOptimizer.TryAdamStep(parameter, gradient, m, v, lr, b1, b2, eps, wd, step);
+        if (ran) slot["step"].IntValue = step;
+        return ran;
+    }
+
+    /// <inheritdoc />
     public override void Step()
     {
-        bool maximized = ApplyMaximize();
+        BeginStep();
         try {
         for (int gi = 0; gi < ParamGroups.Count; gi++)
         {
@@ -123,7 +172,8 @@ public sealed class AdamOptimizer : OptimizerBase
             bool amsgrad = g.GetOption("amsgrad", 0.0) != 0.0;
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
-                float[] p = g.Parameters[pi]; float[] grad = g.Gradients[pi];
+                if (!ShouldStep(gi, pi) || StepOnDevice(gi, pi)) continue;
+                float[] p = HostParameter(gi, pi);
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 int step = (slot["step"].IntValue ?? 0) + 1;
                 slot["step"].IntValue = step;
@@ -163,28 +213,27 @@ public sealed class AdamOptimizer : OptimizerBase
                     continue;
                 }
 
-                if (wd != 0f)
-                    for (int i = 0; i < p.Length; i++) grad[i] += wd * p[i];
+                var grad = DenseGradient(gi, pi, p, wd);
 
-                unsafe
+                var vmax = amsgrad ? slot["max_exp_avg_sq"].Tensor! : null;
+                ForEachChunk(p.Length, (start, count) =>
                 {
-                    fixed (float* pp = p) fixed (float* pg = grad) fixed (float* pm = m) fixed (float* pv = v)
+                    unsafe
                     {
-                        if (amsgrad)
+                        fixed (float* pp = p, pg = grad.Array, pm = m, pv = v, pvm = vmax)
                         {
-                            var vmax = slot["max_exp_avg_sq"].Tensor!;
-                            fixed (float* pvm = vmax)
-                                FusedOptimizer.AMSGradUpdateSimd(pp, pg, pm, pv, pvm, p.Length, lr, b1, b2, eps, step);
-                        }
-                        else
-                        {
-                            FusedOptimizer.AdamUpdateSimd(pp, pg, pm, pv, p.Length, lr, b1, b2, eps, step);
+                            if (pvm != null)
+                                FusedOptimizer.AMSGradUpdateSimd(pp + start, pg + grad.Offset + start, pm + start, pv + start,
+                                    pvm + start, count, lr, b1, b2, eps, step);
+                            else
+                                FusedOptimizer.AdamUpdateSimd(pp + start, pg + grad.Offset + start, pm + start, pv + start,
+                                    count, lr, b1, b2, eps, step);
                         }
                     }
-                }
+                });
             }
         }
-        } finally { if (maximized) UnflipMaximize(); ClearAutoClearSparseGrads(); }
+        } finally { EndStep(); }
     }
 }
 
@@ -204,9 +253,22 @@ public sealed class AdamWOptimizer : OptimizerBase
     protected override IReadOnlyList<string> StateNames => _stateNames;
 
     /// <inheritdoc />
+    private protected override bool TryStepOnDevice(int gi, int pi, Tensor<float> parameter, Tensor<float> gradient)
+    {
+        var g = ParamGroups[gi];
+        var slot = DeviceState(gi, pi, parameter.Length);
+        int step = (slot["step"].IntValue ?? 0) + 1;
+        bool ran = GpuOptimizer.TryAdamWStep(parameter, gradient, DeviceSlot(slot, "exp_avg"), DeviceSlot(slot, "exp_avg_sq"),
+            (float)g.LearningRate, (float)g.GetOption("beta1", 0.9), (float)g.GetOption("beta2", 0.999),
+            (float)g.GetOption("eps", 1e-8), (float)g.GetOption("weight_decay", 1e-2), step);
+        if (ran) slot["step"].IntValue = step;
+        return ran;
+    }
+
+    /// <inheritdoc />
     public override void Step()
     {
-        bool maximized = ApplyMaximize();
+        BeginStep();
         try {
         for (int gi = 0; gi < ParamGroups.Count; gi++)
         {
@@ -218,7 +280,8 @@ public sealed class AdamWOptimizer : OptimizerBase
             float wd = (float)g.GetOption("weight_decay", 1e-2);
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
-                float[] p = g.Parameters[pi]; float[] grad = g.Gradients[pi];
+                if (!ShouldStep(gi, pi) || StepOnDevice(gi, pi)) continue;
+                float[] p = HostParameter(gi, pi);
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 int step = (slot["step"].IntValue ?? 0) + 1;
                 slot["step"].IntValue = step;
@@ -237,14 +300,18 @@ public sealed class AdamWOptimizer : OptimizerBase
                     continue;
                 }
 
-                unsafe
+                var grad = DenseGradient(gi, pi, p);
+                ForEachChunk(p.Length, (start, count) =>
                 {
-                    fixed (float* pp = p) fixed (float* pg = grad) fixed (float* pm = m) fixed (float* pv = v)
-                        FusedOptimizer.AdamWUpdateSimd(pp, pg, pm, pv, p.Length, lr, b1, b2, eps, wd, step);
-                }
+                    unsafe
+                    {
+                        fixed (float* pp = p, pg = grad.Array, pm = m, pv = v)
+                            FusedOptimizer.AdamWUpdateSimd(pp + start, pg + grad.Offset + start, pm + start, pv + start, count, lr, b1, b2, eps, wd, step);
+                    }
+                });
             }
         }
-        } finally { if (maximized) UnflipMaximize(); ClearAutoClearSparseGrads(); }
+        } finally { EndStep(); }
     }
 }
 
@@ -266,7 +333,7 @@ public sealed class RAdamOptimizer : OptimizerBase
     /// <inheritdoc />
     public override void Step()
     {
-        bool maximized = ApplyMaximize();
+        BeginStep();
         try {
         for (int gi = 0; gi < ParamGroups.Count; gi++)
         {
@@ -278,7 +345,8 @@ public sealed class RAdamOptimizer : OptimizerBase
             float wd = (float)g.GetOption("weight_decay", 0.0);
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
-                float[] p = g.Parameters[pi]; float[] grad = g.Gradients[pi];
+                if (!ShouldStep(gi, pi) || StepOnDevice(gi, pi)) continue;
+                float[] p = HostParameter(gi, pi);
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 int step = (slot["step"].IntValue ?? 0) + 1;
                 slot["step"].IntValue = step;
@@ -297,17 +365,19 @@ public sealed class RAdamOptimizer : OptimizerBase
                     continue;
                 }
 
-                if (wd != 0f)
-                    for (int i = 0; i < p.Length; i++) grad[i] += wd * p[i];
+                var grad = DenseGradient(gi, pi, p, wd);
 
-                unsafe
+                ForEachChunk(p.Length, (start, count) =>
                 {
-                    fixed (float* pp = p) fixed (float* pg = grad) fixed (float* pm = m) fixed (float* pv = v)
-                        FusedOptimizer.RAdamUpdateSimd(pp, pg, pm, pv, p.Length, lr, b1, b2, eps, step);
-                }
+                    unsafe
+                    {
+                        fixed (float* pp = p, pg = grad.Array, pm = m, pv = v)
+                            FusedOptimizer.RAdamUpdateSimd(pp + start, pg + grad.Offset + start, pm + start, pv + start, count, lr, b1, b2, eps, step);
+                    }
+                });
             }
         }
-        } finally { if (maximized) UnflipMaximize(); ClearAutoClearSparseGrads(); }
+        } finally { EndStep(); }
     }
 }
 
@@ -327,9 +397,22 @@ public sealed class NAdamOptimizer : OptimizerBase
     protected override IReadOnlyList<string> StateNames => _stateNames;
 
     /// <inheritdoc />
+    private protected override bool TryStepOnDevice(int gi, int pi, Tensor<float> parameter, Tensor<float> gradient)
+    {
+        var g = ParamGroups[gi];
+        var slot = DeviceState(gi, pi, parameter.Length);
+        int step = (slot["step"].IntValue ?? 0) + 1;
+        bool ran = GpuOptimizer.TryNadamStep(parameter, gradient, DeviceSlot(slot, "exp_avg"), DeviceSlot(slot, "exp_avg_sq"),
+            (float)g.LearningRate, (float)g.GetOption("beta1", 0.9), (float)g.GetOption("beta2", 0.999),
+            (float)g.GetOption("eps", 1e-8), (float)g.GetOption("weight_decay", 0.0), step);
+        if (ran) slot["step"].IntValue = step;
+        return ran;
+    }
+
+    /// <inheritdoc />
     public override void Step()
     {
-        bool maximized = ApplyMaximize();
+        BeginStep();
         try {
         for (int gi = 0; gi < ParamGroups.Count; gi++)
         {
@@ -341,7 +424,8 @@ public sealed class NAdamOptimizer : OptimizerBase
             float wd = (float)g.GetOption("weight_decay", 0.0);
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
-                float[] p = g.Parameters[pi]; float[] grad = g.Gradients[pi];
+                if (!ShouldStep(gi, pi) || StepOnDevice(gi, pi)) continue;
+                float[] p = HostParameter(gi, pi);
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 int step = (slot["step"].IntValue ?? 0) + 1;
                 slot["step"].IntValue = step;
@@ -360,17 +444,19 @@ public sealed class NAdamOptimizer : OptimizerBase
                     continue;
                 }
 
-                if (wd != 0f)
-                    for (int i = 0; i < p.Length; i++) grad[i] += wd * p[i];
+                var grad = DenseGradient(gi, pi, p, wd);
 
-                unsafe
+                ForEachChunk(p.Length, (start, count) =>
                 {
-                    fixed (float* pp = p) fixed (float* pg = grad) fixed (float* pm = m) fixed (float* pv = v)
-                        FusedOptimizer.NadamUpdateSimd(pp, pg, pm, pv, p.Length, lr, b1, b2, eps, step);
-                }
+                    unsafe
+                    {
+                        fixed (float* pp = p, pg = grad.Array, pm = m, pv = v)
+                            FusedOptimizer.NadamUpdateSimd(pp + start, pg + grad.Offset + start, pm + start, pv + start, count, lr, b1, b2, eps, step);
+                    }
+                });
             }
         }
-        } finally { if (maximized) UnflipMaximize(); ClearAutoClearSparseGrads(); }
+        } finally { EndStep(); }
     }
 }
 
@@ -390,9 +476,22 @@ public sealed class AdamaxOptimizer : OptimizerBase
     protected override IReadOnlyList<string> StateNames => _stateNames;
 
     /// <inheritdoc />
+    private protected override bool TryStepOnDevice(int gi, int pi, Tensor<float> parameter, Tensor<float> gradient)
+    {
+        var g = ParamGroups[gi];
+        var slot = DeviceState(gi, pi, parameter.Length);
+        int step = (slot["step"].IntValue ?? 0) + 1;
+        bool ran = GpuOptimizer.TryAdamaxStep(parameter, gradient, DeviceSlot(slot, "exp_avg"), DeviceSlot(slot, "exp_inf"),
+            (float)g.LearningRate, (float)g.GetOption("beta1", 0.9), (float)g.GetOption("beta2", 0.999),
+            (float)g.GetOption("eps", 1e-8), (float)g.GetOption("weight_decay", 0.0), step);
+        if (ran) slot["step"].IntValue = step;
+        return ran;
+    }
+
+    /// <inheritdoc />
     public override void Step()
     {
-        bool maximized = ApplyMaximize();
+        BeginStep();
         try {
         for (int gi = 0; gi < ParamGroups.Count; gi++)
         {
@@ -404,7 +503,8 @@ public sealed class AdamaxOptimizer : OptimizerBase
             float wd = (float)g.GetOption("weight_decay", 0.0);
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
-                float[] p = g.Parameters[pi]; float[] grad = g.Gradients[pi];
+                if (!ShouldStep(gi, pi) || StepOnDevice(gi, pi)) continue;
+                float[] p = HostParameter(gi, pi);
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 int step = (slot["step"].IntValue ?? 0) + 1;
                 slot["step"].IntValue = step;
@@ -423,17 +523,19 @@ public sealed class AdamaxOptimizer : OptimizerBase
                     continue;
                 }
 
-                if (wd != 0f)
-                    for (int i = 0; i < p.Length; i++) grad[i] += wd * p[i];
+                var grad = DenseGradient(gi, pi, p, wd);
 
-                unsafe
+                ForEachChunk(p.Length, (start, count) =>
                 {
-                    fixed (float* pp = p) fixed (float* pg = grad) fixed (float* pm = m) fixed (float* pu = u)
-                        FusedOptimizer.AdaMaxUpdateSimd(pp, pg, pm, pu, p.Length, lr, b1, b2, eps, step);
-                }
+                    unsafe
+                    {
+                        fixed (float* pp = p, pg = grad.Array, pm = m, pu = u)
+                            FusedOptimizer.AdaMaxUpdateSimd(pp + start, pg + grad.Offset + start, pm + start, pu + start, count, lr, b1, b2, eps, step);
+                    }
+                });
             }
         }
-        } finally { if (maximized) UnflipMaximize(); ClearAutoClearSparseGrads(); }
+        } finally { EndStep(); }
     }
 }
 
@@ -445,15 +547,33 @@ public sealed class AdagradOptimizer : OptimizerBase
     {
         ["lr"] = 1e-2, ["eps"] = 1e-10, ["weight_decay"] = 0.0,
     };
-    private static readonly string[] _stateNames = new[] { "sum" };
+    private static readonly string[] _stateNames = new[] { "step", "sum" };
     /// <inheritdoc />
     protected override IReadOnlyDictionary<string, double> Defaults => _defaults;
     /// <inheritdoc />
     protected override IReadOnlyList<string> StateNames => _stateNames;
 
     /// <inheritdoc />
+    private protected override bool TryStepOnDevice(int gi, int pi, Tensor<float> parameter, Tensor<float> gradient)
+    {
+        var g = ParamGroups[gi];
+        var slot = DeviceState(gi, pi, parameter.Length);
+        int priorSteps = slot.TryGetValue("step", out var sv) ? sv.IntValue ?? 0 : 0;
+        float clr = (float)g.LearningRate / (1f + priorSteps * (float)g.GetOption("lr_decay", 0.0));
+        bool ran = GpuOptimizer.TryAdagradStep(parameter, gradient, DeviceSlot(slot, "sum"), clr,
+            (float)g.GetOption("eps", 1e-10), (float)g.GetOption("weight_decay", 0.0));
+        if (ran)
+        {
+            if (sv is null) slot["step"] = OptimizerStateValue.FromInt(priorSteps + 1);
+            else sv.IntValue = priorSteps + 1;
+        }
+        return ran;
+    }
+
+    /// <inheritdoc />
     public override void Step()
     {
+        BeginStep();
         try {
         for (int gi = 0; gi < ParamGroups.Count; gi++)
         {
@@ -464,11 +584,16 @@ public sealed class AdagradOptimizer : OptimizerBase
             float lrDecay = (float)g.GetOption("lr_decay", 0.0);
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
-                float[] p = g.Parameters[pi]; float[] grad = g.Gradients[pi];
+                if (!ShouldStep(gi, pi) || StepOnDevice(gi, pi)) continue;
+                float[] p = HostParameter(gi, pi);
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 var s = slot["sum"].Tensor!;
-                int step = (slot.TryGetValue("step", out var sv) ? sv.IntValue : 0) ?? 0;
-                if (slot.ContainsKey("step")) slot["step"].IntValue = step + 1;
+                // PyTorch: clr = lr / (1 + (step - 1)·lr_decay), step counted from 1. A state loaded from before the
+                // step slot existed starts counting here.
+                int priorSteps = (slot.TryGetValue("step", out var sv) ? sv.IntValue : 0) ?? 0;
+                if (sv is null) slot["step"] = OptimizerStateValue.FromInt(priorSteps + 1);
+                else sv.IntValue = priorSteps + 1;
+                float clr = lr / (1f + priorSteps * lrDecay);
 
                 if (TryGetSparseGradient(gi, pi, out var sIdx, out var sVal, out var sNnz))
                 {
@@ -476,21 +601,23 @@ public sealed class AdagradOptimizer : OptimizerBase
                     unsafe
                     {
                         fixed (float* pp = p) fixed (int* pIdx = sIdx) fixed (float* pVal = sVal) fixed (float* ps = s)
-                            FusedOptimizer.SparseAdagradUpdate(pp, pIdx, pVal, ps, sNnz, lr, eps, wd, lrDecay, step + 1);
+                            FusedOptimizer.SparseAdagradUpdate(pp, pIdx, pVal, ps, sNnz, lr, eps, wd, lrDecay, priorSteps);
                     }
                     continue;
                 }
 
-                if (wd != 0f)
-                    for (int i = 0; i < p.Length; i++) grad[i] += wd * p[i];
-                unsafe
+                var grad = DenseGradient(gi, pi, p, wd);
+                ForEachChunk(p.Length, (start, count) =>
                 {
-                    fixed (float* pp = p) fixed (float* pg = grad) fixed (float* ps = s)
-                        FusedOptimizer.AdagradUpdateSimd(pp, pg, ps, p.Length, lr, eps);
-                }
+                    unsafe
+                    {
+                        fixed (float* pp = p, pg = grad.Array, ps = s)
+                            FusedOptimizer.AdagradUpdateSimd(pp + start, pg + grad.Offset + start, ps + start, count, clr, eps);
+                    }
+                });
             }
         }
-        } finally { ClearAutoClearSparseGrads(); }
+        } finally { EndStep(); }
     }
 }
 
@@ -512,8 +639,20 @@ public sealed class RmsPropOptimizer : OptimizerBase
     protected override IReadOnlyList<string> StateNames => _stateNames;
 
     /// <inheritdoc />
+    private protected override bool TryStepOnDevice(int gi, int pi, Tensor<float> parameter, Tensor<float> gradient)
+    {
+        var g = ParamGroups[gi];
+        // The device kernel is the plain form; centered and momentum variants run on the host.
+        if (g.GetOption("centered", 0.0) != 0.0 || g.GetOption("momentum", 0.0) != 0.0) return false;
+        var slot = DeviceState(gi, pi, parameter.Length);
+        return GpuOptimizer.TryRmspropStep(parameter, gradient, DeviceSlot(slot, "square_avg"), (float)g.LearningRate,
+            (float)g.GetOption("alpha", 0.99), (float)g.GetOption("eps", 1e-8), (float)g.GetOption("weight_decay", 0.0));
+    }
+
+    /// <inheritdoc />
     public override void Step()
     {
+        BeginStep();
         try {
         for (int gi = 0; gi < ParamGroups.Count; gi++)
         {
@@ -526,7 +665,8 @@ public sealed class RmsPropOptimizer : OptimizerBase
             bool centered = g.GetOption("centered", 0.0) != 0.0;
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
-                float[] p = g.Parameters[pi]; float[] grad = g.Gradients[pi];
+                if (!ShouldStep(gi, pi) || StepOnDevice(gi, pi)) continue;
+                float[] p = HostParameter(gi, pi);
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 var v = slot["square_avg"].Tensor!;
 
@@ -546,58 +686,75 @@ public sealed class RmsPropOptimizer : OptimizerBase
                     continue;
                 }
 
-                if (wd != 0f)
-                    for (int i = 0; i < p.Length; i++) grad[i] += wd * p[i];
+                var grad = DenseGradient(gi, pi, p, wd);
 
                 if (centered)
                 {
                     var gAvg = slot["grad_avg"].Tensor!;
                     if (mom == 0f)
                     {
-                        unsafe
+                        ForEachChunk(p.Length, (start, count) =>
                         {
-                            fixed (float* pp = p) fixed (float* pg = grad) fixed (float* pv = v) fixed (float* pga = gAvg)
-                                FusedOptimizer.RMSpropCenteredUpdate(pp, pg, pv, pga, p.Length, lr, rho, eps);
-                        }
+                            unsafe
+                            {
+                                fixed (float* pp = p, pg = grad.Array, pv = v, pga = gAvg)
+                                    FusedOptimizer.RMSpropCenteredUpdate(pp + start, pg + grad.Offset + start, pv + start, pga + start, count, lr, rho, eps);
+                            }
+                        });
                     }
                     else
                     {
                         // Centered + Polyak momentum: maintain mom_buf = mom·mom_buf + g/(sqrt(var)+eps); p -= lr·mom_buf
                         var mb = slot["momentum_buffer"].Tensor!;
-                        for (int i = 0; i < p.Length; i++)
+                        ForEachChunk(p.Length, (start, count) =>
                         {
-                            v[i] = rho * v[i] + (1f - rho) * grad[i] * grad[i];
-                            gAvg[i] = rho * gAvg[i] + (1f - rho) * grad[i];
-                            float variance = v[i] - gAvg[i] * gAvg[i];
-                            if (variance < 0f) variance = 0f;
-                            float scaled = grad[i] / (MathF.Sqrt(variance) + eps);
-                            mb[i] = mom * mb[i] + scaled;
-                            p[i] -= lr * mb[i];
-                        }
+                            float[] ga = grad.Array;
+                            int go = grad.Offset;
+                            for (int i = start; i < start + count; i++)
+                            {
+                                float gi_ = ga[go + i];
+                                v[i] = rho * v[i] + (1f - rho) * gi_ * gi_;
+                                gAvg[i] = rho * gAvg[i] + (1f - rho) * gi_;
+                                float variance = v[i] - gAvg[i] * gAvg[i];
+                                if (variance < 0f) variance = 0f;
+                                float scaled = gi_ / (MathF.Sqrt(variance) + eps);
+                                mb[i] = mom * mb[i] + scaled;
+                                p[i] -= lr * mb[i];
+                            }
+                        });
                     }
                 }
                 else if (mom != 0f)
                 {
                     var mb = slot["momentum_buffer"].Tensor!;
-                    for (int i = 0; i < p.Length; i++)
+                    ForEachChunk(p.Length, (start, count) =>
                     {
-                        v[i] = rho * v[i] + (1f - rho) * grad[i] * grad[i];
-                        float scaled = grad[i] / (MathF.Sqrt(v[i]) + eps);
-                        mb[i] = mom * mb[i] + scaled;
-                        p[i] -= lr * mb[i];
-                    }
+                        float[] ga = grad.Array;
+                        int go = grad.Offset;
+                        for (int i = start; i < start + count; i++)
+                        {
+                            float gi_ = ga[go + i];
+                            v[i] = rho * v[i] + (1f - rho) * gi_ * gi_;
+                            float scaled = gi_ / (MathF.Sqrt(v[i]) + eps);
+                            mb[i] = mom * mb[i] + scaled;
+                            p[i] -= lr * mb[i];
+                        }
+                    });
                 }
                 else
                 {
-                    unsafe
+                    ForEachChunk(p.Length, (start, count) =>
                     {
-                        fixed (float* pp = p) fixed (float* pg = grad) fixed (float* pv = v)
-                            FusedOptimizer.RMSpropUpdateSimd(pp, pg, pv, p.Length, lr, rho, eps);
-                    }
+                        unsafe
+                        {
+                            fixed (float* pp = p, pg = grad.Array, pv = v)
+                                FusedOptimizer.RMSpropUpdateSimd(pp + start, pg + grad.Offset + start, pv + start, count, lr, rho, eps);
+                        }
+                    });
                 }
             }
         }
-        } finally { ClearAutoClearSparseGrads(); }
+        } finally { EndStep(); }
     }
 }
 
@@ -616,8 +773,20 @@ public sealed class AdaDeltaOptimizer : OptimizerBase
     protected override IReadOnlyList<string> StateNames => _stateNames;
 
     /// <inheritdoc />
+    private protected override bool TryStepOnDevice(int gi, int pi, Tensor<float> parameter, Tensor<float> gradient)
+    {
+        var g = ParamGroups[gi];
+        // The device kernel applies the update unscaled, i.e. lr = 1 (the paper's and PyTorch's default).
+        if (g.LearningRate != 1.0) return false;
+        var slot = DeviceState(gi, pi, parameter.Length);
+        return GpuOptimizer.TryAdadeltaStep(parameter, gradient, DeviceSlot(slot, "square_avg"), DeviceSlot(slot, "acc_delta"),
+            (float)g.GetOption("rho", 0.9), (float)g.GetOption("eps", 1e-6), (float)g.GetOption("weight_decay", 0.0));
+    }
+
+    /// <inheritdoc />
     public override void Step()
     {
+        BeginStep();
         try {
         for (int gi = 0; gi < ParamGroups.Count; gi++)
         {
@@ -628,7 +797,8 @@ public sealed class AdaDeltaOptimizer : OptimizerBase
             float wd = (float)g.GetOption("weight_decay", 0.0);
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
-                float[] p = g.Parameters[pi]; float[] grad = g.Gradients[pi];
+                if (!ShouldStep(gi, pi) || StepOnDevice(gi, pi)) continue;
+                float[] p = HostParameter(gi, pi);
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 var sq = slot["square_avg"].Tensor!;
                 var ad = slot["acc_delta"].Tensor!;
@@ -645,16 +815,18 @@ public sealed class AdaDeltaOptimizer : OptimizerBase
                     continue;
                 }
 
-                if (wd != 0f)
-                    for (int i = 0; i < p.Length; i++) grad[i] += wd * p[i];
-                unsafe
+                var grad = DenseGradient(gi, pi, p, wd);
+                ForEachChunk(p.Length, (start, count) =>
                 {
-                    fixed (float* pp = p) fixed (float* pg = grad) fixed (float* psq = sq) fixed (float* pad = ad)
-                        FusedOptimizer.AdaDeltaUpdateSimd(pp, pg, psq, pad, p.Length, lr, rho, eps);
-                }
+                    unsafe
+                    {
+                        fixed (float* pp = p, pg = grad.Array, psq = sq, pad = ad)
+                            FusedOptimizer.AdaDeltaUpdateSimd(pp + start, pg + grad.Offset + start, psq + start, pad + start, count, lr, rho, eps);
+                    }
+                });
             }
         }
-        } finally { ClearAutoClearSparseGrads(); }
+        } finally { EndStep(); }
     }
 }
 
@@ -673,8 +845,18 @@ public sealed class LionOptimizer : OptimizerBase
     protected override IReadOnlyList<string> StateNames => _stateNames;
 
     /// <inheritdoc />
+    private protected override bool TryStepOnDevice(int gi, int pi, Tensor<float> parameter, Tensor<float> gradient)
+    {
+        var g = ParamGroups[gi];
+        var slot = DeviceState(gi, pi, parameter.Length);
+        return GpuOptimizer.TryLionStep(parameter, gradient, DeviceSlot(slot, "exp_avg"), (float)g.LearningRate,
+            (float)g.GetOption("beta1", 0.9), (float)g.GetOption("beta2", 0.99), (float)g.GetOption("weight_decay", 0.0));
+    }
+
+    /// <inheritdoc />
     public override void Step()
     {
+        BeginStep();
         try {
         for (int gi = 0; gi < ParamGroups.Count; gi++)
         {
@@ -685,7 +867,8 @@ public sealed class LionOptimizer : OptimizerBase
             float wd = (float)g.GetOption("weight_decay", 0.0);
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
-                float[] p = g.Parameters[pi]; float[] grad = g.Gradients[pi];
+                if (!ShouldStep(gi, pi) || StepOnDevice(gi, pi)) continue;
+                float[] p = HostParameter(gi, pi);
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 var m = slot["exp_avg"].Tensor!;
 
@@ -700,14 +883,18 @@ public sealed class LionOptimizer : OptimizerBase
                     continue;
                 }
 
-                unsafe
+                var grad = DenseGradient(gi, pi, p);
+                ForEachChunk(p.Length, (start, count) =>
                 {
-                    fixed (float* pp = p) fixed (float* pg = grad) fixed (float* pm = m)
-                        FusedOptimizer.LionUpdateSimd(pp, pg, pm, p.Length, lr, b1, b2, wd);
-                }
+                    unsafe
+                    {
+                        fixed (float* pp = p, pg = grad.Array, pm = m)
+                            FusedOptimizer.LionUpdateSimd(pp + start, pg + grad.Offset + start, pm + start, count, lr, b1, b2, wd);
+                    }
+                });
             }
         }
-        } finally { ClearAutoClearSparseGrads(); }
+        } finally { EndStep(); }
     }
 }
 
@@ -731,6 +918,7 @@ public sealed class AsgdOptimizer : OptimizerBase
     /// <inheritdoc />
     public override void Step()
     {
+        BeginStep();
         try {
         for (int gi = 0; gi < ParamGroups.Count; gi++)
         {
@@ -742,7 +930,8 @@ public sealed class AsgdOptimizer : OptimizerBase
             float wd = (float)g.GetOption("weight_decay", 0.0);
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
-                float[] p = g.Parameters[pi]; float[] grad = g.Gradients[pi];
+                if (!ShouldStep(gi, pi) || StepOnDevice(gi, pi)) continue;
+                float[] p = HostParameter(gi, pi);
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 int step = (slot["step"].IntValue ?? 0) + 1;
                 slot["step"].IntValue = step;
@@ -775,14 +964,18 @@ public sealed class AsgdOptimizer : OptimizerBase
                     continue;
                 }
 
-                unsafe
+                var grad = DenseGradient(gi, pi, p);
+                ForEachChunk(p.Length, (start, count) =>
                 {
-                    fixed (float* pp = p) fixed (float* pg = grad) fixed (float* pax = ax)
-                        FusedOptimizer.ASGDUpdateSimd(pp, pg, pax, p.Length, eta, lambd, alpha, wd, mu);
-                }
+                    unsafe
+                    {
+                        fixed (float* pp = p, pg = grad.Array, pax = ax)
+                            FusedOptimizer.ASGDUpdateSimd(pp + start, pg + grad.Offset + start, pax + start, count, eta, lambd, alpha, wd, mu);
+                    }
+                });
             }
         }
-        } finally { ClearAutoClearSparseGrads(); }
+        } finally { EndStep(); }
     }
 }
 
@@ -802,6 +995,7 @@ public sealed class RpropOptimizer : OptimizerBase
     /// <inheritdoc />
     public override void Step()
     {
+        BeginStep();
         try {
         for (int gi = 0; gi < ParamGroups.Count; gi++)
         {
@@ -813,7 +1007,8 @@ public sealed class RpropOptimizer : OptimizerBase
             float lr0 = (float)g.LearningRate;
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
-                float[] p = g.Parameters[pi]; float[] grad = g.Gradients[pi];
+                if (!ShouldStep(gi, pi) || StepOnDevice(gi, pi)) continue;
+                float[] p = HostParameter(gi, pi);
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 var prev = slot["prev_grad"].Tensor!;
                 var ss = slot["step_size"].Tensor!;
@@ -845,14 +1040,18 @@ public sealed class RpropOptimizer : OptimizerBase
                     continue;
                 }
 
-                unsafe
+                var grad = DenseGradient(gi, pi, p);
+                ForEachChunk(p.Length, (start, count) =>
                 {
-                    fixed (float* pp = p) fixed (float* pg = grad) fixed (float* ppr = prev) fixed (float* pss = ss)
-                        FusedOptimizer.RpropUpdate(pp, pg, ppr, pss, p.Length, etaP, etaM, sMin, sMax);
-                }
+                    unsafe
+                    {
+                        fixed (float* pp = p, pg = grad.Array, ppr = prev, pss = ss)
+                            FusedOptimizer.RpropUpdate(pp + start, pg + grad.Offset + start, ppr + start, pss + start, count, etaP, etaM, sMin, sMax);
+                    }
+                });
             }
         }
-        } finally { ClearAutoClearSparseGrads(); }
+        } finally { EndStep(); }
     }
 }
 
@@ -874,6 +1073,7 @@ public sealed class LambOptimizer : OptimizerBase
     /// <inheritdoc />
     public override void Step()
     {
+        BeginStep();
         try {
         for (int gi = 0; gi < ParamGroups.Count; gi++)
         {
@@ -885,7 +1085,8 @@ public sealed class LambOptimizer : OptimizerBase
             float wd = (float)g.GetOption("weight_decay", 0.0);
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
-                float[] p = g.Parameters[pi]; float[] grad = g.Gradients[pi];
+                if (!ShouldStep(gi, pi) || StepOnDevice(gi, pi)) continue;
+                float[] p = HostParameter(gi, pi);
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 int step = (slot["step"].IntValue ?? 0) + 1;
                 slot["step"].IntValue = step;
@@ -908,14 +1109,15 @@ public sealed class LambOptimizer : OptimizerBase
                     continue;
                 }
 
+                var grad = DenseGradient(gi, pi, p);
                 unsafe
                 {
-                    fixed (float* pp = p) fixed (float* pg = grad) fixed (float* pm = m) fixed (float* pv = v)
-                        FusedOptimizer.LAMBUpdateSimd(pp, pg, pm, pv, p.Length, lr, b1, b2, eps, wd, step);
+                    fixed (float* pp = p, pg = grad.Array, pm = m, pv = v)
+                        FusedOptimizer.LAMBUpdateSimd(pp, pg + grad.Offset, pm, pv, p.Length, lr, b1, b2, eps, wd, step);
                 }
             }
         }
-        } finally { ClearAutoClearSparseGrads(); }
+        } finally { EndStep(); }
     }
 }
 
@@ -938,6 +1140,7 @@ public sealed class LarsOptimizer : OptimizerBase
     /// <inheritdoc />
     public override void Step()
     {
+        BeginStep();
         try {
         for (int gi = 0; gi < ParamGroups.Count; gi++)
         {
@@ -949,7 +1152,8 @@ public sealed class LarsOptimizer : OptimizerBase
             float eps = (float)g.GetOption("eps", 1e-8);
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
-                float[] p = g.Parameters[pi]; float[] grad = g.Gradients[pi];
+                if (!ShouldStep(gi, pi) || StepOnDevice(gi, pi)) continue;
+                float[] p = HostParameter(gi, pi);
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 var v = slot["momentum_buffer"].Tensor!;
 
@@ -967,14 +1171,15 @@ public sealed class LarsOptimizer : OptimizerBase
                     continue;
                 }
 
+                var grad = DenseGradient(gi, pi, p);
                 unsafe
                 {
-                    fixed (float* pp = p) fixed (float* pg = grad) fixed (float* pv = v)
-                        FusedOptimizer.LARSUpdateSimd(pp, pg, pv, p.Length, lr, mom, wd, tc, eps);
+                    fixed (float* pp = p, pg = grad.Array, pv = v)
+                        FusedOptimizer.LARSUpdateSimd(pp, pg + grad.Offset, pv, p.Length, lr, mom, wd, tc, eps);
                 }
             }
         }
-        } finally { ClearAutoClearSparseGrads(); }
+        } finally { EndStep(); }
     }
 }
 
@@ -993,8 +1198,20 @@ public sealed class FtrlOptimizer : OptimizerBase
     protected override IReadOnlyList<string> StateNames => _stateNames;
 
     /// <inheritdoc />
+    private protected override bool TryStepOnDevice(int gi, int pi, Tensor<float> parameter, Tensor<float> gradient)
+    {
+        var g = ParamGroups[gi];
+        // The device kernel is the sqrt(n) schedule, lr_power = -0.5; other powers run on the host.
+        if (g.GetOption("lr_power", -0.5) != -0.5) return false;
+        var slot = DeviceState(gi, pi, parameter.Length);
+        return GpuOptimizer.TryFtrlStep(parameter, gradient, DeviceSlot(slot, "z"), DeviceSlot(slot, "n"), (float)g.LearningRate,
+            (float)g.GetOption("l1_reg", 0.0), (float)g.GetOption("l2_reg", 0.0), 0f);
+    }
+
+    /// <inheritdoc />
     public override void Step()
     {
+        BeginStep();
         try {
         for (int gi = 0; gi < ParamGroups.Count; gi++)
         {
@@ -1008,7 +1225,8 @@ public sealed class FtrlOptimizer : OptimizerBase
             float lrPow = (float)g.GetOption("lr_power", -0.5);
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
-                float[] p = g.Parameters[pi]; float[] grad = g.Gradients[pi];
+                if (!ShouldStep(gi, pi) || StepOnDevice(gi, pi)) continue;
+                float[] p = HostParameter(gi, pi);
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 var z = slot["z"].Tensor!;
                 var n = slot["n"].Tensor!;
@@ -1025,14 +1243,18 @@ public sealed class FtrlOptimizer : OptimizerBase
                     continue;
                 }
 
-                unsafe
+                var grad = DenseGradient(gi, pi, p);
+                ForEachChunk(p.Length, (start, count) =>
                 {
-                    fixed (float* pp = p) fixed (float* pg = grad) fixed (float* pz = z) fixed (float* pn = n)
-                        FusedOptimizer.FTRLUpdateSimd(pp, pg, pz, pn, p.Length, lr, l1, l2, lrPow);
-                }
+                    unsafe
+                    {
+                        fixed (float* pp = p, pg = grad.Array, pz = z, pn = n)
+                            FusedOptimizer.FTRLUpdateSimd(pp + start, pg + grad.Offset + start, pz + start, pn + start, count, lr, l1, l2, lrPow);
+                    }
+                });
             }
         }
-        } finally { ClearAutoClearSparseGrads(); }
+        } finally { EndStep(); }
     }
 }
 
@@ -1059,6 +1281,7 @@ public sealed class SparseAdamOptimizer : OptimizerBase
     /// <inheritdoc />
     public override void Step()
     {
+        BeginStep();
         try {
         for (int gi = 0; gi < ParamGroups.Count; gi++)
         {
@@ -1069,7 +1292,8 @@ public sealed class SparseAdamOptimizer : OptimizerBase
             float eps = (float)g.GetOption("eps", 1e-8);
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
-                float[] p = g.Parameters[pi]; float[] grad = g.Gradients[pi];
+                if (!ShouldStep(gi, pi) || StepOnDevice(gi, pi)) continue;
+                float[] p = HostParameter(gi, pi);
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 int step = (slot["step"].IntValue ?? 0) + 1;
                 slot["step"].IntValue = step;
@@ -1086,6 +1310,9 @@ public sealed class SparseAdamOptimizer : OptimizerBase
                 }
                 else
                 {
+                    var dense = DenseGradient(gi, pi, p);
+                    float[] grad = dense.Array;
+                    int gradOffset = dense.Offset;
                     // Build the sparse view in a single pass over the dense gradient, growing
                     // the per-parameter scratch buffers in place rather than allocating each step.
                     if (!_scratch.TryGetValue((gi, pi), out var pair))
@@ -1095,9 +1322,10 @@ public sealed class SparseAdamOptimizer : OptimizerBase
                     }
                     int cap = pair.idx.Length;
                     int k = 0;
-                    for (int i = 0; i < grad.Length; i++)
+                    for (int i = 0; i < p.Length; i++)
                     {
-                        if (grad[i] == 0f) continue;
+                        float gv = grad[gradOffset + i];
+                        if (gv == 0f) continue;
                         if (k == cap)
                         {
                             // Geometric growth — amortised O(1) per insertion.
@@ -1107,7 +1335,7 @@ public sealed class SparseAdamOptimizer : OptimizerBase
                             cap = newCap;
                         }
                         pair.idx[k] = i;
-                        pair.val[k] = grad[i];
+                        pair.val[k] = gv;
                         k++;
                     }
                     _scratch[(gi, pi)] = pair;
@@ -1125,6 +1353,6 @@ public sealed class SparseAdamOptimizer : OptimizerBase
                 }
             }
         }
-        } finally { ClearAutoClearSparseGrads(); }
+        } finally { EndStep(); }
     }
 }

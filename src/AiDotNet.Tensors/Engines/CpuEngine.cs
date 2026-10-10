@@ -3306,7 +3306,7 @@ public partial class CpuEngine : ITensorLevelEngine
             }
 
             // Fallback: SimdKernels with parallel chunking for large arrays
-            int numChunks = CpuParallelSettings.ElementwiseChunkCount(length);
+            int numChunks = ElementwiseChunks(length);
             if (numChunks >= 2)
             {
                 int chunkSize = (length + numChunks - 1) / numChunks;
@@ -3341,7 +3341,7 @@ public partial class CpuEngine : ITensorLevelEngine
             double* pA = (double*)pinA.Pointer;
             double* pB = (double*)pinB.Pointer;
 
-            int numChunks = CpuParallelSettings.ElementwiseChunkCount(length);
+            int numChunks = ElementwiseChunks(length);
             if (numChunks >= 2)
             {
                 int chunkSize = (length + numChunks - 1) / numChunks;
@@ -5796,7 +5796,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
                 else
                 {
-                    int subChunks = CpuParallelSettings.ElementwiseChunkCount(length);
+                    int subChunks = ElementwiseChunks(length);
                     if (subChunks >= 2)
                     {
                         int chunkSize = (length + subChunks - 1) / subChunks;
@@ -5955,7 +5955,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
                 else
                 {
-                    int mulChunks = CpuParallelSettings.ElementwiseChunkCount(length);
+                    int mulChunks = ElementwiseChunks(length);
                     if (mulChunks >= 2)
                     {
                         int chunkSize = (length + mulChunks - 1) / mulChunks;
@@ -6096,7 +6096,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return;
             }
 
-            int numChunks = CpuParallelSettings.ElementwiseChunkCount(length);
+            int numChunks = ElementwiseChunks(length);
             if (numChunks >= 2)
             {
                 int chunkSize = (length + numChunks - 1) / numChunks;
@@ -6129,7 +6129,7 @@ public partial class CpuEngine : ITensorLevelEngine
             double* pA = (double*)pinA.Pointer;
             double* pB = (double*)pinB.Pointer;
 
-            int numChunks = CpuParallelSettings.ElementwiseChunkCount(length);
+            int numChunks = ElementwiseChunks(length);
             if (numChunks >= 2)
             {
                 int chunkSize = (length + numChunks - 1) / numChunks;
@@ -6265,7 +6265,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 return;
             }
 
-            int numChunks = CpuParallelSettings.ElementwiseChunkCount(length);
+            int numChunks = ElementwiseChunks(length);
             if (numChunks >= 2)
             {
                 int chunkSize = (length + numChunks - 1) / numChunks;
@@ -6298,7 +6298,7 @@ public partial class CpuEngine : ITensorLevelEngine
             double* pA = (double*)pinA.Pointer;
             double* pB = (double*)pinB.Pointer;
 
-            int numChunks = CpuParallelSettings.ElementwiseChunkCount(length);
+            int numChunks = ElementwiseChunks(length);
             if (numChunks >= 2)
             {
                 int chunkSize = (length + numChunks - 1) / numChunks;
@@ -6362,7 +6362,7 @@ public partial class CpuEngine : ITensorLevelEngine
             using var pinA = aMem.Pin();
             float* pA = (float*)pinA.Pointer;
 
-            int numChunks = CpuParallelSettings.ElementwiseChunkCount(length);
+            int numChunks = ElementwiseChunks(length);
             if (numChunks >= 2)
             {
                 int chunkSize = (length + numChunks - 1) / numChunks;
@@ -6390,7 +6390,7 @@ public partial class CpuEngine : ITensorLevelEngine
             using var pinA = aMem.Pin();
             double* pA = (double*)pinA.Pointer;
 
-            int numChunks = CpuParallelSettings.ElementwiseChunkCount(length);
+            int numChunks = ElementwiseChunks(length);
             if (numChunks >= 2)
             {
                 int chunkSize = (length + numChunks - 1) / numChunks;
@@ -6457,7 +6457,7 @@ public partial class CpuEngine : ITensorLevelEngine
             float* pA = (float*)pinA.Pointer;
             float* pD = (float*)pinD.Pointer;
 
-            int numChunks = CpuParallelSettings.ElementwiseChunkCount(length);
+            int numChunks = ElementwiseChunks(length);
             if (numChunks >= 2)
             {
                 int chunkSize = (length + numChunks - 1) / numChunks;
@@ -6488,7 +6488,7 @@ public partial class CpuEngine : ITensorLevelEngine
             double* pA = (double*)pinA.Pointer;
             double* pD = (double*)pinD.Pointer;
 
-            int numChunks = CpuParallelSettings.ElementwiseChunkCount(length);
+            int numChunks = ElementwiseChunks(length);
             if (numChunks >= 2)
             {
                 int chunkSize = (length + numChunks - 1) / numChunks;
@@ -6689,7 +6689,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 }
                 else
                 {
-                    int subChunks = CpuParallelSettings.ElementwiseChunkCount(length);
+                    int subChunks = ElementwiseChunks(length);
                     if (subChunks >= 2)
                     {
                         int chunkSize = (length + subChunks - 1) / subChunks;
@@ -11673,6 +11673,17 @@ public partial class CpuEngine : ITensorLevelEngine
         }
     }
 
+    /// <summary>
+    /// Elements per parallel chunk for the memory-bound float elementwise kernels (ReLU, add, subtract, multiply,
+    /// and the like). They split at 2M (or 500K) elements per chunk, so every activation of a training-scale CNN
+    /// (65K-524K elements) ran on one thread: a ResNet step spent 4 ms in ReLU against PyTorch's 0.9. One knob shared
+    /// with CpuParallelSettings.ElementwiseChunkCount: 32K by default (libtorch's grain), env AIDOTNET_ELEMENTWISE_GRAIN.
+    /// </summary>
+    internal static int ElementwiseGrain => CpuParallelSettings.ElementwiseGrain;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int ElementwiseChunks(int length) => CpuParallelSettings.ElementwiseChunkCount(length);
+
     public virtual unsafe Tensor<T> ReLU<T>(Tensor<T> tensor)
     {
         if (tensor == null)
@@ -11737,7 +11748,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var srcArr = (float[])(object)tensor._storage.GetDataArray();
             var dstArr = (float[])(object)result._storage.GetDataArray();
             int sOff = tensor._storageOffset, dOff = result._storageOffset;
-            int reluChunks = CpuParallelSettings.ElementwiseChunkCount(length);
+            int reluChunks = ElementwiseChunks(length);
             if (reluChunks >= 2)
             {
                 fixed (float* pSrcFix = srcArr, pDstFix = dstArr)
@@ -16819,7 +16830,7 @@ public partial class CpuEngine : ITensorLevelEngine
         {
 #if NET5_0_OR_GREATER
             if (Simd.DirectConvAvx2.TryChoose(new Simd.DirectConvShape(Simd.DirectConvPass.BackwardKernel, batch, inChannels, outChannels,
-                    height, width, kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW), out _))
+                    height, width, kernelHeight, kernelWidth, strideH, strideW, padH, padW, dilationH, dilationW), out int directTasks))
             {
                 // Both operands were made contiguous above; read them in place (see the input-gradient route).
                 var xArr = (float[]?)(object?)input.GetCpuBackingForStridedRead(out int xOff);
@@ -16829,7 +16840,7 @@ public partial class CpuEngine : ITensorLevelEngine
                 {
                     Simd.DirectConvAvx2.BackwardKernel(xArr, xOff, gArr, gOff, dArr, dOff, accumulate,
                         batch, inChannels, height, width, outChannels, kernelHeight, kernelWidth,
-                        strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth);
+                        strideH, strideW, padH, padW, dilationH, dilationW, outputHeight, outputWidth, directTasks);
                     return;
                 }
             }
@@ -25105,26 +25116,15 @@ public partial class CpuEngine : ITensorLevelEngine
             float epsF = numOps.ToDouble(eps) is double d ? (float)d : 1e-5f;
             var meanF = new float[channels];
             var varF = new float[channels];
-            // Allocate the output buffer to the LOGICAL extent
-            // (batch * channels * H * W = input.Length), NOT to inF.Length.
-            // The underlying float[] returned by GetDataArray() is allowed
-            // to be SIMD-padded — e.g. for [1, 32, 112, 112] the logical
-            // extent is 401,408 but the padded buffer can be 524,288 (the
-            // next multiple of 32 spatial / 128 channel for AVX-friendly
-            // layouts). The inner BatchNorm4DFloat kernel iterates strictly
-            // in logical-index space (offset = n * channels * spatialSize
-            // + c * spatialSize), so the output only needs to hold the
-            // logical extent — and TensorAllocator.Rent(shape, data) below
-            // hard-asserts data.Length == product(shape). Issue #310.
-            // Pooled output (exactly input.Length elements), so a caller that returns the result gets
-            // the buffer back on the next call; a fresh unpooled array cost a Large Object Heap
-            // allocation and its page faults on every call (1.24 ms against libtorch's 0.47 ms for
-            // 32x64x32x32).
-            var resultF = AutoTensorCache.RentOrAllocate<float>(input._shape);
-            BatchNorm4DFloat(inF, gamF, betF, epsF, batch, channels, spatialSize, meanF, varF, resultF.GetDataArray());
+            // Rent the output (arena / thread cache / pool) rather than allocating a fresh array per
+            // call: a new multi-megabyte array put ~77% of BN forward time in kernel page faults.
+            // The rented backing array may be longer than the logical extent; BatchNorm4DFloat walks
+            // logical indices only (offset = n * channels * spatialSize + c * spatialSize). Issue #310.
+            var outTensor = TensorAllocator.RentUninitialized<float>(input._shape);
+            BatchNorm4DFloat(inF, gamF, betF, epsF, batch, channels, spatialSize, meanF, varF, outTensor.GetDataArray());
             mean = (Tensor<T>)(object)TensorAllocator.Rent<T>(new[] { channels }, (Vector<T>)(object)Vector<float>.FromMemory(meanF));
             variance = (Tensor<T>)(object)TensorAllocator.Rent<T>(new[] { channels }, (Vector<T>)(object)Vector<float>.FromMemory(varF));
-            return (Tensor<T>)(object)resultF;
+            return (Tensor<T>)(object)outTensor;
         }
 
         // Double fast path — mirrors the float kernel's fused single-sweep
@@ -25141,16 +25141,14 @@ public partial class CpuEngine : ITensorLevelEngine
             double epsD = numOps.ToDouble(eps);
             var meanDArr = new double[channels];
             var varDArr  = new double[channels];
-            // Pooled output, as in the float path above.
-            var resultD = AutoTensorCache.RentOrAllocate<double>(input._shape);
-            var outDArr = resultD.GetDataArray();
-            BatchNorm4DDouble(inD, gamD, betD, epsD, batch, channels, spatialSize, meanDArr, varDArr, outDArr);
+            var outTensorD = TensorAllocator.RentUninitialized<double>(input._shape);
+            BatchNorm4DDouble(inD, gamD, betD, epsD, batch, channels, spatialSize, meanDArr, varDArr, outTensorD.GetDataArray());
             // #478: wrap the freshly-allocated result arrays with FromMemory (zero-copy hand-off, like
             // the float path above) instead of `new Vector<double>(arr)`, which COPIED every array —
             // doubling the output allocation (measured 4x the float path; now ~2x = just the bytes).
             mean = (Tensor<T>)(object)TensorAllocator.Rent<T>(new[] { channels }, (Vector<T>)(object)Vector<double>.FromMemory(meanDArr));
             variance = (Tensor<T>)(object)TensorAllocator.Rent<T>(new[] { channels }, (Vector<T>)(object)Vector<double>.FromMemory(varDArr));
-            return (Tensor<T>)(object)resultD;
+            return (Tensor<T>)(object)outTensorD;
         }
 
         var meanData = new T[channels];
@@ -41617,6 +41615,31 @@ public partial class CpuEngine : ITensorLevelEngine
         // backward can trace the dependency chain from loss -> output -> parameters.
         // The BLAS fast path below bypasses the tape (operates on raw arrays), so we
         // must use the recorded path during training.
+        if (Autodiff.GradientTape<T>.Current is not null && !Autodiff.NoGradScope<T>.IsSuppressed
+            && typeof(T) == typeof(float) && input.Rank == 2 && weights.Rank == 2
+            && (activation == FusedActivationType.None || activation == FusedActivationType.ReLU))
+        {
+            // Under a tape the general path below ran the GEMM, then a separate broadcast bias add, then a separate
+            // activation, each a full pass and allocation (an MLP's 128x784->512 layer: 0.23 ms against 0.18 for the
+            // fused single pass). Identity and ReLU take the fused untaped kernel and record one entry. ReLU's
+            // backward masks on pre-activation > 0, which is exactly output > 0, so the output stands in for it.
+            Tensor<T> fused;
+            using (new NoGradScope<T>())
+                fused = FusedLinear(input, weights, bias, activation, activationParams);
+            var fusedLinearInputs = bias != null ? new[] { input, weights, bias } : new[] { input, weights };
+            object[]? fusedState = null;
+            if (activation == FusedActivationType.ReLU)
+            {
+                fusedState = new object[activationParams is null ? 2 : 3];
+                fusedState[0] = activation;
+                fusedState[1] = fused;
+                if (activationParams is not null) fusedState[2] = activationParams;
+            }
+            Autodiff.DifferentiableOps.RecordIfActive("FusedLinear", fused, fusedLinearInputs,
+                Autodiff.BackwardFunctions<T>.FusedLinearWithActivationBackward, fusedState);
+            { var ci = input; var cw = weights; var cb = bias; var cact = activation; AutoTracer.RecordOp("FusedLinear", fused, eng => eng.FusedLinear(ci, cw, cb, cact)); }
+            return fused;
+        }
         if (Autodiff.GradientTape<T>.Current is not null && !Autodiff.NoGradScope<T>.IsSuppressed)
         {
             // Fused tape path: use the exact same TensorMatMul code path as unfused
@@ -44550,16 +44573,13 @@ public partial class CpuEngine : ITensorLevelEngine
         // Float fast path: SIMD grad * sigmoid * (1 - sigmoid)
         if (gradData is float[] gF && outData is float[] oF)
         {
-#if NET5_0_OR_GREATER
-            var resultArr = GC.AllocateUninitializedArray<float>(length);
-#else
-            var resultArr = new float[length];
-#endif
+            var resultTensor = TensorAllocator.RentUninitialized<float>(gradOutput._shape);
+            var resultArr = resultTensor.GetDataArray();
             // Bound by the LOGICAL length — gF/oF can be pool-over-allocated (longer than the tensor's
             // logical Length) while resultArr is sized to `length`; iterating to grad.Length would write
             // past resultArr (unchecked AVX store -> AccessViolation). See TanhBackward for the mechanism.
             SigmoidBackwardFloat(gF, oF, resultArr, length);
-            return (Tensor<T>)(object)TensorAllocator.Rent<T>(gradOutput._shape, (Vector<T>)(object)Vector<float>.FromMemory(resultArr));
+            return (Tensor<T>)(object)resultTensor;
         }
 
         // Double SIMD path
@@ -44740,18 +44760,15 @@ public partial class CpuEngine : ITensorLevelEngine
         // Float fast path: SIMD grad * (1 - tanh^2)
         if (gradData is float[] gF && outData is float[] oF)
         {
-#if NET5_0_OR_GREATER
-            var resultArr = GC.AllocateUninitializedArray<float>(length);
-#else
-            var resultArr = new float[length];
-#endif
+            var resultTensor = TensorAllocator.RentUninitialized<float>(gradOutput._shape);
+            var resultArr = resultTensor.GetDataArray();
             // Bound by the LOGICAL length: gF/oF come from GetFlattenedData/GetDataArray, which
             // can hand back a pool-OVER-ALLOCATED backing array (physically longer than the tensor's
             // logical Length — see VectorBase.GetDataArray returning the full segment.Array at offset 0).
             // resultArr is sized to `length`, so iterating to grad.Length would write past it (the
             // AVX store has no bounds check -> AccessViolation). Pass the logical length explicitly.
             TanhBackwardFloat(gF, oF, resultArr, length);
-            return (Tensor<T>)(object)TensorAllocator.Rent<T>(gradOutput._shape, (Vector<T>)(object)Vector<float>.FromMemory(resultArr));
+            return (Tensor<T>)(object)resultTensor;
         }
 
         // Double SIMD path
@@ -46316,8 +46333,8 @@ public partial class CpuEngine : ITensorLevelEngine
     #region JIT Dispatch Helpers
 
     /// <summary>
-    /// Runs a float binary elementwise op (Add / Subtract / Multiply / Divide), split across threads in
-    /// <see cref="CpuParallelSettings.ElementwiseGrainSize"/> chunks.
+    /// Runs a float binary elementwise op (Add / Subtract / Multiply / Divide) on SimdKernels, split across threads
+    /// at the shared <see cref="ElementwiseGrain"/> (one chunk per grain, at most the pool width).
     /// </summary>
     /// <remarks>
     /// Kept under its historical name; it no longer calls the runtime-generated JIT kernels. Measured on
@@ -46326,8 +46343,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// </remarks>
     private static unsafe void JitBinaryDispatch(float* pA, float* pB, float* pR, int length, JitBinaryOp op)
     {
-        int numChunks = CpuParallelSettings.ElementwiseChunkCount(length);
-        if (numChunks < 2)
+        int numChunks = ElementwiseChunks(length);
+        if (numChunks >= 2)
         {
             RunBinary(pA, pB, pR, length, op);
             return;
@@ -46358,8 +46375,8 @@ public partial class CpuEngine : ITensorLevelEngine
     /// </summary>
     private static unsafe void JitUnaryDispatch(float* pSrc, float* pDst, int length)
     {
-        int numChunks = CpuParallelSettings.ElementwiseChunkCount(length);
-        if (numChunks < 2)
+        int numChunks = ElementwiseChunks(length);
+        if (numChunks >= 2)
         {
             SimdKernels.ReLUUnsafe(pSrc, pDst, length);
             return;

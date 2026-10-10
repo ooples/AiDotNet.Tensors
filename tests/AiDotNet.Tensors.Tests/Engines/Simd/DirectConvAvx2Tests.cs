@@ -132,6 +132,8 @@ public class DirectConvAvx2Tests
     [InlineData(2, 32, 32, 9, 1, 2, 0, 1, false)]
     [InlineData(2, 32, 32, 9, 3, 1, 2, 2, false)]
     [InlineData(2, 32, 32, 6, 5, 1, 2, 1, true)]   // 5 kernel columns: a full 3-column group and a 2-column tail
+    [InlineData(7, 64, 64, 5, 3, 1, 1, 1, true)]   // the batch split unevenly (4 + 3 images) across partial gradients
+    [InlineData(2, 128, 128, 4, 3, 1, 1, 1, false)] // enough block pairs that the batch is not split
     public void BackwardKernel_MatchesANaiveReference(int batch, int inC, int outC, int size, int k, int stride, int pad, int dilation, bool accumulate)
     {
         int outSize = OutSize(size, k, stride, pad, dilation);

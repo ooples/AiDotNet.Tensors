@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines.Optimization.Optimizers;
 
@@ -53,11 +54,39 @@ public sealed class SparseAdam24Optimizer : OptimizerBase
         if (parameter == null) throw new ArgumentNullException(nameof(parameter));
         if (gradient == null) throw new ArgumentNullException(nameof(gradient));
         if (patternNibbles == null) throw new ArgumentNullException(nameof(patternNibbles));
-        if (parameter.Length == 0)
-            throw new ArgumentException("parameter must not be empty.", nameof(parameter));
-        if (parameter.Length % 4 != 0)
+        var patternCopy = ValidatedPattern(parameter.Length, patternNibbles);
+
+        var grp = AddParamGroup(overrides);
+        grp.AddParameter(parameter, gradient);
+        _patterns[(ParamGroups.Count - 1, grp.Parameters.Count - 1)] = patternCopy;
+        return grp;
+    }
+
+    /// <summary>
+    /// Add a 2:4-sparse parameter tensor, updated in place; its gradient comes from
+    /// <see cref="OptimizerBase.Step(IReadOnlyDictionary{Tensor{float}, Tensor{float}})"/> (see
+    /// <see cref="ParamGroup.AddParameter(Tensor{float})"/>). Same layout rules as the array overload.
+    /// </summary>
+    public ParamGroup AddSparse24Parameter(
+        Tensor<float> parameter, byte[] patternNibbles, IDictionary<string, double>? overrides = null)
+    {
+        if (parameter == null) throw new ArgumentNullException(nameof(parameter));
+        if (patternNibbles == null) throw new ArgumentNullException(nameof(patternNibbles));
+        var patternCopy = ValidatedPattern(parameter.Length, patternNibbles);
+
+        var grp = AddParamGroup(overrides);
+        grp.AddParameter(parameter);
+        _patterns[(ParamGroups.Count - 1, grp.Parameters.Count - 1)] = patternCopy;
+        return grp;
+    }
+
+    private static byte[] ValidatedPattern(int length, byte[] patternNibbles)
+    {
+        if (length == 0)
+            throw new ArgumentException("parameter must not be empty.", "parameter");
+        if (length % 4 != 0)
             throw new ArgumentException("2:4 sparsity requires parameter length to be a multiple of 4.");
-        int blocks = parameter.Length / 4;
+        int blocks = length / 4;
         int expectedPatternBytes = (blocks + 1) / 2;
         if (patternNibbles.Length != expectedPatternBytes)
             throw new ArgumentException(
@@ -84,15 +113,15 @@ public sealed class SparseAdam24Optimizer : OptimizerBase
         var patternCopy = new byte[patternNibbles.Length];
         Array.Copy(patternNibbles, patternCopy, patternNibbles.Length);
 
-        var grp = AddParamGroup(overrides);
-        grp.AddParameter(parameter, gradient);
-        _patterns[(ParamGroups.Count - 1, grp.Parameters.Count - 1)] = patternCopy;
-        return grp;
+        return patternCopy;
     }
 
     /// <inheritdoc />
     public override void Step()
     {
+        BeginStep();
+        try
+        {
         for (int gi = 0; gi < ParamGroups.Count; gi++)
         {
             var g = ParamGroups[gi];
@@ -107,7 +136,9 @@ public sealed class SparseAdam24Optimizer : OptimizerBase
                     throw new InvalidOperationException(
                         $"param[{gi},{pi}] was not added via AddSparse24Parameter.");
 
-                float[] p = g.Parameters[pi]; float[] grad = g.Gradients[pi];
+                if (!ShouldStep(gi, pi) || StepOnDevice(gi, pi)) continue;
+                float[] p = HostParameter(gi, pi);
+                var grad = DenseGradient(gi, pi, p);
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 int step = (slot["step"].IntValue ?? 0) + 1;
                 slot["step"].IntValue = step;
@@ -120,27 +151,32 @@ public sealed class SparseAdam24Optimizer : OptimizerBase
                 float bc2Inv = 1f / bc2;
 
                 int blocks = p.Length / 4;
-                for (int blk = 0; blk < blocks; blk++)
+                ForEachChunk(blocks, (start, count) =>
                 {
-                    // Two 2-bit indices per nibble; two nibbles per byte.
-                    byte b = pattern[blk >> 1];
-                    byte nib = (blk & 1) == 0 ? (byte)(b & 0x0F) : (byte)((b >> 4) & 0x0F);
-                    int idx0 = nib & 0x3;
-                    int idx1 = (nib >> 2) & 0x3;
-                    int blockBase = blk * 4;
+                    for (int blk = start; blk < start + count; blk++)
+                    {
+                        // Two 2-bit indices per nibble; two nibbles per byte.
+                        byte b = pattern[blk >> 1];
+                        byte nib = (blk & 1) == 0 ? (byte)(b & 0x0F) : (byte)((b >> 4) & 0x0F);
+                        int idx0 = nib & 0x3;
+                        int idx1 = (nib >> 2) & 0x3;
+                        int blockBase = blk * 4;
 
-                    UpdateOne(blockBase + idx0, grad, m, v, p, b1, b2, eps, lrAdj, bc2Inv);
-                    if (idx1 != idx0)
-                        UpdateOne(blockBase + idx1, grad, m, v, p, b1, b2, eps, lrAdj, bc2Inv);
-                }
+                        UpdateOne(blockBase + idx0, grad.Array, grad.Offset, m, v, p, b1, b2, eps, lrAdj, bc2Inv);
+                        if (idx1 != idx0)
+                            UpdateOne(blockBase + idx1, grad.Array, grad.Offset, m, v, p, b1, b2, eps, lrAdj, bc2Inv);
+                    }
+                });
             }
         }
+        }
+        finally { EndStep(); }
     }
 
-    private static void UpdateOne(int i, float[] grad, float[] m, float[] v, float[] p,
+    private static void UpdateOne(int i, float[] grad, int gradOffset, float[] m, float[] v, float[] p,
                                   float b1, float b2, float eps, float lrAdj, float bc2Inv)
     {
-        float gi = grad[i];
+        float gi = grad[gradOffset + i];
         float mNew = b1 * m[i] + (1f - b1) * gi;
         float vNew = b2 * v[i] + (1f - b2) * gi * gi;
         m[i] = mNew;

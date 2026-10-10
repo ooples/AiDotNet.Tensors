@@ -21,6 +21,9 @@ namespace AiDotNet.Tensors.Engines.Optimization.Optimizers;
 /// </summary>
 public sealed class DAdaptAdamOptimizer : OptimizerBase
 {
+    /// <inheritdoc />
+    internal override bool HasGroupStatistics => true;
+
     private static readonly Dictionary<string, double> _defaults = new Dictionary<string, double>
     {
         ["lr"] = 1.0, ["beta1"] = 0.9, ["beta2"] = 0.999, ["eps"] = 1e-8,
@@ -62,6 +65,7 @@ public sealed class DAdaptAdamOptimizer : OptimizerBase
     /// <inheritdoc />
     public override void Step()
     {
+        BeginStep();
         try {
         // Grow the per-group d-array incrementally — adding a new param group mid-training
         // must not wipe the adapted d_t values that already exist for prior groups.
@@ -90,7 +94,8 @@ public sealed class DAdaptAdamOptimizer : OptimizerBase
 
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
-                float[] p = g.Parameters[pi]; float[] grad = g.Gradients[pi];
+                if (!ShouldStep(gi, pi) || StepOnDevice(gi, pi)) continue;
+                float[] p = HostParameter(gi, pi);
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 if (!slot.ContainsKey("exp_avg"))     slot["exp_avg"]     = OptimizerStateValue.FromTensor(new float[p.Length]);
                 if (!slot.ContainsKey("exp_avg_sq"))  slot["exp_avg_sq"]  = OptimizerStateValue.FromTensor(new float[p.Length]);
@@ -131,7 +136,7 @@ public sealed class DAdaptAdamOptimizer : OptimizerBase
                     continue;
                 }
 
-                if (wd != 0f) for (int i = 0; i < p.Length; i++) grad[i] += wd * p[i];
+                var grad = DenseGradient(gi, pi, p, wd).Span;
 
                 double dg, dgSq;
                 for (int i = 0; i < p.Length; i++)
@@ -155,6 +160,11 @@ public sealed class DAdaptAdamOptimizer : OptimizerBase
             }
 
             // d update — only ever grows. growth_rate caps how fast d can rise per step.
+            // Sharded (ZeRO): the d-update reads sums over the whole group, so combine every rank's share.
+            var groupSums = new[] { sk_l1, numerator };
+            ReduceGroupStatistics(groupSums);
+            sk_l1 = groupSums[0];
+            numerator = groupSums[1];
             if (sk_l1 > 0)
             {
                 double dHat = numerator / ((1.0 - b2) * sk_l1);
@@ -166,7 +176,7 @@ public sealed class DAdaptAdamOptimizer : OptimizerBase
                 CurrentD[gi] = newD;
             }
         }
-        } finally { ClearAutoClearSparseGrads(); }
+        } finally { EndStep(); }
     }
 }
 
@@ -178,6 +188,9 @@ public sealed class DAdaptAdamOptimizer : OptimizerBase
 /// </summary>
 public sealed class ProdigyOptimizer : OptimizerBase
 {
+    /// <inheritdoc />
+    internal override bool HasGroupStatistics => true;
+
     private static readonly Dictionary<string, double> _defaults = new Dictionary<string, double>
     {
         ["lr"] = 1.0, ["beta1"] = 0.9, ["beta2"] = 0.999, ["eps"] = 1e-8,
@@ -233,6 +246,7 @@ public sealed class ProdigyOptimizer : OptimizerBase
     /// <inheritdoc />
     public override void Step()
     {
+        BeginStep();
         try {
         // Grow CurrentD / DNumerator incrementally so groups added mid-training keep their
         // adapted state instead of being silently reset on the next Step().
@@ -267,7 +281,8 @@ public sealed class ProdigyOptimizer : OptimizerBase
 
             for (int pi = 0; pi < g.Parameters.Count; pi++)
             {
-                float[] p = g.Parameters[pi]; float[] grad = g.Gradients[pi];
+                if (!ShouldStep(gi, pi) || StepOnDevice(gi, pi)) continue;
+                float[] p = HostParameter(gi, pi);
                 var slot = GetOrCreateState(gi, pi, p.Length);
                 if (!slot.ContainsKey("exp_avg"))     slot["exp_avg"]     = OptimizerStateValue.FromTensor(new float[p.Length]);
                 if (!slot.ContainsKey("exp_avg_sq"))  slot["exp_avg_sq"]  = OptimizerStateValue.FromTensor(new float[p.Length]);
@@ -312,7 +327,7 @@ public sealed class ProdigyOptimizer : OptimizerBase
                     continue;
                 }
 
-                if (wd != 0f) for (int i = 0; i < p.Length; i++) grad[i] += wd * p[i];
+                var grad = DenseGradient(gi, pi, p, wd).Span;
 
                 for (int i = 0; i < p.Length; i++)
                 {
@@ -331,6 +346,11 @@ public sealed class ProdigyOptimizer : OptimizerBase
                 }
             }
 
+            // Sharded (ZeRO): the d-update reads sums over the whole group, so combine every rank's share.
+            var groupSums = new[] { dDelta, sk_l1 };
+            ReduceGroupStatistics(groupSums);
+            dDelta = groupSums[0];
+            sk_l1 = groupSums[1];
             DNumerator[gi] = b3 * DNumerator[gi] + dDelta;
             if (sk_l1 > 0)
             {
@@ -343,6 +363,6 @@ public sealed class ProdigyOptimizer : OptimizerBase
                 CurrentD[gi] = newD;
             }
         }
-        } finally { ClearAutoClearSparseGrads(); }
+        } finally { EndStep(); }
     }
 }
