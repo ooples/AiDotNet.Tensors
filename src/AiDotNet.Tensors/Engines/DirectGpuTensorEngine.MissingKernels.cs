@@ -7087,16 +7087,16 @@ public partial class DirectGpuTensorEngine
         using var bufWih = GetOrAllocateBuffer(backend, wIh);
         using var bufWhh = GetOrAllocateBuffer(backend, wHh);
         using var bufH0 = h0 is null
-            ? GetOrAllocateBuffer(backend, new T[B * Hd])
+            ? DeviceZeros(backend, B * Hd)
             : GetOrAllocateBuffer(backend, h0);
         using var bufC0 = c0 is null
-            ? GetOrAllocateBuffer(backend, new T[B * Hd])
+            ? DeviceZeros(backend, B * Hd)
             : GetOrAllocateBuffer(backend, c0);
         using var bufBih = bIh is null
-            ? GetOrAllocateBuffer(backend, new T[gateRows])
+            ? DeviceZeros(backend, gateRows)
             : GetOrAllocateBuffer(backend, bIh);
         using var bufBhh = bHh is null
-            ? GetOrAllocateBuffer(backend, new T[gateRows])
+            ? DeviceZeros(backend, gateRows)
             : GetOrAllocateBuffer(backend, bHh);
 
         IGpuBuffer? bufHf = null;
@@ -7105,14 +7105,18 @@ public partial class DirectGpuTensorEngine
         bool hFinalHandedOff = false;
         bool cFinalHandedOff = false;
         bool sequenceHandedOff = false;
+        IGpuBuffer? cacheH = null;
+        IGpuBuffer? cacheC = null;
+        IGpuBuffer? cacheGates = null;
+        bool cachesHandedOff = false;
         try
         {
             bufHf = backend.AllocateBuffer(B * Hd);
             bufOut = backend.AllocateBuffer(S * B * Hd);
             bufCf = backend.AllocateBuffer(B * Hd);
-            using var bufAllH = backend.AllocateBuffer((S + 1) * B * Hd);
-            using var bufAllC = backend.AllocateBuffer((S + 1) * B * Hd);
-            using var bufGates = backend.AllocateBuffer(S * B * Hd * 4);
+            var bufAllH = cacheH = backend.AllocateBuffer((S + 1) * B * Hd);
+            var bufAllC = cacheC = backend.AllocateBuffer((S + 1) * B * Hd);
+            var bufGates = cacheGates = backend.AllocateBuffer(S * B * Hd * 4);
 
             backend.LstmForwardSequence(
                 bufInput.Buffer, bufH0.Buffer, bufC0.Buffer, bufWih.Buffer, bufWhh.Buffer, bufBih.Buffer, bufBhh.Buffer,
@@ -7158,17 +7162,17 @@ public partial class DirectGpuTensorEngine
                 finalCell = null;
             }
 
-            // Training: if a float tape is recording, save the GPU forward caches to host and record a fused
+            // Training: if a float tape is recording, keep the forward caches on the device and record a fused
             // GPU-BPTT backward node (mirrors the CPU fused #1566 node). Without this the GPU forward runs
             // under a tape but records NOTHING, silently dropping all LSTM gradients. float-only (the whole
-            // override is float-gated above).
+            // override is float-gated above). The caches become device-resident tensors the node holds, so a
+            // training step never reads them back to the host.
             if (typeof(T) == typeof(float) && Autodiff.DifferentiableOps.IsRecording<float>())
             {
-                var gatesHost = backend.DownloadBuffer(bufGates);   // [S, B, Hd, 4]  (slot order i,f,g,o)
-                var allHHost = backend.DownloadBuffer(bufAllH);     // [(S+1), B, Hd] (kernel wrote first S)
-                var allCHost = backend.DownloadBuffer(bufAllC);     // [(S+1), B, Hd]
-                var h0Host = backend.DownloadBuffer(bufH0.Buffer);  // [B, Hd]
-                var c0Host = backend.DownloadBuffer(bufC0.Buffer);  // [B, Hd]
+                var gatesCache = DeferTensorResult<float>(backend, bufGates, S * B * Hd * 4, new[] { S * B * Hd * 4 });
+                var allHCache = DeferTensorResult<float>(backend, bufAllH, (S + 1) * B * Hd, new[] { (S + 1) * B * Hd });
+                var allCCache = DeferTensorResult<float>(backend, bufAllC, (S + 1) * B * Hd, new[] { (S + 1) * B * Hd });
+                cachesHandedOff = true;
 
                 // Differentiable-input array, fixed order input, wIh, wHh, [bIh], [bHh], [h0], [c0].
                 int nInputs = 3 + (bIh is not null ? 1 : 0) + (bHh is not null ? 1 : 0)
@@ -7184,7 +7188,7 @@ public partial class DirectGpuTensorEngine
                 int idxC0 = c0 is not null ? idx : -1; if (c0 is not null) inputsArr[idx++] = (Tensor<float>)(object)c0;
 
                 var meta = new int[] { B, S, In, Hd, returnSequences ? 1 : 0, idxBIh, idxBHh, idxH0, idxC0 };
-                var savedState = new object[] { gatesHost, allHHost, allCHost, h0Host, c0Host, meta };
+                var savedState = new object[] { gatesCache, allHCache, allCCache, meta };
                 Autodiff.DifferentiableOps.RecordIfActive<float>(
                     "LstmSequenceForward", (Tensor<float>)(object)output, inputsArr, LstmSequenceBackwardGpuFloat, savedState);
             }
@@ -7196,7 +7200,22 @@ public partial class DirectGpuTensorEngine
             if (!hFinalHandedOff) bufHf?.Dispose();
             if (!cFinalHandedOff) bufCf?.Dispose();
             if (!sequenceHandedOff) bufOut?.Dispose();
+            if (!cachesHandedOff)
+            {
+                cacheH?.Dispose();
+                cacheC?.Dispose();
+                cacheGates?.Dispose();
+            }
         }
+    }
+
+    // A zero-filled device buffer for an absent state or bias: filled on the device, where a host array of zeros
+    // would be uploaded on every call.
+    private static OwnedBuffer DeviceZeros(IDirectGpuBackend backend, int count)
+    {
+        var buffer = backend.AllocateBuffer(count);
+        backend.Fill(buffer, 0f, count);
+        return new OwnedBuffer(buffer, ownsBuffer: true);
     }
 
     private Tensor<T> LstmSequenceForwardFallback<T>(
@@ -7228,12 +7247,10 @@ public partial class DirectGpuTensorEngine
         Tensor<float> gradOutput, Tensor<float>[] inp, Tensor<float> output,
         object[] savedState, IEngine engine, System.Collections.Generic.Dictionary<Tensor<float>, Tensor<float>> grads)
     {
-        var gatesHost = (float[])savedState[0];
-        var allHHost = (float[])savedState[1];
-        var allCHost = (float[])savedState[2];
-        var h0Host = (float[])savedState[3];
-        var c0Host = (float[])savedState[4];
-        var meta = (int[])savedState[5];
+        var gatesCache = (Tensor<float>)savedState[0];
+        var allHCache = (Tensor<float>)savedState[1];
+        var allCCache = (Tensor<float>)savedState[2];
+        var meta = (int[])savedState[3];
         int B = meta[0], S = meta[1], In = meta[2], Hd = meta[3];
         bool returnSequences = meta[4] != 0;
         int idxBIh = meta[5], idxBHh = meta[6], idxH0 = meta[7], idxC0 = meta[8];
@@ -7242,79 +7259,100 @@ public partial class DirectGpuTensorEngine
         if (engine is not DirectGpuTensorEngine gpu || !gpu.TryGetBackend(out var backend))
             throw new InvalidOperationException("GPU LSTM backward requires the DirectGpu backend.");
 
-        var input = inp[0];
-        var wIh = inp[1];
-        var wHh = inp[2];
-        static float[] Host(Tensor<float> t) => (t.IsContiguous ? t : (Tensor<float>)t.Contiguous()).GetDataArray();
+        static Tensor<float> Dense(Tensor<float> t) => t.IsContiguous ? t : (Tensor<float>)t.Contiguous();
 
-        // gradOutput -> dense [B, S, Hd] b-major. For returnSequences it already is; for the final-hidden
-        // overload ([B, Hd]) scatter it into timestep S-1 (all earlier steps get zero upstream gradient).
-        var goData = Host(gradOutput);
-        var gradOutHost = new float[B * S * Hd];
-        if (returnSequences)
+        // A zero-filled device buffer: the kernel accumulates into its gradient targets, and a missing h0/c0 is zero.
+        IGpuBuffer Zeros(int n)
         {
-            System.Array.Copy(goData, gradOutHost, B * S * Hd);
-        }
-        else
-        {
-            for (int b = 0; b < B; b++)
-                for (int h = 0; h < Hd; h++)
-                    gradOutHost[(b * S + (S - 1)) * Hd + h] = goData[b * Hd + h];
+            var buffer = backend.AllocateBuffer(n);
+            backend.Fill(buffer, 0f, n);
+            return buffer;
         }
 
-        using var bufGradOut = backend.AllocateBuffer(gradOutHost);
-        using var bufAllH = backend.AllocateBuffer(allHHost);
-        using var bufAllC = backend.AllocateBuffer(allCHost);
-        using var bufGates = backend.AllocateBuffer(gatesHost);
-        using var bufH0 = backend.AllocateBuffer(h0Host);
-        using var bufC0 = backend.AllocateBuffer(c0Host);
-        using var bufInput = backend.AllocateBuffer(Host(input));
-        using var bufWih = backend.AllocateBuffer(Host(wIh));
-        using var bufWhh = backend.AllocateBuffer(Host(wHh));
-        // Atomic-add targets — MUST be zeroed (the kernel accumulates). dH0/dC0 are written directly.
-        using var bufGradInput = backend.AllocateBuffer(new float[B * S * In]);
-        using var bufDWih = backend.AllocateBuffer(new float[G * In]);
-        using var bufDWhh = backend.AllocateBuffer(new float[G * Hd]);
-        using var bufDBih = backend.AllocateBuffer(new float[G]);
-        using var bufDBhh = backend.AllocateBuffer(new float[G]);
-        using var bufDH0 = backend.AllocateBuffer(new float[B * Hd]);
-        using var bufDC0 = backend.AllocateBuffer(new float[B * Hd]);
-
-        backend.LstmBackwardSequence(
-            bufGradOut, bufAllH, bufAllC, bufGates, bufH0, bufC0,
-            bufWih, bufWhh, bufInput,
-            bufGradInput, bufDH0, bufDC0, bufDWih, bufDWhh, bufDBih, bufDBhh,
-            S, B, In, Hd);
-        backend.Synchronize();
-
-        void Accum(Tensor<float> key, IGpuBuffer gradBuf, int[] shape)
+        // Every operand stays on the device: the saved caches are device-resident tensors, the upstream gradient and
+        // the weights are already there, and the gradients are handed back as device tensors.
+        using var ownGates = gpu.GetOrAllocateBuffer(backend, gatesCache);
+        using var ownAllH = gpu.GetOrAllocateBuffer(backend, allHCache);
+        using var ownAllC = gpu.GetOrAllocateBuffer(backend, allCCache);
+        using var ownInput = gpu.GetOrAllocateBuffer(backend, Dense(inp[0]));
+        using var ownWih = gpu.GetOrAllocateBuffer(backend, Dense(inp[1]));
+        using var ownWhh = gpu.GetOrAllocateBuffer(backend, Dense(inp[2]));
+        using var ownGradOutput = gpu.GetOrAllocateBuffer(backend, Dense(gradOutput));
+        // Buffers this backward owns: scratch, and gradient buffers not (yet) handed to a tensor. All are released
+        // in the finally, after a Synchronize, whether the step succeeds or throws partway.
+        var transient = new System.Collections.Generic.List<IGpuBuffer>();
+        try
         {
-            int n = 1;
-            for (int d = 0; d < shape.Length; d++) n *= shape[d];
-            // The buffer pool may hand back a buffer larger than the logical size, and DownloadBuffer
-            // returns the full pool-rounded capacity. Truncate to exactly n so the tensor shape matches
-            // ("number of values does not match the specified shape" otherwise).
-            var full = backend.DownloadBuffer(gradBuf);
-            float[] host;
-            if (full.Length == n)
+            IGpuBuffer Transient(IGpuBuffer buffer) { transient.Add(buffer); return buffer; }
+
+            // gradOutput -> dense [B, S, Hd] b-major. For returnSequences it already is; for the final-hidden
+            // overload ([B, Hd]) it lands at timestep S-1 and every earlier step gets zero upstream gradient.
+            IGpuBuffer gradOut;
+            if (returnSequences)
             {
-                host = full;
+                gradOut = ownGradOutput.Buffer;
             }
             else
             {
-                host = new float[n];
-                System.Array.Copy(full, host, n);
+                gradOut = Transient(Zeros(B * S * Hd));
+                backend.Copy2DStrided(ownGradOutput.Buffer, gradOut, B, Hd, S * Hd, (S - 1) * Hd);
             }
-            Autodiff.DifferentiableOps.AccumulateGrad(grads, key, new Tensor<float>(host, shape), engine);
-        }
 
-        Accum(input, bufGradInput, new[] { B, S, In });
-        Accum(wIh, bufDWih, new[] { G, In });
-        Accum(wHh, bufDWhh, new[] { G, Hd });
-        if (idxBIh >= 0) Accum(inp[idxBIh], bufDBih, new[] { G });
-        if (idxBHh >= 0) Accum(inp[idxBHh], bufDBhh, new[] { G });
-        if (idxH0 >= 0) Accum(inp[idxH0], bufDH0, new[] { B, Hd });
-        if (idxC0 >= 0) Accum(inp[idxC0], bufDC0, new[] { B, Hd });
+            var h0 = idxH0 >= 0 ? gpu.GetOrAllocateBuffer(backend, Dense(inp[idxH0])) : default;
+            var c0 = idxC0 >= 0 ? gpu.GetOrAllocateBuffer(backend, Dense(inp[idxC0])) : default;
+            try
+            {
+                var bufH0 = idxH0 >= 0 ? h0.Buffer : Transient(Zeros(B * Hd));
+                var bufC0 = idxC0 >= 0 ? c0.Buffer : Transient(Zeros(B * Hd));
+                var bufGradInput = Transient(Zeros(B * S * In));
+                var bufDWih = Transient(Zeros(G * In));
+                var bufDWhh = Transient(Zeros(G * Hd));
+                var bufDBih = Transient(Zeros(G));
+                var bufDBhh = Transient(Zeros(G));
+                var bufDH0 = Transient(Zeros(B * Hd));
+                var bufDC0 = Transient(Zeros(B * Hd));
+
+                backend.LstmBackwardSequence(
+                    gradOut, ownAllH.Buffer, ownAllC.Buffer, ownGates.Buffer, bufH0, bufC0,
+                    ownWih.Buffer, ownWhh.Buffer, ownInput.Buffer,
+                    bufGradInput, bufDH0, bufDC0, bufDWih, bufDWhh, bufDBih, bufDBhh,
+                    S, B, In, Hd);
+                // The kernel must finish before any buffer it touches is handed off or returns to the pool (h0/c0
+                // uploaded from the host, gradients nobody receives).
+                backend.Synchronize();
+
+                // Each received gradient buffer becomes the device tensor handed to the tape and leaves the cleanup
+                // list; one nobody receives stays on it and is freed in the finally.
+                void Accum(Tensor<float>? key, IGpuBuffer gradBuf, int[] shape)
+                {
+                    if (key is null) return;
+                    int n = 1;
+                    for (int d = 0; d < shape.Length; d++) n *= shape[d];
+                    var gradient = gpu.DeferTensorResult<float>(backend, gradBuf, n, shape);
+                    transient.Remove(gradBuf);
+                    Autodiff.DifferentiableOps.AccumulateGrad(grads, key, gradient, engine);
+                }
+
+                Accum(inp[0], bufGradInput, new[] { B, S, In });
+                Accum(inp[1], bufDWih, new[] { G, In });
+                Accum(inp[2], bufDWhh, new[] { G, Hd });
+                Accum(idxBIh >= 0 ? inp[idxBIh] : null, bufDBih, new[] { G });
+                Accum(idxBHh >= 0 ? inp[idxBHh] : null, bufDBhh, new[] { G });
+                Accum(idxH0 >= 0 ? inp[idxH0] : null, bufDH0, new[] { B, Hd });
+                Accum(idxC0 >= 0 ? inp[idxC0] : null, bufDC0, new[] { B, Hd });
+            }
+            finally
+            {
+                if (idxH0 >= 0) h0.Dispose();
+                if (idxC0 >= 0) c0.Dispose();
+            }
+        }
+        finally
+        {
+            // A throw between the launch and its Synchronize lands here: wait before freeing what the kernel uses.
+            backend.Synchronize();
+            foreach (var buffer in transient) buffer.Dispose();
+        }
     }
 
     // Row-wise softmax over the last axis, GPU-resident.

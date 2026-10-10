@@ -1,3 +1,6 @@
+using AiDotNet.Tensors.Engines.Distributed;
+using AiDotNet.Tensors.Engines.Gpu;
+using AiDotNet.Tensors.LinearAlgebra;
 using System.Collections.Generic;
 
 namespace AiDotNet.Tensors.Engines.Optimization.Optimizers;
@@ -42,13 +45,13 @@ public interface IShardedOptimizer : IOptimizer
 /// ZeRO-1 wrapper: takes any base <see cref="OptimizerBase"/> and partitions its
 /// per-parameter state across <see cref="WorldSize"/> ranks. Each rank's
 /// <see cref="IOptimizer.Step"/> applies the inner optimizer only on the local
-/// param-id slice, then assumes an external all-gather/broadcast brings the
-/// updated parameters back into sync (this matches ZeRO-1's invariants — the
-/// tensor-layer is unaware of the communication primitive itself).
+/// param-id slice. With a process group it then sums group-wide statistics across ranks and broadcasts each
+/// rank's updated shard (ZeRO-1); without one the caller brings the parameters back into sync.
 /// </summary>
 public sealed class ZeroShardedOptimizer : IShardedOptimizer
 {
     private readonly OptimizerBase _inner;
+    private readonly IProcessGroup? _processGroup;
 
     /// <inheritdoc />
     public int Rank { get; }
@@ -64,7 +67,11 @@ public sealed class ZeroShardedOptimizer : IShardedOptimizer
     /// </remarks>
     public IReadOnlyList<int> LocalParamIds => ComputeLocalIds(_inner, Rank, WorldSize);
 
-    /// <summary>Build a sharded optimizer view of <paramref name="inner"/>.</summary>
+    /// <summary>
+    /// Build a sharded optimizer view of <paramref name="inner"/> with no communication: <see cref="Step()"/> updates
+    /// only this rank's shard and the caller brings the other parameters back into sync. An inner optimizer with
+    /// group-wide statistics (D-Adaptation, Prodigy) needs the process-group constructor.
+    /// </summary>
     public ZeroShardedOptimizer(OptimizerBase inner, int rank, int worldSize)
     {
         if (inner == null) throw new System.ArgumentNullException(nameof(inner));
@@ -72,6 +79,17 @@ public sealed class ZeroShardedOptimizer : IShardedOptimizer
         if (rank < 0 || rank >= worldSize) throw new System.ArgumentOutOfRangeException(nameof(rank));
         _inner = inner;
         Rank = rank; WorldSize = worldSize;
+    }
+
+    /// <summary>
+    /// Build a ZeRO-1 optimizer over <paramref name="processGroup"/>: each <see cref="Step()"/> updates this rank's
+    /// shard with its shard of the optimizer state, sums group-wide statistics across ranks, then broadcasts every
+    /// rank's updated shard so all parameters are current on every rank. Every rank must step together.
+    /// </summary>
+    public ZeroShardedOptimizer(OptimizerBase inner, IProcessGroup processGroup)
+        : this(inner, (processGroup ?? throw new System.ArgumentNullException(nameof(processGroup))).Rank, processGroup.WorldSize)
+    {
+        _processGroup = processGroup;
     }
 
     private static IReadOnlyList<int> ComputeLocalIds(OptimizerBase inner, int rank, int worldSize)
@@ -93,73 +111,134 @@ public sealed class ZeroShardedOptimizer : IShardedOptimizer
 
     /// <inheritdoc />
     /// <remarks>
-    /// ZeRO-1 contract: each rank steps only its local parameters; non-local parameters
-    /// (and their state) must not change on this rank — they are owned and updated by
-    /// other ranks, then communicated back via all-gather.
-    ///
-    /// We achieve that without touching every concrete optimizer by snapshotting the
-    /// non-local parameters and their state before delegating to <c>_inner.Step()</c>,
-    /// then restoring them afterwards. Local params + state are updated normally.
+    /// ZeRO-1 contract: each rank computes the update of its own shard only. The inner step
+    /// runs under <see cref="OptimizerBase.StepFilter"/>, so other ranks' parameters, gradients
+    /// and optimizer state are never touched (and their state is never allocated here).
+    /// Group-wide statistics (D-Adapt, Prodigy) are all-reduced through the process group.
+    /// With a process group, each rank then broadcasts its updated shard (one packed
+    /// broadcast per owning rank), so every rank ends the step with every parameter current.
+    /// Without one, an optimizer with group-wide statistics is refused on more than one rank.
     /// </remarks>
-    public void Step()
+    public void Step() => RunLocalStep(_inner.Step);
+
+    /// <summary>
+    /// <see cref="OptimizerBase.Step(IReadOnlyDictionary{Tensor{float}, Tensor{float}})"/> for this rank's shard:
+    /// tensor parameters read their gradients from <paramref name="gradients"/> with no copy.
+    /// </summary>
+    public void Step(IReadOnlyDictionary<Tensor<float>, Tensor<float>> gradients)
     {
-        var localSet = new HashSet<int>(LocalParamIds);
+        if (gradients == null) throw new System.ArgumentNullException(nameof(gradients));
+        RunLocalStep(() => _inner.Step(gradients));
+    }
 
-        // Snapshot non-local params + their gradient (so the inner Step's writes are reversible).
-        var paramSnapshots = new List<(float[] target, float[] saved)>();
-        var gradSnapshots = new List<(float[] target, float[] saved)>();
-        // Snapshot non-local optimizer state (deep clone of the OptimizerStateValue dictionary).
-        var stateSnapshots = new List<(int gi, int pi, Dictionary<string, OptimizerStateValue> saved)>();
-        // Track non-local (gi, pi) keys that had no state before the step. If _inner.Step()
-        // lazily creates state for them, we delete those entries during restoration so the
-        // ZeRO-1 contract holds even when the inner optimizer materialises state on first use.
-        var missingState = new List<(int gi, int pi)>();
+    private void RunLocalStep(System.Action innerStep)
+    {
+        if (_processGroup is null && WorldSize > 1 && _inner.HasGroupStatistics)
+            throw new System.InvalidOperationException(
+                $"{_inner.GetType().Name} adapts its step size from statistics over every parameter of a group, which a " +
+                "rank holding only its shard cannot compute alone. Construct the sharded optimizer with a process group.");
 
-        int globalId = 0;
-        for (int gi = 0; gi < _inner.ParamGroups.Count; gi++)
+        // ZeRO-1: this rank computes the update of its own shard only, with that shard's optimizer state; the others'
+        // parameters, gradients and state are not touched.
+        var owner = OwnerRanks();
+        _inner.StepFilter = (gi, pi) => owner[gi][pi] == Rank;
+        if (_processGroup is not null)
         {
-            var grp = _inner.ParamGroups[gi];
-            for (int pi = 0; pi < grp.Parameters.Count; pi++, globalId++)
+            var group = _processGroup;
+            _inner.GroupStatisticsReducer = statistics =>
             {
-                if (localSet.Contains(globalId)) continue;
-                var p = grp.Parameters[pi];
-                var g = grp.Gradients[pi];
-                paramSnapshots.Add((p, (float[])p.Clone()));
-                gradSnapshots.Add((g, (float[])g.Clone()));
-                if (_inner.StateInternal.TryGetValue((gi, pi), out var slots))
-                    stateSnapshots.Add((gi, pi, CloneSlots(slots)));
-                else
-                    missingState.Add((gi, pi));
-            }
+                var reduced = new Tensor<double>((double[])statistics.Clone(), new[] { statistics.Length });
+                group.AllReduce(reduced, ReduceOp.Sum);
+                for (int i = 0; i < statistics.Length; i++) statistics[i] = reduced.GetFlat(i);
+            };
         }
-
-        // Use try/finally so an exception inside _inner.Step() still rolls back every
-        // non-local mutation and removes any lazy state created during the failed call.
         try
         {
-            _inner.Step();
+            innerStep();
         }
         finally
         {
-            foreach (var (target, saved) in paramSnapshots) System.Array.Copy(saved, target, target.Length);
-            foreach (var (target, saved) in gradSnapshots)  System.Array.Copy(saved, target, target.Length);
-            foreach (var key in missingState)               _inner.StateInternal.Remove(key);
-            foreach (var (gi, pi, saved) in stateSnapshots)
-                _inner.StateInternal[(gi, pi)] = saved;
+            _inner.StepFilter = null;
+            _inner.GroupStatisticsReducer = null;
+        }
+
+        if (_processGroup is not null) BroadcastUpdatedShards(owner);
+    }
+
+    // owner[gi][pi]: the rank that owns group gi's parameter pi (round-robin over global ids, as LocalParamIds).
+    private int[][] OwnerRanks()
+    {
+        var owner = new int[_inner.ParamGroups.Count][];
+        int globalId = 0;
+        for (int gi = 0; gi < owner.Length; gi++)
+        {
+            owner[gi] = new int[_inner.ParamGroups[gi].Parameters.Count];
+            for (int pi = 0; pi < owner[gi].Length; pi++, globalId++) owner[gi][pi] = globalId % WorldSize;
+        }
+        return owner;
+    }
+
+    // Each rank broadcasts its freshly updated shard, packed into one buffer, so every rank ends the step with every
+    // parameter current: the all-gather half of ZeRO-1.
+    private void BroadcastUpdatedShards(int[][] owner)
+    {
+        var group = _processGroup ?? throw new System.InvalidOperationException("No process group.");
+        for (int root = 0; root < WorldSize; root++)
+        {
+            int length = 0;
+            for (int gi = 0; gi < owner.Length; gi++)
+                for (int pi = 0; pi < owner[gi].Length; pi++)
+                    if (owner[gi][pi] == root) length += _inner.ParamGroups[gi].Parameters[pi].Length;
+            if (length == 0) continue;
+
+            var packed = new float[length];
+            if (root == Rank)
+                ForEachOwned(owner, root, (gi, pi, offset, n) => System.Array.Copy(ReadParameter(gi, pi), 0, packed, offset, n));
+            var wire = new Tensor<float>(packed, new[] { length });
+            group.Broadcast(wire, root);
+            if (root == Rank) continue;
+            var received = wire.ToArray();
+            ForEachOwned(owner, root, (gi, pi, offset, n) => WriteParameter(gi, pi, received, offset, n));
         }
     }
 
-    private static Dictionary<string, OptimizerStateValue> CloneSlots(Dictionary<string, OptimizerStateValue> src)
+    private void ForEachOwned(int[][] owner, int root, System.Action<int, int, int, int> visit)
     {
-        var dst = new Dictionary<string, OptimizerStateValue>(src.Count);
-        foreach (var kv in src)
-            dst[kv.Key] = new OptimizerStateValue
+        int offset = 0;
+        for (int gi = 0; gi < owner.Length; gi++)
+            for (int pi = 0; pi < owner[gi].Length; pi++)
             {
-                IntValue = kv.Value.IntValue,
-                FloatValue = kv.Value.FloatValue,
-                Tensor = kv.Value.Tensor == null ? null : (float[])kv.Value.Tensor.Clone(),
-            };
-        return dst;
+                if (owner[gi][pi] != root) continue;
+                int n = _inner.ParamGroups[gi].Parameters[pi].Length;
+                visit(gi, pi, offset, n);
+                offset += n;
+            }
+    }
+
+    // A parameter's current values: a GPU-resident tensor parameter is read from the device, the rest from its array.
+    private float[] ReadParameter(int gi, int pi)
+    {
+        var group = _inner.ParamGroups[gi];
+        var tensor = group.ParameterTensor(pi);
+        if (tensor is not null && group.IsDeviceParameter(pi))
+            return GpuOptimizer.TryDownload(tensor) ?? throw new System.InvalidOperationException("A GPU parameter has no device buffer.");
+        return group.Parameters[pi];
+    }
+
+    private void WriteParameter(int gi, int pi, float[] source, int offset, int count)
+    {
+        var group = _inner.ParamGroups[gi];
+        var tensor = group.ParameterTensor(pi);
+        if (tensor is not null && group.IsDeviceParameter(pi))
+        {
+            var values = new float[count];
+            System.Array.Copy(source, offset, values, 0, count);
+            if (!GpuOptimizer.TryUpload(tensor, values))
+                throw new System.InvalidOperationException("A GPU parameter could not be written.");
+            return;
+        }
+        System.Array.Copy(source, offset, group.Parameters[pi], 0, count);
+        tensor?.MarkModified();
     }
 
     /// <inheritdoc />

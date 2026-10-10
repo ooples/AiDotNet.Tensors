@@ -241,7 +241,43 @@ internal static class DifferentiableOps
     internal static bool IsGradientRequired<T>(Tensor<T> tensor)
     {
         var relevant = GradientRelevance<T>.Current;
-        return relevant is null || relevant.Contains(tensor);
+        if (relevant is not null) return relevant.Contains(tensor);
+        // Without a reachability set, a leaf (no GradFn and not recorded by this tape: the batch, a constant) that
+        // is not a requested source can never pass a gradient on, so its gradient is not computed.
+        var leaves = GradientLeafSources<T>.Current;
+        return leaves is null || tensor.GradFn is not null || leaves.Contains(tensor);
+    }
+
+    // The tensors a backward pass may produce gradients for besides those with a GradFn (requested sources,
+    // retained and hooked tensors, and the tape's recorded outputs), installed when the full reachability set is
+    // skipped as too costly for a small tape.
+    private static class GradientLeafSources<T>
+    {
+        [ThreadStatic]
+        internal static HashSet<Tensor<T>>? Current;
+    }
+
+    /// <summary>Installs the leaf filter for one backward scope; null leaves every gradient required.</summary>
+    internal static GradientLeafSourcesScope<T> PushGradientLeafSources<T>(HashSet<Tensor<T>>? leaves)
+    {
+        var previous = GradientLeafSources<T>.Current;
+        GradientLeafSources<T>.Current = leaves;
+        return new GradientLeafSourcesScope<T>(previous);
+    }
+
+    internal readonly struct GradientLeafSourcesScope<T> : IDisposable
+    {
+        private readonly HashSet<Tensor<T>>? _previous;
+
+        internal GradientLeafSourcesScope(HashSet<Tensor<T>>? previous)
+        {
+            _previous = previous;
+        }
+
+        public void Dispose()
+        {
+            GradientLeafSources<T>.Current = _previous;
+        }
     }
 
     internal readonly struct GradientRelevanceScope<T> : IDisposable
@@ -1045,7 +1081,9 @@ internal static class DifferentiableOps
         }
         else
         {
-            owned = new Tensor<T>(contribution._shape);
+            // The copy overwrites every element, so rent uninitialized: a zeroed fresh array per fan-out
+            // (every residual add hands one gradient to two slots) paid page faults on top of the copy.
+            owned = AiDotNet.Tensors.Helpers.TensorAllocator.RentUninitialized<T>(contribution._shape);
             contribution.CopyTo(owned.AsWritableSpan());
         }
         owners[owned] = destination;
@@ -1084,7 +1122,7 @@ internal static class DifferentiableOps
         // Use the explicit destination API instead of TensorAdd. Besides making
         // ownership unambiguous, this cannot be collapsed by an algebraic/CSE
         // identity when both operands are the same tensor object.
-        var accumulated = new Tensor<T>(existing._shape);
+        var accumulated = AiDotNet.Tensors.Helpers.TensorAllocator.RentUninitialized<T>(existing._shape);
         engine.TensorAddInto(accumulated, existing, contribution);
         return accumulated;
     }

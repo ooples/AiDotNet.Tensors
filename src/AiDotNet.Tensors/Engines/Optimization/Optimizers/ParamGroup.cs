@@ -1,5 +1,7 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
+using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines.Optimization.Optimizers;
 
@@ -18,13 +20,23 @@ namespace AiDotNet.Tensors.Engines.Optimization.Optimizers;
 public sealed class ParamGroup
 {
     private readonly List<float[]> _params = new List<float[]>();
-    private readonly List<float[]> _grads = new List<float[]>();
+    private readonly List<float[]?> _grads = new List<float[]?>();
+    private readonly List<Tensor<float>?> _tensors = new List<Tensor<float>?>();
+    private readonly List<bool> _onDevice = new List<bool>();
+    private readonly GradientList _gradientView;
+
+    /// <summary>Creates an empty group.</summary>
+    public ParamGroup() => _gradientView = new GradientList(this);
 
     /// <summary>Parameters in this group (live references — do not copy).</summary>
     public IReadOnlyList<float[]> Parameters => _params;
 
-    /// <summary>Gradient buffers, one-to-one with <see cref="Parameters"/>.</summary>
-    public IReadOnlyList<float[]> Gradients => _grads;
+    /// <summary>
+    /// Gradient buffers, one-to-one with <see cref="Parameters"/>. A parameter added as a tensor gets its buffer
+    /// on first access here; one stepped through <see cref="OptimizerBase.Step(IReadOnlyDictionary{Tensor{float}, Tensor{float}})"/>
+    /// never needs it.
+    /// </summary>
+    public IReadOnlyList<float[]> Gradients => _gradientView;
 
     /// <summary>Free-form, string-keyed hyper-parameter store (parity with PyTorch dict-shape).</summary>
     public Dictionary<string, double> Options { get; } = new Dictionary<string, double>();
@@ -48,6 +60,91 @@ public sealed class ParamGroup
             throw new ArgumentException("parameter and gradient buffers must be the same length.");
         _params.Add(parameter);
         _grads.Add(gradient);
+        _tensors.Add(null);
+        _onDevice.Add(false);
+    }
+
+    /// <summary>
+    /// Add a parameter tensor, updated in place. Its gradient is taken from the dictionary passed to
+    /// <see cref="OptimizerBase.Step(IReadOnlyDictionary{Tensor{float}, Tensor{float}})"/> — the tape's result,
+    /// with no copy — or from <see cref="Gradients"/> on a plain <see cref="OptimizerBase.Step()"/>. The tensor is
+    /// marked modified after every step that updates it.
+    /// </summary>
+    /// <param name="parameter">A contiguous CPU float tensor that owns its whole storage array.</param>
+    public void AddParameter(Tensor<float> parameter)
+    {
+        if (parameter == null) throw new ArgumentNullException(nameof(parameter));
+        // A GPU-resident tensor is updated on the device by the optimizers with a device kernel for their rule; the
+        // array here is then only the host staging buffer of a host-computed step.
+        bool onDevice = IsDeviceResident(parameter);
+        _params.Add(onDevice ? new float[parameter.Length] : ResolveStorage(parameter));
+        _grads.Add(null);
+        _tensors.Add(parameter);
+        _onDevice.Add(onDevice);
+    }
+
+    /// <summary>True for a tensor parameter that lives on the GPU.</summary>
+    internal bool IsDeviceParameter(int index) => _onDevice[index];
+
+    private static bool IsDeviceResident(Tensor<float> tensor) => tensor.IsGpuResident;
+
+    /// <summary>The tensor a parameter was added as, or null for one added as an array.</summary>
+    internal Tensor<float>? ParameterTensor(int index) => _tensors[index];
+
+    /// <summary>The gradient buffer if it exists, without creating one for a tensor parameter.</summary>
+    internal float[]? PeekGradient(int index) => _grads[index];
+
+    /// <summary>
+    /// Re-reads a tensor parameter's storage before a step: a copy-on-write privatization since the last step
+    /// moves the tensor to a new array, and writing the old one would change the peer it was shared with.
+    /// </summary>
+    internal void RefreshTensorParameters()
+    {
+        for (int i = 0; i < _tensors.Count; i++)
+        {
+            var tensor = _tensors[i];
+            if (tensor is not null && !_onDevice[i]) _params[i] = ResolveStorage(tensor);
+        }
+    }
+
+    private static float[] ResolveStorage(Tensor<float> parameter)
+    {
+        var storage = parameter.GetCpuBackingForContiguousWrite(out int offset);
+        if (storage is null || offset != 0 || storage.Length != parameter.Length)
+            throw new ArgumentException(
+                "An optimizer parameter must be a contiguous CPU tensor that owns its whole storage array " +
+                "(not a view, a slice, or a pooled buffer).", nameof(parameter));
+        return storage;
+    }
+
+    private sealed class GradientList : IReadOnlyList<float[]>
+    {
+        private readonly ParamGroup _group;
+
+        public GradientList(ParamGroup group) => _group = group;
+
+        public int Count => _group._grads.Count;
+
+        public float[] this[int index]
+        {
+            get
+            {
+                var gradient = _group._grads[index];
+                if (gradient is null)
+                {
+                    gradient = new float[_group._params[index].Length];
+                    _group._grads[index] = gradient;
+                }
+                return gradient;
+            }
+        }
+
+        public IEnumerator<float[]> GetEnumerator()
+        {
+            for (int i = 0; i < Count; i++) yield return this[i];
+        }
+
+        IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
     }
 
     /// <summary>Look up an option, falling back to <paramref name="defaultValue"/> if unset.</summary>

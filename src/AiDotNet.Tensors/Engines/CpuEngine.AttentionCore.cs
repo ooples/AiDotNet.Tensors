@@ -40,7 +40,7 @@ public partial class CpuEngine
                 nameof(numHeads));
 
         var shape = new AttentionCoreShape(batch, seqQ, seqK, numHeads, modelQ / numHeads, modelV / numHeads,
-            (float)(scale ?? 1.0 / Math.Sqrt(modelQ / numHeads)), causal);
+            scale ?? 1.0 / Math.Sqrt(modelQ / numHeads), causal);
 
         // The fused kernels are host float32. GPU engines and other element types run the primitive chain, which
         // every backend already differentiates (and a GPU plan can capture).
@@ -92,7 +92,7 @@ public partial class CpuEngine
     /// <summary>Shape and options of one <see cref="MultiHeadAttentionCore{T}"/> call, kept with its graph node.</summary>
     internal sealed class AttentionCoreShape
     {
-        public AttentionCoreShape(int batch, int seqQ, int seqK, int heads, int headDim, int valueDim, float scale, bool causal)
+        public AttentionCoreShape(int batch, int seqQ, int seqK, int heads, int headDim, int valueDim, double scale, bool causal)
         {
             Batch = batch; SeqQ = seqQ; SeqK = seqK; Heads = heads;
             HeadDim = headDim; ValueDim = valueDim; Scale = scale; Causal = causal;
@@ -104,7 +104,10 @@ public partial class CpuEngine
         public int Heads { get; }
         public int HeadDim { get; }
         public int ValueDim { get; }
-        public float Scale { get; }
+        /// <summary>The softmax scale at full precision: the decomposed path runs in the tensor's own type.</summary>
+        public double Scale { get; }
+        /// <summary>The scale the fused host float32 kernels use.</summary>
+        public float ScaleF => (float)Scale;
         public bool Causal { get; }
         public int QueryWidth => Heads * HeadDim;
         public int ValueWidth => Heads * ValueDim;
@@ -122,8 +125,24 @@ public partial class CpuEngine
         var q4 = TensorPermute(Reshape(query, new[] { s.Batch, s.SeqQ, s.Heads, s.HeadDim }), new[] { 0, 2, 1, 3 });
         var k4 = TensorPermute(Reshape(key, new[] { s.Batch, s.SeqK, s.Heads, s.HeadDim }), new[] { 0, 2, 1, 3 });
         var v4 = TensorPermute(Reshape(value, new[] { s.Batch, s.SeqK, s.Heads, s.ValueDim }), new[] { 0, 2, 1, 3 });
+        if (!s.Causal)
+        {
+            // softmax(scale * q k^T) v through batched matmuls and a row softmax: primitives every engine keeps on its
+            // own device under the tape. ScaledDotProductAttention with its weights output runs on the host on a GPU
+            // engine, so a GPU training step through it crossed the device boundary on every call.
+            int bh = s.Batch * s.Heads;
+            var q3 = Reshape(q4, new[] { bh, s.SeqQ, s.HeadDim });
+            var k3 = Reshape(k4, new[] { bh, s.SeqK, s.HeadDim });
+            var v3 = Reshape(v4, new[] { bh, s.SeqK, s.ValueDim });
+            var scores = TensorMultiplyScalar(BatchMatMul(q3, TensorPermute(k3, new[] { 0, 2, 1 })),
+                MathHelper.GetNumericOperations<T>().FromDouble(s.Scale));
+            var weighted = BatchMatMul(Softmax(scores, -1), v3);
+            return Reshape(
+                TensorPermute(Reshape(weighted, new[] { s.Batch, s.Heads, s.SeqQ, s.ValueDim }), new[] { 0, 2, 1, 3 }),
+                new[] { s.Batch, s.SeqQ, s.ValueWidth });
+        }
+
         Tensor<bool>? mask = null;
-        if (s.Causal)
         {
             var allowed = new bool[s.Batch * s.Heads * s.SeqQ * s.SeqK];
             for (int bh = 0; bh < s.Batch * s.Heads; bh++)
@@ -186,7 +205,7 @@ public partial class CpuEngine
                 int rows = Math.Min(br, s.SeqQ - i0);
                 for (int r = 0; r < rows; r++)
                 {
-                    ScaleCopy(q, qBase + (i0 + r) * qw, qs, r * hd, hd, s.Scale);
+                    ScaleCopy(q, qBase + (i0 + r) * qw, qs, r * hd, hd, s.ScaleF);
                     rowMax[r] = float.NegativeInfinity;
                     rowSum[r] = 0f;
                 }
@@ -364,7 +383,7 @@ public partial class CpuEngine
                 int rows = Math.Min(br, s.SeqQ - i0);
                 for (int r = 0; r < rows; r++)
                 {
-                    ScaleCopy(q, qBase + (i0 + r) * qw, qs, r * hd, hd, s.Scale);
+                    ScaleCopy(q, qBase + (i0 + r) * qw, qs, r * hd, hd, s.ScaleF);
                     delta[r] = Dot(dO, dOBase + (i0 + r) * vw, o, oBase + (i0 + r) * vw, vd);
                 }
                 Array.Clear(dq, 0, rows * hd);
@@ -408,7 +427,7 @@ public partial class CpuEngine
                 if (dQ.Array is not null)
                     for (int r = 0; r < rows; r++)
                         StoreRow(dq, r * hd, dQ.Array, dQ.Offset + b * s.SeqQ * qw + (i0 + r) * qw + h * hd, hd,
-                            s.Scale, dQ.Overwrite);
+                            s.ScaleF, dQ.Overwrite);
             }
             if (dK.Array is not null)
                 for (int j = 0; j < s.SeqK; j++)

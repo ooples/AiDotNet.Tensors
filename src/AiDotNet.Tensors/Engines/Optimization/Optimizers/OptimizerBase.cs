@@ -1,5 +1,8 @@
 using System;
+using System.Buffers;
 using System.Collections.Generic;
+using AiDotNet.Tensors.Helpers;
+using AiDotNet.Tensors.LinearAlgebra;
 
 namespace AiDotNet.Tensors.Engines.Optimization.Optimizers;
 
@@ -42,6 +45,308 @@ public abstract class OptimizerBase : IOptimizer
     /// <inheritdoc />
     public abstract void Step();
 
+    // Elements per parallel chunk of an element-wise update. Fixed (not derived from the core count) and the update
+    // is element-wise, so the result does not depend on the thread count.
+    private protected const int ElementwiseChunk = 64 * 1024;
+
+    // The gradients bound by Step(gradients), keyed by parameter tensor; null outside that call.
+    private IReadOnlyDictionary<Tensor<float>, Tensor<float>>? _boundGradients;
+
+    // The pooled buffer holding the current parameter's effective gradient (negated for maximize, plus coupled weight
+    // decay) or a contiguous copy of a strided one. Returned when the next parameter needs one and when a step ends.
+    private float[]? _gradientScratch;
+
+    // Negated sparse values for a maximize group; grown, never shrunk.
+    private float[] _sparseScratch = Array.Empty<float>();
+
+    /// <summary>
+    /// Which parameters a step updates, as (group index, parameter index) → true; null updates every parameter.
+    /// Set by <see cref="ZeroShardedOptimizer"/> to restrict a step to its rank's shard.
+    /// </summary>
+    internal Func<int, int, bool>? StepFilter { get; set; }
+
+    /// <summary>
+    /// Combines a group-wide statistic across ranks in place (a sum). Set by <see cref="ZeroShardedOptimizer"/> so an
+    /// optimizer whose update depends on statistics over every parameter of a group (<see cref="HasGroupStatistics"/>)
+    /// sees the whole group while each rank steps only its shard.
+    /// </summary>
+    internal Action<double[]>? GroupStatisticsReducer { get; set; }
+
+    /// <summary>True when an update reads statistics summed over all of a group's parameters (D-Adaptation, Prodigy).</summary>
+    internal virtual bool HasGroupStatistics => false;
+
+    /// <summary>Sums <paramref name="statistics"/> across ranks when the step is sharded; a no-op otherwise.</summary>
+    private protected void ReduceGroupStatistics(double[] statistics) => GroupStatisticsReducer?.Invoke(statistics);
+
+    /// <summary>
+    /// One optimization step that reads each tensor parameter's gradient straight from <paramref name="gradients"/>
+    /// (typically the dictionary <c>GradientTape.ComputeGradients</c> returns), with no copy into
+    /// <see cref="ParamGroup.Gradients"/>. A tensor parameter missing from the dictionary is skipped, as PyTorch skips a
+    /// parameter whose <c>.grad</c> is <c>None</c>. Parameters added as arrays keep reading their own gradient buffers.
+    /// The gradients are never written.
+    /// </summary>
+    /// <param name="gradients">Gradient per parameter tensor; each must have its parameter's element count.</param>
+    public void Step(IReadOnlyDictionary<Tensor<float>, Tensor<float>> gradients)
+    {
+        if (gradients == null) throw new ArgumentNullException(nameof(gradients));
+        _boundGradients = gradients;
+        try { Step(); }
+        finally { _boundGradients = null; }
+    }
+
+    // Device parameters a host-computed step downloaded into their staging arrays; written back when the step ends.
+    private readonly List<(Tensor<float> Tensor, float[] Staging)> _stagedDeviceParameters =
+        new List<(Tensor<float> Tensor, float[] Staging)>();
+
+    /// <summary>
+    /// The host array the update of <c>group[gi].param[pi]</c> writes. For a GPU-resident parameter the optimizer
+    /// had no device kernel for, that is a staging copy downloaded now and written back to the device when the step
+    /// ends (recorded as a fallback: correct, but it crosses the device boundary).
+    /// </summary>
+    private protected float[] HostParameter(int gi, int pi)
+    {
+        var group = _groups[gi];
+        var parameter = group.Parameters[pi];
+        var tensor = group.ParameterTensor(pi);
+        if (tensor is null || !group.IsDeviceParameter(pi)) return parameter;
+        var current = Gpu.GpuOptimizer.TryDownload(tensor)
+            ?? throw new InvalidOperationException("A GPU parameter has no device buffer to update.");
+        Array.Copy(current, parameter, parameter.Length);
+        _stagedDeviceParameters.Add((tensor, parameter));
+        DirectGpu.GpuLaunchProbe.OnFallback($"{GetType().Name}-host-step-of-a-device-parameter", null);
+        return parameter;
+    }
+
+    /// <summary>
+    /// Runs this step's update of <c>group[gi].param[pi]</c> on the GPU when the parameter and its gradient are both
+    /// there and the optimizer has a device kernel for its configuration; false sends it down the host path.
+    /// </summary>
+    private protected bool StepOnDevice(int gi, int pi)
+    {
+        var group = _groups[gi];
+        var tensor = group.ParameterTensor(pi);
+        if (tensor is null || !group.IsDeviceParameter(pi) || _boundGradients is null || HasSparseGradient(gi, pi))
+            return false;
+        if (!_boundGradients.TryGetValue(tensor, out var gradient) || !gradient.IsGpuResident) return false;
+        if (gradient.Length != tensor.Length)
+            throw new ArgumentException(
+                $"A gradient has {gradient.Length} elements but its parameter has {tensor.Length}.", "gradients");
+        if (!(AiDotNetEngine.Current is DirectGpuTensorEngine engine)) return false;
+        // The kernels descend; ascent descends the negated gradient (a new device tensor, the caller's is untouched).
+        if (group.GetOption("maximize", 0.0) != 0.0) gradient = engine.TensorNegate(gradient);
+        return TryStepOnDevice(gi, pi, tensor, gradient);
+    }
+
+    /// <summary>
+    /// The optimizer's device update of one GPU parameter with a GPU gradient (maximize already applied), using
+    /// <see cref="DeviceState"/> for its state. False when it has no kernel for the group's configuration.
+    /// </summary>
+    private protected virtual bool TryStepOnDevice(int gi, int pi, Tensor<float> parameter, Tensor<float> gradient)
+        => false;
+
+    /// <summary>
+    /// The state record of a device-stepped parameter: scalars on the host as usual, every buffer slot a GPU tensor
+    /// (<see cref="OptimizerStateValue.DeviceTensor"/>), created zeroed or uploaded from a host value it already had.
+    /// </summary>
+    private protected Dictionary<string, OptimizerStateValue> DeviceState(int gi, int pi, int length)
+    {
+        var slot = GetOrCreateStateRecord(gi, pi, length, onDevice: true);
+        foreach (var value in slot.Values)
+        {
+            if (value.DeviceTensor is not null) continue;
+            if (value.Tensor is not null)
+            {
+                var device = Gpu.GpuOptimizer.CreateStateTensor(new[] { value.Tensor.Length });
+                if (!Gpu.GpuOptimizer.TryUpload(device, value.Tensor))
+                    throw new InvalidOperationException("Optimizer state could not be placed on the GPU.");
+                value.DeviceTensor = device;
+                value.Tensor = null;
+            }
+        }
+        return slot;
+    }
+
+    /// <summary>A device state record's GPU buffer for <paramref name="name"/>.</summary>
+    private protected static Tensor<float> DeviceSlot(Dictionary<string, OptimizerStateValue> slot, string name)
+        => slot[name].DeviceTensor ?? throw new InvalidOperationException($"State '{name}' is not on the GPU.");
+
+    // Moves every device-resident buffer of a state record back to the host (a host step is about to read it).
+    private static void MoveStateToHost(Dictionary<string, OptimizerStateValue> slot)
+    {
+        foreach (var value in slot.Values)
+        {
+            if (value.DeviceTensor is null) continue;
+            value.Tensor = Gpu.GpuOptimizer.TryDownload(value.DeviceTensor) ?? value.DeviceTensor.ToArray();
+            value.DeviceTensor = null;
+        }
+    }
+
+    /// <summary>Starts a step: re-reads tensor parameters' storage. Every <see cref="Step()"/> calls it first.</summary>
+    private protected void BeginStep()
+    {
+        foreach (var group in _groups) group.RefreshTensorParameters();
+    }
+
+    /// <summary>
+    /// Ends a step (from a <c>finally</c>): marks every updated tensor parameter modified, so data derived from it
+    /// (packed weights, device copies) is refreshed, and drops this step's sparse gradients and scratch.
+    /// </summary>
+    private protected void EndStep()
+    {
+        for (int gi = 0; gi < _groups.Count; gi++)
+        {
+            var group = _groups[gi];
+            for (int pi = 0; pi < group.Parameters.Count; pi++)
+            {
+                // A device-stepped parameter was marked current on the device by its kernel; marking it modified
+                // here would make the stale host copy look newer.
+                var tensor = group.ParameterTensor(pi);
+                if (tensor is not null && !group.IsDeviceParameter(pi) && ShouldStep(gi, pi)) tensor.MarkModified();
+            }
+        }
+        foreach (var (tensor, staging) in _stagedDeviceParameters)
+            if (!Gpu.GpuOptimizer.TryUpload(tensor, staging))
+                throw new InvalidOperationException("A GPU parameter's host-computed update could not be written back.");
+        _stagedDeviceParameters.Clear();
+        ReturnGradientScratch();
+        ClearAutoClearSparseGrads();
+    }
+
+    /// <summary>
+    /// Whether this step updates <c>group[gi].param[pi]</c>: false outside the <see cref="StepFilter"/> shard, and for
+    /// a tensor parameter that <see cref="Step(IReadOnlyDictionary{Tensor{float}, Tensor{float}})"/> was given no
+    /// gradient for.
+    /// </summary>
+    private protected bool ShouldStep(int gi, int pi)
+    {
+        if (StepFilter is not null && !StepFilter(gi, pi)) return false;
+        var tensor = _groups[gi].ParameterTensor(pi);
+        return tensor is null || _boundGradients is null || _boundGradients.ContainsKey(tensor);
+    }
+
+    /// <summary>A read-only gradient: <see cref="Length"/> elements of <see cref="Array"/> from <see cref="Offset"/>.</summary>
+    private protected readonly struct GradientBuffer
+    {
+        public GradientBuffer(float[] array, int offset, int length)
+        {
+            Array = array;
+            Offset = offset;
+            Length = length;
+        }
+
+        public float[] Array { get; }
+
+        public int Offset { get; }
+
+        public int Length { get; }
+
+        public ReadOnlySpan<float> Span => new ReadOnlySpan<float>(Array, Offset, Length);
+    }
+
+    /// <summary>
+    /// The dense gradient the update of <c>group[gi].param[pi]</c> reads: the bound tensor's storage (or a contiguous
+    /// copy of a strided one) or the group's gradient buffer — negated when the group maximizes, plus
+    /// <paramref name="coupledWeightDecay"/>·parameter for L2-coupled weight decay (PyTorch's
+    /// <c>grad = grad.add(param, alpha=weight_decay)</c>). Those two land in scratch: the caller's gradient is never
+    /// written. Valid until the next call or the end of the step.
+    /// </summary>
+    private protected GradientBuffer DenseGradient(int gi, int pi, float[] parameter, float coupledWeightDecay = 0f)
+    {
+        var group = _groups[gi];
+        int length = parameter.Length;
+        float[] source;
+        int offset = 0;
+        var tensor = group.ParameterTensor(pi);
+        if (tensor is not null && _boundGradients is not null)
+        {
+            if (!_boundGradients.TryGetValue(tensor, out var bound))
+                throw new InvalidOperationException("No gradient was given for this parameter; ShouldStep skips it.");
+            if (bound.Length != length)
+                throw new ArgumentException(
+                    $"A gradient has {bound.Length} elements but its parameter has {length}.", "gradients");
+            var backing = bound.IsContiguous ? bound.GetCpuBackingForStridedRead(out offset) : null;
+            if (backing is null)
+            {
+                source = RentGradientScratch(length);
+                bound.CopyLogicalTo(new Span<float>(source, 0, length));
+                offset = 0;
+            }
+            else
+            {
+                source = backing;
+            }
+        }
+        else
+        {
+            source = group.Gradients[pi];
+        }
+
+        bool negate = group.GetOption("maximize", 0.0) != 0.0;
+        if (!negate && coupledWeightDecay == 0f) return new GradientBuffer(source, offset, length);
+
+        var effective = ReferenceEquals(source, _gradientScratch) ? source : RentGradientScratch(length);
+        float sign = negate ? -1f : 1f;
+        int sourceOffset = offset;
+        ForEachChunk(length, (start, count) =>
+            SignedAddScaled(source, sourceOffset + start, parameter, start, effective, start, count, sign, coupledWeightDecay));
+        return new GradientBuffer(effective, 0, length);
+    }
+
+    // destination[i] = sign·gradient[i] + decay·parameter[i], rounded per operation as the scalar form is.
+    private static void SignedAddScaled(float[] gradient, int gradientOffset, float[] parameter, int parameterOffset,
+        float[] destination, int destinationOffset, int count, float sign, float decay)
+    {
+        int i = 0;
+        int width = System.Numerics.Vector<float>.Count;
+        if (System.Numerics.Vector.IsHardwareAccelerated)
+        {
+            var signVector = new System.Numerics.Vector<float>(sign);
+            var decayVector = new System.Numerics.Vector<float>(decay);
+            for (; i <= count - width; i += width)
+            {
+                var g = new System.Numerics.Vector<float>(gradient, gradientOffset + i) * signVector;
+                var p = new System.Numerics.Vector<float>(parameter, parameterOffset + i) * decayVector;
+                (g + p).CopyTo(destination, destinationOffset + i);
+            }
+        }
+        for (; i < count; i++)
+            destination[destinationOffset + i] = sign * gradient[gradientOffset + i] + decay * parameter[parameterOffset + i];
+    }
+
+    /// <summary>How many times a step has rented gradient scratch (one per parameter that needs it), for tests.</summary>
+    internal int GradientScratchRentals { get; private set; }
+
+    private float[] RentGradientScratch(int length)
+    {
+        GradientScratchRentals++;
+        ReturnGradientScratch();
+        _gradientScratch = ArrayPool<float>.Shared.Rent(length);
+        return _gradientScratch;
+    }
+
+    private void ReturnGradientScratch()
+    {
+        if (_gradientScratch is null) return;
+        ArrayPool<float>.Shared.Return(_gradientScratch);
+        _gradientScratch = null;
+    }
+
+    /// <summary>Runs <paramref name="body"/>(start, count) over fixed chunks of <paramref name="length"/> across the pool.</summary>
+    private protected static void ForEachChunk(int length, Action<int, int> body)
+    {
+        int chunks = (length + ElementwiseChunk - 1) / ElementwiseChunk;
+        if (chunks <= 1)
+        {
+            body(0, length);
+            return;
+        }
+        CpuParallelSettings.ParallelForOrSerial(0, chunks, (long)length * 4, c =>
+        {
+            int start = c * ElementwiseChunk;
+            body(start, Math.Min(ElementwiseChunk, length - start));
+        }, deterministicSafe: true);
+    }
+
     /// <summary>Add a parameter group; <paramref name="overrides"/> override <see cref="Defaults"/>.</summary>
     public ParamGroup AddParamGroup(IDictionary<string, double>? overrides = null)
     {
@@ -64,6 +369,14 @@ public abstract class OptimizerBase : IOptimizer
     /// <summary>Get or lazily create the state record for <c>group[gi].param[pi]</c>.</summary>
     protected Dictionary<string, OptimizerStateValue> GetOrCreateState(int gi, int pi, int paramLen)
     {
+        var slot = GetOrCreateStateRecord(gi, pi, paramLen);
+        MoveStateToHost(slot);
+        return slot;
+    }
+
+    // The state record without moving its buffers anywhere; new buffer slots are zeroed on the host.
+    private Dictionary<string, OptimizerStateValue> GetOrCreateStateRecord(int gi, int pi, int paramLen, bool onDevice = false)
+    {
         var key = (gi, pi);
         if (_state.TryGetValue(key, out var dict)) return dict;
         dict = new Dictionary<string, OptimizerStateValue>();
@@ -74,6 +387,8 @@ public abstract class OptimizerBase : IOptimizer
                 dict[name] = OptimizerStateValue.FromInt(0);
             else if (scalarSet.Contains(name))
                 dict[name] = OptimizerStateValue.FromFloat(0f);
+            else if (onDevice)
+                dict[name] = new OptimizerStateValue { DeviceTensor = Gpu.GpuOptimizer.CreateStateTensor(new[] { paramLen }) };
             else
                 dict[name] = OptimizerStateValue.FromTensor(new float[paramLen]);
         }
@@ -85,8 +400,11 @@ public abstract class OptimizerBase : IOptimizer
     public void ZeroGrad()
     {
         foreach (var g in _groups)
-            for (int i = 0; i < g.Gradients.Count; i++)
-                Array.Clear(g.Gradients[i], 0, g.Gradients[i].Length);
+            for (int i = 0; i < g.Parameters.Count; i++)
+            {
+                var gradient = g.PeekGradient(i);
+                if (gradient is not null) Array.Clear(gradient, 0, gradient.Length);
+            }
     }
 
     // ------------------------------------------------------------------
@@ -144,6 +462,13 @@ public abstract class OptimizerBase : IOptimizer
             idx = pair.idx;
             val = pair.val;
             nnz = pair.idx.Length;
+            if (_groups[paramGroupIndex].GetOption("maximize", 0.0) != 0.0)
+            {
+                // Ascent: hand the update negated values, leaving the published ones untouched.
+                if (_sparseScratch.Length < nnz) _sparseScratch = new float[nnz];
+                for (int k = 0; k < nnz; k++) _sparseScratch[k] = -pair.val[k];
+                val = _sparseScratch;
+            }
             return true;
         }
         idx = null!;
@@ -195,6 +520,7 @@ public abstract class OptimizerBase : IOptimizer
     /// in-place so the downstream descent kernel performs an ascent step. Gradients are written
     /// back to their original sign at the end of <see cref="Step"/> via <see cref="UnflipMaximize"/>.</summary>
     /// <returns>True if any group had maximize active (caller must call <see cref="UnflipMaximize"/>).</returns>
+    [Obsolete("Writes the caller's gradients. The built-in optimizers read DenseGradient, which negates into scratch.")]
     protected bool ApplyMaximize()
     {
         bool any = false;
@@ -213,6 +539,7 @@ public abstract class OptimizerBase : IOptimizer
     }
 
     /// <summary>Restore the original sign of gradients flipped by <see cref="ApplyMaximize"/>.</summary>
+    [Obsolete("Pairs with ApplyMaximize; the built-in optimizers no longer flip gradients in place.")]
     protected void UnflipMaximize()
     {
         for (int gi = 0; gi < _groups.Count; gi++)
@@ -273,7 +600,10 @@ public abstract class OptimizerBase : IOptimizer
                         {
                             IntValue = v.IntValue,
                             FloatValue = v.FloatValue,
-                            Tensor = v.Tensor == null ? null : (float[])v.Tensor.Clone()
+                            // A device-resident buffer is read back; the saved dict is always host data.
+                            Tensor = v.DeviceTensor is not null
+                                ? Gpu.GpuOptimizer.TryDownload(v.DeviceTensor) ?? v.DeviceTensor.ToArray()
+                                : v.Tensor == null ? null : (float[])v.Tensor.Clone()
                         };
                     }
                     sd.State[id] = copy;
@@ -326,6 +656,7 @@ public abstract class OptimizerBase : IOptimizer
                 // sharded / partial state-dict loads.
                 int id = gs.ParamIds[pi];
                 if (!state.State.TryGetValue(id, out var slots)) continue;
+                // Host-side: a device parameter's next device step uploads what is loaded here.
                 var dst = GetOrCreateState(gi, pi, group.Parameters[pi].Length);
                 foreach (var kv in slots)
                 {
