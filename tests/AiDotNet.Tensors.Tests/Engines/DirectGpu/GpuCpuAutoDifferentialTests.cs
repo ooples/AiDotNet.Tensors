@@ -634,6 +634,10 @@ public sealed class GpuCpuAutoDifferentialTests : IClassFixture<GpuCpuAutoDiffer
     // TODO(gpu-correctness): add dedicated GPU-vs-CPU tests for these and remove them from the list.
     private static readonly HashSet<string> DedicatedlyCovered = new(StringComparer.Ordinal)
     {
+        // Advanced indexing and grouped / scaled-grouped GEMM: TorchParityGpuCorrectnessTests.
+        "TensorIndex(Tensor<T>,Tensor<Int32>[])",
+        "TensorGroupedMatMul(Tensor<T>,Tensor<T>,Tensor<Int32>,Tensor<T>)",
+        "TensorScaledGroupedMatMul(Tensor<T>,Tensor<T>,Tensor<T>,ScalingRecipe,Tensor<T>,ScalingRecipe,ScaleSwizzle,ScaleSwizzle,Tensor<T>,Tensor<Int32>)",
         // PyTorch-parity ops the generic harness cannot drive (constant constructors, integer-valued operands,
         // shape-coupled convolution/pooling/sampling): TorchParityGpuCorrectnessTests, GPU vs CPU per op.
         "TensorAdaptiveAvgPool3D(Tensor<T>,Int32[])",

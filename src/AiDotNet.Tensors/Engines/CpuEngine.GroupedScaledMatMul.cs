@@ -211,64 +211,67 @@ public partial class CpuEngine
 
     // A grouped operand: a 3-D operand is G matrices, each with its slice of the scales; a 2-D one is one matrix, except
     // with a jagged contraction dimension, where row-wise scales are per group ([G, M] for a, [G, N] for b).
+    // Everything is engine ops: the scales are never read on the host, so a GPU engine keeps them on the device.
     private static Tensor<T> DequantizeGrouped<T>(IEngine e, Tensor<T> x, Tensor<T> scale, ScalingRecipe recipe, ScaleSwizzle swizzle,
         bool rightOperand, Tensor<int>? jaggedKOffsets)
     {
         if (x.Rank == 2 && jaggedKOffsets is null) return Dequantize(e, x, scale, recipe, swizzle, rightOperand);
-        var numOps = MathHelper.GetNumericOperations<T>();
         if (x.Rank == 2)
         {
             if (recipe == ScalingRecipe.TensorWise) return Dequantize(e, x, scale, recipe, swizzle, rightOperand);
             // Row-wise per group along the jagged K: a [M, Ktot] with scale [G, M]; b [Ktot, N] with scale [G, N].
             var ends = jaggedKOffsets!.AsSpan().ToArray();
-            var full = new Tensor<T>(x._shape);
-            var fs = full.AsWritableSpan();
-            var ss = (scale.IsContiguous ? scale : scale.Contiguous()).AsSpan();
             int rows = x._shape[0], cols = x._shape[1], per = rightOperand ? cols : rows;
-            int start = 0;
+            var scales = e.Reshape(scale, new[] { ends.Length, per });
+            var parts = new List<Tensor<T>>();
+            int start = 0, kTotal = rightOperand ? rows : cols;
             for (int g = 0; g < ends.Length; g++)
             {
-                for (int kk = start; kk < ends[g]; kk++)
-                    for (int o = 0; o < per; o++)
-                    {
-                        T s = ss[g * per + o];
-                        if (rightOperand) fs[kk * cols + o] = s; else fs[o * cols + kk] = s;
-                    }
+                int len = ends[g] - start;
+                if (len > 0)
+                {
+                    var row = e.TensorNarrow(scales, 0, g, 1);                                   // [1, per]
+                    var slice = rightOperand ? e.TensorNarrow(x, 0, start, len) : e.TensorNarrow(x, 1, start, len);
+                    var s = rightOperand
+                        ? e.TensorBroadcastTo(row, new[] { len, per })                              // scale each column of b
+                        : e.TensorBroadcastTo(e.Reshape(row, new[] { per, 1 }), new[] { per, len }); // scale each row of a
+                    parts.Add(e.TensorMultiply(slice, s));
+                }
                 start = ends[g];
             }
-            return e.TensorMultiply(x, full);
+            if (start < kTotal)
+                parts.Add(rightOperand ? e.TensorNarrow(x, 0, start, kTotal - start) : e.TensorNarrow(x, 1, start, kTotal - start));
+            return parts.Count == 1 ? parts[0] : e.TensorConcatenate(parts.ToArray(), rightOperand ? 0 : 1);
         }
         // 3-D: G matrices; the scales have a leading G axis (none for tensor-wise).
         int groups = x._shape[0];
         var slices = new Tensor<T>[groups];
         int perGroup = recipe == ScalingRecipe.TensorWise ? 0 : scale.Length / groups;
-        var scaleFlat = scale.IsContiguous ? scale : scale.Contiguous();
+        var flatScale = recipe == ScalingRecipe.TensorWise ? scale : e.Reshape(scale, new[] { scale.Length });
         for (int g = 0; g < groups; g++)
         {
             var mat = e.Reshape(e.TensorNarrow(x, 0, g, 1), new[] { x._shape[1], x._shape[2] });
-            var s = recipe == ScalingRecipe.TensorWise ? scale : e.Reshape(e.TensorNarrow(e.Reshape(scaleFlat, new[] { scale.Length }), 0, g * perGroup, perGroup), new[] { perGroup });
+            var s = recipe == ScalingRecipe.TensorWise ? scale : e.TensorNarrow(flatScale, 0, g * perGroup, perGroup);
             slices[g] = e.Reshape(Dequantize(e, mat, s, recipe, swizzle, rightOperand), new[] { 1, x._shape[1], x._shape[2] });
         }
-        _ = numOps;
         return groups == 1 ? slices[0] : e.TensorConcatenate(slices, 0);
     }
 
     /// <summary>
     /// <paramref name="x"/> times its decoding scales. The left operand is [M, K]; the right operand is [K, N] and its
-    /// block scales are laid out over its transpose [N, K], as torch passes it (column-major).
+    /// block scales are laid out over its transpose [N, K], as torch passes it (column-major). Engine ops only.
     /// </summary>
     private static Tensor<T> Dequantize<T>(IEngine e, Tensor<T> x, Tensor<T> scale, ScalingRecipe recipe, ScaleSwizzle swizzle, bool rightOperand)
     {
         if (scale is null) throw new ArgumentNullException(nameof(scale));
         int rows = x._shape[0], cols = x._shape[1];
-        // The operand as [outer, K]: the left operand's rows, the right operand's columns.
-        int outer = rightOperand ? cols : rows, k = rightOperand ? rows : cols;
         if (recipe == ScalingRecipe.TensorWise)
         {
             if (scale.Length != 1) throw new ArgumentException("A tensor-wise scale is a single value.", nameof(scale));
-            var s0 = (scale.IsContiguous ? scale : scale.Contiguous()).AsSpan()[0];
-            return e.TensorMultiplyScalar(x, s0);
+            return e.TensorMultiply(x, e.TensorBroadcastTo(e.Reshape(scale, new[] { 1, 1 }), x._shape));
         }
+        // The operand as [outer, K]: the left operand's rows, the right operand's columns.
+        int outer = rightOperand ? cols : rows, k = rightOperand ? rows : cols;
         int blockOuter, blockK;
         switch (recipe)
         {
@@ -280,42 +283,39 @@ public partial class CpuEngine
             default: throw new ArgumentOutOfRangeException(nameof(recipe));
         }
         int scaleRows = (outer + blockOuter - 1) / blockOuter, scaleCols = (k + blockK - 1) / blockK;
-        var logical = UnswizzleScales(scale, scaleRows, scaleCols, swizzle);
-        var full = new Tensor<T>(x._shape);
-        var fs = full.AsWritableSpan();
-        for (int o = 0; o < outer; o++)
-            for (int kk = 0; kk < k; kk++)
-            {
-                T s = logical[(o / blockOuter) * scaleCols + kk / blockK];
-                if (rightOperand) fs[kk * cols + o] = s; else fs[o * cols + kk] = s;
-            }
+        var logical = LogicalScales(e, scale, scaleRows, scaleCols, swizzle);                 // [scaleRows, scaleCols]
+        // Expand every scale over its block: [sr, 1, sc, 1] -> [sr, bo, sc, bk] -> [sr*bo, sc*bk], then cut to [outer, K].
+        var expanded = e.Reshape(
+            e.TensorBroadcastTo(e.Reshape(logical, new[] { scaleRows, 1, scaleCols, 1 }), new[] { scaleRows, blockOuter, scaleCols, blockK }),
+            new[] { scaleRows * blockOuter, scaleCols * blockK });
+        if (scaleRows * blockOuter != outer) expanded = e.TensorNarrow(expanded, 0, 0, outer);
+        if (scaleCols * blockK != k) expanded = e.TensorNarrow(expanded, 1, 0, k);
+        var full = rightOperand ? e.TensorTranspose(expanded) : expanded;                       // to x's own [rows, cols]
         return e.TensorMultiply(x, full);
     }
 
-    /// <summary>The [rows, cols] scale matrix in row-major order, from its stored layout.</summary>
-    private static T[] UnswizzleScales<T>(Tensor<T> scale, int rows, int cols, ScaleSwizzle swizzle)
+    /// <summary>The [rows, cols] scale matrix from its stored layout, by engine ops (a gather for the swizzled one).</summary>
+    private static Tensor<T> LogicalScales<T>(IEngine e, Tensor<T> scale, int rows, int cols, ScaleSwizzle swizzle)
     {
-        var s = (scale.IsContiguous ? scale : scale.Contiguous()).AsSpan();
-        var logical = new T[rows * cols];
         if (swizzle == ScaleSwizzle.None)
         {
-            if (s.Length != rows * cols)
-                throw new ArgumentException($"Expected {rows * cols} scales ([{rows}, {cols}]); got {s.Length}.", nameof(scale));
-            s.CopyTo(logical);
-            return logical;
+            if (scale.Length != rows * cols)
+                throw new ArgumentException($"Expected {rows * cols} scales ([{rows}, {cols}]); got {scale.Length}.", nameof(scale));
+            return e.Reshape(scale, new[] { rows, cols });
         }
-        // 32x4x4: tiles of 128 rows x 4 columns over the padded matrix, row-major over tiles; inside a tile the
-        // element (r, c) sits at (r % 32) * 16 + (r / 32) * 4 + c.
+        // 32x4x4: tiles of 128 rows x 4 columns over the padded matrix, row-major over tiles; inside a tile the element
+        // (r, c) sits at (r % 32) * 16 + (r / 32) * 4 + c. The positions depend only on the shape, never on the data.
         int tileCols = (cols + 3) / 4, tileRows = (rows + 127) / 128;
-        if (s.Length < tileRows * tileCols * 512)
-            throw new ArgumentException($"A 32x4x4-swizzled [{rows}, {cols}] scale matrix has {tileRows * tileCols * 512} entries; got {s.Length}.", nameof(scale));
+        if (scale.Length < tileRows * tileCols * 512)
+            throw new ArgumentException($"A 32x4x4-swizzled [{rows}, {cols}] scale matrix has {tileRows * tileCols * 512} entries; got {scale.Length}.", nameof(scale));
+        var positions = new int[rows * cols];
         for (int r = 0; r < rows; r++)
             for (int c = 0; c < cols; c++)
             {
                 int tile = (r / 128) * tileCols + c / 4;
                 int rr = r % 128, cc = c % 4;
-                logical[r * cols + c] = s[tile * 512 + (rr % 32) * 16 + (rr / 32) * 4 + cc];
+                positions[r * cols + c] = tile * 512 + (rr % 32) * 16 + (rr / 32) * 4 + cc;
             }
-        return logical;
+        return e.TensorTake(scale, new Tensor<int>(positions, new[] { rows, cols }));
     }
 }
