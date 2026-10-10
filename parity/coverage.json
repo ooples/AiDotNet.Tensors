@@ -1,6 +1,6 @@
 {
   "torchVersion": "2.11.0",
-  "gapBaseline": 18,
+  "gapBaseline": 3,
   "entries": {
     "Tensor:abs": {
       "status": "mapped",
@@ -1178,8 +1178,9 @@
       "source": "reviewed"
     },
     "Tensor:index": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorIndex",
+      "source": "reviewed"
     },
     "Tensor:index_add": {
       "status": "mapped",
@@ -1237,8 +1238,9 @@
       "source": "name-match"
     },
     "Tensor:indices": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.SparseTensor`1::Indices",
+      "source": "reviewed"
     },
     "Tensor:inner": {
       "status": "mapped",
@@ -2189,8 +2191,9 @@
       "source": "reviewed"
     },
     "Tensor:resize_as_sparse_": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.SparseTensor`1::ResizeAsSparse",
+      "source": "reviewed"
     },
     "Tensor:resolve_conj": {
       "status": "not-applicable",
@@ -2382,8 +2385,9 @@
       "source": "reviewed-alias"
     },
     "Tensor:smm": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.SparseTensor`1::Smm",
+      "source": "reviewed"
     },
     "Tensor:softmax": {
       "status": "mapped",
@@ -2406,16 +2410,19 @@
       "source": "reviewed"
     },
     "Tensor:sparse_mask": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.SparseTensor`1::SparseMask",
+      "source": "reviewed"
     },
     "Tensor:sparse_resize_": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.SparseTensor`1::SparseResize",
+      "source": "reviewed"
     },
     "Tensor:sparse_resize_and_clear_": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.SparseTensor`1::SparseResizeAndClear",
+      "source": "reviewed"
     },
     "Tensor:split": {
       "status": "mapped",
@@ -2458,8 +2465,9 @@
       "source": "reviewed"
     },
     "Tensor:sspaddmm": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.SparseTensor`1::Sspaddmm",
+      "source": "reviewed"
     },
     "Tensor:std": {
       "status": "mapped",
@@ -4237,8 +4245,9 @@
       "source": "reviewed"
     },
     "aten:index": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.IEngine::TensorIndex",
+      "source": "reviewed"
     },
     "aten:index_add": {
       "status": "mapped",
@@ -9501,8 +9510,9 @@
       "source": "name-match"
     },
     "torch:hsmm": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.SparseTensor`1::Hsmm",
+      "source": "reviewed"
     },
     "torch:hsplit": {
       "status": "mapped",
@@ -9510,8 +9520,9 @@
       "source": "name-match"
     },
     "torch:hspmm": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.SparseTensor`1::Hspmm",
+      "source": "reviewed"
     },
     "torch:hstack": {
       "status": "mapped",
@@ -10674,8 +10685,9 @@
       "source": "reviewed"
     },
     "torch:resize_as_sparse_": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.SparseTensor`1::ResizeAsSparse",
+      "source": "reviewed"
     },
     "torch:resolve_conj": {
       "status": "not-applicable",
@@ -10773,8 +10785,9 @@
       "source": "reviewed-alias"
     },
     "torch:saddmm": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.SparseTensor`1::Saddmm",
+      "source": "reviewed"
     },
     "torch:scalar_tensor": {
       "status": "mapped",
@@ -11012,8 +11025,9 @@
       "source": "reviewed-alias"
     },
     "torch:smm": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.SparseTensor`1::Smm",
+      "source": "reviewed"
     },
     "torch:softmax": {
       "status": "mapped",
@@ -11111,8 +11125,9 @@
       "source": "reviewed"
     },
     "torch:sspaddmm": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.SparseTensor`1::Sspaddmm",
+      "source": "reviewed"
     },
     "torch:stack": {
       "status": "mapped",

@@ -2078,6 +2078,30 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     }
 
     /// <summary>
+    /// Changes a sparse tensor's logical shape in place and, when <paramref name="values"/> is given, its stored
+    /// values (the in-place sparse resizes). The caller keeps the indices consistent with both.
+    /// </summary>
+    internal void ReplaceSparseLayout(int[] logicalShape, Vector<T>? values)
+    {
+        if (!IsSparse) throw new InvalidOperationException("Only a sparse tensor's layout is replaced this way.");
+        ValidateShape(logicalShape);
+        _shape = (int[])logicalShape.Clone();
+        Shape = TensorShape.WrapUnsafe(_shape);
+        _strides = ComputeRowMajorStrides(_shape);
+        _rowMajorStridesCache = null;
+        Length = ComputeProduct(_shape);
+        if (values is not null)
+        {
+            var oldStorage = _storage;
+            _data = values;
+            _storage = new TensorStorage<T>(_data, shareExternalGpuCacheEpoch: true);
+            oldStorage.Release();
+            InvalidateGpuBindingAfterStorageReplacement();
+        }
+        IncrementVersion();
+    }
+
+    /// <summary>
     /// Internal constructor for creating views with custom strides and offset.
     /// No data is copied — the view shares the same underlying storage via reference counting.
     /// </summary>
