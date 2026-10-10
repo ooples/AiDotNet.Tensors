@@ -29,8 +29,7 @@ internal static class LinearSolvers
                 var (factor, info) = Decompositions.CholeskyDecomposition.Compute(a, upper: false);
                 // All info entries must be 0 for Cholesky path; otherwise fall through to LU.
                 bool cholOk = true;
-                using var iDataLease = info.LeaseArray();
-                var iData = iDataLease.Array;
+                var iData = info.GetDataArray();
                 for (int i = 0; i < info.Length; i++) if (iData[i] != 0) { cholOk = false; break; }
                 if (cholOk)
                     return Decompositions.CholeskyDecomposition.Solve(factor, b, upper: false);

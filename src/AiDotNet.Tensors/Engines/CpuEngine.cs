@@ -2844,10 +2844,8 @@ public partial class CpuEngine : ITensorLevelEngine
                 int ldb = transB ? b._strides[b.Rank - 1] : n;
 
                 // Get raw storage arrays (NOT GetDataArray which copies for views)
-                using var aArrLease = a._storage.LeaseArray();
-                var aArr = aArrLease.Array;
-                using var bArrLease = b._storage.LeaseArray();
-                var bArr = bArrLease.Array;
+                var aArr = a._storage.GetDataArray();
+                var bArr = b._storage.GetDataArray();
                 using var rArrLease = result.LeaseArray();
                 var rArr = rArrLease.Array;
                 var aFloat = new ReadOnlySpan<float>((float[])(object)aArr).Slice(a._storageOffset);
@@ -2899,10 +2897,8 @@ public partial class CpuEngine : ITensorLevelEngine
             // generic loop for moderate-size shapes.
             if (typeof(T) == typeof(double) && a.IsContiguous && b.IsContiguous)
             {
-                using var aArrDLease = a._storage.LeaseArray();
-                var aArrD = aArrDLease.Array;
-                using var bArrDLease = b._storage.LeaseArray();
-                var bArrD = bArrDLease.Array;
+                var aArrD = a._storage.GetDataArray();
+                var bArrD = b._storage.GetDataArray();
                 using var rArrDLease = result.LeaseArray();
                 var rArrD = rArrDLease.Array;
                 var aSpanD = new ReadOnlySpan<double>((double[])(object)aArrD, a._storageOffset, m * k);
@@ -2915,10 +2911,8 @@ public partial class CpuEngine : ITensorLevelEngine
             }
 
             // Generic fallback: stride-aware scalar matmul (raw storage for stride access)
-            using var aDataArrLease = a._storage.LeaseArray();
-            var aDataArr = aDataArrLease.Array;
-            using var bDataArrLease = b._storage.LeaseArray();
-            var bDataArr = bDataArrLease.Array;
+            var aDataArr = a._storage.GetDataArray();
+            var bDataArr = b._storage.GetDataArray();
             using var rDataArrLease = result.LeaseArray();
             var rDataArr = rDataArrLease.Array;
             int aOff = a._storageOffset, bOff = b._storageOffset;
@@ -3777,12 +3771,9 @@ public partial class CpuEngine : ITensorLevelEngine
                 // the allocation-free fast path. The Contiguous() call
                 // above only rebinds when IsContiguous is false, so
                 // offset-bearing contiguous views still reach this point.
-                using var aStorageLease = a._storage.LeaseArray();
-                var aStorage = aStorageLease.Array;
-                using var bStorageLease = b._storage.LeaseArray();
-                var bStorage = bStorageLease.Array;
-                using var rStorageLease = res._storage.LeaseArray();
-                var rStorage = rStorageLease.Array;
+                var aStorage = a._storage.GetDataArray();
+                var bStorage = b._storage.GetDataArray();
+                var rStorage = res._storage.GetDataArray();
                 var ad = (double[])(object)aStorage;
                 var bd = (double[])(object)bStorage;
                 var rd = (double[])(object)rStorage;
@@ -5441,8 +5432,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else
         {
-            using var srcLease = a._storage.LeaseArray();
-            var src = srcLease.Array;
+            var src = a._storage.GetDataArray();
             using var dstLease = destination.LeaseArray();
             var dst = dstLease.Array;
             for (int i = 0; i < a.Length; i++) dst[i] = numOps.Add(src[a.LogicalToStorageIndex(i)], scalar);
@@ -6665,8 +6655,7 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else
         {
-            using var srcLease = tensor._storage.LeaseArray();
-            var src = srcLease.Array;
+            var src = tensor._storage.GetDataArray();
             using var dstLease = result.LeaseArray();
             var dst = dstLease.Array;
             for (int i = 0; i < tensor.Length; i++)
@@ -7269,10 +7258,8 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             // In-house: pin raw storage + storageOffset and call our
             // SimdKernels.AbsUnsafe via ParallelComputeBound.
-            using var srcRawLease = tensor._storage.LeaseArray();
-            var srcRaw = (float[])(object)srcRawLease.Array;
-            using var dstRawLease = result._storage.LeaseArray();
-            var dstRaw = (float[])(object)dstRawLease.Array;
+            var srcRaw = (float[])(object)tensor._storage.GetDataArray();
+            var dstRaw = (float[])(object)result._storage.GetDataArray();
             int sOff = tensor._storageOffset, dOff = result._storageOffset;
             fixed (float* pSrcFix = srcRaw, pDstFix = dstRaw)
             {
@@ -7286,10 +7273,8 @@ public partial class CpuEngine : ITensorLevelEngine
             // In-house double Abs: bit-clear sign bit via Vector256<long>
             // mask. SimdKernels.AbsUnsafe(double*) is the same kernel
             // family that beat TensorPrimitives on every measured shape.
-            using var srcRawLease = tensor._storage.LeaseArray();
-            var srcRaw = (double[])(object)srcRawLease.Array;
-            using var dstRawLease = result._storage.LeaseArray();
-            var dstRaw = (double[])(object)dstRawLease.Array;
+            var srcRaw = (double[])(object)tensor._storage.GetDataArray();
+            var dstRaw = (double[])(object)result._storage.GetDataArray();
             int sOff = tensor._storageOffset, dOff = result._storageOffset;
             fixed (double* pSrcFix = srcRaw, pDstFix = dstRaw)
             {
@@ -8376,8 +8361,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!tensor.IsContiguous)
         {
             var ops = MathHelper.GetNumericOperations<T>();
-            using var srcArrLease = tensor._storage.LeaseArray();
-            var srcArr = srcArrLease.Array;
+            var srcArr = tensor._storage.GetDataArray();
             var idxBuf = new int[tensor.Length];
             tensor.FillStorageIndices(idxBuf);
             T sum = ops.Zero;
@@ -8448,8 +8432,7 @@ public partial class CpuEngine : ITensorLevelEngine
         // GEMM paths above.
         if (typeof(T) == typeof(double))
         {
-            using var storageArrLease = tensor._storage.LeaseArray();
-            T[] storageArr = storageArrLease.Array;
+            T[] storageArr = tensor._storage.GetDataArray();
             double[] dArr = Unsafe.As<T[], double[]>(ref storageArr);
             fixed (double* basePtr = dArr)
             {
@@ -8535,8 +8518,7 @@ public partial class CpuEngine : ITensorLevelEngine
             var result = AutoTensorCache.RentOrAllocate<T>(outShape.ToArray());
             using var rArrLease = result.LeaseArray();
             var rArr = rArrLease.Array;
-            using var srcArrLease = tensor._storage.LeaseArray();
-            var srcArr = srcArrLease.Array;
+            var srcArr = tensor._storage.GetDataArray();
 
             for (int o = 0; o < outerSize; o++)
             {
@@ -8725,8 +8707,7 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             // In-house: ParallelReduceFloat over SimdKernels.MaxUnsafe.
             // Storage + offset slice avoids GetDataArray() view-copy.
-            using var fArrLease = tensor._storage.LeaseArray();
-            var fArr = (float[])(object)fArrLease.Array;
+            var fArr = (float[])(object)tensor._storage.GetDataArray();
             int length = tensor.Length;
             int sOff = tensor._storageOffset;
             fixed (float* basePtr = fArr)
@@ -8740,8 +8721,7 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(double) && tensor.IsContiguous)
         {
             // In-house double Max via SimdKernels.MaxUnsafe(double*).
-            using var dArrLease = tensor._storage.LeaseArray();
-            var dArr = (double[])(object)dArrLease.Array;
+            var dArr = (double[])(object)tensor._storage.GetDataArray();
             int length = tensor.Length;
             int sOff = tensor._storageOffset;
             fixed (double* basePtr = dArr)
@@ -11063,8 +11043,7 @@ public partial class CpuEngine : ITensorLevelEngine
         float[] panel = pool.Rent(checked(colH * maxNcBlock));
         try
         {
-            using var panelSpanLease = panel.Lease();
-            var panelSpan = panelSpanLease.Span;
+            var panelSpan = panel.AsSpan();
             for (int b = 0; b < batch; b++)
             {
                 var inSlice = inputSpan.Slice(b * inputSliceSize, inputSliceSize);
@@ -11513,8 +11492,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var ops = MathHelper.GetNumericOperations<T>();
                 var resultS = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
-                using var srcRawLease = tensor._storage.LeaseArray();
-                var srcRaw = srcRawLease.Array;
+                var srcRaw = tensor._storage.GetDataArray();
                 using var dstArrLease = resultS.LeaseArray();
                 var dstArr = dstArrLease.Array;
                 var idxBuf = new int[tensor.Length];
@@ -11596,8 +11574,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var ops = MathHelper.GetNumericOperations<T>();
                 var resultS = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
-                using var srcRawLease = tensor._storage.LeaseArray();
-                var srcRaw = srcRawLease.Array;
+                var srcRaw = tensor._storage.GetDataArray();
                 using var dstArrLease = resultS.LeaseArray();
                 var dstArr = dstArrLease.Array;
                 var idxBuf = new int[tensor.Length];
@@ -11900,8 +11877,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var ops = MathHelper.GetNumericOperations<T>();
                 var resultS = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
-                using var srcRawLease = tensor._storage.LeaseArray();
-                var srcRaw = srcRawLease.Array;
+                var srcRaw = tensor._storage.GetDataArray();
                 using var dstArrLease = resultS.LeaseArray();
                 var dstArr = dstArrLease.Array;
                 var idxBuf = new int[tensor.Length];
@@ -12228,8 +12204,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var ops = MathHelper.GetNumericOperations<T>();
                 var resultS = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
-                using var srcRawLease = tensor._storage.LeaseArray();
-                var srcRaw = srcRawLease.Array;
+                var srcRaw = tensor._storage.GetDataArray();
                 using var dstArrLease = resultS.LeaseArray();
                 var dstArr = dstArrLease.Array;
                 var idxBuf = new int[tensor.Length];
@@ -12322,8 +12297,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var ops = MathHelper.GetNumericOperations<T>();
                 var resultS = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
-                using var srcRawLease = tensor._storage.LeaseArray();
-                var srcRaw = srcRawLease.Array;
+                var srcRaw = tensor._storage.GetDataArray();
                 using var dstArrLease = resultS.LeaseArray();
                 var dstArr = dstArrLease.Array;
                 var idxBuf = new int[tensor.Length];
@@ -13241,12 +13215,9 @@ public partial class CpuEngine : ITensorLevelEngine
             // (0, M*K) on a contiguous-but-offset tensor would index wrong.
             // The _storageOffset is 0 for non-view tensors but the explicit
             // pin keeps the contract clean for any future view caller.
-            using var aRawLease = a._storage.LeaseArray();
-            var aRaw = (float[])(object)aRawLease.Array;
-            using var bRawLease = b._storage.LeaseArray();
-            var bRaw = (float[])(object)bRawLease.Array;
-            using var rRawLease = result._storage.LeaseArray();
-            var rRaw = (float[])(object)rRawLease.Array;
+            var aRaw = (float[])(object)a._storage.GetDataArray();
+            var bRaw = (float[])(object)b._storage.GetDataArray();
+            var rRaw = (float[])(object)result._storage.GetDataArray();
             int aOff = a._storageOffset, bOff = b._storageOffset, rOff = result._storageOffset;
             // Sgemm(a, lda, transA, b, ldb, transB, c, m, k, n).
             // a is [M,K] row-major (lda=K, transA=false). b is stored
@@ -13281,13 +13252,10 @@ public partial class CpuEngine : ITensorLevelEngine
         // PyTorch-class throughput when libopenblas is available).
         if (typeof(T) == typeof(double) && a.Rank == 2 && b.Rank == 2 && a.IsContiguous && b.IsContiguous)
         {
-            using var aRawLease = a._storage.LeaseArray();
-            var aRaw = (double[])(object)aRawLease.Array;
-            using var bRawLease = b._storage.LeaseArray();
-            var bRaw = (double[])(object)bRawLease.Array;
+            var aRaw = (double[])(object)a._storage.GetDataArray();
+            var bRaw = (double[])(object)b._storage.GetDataArray();
             var result = AutoTensorCache.RentOrAllocate<T>(outShape);
-            using var rRawLease = result._storage.LeaseArray();
-            var rRaw = (double[])(object)rRawLease.Array;
+            var rRaw = (double[])(object)result._storage.GetDataArray();
             int aOff = a._storageOffset, bOff = b._storageOffset, rOff = result._storageOffset;
 
             if (BlasProvider.TryGemmEx(M, N, K,
@@ -13481,12 +13449,9 @@ public partial class CpuEngine : ITensorLevelEngine
         // hidden alloc, so we read the backing storage directly and
         // thread the per-tensor storage offset into every BLAS / SIMD
         // GEMM call. Same pattern as TensorMatMulTransposed's BLAS path.
-        using var aArrLease = a._storage.LeaseArray();
-        var aArr = aArrLease.Array;
-        using var bArrLease = b._storage.LeaseArray();
-        var bArr = bArrLease.Array;
-        using var oArrLease = output._storage.LeaseArray();
-        var oArr = oArrLease.Array;
+        var aArr = a._storage.GetDataArray();
+        var bArr = b._storage.GetDataArray();
+        var oArr = output._storage.GetDataArray();
         int aOff = a._storageOffset;
         int bOff = b._storageOffset;
         int oOff = output._storageOffset;
@@ -15911,8 +15876,7 @@ public partial class CpuEngine : ITensorLevelEngine
                     // Rented, not allocated: at 512 channels the flipped 3x3 kernel is 9.4 MB, a large-object-heap
                     // allocation per backward call that cost more than the transposed conv itself.
                     var flippedKernel = Helpers.AutoTensorCache.RentOrAllocate<float>(new[] { inChannels, outChannels, kernelHeight, kernelWidth });
-                    using var flippedFLease = flippedKernel._storage.LeaseArray();
-                    var flippedF = (float[])(object)flippedFLease.Array;
+                    var flippedF = (float[])(object)flippedKernel._storage.GetDataArray();
                     int flippedOff = flippedKernel._storageOffset;
                     var kernelFlip = (float[])(object)kernel.GetFlattenedData();
                     CpuParallelSettings.ParallelForOrSerial(0, inChannels, (long)inChannels * outChannels * kHWf, ic =>
@@ -15927,8 +15891,7 @@ public partial class CpuEngine : ITensorLevelEngine
                                         kernelFlip[kBase + (kernelHeight - 1 - kh) * kernelWidth + (kernelWidth - 1 - kw)];
                         }
                     }, deterministicSafe: true);
-                    using var destFusedLease = dest._storage.LeaseArray();
-                    var destFused = (float[])(object)destFusedLease.Array;
+                    var destFused = (float[])(object)dest._storage.GetDataArray();
                     int destOffFused = dest._storageOffset;
                     int totalFused = batch * inChannels * height * width;
                     const int UnitStride = 1;
@@ -15969,8 +15932,7 @@ public partial class CpuEngine : ITensorLevelEngine
             // public path pays. The plan's pre-allocated dest is contiguous +
             // CPU-resident; getting its array via _storage.GetDataArray()
             // hands back the live float[] (no copy).
-            using var destFLease = dest._storage.LeaseArray();
-            var destF = (float[])(object)destFLease.Array;
+            var destF = (float[])(object)dest._storage.GetDataArray();
             int destOff = dest._storageOffset;
             // Col2ImAccumulate is accumulating — for overwrite mode, zero the
             // destination region first.
@@ -16058,8 +16020,7 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             int colH = inChannels * kernelHeight * kernelWidth;
             int colW = outputHeight * outputWidth;
-            using var destDLease = dest._storage.LeaseArray();
-            var destD = (double[])(object)destDLease.Array;
+            var destD = (double[])(object)dest._storage.GetDataArray();
             int destOff = dest._storageOffset;
             if (!accumulate)
                 Array.Clear(destD, destOff, batch * inChannels * height * width);
@@ -17075,8 +17036,7 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 var gradOutputData = (float[])(object)gradOutput.GetFlattenedData();
                 var inputData = (float[])(object)input.GetFlattenedData();
-                using var destDataLease = dest._storage.LeaseArray();
-                var destData = (float[])(object)destDataLease.Array;
+                var destData = (float[])(object)dest._storage.GetDataArray();
                 unsafe
                 {
                     fixed (float* pIn = inputData)
@@ -17103,8 +17063,7 @@ public partial class CpuEngine : ITensorLevelEngine
             int colH = inChannels * kernelHeight * kernelWidth;
             int colW = outputHeight * outputWidth;
             int totalLen = outChannels * colH;
-            using var destFLease = dest._storage.LeaseArray();
-            var destF = (float[])(object)destFLease.Array;
+            var destF = (float[])(object)dest._storage.GetDataArray();
             int destOff = dest._storageOffset;
             var kPool = System.Buffers.ArrayPool<float>.Shared;
             // #639: rent the kernel-gradient accumulator instead of `new float[]` per call.
@@ -17228,8 +17187,7 @@ public partial class CpuEngine : ITensorLevelEngine
             int colH = inChannels * kernelHeight * kernelWidth;
             int colW = outputHeight * outputWidth;
             int totalLen = outChannels * colH;
-            using var destDLease = dest._storage.LeaseArray();
-            var destD = (double[])(object)destDLease.Array;
+            var destD = (double[])(object)dest._storage.GetDataArray();
             int destOff = dest._storageOffset;
             var gradOutputD = (double[])(object)gradOutput.GetFlattenedData();
             var inputD = (double[])(object)input.GetFlattenedData();

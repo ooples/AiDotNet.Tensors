@@ -4689,8 +4689,7 @@ internal static class BackwardFunctions<T>
 
             // Step 1: Fused ReLU mask — pool the masked gradient buffer
             var maskedTensor = Helpers.AutoTensorCache.RentOrAllocate<float>(new[] { M, N });
-            using var maskedArrLease = maskedTensor.LeaseArray();
-            var maskedArr = maskedArrLease.Array;
+            var maskedArr = maskedTensor.GetDataArray();
             fixed (float* pG = gArr, pPA = paArr, pM = maskedArr)
             {
                 SimdKernels.ReluBackwardUnsafe(pG, pPA, pM, M * N);
@@ -4698,11 +4697,9 @@ internal static class BackwardFunctions<T>
 
             // Step 2 + 3: gradInput / gradWeight via SimdGemm or BLAS
             var gradInput = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[0]._shape);
-            using var gradInputArrLease = gradInput.LeaseArray();
-            var gradInputArr = (float[])(object)gradInputArrLease.Array;
+            var gradInputArr = (float[])(object)gradInput.GetDataArray();
             var gradWeight = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[1]._shape);
-            using var gradWeightArrLease = gradWeight.LeaseArray();
-            var gradWeightArr = (float[])(object)gradWeightArrLease.Array;
+            var gradWeightArr = (float[])(object)gradWeight.GetDataArray();
 
             if (UseSimdGemmBackward(backwardWork))
             {
@@ -4726,8 +4723,7 @@ internal static class BackwardFunctions<T>
 
             // Step 4: gradBias = sum(maskedGrad, axis=0) — single SIMD pass, pooled buffer
             var gradBias = Helpers.AutoTensorCache.RentOrAllocate<T>(inputs[2]._shape);
-            using var biasArrLease = gradBias.LeaseArray();
-            var biasArr = (float[])(object)biasArrLease.Array;
+            var biasArr = (float[])(object)gradBias.GetDataArray();
             Array.Clear(biasArr, 0, N);
             fixed (float* pM = maskedArr, pB = biasArr)
             {
@@ -6615,8 +6611,7 @@ internal static class BackwardFunctions<T>
             int K = inputs[0]._shape[1]; // in_features
             int N = inputs[1]._shape[1]; // out_features
 
-            using var gArrLease = gradOutput.LeaseArray();
-            var gArr = (double[])(object)gArrLease.Array;
+            var gArr = (double[])(object)gradOutput.GetDataArray();
             var inArr = (double[])(object)inputs[0].GetDataArray();
             var wArr = (double[])(object)inputs[1].GetDataArray();
 

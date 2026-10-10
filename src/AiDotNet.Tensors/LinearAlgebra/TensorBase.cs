@@ -2232,8 +2232,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         }
         else
         {
-            using var dstDataLease = _storage.LeaseWritable();
-            var dstData = dstDataLease.Span;
+            var dstData = _storage.AsWritableSpan();
             for (int i = 0; i < Length; i++)
                 dstData[FlatIndexToStorageIndex(i)] = source[i];
         }
@@ -2271,8 +2270,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         EnsureOwnedForWrite();
         // Route through _storage so a read-only mmap alias throws rather than faulting on write
         // (transparent for normal tensors — _storage wraps the same Vector as _data).
-        using var writableLease = _storage.LeaseWritable();
-        var writable = writableLease.Span;
+        var writable = _storage.AsWritableSpan();
         if (IsContiguous)
             writable[flatIndex + _storageOffset] = value;
         else
@@ -2809,8 +2807,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         if (Length == 0)
             return;
 
-        using var sourceLease = _storage.Lease();
-        var source = sourceLease.Span;
+        var source = _storage.AsSpan();
         if (IsContiguous)
         {
             source.Slice(_storageOffset, Length).CopyTo(destination);
@@ -2905,8 +2902,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         EnsureNonOverlappingWritableLayout();
         EnsureOwnedForWrite();
 
-        using var destinationLease = _storage.LeaseWritable();
-        var destination = destinationLease.Span;
+        var destination = _storage.AsWritableSpan();
         if (IsContiguous)
         {
             var logical = destination.Slice(_storageOffset, Length);
@@ -2939,8 +2935,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         EnsureNonOverlappingWritableLayout();
         EnsureOwnedForWrite();
 
-        using var destinationLease = _storage.LeaseWritable();
-        var destination = destinationLease.Span;
+        var destination = _storage.AsWritableSpan();
         if (IsContiguous)
         {
             ClampSpan(destination.Slice(_storageOffset, Length), min, max);
@@ -3706,8 +3701,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
         else
         {
             // Non-contiguous — stride iteration
-            using var srcLease = _storage.LeaseArray();
-            var src = srcLease.Array;
+            var src = _storage.GetDataArray();
             var indices = new int[Length];
             FillStorageIndices(indices);
             for (int i = 0; i < Length; i++)
