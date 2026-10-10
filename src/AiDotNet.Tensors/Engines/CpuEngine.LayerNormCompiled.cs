@@ -56,7 +56,9 @@ public partial class CpuEngine
             {
                 var staged = new float[input.Length];
                 ProcessBatchesSimd(x, g, b, staged, meanArr, varArr, rows, features, eps);
-                staged.AsSpan().CopyTo(output.AsWritableSpan());
+                using var stagedKeep1 = new KeepAliveScope(staged);
+                using var outputKeep1 = new KeepAliveScope(output);
+                staged.AsSpanUnmarked().CopyTo(output.AsWritableSpanUnmarked());
             }
             output.IncrementVersion();
             meanT.IncrementVersion();

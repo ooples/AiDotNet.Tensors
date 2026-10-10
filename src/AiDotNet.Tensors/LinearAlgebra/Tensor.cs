@@ -343,7 +343,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
                 result,
                 (_, output) =>
                 {
-                    CopyTo(output.AsWritableSpan());
+                    using var outputKeep1 = new KeepAliveScope(output);
+                    CopyTo(output.AsWritableSpanUnmarked());
                     output.IncrementVersion();
                 },
                 backward,
@@ -900,7 +901,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
 
         // Use vectorized Copy operation to copy entire matrix data at once (5-10x faster than nested loops)
         // Matrix is stored in row-major order, which matches tensor storage
-        _numOps.Copy(matrix.AsSpan(), _data.AsWritableSpan());
+        using var matrixKeep1 = new KeepAliveScope(matrix);
+        _numOps.Copy(matrix.AsSpanUnmarked(), _data.AsWritableSpan());
     }
 
     /// <summary>
@@ -989,7 +991,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     private void SetElementAt(int storageIndex, T value)
     {
         EnsureOwnedForWrite();
-        _storage.AsWritableSpan()[storageIndex] = value;
+        using var storageKeep1 = new KeepAliveScope(_storage);
+        _storage.AsWritableSpanUnmarked()[storageIndex] = value;
         IncrementVersion();
     }
 
@@ -1450,7 +1453,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
                 int offset = i * rowLength;
                 var sourceRow = srcSpan.Slice(offset, rowLength);
                 var destRow = destSpan.Slice(offset, rowLength);
-                _numOps.Add(sourceRow, vector.AsSpan(), destRow);
+                using var vectorKeep1 = new KeepAliveScope(vector);
+                _numOps.Add(sourceRow, vector.AsSpanUnmarked(), destRow);
             }
             return result;
         }
@@ -1472,7 +1476,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
                     int offset = i * sliceSize + j * lastDimLength;
                     var sourceSlice = srcSpan.Slice(offset, lastDimLength);
                     var destSlice = destSpan.Slice(offset, lastDimLength);
-                    _numOps.Add(sourceSlice, vector.AsSpan(), destSlice);
+                    using var vectorKeep2 = new KeepAliveScope(vector);
+                    _numOps.Add(sourceSlice, vector.AsSpanUnmarked(), destSlice);
                 }
             }
             return result;
@@ -1645,7 +1650,8 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
     {
         var src = IsContiguous ? this : Contiguous();
         var result = TensorAllocator.Rent<T>(this._shape);
-        _numOps.MultiplyScalar(src.AsSpan(), factor, result._data.AsWritableSpan());
+        using var srcKeep1 = new KeepAliveScope(src);
+        _numOps.MultiplyScalar(src.AsSpanUnmarked(), factor, result._data.AsWritableSpan());
         return result;
     }
 

@@ -128,7 +128,9 @@ public static class SimdHrrKernels
 
         if (n < ParallelThresholdElements)
         {
-            GatherDouble(input.AsSpan(), indices.AsSpan(), output.AsSpan());
+            using var inputKeep1 = new KeepAliveScope(input);
+            using var outputKeep1 = new KeepAliveScope(output);
+            GatherDouble(input.AsSpanUnmarked(), indices.AsSpan(), output.AsSpanUnmarked());
             return;
         }
 
@@ -482,11 +484,13 @@ public static class SimdHrrKernels
         AiDotNet.Tensors.Helpers.CpuParallelSettings.ParallelForOrSerial(0, V, (long)V * D, v =>
         {
             int rowOff = v * D;
+            using var queryRKeep1 = new KeepAliveScope(queryR);
+            using var queryIKeep1 = new KeepAliveScope(queryI);
             scores[v] = PhaseCoherenceRow(
                 new ReadOnlySpan<double>(codesR, rowOff, D),
                 new ReadOnlySpan<double>(codesI, rowOff, D),
-                queryR.AsSpan(),
-                queryI.AsSpan());
+                queryR.AsSpanUnmarked(),
+                queryI.AsSpanUnmarked());
         });
     }
 

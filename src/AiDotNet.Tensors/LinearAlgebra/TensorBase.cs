@@ -1710,6 +1710,26 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     internal Memory<T> Data => Memory;
 
     /// <summary>
+    /// <see cref="Data"/> without the escape mark: for engine code that keeps this tensor alive while it uses the memory
+    /// (<see cref="KeepAliveScope"/>) and does not let the memory outlive that scope, so a large result stays
+    /// recyclable once nothing references it.
+    /// </summary>
+    internal Memory<T> DataUnmarked
+    {
+        get
+        {
+            EnsureMaterialized();
+            EnsureOwnedForWrite();
+            if (!IsContiguous)
+                throw new InvalidOperationException(
+                    "Cannot get contiguous Memory from a non-contiguous tensor view. Call Contiguous() first.");
+            if (_storageOffset == 0 && _storage.Length == Length)
+                return _storage.AsMemoryUnmarked();
+            return _storage.AsMemoryUnmarked().Slice(_storageOffset, Length);
+        }
+    }
+
+    /// <summary>
     /// COW Stage 2 (#624): a READ-ONLY <see cref="ReadOnlyMemory{T}"/> view of the backing store
     /// that does <b>not</b> privatize a copy-on-write clone — the <see cref="Memory"/>/<see cref="Data"/>
     /// counterpart for engine INPUT operands passed to read-only-typed parameters (e.g.

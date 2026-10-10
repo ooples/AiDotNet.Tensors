@@ -61,10 +61,13 @@ internal static class FusedMultiLayerBackward
             // caller's gradW2 may be reused across steps and carry stale
             // values from a previous backward.
             Array.Clear(gradW2, 0, h * n);
+            using var activatedKeep1 = new KeepAliveScope(activated);
+            using var gradOutputKeep1 = new KeepAliveScope(gradOutput);
+            using var gradW2Keep1 = new KeepAliveScope(gradW2);
             SimdGemm.Sgemm(
-                activated.AsSpan(), h, true,
-                gradOutput.AsSpan(), n, false,
-                gradW2.AsSpan(), h, m, n);
+                activated.AsSpanUnmarked(), h, true,
+                gradOutput.AsSpanUnmarked(), n, false,
+                gradW2.AsSpanUnmarked(), h, m, n);
         }
 
         // Step 2: gradB2 = sum(gradOutput, axis=0)  → [N]
@@ -95,10 +98,13 @@ internal static class FusedMultiLayerBackward
         {
             // workspace may be reused across steps; clear before fallback.
             Array.Clear(grad_h, 0, requiredSize);
+            using var gradOutputKeep2 = new KeepAliveScope(gradOutput);
+            using var w2Keep1 = new KeepAliveScope(w2);
+            using var grad_hKeep1 = new KeepAliveScope(grad_h);
             SimdGemm.Sgemm(
-                gradOutput.AsSpan(), n, false,
-                w2.AsSpan(), n, true,
-                grad_h.AsSpan(), m, n, h);
+                gradOutput.AsSpanUnmarked(), n, false,
+                w2.AsSpanUnmarked(), n, true,
+                grad_h.AsSpanUnmarked(), m, n, h);
         }
 
         // Step 4: Apply activation derivative in-place: grad_pre = grad_h * act'(activated)
@@ -116,10 +122,13 @@ internal static class FusedMultiLayerBackward
                 gradW1, 0, h))
         {
             Array.Clear(gradW1, 0, k * h);
+            using var inputKeep1 = new KeepAliveScope(input);
+            using var grad_hKeep2 = new KeepAliveScope(grad_h);
+            using var gradW1Keep1 = new KeepAliveScope(gradW1);
             SimdGemm.Sgemm(
-                input.AsSpan(), k, true,
-                grad_h.AsSpan(), h, false,
-                gradW1.AsSpan(), k, m, h);
+                input.AsSpanUnmarked(), k, true,
+                grad_h.AsSpanUnmarked(), h, false,
+                gradW1.AsSpanUnmarked(), k, m, h);
         }
 
         // Step 6: gradB1 = sum(grad_pre, axis=0) → [H]
@@ -146,10 +155,13 @@ internal static class FusedMultiLayerBackward
                     gradInput, 0, k))
             {
                 Array.Clear(gradInput, 0, m * k);
+                using var grad_hKeep3 = new KeepAliveScope(grad_h);
+                using var w1Keep1 = new KeepAliveScope(w1);
+                using var gradInputKeep1 = new KeepAliveScope(gradInput);
                 SimdGemm.Sgemm(
-                    grad_h.AsSpan(), h, false,
-                    w1.AsSpan(), h, true,
-                    gradInput.AsSpan(), m, h, k);
+                    grad_h.AsSpanUnmarked(), h, false,
+                    w1.AsSpanUnmarked(), h, true,
+                    gradInput.AsSpanUnmarked(), m, h, k);
             }
         }
     }
@@ -233,10 +245,13 @@ internal static class FusedMultiLayerBackward
             // owned and may carry values from a previous backward. Clear
             // before writing.
             Array.Clear(gradW2, 0, h * n);
+            using var activatedKeep2 = new KeepAliveScope(activated);
+            using var gradOutputKeep3 = new KeepAliveScope(gradOutput);
+            using var gradW2Keep2 = new KeepAliveScope(gradW2);
             SimdGemm.Sgemm(
-                activated.AsSpan(), h, true,
-                gradOutput.AsSpan(), n, false,
-                gradW2.AsSpan(), h, m, n);
+                activated.AsSpanUnmarked(), h, true,
+                gradOutput.AsSpanUnmarked(), n, false,
+                gradW2.AsSpanUnmarked(), h, m, n);
         }
 
         // Step 2: gradB2 = sum(gradOutput, axis=0) → [N]
@@ -266,10 +281,13 @@ internal static class FusedMultiLayerBackward
         {
             // workspace may be reused across steps; clear before fallback.
             Array.Clear(grad_h, 0, requiredSize);
+            using var gradOutputKeep4 = new KeepAliveScope(gradOutput);
+            using var w2Keep2 = new KeepAliveScope(w2);
+            using var grad_hKeep4 = new KeepAliveScope(grad_h);
             SimdGemm.Sgemm(
-                gradOutput.AsSpan(), n, false,
-                w2.AsSpan(), n, true,
-                grad_h.AsSpan(), m, n, h);
+                gradOutput.AsSpanUnmarked(), n, false,
+                w2.AsSpanUnmarked(), n, true,
+                grad_h.AsSpanUnmarked(), m, n, h);
         }
 
         // Step 4: Apply activation derivative against PRE-activation
@@ -288,10 +306,13 @@ internal static class FusedMultiLayerBackward
                 gradW1, 0, h))
         {
             Array.Clear(gradW1, 0, k * h);
+            using var inputKeep2 = new KeepAliveScope(input);
+            using var grad_hKeep5 = new KeepAliveScope(grad_h);
+            using var gradW1Keep2 = new KeepAliveScope(gradW1);
             SimdGemm.Sgemm(
-                input.AsSpan(), k, true,
-                grad_h.AsSpan(), h, false,
-                gradW1.AsSpan(), k, m, h);
+                input.AsSpanUnmarked(), k, true,
+                grad_h.AsSpanUnmarked(), h, false,
+                gradW1.AsSpanUnmarked(), k, m, h);
         }
 
         // Step 6: gradB1 = sum(grad_pre, axis=0) → [H]
@@ -318,10 +339,13 @@ internal static class FusedMultiLayerBackward
                     gradInput, 0, k))
             {
                 Array.Clear(gradInput, 0, m * k);
+                using var grad_hKeep6 = new KeepAliveScope(grad_h);
+                using var w1Keep2 = new KeepAliveScope(w1);
+                using var gradInputKeep2 = new KeepAliveScope(gradInput);
                 SimdGemm.Sgemm(
-                    grad_h.AsSpan(), h, false,
-                    w1.AsSpan(), h, true,
-                    gradInput.AsSpan(), m, h, k);
+                    grad_h.AsSpanUnmarked(), h, false,
+                    w1.AsSpanUnmarked(), h, true,
+                    gradInput.AsSpanUnmarked(), m, h, k);
             }
         }
     }

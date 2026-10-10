@@ -217,7 +217,9 @@ public sealed class DTensor<T>
     private static Tensor<T> AllReduceCopy(Tensor<T> t, IProcessGroup g)
     {
         var copy = new Tensor<T>((int[])t._shape.Clone());
-        t.AsSpan().CopyTo(copy.AsWritableSpan());
+        using var tKeep1 = new KeepAliveScope(t);
+        using var copyKeep1 = new KeepAliveScope(copy);
+        t.AsSpanUnmarked().CopyTo(copy.AsWritableSpanUnmarked());
         g.AllReduce(copy, ReduceOp.Sum);
         return copy;
     }

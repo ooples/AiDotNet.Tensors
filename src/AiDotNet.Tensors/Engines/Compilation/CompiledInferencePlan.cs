@@ -1012,7 +1012,9 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
         // under CUDA graph capture it's recorded as a device memcpy node and
         // replays correctly every iteration.
         Execute();
-        _finalOutput.AsSpan().CopyTo(output.AsWritableSpan());
+        using var finalOutputKeep1 = new KeepAliveScope(_finalOutput);
+        using var outputKeep1 = new KeepAliveScope(output);
+        _finalOutput.AsSpanUnmarked().CopyTo(output.AsWritableSpanUnmarked());
     }
 
     /// <inheritdoc/>
@@ -1042,7 +1044,8 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
             var src = inputs[i] ?? throw new ArgumentException(
                 $"inputs[{i}] is null.", nameof(inputs));
             ValidateShapesMatch(_compiledInputTensors[i], src, $"inputs[{i}]");
-            src.AsSpan().CopyTo(_compiledInputTensors[i].AsWritableSpan());
+            using var srcKeep1 = new KeepAliveScope(src);
+            src.AsSpanUnmarked().CopyTo(_compiledInputTensors[i].AsWritableSpan());
         }
     }
 
@@ -1056,7 +1059,8 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                 $"{nameof(SetInput)} requires exactly one.");
 
         ValidateShapesMatch(_compiledInputTensors[0], input, nameof(input));
-        input.AsSpan().CopyTo(_compiledInputTensors[0].AsWritableSpan());
+        using var inputKeep1 = new KeepAliveScope(input);
+        input.AsSpanUnmarked().CopyTo(_compiledInputTensors[0].AsWritableSpan());
     }
 
     private static void ValidateShapesMatch(Tensor<T> expected, Tensor<T> actual, string paramName)
@@ -1405,7 +1409,9 @@ internal sealed class CompiledInferencePlan<T> : ICompiledPlan<T>
                         (eng, o) =>
                         {
                             var transposed = eng.TensorTranspose(capturedInput);
-                            transposed.AsSpan().CopyTo(capturedOutput.AsWritableSpan());
+                            using var transposedKeep1 = new KeepAliveScope(transposed);
+                            using var capturedOutputKeep1 = new KeepAliveScope(capturedOutput);
+                            transposed.AsSpanUnmarked().CopyTo(capturedOutput.AsWritableSpanUnmarked());
                         },
                         step.OutputBuffer,
                         step.Inputs,

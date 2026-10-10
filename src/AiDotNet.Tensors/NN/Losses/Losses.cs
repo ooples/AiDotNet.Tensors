@@ -271,7 +271,8 @@ public static class Losses
         var inSpan = inSpanLease.Span;
         using var tSpanLease = target.Lease();
         var tSpan = tSpanLease.Span;
-        var wSpan = weight is null ? ReadOnlySpan<T>.Empty : weight.AsSpan();
+        using var weightKeep1 = new KeepAliveScope(weight);
+        var wSpan = weight is null ? ReadOnlySpan<T>.Empty : weight.AsSpanUnmarked();
         using var outSpanLease = output.LeaseWritable();
         var outSpan = outSpanLease.Span;
         for (int b = 0; b < batch; b++)
@@ -361,7 +362,8 @@ public static class Losses
         var inSpan = inSpanLease.Span;
         using var tSpanLease = target.Lease();
         var tSpan = tSpanLease.Span;
-        var wSpan = weight is null ? ReadOnlySpan<T>.Empty : weight.AsSpan();
+        using var weightKeep2 = new KeepAliveScope(weight);
+        var wSpan = weight is null ? ReadOnlySpan<T>.Empty : weight.AsSpanUnmarked();
         using var outSpanLease = output.LeaseWritable();
         var outSpan = outSpanLease.Span;
         int rows = output.Length;
@@ -614,7 +616,8 @@ public static class Losses
         if (reduction == LossReduction.Mean)
             acc = ops.Divide(acc, ops.FromDouble(src.Length));
         var result = new Tensor<T>(new[] { 1 });
-        result.AsWritableSpan()[0] = acc;
+        using var resultKeep1 = new KeepAliveScope(result);
+        result.AsWritableSpanUnmarked()[0] = acc;
         return result;
     }
 

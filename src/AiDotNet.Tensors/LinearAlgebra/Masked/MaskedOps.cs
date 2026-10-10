@@ -26,7 +26,8 @@ public static class MaskedOps
             if ((mask[i >> 3] & (1 << (i & 7))) != 0)
                 acc = ops.Add(acc, src[i]);
         var result = new Tensor<T>(new[] { 1 });
-        result.AsWritableSpan()[0] = acc;
+        using var resultKeep1 = new KeepAliveScope(result);
+        result.AsWritableSpanUnmarked()[0] = acc;
         return result;
     }
 
@@ -41,7 +42,9 @@ public static class MaskedOps
         var sum = Sum(a);
         T scale = ops.Divide(ops.One, ops.FromDouble(a.ValidCount));
         var result = new Tensor<T>(new[] { 1 });
-        result.AsWritableSpan()[0] = ops.Multiply(sum.AsSpan()[0], scale);
+        using var resultKeep2 = new KeepAliveScope(result);
+        using var sumKeep1 = new KeepAliveScope(sum);
+        result.AsWritableSpanUnmarked()[0] = ops.Multiply(sum.AsSpanUnmarked()[0], scale);
         return result;
     }
 
@@ -64,7 +67,8 @@ public static class MaskedOps
         }
         T scale = ops.Divide(ops.One, ops.FromDouble(a.ValidCount));
         var result = new Tensor<T>(new[] { 1 });
-        result.AsWritableSpan()[0] = ops.Multiply(sumSq, scale);
+        using var resultKeep3 = new KeepAliveScope(result);
+        result.AsWritableSpanUnmarked()[0] = ops.Multiply(sumSq, scale);
         return result;
     }
 
@@ -74,7 +78,8 @@ public static class MaskedOps
         var ops = MathHelper.GetNumericOperations<T>();
         var v = Var(a).AsSpan()[0];
         var result = new Tensor<T>(new[] { 1 });
-        result.AsWritableSpan()[0] = ops.FromDouble(Math.Sqrt(ops.ToDouble(v)));
+        using var resultKeep4 = new KeepAliveScope(result);
+        result.AsWritableSpanUnmarked()[0] = ops.FromDouble(Math.Sqrt(ops.ToDouble(v)));
         return result;
     }
 
@@ -90,7 +95,8 @@ public static class MaskedOps
             if ((mask[i >> 3] & (1 << (i & 7))) != 0)
                 acc = ops.Multiply(acc, src[i]);
         var result = new Tensor<T>(new[] { 1 });
-        result.AsWritableSpan()[0] = acc;
+        using var resultKeep5 = new KeepAliveScope(result);
+        result.AsWritableSpanUnmarked()[0] = acc;
         return result;
     }
 
@@ -111,7 +117,8 @@ public static class MaskedOps
             else if (ops.LessThan(src[i], best)) best = src[i];
         }
         var result = new Tensor<T>(new[] { 1 });
-        result.AsWritableSpan()[0] = best;
+        using var resultKeep6 = new KeepAliveScope(result);
+        result.AsWritableSpanUnmarked()[0] = best;
         return result;
     }
 
@@ -132,7 +139,8 @@ public static class MaskedOps
             else if (ops.GreaterThan(src[i], best)) best = src[i];
         }
         var result = new Tensor<T>(new[] { 1 });
-        result.AsWritableSpan()[0] = best;
+        using var resultKeep7 = new KeepAliveScope(result);
+        result.AsWritableSpanUnmarked()[0] = best;
         return result;
     }
 

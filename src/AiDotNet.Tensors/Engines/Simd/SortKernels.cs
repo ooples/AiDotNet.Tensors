@@ -50,7 +50,8 @@ internal static class SortKernels
         // a lambda" restriction.
         var buf = data.ToArray();
         Array.Sort(buf);
-        buf.AsSpan().CopyTo(data);
+        using var bufKeep1 = new KeepAliveScope(buf);
+        buf.AsSpanUnmarked().CopyTo(data);
     }
 
     /// <summary>
@@ -70,8 +71,10 @@ internal static class SortKernels
         var v = values.ToArray();
         var i = indices.ToArray();
         Array.Sort(v, i);
-        v.AsSpan().CopyTo(values);
-        i.AsSpan().CopyTo(indices);
+        using var vKeep1 = new KeepAliveScope(v);
+        v.AsSpanUnmarked().CopyTo(values);
+        using var iKeep1 = new KeepAliveScope(i);
+        i.AsSpanUnmarked().CopyTo(indices);
     }
 
     /// <summary>

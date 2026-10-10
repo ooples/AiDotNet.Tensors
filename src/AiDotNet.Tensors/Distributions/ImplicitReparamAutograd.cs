@@ -49,7 +49,8 @@ public static class ImplicitReparamAutograd
         // Snapshot α so backward sees the values that produced these
         // samples even if α gets mutated downstream.
         var alphaSnapshot = new Tensor<float>((int[])alpha._shape.Clone());
-        aSpan.CopyTo(alphaSnapshot.AsWritableSpan());
+        using var alphaSnapshotKeep1 = new KeepAliveScope(alphaSnapshot);
+        aSpan.CopyTo(alphaSnapshot.AsWritableSpanUnmarked());
         var savedState = new object[] { alphaSnapshot };
         DifferentiableOps.RecordUnary(
             "GammaRSample",
@@ -87,9 +88,11 @@ public static class ImplicitReparamAutograd
         if (DifferentiableOps._anyTapeActive == 0) return output;
 
         var alphaSnapshot = new Tensor<float>((int[])alpha._shape.Clone());
-        aSpan.CopyTo(alphaSnapshot.AsWritableSpan());
+        using var alphaSnapshotKeep2 = new KeepAliveScope(alphaSnapshot);
+        aSpan.CopyTo(alphaSnapshot.AsWritableSpanUnmarked());
         var betaSnapshot = new Tensor<float>((int[])beta._shape.Clone());
-        bSpan.CopyTo(betaSnapshot.AsWritableSpan());
+        using var betaSnapshotKeep1 = new KeepAliveScope(betaSnapshot);
+        bSpan.CopyTo(betaSnapshot.AsWritableSpanUnmarked());
         var savedState = new object[] { alphaSnapshot, betaSnapshot };
         DifferentiableOps.RecordBinary(
             "BetaRSample",
@@ -141,7 +144,8 @@ public static class ImplicitReparamAutograd
         if (DifferentiableOps._anyTapeActive == 0) return output;
 
         var alphaSnapshot = new Tensor<float>((int[])concentration._shape.Clone());
-        aSpan.CopyTo(alphaSnapshot.AsWritableSpan());
+        using var alphaSnapshotKeep3 = new KeepAliveScope(alphaSnapshot);
+        aSpan.CopyTo(alphaSnapshot.AsWritableSpanUnmarked());
         var savedState = new object[] { alphaSnapshot, gammaSamples, gammaSums, k };
         DifferentiableOps.RecordUnary(
             "DirichletRSample",

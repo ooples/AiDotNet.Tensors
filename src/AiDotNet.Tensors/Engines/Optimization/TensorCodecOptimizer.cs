@@ -65,7 +65,8 @@ internal static class TensorCodecOptimizer
         {
             // Fallback: separate ops
             var hidden = new float[m * h];
-            SimdGemm.Sgemm(input.AsSpan(0, m * k), w1.AsSpan(0, k * h), hidden.AsSpan(), m, k, h);
+            using var hiddenKeep1 = new KeepAliveScope(hidden);
+            SimdGemm.Sgemm(input.AsSpan(0, m * k), w1.AsSpan(0, k * h), hidden.AsSpanUnmarked(), m, k, h);
             for (int i = 0; i < m * h; i++)
             {
                 float val = activation(hidden[i]);

@@ -226,16 +226,20 @@ public static class NestedOps
             var qRow = new Tensor<T>(new[] { rowLen, headDim });
             var kRow = new Tensor<T>(new[] { rowLen, headDim });
             var vRow = new Tensor<T>(new[] { rowLen, headDim });
-            qSpan.Slice(qOff, rowLen * headDim).CopyTo(qRow.AsWritableSpan());
-            kSpan.Slice(kOff, rowLen * headDim).CopyTo(kRow.AsWritableSpan());
-            vSpan.Slice(vOff, rowLen * headDim).CopyTo(vRow.AsWritableSpan());
+            using var qRowKeep1 = new KeepAliveScope(qRow);
+            qSpan.Slice(qOff, rowLen * headDim).CopyTo(qRow.AsWritableSpanUnmarked());
+            using var kRowKeep1 = new KeepAliveScope(kRow);
+            kSpan.Slice(kOff, rowLen * headDim).CopyTo(kRow.AsWritableSpanUnmarked());
+            using var vRowKeep1 = new KeepAliveScope(vRow);
+            vSpan.Slice(vOff, rowLen * headDim).CopyTo(vRow.AsWritableSpanUnmarked());
 
             var kT = Engine.TensorTranspose(kRow);
             var scores = Engine.TensorMatMul(qRow, kT);
             var scaledScores = Engine.TensorMultiplyScalar(scores, invSqrtD);
             var probs = Engine.Softmax(scaledScores, axis: 1);
             var attended = Engine.TensorMatMul(probs, vRow);
-            attended.AsSpan().CopyTo(outSpan.Slice(qOff, rowLen * headDim));
+            using var attendedKeep1 = new KeepAliveScope(attended);
+            attended.AsSpanUnmarked().CopyTo(outSpan.Slice(qOff, rowLen * headDim));
         }
         return NestedTensor<T>.FromValuesOffsets(outValues, (int[])q.Offsets.Clone(), headDim, q.Layout);
     }
@@ -336,7 +340,8 @@ public static class NestedOps
         // grows a zero-copy reshape API for the contiguous case we'll
         // route through it.
         var t = new Tensor<T>(new[] { totalRows, features });
-        x.Values.AsSpan().CopyTo(t.AsWritableSpan());
+        using var tKeep1 = new KeepAliveScope(t);
+        x.Values.AsSpan().CopyTo(t.AsWritableSpanUnmarked());
         return t;
     }
 

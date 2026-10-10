@@ -138,7 +138,8 @@ public sealed class ResidentInferenceGraph : System.IDisposable
                 double inSum = 0; var isp = s[0].AsSpan();
                 for (int i = 0; i < isp.Length; i++) inSum += System.Convert.ToDouble(isp[i]);
                 double tSum = 0; if (s.Length > 1) { var tsp = s[1].AsSpan(); for (int i = 0; i < tsp.Length; i++) tSum += System.Convert.ToDouble(tsp[i]); }
-                double outSum = 0; var osp = outR.AsSpan();
+                using var outRKeep1 = new KeepAliveScope(outR);
+                double outSum = 0; var osp = outR.AsSpanUnmarked();
                 for (int i = 0; i < osp.Length; i++) outSum += System.Convert.ToDouble(osp[i]);
                 try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_replay_verify.txt"),
                     $"REPLAY inSum(s0)={inSum:F4} timeSum(s1)={tSum:F4} -> outSum={outSum:F4}\n"); } catch { }
@@ -171,7 +172,8 @@ public sealed class ResidentInferenceGraph : System.IDisposable
             {
                 long t0 = System.Diagnostics.Stopwatch.GetTimestamp();
                 var w = forward(s);
-                _ = w.AsSpan(); // force materialization so timing includes the eager download
+                using var wKeep1 = new KeepAliveScope(w);
+                _ = w.AsSpanUnmarked(); // force materialization so timing includes the eager download
                 double us = (System.Diagnostics.Stopwatch.GetTimestamp() - t0) * 1_000_000.0 / System.Diagnostics.Stopwatch.Frequency;
                 try { System.IO.File.AppendAllText(System.IO.Path.Combine(System.IO.Path.GetTempPath(), "aidotnet_infgraph_timing.txt"), $"EAGER {us:F1} us\n"); } catch { }
                 return w;
@@ -191,7 +193,8 @@ public sealed class ResidentInferenceGraph : System.IDisposable
             if (verify)
             {
                 var refOut = forward(s);
-                verifyRef = refOut.AsSpan().ToArray() as float[];
+                using var refOutKeep1 = new KeepAliveScope(refOut);
+                verifyRef = refOut.AsSpanUnmarked().ToArray() as float[];
             }
 
             _scope = _engine.EnterResidentCaptureScope();
@@ -274,7 +277,8 @@ public sealed class ResidentInferenceGraph : System.IDisposable
                         if (i == 0) c0 = ci;
                         mutd = System.Math.Max(mutd, System.Math.Abs(System.Convert.ToDouble(a[i]) - ci));
                     }
-                    orig.AsSpan().CopyTo(s[0].AsWritableSpan()); // restore
+                    using var origKeep1 = new KeepAliveScope(orig);
+                    orig.AsSpanUnmarked().CopyTo(s[0].AsWritableSpan()); // restore
                     _engine.RefreshResidentInputInPlace(s[0]);
                     _engine.LaunchGpuGraph(exec);
                     out1 = DownloadOutput<T>();

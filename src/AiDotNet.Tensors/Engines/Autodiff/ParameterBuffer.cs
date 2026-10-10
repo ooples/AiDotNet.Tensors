@@ -570,7 +570,8 @@ public sealed class ParameterBuffer<T>
                 $"Source vector length ({source.Length}) must match buffer size ({_totalSize}).",
                 nameof(source));
 
-        source.AsSpan().CopyTo(_data.AsWritableSpan());
+        using var sourceKeep1 = new KeepAliveScope(source);
+        source.AsSpanUnmarked().CopyTo(_data.AsWritableSpan());
     }
 
     /// <summary>

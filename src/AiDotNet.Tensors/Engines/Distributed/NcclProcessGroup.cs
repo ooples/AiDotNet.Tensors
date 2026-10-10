@@ -121,7 +121,8 @@ public sealed class NcclProcessGroup : IProcessGroup
 
             // Upload: pin a copy of the tensor's contents and HtoD.
             var hostBuffer = new T[tensor.Length];
-            tensor.AsSpan().CopyTo(hostBuffer);
+            using var tensorKeep1 = new KeepAliveScope(tensor);
+            tensor.AsSpanUnmarked().CopyTo(hostBuffer);
             var hostHandle = GCHandle.Alloc(hostBuffer, GCHandleType.Pinned);
             try
             {
@@ -144,7 +145,8 @@ public sealed class NcclProcessGroup : IProcessGroup
                     throw new InvalidOperationException("cuMemcpyDtoH failed.");
             }
             finally { hostHandle.Free(); }
-            hostBuffer.AsSpan().CopyTo(tensor.AsWritableSpan());
+            using var tensorKeep2 = new KeepAliveScope(tensor);
+            hostBuffer.AsSpan().CopyTo(tensor.AsWritableSpanUnmarked());
         }
         finally
         {
@@ -155,7 +157,8 @@ public sealed class NcclProcessGroup : IProcessGroup
     private static T[] GetBackingArray<T>(Tensor<T> t)
     {
         var arr = new T[t.Length];
-        t.AsSpan().CopyTo(arr);
+        using var tKeep1 = new KeepAliveScope(t);
+        t.AsSpanUnmarked().CopyTo(arr);
         return arr;
     }
 
@@ -235,7 +238,8 @@ public sealed class NcclProcessGroup : IProcessGroup
                     CheckCuda(AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaNativeBindings.cuMemcpyDtoH(ch.AddrOfPinnedObject(), src, sendBytes), "cuMemcpyDtoH(AllGather rank chunk)");
                 }
                 finally { ch.Free(); }
-                chunk.AsSpan().CopyTo(output[r].AsWritableSpan());
+                using var chunkKeep1 = new KeepAliveScope(chunk);
+                chunk.AsSpanUnmarked().CopyTo(output[r].AsWritableSpan());
             }
         }
         finally
@@ -281,7 +285,8 @@ public sealed class NcclProcessGroup : IProcessGroup
             var oh = GCHandle.Alloc(outArr, GCHandleType.Pinned);
             try { CheckCuda(AiDotNet.Tensors.Engines.DirectGpu.CUDA.CudaNativeBindings.cuMemcpyDtoH(oh.AddrOfPinnedObject(), recvDev, recvBytes), "cuMemcpyDtoH(ReduceScatter result)"); }
             finally { oh.Free(); }
-            outArr.AsSpan().CopyTo(output.AsWritableSpan());
+            using var outputKeep1 = new KeepAliveScope(output);
+            outArr.AsSpan().CopyTo(output.AsWritableSpanUnmarked());
         }
         finally
         {

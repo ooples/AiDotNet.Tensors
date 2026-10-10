@@ -57,7 +57,8 @@ public sealed class CpuDevicePrimitives : IDevicePrimitives
             T acc = src[0];
             for (int i = 1; i < src.Length; i++) acc = Combine(acc, src[i], ops, kind);
             var scalar = new Tensor<T>(new[] { 1 });
-            scalar.AsWritableSpan()[0] = acc;
+            using var scalarKeep1 = new KeepAliveScope(scalar);
+            scalar.AsWritableSpanUnmarked()[0] = acc;
             return scalar;
         }
         // Reduce along a single axis.
@@ -151,7 +152,9 @@ public sealed class CpuDevicePrimitives : IDevicePrimitives
         if (actualAxis < 0 || actualAxis >= input.Rank)
             throw new ArgumentOutOfRangeException(nameof(axis));
         var output = new Tensor<T>((int[])input._shape.Clone());
-        input.AsSpan().CopyTo(output.AsWritableSpan());
+        using var inputKeep1 = new KeepAliveScope(input);
+        using var outputKeep1 = new KeepAliveScope(output);
+        input.AsSpanUnmarked().CopyTo(output.AsWritableSpanUnmarked());
         SortAxis<T>(output, actualAxis, descending, ops);
         return output;
     }

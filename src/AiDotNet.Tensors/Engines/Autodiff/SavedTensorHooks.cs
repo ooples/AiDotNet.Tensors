@@ -307,7 +307,8 @@ public static class SavedTensorRecipes
             pack: tensor =>
             {
                 var data = new T[tensor.Length];
-                tensor.AsSpan().CopyTo(data);
+                using var tensorKeep1 = new KeepAliveScope(tensor);
+                tensor.AsSpanUnmarked().CopyTo(data);
                 return new CpuSaved<T>(data, tensor.Shape.ToArray());
             },
             unpack: packed =>

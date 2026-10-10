@@ -278,9 +278,12 @@ public static class SparseOps
         {
             // Slice the batch's dense slab into its own 2-D tensor.
             var slab = new Tensor<T>(new[] { k, outCols });
-            denseBatch.AsSpan().Slice(b * k * outCols, k * outCols).CopyTo(slab.AsWritableSpan());
+            using var denseBatchKeep1 = new KeepAliveScope(denseBatch);
+            using var slabKeep1 = new KeepAliveScope(slab);
+            denseBatch.AsSpanUnmarked().Slice(b * k * outCols, k * outCols).CopyTo(slab.AsWritableSpanUnmarked());
             var prod = SparseMatMul(batchSparse[b], slab);
-            prod.AsSpan().CopyTo(outSpan.Slice(b * outRows * outCols, outRows * outCols));
+            using var prodKeep1 = new KeepAliveScope(prod);
+            prod.AsSpanUnmarked().CopyTo(outSpan.Slice(b * outRows * outCols, outRows * outCols));
         }
         return output;
     }
@@ -298,7 +301,8 @@ public static class SparseOps
             var span = spanLease.Span;
             for (int i = 0; i < span.Length; i++) acc = ops.Add(acc, span[i]);
             var result = new Tensor<T>(new[] { 1 });
-            result.AsWritableSpan()[0] = acc;
+            using var resultKeep1 = new KeepAliveScope(result);
+            result.AsWritableSpanUnmarked()[0] = acc;
             return result;
         }
         // Axis-aware sum: dense the answer (PyTorch returns dense for axis-reduced sparse sums).

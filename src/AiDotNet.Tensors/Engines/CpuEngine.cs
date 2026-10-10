@@ -290,7 +290,9 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float) && vector is Vector<float> floatVec)
         {
             var result = new Vector<float>(floatVec.Length);
-            Exp2(floatVec.AsSpan(), result.AsWritableSpan());
+            using var floatVecKeep1 = new KeepAliveScope(floatVec);
+            using var resultKeep1 = new KeepAliveScope(result);
+            Exp2(floatVec.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
             if (result is Vector<T> typedResult)
             {
                 return typedResult;
@@ -299,7 +301,9 @@ public partial class CpuEngine : ITensorLevelEngine
         else if (typeof(T) == typeof(double) && vector is Vector<double> doubleVec)
         {
             var result = new Vector<double>(doubleVec.Length);
-            Exp2(doubleVec.AsSpan(), result.AsWritableSpan());
+            using var doubleVecKeep1 = new KeepAliveScope(doubleVec);
+            using var resultKeep2 = new KeepAliveScope(result);
+            Exp2(doubleVec.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
             if (result is Vector<T> typedResult)
             {
                 return typedResult;
@@ -326,7 +330,9 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float) && vector is Vector<float> floatVec)
         {
             var result = new Vector<float>(floatVec.Length);
-            Exp10(floatVec.AsSpan(), result.AsWritableSpan());
+            using var floatVecKeep2 = new KeepAliveScope(floatVec);
+            using var resultKeep3 = new KeepAliveScope(result);
+            Exp10(floatVec.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
             if (result is Vector<T> typedResult)
             {
                 return typedResult;
@@ -335,7 +341,9 @@ public partial class CpuEngine : ITensorLevelEngine
         else if (typeof(T) == typeof(double) && vector is Vector<double> doubleVec)
         {
             var result = new Vector<double>(doubleVec.Length);
-            Exp10(doubleVec.AsSpan(), result.AsWritableSpan());
+            using var doubleVecKeep2 = new KeepAliveScope(doubleVec);
+            using var resultKeep4 = new KeepAliveScope(result);
+            Exp10(doubleVec.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
             if (result is Vector<T> typedResult)
             {
                 return typedResult;
@@ -883,9 +891,11 @@ public partial class CpuEngine : ITensorLevelEngine
             float[] floatInput = Unsafe.As<float[]>(inputData);
             float[] floatOutput = Unsafe.As<float[]>(outputData);
 
+            using var floatInputKeep1 = new KeepAliveScope(floatInput);
+            using var floatOutputKeep1 = new KeepAliveScope(floatOutput);
             TensorPrimitivesCore.InvokeSpanIntoSpan<SinOperatorFloat>(
-                floatInput.AsSpan(),
-                floatOutput.AsSpan());
+                floatInput.AsSpanUnmarked(),
+                floatOutput.AsSpanUnmarked());
 
             var result = new Vector<T>(vector.Length);
             for (int i = 0; i < outputData.Length; i++)
@@ -904,9 +914,11 @@ public partial class CpuEngine : ITensorLevelEngine
             double[] doubleInput = Unsafe.As<double[]>(inputData);
             double[] doubleOutput = Unsafe.As<double[]>(outputData);
 
+            using var doubleInputKeep1 = new KeepAliveScope(doubleInput);
+            using var doubleOutputKeep1 = new KeepAliveScope(doubleOutput);
             TensorPrimitivesCore.InvokeSpanIntoSpan<SinOperatorDouble>(
-                doubleInput.AsSpan(),
-                doubleOutput.AsSpan());
+                doubleInput.AsSpanUnmarked(),
+                doubleOutput.AsSpanUnmarked());
 
             var result = new Vector<T>(vector.Length);
             for (int i = 0; i < outputData.Length; i++)
@@ -945,9 +957,11 @@ public partial class CpuEngine : ITensorLevelEngine
             float[] floatInput = Unsafe.As<float[]>(inputData);
             float[] floatOutput = Unsafe.As<float[]>(outputData);
 
+            using var floatInputKeep2 = new KeepAliveScope(floatInput);
+            using var floatOutputKeep2 = new KeepAliveScope(floatOutput);
             TensorPrimitivesCore.InvokeSpanIntoSpan<CosOperatorFloat>(
-                floatInput.AsSpan(),
-                floatOutput.AsSpan());
+                floatInput.AsSpanUnmarked(),
+                floatOutput.AsSpanUnmarked());
 
             var result = new Vector<T>(vector.Length);
             for (int i = 0; i < outputData.Length; i++)
@@ -966,9 +980,11 @@ public partial class CpuEngine : ITensorLevelEngine
             double[] doubleInput = Unsafe.As<double[]>(inputData);
             double[] doubleOutput = Unsafe.As<double[]>(outputData);
 
+            using var doubleInputKeep2 = new KeepAliveScope(doubleInput);
+            using var doubleOutputKeep2 = new KeepAliveScope(doubleOutput);
             TensorPrimitivesCore.InvokeSpanIntoSpan<CosOperatorDouble>(
-                doubleInput.AsSpan(),
-                doubleOutput.AsSpan());
+                doubleInput.AsSpanUnmarked(),
+                doubleOutput.AsSpanUnmarked());
 
             var result = new Vector<T>(vector.Length);
             for (int i = 0; i < outputData.Length; i++)
@@ -1119,7 +1135,9 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float) && vector is Vector<float> floatVec)
         {
             var result = new Vector<float>(floatVec.Length);
-            Asin(floatVec.AsSpan(), result.AsWritableSpan());
+            using var floatVecKeep3 = new KeepAliveScope(floatVec);
+            using var resultKeep5 = new KeepAliveScope(result);
+            Asin(floatVec.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
             if (result is Vector<T> typedResult)
             {
                 return typedResult;
@@ -1128,7 +1146,9 @@ public partial class CpuEngine : ITensorLevelEngine
         else if (typeof(T) == typeof(double) && vector is Vector<double> doubleVec)
         {
             var result = new Vector<double>(doubleVec.Length);
-            Asin(doubleVec.AsSpan(), result.AsWritableSpan());
+            using var doubleVecKeep3 = new KeepAliveScope(doubleVec);
+            using var resultKeep6 = new KeepAliveScope(result);
+            Asin(doubleVec.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
             if (result is Vector<T> typedResult)
             {
                 return typedResult;
@@ -1170,7 +1190,9 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float) && vector is Vector<float> floatVec)
         {
             var result = new Vector<float>(floatVec.Length);
-            Acos(floatVec.AsSpan(), result.AsWritableSpan());
+            using var floatVecKeep4 = new KeepAliveScope(floatVec);
+            using var resultKeep7 = new KeepAliveScope(result);
+            Acos(floatVec.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
             if (result is Vector<T> typedResult)
             {
                 return typedResult;
@@ -1179,7 +1201,9 @@ public partial class CpuEngine : ITensorLevelEngine
         else if (typeof(T) == typeof(double) && vector is Vector<double> doubleVec)
         {
             var result = new Vector<double>(doubleVec.Length);
-            Acos(doubleVec.AsSpan(), result.AsWritableSpan());
+            using var doubleVecKeep4 = new KeepAliveScope(doubleVec);
+            using var resultKeep8 = new KeepAliveScope(result);
+            Acos(doubleVec.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
             if (result is Vector<T> typedResult)
             {
                 return typedResult;
@@ -1221,7 +1245,9 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float) && vector is Vector<float> floatVec)
         {
             var result = new Vector<float>(floatVec.Length);
-            Atan(floatVec.AsSpan(), result.AsWritableSpan());
+            using var floatVecKeep5 = new KeepAliveScope(floatVec);
+            using var resultKeep9 = new KeepAliveScope(result);
+            Atan(floatVec.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
             if (result is Vector<T> typedResult)
             {
                 return typedResult;
@@ -1230,7 +1256,9 @@ public partial class CpuEngine : ITensorLevelEngine
         else if (typeof(T) == typeof(double) && vector is Vector<double> doubleVec)
         {
             var result = new Vector<double>(doubleVec.Length);
-            Atan(doubleVec.AsSpan(), result.AsWritableSpan());
+            using var doubleVecKeep5 = new KeepAliveScope(doubleVec);
+            using var resultKeep10 = new KeepAliveScope(result);
+            Atan(doubleVec.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
             if (result is Vector<T> typedResult)
             {
                 return typedResult;
@@ -1851,7 +1879,8 @@ public partial class CpuEngine : ITensorLevelEngine
                 var rowSpan = rowData.AsSpan(0, bFloat.Length);
                 for (int i = 0; i < aFloat.Length; i++)
                 {
-                    SimdKernels.MultiplyScalar(bFloat.AsSpan(), aFloat[i], rowSpan);
+                    using var bFloatKeep1 = new KeepAliveScope(bFloat);
+                    SimdKernels.MultiplyScalar(bFloat.AsSpanUnmarked(), aFloat[i], rowSpan);
                     for (int j = 0; j < bFloat.Length; j++)
                         result[i, j] = (T)(object)rowData[j];
                 }
@@ -1868,7 +1897,8 @@ public partial class CpuEngine : ITensorLevelEngine
                 var rowSpan = rowData.AsSpan(0, bDouble.Length);
                 for (int i = 0; i < aDouble.Length; i++)
                 {
-                    SimdKernels.MultiplyScalar(bDouble.AsSpan(), aDouble[i], rowSpan);
+                    using var bDoubleKeep1 = new KeepAliveScope(bDouble);
+                    SimdKernels.MultiplyScalar(bDouble.AsSpanUnmarked(), aDouble[i], rowSpan);
                     for (int j = 0; j < bDouble.Length; j++)
                         result[i, j] = (T)(object)rowData[j];
                 }
@@ -2128,7 +2158,9 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var srcF = (Tensor<float>)(object)tensor;
             var dstF = (Tensor<float>)(object)result;
-            Simd.NchwcReorder.ToNchwc(srcF.AsSpan(), dstF.AsWritableSpan(), n, c, h, w, cBlock);
+            using var srcFKeep1 = new KeepAliveScope(srcF);
+            using var dstFKeep1 = new KeepAliveScope(dstF);
+            Simd.NchwcReorder.ToNchwc(srcF.AsSpanUnmarked(), dstF.AsWritableSpanUnmarked(), n, c, h, w, cBlock);
         }
         else
         {
@@ -2202,7 +2234,9 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var srcF = (Tensor<float>)(object)tensor;
             var dstF = (Tensor<float>)(object)result;
-            Simd.NchwcReorder.ToNchw(srcF.AsSpan(), dstF.AsWritableSpan(), n, c, h, w, cBlock);
+            using var srcFKeep2 = new KeepAliveScope(srcF);
+            using var dstFKeep2 = new KeepAliveScope(dstF);
+            Simd.NchwcReorder.ToNchw(srcF.AsSpanUnmarked(), dstF.AsWritableSpanUnmarked(), n, c, h, w, cBlock);
         }
         else
         {
@@ -2262,17 +2296,29 @@ public partial class CpuEngine : ITensorLevelEngine
             dstF.Layout = x.Layout;
             if (x.Layout == LinearAlgebra.TensorLayout.Nchwc8 && C % Simd.NchwcBatchNorm.CBlock == 0)
             {
+                using var xfKeep1 = new KeepAliveScope(xf);
+                using var gammaFKeep1 = new KeepAliveScope(gammaF);
+                using var betaFKeep1 = new KeepAliveScope(betaF);
+                using var meanFKeep1 = new KeepAliveScope(meanF);
+                using var varFKeep1 = new KeepAliveScope(varF);
+                using var dstFKeep3 = new KeepAliveScope(dstF);
                 Simd.NchwcBatchNorm.RunNchwc8(
-                    xf.AsSpan(), gammaF.AsSpan(), betaF.AsSpan(),
-                    meanF.AsSpan(), varF.AsSpan(), (float)epsilon,
-                    dstF.AsWritableSpan(), N, C, H, W);
+                    xf.AsSpanUnmarked(), gammaF.AsSpanUnmarked(), betaF.AsSpanUnmarked(),
+                    meanF.AsSpanUnmarked(), varF.AsSpanUnmarked(), (float)epsilon,
+                    dstF.AsWritableSpanUnmarked(), N, C, H, W);
             }
             else
             {
+                using var xfKeep2 = new KeepAliveScope(xf);
+                using var gammaFKeep2 = new KeepAliveScope(gammaF);
+                using var betaFKeep2 = new KeepAliveScope(betaF);
+                using var meanFKeep2 = new KeepAliveScope(meanF);
+                using var varFKeep2 = new KeepAliveScope(varF);
+                using var dstFKeep4 = new KeepAliveScope(dstF);
                 Simd.NchwcBatchNorm.RunNchw(
-                    xf.AsSpan(), gammaF.AsSpan(), betaF.AsSpan(),
-                    meanF.AsSpan(), varF.AsSpan(), (float)epsilon,
-                    dstF.AsWritableSpan(), N, C, H, W);
+                    xf.AsSpanUnmarked(), gammaF.AsSpanUnmarked(), betaF.AsSpanUnmarked(),
+                    meanF.AsSpanUnmarked(), varF.AsSpanUnmarked(), (float)epsilon,
+                    dstF.AsWritableSpanUnmarked(), N, C, H, W);
             }
             return;
         }
@@ -2603,17 +2649,29 @@ public partial class CpuEngine : ITensorLevelEngine
             var result = new Tensor<float>(x._shape) { Layout = x.Layout };
             if (x.Layout == LinearAlgebra.TensorLayout.Nchwc8 && C % Simd.NchwcBatchNorm.CBlock == 0)
             {
+                using var xfKeep3 = new KeepAliveScope(xf);
+                using var gammaFKeep3 = new KeepAliveScope(gammaF);
+                using var betaFKeep3 = new KeepAliveScope(betaF);
+                using var meanFKeep3 = new KeepAliveScope(meanF);
+                using var varFKeep3 = new KeepAliveScope(varF);
+                using var resultKeep11 = new KeepAliveScope(result);
                 Simd.NchwcBatchNorm.RunNchwc8(
-                    xf.AsSpan(), gammaF.AsSpan(), betaF.AsSpan(),
-                    meanF.AsSpan(), varF.AsSpan(), (float)epsilon,
-                    result.AsWritableSpan(), N, C, H, W);
+                    xf.AsSpanUnmarked(), gammaF.AsSpanUnmarked(), betaF.AsSpanUnmarked(),
+                    meanF.AsSpanUnmarked(), varF.AsSpanUnmarked(), (float)epsilon,
+                    result.AsWritableSpanUnmarked(), N, C, H, W);
             }
             else if (x.Layout == LinearAlgebra.TensorLayout.Nchw)
             {
+                using var xfKeep4 = new KeepAliveScope(xf);
+                using var gammaFKeep4 = new KeepAliveScope(gammaF);
+                using var betaFKeep4 = new KeepAliveScope(betaF);
+                using var meanFKeep4 = new KeepAliveScope(meanF);
+                using var varFKeep4 = new KeepAliveScope(varF);
+                using var resultKeep12 = new KeepAliveScope(result);
                 Simd.NchwcBatchNorm.RunNchw(
-                    xf.AsSpan(), gammaF.AsSpan(), betaF.AsSpan(),
-                    meanF.AsSpan(), varF.AsSpan(), (float)epsilon,
-                    result.AsWritableSpan(), N, C, H, W);
+                    xf.AsSpanUnmarked(), gammaF.AsSpanUnmarked(), betaF.AsSpanUnmarked(),
+                    meanF.AsSpanUnmarked(), varF.AsSpanUnmarked(), (float)epsilon,
+                    result.AsWritableSpanUnmarked(), N, C, H, W);
             }
             else
             {
@@ -2623,11 +2681,19 @@ public partial class CpuEngine : ITensorLevelEngine
                 // and produce garbage. Unpack to plain NCHW first, then run
                 // the generic NCHW kernel, and mark the result as Nchw.
                 var unpackedT = new Tensor<float>(new[] { N, C, H, W }) { Layout = LinearAlgebra.TensorLayout.Nchw };
-                Simd.NchwcReorder.ToNchw(xf.AsSpan(), unpackedT.AsWritableSpan(), N, C, H, W, Simd.NchwcConv2D.CBlock);
+                using var xfKeep5 = new KeepAliveScope(xf);
+                using var unpackedTKeep1 = new KeepAliveScope(unpackedT);
+                Simd.NchwcReorder.ToNchw(xf.AsSpanUnmarked(), unpackedT.AsWritableSpanUnmarked(), N, C, H, W, Simd.NchwcConv2D.CBlock);
+                using var unpackedTKeep2 = new KeepAliveScope(unpackedT);
+                using var gammaFKeep5 = new KeepAliveScope(gammaF);
+                using var betaFKeep5 = new KeepAliveScope(betaF);
+                using var meanFKeep5 = new KeepAliveScope(meanF);
+                using var varFKeep5 = new KeepAliveScope(varF);
+                using var resultKeep13 = new KeepAliveScope(result);
                 Simd.NchwcBatchNorm.RunNchw(
-                    unpackedT.AsSpan(), gammaF.AsSpan(), betaF.AsSpan(),
-                    meanF.AsSpan(), varF.AsSpan(), (float)epsilon,
-                    result.AsWritableSpan(), N, C, H, W);
+                    unpackedT.AsSpanUnmarked(), gammaF.AsSpanUnmarked(), betaF.AsSpanUnmarked(),
+                    meanF.AsSpanUnmarked(), varF.AsSpanUnmarked(), (float)epsilon,
+                    result.AsWritableSpanUnmarked(), N, C, H, W);
                 result.Layout = LinearAlgebra.TensorLayout.Nchw;
             }
             return (Tensor<T>)(object)result;
@@ -3173,7 +3239,8 @@ public partial class CpuEngine : ITensorLevelEngine
             // the iter18c sweep.
             var aMem = AsFloatReadOnlyMemory(a.ReadOnlyData);
             var bMem = AsFloatReadOnlyMemory(b.ReadOnlyData);
-            var rMem = AsFloatMemory(result.Data);
+            using var resultDataKeep1 = new KeepAliveScope(result);
+            var rMem = AsFloatMemory(result.DataUnmarked);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
@@ -3221,7 +3288,8 @@ public partial class CpuEngine : ITensorLevelEngine
             // In-house: pin logical memory and call SimdKernels.VectorAddUnsafe(double*).
             var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyData);
             var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyData);
-            var rMem = AsDoubleMemory(result.Data);
+            using var resultDataKeep2 = new KeepAliveScope(result);
+            var rMem = AsDoubleMemory(result.DataUnmarked);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
@@ -3253,7 +3321,10 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.Add(a.AsSpan(), b.AsSpan(), result.AsWritableSpan());
+            using var aKeep1 = new KeepAliveScope(a);
+            using var bKeep1 = new KeepAliveScope(b);
+            using var resultKeep14 = new KeepAliveScope(result);
+            numOps.Add(a.AsSpanUnmarked(), b.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
         }
 
         DifferentiableOps.RecordBinary("TensorAdd", result, a, b, BackwardFunctions<T>.AddBackward);
@@ -3407,7 +3478,9 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Add(a.AsSpan(), b.AsSpan(), a.AsWritableSpan());
+        using var aKeep2 = new KeepAliveScope(a);
+        using var bKeep2 = new KeepAliveScope(b);
+        numOps.Add(a.AsSpanUnmarked(), b.AsSpanUnmarked(), a.AsWritableSpanUnmarked());
         if (savedA is not null)
             DifferentiableOps.RecordBinary("TensorAddInPlace", a, savedA, bOrig, BackwardFunctions<T>.AddBackward);
     }
@@ -3438,7 +3511,8 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var aMem = AsFloatReadOnlyMemory(a.ReadOnlyData);
             var bMem = AsFloatReadOnlyMemory(b.ReadOnlyData);
-            var rMem = AsFloatMemory(destination.Data);
+            using var destinationDataKeep1 = new KeepAliveScope(destination);
+            var rMem = AsFloatMemory(destination.DataUnmarked);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
@@ -3454,7 +3528,8 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyData);
             var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyData);
-            var rMem = AsDoubleMemory(destination.Data);
+            using var destinationDataKeep2 = new KeepAliveScope(destination);
+            var rMem = AsDoubleMemory(destination.DataUnmarked);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
@@ -3463,7 +3538,10 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.Add(a.AsSpan(), b.AsSpan(), destination.AsWritableSpan());
+            using var aKeep3 = new KeepAliveScope(a);
+            using var bKeep3 = new KeepAliveScope(b);
+            using var destinationKeep1 = new KeepAliveScope(destination);
+            numOps.Add(a.AsSpanUnmarked(), b.AsSpanUnmarked(), destination.AsWritableSpanUnmarked());
         }
     }
 
@@ -3528,7 +3606,8 @@ public partial class CpuEngine : ITensorLevelEngine
             var numeric = MathHelper.GetNumericOperations<T>();
             var inputSpan = input.ReadOnlyData.Span;
             var biasSpan = bias.ReadOnlyData.Span;
-            var resultSpan = result.Data.Span;
+            using var resultDataKeep3 = new KeepAliveScope(result);
+            var resultSpan = result.DataUnmarked.Span;
             for (int batch = 0; batch < batchCount; batch++)
             {
                 for (int channel = 0; channel < channelCount; channel++)
@@ -4276,7 +4355,8 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!b.IsContiguous) b = b.Contiguous();
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        var aSpan = a.Data.Span;
+        using var aDataKeep1 = new KeepAliveScope(a);
+        var aSpan = a.DataUnmarked.Span;
         var bSpan = b.ReadOnlyData.Span;
 
         // Fast path: same shape — no broadcasting needed
@@ -4348,7 +4428,8 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentException(
                 $"In-place broadcast add cannot resize its target: {FormatShape(a._shape)} " +
                 $"+= {FormatShape(b._shape)} broadcasts to {FormatShape(result._shape)}.", nameof(b));
-        result.Data.Span.CopyTo(aSpan);
+        using var resultDataKeep4 = new KeepAliveScope(result);
+        result.DataUnmarked.Span.CopyTo(aSpan);
     }
 
     /// <summary>
@@ -4459,7 +4540,8 @@ public partial class CpuEngine : ITensorLevelEngine
             // Input and affine parameters are read-only. Pinning through Data would
             // privatize every COW peer during compiled GroupNorm replay.
             using var pinIn = input.ReadOnlyData.Pin();
-            using var pinOut = output.Data.Pin();
+            using var outputDataKeep1 = new KeepAliveScope(output);
+            using var pinOut = output.DataUnmarked.Pin();
             using var pinGamma = gamma.ReadOnlyData.Pin();
             using var pinBeta = beta.ReadOnlyData.Pin();
             unsafe
@@ -4575,7 +4657,10 @@ public partial class CpuEngine : ITensorLevelEngine
         // output = GroupNorm(a + b)
         // Step 1: Add a + b directly into output (zero alloc)
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Add(a.AsSpan(), b.AsSpan(), output.AsWritableSpan());
+        using var aKeep4 = new KeepAliveScope(a);
+        using var bKeep4 = new KeepAliveScope(b);
+        using var outputKeep1 = new KeepAliveScope(output);
+        numOps.Add(a.AsSpanUnmarked(), b.AsSpanUnmarked(), output.AsWritableSpanUnmarked());
         // Step 2: GroupNorm in-place on output via GroupNormInto
         GroupNormInto(output, output, numGroups, gamma, beta, epsilon, out _, out _);
     }
@@ -4601,10 +4686,11 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
         // Swish uses ArrayPool internally for the sigmoid buffer (no GC allocation)
+        using var tensorKeep1 = new KeepAliveScope(tensor);
         if (typeof(T) == typeof(float) || typeof(T) == typeof(double))
             SwishInto(tensor, tensor); // fused, parallel, alias-safe kernel (see SwishBlocked)
         else
-            numOps.Swish(tensor.AsSpan(), tensor.AsWritableSpan());
+            numOps.Swish(tensor.AsSpanUnmarked(), tensor.AsWritableSpanUnmarked());
         if (!ReferenceEquals(tensor, tensorOrig)) WriteBackToView(tensorOrig, tensor);
     }
 
@@ -4617,8 +4703,10 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float))
         {
             // Fused sigmoid*x in two SIMD passes using unsafe pointers (no ArrayPool)
-            var srcMem = AsFloatMemory(input.Data);
-            var dstMem = AsFloatMemory(destination.Data);
+            using var inputDataKeep1 = new KeepAliveScope(input);
+            var srcMem = AsFloatMemory(input.DataUnmarked);
+            using var destinationDataKeep3 = new KeepAliveScope(destination);
+            var dstMem = AsFloatMemory(destination.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             float* pSrc = (float*)pinSrc.Pointer;
@@ -4631,16 +4719,22 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             // Fused swish = x * sigmoid(x), fanned across cores for large activations (#653 — parity
             // with the float path; the double path was a serial straggler).
-            var srcMemD = AsDoubleMemory(input.Data);
-            var dstMemD = AsDoubleMemory(destination.Data);
+            using var inputDataKeep2 = new KeepAliveScope(input);
+            var srcMemD = AsDoubleMemory(input.DataUnmarked);
+            using var destinationDataKeep4 = new KeepAliveScope(destination);
+            var dstMemD = AsDoubleMemory(destination.DataUnmarked);
             using var pinSrcD = srcMemD.Pin();
             using var pinDstD = dstMemD.Pin();
             ParallelSwish((double*)pinSrcD.Pointer, (double*)pinDstD.Pointer, input.Length);
             return;
         }
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Sigmoid(input.AsSpan(), destination.AsWritableSpan());
-        numOps.Multiply(input.AsSpan(), destination.AsSpan(), destination.AsWritableSpan());
+        using var inputKeep1 = new KeepAliveScope(input);
+        using var destinationKeep2 = new KeepAliveScope(destination);
+        numOps.Sigmoid(input.AsSpanUnmarked(), destination.AsWritableSpanUnmarked());
+        using var inputKeep2 = new KeepAliveScope(input);
+        using var destinationKeep3 = new KeepAliveScope(destination);
+        numOps.Multiply(input.AsSpanUnmarked(), destination.AsSpanUnmarked(), destination.AsWritableSpanUnmarked());
     }
 
     /// <inheritdoc/>
@@ -4663,7 +4757,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.GELU(tensor.AsSpan(), tensor.AsWritableSpan());
+        using var tensorKeep2 = new KeepAliveScope(tensor);
+        numOps.GELU(tensor.AsSpanUnmarked(), tensor.AsWritableSpanUnmarked());
         if (!ReferenceEquals(tensor, tensorOrig)) WriteBackToView(tensorOrig, tensor);
     }
 
@@ -4687,16 +4782,20 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"Destination length {destination.Length} is smaller than input length {input.Length}");
         if (typeof(T) == typeof(float))
         {
-            var srcMem = AsFloatMemory(input.Data);
-            var dstMem = AsFloatMemory(destination.Data);
+            using var inputDataKeep3 = new KeepAliveScope(input);
+            var srcMem = AsFloatMemory(input.DataUnmarked);
+            using var destinationDataKeep5 = new KeepAliveScope(destination);
+            var dstMem = AsFloatMemory(destination.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             ParallelComputeBound((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length, Simd.SimdKernels.GELUUnsafe);
         }
         else if (typeof(T) == typeof(double))
         {
-            var srcMem = AsDoubleMemory(input.Data);
-            var dstMem = AsDoubleMemory(destination.Data);
+            using var inputDataKeep4 = new KeepAliveScope(input);
+            var srcMem = AsDoubleMemory(input.DataUnmarked);
+            using var destinationDataKeep6 = new KeepAliveScope(destination);
+            var dstMem = AsDoubleMemory(destination.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             ParallelComputeBound((double*)pinSrc.Pointer, (double*)pinDst.Pointer, input.Length, Simd.SimdKernels.GELUUnsafe);
@@ -4704,7 +4803,9 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.GELU(input.AsSpan(), destination.AsWritableSpan());
+            using var inputKeep3 = new KeepAliveScope(input);
+            using var destinationKeep4 = new KeepAliveScope(destination);
+            numOps.GELU(input.AsSpanUnmarked(), destination.AsWritableSpanUnmarked());
         }
     }
 
@@ -4728,7 +4829,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Tanh(tensor.AsSpan(), tensor.AsWritableSpan());
+        using var tensorKeep3 = new KeepAliveScope(tensor);
+        numOps.Tanh(tensor.AsSpanUnmarked(), tensor.AsWritableSpanUnmarked());
         if (!ReferenceEquals(tensor, tensorOrig)) WriteBackToView(tensorOrig, tensor);
     }
 
@@ -4744,16 +4846,20 @@ public partial class CpuEngine : ITensorLevelEngine
         int length = input.Length;
         if (typeof(T) == typeof(float))
         {
-            var srcMem = AsFloatMemory(input.Data);
-            var dstMem = AsFloatMemory(destination.Data);
+            using var inputDataKeep5 = new KeepAliveScope(input);
+            var srcMem = AsFloatMemory(input.DataUnmarked);
+            using var destinationDataKeep7 = new KeepAliveScope(destination);
+            var dstMem = AsFloatMemory(destination.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             ParallelComputeBound((float*)pinSrc.Pointer, (float*)pinDst.Pointer, length, Simd.SimdKernels.TanhUnsafe);
         }
         else if (typeof(T) == typeof(double))
         {
-            var srcMem = AsDoubleMemory(input.Data);
-            var dstMem = AsDoubleMemory(destination.Data);
+            using var inputDataKeep6 = new KeepAliveScope(input);
+            var srcMem = AsDoubleMemory(input.DataUnmarked);
+            using var destinationDataKeep8 = new KeepAliveScope(destination);
+            var dstMem = AsDoubleMemory(destination.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             ParallelComputeBound((double*)pinSrc.Pointer, (double*)pinDst.Pointer, length, Simd.SimdKernels.TanhUnsafe);
@@ -4761,7 +4867,9 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.Tanh(input.AsSpan(), destination.AsWritableSpan());
+            using var inputKeep4 = new KeepAliveScope(input);
+            using var destinationKeep5 = new KeepAliveScope(destination);
+            numOps.Tanh(input.AsSpanUnmarked(), destination.AsWritableSpanUnmarked());
         }
     }
 
@@ -4785,7 +4893,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Mish(tensor.AsSpan(), tensor.AsWritableSpan());
+        using var tensorKeep4 = new KeepAliveScope(tensor);
+        numOps.Mish(tensor.AsSpanUnmarked(), tensor.AsWritableSpanUnmarked());
         if (!ReferenceEquals(tensor, tensorOrig)) WriteBackToView(tensorOrig, tensor);
     }
 
@@ -4797,8 +4906,10 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!input.IsContiguous) input = input.Contiguous();
         if (typeof(T) == typeof(float))
         {
-            var srcMem = AsFloatMemory(input.Data);
-            var dstMem = AsFloatMemory(destination.Data);
+            using var inputDataKeep7 = new KeepAliveScope(input);
+            var srcMem = AsFloatMemory(input.DataUnmarked);
+            using var destinationDataKeep9 = new KeepAliveScope(destination);
+            var dstMem = AsFloatMemory(destination.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             ParallelComputeBound((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length, Simd.SimdKernels.MishUnsafe);
@@ -4809,13 +4920,17 @@ public partial class CpuEngine : ITensorLevelEngine
             // SIMD double-precision Mish via the Span overload (no unsafe ptr
             // variant exists for double Mish yet — same elementwise cost
             // class either way).
-            var srcSpan = ((ReadOnlyMemory<double>)AsDoubleMemory(input.Data)).Span;
-            var dstSpan = AsDoubleMemory(destination.Data).Span;
+            using var inputDataKeep8 = new KeepAliveScope(input);
+            var srcSpan = ((ReadOnlyMemory<double>)AsDoubleMemory(input.DataUnmarked)).Span;
+            using var destinationDataKeep10 = new KeepAliveScope(destination);
+            var dstSpan = AsDoubleMemory(destination.DataUnmarked).Span;
             Simd.SimdKernels.Mish(srcSpan, dstSpan);
             return;
         }
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Mish(input.AsSpan(), destination.AsWritableSpan());
+        using var inputKeep5 = new KeepAliveScope(input);
+        using var destinationKeep6 = new KeepAliveScope(destination);
+        numOps.Mish(input.AsSpanUnmarked(), destination.AsWritableSpanUnmarked());
     }
 
     /// <inheritdoc/>
@@ -4838,7 +4953,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
         if (!tensor.IsContiguous) tensor = tensor.Contiguous();
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.LeakyReLU(tensor.AsSpan(), alpha, tensor.AsWritableSpan());
+        using var tensorKeep5 = new KeepAliveScope(tensor);
+        numOps.LeakyReLU(tensor.AsSpanUnmarked(), alpha, tensor.AsWritableSpanUnmarked());
         if (!ReferenceEquals(tensor, tensorOrig)) WriteBackToView(tensorOrig, tensor);
     }
 
@@ -4854,8 +4970,10 @@ public partial class CpuEngine : ITensorLevelEngine
             throw new ArgumentException($"Destination length {destination.Length} is smaller than input length {input.Length}");
         if (typeof(T) == typeof(float))
         {
-            var srcMem = AsFloatMemory(input.Data);
-            var dstMem = AsFloatMemory(destination.Data);
+            using var inputDataKeep9 = new KeepAliveScope(input);
+            var srcMem = AsFloatMemory(input.DataUnmarked);
+            using var destinationDataKeep11 = new KeepAliveScope(destination);
+            var dstMem = AsFloatMemory(destination.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             float alphaF = (float)MathHelper.GetNumericOperations<T>().ToDouble(alpha);
@@ -4863,15 +4981,19 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else if (typeof(T) == typeof(double))
         {
-            var srcSpan = ((ReadOnlyMemory<double>)AsDoubleMemory(input.Data)).Span;
-            var dstSpan = AsDoubleMemory(destination.Data).Span;
+            using var inputDataKeep10 = new KeepAliveScope(input);
+            var srcSpan = ((ReadOnlyMemory<double>)AsDoubleMemory(input.DataUnmarked)).Span;
+            using var destinationDataKeep12 = new KeepAliveScope(destination);
+            var dstSpan = AsDoubleMemory(destination.DataUnmarked).Span;
             double alphaD = MathHelper.GetNumericOperations<T>().ToDouble(alpha);
             Simd.SimdKernels.LeakyReLU(srcSpan, alphaD, dstSpan);
         }
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.LeakyReLU(input.AsSpan(), alpha, destination.AsWritableSpan());
+            using var inputKeep6 = new KeepAliveScope(input);
+            using var destinationKeep7 = new KeepAliveScope(destination);
+            numOps.LeakyReLU(input.AsSpanUnmarked(), alpha, destination.AsWritableSpanUnmarked());
         }
     }
 
@@ -4903,7 +5025,8 @@ public partial class CpuEngine : ITensorLevelEngine
             // SIMD-blocked fallback (see TensorMatMul2D for rationale).
             // MultiplyBlocked accumulates, so pre-zero the destination.
             var numOps = MathHelper.GetNumericOperations<T>();
-            destination.AsWritableSpan().Clear();
+            using var destinationKeep8 = new KeepAliveScope(destination);
+            destination.AsWritableSpanUnmarked().Clear();
             MatrixMultiplyHelper.MultiplyBlocked(
                 numOps, a.Data, b.Data, destination.Data,
                 m, n, p, n, p, p);
@@ -4939,7 +5062,9 @@ public partial class CpuEngine : ITensorLevelEngine
             }
         }
         var result = TensorMatMul(a, b);
-        result.Data.Span.CopyTo(destination.Data.Span);
+        using var resultDataKeep5 = new KeepAliveScope(result);
+        using var destinationDataKeep13 = new KeepAliveScope(destination);
+        result.DataUnmarked.Span.CopyTo(destination.DataUnmarked.Span);
     }
 
     /// <inheritdoc/>
@@ -4993,7 +5118,8 @@ public partial class CpuEngine : ITensorLevelEngine
         int columnOffset = 0;
         foreach (var tensor in tensors)
         {
-            var src = tensor.IsContiguous ? tensor.AsSpan() : tensor.Contiguous().AsSpan();
+            using var tensorKeep6 = new KeepAliveScope(tensor);
+            var src = tensor.IsContiguous ? tensor.AsSpanUnmarked() : tensor.Contiguous().AsSpan();
             int slab = tensor._shape[axis] * inner;
             for (int o = 0; o < outer; o++)
             {
@@ -5097,8 +5223,10 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float) && innerSize == 1)
         {
             // Use Pin() for NativeMemory compatibility (no GetDataArray copy)
-            using var pinIn = input.Data.Pin();
-            using var pinOut = destination.Data.Pin();
+            using var inputDataKeep11 = new KeepAliveScope(input);
+            using var pinIn = input.DataUnmarked.Pin();
+            using var destinationDataKeep14 = new KeepAliveScope(destination);
+            using var pinOut = destination.DataUnmarked.Pin();
             unsafe
             {
                 SoftmaxFloatFastPtr((float*)pinIn.Pointer, (float*)pinOut.Pointer, outerSize, axisSize);
@@ -5114,8 +5242,10 @@ public partial class CpuEngine : ITensorLevelEngine
         // across rows for cache locality and core saturation.
         if (typeof(T) == typeof(double) && innerSize == 1)
         {
-            using var pinIn = input.Data.Pin();
-            using var pinOut = destination.Data.Pin();
+            using var inputDataKeep12 = new KeepAliveScope(input);
+            using var pinIn = input.DataUnmarked.Pin();
+            using var destinationDataKeep15 = new KeepAliveScope(destination);
+            using var pinOut = destination.DataUnmarked.Pin();
             unsafe
             {
                 double* pIn = (double*)pinIn.Pointer;
@@ -5152,7 +5282,9 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = Softmax(input, axis);
         try
         {
-            result.Data.Span.CopyTo(destination.Data.Span);
+            using var resultDataKeep6 = new KeepAliveScope(result);
+            using var destinationDataKeep16 = new KeepAliveScope(destination);
+            result.DataUnmarked.Span.CopyTo(destination.DataUnmarked.Span);
         }
         finally
         {
@@ -5176,7 +5308,9 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = TensorLogSoftmax(input, axis);
         try
         {
-            result.Data.Span.CopyTo(destination.Data.Span);
+            using var resultDataKeep7 = new KeepAliveScope(result);
+            using var destinationDataKeep17 = new KeepAliveScope(destination);
+            result.DataUnmarked.Span.CopyTo(destination.DataUnmarked.Span);
         }
         finally
         {
@@ -5266,7 +5400,9 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = ScaledDotProductAttention(query, key, value, mask: null, scale: scaleVal, out var weights);
         try
         {
-            result.Data.Span.CopyTo(destination.Data.Span);
+            using var resultDataKeep8 = new KeepAliveScope(result);
+            using var destinationDataKeep18 = new KeepAliveScope(destination);
+            result.DataUnmarked.Span.CopyTo(destination.DataUnmarked.Span);
         }
         finally
         {
@@ -5362,7 +5498,9 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         var result = TensorBroadcastMultiply(a, b);
-        try { result.Data.Span.CopyTo(destination.Data.Span); }
+        using var resultDataKeep9 = new KeepAliveScope(result);
+        using var destinationDataKeep19 = new KeepAliveScope(destination);
+        try { result.DataUnmarked.Span.CopyTo(destination.DataUnmarked.Span); }
         finally { TensorAllocator.Return(result); }
     }
 
@@ -5406,7 +5544,9 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         var result = TensorBroadcastAdd(a, b);
-        try { result.Data.Span.CopyTo(destination.Data.Span); }
+        using var resultDataKeep10 = new KeepAliveScope(result);
+        using var destinationDataKeep20 = new KeepAliveScope(destination);
+        try { result.DataUnmarked.Span.CopyTo(destination.DataUnmarked.Span); }
         finally { TensorAllocator.Return(result); }
     }
 
@@ -5428,7 +5568,9 @@ public partial class CpuEngine : ITensorLevelEngine
         var numOps = MathHelper.GetNumericOperations<T>();
         if (a.IsContiguous)
         {
-            numOps.AddScalar(a.AsSpan(), scalar, destination.AsWritableSpan());
+            using var aKeep5 = new KeepAliveScope(a);
+            using var destinationKeep9 = new KeepAliveScope(destination);
+            numOps.AddScalar(a.AsSpanUnmarked(), scalar, destination.AsWritableSpanUnmarked());
         }
         else
         {
@@ -5481,7 +5623,8 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var aMem = AsFloatReadOnlyMemory(a.ReadOnlyData);
             var bMem = AsFloatReadOnlyMemory(b.ReadOnlyData);
-            var rMem = AsFloatMemory(destination.Data);
+            using var destinationDataKeep21 = new KeepAliveScope(destination);
+            var rMem = AsFloatMemory(destination.DataUnmarked);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
@@ -5491,7 +5634,8 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyData);
             var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyData);
-            var rMem = AsDoubleMemory(destination.Data);
+            using var destinationDataKeep22 = new KeepAliveScope(destination);
+            var rMem = AsDoubleMemory(destination.DataUnmarked);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
@@ -5500,7 +5644,10 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.Subtract(a.AsSpan(), b.AsSpan(), destination.AsWritableSpan());
+            using var aKeep6 = new KeepAliveScope(a);
+            using var bKeep5 = new KeepAliveScope(b);
+            using var destinationKeep10 = new KeepAliveScope(destination);
+            numOps.Subtract(a.AsSpanUnmarked(), b.AsSpanUnmarked(), destination.AsWritableSpanUnmarked());
         }
     }
 
@@ -5518,7 +5665,8 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var aMem = AsFloatReadOnlyMemory(a.ReadOnlyData);
             var bMem = AsFloatReadOnlyMemory(b.ReadOnlyData);
-            var rMem = AsFloatMemory(destination.Data);
+            using var destinationDataKeep23 = new KeepAliveScope(destination);
+            var rMem = AsFloatMemory(destination.DataUnmarked);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
@@ -5528,7 +5676,8 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyData);
             var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyData);
-            var rMem = AsDoubleMemory(destination.Data);
+            using var destinationDataKeep24 = new KeepAliveScope(destination);
+            var rMem = AsDoubleMemory(destination.DataUnmarked);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
@@ -5537,7 +5686,10 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.Divide(a.AsSpan(), b.AsSpan(), destination.AsWritableSpan());
+            using var aKeep7 = new KeepAliveScope(a);
+            using var bKeep6 = new KeepAliveScope(b);
+            using var destinationKeep11 = new KeepAliveScope(destination);
+            numOps.Divide(a.AsSpanUnmarked(), b.AsSpanUnmarked(), destination.AsWritableSpanUnmarked());
         }
     }
 
@@ -5549,8 +5701,10 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!input.IsContiguous) input = input.Contiguous();
         if (typeof(T) == typeof(float))
         {
-            var srcMem = AsFloatMemory(input.Data);
-            var dstMem = AsFloatMemory(destination.Data);
+            using var inputDataKeep13 = new KeepAliveScope(input);
+            var srcMem = AsFloatMemory(input.DataUnmarked);
+            using var destinationDataKeep25 = new KeepAliveScope(destination);
+            var dstMem = AsFloatMemory(destination.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             ParallelComputeBound((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length, Simd.SimdKernels.ExpUnsafe);
@@ -5558,15 +5712,19 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         if (typeof(T) == typeof(double))
         {
-            var srcMem = AsDoubleMemory(input.Data);
-            var dstMem = AsDoubleMemory(destination.Data);
+            using var inputDataKeep14 = new KeepAliveScope(input);
+            var srcMem = AsDoubleMemory(input.DataUnmarked);
+            using var destinationDataKeep26 = new KeepAliveScope(destination);
+            var dstMem = AsDoubleMemory(destination.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             ParallelComputeBound((double*)pinSrc.Pointer, (double*)pinDst.Pointer, input.Length, Simd.SimdKernels.ExpUnsafe);
             return;
         }
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Exp(input.AsSpan(), destination.AsWritableSpan());
+        using var inputKeep7 = new KeepAliveScope(input);
+        using var destinationKeep12 = new KeepAliveScope(destination);
+        numOps.Exp(input.AsSpanUnmarked(), destination.AsWritableSpanUnmarked());
     }
 
     /// <summary>Log into pre-allocated destination. Uses VML/SVML with parallel chunking.</summary>
@@ -5579,8 +5737,10 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!input.IsContiguous) input = input.Contiguous();
         if (typeof(T) == typeof(float))
         {
-            var srcMem = AsFloatMemory(input.Data);
-            var dstMem = AsFloatMemory(destination.Data);
+            using var inputDataKeep15 = new KeepAliveScope(input);
+            var srcMem = AsFloatMemory(input.DataUnmarked);
+            using var destinationDataKeep27 = new KeepAliveScope(destination);
+            var dstMem = AsFloatMemory(destination.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             ParallelComputeBound((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length, Simd.SimdKernels.LogUnsafe);
@@ -5588,15 +5748,19 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         if (typeof(T) == typeof(double))
         {
-            var srcMem = AsDoubleMemory(input.Data);
-            var dstMem = AsDoubleMemory(destination.Data);
+            using var inputDataKeep16 = new KeepAliveScope(input);
+            var srcMem = AsDoubleMemory(input.DataUnmarked);
+            using var destinationDataKeep28 = new KeepAliveScope(destination);
+            var dstMem = AsDoubleMemory(destination.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             ParallelComputeBound((double*)pinSrc.Pointer, (double*)pinDst.Pointer, input.Length, Simd.SimdKernels.LogUnsafe);
             return;
         }
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Log(input.AsSpan(), destination.AsWritableSpan());
+        using var inputKeep8 = new KeepAliveScope(input);
+        using var destinationKeep13 = new KeepAliveScope(destination);
+        numOps.Log(input.AsSpanUnmarked(), destination.AsWritableSpanUnmarked());
     }
 
     /// <summary>Sqrt into pre-allocated destination. Zero allocation. Uses AVX SIMD for float.</summary>
@@ -5607,8 +5771,10 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!input.IsContiguous) input = input.Contiguous();
         if (typeof(T) == typeof(float))
         {
-            var srcMem = AsFloatMemory(input.Data);
-            var dstMem = AsFloatMemory(destination.Data);
+            using var inputDataKeep17 = new KeepAliveScope(input);
+            var srcMem = AsFloatMemory(input.DataUnmarked);
+            using var destinationDataKeep29 = new KeepAliveScope(destination);
+            var dstMem = AsFloatMemory(destination.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             ParallelComputeBound((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length, SimdKernels.SqrtUnsafe);
@@ -5617,13 +5783,17 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(double))
         {
             // SIMD double sqrt via Span overload (no unsafe ptr variant in SimdKernels).
-            var srcSpan = ((ReadOnlyMemory<double>)AsDoubleMemory(input.Data)).Span;
-            var dstSpan = AsDoubleMemory(destination.Data).Span;
+            using var inputDataKeep18 = new KeepAliveScope(input);
+            var srcSpan = ((ReadOnlyMemory<double>)AsDoubleMemory(input.DataUnmarked)).Span;
+            using var destinationDataKeep30 = new KeepAliveScope(destination);
+            var dstSpan = AsDoubleMemory(destination.DataUnmarked).Span;
             SimdKernels.Sqrt(srcSpan, dstSpan);
             return;
         }
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Sqrt(input.AsSpan(), destination.AsWritableSpan());
+        using var inputKeep9 = new KeepAliveScope(input);
+        using var destinationKeep14 = new KeepAliveScope(destination);
+        numOps.Sqrt(input.AsSpanUnmarked(), destination.AsWritableSpanUnmarked());
     }
 
     /// <summary>Abs into pre-allocated destination. Zero allocation. Uses AVX SIMD for float.</summary>
@@ -5634,8 +5804,10 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!input.IsContiguous) input = input.Contiguous();
         if (typeof(T) == typeof(float))
         {
-            var srcMem = AsFloatMemory(input.Data);
-            var dstMem = AsFloatMemory(destination.Data);
+            using var inputDataKeep19 = new KeepAliveScope(input);
+            var srcMem = AsFloatMemory(input.DataUnmarked);
+            using var destinationDataKeep31 = new KeepAliveScope(destination);
+            var dstMem = AsFloatMemory(destination.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             ParallelComputeBound((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length, SimdKernels.AbsUnsafe);
@@ -5643,15 +5815,19 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         if (typeof(T) == typeof(double))
         {
-            var srcMem = AsDoubleMemory(input.Data);
-            var dstMem = AsDoubleMemory(destination.Data);
+            using var inputDataKeep20 = new KeepAliveScope(input);
+            var srcMem = AsDoubleMemory(input.DataUnmarked);
+            using var destinationDataKeep32 = new KeepAliveScope(destination);
+            var dstMem = AsDoubleMemory(destination.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             ParallelComputeBound((double*)pinSrc.Pointer, (double*)pinDst.Pointer, input.Length, SimdKernels.AbsUnsafe);
             return;
         }
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Abs(input.AsSpan(), destination.AsWritableSpan());
+        using var inputKeep10 = new KeepAliveScope(input);
+        using var destinationKeep15 = new KeepAliveScope(destination);
+        numOps.Abs(input.AsSpanUnmarked(), destination.AsWritableSpanUnmarked());
     }
 
     /// <summary>Sin into pre-allocated destination. Uses VML when available, MathF fallback.</summary>
@@ -5662,8 +5838,10 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!input.IsContiguous) input = input.Contiguous();
         if (typeof(T) == typeof(float))
         {
-            var srcMem = AsFloatMemory(input.Data);
-            var dstMem = AsFloatMemory(destination.Data);
+            using var inputDataKeep21 = new KeepAliveScope(input);
+            var srcMem = AsFloatMemory(input.DataUnmarked);
+            using var destinationDataKeep33 = new KeepAliveScope(destination);
+            var dstMem = AsFloatMemory(destination.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             if (!VmlProvider.TrySin((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length))
@@ -5678,13 +5856,17 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         if (typeof(T) == typeof(double))
         {
-            var srcSpan = ((ReadOnlyMemory<double>)AsDoubleMemory(input.Data)).Span;
-            var dstSpan = AsDoubleMemory(destination.Data).Span;
+            using var inputDataKeep22 = new KeepAliveScope(input);
+            var srcSpan = ((ReadOnlyMemory<double>)AsDoubleMemory(input.DataUnmarked)).Span;
+            using var destinationDataKeep34 = new KeepAliveScope(destination);
+            var dstSpan = AsDoubleMemory(destination.DataUnmarked).Span;
             SimdKernels.Sin(srcSpan, dstSpan);
             return;
         }
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Sin(input.AsSpan(), destination.AsWritableSpan());
+        using var inputKeep11 = new KeepAliveScope(input);
+        using var destinationKeep16 = new KeepAliveScope(destination);
+        numOps.Sin(input.AsSpanUnmarked(), destination.AsWritableSpanUnmarked());
     }
 
     /// <summary>Cos into pre-allocated destination. Uses VML when available, MathF fallback.</summary>
@@ -5695,8 +5877,10 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!input.IsContiguous) input = input.Contiguous();
         if (typeof(T) == typeof(float))
         {
-            var srcMem = AsFloatMemory(input.Data);
-            var dstMem = AsFloatMemory(destination.Data);
+            using var inputDataKeep23 = new KeepAliveScope(input);
+            var srcMem = AsFloatMemory(input.DataUnmarked);
+            using var destinationDataKeep35 = new KeepAliveScope(destination);
+            var dstMem = AsFloatMemory(destination.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             if (!VmlProvider.TryCos((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length))
@@ -5711,13 +5895,17 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         if (typeof(T) == typeof(double))
         {
-            var srcSpan = ((ReadOnlyMemory<double>)AsDoubleMemory(input.Data)).Span;
-            var dstSpan = AsDoubleMemory(destination.Data).Span;
+            using var inputDataKeep24 = new KeepAliveScope(input);
+            var srcSpan = ((ReadOnlyMemory<double>)AsDoubleMemory(input.DataUnmarked)).Span;
+            using var destinationDataKeep36 = new KeepAliveScope(destination);
+            var dstSpan = AsDoubleMemory(destination.DataUnmarked).Span;
             SimdKernels.Cos(srcSpan, dstSpan);
             return;
         }
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Cos(input.AsSpan(), destination.AsWritableSpan());
+        using var inputKeep12 = new KeepAliveScope(input);
+        using var destinationKeep17 = new KeepAliveScope(destination);
+        numOps.Cos(input.AsSpanUnmarked(), destination.AsWritableSpanUnmarked());
     }
 
     /// <inheritdoc/>
@@ -5747,12 +5935,14 @@ public partial class CpuEngine : ITensorLevelEngine
         // Chain pairwise additions using span-based numOps: result = t0 + t1 + t2 + ...
         // First: result = tensors[0] + tensors[1]
         var result = AutoTensorCache.RentOrAllocate<T>(referenceShape);
-        numOps.Add(tensors[0].AsSpan(), tensors[1].AsSpan(), result.AsWritableSpan());
+        using var resultKeep15 = new KeepAliveScope(result);
+        numOps.Add(tensors[0].AsSpan(), tensors[1].AsSpan(), result.AsWritableSpanUnmarked());
 
         // Accumulate remaining tensors into result
         for (int t = 2; t < tensors.Length; t++)
         {
-            numOps.Add(result.AsSpan(), tensors[t].AsSpan(), result.AsWritableSpan());
+            using var resultKeep16 = new KeepAliveScope(result);
+            numOps.Add(result.AsSpanUnmarked(), tensors[t].AsSpan(), result.AsWritableSpanUnmarked());
         }
 
         DifferentiableOps.RecordIfActive("TensorAddMany", result, tensors, BackwardFunctions<T>.AddManyBackward);
@@ -5850,7 +6040,8 @@ public partial class CpuEngine : ITensorLevelEngine
             // VectorSubtractUnsafe (4× unrolled AVX2/AVX-512 with FMA).
             var aMem = AsFloatReadOnlyMemory(a.ReadOnlyData);
             var bMem = AsFloatReadOnlyMemory(b.ReadOnlyData);
-            var rMem = AsFloatMemory(result.Data);
+            using var resultDataKeep11 = new KeepAliveScope(result);
+            var rMem = AsFloatMemory(result.DataUnmarked);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
@@ -5889,7 +6080,8 @@ public partial class CpuEngine : ITensorLevelEngine
             // In-house: pin logical memory and call VectorSubtractUnsafe(double*).
             var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyData);
             var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyData);
-            var rMem = AsDoubleMemory(result.Data);
+            using var resultDataKeep12 = new KeepAliveScope(result);
+            var rMem = AsDoubleMemory(result.DataUnmarked);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
@@ -5921,7 +6113,10 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.Subtract(a.AsSpan(), b.AsSpan(), result.AsWritableSpan());
+            using var aKeep8 = new KeepAliveScope(a);
+            using var bKeep7 = new KeepAliveScope(b);
+            using var resultKeep17 = new KeepAliveScope(result);
+            numOps.Subtract(a.AsSpanUnmarked(), b.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
         }
 
         DifferentiableOps.RecordBinary("TensorSubtract", result, a, b, BackwardFunctions<T>.SubtractBackward);
@@ -6009,7 +6204,8 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var aMem = AsFloatReadOnlyMemory(a.ReadOnlyData);
             var bMem = AsFloatReadOnlyMemory(b.ReadOnlyData);
-            var rMem = AsFloatMemory(result.Data);
+            using var resultDataKeep13 = new KeepAliveScope(result);
+            var rMem = AsFloatMemory(result.DataUnmarked);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
@@ -6047,7 +6243,8 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyData);
             var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyData);
-            var rMem = AsDoubleMemory(result.Data);
+            using var resultDataKeep14 = new KeepAliveScope(result);
+            var rMem = AsDoubleMemory(result.DataUnmarked);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
@@ -6079,7 +6276,10 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.Multiply(a.AsSpan(), b.AsSpan(), result.AsWritableSpan());
+            using var aKeep9 = new KeepAliveScope(a);
+            using var bKeep8 = new KeepAliveScope(b);
+            using var resultKeep18 = new KeepAliveScope(result);
+            numOps.Multiply(a.AsSpanUnmarked(), b.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
         }
 
         DifferentiableOps.RecordBinary("TensorMultiply", result, a, b, BackwardFunctions<T>.MultiplyBackward);
@@ -6219,7 +6419,9 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Multiply(a.AsSpan(), b.AsSpan(), a.AsWritableSpan());
+        using var aKeep10 = new KeepAliveScope(a);
+        using var bKeep9 = new KeepAliveScope(b);
+        numOps.Multiply(a.AsSpanUnmarked(), b.AsSpanUnmarked(), a.AsWritableSpanUnmarked());
         if (savedA is not null)
             DifferentiableOps.RecordBinary("TensorMultiplyInPlace", a, savedA, bOrig, BackwardFunctions<T>.MultiplyBackward);
     }
@@ -6250,7 +6452,8 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var aMem = AsFloatReadOnlyMemory(a.ReadOnlyData);
             var bMem = AsFloatReadOnlyMemory(b.ReadOnlyData);
-            var rMem = AsFloatMemory(destination.Data);
+            using var destinationDataKeep37 = new KeepAliveScope(destination);
+            var rMem = AsFloatMemory(destination.DataUnmarked);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
@@ -6260,7 +6463,8 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyData);
             var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyData);
-            var rMem = AsDoubleMemory(destination.Data);
+            using var destinationDataKeep38 = new KeepAliveScope(destination);
+            var rMem = AsDoubleMemory(destination.DataUnmarked);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
@@ -6269,7 +6473,10 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.Multiply(a.AsSpan(), b.AsSpan(), destination.AsWritableSpan());
+            using var aKeep11 = new KeepAliveScope(a);
+            using var bKeep10 = new KeepAliveScope(b);
+            using var destinationKeep18 = new KeepAliveScope(destination);
+            numOps.Multiply(a.AsSpanUnmarked(), b.AsSpanUnmarked(), destination.AsWritableSpanUnmarked());
         }
     }
 
@@ -6318,8 +6525,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(float))
         {
-            var aMem = AsFloatMemory(a.Data);
-            var bMem = AsFloatMemory(b.Data);
+            using var aDataKeep2 = new KeepAliveScope(a);
+            var aMem = AsFloatMemory(a.DataUnmarked);
+            using var bDataKeep1 = new KeepAliveScope(b);
+            var bMem = AsFloatMemory(b.DataUnmarked);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             float* pA = (float*)pinA.Pointer;
@@ -6359,8 +6568,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(double))
         {
-            var aMem = AsDoubleMemory(a.Data);
-            var bMem = AsDoubleMemory(b.Data);
+            using var aDataKeep3 = new KeepAliveScope(a);
+            var aMem = AsDoubleMemory(a.DataUnmarked);
+            using var bDataKeep2 = new KeepAliveScope(b);
+            var bMem = AsDoubleMemory(b.DataUnmarked);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             double* pA = (double*)pinA.Pointer;
@@ -6388,7 +6599,9 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Subtract(a.AsSpan(), b.AsSpan(), a.AsWritableSpan());
+        using var aKeep12 = new KeepAliveScope(a);
+        using var bKeep11 = new KeepAliveScope(b);
+        numOps.Subtract(a.AsSpanUnmarked(), b.AsSpanUnmarked(), a.AsWritableSpanUnmarked());
         if (savedASub is not null)
             DifferentiableOps.RecordBinary("TensorSubtractInPlace", a, savedASub, bOrig, BackwardFunctions<T>.SubtractBackward);
     }
@@ -6426,7 +6639,8 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float))
         {
             float scalarF = (float)(object)scalar!;
-            var aMem = AsFloatMemory(a.Data);
+            using var aDataKeep4 = new KeepAliveScope(a);
+            var aMem = AsFloatMemory(a.DataUnmarked);
             using var pinA = aMem.Pin();
             float* pA = (float*)pinA.Pointer;
 
@@ -6454,7 +6668,8 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(double))
         {
             double scalarD = (double)(object)scalar!;
-            var aMem = AsDoubleMemory(a.Data);
+            using var aDataKeep5 = new KeepAliveScope(a);
+            var aMem = AsDoubleMemory(a.DataUnmarked);
             using var pinA = aMem.Pin();
             double* pA = (double*)pinA.Pointer;
 
@@ -6480,7 +6695,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // Generic fallback: vectorized numOps
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.MultiplyScalar(a.AsSpan(), scalar, a.AsWritableSpan());
+        using var aKeep13 = new KeepAliveScope(a);
+        numOps.MultiplyScalar(a.AsSpanUnmarked(), scalar, a.AsWritableSpanUnmarked());
     }
 
     /// <summary>
@@ -6518,8 +6734,10 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float))
         {
             float scalarF = (float)(object)scalar!;
-            var aMem = AsFloatMemory(a.Data);
-            var dMem = AsFloatMemory(destination.Data);
+            using var aDataKeep6 = new KeepAliveScope(a);
+            var aMem = AsFloatMemory(a.DataUnmarked);
+            using var destinationDataKeep39 = new KeepAliveScope(destination);
+            var dMem = AsFloatMemory(destination.DataUnmarked);
             using var pinA = aMem.Pin();
             using var pinD = dMem.Pin();
             float* pA = (float*)pinA.Pointer;
@@ -6549,8 +6767,10 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(double))
         {
             double scalarD = (double)(object)scalar!;
-            var aMem = AsDoubleMemory(a.Data);
-            var dMem = AsDoubleMemory(destination.Data);
+            using var aDataKeep7 = new KeepAliveScope(a);
+            var aMem = AsDoubleMemory(a.DataUnmarked);
+            using var destinationDataKeep40 = new KeepAliveScope(destination);
+            var dMem = AsDoubleMemory(destination.DataUnmarked);
             using var pinA = aMem.Pin();
             using var pinD = dMem.Pin();
             double* pA = (double*)pinA.Pointer;
@@ -6578,7 +6798,9 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // Generic fallback: vectorized numOps
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.MultiplyScalar(a.AsSpan(), scalar, destination.AsWritableSpan());
+        using var aKeep14 = new KeepAliveScope(a);
+        using var destinationKeep19 = new KeepAliveScope(destination);
+        numOps.MultiplyScalar(a.AsSpanUnmarked(), scalar, destination.AsWritableSpanUnmarked());
     }
 
     /// <inheritdoc/>
@@ -6606,11 +6828,13 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // Chain pairwise multiplications: result = t0 * t1 * t2 * ...
         var result = AutoTensorCache.RentOrAllocate<T>(referenceShape);
-        numOps.Multiply(tensors[0].AsSpan(), tensors[1].AsSpan(), result.AsWritableSpan());
+        using var resultKeep19 = new KeepAliveScope(result);
+        numOps.Multiply(tensors[0].AsSpan(), tensors[1].AsSpan(), result.AsWritableSpanUnmarked());
 
         for (int t = 2; t < tensors.Length; t++)
         {
-            numOps.Multiply(result.AsSpan(), tensors[t].AsSpan(), result.AsWritableSpan());
+            using var resultKeep20 = new KeepAliveScope(result);
+            numOps.Multiply(result.AsSpanUnmarked(), tensors[t].AsSpan(), result.AsWritableSpanUnmarked());
         }
 
         DifferentiableOps.RecordIfActive("TensorMultiplyMany", result, tensors, BackwardFunctions<T>.MultiplyManyBackward);
@@ -6651,7 +6875,9 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (tensor.IsContiguous)
         {
-            numOps.MultiplyScalar(tensor.AsSpan(), scalar, result.AsWritableSpan());
+            using var tensorKeep7 = new KeepAliveScope(tensor);
+            using var resultKeep21 = new KeepAliveScope(result);
+            numOps.MultiplyScalar(tensor.AsSpanUnmarked(), scalar, result.AsWritableSpanUnmarked());
         }
         else
         {
@@ -6720,7 +6946,10 @@ public partial class CpuEngine : ITensorLevelEngine
                         if (eng is DirectGpuTensorEngine dGpu && dGpu.TryBinaryResidentInto(output, capturedA, capturedB,
                                 static (be, ia, ib, o, n) => be.Divide(ia, ib, o, n), "Divide"))
                             return;
-                        MathHelper.GetNumericOperations<T>().Divide(capturedA.AsSpan(), capturedB.AsSpan(), output.AsWritableSpan());
+                        using var capturedAKeep1 = new KeepAliveScope(capturedA);
+                        using var capturedBKeep1 = new KeepAliveScope(capturedB);
+                        using var outputKeep2 = new KeepAliveScope(output);
+                        MathHelper.GetNumericOperations<T>().Divide(capturedA.AsSpanUnmarked(), capturedB.AsSpanUnmarked(), output.AsWritableSpanUnmarked());
                         output.IncrementVersion();
                     },
                     BackwardFunctions<T>.DivideBackward);
@@ -6744,7 +6973,8 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var aMem = AsFloatReadOnlyMemory(a.ReadOnlyData);
             var bMem = AsFloatReadOnlyMemory(b.ReadOnlyData);
-            var rMem = AsFloatMemory(result.Data);
+            using var resultDataKeep15 = new KeepAliveScope(result);
+            var rMem = AsFloatMemory(result.DataUnmarked);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
@@ -6782,7 +7012,8 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var aMem = AsDoubleReadOnlyMemory(a.ReadOnlyData);
             var bMem = AsDoubleReadOnlyMemory(b.ReadOnlyData);
-            var rMem = AsDoubleMemory(result.Data);
+            using var resultDataKeep16 = new KeepAliveScope(result);
+            var rMem = AsDoubleMemory(result.DataUnmarked);
             using var pinA = aMem.Pin();
             using var pinB = bMem.Pin();
             using var pinR = rMem.Pin();
@@ -6814,7 +7045,10 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.Divide(a.AsSpan(), b.AsSpan(), result.AsWritableSpan());
+            using var aKeep15 = new KeepAliveScope(a);
+            using var bKeep12 = new KeepAliveScope(b);
+            using var resultKeep22 = new KeepAliveScope(result);
+            numOps.Divide(a.AsSpanUnmarked(), b.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
         }
 
         DifferentiableOps.RecordBinary("TensorDivide", result, a, b, BackwardFunctions<T>.DivideBackward);
@@ -7076,8 +7310,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(float))
         {
-            var iMem = AsFloatMemory(tensor.Data);
-            var rMem = AsFloatMemory(result.Data);
+            using var tensorDataKeep1 = new KeepAliveScope(tensor);
+            var iMem = AsFloatMemory(tensor.DataUnmarked);
+            using var resultDataKeep17 = new KeepAliveScope(result);
+            var rMem = AsFloatMemory(result.DataUnmarked);
             using var pinI = iMem.Pin();
             using var pinR = rMem.Pin();
             float* pI = (float*)pinI.Pointer;
@@ -7089,8 +7325,10 @@ public partial class CpuEngine : ITensorLevelEngine
             // In-house Vector256<double> Log via FastLogDouble256, dispatched
             // across the persistent thread pool. Closes the Log_Double gap
             // (was 16× behind libtorch's MKL-routed log).
-            var iMem = AsDoubleMemory(tensor.Data);
-            var rMem = AsDoubleMemory(result.Data);
+            using var tensorDataKeep2 = new KeepAliveScope(tensor);
+            var iMem = AsDoubleMemory(tensor.DataUnmarked);
+            using var resultDataKeep18 = new KeepAliveScope(result);
+            var rMem = AsDoubleMemory(result.DataUnmarked);
             using var pinI = iMem.Pin();
             using var pinR = rMem.Pin();
             double* pI = (double*)pinI.Pointer;
@@ -7100,7 +7338,9 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.Log(tensor.AsSpan(), result.AsWritableSpan());
+            using var tensorKeep8 = new KeepAliveScope(tensor);
+            using var resultKeep23 = new KeepAliveScope(result);
+            numOps.Log(tensor.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
         }
 
         DifferentiableOps.RecordUnary("TensorLog", result, tensorOrig, BackwardFunctions<T>.LogBackward);
@@ -7141,8 +7381,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(float))
         {
-            var iMem = AsFloatMemory(tensor.Data);
-            var rMem = AsFloatMemory(result.Data);
+            using var tensorDataKeep3 = new KeepAliveScope(tensor);
+            var iMem = AsFloatMemory(tensor.DataUnmarked);
+            using var resultDataKeep19 = new KeepAliveScope(result);
+            var rMem = AsFloatMemory(result.DataUnmarked);
             using var pinI = iMem.Pin();
             using var pinR = rMem.Pin();
             float* pI = (float*)pinI.Pointer;
@@ -7153,8 +7395,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             // In-house Vector256<double> Exp via FastExpDouble256, parallel-dispatched.
             // No external library fallback (zero-dependency policy).
-            var iMem = AsDoubleMemory(tensor.Data);
-            var rMem = AsDoubleMemory(result.Data);
+            using var tensorDataKeep4 = new KeepAliveScope(tensor);
+            var iMem = AsDoubleMemory(tensor.DataUnmarked);
+            using var resultDataKeep20 = new KeepAliveScope(result);
+            var rMem = AsDoubleMemory(result.DataUnmarked);
             using var pinI = iMem.Pin();
             using var pinR = rMem.Pin();
             double* pI = (double*)pinI.Pointer;
@@ -7164,7 +7408,9 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.Exp(tensor.AsSpan(), result.AsWritableSpan());
+            using var tensorKeep9 = new KeepAliveScope(tensor);
+            using var resultKeep24 = new KeepAliveScope(result);
+            numOps.Exp(tensor.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
         }
 
         DifferentiableOps.RecordUnary("TensorExp", result, tensorOrig, BackwardFunctions<T>.ExpBackward);
@@ -7206,8 +7452,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(float))
         {
-            var iMem = AsFloatMemory(tensor.Data);
-            var rMem = AsFloatMemory(result.Data);
+            using var tensorDataKeep5 = new KeepAliveScope(tensor);
+            var iMem = AsFloatMemory(tensor.DataUnmarked);
+            using var resultDataKeep21 = new KeepAliveScope(result);
+            var rMem = AsFloatMemory(result.DataUnmarked);
             using var pinI = iMem.Pin();
             using var pinR = rMem.Pin();
             float* pI = (float*)pinI.Pointer;
@@ -7217,7 +7465,9 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.Sqrt(tensor.AsSpan(), result.AsWritableSpan());
+            using var tensorKeep10 = new KeepAliveScope(tensor);
+            using var resultKeep25 = new KeepAliveScope(result);
+            numOps.Sqrt(tensor.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
         }
 
         DifferentiableOps.RecordUnary("TensorSqrt", result, tensorOrig, BackwardFunctions<T>.SqrtBackward);
@@ -7286,7 +7536,9 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.Abs(tensor.AsSpan(), result.AsWritableSpan());
+            using var tensorKeep11 = new KeepAliveScope(tensor);
+            using var resultKeep26 = new KeepAliveScope(result);
+            numOps.Abs(tensor.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
         }
 
         DifferentiableOps.RecordUnary("TensorAbs", result, tensorOrig, BackwardFunctions<T>.AbsBackward);
@@ -7311,7 +7563,9 @@ public partial class CpuEngine : ITensorLevelEngine
                     {
                         // During CUDA-graph capture the GPU engine keeps this resident (no AsSpan download → CUDA-900).
                         if (eng is DirectGpuTensorEngine gpu && gpu.TensorNegateIntoResident(output, captured)) return;
-                        MathHelper.GetNumericOperations<T>().Negate(captured.AsSpan(), output.AsWritableSpan());
+                        using var capturedKeep1 = new KeepAliveScope(captured);
+                        using var outputKeep3 = new KeepAliveScope(output);
+                        MathHelper.GetNumericOperations<T>().Negate(captured.AsSpanUnmarked(), output.AsWritableSpanUnmarked());
                     },
                     BackwardFunctions<T>.NegateBackward);
             }
@@ -7325,7 +7579,9 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
-        numOps.Negate(tensor.AsSpan(), result.AsWritableSpan());
+        using var tensorKeep12 = new KeepAliveScope(tensor);
+        using var resultKeep27 = new KeepAliveScope(result);
+        numOps.Negate(tensor.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
 
         DifferentiableOps.RecordUnary("TensorNegate", result, tensorOrig, BackwardFunctions<T>.NegateBackward);
         { var c = tensor; AutoTracer.RecordOp("TensorNegate", result, eng => eng.TensorNegate(c)); }
@@ -7371,7 +7627,9 @@ public partial class CpuEngine : ITensorLevelEngine
         // Copy data to a new tensor with no tape connection.
         // Intentionally does NOT call DifferentiableOps.Record — this is the whole point.
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
-        tensor.AsSpan().CopyTo(result.AsWritableSpan());
+        using var tensorKeep13 = new KeepAliveScope(tensor);
+        using var resultKeep28 = new KeepAliveScope(result);
+        tensor.AsSpanUnmarked().CopyTo(result.AsWritableSpanUnmarked());
         // Transparent inference tracing has the same forward-dependency contract as
         // GraphMode, while remaining outside the autodiff tape.
         { var c = tracedInput; AutoTracer.RecordOp("StopGradient", result, eng => eng.StopGradient(c)); }
@@ -7417,8 +7675,10 @@ public partial class CpuEngine : ITensorLevelEngine
             if (fExp == 2.0f)
             {
                 // x^2 = x * x — use SIMD multiply
-                var srcMem = AsFloatMemory(tensor.Data);
-                var dstMem = AsFloatMemory(result.Data);
+                using var tensorDataKeep6 = new KeepAliveScope(tensor);
+                var srcMem = AsFloatMemory(tensor.DataUnmarked);
+                using var resultDataKeep22 = new KeepAliveScope(result);
+                var dstMem = AsFloatMemory(result.DataUnmarked);
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 Simd.SimdKernels.VectorMultiplyUnsafe((float*)pinSrc.Pointer, (float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length);
@@ -7439,8 +7699,10 @@ public partial class CpuEngine : ITensorLevelEngine
             if (dExp == 2.0)
             {
                 // x^2 = x * x — used by every L2 regularization / squared-error loss term.
-                var srcMem = AsDoubleMemory(tensor.Data);
-                var dstMem = AsDoubleMemory(result.Data);
+                using var tensorDataKeep7 = new KeepAliveScope(tensor);
+                var srcMem = AsDoubleMemory(tensor.DataUnmarked);
+                using var resultDataKeep23 = new KeepAliveScope(result);
+                var dstMem = AsDoubleMemory(result.DataUnmarked);
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 Simd.SimdKernels.VectorMultiplyUnsafe((double*)pinSrc.Pointer, (double*)pinSrc.Pointer, (double*)pinDst.Pointer, tensor.Length);
@@ -7511,8 +7773,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             unsafe
             {
-                var srcMem = AsFloatMemory(tensor.Data);
-                var dstMem = AsFloatMemory(result.Data);
+                using var tensorDataKeep8 = new KeepAliveScope(tensor);
+                var srcMem = AsFloatMemory(tensor.DataUnmarked);
+                using var resultDataKeep24 = new KeepAliveScope(result);
+                var dstMem = AsFloatMemory(result.DataUnmarked);
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 SimdKernels.FloorUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length);
@@ -7522,8 +7786,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             unsafe
             {
-                var srcMem = AsDoubleMemory(tensor.Data);
-                var dstMem = AsDoubleMemory(result.Data);
+                using var tensorDataKeep9 = new KeepAliveScope(tensor);
+                var srcMem = AsDoubleMemory(tensor.DataUnmarked);
+                using var resultDataKeep25 = new KeepAliveScope(result);
+                var dstMem = AsDoubleMemory(result.DataUnmarked);
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 SimdKernels.FloorUnsafe((double*)pinSrc.Pointer, (double*)pinDst.Pointer, tensor.Length);
@@ -7559,8 +7825,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             unsafe
             {
-                var srcMem = AsFloatMemory(tensor.Data);
-                var dstMem = AsFloatMemory(result.Data);
+                using var tensorDataKeep10 = new KeepAliveScope(tensor);
+                var srcMem = AsFloatMemory(tensor.DataUnmarked);
+                using var resultDataKeep26 = new KeepAliveScope(result);
+                var dstMem = AsFloatMemory(result.DataUnmarked);
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 SimdKernels.CeilingUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length);
@@ -7570,8 +7838,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             unsafe
             {
-                var srcMem = AsDoubleMemory(tensor.Data);
-                var dstMem = AsDoubleMemory(result.Data);
+                using var tensorDataKeep11 = new KeepAliveScope(tensor);
+                var srcMem = AsDoubleMemory(tensor.DataUnmarked);
+                using var resultDataKeep27 = new KeepAliveScope(result);
+                var dstMem = AsDoubleMemory(result.DataUnmarked);
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 SimdKernels.CeilingUnsafe((double*)pinSrc.Pointer, (double*)pinDst.Pointer, tensor.Length);
@@ -7608,8 +7878,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             unsafe
             {
-                var srcMem = AsFloatMemory(tensor.Data);
-                var dstMem = AsFloatMemory(result.Data);
+                using var tensorDataKeep12 = new KeepAliveScope(tensor);
+                var srcMem = AsFloatMemory(tensor.DataUnmarked);
+                using var resultDataKeep28 = new KeepAliveScope(result);
+                var dstMem = AsFloatMemory(result.DataUnmarked);
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 SimdKernels.RoundUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length);
@@ -7619,8 +7891,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             unsafe
             {
-                var srcMem = AsDoubleMemory(tensor.Data);
-                var dstMem = AsDoubleMemory(result.Data);
+                using var tensorDataKeep13 = new KeepAliveScope(tensor);
+                var srcMem = AsDoubleMemory(tensor.DataUnmarked);
+                using var resultDataKeep29 = new KeepAliveScope(result);
+                var dstMem = AsDoubleMemory(result.DataUnmarked);
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 SimdKernels.RoundUnsafe((double*)pinSrc.Pointer, (double*)pinDst.Pointer, tensor.Length);
@@ -7705,8 +7979,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             unsafe
             {
-                var srcMem = AsFloatMemory(tensor.Data);
-                var dstMem = AsFloatMemory(result.Data);
+                using var tensorDataKeep14 = new KeepAliveScope(tensor);
+                var srcMem = AsFloatMemory(tensor.DataUnmarked);
+                using var resultDataKeep30 = new KeepAliveScope(result);
+                var dstMem = AsFloatMemory(result.DataUnmarked);
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 if (!VmlProvider.TrySin((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length))
@@ -7722,7 +7998,9 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.Sin(tensor.AsSpan(), result.AsWritableSpan());
+            using var tensorKeep14 = new KeepAliveScope(tensor);
+            using var resultKeep29 = new KeepAliveScope(result);
+            numOps.Sin(tensor.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
         }
 
         DifferentiableOps.RecordUnary("Sin", result, tensorOrig,
@@ -7762,8 +8040,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             unsafe
             {
-                var srcMem = AsFloatMemory(tensor.Data);
-                var dstMem = AsFloatMemory(result.Data);
+                using var tensorDataKeep15 = new KeepAliveScope(tensor);
+                var srcMem = AsFloatMemory(tensor.DataUnmarked);
+                using var resultDataKeep31 = new KeepAliveScope(result);
+                var dstMem = AsFloatMemory(result.DataUnmarked);
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 if (!VmlProvider.TryCos((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length))
@@ -7779,7 +8059,9 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.Cos(tensor.AsSpan(), result.AsWritableSpan());
+            using var tensorKeep15 = new KeepAliveScope(tensor);
+            using var resultKeep30 = new KeepAliveScope(result);
+            numOps.Cos(tensor.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
         }
 
         DifferentiableOps.RecordUnary("Cos", result, tensorOrig,
@@ -8119,9 +8401,12 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             unsafe
             {
-                var srcMemA = AsFloatMemory(a.Data);
-                var srcMemB = AsFloatMemory(b.Data);
-                var dstMem = AsFloatMemory(result.Data);
+                using var aDataKeep8 = new KeepAliveScope(a);
+                var srcMemA = AsFloatMemory(a.DataUnmarked);
+                using var bDataKeep3 = new KeepAliveScope(b);
+                var srcMemB = AsFloatMemory(b.DataUnmarked);
+                using var resultDataKeep32 = new KeepAliveScope(result);
+                var dstMem = AsFloatMemory(result.DataUnmarked);
                 using var pinA = srcMemA.Pin();
                 using var pinB = srcMemB.Pin();
                 using var pinD = dstMem.Pin();
@@ -8132,9 +8417,12 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             unsafe
             {
-                var srcMemA = AsDoubleMemory(a.Data);
-                var srcMemB = AsDoubleMemory(b.Data);
-                var dstMem = AsDoubleMemory(result.Data);
+                using var aDataKeep9 = new KeepAliveScope(a);
+                var srcMemA = AsDoubleMemory(a.DataUnmarked);
+                using var bDataKeep4 = new KeepAliveScope(b);
+                var srcMemB = AsDoubleMemory(b.DataUnmarked);
+                using var resultDataKeep33 = new KeepAliveScope(result);
+                var dstMem = AsDoubleMemory(result.DataUnmarked);
                 using var pinA = srcMemA.Pin();
                 using var pinB = srcMemB.Pin();
                 using var pinD = dstMem.Pin();
@@ -8221,9 +8509,12 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             unsafe
             {
-                var srcMemA = AsFloatMemory(a.Data);
-                var srcMemB = AsFloatMemory(b.Data);
-                var dstMem = AsFloatMemory(result.Data);
+                using var aDataKeep10 = new KeepAliveScope(a);
+                var srcMemA = AsFloatMemory(a.DataUnmarked);
+                using var bDataKeep5 = new KeepAliveScope(b);
+                var srcMemB = AsFloatMemory(b.DataUnmarked);
+                using var resultDataKeep34 = new KeepAliveScope(result);
+                var dstMem = AsFloatMemory(result.DataUnmarked);
                 using var pinA = srcMemA.Pin();
                 using var pinB = srcMemB.Pin();
                 using var pinD = dstMem.Pin();
@@ -8234,9 +8525,12 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             unsafe
             {
-                var srcMemA = AsDoubleMemory(a.Data);
-                var srcMemB = AsDoubleMemory(b.Data);
-                var dstMem = AsDoubleMemory(result.Data);
+                using var aDataKeep11 = new KeepAliveScope(a);
+                var srcMemA = AsDoubleMemory(a.DataUnmarked);
+                using var bDataKeep6 = new KeepAliveScope(b);
+                var srcMemB = AsDoubleMemory(b.DataUnmarked);
+                using var resultDataKeep35 = new KeepAliveScope(result);
+                var dstMem = AsDoubleMemory(result.DataUnmarked);
                 using var pinA = srcMemA.Pin();
                 using var pinB = srcMemB.Pin();
                 using var pinD = dstMem.Pin();
@@ -8320,8 +8614,10 @@ public partial class CpuEngine : ITensorLevelEngine
             float fMax = max is not null ? (float)(object)max : float.MaxValue;
             unsafe
             {
-                var srcMem = AsFloatMemory(tensor.Data);
-                var dstMem = AsFloatMemory(result.Data);
+                using var tensorDataKeep16 = new KeepAliveScope(tensor);
+                var srcMem = AsFloatMemory(tensor.DataUnmarked);
+                using var resultDataKeep36 = new KeepAliveScope(result);
+                var dstMem = AsFloatMemory(result.DataUnmarked);
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 SimdKernels.ClampUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length, fMin, fMax);
@@ -8770,7 +9066,8 @@ public partial class CpuEngine : ITensorLevelEngine
             // _storageOffset, so contiguous-but-offset views would read the
             // wrong elements. tensor was already Contiguous()-materialized
             // above when not contiguous, so .Data is the right span here.
-            var span = AsDoubleMemory(tensor.Data).Span;
+            using var tensorDataKeep17 = new KeepAliveScope(tensor);
+            var span = AsDoubleMemory(tensor.DataUnmarked).Span;
             if (span.Length > tensor.Length) span = span[..tensor.Length];
             fixed (double* ptr = span)
             {
@@ -8882,7 +9179,8 @@ public partial class CpuEngine : ITensorLevelEngine
         // Float fast path: direct Pin + SumUnsafe (avoids TensorSum's GCHandle overhead)
         if (typeof(T) == typeof(float) && tensor.IsContiguous)
         {
-            var mem = AsFloatMemory(tensor.Data);
+            using var tensorDataKeep18 = new KeepAliveScope(tensor);
+            var mem = AsFloatMemory(tensor.DataUnmarked);
             using var pin = mem.Pin();
             float fSum = SimdKernels.SumUnsafe((float*)pin.Pointer, tensor.Length);
             float result = fSum / tensor.Length;
@@ -8896,7 +9194,8 @@ public partial class CpuEngine : ITensorLevelEngine
         // that didn't honor _storageOffset.
         if (typeof(T) == typeof(double) && tensor.IsContiguous)
         {
-            var span = AsDoubleMemory(tensor.Data).Span;
+            using var tensorDataKeep19 = new KeepAliveScope(tensor);
+            var span = AsDoubleMemory(tensor.DataUnmarked).Span;
             if (span.Length > tensor.Length) span = span[..tensor.Length];
             double dSum = SimdKernels.Sum(span);
             double result = dSum / tensor.Length;
@@ -10166,9 +10465,12 @@ public partial class CpuEngine : ITensorLevelEngine
                 var dInput  = (Tensor<double>)(object)input;
                 var dKernel = (Tensor<double>)(object)kernel;
                 var dResult = (Tensor<double>)(object)result;
-                using var pinIn = dInput.Data.Pin();
-                using var pinK  = dKernel.Data.Pin();
-                using var pinO  = dResult.Data.Pin();
+                using var dInputDataKeep1 = new KeepAliveScope(dInput);
+                using var pinIn = dInput.DataUnmarked.Pin();
+                using var dKernelDataKeep1 = new KeepAliveScope(dKernel);
+                using var pinK  = dKernel.DataUnmarked.Pin();
+                using var dResultDataKeep1 = new KeepAliveScope(dResult);
+                using var pinO  = dResult.DataUnmarked.Pin();
                 unsafe
                 {
                     Helpers.SimdConvHelper.Conv2DDirectDouble(
@@ -10357,9 +10659,12 @@ public partial class CpuEngine : ITensorLevelEngine
                 // No outer Span.Clear() — the per-oc direct kernels (and the
                 // GEMM-based Conv1x1Stride1Double via Dgemm's c.Clear()) own
                 // initialization of every byte they write.
-                using var pinIn = dInput.Data.Pin();
-                using var pinK  = dKernel.Data.Pin();
-                using var pinO  = dOutput.Data.Pin();
+                using var dInputDataKeep2 = new KeepAliveScope(dInput);
+                using var pinIn = dInput.DataUnmarked.Pin();
+                using var dKernelDataKeep2 = new KeepAliveScope(dKernel);
+                using var pinK  = dKernel.DataUnmarked.Pin();
+                using var dOutputDataKeep1 = new KeepAliveScope(dOutput);
+                using var pinO  = dOutput.DataUnmarked.Pin();
                 unsafe
                 {
                     Helpers.SimdConvHelper.Conv2DDirectDouble(
@@ -10627,7 +10932,8 @@ public partial class CpuEngine : ITensorLevelEngine
             var inputSpan = inputSpanLease.Span;
             using var kernelSpanLease = kernel.Lease();
             var kernelSpan = kernelSpanLease.Span;
-            var outputSpan = result.Data.Span;
+            using var resultDataKeep37 = new KeepAliveScope(result);
+            var outputSpan = result.DataUnmarked.Span;
 
             FusedConvHelper.Conv2DFused(
                 inputSpan, kernelSpan, outputSpan,
@@ -10646,7 +10952,8 @@ public partial class CpuEngine : ITensorLevelEngine
             var inputSpan = inputSpanLease.Span;
             using var kernelSpanLease = kernel.Lease();
             var kernelSpan = kernelSpanLease.Span;
-            var outputSpan = result.Data.Span;
+            using var resultDataKeep38 = new KeepAliveScope(result);
+            var outputSpan = result.DataUnmarked.Span;
 
             WinogradHelper.Conv2DWinograd(
                 inputSpan, kernelSpan, outputSpan,
@@ -10715,7 +11022,8 @@ public partial class CpuEngine : ITensorLevelEngine
         int outputImage = outChannels * colW;
         using var pinIn = input.ReadOnlyData.Pin();
         using var pinK = kernel.ReadOnlyData.Pin();
-        using var pinOut = result.Data.Pin();
+        using var resultDataKeep39 = new KeepAliveScope(result);
+        using var pinOut = result.DataUnmarked.Pin();
         nint pIn = (nint)pinIn.Pointer, pK = (nint)pinK.Pointer, pOut = (nint)pinOut.Pointer;
         long work = (long)batch * outChannels * colH * colW;
 
@@ -10767,7 +11075,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var inputSpan = inputSpanLease.Span;
         using var kernelSpanLease = kernel.Lease();
         var kernelSpan = kernelSpanLease.Span;
-        var outputSpan = result.Data.Span;
+        using var resultDataKeep40 = new KeepAliveScope(result);
+        var outputSpan = result.DataUnmarked.Span;
 
         fixed (float* inputPtr = inputSpan)
         fixed (float* kernelPtr = kernelSpan)
@@ -10801,7 +11110,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var inputSpan = inputSpanLease.Span;
         using var kernelSpanLease = kernel.Lease();
         var kernelSpan = kernelSpanLease.Span;
-        var outputSpan = result.Data.Span;
+        using var resultDataKeep41 = new KeepAliveScope(result);
+        var outputSpan = result.DataUnmarked.Span;
         var biasSpan = epilogueBias is null ? default : epilogueBias.AsSpan();
 
         fixed (float* inputPtr = inputSpan)
@@ -10857,7 +11167,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var inputSpan = inputSpanLease.Span;
         using var kernelSpanLease = kernel.Lease();
         var kernelSpan = kernelSpanLease.Span;
-        var outputSpan = result.Data.Span;
+        using var resultDataKeep42 = new KeepAliveScope(result);
+        var outputSpan = result.DataUnmarked.Span;
         int inputSliceSize = inChannels * height * width;
 
 #if !NET471
@@ -11036,7 +11347,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var inputSpan = inputSpanLease.Span;
         using var kernelSpanLease = kernel.Lease();
         var kernelSpan = kernelSpanLease.Span;
-        var outputSpan = result.Data.Span;
+        using var resultDataKeep43 = new KeepAliveScope(result);
+        var outputSpan = result.DataUnmarked.Span;
         int inputSliceSize = checked(inChannels * height * width);
 
         var pool = System.Buffers.ArrayPool<float>.Shared;
@@ -11132,7 +11444,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var inputSpan = inputSpanLease.Span;
         using var kernelSpanLease = kernel.Lease();
         var kernelSpan = kernelSpanLease.Span;
-        var outputSpan = result.Data.Span;
+        using var resultDataKeep44 = new KeepAliveScope(result);
+        var outputSpan = result.DataUnmarked.Span;
         int inputSliceSize = inChannels * height * width;
 
         // 1×1 fast path (issue #251): when the kernel is 1×1 with stride=1,
@@ -11457,7 +11770,9 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = new Vector<T>(vector.Length);
-        numOps.ReLU(vector.AsSpan(), result.AsWritableSpan());
+        using var vectorKeep1 = new KeepAliveScope(vector);
+        using var resultKeep31 = new KeepAliveScope(result);
+        numOps.ReLU(vector.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
 
         return result;
     }
@@ -11514,8 +11829,10 @@ public partial class CpuEngine : ITensorLevelEngine
             // our own Padé-approximation SIMD kernel on Ryzen 9 3950X for
             // 1M-element inputs (measured 7325 µs vs 369 µs in BENCHMARK
             // RESULTS). Stay on the in-house path until that regresses.
-            var srcMem = AsFloatMemory(tensor.Data);
-            var dstMem = AsFloatMemory(result.Data);
+            using var tensorDataKeep20 = new KeepAliveScope(tensor);
+            var srcMem = AsFloatMemory(tensor.DataUnmarked);
+            using var resultDataKeep45 = new KeepAliveScope(result);
+            var dstMem = AsFloatMemory(result.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             float* pSrc = (float*)pinSrc.Pointer;
@@ -11526,8 +11843,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             // In-house Vector256<double> Tanh via FastExpDouble256, parallel-dispatched.
             // No external library fallback (zero-dependency policy).
-            var srcMem = AsDoubleMemory(tensor.Data);
-            var dstMem = AsDoubleMemory(result.Data);
+            using var tensorDataKeep21 = new KeepAliveScope(tensor);
+            var srcMem = AsDoubleMemory(tensor.DataUnmarked);
+            using var resultDataKeep46 = new KeepAliveScope(result);
+            var dstMem = AsDoubleMemory(result.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             double* pSrc = (double*)pinSrc.Pointer;
@@ -11537,7 +11856,9 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.Tanh(tensor.AsSpan(), result.AsWritableSpan());
+            using var tensorKeep16 = new KeepAliveScope(tensor);
+            using var resultKeep32 = new KeepAliveScope(result);
+            numOps.Tanh(tensor.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
         }
 
         DifferentiableOps.RecordUnary("Tanh", result, tensor, BackwardFunctions<T>.TanhBackward);
@@ -11599,8 +11920,10 @@ public partial class CpuEngine : ITensorLevelEngine
             // par with our JIT-compiled Padé-3,3 approximation, but for
             // double precision it regresses 12× (530 µs → 6,121 µs in
             // BENCHMARK_RESULTS). Stay on the in-house path.
-            var srcMem = AsFloatMemory(tensor.Data);
-            var dstMem = AsFloatMemory(result.Data);
+            using var tensorDataKeep22 = new KeepAliveScope(tensor);
+            var srcMem = AsFloatMemory(tensor.DataUnmarked);
+            using var resultDataKeep47 = new KeepAliveScope(result);
+            var dstMem = AsFloatMemory(result.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             float* pSrc = (float*)pinSrc.Pointer;
@@ -11625,8 +11948,10 @@ public partial class CpuEngine : ITensorLevelEngine
         // the residual Sigmoid_Double gap to libtorch.
         if (typeof(T) == typeof(double))
         {
-            var srcMem = AsDoubleMemory(tensor.Data);
-            var dstMem = AsDoubleMemory(result.Data);
+            using var tensorDataKeep23 = new KeepAliveScope(tensor);
+            var srcMem = AsDoubleMemory(tensor.DataUnmarked);
+            using var resultDataKeep48 = new KeepAliveScope(result);
+            var dstMem = AsDoubleMemory(result.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             double* pSrc = (double*)pinSrc.Pointer;
@@ -11639,7 +11964,9 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // Generic fallback
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Sigmoid(tensor.AsSpan(), result.AsWritableSpan());
+        using var tensorKeep17 = new KeepAliveScope(tensor);
+        using var resultKeep33 = new KeepAliveScope(result);
+        numOps.Sigmoid(tensor.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
 
         DifferentiableOps.RecordUnary("Sigmoid", result, tensor, BackwardFunctions<T>.SigmoidBackward);
         { var c = tensor; AutoTracer.RecordOp("Sigmoid", result, eng => eng.Sigmoid(c)); }
@@ -11747,7 +12074,8 @@ public partial class CpuEngine : ITensorLevelEngine
         // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy (breaking in-place writes)
         if (typeof(T) == typeof(float))
         {
-            var mem = AsFloatMemory(tensor.Data);
+            using var tensorDataKeep24 = new KeepAliveScope(tensor);
+            var mem = AsFloatMemory(tensor.DataUnmarked);
             using var pin = mem.Pin();
             float* p = (float*)pin.Pointer;
 
@@ -11758,7 +12086,8 @@ public partial class CpuEngine : ITensorLevelEngine
         // Double fast-path — the SIMD kernel exists, the dispatch didn't.
         if (typeof(T) == typeof(double))
         {
-            var mem = AsDoubleMemory(tensor.Data);
+            using var tensorDataKeep25 = new KeepAliveScope(tensor);
+            var mem = AsDoubleMemory(tensor.DataUnmarked);
             using var pin = mem.Pin();
             double* p = (double*)pin.Pointer;
 
@@ -11786,7 +12115,8 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.Sigmoid(tensor.AsSpan(), tensor.AsWritableSpan());
+        using var tensorKeep18 = new KeepAliveScope(tensor);
+        numOps.Sigmoid(tensor.AsSpanUnmarked(), tensor.AsWritableSpanUnmarked());
     }
 
     /// <summary>
@@ -11807,16 +12137,20 @@ public partial class CpuEngine : ITensorLevelEngine
         int length = input.Length;
         if (typeof(T) == typeof(float))
         {
-            var srcMem = AsFloatMemory(input.Data);
-            var dstMem = AsFloatMemory(destination.Data);
+            using var inputDataKeep25 = new KeepAliveScope(input);
+            var srcMem = AsFloatMemory(input.DataUnmarked);
+            using var destinationDataKeep41 = new KeepAliveScope(destination);
+            var dstMem = AsFloatMemory(destination.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             ParallelComputeBound((float*)pinSrc.Pointer, (float*)pinDst.Pointer, length, CpuSigmoidKernel.Execute);
         }
         else if (typeof(T) == typeof(double))
         {
-            var srcMem = AsDoubleMemory(input.Data);
-            var dstMem = AsDoubleMemory(destination.Data);
+            using var inputDataKeep26 = new KeepAliveScope(input);
+            var srcMem = AsDoubleMemory(input.DataUnmarked);
+            using var destinationDataKeep42 = new KeepAliveScope(destination);
+            var dstMem = AsDoubleMemory(destination.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             ParallelComputeBound((double*)pinSrc.Pointer, (double*)pinDst.Pointer, length, Simd.SimdKernels.SigmoidUnsafe);
@@ -11824,7 +12158,9 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.Sigmoid(input.AsSpan(), destination.AsWritableSpan());
+            using var inputKeep13 = new KeepAliveScope(input);
+            using var destinationKeep20 = new KeepAliveScope(destination);
+            numOps.Sigmoid(input.AsSpanUnmarked(), destination.AsWritableSpanUnmarked());
         }
     }
 
@@ -11952,7 +12288,9 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.ReLU(tensor.AsSpan(), result.AsWritableSpan());
+            using var tensorKeep19 = new KeepAliveScope(tensor);
+            using var resultKeep34 = new KeepAliveScope(result);
+            numOps.ReLU(tensor.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
         }
 
         DifferentiableOps.RecordUnary("ReLU", result, tensor, BackwardFunctions<T>.ReLUBackward);
@@ -12061,7 +12399,8 @@ public partial class CpuEngine : ITensorLevelEngine
         // Use Memory<T>.Pin() directly — avoids GetDataArray() which can copy (breaking in-place writes)
         if (typeof(T) == typeof(float))
         {
-            var mem = AsFloatMemory(tensor.Data);
+            using var tensorDataKeep26 = new KeepAliveScope(tensor);
+            var mem = AsFloatMemory(tensor.DataUnmarked);
             using var pin = mem.Pin();
             float* p = (float*)pin.Pointer;
 
@@ -12075,7 +12414,8 @@ public partial class CpuEngine : ITensorLevelEngine
         // hottest activation (every Conv/Dense forward pass calls this).
         if (typeof(T) == typeof(double))
         {
-            var mem = AsDoubleMemory(tensor.Data);
+            using var tensorDataKeep27 = new KeepAliveScope(tensor);
+            var mem = AsDoubleMemory(tensor.DataUnmarked);
             using var pin = mem.Pin();
             double* p = (double*)pin.Pointer;
 
@@ -12084,7 +12424,8 @@ public partial class CpuEngine : ITensorLevelEngine
         }
 
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.ReLU(tensor.AsSpan(), tensor.AsWritableSpan());
+        using var tensorKeep20 = new KeepAliveScope(tensor);
+        numOps.ReLU(tensor.AsSpanUnmarked(), tensor.AsWritableSpanUnmarked());
     }
 
     /// <summary>
@@ -12105,8 +12446,10 @@ public partial class CpuEngine : ITensorLevelEngine
         int length = input.Length;
         if (typeof(T) == typeof(float))
         {
-            var srcMem = AsFloatMemory(input.Data);
-            var dstMem = AsFloatMemory(destination.Data);
+            using var inputDataKeep27 = new KeepAliveScope(input);
+            var srcMem = AsFloatMemory(input.DataUnmarked);
+            using var destinationDataKeep43 = new KeepAliveScope(destination);
+            var dstMem = AsFloatMemory(destination.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             float* pSrc = (float*)pinSrc.Pointer;
@@ -12118,8 +12461,10 @@ public partial class CpuEngine : ITensorLevelEngine
         }
         else if (typeof(T) == typeof(double))
         {
-            var srcMem = AsDoubleMemory(input.Data);
-            var dstMem = AsDoubleMemory(destination.Data);
+            using var inputDataKeep28 = new KeepAliveScope(input);
+            var srcMem = AsDoubleMemory(input.DataUnmarked);
+            using var destinationDataKeep44 = new KeepAliveScope(destination);
+            var dstMem = AsDoubleMemory(destination.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             double* pSrc = (double*)pinSrc.Pointer;
@@ -12129,7 +12474,9 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.ReLU(input.AsSpan(), destination.AsWritableSpan());
+            using var inputKeep14 = new KeepAliveScope(input);
+            using var destinationKeep21 = new KeepAliveScope(destination);
+            numOps.ReLU(input.AsSpanUnmarked(), destination.AsWritableSpanUnmarked());
         }
     }
 
@@ -12231,8 +12578,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(float))
         {
-            var srcMem = AsFloatMemory(tensor.Data);
-            var dstMem = AsFloatMemory(result.Data);
+            using var tensorDataKeep28 = new KeepAliveScope(tensor);
+            var srcMem = AsFloatMemory(tensor.DataUnmarked);
+            using var resultDataKeep49 = new KeepAliveScope(result);
+            var dstMem = AsFloatMemory(result.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             float* pSrc = (float*)pinSrc.Pointer;
@@ -12248,8 +12597,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             // In-house Vector256<double> GELU via FastExpDouble256-routed tanh, parallel-dispatched.
             // Was single-threaded — 1M-element double GELU now scales across all cores.
-            var srcMem = AsDoubleMemory(tensor.Data);
-            var dstMem = AsDoubleMemory(result.Data);
+            using var tensorDataKeep29 = new KeepAliveScope(tensor);
+            var srcMem = AsDoubleMemory(tensor.DataUnmarked);
+            using var resultDataKeep50 = new KeepAliveScope(result);
+            var dstMem = AsDoubleMemory(result.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             double* pSrc = (double*)pinSrc.Pointer;
@@ -12259,7 +12610,9 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.GELU(tensor.AsSpan(), result.AsWritableSpan());
+            using var tensorKeep21 = new KeepAliveScope(tensor);
+            using var resultKeep35 = new KeepAliveScope(result);
+            numOps.GELU(tensor.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
         }
 
         DifferentiableOps.RecordUnary("GELU", result, tensor, BackwardFunctions<T>.GELUBackward);
@@ -12315,8 +12668,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(float))
         {
-            var srcMem = AsFloatMemory(tensor.Data);
-            var dstMem = AsFloatMemory(result.Data);
+            using var tensorDataKeep30 = new KeepAliveScope(tensor);
+            var srcMem = AsFloatMemory(tensor.DataUnmarked);
+            using var resultDataKeep51 = new KeepAliveScope(result);
+            var dstMem = AsFloatMemory(result.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             float* pSrc = (float*)pinSrc.Pointer;
@@ -12326,7 +12681,9 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.Mish(tensor.AsSpan(), result.AsWritableSpan());
+            using var tensorKeep22 = new KeepAliveScope(tensor);
+            using var resultKeep36 = new KeepAliveScope(result);
+            numOps.Mish(tensor.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
         }
 
         DifferentiableOps.RecordUnary("Mish", result, tensor, BackwardFunctions<T>.MishBackward);
@@ -12374,8 +12731,10 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(float))
         {
-            var srcMem = AsFloatMemory(tensor.Data);
-            var dstMem = AsFloatMemory(result.Data);
+            using var tensorDataKeep31 = new KeepAliveScope(tensor);
+            var srcMem = AsFloatMemory(tensor.DataUnmarked);
+            using var resultDataKeep52 = new KeepAliveScope(result);
+            var dstMem = AsFloatMemory(result.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             unsafe
@@ -12390,7 +12749,9 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.Swish(tensor.AsSpan(), result.AsWritableSpan());
+            using var tensorKeep23 = new KeepAliveScope(tensor);
+            using var resultKeep37 = new KeepAliveScope(result);
+            numOps.Swish(tensor.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
         }
 
         DifferentiableOps.RecordUnary("Swish", result, tensor, BackwardFunctions<T>.SwishBackward);
@@ -12448,8 +12809,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             unsafe
             {
-                var srcMem = AsFloatMemory(tensor.Data);
-                var dstMem = AsFloatMemory(result.Data);
+                using var tensorDataKeep32 = new KeepAliveScope(tensor);
+                var srcMem = AsFloatMemory(tensor.DataUnmarked);
+                using var resultDataKeep53 = new KeepAliveScope(result);
+                var dstMem = AsFloatMemory(result.DataUnmarked);
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 SimdKernels.ELUUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length, (float)alpha);
@@ -12458,14 +12821,18 @@ public partial class CpuEngine : ITensorLevelEngine
         else if (typeof(T) == typeof(double))
         {
             // SIMD double ELU via the Span overload (no double unsafe-ptr variant in SimdKernels).
-            var srcSpan = ((ReadOnlyMemory<double>)AsDoubleMemory(tensor.Data)).Span;
-            var dstSpan = AsDoubleMemory(result.Data).Span;
+            using var tensorDataKeep33 = new KeepAliveScope(tensor);
+            var srcSpan = ((ReadOnlyMemory<double>)AsDoubleMemory(tensor.DataUnmarked)).Span;
+            using var resultDataKeep54 = new KeepAliveScope(result);
+            var dstSpan = AsDoubleMemory(result.DataUnmarked).Span;
             SimdKernels.ELU(srcSpan, alpha, dstSpan);
         }
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.ELU(tensor.AsSpan(), numOps.FromDouble(alpha), result.AsWritableSpan());
+            using var tensorKeep24 = new KeepAliveScope(tensor);
+            using var resultKeep38 = new KeepAliveScope(result);
+            numOps.ELU(tensor.AsSpanUnmarked(), numOps.FromDouble(alpha), result.AsWritableSpanUnmarked());
         }
 
         DifferentiableOps.RecordUnary("ELU", result, tensor, BackwardFunctions<T>.ELUBackward, new object[] { alpha });
@@ -12481,15 +12848,19 @@ public partial class CpuEngine : ITensorLevelEngine
         if (!input.IsContiguous) input = input.Contiguous();
         if (typeof(T) == typeof(float))
         {
-            var srcMem = AsFloatMemory(input.Data);
-            var dstMem = AsFloatMemory(destination.Data);
+            using var inputDataKeep29 = new KeepAliveScope(input);
+            var srcMem = AsFloatMemory(input.DataUnmarked);
+            using var destinationDataKeep45 = new KeepAliveScope(destination);
+            var dstMem = AsFloatMemory(destination.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             SimdKernels.ELUUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length, (float)alpha);
             return;
         }
         var numOps = MathHelper.GetNumericOperations<T>();
-        numOps.ELU(input.AsSpan(), numOps.FromDouble(alpha), destination.AsWritableSpan());
+        using var inputKeep15 = new KeepAliveScope(input);
+        using var destinationKeep22 = new KeepAliveScope(destination);
+        numOps.ELU(input.AsSpanUnmarked(), numOps.FromDouble(alpha), destination.AsWritableSpanUnmarked());
     }
 
     /// <inheritdoc/>
@@ -12538,8 +12909,10 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(float))
         {
             float alphaF = System.Runtime.CompilerServices.Unsafe.As<T, float>(ref alpha);
-            var srcMem = AsFloatMemory(tensor.Data);
-            var dstMem = AsFloatMemory(result.Data);
+            using var tensorDataKeep34 = new KeepAliveScope(tensor);
+            var srcMem = AsFloatMemory(tensor.DataUnmarked);
+            using var resultDataKeep55 = new KeepAliveScope(result);
+            var dstMem = AsFloatMemory(result.DataUnmarked);
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             float* pSrc = (float*)pinSrc.Pointer;
@@ -12570,7 +12943,9 @@ public partial class CpuEngine : ITensorLevelEngine
         else
         {
             var numOps = MathHelper.GetNumericOperations<T>();
-            numOps.LeakyReLU(tensor.AsSpan(), alpha, result.AsWritableSpan());
+            using var tensorKeep25 = new KeepAliveScope(tensor);
+            using var resultKeep39 = new KeepAliveScope(result);
+            numOps.LeakyReLU(tensor.AsSpanUnmarked(), alpha, result.AsWritableSpanUnmarked());
         }
 
         DifferentiableOps.RecordUnary("LeakyReLU", result, tensor, BackwardFunctions<T>.LeakyReLUBackward, new object[] { negSlope });
@@ -14325,7 +14700,8 @@ public partial class CpuEngine : ITensorLevelEngine
             // the slice since MultiplyBlocked accumulates. allowParallel:false
             // because we're already inside a Parallel.For over batch — letting
             // MultiplyBlocked spawn a second tier would oversubscribe.
-            result.Data.Span.Slice(resultOffset, matrixSizeResult).Clear();
+            using var resultDataKeep56 = new KeepAliveScope(result);
+            result.DataUnmarked.Span.Slice(resultOffset, matrixSizeResult).Clear();
             MatrixMultiplyHelper.MultiplyBlocked(
                 numOps, aData, bData, result.Data,
                 m, n, p, n, p, p,
@@ -14472,7 +14848,8 @@ public partial class CpuEngine : ITensorLevelEngine
             // SIMD-blocked fallback (see TensorMatMul2D for rationale). Pre-zero
             // the slice since MultiplyBlocked accumulates. allowParallel:false
             // because we're already inside a Parallel.For over batch.
-            result.Data.Span.Slice(resultOffset, matrixSizeResult).Clear();
+            using var resultDataKeep57 = new KeepAliveScope(result);
+            result.DataUnmarked.Span.Slice(resultOffset, matrixSizeResult).Clear();
             MatrixMultiplyHelper.MultiplyBlocked(
                 numOps, aData, bData, result.Data,
                 m, n, p, n, p, p,
@@ -16159,7 +16536,9 @@ public partial class CpuEngine : ITensorLevelEngine
             }
             else
             {
-                tmp.AsSpan().CopyTo(dest.AsWritableSpan());
+                using var tmpKeep1 = new KeepAliveScope(tmp);
+                using var destKeep1 = new KeepAliveScope(dest);
+                tmp.AsSpanUnmarked().CopyTo(dest.AsWritableSpanUnmarked());
             }
         }
         finally
@@ -17416,7 +17795,9 @@ public partial class CpuEngine : ITensorLevelEngine
             }
             else
             {
-                tmp.AsSpan().CopyTo(dest.AsWritableSpan());
+                using var tmpKeep2 = new KeepAliveScope(tmp);
+                using var destKeep2 = new KeepAliveScope(dest);
+                tmp.AsSpanUnmarked().CopyTo(dest.AsWritableSpanUnmarked());
             }
         }
         finally
@@ -19165,7 +19546,9 @@ public partial class CpuEngine : ITensorLevelEngine
         // Generic numOps fallback: delegate to allocating ConvTranspose2D + copy.
         // Non-float/non-double T is a rare niche; the alloc-and-copy is acceptable here.
         var allocated = ConvTranspose2D(input, kernel, stride, padding, outputPadding);
-        allocated.AsSpan().CopyTo(output.AsWritableSpan());
+        using var allocatedKeep1 = new KeepAliveScope(allocated);
+        using var outputKeep4 = new KeepAliveScope(output);
+        allocated.AsSpanUnmarked().CopyTo(output.AsWritableSpanUnmarked());
     }
 
     /// <inheritdoc/>
@@ -23844,8 +24227,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             // Use Pin() for NativeMemory compatibility (no GetDataArray copy)
             var result = AutoTensorCache.RentOrAllocate<T>(input._shape);
-            using var pinIn = input.Data.Pin();
-            using var pinOut = result.Data.Pin();
+            using var inputDataKeep30 = new KeepAliveScope(input);
+            using var pinIn = input.DataUnmarked.Pin();
+            using var resultDataKeep58 = new KeepAliveScope(result);
+            using var pinOut = result.DataUnmarked.Pin();
             unsafe
             {
                 SoftmaxFloatFastPtr((float*)pinIn.Pointer, (float*)pinOut.Pointer, outerSize, axisSize);
@@ -23861,8 +24246,10 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(double) && innerSize == 1)
         {
             var result = AutoTensorCache.RentOrAllocate<T>(input._shape);
-            using var pinIn = input.Data.Pin();
-            using var pinOut = result.Data.Pin();
+            using var inputDataKeep31 = new KeepAliveScope(input);
+            using var pinIn = input.DataUnmarked.Pin();
+            using var resultDataKeep59 = new KeepAliveScope(result);
+            using var pinOut = result.DataUnmarked.Pin();
             unsafe
             {
                 double* pIn = (double*)pinIn.Pointer;
@@ -25081,9 +25468,13 @@ public partial class CpuEngine : ITensorLevelEngine
     private static Tensor<T> BatchStatisticOutput<T>(
         LazyTensorScope scope, Tensor<T> batchNormOutput, Tensor<T> refreshedStatistic, string opName)
     {
+        using var refreshedStatisticKeep1 = new KeepAliveScope(refreshedStatistic);
+        using var outputKeep5 = new KeepAliveScope(output);
         var statistic = scope.RecordUnary(LazyNodeType.Custom, opName, batchNormOutput, refreshedStatistic._shape,
-            (eng, output) => refreshedStatistic.AsSpan().CopyTo(output.AsWritableSpan()));
-        refreshedStatistic.AsSpan().CopyTo(statistic.AsWritableSpan());
+            (eng, output) => refreshedStatistic.AsSpanUnmarked().CopyTo(output.AsWritableSpanUnmarked()));
+        using var refreshedStatisticKeep2 = new KeepAliveScope(refreshedStatistic);
+        using var statisticKeep1 = new KeepAliveScope(statistic);
+        refreshedStatistic.AsSpanUnmarked().CopyTo(statistic.AsWritableSpanUnmarked());
         return statistic;
     }
 
@@ -25174,7 +25565,9 @@ public partial class CpuEngine : ITensorLevelEngine
                         }
                     },
                     BackwardFunctions<T>.BatchNormBackward, new object[] { mean, variance, epsilon });
-                eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
+                using var eagerResultKeep1 = new KeepAliveScope(eagerResult);
+                using var lazyResultKeep1 = new KeepAliveScope(lazyResult);
+                eagerResult.AsSpanUnmarked().CopyTo(lazyResult.AsWritableSpanUnmarked());
                 Helpers.TensorAllocator.Return(eagerResult);
                 // Hand the batch statistics out as outputs OF this node. The replay above refreshes capturedMean /
                 // capturedVar as a side effect the plan cannot see, so a consumer reading them directly - the
@@ -26704,7 +27097,9 @@ public partial class CpuEngine : ITensorLevelEngine
                         stateRef.Variance = freshVar;
                     },
                     BackwardFunctions<T>.LayerNormBackward, new object[] { stateRef, stateRef, epsilon });
-                eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
+                using var eagerResultKeep2 = new KeepAliveScope(eagerResult);
+                using var lazyResultKeep2 = new KeepAliveScope(lazyResult);
+                eagerResult.AsSpanUnmarked().CopyTo(lazyResult.AsWritableSpanUnmarked());
                 return lazyResult;
             }
         }
@@ -27041,7 +27436,9 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             result = LayerNorm(input, gamma, beta, epsilon, out _, out _);
         }
-        result.AsSpan().CopyTo(destination.AsWritableSpan());
+        using var resultKeep40 = new KeepAliveScope(result);
+        using var destinationKeep23 = new KeepAliveScope(destination);
+        result.AsSpanUnmarked().CopyTo(destination.AsWritableSpanUnmarked());
     }
     [MethodImpl(Hot)]
     private static void ProcessBatchesSimd(
@@ -28236,7 +28633,9 @@ public partial class CpuEngine : ITensorLevelEngine
                     // SavedState order per #178 fix above: numGroups must come first so
                     // GroupNormBackward reads savedState[0] as int (not as Tensor).
                     BackwardFunctions<T>.GroupNormBackward, new object[] { numGroups, mean, variance, epsilon });
-                eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
+                using var eagerResultKeep3 = new KeepAliveScope(eagerResult);
+                using var lazyResultKeep3 = new KeepAliveScope(lazyResult);
+                eagerResult.AsSpanUnmarked().CopyTo(lazyResult.AsWritableSpanUnmarked());
                 return lazyResult;
             }
         }
@@ -28270,7 +28669,8 @@ public partial class CpuEngine : ITensorLevelEngine
             // COW Stage 2 (#624): input/gamma/beta are read-only — pin via the non-privatizing
             // ReadOnlyData so a cloned model's shared norm weights stay O(1); only pinOut writes.
             using var pinIn = input.ReadOnlyData.Pin();
-            using var pinOut = result.Data.Pin();
+            using var resultDataKeep60 = new KeepAliveScope(result);
+            using var pinOut = result.DataUnmarked.Pin();
             using var pinGamma = gamma.ReadOnlyData.Pin();
             using var pinBeta = beta.ReadOnlyData.Pin();
             unsafe
@@ -28910,7 +29310,9 @@ public partial class CpuEngine : ITensorLevelEngine
                         DirectGpuTensorEngine.CopyResultInto(eng, freshRms, capturedRms);
                     },
                     BackwardFunctions<T>.RMSNormBackward, new object[] { rms, epsilon });
-                eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
+                using var eagerResultKeep4 = new KeepAliveScope(eagerResult);
+                using var lazyResultKeep4 = new KeepAliveScope(lazyResult);
+                eagerResult.AsSpanUnmarked().CopyTo(lazyResult.AsWritableSpanUnmarked());
                 return lazyResult;
             }
         }
@@ -30831,7 +31233,9 @@ public partial class CpuEngine : ITensorLevelEngine
                 // that uses the returned tensor's data BEFORE plan.Step() sees
                 // the eager values (matches LayerNorm's eagerResult.AsSpan
                 // copy-into-lazy pattern).
-                eagerOutput.AsSpan().CopyTo(lazyResult.AsWritableSpan());
+                using var eagerOutputKeep1 = new KeepAliveScope(eagerOutput);
+                using var lazyResultKeep5 = new KeepAliveScope(lazyResult);
+                eagerOutput.AsSpanUnmarked().CopyTo(lazyResult.AsWritableSpanUnmarked());
                 return lazyResult;
             }
         }
@@ -30990,8 +31394,10 @@ public partial class CpuEngine : ITensorLevelEngine
             // Local accumulators per query position
             var rowMax = new T[seqQ];
             var rowSum = new T[seqQ];
-            numOps.Fill(rowMax.AsSpan(), negInf);
-            numOps.Fill(rowSum.AsSpan(), numOps.Zero);
+            using var rowMaxKeep1 = new KeepAliveScope(rowMax);
+            numOps.Fill(rowMax.AsSpanUnmarked(), negInf);
+            using var rowSumKeep1 = new KeepAliveScope(rowSum);
+            numOps.Fill(rowSum.AsSpanUnmarked(), numOps.Zero);
 
             // Process KV blocks
             for (int kvBlockStart = 0; kvBlockStart < seqK; kvBlockStart += BLOCK_KV)
@@ -33072,7 +33478,9 @@ public partial class CpuEngine : ITensorLevelEngine
                             DirectGpuTensorEngine.CopyResultInto(eng, freshCounts, capturedCounts);
                     },
                     BackwardFunctions<T>.ScatterMeanBackward, new object[] { indices, dim });
-                eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
+                using var eagerResultKeep5 = new KeepAliveScope(eagerResult);
+                using var lazyResultKeep6 = new KeepAliveScope(lazyResult);
+                eagerResult.AsSpanUnmarked().CopyTo(lazyResult.AsWritableSpanUnmarked());
                 return lazyResult;
             }
         }
@@ -33721,7 +34129,8 @@ public partial class CpuEngine : ITensorLevelEngine
                         var normAxes = ValidateAndNormalizeAxes(capturedEffectiveAxes, inShape.Length);
                         var outShapeLocal = output._shape;
                         int outSize = output.Length;
-                        var outSpan = output.Data.Span;
+                        using var outputDataKeep2 = new KeepAliveScope(output);
+                        var outSpan = output.DataUnmarked.Span;
                         var idxArr = new int[outSize];
                         T minVal = numOps.MinValue;
                         for (int i = 0; i < outSize; i++) { outSpan[i] = minVal; idxArr[i] = -1; }
@@ -34063,7 +34472,8 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             if (typeof(T) == typeof(double))
             {
-                var dSpan = AsDoubleMemory(input.Data).Span;
+                using var inputDataKeep32 = new KeepAliveScope(input);
+                var dSpan = AsDoubleMemory(input.DataUnmarked).Span;
                 double dSum = SimdKernels.Sum(dSpan);
                 double dMean = dSum / input.Length;
                 var scalarResult = AutoTensorCache.RentOrAllocate<T>(new[] { 1 });
@@ -34084,7 +34494,8 @@ public partial class CpuEngine : ITensorLevelEngine
             {
                 unsafe
                 {
-                    var mem = AsFloatMemory(input.Data);
+                    using var inputDataKeep33 = new KeepAliveScope(input);
+                    var mem = AsFloatMemory(input.DataUnmarked);
                     using var pin = mem.Pin();
                     float fSum = SimdKernels.SumUnsafe((float*)pin.Pointer, input.Length);
                     float fMean = fSum / input.Length;
@@ -36064,7 +36475,8 @@ public partial class CpuEngine : ITensorLevelEngine
             }
             else
             {
-                outArrD.AsSpan().Fill(padD);
+                using var outArrDKeep1 = new KeepAliveScope(outArrD);
+                outArrD.AsSpanUnmarked().Fill(padD);
             }
             int h = height, w = width, nH = newHeight, nW = newWidth;
             int pt = padTop, pl = padLeft;
@@ -37017,7 +37429,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var gradCenters = AutoTensorCache.RentOrAllocate<T>(centers._shape);
         var gradEpsilons = AutoTensorCache.RentOrAllocate<T>(epsilons._shape);
         // Zero pooled buffers — RentOrAllocate can return stale data from the cache
-        gradInput.AsWritableSpan().Clear();
+        using var gradInputKeep1 = new KeepAliveScope(gradInput);
+        gradInput.AsWritableSpanUnmarked().Clear();
         gradCenters.AsWritableSpan().Clear();
         gradEpsilons.AsWritableSpan().Clear();
 
@@ -37522,7 +37935,9 @@ public partial class CpuEngine : ITensorLevelEngine
         // parameter with TensorCopy (FTRL, ASGD) therefore never updated pooled parameters at all. AsWritableSpan
         // slices the live storage at the view's offset, and the version bump tells caches the data changed.
         // Exactly source.Length elements are copied, never a (possibly over-allocated) backing array's length.
-        source.AsSpan().Slice(0, source.Length).CopyTo(destination.AsWritableSpan());
+        using var sourceKeep1 = new KeepAliveScope(source);
+        using var destinationKeep24 = new KeepAliveScope(destination);
+        source.AsSpanUnmarked().Slice(0, source.Length).CopyTo(destination.AsWritableSpanUnmarked());
         destination.IncrementVersion();
     }
 
@@ -37649,8 +38064,10 @@ public partial class CpuEngine : ITensorLevelEngine
         // srcStrides[rank - 1] which is out of bounds.
         if (axes.Length == 0)
         {
+            using var outputDataKeep3 = new KeepAliveScope(output);
+            using var tensorDataKeep35 = new KeepAliveScope(tensor);
             if (output.Length > 0 && tensor.Length > 0)
-                output.Data.Span[0] = tensor.Data.Span[0];
+                output.DataUnmarked.Span[0] = tensor.DataUnmarked.Span[0];
             return;
         }
 
@@ -37728,8 +38145,10 @@ public partial class CpuEngine : ITensorLevelEngine
             permutedSrcStrides[i] = srcStrides[axes[i]];
 
         var dstShape = output._shape;
-        var srcSpan = tensor.Data.Span;
-        var dstSpan = output.Data.Span;
+        using var tensorDataKeep36 = new KeepAliveScope(tensor);
+        var srcSpan = tensor.DataUnmarked.Span;
+        using var outputDataKeep4 = new KeepAliveScope(output);
+        var dstSpan = output.DataUnmarked.Span;
 
         // For rank ≤ 4 (the diffusion / transformer hot path), unroll the
         // index walk into nested loops; for higher ranks, fall back to a
@@ -38351,7 +38770,8 @@ public partial class CpuEngine : ITensorLevelEngine
         if (shape == null) throw new ArgumentNullException(nameof(shape));
         var tensor = new Tensor<T>(shape);
         var rng = new Helpers.SimdRandom();
-        rng.FillUniform(tensor.AsWritableSpan());
+        using var tensorKeep26 = new KeepAliveScope(tensor);
+        rng.FillUniform(tensor.AsWritableSpanUnmarked());
         return tensor;
     }
 
@@ -38387,7 +38807,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (destination.IsContiguous)
         {
-            FillRandomNormal(destination.AsWritableSpan(), numOps, random, meanD, stdD);
+            using var destinationKeep25 = new KeepAliveScope(destination);
+            FillRandomNormal(destination.AsWritableSpanUnmarked(), numOps, random, meanD, stdD);
             return;
         }
 
@@ -38490,7 +38911,8 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (destination.IsContiguous)
         {
-            FillUniformRange(destination.AsWritableSpan(), numOps, random, minD, range);
+            using var destinationKeep26 = new KeepAliveScope(destination);
+            FillUniformRange(destination.AsWritableSpanUnmarked(), numOps, random, minD, range);
             return;
         }
 
@@ -38819,8 +39241,11 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
 
         // scalar - tensor = -(tensor - scalar) = negate(tensor) + scalar
-        numOps.Negate(tensor.AsSpan(), result.AsWritableSpan());
-        numOps.AddScalar(result.AsSpan(), scalar, result.AsWritableSpan());
+        using var tensorKeep27 = new KeepAliveScope(tensor);
+        using var resultKeep41 = new KeepAliveScope(result);
+        numOps.Negate(tensor.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
+        using var resultKeep42 = new KeepAliveScope(result);
+        numOps.AddScalar(result.AsSpanUnmarked(), scalar, result.AsWritableSpanUnmarked());
 
         // d(scalar - x)/dx = -1, so gradient is negated
         DifferentiableOps.RecordUnary("ScalarMinusTensor", result, tensorOrig, BackwardFunctions<T>.NegateBackward);
@@ -39008,7 +39433,9 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
-        if (tensor.IsContiguous) { numOps.AddScalar(tensor.AsSpan(), scalar, result.AsWritableSpan()); }
+        using var tensorKeep28 = new KeepAliveScope(tensor);
+        using var resultKeep43 = new KeepAliveScope(result);
+        if (tensor.IsContiguous) { numOps.AddScalar(tensor.AsSpanUnmarked(), scalar, result.AsWritableSpanUnmarked()); }
         else { var src = tensor._storage.GetDataArray(); var dst = result.GetDataArray(); for (int i = 0; i < tensor.Length; i++) dst[i] = numOps.Add(src[tensor.LogicalToStorageIndex(i)], scalar); }
 
         DifferentiableOps.RecordUnary("TensorAddScalar", result, tensor, BackwardFunctions<T>.AddScalarBackward);
@@ -39038,7 +39465,9 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
-        if (tensor.IsContiguous) { numOps.SubtractScalar(tensor.AsSpan(), scalar, result.AsWritableSpan()); }
+        using var tensorKeep29 = new KeepAliveScope(tensor);
+        using var resultKeep44 = new KeepAliveScope(result);
+        if (tensor.IsContiguous) { numOps.SubtractScalar(tensor.AsSpanUnmarked(), scalar, result.AsWritableSpanUnmarked()); }
         else { var src = tensor._storage.GetDataArray(); var dst = result.GetDataArray(); for (int i = 0; i < tensor.Length; i++) dst[i] = numOps.Subtract(src[tensor.LogicalToStorageIndex(i)], scalar); }
 
         DifferentiableOps.RecordUnary("TensorSubtractScalar", result, tensor, BackwardFunctions<T>.SubtractScalarBackward);
@@ -39068,7 +39497,9 @@ public partial class CpuEngine : ITensorLevelEngine
 
         var numOps = MathHelper.GetNumericOperations<T>();
         var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
-        if (tensor.IsContiguous) { numOps.DivideScalar(tensor.AsSpan(), scalar, result.AsWritableSpan()); }
+        using var tensorKeep30 = new KeepAliveScope(tensor);
+        using var resultKeep45 = new KeepAliveScope(result);
+        if (tensor.IsContiguous) { numOps.DivideScalar(tensor.AsSpanUnmarked(), scalar, result.AsWritableSpanUnmarked()); }
         else { var src = tensor._storage.GetDataArray(); var dst = result.GetDataArray(); for (int i = 0; i < tensor.Length; i++) dst[i] = numOps.Divide(src[tensor.LogicalToStorageIndex(i)], scalar); }
 
         if (scalar is not null)
@@ -39116,9 +39547,10 @@ public partial class CpuEngine : ITensorLevelEngine
         var y = yLease.Span;
         using var oneMinusYLease = temp.LeaseWritable();
         var oneMinusY = oneMinusYLease.Span;
+        using var resultKeep46 = new KeepAliveScope(result);
         numOps.Negate(y, oneMinusY);                     // oneMinusY = -y
         numOps.AddScalar(oneMinusY, numOps.One, oneMinusY); // oneMinusY = 1 - y
-        numOps.Multiply(y, oneMinusY, result.AsWritableSpan()); // result = y * (1-y)
+        numOps.Multiply(y, oneMinusY, result.AsWritableSpanUnmarked()); // result = y * (1-y)
 
         return result;
     }
@@ -39495,7 +39927,8 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             var outShape = ConcatenateOutputShape(tensors, normalizedAxis);
             result = AutoTensorCache.RentOrAllocate<T>(outShape);
-            ConcatenateContiguousInto(tensors, normalizedAxis, result.AsWritableSpan());
+            using var resultKeep47 = new KeepAliveScope(result);
+            ConcatenateContiguousInto(tensors, normalizedAxis, result.AsWritableSpanUnmarked());
         }
         // Fast path for axis=0 contiguous tensors: direct Array.Copy (any rank)
         else if (axis == 0 && tensors.All(t => t.IsContiguous))
@@ -39612,7 +40045,8 @@ public partial class CpuEngine : ITensorLevelEngine
         for (int d = 0; d < rank; d++)
             if (outShape[d] != output._shape[d]) return false;
 
-        ConcatenateContiguousInto(tensors, normalizedAxis, output.AsWritableSpan());
+        using var outputKeep6 = new KeepAliveScope(output);
+        ConcatenateContiguousInto(tensors, normalizedAxis, output.AsWritableSpanUnmarked());
         output.IncrementVersion();
         return true;
     }
@@ -40408,8 +40842,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             // Use Pin() for NativeMemory compatibility
             var result = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
-            using var pinIn = tensor.Data.Pin();
-            using var pinOut = result.Data.Pin();
+            using var tensorDataKeep37 = new KeepAliveScope(tensor);
+            using var pinIn = tensor.DataUnmarked.Pin();
+            using var resultDataKeep61 = new KeepAliveScope(result);
+            using var pinOut = result.DataUnmarked.Pin();
             unsafe
             {
                 LogSoftmaxFloatFastPtr((float*)pinIn.Pointer, (float*)pinOut.Pointer, outerSize, axisSize);
@@ -40426,8 +40862,10 @@ public partial class CpuEngine : ITensorLevelEngine
         if (typeof(T) == typeof(double) && innerSize == 1)
         {
             var resultD = AutoTensorCache.RentOrAllocate<T>(tensor._shape);
-            using var pinIn = tensor.Data.Pin();
-            using var pinOut = resultD.Data.Pin();
+            using var tensorDataKeep38 = new KeepAliveScope(tensor);
+            using var pinIn = tensor.DataUnmarked.Pin();
+            using var resultDDataKeep1 = new KeepAliveScope(resultD);
+            using var pinOut = resultD.DataUnmarked.Pin();
             unsafe
             {
                 double* pIn = (double*)pinIn.Pointer;
@@ -41899,8 +42337,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             unsafe
             {
-                var srcMem = AsFloatMemory(tensor.Data);
-                var dstMem = AsFloatMemory(result.Data);
+                using var tensorDataKeep39 = new KeepAliveScope(tensor);
+                var srcMem = AsFloatMemory(tensor.DataUnmarked);
+                using var resultDataKeep62 = new KeepAliveScope(result);
+                var dstMem = AsFloatMemory(result.DataUnmarked);
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 SimdKernels.CoshUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, length);
@@ -41957,8 +42397,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             unsafe
             {
-                var srcMem = AsFloatMemory(tensor.Data);
-                var dstMem = AsFloatMemory(result.Data);
+                using var tensorDataKeep40 = new KeepAliveScope(tensor);
+                var srcMem = AsFloatMemory(tensor.DataUnmarked);
+                using var resultDataKeep63 = new KeepAliveScope(result);
+                var dstMem = AsFloatMemory(result.DataUnmarked);
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 SimdKernels.SinhUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, length);
@@ -42689,7 +43131,9 @@ public partial class CpuEngine : ITensorLevelEngine
             if (destination.Length != result.Length)
                 throw new ArgumentException(
                     $"Destination length ({destination.Length}) must equal FusedLinear result length ({result.Length}).");
-            result.Data.Span.CopyTo(destination.Data.Span);
+            using var resultDataKeep64 = new KeepAliveScope(result);
+            using var destinationDataKeep46 = new KeepAliveScope(destination);
+            result.DataUnmarked.Span.CopyTo(destination.DataUnmarked.Span);
         }
         finally
         {
@@ -44909,8 +45353,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             unsafe
             {
-                var srcMem = AsFloatMemory(input.Data);
-                var dstMem = AsFloatMemory(softplusResult.Data);
+                using var inputDataKeep34 = new KeepAliveScope(input);
+                var srcMem = AsFloatMemory(input.DataUnmarked);
+                using var softplusResultDataKeep1 = new KeepAliveScope(softplusResult);
+                var dstMem = AsFloatMemory(softplusResult.DataUnmarked);
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 SimdKernels.SoftplusUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, length);
@@ -44962,8 +45408,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             unsafe
             {
-                var srcMem = AsFloatMemory(input.Data);
-                var dstMem = AsFloatMemory(hardSwishResult.Data);
+                using var inputDataKeep35 = new KeepAliveScope(input);
+                var srcMem = AsFloatMemory(input.DataUnmarked);
+                using var hardSwishResultDataKeep1 = new KeepAliveScope(hardSwishResult);
+                var dstMem = AsFloatMemory(hardSwishResult.DataUnmarked);
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 SimdKernels.HardSwishUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, length);
@@ -45065,9 +45513,12 @@ public partial class CpuEngine : ITensorLevelEngine
         else if (typeof(T) == typeof(double))
         {
             // Double SIMD backward (AVX2: 4 doubles per vector)
-            var gMem = AsDoubleMemory(gradOutput.Data);
-            var iMem = AsDoubleMemory(input.Data);
-            var rMem = AsDoubleMemory(resultTensor2.Data);
+            using var gradOutputDataKeep1 = new KeepAliveScope(gradOutput);
+            var gMem = AsDoubleMemory(gradOutput.DataUnmarked);
+            using var inputDataKeep36 = new KeepAliveScope(input);
+            var iMem = AsDoubleMemory(input.DataUnmarked);
+            using var resultTensor2DataKeep1 = new KeepAliveScope(resultTensor2);
+            var rMem = AsDoubleMemory(resultTensor2.DataUnmarked);
             using var pinG = gMem.Pin();
             using var pinI = iMem.Pin();
             using var pinR = rMem.Pin();
@@ -45179,7 +45630,8 @@ public partial class CpuEngine : ITensorLevelEngine
         var result = AutoTensorCache.RentOrAllocate<float>(a._shape);
         using var pinA = a.ReadOnlyData.Pin();
         using var pinB = b.ReadOnlyData.Pin();
-        using var pinR = result.Data.Pin();
+        using var resultDataKeep65 = new KeepAliveScope(result);
+        using var pinR = result.DataUnmarked.Pin();
         nint pa = (nint)pinA.Pointer, pb = (nint)pinB.Pointer, pr = (nint)pinR.Pointer;
         int length = result.Length;
         int chunks = CpuParallelSettings.ElementwiseChunkCount(length);
@@ -45415,9 +45867,12 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (typeof(T) == typeof(float))
         {
-            var gMem = AsFloatMemory(gradOutput.Data);
-            var iMem = AsFloatMemory(input.Data);
-            var rMem = AsFloatMemory(resultTensor.Data);
+            using var gradOutputDataKeep2 = new KeepAliveScope(gradOutput);
+            var gMem = AsFloatMemory(gradOutput.DataUnmarked);
+            using var inputDataKeep37 = new KeepAliveScope(input);
+            var iMem = AsFloatMemory(input.DataUnmarked);
+            using var resultTensorDataKeep1 = new KeepAliveScope(resultTensor);
+            var rMem = AsFloatMemory(resultTensor.DataUnmarked);
             using var pinG = gMem.Pin();
             using var pinI = iMem.Pin();
             using var pinR = rMem.Pin();
@@ -45943,7 +46398,9 @@ public partial class CpuEngine : ITensorLevelEngine
                         DirectGpuTensorEngine.CopyResultInto(eng, freshVar, capturedINVar);
                     },
                     BackwardFunctions<T>.InstanceNormBackward, new object[] { mean, variance, epsilon });
-                eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
+                using var eagerResultKeep6 = new KeepAliveScope(eagerResult);
+                using var lazyResultKeep7 = new KeepAliveScope(lazyResult);
+                eagerResult.AsSpanUnmarked().CopyTo(lazyResult.AsWritableSpanUnmarked());
                 return lazyResult;
             }
         }
@@ -46161,7 +46618,9 @@ public partial class CpuEngine : ITensorLevelEngine
                         DirectGpuTensorEngine.CopyResultInto(eng, freshMask, capturedMask);
                     },
                     BackwardFunctions<T>.DropoutBackward, new object[] { mask, dropoutRate });
-                eagerResult.AsSpan().CopyTo(lazyResult.AsWritableSpan());
+                using var eagerResultKeep7 = new KeepAliveScope(eagerResult);
+                using var lazyResultKeep8 = new KeepAliveScope(lazyResult);
+                eagerResult.AsSpanUnmarked().CopyTo(lazyResult.AsWritableSpanUnmarked());
                 return lazyResult;
             }
         }
@@ -46173,7 +46632,9 @@ public partial class CpuEngine : ITensorLevelEngine
 
         if (!training || dropoutRate <= 0)
         {
-            input.AsSpan().CopyTo(dropResult.AsWritableSpan());
+            using var inputKeep16 = new KeepAliveScope(input);
+            using var dropResultKeep1 = new KeepAliveScope(dropResult);
+            input.AsSpanUnmarked().CopyTo(dropResult.AsWritableSpanUnmarked());
             if (typeof(T) == typeof(float))
             {
                 using var mArrLease = mask.LeaseArray();
@@ -46561,8 +47022,10 @@ public partial class CpuEngine : ITensorLevelEngine
         // MSE = mean((pred - target)^2) = (dot(diff, diff)) / N
         // Use span-based subtract + dot product instead of ToArray + ToDouble per element
         var diff = AutoTensorCache.RentOrAllocate<T>(predictions._shape);
-        numOps.Subtract(predictions.AsSpan(), targets.AsSpan(), diff.AsWritableSpan());
-        T sumSq = numOps.Dot(diff.AsSpan(), diff.AsSpan());
+        using var diffKeep1 = new KeepAliveScope(diff);
+        numOps.Subtract(predictions.AsSpan(), targets.AsSpan(), diff.AsWritableSpanUnmarked());
+        using var diffKeep2 = new KeepAliveScope(diff);
+        T sumSq = numOps.Dot(diff.AsSpanUnmarked(), diff.AsSpanUnmarked());
 
         return numOps.Divide(sumSq, numOps.FromDouble(predictions.Length));
     }
@@ -46578,9 +47041,11 @@ public partial class CpuEngine : ITensorLevelEngine
 
         // grad = 2 * (pred - target) / N
         var result = AutoTensorCache.RentOrAllocate<T>(predictions._shape);
-        numOps.Subtract(predictions.AsSpan(), targets.AsSpan(), result.AsWritableSpan());
+        using var resultKeep48 = new KeepAliveScope(result);
+        numOps.Subtract(predictions.AsSpan(), targets.AsSpan(), result.AsWritableSpanUnmarked());
         T scale = numOps.FromDouble(2.0 / predictions.Length);
-        numOps.MultiplyScalar(result.AsSpan(), scale, result.AsWritableSpan());
+        using var resultKeep49 = new KeepAliveScope(result);
+        numOps.MultiplyScalar(result.AsSpanUnmarked(), scale, result.AsWritableSpanUnmarked());
 
         return result;
     }
@@ -48023,8 +48488,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             unsafe
             {
-                var srcMem = AsFloatMemory(tensor.Data);
-                var dstMem = AsFloatMemory(result.Data);
+                using var tensorDataKeep41 = new KeepAliveScope(tensor);
+                var srcMem = AsFloatMemory(tensor.DataUnmarked);
+                using var resultDataKeep66 = new KeepAliveScope(result);
+                var dstMem = AsFloatMemory(result.DataUnmarked);
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 SimdKernels.SELUUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length);
@@ -48089,8 +48556,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             unsafe
             {
-                var srcMem = AsFloatMemory(tensor.Data);
-                var dstMem = AsFloatMemory(result.Data);
+                using var tensorDataKeep42 = new KeepAliveScope(tensor);
+                var srcMem = AsFloatMemory(tensor.DataUnmarked);
+                using var resultDataKeep67 = new KeepAliveScope(result);
+                var dstMem = AsFloatMemory(result.DataUnmarked);
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 SimdKernels.HardSigmoidUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length);
@@ -48401,8 +48870,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             unsafe
             {
-                var srcMem = AsFloatMemory(tensor.Data);
-                var dstMem = AsFloatMemory(result.Data);
+                using var tensorDataKeep43 = new KeepAliveScope(tensor);
+                var srcMem = AsFloatMemory(tensor.DataUnmarked);
+                using var resultDataKeep68 = new KeepAliveScope(result);
+                var dstMem = AsFloatMemory(result.DataUnmarked);
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 SimdKernels.ReciprocalUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length);
@@ -48447,8 +48918,10 @@ public partial class CpuEngine : ITensorLevelEngine
         {
             unsafe
             {
-                var srcMem = AsFloatMemory(tensor.Data);
-                var dstMem = AsFloatMemory(result.Data);
+                using var tensorDataKeep44 = new KeepAliveScope(tensor);
+                var srcMem = AsFloatMemory(tensor.DataUnmarked);
+                using var resultDataKeep69 = new KeepAliveScope(result);
+                var dstMem = AsFloatMemory(result.DataUnmarked);
                 using var pinSrc = srcMem.Pin();
                 using var pinDst = dstMem.Pin();
                 SimdKernels.SignUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, tensor.Length);
@@ -53414,7 +53887,8 @@ public partial class CpuEngine : ITensorLevelEngine
             // Radix-2 only below — see NativeFFTBluestein.
             var arbitrary = data.ToArray();
             NativeFFTBluestein<double>(arbitrary, n, inverse, MathHelper.GetNumericOperations<double>());
-            arbitrary.AsSpan().CopyTo(data);
+            using var arbitraryKeep1 = new KeepAliveScope(arbitrary);
+            arbitrary.AsSpanUnmarked().CopyTo(data);
             return;
         }
 
@@ -53507,7 +53981,8 @@ public partial class CpuEngine : ITensorLevelEngine
             // Radix-2 only below — see NativeFFTBluestein.
             var arbitrary = data.ToArray();
             NativeFFTBluestein<float>(arbitrary, n, inverse, MathHelper.GetNumericOperations<float>());
-            arbitrary.AsSpan().CopyTo(data);
+            using var arbitraryKeep2 = new KeepAliveScope(arbitrary);
+            arbitrary.AsSpanUnmarked().CopyTo(data);
             return;
         }
 

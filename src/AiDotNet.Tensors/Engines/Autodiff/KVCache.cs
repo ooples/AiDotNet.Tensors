@@ -135,8 +135,10 @@ public sealed class KVCache<T>
         if (len > 0)
         {
             int srcBase = batchIdx * MaxSeq * stepStride;
-            _keys.AsSpan().Slice(srcBase, len * stepStride).CopyTo(k.AsWritableSpan());
-            _values.AsSpan().Slice(srcBase, len * stepStride).CopyTo(v.AsWritableSpan());
+            using var kKeep1 = new KeepAliveScope(k);
+            _keys.AsSpan().Slice(srcBase, len * stepStride).CopyTo(k.AsWritableSpanUnmarked());
+            using var vKeep1 = new KeepAliveScope(v);
+            _values.AsSpan().Slice(srcBase, len * stepStride).CopyTo(v.AsWritableSpanUnmarked());
         }
         return (k, v);
     }

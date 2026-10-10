@@ -141,7 +141,8 @@ public sealed class FullyShardedDataParallel<T>
         // copy-on-demand semantics — the dictionary entry is consumed.
         if (_options.CpuOffload && _offloadedShards.TryGetValue(param, out var offloaded))
         {
-            offloaded.AsSpan().CopyTo(param.LocalShard.AsWritableSpan());
+            using var offloadedKeep1 = new KeepAliveScope(offloaded);
+            offloaded.AsSpanUnmarked().CopyTo(param.LocalShard.AsWritableSpan());
             _offloadedShards.Remove(param);
         }
         // NoShard and ShardOptimizerOnly both replicate the parameter;
@@ -361,8 +362,10 @@ public sealed class FullyShardedDataParallel<T>
         int from = _group.Rank * chunk;
         int actual = Math.Min(chunk, Math.Max(0, total - from));
         var slice = new Tensor<T>(new[] { chunk });
+        using var fullKeep1 = new KeepAliveScope(full);
+        using var sliceKeep1 = new KeepAliveScope(slice);
         if (actual > 0)
-            full.AsSpan().Slice(from, actual).CopyTo(slice.AsWritableSpan().Slice(0, actual));
+            full.AsSpanUnmarked().Slice(from, actual).CopyTo(slice.AsWritableSpanUnmarked().Slice(0, actual));
         // Reuse param to suppress unused-arg warnings; param.FullShape and
         // local-chunk size are by construction the same as the inferred
         // chunk above (RegisterParameter computes chunk identically).
@@ -414,7 +417,9 @@ public sealed class ShardedParameter<T>
         var shard = new Tensor<T>(new[] { chunk });
         if (actual > 0)
         {
-            full.AsSpan().Slice(from, actual).CopyTo(shard.AsWritableSpan().Slice(0, actual));
+            using var fullKeep2 = new KeepAliveScope(full);
+            using var shardKeep1 = new KeepAliveScope(shard);
+            full.AsSpanUnmarked().Slice(from, actual).CopyTo(shard.AsWritableSpanUnmarked().Slice(0, actual));
         }
         return new ShardedParameter<T>(fullShape, shard);
     }

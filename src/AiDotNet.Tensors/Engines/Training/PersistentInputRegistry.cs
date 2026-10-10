@@ -84,7 +84,8 @@ public sealed class PersistentInputRegistry<T> : IDisposable
             throw new ArgumentException(
                 $"freshData length {freshData.Length} does not match slot {slotIndex}'s length {slot.Length}.",
                 nameof(freshData));
-        freshData.AsSpan().CopyTo(slot.AsWritableSpan());
+        using var slotKeep1 = new KeepAliveScope(slot);
+        freshData.AsSpan().CopyTo(slot.AsWritableSpanUnmarked());
     }
 
     /// <summary>

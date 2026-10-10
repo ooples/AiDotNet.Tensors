@@ -362,6 +362,13 @@ internal sealed class TensorStorage<T>
         return _data.AsWritableMemory();
     }
 
+    /// <summary><see cref="AsMemory"/> without the escape mark; see <see cref="VectorBase{T}.AsWritableMemoryUnmarked"/>.</summary>
+    internal Memory<T> AsMemoryUnmarked()
+    {
+        ThrowIfReadOnlyMapped();
+        return _data.AsWritableMemoryUnmarked();
+    }
+
     /// <summary>
     /// Gets the raw backing array. Use with care — bypasses safety checks.
     /// </summary>

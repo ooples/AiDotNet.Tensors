@@ -301,7 +301,9 @@ public sealed class GraphExecutor<T> : IDisposable
     /// </summary>
     private static void CopyAndReturn(Tensor<T> result, Tensor<T> output)
     {
-        result.AsSpan().Slice(0, Math.Min(result.Length, output.Length)).CopyTo(output.AsWritableSpan());
+        using var resultKeep1 = new KeepAliveScope(result);
+        using var outputKeep1 = new KeepAliveScope(output);
+        result.AsSpanUnmarked().Slice(0, Math.Min(result.Length, output.Length)).CopyTo(output.AsWritableSpanUnmarked());
         TensorAllocator.Return(result);
     }
 

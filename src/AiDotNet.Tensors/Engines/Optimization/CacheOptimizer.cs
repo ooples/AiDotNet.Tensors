@@ -370,7 +370,9 @@ namespace AiDotNet.Tensors.Engines.Optimization
         {
             if (src is null) throw new ArgumentNullException(nameof(src));
             if (dst is null) throw new ArgumentNullException(nameof(dst));
-            TransposeBlocked<float>(src.AsSpan(), dst.AsSpan(), rows, cols);
+            using var srcKeep1 = new KeepAliveScope(src);
+            using var dstKeep1 = new KeepAliveScope(dst);
+            TransposeBlocked<float>(src.AsSpanUnmarked(), dst.AsSpanUnmarked(), rows, cols);
         }
 
         /// <summary>[Obsolete] Use the generic

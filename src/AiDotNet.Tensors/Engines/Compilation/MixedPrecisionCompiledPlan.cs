@@ -451,7 +451,8 @@ public sealed class MixedPrecisionCompiledPlan : IDisposable
         if (!_halfStore!.TryGetValue(t, out var h)) return; // already float-resident
         var f = new float[h.Length];
         for (int i = 0; i < h.Length; i++) f[i] = (float)h[i];
-        t.RestoreStorageFromBytes(MemoryMarshal.AsBytes(f.AsSpan()));
+        using var fKeep1 = new KeepAliveScope(f);
+        t.RestoreStorageFromBytes(MemoryMarshal.AsBytes(f.AsSpanUnmarked()));
         _storageLeases!.Add(t);
         _halfStore.Remove(t);
     }

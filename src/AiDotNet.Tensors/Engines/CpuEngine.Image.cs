@@ -404,7 +404,8 @@ internal static class JpegBinding
         ulong dstLen = 0;
         try
         {
-            var srcBytes = image.AsSpan().ToArray();
+            using var imageKeep1 = new KeepAliveScope(image);
+            var srcBytes = image.AsSpanUnmarked().ToArray();
             int r = tjCompress2(h, srcBytes, W, 0, H, pixFmt, ref dst, ref dstLen, TJSAMP_444, quality, 0);
             if (r != 0) throw new InvalidDataException("JPEG encode failed.");
             var result = new byte[(int)dstLen];
@@ -464,7 +465,8 @@ internal static class WebPBinding
         if (C != 4) throw new ArgumentException("WebP encode needs 4-channel RGBA; pad if needed.");
         IntPtr outPtr = IntPtr.Zero;
         nuint outLen;
-        try { outLen = WebPEncodeRGBA(image.AsSpan().ToArray(), W, H, W * 4, quality, out outPtr); }
+        using var imageKeep2 = new KeepAliveScope(image);
+        try { outLen = WebPEncodeRGBA(image.AsSpanUnmarked().ToArray(), W, H, W * 4, quality, out outPtr); }
         catch (DllNotFoundException ex)
         {
             throw new PlatformNotSupportedException(

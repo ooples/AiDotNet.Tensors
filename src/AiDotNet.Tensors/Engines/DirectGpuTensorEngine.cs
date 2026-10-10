@@ -1072,7 +1072,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     private static void DownloadIntoTensor(IDirectGpuBackend backend, IGpuBuffer gpuBuffer, Tensor<float> tensor)
     {
         var downloaded = backend.DownloadBuffer(gpuBuffer);
-        downloaded.AsSpan(0, Math.Min(downloaded.Length, tensor.Length)).CopyTo(tensor.Data.Span);
+        using var tensorDataKeep1 = new KeepAliveScope(tensor);
+        downloaded.AsSpan(0, Math.Min(downloaded.Length, tensor.Length)).CopyTo(tensor.DataUnmarked.Span);
     }
 
     private bool TryGetBackend(out IDirectGpuBackend backend)
@@ -3958,8 +3959,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
         }
         using var destinationLease = dest.LeaseWritable();
         var destination = destinationLease.Span;
+        using var srcKeep1 = new KeepAliveScope(src);
         if (src.IsContiguous)
-            src.AsSpan().CopyTo(destination);
+            src.AsSpanUnmarked().CopyTo(destination);
         else
             src.CopyLogicalTo(destination);
         dest.IncrementVersion();
@@ -6524,7 +6526,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return base.MatrixAdd(a, b);
 
         var matrix = new Matrix<T>(a.Rows, a.Columns);
-        result.AsSpan().CopyTo(matrix.AsWritableSpan());
+        using var resultKeep1 = new KeepAliveScope(result);
+        using var matrixKeep1 = new KeepAliveScope(matrix);
+        result.AsSpanUnmarked().CopyTo(matrix.AsWritableSpanUnmarked());
         return matrix;
     }
 
@@ -6539,7 +6543,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return base.MatrixSubtract(a, b);
 
         var matrix = new Matrix<T>(a.Rows, a.Columns);
-        result.AsSpan().CopyTo(matrix.AsWritableSpan());
+        using var resultKeep2 = new KeepAliveScope(result);
+        using var matrixKeep2 = new KeepAliveScope(matrix);
+        result.AsSpanUnmarked().CopyTo(matrix.AsWritableSpanUnmarked());
         return matrix;
     }
 
@@ -6551,7 +6557,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             return base.MatrixMultiplyScalar(matrix, scalar);
 
         var output = new Matrix<T>(matrix.Rows, matrix.Columns);
-        result.AsSpan().CopyTo(output.AsWritableSpan());
+        using var resultKeep3 = new KeepAliveScope(result);
+        using var outputKeep1 = new KeepAliveScope(output);
+        result.AsSpanUnmarked().CopyTo(output.AsWritableSpanUnmarked());
         return output;
     }
 
@@ -6695,7 +6703,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (TryUnaryResidentInto(dest, input, static (be, i, o, n) => be.Sigmoid(i, o, n), "Sigmoid")) return;
         var result = ((IEngine)this).Sigmoid(input);
-        result.Data.Span.CopyTo(dest.Data.Span);
+        using var resultDataKeep1 = new KeepAliveScope(result);
+        using var destDataKeep1 = new KeepAliveScope(dest);
+        result.DataUnmarked.Span.CopyTo(dest.DataUnmarked.Span);
     }
 
     void IEngine.ReLUInPlace<T>(Tensor<T> tensor)
@@ -6743,7 +6753,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         if (TryUnaryResidentInto(dest, input, static (be, i, o, n) => be.Relu(i, o, n), "ReLU")) return;
         var result = ((IEngine)this).ReLU(input);
-        result.Data.Span.CopyTo(dest.Data.Span);
+        using var resultDataKeep2 = new KeepAliveScope(result);
+        using var destDataKeep2 = new KeepAliveScope(dest);
+        result.DataUnmarked.Span.CopyTo(dest.DataUnmarked.Span);
     }
 
     /// <summary>GPU-resident elementwise log into the destination's stable buffer (the cross-entropy loss's log
@@ -7223,7 +7235,9 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
     {
         // GPU matmul into destination
         var result = ((IEngine)this).TensorMatMul(a, b);
-        result.Data.Span.CopyTo(dest.Data.Span);
+        using var resultDataKeep3 = new KeepAliveScope(result);
+        using var destDataKeep3 = new KeepAliveScope(dest);
+        result.DataUnmarked.Span.CopyTo(dest.DataUnmarked.Span);
     }
 
     void IEngine.ConcatInto<T>(Tensor<T> dest, Tensor<T>[] tensors, int axis)
@@ -23841,7 +23855,8 @@ public partial class DirectGpuTensorEngine : CpuEngine, ITensorLevelEngine, IDis
             backend.LeakyRelu(buf.Buffer, buf.Buffer, alphaF, tensor.Length);
             float[] result = backend.DownloadBuffer(buf.Buffer);
             var ops = MathHelper.GetNumericOperations<T>();
-            ops.FromFloatSpan(new ReadOnlySpan<float>(result), tensor.AsWritableSpan());
+            using var tensorKeep1 = new KeepAliveScope(tensor);
+            ops.FromFloatSpan(new ReadOnlySpan<float>(result), tensor.AsWritableSpanUnmarked());
             // Version-counter contract — same rationale as TryRunUnaryInPlace.
             tensor.IncrementVersion();
             tensor._gpuBufferVersion = tensor.GpuCacheVersion;

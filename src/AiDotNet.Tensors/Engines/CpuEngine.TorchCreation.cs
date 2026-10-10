@@ -61,7 +61,8 @@ public partial class CpuEngine
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
         var ops = MathHelper.GetNumericOperations<T>();
         var source = tensor.IsContiguous ? tensor : tensor.Contiguous();
-        var values = source.AsSpan().ToArray();
+        using var sourceKeep1 = new KeepAliveScope(source);
+        var values = source.AsSpanUnmarked().ToArray();
         var indicator = FromDoubles<T>((int[])source._shape.Clone(), i => ops.Equals(values[i], ops.Zero) ? 0 : 1);
         var reduceAxes = axes ?? AllAxes(tensor.Rank);
         using (new NoGradScope<T>())
@@ -114,7 +115,8 @@ public partial class CpuEngine
     public virtual Tensor<T> TensorFullLike<T>(Tensor<T> tensor, T value)
     {
         var result = new Tensor<T>(LikeShape(tensor));
-        result.AsWritableSpan().Fill(value);
+        using var resultKeep1 = new KeepAliveScope(result);
+        result.AsWritableSpanUnmarked().Fill(value);
         return result;
     }
 

@@ -22,7 +22,9 @@ internal abstract class ActivationHandler
     public virtual void ApplyInPlace<T>(CpuEngine engine, Tensor<T> input)
     {
         var result = Apply(engine, input);
-        result.AsSpan().CopyTo(input.AsWritableSpan());
+        using var resultKeep1 = new KeepAliveScope(result);
+        using var inputKeep1 = new KeepAliveScope(input);
+        result.AsSpanUnmarked().CopyTo(input.AsWritableSpanUnmarked());
     }
 
     /// <summary>
@@ -55,7 +57,9 @@ internal abstract class ActivationHandler
             return;
         }
         var result = Apply(engine, input, activationParams);
-        result.AsSpan().CopyTo(input.AsWritableSpan());
+        using var resultKeep2 = new KeepAliveScope(result);
+        using var inputKeep2 = new KeepAliveScope(input);
+        result.AsSpanUnmarked().CopyTo(input.AsWritableSpanUnmarked());
     }
 
     /// <summary>Backward with explicit parametric settings. Default ignores them.</summary>

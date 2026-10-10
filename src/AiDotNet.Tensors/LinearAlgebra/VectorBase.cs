@@ -675,6 +675,17 @@ public abstract class VectorBase<T> : Helpers.IHostSyncOwner
     /// </para>
     /// <para><b>Warning:</b> Use with caution - modifications affect the vector directly.</para>
     /// </remarks>
+    /// <summary>
+    /// <see cref="AsWritableMemory"/> without the escape mark, for a caller that keeps this vector alive while it uses
+    /// the memory (a <see cref="KeepAliveScope"/> on its owner) and does not let the memory outlive that scope.
+    /// </summary>
+    internal Memory<T> AsWritableMemoryUnmarked()
+    {
+        _beforeWrite?.Invoke();
+        EnsureMaterialized();
+        return _memory;
+    }
+
     internal Memory<T> AsWritableMemory()
     {
         // Raw access: from here nothing guarantees this vector outlives the caller's use of the data, so its array

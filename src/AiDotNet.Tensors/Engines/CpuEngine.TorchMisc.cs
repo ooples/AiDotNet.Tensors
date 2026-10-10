@@ -47,7 +47,8 @@ public partial class CpuEngine
         var rng = training ? RandomSource(seed) : null;
         double evalSlope = (lower + upper) / 2;
         var source = tensor.IsContiguous ? tensor : tensor.Contiguous();
-        var values = source.AsSpan().ToArray();
+        using var sourceKeep1 = new KeepAliveScope(source);
+        var values = source.AsSpanUnmarked().ToArray();
         // PyTorch draws a slope for every x <= 0 (and leaky_relu's derivative at 0 is the slope), so the slope
         // array is also the exact derivative; the backward reads it rather than recovering y / x after rounding.
         var slopes = new double[values.Length];

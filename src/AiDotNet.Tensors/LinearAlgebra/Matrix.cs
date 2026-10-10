@@ -147,7 +147,8 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
         var identityMatrix = new Matrix<T>(size, size);
 
         // Use vectorized Fill to initialize entire matrix with zeros
-        _numOps.Fill(identityMatrix.AsWritableSpan(), _numOps.Zero);
+        using var identityMatrixKeep1 = new KeepAliveScope(identityMatrix);
+        _numOps.Fill(identityMatrix.AsWritableSpanUnmarked(), _numOps.Zero);
 
         // Set diagonal elements to one
         for (int i = 0; i < size; i++)
@@ -476,7 +477,8 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
         var matrix = new Matrix<T>(diagonal.Length, diagonal.Length);
 
         // Use vectorized Fill to initialize entire matrix with zeros
-        _numOps.Fill(matrix.AsWritableSpan(), _numOps.Zero);
+        using var matrixKeep1 = new KeepAliveScope(matrix);
+        _numOps.Fill(matrix.AsWritableSpanUnmarked(), _numOps.Zero);
 
         // Set diagonal elements from the vector
         for (int i = 0; i < diagonal.Length; i++)
@@ -503,7 +505,8 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
         var identity = new Matrix<T>(size, size);
 
         // Use vectorized Fill to initialize entire matrix with zeros
-        _numOps.Fill(identity.AsWritableSpan(), _numOps.Zero);
+        using var identityKeep1 = new KeepAliveScope(identity);
+        _numOps.Fill(identity.AsWritableSpanUnmarked(), _numOps.Zero);
 
         // Set diagonal elements to one
         for (int i = 0; i < size; i++)
@@ -529,7 +532,8 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     {
         var matrix = new Matrix<T>(rows, columns);
         var rng = new Helpers.SimdRandom();
-        rng.FillUniform(matrix.AsWritableSpan());
+        using var matrixKeep2 = new KeepAliveScope(matrix);
+        rng.FillUniform(matrix.AsWritableSpanUnmarked());
 
         return matrix;
     }
@@ -578,7 +582,8 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     public static Matrix<T> CreateDefault(int rows, int columns, T defaultValue)
     {
         var matrix = new Matrix<T>(rows, columns);
-        _numOps.Fill(matrix.AsWritableSpan(), defaultValue);
+        using var matrixKeep3 = new KeepAliveScope(matrix);
+        _numOps.Fill(matrix.AsWritableSpanUnmarked(), defaultValue);
         return matrix;
     }
 
@@ -603,7 +608,8 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
 
         var matrix = new Matrix<T>(rows, columns);
         var rng = new Helpers.SimdRandom();
-        rng.FillUniformRange(matrix.AsWritableSpan(), min, max);
+        using var matrixKeep4 = new KeepAliveScope(matrix);
+        rng.FillUniformRange(matrix.AsWritableSpanUnmarked(), min, max);
 
         return matrix;
     }
@@ -879,7 +885,8 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
         }
 
         var result = MA.RentUninitialized<T>(Rows, Columns);
-        _numOps.Add(_memory.Span, tensor.AsSpan(), result.AsWritableSpanUnmarked());
+        using var tensorKeep1 = new KeepAliveScope(tensor);
+        _numOps.Add(_memory.Span, tensor.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
         return result;
     }
 
@@ -956,7 +963,9 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
     public static Matrix<T> FromVector(Vector<T> vector)
     {
         var matrix = new Matrix<T>(vector.Length, 1);
-        _numOps.Copy(vector.AsSpan(), matrix.AsWritableSpan());
+        using var vectorKeep1 = new KeepAliveScope(vector);
+        using var matrixKeep5 = new KeepAliveScope(matrix);
+        _numOps.Copy(vector.AsSpanUnmarked(), matrix.AsWritableSpanUnmarked());
         return matrix;
     }
 
@@ -1172,7 +1181,8 @@ public class Matrix<T> : MatrixBase<T>, IEnumerable<T>
 
         for (int i = 0; i < rows; i++)
         {
-            _numOps.MultiplyScalar(b.AsSpan(), a[i], result.GetRowSpan(i));
+            using var bKeep1 = new KeepAliveScope(b);
+            _numOps.MultiplyScalar(b.AsSpanUnmarked(), a[i], result.GetRowSpan(i));
         }
 
         return result;

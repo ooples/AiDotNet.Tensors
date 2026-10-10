@@ -7669,7 +7669,8 @@ internal static class BackwardFunctions<T>
         using var dstLease = grad.LeaseWritable();
         var dst = dstLease.Span;
         // gradOutput is a scalar tensor.
-        T scalar = gradOutput.AsSpan()[0];
+        using var gradOutputKeep1 = new KeepAliveScope(gradOutput);
+        T scalar = gradOutput.AsSpanUnmarked()[0];
         int rows = input._shape[0];
         int cols = input._shape[1];
         int n = System.Math.Min(rows, cols);
@@ -8306,7 +8307,8 @@ internal static class BackwardFunctions<T>
         // Common scalar-output vector case: gradOutput is a scalar s.
         if (a.Rank == 1 && b.Rank == 1)
         {
-            T s = gradOutput.AsSpan()[0];
+            using var gradOutputKeep2 = new KeepAliveScope(gradOutput);
+            T s = gradOutput.AsSpanUnmarked()[0];
             var dA = engine.TensorMultiplyScalar(b, s);
             var dB = engine.TensorMultiplyScalar(a, s);
             DifferentiableOps.AccumulateGrad(grads, a, dA, engine);
@@ -9206,7 +9208,9 @@ internal static class BackwardFunctions<T>
         if (origRate == newRate)
         {
             // Identity forward → identity backward.
-            gradOutput.AsSpan().CopyTo(result.AsWritableSpan());
+            using var gradOutputKeep3 = new KeepAliveScope(gradOutput);
+            using var resultKeep1 = new KeepAliveScope(result);
+            gradOutput.AsSpanUnmarked().CopyTo(result.AsWritableSpanUnmarked());
             DifferentiableOps.AccumulateGrad(grads, input, result, engine);
             return;
         }

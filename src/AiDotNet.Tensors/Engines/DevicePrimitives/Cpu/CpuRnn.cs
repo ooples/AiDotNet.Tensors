@@ -232,7 +232,9 @@ public sealed class CpuRnn : IDeviceRnn
             weights.AsSpan().CopyTo(w);
 
             var layerInput = new Tensor<T>(new[] { seqLen, batch, inputSize });
-            input.AsSpan().CopyTo(layerInput.AsWritableSpan());
+            using var inputKeep1 = new KeepAliveScope(input);
+            using var layerInputKeep1 = new KeepAliveScope(layerInput);
+            input.AsSpanUnmarked().CopyTo(layerInput.AsWritableSpanUnmarked());
 
             var hN = new Tensor<T>(new[] { numLayers * numDirections, batch, featOut });
             Tensor<T>? cN = cell == RnnCellType.Lstm
@@ -359,7 +361,8 @@ public sealed class CpuRnn : IDeviceRnn
                         h0, c0, reverseTime: d == 1, saveCache);
 
                 dirOutputs[d] = output;
-                hLast.AsSpan().CopyTo(hNSpan.Slice(ld * layout.Batch * layout.FeatOut, layout.Batch * layout.FeatOut));
+                using var hLastKeep1 = new KeepAliveScope(hLast);
+                hLast.AsSpanUnmarked().CopyTo(hNSpan.Slice(ld * layout.Batch * layout.FeatOut, layout.Batch * layout.FeatOut));
                 if (layout.Cell == RnnCellType.Lstm)
                     cLast!.AsSpan().CopyTo(cNSpan.Slice(ld * layout.Batch * layout.Hidden, layout.Batch * layout.Hidden));
 
@@ -373,11 +376,13 @@ public sealed class CpuRnn : IDeviceRnn
             }
 
             var layerOutput = new Tensor<T>(new[] { layout.SeqLen, layout.Batch, layout.OutputFeature });
-            ConcatDirections(dirOutputs, layerOutput.AsWritableSpan(), layout.SeqLen, layout.Batch, layout.FeatOut, layout.NumDirections);
+            using var layerOutputKeep1 = new KeepAliveScope(layerOutput);
+            ConcatDirections(dirOutputs, layerOutput.AsWritableSpanUnmarked(), layout.SeqLen, layout.Batch, layout.FeatOut, layout.NumDirections);
 
             if (l < layout.NumLayers - 1 && ctx.DropoutRng is not null)
             {
-                var mask = ApplyDropout(layerOutput.AsWritableSpan(), ctx.Options.Dropout, ctx.DropoutRng);
+                using var layerOutputKeep2 = new KeepAliveScope(layerOutput);
+                var mask = ApplyDropout(layerOutput.AsWritableSpanUnmarked(), ctx.Options.Dropout, ctx.DropoutRng);
                 if (saveCache) ctx.CacheDropoutMasks![l] = mask;
             }
             else if (saveCache)
@@ -392,8 +397,9 @@ public sealed class CpuRnn : IDeviceRnn
     private static T[] SliceLayerDir<T>(Tensor<T> source, int ld, int batch, int feature)
     {
         var dest = new T[batch * feature];
+        using var sourceKeep1 = new KeepAliveScope(source);
         if (source.Rank == 3)
-            source.AsSpan().Slice(ld * batch * feature, batch * feature).CopyTo(dest);
+            source.AsSpanUnmarked().Slice(ld * batch * feature, batch * feature).CopyTo(dest);
         else
             source.AsSpan().CopyTo(dest);
         return dest;
@@ -419,7 +425,8 @@ public sealed class CpuRnn : IDeviceRnn
 
     private static void SplitDirections<T>(T[] flat, T[][] perDir, int seqLen, int batch, int featOut, int numDirections)
     {
-        if (numDirections == 1) { flat.AsSpan().CopyTo(perDir[0]); return; }
+        using var flatKeep1 = new KeepAliveScope(flat);
+        if (numDirections == 1) { flat.AsSpanUnmarked().CopyTo(perDir[0]); return; }
         for (int t = 0; t < seqLen; t++)
             for (int b = 0; b < batch; b++)
             {
@@ -474,7 +481,8 @@ public sealed class CpuRnn : IDeviceRnn
 
         var output = new T[T_ * B * F];
         var hPrev = new T[B * F];
-        h0.AsSpan().CopyTo(hPrev);
+        using var h0Keep1 = new KeepAliveScope(h0);
+        h0.AsSpanUnmarked().CopyTo(hPrev);
         var cPrev = c0 is null ? null : new T[B * H];
         c0?.AsSpan().CopyTo(cPrev);
 
@@ -485,7 +493,8 @@ public sealed class CpuRnn : IDeviceRnn
 
         if (saveCache)
         {
-            hPrev.AsSpan().CopyTo(allH.AsSpan(0, B * F));
+            using var hPrevKeep1 = new KeepAliveScope(hPrev);
+            hPrev.AsSpanUnmarked().CopyTo(allH.AsSpan(0, B * F));
             if (cell == RnnCellType.Lstm) cPrev!.AsSpan().CopyTo(allC.AsSpan(0, B * H));
         }
 
@@ -521,13 +530,15 @@ public sealed class CpuRnn : IDeviceRnn
 
             if (saveCache)
             {
-                hPrev.AsSpan().CopyTo(allH.AsSpan((step + 1) * B * F, B * F));
+                using var hPrevKeep2 = new KeepAliveScope(hPrev);
+                hPrev.AsSpanUnmarked().CopyTo(allH.AsSpan((step + 1) * B * F, B * F));
                 if (cell == RnnCellType.Lstm) cPrev!.AsSpan().CopyTo(allC.AsSpan((step + 1) * B * H, B * H));
             }
         }
 
         var hLast = new T[B * F];
-        hPrev.AsSpan().CopyTo(hLast);
+        using var hPrevKeep3 = new KeepAliveScope(hPrev);
+        hPrev.AsSpanUnmarked().CopyTo(hLast);
         T[]? cLast = cell == RnnCellType.Lstm ? new T[B * H] : null;
         cPrev?.AsSpan().CopyTo(cLast);
 
@@ -668,7 +679,8 @@ public sealed class CpuRnn : IDeviceRnn
                 }
             }
         }
-        hNew.AsSpan().CopyTo(hPrev);
+        using var hNewKeep1 = new KeepAliveScope(hNew);
+        hNew.AsSpanUnmarked().CopyTo(hPrev);
     }
 
     private static void StepPlain<T>(
@@ -698,7 +710,8 @@ public sealed class CpuRnn : IDeviceRnn
                 output[(t * B + b) * H + j] = hNew[b * H + j];
             }
         }
-        hNew.AsSpan().CopyTo(hPrev);
+        using var hNewKeep2 = new KeepAliveScope(hNew);
+        hNew.AsSpanUnmarked().CopyTo(hPrev);
     }
 
     private static double Sigmoid(double x) => 1.0 / (1.0 + Math.Exp(-x));
@@ -725,21 +738,25 @@ public sealed class CpuRnn : IDeviceRnn
             : null;
         using var gradH0SpanLease = gradH0.LeaseWritable();
         var gradH0Span = gradH0SpanLease.Span;
-        Span<T> gradC0Span = gradC0 is null ? default : gradC0.AsWritableSpan();
+        using var gradC0Keep1 = new KeepAliveScope(gradC0);
+        Span<T> gradC0Span = gradC0 is null ? default : gradC0.AsWritableSpanUnmarked();
 
         var dY = new T[layout.SeqLen * layout.Batch * layout.OutputFeature];
-        gradOutput.AsSpan().CopyTo(dY);
+        using var gradOutputKeep1 = new KeepAliveScope(gradOutput);
+        gradOutput.AsSpanUnmarked().CopyTo(dY);
 
         T[]? dHN = null, dCN = null;
         if (gradHN is not null)
         {
             dHN = new T[layout.NumLayers * layout.NumDirections * layout.Batch * layout.FeatOut];
-            gradHN.AsSpan().CopyTo(dHN);
+            using var gradHNKeep1 = new KeepAliveScope(gradHN);
+            gradHN.AsSpanUnmarked().CopyTo(dHN);
         }
         if (gradCN is not null && cell == RnnCellType.Lstm)
         {
             dCN = new T[layout.NumLayers * layout.NumDirections * layout.Batch * layout.Hidden];
-            gradCN.AsSpan().CopyTo(dCN);
+            using var gradCNKeep1 = new KeepAliveScope(gradCN);
+            gradCN.AsSpanUnmarked().CopyTo(dCN);
         }
 
         for (int l = layout.NumLayers - 1; l >= 0; l--)
@@ -783,7 +800,8 @@ public sealed class CpuRnn : IDeviceRnn
                     dInput, gradWeightsArr,
                     out var dH0Out, out var dC0Out);
 
-                dH0Out.AsSpan().CopyTo(gradH0Span.Slice(ld * layout.Batch * layout.FeatOut, layout.Batch * layout.FeatOut));
+                using var dH0OutKeep1 = new KeepAliveScope(dH0Out);
+                dH0Out.AsSpanUnmarked().CopyTo(gradH0Span.Slice(ld * layout.Batch * layout.FeatOut, layout.Batch * layout.FeatOut));
                 if (cell == RnnCellType.Lstm)
                     dC0Out!.AsSpan().CopyTo(gradC0Span.Slice(ld * layout.Batch * layout.Hidden, layout.Batch * layout.Hidden));
             }
@@ -792,7 +810,9 @@ public sealed class CpuRnn : IDeviceRnn
         }
 
         var gradInput = new Tensor<T>(new[] { layout.SeqLen, layout.Batch, layout.InputSize });
-        dY.AsSpan().CopyTo(gradInput.AsWritableSpan());
+        using var dYKeep1 = new KeepAliveScope(dY);
+        using var gradInputKeep1 = new KeepAliveScope(gradInput);
+        dY.AsSpanUnmarked().CopyTo(gradInput.AsWritableSpanUnmarked());
         var gradWeights = new Tensor<T>(new[] { ctx.Weights.Length });
         gradWeightsArr.AsSpan().CopyTo(gradWeights.AsWritableSpan());
 
@@ -834,9 +854,11 @@ public sealed class CpuRnn : IDeviceRnn
         var dWHr = slice.WHrLen > 0 ? new Span<T>(gradWeights, slice.Off + slice.WIhLen + slice.WHhLen + 2 * slice.BLen, slice.WHrLen) : default;
 
         var dH = new T[B * F];
-        if (dHNSlice is not null) dHNSlice.AsSpan().CopyTo(dH);
+        using var dHNSliceKeep1 = new KeepAliveScope(dHNSlice);
+        if (dHNSlice is not null) dHNSlice.AsSpanUnmarked().CopyTo(dH);
         var dC = cell == RnnCellType.Lstm ? new T[B * H] : null;
-        if (dCNSlice is not null) dCNSlice.AsSpan().CopyTo(dC);
+        using var dCNSliceKeep1 = new KeepAliveScope(dCNSlice);
+        if (dCNSlice is not null) dCNSlice.AsSpanUnmarked().CopyTo(dC);
 
         for (int step = T_ - 1; step >= 0; step--)
         {

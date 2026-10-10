@@ -155,7 +155,8 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     public static Vector<T> FromSpan(ReadOnlySpan<T> span)
     {
         var vec = new Vector<T>(span.Length, skipZeroInit: true);
-        span.CopyTo(vec.AsWritableSpan());
+        using var vecKeep1 = new KeepAliveScope(vec);
+        span.CopyTo(vec.AsWritableSpanUnmarked());
         return vec;
     }
 
@@ -705,7 +706,8 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
 
         Vector<T> subVector = new Vector<T>(length);
         // Use vectorized copy via Span slicing
-        _numOps.Copy(_memory.Span.Slice(startIndex, length), subVector.AsWritableSpan());
+        using var subVectorKeep1 = new KeepAliveScope(subVector);
+        _numOps.Copy(_memory.Span.Slice(startIndex, length), subVector.AsWritableSpanUnmarked());
         return subVector;
     }
 
@@ -1115,7 +1117,8 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     public static Vector<T> CreateRandom(int size)
     {
         var vector = new Vector<T>(size);
-        Helpers.SimdRandom.SecureFillUniform(vector.AsWritableSpan());
+        using var vectorKeep1 = new KeepAliveScope(vector);
+        Helpers.SimdRandom.SecureFillUniform(vector.AsWritableSpanUnmarked());
 
         return vector;
     }
@@ -1131,7 +1134,8 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     {
         var vector = new Vector<T>(size);
         var rng = new Helpers.SimdRandom();
-        rng.FillUniform(vector.AsWritableSpan());
+        using var vectorKeep2 = new KeepAliveScope(vector);
+        rng.FillUniform(vector.AsWritableSpanUnmarked());
 
         return vector;
     }
@@ -1146,7 +1150,8 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
     public static Vector<T> CreateSecureRandom(int size)
     {
         var vector = new Vector<T>(size);
-        Helpers.SimdRandom.SecureFillUniform(vector.AsWritableSpan());
+        using var vectorKeep3 = new KeepAliveScope(vector);
+        Helpers.SimdRandom.SecureFillUniform(vector.AsWritableSpanUnmarked());
 
         return vector;
     }
@@ -1195,7 +1200,8 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
 
         var vector = new Vector<T>(size);
         var rng = new Helpers.SimdRandom();
-        rng.FillUniformRange(vector.AsWritableSpan(), min, max);
+        using var vectorKeep4 = new KeepAliveScope(vector);
+        rng.FillUniformRange(vector.AsWritableSpanUnmarked(), min, max);
 
         return vector;
     }
@@ -1479,7 +1485,8 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
             throw new ArgumentException("Vectors must have the same length");
 
         var result = VA.RentUninitialized<T>(Length);
-        _numOps.Add(_memory.Span, other.AsSpan(), result.AsWritableSpanUnmarked());
+        using var otherKeep1 = new KeepAliveScope(other);
+        _numOps.Add(_memory.Span, other.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
         return result;
     }
 
@@ -1499,7 +1506,8 @@ public class Vector<T> : VectorBase<T>, IEnumerable<T>
             throw new ArgumentException("Vectors must have the same length");
 
         var result = VA.RentUninitialized<T>(Length);
-        _numOps.Subtract(_memory.Span, other.AsSpan(), result.AsWritableSpanUnmarked());
+        using var otherKeep2 = new KeepAliveScope(other);
+        _numOps.Subtract(_memory.Span, other.AsSpanUnmarked(), result.AsWritableSpanUnmarked());
         return result;
     }
 

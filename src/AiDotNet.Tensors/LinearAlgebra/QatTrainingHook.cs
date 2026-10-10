@@ -58,7 +58,8 @@ public sealed class QatTrainingHook
         var contig = floatWeight.IsContiguous ? floatWeight : floatWeight.Contiguous();
         var master = new FloatMaster
         {
-            Buffer = contig.AsSpan().ToArray(),
+            using var contigKeep1 = new KeepAliveScope(contig);
+            Buffer = contig.AsSpanUnmarked().ToArray(),
             Shape = (int[])contig._shape.Clone(),
         };
         _masters[key] = master;
@@ -112,7 +113,8 @@ public sealed class QatTrainingHook
             throw new InvalidOperationException("ExportInt8 requires the hook to be configured for Int8.");
         var m = _masters[key];
         var t = new Tensor<float>(m.Shape);
-        m.Buffer.AsSpan().CopyTo(t.AsWritableSpan());
+        using var tKeep1 = new KeepAliveScope(t);
+        m.Buffer.AsSpan().CopyTo(t.AsWritableSpanUnmarked());
         return QuantizedTensor<sbyte>.FromFloatInt8(t, _groupSize, _scheme);
     }
 
@@ -123,7 +125,8 @@ public sealed class QatTrainingHook
             throw new InvalidOperationException("ExportInt4 requires the hook to be configured for Int4.");
         var m = _masters[key];
         var t = new Tensor<float>(m.Shape);
-        m.Buffer.AsSpan().CopyTo(t.AsWritableSpan());
+        using var tKeep2 = new KeepAliveScope(t);
+        m.Buffer.AsSpan().CopyTo(t.AsWritableSpanUnmarked());
         return QuantizedTensor<PackedInt4>.FromFloatInt4(t, _groupSize, _scheme);
     }
 

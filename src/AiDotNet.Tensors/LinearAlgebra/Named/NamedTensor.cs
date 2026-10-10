@@ -203,7 +203,9 @@ public sealed class NamedTensor<T>
             newShape[dst] = permutedTensor._shape[i];
         }
         var reshaped = new Tensor<T>(newShape);
-        permutedTensor.AsSpan().CopyTo(reshaped.AsWritableSpan());
+        using var permutedTensorKeep1 = new KeepAliveScope(permutedTensor);
+        using var reshapedKeep1 = new KeepAliveScope(reshaped);
+        permutedTensor.AsSpanUnmarked().CopyTo(reshaped.AsWritableSpanUnmarked());
         return new NamedTensor<T>(reshaped, newNames);
     }
 
@@ -252,7 +254,9 @@ public sealed class NamedTensor<T>
             writer++;
         }
         var flat = new Tensor<T>(newShape);
-        Tensor.AsSpan().CopyTo(flat.AsWritableSpan());
+        using var TensorKeep1 = new KeepAliveScope(Tensor);
+        using var flatKeep1 = new KeepAliveScope(flat);
+        Tensor.AsSpanUnmarked().CopyTo(flat.AsWritableSpanUnmarked());
         return new NamedTensor<T>(flat, newNames);
     }
 
@@ -294,7 +298,9 @@ public sealed class NamedTensor<T>
             writer++;
         }
         var unflat = new Tensor<T>(resultShape);
-        Tensor.AsSpan().CopyTo(unflat.AsWritableSpan());
+        using var TensorKeep2 = new KeepAliveScope(Tensor);
+        using var unflatKeep1 = new KeepAliveScope(unflat);
+        Tensor.AsSpanUnmarked().CopyTo(unflat.AsWritableSpanUnmarked());
         return new NamedTensor<T>(unflat, resultNames);
     }
 

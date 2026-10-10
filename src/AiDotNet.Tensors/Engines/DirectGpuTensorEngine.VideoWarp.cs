@@ -260,7 +260,8 @@ public partial class DirectGpuTensorEngine
     private static Tensor<T> CreateFilledTensor<T>(int[] shape, double value)
     {
         var tensor = new Tensor<T>(shape);
-        tensor.AsWritableSpan().Fill(MathHelper.GetNumericOperations<T>().FromDouble(value));
+        using var tensorKeep1 = new KeepAliveScope(tensor);
+        tensor.AsWritableSpanUnmarked().Fill(MathHelper.GetNumericOperations<T>().FromDouble(value));
         return tensor;
     }
 
