@@ -4866,8 +4866,79 @@ public partial class CpuEngine : ITensorLevelEngine
     public void ConcatInto<T>(Tensor<T> destination, Tensor<T>[] tensors, int axis)
     {
         if (!destination.IsContiguous) throw new InvalidOperationException("Output tensor must be contiguous.");
+        int rank = tensors[0]._shape.Length;
+        int ax = axis < 0 ? rank + axis : axis;
+        var live = destination.GetLiveBackingArrayAllowingPaddingOrNull();
+        if (live is not null && tensors.All(t => t.Layout != LinearAlgebra.TensorLayout.Nchwc8))
+        {
+            // Straight into the plan's buffer: no temporary concat plus a second full copy.
+            int total = 0;
+            foreach (var t in tensors) total += t._shape[ax];
+            ConcatBlocks(live, tensors, ax, total);
+            destination.IncrementVersion();
+            return;
+        }
         var result = Concat(tensors, axis);
         result.Data.Span.CopyTo(destination.Data.Span);
+    }
+
+    /// <summary>
+    /// Writes the concatenation of <paramref name="tensors"/> along <paramref name="axis"/> (whose output extent is
+    /// <paramref name="totalAxis"/>) into the dense row-major <paramref name="dst"/>: per input, <c>outer</c>
+    /// contiguous runs of <c>shape[axis] * inner</c> elements, copied in parallel over <c>outer</c> when large.
+    /// </summary>
+    private static void ConcatBlocks<T>(T[] dst, IReadOnlyList<Tensor<T>> tensors, int axis, int totalAxis)
+    {
+        var shape = tensors[0]._shape;
+        int outer = 1, inner = 1;
+        for (int d = 0; d < axis; d++) outer *= shape[d];
+        for (int d = axis + 1; d < shape.Length; d++) inner *= shape[d];
+        int outRun = totalAxis * inner;
+        int axisOffset = 0;
+        foreach (var tensor in tensors)
+        {
+            int run = tensor._shape[axis] * inner;
+            int dstBase = axisOffset * inner;
+            axisOffset += tensor._shape[axis];
+            if (run <= 0) continue;
+
+            // A view that is packed from `axis` inward (row-major strides for every dim >= axis -- a narrow or an
+            // offset slice along an outer dim) still has contiguous source runs: copy them straight from its storage
+            // instead of materializing the view element by element first.
+            T[] src; Func<int, int> srcStart;
+            var tShape = tensor._shape; var strides = tensor._strides;
+            bool packedFromAxis = strides[tShape.Length - 1] == 1;
+            for (int d = tShape.Length - 2; d >= axis && packedFromAxis; d--)
+                packedFromAxis = strides[d] == strides[d + 1] * tShape[d + 1];
+            if (!tensor.IsContiguous && packedFromAxis)
+            {
+                src = tensor._storage.GetDataArray();
+                int off = tensor._storageOffset;
+                srcStart = o =>
+                {
+                    int s = off, rem = o;
+                    for (int d = axis - 1; d >= 0; d--) { s += (rem % tShape[d]) * strides[d]; rem /= tShape[d]; }
+                    return s;
+                };
+            }
+            else
+            {
+                src = tensor.GetFlattenedData();   // the live array when dense, one strided copy otherwise
+                srcStart = o => o * run;
+            }
+
+            if ((long)outer * run >= 64 * 1024 && outer > 1)
+            {
+                CpuParallelSettings.ParallelForOrSerial(0, outer, (long)outer * run, o =>
+                    new ReadOnlySpan<T>(src, srcStart(o), run).CopyTo(new Span<T>(dst, o * outRun + dstBase, run)),
+                    deterministicSafe: true);
+            }
+            else
+            {
+                for (int o = 0; o < outer; o++)
+                    new ReadOnlySpan<T>(src, srcStart(o), run).CopyTo(new Span<T>(dst, o * outRun + dstBase, run));
+            }
+        }
     }
 
     /// <inheritdoc/>
@@ -11896,6 +11967,12 @@ public partial class CpuEngine : ITensorLevelEngine
             using var pinSrc = srcMem.Pin();
             using var pinDst = dstMem.Pin();
             SimdKernels.ELUUnsafe((float*)pinSrc.Pointer, (float*)pinDst.Pointer, input.Length, (float)alpha);
+            return;
+        }
+        if (typeof(T) == typeof(double))
+        {
+            // The same SIMD kernel as the eager path; the generic numOps.ELU below was the compiled plan's double ELU.
+            SimdKernels.ELU(((ReadOnlyMemory<double>)AsDoubleMemory(input.Data)).Span, alpha, AsDoubleMemory(destination.Data).Span);
             return;
         }
         var numOps = MathHelper.GetNumericOperations<T>();
@@ -32744,6 +32821,58 @@ public partial class CpuEngine : ITensorLevelEngine
     }
 
     /// <inheritdoc/>
+    /// <summary>
+    /// Max over ONE axis of a dense row-major float/double array into <paramref name="outData"/> (output extent
+    /// outer*inner) and <paramref name="maxIdx"/> (the input's flat index of each max, as ReduceMaxBackward expects).
+    /// Same semantics as the generic odometer: start at MinValue / -1 and take a strictly greater value, so the first
+    /// max wins and NaN is never selected. Returns false for other element types.
+    /// </summary>
+    private static bool TryReduceMaxSingleAxisDense<T>(T[] data, int[] shape, int axis, T[] outData, int[] maxIdx)
+    {
+        if (typeof(T) != typeof(double) && typeof(T) != typeof(float)) return false;
+        int outer = 1, inner = 1, axisSize = shape[axis];
+        for (int d = 0; d < axis; d++) outer *= shape[d];
+        for (int d = axis + 1; d < shape.Length; d++) inner *= shape[d];
+        long work = (long)outer * axisSize * inner;
+        if (typeof(T) == typeof(double))
+        {
+            var src = (double[])(object)data; var dst = (double[])(object)outData;
+            CpuParallelSettings.ParallelForOrSerial(0, outer, work, o =>
+            {
+                int ob = o * inner, ib = o * axisSize * inner;
+                for (int j = 0; j < inner; j++) { dst[ob + j] = double.MinValue; maxIdx[ob + j] = -1; }
+                for (int a = 0; a < axisSize; a++)
+                {
+                    int rb = ib + a * inner;
+                    for (int j = 0; j < inner; j++)
+                    {
+                        double v = src[rb + j];
+                        if (v > dst[ob + j]) { dst[ob + j] = v; maxIdx[ob + j] = rb + j; }
+                    }
+                }
+            }, deterministicSafe: true);
+        }
+        else
+        {
+            var src = (float[])(object)data; var dst = (float[])(object)outData;
+            CpuParallelSettings.ParallelForOrSerial(0, outer, work, o =>
+            {
+                int ob = o * inner, ib = o * axisSize * inner;
+                for (int j = 0; j < inner; j++) { dst[ob + j] = float.MinValue; maxIdx[ob + j] = -1; }
+                for (int a = 0; a < axisSize; a++)
+                {
+                    int rb = ib + a * inner;
+                    for (int j = 0; j < inner; j++)
+                    {
+                        float v = src[rb + j];
+                        if (v > dst[ob + j]) { dst[ob + j] = v; maxIdx[ob + j] = rb + j; }
+                    }
+                }
+            }, deterministicSafe: true);
+        }
+        return true;
+    }
+
     public virtual Tensor<T> ReduceMax<T>(Tensor<T> input, int[] axes, bool keepDims, out int[] maxIndices)
     {
         axes = axes == null || axes.Length == 0
@@ -32794,8 +32923,15 @@ public partial class CpuEngine : ITensorLevelEngine
                         var normAxes = ValidateAndNormalizeAxes(capturedEffectiveAxes, inShape.Length);
                         var outShapeLocal = output._shape;
                         int outSize = output.Length;
-                        var outSpan = output.Data.Span;
                         var idxArr = new int[outSize];
+                        if (normAxes.Length == 1 && output.GetLiveBackingArrayAllowingPaddingOrNull() is { } liveOut
+                            && TryReduceMaxSingleAxisDense(inputData, inShape, normAxes[0], liveOut, idxArr))
+                        {
+                            output.IncrementVersion();
+                            savedStateArr[0] = idxArr;
+                            return;
+                        }
+                        var outSpan = output.Data.Span;
                         T minVal = numOps.MinValue;
                         for (int i = 0; i < outSize; i++) { outSpan[i] = minVal; idxArr[i] = -1; }
                         int rank = inShape.Length;
@@ -32877,6 +33013,16 @@ public partial class CpuEngine : ITensorLevelEngine
         int outputSize = outputShape.Aggregate(1, (a, b) => a * b);
         var outputData = new T[outputSize];
         maxIndices = new int[outputSize];
+
+        // Dense single-axis float/double reduction: walk the contiguous inner axis instead of the generic odometer
+        // with an INumericOperations compare per element (a [256, 12, 2, 32] double max-pool took ~1.6 ms).
+        if (normalizedAxes.Length == 1 && TryReduceMaxSingleAxisDense(inputData, inputShape, normalizedAxes[0], outputData, maxIndices))
+        {
+            var fastMaxResult = TensorAllocator.Rent<T>(outputShape, outputData);
+            DifferentiableOps.RecordUnary("ReduceMax", fastMaxResult, input, BackwardFunctions<T>.ReduceMaxBackward, new object[] { maxIndices });
+            { var ci = input; var ca = axes; var ck = keepDims; AutoTracer.RecordOp("ReduceMax", fastMaxResult, eng => { eng.ReduceMax(ci, ca, ck, out _); return fastMaxResult; }); }
+            return fastMaxResult;
+        }
 
         // Initialize with minimum values
         T minVal = numOps.MinValue;
@@ -35277,7 +35423,6 @@ public partial class CpuEngine : ITensorLevelEngine
         outputShape[axis] = totalAxisSize;
 
         int outputSize = outputShape.Aggregate(1, (a, b) => a * b);
-        var outputData = new T[outputSize];
 
         // NCHWc8 fast path: channel-axis concat where every input is
         // NCHWc8 and each C is divisible by the cBlock. Physical layout is
@@ -35295,6 +35440,7 @@ public partial class CpuEngine : ITensorLevelEngine
             int N = firstShape[0], H = firstShape[2], W = firstShape[3];
             int cgOut = totalAxisSize / cb;
             int outImageStride = cgOut * H * W * cb; // floats per batch image
+            var outputData = new T[outputSize];
             var outF = (T[])(object)outputData;
             int dstCgOffset = 0;
             foreach (var t in tensors)
@@ -35317,38 +35463,22 @@ public partial class CpuEngine : ITensorLevelEngine
             return packedResult;
         }
 
-        var outputStrides = ComputeStrides(outputShape);
-
-        int axisOffset = 0;
-        foreach (var tensor in tensors)
+        // Block copy: along `axis`, every input contributes `outer` contiguous runs of shape[axis] * inner elements.
+        // The former per-element odometer (plus a GetDataArray copy of every strided input) made a [256, 24, 32]
+        // double concat take ~3 ms. Every output element is written, so the output is rented uninitialized.
+        var result = TensorAllocator.RentUninitialized<T>(outputShape);
+        var liveOut = result.GetLiveBackingArrayAllowingPaddingOrNull();
+        if (liveOut is not null)
         {
-            var tensorData = tensor.GetDataArray();
-            var tensorShape = tensor._shape;
-
-            // Allocation-free odometer: output and input share rank; only the
-            // concat axis is offset. outFlat tracks the input coord mapped onto
-            // the output strides; the constant axis offset is added once
-            // (replaces per-element FlatToMultiIndex + MultiToFlatIndex).
-            int cRank = tensorShape.Length;
-            int cBase = axisOffset * outputStrides[axis];
-            var cCoord = new int[cRank];
-            int cOutFlat = 0;
-            int cLen = tensor.Length;
-            for (int i = 0; i < cLen; i++)
-            {
-                outputData[cBase + cOutFlat] = tensorData[i];
-                for (int d = cRank - 1; d >= 0; d--)
-                {
-                    cCoord[d]++; cOutFlat += outputStrides[d];
-                    if (cCoord[d] < tensorShape[d]) break;
-                    cCoord[d] = 0; cOutFlat -= outputStrides[d] * tensorShape[d];
-                }
-            }
-
-            axisOffset += tensor._shape[axis];
+            ConcatBlocks(liveOut, tensors, axis, totalAxisSize);
+            result.IncrementVersion();
         }
-
-        var result = TensorAllocator.Rent<T>(outputShape, outputData);
+        else
+        {
+            var outputDataFallback = new T[outputSize];
+            ConcatBlocks(outputDataFallback, tensors, axis, totalAxisSize);
+            result = TensorAllocator.Rent<T>(outputShape, outputDataFallback);
+        }
         if (GradientTape<T>.Current is not null)
         {
             DifferentiableOps.RecordIfActive("Concat", result, tensors.ToArray(),

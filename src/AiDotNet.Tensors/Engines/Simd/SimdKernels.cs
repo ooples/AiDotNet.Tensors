@@ -6344,7 +6344,19 @@ namespace AiDotNet.Tensors.Engines.Simd
                 {
                     var vx = ReadVector256Double(input, i);
                     var mask = Avx.Compare(vx, vzero, FloatComparisonMode.OrderedGreaterThanSignaling);
-                    // Scalar exp for negative values (no AVX exp intrinsic for double)
+                    // Vector exp (FastExpDouble256, ~1e-16 rel.) on the non-positive lanes; positive lanes are
+                    // blended away below, so evaluating them at min(0, x) keeps the polynomial in range (and a NaN lane stays NaN,
+                    // where the former scalar path produced -alpha). Its clamp at
+                    // -708.4 gives exp ~ 2e-308, so alpha * (exp - 1) equals the Math.Exp result exactly, and a NaN
+                    // propagates through the clamp. The former per-lane scalar Math.Exp made a 196K-element double
+                    // ELU take ~1.3 ms.
+                    if (Fma.IsSupported)
+                    {
+                        var expResultV = FastExpDouble256(Avx.Min(vzero, vx));   // Min returns its SECOND operand on NaN: keeps NaN
+                        var negPartV = Avx.Multiply(valpha, Avx.Subtract(expResultV, vone));
+                        WriteVector256Double(output, i, Avx.BlendVariable(negPartV, vx, mask));
+                        continue;
+                    }
                     var expResult = Vector256.Create(
                         input[i] <= 0 ? Math.Exp(input[i]) : 0.0,
                         input[i + 1] <= 0 ? Math.Exp(input[i + 1]) : 0.0,
