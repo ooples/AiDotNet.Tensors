@@ -445,6 +445,12 @@ public sealed class GpuCpuAutoDifferentialTests : IClassFixture<GpuCpuAutoDiffer
 
     // Compares one GPU value against the CPU reference (Tensor<float> exact-ish, Tensor<Complex<float>>
     // by real+imag). Returns max abs error, or -1 if not a comparable pair.
+    // Scale-aware error: absolute up to |cpu| = 1 and relative above it, so the one tolerance means the same thing for
+    // an op whose outputs are ~1 and one whose outputs are ~1e4. With a flat absolute error, TensorNormExceptDim at the
+    // harness's pow = 0.5 -- (sum of sqrt(x))^2 ~ 2e4 over 129 elements -- failed at 1.17e-2 absolute, which is
+    // 7.3e-7 relative: exact FP32 agreement, reported as a GPU defect.
+    private static double ScaledError(double gpu, double cpu) => Math.Abs(gpu - cpu) / Math.Max(1.0, Math.Abs(cpu));
+
     private static double CompareValue(object gpu, object cpu)
     {
         if (gpu is Tensor<float> gf && cpu is Tensor<float> cf)
@@ -469,7 +475,7 @@ public sealed class GpuCpuAutoDifferentialTests : IClassFixture<GpuCpuAutoDiffer
                     // Both non-finite — treat as match for tolerance accounting.
                     continue;
                 }
-                double e = Math.Abs((double)ga[i] - ca[i]); if (e > m) m = e;
+                double e = ScaledError(ga[i], ca[i]); if (e > m) m = e;
             }
             return m;
         }
@@ -480,7 +486,7 @@ public sealed class GpuCpuAutoDifferentialTests : IClassFixture<GpuCpuAutoDiffer
             double m = 0;
             for (int i = 0; i < ca.Length; i++)
             {
-                double er = Math.Abs((double)ga[i].Real - ca[i].Real), ei = Math.Abs((double)ga[i].Imaginary - ca[i].Imaginary);
+                double er = ScaledError(ga[i].Real, ca[i].Real), ei = ScaledError(ga[i].Imaginary, ca[i].Imaginary);
                 if (er > m) m = er; if (ei > m) m = ei;
             }
             return m;
@@ -582,7 +588,7 @@ public sealed class GpuCpuAutoDifferentialTests : IClassFixture<GpuCpuAutoDiffer
                     double e = CompareValue(gpuArgs[i], cpuArgs[i]);
                     if (e > maxErr) maxErr = e; // -1 (non-comparable out) ignored
                 }
-                Assert.True(maxErr < Tol, $"{opKey} on shape [{string.Join(",", shape)}]: GPU vs CPU max_abs_err {maxErr:E3} exceeded tolerance {Tol:E3}");
+                Assert.True(maxErr < Tol, $"{opKey} on shape [{string.Join(",", shape)}]: GPU vs CPU max scaled error {maxErr:E3} (absolute up to |cpu| = 1, relative above) exceeded tolerance {Tol:E3}");
                 return; // first CPU-accepted combo checked -> done
             }
         }
