@@ -53,10 +53,13 @@ public class ElementwiseExtraOpsTests
         var x = new Tensor<double>(new[] { 1e-12, -3e-15 }, new[] { 2 });
         var l = _engine.TensorLog1p(x).ToArray();
         var e = _engine.TensorExpm1(x).ToArray();
-        Assert.Equal(1e-12 - 0.5e-24, l[0], 25);
-        Assert.Equal(1e-12 + 0.5e-24, e[0], 25);
-        Assert.Equal(-3e-15, l[1], 28);
-        Assert.Equal(-3e-15, e[1], 28);
+        // Relative error: the naive log(1 + x) / exp(x) - 1 are off by ~1e-4 relative here, the accurate forms by ~1e-16.
+        static void Rel(double expected, double actual) =>
+            Assert.True(Math.Abs(actual - expected) <= 1e-14 * Math.Abs(expected), $"expected {expected:R}, got {actual:R}");
+        Rel(1e-12 - 0.5e-24, l[0]);
+        Rel(1e-12 + 0.5e-24, e[0]);
+        Rel(-3e-15, l[1]);
+        Rel(-3e-15, e[1]);
     }
 
     [Theory]
