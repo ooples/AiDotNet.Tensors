@@ -1,6 +1,6 @@
 {
   "torchVersion": "2.11.0",
-  "gapBaseline": 3,
+  "gapBaseline": 1,
   "entries": {
     "Tensor:abs": {
       "status": "mapped",
@@ -1328,8 +1328,8 @@
       "source": "reviewed"
     },
     "Tensor:is_shared": {
-      "status": "not-applicable",
-      "reason": "A Python-object, storage-pointer, named-tensor or quantized-qtensor accessor without a counterpart in Tensors' managed, unnamed tensor model.",
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor`1::IsShared",
       "source": "reviewed"
     },
     "Tensor:is_signed": {
@@ -2098,8 +2098,9 @@
       "source": "reviewed"
     },
     "Tensor:register_post_accumulate_grad_hook": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.Engines.Autodiff.GradientTape`1::RegisterPostAccumulateGradHook",
+      "source": "reviewed"
     },
     "Tensor:reinforce": {
       "status": "not-applicable",
@@ -2301,8 +2302,9 @@
       "source": "reviewed"
     },
     "Tensor:share_memory_": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor`1::ShareMemory",
+      "source": "reviewed"
     },
     "Tensor:short": {
       "status": "mapped",

@@ -595,6 +595,17 @@ public sealed class GradientTape<T> : IDisposable
         ResolveEngineFromData();
         if (sources is null) throw new ArgumentNullException(nameof(sources));
         if (onSourceGradient is null) throw new ArgumentNullException(nameof(onSourceGradient));
+        if (_postAccumulateHooks is { Count: > 0 })
+        {
+            // A post-accumulate hook sees each source's gradient the moment it is final, before the consumer.
+            var consumer = onSourceGradient;
+            onSourceGradient = (source, gradient) =>
+            {
+                if (_postAccumulateHooks.TryGetValue(source, out var hooks) && hooks.Count > 0)
+                    FirePostAccumulateHooks(source, MaterializeStreamingGradient(gradient));
+                consumer(source, gradient);
+            };
+        }
         if (_entries.Count == 0)
             throw new InvalidOperationException("Cannot compute gradients: the tape has no recorded operations.");
         GradNode<T> lossGradFn = loss.GradFn ?? throw new InvalidOperationException(
@@ -1039,6 +1050,9 @@ public sealed class GradientTape<T> : IDisposable
         IReadOnlyList<KeyValuePair<Tensor<T>, Tensor<T>>>? seedOverride)
     {
         var grads = ComputeGradientsCore(loss, sources, createGraph, seedOverride);
+        if (_postAccumulateHooks is { Count: > 0 })
+            foreach (var pair in grads)
+                if (pair.Value is not null) FirePostAccumulateHooks(pair.Key, pair.Value);
         // What backward hands back belongs to the caller: the gradients (produced on the device during backward,
         // so inside the release window) and the loss outlive the tape, for as long as the caller holds them.
         KeepAfterTape(loss);
@@ -2732,6 +2746,45 @@ public sealed class GradientTape<T> : IDisposable
     /// </summary>
     /// <param name="tensor">The tensor to hook.</param>
     /// <param name="hook">Function receiving gradient, returning (possibly modified) gradient.</param>
+    /// <summary>
+    /// Registers <paramref name="hook"/> to run once <paramref name="tensor"/>'s gradient for a backward is complete
+    /// (torch <c>Tensor.register_post_accumulate_grad_hook</c>), as <c>(tensor, gradient)</c>: after
+    /// <see cref="ComputeGradients(Tensor{T}, IReadOnlyList{Tensor{T}}?, bool)"/> has accumulated every contribution,
+    /// or the moment <see cref="ComputeGradientsStreaming"/> emits it. The usual use is an optimizer step fused into
+    /// the backward. Disposing the returned handle removes the hook. Independent of
+    /// <see cref="GradientTapeOptions.EnableHooks"/>, since it never alters a gradient.
+    /// </summary>
+    public IDisposable RegisterPostAccumulateGradHook(Tensor<T> tensor, Action<Tensor<T>, Tensor<T>> hook)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(GradientTape<T>));
+        if (tensor is null) throw new ArgumentNullException(nameof(tensor));
+        if (hook is null) throw new ArgumentNullException(nameof(hook));
+        _postAccumulateHooks ??= new Dictionary<Tensor<T>, List<Action<Tensor<T>, Tensor<T>>>>(ReferenceEqualityComparer<Tensor<T>>.Instance);
+        if (!_postAccumulateHooks.TryGetValue(tensor, out var list))
+        {
+            list = new List<Action<Tensor<T>, Tensor<T>>>();
+            _postAccumulateHooks[tensor] = list;
+        }
+        list.Add(hook);
+        return new PostAccumulateHookHandle(list, hook);
+    }
+
+    private Dictionary<Tensor<T>, List<Action<Tensor<T>, Tensor<T>>>>? _postAccumulateHooks;
+
+    private sealed class PostAccumulateHookHandle : IDisposable
+    {
+        private List<Action<Tensor<T>, Tensor<T>>>? _list;
+        private readonly Action<Tensor<T>, Tensor<T>> _hook;
+        internal PostAccumulateHookHandle(List<Action<Tensor<T>, Tensor<T>>> list, Action<Tensor<T>, Tensor<T>> hook) { _list = list; _hook = hook; }
+        public void Dispose() { _list?.Remove(_hook); _list = null; }
+    }
+
+    private void FirePostAccumulateHooks(Tensor<T> tensor, Tensor<T> gradient)
+    {
+        if (_postAccumulateHooks is null || !_postAccumulateHooks.TryGetValue(tensor, out var list) || list.Count == 0) return;
+        foreach (var hook in list.ToArray()) hook(tensor, gradient);
+    }
+
     public void RegisterHook(Tensor<T> tensor, Func<Tensor<T>, Tensor<T>> hook)
     {
         if (_disposed) throw new ObjectDisposedException(nameof(GradientTape<T>));
