@@ -117,7 +117,7 @@ public partial class CpuEngine
             if (_mode == GridSampleMode.Nearest)
             {
                 // nearbyint: round half to even.
-                int ix = (int)Math.Round(coord[0]), iy = (int)Math.Round(coord[1]), iz = (int)Math.Round(coord[2]);
+                int ix = VoxelIndex(Math.Round(coord[0])), iy = VoxelIndex(Math.Round(coord[1])), iz = VoxelIndex(Math.Round(coord[2]));
                 if (Inside(ix, 0) && Inside(iy, 1) && Inside(iz, 2))
                 {
                     Offset[0] = (iz * _size[1] + iy) * _size[0] + ix; Weight[0] = 1;
@@ -126,7 +126,7 @@ public partial class CpuEngine
                 }
                 return;
             }
-            int x0 = (int)Math.Floor(coord[0]), y0 = (int)Math.Floor(coord[1]), z0 = (int)Math.Floor(coord[2]);
+            int x0 = VoxelIndex(Math.Floor(coord[0])), y0 = VoxelIndex(Math.Floor(coord[1])), z0 = VoxelIndex(Math.Floor(coord[2]));
             double fx = coord[0] - x0, fy = coord[1] - y0, fz = coord[2] - z0;
             for (int oz = 0; oz < 2; oz++)
                 for (int oy = 0; oy < 2; oy++)
@@ -145,6 +145,12 @@ public partial class CpuEngine
         }
 
         private bool Inside(int i, int axis) => i >= 0 && i < _size[axis];
+
+        // A voxel index for a rounded coordinate. NaN, infinite and out-of-int-range coordinates map to -100, outside
+        // the volume (PyTorch's safe_downgrade_to_int_range), so they sample nothing. A bare (int) cast is
+        // runtime-dependent here: .NET Framework gives int.MinValue (outside) but .NET 9+ saturates NaN to 0, which
+        // read voxel 0 and returned NaN or a real value for a NaN grid point.
+        private static int VoxelIndex(double v) => double.IsNaN(v) || v <= int.MinValue || v >= int.MaxValue ? -100 : (int)v;
 
         // The voxel coordinate for a normalized one, and d(voxel)/d(normalized).
         private double SourceIndex(double normalized, int size, out double slope)

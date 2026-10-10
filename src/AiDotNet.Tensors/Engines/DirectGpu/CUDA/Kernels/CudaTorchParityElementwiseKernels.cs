@@ -858,6 +858,241 @@ extern ""C"" __global__ __launch_bounds__(256) void parity_random_keys(float* __
     ParityRng r = parity_rng(seed, (unsigned long long)i);
     y[i] = (float)parity_uniform(&r);
 }
+
+// nonzero_static / unravel_index / unique_dim / grid_sample 3-D (#1112 tier 8).
+
+struct ParityShape8 { int rank; int extent[8]; };
+
+// nonzero_static: an element that is non-zero (NaN counts; -0 does not) and whose inclusive-scan position is within
+// `size` writes its coordinates to row (position - 1) of the [size, rank] output (pre-filled with the fill value).
+extern ""C"" __global__ __launch_bounds__(256) void parity_nonzero_static_scatter(const float* __restrict__ x, const float* __restrict__ positions,
+    float* __restrict__ y, int n, int size, ParityShape8 shape)
+{
+    PARITY_INDEX
+    if (x[i] == 0.0f) return;
+    int row = (int)positions[i] - 1;
+    if (row >= size) return;
+    int rest = i;
+    for (int k = shape.rank - 1; k >= 0; k--) { y[row * shape.rank + k] = (float)(rest % shape.extent[k]); rest /= shape.extent[k]; }
+}
+
+// unravel_index, one launch per output axis: ((flat + total) % total) / stride % extent. The first launch also flags
+// (code 1) an index outside [-total, total), or a NaN (which the CPU's (long) cast also rejects).
+extern ""C"" __global__ __launch_bounds__(256) void parity_unravel_axis(const float* __restrict__ indices, float* __restrict__ y, int n,
+    long long total, long long stride, long long extent, int validate, unsigned long long* flag)
+{
+    PARITY_INDEX
+    double v = (double)indices[i];
+    if (isnan(v) || v < -(double)total || v >= (double)total)
+    {
+        if (validate) parity_flag(flag, (unsigned long long)i, 1);
+        return;
+    }
+    long long f = (long long)v;
+    if (f < -total || f >= total) { if (validate) parity_flag(flag, (unsigned long long)i, 1); return; }
+    y[i] = (float)(((f + total) % total) / stride % extent);
+}
+
+// unique_dim's slice order, as the CPU's comparer: element by element with double.CompareTo, which ranks NaN below
+// every number and equal to NaN, and -0 equal to 0. Padding slots (index < 0) sort after every slice; equal slices
+// keep index order.
+__device__ int parity_slice_compare(const float* __restrict__ data, int a, int b, int length)
+{
+    const float* sa = data + (long long)a * length;
+    const float* sb = data + (long long)b * length;
+    for (int k = 0; k < length; k++)
+    {
+        float x = sa[k], y = sb[k];
+        int nx = isnan(x), ny = isnan(y);
+        if (nx || ny) { if (nx && ny) continue; return nx ? -1 : 1; }
+        if (x < y) return -1;
+        if (x > y) return 1;
+    }
+    return 0;
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void parity_slice_bitonic_step(const float* __restrict__ data, float* __restrict__ order,
+    int rowLen, int k, int j, int length)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rowLen) return;
+    int ixj = i ^ j;
+    if (ixj <= i) return;
+    float fa = order[i], fb = order[ixj];
+    int a = (int)fa, b = (int)fb;
+    // ""b sorts before a"" / ""a sorts before b"" under the slice order.
+    int bBeforeA, aBeforeB;
+    if (a < 0 || b < 0) { bBeforeA = a < 0 && b >= 0; aBeforeB = b < 0 && a >= 0; }
+    else
+    {
+        int c = parity_slice_compare(data, a, b, length);
+        bBeforeA = c > 0 || (c == 0 && b < a);
+        aBeforeB = c < 0 || (c == 0 && a < b);
+    }
+    int up = (i & k) == 0;
+    if (up ? bBeforeA : aBeforeB) { order[i] = fb; order[ixj] = fa; }
+}
+
+// 1 where a sorted slice differs from the one before it (the first slice always), else 0.
+extern ""C"" __global__ __launch_bounds__(256) void parity_slice_first_flags(const float* __restrict__ data, const float* __restrict__ order,
+    float* __restrict__ flags, int n, int length)
+{
+    PARITY_INDEX
+    flags[i] = (i == 0 || parity_slice_compare(data, (int)order[i], (int)order[i - 1], length) != 0) ? 1.0f : 0.0f;
+}
+
+// Copies each first-of-a-run slice (in sorted order) to row (position - 1) of the [unique, length] output.
+extern ""C"" __global__ __launch_bounds__(256) void parity_slice_gather_unique(const float* __restrict__ data, const float* __restrict__ order,
+    const float* __restrict__ flags, const float* __restrict__ positions, float* __restrict__ y, int total, int length)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+    int s = idx / length, k = idx % length;
+    if (flags[s] == 0.0f) return;
+    int row = (int)positions[s] - 1;
+    y[(long long)row * length + k] = data[(long long)(int)order[s] * length + k];
+}
+
+// grid_sample 3-D, as the CPU's GridSampler3D: unnormalize, clip or reflect, then trilinear (8 taps) or nearest
+// (round half to even), skipping out-of-range voxels. mode 0 bilinear, 1 nearest; padding 0 zeros, 1 border,
+// 2 reflection. One thread per (batch, point) locates its taps once and sums every channel.
+__device__ double parity_grid_reflect(double coord, int twiceLow, int twiceHigh)
+{
+    if (twiceLow == twiceHigh) return 0.0;
+    double mn = twiceLow / 2.0, span = (twiceHigh - twiceLow) / 2.0;
+    coord -= mn;
+    if (coord < 0.0) coord = -coord;
+    double extra = fmod(coord, span), flips = floor(coord / span);
+    return fmod(flips, 2.0) == 0.0 ? extra + mn : span - extra + mn;
+}
+
+__device__ double parity_grid_source(double normalized, int size, int padding, int align)
+{
+    double coord = align ? (normalized + 1.0) / 2.0 * (size - 1) : ((normalized + 1.0) * size - 1.0) / 2.0;
+    if (padding == 2) coord = align ? parity_grid_reflect(coord, 0, 2 * (size - 1)) : parity_grid_reflect(coord, -1, 2 * size - 1);
+    if (padding >= 1)
+    {
+        if (coord <= 0.0) return 0.0;
+        if (coord >= size - 1) return (double)(size - 1);
+    }
+    return coord;
+}
+
+// A voxel index from a coordinate as the CPU's (int) cast, where NaN and out-of-range values become int.MinValue: here
+// a sentinel far enough below zero that neither it nor its +1 neighbour lands inside the volume.
+__device__ __forceinline__ long long parity_grid_index(double v) { return (isnan(v) || v < -2147483648.0 || v >= 2147483648.0) ? -4 : (long long)v; }
+
+extern ""C"" __global__ __launch_bounds__(256) void parity_grid_sample_3d(const float* __restrict__ x, const float* __restrict__ grid,
+    float* __restrict__ y, int batches, int channels, int depth, int height, int width, int points, int mode, int padding, int align)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= batches * points) return;
+    int b = idx / points, q = idx % points;
+    const float* g = grid + (long long)idx * 3;
+    double cx = parity_grid_source((double)g[0], width, padding, align);
+    double cy = parity_grid_source((double)g[1], height, padding, align);
+    double cz = parity_grid_source((double)g[2], depth, padding, align);
+    int volume = depth * height * width;
+    int offsets[8]; double weights[8]; int taps = 0;
+    if (mode == 1)
+    {
+        long long ix = parity_grid_index(rint(cx)), iy = parity_grid_index(rint(cy)), iz = parity_grid_index(rint(cz));
+        if (ix >= 0 && ix < width && iy >= 0 && iy < height && iz >= 0 && iz < depth)
+        { offsets[0] = (int)((iz * height + iy) * width + ix); weights[0] = 1.0; taps = 1; }
+    }
+    else
+    {
+        double fx0 = floor(cx), fy0 = floor(cy), fz0 = floor(cz);
+        long long x0 = parity_grid_index(fx0), y0 = parity_grid_index(fy0), z0 = parity_grid_index(fz0);
+        double fx = cx - fx0, fy = cy - fy0, fz = cz - fz0;
+        for (int oz = 0; oz < 2; oz++)
+            for (int oy = 0; oy < 2; oy++)
+                for (int ox = 0; ox < 2; ox++)
+                {
+                    long long ix = x0 + ox, iy = y0 + oy, iz = z0 + oz;
+                    if (ix < 0 || ix >= width || iy < 0 || iy >= height || iz < 0 || iz >= depth) continue;
+                    double wx = ox == 1 ? fx : 1.0 - fx, wy = oy == 1 ? fy : 1.0 - fy, wz = oz == 1 ? fz : 1.0 - fz;
+                    offsets[taps] = (int)((iz * height + iy) * width + ix);
+                    weights[taps] = wx * wy * wz;
+                    taps++;
+                }
+    }
+    for (int ch = 0; ch < channels; ch++)
+    {
+        const float* plane = x + ((long long)b * channels + ch) * volume;
+        double acc = 0.0;
+        for (int t = 0; t < taps; t++) acc += weights[t] * (double)plane[offsets[t]];
+        y[((long long)b * channels + ch) * points + q] = (float)acc;
+    }
+}
+
+// Inclusive prefix sum (#1112 tier 8): a 1024-element Hillis-Steele scan per block, the block totals scanned the same
+// way (recursively, on the host side), then each block's carry added. Exact in float for counts below 2^24.
+extern ""C"" __global__ __launch_bounds__(1024) void parity_scan_block(const float* __restrict__ input, float* __restrict__ output,
+    float* __restrict__ sums, int n)
+{
+    __shared__ float s[1024];
+    int t = threadIdx.x, i = blockIdx.x * 1024 + t;
+    s[t] = i < n ? input[i] : 0.0f;
+    __syncthreads();
+    for (int offset = 1; offset < 1024; offset <<= 1)
+    {
+        float v = t >= offset ? s[t - offset] : 0.0f;
+        __syncthreads();
+        s[t] += v;
+        __syncthreads();
+    }
+    if (i < n) output[i] = s[t];
+    if (sums != 0 && t == 1023) sums[blockIdx.x] = s[1023];
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void parity_scan_add(float* __restrict__ output, const float* __restrict__ carries, int n)
+{
+    PARITY_INDEX
+    int block = i / 1024;
+    if (block > 0) output[i] += carries[block - 1];
+}
+
+// Integer ops on raw int32 storage (#1112 tier 9), as the CPU's IntegerBinary: each op runs in 64-bit arithmetic on
+// the sign-extended operands and wraps to int32. op: 0 and, 1 or, 2 xor, 3 left shift, 4 right shift, 5 gcd, 6 lcm,
+// 7 floor divide (code 1 for a zero divisor: the CPU's DivideByZeroException). Shifts follow C#'s long shifts: a
+// count of 64 or more gives 0 (left) or the sign fill (right); otherwise the count is masked to its low 6 bits.
+__device__ long long parity_gcd(long long x, long long y)
+{
+    x = x < 0 ? -x : x;
+    y = y < 0 ? -y : y;
+    while (y != 0) { long long t = x % y; x = y; y = t; }
+    return x;
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void parity_int_binary(const int* __restrict__ a, const int* __restrict__ b,
+    int* __restrict__ y, int n, int op, unsigned long long* flag)
+{
+    PARITY_INDEX
+    long long x = a[i], v = b[i], r;
+    switch (op)
+    {
+        case 0: r = x & v; break;
+        case 1: r = x | v; break;
+        case 2: r = x ^ v; break;
+        case 3: r = v >= 64 ? 0 : (long long)((unsigned long long)x << (v & 63)); break;
+        case 4: r = v >= 64 ? (x < 0 ? -1 : 0) : x >> (v & 63); break;
+        case 5: r = parity_gcd(x, v); break;
+        case 6: { long long g = parity_gcd(x, v); long long m = g == 0 ? 0 : x / g * v; r = m < 0 ? -m : m; break; }
+        default:
+            if (v == 0) { parity_flag(flag, (unsigned long long)i, 1); return; }
+            r = x / v;
+            if (x % v != 0 && ((x < 0) != (v < 0))) r -= 1;
+            break;
+    }
+    y[i] = (int)r;
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void parity_int_not(const int* __restrict__ a, int* __restrict__ y, int n)
+{
+    PARITY_INDEX
+    y[i] = ~a[i];
+}
 ";
         }
 
@@ -889,6 +1124,8 @@ extern ""C"" __global__ __launch_bounds__(256) void parity_random_keys(float* __
             "parity_angle", "parity_nonzero", "parity_floor_divide", "parity_diagflat", "parity_diagonal_scatter", "parity_quantile_rows",
             "parity_flag_reset", "parity_sample", "parity_bernoulli", "parity_poisson", "parity_binomial", "parity_multinomial",
             "parity_dropout_affine", "parity_rrelu", "parity_random_keys",
+            "parity_nonzero_static_scatter", "parity_unravel_axis", "parity_slice_bitonic_step", "parity_slice_first_flags",
+            "parity_slice_gather_unique", "parity_grid_sample_3d", "parity_scan_block", "parity_scan_add", "parity_int_binary", "parity_int_not",
         };
     }
 }

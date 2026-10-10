@@ -293,6 +293,148 @@ public sealed partial class CudaBackend : ITorchParityElementwiseBackend
         LaunchKernel(keysKernel, ParityGrid(n), DefaultBlockSize, args);
     }
 
+    unsafe void ITorchParityElementwiseBackend.TorchParityIntBinary(int op, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int n, IGpuBuffer flag)
+    {
+        if (n <= 0) return;
+        IntPtr intKernel = ParityKernel("parity_int_binary");
+        using var _ = PushContext();
+        IntPtr pa = a.Handle, pb = b.Handle, py = output.Handle, pf = flag.Handle;
+        void** args = stackalloc void*[6];
+        args[0] = &pa; args[1] = &pb; args[2] = &py; args[3] = &n; args[4] = &op; args[5] = &pf;
+        LaunchKernel(intKernel, ParityGrid(n), DefaultBlockSize, args);
+    }
+
+    unsafe void ITorchParityElementwiseBackend.TorchParityIntNot(IGpuBuffer input, IGpuBuffer output, int n)
+    {
+        if (n <= 0) return;
+        IntPtr notKernel = ParityKernel("parity_int_not");
+        using var _ = PushContext();
+        IntPtr pa = input.Handle, py = output.Handle;
+        void** args = stackalloc void*[3];
+        args[0] = &pa; args[1] = &py; args[2] = &n;
+        LaunchKernel(notKernel, ParityGrid(n), DefaultBlockSize, args);
+    }
+
+    unsafe void ITorchParityElementwiseBackend.TorchParityInclusiveScan(IGpuBuffer input, IGpuBuffer output, int n)
+    {
+        if (n <= 0) return;
+        IntPtr scanKernel = ParityKernel("parity_scan_block");
+        int blocks = (n + 1023) / 1024;
+        IGpuBuffer? sums = blocks > 1 ? AllocateBuffer(blocks) : null;
+        IGpuBuffer? carries = blocks > 1 ? AllocateBuffer(blocks) : null;
+        try
+        {
+            using (PushContext())
+            {
+                IntPtr px = input.Handle, py = output.Handle, ps = sums?.Handle ?? IntPtr.Zero;
+                void** args = stackalloc void*[4];
+                args[0] = &px; args[1] = &py; args[2] = &ps; args[3] = &n;
+                LaunchKernel(scanKernel, (uint)blocks, 1024, args);
+            }
+            if (sums is null || carries is null) return;
+            ((ITorchParityElementwiseBackend)this).TorchParityInclusiveScan(sums, carries, blocks);
+            IntPtr addKernel = ParityKernel("parity_scan_add");
+            using (PushContext())
+            {
+                IntPtr py = output.Handle, pc = carries.Handle;
+                void** args = stackalloc void*[3];
+                args[0] = &py; args[1] = &pc; args[2] = &n;
+                LaunchKernel(addKernel, ParityGrid(n), DefaultBlockSize, args);
+            }
+        }
+        finally
+        {
+            sums?.Dispose();
+            carries?.Dispose();
+        }
+    }
+
+    // Mirrors the kernels' by-value ParityShape8.
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    private unsafe struct ParityShape8
+    {
+        public int Rank;
+        public fixed int Extent[8];
+    }
+
+    unsafe void ITorchParityElementwiseBackend.TorchParityNonzeroStaticScatter(IGpuBuffer input, IGpuBuffer positions, IGpuBuffer output,
+        int n, int size, int[] shape)
+    {
+        if (n <= 0) return;
+        if (shape.Length > 8) throw new ArgumentOutOfRangeException(nameof(shape), "at most 8 axes.");
+        IntPtr scatterKernel = ParityKernel("parity_nonzero_static_scatter");
+        var packed = new ParityShape8 { Rank = shape.Length };
+        for (int k = 0; k < shape.Length; k++) packed.Extent[k] = shape[k];
+        using var _ = PushContext();
+        IntPtr px = input.Handle, pp = positions.Handle, py = output.Handle;
+        void** args = stackalloc void*[6];
+        args[0] = &px; args[1] = &pp; args[2] = &py; args[3] = &n; args[4] = &size; args[5] = &packed;
+        LaunchKernel(scatterKernel, ParityGrid(n), DefaultBlockSize, args);
+    }
+
+    unsafe void ITorchParityElementwiseBackend.TorchParityUnravelAxis(IGpuBuffer indices, IGpuBuffer output, int n, long total, long stride,
+        long extent, bool validate, IGpuBuffer flag)
+    {
+        if (n <= 0) return;
+        IntPtr unravelKernel = ParityKernel("parity_unravel_axis");
+        using var _ = PushContext();
+        IntPtr px = indices.Handle, py = output.Handle, pf = flag.Handle;
+        int check = validate ? 1 : 0;
+        void** args = stackalloc void*[8];
+        args[0] = &px; args[1] = &py; args[2] = &n; args[3] = &total; args[4] = &stride; args[5] = &extent; args[6] = &check; args[7] = &pf;
+        LaunchKernel(unravelKernel, ParityGrid(n), DefaultBlockSize, args);
+    }
+
+    unsafe void ITorchParityElementwiseBackend.TorchParitySliceBitonicStep(IGpuBuffer slices, IGpuBuffer order, int rowLen, int k, int j, int length)
+    {
+        if (rowLen <= 0) return;
+        IntPtr stepKernel = ParityKernel("parity_slice_bitonic_step");
+        using var _ = PushContext();
+        IntPtr ps = slices.Handle, po = order.Handle;
+        void** args = stackalloc void*[6];
+        args[0] = &ps; args[1] = &po; args[2] = &rowLen; args[3] = &k; args[4] = &j; args[5] = &length;
+        LaunchKernel(stepKernel, ParityGrid(rowLen), DefaultBlockSize, args);
+    }
+
+    unsafe void ITorchParityElementwiseBackend.TorchParitySliceFirstFlags(IGpuBuffer slices, IGpuBuffer order, IGpuBuffer flags, int n, int length)
+    {
+        if (n <= 0) return;
+        IntPtr flagsKernel = ParityKernel("parity_slice_first_flags");
+        using var _ = PushContext();
+        IntPtr ps = slices.Handle, po = order.Handle, pf = flags.Handle;
+        void** args = stackalloc void*[5];
+        args[0] = &ps; args[1] = &po; args[2] = &pf; args[3] = &n; args[4] = &length;
+        LaunchKernel(flagsKernel, ParityGrid(n), DefaultBlockSize, args);
+    }
+
+    unsafe void ITorchParityElementwiseBackend.TorchParitySliceGatherUnique(IGpuBuffer slices, IGpuBuffer order, IGpuBuffer flags,
+        IGpuBuffer positions, IGpuBuffer output, int n, int length)
+    {
+        int total = n * length;
+        if (total <= 0) return;
+        IntPtr gatherKernel = ParityKernel("parity_slice_gather_unique");
+        using var _ = PushContext();
+        IntPtr ps = slices.Handle, po = order.Handle, pf = flags.Handle, pp = positions.Handle, py = output.Handle;
+        void** args = stackalloc void*[7];
+        args[0] = &ps; args[1] = &po; args[2] = &pf; args[3] = &pp; args[4] = &py; args[5] = &total; args[6] = &length;
+        LaunchKernel(gatherKernel, ParityGrid(total), DefaultBlockSize, args);
+    }
+
+    unsafe void ITorchParityElementwiseBackend.TorchParityGridSample3D(IGpuBuffer input, IGpuBuffer grid, IGpuBuffer output, int batches,
+        int channels, int depth, int height, int width, int points, int mode, int padding, bool alignCorners)
+    {
+        int threads = batches * points;
+        if (threads <= 0) return;
+        IntPtr gridKernel = ParityKernel("parity_grid_sample_3d");
+        using var _ = PushContext();
+        IntPtr px = input.Handle, pg = grid.Handle, py = output.Handle;
+        int align = alignCorners ? 1 : 0;
+        void** args = stackalloc void*[12];
+        args[0] = &px; args[1] = &pg; args[2] = &py; args[3] = &batches; args[4] = &channels; args[5] = &depth; args[6] = &height;
+        args[7] = &width; args[8] = &points; args[9] = &mode; args[10] = &padding; args[11] = &align;
+        LaunchKernel(gridKernel, ParityGrid(threads), DefaultBlockSize, args);
+    }
+
     unsafe void ITorchParityElementwiseBackend.TorchParityBinary(
         TorchParityBinaryOp op, IGpuBuffer a, IGpuBuffer b, IGpuBuffer output, int n)
     {
