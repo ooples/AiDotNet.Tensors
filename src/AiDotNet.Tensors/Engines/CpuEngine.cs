@@ -8311,8 +8311,10 @@ public partial class CpuEngine : ITensorLevelEngine
             double[] dArr = Unsafe.As<T[], double[]>(ref storageArr);
             fixed (double* basePtr = dArr)
             {
-                double sum = ParallelReduceDouble(basePtr + tensor._storageOffset, tensor.Length,
-                    SimdKernels.Sum, static (a, b) => a + b);
+                // One chunk (the common case) calls the kernel directly: no delegate and no allocation per call.
+                double sum = tensor.Length <= DoubleReduceChunk
+                    ? SimdKernels.Sum(new ReadOnlySpan<double>(basePtr + tensor._storageOffset, tensor.Length))
+                    : ParallelReduceDouble(basePtr + tensor._storageOffset, tensor.Length, s_doubleSumKernel, s_doubleAdd);
                 return Unsafe.As<double, T>(ref sum);
             }
         }
@@ -8592,7 +8594,9 @@ public partial class CpuEngine : ITensorLevelEngine
             int sOff = tensor._storageOffset;
             fixed (double* basePtr = dArr)
             {
-                double result = ParallelReduceDouble(basePtr + sOff, length, SimdKernels.Max, Math.Max);
+                double result = length <= DoubleReduceChunk
+                    ? SimdKernels.Max(new ReadOnlySpan<double>(basePtr + sOff, length))
+                    : ParallelReduceDouble(basePtr + sOff, length, s_doubleMaxKernel, s_doubleMax);
                 return Unsafe.As<double, T>(ref result);
             }
         }
@@ -8637,7 +8641,9 @@ public partial class CpuEngine : ITensorLevelEngine
             if (span.Length > tensor.Length) span = span[..tensor.Length];
             fixed (double* ptr = span)
             {
-                double result = ParallelReduceDouble(ptr, span.Length, SimdKernels.Min, Math.Min);
+                double result = span.Length <= DoubleReduceChunk
+                    ? SimdKernels.Min(new ReadOnlySpan<double>(ptr, span.Length))
+                    : ParallelReduceDouble(ptr, span.Length, s_doubleMinKernel, s_doubleMin);
                 return Unsafe.As<double, T>(ref result);
             }
         }
@@ -8655,6 +8661,15 @@ public partial class CpuEngine : ITensorLevelEngine
     /// floating-point combine order depend only on the length, never on the thread count.
     /// </summary>
     private const int DoubleReduceChunk = 32 * 1024;
+
+    // Converted once: passing a method group or lambda at each call allocated a delegate per reduction (48 B per
+    // TensorSum/TensorMaxValue call, and 60 -> 84 ns at 1000 elements).
+    private static readonly DoubleSpanReductionKernel s_doubleSumKernel = SimdKernels.Sum;
+    private static readonly DoubleSpanReductionKernel s_doubleMaxKernel = SimdKernels.Max;
+    private static readonly DoubleSpanReductionKernel s_doubleMinKernel = SimdKernels.Min;
+    private static readonly Func<double, double, double> s_doubleAdd = static (a, b) => a + b;
+    private static readonly Func<double, double, double> s_doubleMax = Math.Max;
+    private static readonly Func<double, double, double> s_doubleMin = Math.Min;
 
     /// <summary>
     /// Parallel reduction for double arrays: reduces fixed 32K-element chunks concurrently, then
