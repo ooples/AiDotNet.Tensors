@@ -1365,6 +1365,52 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// </summary>
     internal int StorageMutationVersion => _storage.GpuCacheVersion;
 
+    /// <summary>
+    /// Makes this tensor take <paramref name="source"/>'s storage and layout (shape, strides, storage offset).
+    /// </summary>
+    /// <remarks>
+    /// <para>The primitive behind torch's <c>set_</c>, and the metadata half of the in-place view ops
+    /// (<c>squeeze_</c>, <c>t_</c>, <c>transpose_</c>, <c>as_strided_</c>, <c>resize_</c>): their out-of-place form
+    /// returns a view of this tensor's storage, and adopting it changes only the layout. Other tensors that view the
+    /// old storage keep it, as in torch.</para>
+    /// <para>Host data is made current first: this tensor's device binding describes the old layout and is dropped,
+    /// and data that lived only on the device would go with it. The next device op uploads the new layout.</para>
+    /// </remarks>
+    internal void AdoptFrom(TensorBase<T> source)
+    {
+        if (source is null) throw new ArgumentNullException(nameof(source));
+        if (ReferenceEquals(source, this)) return;
+        if (IsSparse || source.IsSparse)
+            throw new NotSupportedException("A sparse tensor cannot adopt or donate a dense layout.");
+
+        // Reading the data runs any pending device download into the host array.
+        _ = _data.AsSpan();
+        _ = source._data.AsSpan();
+
+        bool sameStorage = ReferenceEquals(_storage, source._storage);
+        if (!sameStorage)
+        {
+            // Acquire before release, as in RebindStorageFrom: source may hold the only other reference.
+            source._storage.AddRef();
+            var oldStorage = _storage;
+            _storage = source._storage;
+            oldStorage.Release();
+        }
+        _data = source._data;
+        _shape = (int[])source._shape.Clone();
+        Shape = TensorShape.WrapUnsafe(_shape);
+        _strides = (int[])source._strides.Clone();
+        _rowMajorStridesCache = null;
+        _storageOffset = source._storageOffset;
+        Length = source.Length;
+        IsContiguous = source.IsContiguous;
+        // Sharing another tensor's storage makes this a view of it; a layout change over its own storage does not.
+        IsView = sameStorage ? IsView || source.IsView : true;
+        InvalidateGpuBindingAfterStorageReplacement();
+        _viewGpuBufferVersion = -1;
+        IncrementVersion();
+    }
+
     private void InvalidateGpuBindingAfterStorageReplacement()
     {
         _gpuBuffer = null;
@@ -1596,7 +1642,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// Whether this tensor is a view into another tensor's storage.
     /// Views share memory — mutations through one view are visible in others.
     /// </summary>
-    public bool IsView { get; }
+    public bool IsView { get; private set; }
 
     /// <summary>
     /// Whether this tensor uses sparse storage (COO, CSR, or CSC format).
@@ -1646,7 +1692,7 @@ public abstract class TensorBase<T> : IDisposable, IStreamingDroppable, ITensorS
     /// Gets the total number of logical elements in this tensor (product of all shape dimensions).
     /// For views, this is the view's element count, not the underlying storage size.
     /// </summary>
-    public int Length { get; }
+    public int Length { get; private set; }
 
     /// <summary>
     /// Gets the rank (number of dimensions) of the tensor.

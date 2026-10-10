@@ -1561,7 +1561,16 @@ public partial class Tensor<T> : TensorBase<T>, IEnumerable<T>
         ThrowIfSparse();
         EnsureMaterialized();
         EnsureOwnedForWrite();
-        _numOps.Fill(_data.AsWritableSpan(), value);
+        // Only this tensor's elements. Filling the whole data vector also overwrote every other view of the storage
+        // (a row of a matrix filled the matrix), and a strided view filled the elements between its own.
+        if (IsContiguous)
+        {
+            _numOps.Fill(AsWritableSpan(), value);
+        }
+        else
+        {
+            for (int i = 0; i < Length; i++) this[i] = value;
+        }
         IncrementVersion();
         UniformFillValue = _numOps.ToDouble(value);
     }

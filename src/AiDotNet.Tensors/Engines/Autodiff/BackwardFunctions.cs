@@ -364,6 +364,121 @@ internal static class BackwardFunctions<T>
     }
 
     /// <summary>
+    /// The write-back of an in-place op: the tensor now holds the op's result, so its gradient is the result's.
+    /// </summary>
+    internal static void InPlaceAssignBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+        => DifferentiableOps.AccumulateGrad(grads, inputs[0], gradOutput, engine);
+
+    /// <summary>A gradient cut (<c>detach_</c>): drops the gradient that reached the tensor, passing nothing on.</summary>
+    internal static void GradientCutBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+        => grads.Remove(output);
+
+    /// <summary>d(acosh(x))/dx = grad / sqrt(x^2 - 1)</summary>
+    internal static void AcoshBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var x = inputs[0];
+        var denominator = engine.TensorSqrt(engine.TensorAddScalar(engine.TensorMultiply(x, x), numOps.Negate(numOps.One)));
+        DifferentiableOps.AccumulateGrad(grads, x, engine.TensorDivide(gradOutput, denominator), engine);
+    }
+
+    /// <summary>d(asinh(x))/dx = grad / sqrt(x^2 + 1)</summary>
+    internal static void AsinhBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var x = inputs[0];
+        var denominator = engine.TensorSqrt(engine.TensorAddScalar(engine.TensorMultiply(x, x), numOps.One));
+        DifferentiableOps.AccumulateGrad(grads, x, engine.TensorDivide(gradOutput, denominator), engine);
+    }
+
+    /// <summary>d(2^x)/dx = grad * 2^x * ln 2, from the saved output.</summary>
+    internal static void Exp2Backward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var slope = engine.TensorMultiplyScalar(output, numOps.FromDouble(0.69314718055994530942));
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], engine.TensorMultiply(gradOutput, slope), engine);
+    }
+
+    /// <summary>d(e^x - 1)/dx = grad * e^x = grad * (output + 1)</summary>
+    internal static void Expm1Backward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var slope = engine.TensorAddScalar(output, numOps.One);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], engine.TensorMultiply(gradOutput, slope), engine);
+    }
+
+    /// <summary>d(log10(x))/dx = grad / (x ln 10)</summary>
+    internal static void Log10Backward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var x = inputs[0];
+        var denominator = engine.TensorMultiplyScalar(x, numOps.FromDouble(2.30258509299404568402));
+        DifferentiableOps.AccumulateGrad(grads, x, engine.TensorDivide(gradOutput, denominator), engine);
+    }
+
+    /// <summary>d(log(1 + x))/dx = grad / (1 + x)</summary>
+    internal static void Log1pBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var x = inputs[0];
+        DifferentiableOps.AccumulateGrad(grads, x, engine.TensorDivide(gradOutput, engine.TensorAddScalar(x, numOps.One)), engine);
+    }
+
+    /// <summary>d(log2(x))/dx = grad / (x ln 2)</summary>
+    internal static void Log2Backward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var x = inputs[0];
+        var denominator = engine.TensorMultiplyScalar(x, numOps.FromDouble(0.69314718055994530942));
+        DifferentiableOps.AccumulateGrad(grads, x, engine.TensorDivide(gradOutput, denominator), engine);
+    }
+
+    /// <summary>d(x^-1/2)/dx = -grad / 2 * x^-3/2 = -grad / 2 * output^3</summary>
+    internal static void RsqrtBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var cube = engine.TensorMultiply(engine.TensorMultiply(output, output), output);
+        var slope = engine.TensorMultiplyScalar(cube, numOps.FromDouble(-0.5));
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], engine.TensorMultiply(gradOutput, slope), engine);
+    }
+
+    /// <summary>d(tan(x))/dx = grad * (1 + tan(x)^2), from the saved output.</summary>
+    internal static void TanBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+    {
+        var numOps = MathHelper.GetNumericOperations<T>();
+        var slope = engine.TensorAddScalar(engine.TensorMultiply(output, output), numOps.One);
+        DifferentiableOps.AccumulateGrad(grads, inputs[0], engine.TensorMultiply(gradOutput, slope), engine);
+    }
+
+    /// <summary>trunc is piecewise constant: zero gradient, written exactly as <see cref="SignBackward"/> writes it.</summary>
+    internal static void TruncBackward(
+        Tensor<T> gradOutput, Tensor<T>[] inputs, Tensor<T> output,
+        object[] savedState, IEngine engine, Dictionary<Tensor<T>, Tensor<T>> grads)
+        => SignBackward(gradOutput, inputs, output, savedState, engine, grads);
+
+    /// <summary>
     /// d(atan2(y, x))/dy = grad * x / (x^2 + y^2), d/dx = -grad * y / (x^2 + y^2).
     /// </summary>
     /// <remarks>

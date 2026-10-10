@@ -37142,8 +37142,8 @@ public partial class CpuEngine : ITensorLevelEngine
     public void TensorFill<T>(Tensor<T> tensor, T value)
     {
         if (tensor == null) throw new ArgumentNullException(nameof(tensor));
-        var tensorOrig = tensor;  // #257: preserve user-facing ref before .Contiguous() discards GradFn.
-        if (!tensor.IsContiguous) tensor = tensor.Contiguous();
+        // Filled through its own layout: filling tensor.Contiguous() filled a copy of a view and left the view, and
+        // every alias of its storage, unchanged.
         tensor.Fill(value);
     }
 
