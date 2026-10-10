@@ -1,6 +1,6 @@
 {
   "torchVersion": "2.11.0",
-  "gapBaseline": 1,
+  "gapBaseline": 0,
   "entries": {
     "Tensor:abs": {
       "status": "mapped",
@@ -118,13 +118,13 @@
       "source": "reviewed"
     },
     "Tensor:align_as": {
-      "status": "not-applicable",
-      "reason": "A Python-object, storage-pointer, named-tensor or quantized-qtensor accessor without a counterpart in Tensors' managed, unnamed tensor model.",
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor`1::AlignAs",
       "source": "reviewed"
     },
     "Tensor:align_to": {
-      "status": "not-applicable",
-      "reason": "A Python-object, storage-pointer, named-tensor or quantized-qtensor accessor without a counterpart in Tensors' managed, unnamed tensor model.",
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor`1::AlignTo",
       "source": "reviewed"
     },
     "Tensor:all": {
@@ -1103,8 +1103,8 @@
       "source": "reviewed"
     },
     "Tensor:has_names": {
-      "status": "not-applicable",
-      "reason": "A Python-object, storage-pointer, named-tensor or quantized-qtensor accessor without a counterpart in Tensors' managed, unnamed tensor model.",
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor`1::HasNames",
       "source": "reviewed"
     },
     "Tensor:hash_tensor": {
@@ -2088,8 +2088,8 @@
       "source": "reviewed"
     },
     "Tensor:refine_names": {
-      "status": "not-applicable",
-      "reason": "A Python-object, storage-pointer, named-tensor or quantized-qtensor accessor without a counterpart in Tensors' managed, unnamed tensor model.",
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor`1::RefineNames",
       "source": "reviewed"
     },
     "Tensor:register_hook": {
@@ -2128,13 +2128,14 @@
       "source": "reviewed"
     },
     "Tensor:rename": {
-      "status": "not-applicable",
-      "reason": "A Python-object, storage-pointer, named-tensor or quantized-qtensor accessor without a counterpart in Tensors' managed, unnamed tensor model.",
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor`1::Rename",
       "source": "reviewed"
     },
     "Tensor:rename_": {
-      "status": "gap",
-      "source": "name-match"
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor`1::RenameInPlace",
+      "source": "reviewed"
     },
     "Tensor:renorm": {
       "status": "mapped",
@@ -8132,8 +8133,8 @@
       "source": "reviewed"
     },
     "torch:align_tensors": {
-      "status": "not-applicable",
-      "reason": "A Python-object, storage-pointer, named-tensor or quantized-qtensor accessor without a counterpart in Tensors' managed, unnamed tensor model.",
+      "status": "mapped",
+      "symbol": "AiDotNet.Tensors.LinearAlgebra.Tensor`1::AlignTensors",
       "source": "reviewed"
     },
     "torch:all": {
