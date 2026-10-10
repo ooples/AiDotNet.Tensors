@@ -1,7 +1,11 @@
 namespace AiDotNet.Tensors.Engines.DirectGpu;
 
 /// <summary>Unary PyTorch-parity elementwise ops with a device kernel (#1112).</summary>
-internal enum TorchParityUnaryOp { Celu, Hardtanh, LogSigmoid, Softsign, Logit, Sinc, Erf }
+internal enum TorchParityUnaryOp
+{
+    Celu, Hardtanh, LogSigmoid, Softsign, Logit, Sinc, Erf,
+    BesselJ0, BesselJ1, BesselY0, BesselY1, ModifiedBesselI0, ModifiedBesselI1, Erfcx, Ndtr, Ndtri, Entr, Signbit, IsPosInf, IsNegInf,
+}
 
 /// <summary>Binary (same-shape) PyTorch-parity elementwise ops with a device kernel (#1112).</summary>
 internal enum TorchParityBinaryOp { Fmax, Fmin, Heaviside, GreaterEqual, LessEqual }

@@ -106,6 +106,100 @@ extern ""C"" __global__ __launch_bounds__(256) void parity_less_equal(const floa
     PARITY_INDEX
     y[i] = a[i] <= b[i] ? 1.0f : 0.0f;
 }
+
+// Special functions and indicators (#1112 tier 4): CUDA libm's j0f / j1f / y0f / y1f / cyl_bessel_i0f / i1f /
+// erfcxf / normcdff / normcdfinvf share the CPU references' edge values (Y_n: NaN for x < 0, -inf at 0, 0 at +inf;
+// J_n: 0 at +-inf; ndtri: NaN outside [0, 1], -+inf at 0 / 1). entr mirrors its CPU lambda.
+extern ""C"" __global__ __launch_bounds__(256) void parity_bessel_j0(const float* __restrict__ x, float* __restrict__ y, int n, float unused0, float unused1)
+{
+    PARITY_INDEX
+    float v = x[i];
+    y[i] = j0f(v);
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void parity_bessel_j1(const float* __restrict__ x, float* __restrict__ y, int n, float unused0, float unused1)
+{
+    PARITY_INDEX
+    float v = x[i];
+    y[i] = j1f(v);
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void parity_bessel_y0(const float* __restrict__ x, float* __restrict__ y, int n, float unused0, float unused1)
+{
+    PARITY_INDEX
+    float v = x[i];
+    y[i] = y0f(v);
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void parity_bessel_y1(const float* __restrict__ x, float* __restrict__ y, int n, float unused0, float unused1)
+{
+    PARITY_INDEX
+    float v = x[i];
+    y[i] = y1f(v);
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void parity_bessel_i0(const float* __restrict__ x, float* __restrict__ y, int n, float unused0, float unused1)
+{
+    PARITY_INDEX
+    float v = x[i];
+    y[i] = cyl_bessel_i0f(v);
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void parity_bessel_i1(const float* __restrict__ x, float* __restrict__ y, int n, float unused0, float unused1)
+{
+    PARITY_INDEX
+    float v = x[i];
+    y[i] = cyl_bessel_i1f(v);
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void parity_erfcx(const float* __restrict__ x, float* __restrict__ y, int n, float unused0, float unused1)
+{
+    PARITY_INDEX
+    float v = x[i];
+    y[i] = erfcxf(v);
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void parity_ndtr(const float* __restrict__ x, float* __restrict__ y, int n, float unused0, float unused1)
+{
+    PARITY_INDEX
+    float v = x[i];
+    y[i] = normcdff(v);
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void parity_ndtri(const float* __restrict__ x, float* __restrict__ y, int n, float unused0, float unused1)
+{
+    PARITY_INDEX
+    float v = x[i];
+    y[i] = normcdfinvf(v);
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void parity_entr(const float* __restrict__ x, float* __restrict__ y, int n, float unused0, float unused1)
+{
+    PARITY_INDEX
+    float v = x[i];
+    y[i] = isnan(v) ? v : (v > 0.0f ? -v * logf(v) : (v == 0.0f ? 0.0f : -INFINITY));
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void parity_signbit(const float* __restrict__ x, float* __restrict__ y, int n, float unused0, float unused1)
+{
+    PARITY_INDEX
+    float v = x[i];
+    y[i] = signbit(v) ? 1.0f : 0.0f;
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void parity_isposinf(const float* __restrict__ x, float* __restrict__ y, int n, float unused0, float unused1)
+{
+    PARITY_INDEX
+    float v = x[i];
+    y[i] = (isinf(v) && v > 0.0f) ? 1.0f : 0.0f;
+}
+
+extern ""C"" __global__ __launch_bounds__(256) void parity_isneginf(const float* __restrict__ x, float* __restrict__ y, int n, float unused0, float unused1)
+{
+    PARITY_INDEX
+    float v = x[i];
+    y[i] = (isinf(v) && v < 0.0f) ? 1.0f : 0.0f;
+}
 ";
         }
 
@@ -113,6 +207,7 @@ extern ""C"" __global__ __launch_bounds__(256) void parity_less_equal(const floa
         {
             "parity_celu", "parity_hardtanh", "parity_logsigmoid", "parity_softsign", "parity_logit", "parity_sinc",
             "parity_erf", "parity_fmax", "parity_fmin", "parity_heaviside", "parity_greater_equal", "parity_less_equal",
+            "parity_bessel_j0", "parity_bessel_j1", "parity_bessel_y0", "parity_bessel_y1", "parity_bessel_i0", "parity_bessel_i1", "parity_erfcx", "parity_ndtr", "parity_ndtri", "parity_entr", "parity_signbit", "parity_isposinf", "parity_isneginf",
         };
     }
 }

@@ -47,7 +47,7 @@ public class TorchParityElementwiseDeviceTests : IClassFixture<DirectGpuTensorEn
         return gpu;
     }
 
-    private static void AssertMatches(string op, Tensor<float> cpu, Tensor<float> gpu)
+    private static void AssertMatches(string op, Tensor<float> cpu, Tensor<float> gpu, double tolerance = 2e-6)
     {
         Assert.Equal(cpu._shape, gpu._shape);
         for (int i = 0; i < cpu.Length; i++)
@@ -55,7 +55,7 @@ public class TorchParityElementwiseDeviceTests : IClassFixture<DirectGpuTensorEn
             float c = cpu[i], g = gpu[i];
             if (float.IsNaN(c) || float.IsNaN(g)) { Assert.True(float.IsNaN(c) && float.IsNaN(g), $"{op}[{i}]: cpu {c} gpu {g}"); continue; }
             if (float.IsInfinity(c) || float.IsInfinity(g)) { Assert.Equal(c, g); continue; }
-            Assert.True(Math.Abs(c - g) <= 2e-6 * Math.Max(1.0, Math.Abs(c)), $"{op}[{i}]: cpu {c:R} gpu {g:R}");
+            Assert.True(Math.Abs(c - g) <= tolerance * Math.Max(1.0, Math.Abs(c)), $"{op}[{i}]: cpu {c:R} gpu {g:R}");
         }
     }
 
@@ -70,7 +70,12 @@ public class TorchParityElementwiseDeviceTests : IClassFixture<DirectGpuTensorEn
         return r;
     }
 
-    public static TheoryData<string> UnaryOps() => new() { "celu", "celu2", "hardtanh", "logsigmoid", "softsign", "logit", "logitEps", "sinc", "erf" };
+    public static TheoryData<string> UnaryOps() => new()
+    {
+        "celu", "celu2", "hardtanh", "logsigmoid", "softsign", "logit", "logitEps", "sinc", "erf",
+        "besselJ0", "besselJ1", "besselY0", "besselY1", "modifiedBesselI0", "modifiedBesselI1", "erfcx", "ndtr", "ndtri",
+        "entr", "signbit", "isPosInf", "isNegInf",
+    };
 
     [SkippableTheory]
     [MemberData(nameof(UnaryOps))]
@@ -78,7 +83,12 @@ public class TorchParityElementwiseDeviceTests : IClassFixture<DirectGpuTensorEn
     {
         var gpu = GpuOrSkip();
         var cpu = new CpuEngine();
-        var x = op.StartsWith("logit") ? Input(11, v => float.IsNaN(v) ? v : 1f / (1f + MathF.Exp(-v))) : Input(7);
+        // logit / ndtri take probabilities: the edges plus a sigmoid of the random values (and, for ndtri, the out-of-range
+        // edges that must give NaN).
+        var x = op.StartsWith("logit") || op == "ndtri"
+            ? Input(11, v => float.IsNaN(v) || (op == "ndtri" && (v == 1e30f || v == -1e30f)) ? (v > 0 ? 1.25f : v < 0 ? -0.25f : v)
+                : v == 0f ? 0f : v == 1f ? 1f : 1f / (1f + MathF.Exp(-v)))
+            : Input(7);
         Func<IEngine, Tensor<float>> f = op switch
         {
             "celu" => e => e.TensorCelu(x),
@@ -89,10 +99,25 @@ public class TorchParityElementwiseDeviceTests : IClassFixture<DirectGpuTensorEn
             "logit" => e => e.TensorLogit(x),
             "logitEps" => e => e.TensorLogit(x, 1e-3),
             "sinc" => e => e.TensorSinc(x),
-            _ => e => e.TensorErf(x),
+            "erf" => e => e.TensorErf(x),
+            "besselJ0" => e => e.TensorBesselJ0(x),
+            "besselJ1" => e => e.TensorBesselJ1(x),
+            "besselY0" => e => e.TensorBesselY0(x),
+            "besselY1" => e => e.TensorBesselY1(x),
+            "modifiedBesselI0" => e => e.TensorModifiedBesselI0(x),
+            "modifiedBesselI1" => e => e.TensorModifiedBesselI1(x),
+            "erfcx" => e => e.TensorErfcx(x),
+            "ndtr" => e => e.TensorNdtr(x),
+            "ndtri" => e => e.TensorNdtri(x),
+            "entr" => e => e.TensorEntr(x),
+            "signbit" => e => e.TensorSignbit(x),
+            "isPosInf" => e => e.TensorIsPosInf(x),
+            _ => e => e.TensorIsNegInf(x),
         };
+        // CUDA's Bessel / erfcx / ndtri carry a few 1e-6 of error against the CPU's double-precision quadratures.
+        double tolerance = op.Contains("essel") || op == "erfcx" || op == "ndtri" ? 1e-5 : 2e-6;
         string probeName = "Tensor" + char.ToUpperInvariant(op[0]) + op.Substring(1);
-        AssertMatches(op, f(cpu), OnDevice(probeName, () => f(gpu)));
+        AssertMatches(op, f(cpu), OnDevice(probeName, () => f(gpu)), tolerance);
     }
 
     public static TheoryData<string> BinaryOps() => new() { "fmax", "fmin", "heaviside", "greaterEqual", "lessEqual" };
